@@ -19,6 +19,9 @@ path = "src/main.rs"
 buzz-geom.workspace = true
 buzz-jobs.workspace = true
 buzz-render.workspace = true
+buzz-scene.workspace = true
+buzz-doc.workspace = true
+buzz-ui.workspace = true
 
 vello.workspace = true
 kurbo.workspace = true
@@ -34,5 +37,6 @@ egui-winit.workspace = true
 anyhow.workspace = true
 pollster.workspace = true
 rayon.workspace = true
+rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "tokio"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

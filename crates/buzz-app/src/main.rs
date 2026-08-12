@@ -25,10 +25,24 @@ fn main() -> Result<()> {
     let preference = parse_gpu_preference(std::env::args().skip(1));
 
     let event_loop = EventLoop::new()?;
-    // Poll rather than Wait: the HUD animates live CPU utilisation.
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = app::App::new(preference);
+
+    // A trailing path argument opens that document, so the app can be
+    // associated with the .buzz extension.
+    if let Some(path) = std::env::args().skip(1).find(|a| {
+        !a.starts_with("--")
+            && std::path::Path::new(a)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case(buzz_doc::EXTENSION))
+    }) {
+        match buzz_doc::Document::open(&path) {
+            Ok(doc) => app = app.with_document(doc),
+            Err(e) => eprintln!("could not open {path}: {e}"),
+        }
+    }
+
     event_loop.run_app(&mut app)?;
     Ok(())
 }

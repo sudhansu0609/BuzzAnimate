@@ -57,6 +57,7 @@ buzz-jobs = { path = "crates/buzz-jobs" }
 buzz-render = { path = "crates/buzz-render" }
 buzz-scene = { path = "crates/buzz-scene" }
 buzz-doc = { path = "crates/buzz-doc" }
+buzz-ui = { path = "crates/buzz-ui" }
 
 [profile.dev]
 opt-level = 1

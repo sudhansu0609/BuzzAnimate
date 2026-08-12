@@ -6,4 +6,7 @@
 
 pub mod app;
 pub mod demo;
+pub mod editor;
 pub mod hud;
+pub mod stage;
+pub mod tools;

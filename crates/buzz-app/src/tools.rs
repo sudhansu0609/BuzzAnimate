@@ -1,0 +1,872 @@
+//! Tool behaviour.
+//!
+//! [`buzz_ui::tools`] is the catalogue — names, glyphs, shortcuts. This is what
+//! the tools actually *do*.
+//!
+//! # Shape of the design
+//!
+//! A gesture is three events: press, drag, release. [`ToolAction`] is what a
+//! tool asks for, and the editor carries it out — tools never touch the
+//! document directly. That keeps undo labelling, layer locking and the
+//! merge-shape rules in one place instead of repeated in every tool, where one
+//! of them would inevitably be forgotten.
+
+use buzz_geom::{Affine, BezPath, Point, Rect, Shape as _, Vec2};
+use buzz_scene::ShapeData;
+use buzz_ui::{DrawStyle, ToolId};
+use kurbo::{Circle, Ellipse, Line};
+use peniko::Color;
+
+/// Keyboard modifiers during a gesture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Mods {
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+
+/// What a tool wants the editor to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolAction {
+    /// Nothing yet; the gesture is still in progress.
+    None,
+    /// Add this shape to the active layer, honouring the drawing mode.
+    AddShape { shape: ShapeData, label: &'static str },
+    /// Replace the selection with whatever is under the point.
+    PickAt { point: Point, additive: bool },
+    /// Select everything intersecting the rectangle.
+    PickInRect { rect: Rect, additive: bool },
+    /// Move the current selection.
+    MoveSelection { delta: Vec2 },
+    /// Scale the selection about a fixed corner.
+    TransformSelection { transform: Affine },
+    /// Erase within a stroked path.
+    Erase { path: BezPath, width: f64 },
+    /// Fill whatever is under the point with the current fill colour.
+    BucketFill { point: Point },
+    /// Apply the current stroke to whatever is under the point.
+    ApplyStroke { point: Point },
+    /// Adopt the colour under the point.
+    SampleColor { point: Point },
+    /// Pan the view.
+    PanView { delta_screen: Vec2 },
+    /// Zoom about a screen point.
+    ZoomView { factor: f64, at_screen: Point },
+    /// Clear the selection.
+    Deselect,
+}
+
+/// Live feedback while a gesture is in progress.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Preview {
+    None,
+    /// Outline of the shape being drawn.
+    Shape(BezPath),
+    /// Rubber-band selection rectangle.
+    Marquee(Rect),
+    /// Freehand stroke so far.
+    Stroke { path: BezPath, width: f64 },
+}
+
+/// State shared with a tool for the duration of a gesture.
+pub struct ToolContext<'a> {
+    pub style: &'a DrawStyle,
+    /// Document units per screen pixel, for size-independent thresholds.
+    pub zoom: f64,
+    pub selection_bounds: Option<Rect>,
+}
+
+/// A gesture in progress.
+#[derive(Debug, Clone, PartialEq)]
+enum Gesture {
+    Idle,
+    /// Press-drag-release from a fixed origin.
+    Dragging { origin: Point, current: Point, mods: Mods },
+    /// Accumulating freehand points.
+    Freehand { points: Vec<Point> },
+}
+
+/// Drives one tool through a gesture.
+#[derive(Debug, Clone)]
+pub struct ToolMachine {
+    tool: ToolId,
+    gesture: Gesture,
+    /// Screen-space position, for the navigation tools.
+    last_screen: Point,
+}
+
+/// A drag shorter than this is a click, not a drag.
+///
+/// In *screen* pixels, converted using the zoom, so the threshold feels the
+/// same at every magnification.
+const CLICK_SLOP_PX: f64 = 3.0;
+
+impl ToolMachine {
+    pub fn new(tool: ToolId) -> Self {
+        Self {
+            tool,
+            gesture: Gesture::Idle,
+            last_screen: Point::ORIGIN,
+        }
+    }
+
+    pub fn tool(&self) -> ToolId {
+        self.tool
+    }
+
+    /// Switch tools, abandoning any gesture in progress.
+    pub fn set_tool(&mut self, tool: ToolId) {
+        self.tool = tool;
+        self.gesture = Gesture::Idle;
+    }
+
+    pub fn is_active(&self) -> bool {
+        !matches!(self.gesture, Gesture::Idle)
+    }
+
+    /// Abandon the current gesture, as Escape does.
+    pub fn cancel(&mut self) {
+        self.gesture = Gesture::Idle;
+    }
+
+    pub fn pointer_down(&mut self, doc: Point, screen: Point, mods: Mods) -> ToolAction {
+        self.last_screen = screen;
+        match self.tool {
+            ToolId::Pencil | ToolId::Brush | ToolId::Eraser => {
+                self.gesture = Gesture::Freehand { points: vec![doc] };
+            }
+            _ => {
+                self.gesture = Gesture::Dragging {
+                    origin: doc,
+                    current: doc,
+                    mods,
+                };
+            }
+        }
+        ToolAction::None
+    }
+
+    pub fn pointer_move(&mut self, doc: Point, screen: Point, mods: Mods) -> ToolAction {
+        let delta_screen = screen - self.last_screen;
+        self.last_screen = screen;
+
+        match &mut self.gesture {
+            Gesture::Idle => ToolAction::None,
+            Gesture::Freehand { points } => {
+                // Drop points that add nothing, so a slow drag does not build a
+                // path with thousands of coincident vertices.
+                if points.last().is_none_or(|p| (doc - *p).hypot() > f64::EPSILON) {
+                    points.push(doc);
+                }
+                ToolAction::None
+            }
+            Gesture::Dragging { current, mods: m, .. } => {
+                *current = doc;
+                *m = mods;
+                match self.tool {
+                    ToolId::Hand => ToolAction::PanView { delta_screen },
+                    _ => ToolAction::None,
+                }
+            }
+        }
+    }
+
+    pub fn pointer_up(&mut self, doc: Point, screen: Point, ctx: &ToolContext<'_>) -> ToolAction {
+        let gesture = std::mem::replace(&mut self.gesture, Gesture::Idle);
+        self.last_screen = screen;
+
+        match gesture {
+            Gesture::Idle => ToolAction::None,
+            Gesture::Freehand { mut points } => {
+                if points.last().is_none_or(|p| *p != doc) {
+                    points.push(doc);
+                }
+                self.finish_freehand(points, ctx)
+            }
+            Gesture::Dragging { origin, mods, .. } => {
+                self.finish_drag(origin, doc, mods, ctx)
+            }
+        }
+    }
+
+    /// The current preview, for drawing feedback on the stage.
+    pub fn preview(&self, ctx: &ToolContext<'_>) -> Preview {
+        match &self.gesture {
+            Gesture::Idle => Preview::None,
+            Gesture::Freehand { points } => match self.tool {
+                ToolId::Eraser => Preview::Stroke {
+                    path: polyline(points),
+                    width: ctx.style.stroke_width.max(1.0) * 4.0,
+                },
+                _ => Preview::Stroke {
+                    path: polyline(points),
+                    width: brush_width(self.tool, ctx.style),
+                },
+            },
+            Gesture::Dragging { origin, current, mods } => match self.tool {
+                ToolId::Rectangle | ToolId::Oval | ToolId::PolyStar | ToolId::Line | ToolId::Pen => {
+                    build_shape_path(self.tool, *origin, *current, *mods)
+                        .map(Preview::Shape)
+                        .unwrap_or(Preview::None)
+                }
+                ToolId::Selection | ToolId::Lasso | ToolId::Subselection => {
+                    Preview::Marquee(Rect::from_points(*origin, *current))
+                }
+                ToolId::Zoom => Preview::Marquee(Rect::from_points(*origin, *current)),
+                _ => Preview::None,
+            },
+        }
+    }
+
+    fn finish_freehand(&self, points: Vec<Point>, ctx: &ToolContext<'_>) -> ToolAction {
+        if points.len() < 2 {
+            return ToolAction::None;
+        }
+        let path = polyline(&points);
+        match self.tool {
+            ToolId::Eraser => ToolAction::Erase {
+                path,
+                width: ctx.style.stroke_width.max(1.0) * 4.0,
+            },
+            ToolId::Brush => {
+                // The brush paints a filled stroke, so its colour comes from
+                // the fill swatch — as in Animate.
+                let width = brush_width(self.tool, ctx.style);
+                let outline = buzz_geom::outline_stroke(
+                    &path,
+                    buzz_geom::StrokeStyle::new(width),
+                    (width / 40.0).max(1e-4),
+                );
+                ToolAction::AddShape {
+                    shape: ShapeData::filled(
+                        outline,
+                        ctx.style.fill_for_new_shape().unwrap_or(Color::BLACK),
+                    ),
+                    label: "Brush",
+                }
+            }
+            _ => {
+                let (color, width, hairline) = ctx
+                    .style
+                    .stroke_for_new_shape()
+                    .unwrap_or((Color::BLACK, 1.0, false));
+                ToolAction::AddShape {
+                    shape: ShapeData {
+                        path,
+                        fill: None,
+                        stroke: Some(buzz_scene::StrokeSpec {
+                            color,
+                            width,
+                            hairline,
+                        }),
+                    },
+                    label: "Pencil",
+                }
+            }
+        }
+    }
+
+    fn finish_drag(
+        &self,
+        origin: Point,
+        end: Point,
+        mods: Mods,
+        ctx: &ToolContext<'_>,
+    ) -> ToolAction {
+        let slop = CLICK_SLOP_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+        let was_click = (end - origin).hypot() <= slop;
+
+        match self.tool {
+            ToolId::Selection | ToolId::Subselection => {
+                if was_click {
+                    ToolAction::PickAt {
+                        point: end,
+                        additive: mods.shift,
+                    }
+                } else if ctx.selection_bounds.is_some_and(|b| contains(b, origin)) {
+                    // Started inside the selection: move it.
+                    ToolAction::MoveSelection {
+                        delta: end - origin,
+                    }
+                } else {
+                    ToolAction::PickInRect {
+                        rect: Rect::from_points(origin, end),
+                        additive: mods.shift,
+                    }
+                }
+            }
+
+            ToolId::FreeTransform => match ctx.selection_bounds {
+                Some(bounds) if !was_click => {
+                    ToolAction::TransformSelection {
+                        transform: scale_about_corner(bounds, origin, end, mods.shift),
+                    }
+                }
+                Some(_) => ToolAction::None,
+                None => ToolAction::PickAt {
+                    point: end,
+                    additive: false,
+                },
+            },
+
+            ToolId::Rectangle | ToolId::Oval | ToolId::PolyStar | ToolId::Line | ToolId::Pen => {
+                if was_click {
+                    return ToolAction::None;
+                }
+                let Some(path) = build_shape_path(self.tool, origin, end, mods) else {
+                    return ToolAction::None;
+                };
+                let filled = self.tool != ToolId::Line && self.tool != ToolId::Pen;
+                ToolAction::AddShape {
+                    shape: ShapeData {
+                        path,
+                        fill: filled
+                            .then(|| ctx.style.fill_for_new_shape())
+                            .flatten()
+                            .map(buzz_scene::FillSpec::solid),
+                        stroke: ctx.style.stroke_for_new_shape().map(|(color, width, hairline)| {
+                            buzz_scene::StrokeSpec {
+                                color,
+                                width,
+                                hairline,
+                            }
+                        }),
+                    },
+                    label: shape_label(self.tool),
+                }
+            }
+
+            ToolId::PaintBucket => ToolAction::BucketFill { point: end },
+            ToolId::InkBottle => ToolAction::ApplyStroke { point: end },
+            ToolId::Eyedropper => ToolAction::SampleColor { point: end },
+
+            ToolId::Zoom => {
+                if was_click {
+                    // Alt-click zooms out, as in Animate.
+                    let factor = if mods.alt { 0.5 } else { 2.0 };
+                    ToolAction::ZoomView {
+                        factor,
+                        at_screen: self.last_screen,
+                    }
+                } else {
+                    ToolAction::None
+                }
+            }
+
+            ToolId::Hand => ToolAction::None,
+            _ => ToolAction::None,
+        }
+    }
+}
+
+fn shape_label(tool: ToolId) -> &'static str {
+    match tool {
+        ToolId::Rectangle => "Draw Rectangle",
+        ToolId::Oval => "Draw Oval",
+        ToolId::PolyStar => "Draw PolyStar",
+        ToolId::Line => "Draw Line",
+        ToolId::Pen => "Draw Path",
+        _ => "Draw",
+    }
+}
+
+fn brush_width(tool: ToolId, style: &DrawStyle) -> f64 {
+    match tool {
+        // Animate's brush is much fatter than the pencil at the same setting.
+        ToolId::Brush => (style.stroke_width * 5.0).max(2.0),
+        _ => style.stroke_width.max(0.1),
+    }
+}
+
+fn polyline(points: &[Point]) -> BezPath {
+    let mut path = BezPath::new();
+    if let Some(first) = points.first() {
+        path.move_to(*first);
+        for p in &points[1..] {
+            path.line_to(*p);
+        }
+    }
+    path
+}
+
+fn contains(rect: Rect, p: Point) -> bool {
+    p.x >= rect.x0 && p.x <= rect.x1 && p.y >= rect.y0 && p.y <= rect.y1
+}
+
+/// Build the path for a drag-created shape.
+///
+/// Shift constrains: squares, circles, and lines to 45° steps — all Animate
+/// behaviours a user will reach for without thinking.
+fn build_shape_path(tool: ToolId, origin: Point, end: Point, mods: Mods) -> Option<BezPath> {
+    let mut end = end;
+
+    if mods.shift {
+        match tool {
+            ToolId::Rectangle | ToolId::Oval => {
+                let dx = end.x - origin.x;
+                let dy = end.y - origin.y;
+                let size = dx.abs().max(dy.abs());
+                end = Point::new(
+                    origin.x + size * dx.signum(),
+                    origin.y + size * dy.signum(),
+                );
+            }
+            ToolId::Line | ToolId::Pen => {
+                let d = end - origin;
+                let angle = d.y.atan2(d.x);
+                let step = std::f64::consts::FRAC_PI_4;
+                let snapped = (angle / step).round() * step;
+                let length = d.hypot();
+                end = Point::new(
+                    origin.x + length * snapped.cos(),
+                    origin.y + length * snapped.sin(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let rect = Rect::from_points(origin, end);
+    if rect.width() <= 0.0 && rect.height() <= 0.0 {
+        return None;
+    }
+
+    Some(match tool {
+        ToolId::Rectangle => rect.to_path(1e-6),
+        ToolId::Oval => {
+            if mods.shift {
+                Circle::new(rect.center(), rect.width().min(rect.height()) / 2.0).to_path(1e-3)
+            } else {
+                Ellipse::new(rect.center(), (rect.width() / 2.0, rect.height() / 2.0), 0.0)
+                    .to_path(1e-3)
+            }
+        }
+        ToolId::PolyStar => star_path(rect.center(), rect.width().min(rect.height()) / 2.0, 5),
+        ToolId::Line | ToolId::Pen => Line::new(origin, end).to_path(1e-6),
+        _ => return None,
+    })
+}
+
+/// A five-pointed star, Animate's PolyStar default.
+fn star_path(center: Point, radius: f64, points: usize) -> BezPath {
+    let mut path = BezPath::new();
+    let points = points.max(3);
+    let inner = radius * 0.382; // The golden-ratio inner radius of a pentagram.
+    let step = std::f64::consts::PI / points as f64;
+    // Start at the top.
+    let mut angle = -std::f64::consts::FRAC_PI_2;
+
+    for i in 0..(points * 2) {
+        let r = if i % 2 == 0 { radius } else { inner };
+        let p = Point::new(center.x + r * angle.cos(), center.y + r * angle.sin());
+        if i == 0 {
+            path.move_to(p);
+        } else {
+            path.line_to(p);
+        }
+        angle += step;
+    }
+    path.close_path();
+    path
+}
+
+/// Scale the selection by dragging, anchored at the opposite corner.
+fn scale_about_corner(bounds: Rect, origin: Point, end: Point, uniform: bool) -> Affine {
+    // Whichever corner the drag started nearest stays put... its opposite does.
+    let anchor = Point::new(
+        if (origin.x - bounds.x0).abs() < (origin.x - bounds.x1).abs() {
+            bounds.x1
+        } else {
+            bounds.x0
+        },
+        if (origin.y - bounds.y0).abs() < (origin.y - bounds.y1).abs() {
+            bounds.y1
+        } else {
+            bounds.y0
+        },
+    );
+
+    let before = origin - anchor;
+    let after = end - anchor;
+
+    let safe = |a: f64, b: f64| {
+        if b.abs() < 1e-9 {
+            1.0
+        } else {
+            a / b
+        }
+    };
+    let mut sx = safe(after.x, before.x);
+    let mut sy = safe(after.y, before.y);
+
+    if uniform {
+        let s = (sx.abs() + sy.abs()) / 2.0;
+        sx = s * sx.signum();
+        sy = s * sy.signum();
+    }
+
+    // Refuse to collapse geometry to nothing, which would be unrecoverable.
+    const MIN: f64 = 1e-4;
+    if sx.abs() < MIN {
+        sx = MIN * if sx < 0.0 { -1.0 } else { 1.0 };
+    }
+    if sy.abs() < MIN {
+        sy = MIN * if sy < 0.0 { -1.0 } else { 1.0 };
+    }
+
+    Affine::translate(anchor.to_vec2())
+        * Affine::scale_non_uniform(sx, sy)
+        * Affine::translate(-anchor.to_vec2())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(style: &DrawStyle) -> ToolContext<'_> {
+        ToolContext {
+            style,
+            zoom: 1.0,
+            selection_bounds: None,
+        }
+    }
+
+    fn drag(machine: &mut ToolMachine, from: Point, to: Point, ctx: &ToolContext<'_>) -> ToolAction {
+        machine.pointer_down(from, from, Mods::default());
+        machine.pointer_move(to, to, Mods::default());
+        machine.pointer_up(to, to, ctx)
+    }
+
+    #[test]
+    fn dragging_the_rectangle_tool_creates_a_rectangle() {
+        let style = DrawStyle::default();
+        let mut m = ToolMachine::new(ToolId::Rectangle);
+        let action = drag(&mut m, Point::new(10.0, 10.0), Point::new(60.0, 40.0), &ctx(&style));
+
+        match action {
+            ToolAction::AddShape { shape, label } => {
+                assert_eq!(label, "Draw Rectangle");
+                let bb = shape.path.bounding_box();
+                assert!((bb.width() - 50.0).abs() < 1e-6, "{bb:?}");
+                assert!((bb.height() - 30.0).abs() < 1e-6);
+                assert!(shape.fill.is_some() && shape.stroke.is_some());
+            }
+            other => panic!("expected a shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shift_constrains_a_rectangle_to_a_square() {
+        let path = build_shape_path(
+            ToolId::Rectangle,
+            Point::new(0.0, 0.0),
+            Point::new(100.0, 30.0),
+            Mods { shift: true, ..Default::default() },
+        )
+        .unwrap();
+        let bb = path.bounding_box();
+        assert!(
+            (bb.width() - bb.height()).abs() < 1e-6,
+            "shift should give a square, got {bb:?}"
+        );
+    }
+
+    #[test]
+    fn shift_constrains_a_line_to_45_degree_steps() {
+        let path = build_shape_path(
+            ToolId::Line,
+            Point::new(0.0, 0.0),
+            // Nearly horizontal, so it should snap flat.
+            Point::new(100.0, 12.0),
+            Mods { shift: true, ..Default::default() },
+        )
+        .unwrap();
+        let bb = path.bounding_box();
+        assert!(bb.height() < 1e-6, "expected a horizontal line, got {bb:?}");
+    }
+
+    #[test]
+    fn a_line_has_a_stroke_but_no_fill() {
+        let style = DrawStyle::default();
+        let mut m = ToolMachine::new(ToolId::Line);
+        match drag(&mut m, Point::new(0.0, 0.0), Point::new(50.0, 50.0), &ctx(&style)) {
+            ToolAction::AddShape { shape, .. } => {
+                assert!(shape.stroke.is_some());
+                assert!(shape.fill.is_none(), "a line must not be filled");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A click is not a drag; drawing tools must not leave zero-size shapes
+    /// behind every time the user clicks the stage.
+    #[test]
+    fn a_click_does_not_create_a_shape() {
+        let style = DrawStyle::default();
+        let mut m = ToolMachine::new(ToolId::Rectangle);
+        let p = Point::new(20.0, 20.0);
+        assert_eq!(drag(&mut m, p, p, &ctx(&style)), ToolAction::None);
+    }
+
+    /// The click threshold is in screen pixels, so it must shrink as you zoom.
+    #[test]
+    fn the_click_threshold_scales_with_zoom() {
+        let style = DrawStyle::default();
+        let from = Point::new(0.0, 0.0);
+        let to = Point::new(2.0, 0.0);
+
+        // At 1x, 2 document units is under the 3 px slop: a click.
+        let mut m = ToolMachine::new(ToolId::Rectangle);
+        let zoomed_out = ToolContext { style: &style, zoom: 1.0, selection_bounds: None };
+        assert_eq!(drag(&mut m, from, to, &zoomed_out), ToolAction::None);
+
+        // At 10x, the same 2 units is 20 px: a real drag.
+        let mut m = ToolMachine::new(ToolId::Rectangle);
+        let zoomed_in = ToolContext { style: &style, zoom: 10.0, selection_bounds: None };
+        assert!(matches!(
+            drag(&mut m, from, to, &zoomed_in),
+            ToolAction::AddShape { .. }
+        ));
+    }
+
+    #[test]
+    fn clicking_with_the_selection_tool_picks_what_is_under_the_cursor() {
+        let style = DrawStyle::default();
+        let mut m = ToolMachine::new(ToolId::Selection);
+        let p = Point::new(30.0, 30.0);
+        match drag(&mut m, p, p, &ctx(&style)) {
+            ToolAction::PickAt { point, additive } => {
+                assert_eq!(point, p);
+                assert!(!additive);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shift_click_extends_the_selection() {
+        let style = DrawStyle::default();
+        let mut m = ToolMachine::new(ToolId::Selection);
+        let p = Point::new(5.0, 5.0);
+        let mods = Mods { shift: true, ..Default::default() };
+        m.pointer_down(p, p, mods);
+        match m.pointer_up(p, p, &ctx(&style)) {
+            ToolAction::PickAt { additive, .. } => assert!(additive),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dragging_empty_space_marquee_selects() {
+        let style = DrawStyle::default();
+        let mut m = ToolMachine::new(ToolId::Selection);
+        match drag(&mut m, Point::new(0.0, 0.0), Point::new(100.0, 80.0), &ctx(&style)) {
+            ToolAction::PickInRect { rect, .. } => {
+                assert!((rect.width() - 100.0).abs() < 1e-9);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// Dragging from *inside* the selection moves it instead of starting a new
+    /// marquee — the behaviour that makes the Selection tool feel right.
+    #[test]
+    fn dragging_from_inside_the_selection_moves_it() {
+        let style = DrawStyle::default();
+        let c = ToolContext {
+            style: &style,
+            zoom: 1.0,
+            selection_bounds: Some(Rect::new(0.0, 0.0, 100.0, 100.0)),
+        };
+        let mut m = ToolMachine::new(ToolId::Selection);
+        match drag(&mut m, Point::new(50.0, 50.0), Point::new(80.0, 90.0), &c) {
+            ToolAction::MoveSelection { delta } => {
+                assert!((delta.x - 30.0).abs() < 1e-9 && (delta.y - 40.0).abs() < 1e-9);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn freehand_tools_accumulate_a_path() {
+        let style = DrawStyle::default();
+        let mut m = ToolMachine::new(ToolId::Pencil);
+        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default());
+        for i in 1..20 {
+            let p = Point::new(i as f64, (i as f64).sin() * 5.0);
+            m.pointer_move(p, p, Mods::default());
+        }
+        match m.pointer_up(Point::new(20.0, 0.0), Point::ORIGIN, &ctx(&style)) {
+            ToolAction::AddShape { shape, label } => {
+                assert_eq!(label, "Pencil");
+                assert!(shape.path.elements().len() > 10);
+                assert!(shape.stroke.is_some() && shape.fill.is_none());
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// The brush paints a filled outline, not a stroke — Animate's behaviour,
+    /// and why it uses the fill colour.
+    #[test]
+    fn the_brush_produces_a_filled_outline() {
+        let style = DrawStyle::default();
+        let mut m = ToolMachine::new(ToolId::Brush);
+        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default());
+        for i in 1..10 {
+            let p = Point::new(i as f64 * 5.0, 0.0);
+            m.pointer_move(p, p, Mods::default());
+        }
+        match m.pointer_up(Point::new(50.0, 0.0), Point::ORIGIN, &ctx(&style)) {
+            ToolAction::AddShape { shape, label } => {
+                assert_eq!(label, "Brush");
+                assert!(shape.fill.is_some(), "the brush fills");
+                assert!(shape.stroke.is_none(), "the brush does not stroke");
+                assert!(shape.path.area().abs() > 0.0, "the outline should enclose area");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_single_point_freehand_gesture_produces_nothing() {
+        let style = DrawStyle::default();
+        let mut m = ToolMachine::new(ToolId::Pencil);
+        let p = Point::new(1.0, 1.0);
+        m.pointer_down(p, p, Mods::default());
+        assert_eq!(m.pointer_up(p, p, &ctx(&style)), ToolAction::None);
+    }
+
+    #[test]
+    fn the_hand_tool_pans_while_dragging() {
+        let mut m = ToolMachine::new(ToolId::Hand);
+        m.pointer_down(Point::ORIGIN, Point::new(100.0, 100.0), Mods::default());
+        match m.pointer_move(Point::ORIGIN, Point::new(120.0, 90.0), Mods::default()) {
+            ToolAction::PanView { delta_screen } => {
+                assert!((delta_screen.x - 20.0).abs() < 1e-9);
+                assert!((delta_screen.y + 10.0).abs() < 1e-9);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_zoom_tool_zooms_in_and_alt_zooms_out() {
+        let style = DrawStyle::default();
+        let p = Point::new(10.0, 10.0);
+
+        let mut m = ToolMachine::new(ToolId::Zoom);
+        m.pointer_down(p, p, Mods::default());
+        match m.pointer_up(p, p, &ctx(&style)) {
+            ToolAction::ZoomView { factor, .. } => assert!(factor > 1.0),
+            other => panic!("got {other:?}"),
+        }
+
+        let mut m = ToolMachine::new(ToolId::Zoom);
+        let alt = Mods { alt: true, ..Default::default() };
+        m.pointer_down(p, p, alt);
+        match m.pointer_up(p, p, &ctx(&style)) {
+            ToolAction::ZoomView { factor, .. } => assert!(factor < 1.0),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn previews_appear_while_dragging_and_vanish_after() {
+        let style = DrawStyle::default();
+        let c = ctx(&style);
+        let mut m = ToolMachine::new(ToolId::Oval);
+        assert_eq!(m.preview(&c), Preview::None);
+
+        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default());
+        m.pointer_move(Point::new(40.0, 30.0), Point::ORIGIN, Mods::default());
+        assert!(matches!(m.preview(&c), Preview::Shape(_)));
+
+        m.pointer_up(Point::new(40.0, 30.0), Point::ORIGIN, &c);
+        assert_eq!(m.preview(&c), Preview::None);
+    }
+
+    #[test]
+    fn escape_cancels_a_gesture_without_creating_anything() {
+        let mut m = ToolMachine::new(ToolId::Rectangle);
+        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default());
+        m.pointer_move(Point::new(50.0, 50.0), Point::ORIGIN, Mods::default());
+        assert!(m.is_active());
+
+        m.cancel();
+        assert!(!m.is_active());
+        let style = DrawStyle::default();
+        assert_eq!(
+            m.pointer_up(Point::new(50.0, 50.0), Point::ORIGIN, &ctx(&style)),
+            ToolAction::None
+        );
+    }
+
+    #[test]
+    fn changing_tool_abandons_the_gesture() {
+        let mut m = ToolMachine::new(ToolId::Rectangle);
+        m.pointer_down(Point::ORIGIN, Point::ORIGIN, Mods::default());
+        m.set_tool(ToolId::Oval);
+        assert!(!m.is_active());
+        assert_eq!(m.tool(), ToolId::Oval);
+    }
+
+    #[test]
+    fn a_star_is_closed_and_has_the_right_number_of_points() {
+        let star = star_path(Point::new(0.0, 0.0), 50.0, 5);
+        let lines = star
+            .elements()
+            .iter()
+            .filter(|e| matches!(e, kurbo::PathEl::LineTo(_)))
+            .count();
+        assert_eq!(lines, 9, "five points means ten vertices");
+        assert!(star.elements().iter().any(|e| matches!(e, kurbo::PathEl::ClosePath)));
+        assert!(star.area().abs() > 0.0);
+    }
+
+    #[test]
+    fn scaling_anchors_the_opposite_corner() {
+        let bounds = Rect::new(0.0, 0.0, 100.0, 100.0);
+        // Drag the bottom-right corner outwards; the top-left must stay put.
+        let t = scale_about_corner(bounds, Point::new(100.0, 100.0), Point::new(200.0, 200.0), false);
+
+        let top_left = t * Point::new(0.0, 0.0);
+        assert!(top_left.to_vec2().hypot() < 1e-9, "anchor moved to {top_left:?}");
+
+        let bottom_right = t * Point::new(100.0, 100.0);
+        assert!((bottom_right.x - 200.0).abs() < 1e-6, "got {bottom_right:?}");
+    }
+
+    #[test]
+    fn uniform_scaling_keeps_the_aspect_ratio() {
+        let bounds = Rect::new(0.0, 0.0, 100.0, 50.0);
+        let t = scale_about_corner(bounds, Point::new(100.0, 50.0), Point::new(300.0, 60.0), true);
+        let c = t.as_coeffs();
+        assert!(
+            (c[0] - c[3]).abs() < 1e-9,
+            "uniform scaling should match both axes: {} vs {}",
+            c[0],
+            c[3]
+        );
+    }
+
+    /// Collapsing a shape to zero size would be unrecoverable.
+    #[test]
+    fn scaling_refuses_to_collapse_geometry() {
+        let bounds = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let t = scale_about_corner(bounds, Point::new(100.0, 100.0), Point::new(0.0, 0.0), false);
+        let c = t.as_coeffs();
+        assert!(c[0].abs() > 0.0 && c[3].abs() > 0.0);
+        assert!(c[0].is_finite() && c[3].is_finite());
+    }
+
+    #[test]
+    fn unimplemented_tools_do_nothing_rather_than_misbehave() {
+        let style = DrawStyle::default();
+        for tool in [ToolId::Bone, ToolId::Camera, ToolId::Text, ToolId::GradientTransform] {
+            let mut m = ToolMachine::new(tool);
+            let action = drag(&mut m, Point::new(0.0, 0.0), Point::new(50.0, 50.0), &ctx(&style));
+            assert_eq!(action, ToolAction::None, "{tool:?} should be inert");
+        }
+    }
+}

@@ -187,6 +187,20 @@ impl<'a> SceneBuilder<'a> {
         self.clip.bounds()
     }
 
+    /// Shift the rendered output by a screen-space offset.
+    ///
+    /// The editor draws the stage into the central area between the docked
+    /// panels, but Vello renders across the whole window texture. The camera's
+    /// viewport is set to the central rectangle's *size*, and this supplies its
+    /// *origin*, so document coordinates land in the right place on screen.
+    ///
+    /// Applied to the GPU transform only, which keeps it away from the
+    /// precision-critical CPU stages.
+    pub fn with_viewport_offset(mut self, offset: buzz_geom::Vec2) -> Self {
+        self.split.gpu_view = Affine::translate(offset) * self.split.gpu_view;
+        self
+    }
+
     /// Curve-flattening tolerance, in **document units**, for the current zoom.
     ///
     /// A fixed document-space tolerance is wrong in both directions, and both
@@ -319,6 +333,30 @@ mod tests {
             err > 1e-4,
             "expected the fused form to be measurably worse, error was {err}"
         );
+    }
+
+    /// The offset must move the picture without disturbing the scale, and
+    /// without letting anything large reach the GPU transform.
+    #[test]
+    fn a_viewport_offset_shifts_output_without_changing_scale() {
+        let mut scene = Scene::new();
+        let cam = Camera::new(Point::new(100.0, 100.0), 4.0, Size::new(800.0, 600.0));
+
+        let plain_scale = SceneBuilder::new(&mut scene, &cam).view_scale();
+        let offset = buzz_geom::Vec2::new(64.0, 30.0);
+        let shifted = SceneBuilder::new(&mut scene, &cam).with_viewport_offset(offset);
+
+        assert_eq!(shifted.view_scale(), plain_scale, "scale must not change");
+
+        let c = shifted.split.gpu_view.as_coeffs();
+        let gpu_scale = (c[0] * c[0] + c[1] * c[1]).sqrt();
+        assert!(
+            (gpu_scale - 1.0).abs() < 1e-12,
+            "the GPU transform must stay unit scale, was {gpu_scale}"
+        );
+        // Viewport centre (400, 300) plus the offset.
+        assert!((c[4] - 464.0).abs() < 1e-9, "x translation was {}", c[4]);
+        assert!((c[5] - 330.0).abs() < 1e-9, "y translation was {}", c[5]);
     }
 
     #[test]

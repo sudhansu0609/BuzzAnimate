@@ -10,3 +10,5 @@ authors.workspace = true
 [dependencies]
 kurbo.workspace = true
 serde.workspace = true
+i_overlay.workspace = true
+rayon.workspace = true

@@ -156,6 +156,32 @@ Rules that follow from this, applied to every phase:
   root* of `radius/tolerance`, so `to_path` at a 5e-12 tolerance is ~200 cubics.
   Clipping after flattening is therefore the correct order.
 
+### ✅ CP-1.1b — Boolean operations
+- [x] `buzz-geom::boolean` — Union, Intersect, Difference, Xor on filled paths
+- [x] NonZero and EvenOdd fill rules
+- [x] `boolean_many` uses a **rayon tree reduction**: `n` paths combine in
+      `log n` dependent rounds, not `n` sequential steps
+- [x] Difference is correctly excluded from tree reduction — it is not
+      associative, so it stays a left fold
+- [x] Curves are **refitted** after the operation via `kurbo::simplify`, so
+      results stay editable rather than polygonal
+- [x] `BooleanOptions::for_shape_size` derives tolerance from geometry, so a
+      2-unit glyph and a 10 000-unit background both behave
+- [x] 18 tests: area identities for every operator, holes, disjoint shapes,
+      non-commutativity, empty and degenerate inputs, parallel-vs-sequential
+- **Design decision:** delegated to `i_overlay` rather than writing Bézier-native
+  booleans. Robust booleans fail on tangencies, self-intersection and
+  near-degenerate curves, and a subtly wrong answer corrupts artwork silently.
+  Cost is a flatten/refit round trip; tolerance is the quality control.
+- **Bug found and fixed:** kurbo's default corner threshold is ~1 milliradian,
+  so every vertex of a freshly flattened path counted as a corner and refitting
+  returned pure lines. Raised to a tangent of 0.2 (~11°), derived from the
+  `2·√(2t/r)` turn angle that flattening leaves. A test guards that real 90°
+  corners still survive.
+- **Precision note:** `i_overlay` snaps to an integer grid, which is fine
+  because booleans are a document edit at authoring scale — never a render-path
+  operation at 1e12× zoom.
+
 ---
 
 ## 5. Current metrics
@@ -168,8 +194,8 @@ Rules that follow from this, applied to every phase:
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 213 of 224 (was 70 before clipping) |
-| Tests | 56 passing, clippy clean |
-| Rust source | ~3 600 lines |
+| Tests | 74 passing, clippy clean |
+| Rust source | ~4 200 lines |
 
 ---
 
@@ -180,7 +206,7 @@ Rules that follow from this, applied to every phase:
 
 - [ ] **CP-1.1** `buzz-geom` expansion
   - [x] **Document-space clipping** (retires the culling limitation, §7)
-  - [ ] Boolean ops (union, subtract, intersect, xor) parallelised per shape pair
+  - [x] Boolean ops (union, subtract, intersect, xor), parallel tree reduction
   - [ ] Path offsetting, simplification, smoothing
   - [ ] Parallel hit-testing; stroke hit-testing with tolerance
 - [ ] **CP-1.2** `buzz-scene` — the document model

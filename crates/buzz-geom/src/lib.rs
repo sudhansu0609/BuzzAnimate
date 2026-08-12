@@ -7,9 +7,11 @@
 //!
 //! See [`camera`] for the mechanism that makes unbounded zoom actually work.
 
+pub mod boolean;
 pub mod camera;
 pub mod clip;
 
+pub use boolean::{BoolOp, BooleanOptions, FillMode, boolean, boolean_many, union_all};
 pub use camera::{Camera, RebasedTransform, RenderSplit};
 pub use clip::RenderClip;
 

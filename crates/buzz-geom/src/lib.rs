@@ -8,8 +8,10 @@
 //! See [`camera`] for the mechanism that makes unbounded zoom actually work.
 
 pub mod camera;
+pub mod clip;
 
 pub use camera::{Camera, RebasedTransform, RenderSplit};
+pub use clip::RenderClip;
 
 /// Re-exported so downstream crates share one `kurbo` and one notion of `Point`.
 pub use kurbo::{Affine, BezPath, Circle, Line, Point, Rect, Shape, Size, Vec2};

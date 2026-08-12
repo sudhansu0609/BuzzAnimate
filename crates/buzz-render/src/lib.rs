@@ -10,7 +10,7 @@
 pub mod adapter;
 
 use anyhow::{Context, Result};
-use buzz_geom::{Affine, BezPath, Camera, RenderSplit, Shape};
+use buzz_geom::{Affine, BezPath, Camera, RenderClip, RenderSplit, Shape};
 use peniko::{Color, Fill};
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 use wgpu::{Device, Instance, Queue, TextureFormat, TextureView};
@@ -142,6 +142,7 @@ pub const RENDER_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 pub struct SceneBuilder<'a> {
     scene: &'a mut Scene,
     split: RenderSplit,
+    clip: RenderClip,
 }
 
 impl<'a> SceneBuilder<'a> {
@@ -151,22 +152,39 @@ impl<'a> SceneBuilder<'a> {
         Self {
             scene,
             split: camera.render_split(),
+            clip: RenderClip::new(camera.visible_doc_rect()),
         }
     }
 
     /// Move a document-space shape into render space, in `f64`.
     ///
-    /// Two *separate* affine applications, deliberately. Fusing them into one
-    /// matrix would make it evaluate `zoom·p − zoom·anchor` and reintroduce
-    /// catastrophic cancellation — see [`buzz_geom::RenderSplit`].
+    /// Three stages, in an order that is load-bearing:
+    ///
+    /// 1. **Clip in document space.** Bounds both segment count and coordinate
+    ///    magnitude for shapes far larger than the viewport. Done *before* the
+    ///    magnification so the clip rectangle is expressed in the same units as
+    ///    the geometry.
+    /// 2. **Subtract the anchor**, in `f64`. Operands are document-scale, so
+    ///    this is well conditioned and the result is small.
+    /// 3. **Magnify**, in `f64`. A pure scale has no translation term, so there
+    ///    is nothing to cancel against.
+    ///
+    /// Steps 2 and 3 must stay separate: fusing them evaluates
+    /// `zoom·p − zoom·anchor` and reintroduces catastrophic cancellation. See
+    /// [`buzz_geom::RenderSplit`].
     fn to_render_space(&self, shape: &impl Shape) -> BezPath {
+        // Cheap even at extreme tolerance: kurbo grows a circle's segment
+        // count as the sixth root of radius/tolerance, so a 300-unit circle at
+        // a 5e-12 tolerance is ~200 cubics, not millions.
         let path = shape.to_path(self.tolerance());
-        // Step 1: subtract the anchor. Operands are document-scale, so this is
-        // well conditioned and the result is tiny.
-        let centred = Affine::translate(-self.split.anchor.to_vec2()) * path;
-        // Step 2: magnify. A pure scale has no translation term, so there is
-        // nothing to cancel against.
+        let clipped = self.clip.apply(&path);
+        let centred = Affine::translate(-self.split.anchor.to_vec2()) * clipped;
         Affine::scale(self.split.scale) * centred
+    }
+
+    /// The region within which geometry is preserved exactly.
+    pub fn clip_bounds(&self) -> buzz_geom::Rect {
+        self.clip.bounds()
     }
 
     /// Curve-flattening tolerance, in **document units**, for the current zoom.

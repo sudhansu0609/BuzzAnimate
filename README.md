@@ -137,7 +137,7 @@ grep -A1 '^name = "wgpu"' Cargo.lock   # must list exactly one version
 ## Testing
 
 ```sh
-cargo test --workspace            # 44 tests
+cargo test --workspace            # 56 tests
 cargo clippy --workspace --all-targets
 cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 ```
@@ -157,7 +157,7 @@ Then: drawing tools and UI shell · timeline · symbols and tweens · importers
 (`.fla`/`.xfl`, `.pdf`/`.ai`, `.swf`) · export (MP4 via NVENC, PNG, GIF, HTML5)
 · rigging and IK · scripting and ActionScript.
 
-One item carried forward from Phase 0: oversized paths are currently culled
-rather than clipped, so a shape far larger than the viewport is dropped instead
-of drawn as the near-straight line it would appear as. Proper document-space
-clipping belongs with the Phase 1 geometry work.
+**CP-1.1 done:** document-space clipping (`buzz_geom::RenderClip`) has replaced
+Phase 0's culling, so shapes far larger than the viewport are now drawn
+correctly instead of vanishing. Items drawn at 2×10¹⁴% went from 70 to 213 with
+GPU time still 0.8–1.7 ms.

@@ -11,8 +11,8 @@
 use std::time::Instant;
 
 use buzz_app::demo::ZoomTarget;
-use buzz_geom::Size;
-use buzz_render::{GpuContext, GpuPreference, wgpu};
+use buzz_geom::{Camera, Circle, Point, Rect, Size};
+use buzz_render::{GpuContext, GpuPreference, SceneBuilder, wgpu};
 use peniko::Color;
 use vello::Scene;
 
@@ -269,6 +269,95 @@ fn detail_survives_far_beyond_animates_ceiling() {
     );
     println!(
         "distinct colours — at 2000%: {at_animate_max}, at ~1e12%: {at_trillion}"
+    );
+}
+
+/// Regression test for the Phase 0 limitation retired in CP-1.1.
+///
+/// A filled rectangle far larger than the viewport — a stage background, say —
+/// must fill the screen. Phase 0 culled anything more than 64× the viewport, so
+/// this shape vanished entirely the moment you zoomed in. Document-space
+/// clipping now handles it correctly, and cheaply.
+#[test]
+fn an_oversized_background_is_drawn_not_dropped() {
+    let Some(mut h) = Harness::new() else { return };
+
+    let mut scene = Scene::new();
+    let centre = Point::new(1024.0, 768.0);
+
+    for zoom_percent in [100.0, 1e6, 1e12] {
+        let mut camera = Camera::new(centre, 1.0, Size::new(W as f64, H as f64));
+        camera.set_zoom_percent(zoom_percent);
+
+        // Extends far past the viewport in every direction at every zoom.
+        let background = Rect::new(
+            centre.x - 1e6,
+            centre.y - 1e6,
+            centre.x + 1e6,
+            centre.y + 1e6,
+        );
+
+        let started = Instant::now();
+        {
+            let mut b = SceneBuilder::new(&mut scene, &camera);
+            b.fill_shape(&background, Color::from_rgb8(0xE0, 0x50, 0x30));
+        }
+        let encode_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let pixels = h.render_and_read(&scene);
+        let ink = ink_coverage(&pixels);
+
+        println!(
+            "background at {zoom_percent:>9.0e}% -> ink {:.1}%, encode {encode_ms:.2} ms",
+            ink * 100.0
+        );
+
+        assert!(
+            ink > 0.99,
+            "an oversized background should fill the frame at {zoom_percent:e}%, \
+             got {:.2}% ink — this is the Phase 0 culling bug returning",
+            ink * 100.0
+        );
+        assert!(
+            encode_ms < 50.0,
+            "clipping an oversized shape took {encode_ms} ms; it must stay cheap"
+        );
+    }
+}
+
+/// A shape that only partly overlaps the view must keep its visible edge.
+///
+/// This is the case simple culling cannot get right at all: too big to draw
+/// whole, but genuinely visible.
+#[test]
+fn a_huge_shape_keeps_its_visible_edge() {
+    let Some(mut h) = Harness::new() else { return };
+
+    let mut scene = Scene::new();
+    let centre = Point::new(1024.0, 768.0);
+    let mut camera = Camera::new(centre, 1.0, Size::new(W as f64, H as f64));
+    camera.set_zoom_percent(1e9);
+
+    // A circle whose radius dwarfs the viewport, placed so its rightmost point
+    // sits exactly at the centre of the view. Over a viewport this small the
+    // arc is indistinguishable from a vertical line, so the left half of the
+    // frame should be covered and the right half empty.
+    let radius = 1e5;
+    let huge = Circle::new(Point::new(centre.x - radius, centre.y), radius);
+
+    {
+        let mut b = SceneBuilder::new(&mut scene, &camera);
+        b.fill_shape(&huge, Color::from_rgb8(0x40, 0xC0, 0xF0));
+    }
+
+    let ink = ink_coverage(&h.render_and_read(&scene));
+    println!("huge circle edge through view -> ink {:.1}%", ink * 100.0);
+
+    // Roughly half the frame: the arc is essentially straight at this scale.
+    assert!(
+        ink > 0.2 && ink < 0.8,
+        "expected the edge to cross the view leaving partial coverage, got {:.1}%",
+        ink * 100.0
     );
 }
 

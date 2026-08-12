@@ -67,6 +67,7 @@ Rules that follow from this, applied to every phase:
 > | Tag | Contents |
 > |---|---|
 > | `phase-0` | Engine foundation — unbounded zoom, multicore, GPU rasterisation |
+> | `cp-1.1` | Document-space clipping — retires the Phase 0 culling limitation |
 >
 > Tags, not commit hashes, are the identifier: a hash written into this file
 > can never name the commit that contains the file.
@@ -132,6 +133,31 @@ Rules that follow from this, applied to every phase:
 
 ---
 
+### ✅ CP-1.1a — Document-space clipping
+- [x] `buzz-geom::clip::RenderClip` — adaptive Bézier clipping to a rectangle
+- [x] Uses the convex-hull property: control-point bbox is a cheap conservative
+      reject, so in-view curves are emitted untouched and cost nothing
+- [x] Invisible segments collapse to one line **to their endpoint**, which
+      preserves winding so enclosing fills still fill
+- [x] Bounds **both** segment count (budget 20 000) and coordinate magnitude
+      (clamped into an expanded rect)
+- [x] Wired into `SceneBuilder` before the anchor subtraction and scale
+- [x] `culled_huge` removed from the render path — culling is now purely an
+      optimisation, never load-bearing for correctness
+- [x] 11 clipping tests, including winding-number preservation over a sampled
+      grid across five shape cases (no rasteriser involved)
+- **Measured:** items drawn at 2e14% went **70 → 213** (shapes that used to be
+  dropped are now correctly clipped and drawn), GPU time **0.8–1.7 ms**, ink
+  coverage unchanged at 4.01%
+- **Regression tests added:** an oversized background fills the frame at 100%
+  ink at 1e2/1e6/1e12% (Phase 0 made it vanish); a huge circle's edge through
+  the view yields exactly 50.0% coverage
+- **Checked, not assumed:** kurbo grows a circle's segment count as the *sixth
+  root* of `radius/tolerance`, so `to_path` at a 5e-12 tolerance is ~200 cubics.
+  Clipping after flattening is therefore the correct order.
+
+---
+
 ## 5. Current metrics
 
 | Measure | Value |
@@ -141,8 +167,9 @@ Rules that follow from this, applied to every phase:
 | GPU frame time at 1e12% | 0.9 ms |
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
-| Tests | 44 passing, clippy clean |
-| Rust source | ~3 160 lines |
+| Items drawn at 2e14% | 213 of 224 (was 70 before clipping) |
+| Tests | 56 passing, clippy clean |
+| Rust source | ~3 600 lines |
 
 ---
 
@@ -152,10 +179,10 @@ Rules that follow from this, applied to every phase:
 *No UI yet. This is the foundation everything else sits on.*
 
 - [ ] **CP-1.1** `buzz-geom` expansion
-  - [ ] Boolean ops (union, subtract, intersect) parallelised per shape pair
+  - [x] **Document-space clipping** (retires the culling limitation, §7)
+  - [ ] Boolean ops (union, subtract, intersect, xor) parallelised per shape pair
   - [ ] Path offsetting, simplification, smoothing
   - [ ] Parallel hit-testing; stroke hit-testing with tolerance
-  - [ ] **Document-space clipping** (retires the culling limitation, §7)
 - [ ] **CP-1.2** `buzz-scene` — the document model
   - [ ] Copy-on-write scene graph (`Arc` structural sharing)
   - [ ] **Layer model matching Animate** — see §8.2
@@ -255,7 +282,7 @@ Rules that follow from this, applied to every phase:
 
 | # | Item | Status |
 |---|---|---|
-| 1 | **Oversized paths culled, not clipped.** A shape far larger than the viewport is dropped rather than drawn as the near-straight line it would appear as. Culling is mandatory — without it a single circle at deep zoom needs ~3e7 segments and hangs. | Fix in **CP-1.1** |
+| 1 | ~~**Oversized paths culled, not clipped.**~~ | ✅ **Resolved in CP-1.1** by `RenderClip` |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |

@@ -35,15 +35,13 @@ pub struct CullStats {
     pub culled_offscreen: usize,
     /// Too small on screen to register.
     pub culled_tiny: usize,
-    /// Too large to flatten affordably. See [`ZoomTarget::encode`].
-    pub culled_huge: usize,
     pub min_generation: Option<usize>,
     pub max_generation: Option<usize>,
 }
 
 impl CullStats {
     pub fn culled(&self) -> usize {
-        self.culled_offscreen + self.culled_tiny + self.culled_huge
+        self.culled_offscreen + self.culled_tiny
     }
 
     /// Range of detail generations currently on screen, e.g. `"9–11"`.
@@ -154,33 +152,25 @@ impl ZoomTarget {
         }
     }
 
-    /// Encode the artwork into `scene` for `camera`, culling what cannot or
-    /// must not be drawn.
+    /// Encode the artwork into `scene` for `camera`.
     ///
-    /// # Why culling is mandatory here, not an optimisation
+    /// # Culling here is purely an optimisation
     ///
-    /// Vello flattens curves to line segments at *screen-space* tolerance. At
-    /// 1e12× zoom, generation 0's 300-unit circle spans ~3e14 pixels, which
-    /// would need on the order of 3e7 segments for that one path — enough to
-    /// hang the frame. Anything far larger than the viewport must therefore be
-    /// dropped before it reaches the encoder.
+    /// Correctness is handled by document-space clipping inside
+    /// [`SceneBuilder`], which bounds both segment count and coordinate
+    /// magnitude for shapes far larger than the viewport. Phase 0 instead
+    /// *dropped* such shapes, which was wrong: a huge circle whose arc crosses
+    /// the view would vanish, as would any background larger than the stage.
+    /// That limitation is now retired.
     ///
-    /// Dropping an oversized path is a slight visual cheat: a huge circle whose
-    /// arc genuinely crosses the viewport disappears rather than being drawn as
-    /// the near-straight line it would appear as. Correct handling is
-    /// document-space clipping against the visible rect, which belongs with the
-    /// real geometry work in Phase 1. For this artwork the difference is not
-    /// observable.
+    /// The two remaining tests are cheap bounding-box rejections that spare the
+    /// clipper work it would otherwise do correctly but pointlessly. Removing
+    /// them would cost performance, never correctness.
     pub fn encode(&self, scene: &mut Scene, camera: &Camera) -> CullStats {
         /// Below this on-screen size an item cannot be seen at all.
         const MIN_SCREEN_PX: f64 = 0.35;
-        /// Above this multiple of the viewport, flattening cost explodes.
-        const MAX_VIEWPORT_MULTIPLE: f64 = 64.0;
 
         let visible = camera.visible_doc_rect();
-        let viewport_diagonal = camera.viewport.width.hypot(camera.viewport.height);
-        let max_screen_px = viewport_diagonal * MAX_VIEWPORT_MULTIPLE;
-
         let mut stats = CullStats::default();
         let mut b = SceneBuilder::new(scene, camera);
         let scale = b.view_scale();
@@ -197,10 +187,6 @@ impl ZoomTarget {
             let screen_size = bb.width().hypot(bb.height()) * scale;
             if screen_size < MIN_SCREEN_PX {
                 stats.culled_tiny += 1;
-                continue;
-            }
-            if screen_size > max_screen_px {
-                stats.culled_huge += 1;
                 continue;
             }
 

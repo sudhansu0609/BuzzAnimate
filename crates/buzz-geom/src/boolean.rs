@@ -201,13 +201,60 @@ fn from_shapes(shapes: &[Vec<Vec<[f64; 2]>>]) -> BezPath {
 /// real corner — a square's 90°, say — as a corner.
 const CORNER_TANGENT_THRESHOLD: f64 = 0.2;
 
-/// Refit Béziers to a polygonal path.
-fn refit(path: BezPath, tolerance: f64, corner_threshold: f64) -> BezPath {
-    if path.elements().is_empty() {
-        return path;
+/// Refit Béziers to a polygonal path, **verifying the result**.
+///
+/// # Why the output is checked
+///
+/// Curve fitting is a heuristic, and kurbo says so: its simplifier "works best
+/// if the source path is very smooth", and warns results may be poor otherwise.
+/// That is not a theoretical caveat. Expanding a 100×100 square by 5 produces a
+/// correct polygon spanning `-5..105`, which the fitter turned into a path
+/// spanning `-5..1071` — a tenfold overshoot on a rounded corner. Trusting it
+/// blindly would silently corrupt the user's artwork.
+///
+/// So the fit is accepted only if it stays within the source bounds plus a
+/// small slack and preserves area. Otherwise the polygon is kept. A correct
+/// polygon always beats a corrupted curve; the cost of falling back is more
+/// anchor points, not a wrong shape.
+pub(crate) fn refit_checked(
+    source: &BezPath,
+    accuracy: f64,
+    corner_threshold: f64,
+    area_slack: f64,
+) -> BezPath {
+    if source.elements().is_empty() {
+        return source.clone();
     }
+
     let options = kurbo::simplify::SimplifyOptions::default().angle_thresh(corner_threshold);
-    kurbo::simplify::simplify_bezpath(path, tolerance, &options)
+    let fitted = kurbo::simplify::simplify_bezpath(source.clone(), accuracy, &options);
+
+    if fitted.elements().is_empty() {
+        return source.clone();
+    }
+
+    let source_bb = source.bounding_box();
+    let diagonal = source_bb.width().hypot(source_bb.height());
+    let slack = (accuracy * 4.0).max(diagonal * 1e-4);
+
+    if !source_bb.inflate(slack, slack).contains_rect(fitted.bounding_box()) {
+        return source.clone();
+    }
+
+    let source_area = source.area().abs();
+    if source_area > 0.0 {
+        let drift = (fitted.area().abs() - source_area).abs() / source_area;
+        if drift > area_slack {
+            return source.clone();
+        }
+    }
+
+    fitted
+}
+
+/// Refit for boolean results: geometry must not move perceptibly.
+fn refit(path: BezPath, tolerance: f64, corner_threshold: f64) -> BezPath {
+    refit_checked(&path, tolerance, corner_threshold, 0.02)
 }
 
 /// Combine two paths.

@@ -178,8 +178,10 @@ impl ZoomTarget {
         for item in &self.items {
             let bb = item.path.bounding_box();
 
-            let hit = bb.intersect(visible);
-            if hit.width() < 0.0 || hit.height() < 0.0 {
+            // `Rect::intersect` clamps to zero size rather than producing
+            // negative extents, so a width test here would never fire and the
+            // rejection would be dead code. `overlaps` is the real predicate.
+            if !bb.overlaps(visible) {
                 stats.culled_offscreen += 1;
                 continue;
             }

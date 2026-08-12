@@ -425,8 +425,15 @@ mod tests {
     #[test]
     fn utilisation_is_bounded_and_near_zero_when_idle() {
         let js = JobSystem::with_sizes(4, 1);
-        let before = js.sample(Pool::Interactive);
+
+        // Let the pool settle before the first snapshot. Spawning threads costs
+        // CPU, and rayon workers spin briefly before parking; measuring from
+        // the instant of construction folds that startup cost into the window
+        // and makes an idle pool look busy on a loaded machine.
         std::thread::sleep(Duration::from_millis(50));
+
+        let before = js.sample(Pool::Interactive);
+        std::thread::sleep(Duration::from_millis(100));
         let u = js.utilisation_since(Pool::Interactive, &before);
 
         assert_eq!(u.per_worker.len(), 4);

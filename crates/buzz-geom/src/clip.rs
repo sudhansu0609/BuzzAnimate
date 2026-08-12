@@ -116,7 +116,7 @@ impl RenderClip {
 
         // Fast path: entirely inside, nothing to do.
         let bb = path.bounding_box();
-        if rect_contains_rect(self.bounds, bb) {
+        if self.bounds.contains_rect(bb) {
             return path.clone();
         }
 
@@ -176,14 +176,14 @@ impl RenderClip {
         // Wholly invisible: collapse to a single line. Keeping the endpoint
         // (rather than dropping the segment) is what preserves winding, so
         // fills that enclose the viewport still fill it.
-        if !rects_overlap(hull, self.bounds) {
+        if !hull.overlaps(self.bounds) {
             out.line_to(self.clamp(c.p3));
             *budget = budget.saturating_sub(1);
             return;
         }
 
         // Wholly visible: keep the curve exactly as authored.
-        if rect_contains_rect(self.bounds, hull) {
+        if self.bounds.contains_rect(hull) {
             out.curve_to(c.p1, c.p2, c.p3);
             *budget = budget.saturating_sub(1);
             return;
@@ -235,19 +235,6 @@ fn subdivide(c: CubicBez) -> (CubicBez, CubicBez) {
         CubicBez::new(c.p0, p01, p012, p0123),
         CubicBez::new(p0123, p123, p23, c.p3),
     )
-}
-
-/// Does `outer` fully contain `inner`?
-#[inline]
-fn rect_contains_rect(outer: Rect, inner: Rect) -> bool {
-    inner.x0 >= outer.x0 && inner.y0 >= outer.y0 && inner.x1 <= outer.x1 && inner.y1 <= outer.y1
-}
-
-/// Do the rectangles share any area? Touching edges count as overlapping, so
-/// geometry exactly on the boundary is kept rather than dropped.
-#[inline]
-fn rects_overlap(a: Rect, b: Rect) -> bool {
-    a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1
 }
 
 #[cfg(test)]

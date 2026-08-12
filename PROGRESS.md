@@ -68,6 +68,8 @@ Rules that follow from this, applied to every phase:
 > |---|---|
 > | `phase-0` | Engine foundation — unbounded zoom, multicore, GPU rasterisation |
 > | `cp-1.1` | Document-space clipping — retires the Phase 0 culling limitation |
+> | `cp-1.1b` | Boolean path operations with parallel tree reduction |
+> | `cp-1.1-complete` | Path editing and parallel hit-testing; CP-1.1 done |
 >
 > Tags, not commit hashes, are the identifier: a hash written into this file
 > can never name the commit that contains the file.
@@ -182,6 +184,39 @@ Rules that follow from this, applied to every phase:
   because booleans are a document edit at authoring scale — never a render-path
   operation at 1e12× zoom.
 
+### ✅ CP-1.1c — Path editing operations
+- [x] `buzz-geom::edit` mapped directly to Animate menu commands:
+      `outline_stroke` (Convert Lines to Fills) · `expand_fill` (Expand Fill) ·
+      `smooth` (Smooth) · `straighten` (Straighten)
+- [x] `path_length` and `point_at_fraction`, needed for Phase 4 motion paths
+- [x] **`expand_fill` is built from stroking + booleans**, not curve offsetting.
+      Direct offsetting means handling joins, caps, cusps and the
+      self-intersections that appear when the offset exceeds a local radius of
+      curvature. Stroking the boundary at `2·|amount|` and unioning (or
+      subtracting) reuses two already-tested components instead.
+- [x] **Bug found and fixed — corrupted geometry.** Refitting a *correct*
+      polygon spanning `-5..105` produced a path spanning `-5..1071`, a tenfold
+      overshoot on a rounded corner. kurbo documents that its fitter "works best
+      if the source path is very smooth". `refit_checked` now verifies every fit
+      against the source bounds and area and falls back to the polygon when it
+      diverges. A correct polygon always beats a corrupted curve.
+
+### ✅ CP-1.1d — Parallel hit-testing
+- [x] `buzz-geom::hit` — fill (winding), stroke (distance with tolerance),
+      nearest-point queries for subselection and snapping
+- [x] `hit_test_topmost` / `hit_test_all` / `select_in_rect`, parallel above 64
+      targets and sequential below, with a test asserting both agree
+- [x] Stroke takes priority over fill, matching Animate's Selection tool
+- [x] Locked and hidden layers are skipped via `selectable`
+- [x] Marquee distinguishes enclosing from crossing selection
+- [x] Tolerance is in **document units**, supplied by the caller from the
+      current zoom — without it a hairline would be unclickable
+- [x] **Bug found and fixed — dead code.** kurbo's `Rect::intersect` *clamps*
+      to zero size (`x1.max(x0)`) rather than returning negative extents, so the
+      `width() < 0.0` off-screen rejection copied into `demo.rs` could never
+      fire. Replaced with `Rect::overlaps`. Effect at 2e14% zoom: items drawn
+      **213 → 61** for byte-identical output — roughly 3.5× less work.
+
 ---
 
 ## 5. Current metrics
@@ -193,9 +228,9 @@ Rules that follow from this, applied to every phase:
 | GPU frame time at 1e12% | 0.9 ms |
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
-| Items drawn at 2e14% | 213 of 224 (was 70 before clipping) |
-| Tests | 74 passing, clippy clean |
-| Rust source | ~4 200 lines |
+| Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
+| Tests | 104 passing, clippy clean |
+| Rust source | ~5 400 lines |
 
 ---
 
@@ -204,11 +239,11 @@ Rules that follow from this, applied to every phase:
 ### ⬜ Phase 1 — Geometry & document core
 *No UI yet. This is the foundation everything else sits on.*
 
-- [ ] **CP-1.1** `buzz-geom` expansion
+- [x] **CP-1.1** `buzz-geom` expansion — **complete**
   - [x] **Document-space clipping** (retires the culling limitation, §7)
   - [x] Boolean ops (union, subtract, intersect, xor), parallel tree reduction
-  - [ ] Path offsetting, simplification, smoothing
-  - [ ] Parallel hit-testing; stroke hit-testing with tolerance
+  - [x] Path offsetting, simplification, smoothing
+  - [x] Parallel hit-testing; stroke hit-testing with tolerance
 - [ ] **CP-1.2** `buzz-scene` — the document model
   - [ ] Copy-on-write scene graph (`Arc` structural sharing)
   - [ ] **Layer model matching Animate** — see §8.2
@@ -394,6 +429,14 @@ cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 
 ## 10. Next action
 
-**Begin Phase 1, CP-1.1** — `buzz-geom` boolean operations and document-space
-clipping. Clipping is first: it retires known issue #1 and is a prerequisite for
-correct rendering at every later phase.
+**Begin CP-1.2** — `buzz-scene`, the document model:
+
+- Copy-on-write scene graph with `Arc` structural sharing. This is the decision
+  the whole multithreading model rests on: the renderer reads a snapshot with
+  zero locks while the document thread builds the next one, and undo becomes
+  nearly free because old snapshots *are* the history.
+- Animate's six layer types — Normal, Folder, Mask, Masked, Guide, Guided — with
+  show/hide, lock, outline view, layer colour and depth (§8.2).
+- Groups, transforms, z-order.
+- R-tree spatial index (`rstar`), rebuilt off-thread, feeding the hit-testing
+  built in CP-1.1d.

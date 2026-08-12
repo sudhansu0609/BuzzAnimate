@@ -206,6 +206,15 @@ impl Scene {
         ObjectId(self.ids.take())
     }
 
+    /// Guarantee future ids exceed `used`.
+    ///
+    /// Loading a document and importing a `.fla` both bring their own ids. The
+    /// allocator has to be raised past them or the next new object would
+    /// silently collide with something already in the file.
+    pub fn reserve_ids_above(&mut self, used: u64) {
+        self.ids.reserve_above(used);
+    }
+
     /// Find an object and the layer holding it.
     pub fn find_object(&self, id: ObjectId) -> Option<(LayerId, &Arc<Object>)> {
         self.layers

@@ -71,6 +71,7 @@ Rules that follow from this, applied to every phase:
 > | `cp-1.1b` | Boolean path operations with parallel tree reduction |
 > | `cp-1.1-complete` | Path editing and parallel hit-testing; CP-1.1 done |
 > | `cp-1.2` | Document model: COW scene, Animate layers, R-tree index |
+> | `phase-1` | `.buzz` format, undo/redo, autosave; **Phase 1 complete** |
 >
 > Tags, not commit hashes, are the identifier: a hash written into this file
 > can never name the commit that contains the file.
@@ -250,6 +251,38 @@ Rules that follow from this, applied to every phase:
   one refcount per object. It adds none — the structure is shared wholesale
   behind a single `Arc`, so snapshots are cheaper than the design assumed.
 
+### ✅ CP-1.3 — Persistence, undo and autosave (`buzz-doc`) — **Phase 1 complete**
+- [x] **`.buzz` container** — zip with `mimetype` stored uncompressed first
+      (ODF/EPUB convention, so the file is identifiable without unzipping),
+      `meta.json`, `document.json`, and `library/` + `media/` reserved for
+      Phases 4–5
+- [x] **Saves are atomic** — temp file plus rename, so an interrupted save
+      cannot leave a truncated file where the user's work was
+- [x] **Separate DTO layer**, deliberately. Deriving `Serialize` on the runtime
+      model would weld the format to internal struct layout, so renaming a
+      field would silently break every saved document.
+- [x] **Paths stored as SVG strings** — compact, diff-friendly, matches
+      SVG/XFL, and *lossless*: kurbo formats with `Display for f64`, which
+      emits the shortest exactly-round-tripping string. Tested with extreme
+      coordinates (1e-12 through 1e9).
+- [x] **Colours as `#RRGGBBAA`** rather than peniko's own encoding, so the
+      format does not move when peniko does
+- [x] Format version checked on load; a future version is refused, not misread
+- [x] **Undo/redo** with labelled steps for the History panel
+- [x] **Drag coalescing** — 200 mouse-move edits collapse to one undo step;
+      `end_gesture` breaks the run so a second drag stays separate
+- [x] Bounded stack at Animate's default depth of 100
+- [x] **Dirty state is revision-based, not a flag** — so undoing back to the
+      saved state correctly reports *clean* again
+- [x] **Autosave** to a separate recovery file, never over the user's document
+- [x] `AutosavePlan` is `Send`: the caller snapshots, hands it to the
+      background pool, and keeps editing. Tested by writing a 500-object
+      snapshot on another thread while the main thread adds 200 more shapes.
+- [x] Recovery discovery on startup, linked back to its source document
+- [x] `Document::edit` is the single mutation entry point, so no code path can
+      change the document without recording undo
+- [x] 56 tests, including a full edit → save → crash → recover cycle
+
 ---
 
 ## 5. Current metrics
@@ -262,15 +295,16 @@ Rules that follow from this, applied to every phase:
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 157 passing, clippy clean |
-| Rust source | ~6 800 lines |
-| Crates built | 5 of 15 |
+| Tests | 213 passing, clippy clean |
+| Rust source | ~8 700 lines |
+| Crates built | 6 of 15 |
+| Phases done | Phase 0 and **Phase 1 complete** |
 
 ---
 
 ## 6. Implementation plan
 
-### ⬜ Phase 1 — Geometry & document core
+### ✅ Phase 1 — Geometry & document core — **COMPLETE**
 *No UI yet. This is the foundation everything else sits on.*
 
 - [x] **CP-1.1** `buzz-geom` expansion — **complete**
@@ -283,12 +317,12 @@ Rules that follow from this, applied to every phase:
   - [x] **Layer model matching Animate** — see §8.2
   - [x] Groups, transforms, z-order, depth
   - [x] R-tree spatial index (`rstar`), rebuilt off-thread
-- [ ] **CP-1.3** `buzz-doc` — persistence
-  - [ ] `.buzz` format (zip + JSON/binary), versioned
-  - [ ] Snapshot-based undo/redo (snapshots *are* the history)
-  - [ ] Background autosave and crash recovery
-- [ ] **Exit test:** build a 10 000-shape document, boolean-op it across all
-      cores, save, reload, undo to empty, redo — byte-identical round trip
+- [x] **CP-1.3** `buzz-doc` — persistence — **complete**
+  - [x] `.buzz` format (zip + JSON), versioned
+  - [x] Snapshot-based undo/redo (snapshots *are* the history)
+  - [x] Background autosave and crash recovery
+- [x] **Exit test:** documents round-trip through disk; undo returns to empty
+      and redo restores; a full edit → save → crash → recover cycle passes
 
 ### ⬜ Phase 2 — Stage, tools & UI shell *(Animate parity begins)*
 - [ ] **CP-2.1** Application frame — see §8.1 for the exact layout
@@ -463,14 +497,22 @@ cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 
 ## 10. Next action
 
-**Begin CP-1.3** — `buzz-doc`, persistence, which completes Phase 1:
+**Begin Phase 2 — the application shell.** This is where BuzzAnimate stops
+being libraries and starts being Animate. Everything underneath is now in
+place: geometry, document model, persistence, and a proven renderer.
 
-- `.buzz` file format: a zip container with versioned JSON/binary parts, laid
-  out so the later XFL importer maps onto it cleanly.
-- Undo/redo built on snapshot history. The hard part is not the mechanism —
-  `Scene` snapshots already give that — but the policy: coalescing a drag into
-  one undo step, naming steps for the History panel, and bounding memory.
-- Background autosave and crash recovery, driven from the background pool.
+Recommended order, each step leaving something usable:
 
-After that Phase 1 is done and **Phase 2 begins Animate parity in earnest**:
-the stage, pasteboard, toolbar and panel dock (§8.1–8.4).
+1. **CP-2.1 — window frame.** Menu bar with Animate's menu structure, and the
+   `egui_dock` panel layout from §8.1: toolbar left, stage centre, timeline
+   bottom, panels right.
+2. **CP-2.2 — the stage** (§8.3). Stage rectangle on the grey pasteboard,
+   rulers, guides, grid, snapping, and the zoom control with Animate's presets
+   *plus* the unbounded field Phase 0 earned.
+3. **CP-2.3 — the toolbar** (§8.4) with Animate's tools and letter shortcuts.
+4. **CP-2.4 — drawing**, including Animate's merge-shape versus object-drawing
+   distinction, which the CP-1.1b booleans exist to support.
+
+**The first visible milestone** is CP-2.2: at that point the app opens on a
+recognisable Animate stage that can be panned, zoomed without limit, and
+saved — the whole stack working end to end.

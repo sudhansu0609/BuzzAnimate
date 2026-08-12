@@ -62,7 +62,9 @@ impl BoolOp {
 }
 
 /// How overlapping sub-regions of a single path are filled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum FillMode {
     /// Overlaps stay filled. The sane default for artwork and what Vello uses.
     #[default]

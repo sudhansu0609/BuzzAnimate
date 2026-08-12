@@ -23,7 +23,9 @@ repository = "https://github.com/buzzcaf/buzzanimate"
 wgpu = "29.0.4"
 vello = "0.9.0"
 kurbo = { version = "0.13.1", features = ["serde"] }
-peniko = "0.6.1"
+# `serde` here also turns it on for the `color` crate, so peniko::Color can be
+# persisted directly in the .buzz format rather than needing a wrapper type.
+peniko = { version = "0.6.1", features = ["serde"] }
 winit = "0.30.13"
 
 egui = "0.35.0"
@@ -46,10 +48,13 @@ sysinfo = "0.39.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+rstar = "0.13.0"
+
 # Internal crates
 buzz-geom = { path = "crates/buzz-geom" }
 buzz-jobs = { path = "crates/buzz-jobs" }
 buzz-render = { path = "crates/buzz-render" }
+buzz-scene = { path = "crates/buzz-scene" }
 
 [profile.dev]
 opt-level = 1

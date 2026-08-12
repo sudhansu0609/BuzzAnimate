@@ -70,6 +70,7 @@ Rules that follow from this, applied to every phase:
 > | `cp-1.1` | Document-space clipping — retires the Phase 0 culling limitation |
 > | `cp-1.1b` | Boolean path operations with parallel tree reduction |
 > | `cp-1.1-complete` | Path editing and parallel hit-testing; CP-1.1 done |
+> | `cp-1.2` | Document model: COW scene, Animate layers, R-tree index |
 >
 > Tags, not commit hashes, are the identifier: a hash written into this file
 > can never name the commit that contains the file.
@@ -217,6 +218,38 @@ Rules that follow from this, applied to every phase:
       fire. Replaced with `Rect::overlaps`. Effect at 2e14% zoom: items drawn
       **213 → 61** for byte-identical output — roughly 3.5× less work.
 
+### ✅ CP-1.2 — Document model (`buzz-scene`)
+- [x] **Copy-on-write `Scene`** — snapshotting is `O(1)`: cloning bumps the one
+      `Arc` around the layer list, and copy-on-write descends into a layer, then
+      an object, only when an edit forces it
+- [x] Revision counter on every edit, so derived data can detect staleness
+- [x] `Object` / `ObjectKind` — shapes and nestable groups, with transform
+      accumulation and correct rotated bounds
+- [x] Stroke width included in bounds; hairlines correctly excluded
+- [x] **Animate's six layer types** — Normal, Folder, Mask, Masked, Guide,
+      Guided — with show/hide, lock, outline view, layer colour, layer height,
+      folder nesting and reordering
+- [x] **Positional mask resolution**: a mask claims the unbroken run of masked
+      layers below it, stopping at the first that is not. This is Animate's own
+      rule and what `.fla` files depend on — not an invented explicit link.
+- [x] Guide/guided resolved by the same positional rule
+- [x] Visibility and locking resolve through folder ancestors, with a bounded
+      walk so a corrupt parent cycle cannot hang
+- [x] `StageProperties` matching Animate's defaults (550×400, 24 fps)
+- [x] `IdAllocator` with `reserve_above`, so importer-assigned ids are never
+      reused by later edits
+- [x] **R-tree spatial index** (`rstar`), bulk-loaded, with a test asserting it
+      agrees with a brute-force scan over 5 000 objects
+- [x] Index records the revision it was built from and reports itself stale
+- [x] 53 tests
+- **Proven, not asserted:** a test builds an index for a 5 000-object snapshot
+  on another thread *while the main thread keeps editing*, then confirms the
+  index describes the snapshot and reports itself stale against the new
+  revision. That is the payoff of the immutable model.
+- **Corrected assumption:** the first sharing test expected snapshotting to add
+  one refcount per object. It adds none — the structure is shared wholesale
+  behind a single `Arc`, so snapshots are cheaper than the design assumed.
+
 ---
 
 ## 5. Current metrics
@@ -229,8 +262,9 @@ Rules that follow from this, applied to every phase:
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 104 passing, clippy clean |
-| Rust source | ~5 400 lines |
+| Tests | 157 passing, clippy clean |
+| Rust source | ~6 800 lines |
+| Crates built | 5 of 15 |
 
 ---
 
@@ -244,11 +278,11 @@ Rules that follow from this, applied to every phase:
   - [x] Boolean ops (union, subtract, intersect, xor), parallel tree reduction
   - [x] Path offsetting, simplification, smoothing
   - [x] Parallel hit-testing; stroke hit-testing with tolerance
-- [ ] **CP-1.2** `buzz-scene` — the document model
-  - [ ] Copy-on-write scene graph (`Arc` structural sharing)
-  - [ ] **Layer model matching Animate** — see §8.2
-  - [ ] Groups, transforms, z-order, depth
-  - [ ] R-tree spatial index (`rstar`), rebuilt off-thread
+- [x] **CP-1.2** `buzz-scene` — the document model — **complete**
+  - [x] Copy-on-write scene graph (`Arc` structural sharing)
+  - [x] **Layer model matching Animate** — see §8.2
+  - [x] Groups, transforms, z-order, depth
+  - [x] R-tree spatial index (`rstar`), rebuilt off-thread
 - [ ] **CP-1.3** `buzz-doc` — persistence
   - [ ] `.buzz` format (zip + JSON/binary), versioned
   - [ ] Snapshot-based undo/redo (snapshots *are* the history)
@@ -429,14 +463,14 @@ cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 
 ## 10. Next action
 
-**Begin CP-1.2** — `buzz-scene`, the document model:
+**Begin CP-1.3** — `buzz-doc`, persistence, which completes Phase 1:
 
-- Copy-on-write scene graph with `Arc` structural sharing. This is the decision
-  the whole multithreading model rests on: the renderer reads a snapshot with
-  zero locks while the document thread builds the next one, and undo becomes
-  nearly free because old snapshots *are* the history.
-- Animate's six layer types — Normal, Folder, Mask, Masked, Guide, Guided — with
-  show/hide, lock, outline view, layer colour and depth (§8.2).
-- Groups, transforms, z-order.
-- R-tree spatial index (`rstar`), rebuilt off-thread, feeding the hit-testing
-  built in CP-1.1d.
+- `.buzz` file format: a zip container with versioned JSON/binary parts, laid
+  out so the later XFL importer maps onto it cleanly.
+- Undo/redo built on snapshot history. The hard part is not the mechanism —
+  `Scene` snapshots already give that — but the policy: coalescing a drag into
+  one undo step, naming steps for the History panel, and bounding memory.
+- Background autosave and crash recovery, driven from the background pool.
+
+After that Phase 1 is done and **Phase 2 begins Animate parity in earnest**:
+the stage, pasteboard, toolbar and panel dock (§8.1–8.4).

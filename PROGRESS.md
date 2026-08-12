@@ -533,6 +533,48 @@ animator spends the most time holding.
 - [x] The preview is painted by the *artwork* renderer in the real colour,
       not sketched as chrome — for a brush, the preview is the result.
 
+**Build-up paint** — overlapping opacities *add*
+
+- [x] A brush stroke at alpha 0.2 crossing one at 0.3 gives exactly **0.5** in
+      the overlap, rather than the 0.44 ordinary source-over produces. Working
+      over an area deepens it the way ink does, and repeated strokes accumulate
+      in equal steps.
+- [x] `PaintBlend` on the shape, saved with the document (format version 4);
+      off by default, since Animate composites normally and a document whose
+      overlaps silently deepened would surprise anyone who did not ask for it
+- **The isolation group is the whole trick.** Additive compositing sums the
+  source with the destination, and the destination includes the stage: applied
+  straight to the canvas, dark paint at alpha 0.2 on a white background sums to
+  white and the stroke *disappears*. So a layer holding build-up paint is drawn
+  into its own transparent group, where the sum starts from nothing, and that
+  group composites over the stage normally. The layer is the accumulation
+  surface — build-up strokes deepen against their own layer and composite
+  normally onto the layers below, exactly as a paint program's layer does.
+- **Where colours differ the result is their mix**, weighted by how much of
+  each is present: the sum happens in premultiplied space and is divided back
+  out by the summed alpha. So build-up deepens paint rather than washing it
+  towards white, which is what a naive additive blend would do.
+- **Cost:** Vello sets blending per *layer*, not per fill, so each additive
+  shape costs a layer push and pop. That is why it is opt-in rather than the
+  default path. 300 build-up shapes render and read back in **1.4 ms**.
+
+**Proved on the GPU, not on paper.** `headless_build_up.rs` renders through the
+same path the window uses and reads the pixels back. Alpha is measured the way
+the eye would — black paint on a white stage, `a = 1 - v/255` — and asserted
+from the frame's *histogram* rather than named pixel coordinates, so a mistake
+in reproducing the camera's mapping cannot masquerade as a compositing bug.
+
+| Overlap of 0.2 and 0.3 | Measured |
+|---|---|
+| Build-up | **0.502** |
+| Normal | **0.444** |
+
+Further tests pin down that build-up paint does not dissolve into a light
+background, that a normal shape on a build-up layer still composites normally,
+and that build-up does not reach across a layer boundary. The same figures were
+then read off a screenshot of the running application, from a document loaded
+from disk — which also confirms the blend survives a save.
+
 **Measured, release build, on the 14700K:**
 
 | What | Time |
@@ -670,11 +712,11 @@ a test — every test passed while every import was monochrome.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 599 passing, clippy clean |
+| Tests | 610 passing, clippy clean |
 | Rust source | ~32 000 lines |
 | Crates built | 10 of 15 |
 | Phases done | Phase 0, 1, 2, 3, 4, **5** (gaps in §7) |
-| Format version | 3 — symbols, instances and tweens |
+| Format version | 4 — adds the per-shape paint blend |
 | Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |
 | Brush preview frame | 0.57 ms at 6 000 samples and 0.5 spacing |
 
@@ -815,6 +857,7 @@ a test — every test passed while every import was monochrome.
 | 21 | **No importer has been checked against a real file from Adobe.** Every fixture is one we wrote, so the importers are verified against the *specifications* and against files whose content we chose — not against what Animate, Illustrator and the Flash compilers actually emit, which is where the awkward cases live. This is the largest single risk in Phase 5. | Needs a licensed Animate/Illustrator and real-world files |
 | 22 | **Bitmaps are not imported** by any of the three readers — reported, never read. Needs a media pipeline: decode, store in the `.buzz` container's `media/` directory (reserved since Phase 1), and a bitmap object kind. | Phase 6 |
 | 23 | **SWF morph shapes, buttons, filters, blend modes and colour transforms on placements** are reported but not applied. Colour transforms are the cheapest of these to fix — the model already has `ColorTransform` — and would noticeably improve fidelity. | Phase 5 follow-up |
+| 27 | **Build-up paint is a deliberate deviation from Animate**, which has no such mode: its shapes always composite source-over. It is off by default, so a document that does not ask for it behaves exactly as Animate would. Added because overlapping translucent strokes that deepen is what a brush *should* do, and because the request was explicit. | By design |
 | 25 | **Pen pressure is plumbed through but never supplied.** The brush reads `StrokeSample::pressure` and the setting is in the panel, but winit 0.30 gives no tablet pressure on Windows, so every sample arrives at 1.0 and the pressure option paints a constant width. Speed is the default response for exactly this reason. Needs a platform tablet backend (Windows Ink / Wintab). | Brush follow-up |
 | 26 | **Brush strokes do not merge with what is under them.** Each stroke is its own shape even in Merge Shape mode; Animate would fuse same-coloured overlapping paint. The booleans exist (CP-1.1b) — this is a matter of routing brush output through them, which was left out because a boolean per stroke would undo the responsiveness work unless it is done off the interactive thread. | Brush follow-up |
 | 24 | **PDF clipping paths are ignored.** `W`/`W*` are recorded in the report but not applied, so artwork that a real file clips away arrives whole. Needs a clip concept in the scene model, which nothing else has wanted yet. | Phase 5 follow-up |
@@ -899,13 +942,16 @@ a test — every test passed while every import was monochrome.
 cargo run --release -p buzz-app              # run
 cargo run --release -p buzz-app -- file.buzz # run, opening a document
 cargo run --release -p buzz-app -- art.fla   # run, importing a foreign file
-cargo test --workspace                       # 561 tests
+cargo test --workspace                       # 610 tests
 cargo clippy --workspace --all-targets       # lint
 cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 
 # Write a document exercising symbols, folders, instances and all four tween
 # span styles, for looking at by hand. Prints the path it wrote.
 cargo test -p buzz-doc --test make_fixture -- --ignored --nocapture
+
+# Prove build-up paint on the GPU: 0.2 over 0.3 reads back as 0.5.
+cargo test -p buzz-app --test headless_build_up -- --nocapture
 
 # Write one .fla, .swf and .pdf fixture, then open one of them.
 cargo test -p buzz-app --test make_import_fixtures -- --ignored --nocapture

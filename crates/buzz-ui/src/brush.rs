@@ -189,6 +189,13 @@ pub struct BrushSettings {
     pub spacing: f64,
     /// Geometry for [`PatternShape::Custom`].
     pub custom_pattern: Option<BezPath>,
+    /// Paint that **builds up** where strokes overlap.
+    ///
+    /// With this on, a stroke at alpha 0.2 crossing one at 0.3 gives exactly
+    /// 0.5 in the overlap rather than the 0.44 that ordinary compositing
+    /// produces, so working over an area deepens it the way ink does.
+    /// See [`buzz_scene::PaintBlend::Additive`].
+    pub build_up: bool,
 }
 
 impl Default for BrushSettings {
@@ -204,6 +211,10 @@ impl Default for BrushSettings {
             pattern: PatternShape::default(),
             spacing: 12.0,
             custom_pattern: None,
+            // Off by default: Animate composites normally, and a document
+            // whose overlaps silently deepen would surprise anyone who did
+            // not ask for it.
+            build_up: false,
         }
     }
 }
@@ -260,6 +271,15 @@ impl BrushSettings {
         }
         let scale = self.size.max(0.01) / extent;
         Some(kurbo::Affine::scale(scale) * base)
+    }
+
+    /// How strokes from this brush combine with the paint under them.
+    pub fn blend(&self) -> buzz_scene::PaintBlend {
+        if self.build_up {
+            buzz_scene::PaintBlend::Additive
+        } else {
+            buzz_scene::PaintBlend::Normal
+        }
     }
 
     /// Adopt a shape from the document as the custom pattern.

@@ -26,8 +26,8 @@ use std::sync::Arc;
 use buzz_geom::{Affine, BezPath, FillMode, Size};
 use buzz_scene::{
     ColorTransform, FillSpec, Layer, LayerHeight, LayerId, LayerKind, LoopMode, Object, ObjectId,
-    ObjectKind, Scene, ShapeData, StageProperties, StrokeSpec, Symbol, SymbolId, SymbolInstance,
-    SymbolKind, Tween,
+    ObjectKind, PaintBlend, Scene, ShapeData, StageProperties, StrokeSpec, Symbol, SymbolId,
+    SymbolInstance, SymbolKind, Tween,
 };
 use peniko::Color;
 use serde::{Deserialize, Serialize};
@@ -37,12 +37,13 @@ use serde::{Deserialize, Serialize};
 /// * **1** — layers held a flat object list.
 /// * **2** — layers hold keyframes, and the document has a camera track.
 /// * **3** — a library of symbols, instance objects, and tweens on keyframes.
+/// * **4** — shapes carry a paint blend, so build-up strokes survive a save.
 ///
 /// Every older version still loads. Version 1's flat list becomes a single
 /// keyframe at frame 0, which is exactly what it meant; version 2 simply has
 /// no library and no tweens, and both default to empty. Keeping those paths is
 /// cheap and it exercises the version check for real rather than in theory.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -199,6 +200,10 @@ fn tween_is_absent(tween: &Tween) -> bool {
     !tween.is_active()
 }
 
+fn is_normal_blend(blend: &PaintBlend) -> bool {
+    *blend == PaintBlend::Normal
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraDto {
     pub enabled: bool,
@@ -248,6 +253,12 @@ pub enum ObjectKindDto {
         fill: Option<FillDto>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stroke: Option<StrokeDto>,
+        /// How the shape combines with the paint under it. Version 4.
+        ///
+        /// Defaulted and omitted when Normal, so every version-3 document
+        /// still loads and every ordinary shape stays as compact as it was.
+        #[serde(default, skip_serializing_if = "is_normal_blend")]
+        blend: PaintBlend,
     },
     Group {
         children: Vec<ObjectDto>,
@@ -519,6 +530,7 @@ impl ObjectDto {
                     width: s.width,
                     hairline: s.hairline,
                 }),
+                blend: s.blend,
             },
             ObjectKind::Group(children) => ObjectKindDto::Group {
                 children: children
@@ -551,7 +563,12 @@ impl ObjectDto {
 
     fn to_object(&self) -> Result<Object, SerialError> {
         let kind = match &self.kind {
-            ObjectKindDto::Shape { path, fill, stroke } => {
+            ObjectKindDto::Shape {
+                path,
+                fill,
+                stroke,
+                blend,
+            } => {
                 let parsed =
                     BezPath::from_svg(path).map_err(|e| SerialError::BadPath(e.to_string()))?;
                 ObjectKind::Shape(ShapeData {
@@ -575,6 +592,7 @@ impl ObjectDto {
                             })
                         })
                         .transpose()?,
+                    blend: *blend,
                 })
             }
             ObjectKindDto::Group { children } => ObjectKind::Group(
@@ -854,7 +872,7 @@ mod tests {
         });
 
         let dto = DocumentDto::from_scene(&scene);
-        assert_eq!(dto.format_version, 3);
+        assert_eq!(dto.format_version, FORMAT_VERSION);
         let json = serde_json::to_string(&dto).unwrap();
         let back = serde_json::from_str::<DocumentDto>(&json)
             .unwrap()

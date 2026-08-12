@@ -467,6 +467,7 @@ fn build_shape_symbol(id: CharacterId, paths: &[StyledPath], ids: &mut IdSource)
                 stroke: styled
                     .stroke
                     .map(|(color, width)| StrokeSpec::new(color, width)),
+                blend: buzz_scene::PaintBlend::Normal,
             };
             std::sync::Arc::new(Object::shape(ObjectId(ids.take()), shape))
         })

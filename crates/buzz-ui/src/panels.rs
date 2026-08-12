@@ -602,6 +602,13 @@ fn brush_properties(ui: &mut Ui, style: &mut DrawStyle) {
             .on_hover_text("Steadies a shaky hand. The ends never move.");
         ui.end_row();
 
+        ui.label("Build up");
+        ui.checkbox(&mut style.brush.build_up, "")
+            .on_hover_text(
+                "Opacity adds where strokes overlap: 20% crossing 30% gives                  50%, not 44%. Paint deepens as you work over it, the way ink                  does.",
+            );
+        ui.end_row();
+
         if style.brush.kind == BrushKind::Fluid {
             ui.label("Thinnest");
             ui.add(egui::Slider::new(&mut style.brush.min_ratio, 0.0..=1.0))

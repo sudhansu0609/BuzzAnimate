@@ -392,7 +392,8 @@ impl ToolMachine {
                     shape: ShapeData::filled(
                         path,
                         ctx.style.fill_for_new_shape().unwrap_or(Color::BLACK),
-                    ),
+                    )
+                    .with_blend(ctx.style.brush.blend()),
                     label: "Brush",
                 }
             }
@@ -410,6 +411,7 @@ impl ToolMachine {
                             width,
                             hairline,
                         }),
+                        blend: buzz_scene::PaintBlend::Normal,
                     },
                     label: "Pencil",
                 }
@@ -475,6 +477,7 @@ impl ToolMachine {
                             .then(|| ctx.style.fill_for_new_shape())
                             .flatten()
                             .map(buzz_scene::FillSpec::solid),
+                        blend: buzz_scene::PaintBlend::Normal,
                         stroke: ctx.style.stroke_for_new_shape().map(|(color, width, hairline)| {
                             buzz_scene::StrokeSpec {
                                 color,

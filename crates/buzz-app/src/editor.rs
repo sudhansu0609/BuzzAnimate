@@ -1663,6 +1663,9 @@ fn merge_shape_into_layer(
             path: merged,
             fill: Some(new_fill),
             stroke: incoming.stroke,
+            // A merge takes the incoming shape's blend: it is the paint being
+            // applied, and the result is one shape from here on.
+            blend: incoming.blend,
         },
     )
 }

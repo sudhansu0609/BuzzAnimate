@@ -464,6 +464,9 @@ impl<'a> Interpreter<'a> {
             path: placed,
             fill: None,
             stroke: None,
+            // Imported artwork always composites normally; build-up is an
+            // authoring choice, and no source format expresses it.
+            blend: buzz_scene::PaintBlend::Normal,
         };
         if fills {
             shape.fill = Some(FillSpec::solid(state.fill));

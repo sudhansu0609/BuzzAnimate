@@ -58,12 +58,69 @@ impl StrokeSpec {
     }
 }
 
+/// How a shape combines with the paint already on its layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PaintBlend {
+    /// Ordinary source-over compositing. Two translucent shapes at alpha 0.2
+    /// and 0.3 overlap to `0.2 + 0.3 x (1 - 0.2) = 0.44`, because the second
+    /// only paints on what the first left showing. This is what Animate does
+    /// and what every other shape in the document uses.
+    #[default]
+    Normal,
+    /// **Build-up.** Opacities *add* where shapes overlap, so alpha 0.2 over
+    /// alpha 0.3 gives exactly 0.5, and paint deepens as you work over it —
+    /// the way ink or airbrush does.
+    ///
+    /// # Why this needs an isolation group
+    ///
+    /// Additive compositing sums the source and destination outright. Applied
+    /// straight to the canvas it would sum with the *stage* as well: a black
+    /// stroke at alpha 0.2 over a white background gives `white + a little
+    /// black`, which clamps back to white and the stroke disappears. So a
+    /// layer holding additive paint is rendered into its own transparent
+    /// group, where the sum starts from nothing and means what it should, and
+    /// that group is then composited over the stage normally.
+    ///
+    /// The layer is therefore the accumulation surface: additive strokes build
+    /// up with everything on their own layer and composite normally onto the
+    /// layers below, which is how a paint program's layer behaves.
+    Additive,
+}
+
+impl PaintBlend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Additive => "Build Up",
+        }
+    }
+
+    pub fn is_additive(self) -> bool {
+        matches!(self, Self::Additive)
+    }
+
+    /// The alpha two overlapping shapes produce under this mode.
+    ///
+    /// Exposed and tested because it is the whole observable point of the
+    /// mode, and because it is far easier to reason about here than by reading
+    /// pixels back off a GPU — though a headless test does that too.
+    pub fn combine_alpha(self, under: f64, over: f64) -> f64 {
+        let (under, over) = (under.clamp(0.0, 1.0), over.clamp(0.0, 1.0));
+        match self {
+            Self::Normal => under + over * (1.0 - under),
+            Self::Additive => (under + over).min(1.0),
+        }
+    }
+}
+
 /// A filled and/or stroked path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShapeData {
     pub path: BezPath,
     pub fill: Option<FillSpec>,
     pub stroke: Option<StrokeSpec>,
+    /// How this shape combines with the paint under it.
+    pub blend: PaintBlend,
 }
 
 impl ShapeData {
@@ -72,6 +129,7 @@ impl ShapeData {
             path,
             fill: Some(FillSpec::solid(color)),
             stroke: None,
+            blend: PaintBlend::Normal,
         }
     }
 
@@ -80,7 +138,14 @@ impl ShapeData {
             path,
             fill: None,
             stroke: Some(StrokeSpec::new(color, width)),
+            blend: PaintBlend::Normal,
         }
+    }
+
+    /// The same shape, painting additively.
+    pub fn with_blend(mut self, blend: PaintBlend) -> Self {
+        self.blend = blend;
+        self
     }
 }
 
@@ -310,6 +375,71 @@ mod tests {
         );
     }
 
+    /// The behaviour build-up exists for: two translucent strokes at 0.2 and
+    /// 0.3 overlap at exactly 0.5, not the 0.44 ordinary compositing gives.
+    #[test]
+    fn build_up_adds_opacities_where_normal_compositing_does_not() {
+        let under = 0.2;
+        let over = 0.3;
+
+        let additive = PaintBlend::Additive.combine_alpha(under, over);
+        assert!(
+            (additive - 0.5).abs() < 1e-12,
+            "0.2 and 0.3 should build up to 0.5, got {additive}"
+        );
+
+        let normal = PaintBlend::Normal.combine_alpha(under, over);
+        assert!(
+            (normal - 0.44).abs() < 1e-12,
+            "ordinary compositing gives 0.2 + 0.3x0.8 = 0.44, got {normal}"
+        );
+    }
+
+    /// Opacity cannot exceed fully opaque however much paint is laid down.
+    #[test]
+    fn build_up_saturates_at_opaque_rather_than_overflowing() {
+        assert_eq!(PaintBlend::Additive.combine_alpha(0.6, 0.7), 1.0);
+        assert_eq!(PaintBlend::Additive.combine_alpha(1.0, 1.0), 1.0);
+
+        // And out-of-range input is clamped rather than believed.
+        assert_eq!(PaintBlend::Additive.combine_alpha(-5.0, 0.25), 0.25);
+        assert_eq!(PaintBlend::Normal.combine_alpha(2.0, 0.5), 1.0);
+    }
+
+    /// Painting onto nothing gives back exactly what was painted, in either
+    /// mode — the two only differ where they overlap something.
+    #[test]
+    fn painting_on_empty_canvas_is_the_same_in_both_modes() {
+        for alpha in [0.0, 0.15, 0.5, 1.0] {
+            assert_eq!(PaintBlend::Normal.combine_alpha(0.0, alpha), alpha);
+            assert_eq!(PaintBlend::Additive.combine_alpha(0.0, alpha), alpha);
+        }
+    }
+
+    /// Repeated strokes build up linearly, which is what makes working over an
+    /// area deepen it predictably.
+    #[test]
+    fn repeated_build_up_strokes_accumulate_in_equal_steps() {
+        let mut alpha = 0.0;
+        for expected in [0.2, 0.4, 0.6, 0.8, 1.0] {
+            alpha = PaintBlend::Additive.combine_alpha(alpha, 0.2);
+            assert!((alpha - expected).abs() < 1e-12, "got {alpha}, want {expected}");
+        }
+        // The sixth stroke can add nothing; it is already opaque.
+        assert_eq!(PaintBlend::Additive.combine_alpha(alpha, 0.2), 1.0);
+    }
+
+    #[test]
+    fn shapes_composite_normally_unless_asked_otherwise() {
+        let plain = ShapeData::filled(square(0.0, 0.0, 1.0), Color::BLACK);
+        assert_eq!(plain.blend, PaintBlend::Normal);
+        assert!(!plain.blend.is_additive());
+
+        let built = plain.with_blend(PaintBlend::Additive);
+        assert!(built.blend.is_additive());
+        assert_eq!(built.blend.label(), "Build Up");
+    }
+
     #[test]
     fn hairline_strokes_do_not_inflate_bounds() {
         let o = Object::shape(
@@ -318,6 +448,7 @@ mod tests {
                 path: square(0.0, 0.0, 10.0),
                 fill: None,
                 stroke: Some(StrokeSpec::hairline(Color::WHITE)),
+                blend: PaintBlend::Normal,
             },
         );
         // A hairline is a screen-space width; it has no document-space extent.

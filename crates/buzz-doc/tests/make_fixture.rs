@@ -85,3 +85,43 @@ fn write_phase4_fixture() {
     buzz_doc::format::save(&scene, &path).expect("the fixture saves");
     println!("wrote {}", path.display());
 }
+
+/// A document showing build-up paint against ordinary compositing.
+///
+/// Two rows of crossing translucent bars: the top row composites normally, the
+/// bottom row builds up. The overlaps should differ visibly — 0.44 against
+/// 0.50 — and the file itself proves the blend survives a save and reload,
+/// which is what format version 4 added.
+#[test]
+#[ignore = "writes a file for manual inspection"]
+fn write_build_up_fixture() {
+    use buzz_scene::PaintBlend;
+
+    let mut scene = Scene::default();
+    let normal_layer = scene.layers().iter().next().unwrap().id;
+    scene.update_layer(normal_layer, |l| l.name = "Normal".into());
+    let build_up_layer = scene.add_layer("Build Up", LayerKind::Normal);
+
+    let ink = |alpha: f64| Color::from_rgba8(0x10, 0x30, 0x80, (alpha * 255.0).round() as u8);
+
+    for (layer, top, blend) in [
+        (normal_layer, 40.0, PaintBlend::Normal),
+        (build_up_layer, 220.0, PaintBlend::Additive),
+    ] {
+        // A horizontal bar at 0.2 and a vertical one at 0.3, crossing.
+        for (rect, alpha) in [
+            (Rect::new(60.0, top + 50.0, 480.0, top + 100.0), 0.2),
+            (Rect::new(220.0, top, 320.0, top + 150.0), 0.3),
+        ] {
+            scene.add_shape(
+                layer,
+                ShapeData::filled(rect.to_path(1e-9), ink(alpha)).with_blend(blend),
+            );
+        }
+    }
+
+    let mut path = std::env::temp_dir();
+    path.push("build-up-fixture.buzz");
+    buzz_doc::format::save(&scene, &path).expect("the fixture saves");
+    println!("wrote {}", path.display());
+}

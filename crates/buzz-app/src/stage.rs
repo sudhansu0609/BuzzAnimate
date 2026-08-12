@@ -67,6 +67,16 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect) {
     }
 }
 
+/// Draw a document's artwork for one frame: no camera, no onion skins, no
+/// preview.
+///
+/// Exposed so a test can render a document through exactly the path the window
+/// uses. A test that reimplemented the walk would be testing its own copy, and
+/// compositing bugs are precisely the kind that hide in the difference.
+pub fn draw_document(builder: &mut SceneBuilder<'_>, scene: &buzz_scene::Scene, frame: u32) {
+    draw_frame(builder, scene, frame, Affine::IDENTITY, None, false);
+}
+
 /// Draw one frame's layers.
 ///
 /// `ghost` fades everything for onion skinning; `None` draws normally.
@@ -87,9 +97,63 @@ fn draw_frame(
         // Resolve tweens: what is drawn between two keyframes exists nowhere
         // in the document and has to be interpolated.
         let ctx = DrawCtx { scene, frame, tint, faded, ghost, effect: ColorTransform::default(), depth: 0 };
-        for object in layer.frames.resolved_at(frame).iter() {
+        let resolved = layer.frames.resolved_at(frame);
+
+        // A layer holding build-up paint is drawn into its own transparent
+        // group. Additive compositing sums with the destination, and without
+        // the group the destination would include the stage — a dark stroke on
+        // a white background would sum to white and disappear. Inside, the sum
+        // starts from nothing and means what it should.
+        //
+        // The group is skipped entirely when nothing on the layer is additive,
+        // because every group is a render target and they are not free.
+        let accumulates = resolved
+            .iter()
+            .any(|object| has_additive_paint(object, scene, 0));
+
+        if accumulates {
+            // Bounded to the layer's own artwork: an unbounded group would
+            // cost a full-viewport buffer whatever the layer contains.
+            let bounds = layer
+                .bounds_at(frame)
+                .map(|b| b.inflate(2.0, 2.0))
+                .unwrap_or_else(|| builder.clip_bounds());
+            builder.push_isolation(bounds.intersect(builder.clip_bounds()));
+        }
+
+        for object in resolved.iter() {
             draw_object(builder, object, camera, &ctx);
         }
+
+        if accumulates {
+            builder.pop_isolation();
+        }
+    }
+}
+
+/// Does this object, or anything inside it, paint additively?
+///
+/// Instances are followed into the library, because a symbol full of build-up
+/// paint placed on a layer still needs that layer isolated.
+fn has_additive_paint(object: &Object, scene: &buzz_scene::Scene, depth: usize) -> bool {
+    if depth >= MAX_SYMBOL_DEPTH {
+        return false;
+    }
+    match &object.kind {
+        ObjectKind::Shape(shape) => shape.blend.is_additive(),
+        ObjectKind::Group(children) => children
+            .iter()
+            .any(|child| has_additive_paint(child, scene, depth + 1)),
+        ObjectKind::Instance(instance) => scene
+            .library()
+            .get(instance.symbol)
+            .is_some_and(|symbol| {
+                symbol.layers.iter().any(|layer| {
+                    layer
+                        .all_objects()
+                        .any(|child| has_additive_paint(child, scene, depth + 1))
+                })
+            }),
     }
 }
 
@@ -204,7 +268,15 @@ fn draw_object(builder: &mut SceneBuilder<'_>, object: &Object, parent: Affine, 
             }
 
             if let Some(fill) = shape.fill {
-                builder.fill_shape(&path, ctx.colour(fill.color));
+                let color = ctx.colour(fill.color);
+                // Build-up paint sums its opacity with what is under it. The
+                // enclosing isolation group, opened by `draw_frame`, is what
+                // keeps that sum away from the stage behind it.
+                if shape.blend.is_additive() {
+                    builder.fill_shape_additive(&path, color);
+                } else {
+                    builder.fill_shape(&path, color);
+                }
             }
             if let Some(stroke) = shape.stroke {
                 let color = ctx.colour(stroke.color);

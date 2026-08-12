@@ -758,6 +758,9 @@ impl FrameContext {
                             path,
                             fill: fill.map(FillSpec::solid),
                             stroke: stroke.map(|(c, w)| StrokeSpec::new(c, w)),
+                            // No source format expresses build-up paint, so
+                            // imported artwork always composites normally.
+                            blend: buzz_scene::PaintBlend::Normal,
                         };
                         frame
                             .objects

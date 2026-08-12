@@ -44,7 +44,7 @@ pub use camera_track::{CameraKey, CameraTrack};
 pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
 pub use merge::{ImportTarget, MergeReport};
-pub use object::{FillSpec, Object, ObjectId, ObjectKind, ShapeData, StrokeSpec};
+pub use object::{FillSpec, Object, ObjectId, ObjectKind, PaintBlend, ShapeData, StrokeSpec};
 pub use symbol::{
     ColorEffect, ColorTransform, Library, LoopMode, Symbol, SymbolId, SymbolInstance, SymbolKind,
 };

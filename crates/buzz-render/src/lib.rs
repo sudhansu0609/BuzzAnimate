@@ -234,6 +234,64 @@ impl<'a> SceneBuilder<'a> {
             .fill(Fill::NonZero, self.split.gpu_view, color, None, &path);
     }
 
+    /// Fill a shape so that its opacity **adds** to whatever is under it.
+    ///
+    /// Two strokes at alpha 0.2 and 0.3 overlap at exactly 0.5, rather than the
+    /// 0.44 that ordinary source-over gives. Where the colours differ the
+    /// result is their mix weighted by how much of each is present, because
+    /// the sum happens in premultiplied space and is divided back out by the
+    /// summed alpha — so this deepens paint without washing it towards white.
+    ///
+    /// # This must be inside an isolation group
+    ///
+    /// Additive compositing sums the source with the destination, and the
+    /// destination includes the stage. Called outside a group, a dark stroke
+    /// on a white background would sum to white and vanish. See
+    /// [`Self::push_isolation`], which the caller is responsible for opening.
+    ///
+    /// # Cost
+    ///
+    /// Vello sets blending per *layer*, not per fill, so each additive shape
+    /// costs a layer push and pop. That is real GPU work, which is why it is a
+    /// separate method the caller opts into rather than the default path.
+    pub fn fill_shape_additive(&mut self, shape: &impl Shape, color: Color) {
+        let path = self.to_render_space(shape);
+        let blend = peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Plus);
+
+        // The shape is its own clip, so the fill inside the layer covers
+        // exactly the shape and nothing else.
+        self.scene
+            .push_layer(Fill::NonZero, blend, 1.0, self.split.gpu_view, &path);
+        self.scene
+            .fill(Fill::NonZero, self.split.gpu_view, color, None, &path);
+        self.scene.pop_layer();
+    }
+
+    /// Begin a transparent group that later drawing composites into.
+    ///
+    /// Ordinary source-over drawing is unaffected by being inside one — an
+    /// isolation group at full alpha is invisible to it — so a layer can be
+    /// wrapped unconditionally when it holds any additive paint, without
+    /// changing how its normal shapes look.
+    ///
+    /// `bounds` limits the group to the region that needs it. Every group is a
+    /// render target, so an unbounded one would cost a full-viewport buffer.
+    pub fn push_isolation(&mut self, bounds: buzz_geom::Rect) {
+        let path = self.to_render_space(&bounds);
+        self.scene.push_layer(
+            Fill::NonZero,
+            peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::SrcOver),
+            1.0,
+            self.split.gpu_view,
+            &path,
+        );
+    }
+
+    /// Close the group opened by [`Self::push_isolation`].
+    pub fn pop_isolation(&mut self) {
+        self.scene.pop_layer();
+    }
+
     /// Stroke a document-space shape with a width in document units.
     pub fn stroke_shape(&mut self, shape: &impl Shape, color: Color, width: f64) {
         let path = self.to_render_space(shape);

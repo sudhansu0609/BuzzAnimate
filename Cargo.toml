@@ -50,6 +50,7 @@ serde_json = "1"
 
 rstar = "0.13.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+quick-xml = "0.41.0"
 
 # Internal crates
 buzz-geom = { path = "crates/buzz-geom" }
@@ -58,6 +59,7 @@ buzz-render = { path = "crates/buzz-render" }
 buzz-scene = { path = "crates/buzz-scene" }
 buzz-doc = { path = "crates/buzz-doc" }
 buzz-ui = { path = "crates/buzz-ui" }
+buzz-import-xfl = { path = "crates/buzz-import-xfl" }
 
 [profile.dev]
 opt-level = 1

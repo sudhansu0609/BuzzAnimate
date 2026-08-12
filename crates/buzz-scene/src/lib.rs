@@ -29,7 +29,9 @@ pub mod camera_track;
 pub mod index;
 pub mod layer;
 pub mod object;
+pub mod symbol;
 pub mod timeline;
+pub mod tween;
 
 use std::sync::Arc;
 
@@ -41,7 +43,9 @@ pub use camera_track::{CameraKey, CameraTrack};
 pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
 pub use object::{FillSpec, Object, ObjectId, ObjectKind, ShapeData, StrokeSpec};
-pub use timeline::{FrameKind, Keyframe, LayerTimeline};
+pub use symbol::{ColorTransform, Library, LoopMode, Symbol, SymbolId, SymbolInstance, SymbolKind};
+pub use timeline::{FrameKind, Keyframe, LayerTimeline, ResolvedFrame};
+pub use tween::{Easing, Tween, TweenKind};
 
 /// Stage setup, matching Animate's Document Properties dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -109,6 +113,8 @@ pub struct Scene {
     /// The animated camera. Off until the user enables it. Private for the
     /// same reason as `stage`.
     camera: CameraTrack,
+    /// Reusable symbols, organised into folders. Private for the same reason.
+    library: Library,
     layers: LayerStack,
     ids: IdAllocator,
     revision: u64,
@@ -119,6 +125,7 @@ impl Default for Scene {
         let mut scene = Self {
             stage: StageProperties::default(),
             camera: CameraTrack::new(),
+            library: Library::new(),
             layers: LayerStack::new(),
             ids: IdAllocator::default(),
             revision: 0,
@@ -137,6 +144,7 @@ impl Scene {
         Self {
             stage: StageProperties::default(),
             camera: CameraTrack::new(),
+            library: Library::new(),
             layers: LayerStack::new(),
             ids: IdAllocator::default(),
             revision: 0,
@@ -170,6 +178,109 @@ impl Scene {
     pub fn camera_mut(&mut self) -> &mut CameraTrack {
         self.revision += 1;
         &mut self.camera
+    }
+
+    pub fn library(&self) -> &Library {
+        &self.library
+    }
+
+    /// Mutable library. Bumps the revision, so library edits are undoable.
+    pub fn library_mut(&mut self) -> &mut Library {
+        self.revision += 1;
+        &mut self.library
+    }
+
+    /// Add a symbol, giving it a unique name and a fresh id.
+    pub fn add_symbol(
+        &mut self,
+        name: impl Into<String>,
+        kind: SymbolKind,
+        folder: Option<&str>,
+    ) -> SymbolId {
+        let id = SymbolId(self.ids.take());
+        let name = self.library.unique_name(&name.into());
+        let mut symbol = Symbol::new(id, name, kind);
+        symbol.folder = folder.map(|f| f.trim_matches('/').to_string());
+        // A symbol always needs one layer, or there is nowhere to draw.
+        symbol.layers.push_front(Layer::normal(LayerId(self.ids.take()), "Layer_1"));
+        self.library.insert(symbol);
+        self.bump();
+        id
+    }
+
+    /// Place an instance of `symbol` on a layer at `frame`.
+    pub fn add_instance_at(
+        &mut self,
+        layer: LayerId,
+        frame: u32,
+        symbol: SymbolId,
+        transform: Affine,
+    ) -> Option<ObjectId> {
+        if self.library.get(symbol).is_none() {
+            return None;
+        }
+        let id = ObjectId(self.ids.take());
+        let object = Object::instance_of(id, symbol).with_transform(transform);
+        self.add_object_at(layer, frame, object)
+    }
+
+    /// Bounds of a placed instance, resolved through the library.
+    ///
+    /// [`Object::bounds`] cannot do this because an object has no way to reach
+    /// the library, so it returns a placeholder; anything that needs real
+    /// extents for an instance comes here.
+    pub fn instance_bounds(&self, object: &Object) -> Option<Rect> {
+        let instance = object.instance()?;
+        let symbol = self.library.get(instance.symbol)?;
+        let local = symbol.bounds()?;
+        Some(object::transform_rect(object.transform, local))
+    }
+
+    /// Bounds of an object, resolving instances through the library.
+    pub fn resolved_bounds(&self, object: &Object) -> Rect {
+        match &object.kind {
+            ObjectKind::Instance(_) => self
+                .instance_bounds(object)
+                .unwrap_or_else(|| object.bounds()),
+            ObjectKind::Group(children) => children
+                .iter()
+                .map(|c| {
+                    object::transform_rect(object.transform, self.resolved_bounds(c))
+                })
+                .reduce(|a, b| a.union(b))
+                .unwrap_or_else(|| object.bounds()),
+            ObjectKind::Shape(_) => object.bounds(),
+        }
+    }
+
+    /// How many times each symbol is used, for the Library panel.
+    ///
+    /// Counts instances on the stage *and* inside other symbols, because a
+    /// symbol used only inside another is still in use — deleting it would
+    /// break that one.
+    pub fn symbol_usage(&self) -> std::collections::BTreeMap<SymbolId, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+
+        fn walk(object: &Object, counts: &mut std::collections::BTreeMap<SymbolId, usize>) {
+            match &object.kind {
+                ObjectKind::Instance(i) => *counts.entry(i.symbol).or_insert(0) += 1,
+                ObjectKind::Group(children) => {
+                    for c in children {
+                        walk(c, counts);
+                    }
+                }
+                ObjectKind::Shape(_) => {}
+            }
+        }
+
+        let stage = self.layers.iter();
+        let nested = self.library.iter().flat_map(|s| s.layers.iter());
+        for layer in stage.chain(nested) {
+            for object in layer.all_objects() {
+                walk(object, &mut counts);
+            }
+        }
+        counts
     }
 
     /// Mutable access that bumps the revision.

@@ -1,0 +1,22 @@
+[package]
+name = "buzz-import-xfl"
+description = "Import Adobe Animate .fla and .xfl documents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+buzz-geom.workspace = true
+buzz-scene.workspace = true
+
+kurbo.workspace = true
+peniko.workspace = true
+quick-xml.workspace = true
+zip.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -13,7 +13,7 @@
 
 use buzz_geom::{Affine, Point, Rect, Vec2};
 use buzz_render::SceneBuilder;
-use buzz_scene::{LayerKind, Object, ObjectKind};
+use buzz_scene::{ColorTransform, LayerKind, Object, ObjectKind};
 use buzz_ui::{Metrics, Orientation, Palette};
 use egui::{Align2, Color32, FontId, Sense, Stroke, StrokeKind, Ui};
 use peniko::Color;
@@ -76,20 +76,68 @@ fn draw_frame(
         let tint = outline.then_some(layer.color);
         let faded = layer.kind == LayerKind::Guide;
 
-        for object in layer.objects_at(frame) {
-            draw_object(builder, object, camera, tint, faded, ghost);
+        // Resolve tweens: what is drawn between two keyframes exists nowhere
+        // in the document and has to be interpolated.
+        let ctx = DrawCtx { scene, frame, tint, faded, ghost, effect: ColorTransform::default(), depth: 0 };
+        for object in layer.frames.resolved_at(frame).iter() {
+            draw_object(builder, object, camera, &ctx);
         }
     }
 }
 
-fn draw_object(
-    builder: &mut SceneBuilder<'_>,
-    object: &Object,
-    parent: Affine,
+/// How deep a symbol may nest before we stop.
+///
+/// A symbol containing an instance of itself is a cycle; without a limit the
+/// renderer would recurse until the stack ran out. Animate refuses to create
+/// one, but an imported or hand-edited file can contain it.
+const MAX_SYMBOL_DEPTH: usize = 12;
+
+/// State the draw walk carries down through groups and nested symbols.
+///
+/// Descending into an instance changes nearly all of it — the frame, the
+/// colour effect, the depth — so it travels as one value rather than as a
+/// growing argument list.
+#[derive(Clone)]
+struct DrawCtx<'a> {
+    scene: &'a buzz_scene::Scene,
+    /// Which frame of *this* timeline is being drawn. A nested graphic symbol
+    /// runs on its own frame number, not the stage's.
+    frame: u32,
+    /// Outline view: draw silhouettes in this colour instead of the artwork.
     tint: Option<Color>,
+    /// Guide layer.
     faded: bool,
+    /// Onion-skin ghost alpha.
     ghost: Option<f64>,
-) {
+    /// Accumulated colour effect from every enclosing instance.
+    effect: ColorTransform,
+    depth: usize,
+}
+
+impl DrawCtx<'_> {
+    /// Final colour for a fill or stroke, with every modifier applied.
+    ///
+    /// Instance effects come first because they are part of the artwork; the
+    /// guide fade and ghost alpha are authoring overlays applied on top.
+    fn colour(&self, c: Color) -> Color {
+        self.overlay(self.effect.apply(c))
+    }
+
+    /// Apply only the authoring overlays.
+    ///
+    /// Outline view draws in the layer's identifying colour, which is chrome
+    /// rather than artwork — running it through an instance's tint would
+    /// defeat the point of colour-coding layers.
+    fn overlay(&self, c: Color) -> Color {
+        let c = if self.faded { fade(c) } else { c };
+        match self.ghost {
+            Some(alpha) => c.multiply_alpha(alpha as f32),
+            None => c,
+        }
+    }
+}
+
+fn draw_object(builder: &mut SceneBuilder<'_>, object: &Object, parent: Affine, ctx: &DrawCtx<'_>) {
     if !object.visible {
         return;
     }
@@ -98,32 +146,60 @@ fn draw_object(
     match &object.kind {
         ObjectKind::Group(children) => {
             for child in children {
-                draw_object(builder, child, world, tint, faded, ghost);
+                draw_object(builder, child, world, ctx);
             }
         }
+
+        ObjectKind::Instance(instance) => {
+            if ctx.depth >= MAX_SYMBOL_DEPTH {
+                return;
+            }
+            let Some(symbol) = ctx.scene.library().get(instance.symbol) else {
+                // A dangling reference draws nothing rather than crashing; the
+                // Library panel is where a missing symbol gets reported.
+                return;
+            };
+
+            // A graphic follows the parent playhead; a movie clip shows its
+            // first frame while authoring.
+            let inner = instance.resolve_frame(symbol.kind, ctx.frame, symbol.length());
+
+            let mut inner_ctx = ctx.clone();
+            inner_ctx.frame = inner;
+            inner_ctx.depth += 1;
+            // Compose rather than replace: a tinted symbol inside a faded one
+            // must show both effects.
+            inner_ctx.effect = instance.color.compose(&ctx.effect);
+
+            for layer in symbol.layers.drawable_at(inner) {
+                // An outline already in force wins — the stage layer's outline
+                // toggle applies to everything it contains.
+                let layer_ctx = DrawCtx {
+                    tint: ctx.tint.or_else(|| layer.outline.then_some(layer.color)),
+                    faded: ctx.faded || layer.kind == LayerKind::Guide,
+                    ..inner_ctx.clone()
+                };
+                for child in layer.frames.resolved_at(inner).iter() {
+                    draw_object(builder, child, world, &layer_ctx);
+                }
+            }
+        }
+
         ObjectKind::Shape(shape) => {
             let path = world * shape.path.clone();
 
-            let adjust = |c: Color| {
-                let c = if faded { fade(c) } else { c };
-                match ghost {
-                    Some(alpha) => c.multiply_alpha(alpha as f32),
-                    None => c,
-                }
-            };
-
             // Outline view: draw the silhouette in the layer colour instead of
             // the artwork, which is what the timeline's outline column does.
-            if let Some(color) = tint {
-                builder.stroke_hairline(&path, adjust(color), 1.0);
+            if let Some(color) = ctx.tint {
+                builder.stroke_hairline(&path, ctx.overlay(color), 1.0);
                 return;
             }
 
             if let Some(fill) = shape.fill {
-                builder.fill_shape(&path, adjust(fill.color));
+                builder.fill_shape(&path, ctx.colour(fill.color));
             }
             if let Some(stroke) = shape.stroke {
-                let color = adjust(stroke.color);
+                let color = ctx.colour(stroke.color);
                 if stroke.hairline {
                     builder.stroke_hairline(&path, color, 1.0);
                 } else {

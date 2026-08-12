@@ -25,8 +25,9 @@ use std::sync::Arc;
 
 use buzz_geom::{Affine, BezPath, FillMode, Size};
 use buzz_scene::{
-    FillSpec, Layer, LayerHeight, LayerId, LayerKind, Object, ObjectId, ObjectKind, Scene,
-    ShapeData, StageProperties, StrokeSpec,
+    ColorTransform, FillSpec, Layer, LayerHeight, LayerId, LayerKind, LoopMode, Object, ObjectId,
+    ObjectKind, Scene, ShapeData, StageProperties, StrokeSpec, Symbol, SymbolId, SymbolInstance,
+    SymbolKind, Tween,
 };
 use peniko::Color;
 use serde::{Deserialize, Serialize};
@@ -35,11 +36,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// * **1** — layers held a flat object list.
 /// * **2** — layers hold keyframes, and the document has a camera track.
+/// * **3** — a library of symbols, instance objects, and tweens on keyframes.
 ///
-/// Version 1 files still load: their flat list becomes a single keyframe at
-/// frame 0, which is exactly what it meant. Keeping that path is cheap and it
-/// exercises the version check for real rather than in theory.
-pub const FORMAT_VERSION: u32 = 2;
+/// Every older version still loads. Version 1's flat list becomes a single
+/// keyframe at frame 0, which is exactly what it meant; version 2 simply has
+/// no library and no tweens, and both default to empty. Keeping those paths is
+/// cheap and it exercises the version check for real rather than in theory.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -88,9 +91,53 @@ pub struct DocumentDto {
     /// Front to back, as in the timeline.
     pub layers: Vec<LayerDto>,
     /// Highest id in use, so the allocator can resume safely.
+    ///
+    /// Symbols, layers and objects all draw from one allocator, so one figure
+    /// covers all three — but it must be taken across the library as well as
+    /// the stage, or a reopened document could hand out a symbol's id again.
     pub max_id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<CameraDto>,
+    /// Version 3. Absent in older files, which had no symbols.
+    #[serde(default, skip_serializing_if = "LibraryDto::is_empty")]
+    pub library: LibraryDto,
+}
+
+/// The document library: symbols plus the folder tree they sit in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LibraryDto {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<SymbolDto>,
+    /// Folder paths, including empty ones.
+    ///
+    /// Written separately from the symbols' own `folder` fields because
+    /// Animate lets you create a folder before putting anything in it, and
+    /// silently losing it on save would be surprising.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<String>,
+}
+
+impl LibraryDto {
+    fn is_empty(&self) -> bool {
+        self.symbols.is_empty() && self.folders.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolDto {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub kind: SymbolKind,
+    /// Slash-separated library folder, or absent for the library root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    /// Registration point — the origin an instance's transform is about.
+    #[serde(default)]
+    pub registration: [f64; 2],
+    /// A symbol has its own timeline, with the same shape as the stage's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<LayerDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +186,17 @@ pub struct KeyframeDto {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub objects: Vec<ObjectDto>,
+    /// The tween running from here to the next keyframe. Version 3.
+    ///
+    /// Stored as the runtime type: `Tween` is a small closed value like
+    /// `LayerKind`, already part of the format's vocabulary rather than an
+    /// internal layout detail.
+    #[serde(default, skip_serializing_if = "tween_is_absent")]
+    pub tween: Tween,
+}
+
+fn tween_is_absent(tween: &Tween) -> bool {
+    !tween.is_active()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +252,29 @@ pub enum ObjectKindDto {
     Group {
         children: Vec<ObjectDto>,
     },
+    /// A placed instance of a library symbol. Version 3.
+    Instance {
+        symbol: u64,
+        #[serde(default)]
+        first_frame: u32,
+        #[serde(default)]
+        loop_mode: LoopMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<ColorTransformDto>,
+    },
+}
+
+/// An instance's colour effect.
+///
+/// Written as two arrays rather than as Animate's Advanced-panel percentages
+/// so the stored value is exactly what the renderer multiplies by; the panel's
+/// percentages are a view of it, not the truth.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ColorTransformDto {
+    /// Per-channel multiplier, RGBA.
+    pub multiply: [f32; 4],
+    /// Per-channel offset in 0..=1 units, RGBA.
+    pub add: [f32; 4],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,44 +296,128 @@ pub struct StrokeDto {
 // Scene -> DTO
 // ---------------------------------------------------------------------------
 
+impl LayerDto {
+    fn from_layer(layer: &Layer, max_id: &mut u64) -> Self {
+        *max_id = (*max_id).max(layer.id.0);
+        Self {
+            id: layer.id.0,
+            name: layer.name.clone(),
+            kind: layer.kind,
+            parent: layer.parent.map(|p| p.0),
+            visible: layer.visible,
+            locked: layer.locked,
+            outline: layer.outline,
+            color: color_to_hex(layer.color),
+            height: layer.height,
+            collapsed: layer.collapsed,
+            length: layer.frames.length(),
+            keyframes: layer
+                .frames
+                .keyframes()
+                .iter()
+                .map(|k| KeyframeDto {
+                    start: k.start,
+                    label: k.label.clone(),
+                    objects: k
+                        .objects
+                        .iter()
+                        .map(|o| ObjectDto::from_object(o, max_id))
+                        .collect(),
+                    tween: k.tween,
+                })
+                .collect(),
+            objects: Vec::new(),
+        }
+    }
+
+    fn to_layer(&self) -> Result<Layer, SerialError> {
+        let mut layer = Layer::new(LayerId(self.id), self.name.clone(), self.kind);
+        layer.parent = self.parent.map(LayerId);
+        layer.visible = self.visible;
+        layer.locked = self.locked;
+        layer.outline = self.outline;
+        layer.color = color_from_hex(&self.color)?;
+        layer.height = self.height;
+        layer.collapsed = self.collapsed;
+
+        // Version 1 stored a flat object list, which meant exactly "one
+        // keyframe at frame 0". Translate rather than reject.
+        let source: Vec<KeyframeDto> = if self.keyframes.is_empty() && !self.objects.is_empty() {
+            vec![KeyframeDto {
+                start: 0,
+                label: None,
+                objects: self.objects.clone(),
+                tween: Tween::default(),
+            }]
+        } else {
+            self.keyframes.clone()
+        };
+
+        let mut keyframes = Vec::with_capacity(source.len());
+        for k in &source {
+            let mut objects = Vec::with_capacity(k.objects.len());
+            for object in &k.objects {
+                objects.push(Arc::new(object.to_object()?));
+            }
+            keyframes.push(buzz_scene::Keyframe {
+                start: k.start,
+                objects: Arc::new(objects),
+                label: k.label.clone(),
+                tween: k.tween,
+            });
+        }
+        layer.frames = buzz_scene::LayerTimeline::from_parts(keyframes, self.length.max(1));
+        Ok(layer)
+    }
+}
+
+impl SymbolDto {
+    fn from_symbol(symbol: &Symbol, max_id: &mut u64) -> Self {
+        *max_id = (*max_id).max(symbol.id.0);
+        Self {
+            id: symbol.id.0,
+            name: symbol.name.clone(),
+            kind: symbol.kind,
+            folder: symbol.folder.clone(),
+            registration: [symbol.registration.x, symbol.registration.y],
+            layers: symbol
+                .layers
+                .iter()
+                .map(|l| LayerDto::from_layer(l, max_id))
+                .collect(),
+        }
+    }
+
+    fn to_symbol(&self) -> Result<Symbol, SerialError> {
+        let mut symbol = Symbol::new(SymbolId(self.id), self.name.clone(), self.kind);
+        symbol.folder = self.folder.clone();
+        symbol.registration = buzz_geom::Point::new(self.registration[0], self.registration[1]);
+        for (index, dto) in self.layers.iter().enumerate() {
+            symbol.layers.insert(index, dto.to_layer()?);
+        }
+        Ok(symbol)
+    }
+}
+
 impl DocumentDto {
     pub fn from_scene(scene: &Scene) -> Self {
         let mut max_id = 0u64;
         let layers: Vec<LayerDto> = scene
             .layers()
             .iter()
-            .map(|layer| {
-                max_id = max_id.max(layer.id.0);
-                LayerDto {
-                    id: layer.id.0,
-                    name: layer.name.clone(),
-                    kind: layer.kind,
-                    parent: layer.parent.map(|p| p.0),
-                    visible: layer.visible,
-                    locked: layer.locked,
-                    outline: layer.outline,
-                    color: color_to_hex(layer.color),
-                    height: layer.height,
-                    collapsed: layer.collapsed,
-                    length: layer.frames.length(),
-                    keyframes: layer
-                        .frames
-                        .keyframes()
-                        .iter()
-                        .map(|k| KeyframeDto {
-                            start: k.start,
-                            label: k.label.clone(),
-                            objects: k
-                                .objects
-                                .iter()
-                                .map(|o| ObjectDto::from_object(o, &mut max_id))
-                                .collect(),
-                        })
-                        .collect(),
-                    objects: Vec::new(),
-                }
-            })
+            .map(|layer| LayerDto::from_layer(layer, &mut max_id))
             .collect();
+
+        // Symbols share the id allocator with stage layers and objects, so
+        // their ids have to raise `max_id` too.
+        let library = LibraryDto {
+            symbols: scene
+                .library()
+                .iter()
+                .map(|s| SymbolDto::from_symbol(s, &mut max_id))
+                .collect(),
+            folders: scene.library().folders().cloned().collect(),
+        };
 
         Self {
             format_version: FORMAT_VERSION,
@@ -279,6 +444,7 @@ impl DocumentDto {
                     })
                     .collect(),
             }),
+            library,
         }
     }
 
@@ -299,42 +465,17 @@ impl DocumentDto {
         };
 
         for (index, dto) in self.layers.iter().enumerate() {
-            let mut layer = Layer::new(LayerId(dto.id), dto.name.clone(), dto.kind);
-            layer.parent = dto.parent.map(LayerId);
-            layer.visible = dto.visible;
-            layer.locked = dto.locked;
-            layer.outline = dto.outline;
-            layer.color = color_from_hex(&dto.color)?;
-            layer.height = dto.height;
-            layer.collapsed = dto.collapsed;
+            scene.edit_layers().insert(index, dto.to_layer()?);
+        }
 
-            // Version 1 stored a flat object list, which meant exactly "one
-            // keyframe at frame 0". Translate rather than reject.
-            let source: Vec<KeyframeDto> = if dto.keyframes.is_empty() && !dto.objects.is_empty() {
-                vec![KeyframeDto {
-                    start: 0,
-                    label: None,
-                    objects: dto.objects.clone(),
-                }]
-            } else {
-                dto.keyframes.clone()
-            };
-
-            let mut keyframes = Vec::with_capacity(source.len());
-            for k in &source {
-                let mut objects = Vec::with_capacity(k.objects.len());
-                for object in &k.objects {
-                    objects.push(Arc::new(object.to_object()?));
-                }
-                keyframes.push(buzz_scene::Keyframe {
-                    start: k.start,
-                    objects: Arc::new(objects),
-                    label: k.label.clone(),
-                });
-            }
-            layer.frames = buzz_scene::LayerTimeline::from_parts(keyframes, dto.length.max(1));
-
-            scene.edit_layers().insert(index, layer);
+        // The library loads before anything can reference it, so an instance
+        // never resolves against a half-built one.
+        for folder in &self.library.folders {
+            scene.library_mut().add_folder(folder);
+        }
+        for dto in &self.library.symbols {
+            let symbol = dto.to_symbol()?;
+            scene.library_mut().insert(symbol);
         }
 
         if let Some(camera) = &self.camera {
@@ -382,6 +523,17 @@ impl ObjectDto {
                     .map(|c| Self::from_object(c, max_id))
                     .collect(),
             },
+            ObjectKind::Instance(i) => ObjectKindDto::Instance {
+                symbol: i.symbol.0,
+                first_frame: i.first_frame,
+                loop_mode: i.loop_mode,
+                // The identity is the common case; leaving it out keeps a
+                // document full of plain instances readable.
+                color: (!i.color.is_identity()).then(|| ColorTransformDto {
+                    multiply: i.color.multiply,
+                    add: i.color.add,
+                }),
+            },
         };
 
         Self {
@@ -428,6 +580,20 @@ impl ObjectDto {
                     .map(|c| c.to_object().map(Arc::new))
                     .collect::<Result<Vec<_>, _>>()?,
             ),
+            ObjectKindDto::Instance {
+                symbol,
+                first_frame,
+                loop_mode,
+                color,
+            } => ObjectKind::Instance(SymbolInstance {
+                symbol: SymbolId(*symbol),
+                first_frame: *first_frame,
+                loop_mode: *loop_mode,
+                color: color.map_or_else(ColorTransform::default, |c| ColorTransform {
+                    multiply: c.multiply,
+                    add: c.add,
+                }),
+            }),
         };
 
         Ok(Object {
@@ -445,6 +611,7 @@ impl ObjectDto {
 mod tests {
     use super::*;
     use buzz_geom::{Point, Shape as _};
+    use buzz_scene::Tween;
     use kurbo::{Circle, Rect};
 
     fn sample_scene() -> Scene {
@@ -629,6 +796,124 @@ mod tests {
         );
     }
 
+    /// A library with folders, an instance and a tween must come back intact —
+    /// this is the whole of what format 3 added.
+    #[test]
+    fn symbols_instances_and_tweens_survive_a_round_trip() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Stage", LayerKind::Normal);
+
+        // An empty folder, and one holding a symbol.
+        scene.library_mut().add_folder("Characters/Hero");
+        scene.library_mut().add_folder("Unused");
+        let symbol = scene.add_symbol("Ball", buzz_scene::SymbolKind::MovieClip, Some("Characters/Hero"));
+
+        let inner_layer = scene.library().get(symbol).unwrap().layers.iter().next().unwrap().id;
+        scene.library_mut().update(symbol, |s| {
+            s.layers.update(inner_layer, |l| {
+                l.push_object_at(
+                    0,
+                    Arc::new(Object::shape(
+                        ObjectId(500),
+                        ShapeData::filled(
+                            Circle::new(Point::new(0.0, 0.0), 20.0).to_path(0.05),
+                            Color::from_rgb8(0xFF, 0x88, 0x00),
+                        ),
+                    )),
+                );
+            });
+        });
+
+        let instance = scene
+            .add_instance_at(layer, 0, symbol, Affine::translate((100.0, 50.0)))
+            .expect("symbol exists");
+
+        // A classic tween with a non-default ease and extra rotations, plus
+        // the instance overrides the panel would set.
+        scene.edit_layers().update(layer, |l| {
+            for object in l.frames.objects_at_mut(0).expect("keyframe 0 exists") {
+                if let ObjectKind::Instance(i) = &mut Arc::make_mut(object).kind {
+                    i.first_frame = 3;
+                    i.loop_mode = LoopMode::PlayOnce;
+                    i.color = ColorTransform::alpha(0.4);
+                }
+            }
+            l.frames.insert_keyframe(11);
+            l.frames.set_tween(
+                0,
+                Tween {
+                    kind: buzz_scene::TweenKind::Classic,
+                    easing: buzz_scene::Easing::Strength(-40.0),
+                    extra_rotations: 2,
+                    orient_to_path: true,
+                },
+            );
+        });
+
+        let dto = DocumentDto::from_scene(&scene);
+        assert_eq!(dto.format_version, 3);
+        let json = serde_json::to_string(&dto).unwrap();
+        let back = serde_json::from_str::<DocumentDto>(&json)
+            .unwrap()
+            .to_scene()
+            .unwrap();
+
+        // The library, including the folder nobody put anything in.
+        assert_eq!(back.library().len(), 1);
+        let restored = back.library().get(symbol).expect("symbol id preserved");
+        assert_eq!(restored.name, "Ball");
+        assert_eq!(restored.kind, buzz_scene::SymbolKind::MovieClip);
+        assert_eq!(restored.folder.as_deref(), Some("Characters/Hero"));
+        assert_eq!(restored.objects_at(0).len(), 1, "symbol artwork must survive");
+        let folders: Vec<&String> = back.library().folders().collect();
+        assert!(
+            folders.iter().any(|f| f.as_str() == "Unused"),
+            "an empty folder must survive; got {folders:?}"
+        );
+
+        // The instance, with its overrides.
+        let (_, object) = back.find_object(instance).expect("instance preserved");
+        let i = object.instance().expect("still an instance");
+        assert_eq!(i.symbol, symbol);
+        assert_eq!(i.first_frame, 3);
+        assert_eq!(i.loop_mode, LoopMode::PlayOnce);
+        assert!(!i.color.is_identity(), "the colour effect was dropped");
+
+        // The tween.
+        let tween = back.layers().get(layer).unwrap().frames.tween_at(0);
+        assert_eq!(tween.kind, buzz_scene::TweenKind::Classic);
+        assert_eq!(tween.easing, buzz_scene::Easing::Strength(-40.0));
+        assert_eq!(tween.extra_rotations, 2);
+        assert!(tween.orient_to_path);
+
+        // The allocator must clear the symbol's id too, not just the stage's.
+        let mut back = back;
+        let fresh = back.next_object_id();
+        assert!(fresh.0 > symbol.0, "a new id would collide with the symbol");
+    }
+
+    /// A version 2 file has no library and no tweens. It must still load.
+    #[test]
+    fn a_version_two_document_loads_without_a_library() {
+        let json = r##"{
+            "format_version": 2,
+            "stage": { "width": 550, "height": 400, "background": "#FFFFFF", "frame_rate": 24 },
+            "layers": [
+                { "id": 1, "name": "Layer_1", "kind": "Normal", "visible": true,
+                  "locked": false, "color": "#0099FF", "length": 5,
+                  "keyframes": [ { "start": 0, "objects": [] } ] }
+            ],
+            "max_id": 1
+        }"##;
+        let scene = serde_json::from_str::<DocumentDto>(json)
+            .unwrap()
+            .to_scene()
+            .unwrap();
+        assert!(scene.library().is_empty());
+        assert_eq!(scene.layers().get(LayerId(1)).unwrap().frames.length(), 5);
+        assert!(!scene.layers().get(LayerId(1)).unwrap().frames.tween_at(0).is_active());
+    }
+
     #[test]
     fn a_future_format_version_is_refused_rather_than_misread() {
         let mut dto = DocumentDto::from_scene(&sample_scene());
@@ -652,7 +937,7 @@ mod tests {
                     *path = "this is not a path".into();
                     Some(())
                 }
-                ObjectKindDto::Group { .. } => None,
+                _ => None,
             });
         assert!(corrupted.is_some(), "the sample should contain a shape");
         assert!(matches!(dto.to_scene(), Err(SerialError::BadPath(_))));
@@ -686,7 +971,7 @@ mod tests {
             .flat_map(|l| l.all_objects())
             .map(|o| match &o.kind {
                 buzz_scene::ObjectKind::Shape(s) => s.path.elements().len(),
-                buzz_scene::ObjectKind::Group(_) => 0,
+                _ => 0,
             })
             .sum();
         let per_segment = a.len() / segments.max(1);

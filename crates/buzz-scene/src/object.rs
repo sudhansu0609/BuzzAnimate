@@ -91,6 +91,11 @@ pub enum ObjectKind {
     /// Animate's Group: children move together but stay individually editable
     /// once you enter the group.
     Group(Vec<Arc<Object>>),
+    /// A placed instance of a library symbol.
+    ///
+    /// Instances carry no artwork of their own — that lives in the library —
+    /// so editing the symbol updates every instance at once.
+    Instance(crate::symbol::SymbolInstance),
 }
 
 /// An object placed on a layer.
@@ -160,6 +165,11 @@ impl Object {
                 .map(|c| c.bounds())
                 .reduce(|a, b| a.union(b))
                 .unwrap_or(Rect::ZERO),
+            // An instance's extent depends on the library, which is not
+            // reachable from here. Callers that need real bounds resolve them
+            // through `Scene::instance_bounds`; this keeps hit-testing and
+            // culling from silently treating an instance as empty.
+            ObjectKind::Instance(_) => Rect::new(-1.0, -1.0, 1.0, 1.0),
         }
     }
 
@@ -189,6 +199,9 @@ impl Object {
                     child.flatten(world, out);
                 }
             }
+            // Instances need the library to resolve, so they are skipped here
+            // and expanded by the renderer, which has it.
+            ObjectKind::Instance(_) => {}
         }
     }
 
@@ -197,6 +210,27 @@ impl Object {
         match &self.kind {
             ObjectKind::Shape(_) => 1,
             ObjectKind::Group(children) => children.iter().map(|c| c.shape_count()).sum(),
+            ObjectKind::Instance(_) => 1,
+        }
+    }
+
+    /// The symbol this object instantiates, if it is an instance.
+    pub fn instance(&self) -> Option<&crate::symbol::SymbolInstance> {
+        match &self.kind {
+            ObjectKind::Instance(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Place a library symbol.
+    pub fn instance_of(id: ObjectId, symbol: crate::symbol::SymbolId) -> Self {
+        Self {
+            id,
+            name: None,
+            transform: Affine::IDENTITY,
+            kind: ObjectKind::Instance(crate::symbol::SymbolInstance::new(symbol)),
+            locked: false,
+            visible: true,
         }
     }
 }

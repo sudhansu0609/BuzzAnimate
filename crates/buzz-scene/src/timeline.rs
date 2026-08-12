@@ -34,6 +34,8 @@ pub struct Keyframe {
     pub objects: Arc<Vec<Arc<Object>>>,
     /// Optional frame label, shown in the timeline and used by scripts.
     pub label: Option<String>,
+    /// A tween running from here to the next keyframe.
+    pub tween: crate::tween::Tween,
 }
 
 impl Keyframe {
@@ -42,6 +44,7 @@ impl Keyframe {
             start,
             objects: Arc::new(Vec::new()),
             label: None,
+            tween: crate::tween::Tween::default(),
         }
     }
 
@@ -75,6 +78,37 @@ impl FrameKind {
     /// Does a new keyframe start here?
     pub fn starts_keyframe(self) -> bool {
         matches!(self, Self::Keyframe | Self::BlankKeyframe)
+    }
+}
+
+/// What a frame resolves to once tweening is taken into account.
+///
+/// Borrowed when untweened so the common path costs nothing; owned when a
+/// tween had to synthesise the state.
+#[derive(Debug)]
+pub enum ResolvedFrame<'a> {
+    Stored(&'a [Arc<Object>]),
+    Tweened(Vec<Object>),
+}
+
+impl ResolvedFrame<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Stored(objects) => objects.len(),
+            Self::Tweened(objects) => objects.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Iterate whichever representation this is.
+    pub fn iter(&self) -> Box<dyn Iterator<Item = &Object> + '_> {
+        match self {
+            Self::Stored(objects) => Box::new(objects.iter().map(|o| &**o)),
+            Self::Tweened(objects) => Box::new(objects.iter()),
+        }
     }
 }
 
@@ -131,11 +165,70 @@ impl LayerTimeline {
     }
 
     /// Artwork shown at `frame`. Empty beyond the span or on a blank keyframe.
+    ///
+    /// **Untweened**: this is the keyframe's stored artwork. Use
+    /// [`Self::resolved_at`] for what should actually be drawn.
     pub fn objects_at(&self, frame: u32) -> &[Arc<Object>] {
         match self.keyframe_at(frame) {
             Some(k) => &k.objects,
             None => &[],
         }
+    }
+
+    /// Artwork to draw at `frame`, with any tween applied.
+    ///
+    /// Returns borrowed objects when there is no tween, so the common case
+    /// allocates nothing; a tween has to build new objects because the
+    /// interpolated state does not exist anywhere in the document.
+    pub fn resolved_at(&self, frame: u32) -> ResolvedFrame<'_> {
+        let Some(index) = self.index_at(frame) else {
+            return ResolvedFrame::Stored(&[]);
+        };
+        let keyframe = &self.keyframes[index];
+
+        if !keyframe.tween.is_active() {
+            return ResolvedFrame::Stored(&keyframe.objects);
+        }
+
+        // The tween runs to the next keyframe, or to the end of the span if
+        // this is the last one.
+        let Some(next) = self.keyframes.get(index + 1) else {
+            return ResolvedFrame::Stored(&keyframe.objects);
+        };
+
+        let span = next.start.saturating_sub(keyframe.start);
+        if span == 0 {
+            return ResolvedFrame::Stored(&keyframe.objects);
+        }
+        let progress = (frame - keyframe.start) as f64 / span as f64;
+        if progress <= 0.0 {
+            return ResolvedFrame::Stored(&keyframe.objects);
+        }
+
+        ResolvedFrame::Tweened(crate::tween::interpolate_objects(
+            &keyframe.objects,
+            &next.objects,
+            &keyframe.tween,
+            progress,
+        ))
+    }
+
+    /// Set the tween on the keyframe governing `frame`.
+    pub fn set_tween(&mut self, frame: u32, tween: crate::tween::Tween) -> bool {
+        match self.keyframe_at_mut(frame) {
+            Some(k) => {
+                k.tween = tween;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The tween on the keyframe governing `frame`.
+    pub fn tween_at(&self, frame: u32) -> crate::tween::Tween {
+        self.keyframe_at(frame)
+            .map(|k| k.tween)
+            .unwrap_or_default()
     }
 
     /// What the timeline draws at `frame`.
@@ -224,6 +317,7 @@ impl LayerTimeline {
             start: frame,
             objects,
             label: None,
+            tween: crate::tween::Tween::default(),
         });
         true
     }

@@ -584,7 +584,7 @@ impl Editor {
                 if !object.visible || object.locked {
                     continue;
                 }
-                if object_contains(object, point, tolerance) {
+                if object_contains(scene, object, point, tolerance, frame, 0) {
                     hit = Some(object.id);
                 }
             }
@@ -1133,9 +1133,26 @@ fn update_shape(scene: &mut Scene, id: ObjectId, f: impl FnOnce(&mut ShapeData))
 }
 
 /// Precise hit test against an object, including its transform.
-fn object_contains(object: &Object, point: Point, tolerance: f64) -> bool {
-    // Cheap rejection first.
-    if !object.bounds().inflate(tolerance, tolerance).contains(point) {
+///
+/// `scene` is needed because a symbol instance's real geometry lives in the
+/// library, not in the object; without it an instance could only be tested
+/// against a placeholder rectangle. `frame` is the timeline position the
+/// object is being tested at, which nested graphic symbols inherit.
+fn object_contains(
+    scene: &Scene,
+    object: &Object,
+    point: Point,
+    tolerance: f64,
+    frame: u32,
+    depth: usize,
+) -> bool {
+    // Cheap rejection first, resolved through the library so an instance is
+    // rejected on its artwork's extents rather than a placeholder.
+    if !scene
+        .resolved_bounds(object)
+        .inflate(tolerance, tolerance)
+        .contains(point)
+    {
         return false;
     }
 
@@ -1161,9 +1178,33 @@ fn object_contains(object: &Object, point: Point, tolerance: f64) -> bool {
         }
         ObjectKind::Group(children) => children
             .iter()
-            .any(|c| object_contains(c, local, tolerance)),
+            .any(|c| object_contains(scene, c, local, tolerance, frame, depth)),
+
+        ObjectKind::Instance(instance) => {
+            // Same cycle guard the renderer uses.
+            if depth >= MAX_SYMBOL_DEPTH {
+                return false;
+            }
+            let Some(symbol) = scene.library().get(instance.symbol) else {
+                return false;
+            };
+            let inner = instance.resolve_frame(symbol.kind, frame, symbol.length());
+            // Hit the artwork, not the bounding box: clicking the hole in a
+            // ring selects what is behind it, as it does in Animate.
+            symbol
+                .layers
+                .selectable()
+                .flat_map(|l| l.objects_at(inner))
+                .any(|c| object_contains(scene, c, local, tolerance, inner, depth + 1))
+        }
     }
 }
+
+/// How deep a symbol may nest before hit testing gives up.
+///
+/// Matches the renderer's limit in [`crate::stage`]: anything it will not draw
+/// must not be clickable either.
+const MAX_SYMBOL_DEPTH: usize = 12;
 
 /// Invert an affine, or `None` if it is singular.
 fn invert(t: Affine) -> Option<Affine> {
@@ -1217,7 +1258,10 @@ fn merge_shape_into_layer(
                 .filter(|o| o.visible && !o.locked)
                 .filter_map(|o| match &o.kind {
                     ObjectKind::Shape(s) => s.fill.map(|f| (o.id, f.color, s.path.clone())),
-                    ObjectKind::Group(_) => None,
+                    // Merge-shape rules apply to raw shapes only. Groups and
+                    // symbol instances are objects: in Animate they sit above
+                    // the merge layer and never fuse with what they overlap.
+                    ObjectKind::Group(_) | ObjectKind::Instance(_) => None,
                 })
                 .filter(|(_, _, path)| path.bounding_box().overlaps(bb))
                 .collect()

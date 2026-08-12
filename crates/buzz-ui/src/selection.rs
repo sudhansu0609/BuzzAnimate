@@ -144,10 +144,13 @@ impl Selection {
     }
 
     /// Combined bounds of the selection, for transform handles.
+    ///
+    /// Goes through the scene rather than [`Object::bounds`] so that a
+    /// selected symbol instance reports the extents of the artwork inside it.
     pub fn bounds(&self, scene: &Scene) -> Option<Rect> {
         self.objects
             .iter()
-            .filter_map(|id| scene.find_object(*id).map(|(_, o)| o.bounds()))
+            .filter_map(|id| scene.find_object(*id).map(|(_, o)| scene.resolved_bounds(o)))
             .reduce(|a, b| a.union(b))
     }
 
@@ -161,6 +164,13 @@ impl Selection {
                     Some((_, o)) => match &o.kind {
                         buzz_scene::ObjectKind::Shape(_) => "Shape".to_string(),
                         buzz_scene::ObjectKind::Group(c) => format!("Group ({} items)", c.len()),
+                        // Animate names the symbol kind here, not "Instance".
+                        buzz_scene::ObjectKind::Instance(i) => {
+                            match scene.library().get(i.symbol) {
+                                Some(s) => format!("{} — {}", s.kind.label(), s.name),
+                                None => "Missing Symbol".to_string(),
+                            }
+                        }
                     },
                     None => "Shape".to_string(),
                 }

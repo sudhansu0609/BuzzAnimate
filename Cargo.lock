@@ -315,6 +315,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-import-xfl"
+version = "0.1.0"
+dependencies = [
+ "buzz-geom",
+ "buzz-scene",
+ "kurbo",
+ "peniko",
+ "quick-xml",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "zip",
+]
+
+[[package]]
 name = "buzz-jobs"
 version = "0.1.0"
 dependencies = [

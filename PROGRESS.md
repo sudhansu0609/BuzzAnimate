@@ -64,9 +64,12 @@ Rules that follow from this, applied to every phase:
 > git diff phase-0 HEAD      # what changed since
 > ```
 >
-> | Tag | Commit | Contents |
-> |---|---|---|
-> | `phase-0` | `82a308a` | Engine foundation: unbounded zoom, multicore, GPU |
+> | Tag | Contents |
+> |---|---|
+> | `phase-0` | Engine foundation — unbounded zoom, multicore, GPU rasterisation |
+>
+> Tags, not commit hashes, are the identifier: a hash written into this file
+> can never name the commit that contains the file.
 
 ### ✅ CP-0.1 — Toolchain
 - [x] Rust 1.97.1 `stable-x86_64-pc-windows-msvc` installed via rustup

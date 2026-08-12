@@ -67,14 +67,17 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect) {
     }
 }
 
-/// Draw a document's artwork for one frame: no camera, no onion skins, no
-/// preview.
+/// Draw a document's artwork for one frame, with its camera: no onion skins,
+/// no preview, no editor chrome.
 ///
 /// Exposed so a test can render a document through exactly the path the window
 /// uses. A test that reimplemented the walk would be testing its own copy, and
-/// compositing bugs are precisely the kind that hide in the difference.
+/// compositing and perspective bugs are precisely the kind that hide in the
+/// difference. The document camera is applied for the same reason — a helper
+/// that quietly skipped it would report that a camera pan moves nothing.
 pub fn draw_document(builder: &mut SceneBuilder<'_>, scene: &buzz_scene::Scene, frame: u32) {
-    draw_frame(builder, scene, frame, Affine::IDENTITY, None, false);
+    let camera = scene.camera_transform(frame);
+    draw_frame(builder, scene, frame, camera, None, false);
 }
 
 /// Draw one frame's layers.
@@ -89,6 +92,21 @@ fn draw_frame(
     ghost_outlines: bool,
 ) {
     for layer in scene.layers().drawable_at(frame) {
+        // Layer depth: artwork further from the camera is drawn smaller and
+        // slides less as the camera pans. A layer at or behind the camera is
+        // skipped entirely rather than magnified into a wall of colour.
+        //
+        // `camera` is passed in already resolved for depth zero; a layer off
+        // the focal plane needs its own, so this replaces it.
+        let camera = if layer.depth == 0.0 {
+            camera
+        } else {
+            match scene.camera_transform_at_depth(frame, layer.depth) {
+                Some(transform) => transform,
+                None => continue,
+            }
+        };
+
         // Guides are authoring aids: visible on stage, never exported.
         let outline = layer.outline || (ghost.is_some() && ghost_outlines);
         let tint = outline.then_some(layer.color);
@@ -114,9 +132,13 @@ fn draw_frame(
         if accumulates {
             // Bounded to the layer's own artwork: an unbounded group would
             // cost a full-viewport buffer whatever the layer contains.
+            //
+            // Through the camera, because that is where the artwork actually
+            // lands — a layer moved by depth or by a camera pan would
+            // otherwise be clipped against where its geometry used to be.
             let bounds = layer
                 .bounds_at(frame)
-                .map(|b| b.inflate(2.0, 2.0))
+                .map(|b| buzz_scene::object::transform_rect(camera, b).inflate(2.0, 2.0))
                 .unwrap_or_else(|| builder.clip_bounds());
             builder.push_isolation(bounds.intersect(builder.clip_bounds()));
         }

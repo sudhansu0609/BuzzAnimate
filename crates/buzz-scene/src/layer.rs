@@ -119,6 +119,18 @@ pub struct Layer {
     /// Tint used for outline view and selection highlights.
     pub color: Color,
     pub height: LayerHeight,
+    /// How far this layer sits from the camera, in document units.
+    ///
+    /// Zero is the focal plane, where artwork renders at its natural size.
+    /// Positive is further away: smaller, and slower to slide as the camera
+    /// pans. Negative is nearer: larger, and faster. This is Animate's Layer
+    /// Depth, and it is what produces parallax.
+    ///
+    /// Depth does **not** reorder drawing. Paint order is still the layer
+    /// order in the timeline, exactly as in Animate — a layer pushed into the
+    /// distance keeps its place in the stack, so pushing a foreground layer
+    /// back shrinks it without sending it behind anything.
+    pub depth: f64,
     /// Folders only: whether children are hidden in the timeline. Purely a UI
     /// state — it never affects rendering.
     pub collapsed: bool,
@@ -128,6 +140,16 @@ pub struct Layer {
 }
 
 /// Animate cycles through these when creating layers.
+/// The colour a layer gets when it is the `index`-th in the document.
+///
+/// Indexed by *position*, not by id. Ids are shared with objects, so a
+/// document with seven shapes per layer strides the ids by eight and hands
+/// every layer the same colour — which defeats the point of a colour meant to
+/// tell layers apart, in the timeline chips and in the Layer Depth view alike.
+pub fn default_color(index: usize) -> Color {
+    DEFAULT_COLORS[index % DEFAULT_COLORS.len()]
+}
+
 const DEFAULT_COLORS: [Color; 8] = [
     Color::from_rgb8(0x00, 0x99, 0xFF),
     Color::from_rgb8(0xFF, 0x66, 0x00),
@@ -151,6 +173,8 @@ impl Layer {
             locked: false,
             outline: false,
             height: LayerHeight::Normal,
+            // On the focal plane, so a new layer is unaffected by perspective.
+            depth: 0.0,
             collapsed: false,
             frames: LayerTimeline::new(),
         }

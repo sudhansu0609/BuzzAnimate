@@ -36,7 +36,7 @@ pub mod tween;
 
 use std::sync::Arc;
 
-use buzz_geom::{Affine, Rect, Size};
+use buzz_geom::{Affine, Point, Rect, Size};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
@@ -422,7 +422,10 @@ impl Scene {
     /// Add a layer at the top, as Animate does.
     pub fn add_layer(&mut self, name: impl Into<String>, kind: LayerKind) -> LayerId {
         let id = LayerId(self.ids.take());
-        self.active_layers_mut().push_front(Layer::new(id, name, kind));
+        let mut layer = Layer::new(id, name, kind);
+        // By position rather than by id: see `layer::default_color`.
+        layer.color = crate::layer::default_color(self.layers().len());
+        self.active_layers_mut().push_front(layer);
         self.bump();
         id
     }
@@ -510,6 +513,38 @@ impl Scene {
     /// The camera transform for `frame`, or identity when the camera is off.
     pub fn camera_transform(&self, frame: u32) -> Affine {
         self.camera().transform_at(frame, self.stage().size)
+    }
+
+    /// The camera transform for artwork on a layer at `depth`.
+    ///
+    /// `None` when the layer sits at or behind the camera and should not be
+    /// drawn at all.
+    pub fn camera_transform_at_depth(&self, frame: u32, depth: f64) -> Option<Affine> {
+        self.camera()
+            .transform_at_depth(frame, self.stage().size, depth)
+    }
+
+    /// Move a point from where the user sees it into a layer's own
+    /// coordinates.
+    ///
+    /// Depth draws a layer's artwork somewhere other than where its geometry
+    /// says it is, so a click has to be moved the same way in reverse before it
+    /// can be tested against that geometry. Without this, clicking a layer
+    /// pushed into the distance selects nothing — the artwork is on screen but
+    /// the hit test is looking where it used to be.
+    ///
+    /// Returns the point unchanged for a layer on the focal plane, which is
+    /// every layer in a document that does not use depth.
+    pub fn view_to_layer(&self, frame: u32, depth: f64, point: Point) -> Option<Point> {
+        if depth == 0.0 {
+            return Some(point);
+        }
+        let with_depth = self.camera_transform_at_depth(frame, depth)?;
+        // Relative to the depth-zero transform, because that is the space the
+        // rest of the editor already works in.
+        let base = self.camera_transform(frame);
+        let combined = base * with_depth.inverse();
+        Some(combined * point)
     }
 
     /// Allocate an id without attaching anything to the document yet.
@@ -1047,6 +1082,41 @@ mod tests {
         let instance = object.instance().expect("still an instance");
         assert_eq!(instance.first_frame, 3);
         assert_eq!(instance.loop_mode, LoopMode::PlayOnce);
+    }
+
+    /// Layer colours exist to tell layers apart, so two layers in one document
+    /// must not share one until the palette genuinely runs out. Indexing by id
+    /// broke this: ids are shared with objects, so a document with seven
+    /// shapes per layer strode the ids by eight and gave every layer the same
+    /// colour.
+    #[test]
+    fn layers_get_distinct_colours_even_when_objects_consume_ids() {
+        let mut scene = Scene::default();
+
+        for _ in 0..5 {
+            let layer = scene.layers().iter().next().unwrap().id;
+            // Seven shapes, which is what strode the ids by eight.
+            for i in 0..7 {
+                scene.add_shape(
+                    layer,
+                    ShapeData::filled(square(i as f64, 0.0, 5.0), Color::WHITE),
+                );
+            }
+            scene.add_layer("Another", LayerKind::Normal);
+        }
+
+        let colours: Vec<[u8; 4]> = scene
+            .layers()
+            .iter()
+            .map(|l| l.color.to_rgba8().to_u8_array())
+            .collect();
+        let distinct: std::collections::BTreeSet<_> = colours.iter().collect();
+
+        assert_eq!(
+            distinct.len(),
+            colours.len(),
+            "every layer should have its own colour, got {colours:?}"
+        );
     }
 
     /// A no-op must stay a no-op: bumping for an object that does not exist

@@ -39,18 +39,101 @@ impl CameraKey {
     }
 }
 
+/// How far the camera sits from the plane where depth is zero.
+///
+/// Layers nearer than this look bigger and slide further as the camera pans;
+/// layers beyond it look smaller and slide less. The number is in document
+/// units, so at the default a layer at depth 1000 is twice as far from the
+/// camera as the stage and therefore renders at half size.
+pub const DEFAULT_FOCAL_DISTANCE: f64 = 1000.0;
+
+/// Nearest a layer may come to the camera before it is treated as behind it.
+///
+/// At the camera plane the perspective divide blows up; a hair in front of it
+/// a layer would be magnified by thousands and swamp the frame. Layers this
+/// close or closer are simply not drawn, which is what Animate does and is far
+/// better than a frame filled by one runaway layer.
+const NEAR_PLANE: f64 = 1.0;
+
 /// The camera's keyframes over the whole timeline.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CameraTrack {
     /// Off by default. Animate hides the camera until you enable it.
     pub enabled: bool,
+    /// Distance from the camera to the depth-zero plane.
+    ///
+    /// This is what turns a layer's depth into a size: the smaller it is, the
+    /// more violent the perspective, exactly as a shorter lens exaggerates it.
+    pub focal_distance: f64,
     /// Sorted by frame.
     keys: Vec<CameraKey>,
+}
+
+impl Default for CameraTrack {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            focal_distance: DEFAULT_FOCAL_DISTANCE,
+            keys: Vec::new(),
+        }
+    }
 }
 
 impl CameraTrack {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How much smaller a layer at `depth` appears.
+    ///
+    /// Straight pinhole projection: a layer at distance `f + depth` from the
+    /// camera subtends `f / (f + depth)` of what the same layer would at the
+    /// focal plane. Depth 0 gives exactly 1.0, so a document that never
+    /// touches depth is unaffected — which is why this is safe to apply
+    /// unconditionally rather than behind a flag.
+    ///
+    /// `None` means the layer is at or behind the camera and should not be
+    /// drawn.
+    pub fn depth_scale(&self, depth: f64) -> Option<f64> {
+        if depth == 0.0 {
+            // Exactly 1.0, with no arithmetic to round it away.
+            return Some(1.0);
+        }
+        let focal = self.focal_distance.max(NEAR_PLANE);
+        let distance = focal + depth;
+        (distance >= NEAR_PLANE).then(|| focal / distance)
+    }
+
+    /// The transform for artwork on a layer at `depth`.
+    ///
+    /// The same construction as [`Self::transform_at`] with the zoom scaled by
+    /// the perspective factor. That single change gives both effects at once,
+    /// and gives them consistently: a far layer is drawn smaller *and*, because
+    /// its offset from the camera centre is scaled by the same factor, slides
+    /// less when the camera pans. Parallax is not a separate rule bolted on —
+    /// it falls out of the projection.
+    ///
+    /// `None` when the layer is at or behind the camera.
+    pub fn transform_at_depth(&self, frame: u32, stage: Size, depth: f64) -> Option<Affine> {
+        let scale = self.depth_scale(depth)?;
+
+        let centre = buzz_geom::Vec2::new(stage.width / 2.0, stage.height / 2.0);
+        let state = self.state_at(frame);
+
+        // With no camera keys the camera still has a position: the middle of
+        // the stage, unzoomed. Depth has to work without one, or setting a
+        // layer's depth would do nothing until a camera keyframe existed.
+        let (camera_centre, zoom, rotation) = match state {
+            Some(s) => (s.center, s.zoom, s.rotation),
+            None => (centre.to_point(), 1.0, 0.0),
+        };
+
+        Some(
+            Affine::translate(centre)
+                * Affine::rotate(-rotation)
+                * Affine::scale((zoom * scale).max(f64::MIN_POSITIVE))
+                * Affine::translate(-camera_centre.to_vec2()),
+        )
     }
 
     pub fn keys(&self) -> &[CameraKey] {
@@ -157,10 +240,20 @@ impl CameraTrack {
     }
 
     /// Rebuild from parts, for loading and importing.
-    pub fn from_parts(mut keys: Vec<CameraKey>, enabled: bool) -> Self {
+    pub fn from_parts(mut keys: Vec<CameraKey>, enabled: bool, focal_distance: f64) -> Self {
         keys.sort_by_key(|k| k.frame);
         keys.dedup_by_key(|k| k.frame);
-        Self { enabled, keys }
+        Self {
+            enabled,
+            // A file written before depth existed, or a corrupt one, must not
+            // produce a camera sitting on the artwork.
+            focal_distance: if focal_distance.is_finite() && focal_distance > 0.0 {
+                focal_distance
+            } else {
+                DEFAULT_FOCAL_DISTANCE
+            },
+            keys,
+        }
     }
 }
 
@@ -380,9 +473,157 @@ mod tests {
                 CameraKey::new(5, Point::new(1.0, 1.0)),
             ],
             true,
+            DEFAULT_FOCAL_DISTANCE,
         );
         assert_eq!(t.keys().len(), 2);
         assert_eq!(t.keys()[0].frame, 0);
         assert_eq!(t.last_frame(), 5);
+    }
+
+    // -- layer depth --------------------------------------------------------
+
+    const STAGE: Size = Size::new(400.0, 300.0);
+
+    /// A document that never touches depth must render exactly as it did
+    /// before depth existed, so the focal plane has to be exactly 1.0 — not
+    /// 0.9999999 from a divide.
+    #[test]
+    fn the_focal_plane_is_untouched_by_perspective() {
+        let track = CameraTrack::new();
+        assert_eq!(track.depth_scale(0.0), Some(1.0));
+
+        let plain = track.transform_at(0, STAGE);
+        let at_depth = track.transform_at_depth(0, STAGE, 0.0).unwrap();
+        // With no camera keys the plain transform is the identity, and depth
+        // zero must agree with it on where artwork lands.
+        let probe = Point::new(37.0, 91.0);
+        assert!((plain * probe - at_depth * probe).hypot() < 1e-9);
+    }
+
+    /// The headline behaviour: further away is smaller, nearer is larger.
+    #[test]
+    fn distance_shrinks_a_layer_and_nearness_enlarges_it() {
+        let track = CameraTrack::new(); // focal distance 1000
+
+        // Twice as far from the camera, so half the size.
+        assert_eq!(track.depth_scale(1000.0), Some(0.5));
+        // Half as far, so twice the size.
+        assert_eq!(track.depth_scale(-500.0), Some(2.0));
+
+        let far = track.depth_scale(400.0).unwrap();
+        let near = track.depth_scale(-400.0).unwrap();
+        assert!(far < 1.0 && near > 1.0, "far {far}, near {near}");
+    }
+
+    /// A shorter focal distance exaggerates perspective, exactly as a wider
+    /// lens does. This is the knob that makes depth subtle or dramatic.
+    #[test]
+    fn a_shorter_focal_distance_exaggerates_perspective() {
+        let mut gentle = CameraTrack::new();
+        gentle.focal_distance = 4000.0;
+        let mut dramatic = CameraTrack::new();
+        dramatic.focal_distance = 250.0;
+
+        let a = gentle.depth_scale(500.0).unwrap();
+        let b = dramatic.depth_scale(500.0).unwrap();
+        assert!(
+            b < a,
+            "the shorter lens should shrink it more: gentle {a}, dramatic {b}"
+        );
+    }
+
+    /// A layer at or behind the camera is not drawn. Without this the
+    /// perspective divide explodes and one layer swamps the frame.
+    #[test]
+    fn a_layer_at_or_behind_the_camera_is_not_drawn() {
+        let track = CameraTrack::new();
+        assert_eq!(track.depth_scale(-1000.0), None, "exactly at the camera");
+        assert_eq!(track.depth_scale(-5000.0), None, "behind it");
+        assert!(track.transform_at_depth(0, STAGE, -1000.0).is_none());
+
+        // Just in front of it still works, and is very large.
+        let just_in_front = track.depth_scale(-999.0).expect("still visible");
+        assert!(just_in_front > 100.0, "got {just_in_front}");
+    }
+
+    /// Parallax: as the camera pans, a distant layer slides less than a near
+    /// one. This is the whole reason layer depth exists, and it falls out of
+    /// the projection rather than being a separate rule.
+    #[test]
+    fn panning_the_camera_moves_a_distant_layer_less_than_a_near_one() {
+        let mut track = CameraTrack::new();
+        track.enabled = true;
+        track.set_key(CameraKey::new(0, Point::new(200.0, 150.0)));
+        // The camera pans 100 units to the right by frame 10.
+        track.set_key(CameraKey::new(10, Point::new(300.0, 150.0)));
+
+        // The same document point, on layers at three depths.
+        let probe = Point::new(200.0, 150.0);
+        let shift = |depth: f64| -> f64 {
+            let before = track.transform_at_depth(0, STAGE, depth).unwrap() * probe;
+            let after = track.transform_at_depth(10, STAGE, depth).unwrap() * probe;
+            (before - after).hypot()
+        };
+
+        let near = shift(-500.0);
+        let focal = shift(0.0);
+        let far = shift(2000.0);
+
+        assert!(
+            far < focal && focal < near,
+            "a pan should move near layers most and far layers least: \
+             near {near:.1}, focal {focal:.1}, far {far:.1}"
+        );
+        // The focal plane moves exactly with the camera.
+        assert!((focal - 100.0).abs() < 1e-9, "focal moved {focal}");
+    }
+
+    /// Depth has to work before any camera keyframe exists, or setting a
+    /// layer's depth would appear to do nothing at all.
+    #[test]
+    fn depth_applies_without_a_camera_keyframe() {
+        let track = CameraTrack::new();
+        assert!(track.state_at(0).is_none(), "no keys, and not enabled");
+
+        // A point on the stage edge, on a layer pushed into the distance.
+        let transform = track.transform_at_depth(0, STAGE, 1000.0).unwrap();
+        let corner = transform * Point::new(0.0, 0.0);
+        let centre = Point::new(200.0, 150.0);
+
+        // Half size about the stage centre.
+        assert!((corner.x - 100.0).abs() < 1e-9, "got {corner:?}");
+        assert!((corner.y - 75.0).abs() < 1e-9, "got {corner:?}");
+        // And the centre itself does not move.
+        assert!((transform * centre - centre).hypot() < 1e-9);
+    }
+
+    /// The camera's own zoom multiplies the perspective scale rather than
+    /// replacing it.
+    #[test]
+    fn camera_zoom_and_depth_compose() {
+        let mut track = CameraTrack::new();
+        track.enabled = true;
+        let mut key = CameraKey::new(0, Point::new(200.0, 150.0));
+        key.zoom = 3.0;
+        track.set_key(key);
+
+        // Depth 1000 halves; zoom 3 triples; together 1.5x.
+        let transform = track.transform_at_depth(0, STAGE, 1000.0).unwrap();
+        let probe = Point::new(300.0, 150.0); // 100 right of the camera centre
+        let moved = transform * probe;
+        assert!(
+            (moved.x - (200.0 + 150.0)).abs() < 1e-9,
+            "expected 100 x 1.5 = 150 from the centre, got {moved:?}"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_focal_distance_falls_back_to_the_default() {
+        for bad in [0.0, -100.0, f64::NAN, f64::INFINITY] {
+            let track = CameraTrack::from_parts(Vec::new(), false, bad);
+            assert_eq!(track.focal_distance, DEFAULT_FOCAL_DISTANCE, "for {bad}");
+        }
+        let good = CameraTrack::from_parts(Vec::new(), false, 750.0);
+        assert_eq!(good.focal_distance, 750.0);
     }
 }

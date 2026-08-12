@@ -481,6 +481,68 @@ styles, the library tree and a red 40% tint read back correctly out of a
 *saved and reloaded* document.
 
 
+### ✅ Layer depth — the 3D arrangement of layers
+
+Listed as done under CP-3.2 and §8.2 since Phase 3, and **it was not**: `Layer`
+had no depth field at all. Now it does.
+
+**The model**
+- [x] `Layer::depth`, in document units. Zero is the focal plane; positive is
+      further from the camera, negative is nearer.
+- [x] `CameraTrack::focal_distance` — how far the camera sits from that plane,
+      and therefore how violent the perspective is. A shorter distance
+      exaggerates it exactly as a wider lens does.
+- [x] Straight pinhole projection: a layer at distance `f + depth` renders at
+      `f / (f + depth)`. Depth 0 returns **exactly** 1.0 with no arithmetic to
+      round it away, so a document that never touches depth is bit-identical to
+      one from before the feature existed.
+- [x] **Parallax is not a second rule bolted on.** The depth transform is the
+      camera transform with the zoom scaled by that factor, so a distant layer
+      is both drawn smaller *and* slides less when the camera pans — the two
+      effects fall out of one projection, and cannot disagree.
+- [x] Depth works **without a camera keyframe**. With no keys the camera still
+      has a position — the middle of the stage — so pushing a layer back does
+      something immediately rather than nothing until you key the camera.
+- [x] A layer at or behind the camera is **not drawn**, rather than magnified
+      by a perspective divide approaching zero into a wall of colour.
+
+**Picking**
+- [x] Depth draws a layer's artwork away from where its geometry sits, so the
+      click is moved the same way in reverse before it is tested. Without this
+      a layer pushed back is visible but unclickable, and one pulled forward is
+      selected by clicking empty space beside it. The pick tolerance is scaled
+      with the layer, so a distant layer is not easier to hit than a near one.
+
+**The Layer Depth panel**
+- [x] A **side-on view** of the arrangement: the camera at the left, depth
+      running right, each layer a plane whose height falls off exactly as the
+      renderer's perspective does, with sight lines to the selected one.
+- **Why side-on rather than through the camera.** The stage already shows what
+  the camera sees, and it cannot answer the question you open this panel to
+  ask: a layer twice as far and twice as big looks identical through the lens.
+  From the side, two layers at the same depth land on the same line.
+- [x] Per-layer depth, a camera-depth slider, and Flatten / Distribute
+- [x] Clicking a plane selects that layer
+
+**Deliberately not done:** depth does **not** reorder drawing. Paint order is
+still the timeline's layer order, exactly as in Animate — pushing a foreground
+layer back shrinks it without sending it behind anything.
+
+**Bug found and fixed — every layer the same colour.** The Layer Depth view
+made it obvious: all five planes came out orange. Layer colours were indexed by
+*id*, and ids are shared with objects, so a document with seven shapes per
+layer strode the ids by eight and handed every layer palette entry 1. Colours
+are now assigned by position. The defect was equally present in the timeline's
+colour chips and in outline view; it took a picture of the layers side by side
+to notice.
+
+**Proved on the GPU:** `headless_build_up.rs` renders through the same path the
+window uses and reads the pixels back — a layer at depth 1000 draws at half
+width, one at the camera plane draws nothing at all, and panning the camera
+sweeps a near layer furthest and a distant one least. Then confirmed on screen
+with a five-layer fixture: sky, hills, trees, stage and foreground, each at its
+own scale, sliding at its own rate as the camera pans.
+
 ### ✅ Brushes — fluid, pattern and art
 
 A Phase 2 follow-up, taken out of order because the brush is the tool an
@@ -712,11 +774,11 @@ a test — every test passed while every import was monochrome.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 610 passing, clippy clean |
+| Tests | 632 passing, clippy clean |
 | Rust source | ~32 000 lines |
 | Crates built | 10 of 15 |
 | Phases done | Phase 0, 1, 2, 3, 4, **5** (gaps in §7) |
-| Format version | 4 — adds the per-shape paint blend |
+| Format version | 5 — adds layer depth and the camera's focal distance |
 | Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |
 | Brush preview frame | 0.57 ms at 6 000 samples and 0.5 spacing |
 
@@ -857,6 +919,8 @@ a test — every test passed while every import was monochrome.
 | 21 | **No importer has been checked against a real file from Adobe.** Every fixture is one we wrote, so the importers are verified against the *specifications* and against files whose content we chose — not against what Animate, Illustrator and the Flash compilers actually emit, which is where the awkward cases live. This is the largest single risk in Phase 5. | Needs a licensed Animate/Illustrator and real-world files |
 | 22 | **Bitmaps are not imported** by any of the three readers — reported, never read. Needs a media pipeline: decode, store in the `.buzz` container's `media/` directory (reserved since Phase 1), and a bitmap object kind. | Phase 6 |
 | 23 | **SWF morph shapes, buttons, filters, blend modes and colour transforms on placements** are reported but not applied. Colour transforms are the cheapest of these to fix — the model already has `ColorTransform` — and would noticeably improve fidelity. | Phase 5 follow-up |
+| 28 | **No 3D object rotation.** Animate's 3D Rotation and 3D Translation tools give a *movie clip* rotationX/Y/Z and a translationZ, with a document perspective angle and vanishing point. Layer depth arranges whole layers in space; rotating an individual object in three dimensions is a separate subsystem — it needs a real projection in the renderer rather than an affine, and a gimbal widget. | Not started |
+| 29 | **Depth does not blur.** Animate's camera has a depth-of-field effect; layers off the focal plane are sharp here however far away they are. Needs a blur in the render path. | Follow-up |
 | 27 | **Build-up paint is a deliberate deviation from Animate**, which has no such mode: its shapes always composite source-over. It is off by default, so a document that does not ask for it behaves exactly as Animate would. Added because overlapping translucent strokes that deepen is what a brush *should* do, and because the request was explicit. | By design |
 | 25 | **Pen pressure is plumbed through but never supplied.** The brush reads `StrokeSample::pressure` and the setting is in the panel, but winit 0.30 gives no tablet pressure on Windows, so every sample arrives at 1.0 and the pressure option paints a constant width. Speed is the default response for exactly this reason. Needs a platform tablet backend (Windows Ink / Wintab). | Brush follow-up |
 | 26 | **Brush strokes do not merge with what is under them.** Each stroke is its own shape even in Merge Shape mode; Animate would fuse same-coloured overlapping paint. The booleans exist (CP-1.1b) — this is a matter of routing brush output through them, which was left out because a boolean per stroke would undo the responsiveness work unless it is done off the interactive thread. | Brush follow-up |
@@ -942,7 +1006,7 @@ a test — every test passed while every import was monochrome.
 cargo run --release -p buzz-app              # run
 cargo run --release -p buzz-app -- file.buzz # run, opening a document
 cargo run --release -p buzz-app -- art.fla   # run, importing a foreign file
-cargo test --workspace                       # 610 tests
+cargo test --workspace                       # 632 tests
 cargo clippy --workspace --all-targets       # lint
 cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 
@@ -950,8 +1014,11 @@ cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 # span styles, for looking at by hand. Prints the path it wrote.
 cargo test -p buzz-doc --test make_fixture -- --ignored --nocapture
 
-# Prove build-up paint on the GPU: 0.2 over 0.3 reads back as 0.5.
+# Prove build-up paint and layer depth on the GPU, by reading pixels back.
 cargo test -p buzz-app --test headless_build_up -- --nocapture
+
+# A five-layer document arranged in depth, with a camera pan to scrub.
+cargo test -p buzz-doc --test make_fixture write_depth -- --ignored --nocapture
 
 # Write one .fla, .swf and .pdf fixture, then open one of them.
 cargo test -p buzz-app --test make_import_fixtures -- --ignored --nocapture
@@ -971,25 +1038,27 @@ targets before there is anywhere to put what they read.
 
 ## 11. Next action
 
-**Phase 6 — export** is the recommended next step. Everything up to here can
-author and import; nothing yet gets a finished animation *out*, and that is
+**Phase 6 — export** remains the recommended next step. Everything up to here
+can author and import; nothing yet gets a finished animation *out*, and that is
 the last thing standing between this and a tool somebody can finish a job with.
 
 - **CP-6.1** PNG sequence first — simplest, needs the same off-screen render
   path every other export wants, and parallelises across all 28 threads
 - **CP-6.2** MP4/MOV via NVENC · **CP-6.3** GIF/WebP · **CP-6.4** HTML5/SVG
 
-Closest to the brushes just landed, if that thread is worth continuing:
+Closest to the drawing and depth work just landed:
 
 - **Merge-shape brush strokes** (§7 item 26). Paint that does not fuse with the
   paint under it is the most Animate-unlike thing about the new brushes. The
   booleans are built; the work is doing them off the interactive thread so the
   fix does not cost the responsiveness the brushes were designed around.
+- **3D object rotation** (§7 item 28) — the other half of "3D" in Animate:
+  rotating an individual movie clip in space, rather than arranging whole
+  layers in it. Needs a real projection in the renderer rather than an affine.
+- **Gradients** (§7 item 8), still the most-cited gap: both importers
+  approximate them to flat colours, and a pattern brush cannot stamp one.
 - **Tablet pressure** (§7 item 25). The brush already reads pressure; nothing
-  supplies it. A Windows Ink backend would make the pressure setting real.
-- **Gradients** (§7 item 8), still the most-cited gap in the codebase: the SWF
-  and XFL importers both approximate them to flat colours, and a pattern brush
-  cannot stamp a gradient-filled shape either.
+  supplies it.
 
 Then: library previews (§7 item 17), the Motion Editor (§7 item 18), text
 (§7 item 9), and checking the importers against real Adobe files (§7 item 21).

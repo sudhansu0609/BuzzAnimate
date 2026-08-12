@@ -125,3 +125,67 @@ fn write_build_up_fixture() {
     buzz_doc::format::save(&scene, &path).expect("the fixture saves");
     println!("wrote {}", path.display());
 }
+
+/// A document arranged in depth, for looking at the parallax by hand.
+///
+/// Five layers from far behind the stage to just in front of it, each a band
+/// of squares. Scrubbing the camera keyframes sweeps the near layers past the
+/// far ones, which is the effect layer depth exists to produce.
+#[test]
+#[ignore = "writes a file for manual inspection"]
+fn write_depth_fixture() {
+    let mut scene = Scene::default();
+
+    // Back to front, so the nearest layer ends up at the top of the stack and
+    // therefore paints last.
+    let bands = [
+        ("Sky", 2400.0, Color::from_rgb8(0x9F, 0xC5, 0xE8)),
+        ("Hills", 1200.0, Color::from_rgb8(0x6F, 0xA8, 0xDC)),
+        ("Trees", 400.0, Color::from_rgb8(0x38, 0x76, 0x1D)),
+        ("Stage", 0.0, Color::from_rgb8(0xE0, 0x6C, 0x3B)),
+        ("Foreground", -400.0, Color::from_rgb8(0x20, 0x20, 0x28)),
+    ];
+
+    let first = scene.layers().iter().next().unwrap().id;
+    scene.update_layer(first, |l| l.name = "Sky".into());
+
+    for (index, (name, depth, colour)) in bands.iter().enumerate() {
+        let layer = if index == 0 {
+            first
+        } else {
+            scene.add_layer(*name, LayerKind::Normal)
+        };
+        scene.update_layer(layer, |l| l.depth = *depth);
+
+        // The layer has to last as long as the camera move, or scrubbing to
+        // the end shows an empty stage.
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(48);
+        });
+
+        // A row of squares, so the horizontal sweep is easy to follow.
+        let y = 120.0 + index as f64 * 30.0;
+        for column in 0..7 {
+            let x = -200.0 + column as f64 * 160.0;
+            scene.add_shape(
+                layer,
+                ShapeData::filled(Rect::new(x, y, x + 90.0, y + 60.0).to_path(1e-9), *colour),
+            );
+        }
+    }
+
+    // A camera that pans right across two seconds, so the parallax is visible
+    // by scrubbing rather than only by moving the depth sliders.
+    scene.camera_mut().enabled = true;
+    scene
+        .camera_mut()
+        .set_key(buzz_scene::CameraKey::new(0, buzz_geom::Point::new(275.0, 200.0)));
+    scene
+        .camera_mut()
+        .set_key(buzz_scene::CameraKey::new(48, buzz_geom::Point::new(675.0, 200.0)));
+
+    let mut path = std::env::temp_dir();
+    path.push("depth-fixture.buzz");
+    buzz_doc::format::save(&scene, &path).expect("the fixture saves");
+    println!("wrote {}", path.display());
+}

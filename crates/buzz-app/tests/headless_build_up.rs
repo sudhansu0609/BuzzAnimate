@@ -144,7 +144,11 @@ fn with_harness(test: impl FnOnce(&mut Harness)) {
     let shared = HARNESS.get_or_init(|| Harness::new().map(std::sync::Mutex::new));
     match shared {
         Some(mutex) => {
-            let mut harness = mutex.lock().expect("the GPU harness is not poisoned");
+            // A panicking test must not take the rest down with it: the GPU
+            // context is still perfectly usable, so the poison is recovered
+            // rather than propagated as six more failures that hide the one
+            // real fault.
+            let mut harness = mutex.lock().unwrap_or_else(|e| e.into_inner());
             test(&mut harness);
         }
         None => eprintln!("skipping: no usable GPU"),
@@ -214,13 +218,12 @@ fn crossing_bars(alpha_a: f64, alpha_b: f64, blend: PaintBlend) -> Document {
 /// Render a document through the same path the window uses.
 fn render(harness: &mut Harness, document: &Document) -> Vec<u8> {
     let mut scene = Scene::new();
-    let mut camera = Camera::new(
-        Point::new(100.0, 100.0),
-        1.0,
-        Size::new(W as f64, H as f64),
-    );
+    // Frame the document's own stage, so a test can place artwork anywhere on
+    // it without also having to know what this function decided to look at.
+    let stage = document.stage().stage_rect();
+    let mut camera = Camera::new(stage.center(), 1.0, Size::new(W as f64, H as f64));
     // `margin` is a divisor: 1.0 is a tight fit.
-    camera.fit_to_rect(Rect::new(0.0, 0.0, 200.0, 200.0), 1.0);
+    camera.fit_to_rect(stage, 1.0);
 
     {
         let mut builder = SceneBuilder::new(&mut scene, &camera);
@@ -429,5 +432,134 @@ fn many_build_up_strokes_still_render_quickly() {
             "300 build-up shapes took {elapsed:?} to render and read back"
         );
         eprintln!("300 build-up shapes rendered and read back in {elapsed:?}");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Layer depth
+// ---------------------------------------------------------------------------
+
+/// The width, in pixels, of the inked region on one row of the frame.
+fn inked_width(pixels: &[u8], row: u32) -> u32 {
+    (0..W)
+        .filter(|x| {
+            let i = ((row * W + x) * 4) as usize;
+            pixels[i] < 250
+        })
+        .count() as u32
+}
+
+/// A document with one opaque bar across the middle of a layer at `depth`.
+fn bar_at_depth(depth: f64) -> Document {
+    let mut document = Document::default();
+    let layer = document.layers().iter().next().unwrap().id;
+    document.update_layer(layer, |l| l.depth = depth);
+    document.add_shape(
+        layer,
+        ShapeData::filled(
+            buzz_geom::Shape::to_path(&Rect::new(50.0, 190.0, 500.0, 210.0), 1e-9),
+            Color::BLACK,
+        ),
+    );
+    document
+}
+
+/// Layer depth's visible claim: further away is drawn smaller.
+#[test]
+fn a_layer_pushed_back_is_rendered_smaller() {
+    with_harness(|harness| {
+        // The stage is 550x400 and the camera's focal distance is 1000, so
+        // depth 1000 is twice as far and should halve the bar's width.
+        let flat = inked_width(&render(harness, &bar_at_depth(0.0)), H / 2);
+        let far = inked_width(&render(harness, &bar_at_depth(1000.0)), H / 2);
+        let near = inked_width(&render(harness, &bar_at_depth(-500.0)), H / 2);
+
+        assert!(flat > 0, "the control bar should be visible");
+        assert!(
+            far > 0 && (far as f64) < flat as f64 * 0.6,
+            "depth 1000 should roughly halve the bar: flat {flat}px, far {far}px"
+        );
+        assert!(
+            near > flat,
+            "depth -500 should enlarge it: flat {flat}px, near {near}px"
+        );
+    });
+}
+
+/// A layer at the camera plane is not drawn at all, rather than magnified into
+/// a wall of colour by a perspective divide approaching zero.
+#[test]
+fn a_layer_at_the_camera_is_not_drawn() {
+    with_harness(|harness| {
+        let pixels = render(harness, &bar_at_depth(-1000.0));
+        assert_eq!(
+            inked_width(&pixels, H / 2),
+            0,
+            "a layer at the camera plane must draw nothing"
+        );
+    });
+}
+
+/// Parallax through the renderer: panning the camera moves a distant layer
+/// less than a near one. The arithmetic is asserted in `buzz-scene`; this is
+/// the part that proves it reaches the screen.
+#[test]
+fn panning_the_camera_shifts_layers_by_their_depth() {
+    with_harness(|harness| {
+        // One square, on a layer at a given depth, with the camera at a given
+        // position. Rendering one at a time removes any question of which
+        // inked region belongs to which layer.
+        let build = |depth: f64, camera_x: f64| -> Document {
+            let mut document = Document::default();
+            let layer = document.layers().iter().next().unwrap().id;
+            document.update_layer(layer, |l| l.depth = depth);
+            document.add_shape(
+                layer,
+                ShapeData::filled(
+                    buzz_geom::Shape::to_path(&Rect::new(255.0, 180.0, 295.0, 220.0), 1e-9),
+                    Color::BLACK,
+                ),
+            );
+            document.camera_mut().enabled = true;
+            document
+                .camera_mut()
+                .set_key(buzz_scene::CameraKey::new(0, Point::new(camera_x, 200.0)));
+            document
+        };
+
+        // Centre of the inked region, over the whole frame.
+        let centre_x = |pixels: &[u8]| -> Option<f64> {
+            let mut total = 0.0;
+            let mut count = 0.0;
+            for y in 0..H {
+                for x in 0..W {
+                    let i = ((y * W + x) * 4) as usize;
+                    if pixels[i] < 250 {
+                        total += x as f64;
+                        count += 1.0;
+                    }
+                }
+            }
+            (count > 0.0).then(|| total / count)
+        };
+
+        // How far the square slides when the camera pans 100 units right.
+        let shift_for = |harness: &mut Harness, depth: f64| -> f64 {
+            let before = centre_x(&render(harness, &build(depth, 275.0)))
+                .unwrap_or_else(|| panic!("the square at depth {depth} should be visible"));
+            let after = centre_x(&render(harness, &build(depth, 375.0)))
+                .unwrap_or_else(|| panic!("the square at depth {depth} should still be visible"));
+            (before - after).abs()
+        };
+
+        let near = shift_for(harness, -400.0);
+        let focal = shift_for(harness, 0.0);
+        let far = shift_for(harness, 2000.0);
+
+        assert!(
+            far < focal && focal < near,
+            "a pan should sweep near layers furthest and distant ones least:              near {near:.1}px, focal {focal:.1}px, far {far:.1}px"
+        );
+        assert!(far > 0.0, "but the distant layer should still move a little");
     });
 }

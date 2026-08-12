@@ -395,6 +395,9 @@ impl App {
 
                         ui.separator();
                         panels::color_panel(ui, &mut editor.style);
+
+                        ui.separator();
+                        self.depth_panel(ui);
                     });
                 });
 
@@ -459,6 +462,63 @@ impl App {
         }
 
         stage_area
+    }
+
+    /// Animate's Layer Depth panel, and the edits it raises.
+    ///
+    /// Each change is its own undo step with its own label, so pushing a layer
+    /// back and then flattening everything are two separate things to undo
+    /// rather than one indivisible "depth" blob.
+    fn depth_panel(&mut self, ui: &mut egui::Ui) {
+        let active = self.editor.selection.active_layer();
+        let response = buzz_ui::depth_panel(ui, self.editor.doc.scene(), active);
+
+        if let Some(layer) = response.select_layer {
+            self.editor.selection.set_active_layer(Some(layer));
+        }
+
+        if let Some((layer, depth)) = response.set_depth {
+            self.editor.doc.edit("Layer Depth", |scene| {
+                scene.update_layer(layer, |l| l.depth = depth);
+            });
+        }
+
+        if let Some(distance) = response.set_focal_distance {
+            self.editor.doc.edit("Camera Depth", |scene| {
+                scene.camera_mut().focal_distance = distance;
+            });
+        }
+
+        if response.flatten {
+            let ids: Vec<_> = self
+                .editor
+                .doc
+                .scene()
+                .layers()
+                .iter()
+                .map(|l| l.id)
+                .collect();
+            self.editor.doc.edit("Flatten Depth", |scene| {
+                for id in ids {
+                    scene.update_layer(id, |l| l.depth = 0.0);
+                }
+            });
+        }
+
+        if response.distribute {
+            let scene = self.editor.doc.scene();
+            let ids: Vec<_> = scene.layers().iter().map(|l| l.id).collect();
+            // The front of the stack takes the nearest depth, so the timeline's
+            // own ordering is what decides which layer ends up where.
+            let depths =
+                buzz_ui::depth_panel::distributed_depths(ids.len(), scene.camera().focal_distance);
+
+            self.editor.doc.edit("Distribute Depth", |scene| {
+                for (id, depth) in ids.into_iter().zip(depths) {
+                    scene.update_layer(id, |l| l.depth = depth);
+                }
+            });
+        }
     }
 
     /// The trail of symbols currently open, with the document at its root.

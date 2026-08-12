@@ -590,11 +590,26 @@ impl Editor {
         let mut hit = None;
         // `selectable` yields back to front, so the last match is on top.
         for layer in scene.layers().selectable() {
+            // Depth draws a layer's artwork somewhere other than where its
+            // geometry says it is, so the click has to be moved the same way
+            // in reverse. Without this, a layer pushed into the distance is
+            // visible but unclickable — and one pulled forward is selected by
+            // clicking empty space beside it.
+            let Some(local) = scene.view_to_layer(frame, layer.depth, point) else {
+                // At or behind the camera: not drawn, so not selectable.
+                continue;
+            };
+            // The tolerance is a distance, so it shrinks with the layer.
+            let local_tolerance = match scene.camera().depth_scale(layer.depth) {
+                Some(scale) if scale > 0.0 => tolerance / scale,
+                _ => tolerance,
+            };
+
             for object in layer.objects_at(frame) {
                 if !object.visible || object.locked {
                     continue;
                 }
-                if object_contains(scene, object, point, tolerance, frame, 0) {
+                if object_contains(scene, object, local, local_tolerance, frame, 0) {
                     hit = Some(object.id);
                 }
             }
@@ -2467,5 +2482,83 @@ mod tests {
 
         let snapped = e.snap(Point::new(102.0, 40.0));
         assert!((snapped.x - 100.0).abs() < 1e-9, "got {snapped:?}");
+    }
+
+    /// An editor with one square on a layer whose depth can be set.
+    fn editor_with_deep_square(depth: f64) -> (Editor, ObjectId) {
+        let mut e = editor();
+        let id = draw_square(&mut e, 200.0, 125.0, 150.0, Color::WHITE)
+            .expect("the square is placed");
+
+        let layer = e.scene().layers().iter().next().unwrap().id;
+        e.doc.edit("Depth", |scene| {
+            scene.update_layer(layer, |l| l.depth = depth);
+        });
+        (e, id)
+    }
+
+    /// The bug depth-aware picking exists to prevent: a layer pushed into the
+    /// distance is drawn smaller, so clicking where it *looks* has to select
+    /// it, and clicking where its geometry used to be must not.
+    #[test]
+    fn a_layer_pushed_into_the_distance_is_clicked_where_it_is_drawn() {
+        // Stage 550x400, so the centre is (275, 200). The square spans
+        // 200..350 x 125..275, centred on the stage.
+        let (deep, id) = editor_with_deep_square(1000.0); // half size
+        let tolerance = 0.5;
+
+        // Half size about the stage centre puts the square's corner at
+        // (237.5, 162.5); its old corner at (200, 125) is now outside it.
+        assert_eq!(
+            deep.object_at(Point::new(245.0, 170.0), tolerance),
+            Some(id),
+            "the click should land where the shrunken square is drawn"
+        );
+        assert_eq!(
+            deep.object_at(Point::new(205.0, 130.0), tolerance),
+            None,
+            "and not where its untransformed geometry sits"
+        );
+
+        // The centre is on the square at any depth, which is a useful control:
+        // it shows the test is not simply missing everything.
+        assert_eq!(deep.object_at(Point::new(275.0, 200.0), tolerance), Some(id));
+    }
+
+    /// A layer on the focal plane must pick exactly as it always did.
+    #[test]
+    fn depth_zero_picking_is_unchanged() {
+        let (flat, id) = editor_with_deep_square(0.0);
+        assert_eq!(flat.object_at(Point::new(205.0, 130.0), 0.5), Some(id));
+        assert_eq!(flat.object_at(Point::new(100.0, 100.0), 0.5), None);
+    }
+
+    /// A layer pulled in front of the camera is drawn larger, so it should be
+    /// selectable well beyond where its geometry sits.
+    #[test]
+    fn a_layer_pulled_forward_is_selectable_over_its_larger_drawn_area() {
+        let (near, id) = editor_with_deep_square(-500.0); // double size
+
+        // Doubling about (275, 200) puts the corner at (125, 50), so a point
+        // outside the original square is now inside the drawn one.
+        assert_eq!(
+            near.object_at(Point::new(150.0, 80.0), 0.5),
+            Some(id),
+            "the enlarged square should cover this"
+        );
+    }
+
+    /// A layer at or behind the camera is not drawn, so it must not be
+    /// selectable either — clicking empty space should not find it.
+    #[test]
+    fn a_layer_behind_the_camera_cannot_be_selected() {
+        let (behind, _) = editor_with_deep_square(-1000.0);
+        for probe in [
+            Point::new(275.0, 200.0),
+            Point::new(205.0, 130.0),
+            Point::new(0.0, 0.0),
+        ] {
+            assert_eq!(behind.object_at(probe, 0.5), None, "at {probe:?}");
+        }
     }
 }

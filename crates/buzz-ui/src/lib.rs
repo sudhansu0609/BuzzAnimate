@@ -7,6 +7,7 @@
 
 pub mod brush;
 pub mod command;
+pub mod depth_panel;
 pub mod library_panel;
 pub mod panels;
 pub mod selection;
@@ -18,6 +19,7 @@ pub mod view;
 
 pub use brush::{BrushKind, BrushSettings, PatternShape};
 pub use command::Command;
+pub use depth_panel::{DepthResponse, depth_panel};
 pub use library_panel::{LibraryState, library_panel};
 pub use selection::Selection;
 pub use style::{DrawStyle, DrawingMode, StrokeKind};

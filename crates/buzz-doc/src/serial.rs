@@ -38,12 +38,13 @@ use serde::{Deserialize, Serialize};
 /// * **2** — layers hold keyframes, and the document has a camera track.
 /// * **3** — a library of symbols, instance objects, and tweens on keyframes.
 /// * **4** — shapes carry a paint blend, so build-up strokes survive a save.
+/// * **5** — layers carry a depth, and the camera a focal distance.
 ///
 /// Every older version still loads. Version 1's flat list becomes a single
 /// keyframe at frame 0, which is exactly what it meant; version 2 simply has
 /// no library and no tweens, and both default to empty. Keeping those paths is
 /// cheap and it exercises the version check for real rather than in theory.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -163,6 +164,9 @@ pub struct LayerDto {
     pub color: String,
     #[serde(default)]
     pub height: LayerHeight,
+    /// Distance from the camera. Version 5; absent means the focal plane.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub depth: f64,
     #[serde(default)]
     pub collapsed: bool,
     /// Frames the layer occupies. At least 1.
@@ -178,6 +182,10 @@ pub struct LayerDto {
 
 fn one() -> u32 {
     1
+}
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,8 +215,16 @@ fn is_normal_blend(blend: &PaintBlend) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraDto {
     pub enabled: bool,
+    /// Distance to the depth-zero plane. Version 5; older files take the
+    /// default, which leaves a document with no depth looking identical.
+    #[serde(default = "default_focal_distance")]
+    pub focal_distance: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<CameraKeyDto>,
+}
+
+fn default_focal_distance() -> f64 {
+    buzz_scene::camera_track::DEFAULT_FOCAL_DISTANCE
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -320,6 +336,7 @@ impl LayerDto {
             outline: layer.outline,
             color: color_to_hex(layer.color),
             height: layer.height,
+            depth: layer.depth,
             collapsed: layer.collapsed,
             length: layer.frames.length(),
             keyframes: layer
@@ -349,6 +366,8 @@ impl LayerDto {
         layer.outline = self.outline;
         layer.color = color_from_hex(&self.color)?;
         layer.height = self.height;
+        // A corrupt value must not put a layer behind the camera for good.
+        layer.depth = if self.depth.is_finite() { self.depth } else { 0.0 };
         layer.collapsed = self.collapsed;
 
         // Version 1 stored a flat object list, which meant exactly "one
@@ -445,6 +464,7 @@ impl DocumentDto {
             max_id,
             camera: (!scene.camera().is_empty() || scene.camera().enabled).then(|| CameraDto {
                 enabled: scene.camera().enabled,
+                focal_distance: scene.camera().focal_distance,
                 keys: scene
                     .camera()
                     .keys()
@@ -505,6 +525,7 @@ impl DocumentDto {
                     })
                     .collect(),
                 camera.enabled,
+                camera.focal_distance,
             );
         }
 

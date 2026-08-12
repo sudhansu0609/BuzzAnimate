@@ -1,4 +1,4 @@
-//! Serialisable mirror of [`buzz_scene::Scene`].
+﻿//! Serialisable mirror of [`buzz_scene::Scene`].
 //!
 //! # Why a separate set of types
 //!
@@ -10,7 +10,7 @@
 //!
 //! # Two representation choices worth stating
 //!
-//! * **Paths are SVG strings.** Serialising `PathEl` as JSON enums is verbose —
+//! * **Paths are SVG strings.** Serialising `PathEl` as JSON enums is verbose â€”
 //!   a 200-segment path becomes a wall of objects. `to_svg`/`from_svg` is
 //!   compact, diff-friendly, and matches what SVG and XFL already do. It is
 //!   also *lossless*: kurbo formats coordinates with Rust's `Display` for
@@ -32,7 +32,14 @@ use peniko::Color;
 use serde::{Deserialize, Serialize};
 
 /// Bumped only for a breaking change to the on-disk layout.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// * **1** â€” layers held a flat object list.
+/// * **2** â€” layers hold keyframes, and the document has a camera track.
+///
+/// Version 1 files still load: their flat list becomes a single keyframe at
+/// frame 0, which is exactly what it meant. Keeping that path is cheap and it
+/// exercises the version check for real rather than in theory.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +89,8 @@ pub struct DocumentDto {
     pub layers: Vec<LayerDto>,
     /// Highest id in use, so the allocator can resume safely.
     pub max_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<CameraDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,8 +117,44 @@ pub struct LayerDto {
     pub height: LayerHeight,
     #[serde(default)]
     pub collapsed: bool,
+    /// Frames the layer occupies. At least 1.
+    #[serde(default = "one")]
+    pub length: u32,
+    /// Keyframes, sorted by start frame.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyframes: Vec<KeyframeDto>,
+    /// Version 1's flat object list. Read, never written.
+    #[serde(default, skip_serializing)]
+    pub objects: Vec<ObjectDto>,
+}
+
+fn one() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyframeDto {
+    pub start: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub objects: Vec<ObjectDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CameraDto {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<CameraKeyDto>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CameraKeyDto {
+    pub frame: u32,
+    pub x: f64,
+    pub y: f64,
+    pub zoom: f64,
+    pub rotation: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,11 +234,22 @@ impl DocumentDto {
                     color: color_to_hex(layer.color),
                     height: layer.height,
                     collapsed: layer.collapsed,
-                    objects: layer
-                        .objects
+                    length: layer.frames.length(),
+                    keyframes: layer
+                        .frames
+                        .keyframes()
                         .iter()
-                        .map(|o| ObjectDto::from_object(o, &mut max_id))
+                        .map(|k| KeyframeDto {
+                            start: k.start,
+                            label: k.label.clone(),
+                            objects: k
+                                .objects
+                                .iter()
+                                .map(|o| ObjectDto::from_object(o, &mut max_id))
+                                .collect(),
+                        })
                         .collect(),
+                    objects: Vec::new(),
                 }
             })
             .collect();
@@ -208,6 +264,21 @@ impl DocumentDto {
             },
             layers,
             max_id,
+            camera: (!scene.camera.is_empty() || scene.camera.enabled).then(|| CameraDto {
+                enabled: scene.camera.enabled,
+                keys: scene
+                    .camera
+                    .keys()
+                    .iter()
+                    .map(|k| CameraKeyDto {
+                        frame: k.frame,
+                        x: k.center.x,
+                        y: k.center.y,
+                        zoom: k.zoom,
+                        rotation: k.rotation,
+                    })
+                    .collect(),
+            }),
         }
     }
 
@@ -236,10 +307,50 @@ impl DocumentDto {
             layer.color = color_from_hex(&dto.color)?;
             layer.height = dto.height;
             layer.collapsed = dto.collapsed;
-            for object in &dto.objects {
-                layer.push_object(Arc::new(object.to_object()?));
+
+            // Version 1 stored a flat object list, which meant exactly "one
+            // keyframe at frame 0". Translate rather than reject.
+            let source: Vec<KeyframeDto> = if dto.keyframes.is_empty() && !dto.objects.is_empty() {
+                vec![KeyframeDto {
+                    start: 0,
+                    label: None,
+                    objects: dto.objects.clone(),
+                }]
+            } else {
+                dto.keyframes.clone()
+            };
+
+            let mut keyframes = Vec::with_capacity(source.len());
+            for k in &source {
+                let mut objects = Vec::with_capacity(k.objects.len());
+                for object in &k.objects {
+                    objects.push(Arc::new(object.to_object()?));
+                }
+                keyframes.push(buzz_scene::Keyframe {
+                    start: k.start,
+                    objects: Arc::new(objects),
+                    label: k.label.clone(),
+                });
             }
+            layer.frames = buzz_scene::LayerTimeline::from_parts(keyframes, dto.length.max(1));
+
             scene.edit_layers().insert(index, layer);
+        }
+
+        if let Some(camera) = &self.camera {
+            scene.camera = buzz_scene::CameraTrack::from_parts(
+                camera
+                    .keys
+                    .iter()
+                    .map(|k| buzz_scene::CameraKey {
+                        frame: k.frame,
+                        center: buzz_geom::Point::new(k.x, k.y),
+                        zoom: k.zoom,
+                        rotation: k.rotation,
+                    })
+                    .collect(),
+                camera.enabled,
+            );
         }
 
         // Raise the allocator past everything the file already uses, so a new
@@ -450,7 +561,7 @@ mod tests {
             assert_eq!(a.locked, b.locked);
             assert_eq!(a.outline, b.outline);
             assert_eq!(a.height, b.height);
-            assert_eq!(a.objects.len(), b.objects.len());
+            assert_eq!(a.objects_at(0).len(), b.objects_at(0).len());
         }
     }
 
@@ -506,7 +617,7 @@ mod tests {
         let existing: Vec<u64> = back
             .layers()
             .iter()
-            .flat_map(|l| l.objects.iter().map(|o| o.id.0))
+            .flat_map(|l| l.all_objects().map(|o| o.id.0))
             .chain(back.layers().iter().map(|l| l.id.0))
             .collect();
         let fresh = back.next_object_id();
@@ -531,11 +642,19 @@ mod tests {
     #[test]
     fn corrupt_path_data_produces_an_error_not_a_panic() {
         let mut dto = DocumentDto::from_scene(&sample_scene());
-        if let Some(layer) = dto.layers.iter_mut().find(|l| !l.objects.is_empty())
-            && let ObjectKindDto::Shape { path, .. } = &mut layer.objects[0].kind
-        {
-            *path = "this is not a path".into();
-        }
+        let corrupted = dto
+            .layers
+            .iter_mut()
+            .flat_map(|l| l.keyframes.iter_mut())
+            .flat_map(|k| k.objects.iter_mut())
+            .find_map(|o| match &mut o.kind {
+                ObjectKindDto::Shape { path, .. } => {
+                    *path = "this is not a path".into();
+                    Some(())
+                }
+                ObjectKindDto::Group { .. } => None,
+            });
+        assert!(corrupted.is_some(), "the sample should contain a shape");
         assert!(matches!(dto.to_scene(), Err(SerialError::BadPath(_))));
     }
 
@@ -553,7 +672,7 @@ mod tests {
         assert_eq!(parsed.to_scene().unwrap().shape_count(), scene.shape_count());
 
         // Cost is dominated by path data, so measure per segment rather than
-        // in absolute bytes — the latter just tracks how detailed the test
+        // in absolute bytes â€” the latter just tracks how detailed the test
         // artwork happens to be.
         //
         // Coordinates are written at full `f64` precision, which is verbose
@@ -564,7 +683,7 @@ mod tests {
         let segments: usize = scene
             .layers()
             .iter()
-            .flat_map(|l| l.objects.iter())
+            .flat_map(|l| l.all_objects())
             .map(|o| match &o.kind {
                 buzz_scene::ObjectKind::Shape(s) => s.path.elements().len(),
                 buzz_scene::ObjectKind::Group(_) => 0,

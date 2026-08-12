@@ -44,14 +44,40 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect) {
     // window's clear colour already provides.
     builder.fill_shape(&scene.stage.stage_rect(), scene.stage.background);
 
-    // Back to front, honouring layer visibility and folder nesting.
-    for layer in scene.layers().drawable() {
-        // Guides are authoring aids: visible on stage, never exported.
-        let tint = if layer.outline { Some(layer.color) } else { None };
-        let ghost = layer.kind == LayerKind::Guide;
+    let frame = editor.current_frame;
+    // The camera is part of the document, so it transforms artwork but not the
+    // stage rectangle the artwork sits on.
+    let camera = scene.camera_transform(frame);
 
-        for object in layer.objects.iter() {
-            draw_object(&mut builder, object, Affine::IDENTITY, tint, ghost);
+    // Onion skin ghosts first, so the live frame draws over them.
+    for ghost_frame in editor.onion_frames() {
+        let distance = ghost_frame.abs_diff(frame).max(1) as f64;
+        let strength = (0.30 / distance).clamp(0.05, 0.30);
+        draw_frame(&mut builder, scene, ghost_frame, camera, Some(strength), editor.onion.outlines);
+    }
+
+    draw_frame(&mut builder, scene, frame, camera, None, false);
+}
+
+/// Draw one frame's layers.
+///
+/// `ghost` fades everything for onion skinning; `None` draws normally.
+fn draw_frame(
+    builder: &mut SceneBuilder<'_>,
+    scene: &buzz_scene::Scene,
+    frame: u32,
+    camera: Affine,
+    ghost: Option<f64>,
+    ghost_outlines: bool,
+) {
+    for layer in scene.layers().drawable_at(frame) {
+        // Guides are authoring aids: visible on stage, never exported.
+        let outline = layer.outline || (ghost.is_some() && ghost_outlines);
+        let tint = outline.then_some(layer.color);
+        let faded = layer.kind == LayerKind::Guide;
+
+        for object in layer.objects_at(frame) {
+            draw_object(builder, object, camera, tint, faded, ghost);
         }
     }
 }
@@ -61,7 +87,8 @@ fn draw_object(
     object: &Object,
     parent: Affine,
     tint: Option<Color>,
-    ghost: bool,
+    faded: bool,
+    ghost: Option<f64>,
 ) {
     if !object.visible {
         return;
@@ -71,25 +98,32 @@ fn draw_object(
     match &object.kind {
         ObjectKind::Group(children) => {
             for child in children {
-                draw_object(builder, child, world, tint, ghost);
+                draw_object(builder, child, world, tint, faded, ghost);
             }
         }
         ObjectKind::Shape(shape) => {
             let path = world * shape.path.clone();
 
+            let adjust = |c: Color| {
+                let c = if faded { fade(c) } else { c };
+                match ghost {
+                    Some(alpha) => c.multiply_alpha(alpha as f32),
+                    None => c,
+                }
+            };
+
             // Outline view: draw the silhouette in the layer colour instead of
             // the artwork, which is what the timeline's outline column does.
             if let Some(color) = tint {
-                builder.stroke_hairline(&path, color, 1.0);
+                builder.stroke_hairline(&path, adjust(color), 1.0);
                 return;
             }
 
             if let Some(fill) = shape.fill {
-                let color = if ghost { fade(fill.color) } else { fill.color };
-                builder.fill_shape(&path, color);
+                builder.fill_shape(&path, adjust(fill.color));
             }
             if let Some(stroke) = shape.stroke {
-                let color = if ghost { fade(stroke.color) } else { stroke.color };
+                let color = adjust(stroke.color);
                 if stroke.hairline {
                     builder.stroke_hairline(&path, color, 1.0);
                 } else {

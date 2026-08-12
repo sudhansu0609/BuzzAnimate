@@ -1,8 +1,8 @@
-//! Editor state and the operations the UI raises against it.
+﻿//! Editor state and the operations the UI raises against it.
 //!
 //! Everything the application can do to a document funnels through here, so
 //! undo labelling, layer locking and Animate's merge-shape rules live in one
-//! place rather than being re-implemented — and eventually forgotten — in each
+//! place rather than being re-implemented â€” and eventually forgotten â€” in each
 //! tool and menu handler.
 
 use std::sync::Arc;
@@ -28,10 +28,63 @@ pub struct Editor {
     pub style: DrawStyle,
     pub view: ViewSettings,
     pub machine: ToolMachine,
+    /// The playhead. Everything the user sees and edits is at this frame.
+    pub current_frame: u32,
+    /// Playback state.
+    pub playback: Playback,
+    /// Onion skinning.
+    pub onion: Onion,
     /// Set when the user asks to quit.
     pub should_quit: bool,
     /// Transient message for the status bar.
     pub status: Option<String>,
+}
+
+/// Playback state.
+///
+/// Playback advances on *elapsed time*, not on frames rendered, so a document
+/// plays at its authored rate whether the display runs at 60 Hz or 144 Hz, and
+/// a slow frame drops rather than stretching the animation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Playback {
+    pub playing: bool,
+    pub looping: bool,
+    /// Seconds accumulated towards the next frame.
+    accumulator: f64,
+}
+
+impl Default for Playback {
+    fn default() -> Self {
+        Self {
+            playing: false,
+            // Animate loops by default in the timeline.
+            looping: true,
+            accumulator: 0.0,
+        }
+    }
+}
+
+/// Onion skinning: ghosts of neighbouring frames.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Onion {
+    pub enabled: bool,
+    /// Draw ghosts as outlines rather than faded artwork.
+    pub outlines: bool,
+    /// Frames shown before the playhead.
+    pub before: u32,
+    /// Frames shown after it.
+    pub after: u32,
+}
+
+impl Default for Onion {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            outlines: false,
+            before: 2,
+            after: 2,
+        }
+    }
 }
 
 impl Default for Editor {
@@ -56,9 +109,95 @@ impl Editor {
             style: DrawStyle::default(),
             view: ViewSettings::default(),
             machine: ToolMachine::new(ToolId::Selection),
+            current_frame: 0,
+            playback: Playback::default(),
+            onion: Onion::default(),
             should_quit: false,
             status: None,
         }
+    }
+
+    /// The frame the user is editing.
+    pub fn frame(&self) -> u32 {
+        self.current_frame
+    }
+
+    /// Move the playhead, clamped to the document.
+    pub fn set_frame(&mut self, frame: u32) {
+        let last = self.doc.scene().frame_count().saturating_sub(1);
+        self.current_frame = frame.min(last);
+        // A selection made on another frame refers to objects that may not be
+        // present here.
+        self.selection.prune_to_frame(self.doc.scene(), self.current_frame);
+    }
+
+    pub fn step_frame(&mut self, delta: i64) {
+        let target = (self.current_frame as i64 + delta).max(0) as u32;
+        self.set_frame(target);
+    }
+
+    /// Advance playback by `elapsed` seconds. Call once per frame.
+    pub fn advance_playback(&mut self, elapsed: f64) {
+        if !self.playback.playing {
+            return;
+        }
+        let fps = self.doc.scene().stage.frame_rate.max(0.01);
+        self.playback.accumulator += elapsed.clamp(0.0, 0.25);
+
+        let per_frame = 1.0 / fps;
+        let mut advanced = 0u32;
+        while self.playback.accumulator >= per_frame {
+            self.playback.accumulator -= per_frame;
+            advanced += 1;
+            // A long stall must not spin here catching up indefinitely.
+            if advanced > 240 {
+                self.playback.accumulator = 0.0;
+                break;
+            }
+        }
+        if advanced == 0 {
+            return;
+        }
+
+        let count = self.doc.scene().frame_count();
+        let next = self.current_frame + advanced;
+        self.current_frame = if next >= count {
+            if self.playback.looping {
+                next % count
+            } else {
+                self.playback.playing = false;
+                count.saturating_sub(1)
+            }
+        } else {
+            next
+        };
+    }
+
+    pub fn toggle_playback(&mut self) {
+        self.playback.playing = !self.playback.playing;
+        self.playback.accumulator = 0.0;
+    }
+
+    /// Frames to draw as onion-skin ghosts, nearest first.
+    pub fn onion_frames(&self) -> Vec<u32> {
+        if !self.onion.enabled || self.playback.playing {
+            // Ghosts during playback would just be visual noise.
+            return Vec::new();
+        }
+        let count = self.doc.scene().frame_count();
+        let mut frames = Vec::new();
+        for back in 1..=self.onion.before {
+            if let Some(f) = self.current_frame.checked_sub(back) {
+                frames.push(f);
+            }
+        }
+        for forward in 1..=self.onion.after {
+            let f = self.current_frame + forward;
+            if f < count {
+                frames.push(f);
+            }
+        }
+        frames
     }
 
     pub fn scene(&self) -> &Scene {
@@ -181,12 +320,13 @@ impl Editor {
             point.x + reach,
             point.y + reach,
         );
+        let frame = self.current_frame;
         let edges: Vec<Rect> = self
             .doc
             .scene()
             .layers()
-            .drawable()
-            .flat_map(|l| l.objects.iter())
+            .drawable_at(frame)
+            .flat_map(|l| l.objects_at(frame).iter())
             .map(|o| o.bounds())
             .filter(|b| b.overlaps(around))
             .take(256)
@@ -336,13 +476,14 @@ impl Editor {
         }
 
         let merge = self.style.drawing_mode == DrawingMode::MergeShape;
+        let frame = self.current_frame;
         let mut created: Option<ObjectId> = None;
 
         self.doc.edit(label, |scene| {
             created = if merge {
-                merge_shape_into_layer(scene, layer, shape)
+                merge_shape_into_layer(scene, layer, frame, shape)
             } else {
-                scene.add_shape(layer, shape)
+                scene.add_shape_at(layer, frame, shape)
             };
         });
 
@@ -386,11 +527,12 @@ impl Editor {
             cutter.bounding_box().width().hypot(cutter.bounding_box().height()),
         );
 
+        let frame = self.current_frame;
         self.doc.edit("Erase", |scene| {
             let ids: Vec<ObjectId> = scene
                 .layers()
                 .get(layer)
-                .map(|l| l.objects.iter().map(|o| o.id).collect())
+                .map(|l| l.objects_at(frame).iter().map(|o| o.id).collect())
                 .unwrap_or_default();
 
             for id in ids {
@@ -417,10 +559,11 @@ impl Editor {
     /// Topmost object under `point`, honouring layer locking and visibility.
     pub fn object_at(&self, point: Point, tolerance: f64) -> Option<ObjectId> {
         let scene = self.doc.scene();
+        let frame = self.current_frame;
         let mut hit = None;
         // `selectable` yields back to front, so the last match is on top.
         for layer in scene.layers().selectable() {
-            for object in layer.objects.iter() {
+            for object in layer.objects_at(frame) {
                 if !object.visible || object.locked {
                     continue;
                 }
@@ -434,11 +577,12 @@ impl Editor {
 
     /// Objects fully inside `rect`, matching Animate's marquee.
     pub fn objects_in(&self, rect: Rect) -> Vec<ObjectId> {
+        let frame = self.current_frame;
         self.doc
             .scene()
             .layers()
             .selectable()
-            .flat_map(|l| l.objects.iter())
+            .flat_map(|l| l.objects_at(frame).iter())
             .filter(|o| o.visible && !o.locked)
             .filter(|o| rect.contains_rect(o.bounds()))
             .map(|o| o.id)
@@ -474,12 +618,13 @@ impl Editor {
             }
             Delete => self.delete_selection(),
             SelectAll => {
+                let frame = self.current_frame;
                 let all: Vec<ObjectId> = self
                     .doc
                     .scene()
                     .layers()
                     .selectable()
-                    .flat_map(|l| l.objects.iter())
+                    .flat_map(|l| l.objects_at(frame).iter())
                     .filter(|o| o.visible && !o.locked)
                     .map(|o| o.id)
                     .collect();
@@ -667,13 +812,16 @@ impl Editor {
             return;
         }
         let ids = self.selection.ids();
+        let frame = self.current_frame;
         self.doc.edit("Arrange", |scene| {
             for id in ids {
                 let Some((layer, _)) = scene.find_object(id) else {
                     continue;
                 };
                 scene.update_layer(layer, |l| {
-                    let objects = Arc::make_mut(&mut l.objects);
+                    let Some(objects) = l.frames.objects_at_mut(frame) else {
+                        return;
+                    };
                     let Some(from) = objects.iter().position(|o| o.id == id) else {
                         return;
                     };
@@ -784,9 +932,14 @@ fn update_object(scene: &mut Scene, id: ObjectId, f: impl FnOnce(&mut Object)) {
         return;
     };
     scene.update_layer(layer, |l| {
-        let objects = Arc::make_mut(&mut l.objects);
-        if let Some(slot) = objects.iter_mut().find(|o| o.id == id) {
-            f(Arc::make_mut(slot));
+        // The object may live on any keyframe, so search them all rather than
+        // assuming the current one.
+        for keyframe in l.frames.keyframes_mut() {
+            let objects = Arc::make_mut(&mut keyframe.objects);
+            if let Some(slot) = objects.iter_mut().find(|o| o.id == id) {
+                f(Arc::make_mut(slot));
+                return;
+            }
         }
     });
 }
@@ -863,11 +1016,12 @@ impl DerefVector for Affine {
 fn merge_shape_into_layer(
     scene: &mut Scene,
     layer: LayerId,
+    frame: u32,
     incoming: ShapeData,
 ) -> Option<ObjectId> {
     let Some(new_fill) = incoming.fill else {
         // Nothing to merge with, so it behaves like an ordinary object.
-        return scene.add_shape(layer, incoming);
+        return scene.add_shape_at(layer, frame, incoming);
     };
 
     let bb = incoming.path.bounding_box();
@@ -879,7 +1033,7 @@ fn merge_shape_into_layer(
         .layers()
         .get(layer)
         .map(|l| {
-            l.objects
+            l.objects_at(frame)
                 .iter()
                 .filter(|o| o.visible && !o.locked)
                 .filter_map(|o| match &o.kind {
@@ -920,8 +1074,9 @@ fn merge_shape_into_layer(
         scene.remove_object(id);
     }
 
-    scene.add_shape(
+    scene.add_shape_at(
         layer,
+        frame,
         ShapeData {
             path: merged,
             fill: Some(new_fill),
@@ -961,7 +1116,7 @@ mod tests {
             .scene()
             .layers()
             .iter()
-            .flat_map(|l| l.objects.iter())
+            .flat_map(|l| l.objects_at(0).iter())
             .map(|o| o.id)
             .collect();
         e.apply(ToolAction::AddShape {
@@ -971,7 +1126,7 @@ mod tests {
         e.scene()
             .layers()
             .iter()
-            .flat_map(|l| l.objects.iter())
+            .flat_map(|l| l.objects_at(0).iter())
             .map(|o| o.id)
             .find(|id| !before.contains(id))
     }
@@ -1055,7 +1210,7 @@ mod tests {
             .scene()
             .layers()
             .iter()
-            .flat_map(|l| l.objects.iter())
+            .flat_map(|l| l.objects_at(0).iter())
             .find_map(|o| match &o.kind {
                 ObjectKind::Shape(s) if s.fill.map(|f| f.color.to_rgba8().to_u8_array()[0]) == Some(255) => {
                     Some(s.path.area().abs())
@@ -1089,7 +1244,7 @@ mod tests {
         e.scene()
             .layers()
             .iter()
-            .flat_map(|l| l.objects.iter())
+            .flat_map(|l| l.objects_at(0).iter())
             .filter_map(|o| match &o.kind {
                 ObjectKind::Shape(s) => Some(s.path.area().abs()),
                 _ => None,
@@ -1176,11 +1331,11 @@ mod tests {
 
         e.run(Command::GroupSelection);
         assert_eq!(e.scene().shape_count(), 2, "the leaves still exist");
-        let top_level = e.scene().layers().iter().map(|l| l.objects.len()).sum::<usize>();
+        let top_level = e.scene().layers().iter().map(|l| l.objects_at(0).len()).sum::<usize>();
         assert_eq!(top_level, 1, "they should be inside one group");
 
         e.run(Command::UngroupSelection);
-        let top_level = e.scene().layers().iter().map(|l| l.objects.len()).sum::<usize>();
+        let top_level = e.scene().layers().iter().map(|l| l.objects_at(0).len()).sum::<usize>();
         assert_eq!(top_level, 2, "ungrouping should free both");
     }
 

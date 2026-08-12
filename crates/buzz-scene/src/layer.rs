@@ -24,6 +24,7 @@ use peniko::Color;
 use serde::{Deserialize, Serialize};
 
 use crate::object::{Object, ObjectId};
+use crate::timeline::{FrameKind, LayerTimeline};
 
 /// Stable identity for a layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -122,8 +123,8 @@ pub struct Layer {
     /// state — it never affects rendering.
     pub collapsed: bool,
 
-    /// Artwork, in paint order: index 0 is at the back.
-    pub objects: Arc<Vec<Arc<Object>>>,
+    /// The layer's frames. Artwork lives in keyframes, not on the layer.
+    pub frames: LayerTimeline,
 }
 
 /// Animate cycles through these when creating layers.
@@ -151,7 +152,7 @@ impl Layer {
             outline: false,
             height: LayerHeight::Normal,
             collapsed: false,
-            objects: Arc::new(Vec::new()),
+            frames: LayerTimeline::new(),
         }
     }
 
@@ -167,30 +168,57 @@ impl Layer {
         self.visible && !self.locked && self.kind.holds_artwork()
     }
 
-    /// Should this layer's artwork be drawn on the stage right now?
-    pub fn is_drawable(&self) -> bool {
-        self.visible && self.kind.paints_on_stage() && !self.objects.is_empty()
+    /// Should this layer's artwork be drawn at `frame`?
+    pub fn is_drawable_at(&self, frame: u32) -> bool {
+        self.visible && self.kind.paints_on_stage() && !self.objects_at(frame).is_empty()
     }
 
-    /// Add an object on top of the layer's existing artwork.
-    pub fn push_object(&mut self, object: Arc<Object>) {
-        Arc::make_mut(&mut self.objects).push(object);
+    /// Artwork shown at `frame`, in paint order.
+    pub fn objects_at(&self, frame: u32) -> &[Arc<Object>] {
+        self.frames.objects_at(frame)
     }
 
+    /// What the timeline should draw for `frame`.
+    pub fn frame_kind(&self, frame: u32) -> FrameKind {
+        self.frames.frame_kind(frame)
+    }
+
+    /// How many frames this layer occupies.
+    pub fn length(&self) -> u32 {
+        self.frames.length()
+    }
+
+    /// Add an object to the keyframe governing `frame`.
+    pub fn push_object_at(&mut self, frame: u32, object: Arc<Object>) -> bool {
+        self.frames.push_object(frame, object)
+    }
+
+    /// Remove an object from wherever on this layer it appears.
     pub fn remove_object(&mut self, id: ObjectId) -> Option<Arc<Object>> {
-        let objects = Arc::make_mut(&mut self.objects);
-        let index = objects.iter().position(|o| o.id == id)?;
-        Some(objects.remove(index))
+        self.frames.remove_object(id)
     }
 
+    /// Find an object anywhere on this layer, across all keyframes.
     pub fn find_object(&self, id: ObjectId) -> Option<&Arc<Object>> {
-        self.objects.iter().find(|o| o.id == id)
+        self.frames.all_objects().find(|o| o.id == id)
     }
 
-    /// Bounds of everything on the layer.
-    pub fn bounds(&self) -> Option<buzz_geom::Rect> {
-        self.objects
+    /// Every object on the layer, across all keyframes.
+    pub fn all_objects(&self) -> impl Iterator<Item = &Arc<Object>> {
+        self.frames.all_objects()
+    }
+
+    /// Bounds of the artwork shown at `frame`.
+    pub fn bounds_at(&self, frame: u32) -> Option<buzz_geom::Rect> {
+        self.objects_at(frame)
             .iter()
+            .map(|o| o.bounds())
+            .reduce(|a, b| a.union(b))
+    }
+
+    /// Bounds of everything on the layer, across every frame.
+    pub fn bounds(&self) -> Option<buzz_geom::Rect> {
+        self.all_objects()
             .map(|o| o.bounds())
             .reduce(|a, b| a.union(b))
     }
@@ -401,10 +429,15 @@ impl LayerStack {
         None
     }
 
-    /// Layers whose artwork should be drawn, back to front.
-    pub fn drawable(&self) -> impl Iterator<Item = &Arc<Layer>> {
+    /// Layers whose artwork should be drawn at `frame`, back to front.
+    pub fn drawable_at(&self, frame: u32) -> impl Iterator<Item = &Arc<Layer>> {
         self.paint_order()
-            .filter(|l| l.is_drawable() && self.is_effectively_visible(l.id))
+            .filter(move |l| l.is_drawable_at(frame) && self.is_effectively_visible(l.id))
+    }
+
+    /// Longest layer, which is the document's frame count.
+    pub fn frame_count(&self) -> u32 {
+        self.layers.iter().map(|l| l.length()).max().unwrap_or(1)
     }
 
     /// Layers the user can currently select on.

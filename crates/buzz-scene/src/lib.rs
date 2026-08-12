@@ -1,10 +1,10 @@
-//! The BuzzAnimate document model.
+﻿//! The BuzzAnimate document model.
 //!
 //! # Copy-on-write, and why the whole architecture rests on it
 //!
 //! A [`Scene`] is an immutable snapshot built from `Arc`s. Cloning one copies
 //! pointers, not artwork, and editing a clone touches only the objects that
-//! actually changed — [`Arc::make_mut`] clones a node just when another
+//! actually changed â€” [`Arc::make_mut`] clones a node just when another
 //! snapshot still shares it.
 //!
 //! Three properties fall out of that, and they are the reason for the design:
@@ -14,7 +14,7 @@
 //!    editing and drawing, so an edit cannot stall a frame and a frame cannot
 //!    stall an edit.
 //! 2. **Undo is nearly free.** Old snapshots *are* the history. Undo is
-//!    swapping back to a previous `Scene`, not replaying inverse operations —
+//!    swapping back to a previous `Scene`, not replaying inverse operations â€”
 //!    which is where undo systems usually accumulate bugs.
 //! 3. **Background work is safe by construction.** Autosave, thumbnails and
 //!    index rebuilds take a snapshot and work from it with no coordination.
@@ -25,9 +25,11 @@
 //! [`SpatialIndex`] records the revision it was built from, so a consumer can
 //! tell whether what it holds is current instead of trusting it blindly.
 
+pub mod camera_track;
 pub mod index;
 pub mod layer;
 pub mod object;
+pub mod timeline;
 
 use std::sync::Arc;
 
@@ -35,14 +37,16 @@ use buzz_geom::{Affine, Rect, Size};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
+pub use camera_track::{CameraKey, CameraTrack};
 pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
 pub use object::{FillSpec, Object, ObjectId, ObjectKind, ShapeData, StrokeSpec};
+pub use timeline::{FrameKind, Keyframe, LayerTimeline};
 
 /// Stage setup, matching Animate's Document Properties dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StageProperties {
-    /// Stage size in document units. Animate's default is 550×400.
+    /// Stage size in document units. Animate's default is 550Ã—400.
     pub size: Size,
     pub background: Color,
     pub frame_rate: f64,
@@ -98,6 +102,8 @@ impl IdAllocator {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scene {
     pub stage: StageProperties,
+    /// The animated camera. Off until the user enables it.
+    pub camera: CameraTrack,
     layers: LayerStack,
     ids: IdAllocator,
     revision: u64,
@@ -107,6 +113,7 @@ impl Default for Scene {
     fn default() -> Self {
         let mut scene = Self {
             stage: StageProperties::default(),
+            camera: CameraTrack::new(),
             layers: LayerStack::new(),
             ids: IdAllocator::default(),
             revision: 0,
@@ -124,6 +131,7 @@ impl Scene {
     pub fn empty() -> Self {
         Self {
             stage: StageProperties::default(),
+            camera: CameraTrack::new(),
             layers: LayerStack::new(),
             ids: IdAllocator::default(),
             revision: 0,
@@ -177,28 +185,72 @@ impl Scene {
         ok
     }
 
-    /// Place a shape on a layer, returning its new id.
-    pub fn add_shape(&mut self, layer: LayerId, shape: ShapeData) -> Option<ObjectId> {
+    /// Place a shape on a layer at `frame`.
+    ///
+    /// The artwork lands on the keyframe governing that frame, so drawing on
+    /// frame 7 of a span beginning at frame 5 edits frame 5 — Animate's
+    /// behaviour.
+    pub fn add_shape_at(
+        &mut self,
+        layer: LayerId,
+        frame: u32,
+        shape: ShapeData,
+    ) -> Option<ObjectId> {
         let id = ObjectId(self.ids.take());
         let object = Arc::new(Object::shape(id, shape));
+        let mut placed = false;
         self.layers
-            .update(layer, |l| l.push_object(object))
-            .then(|| {
-                self.bump();
-                id
-            })
+            .update(layer, |l| placed = l.push_object_at(frame, object));
+        placed.then(|| {
+            self.bump();
+            id
+        })
     }
 
-    /// Place an already-built object on a layer.
-    pub fn add_object(&mut self, layer: LayerId, object: Object) -> Option<ObjectId> {
+    /// Place a shape on frame 0. Convenience for tests and importers.
+    pub fn add_shape(&mut self, layer: LayerId, shape: ShapeData) -> Option<ObjectId> {
+        self.add_shape_at(layer, 0, shape)
+    }
+
+    /// Place an already-built object on a layer at `frame`.
+    pub fn add_object_at(&mut self, layer: LayerId, frame: u32, object: Object) -> Option<ObjectId> {
         let id = object.id;
         self.ids.reserve_above(id.0);
+        let mut placed = false;
         self.layers
-            .update(layer, |l| l.push_object(Arc::new(object)))
-            .then(|| {
-                self.bump();
-                id
-            })
+            .update(layer, |l| placed = l.push_object_at(frame, Arc::new(object)));
+        placed.then(|| {
+            self.bump();
+            id
+        })
+    }
+
+    /// Place an already-built object on frame 0.
+    pub fn add_object(&mut self, layer: LayerId, object: Object) -> Option<ObjectId> {
+        self.add_object_at(layer, 0, object)
+    }
+
+    /// Frames in the document: the longest layer, and at least one.
+    pub fn frame_count(&self) -> u32 {
+        self.layers
+            .frame_count()
+            .max(self.camera.last_frame() + 1)
+            .max(1)
+    }
+
+    /// Duration in seconds at the document's frame rate.
+    pub fn duration_seconds(&self) -> f64 {
+        let fps = if self.stage.frame_rate > 0.0 {
+            self.stage.frame_rate
+        } else {
+            24.0
+        };
+        self.frame_count() as f64 / fps
+    }
+
+    /// The camera transform for `frame`, or identity when the camera is off.
+    pub fn camera_transform(&self, frame: u32) -> Affine {
+        self.camera.transform_at(frame, self.stage.size)
     }
 
     /// Allocate an id without attaching anything to the document yet.
@@ -232,16 +284,25 @@ impl Scene {
         removed
     }
 
-    /// Total leaf shapes across every layer.
+    /// Total leaf shapes across every layer and every keyframe.
     pub fn shape_count(&self) -> usize {
         self.layers
             .iter()
-            .flat_map(|l| l.objects.iter())
+            .flat_map(|l| l.all_objects())
             .map(|o| o.shape_count())
             .sum()
     }
 
-    /// Bounds of all artwork, ignoring the stage rectangle.
+    /// Leaf shapes visible at `frame`.
+    pub fn shape_count_at(&self, frame: u32) -> usize {
+        self.layers
+            .iter()
+            .flat_map(|l| l.objects_at(frame).iter())
+            .map(|o| o.shape_count())
+            .sum()
+    }
+
+    /// Bounds of all artwork across every frame, ignoring the stage rectangle.
     pub fn content_bounds(&self) -> Option<Rect> {
         self.layers.iter().filter_map(|l| l.bounds()).reduce(|a, b| a.union(b))
     }
@@ -259,11 +320,11 @@ impl Scene {
     ///
     /// Depth increases towards the front, matching the convention in
     /// `buzz_geom::hit` where later entries are on top.
-    pub fn index_entries(&self) -> Vec<IndexEntry> {
+    pub fn index_entries_at(&self, frame: u32) -> Vec<IndexEntry> {
         let mut entries = Vec::new();
         let mut depth = 0usize;
-        for layer in self.layers.drawable() {
-            for object in layer.objects.iter() {
+        for layer in self.layers.drawable_at(frame) {
+            for object in layer.objects_at(frame) {
                 if !object.visible {
                     continue;
                 }
@@ -279,25 +340,40 @@ impl Scene {
         entries
     }
 
-    /// Build a spatial index for this snapshot.
+    /// Index entries for frame 0.
+    pub fn index_entries(&self) -> Vec<IndexEntry> {
+        self.index_entries_at(0)
+    }
+
+    /// Build a spatial index for `frame`.
     ///
     /// Cheap enough to call directly for small documents; for large ones run it
     /// on the background pool and hand the result over when it is ready.
-    pub fn build_index(&self) -> SpatialIndex {
-        SpatialIndex::build(self.index_entries(), self.revision)
+    pub fn build_index_at(&self, frame: u32) -> SpatialIndex {
+        SpatialIndex::build(self.index_entries_at(frame), self.revision)
     }
 
-    /// Every drawable shape with its resolved world transform, in paint order.
+    pub fn build_index(&self) -> SpatialIndex {
+        self.build_index_at(0)
+    }
+
+    /// Every shape visible at `frame`, with its resolved world transform.
     ///
-    /// This is what the renderer consumes.
-    pub fn flatten_for_render(&self) -> Vec<(Affine, ShapeData)> {
+    /// The camera transform is *not* applied here: the renderer needs to know
+    /// where artwork sits in document space for hit-testing and culling, and
+    /// applies the camera separately.
+    pub fn flatten_at(&self, frame: u32) -> Vec<(Affine, ShapeData)> {
         let mut out = Vec::new();
-        for layer in self.layers.drawable() {
-            for object in layer.objects.iter() {
+        for layer in self.layers.drawable_at(frame) {
+            for object in layer.objects_at(frame) {
                 object.flatten(Affine::IDENTITY, &mut out);
             }
         }
         out
+    }
+
+    pub fn flatten_for_render(&self) -> Vec<(Affine, ShapeData)> {
+        self.flatten_at(0)
     }
 }
 
@@ -429,13 +505,13 @@ mod tests {
     /// Snapshotting is `O(1)`, not `O(objects)`.
     ///
     /// Cloning a `Scene` clones the single `Arc` wrapping the layer list, so
-    /// nothing per-object happens at all — the individual object refcounts are
+    /// nothing per-object happens at all â€” the individual object refcounts are
     /// untouched. Copy-on-write only descends into a layer, and then into an
     /// object, at the moment one is actually edited.
     #[test]
     fn cloning_a_scene_shares_structure_wholesale() {
         let (scene, layer) = scene_with_shapes(50);
-        let object = Arc::clone(scene.layers().get(layer).unwrap().objects.first().unwrap());
+        let object = Arc::clone(scene.layers().get(layer).unwrap().objects_at(0).first().unwrap());
         let before = Arc::strong_count(&object);
 
         let clones: Vec<Scene> = (0..20).map(|_| scene.clone()).collect();
@@ -475,16 +551,16 @@ mod tests {
     fn an_edit_touches_only_what_changed() {
         let (mut scene, layer) = scene_with_shapes(20);
         let untouched_before =
-            Arc::as_ptr(scene.layers().get(layer).unwrap().objects.last().unwrap());
+            Arc::as_ptr(scene.layers().get(layer).unwrap().objects_at(0).last().unwrap());
 
         scene.update_layer(layer, |l| {
-            let objects = Arc::make_mut(&mut l.objects);
+            let objects = l.frames.objects_at_mut(0).expect("frame 0 exists");
             let first = Arc::make_mut(&mut objects[0]);
             first.transform = Affine::translate((5.0, 5.0));
         });
 
         let untouched_after =
-            Arc::as_ptr(scene.layers().get(layer).unwrap().objects.last().unwrap());
+            Arc::as_ptr(scene.layers().get(layer).unwrap().objects_at(0).last().unwrap());
         assert_eq!(
             untouched_before, untouched_after,
             "an unrelated object was reallocated"

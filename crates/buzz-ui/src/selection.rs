@@ -101,6 +101,20 @@ impl Selection {
         }
     }
 
+    /// Drop anything not visible at `frame`.
+    ///
+    /// Moving the playhead can leave the selection pointing at artwork on a
+    /// keyframe that is no longer showing, which would draw transform handles
+    /// around something the user cannot see.
+    pub fn prune_to_frame(&mut self, scene: &Scene, frame: u32) {
+        self.objects.retain(|id| {
+            scene
+                .layers()
+                .iter()
+                .any(|l| l.objects_at(frame).iter().any(|o| o.id == *id))
+        });
+    }
+
     /// Ensure there is an active layer, choosing a sensible one if not.
     ///
     /// Prefers the topmost layer that can actually hold artwork, since locked

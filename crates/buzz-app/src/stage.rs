@@ -42,7 +42,7 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect) {
 
     // The stage rectangle. Everything outside it is pasteboard, which the
     // window's clear colour already provides.
-    builder.fill_shape(&scene.stage.stage_rect(), scene.stage.background);
+    builder.fill_shape(&scene.stage().stage_rect(), scene.stage().background);
 
     let frame = editor.current_frame;
     // The camera is part of the document, so it transforms artwork but not the
@@ -159,7 +159,7 @@ pub fn draw_chrome(ui: &mut Ui, editor: &Editor, area: egui::Rect) -> ChromeResp
     }
 
     // The stage border sits above the grid but below artwork chrome.
-    let stage = editor.scene().stage.stage_rect();
+    let stage = editor.scene().stage().stage_rect();
     let stage_rect = egui::Rect::from_two_pos(
         to_screen(Point::new(stage.x0, stage.y0)),
         to_screen(Point::new(stage.x1, stage.y1)),

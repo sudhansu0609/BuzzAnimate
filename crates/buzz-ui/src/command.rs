@@ -61,6 +61,25 @@ pub enum Command {
     NewLayerFolder,
     DeleteLayer,
 
+    // Timeline
+    InsertFrame,
+    RemoveFrame,
+    InsertKeyframe,
+    InsertBlankKeyframe,
+    ClearKeyframe,
+    PlayPause,
+    NextFrame,
+    PreviousFrame,
+    FirstFrame,
+    LastFrame,
+    ToggleOnionSkin,
+
+    // Camera
+    ToggleCamera,
+    AddCameraKeyframe,
+    RemoveCameraKeyframe,
+    ResetCamera,
+
     // Tools
     SelectTool(super::tools::ToolId),
 }
@@ -113,6 +132,23 @@ impl Command {
             NewLayer => "New Layer",
             NewLayerFolder => "New Folder",
             DeleteLayer => "Delete Layer",
+
+            InsertFrame => "Insert Frame",
+            RemoveFrame => "Remove Frame",
+            InsertKeyframe => "Insert Keyframe",
+            InsertBlankKeyframe => "Insert Blank Keyframe",
+            ClearKeyframe => "Clear Keyframe",
+            PlayPause => "Play/Pause",
+            NextFrame => "Next Frame",
+            PreviousFrame => "Previous Frame",
+            FirstFrame => "First Frame",
+            LastFrame => "Last Frame",
+            ToggleOnionSkin => "Onion Skin",
+
+            ToggleCamera => "Enable Camera",
+            AddCameraKeyframe => "Add Camera Keyframe",
+            RemoveCameraKeyframe => "Remove Camera Keyframe",
+            ResetCamera => "Reset Camera",
 
             SelectTool(_) => "Tool",
         }
@@ -173,6 +209,24 @@ impl Command {
             NewLayerFolder => sc(ctrl_alt, Key::F),
             DeleteLayer => None,
 
+            // Animate's frame shortcuts, which animators use constantly.
+            InsertFrame => sc(Modifiers::NONE, Key::F5),
+            RemoveFrame => sc(Modifiers::SHIFT, Key::F5),
+            InsertKeyframe => sc(Modifiers::NONE, Key::F6),
+            InsertBlankKeyframe => sc(Modifiers::NONE, Key::F7),
+            ClearKeyframe => sc(Modifiers::SHIFT, Key::F6),
+            PlayPause => sc(Modifiers::NONE, Key::Enter),
+            NextFrame => sc(Modifiers::NONE, Key::Period),
+            PreviousFrame => sc(Modifiers::NONE, Key::Comma),
+            FirstFrame => sc(Modifiers::NONE, Key::Home),
+            LastFrame => sc(Modifiers::NONE, Key::End),
+            ToggleOnionSkin => None,
+
+            ToggleCamera => None,
+            AddCameraKeyframe => None,
+            RemoveCameraKeyframe => None,
+            ResetCamera => None,
+
             SelectTool(_) => None,
         }
     }
@@ -229,7 +283,10 @@ mod tests {
             ToggleGuides, ToggleSnapping, TogglePasteboard, GroupSelection, UngroupSelection,
             BringToFront, BringForward, SendBackward, SendToBack, ConvertLinesToFills,
             ExpandFill, SmoothSelection, StraightenSelection, NewLayer, NewLayerFolder,
-            DeleteLayer,
+            DeleteLayer, InsertFrame, RemoveFrame, InsertKeyframe, InsertBlankKeyframe,
+            ClearKeyframe, PlayPause, NextFrame, PreviousFrame, FirstFrame, LastFrame,
+            ToggleOnionSkin, ToggleCamera, AddCameraKeyframe, RemoveCameraKeyframe,
+            ResetCamera,
         ]
     }
 
@@ -259,6 +316,22 @@ mod tests {
                 assert!(allowed, "{previous:?} and {c:?} both bind {key}");
             }
         }
+    }
+
+    /// Animators use these dozens of times a minute; they must match Animate.
+    #[test]
+    fn the_frame_shortcuts_match_animate() {
+        let expect = |c: Command, m: Modifiers, k: Key| {
+            let sc = c.shortcut().unwrap_or_else(|| panic!("{c:?} has no shortcut"));
+            assert_eq!((sc.modifiers, sc.logical_key), (m, k), "{c:?}");
+        };
+
+        expect(Command::InsertFrame, Modifiers::NONE, Key::F5);
+        expect(Command::InsertKeyframe, Modifiers::NONE, Key::F6);
+        expect(Command::InsertBlankKeyframe, Modifiers::NONE, Key::F7);
+        expect(Command::RemoveFrame, Modifiers::SHIFT, Key::F5);
+        expect(Command::ClearKeyframe, Modifiers::SHIFT, Key::F6);
+        expect(Command::PlayPause, Modifiers::NONE, Key::Enter);
     }
 
     #[test]

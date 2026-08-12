@@ -1,4 +1,4 @@
-﻿//! Serialisable mirror of [`buzz_scene::Scene`].
+//! Serialisable mirror of [`buzz_scene::Scene`].
 //!
 //! # Why a separate set of types
 //!
@@ -10,7 +10,7 @@
 //!
 //! # Two representation choices worth stating
 //!
-//! * **Paths are SVG strings.** Serialising `PathEl` as JSON enums is verbose â€”
+//! * **Paths are SVG strings.** Serialising `PathEl` as JSON enums is verbose —
 //!   a 200-segment path becomes a wall of objects. `to_svg`/`from_svg` is
 //!   compact, diff-friendly, and matches what SVG and XFL already do. It is
 //!   also *lossless*: kurbo formats coordinates with Rust's `Display` for
@@ -33,8 +33,8 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped only for a breaking change to the on-disk layout.
 ///
-/// * **1** â€” layers held a flat object list.
-/// * **2** â€” layers hold keyframes, and the document has a camera track.
+/// * **1** — layers held a flat object list.
+/// * **2** — layers hold keyframes, and the document has a camera track.
 ///
 /// Version 1 files still load: their flat list becomes a single keyframe at
 /// frame 0, which is exactly what it meant. Keeping that path is cheap and it
@@ -257,17 +257,17 @@ impl DocumentDto {
         Self {
             format_version: FORMAT_VERSION,
             stage: StageDto {
-                width: scene.stage.size.width,
-                height: scene.stage.size.height,
-                background: color_to_hex(scene.stage.background),
-                frame_rate: scene.stage.frame_rate,
+                width: scene.stage().size.width,
+                height: scene.stage().size.height,
+                background: color_to_hex(scene.stage().background),
+                frame_rate: scene.stage().frame_rate,
             },
             layers,
             max_id,
-            camera: (!scene.camera.is_empty() || scene.camera.enabled).then(|| CameraDto {
-                enabled: scene.camera.enabled,
+            camera: (!scene.camera().is_empty() || scene.camera().enabled).then(|| CameraDto {
+                enabled: scene.camera().enabled,
                 keys: scene
-                    .camera
+                    .camera()
                     .keys()
                     .iter()
                     .map(|k| CameraKeyDto {
@@ -292,7 +292,7 @@ impl DocumentDto {
         }
 
         let mut scene = Scene::empty();
-        scene.stage = StageProperties {
+        *scene.stage_mut() = StageProperties {
             size: Size::new(self.stage.width, self.stage.height),
             background: color_from_hex(&self.stage.background)?,
             frame_rate: self.stage.frame_rate,
@@ -338,7 +338,7 @@ impl DocumentDto {
         }
 
         if let Some(camera) = &self.camera {
-            scene.camera = buzz_scene::CameraTrack::from_parts(
+            *scene.camera_mut() = buzz_scene::CameraTrack::from_parts(
                 camera
                     .keys
                     .iter()
@@ -549,8 +549,8 @@ mod tests {
         let dto = DocumentDto::from_scene(&scene);
         let back = dto.to_scene().unwrap();
 
-        assert_eq!(back.stage.size, scene.stage.size);
-        assert_eq!(back.stage.frame_rate, scene.stage.frame_rate);
+        assert_eq!(back.stage().size, scene.stage().size);
+        assert_eq!(back.stage().frame_rate, scene.stage().frame_rate);
         assert_eq!(back.layers().len(), scene.layers().len());
         assert_eq!(back.shape_count(), scene.shape_count());
 
@@ -672,7 +672,7 @@ mod tests {
         assert_eq!(parsed.to_scene().unwrap().shape_count(), scene.shape_count());
 
         // Cost is dominated by path data, so measure per segment rather than
-        // in absolute bytes â€” the latter just tracks how detailed the test
+        // in absolute bytes — the latter just tracks how detailed the test
         // artwork happens to be.
         //
         // Coordinates are written at full `f64` precision, which is verbose

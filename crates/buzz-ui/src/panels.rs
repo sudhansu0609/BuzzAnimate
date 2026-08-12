@@ -135,6 +135,58 @@ pub fn menu_bar(
             );
         });
 
+        // Animate keeps playback under Control and the camera under View; the
+        // camera gets its own menu here because it has more than one item.
+        ui.menu_button("Control", |ui| {
+            for c in [
+                Command::PlayPause,
+                Command::FirstFrame,
+                Command::PreviousFrame,
+                Command::NextFrame,
+                Command::LastFrame,
+            ] {
+                item(ui, c, true, &mut raised);
+            }
+            ui.separator();
+            for c in [
+                Command::InsertFrame,
+                Command::RemoveFrame,
+                Command::InsertKeyframe,
+                Command::InsertBlankKeyframe,
+                Command::ClearKeyframe,
+            ] {
+                item(ui, c, true, &mut raised);
+            }
+            ui.separator();
+            item(ui, Command::ToggleOnionSkin, true, &mut raised);
+        });
+
+        ui.menu_button("Camera", |ui| {
+            let on = scene.camera().enabled;
+            let mark = if on { "✔ " } else { "   " };
+            if ui
+                .button(format!("{mark}{}", Command::ToggleCamera.label()))
+                .clicked()
+            {
+                raised.push(Command::ToggleCamera);
+                ui.close();
+            }
+            ui.separator();
+            for c in [
+                Command::AddCameraKeyframe,
+                Command::RemoveCameraKeyframe,
+                Command::ResetCamera,
+            ] {
+                item(ui, c, on, &mut raised);
+            }
+            ui.separator();
+            ui.label(
+                RichText::new(format!("{} keyframes", scene.camera().keys().len()))
+                    .small()
+                    .weak(),
+            );
+        });
+
         ui.menu_button("Modify", |ui| {
             item(ui, Command::GroupSelection, has_selection, &mut raised);
             item(ui, Command::UngroupSelection, has_selection, &mut raised);
@@ -257,7 +309,7 @@ fn well(ui: &mut Ui, label: &str, color: &mut Color, enabled: &mut bool) {
             *color = from_egui(rgba);
             *enabled = true;
         }
-        let mark = if *enabled { "●" } else { "∅" };
+        let mark = if *enabled { "*" } else { "x" };
         if ui
             .small_button(mark)
             .on_hover_text(format!("{label}: click to toggle on or off"))
@@ -285,36 +337,36 @@ pub fn properties_panel(
         ui.label(RichText::new("Document").strong());
         egui::Grid::new("doc-props").num_columns(2).show(ui, |ui| {
             ui.label("Width");
-            let mut w = scene.stage.size.width;
+            let mut w = scene.stage().size.width;
             if ui.add(egui::DragValue::new(&mut w).range(1.0..=16384.0)).changed() {
-                scene.stage.size.width = w;
+                scene.stage_mut().size.width = w;
                 changed = true;
             }
             ui.end_row();
 
             ui.label("Height");
-            let mut h = scene.stage.size.height;
+            let mut h = scene.stage().size.height;
             if ui.add(egui::DragValue::new(&mut h).range(1.0..=16384.0)).changed() {
-                scene.stage.size.height = h;
+                scene.stage_mut().size.height = h;
                 changed = true;
             }
             ui.end_row();
 
             ui.label("FPS");
-            let mut fps = scene.stage.frame_rate;
+            let mut fps = scene.stage().frame_rate;
             if ui
                 .add(egui::DragValue::new(&mut fps).range(0.01..=240.0).speed(0.1))
                 .changed()
             {
-                scene.stage.frame_rate = fps;
+                scene.stage_mut().frame_rate = fps;
                 changed = true;
             }
             ui.end_row();
 
             ui.label("Background");
-            let mut bg = to_egui(scene.stage.background);
+            let mut bg = to_egui(scene.stage().background);
             if ui.color_edit_button_srgba(&mut bg).changed() {
-                scene.stage.background = from_egui(bg);
+                scene.stage_mut().background = from_egui(bg);
                 changed = true;
             }
             ui.end_row();
@@ -482,7 +534,7 @@ pub fn layers_panel(
             if ui.small_button("🗑").on_hover_text("Delete layer").clicked() {
                 command = Some(Command::DeleteLayer);
             }
-            if ui.small_button("📁").on_hover_text("New folder").clicked() {
+            if ui.small_button("Fld").on_hover_text("New folder").clicked() {
                 command = Some(Command::NewLayerFolder);
             }
             if ui.small_button("➕").on_hover_text("New layer").clicked() {
@@ -518,7 +570,7 @@ pub fn layers_panel(
                 ui.add_space(depth as f32 * 12.0);
 
                 if ui
-                    .selectable_label(set_visible, if set_visible { "👁" } else { "—" })
+                    .selectable_label(set_visible, if set_visible { "O" } else { "-" })
                     .on_hover_text("Show or hide")
                     .clicked()
                 {
@@ -544,11 +596,11 @@ pub fn layers_panel(
                 ui.painter().rect_filled(chip, 1.0, to_egui(color));
 
                 let mark = match kind {
-                    LayerKind::Folder => "📁 ",
-                    LayerKind::Mask => "◐ ",
-                    LayerKind::Masked => "· ",
-                    LayerKind::Guide => "⌖ ",
-                    LayerKind::Guided => "· ",
+                    LayerKind::Folder => "F ",
+                    LayerKind::Mask => "M ",
+                    LayerKind::Masked => ". ",
+                    LayerKind::Guide => "G ",
+                    LayerKind::Guided => ". ",
                     LayerKind::Normal => "",
                 };
                 if ui
@@ -577,7 +629,7 @@ pub fn timeline_placeholder(ui: &mut Ui, scene: &Scene) {
     ui.horizontal(|ui| {
         ui.heading("Timeline");
         ui.label(
-            RichText::new(format!("{:.0} fps", scene.stage.frame_rate))
+            RichText::new(format!("{:.0} fps", scene.stage().frame_rate))
                 .small()
                 .weak(),
         );

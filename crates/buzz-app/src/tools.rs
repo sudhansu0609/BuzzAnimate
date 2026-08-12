@@ -1,12 +1,12 @@
-﻿//! Tool behaviour.
+//! Tool behaviour.
 //!
-//! [`buzz_ui::tools`] is the catalogue â€” names, glyphs, shortcuts. This is what
+//! [`buzz_ui::tools`] is the catalogue — names, glyphs, shortcuts. This is what
 //! the tools actually *do*.
 //!
 //! # Shape of the design
 //!
 //! A gesture is three events: press, drag, release. [`ToolAction`] is what a
-//! tool asks for, and the editor carries it out â€” tools never touch the
+//! tool asks for, and the editor carries it out — tools never touch the
 //! document directly. That keeps undo labelling, layer locking and the
 //! merge-shape rules in one place instead of repeated in every tool, where one
 //! of them would inevitably be forgotten.
@@ -40,7 +40,7 @@ pub enum ToolAction {
     MoveSelection { delta: Vec2 },
     /// Scale the selection about a fixed corner.
     TransformSelection { transform: Affine },
-    /// Drag one anchor of the selected path â€” Animate's Subselection tool.
+    /// Drag one anchor of the selected path — Animate's Subselection tool.
     MoveAnchor { element: usize, delta: Vec2 },
     /// Erase within a stroked path.
     Erase { path: BezPath, width: f64 },
@@ -52,6 +52,8 @@ pub enum ToolAction {
     SampleColor { point: Point },
     /// Pan the view.
     PanView { delta_screen: Vec2 },
+    /// Move the document camera. Unlike `PanView` this changes the animation.
+    MoveCamera { delta_doc: Vec2 },
     /// Zoom about a screen point.
     ZoomView { factor: f64, at_screen: Point },
     /// Clear the selection.
@@ -211,11 +213,21 @@ impl ToolMachine {
                 }
                 ToolAction::None
             }
-            Gesture::Dragging { current, mods: m, .. } => {
+            Gesture::Dragging {
+                current,
+                mods: m,
+                ..
+            } => {
+                let previous = *current;
                 *current = doc;
                 *m = mods;
                 match self.tool {
                     ToolId::Hand => ToolAction::PanView { delta_screen },
+                    // The camera moves live so the user can see the framing
+                    // they are choosing, rather than only on release.
+                    ToolId::Camera => ToolAction::MoveCamera {
+                        delta_doc: doc - previous,
+                    },
                     _ => ToolAction::None,
                 }
             }
@@ -292,7 +304,7 @@ impl ToolMachine {
             },
             ToolId::Brush => {
                 // The brush paints a filled stroke, so its colour comes from
-                // the fill swatch â€” as in Animate.
+                // the fill swatch — as in Animate.
                 let width = brush_width(self.tool, ctx.style);
                 let outline = buzz_geom::outline_stroke(
                     &path,
@@ -415,7 +427,8 @@ impl ToolMachine {
                 }
             }
 
-            ToolId::Hand => ToolAction::None,
+            // Both act during the drag; there is nothing left to do on release.
+            ToolId::Hand | ToolId::Camera => ToolAction::None,
             _ => ToolAction::None,
         }
     }
@@ -457,7 +470,7 @@ fn contains(rect: Rect, p: Point) -> bool {
 
 /// Build the path for a drag-created shape.
 ///
-/// Shift constrains: squares, circles, and lines to 45Â° steps â€” all Animate
+/// Shift constrains: squares, circles, and lines to 45° steps — all Animate
 /// behaviours a user will reach for without thinking.
 fn build_shape_path(tool: ToolId, origin: Point, end: Point, mods: Mods) -> Option<BezPath> {
     let mut end = end;
@@ -732,7 +745,7 @@ mod tests {
     }
 
     /// Dragging from *inside* the selection moves it instead of starting a new
-    /// marquee â€” the behaviour that makes the Selection tool feel right.
+    /// marquee — the behaviour that makes the Selection tool feel right.
     #[test]
     fn dragging_from_inside_the_selection_moves_it() {
         let style = DrawStyle::default();
@@ -770,7 +783,7 @@ mod tests {
         }
     }
 
-    /// The brush paints a filled outline, not a stroke â€” Animate's behaviour,
+    /// The brush paints a filled outline, not a stroke — Animate's behaviour,
     /// and why it uses the fill colour.
     #[test]
     fn the_brush_produces_a_filled_outline() {

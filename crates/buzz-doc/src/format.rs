@@ -1,4 +1,4 @@
-//! The `.buzz` container.
+﻿//! The `.buzz` container.
 //!
 //! A zip archive, laid out so the parts that will grow later already have a
 //! home:
@@ -240,7 +240,7 @@ mod tests {
 
         assert_eq!(back.shape_count(), scene.shape_count());
         assert_eq!(back.layers().len(), scene.layers().len());
-        assert_eq!(back.stage.size, scene.stage.size);
+        assert_eq!(back.stage().size, scene.stage().size);
     }
 
     #[test]

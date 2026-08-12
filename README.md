@@ -15,7 +15,7 @@ AVM2/ABC), ISO standards (PDF), or plain XML (XFL).
 
 ---
 
-## Status: Phases 0–2 complete
+## Status: Phases 0–3 complete
 
 BuzzAnimate is now a working editor. It opens on an Animate-shaped window —
 menu bar, tool strip, rulers around a white stage on a grey pasteboard, layers
@@ -27,9 +27,15 @@ Animate's **Merge Shape** model works as it should: overlapping fills of the
 same colour fuse, a different colour cuts. Object Drawing is the alternative,
 on the `J` toggle.
 
-Not yet implemented, and honestly marked as such in the toolbar: gradients,
-Text, Lasso, Bézier pen authoring, multiple Scenes, clipboard. Frames and
-tweening arrive in Phase 3. See `PROGRESS.md` §7 for the full list.
+Phase 3 added the **timeline**: keyframes and frame spans with Animate's
+F5/F6/F7 behaviour, a frame grid using Animate's drawing conventions, playback
+that runs on wall-clock time rather than frames rendered, onion skinning, and
+an animated **camera** whose keys interpolate — zoom geometrically, rotation by
+the shortest way round.
+
+Not yet implemented, and honestly marked as such in the toolbar: tweening,
+gradients, Text, Lasso, Bézier pen authoring, multiple Scenes, clipboard. See
+`PROGRESS.md` §7 for the full list.
 
 ---
 
@@ -158,7 +164,7 @@ grep -A1 '^name = "wgpu"' Cargo.lock   # must list exactly one version
 ## Testing
 
 ```sh
-cargo test --workspace            # 340 tests
+cargo test --workspace            # 395 tests
 cargo clippy --workspace --all-targets
 cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 ```

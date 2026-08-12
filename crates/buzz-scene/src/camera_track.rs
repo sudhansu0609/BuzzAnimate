@@ -276,7 +276,7 @@ mod tests {
         // Halfway is 360 (== 0), not 180.
         let normalised = ((mid % 360.0) + 360.0) % 360.0;
         assert!(
-            normalised < 1.0 || normalised > 359.0,
+            !(1.0..=359.0).contains(&normalised),
             "expected roughly 0 or 360 degrees, got {normalised}"
         );
     }

@@ -263,6 +263,17 @@ fn keyboard_commands(ctx: &egui::Context, editor: &Editor) -> Vec<Command> {
         Command::SendToBack,
         Command::NewLayer,
         Command::NewLayerFolder,
+        // Timeline. Animators press these constantly, so they must be live.
+        Command::InsertFrame,
+        Command::RemoveFrame,
+        Command::InsertKeyframe,
+        Command::InsertBlankKeyframe,
+        Command::ClearKeyframe,
+        Command::PlayPause,
+        Command::NextFrame,
+        Command::PreviousFrame,
+        Command::FirstFrame,
+        Command::LastFrame,
     ];
     for command in all {
         if let Some(shortcut) = command.shortcut()
@@ -331,9 +342,17 @@ impl App {
 
             egui::Panel::bottom("timeline")
                 .resizable(true)
-                .default_size(150.0)
+                .default_size(170.0)
                 .show(ui, |ui| {
-                    panels::timeline_placeholder(ui, self.editor.scene());
+                    let state = buzz_ui::TimelineState {
+                        current_frame: self.editor.current_frame,
+                        active_layer: self.editor.selection.active_layer(),
+                        playing: self.editor.playback.playing,
+                        onion_enabled: self.editor.onion.enabled,
+                    };
+                    let response =
+                        buzz_ui::timeline_panel(ui, self.editor.scene(), &state);
+                    self.apply_timeline(response, &mut commands);
                 });
 
             egui::Panel::left("tools")
@@ -406,6 +425,43 @@ impl App {
         }
 
         stage_area
+    }
+
+    /// Turn timeline interactions into editor actions.
+    fn apply_timeline(&mut self, response: buzz_ui::TimelineResponse, commands: &mut Vec<Command>) {
+        if let Some(frame) = response.scrub_to {
+            // Scrubbing stops playback, as it does in Animate: the user has
+            // taken manual control of the playhead.
+            self.editor.playback.playing = false;
+            self.editor.set_frame(frame);
+        }
+        if let Some(layer) = response.select_layer {
+            self.editor.selection.set_active_layer(Some(layer));
+        }
+        if let Some(action) = response.action {
+            commands.push(match action {
+                buzz_ui::FrameAction::InsertFrame => Command::InsertFrame,
+                buzz_ui::FrameAction::RemoveFrame => Command::RemoveFrame,
+                buzz_ui::FrameAction::InsertKeyframe => Command::InsertKeyframe,
+                buzz_ui::FrameAction::InsertBlankKeyframe => Command::InsertBlankKeyframe,
+                buzz_ui::FrameAction::ClearKeyframe => Command::ClearKeyframe,
+            });
+        }
+        if response.toggle_play {
+            commands.push(Command::PlayPause);
+        }
+        if response.toggle_onion {
+            commands.push(Command::ToggleOnionSkin);
+        }
+        if response.go_to_start {
+            commands.push(Command::FirstFrame);
+        }
+        if response.go_to_end {
+            commands.push(Command::LastFrame);
+        }
+        if response.step != 0 {
+            self.editor.step_frame(response.step);
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -625,8 +681,16 @@ impl App {
         };
 
         let now = Instant::now();
-        active.frame_ms = now.duration_since(active.last_frame).as_secs_f32() * 1000.0;
+        let elapsed = now.duration_since(active.last_frame);
+        active.frame_ms = elapsed.as_secs_f32() * 1000.0;
         active.last_frame = now;
+
+        // Playback runs on wall-clock time, so the document plays at its
+        // authored rate regardless of the display's refresh rate.
+        self.editor.advance_playback(elapsed.as_secs_f64());
+        let Some(active) = self.active.as_mut() else {
+            return Ok(());
+        };
 
         let raw_input = active.egui_state.take_egui_input(&active.window);
         let egui_ctx = active.egui_ctx.clone();

@@ -1,10 +1,10 @@
-﻿//! The BuzzAnimate document model.
+//! The BuzzAnimate document model.
 //!
 //! # Copy-on-write, and why the whole architecture rests on it
 //!
 //! A [`Scene`] is an immutable snapshot built from `Arc`s. Cloning one copies
 //! pointers, not artwork, and editing a clone touches only the objects that
-//! actually changed â€” [`Arc::make_mut`] clones a node just when another
+//! actually changed — [`Arc::make_mut`] clones a node just when another
 //! snapshot still shares it.
 //!
 //! Three properties fall out of that, and they are the reason for the design:
@@ -14,7 +14,7 @@
 //!    editing and drawing, so an edit cannot stall a frame and a frame cannot
 //!    stall an edit.
 //! 2. **Undo is nearly free.** Old snapshots *are* the history. Undo is
-//!    swapping back to a previous `Scene`, not replaying inverse operations â€”
+//!    swapping back to a previous `Scene`, not replaying inverse operations —
 //!    which is where undo systems usually accumulate bugs.
 //! 3. **Background work is safe by construction.** Autosave, thumbnails and
 //!    index rebuilds take a snapshot and work from it with no coordination.
@@ -46,7 +46,7 @@ pub use timeline::{FrameKind, Keyframe, LayerTimeline};
 /// Stage setup, matching Animate's Document Properties dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StageProperties {
-    /// Stage size in document units. Animate's default is 550Ã—400.
+    /// Stage size in document units. Animate's default is 550×400.
     pub size: Size,
     pub background: Color,
     pub frame_rate: f64,
@@ -101,9 +101,14 @@ impl IdAllocator {
 /// An immutable snapshot of the document.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scene {
-    pub stage: StageProperties,
-    /// The animated camera. Off until the user enables it.
-    pub camera: CameraTrack,
+    /// Private so every change goes through [`Scene::stage_mut`] and bumps the
+    /// revision. As a public field it was possible to resize the stage without
+    /// invalidating derived data or recording an undo step — a silent bug that
+    /// only shows up later as a stale index.
+    stage: StageProperties,
+    /// The animated camera. Off until the user enables it. Private for the
+    /// same reason as `stage`.
+    camera: CameraTrack,
     layers: LayerStack,
     ids: IdAllocator,
     revision: u64,
@@ -145,6 +150,26 @@ impl Scene {
 
     pub fn layers(&self) -> &LayerStack {
         &self.layers
+    }
+
+    pub fn stage(&self) -> &StageProperties {
+        &self.stage
+    }
+
+    /// Mutable stage properties. Bumps the revision.
+    pub fn stage_mut(&mut self) -> &mut StageProperties {
+        self.revision += 1;
+        &mut self.stage
+    }
+
+    pub fn camera(&self) -> &CameraTrack {
+        &self.camera
+    }
+
+    /// Mutable camera track. Bumps the revision, so camera moves are undoable.
+    pub fn camera_mut(&mut self) -> &mut CameraTrack {
+        self.revision += 1;
+        &mut self.camera
     }
 
     /// Mutable access that bumps the revision.
@@ -234,14 +259,14 @@ impl Scene {
     pub fn frame_count(&self) -> u32 {
         self.layers
             .frame_count()
-            .max(self.camera.last_frame() + 1)
+            .max(self.camera().last_frame() + 1)
             .max(1)
     }
 
     /// Duration in seconds at the document's frame rate.
     pub fn duration_seconds(&self) -> f64 {
-        let fps = if self.stage.frame_rate > 0.0 {
-            self.stage.frame_rate
+        let fps = if self.stage().frame_rate > 0.0 {
+            self.stage().frame_rate
         } else {
             24.0
         };
@@ -250,7 +275,7 @@ impl Scene {
 
     /// The camera transform for `frame`, or identity when the camera is off.
     pub fn camera_transform(&self, frame: u32) -> Affine {
-        self.camera.transform_at(frame, self.stage.size)
+        self.camera().transform_at(frame, self.stage().size)
     }
 
     /// Allocate an id without attaching anything to the document yet.
@@ -311,8 +336,8 @@ impl Scene {
     /// artwork sitting out on the pasteboard.
     pub fn fit_bounds(&self) -> Rect {
         match self.content_bounds() {
-            Some(content) => content.union(self.stage.stage_rect()),
-            None => self.stage.stage_rect(),
+            Some(content) => content.union(self.stage().stage_rect()),
+            None => self.stage().stage_rect(),
         }
     }
 
@@ -402,8 +427,8 @@ mod tests {
     #[test]
     fn a_new_document_matches_animates_defaults() {
         let scene = Scene::default();
-        assert_eq!(scene.stage.size, Size::new(550.0, 400.0));
-        assert_eq!(scene.stage.frame_rate, 24.0);
+        assert_eq!(scene.stage().size, Size::new(550.0, 400.0));
+        assert_eq!(scene.stage().frame_rate, 24.0);
         assert_eq!(scene.layers().len(), 1, "Animate starts with one layer");
         assert_eq!(scene.layers().iter().next().unwrap().name, "Layer_1");
     }
@@ -505,7 +530,7 @@ mod tests {
     /// Snapshotting is `O(1)`, not `O(objects)`.
     ///
     /// Cloning a `Scene` clones the single `Arc` wrapping the layer list, so
-    /// nothing per-object happens at all â€” the individual object refcounts are
+    /// nothing per-object happens at all — the individual object refcounts are
     /// untouched. Copy-on-write only descends into a layer, and then into an
     /// object, at the moment one is actually edited.
     #[test]
@@ -711,7 +736,7 @@ mod tests {
     #[test]
     fn fit_bounds_always_includes_the_stage() {
         let scene = Scene::default();
-        assert_eq!(scene.fit_bounds(), scene.stage.stage_rect());
+        assert_eq!(scene.fit_bounds(), scene.stage().stage_rect());
 
         let (mut scene, layer) = scene_with_shapes(0);
         scene.add_shape(
@@ -721,7 +746,7 @@ mod tests {
         let fit = scene.fit_bounds();
         assert!(fit.x0 <= -500.0, "pasteboard artwork should be included");
         assert!(
-            fit.x1 >= scene.stage.size.width,
+            fit.x1 >= scene.stage().size.width,
             "the stage should still be included"
         );
     }

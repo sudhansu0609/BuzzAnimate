@@ -1,14 +1,14 @@
-﻿//! Editor state and the operations the UI raises against it.
+//! Editor state and the operations the UI raises against it.
 //!
 //! Everything the application can do to a document funnels through here, so
 //! undo labelling, layer locking and Animate's merge-shape rules live in one
-//! place rather than being re-implemented â€” and eventually forgotten â€” in each
+//! place rather than being re-implemented — and eventually forgotten — in each
 //! tool and menu handler.
 
 use std::sync::Arc;
 
 use buzz_doc::Document;
-use buzz_geom::{Affine, BezPath, Camera, Point, Rect, Shape as _, Size};
+use buzz_geom::{Affine, BezPath, Camera, Point, Rect, Shape as _, Size, Vec2};
 use buzz_scene::{
     FillSpec, LayerId, LayerKind, Object, ObjectId, ObjectKind, Scene, ShapeData, StrokeSpec,
 };
@@ -19,6 +19,10 @@ use crate::tools::{Mods, Preview, ToolAction, ToolContext, ToolMachine};
 
 /// How close a click must come to count as hitting a stroke, in screen pixels.
 const PICK_TOLERANCE_PX: f64 = 4.0;
+
+/// Upper bound on the playhead. Roughly 11 hours at 24 fps — far past anything
+/// real, but finite so a stray value cannot produce an absurd timeline.
+const MAX_FRAME: u32 = 999_999;
 
 /// The whole editor.
 pub struct Editor {
@@ -95,7 +99,7 @@ impl Default for Editor {
 
 impl Editor {
     pub fn new(doc: Document) -> Self {
-        let stage = doc.scene().stage.stage_rect();
+        let stage = doc.scene().stage().stage_rect();
         let mut camera = Camera::new(stage.center(), 1.0, Size::new(1280.0, 720.0));
         camera.fit_to_rect(stage, 1.2);
 
@@ -122,10 +126,14 @@ impl Editor {
         self.current_frame
     }
 
-    /// Move the playhead, clamped to the document.
+    /// Move the playhead.
+    ///
+    /// The playhead may go **past the end of the document**, because that is
+    /// how you extend it: click an empty frame in the timeline and press F5 or
+    /// F6. Clamping to the current length would make the document impossible
+    /// to lengthen. The bound is only there to stop an absurd value.
     pub fn set_frame(&mut self, frame: u32) {
-        let last = self.doc.scene().frame_count().saturating_sub(1);
-        self.current_frame = frame.min(last);
+        self.current_frame = frame.min(MAX_FRAME);
         // A selection made on another frame refers to objects that may not be
         // present here.
         self.selection.prune_to_frame(self.doc.scene(), self.current_frame);
@@ -141,19 +149,26 @@ impl Editor {
         if !self.playback.playing {
             return;
         }
-        let fps = self.doc.scene().stage.frame_rate.max(0.01);
-        self.playback.accumulator += elapsed.clamp(0.0, 0.25);
+        let fps = self.doc.scene().stage().frame_rate.max(0.01);
+        self.playback.accumulator += elapsed.max(0.0);
 
+        // Frames advanced is capped rather than elapsed time, so a normal
+        // long-ish frame still advances the right number of frames. Clamping
+        // the elapsed time instead silently played the document slowly.
+        const MAX_CATCH_UP: u32 = 240;
+
+        // Divide rather than subtract in a loop. Repeated subtraction
+        // accumulates rounding error — half a second at 24 fps came out as 11
+        // frames instead of 12 — and it is O(frames) besides.
         let per_frame = 1.0 / fps;
-        let mut advanced = 0u32;
-        while self.playback.accumulator >= per_frame {
-            self.playback.accumulator -= per_frame;
-            advanced += 1;
-            // A long stall must not spin here catching up indefinitely.
-            if advanced > 240 {
-                self.playback.accumulator = 0.0;
-                break;
-            }
+        let whole = (self.playback.accumulator / per_frame).floor();
+        let advanced = whole.clamp(0.0, MAX_CATCH_UP as f64) as u32;
+
+        if whole >= MAX_CATCH_UP as f64 {
+            // Gave up catching up after a stall; drop the backlog.
+            self.playback.accumulator = 0.0;
+        } else {
+            self.playback.accumulator -= advanced as f64 * per_frame;
         }
         if advanced == 0 {
             return;
@@ -445,6 +460,8 @@ impl Editor {
 
             ToolAction::PanView { delta_screen } => self.camera.pan_screen(delta_screen),
 
+            ToolAction::MoveCamera { delta_doc } => self.nudge_camera(delta_doc),
+
             ToolAction::ZoomView { factor, at_screen } => {
                 self.camera.zoom_by_at(factor, at_screen);
             }
@@ -644,7 +661,7 @@ impl Editor {
             ZoomActual => self.camera.set_zoom_percent(100.0),
             ZoomFitInWindow => self.zoom_fit(),
             ZoomShowFrame => {
-                let stage = self.doc.scene().stage.stage_rect();
+                let stage = self.doc.scene().stage().stage_rect();
                 self.camera.fit_to_rect(stage, 1.05);
             }
             ZoomShowAll => {
@@ -679,8 +696,148 @@ impl Editor {
             }
             DeleteLayer => self.delete_active_layer(),
 
+            // -- timeline ----------------------------------------------------
+            InsertFrame => self.frame_op(FrameOp::InsertFrame),
+            RemoveFrame => self.frame_op(FrameOp::RemoveFrame),
+            InsertKeyframe => self.frame_op(FrameOp::InsertKeyframe),
+            InsertBlankKeyframe => self.frame_op(FrameOp::InsertBlankKeyframe),
+            ClearKeyframe => self.frame_op(FrameOp::ClearKeyframe),
+            PlayPause => self.toggle_playback(),
+            NextFrame => {
+                // Stepping past the end extends nothing; use F5 for that.
+                self.step_frame(1);
+            }
+            PreviousFrame => self.step_frame(-1),
+            FirstFrame => self.set_frame(0),
+            LastFrame => {
+                let last = self.doc.scene().frame_count().saturating_sub(1);
+                self.set_frame(last);
+            }
+            ToggleOnionSkin => self.onion.enabled = !self.onion.enabled,
+
+            // -- camera ------------------------------------------------------
+            ToggleCamera => self.toggle_camera(),
+            AddCameraKeyframe => self.add_camera_key(),
+            RemoveCameraKeyframe => {
+                let frame = self.current_frame;
+                self.doc.edit("Remove Camera Keyframe", |scene| {
+                    scene.camera_mut().remove_key(frame);
+                });
+            }
+            ResetCamera => {
+                self.doc.edit("Reset Camera", |scene| {
+                    scene.camera_mut().clear();
+                });
+            }
+
             SelectTool(tool) => self.set_tool(tool),
         }
+    }
+
+    /// Apply a frame operation to the active layer.
+    fn frame_op(&mut self, op: FrameOp) {
+        let Some(layer) = self.active_layer() else {
+            return;
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return;
+        }
+
+        let frame = self.current_frame;
+        let label = op.label();
+        let mut changed = false;
+
+        self.doc.edit(label, |scene| {
+            scene.update_layer(layer, |l| {
+                changed = match op {
+                    FrameOp::InsertFrame => l.frames.insert_frame(frame),
+                    FrameOp::RemoveFrame => l.frames.remove_frame(frame),
+                    FrameOp::InsertKeyframe => l.frames.insert_keyframe(frame),
+                    FrameOp::InsertBlankKeyframe => l.frames.insert_blank_keyframe(frame),
+                    FrameOp::ClearKeyframe => l.frames.clear_keyframe(frame),
+                };
+            });
+        });
+
+        if !changed {
+            self.status = Some(format!("{label} did nothing here"));
+        }
+        // Removing frames can shorten the document past the playhead.
+        self.set_frame(self.current_frame);
+        self.selection.prune(self.doc.scene());
+    }
+
+    /// Turn the camera on, seeding a key so it has something to show.
+    fn toggle_camera(&mut self) {
+        let frame = self.current_frame;
+        let centre = self.doc.scene().stage().stage_rect().center();
+        self.doc.edit("Toggle Camera", |scene| {
+            scene.camera_mut().enabled = !scene.camera().enabled;
+            if scene.camera().enabled && scene.camera().is_empty() {
+                // Without a key the camera would be enabled but inert, which
+                // looks like a bug.
+                scene.camera_mut().set_key(buzz_scene::CameraKey::new(frame, centre));
+            }
+        });
+        let on = self.doc.scene().camera().enabled;
+        self.status = Some(if on {
+            "Camera enabled — use the Camera tool to move it".into()
+        } else {
+            "Camera disabled".to_string()
+        });
+    }
+
+    /// Key the camera's current state at the playhead.
+    fn add_camera_key(&mut self) {
+        let frame = self.current_frame;
+        let centre = self.doc.scene().stage().stage_rect().center();
+        let current = self.doc.scene().camera().state_at(frame);
+        self.doc.edit("Camera Keyframe", |scene| {
+            scene.camera_mut().enabled = true;
+            let key = current.map(|s| buzz_scene::CameraKey { frame, ..s }).unwrap_or(
+                buzz_scene::CameraKey::new(frame, centre),
+            );
+            scene.camera_mut().set_key(key);
+        });
+    }
+
+    /// Move the camera at the playhead, keying it if needed.
+    ///
+    /// The Camera tool drags the *view*, so dragging right moves the camera
+    /// left — the same inversion a real camera has, and what Animate does.
+    pub fn nudge_camera(&mut self, delta_doc: Vec2) {
+        let frame = self.current_frame;
+        let centre = self.doc.scene().stage().stage_rect().center();
+        let current = self.doc.scene().camera().state_at(frame);
+
+        self.doc.edit("Move Camera", |scene| {
+            scene.camera_mut().enabled = true;
+            let mut key = current
+                .map(|s| buzz_scene::CameraKey { frame, ..s })
+                .unwrap_or(buzz_scene::CameraKey::new(frame, centre));
+            key.center -= delta_doc;
+            scene.camera_mut().set_key(key);
+        });
+    }
+
+    /// Zoom the camera at the playhead.
+    pub fn zoom_camera(&mut self, factor: f64) {
+        if !(factor.is_finite() && factor > 0.0) {
+            return;
+        }
+        let frame = self.current_frame;
+        let centre = self.doc.scene().stage().stage_rect().center();
+        let current = self.doc.scene().camera().state_at(frame);
+
+        self.doc.edit("Zoom Camera", |scene| {
+            scene.camera_mut().enabled = true;
+            let mut key = current
+                .map(|s| buzz_scene::CameraKey { frame, ..s })
+                .unwrap_or(buzz_scene::CameraKey::new(frame, centre));
+            key.zoom = (key.zoom * factor).clamp(0.01, 1000.0);
+            scene.camera_mut().set_key(key);
+        });
     }
 
     fn doc_add_layer(&mut self, prefix: &str, kind: LayerKind) -> LayerId {
@@ -907,7 +1064,7 @@ impl Editor {
     }
 
     pub fn zoom_fit(&mut self) {
-        let stage = self.doc.scene().stage.stage_rect();
+        let stage = self.doc.scene().stage().stage_rect();
         self.camera.fit_to_rect(stage, 1.2);
     }
 }
@@ -924,6 +1081,28 @@ enum Reorder {
 enum Reshape {
     Smooth,
     Straighten,
+}
+
+/// Frame operations, matching Animate's function keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameOp {
+    InsertFrame,
+    RemoveFrame,
+    InsertKeyframe,
+    InsertBlankKeyframe,
+    ClearKeyframe,
+}
+
+impl FrameOp {
+    fn label(self) -> &'static str {
+        match self {
+            Self::InsertFrame => "Insert Frame",
+            Self::RemoveFrame => "Remove Frame",
+            Self::InsertKeyframe => "Insert Keyframe",
+            Self::InsertBlankKeyframe => "Insert Blank Keyframe",
+            Self::ClearKeyframe => "Clear Keyframe",
+        }
+    }
 }
 
 /// Edit an object in place.
@@ -1603,6 +1782,272 @@ mod tests {
         e.run(Command::Undo);
         let restored = e.scene().find_object(id).unwrap().1.bounds();
         assert!((restored.width() - before.width()).abs() < 1e-9);
+    }
+
+    // -- frames, playback and camera ----------------------------------------
+
+    #[test]
+    fn frame_operations_extend_and_key_the_active_layer() {
+        let mut e = editor();
+        let layer = e.selection.active_layer().unwrap();
+
+        e.set_frame(0);
+        e.run(Command::InsertFrame);
+        assert_eq!(e.scene().layers().get(layer).unwrap().length(), 2);
+
+        e.set_frame(5);
+        e.run(Command::InsertKeyframe);
+        assert!(e.scene().layers().get(layer).unwrap().frames.is_keyframe(5));
+    }
+
+    /// F6 duplicates, F7 does not — the distinction animators rely on.
+    #[test]
+    fn f6_carries_artwork_forward_and_f7_does_not() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        draw_square(&mut e, 0.0, 0.0, 50.0, Color::WHITE);
+
+        e.set_frame(0);
+        e.run(Command::InsertFrame);
+        e.set_frame(1);
+        e.run(Command::InsertKeyframe);
+        assert_eq!(e.scene().shape_count_at(1), 1, "F6 should copy the artwork");
+
+        e.run(Command::InsertFrame);
+        e.set_frame(2);
+        e.run(Command::InsertBlankKeyframe);
+        assert_eq!(e.scene().shape_count_at(2), 0, "F7 should be empty");
+    }
+
+    #[test]
+    fn drawing_lands_on_the_keyframe_that_owns_the_current_frame() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let layer = e.selection.active_layer().unwrap();
+        e.doc.edit("Frames", |s| {
+            s.update_layer(layer, |l| {
+                l.frames.insert_frame(9);
+            });
+        });
+
+        // Drawing on frame 7, inside the span that began at frame 0.
+        e.set_frame(7);
+        draw_square(&mut e, 0.0, 0.0, 20.0, Color::WHITE);
+
+        assert_eq!(e.scene().shape_count_at(0), 1, "the edit belongs to frame 0");
+        assert_eq!(e.scene().shape_count_at(7), 1);
+    }
+
+    /// The playhead must be able to go past the end, or the document could
+    /// never be lengthened.
+    #[test]
+    fn the_playhead_may_move_beyond_the_document_but_not_below_zero() {
+        let mut e = editor();
+        assert_eq!(e.scene().frame_count(), 1);
+
+        e.set_frame(30);
+        assert_eq!(e.current_frame, 30, "clicking an empty frame must work");
+
+        // And F5 there extends the layer to reach it.
+        e.run(Command::InsertFrame);
+        assert_eq!(e.scene().frame_count(), 31);
+
+        e.step_frame(-1000);
+        assert_eq!(e.current_frame, 0, "must not go below zero");
+    }
+
+    /// Playback follows wall-clock time, not frames rendered.
+    #[test]
+    fn playback_advances_at_the_documents_frame_rate() {
+        let mut e = editor();
+        let layer = e.selection.active_layer().unwrap();
+        e.doc.edit("Frames", |s| {
+            s.update_layer(layer, |l| {
+                l.frames.insert_frame(23);
+            });
+        });
+        assert_eq!(e.scene().frame_count(), 24);
+
+        e.toggle_playback();
+        assert!(e.playback.playing);
+
+        // Half a second at 24 fps is 12 frames.
+        e.advance_playback(0.5);
+        assert_eq!(e.current_frame, 12, "expected 12 frames in half a second");
+    }
+
+    #[test]
+    fn playback_loops_by_default_and_can_stop_at_the_end() {
+        let mut e = editor();
+        let layer = e.selection.active_layer().unwrap();
+        e.doc.edit("Frames", |s| {
+            s.update_layer(layer, |l| {
+                l.frames.insert_frame(9);
+            });
+        });
+
+        e.toggle_playback();
+        e.advance_playback(1.0); // 24 frames over a 10-frame document
+        assert!(e.playback.playing, "looping should keep playing");
+        assert!(e.current_frame < 10);
+
+        e.playback.looping = false;
+        e.set_frame(0);
+        e.advance_playback(1.0);
+        assert!(!e.playback.playing, "without looping it should stop");
+        assert_eq!(e.current_frame, 9, "and rest on the last frame");
+    }
+
+    /// A stall must not make playback spin catching up.
+    #[test]
+    fn a_long_stall_does_not_cause_a_catch_up_storm() {
+        let mut e = editor();
+        e.toggle_playback();
+        let started = std::time::Instant::now();
+        e.advance_playback(10_000.0);
+        assert!(
+            started.elapsed().as_millis() < 100,
+            "advancing after a huge stall took {:?}",
+            started.elapsed()
+        );
+        assert!(e.current_frame < e.scene().frame_count());
+    }
+
+    #[test]
+    fn onion_frames_surround_the_playhead_and_stay_in_range() {
+        let mut e = editor();
+        let layer = e.selection.active_layer().unwrap();
+        e.doc.edit("Frames", |s| {
+            s.update_layer(layer, |l| {
+                l.frames.insert_frame(19);
+            });
+        });
+
+        assert!(e.onion_frames().is_empty(), "off by default");
+
+        e.onion.enabled = true;
+        e.set_frame(10);
+        let mut frames = e.onion_frames();
+        frames.sort_unstable();
+        assert_eq!(frames, vec![8, 9, 11, 12]);
+
+        // At frame 0 there is nothing before it.
+        e.set_frame(0);
+        let frames = e.onion_frames();
+        assert!(frames.iter().all(|f| *f > 0));
+    }
+
+    #[test]
+    fn onion_skinning_is_suppressed_during_playback() {
+        let mut e = editor();
+        e.onion.enabled = true;
+        e.set_frame(0);
+        e.playback.playing = true;
+        assert!(
+            e.onion_frames().is_empty(),
+            "ghosts during playback would be noise"
+        );
+    }
+
+    #[test]
+    fn the_camera_is_off_until_enabled_and_then_has_a_key() {
+        let mut e = editor();
+        assert!(!e.scene().camera().enabled);
+        assert_eq!(
+            e.scene().camera_transform(0).as_coeffs(),
+            Affine::IDENTITY.as_coeffs()
+        );
+
+        e.run(Command::ToggleCamera);
+        assert!(e.scene().camera().enabled);
+        assert!(
+            !e.scene().camera().is_empty(),
+            "enabling should seed a key so the camera is not inert"
+        );
+    }
+
+    /// Dragging the camera right moves the view left, like a real camera.
+    #[test]
+    fn moving_the_camera_inverts_the_drag() {
+        let mut e = editor();
+        e.run(Command::ToggleCamera);
+        let before = e.scene().camera().state_at(0).unwrap().center;
+
+        e.apply(ToolAction::MoveCamera {
+            delta_doc: Vec2::new(50.0, 0.0),
+        });
+
+        let after = e.scene().camera().state_at(0).unwrap().center;
+        assert!(
+            after.x < before.x,
+            "dragging right should move the camera left: {before:?} -> {after:?}"
+        );
+    }
+
+    #[test]
+    fn camera_keyframes_interpolate_across_the_timeline() {
+        let mut e = editor();
+        e.run(Command::ToggleCamera);
+
+        e.set_frame(0);
+        e.nudge_camera(Vec2::new(0.0, 0.0));
+        e.set_frame(10);
+        e.nudge_camera(Vec2::new(-100.0, 0.0));
+
+        let start = e.scene().camera().state_at(0).unwrap().center.x;
+        let end = e.scene().camera().state_at(10).unwrap().center.x;
+        let mid = e.scene().camera().state_at(5).unwrap().center.x;
+
+        assert!((end - start).abs() > 50.0, "the camera should have moved");
+        assert!(
+            (mid - (start + end) / 2.0).abs() < 1e-6,
+            "frame 5 should be halfway: {start} .. {mid} .. {end}"
+        );
+    }
+
+    #[test]
+    fn camera_edits_are_undoable() {
+        let mut e = editor();
+        e.run(Command::ToggleCamera);
+        let before = e.scene().camera().state_at(0).unwrap().center;
+
+        e.nudge_camera(Vec2::new(80.0, 40.0));
+        assert_ne!(e.scene().camera().state_at(0).unwrap().center, before);
+
+        e.run(Command::Undo);
+        assert_eq!(e.scene().camera().state_at(0).unwrap().center, before);
+    }
+
+    #[test]
+    fn resetting_the_camera_clears_its_keys() {
+        let mut e = editor();
+        e.run(Command::ToggleCamera);
+        e.set_frame(5);
+        e.run(Command::AddCameraKeyframe);
+        assert!(e.scene().camera().keys().len() >= 2);
+
+        e.run(Command::ResetCamera);
+        assert!(e.scene().camera().is_empty());
+    }
+
+    #[test]
+    fn the_camera_tool_is_available_now() {
+        let mut e = editor();
+        e.set_tool(ToolId::Camera);
+        assert_eq!(e.tool(), ToolId::Camera);
+    }
+
+    #[test]
+    fn frame_operations_are_refused_on_a_locked_layer() {
+        let mut e = editor();
+        let layer = e.selection.active_layer().unwrap();
+        e.doc.edit("Lock", |s| {
+            s.update_layer(layer, |l| l.locked = true);
+        });
+
+        e.run(Command::InsertKeyframe);
+        assert_eq!(e.scene().layers().get(layer).unwrap().frames.keyframe_count(), 1);
+        assert!(e.status.is_some());
     }
 
     #[test]

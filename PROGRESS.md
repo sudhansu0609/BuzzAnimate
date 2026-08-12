@@ -73,6 +73,7 @@ Rules that follow from this, applied to every phase:
 > | `cp-1.2` | Document model: COW scene, Animate layers, R-tree index |
 > | `phase-1` | `.buzz` format, undo/redo, autosave; **Phase 1 complete** |
 > | `phase-2` | Application shell, stage, toolbar, drawing and editing |
+> | `phase-3` | Timeline, keyframes, playback, onion skinning, camera |
 >
 > Tags, not commit hashes, are the identifier: a hash written into this file
 > can never name the commit that contains the file.
@@ -334,6 +335,62 @@ as empty boxes because egui's bundled fonts lack those symbols, and the status
 bar sat under the taskbar. Buttons now show their shortcut letter, which always
 renders and teaches the keyboard at the same time.
 
+### ✅ Phase 3 — Timeline, playback and the camera
+
+**CP-3.1 — frame model**
+- [x] `LayerTimeline` replaces the flat object list: keyframes owning spans
+- [x] Three genuinely distinct frame states — beyond the span, inside a span,
+      and a keyframe. A **blank keyframe is not the same as no frame**: it
+      actively clears what the previous keyframe showed.
+- [x] Animate's operations with Animate's semantics: **F6 duplicates** the
+      previous artwork (that is how you make a copy to modify), **F7 starts
+      empty**, F5/Shift+F5 insert and remove frames shifting later keyframes,
+      Shift+F6 merges a keyframe into the span before it
+- [x] Frame 0's keyframe cannot be removed — early frames would have nothing
+      to show
+- [x] Drawing inside a span edits the keyframe that *owns* it, so painting on
+      frame 7 of a span beginning at frame 5 modifies frame 5
+- [x] Binary search for frame lookup, tested on a 10 000-frame timeline
+
+**CP-3.2 — timeline panel**
+- [x] Layer rows plus frame grid, playhead, frame numbers, fps, elapsed time
+- [x] Animate's drawing conventions: filled circle = keyframe, hollow circle =
+      blank keyframe, shaded cell = span, hollow rectangle = span end
+- [x] Scrub by dragging the ruler; click a cell to move the playhead and select
+      the layer
+- [x] Transport controls, and F5/F6/F7 buttons alongside them
+- [x] Column count bounded, so a 50 000-frame document still draws quickly
+
+**CP-3.3 — playback and onion skinning**
+- [x] Playback advances on **elapsed time, not frames rendered**, so a document
+      plays at its authored rate on a 60 Hz or a 144 Hz display
+- [x] Looping on by default; without it playback stops on the last frame
+- [x] Onion skinning with configurable before/after counts, fading with
+      distance, and an outline mode; suppressed during playback
+- [x] Scrubbing stops playback, as in Animate
+
+**CP-3.4 — the camera**
+- [x] A document-level keyed view transform, so moving it is part of the
+      animation rather than part of your view of the stage
+- [x] Camera tool enabled and wired: dragging moves the camera, inverted like a
+      real camera
+- [x] Interpolation that behaves: position linear, **zoom geometric** so 1× to
+      4× passes through 2× rather than 2.5×, rotation by the **shortest way
+      round** so 350° to 10° turns forward 20°
+- [x] Values hold outside the keyed range instead of snapping to the origin
+- [x] Camera edits are undoable and are saved with the document
+
+**Bug found and fixed — silent loss of undo and index invalidation.**
+`Scene::stage` and `Scene::camera` were public fields, so writing to them never
+bumped the revision. Camera moves were therefore not undoable, and resizing the
+stage did not invalidate the spatial index. Both are now private behind
+`stage_mut()` / `camera_mut()`, which bump — and the compiler immediately found
+two more places that had been writing silently.
+
+**Format version 2.** Layers hold keyframes and documents hold a camera track.
+Version 1 files still load, their flat object list becoming a single keyframe
+at frame 0, which is exactly what it meant.
+
 ---
 
 ## 5. Current metrics
@@ -346,10 +403,10 @@ renders and teaches the keyboard at the same time.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 340 passing, clippy clean |
-| Rust source | ~13 400 lines |
+| Tests | 395 passing, clippy clean |
+| Rust source | ~16 000 lines |
 | Crates built | 7 of 15 |
-| Phases done | Phase 0, Phase 1, **Phase 2 (gaps in §7)** |
+| Phases done | Phase 0, 1, 2, **3** (gaps in §7) |
 
 ---
 
@@ -392,7 +449,7 @@ renders and teaches the keyboard at the same time.
   - [ ] Free transform, subselection, path editing
 - [ ] **Exit test:** reproduce a reference Animate drawing tool-for-tool
 
-### ⬜ Phase 3 — Timeline & frame animation
+### ✅ Phase 3 — Timeline & frame animation — **complete**
 - [ ] **CP-3.1** Timeline panel — see §8.5
   - [ ] Layer list + frame grid, playhead, frame numbers, fps, elapsed time
   - [ ] Keyframe / blank keyframe / frame span rendering in Animate's style
@@ -467,7 +524,9 @@ renders and teaches the keyboard at the same time.
 | 9 | **Text tool not implemented.** Needs font loading, shaping and a text-editing caret — a subsystem in its own right. | Phase 2 follow-up |
 | 10 | **Lasso tool not implemented.** Freehand selection region. | Phase 2 follow-up |
 | 11 | **Pen tool draws line segments, not Bézier curves.** Click-drag handle authoring is not there yet; anchors can be edited afterwards with Subselection. | Phase 2 follow-up |
-| 12 | **Multiple Scenes not implemented.** One scene per document. | With Phase 3 timeline |
+| 12 | **Multiple Scenes not implemented.** One scene per document. | Deferred |
+| 15 | **Tweening not implemented.** Frames hold discrete keyframes; only the *camera* interpolates. Classic, motion and shape tweens are Phase 4. | Phase 4 |
+| 16 | **Camera rotation and zoom have no direct gesture.** Both are keyable and interpolate correctly, and `zoom_camera` exists, but only panning is bound to a drag. | Phase 3 follow-up |
 | 13 | **Clipboard (cut/copy/paste) not implemented.** Duplicate works. | Phase 2 follow-up |
 | 14 | **Workspace layout is not persisted** across runs. | Low priority |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
@@ -553,7 +612,7 @@ cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 
 ---
 
-## 10. Next action
+## 10. Next action (superseded — see below)
 
 Two credible paths. **Phase 3 is the recommended one** — the timeline is what
 makes this an *animation* tool rather than a drawing tool, and the layer model
@@ -574,3 +633,23 @@ it needs is already built and tested.
 Phase 2 left the application genuinely usable: a document can be drawn,
 edited, saved, reopened and autosaved. The gaps are missing *features*, not
 broken ones.
+
+---
+
+## 11. Next action
+
+**Phase 4 — symbols, library and tweens** is the recommended next step, and
+tweening is the single biggest thing still missing from an animation tool:
+today frames hold discrete artwork and only the camera interpolates.
+
+- **CP-4.1** Graphic / MovieClip / Button symbols, nested timelines, instance
+  overrides, symbol editing mode with a breadcrumb bar
+- **CP-4.2** Library panel with folders, search, previews and usage counts
+- **CP-4.3** Classic and motion tweens with editable easing, shape tweens with
+  shape hints, and the Motion Editor
+
+Phase 4 must land before Phase 5, because the `.fla` and `.swf` importers need
+symbols and tweens to exist as targets.
+
+Smaller items that could come first if preferred: gradients (§7 item 8), Text,
+or binding camera rotation and zoom to gestures (§7 item 16).

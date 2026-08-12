@@ -151,12 +151,11 @@ impl ToolId {
         match self {
             Selection | Subselection | FreeTransform | Line | Rectangle | Oval | PolyStar
             | Pencil | Brush | Eraser | PaintBucket | InkBottle | Eyedropper | Hand | Zoom
-            | Pen => ToolStatus::Ready,
+            | Pen | Camera => ToolStatus::Ready,
             Text => ToolStatus::Planned("Text arrives with Phase 2 follow-up"),
             Lasso => ToolStatus::Planned("Lasso arrives with Phase 2 follow-up"),
             GradientTransform => ToolStatus::Planned("Gradients arrive with the Color panel"),
             Bone => ToolStatus::Planned("Rigging arrives in Phase 7"),
-            Camera => ToolStatus::Planned("Camera arrives in Phase 3"),
         }
     }
 
@@ -178,6 +177,14 @@ impl ToolId {
     /// Navigation tools stay usable on a locked layer.
     pub fn is_navigation(self) -> bool {
         matches!(self, ToolId::Hand | ToolId::Zoom)
+    }
+
+    /// Does the tool edit the camera rather than artwork?
+    ///
+    /// The camera belongs to the document, so this is *not* navigation even
+    /// though it looks like panning: moving it changes the exported result.
+    pub fn is_camera(self) -> bool {
+        matches!(self, ToolId::Camera)
     }
 }
 
@@ -300,9 +307,19 @@ mod tests {
     #[test]
     fn unimplemented_tools_declare_themselves() {
         assert!(matches!(ToolId::Bone.status(), ToolStatus::Planned(_)));
-        assert!(matches!(ToolId::Camera.status(), ToolStatus::Planned(_)));
+        assert!(matches!(ToolId::Text.status(), ToolStatus::Planned(_)));
         assert!(ToolId::Selection.is_ready());
         assert!(ToolId::Rectangle.is_ready());
+        assert!(ToolId::Camera.is_ready(), "the camera arrived in Phase 3");
+    }
+
+    /// The camera edits the document, so it must not be classed as navigation
+    /// — navigation tools are allowed on locked layers and are not undoable.
+    #[test]
+    fn the_camera_is_not_a_navigation_tool() {
+        assert!(ToolId::Camera.is_camera());
+        assert!(!ToolId::Camera.is_navigation());
+        assert!(!ToolId::Hand.is_camera());
     }
 
     #[test]

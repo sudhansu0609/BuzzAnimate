@@ -1,0 +1,22 @@
+[package]
+name = "buzz-import-swf"
+description = "Import Flash .swf movies as editable vectors and library symbols"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+buzz-geom.workspace = true
+buzz-scene.workspace = true
+
+kurbo.workspace = true
+peniko.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Ruffle's reader: MIT OR Apache-2.0, and the same project whose AVM2 is
+# planned for Phase 8. The `swf-parser` crate does the same job under
+# AGPL-3.0, which this project cannot take.
+swf.workspace = true

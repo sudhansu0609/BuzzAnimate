@@ -398,6 +398,40 @@ impl App {
                     });
                 });
 
+            // The Library sits in its own dock so a long symbol list scrolls
+            // independently of the properties above it, as it does in Animate.
+            egui::Panel::right("library")
+                .resizable(true)
+                .default_size(240.0)
+                .show(ui, |ui| {
+                    let editor = &mut self.editor;
+                    let library = &mut editor.library;
+                    let mut library_command = None;
+                    editor.doc.edit("Library", |scene| {
+                        library_command = buzz_ui::library_panel(ui, scene, library);
+                    });
+                    if let Some(command) = library_command {
+                        commands.push(command);
+                    }
+                });
+
+            // The edit-path breadcrumb. Animate keeps this strip directly above
+            // the stage, and it is the only way back out of a symbol.
+            //
+            // Added and removed rather than collapsed: whether it is there is
+            // decided by the document, not by the user, and egui's collapsible
+            // panel binds a `&mut bool` the user can also flip — which would
+            // let them hide their only way out of a symbol.
+            if !self.editor.scene().edit_path().is_empty() {
+                egui::Panel::top("breadcrumb")
+                    .frame(egui::Frame::new().fill(Palette::CHROME).inner_margin(3))
+                    .show(ui, |ui| {
+                        if let Some(command) = self.breadcrumb(ui) {
+                            commands.push(command);
+                        }
+                    });
+            }
+
             // Whatever is left is the stage.
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
@@ -427,6 +461,64 @@ impl App {
         stage_area
     }
 
+    /// The trail of symbols currently open, with the document at its root.
+    ///
+    /// Clicking a level jumps straight back to it. Returning a [`Command`]
+    /// rather than mutating here keeps every navigation step going through the
+    /// same dispatch path as the menu and the keyboard.
+    fn breadcrumb(&mut self, ui: &mut egui::Ui) -> Option<Command> {
+        let mut command = None;
+        let path: Vec<buzz_scene::SymbolId> = self.editor.scene().edit_path().to_vec();
+
+        ui.horizontal(|ui| {
+            if ui
+                .link(egui::RichText::new("Scene 1").small())
+                .on_hover_text("Back to the main timeline")
+                .clicked()
+            {
+                command = Some(Command::EditDocument);
+            }
+
+            for (depth, id) in path.iter().enumerate() {
+                // ">" rather than a typographic chevron: egui's bundled fonts
+                // have no glyph for "▸" and draw an empty box instead.
+                ui.label(egui::RichText::new(">").small().weak());
+
+                let name = self
+                    .editor
+                    .scene()
+                    .library()
+                    .get(*id)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| "(missing)".to_string());
+
+                // The innermost symbol is where you already are, so it is a
+                // label rather than a link.
+                let last = depth + 1 == path.len();
+                if last {
+                    ui.label(egui::RichText::new(name).small().strong());
+                } else if ui.link(egui::RichText::new(name).small()).clicked() {
+                    self.editor.library.selected = Some(*id);
+                    command = Some(Command::EditSymbol);
+                }
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Exit Symbol").clicked() {
+                    // One level out, not all the way: nested symbols are
+                    // normally stepped through one at a time.
+                    self.editor.doc.edit_view(|scene| {
+                        scene.exit_symbol();
+                    });
+                    self.editor.selection.clear();
+                    self.editor.selection.ensure_active_layer(self.editor.doc.scene());
+                }
+            });
+        });
+
+        command
+    }
+
     /// Turn timeline interactions into editor actions.
     fn apply_timeline(&mut self, response: buzz_ui::TimelineResponse, commands: &mut Vec<Command>) {
         if let Some(frame) = response.scrub_to {
@@ -445,6 +537,14 @@ impl App {
                 buzz_ui::FrameAction::InsertKeyframe => Command::InsertKeyframe,
                 buzz_ui::FrameAction::InsertBlankKeyframe => Command::InsertBlankKeyframe,
                 buzz_ui::FrameAction::ClearKeyframe => Command::ClearKeyframe,
+            });
+        }
+        if let Some(tween) = response.tween {
+            commands.push(match tween {
+                buzz_ui::TweenRequest::Motion => Command::CreateMotionTween,
+                buzz_ui::TweenRequest::Shape => Command::CreateShapeTween,
+                buzz_ui::TweenRequest::Classic => Command::CreateClassicTween,
+                buzz_ui::TweenRequest::Remove => Command::RemoveTween,
             });
         }
         if response.toggle_play {
@@ -616,7 +716,115 @@ impl App {
             Command::Save => self.save(false),
             Command::SaveAs => self.save(true),
             Command::Close => self.editor.should_quit = true,
+            Command::ImportToStage => self.import_dialog(buzz_scene::ImportTarget::Stage),
+            Command::ImportToLibrary => self.import_dialog(buzz_scene::ImportTarget::Library),
             other => self.editor.run(other),
+        }
+    }
+
+    /// Animate's File ▸ Import, for all three formats.
+    ///
+    /// The whole import is one [`Document::edit`], so a file that brings in
+    /// four hundred symbols is still a single Ctrl+Z.
+    fn import_dialog(&mut self, target: buzz_scene::ImportTarget) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("Everything BuzzAnimate can import", crate::import::IMPORTABLE)
+            .add_filter("Animate document", &["fla", "xfl"])
+            .add_filter("Flash movie", &["swf"])
+            .add_filter("PDF or Illustrator artwork", &["pdf", "ai"])
+            .pick_file();
+        let Some(path) = picked else { return };
+
+        let imported = match crate::import::read(&path) {
+            Ok(imported) => imported,
+            Err(message) => {
+                // A failed import must leave the open document untouched, which
+                // it does: nothing has been merged at this point.
+                self.editor.status = Some(format!("Could not import: {message}"));
+                return;
+            }
+        };
+
+        let label = match target {
+            buzz_scene::ImportTarget::Stage => "Import to Stage",
+            buzz_scene::ImportTarget::Library => "Import to Library",
+        };
+
+        let mut merge = None;
+        self.editor.doc.edit(label, |scene| {
+            merge = Some(scene.merge(&imported.scene, target));
+        });
+        let merge = merge.unwrap_or_default();
+
+        // An import can change how many frames the document has and which
+        // layers exist, so the editor's idea of both has to be re-settled.
+        self.editor.selection.clear();
+        self.editor.selection.ensure_active_layer(self.editor.doc.scene());
+
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+
+        self.editor.status = Some(format!("Imported {name}: {}", merge.summary()));
+
+        // Only interrupt the user when something was actually lost or moved.
+        // A clean import speaks for itself in the status bar.
+        if !imported.unsupported.is_empty() || !merge.renamed.is_empty() {
+            let mut unsupported = imported.unsupported.clone();
+            for (wanted, given) in &merge.renamed {
+                unsupported.push(format!(
+                    "\"{wanted}\" was already in the library, so it came in as \"{given}\""
+                ));
+            }
+            self.editor.import_summary = Some(crate::import::ImportSummary {
+                title: format!("Imported {name}"),
+                what_arrived: format!("{} — {}", imported.summary, merge.summary()),
+                unsupported,
+            });
+        }
+    }
+
+    /// The fidelity report, shown after an import that lost something.
+    fn import_report_window(&mut self, ctx: &egui::Context) {
+        let Some(summary) = self.editor.import_summary.clone() else {
+            return;
+        };
+        let mut open = true;
+
+        egui::Window::new(&summary.title)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(460.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(&summary.what_arrived).strong());
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "These parts of the file did not come across. \
+                         Everything else imported normally.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(4.0);
+
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for line in &summary.unsupported {
+                        ui.label(format!("• {line}"));
+                    }
+                });
+
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    self.editor.import_summary = None;
+                }
+            });
+
+        if !open {
+            self.editor.import_summary = None;
         }
     }
 
@@ -701,6 +909,8 @@ impl App {
         let mut stage_area = egui::Rect::NOTHING;
         let output = egui_ctx.run_ui(raw_input, |ui| {
             stage_area = self.build_ui(ui);
+            // Floats above the panels, so it is drawn after them.
+            self.import_report_window(ui.ctx());
         });
 
         let Some(active) = self.active.as_mut() else {

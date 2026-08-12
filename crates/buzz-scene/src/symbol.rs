@@ -197,6 +197,101 @@ impl ColorTransform {
     }
 }
 
+/// Animate's named colour effects.
+///
+/// # Why this is derived rather than stored
+///
+/// The document keeps only the multiply/add pair, because that is what a tween
+/// interpolates and what nesting composes — a stored *name* would have to be
+/// kept in step with a transform that tweening changes every frame, and the
+/// two would eventually disagree. The Properties panel needs the name back, so
+/// the mapping is inverted here, next to the constructors it inverts, and
+/// tested against them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColorEffect {
+    None,
+    /// -1 is black, 1 is white.
+    Brightness(f32),
+    Tint { color: Color, amount: f32 },
+    Alpha(f32),
+    /// A transform none of the named effects produces — the result of nesting,
+    /// of a tween part way through, or of an imported file.
+    Advanced,
+}
+
+impl ColorEffect {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Brightness(_) => "Brightness",
+            Self::Tint { .. } => "Tint",
+            Self::Alpha(_) => "Alpha",
+            Self::Advanced => "Advanced",
+        }
+    }
+
+    /// Name the effect a transform represents.
+    ///
+    /// Positive brightness and a white tint are the *same* transform, so they
+    /// cannot be told apart; this reports Brightness, being the simpler of the
+    /// two. Applying either gives an identical picture, so nothing is lost.
+    pub fn from_transform(t: &ColorTransform) -> Self {
+        if t.is_identity() {
+            return Self::None;
+        }
+        let [mr, mg, mb, ma] = t.multiply;
+        let [ar, ag, ab, aa] = t.add;
+        // Generous, because these values arrive from f32 interpolation.
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        let rgb_add_is = |v: f32| near(ar, v) && near(ag, v) && near(ab, v);
+
+        // Alpha leaves the colour alone and scales only opacity.
+        if near(mr, 1.0) && near(mg, 1.0) && near(mb, 1.0) && rgb_add_is(0.0) && near(aa, 0.0) {
+            return Self::Alpha(ma);
+        }
+
+        // The three colour effects all leave alpha untouched and scale the
+        // three colour channels by the same factor.
+        if !near(ma, 1.0) || !near(aa, 0.0) || !near(mr, mg) || !near(mg, mb) {
+            return Self::Advanced;
+        }
+        let amount = 1.0 - mr;
+        if near(amount, 0.0) {
+            // No scaling, but a non-zero addition: not a named effect.
+            return Self::Advanced;
+        }
+
+        if rgb_add_is(0.0) {
+            return Self::Brightness(-amount);
+        }
+        if rgb_add_is(amount) {
+            return Self::Brightness(amount);
+        }
+
+        // What is left is a blend towards some colour; recovering it is the
+        // addition divided back out by the blend amount.
+        let channel = |v: f32| ((v / amount).clamp(0.0, 1.0) * 255.0).round() as u8;
+        Self::Tint {
+            color: Color::from_rgba8(channel(ar), channel(ag), channel(ab), 255),
+            amount,
+        }
+    }
+
+    /// The transform this effect produces.
+    ///
+    /// `None` for [`ColorEffect::Advanced`], which by definition cannot be
+    /// rebuilt from a name — the caller keeps whatever is already stored.
+    pub fn to_transform(self) -> Option<ColorTransform> {
+        match self {
+            Self::None => Some(ColorTransform::default()),
+            Self::Brightness(a) => Some(ColorTransform::brightness(a)),
+            Self::Tint { color, amount } => Some(ColorTransform::tint(color, amount)),
+            Self::Alpha(a) => Some(ColorTransform::alpha(a)),
+            Self::Advanced => None,
+        }
+    }
+}
+
 /// A placed instance of a library symbol.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SymbolInstance {
@@ -353,6 +448,17 @@ impl Library {
     }
 
     /// Find a symbol by its name, as scripts and importers do.
+    /// Mutable access to a symbol's timeline.
+    ///
+    /// This is what makes symbol editing mode work: the scene hands the editor
+    /// a symbol's layer stack in place of the document's, and every existing
+    /// tool edits the symbol without needing to know.
+    pub fn layers_mut(&mut self, id: SymbolId) -> Option<&mut LayerStack> {
+        self.symbols
+            .get_mut(&id)
+            .map(|s| &mut Arc::make_mut(s).layers)
+    }
+
     pub fn find_by_name(&self, name: &str) -> Option<&Arc<Symbol>> {
         self.symbols.values().find(|s| s.name == name)
     }
@@ -718,5 +824,96 @@ mod tests {
         assert_eq!(lib.max_id(), 0);
         lib.insert(Symbol::new(SymbolId(500), "imported", SymbolKind::Graphic));
         assert_eq!(lib.max_id(), 500);
+    }
+
+    /// The Properties panel reads the effect's name back out of the transform,
+    /// so every effect a user can set must survive the round trip. Without
+    /// this, choosing Tint and reopening the panel could show Advanced.
+    #[test]
+    fn every_named_colour_effect_round_trips_through_its_transform() {
+        let cases = [
+            ColorEffect::None,
+            ColorEffect::Brightness(0.4),
+            ColorEffect::Brightness(-0.75),
+            ColorEffect::Alpha(0.3),
+            ColorEffect::Alpha(0.0),
+            ColorEffect::Tint {
+                color: Color::from_rgba8(0xFF, 0x00, 0x00, 0xFF),
+                amount: 0.5,
+            },
+            ColorEffect::Tint {
+                color: Color::from_rgba8(0x20, 0x80, 0xC0, 0xFF),
+                amount: 0.8,
+            },
+        ];
+
+        for case in cases {
+            let transform = case.to_transform().expect("named effects have transforms");
+            let back = ColorEffect::from_transform(&transform);
+
+            match (case, back) {
+                (ColorEffect::None, ColorEffect::None) => {}
+                (ColorEffect::Brightness(a), ColorEffect::Brightness(b)) => {
+                    assert!((a - b).abs() < 1e-3, "brightness {a} came back as {b}");
+                }
+                (ColorEffect::Alpha(a), ColorEffect::Alpha(b)) => {
+                    assert!((a - b).abs() < 1e-3, "alpha {a} came back as {b}");
+                }
+                (
+                    ColorEffect::Tint { color: c1, amount: a1 },
+                    ColorEffect::Tint { color: c2, amount: a2 },
+                ) => {
+                    assert!((a1 - a2).abs() < 1e-3, "tint amount {a1} came back as {a2}");
+                    // The colour survives an 8-bit round trip through the
+                    // addition term, so it may be off by a step.
+                    let (x, y) = (c1.to_rgba8().to_u8_array(), c2.to_rgba8().to_u8_array());
+                    for i in 0..3 {
+                        assert!(
+                            x[i].abs_diff(y[i]) <= 1,
+                            "tint channel {i}: {:?} came back as {:?}",
+                            x,
+                            y
+                        );
+                    }
+                }
+                (a, b) => panic!("{a:?} came back as {b:?}"),
+            }
+        }
+    }
+
+    /// A transform that is not one of the four named effects has to be
+    /// reported honestly rather than mislabelled as the nearest one.
+    #[test]
+    fn a_transform_no_named_effect_produces_is_advanced() {
+        // Channels scaled differently — only Advanced can express this.
+        let uneven = ColorTransform {
+            multiply: [0.5, 0.9, 0.2, 1.0],
+            add: [0.0; 4],
+        };
+        assert_eq!(ColorEffect::from_transform(&uneven), ColorEffect::Advanced);
+        assert_eq!(ColorEffect::Advanced.to_transform(), None);
+
+        // Two effects composed generally land outside the named set too.
+        let composed = ColorTransform::tint(Color::from_rgba8(0, 0, 255, 255), 0.5)
+            .compose(&ColorTransform::alpha(0.5));
+        assert_eq!(
+            ColorEffect::from_transform(&composed),
+            ColorEffect::Advanced,
+            "a tint inside a faded symbol is no longer a plain tint"
+        );
+    }
+
+    /// Positive brightness and a white tint are the same six numbers. The
+    /// mapping has to pick one, and it must be the same one every time.
+    #[test]
+    fn a_white_tint_and_positive_brightness_are_indistinguishable() {
+        let white = ColorTransform::tint(Color::WHITE, 0.6);
+        let bright = ColorTransform::brightness(0.6);
+        assert_eq!(white, bright, "the two effects produce one transform");
+
+        assert!(matches!(
+            ColorEffect::from_transform(&white),
+            ColorEffect::Brightness(_)
+        ));
     }
 }

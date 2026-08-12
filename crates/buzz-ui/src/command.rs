@@ -19,6 +19,10 @@ pub enum Command {
     SaveAs,
     Close,
     Quit,
+    /// Import an Animate document's symbols into the library.
+    ImportToLibrary,
+    /// Import an Animate document onto the stage as well as the library.
+    ImportToStage,
 
     // Edit
     Undo,
@@ -61,6 +65,27 @@ pub enum Command {
     NewLayerFolder,
     DeleteLayer,
 
+    // Symbols and library
+    /// Wrap the selection in a new symbol, replacing it with an instance.
+    ConvertToSymbol,
+    /// Create an empty symbol and open it for editing.
+    NewSymbol,
+    /// Open the selected instance's symbol for editing.
+    EditSymbol,
+    /// Leave symbol editing and return to the main timeline.
+    EditDocument,
+    /// Place an instance of the library selection on the stage.
+    PlaceInstance,
+    DuplicateSymbol,
+    DeleteSymbol,
+    NewLibraryFolder,
+
+    // Tweens
+    CreateClassicTween,
+    CreateMotionTween,
+    CreateShapeTween,
+    RemoveTween,
+
     // Timeline
     InsertFrame,
     RemoveFrame,
@@ -95,6 +120,8 @@ impl Command {
             SaveAs => "Save As…",
             Close => "Close",
             Quit => "Exit",
+            ImportToLibrary => "Import to Library…",
+            ImportToStage => "Import to Stage…",
 
             Undo => "Undo",
             Redo => "Redo",
@@ -133,6 +160,20 @@ impl Command {
             NewLayerFolder => "New Folder",
             DeleteLayer => "Delete Layer",
 
+            ConvertToSymbol => "Convert to Symbol…",
+            NewSymbol => "New Symbol…",
+            EditSymbol => "Edit Symbol",
+            EditDocument => "Edit Document",
+            PlaceInstance => "Place on Stage",
+            DuplicateSymbol => "Duplicate Symbol",
+            DeleteSymbol => "Delete Symbol",
+            NewLibraryFolder => "New Library Folder",
+
+            CreateClassicTween => "Create Classic Tween",
+            CreateMotionTween => "Create Motion Tween",
+            CreateShapeTween => "Create Shape Tween",
+            RemoveTween => "Remove Tween",
+
             InsertFrame => "Insert Frame",
             RemoveFrame => "Remove Frame",
             InsertKeyframe => "Insert Keyframe",
@@ -170,6 +211,9 @@ impl Command {
             SaveAs => sc(ctrl_shift, Key::S),
             Close => sc(ctrl, Key::W),
             Quit => sc(ctrl, Key::Q),
+            // Animate's import bindings.
+            ImportToStage => sc(ctrl, Key::R),
+            ImportToLibrary => sc(ctrl_shift, Key::R),
 
             Undo => sc(ctrl, Key::Z),
             // Animate accepts both; Ctrl+Y is also handled by the key map.
@@ -188,7 +232,9 @@ impl Command {
             ZoomFitInWindow => sc(ctrl, Key::Num3),
             ZoomShowFrame => sc(ctrl, Key::Num2),
             ZoomShowAll => sc(ctrl_shift, Key::W),
-            ToggleRulers => sc(ctrl_shift, Key::R),
+            // Animate puts rulers on Ctrl+Alt+Shift+R, not Ctrl+Shift+R —
+            // the latter is Import to Library.
+            ToggleRulers => sc(ctrl_shift.plus(Modifiers::ALT), Key::R),
             ToggleGrid => sc(ctrl, Key::Quote),
             ToggleGuides => sc(ctrl_semicolon(), Key::Semicolon),
             ToggleSnapping => sc(ctrl_shift, Key::U),
@@ -208,6 +254,22 @@ impl Command {
             NewLayer => sc(ctrl_alt, Key::N),
             NewLayerFolder => sc(ctrl_alt, Key::F),
             DeleteLayer => None,
+
+            // F8 and Ctrl+F8 are muscle memory for anyone who has used
+            // Animate; Ctrl+E steps in and out of symbol editing.
+            ConvertToSymbol => sc(Modifiers::NONE, Key::F8),
+            NewSymbol => sc(ctrl, Key::F8),
+            EditSymbol => sc(ctrl, Key::E),
+            EditDocument => sc(ctrl, Key::F4),
+            PlaceInstance => None,
+            DuplicateSymbol => None,
+            DeleteSymbol => None,
+            NewLibraryFolder => None,
+
+            CreateClassicTween => None,
+            CreateMotionTween => None,
+            CreateShapeTween => None,
+            RemoveTween => None,
 
             // Animate's frame shortcuts, which animators use constantly.
             InsertFrame => sc(Modifiers::NONE, Key::F5),
@@ -252,6 +314,7 @@ impl Command {
                 | ExpandFill
                 | SmoothSelection
                 | StraightenSelection
+                | ConvertToSymbol
         )
     }
 }
@@ -286,7 +349,10 @@ mod tests {
             DeleteLayer, InsertFrame, RemoveFrame, InsertKeyframe, InsertBlankKeyframe,
             ClearKeyframe, PlayPause, NextFrame, PreviousFrame, FirstFrame, LastFrame,
             ToggleOnionSkin, ToggleCamera, AddCameraKeyframe, RemoveCameraKeyframe,
-            ResetCamera,
+            ResetCamera, ImportToLibrary, ImportToStage, ConvertToSymbol, NewSymbol,
+            EditSymbol, EditDocument, PlaceInstance, DuplicateSymbol, DeleteSymbol,
+            NewLibraryFolder, CreateClassicTween, CreateMotionTween, CreateShapeTween,
+            RemoveTween,
         ]
     }
 
@@ -332,6 +398,20 @@ mod tests {
         expect(Command::RemoveFrame, Modifiers::SHIFT, Key::F5);
         expect(Command::ClearKeyframe, Modifiers::SHIFT, Key::F6);
         expect(Command::PlayPause, Modifiers::NONE, Key::Enter);
+    }
+
+    /// F8 is the single most-pressed key in a symbol-based workflow, and
+    /// Ctrl+E is how you get inside what it made.
+    #[test]
+    fn the_symbol_shortcuts_match_animate() {
+        let expect = |c: Command, m: Modifiers, k: Key| {
+            let sc = c.shortcut().unwrap_or_else(|| panic!("{c:?} has no shortcut"));
+            assert_eq!((sc.modifiers, sc.logical_key), (m, k), "{c:?}");
+        };
+
+        expect(Command::ConvertToSymbol, Modifiers::NONE, Key::F8);
+        expect(Command::NewSymbol, Modifiers::CTRL, Key::F8);
+        expect(Command::EditSymbol, Modifiers::CTRL, Key::E);
     }
 
     #[test]

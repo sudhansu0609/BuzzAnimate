@@ -52,6 +52,17 @@ rstar = "0.13.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 quick-xml = "0.41.0"
 
+# Importers.
+#
+# lopdf is MIT and pure Rust, which is why it is here rather than
+# `pdfium-render`: that would bind a multi-megabyte C++ blob that has to be
+# shipped alongside the executable, for an API that is built around
+# *rasterising* pages. We want the paths themselves, in `f64`, still editable.
+lopdf = { version = "0.44.0", default-features = false }
+# Ruffle's SWF reader, MIT OR Apache-2.0. The `swf-parser` crate does the same
+# job but is AGPL-3.0, which this project cannot take.
+swf = "0.2.2"
+
 # Internal crates
 buzz-geom = { path = "crates/buzz-geom" }
 buzz-jobs = { path = "crates/buzz-jobs" }
@@ -60,6 +71,8 @@ buzz-scene = { path = "crates/buzz-scene" }
 buzz-doc = { path = "crates/buzz-doc" }
 buzz-ui = { path = "crates/buzz-ui" }
 buzz-import-xfl = { path = "crates/buzz-import-xfl" }
+buzz-import-pdf = { path = "crates/buzz-import-pdf" }
+buzz-import-swf = { path = "crates/buzz-import-swf" }
 
 [profile.dev]
 opt-level = 1

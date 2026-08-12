@@ -29,17 +29,32 @@ fn main() -> Result<()> {
 
     let mut app = app::App::new(preference);
 
-    // A trailing path argument opens that document, so the app can be
-    // associated with the .buzz extension.
-    if let Some(path) = std::env::args().skip(1).find(|a| {
-        !a.starts_with("--")
-            && std::path::Path::new(a)
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case(buzz_doc::EXTENSION))
-    }) {
-        match buzz_doc::Document::open(&path) {
-            Ok(doc) => app = app.with_document(doc),
-            Err(e) => eprintln!("could not open {path}: {e}"),
+    // A trailing path argument opens that file, so the app can be associated
+    // with `.buzz` and with every format it can import.
+    if let Some(path) = std::env::args().skip(1).find(|a| !a.starts_with("--")) {
+        let path = std::path::PathBuf::from(path);
+        let is_document = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(buzz_doc::EXTENSION));
+
+        if is_document {
+            match buzz_doc::Document::open(&path) {
+                Ok(doc) => app = app.with_document(doc),
+                Err(e) => eprintln!("could not open {}: {e}", path.display()),
+            }
+        } else {
+            // Importing at startup opens a *new, unsaved* document, so Ctrl+S
+            // cannot overwrite the file that was imported from.
+            match buzz_app::import::read(&path) {
+                Ok(imported) => {
+                    println!("imported {}: {}", path.display(), imported.summary);
+                    for line in &imported.unsupported {
+                        println!("  did not come across: {line}");
+                    }
+                    app = app.with_document(buzz_doc::Document::new(imported.scene));
+                }
+                Err(e) => eprintln!("could not import {}: {e}", path.display()),
+            }
         }
     }
 

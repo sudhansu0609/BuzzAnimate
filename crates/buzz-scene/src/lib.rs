@@ -28,6 +28,7 @@
 pub mod camera_track;
 pub mod index;
 pub mod layer;
+pub mod merge;
 pub mod object;
 pub mod symbol;
 pub mod timeline;
@@ -42,9 +43,12 @@ use serde::{Deserialize, Serialize};
 pub use camera_track::{CameraKey, CameraTrack};
 pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
+pub use merge::{ImportTarget, MergeReport};
 pub use object::{FillSpec, Object, ObjectId, ObjectKind, ShapeData, StrokeSpec};
-pub use symbol::{ColorTransform, Library, LoopMode, Symbol, SymbolId, SymbolInstance, SymbolKind};
-pub use timeline::{FrameKind, Keyframe, LayerTimeline, ResolvedFrame};
+pub use symbol::{
+    ColorEffect, ColorTransform, Library, LoopMode, Symbol, SymbolId, SymbolInstance, SymbolKind,
+};
+pub use timeline::{FrameKind, Keyframe, LayerTimeline, ResolvedFrame, TweenSpan};
 pub use tween::{Easing, Tween, TweenKind};
 
 /// Stage setup, matching Animate's Document Properties dialog.
@@ -103,7 +107,7 @@ impl IdAllocator {
 }
 
 /// An immutable snapshot of the document.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Scene {
     /// Private so every change goes through [`Scene::stage_mut`] and bumps the
     /// revision. As a public field it was possible to resize the stage without
@@ -118,6 +122,37 @@ pub struct Scene {
     layers: LayerStack,
     ids: IdAllocator,
     revision: u64,
+    /// Symbols currently open for editing, outermost first.
+    ///
+    /// # Why this lives on the scene
+    ///
+    /// Animate's symbol editing mode redirects the *whole* authoring surface:
+    /// the stage draws the symbol's contents, the timeline shows its frames,
+    /// F6 inserts a keyframe on its layers, and selection addresses its
+    /// objects. [`Scene::layers`] answering "the timeline the user is looking
+    /// at" makes every panel and tool follow along at once. Threading a
+    /// context parameter through seventy call sites would be the same
+    /// behaviour with seventy more places to forget it.
+    ///
+    /// # Why it is not document state
+    ///
+    /// It is never serialised, never bumps the revision, and is not part of
+    /// [`PartialEq`] — which symbol you happen to have open is not an edit,
+    /// so it must not mark the document dirty or land in the undo history.
+    /// [`Scene::stage_layers`] reaches the document's own timeline regardless
+    /// of context, and that is what saving uses.
+    editing: Vec<SymbolId>,
+}
+
+impl PartialEq for Scene {
+    fn eq(&self, other: &Self) -> bool {
+        self.stage == other.stage
+            && self.camera == other.camera
+            && self.library == other.library
+            && self.layers == other.layers
+            && self.ids == other.ids
+            && self.revision == other.revision
+    }
 }
 
 impl Default for Scene {
@@ -129,6 +164,7 @@ impl Default for Scene {
             layers: LayerStack::new(),
             ids: IdAllocator::default(),
             revision: 0,
+            editing: Vec::new(),
         };
         // Animate starts every document with one layer named "Layer_1".
         scene.add_layer("Layer_1", LayerKind::Normal);
@@ -148,6 +184,7 @@ impl Scene {
             layers: LayerStack::new(),
             ids: IdAllocator::default(),
             revision: 0,
+            editing: Vec::new(),
         }
     }
 
@@ -156,8 +193,67 @@ impl Scene {
         self.revision
     }
 
+    /// The timeline the user is currently authoring.
+    ///
+    /// In symbol editing mode this is the open symbol's own layer stack, so
+    /// the stage, the timeline and every tool address the symbol's contents
+    /// without knowing that they are doing so. Use [`Scene::stage_layers`]
+    /// when you specifically mean the document's main timeline.
     pub fn layers(&self) -> &LayerStack {
+        match self.editing.last() {
+            // A symbol deleted while open falls back to the main timeline
+            // rather than showing nothing.
+            Some(id) => self.library.get(*id).map_or(&self.layers, |s| &s.layers),
+            None => &self.layers,
+        }
+    }
+
+    /// The document's own timeline, whatever is open for editing.
+    ///
+    /// Saving, and anything that has to see the whole document rather than the
+    /// current view, comes here.
+    pub fn stage_layers(&self) -> &LayerStack {
         &self.layers
+    }
+
+    /// Symbols open for editing, outermost first. Empty on the main timeline.
+    ///
+    /// The breadcrumb above the stage is built from this.
+    pub fn edit_path(&self) -> &[SymbolId] {
+        &self.editing
+    }
+
+    /// Which symbol is being edited, if any.
+    pub fn editing_symbol(&self) -> Option<SymbolId> {
+        self.editing.last().copied()
+    }
+
+    /// Open a symbol for editing.
+    ///
+    /// Does not bump the revision: opening a symbol is navigation, not an
+    /// edit, and marking the document dirty for it would be wrong.
+    pub fn enter_symbol(&mut self, id: SymbolId) -> bool {
+        if self.library.get(id).is_none() {
+            return false;
+        }
+        // Re-entering a symbol already on the path would let a user walk a
+        // cycle forever; jump back to that level instead.
+        if let Some(index) = self.editing.iter().position(|s| *s == id) {
+            self.editing.truncate(index + 1);
+        } else {
+            self.editing.push(id);
+        }
+        true
+    }
+
+    /// Step out one level, towards the main timeline.
+    pub fn exit_symbol(&mut self) -> bool {
+        self.editing.pop().is_some()
+    }
+
+    /// Return all the way to the main timeline.
+    pub fn edit_document(&mut self) {
+        self.editing.clear();
     }
 
     pub fn stage(&self) -> &StageProperties {
@@ -216,9 +312,9 @@ impl Scene {
         symbol: SymbolId,
         transform: Affine,
     ) -> Option<ObjectId> {
-        if self.library.get(symbol).is_none() {
-            return None;
-        }
+        // An instance of a symbol that is not in the library would draw
+        // nothing and save as a dangling reference.
+        self.library.get(symbol)?;
         let id = ObjectId(self.ids.take());
         let object = Object::instance_of(id, symbol).with_transform(transform);
         self.add_object_at(layer, frame, object)
@@ -273,7 +369,9 @@ impl Scene {
             }
         }
 
-        let stage = self.layers.iter();
+        // The document's own timeline, not the one being authored: a use count
+        // has to cover the whole file however you are navigating it.
+        let stage = self.stage_layers().iter();
         let nested = self.library.iter().flat_map(|s| s.layers.iter());
         for layer in stage.chain(nested) {
             for object in layer.all_objects() {
@@ -289,6 +387,31 @@ impl Scene {
     /// invalidating derived data.
     pub fn edit_layers(&mut self) -> &mut LayerStack {
         self.revision += 1;
+        self.active_layers_mut()
+    }
+
+    /// The document's own timeline, mutably, whatever is open for editing.
+    ///
+    /// Loading a file comes here: it is rebuilding the document, not editing
+    /// whatever the previous document happened to have open.
+    pub fn edit_stage_layers(&mut self) -> &mut LayerStack {
+        self.revision += 1;
+        &mut self.layers
+    }
+
+    /// Mutable access to the timeline being authored, without bumping.
+    ///
+    /// Private because callers that skip the bump would leave derived data
+    /// stale; every public path either bumps first or calls [`Scene::bump`].
+    fn active_layers_mut(&mut self) -> &mut LayerStack {
+        if let Some(id) = self.editing.last().copied()
+            && self.library.get(id).is_some()
+        {
+            return self
+                .library
+                .layers_mut(id)
+                .expect("the symbol was just confirmed to exist");
+        }
         &mut self.layers
     }
 
@@ -299,13 +422,13 @@ impl Scene {
     /// Add a layer at the top, as Animate does.
     pub fn add_layer(&mut self, name: impl Into<String>, kind: LayerKind) -> LayerId {
         let id = LayerId(self.ids.take());
-        self.layers.push_front(Layer::new(id, name, kind));
+        self.active_layers_mut().push_front(Layer::new(id, name, kind));
         self.bump();
         id
     }
 
     pub fn remove_layer(&mut self, id: LayerId) -> Option<Arc<Layer>> {
-        let removed = self.layers.remove(id);
+        let removed = self.active_layers_mut().remove(id);
         if removed.is_some() {
             self.bump();
         }
@@ -314,7 +437,7 @@ impl Scene {
 
     /// Edit a layer in place. Returns false if it does not exist.
     pub fn update_layer(&mut self, id: LayerId, f: impl FnOnce(&mut Layer)) -> bool {
-        let ok = self.layers.update(id, f);
+        let ok = self.active_layers_mut().update(id, f);
         if ok {
             self.bump();
         }
@@ -335,7 +458,7 @@ impl Scene {
         let id = ObjectId(self.ids.take());
         let object = Arc::new(Object::shape(id, shape));
         let mut placed = false;
-        self.layers
+        self.active_layers_mut()
             .update(layer, |l| placed = l.push_object_at(frame, object));
         placed.then(|| {
             self.bump();
@@ -353,7 +476,7 @@ impl Scene {
         let id = object.id;
         self.ids.reserve_above(id.0);
         let mut placed = false;
-        self.layers
+        self.active_layers_mut()
             .update(layer, |l| placed = l.push_object_at(frame, Arc::new(object)));
         placed.then(|| {
             self.bump();
@@ -368,7 +491,7 @@ impl Scene {
 
     /// Frames in the document: the longest layer, and at least one.
     pub fn frame_count(&self) -> u32 {
-        self.layers
+        self.layers()
             .frame_count()
             .max(self.camera().last_frame() + 1)
             .max(1)
@@ -405,15 +528,47 @@ impl Scene {
 
     /// Find an object and the layer holding it.
     pub fn find_object(&self, id: ObjectId) -> Option<(LayerId, &Arc<Object>)> {
-        self.layers
+        self.layers()
             .iter()
             .find_map(|l| l.find_object(id).map(|o| (l.id, o)))
+    }
+
+    /// Edit an object in place, wherever on the current timeline it lives.
+    ///
+    /// Searches every keyframe rather than only the one under the playhead:
+    /// panels address an object by id, and an object selected on frame 5 is
+    /// still that object when the playhead has moved on. Returns false if no
+    /// such object exists, and bumps the revision only when one was found.
+    pub fn update_object(&mut self, id: ObjectId, f: impl FnOnce(&mut Object)) -> bool {
+        let Some((layer_id, _)) = self.find_object(id) else {
+            return false;
+        };
+        let mut f = Some(f);
+        let mut changed = false;
+        self.active_layers_mut().update(layer_id, |layer| {
+            for keyframe in layer.frames.keyframes_mut() {
+                let objects = Arc::make_mut(&mut keyframe.objects);
+                if let Some(object) = objects.iter_mut().find(|o| o.id == id) {
+                    // `make_mut` here is the copy-on-write step: the object is
+                    // only cloned if a snapshot elsewhere still holds it.
+                    if let Some(f) = f.take() {
+                        f(Arc::make_mut(object));
+                        changed = true;
+                    }
+                    break;
+                }
+            }
+        });
+        if changed {
+            self.bump();
+        }
+        changed
     }
 
     pub fn remove_object(&mut self, id: ObjectId) -> Option<Arc<Object>> {
         let layer_id = self.find_object(id).map(|(l, _)| l)?;
         let mut removed = None;
-        self.layers.update(layer_id, |l| removed = l.remove_object(id));
+        self.active_layers_mut().update(layer_id, |l| removed = l.remove_object(id));
         if removed.is_some() {
             self.bump();
         }
@@ -422,7 +577,7 @@ impl Scene {
 
     /// Total leaf shapes across every layer and every keyframe.
     pub fn shape_count(&self) -> usize {
-        self.layers
+        self.layers()
             .iter()
             .flat_map(|l| l.all_objects())
             .map(|o| o.shape_count())
@@ -431,7 +586,7 @@ impl Scene {
 
     /// Leaf shapes visible at `frame`.
     pub fn shape_count_at(&self, frame: u32) -> usize {
-        self.layers
+        self.layers()
             .iter()
             .flat_map(|l| l.objects_at(frame).iter())
             .map(|o| o.shape_count())
@@ -440,7 +595,7 @@ impl Scene {
 
     /// Bounds of all artwork across every frame, ignoring the stage rectangle.
     pub fn content_bounds(&self) -> Option<Rect> {
-        self.layers.iter().filter_map(|l| l.bounds()).reduce(|a, b| a.union(b))
+        self.layers().iter().filter_map(|l| l.bounds()).reduce(|a, b| a.union(b))
     }
 
     /// Everything the user could reasonably want framed: the stage plus any
@@ -459,7 +614,7 @@ impl Scene {
     pub fn index_entries_at(&self, frame: u32) -> Vec<IndexEntry> {
         let mut entries = Vec::new();
         let mut depth = 0usize;
-        for layer in self.layers.drawable_at(frame) {
+        for layer in self.layers().drawable_at(frame) {
             for object in layer.objects_at(frame) {
                 if !object.visible {
                     continue;
@@ -500,7 +655,7 @@ impl Scene {
     /// applies the camera separately.
     pub fn flatten_at(&self, frame: u32) -> Vec<(Affine, ShapeData)> {
         let mut out = Vec::new();
-        for layer in self.layers.drawable_at(frame) {
+        for layer in self.layers().drawable_at(frame) {
             for object in layer.objects_at(frame) {
                 object.flatten(Affine::IDENTITY, &mut out);
             }
@@ -860,5 +1015,65 @@ mod tests {
             fit.x1 >= scene.stage().size.width,
             "the stage should still be included"
         );
+    }
+
+    /// The Properties panel edits an instance by id, so the edit has to reach
+    /// the object wherever on the layer it lives — not only under the playhead.
+    #[test]
+    fn update_object_reaches_an_object_on_any_keyframe() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().unwrap().id;
+        let symbol = scene.add_symbol("Hero", SymbolKind::Graphic, None);
+
+        // Put the instance on a later keyframe, away from frame 0.
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(20);
+            l.frames.insert_keyframe(10);
+        });
+        let id = scene
+            .add_instance_at(layer, 10, symbol, Affine::IDENTITY)
+            .expect("the instance is placed");
+
+        let before = scene.revision();
+        assert!(scene.update_object(id, |o| {
+            if let ObjectKind::Instance(i) = &mut o.kind {
+                i.first_frame = 3;
+                i.loop_mode = LoopMode::PlayOnce;
+            }
+        }));
+        assert!(scene.revision() > before, "an edit must bump the revision");
+
+        let (_, object) = scene.find_object(id).expect("still there");
+        let instance = object.instance().expect("still an instance");
+        assert_eq!(instance.first_frame, 3);
+        assert_eq!(instance.loop_mode, LoopMode::PlayOnce);
+    }
+
+    /// A no-op must stay a no-op: bumping for an object that does not exist
+    /// would invalidate the spatial index and mark the document dirty for
+    /// nothing.
+    #[test]
+    fn update_object_on_a_missing_object_changes_nothing() {
+        let (mut scene, _) = scene_with_shapes(3);
+        let before = scene.revision();
+
+        assert!(!scene.update_object(ObjectId(9999), |o| o.visible = false));
+        assert_eq!(scene.revision(), before);
+    }
+
+    /// Snapshots must not see later edits — the guarantee the whole
+    /// copy-on-write model rests on.
+    #[test]
+    fn update_object_does_not_reach_into_an_existing_snapshot() {
+        let (mut scene, _) = scene_with_shapes(3);
+        let id = scene.layers().iter().next().unwrap().all_objects().next().unwrap().id;
+
+        let snapshot = scene.clone();
+        assert!(scene.update_object(id, |o| o.visible = false));
+
+        let (_, before) = snapshot.find_object(id).expect("in the snapshot");
+        let (_, after) = scene.find_object(id).expect("in the scene");
+        assert!(before.visible, "the snapshot must be untouched");
+        assert!(!after.visible, "the live scene must have changed");
     }
 }

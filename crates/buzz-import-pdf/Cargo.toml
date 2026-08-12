@@ -1,0 +1,22 @@
+[package]
+name = "buzz-import-pdf"
+description = "Import PDF and Adobe Illustrator artwork as editable vectors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+buzz-geom.workspace = true
+buzz-scene.workspace = true
+
+kurbo.workspace = true
+peniko.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Default features pull in chrono, jiff, time and rayon, none of which a path
+# extractor needs. Flate decoding is built in, not a feature, so compressed
+# content streams still work.
+lopdf = { workspace = true }

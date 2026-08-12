@@ -6,3 +6,7 @@
 /settings.local.json
 /.buzz-cache/
 /out/
+
+# Documents and the recovery files autosave writes beside them. Test fixtures
+# and hand-made scratch documents must never be committed.
+*.buzz

@@ -402,8 +402,11 @@ impl SymbolDto {
 impl DocumentDto {
     pub fn from_scene(scene: &Scene) -> Self {
         let mut max_id = 0u64;
+        // `stage_layers`, not `layers`: with a symbol open for editing the
+        // latter is the symbol's timeline, and saving it as the document's
+        // would quietly replace the main timeline with the symbol's contents.
         let layers: Vec<LayerDto> = scene
-            .layers()
+            .stage_layers()
             .iter()
             .map(|layer| LayerDto::from_layer(layer, &mut max_id))
             .collect();
@@ -465,7 +468,7 @@ impl DocumentDto {
         };
 
         for (index, dto) in self.layers.iter().enumerate() {
-            scene.edit_layers().insert(index, dto.to_layer()?);
+            scene.edit_stage_layers().insert(index, dto.to_layer()?);
         }
 
         // The library loads before anything can reference it, so an instance
@@ -529,7 +532,7 @@ impl ObjectDto {
                 loop_mode: i.loop_mode,
                 // The identity is the common case; leaving it out keeps a
                 // document full of plain instances readable.
-                color: (!i.color.is_identity()).then(|| ColorTransformDto {
+                color: (!i.color.is_identity()).then_some(ColorTransformDto {
                     multiply: i.color.multiply,
                     add: i.color.add,
                 }),

@@ -81,6 +81,35 @@ impl FrameKind {
     }
 }
 
+/// A tween and the stretch of frames it covers.
+///
+/// Returned by [`LayerTimeline::tween_span_at`], and the basis of the tinted
+/// span with an arrow that the timeline draws.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TweenSpan {
+    pub tween: crate::tween::Tween,
+    /// Frame the tween starts on — always a keyframe.
+    pub start: u32,
+    /// Keyframe the tween runs to. `None` means there is not one, so the tween
+    /// is broken and nothing will move.
+    pub end: Option<u32>,
+}
+
+impl TweenSpan {
+    /// Does this tween have somewhere to go?
+    pub fn is_complete(&self) -> bool {
+        self.end.is_some()
+    }
+
+    /// The last frame the tween covers, which is where the arrowhead goes.
+    pub fn last_frame(&self, layer_length: u32) -> u32 {
+        match self.end {
+            Some(end) => end.saturating_sub(1),
+            None => layer_length.saturating_sub(1),
+        }
+    }
+}
+
 /// What a frame resolves to once tweening is taken into account.
 ///
 /// Borrowed when untweened so the common path costs nothing; owned when a
@@ -229,6 +258,27 @@ impl LayerTimeline {
         self.keyframe_at(frame)
             .map(|k| k.tween)
             .unwrap_or_default()
+    }
+
+    /// The tween governing `frame`, together with the frames it runs between.
+    ///
+    /// Returns `None` where no tween is set. The `end` is `None` when the
+    /// tween has no following keyframe — it is *broken*, interpolating towards
+    /// nothing, and [`Self::resolved_at`] holds the keyframe instead of
+    /// animating. That case is worth distinguishing rather than hiding,
+    /// because it is the usual reason a tween that was just created does not
+    /// appear to do anything; Animate draws it as a dashed line.
+    pub fn tween_span_at(&self, frame: u32) -> Option<TweenSpan> {
+        let index = self.index_at(frame)?;
+        let keyframe = &self.keyframes[index];
+        if !keyframe.tween.is_active() {
+            return None;
+        }
+        Some(TweenSpan {
+            tween: keyframe.tween,
+            start: keyframe.start,
+            end: self.keyframes.get(index + 1).map(|k| k.start),
+        })
     }
 
     /// What the timeline draws at `frame`.
@@ -670,6 +720,65 @@ mod tests {
             started.elapsed().as_millis() < 200,
             "10k lookups took {:?}; the search should be binary",
             started.elapsed()
+        );
+    }
+
+    /// A tween covers every frame its keyframe governs, and stops at the next
+    /// keyframe — which is exactly the stretch the timeline tints.
+    #[test]
+    fn a_tween_span_runs_from_its_keyframe_to_the_next() {
+        let mut t = LayerTimeline::new();
+        t.push_object(0, object(1));
+        t.insert_frame(19);
+        t.insert_keyframe(10);
+        assert!(t.set_tween(0, crate::tween::Tween::classic()));
+
+        for frame in 0..10 {
+            let span = t.tween_span_at(frame).unwrap_or_else(|| {
+                panic!("frame {frame} is inside the tweened span");
+            });
+            assert_eq!(span.start, 0);
+            assert_eq!(span.end, Some(10));
+            assert!(span.is_complete());
+            assert_eq!(span.last_frame(t.length()), 9, "the arrow goes on frame 9");
+        }
+
+        assert!(
+            t.tween_span_at(10).is_none(),
+            "the second keyframe carries no tween of its own"
+        );
+    }
+
+    /// A tween with no following keyframe interpolates towards nothing. The
+    /// model has to say so, because that is the difference between a dashed
+    /// line and a working animation.
+    #[test]
+    fn a_tween_with_no_next_keyframe_is_reported_as_broken() {
+        let mut t = LayerTimeline::new();
+        t.push_object(0, object(1));
+        t.insert_frame(9);
+        assert!(t.set_tween(0, crate::tween::Tween::motion()));
+
+        let span = t.tween_span_at(4).expect("the tween is set");
+        assert_eq!(span.end, None);
+        assert!(!span.is_complete());
+        assert_eq!(span.last_frame(t.length()), t.length() - 1);
+
+        // And it draws the keyframe unchanged rather than inventing motion.
+        assert!(matches!(t.resolved_at(4), ResolvedFrame::Stored(_)));
+    }
+
+    #[test]
+    fn frames_beyond_the_layer_carry_no_tween() {
+        let mut t = LayerTimeline::new();
+        t.push_object(0, object(1));
+        t.insert_frame(4);
+        t.set_tween(0, crate::tween::Tween::shape());
+
+        assert!(t.tween_span_at(4).is_some());
+        assert!(
+            t.tween_span_at(500).is_none(),
+            "a frame the layer does not reach cannot be tweened"
         );
     }
 }

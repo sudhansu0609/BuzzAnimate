@@ -6,6 +6,7 @@
 //! themselves.
 
 pub mod command;
+pub mod library_panel;
 pub mod panels;
 pub mod selection;
 pub mod style;
@@ -15,9 +16,12 @@ pub mod tools;
 pub mod view;
 
 pub use command::Command;
+pub use library_panel::{LibraryState, library_panel};
 pub use selection::Selection;
 pub use style::{DrawStyle, DrawingMode, StrokeKind};
 pub use theme::{Metrics, Palette};
-pub use timeline_panel::{FrameAction, TimelineResponse, TimelineState, timeline_panel};
+pub use timeline_panel::{
+    FrameAction, TimelineResponse, TimelineState, TweenRequest, timeline_panel,
+};
 pub use tools::{ToolId, ToolStatus, all_tools, tool_for_key};
 pub use view::{Guide, Orientation, SnapSettings, SnapTarget, Snapped, ViewSettings};

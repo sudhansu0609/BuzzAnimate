@@ -296,6 +296,14 @@ fn attr_u32(attrs: &HashMap<String, String>, key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// A style's `index` attribute. XFL numbers styles from one.
+fn attr_index(attrs: &HashMap<String, String>) -> u32 {
+    attrs
+        .get("index")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(1)
+}
+
 fn attr_bool(attrs: &HashMap<String, String>, key: &str, default: bool) -> bool {
     match attrs.get(key).map(String::as_str) {
         Some("true") | Some("1") => true,
@@ -341,15 +349,12 @@ fn parse_layer_kind(attrs: &HashMap<String, String>) -> LayerKind {
         Some("folder") => LayerKind::Folder,
         Some("mask") => LayerKind::Mask,
         Some("guide") => LayerKind::Guide,
-        _ => {
-            // Animate marks a masked or guided layer by pointing at its parent
-            // rather than by naming its own type.
-            if attrs.contains_key("parentLayerIndex") {
-                LayerKind::Normal
-            } else {
-                LayerKind::Normal
-            }
-        }
+        // `masked` and `guided` matter: the positional rule that resolves
+        // masking reads these kinds. Importing a masked layer as Normal breaks
+        // the run beneath its mask, and the mask silently clips nothing.
+        Some("masked") => LayerKind::Masked,
+        Some("guided") => LayerKind::Guided,
+        _ => LayerKind::Normal,
     }
 }
 
@@ -389,7 +394,7 @@ fn parse_document(
     // not half-imported into a document that looks complete.
     reader.config_mut().check_end_names = true;
 
-    let mut layers: Vec<Layer> = Vec::new();
+    let mut layers: Vec<PendingLayer> = Vec::new();
     let mut context = FrameContext::default();
     let mut open_elements = 0usize;
     // Only the first timeline is the main one; symbol timelines live in
@@ -457,16 +462,64 @@ fn parse_document(
 
     context.flush_layer(&mut layers, report);
 
+    resolve_layer_parents(&mut layers);
+
     // Animate writes layers bottom-first; our stack is front-first.
     layers.reverse();
     if layers.is_empty() {
-        layers.push(Layer::normal(LayerId(ids.take()), "Layer_1"));
+        layers.push(PendingLayer {
+            layer: Layer::normal(LayerId(ids.take()), "Layer_1"),
+            parent_index: None,
+        });
     }
-    for (index, layer) in layers.into_iter().enumerate() {
+    for (index, pending) in layers.into_iter().enumerate() {
         report.layers += 1;
-        scene.edit_layers().insert(index, layer);
+        scene.edit_layers().insert(index, pending.layer);
     }
     Ok(())
+}
+
+/// A layer, plus the `parentLayerIndex` it was written with.
+struct PendingLayer {
+    layer: Layer,
+    /// Index into the layer list **in document order**, which is why this is
+    /// resolved before the list is reversed.
+    parent_index: Option<usize>,
+}
+
+/// Turn Animate's `parentLayerIndex` into our `parent` links.
+///
+/// # Why only folders
+///
+/// Animate uses one attribute for two different relationships: a layer inside
+/// a **folder** points at the folder, and a **masked or guided** layer points
+/// at the mask or guide governing it. Our model only has the first — masked
+/// and guided layers resolve positionally, by a mask claiming the unbroken run
+/// of layers beneath it, which is Animate's own rule and what the rest of the
+/// engine already implements.
+///
+/// So a pointer at a folder becomes a `parent`, and a pointer at anything else
+/// is deliberately dropped. Honouring it would put a masked layer *inside* its
+/// mask, which is not what the file means and would break the positional
+/// resolution that does the real work.
+fn resolve_layer_parents(layers: &mut [PendingLayer]) {
+    let ids: Vec<LayerId> = layers.iter().map(|p| p.layer.id).collect();
+    let is_folder: Vec<bool> = layers
+        .iter()
+        .map(|p| p.layer.kind == LayerKind::Folder)
+        .collect();
+
+    for (index, pending) in layers.iter_mut().enumerate() {
+        let Some(parent) = pending.parent_index else {
+            continue;
+        };
+        // A layer cannot contain itself, and an index past the end is a
+        // corrupt file rather than a relationship.
+        if parent == index || parent >= ids.len() || !is_folder[parent] {
+            continue;
+        }
+        pending.layer.parent = Some(ids[parent]);
+    }
 }
 
 /// Accumulates layers, frames and elements while walking the XML.
@@ -476,6 +529,98 @@ struct FrameContext {
     keyframes: Vec<buzz_scene::Keyframe>,
     length: u32,
     current: Option<PendingFrame>,
+    /// The `parentLayerIndex` of the layer being read, kept beside it because
+    /// it cannot be resolved until every layer has been seen and given an id.
+    parent_index: Option<usize>,
+    /// Style tables for the `DOMShape` currently being read.
+    ///
+    /// XFL declares fills and strokes once per shape and then has each edge
+    /// reference them by index, so the tables have to be accumulated before
+    /// the edges that use them can be coloured.
+    styles: ShapeStyleTable,
+}
+
+/// The fills and strokes declared by one `DOMShape`.
+#[derive(Default)]
+struct ShapeStyleTable {
+    fills: HashMap<u32, Color>,
+    /// Index to (colour, weight).
+    strokes: HashMap<u32, (Color, f64)>,
+    /// Which style the elements now arriving belong to.
+    ///
+    /// `SolidColor` appears under both `FillStyle` and `StrokeStyle`, so the
+    /// enclosing style has to be remembered to know which table to write to.
+    /// The document is walked as a flat event stream, so this is how nesting
+    /// is recovered.
+    current: Option<StyleSlot>,
+    /// Colours seen so far in the gradient being read, if any.
+    gradient: Vec<Color>,
+}
+
+#[derive(Clone, Copy)]
+enum StyleSlot {
+    Fill(u32),
+    Stroke(u32),
+}
+
+impl ShapeStyleTable {
+    fn begin_shape(&mut self) {
+        self.fills.clear();
+        self.strokes.clear();
+        self.current = None;
+        self.gradient.clear();
+    }
+
+    /// Record a solid colour against whichever style is being read.
+    fn set_color(&mut self, color: Color) {
+        match self.current {
+            Some(StyleSlot::Fill(index)) => {
+                self.fills.insert(index, color);
+            }
+            Some(StyleSlot::Stroke(index)) => {
+                // Keep whatever weight `SolidStroke` already recorded.
+                let width = self.strokes.get(&index).map(|(_, w)| *w).unwrap_or(1.0);
+                self.strokes.insert(index, (color, width));
+            }
+            None => {}
+        }
+    }
+
+    fn set_stroke_width(&mut self, width: f64) {
+        if let Some(StyleSlot::Stroke(index)) = self.current {
+            let color = self
+                .strokes
+                .get(&index)
+                .map(|(c, _)| *c)
+                .unwrap_or(Color::BLACK);
+            self.strokes.insert(index, (color, width));
+        }
+    }
+
+    /// Add a gradient stop and set the style to the running average.
+    ///
+    /// Gradients are not implemented yet, so the closest flat colour is used.
+    /// Averaging as each stop arrives avoids needing to see the closing tag,
+    /// which this flat walk never observes.
+    fn add_gradient_stop(&mut self, color: Color) {
+        self.gradient.push(color);
+        let n = self.gradient.len() as u32;
+        let mut sum = [0u32; 4];
+        for stop in &self.gradient {
+            let [r, g, b, a] = stop.to_rgba8().to_u8_array();
+            sum[0] += r as u32;
+            sum[1] += g as u32;
+            sum[2] += b as u32;
+            sum[3] += a as u32;
+        }
+        let average = Color::from_rgba8(
+            (sum[0] / n) as u8,
+            (sum[1] / n) as u8,
+            (sum[2] / n) as u8,
+            (sum[3] / n) as u8,
+        );
+        self.set_color(average);
+    }
 }
 
 struct PendingFrame {
@@ -501,6 +646,9 @@ impl FrameContext {
             layer.color = parse_color(&map, "c", "__none");
         }
         self.layer = Some(layer);
+        self.parent_index = attrs
+            .get("parentLayerIndex")
+            .and_then(|v| v.trim().parse::<usize>().ok());
         self.keyframes.clear();
         self.length = 0;
     }
@@ -536,27 +684,80 @@ impl FrameContext {
         };
 
         match name {
+            // A new shape starts a new set of style tables.
+            "DOMShape" => self.styles.begin_shape(),
+
+            "FillStyle" => {
+                self.styles.current = Some(StyleSlot::Fill(attr_index(attrs)));
+                self.styles.gradient.clear();
+            }
+            "StrokeStyle" => {
+                self.styles.current = Some(StyleSlot::Stroke(attr_index(attrs)));
+                self.styles.gradient.clear();
+            }
+            // Every stroke kind carries its weight the same way; the dash and
+            // stipple variants differ only in decoration we cannot draw yet.
+            "SolidStroke" | "DashedStroke" | "DottedStroke" | "RaggedStroke" | "StippleStroke"
+            | "HatchedStroke" => {
+                self.styles.set_stroke_width(attr_f64(attrs, "weight", 1.0));
+                if name != "SolidStroke" {
+                    report.note_unsupported("a decorated stroke, imported as a plain one");
+                }
+            }
+            "SolidColor" => self.styles.set_color(parse_color(attrs, "color", "alpha")),
+            "LinearGradient" | "RadialGradient" => {
+                self.styles.gradient.clear();
+                report.note_unsupported("a gradient, imported as a flat colour");
+            }
+            "GradientEntry" => self
+                .styles
+                .add_gradient_stop(parse_color(attrs, "color", "alpha")),
+            "BitmapFill" => {
+                report.note_unsupported("a bitmap fill, imported as a flat colour");
+                self.styles.set_color(Color::from_rgb8(0x80, 0x80, 0x80));
+            }
+
             "Edge" => {
-                // The geometry itself. `fillStyle0` etc. reference styles
-                // declared earlier in the shape; without tracking those we
-                // fall back to a visible default rather than dropping the art.
+                // The geometry, referencing the styles declared above it.
                 let Some(data) = attrs.get("edges") else { return };
                 match parse_edges_closed(data) {
                     Ok(path) if !path.elements().is_empty() => {
-                        let filled = attrs.contains_key("fillStyle0")
+                        // Either fill reference means "this edge bounds that
+                        // fill"; which side it lies on does not change the
+                        // colour, only the winding, which the path already
+                        // carries.
+                        let fill = ["fillStyle0", "fillStyle1"]
+                            .iter()
+                            .filter_map(|k| attrs.get(*k))
+                            .filter_map(|v| v.trim().parse::<u32>().ok())
+                            .find_map(|index| self.styles.fills.get(&index).copied());
+                        let stroke = attrs
+                            .get("strokeStyle")
+                            .and_then(|v| v.trim().parse::<u32>().ok())
+                            .and_then(|index| self.styles.strokes.get(&index).copied());
+
+                        // A shape referencing a style the file never declared
+                        // still has to be visible, or artwork silently vanishes.
+                        let referenced_fill = attrs.contains_key("fillStyle0")
                             || attrs.contains_key("fillStyle1");
-                        let shape = if filled {
-                            ShapeData {
-                                path,
-                                fill: Some(FillSpec::solid(Color::from_rgb8(0x99, 0x99, 0x99))),
-                                stroke: None,
-                            }
-                        } else {
-                            ShapeData {
-                                path,
-                                fill: None,
-                                stroke: Some(StrokeSpec::new(Color::BLACK, 1.0)),
-                            }
+                        let fill = fill.or_else(|| {
+                            referenced_fill.then_some(Color::from_rgb8(0x99, 0x99, 0x99))
+                        });
+                        let stroke = stroke.or_else(|| {
+                            (!referenced_fill && attrs.contains_key("strokeStyle"))
+                                .then_some((Color::BLACK, 1.0))
+                        });
+                        // An edge with no style at all is a hairline outline,
+                        // which is what Animate shows for one.
+                        let (fill, stroke) = match (fill, stroke) {
+                            (None, None) => (None, Some((Color::BLACK, 1.0))),
+                            other => other,
+                        };
+
+                        let shape = ShapeData {
+                            path,
+                            fill: fill.map(FillSpec::solid),
+                            stroke: stroke.map(|(c, w)| StrokeSpec::new(c, w)),
                         };
                         frame
                             .objects
@@ -615,7 +816,7 @@ impl FrameContext {
         });
     }
 
-    fn flush_layer(&mut self, layers: &mut Vec<Layer>, _report: &mut ImportReport) {
+    fn flush_layer(&mut self, layers: &mut Vec<PendingLayer>, _report: &mut ImportReport) {
         self.finish_frame();
         let Some(mut layer) = self.layer.take() else {
             return;
@@ -624,7 +825,10 @@ impl FrameContext {
             std::mem::take(&mut self.keyframes),
             self.length.max(1),
         );
-        layers.push(layer);
+        layers.push(PendingLayer {
+            layer,
+            parent_index: self.parent_index.take(),
+        });
     }
 }
 
@@ -653,7 +857,7 @@ fn parse_symbol(
     symbol.folder = folder;
 
     let mut context = FrameContext::default();
-    let mut layers: Vec<Layer> = Vec::new();
+    let mut layers: Vec<PendingLayer> = Vec::new();
     let empty_symbols = HashMap::new();
 
     loop {
@@ -689,12 +893,18 @@ fn parse_symbol(
     }
     context.flush_layer(&mut layers, report);
 
+    // A symbol's timeline has layer folders just as the document's does.
+    resolve_layer_parents(&mut layers);
+
     layers.reverse();
     if layers.is_empty() {
-        layers.push(Layer::normal(LayerId(ids.take()), "Layer_1"));
+        layers.push(PendingLayer {
+            layer: Layer::normal(LayerId(ids.take()), "Layer_1"),
+            parent_index: None,
+        });
     }
-    for (index, layer) in layers.into_iter().enumerate() {
-        symbol.layers.insert(index, layer);
+    for (index, pending) in layers.into_iter().enumerate() {
+        symbol.layers.insert(index, pending.layer);
     }
     Ok(symbol)
 }
@@ -1017,5 +1227,265 @@ mod tests {
         assert_eq!(scene.layers().len(), 2);
         assert_eq!(report.symbols, 1);
         assert!(report.summary().contains("2 layers"));
+    }
+
+    /// Animate writes layers bottom-first and points a nested layer at its
+    /// folder by *index into that list*, so the link has to be resolved before
+    /// the list is reversed.
+    const NESTED_LAYERS: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
+  <timelines>
+    <DOMTimeline name="Scene 1">
+      <layers>
+        <DOMLayer name="Folder" layerType="folder"/>
+        <DOMLayer name="Inside" parentLayerIndex="0"/>
+        <DOMLayer name="Outside"/>
+      </layers>
+    </DOMTimeline>
+  </timelines>
+</DOMDocument>"##;
+
+    #[test]
+    fn a_layer_inside_a_folder_arrives_inside_that_folder() {
+        let (scene, _) = build(NESTED_LAYERS, &[]).unwrap();
+
+        let folder = scene
+            .layers()
+            .iter()
+            .find(|l| l.name == "Folder")
+            .expect("the folder came across");
+        let inside = scene.layers().iter().find(|l| l.name == "Inside").unwrap();
+        let outside = scene.layers().iter().find(|l| l.name == "Outside").unwrap();
+
+        assert_eq!(folder.kind, LayerKind::Folder);
+        assert_eq!(
+            inside.parent,
+            Some(folder.id),
+            "parentLayerIndex must survive the bottom-first-to-top-first flip"
+        );
+        assert_eq!(outside.parent, None);
+    }
+
+    /// Animate overloads `parentLayerIndex`: a **masked** layer points at its
+    /// mask with the same attribute a nested layer uses for its folder. Our
+    /// model resolves masking positionally, so honouring it here would nest a
+    /// layer inside its own mask and break that resolution.
+    const MASKED_LAYERS: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
+  <timelines>
+    <DOMTimeline name="Scene 1">
+      <layers>
+        <DOMLayer name="Masked" layerType="masked" parentLayerIndex="1"/>
+        <DOMLayer name="TheMask" layerType="mask"/>
+      </layers>
+    </DOMTimeline>
+  </timelines>
+</DOMDocument>"##;
+
+    #[test]
+    fn a_masked_layer_is_not_nested_inside_its_mask() {
+        let (scene, _) = build(MASKED_LAYERS, &[]).unwrap();
+
+        let masked = scene.layers().iter().find(|l| l.name == "Masked").unwrap();
+        let mask = scene.layers().iter().find(|l| l.name == "TheMask").unwrap();
+
+        assert_eq!(mask.kind, LayerKind::Mask);
+        assert_eq!(
+            masked.kind,
+            LayerKind::Masked,
+            "the kind is what the positional rule reads; as Normal the mask clips nothing"
+        );
+        assert_eq!(
+            masked.parent, None,
+            "a mask is not a folder; masking is resolved positionally"
+        );
+
+        // And the positional rule does the real work: the mask sits above the
+        // layer it claims, which is what the renderer reads.
+        assert_eq!(
+            scene.layers().mask_for(masked.id),
+            Some(mask.id),
+            "the mask should still claim the layer beneath it"
+        );
+    }
+
+    /// A corrupt or hand-edited file must not be able to make a layer its own
+    /// parent, or point outside the list.
+    const BAD_PARENTS: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
+  <timelines>
+    <DOMTimeline name="Scene 1">
+      <layers>
+        <DOMLayer name="SelfParent" layerType="folder" parentLayerIndex="0"/>
+        <DOMLayer name="OffTheEnd" parentLayerIndex="99"/>
+        <DOMLayer name="NotANumber" parentLayerIndex="banana"/>
+      </layers>
+    </DOMTimeline>
+  </timelines>
+</DOMDocument>"##;
+
+    /// XFL declares fills once per shape and has each edge reference one by
+    /// index. Ignoring the table imports every file as flat grey, which is
+    /// what this guards against.
+    const STYLED_SHAPES: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
+  <timelines>
+    <DOMTimeline name="Scene 1">
+      <layers>
+        <DOMLayer name="Art">
+          <frames>
+            <DOMFrame index="0" duration="1">
+              <elements>
+                <DOMShape>
+                  <fills>
+                    <FillStyle index="1"><SolidColor color="#3366CC"/></FillStyle>
+                    <FillStyle index="2"><SolidColor color="#FF0000" alpha="0.5"/></FillStyle>
+                  </fills>
+                  <strokes>
+                    <StrokeStyle index="1">
+                      <SolidStroke weight="4">
+                        <fill><SolidColor color="#00FF00"/></fill>
+                      </SolidStroke>
+                    </StrokeStyle>
+                  </strokes>
+                  <edges>
+                    <Edge fillStyle1="1" edges="!0 0|2000 0|2000 2000|0 2000|0 0"/>
+                    <Edge fillStyle0="2" edges="!0 0|400 0|400 400|0 400|0 0"/>
+                    <Edge strokeStyle="1" edges="!0 0|2000 0"/>
+                  </edges>
+                </DOMShape>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timelines>
+</DOMDocument>"##;
+
+    fn shapes_of(scene: &Scene) -> Vec<ShapeData> {
+        scene
+            .layers()
+            .iter()
+            .flat_map(|l| l.all_objects())
+            .filter_map(|o| match &o.kind {
+                buzz_scene::ObjectKind::Shape(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_edge_takes_the_colour_of_the_fill_style_it_references() {
+        let (scene, _) = build(STYLED_SHAPES, &[]).unwrap();
+        let shapes = shapes_of(&scene);
+        assert_eq!(shapes.len(), 3);
+
+        let first = shapes[0].fill.expect("the first edge is filled").color;
+        assert_eq!(
+            first.to_rgba8().to_u8_array(),
+            [0x33, 0x66, 0xCC, 0xFF],
+            "fillStyle1=1 must resolve to the declared blue, not a grey default"
+        );
+    }
+
+    /// `fillStyle0` names the fill on the other side of the edge, but it is
+    /// still that fill's colour.
+    #[test]
+    fn a_fill_referenced_by_fill_style_zero_is_resolved_too() {
+        let (scene, _) = build(STYLED_SHAPES, &[]).unwrap();
+        let second = shapes_of(&scene)[1].fill.expect("filled").color;
+        let [r, g, b, a] = second.to_rgba8().to_u8_array();
+        assert_eq!([r, g, b], [0xFF, 0x00, 0x00]);
+        assert_eq!(a, 128, "the alpha attribute must be honoured");
+    }
+
+    #[test]
+    fn a_stroke_style_supplies_both_colour_and_weight() {
+        let (scene, _) = build(STYLED_SHAPES, &[]).unwrap();
+        let stroke = shapes_of(&scene)[2].stroke.expect("the third edge is stroked");
+        assert_eq!(stroke.color.to_rgba8().to_u8_array(), [0x00, 0xFF, 0x00, 0xFF]);
+        assert_eq!(stroke.width, 4.0);
+    }
+
+    /// A gradient cannot be drawn yet. Averaging its stops keeps the artwork
+    /// visible and roughly right, and the loss is reported.
+    #[test]
+    fn a_gradient_fill_becomes_its_average_colour_and_is_reported() {
+        const GRADIENT: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
+  <timelines><DOMTimeline name="Scene 1"><layers>
+    <DOMLayer name="Art"><frames><DOMFrame index="0" duration="1"><elements>
+      <DOMShape>
+        <fills>
+          <FillStyle index="1">
+            <LinearGradient>
+              <GradientEntry color="#000000" ratio="0"/>
+              <GradientEntry color="#FFFFFF" ratio="1"/>
+            </LinearGradient>
+          </FillStyle>
+        </fills>
+        <edges><Edge fillStyle1="1" edges="!0 0|2000 0|2000 2000|0 2000|0 0"/></edges>
+      </DOMShape>
+    </elements></DOMFrame></frames></DOMLayer>
+  </layers></DOMTimeline></timelines>
+</DOMDocument>"##;
+
+        let (scene, report) = build(GRADIENT, &[]).unwrap();
+        let fill = shapes_of(&scene)[0].fill.expect("filled").color;
+        assert_eq!(
+            fill.to_rgba8().to_u8_array()[0],
+            127,
+            "black to white averages to mid grey"
+        );
+        assert!(
+            report.unsupported.iter().any(|u| u.contains("gradient")),
+            "the approximation must be reported: {:?}",
+            report.unsupported
+        );
+    }
+
+    /// Each shape gets its own style table, so a later shape must not pick up
+    /// an earlier one's colours by index.
+    #[test]
+    fn style_tables_do_not_leak_between_shapes() {
+        const TWO_SHAPES: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
+  <timelines><DOMTimeline name="Scene 1"><layers>
+    <DOMLayer name="Art"><frames><DOMFrame index="0" duration="1"><elements>
+      <DOMShape>
+        <fills><FillStyle index="1"><SolidColor color="#112233"/></FillStyle></fills>
+        <edges><Edge fillStyle1="1" edges="!0 0|400 0|400 400|0 400|0 0"/></edges>
+      </DOMShape>
+      <DOMShape>
+        <edges><Edge fillStyle1="1" edges="!0 0|400 0|400 400|0 400|0 0"/></edges>
+      </DOMShape>
+    </elements></DOMFrame></frames></DOMLayer>
+  </layers></DOMTimeline></timelines>
+</DOMDocument>"##;
+
+        let (scene, _) = build(TWO_SHAPES, &[]).unwrap();
+        let shapes = shapes_of(&scene);
+        assert_eq!(shapes.len(), 2);
+
+        assert_eq!(
+            shapes[0].fill.unwrap().color.to_rgba8().to_u8_array(),
+            [0x11, 0x22, 0x33, 0xFF]
+        );
+        // The second shape declares no styles, so it falls back to the visible
+        // default rather than inheriting the first shape's blue.
+        assert_ne!(
+            shapes[1].fill.unwrap().color.to_rgba8().to_u8_array(),
+            [0x11, 0x22, 0x33, 0xFF],
+            "the second shape must not inherit the first shape's fill table"
+        );
+    }
+
+    #[test]
+    fn nonsense_parent_indexes_are_ignored_rather_than_believed() {
+        let (scene, _) = build(BAD_PARENTS, &[]).unwrap();
+        for layer in scene.layers().iter() {
+            assert_eq!(layer.parent, None, "{} should have no parent", layer.name);
+        }
     }
 }

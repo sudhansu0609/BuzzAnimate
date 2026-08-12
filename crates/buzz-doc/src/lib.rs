@@ -110,6 +110,26 @@ impl Document {
         self.history.record(before, label);
     }
 
+    /// Change view state on the scene without recording an undo step.
+    ///
+    /// Only one thing qualifies: which symbol is open for editing. It lives on
+    /// [`Scene`] so that every panel and tool sees the same answer, but opening
+    /// a symbol is navigation rather than an edit — it must not mark the
+    /// document dirty, and Ctrl+Z must not take you back out of it.
+    ///
+    /// Nothing here may touch the artwork. `Scene`'s navigation methods do not
+    /// bump the revision, so an accidental artwork change made through this
+    /// path would go unrecorded; a debug assertion catches that.
+    pub fn edit_view(&mut self, f: impl FnOnce(&mut Scene)) {
+        let before = self.scene.revision();
+        f(&mut self.scene);
+        debug_assert_eq!(
+            before,
+            self.scene.revision(),
+            "edit_view changed the document; use edit() so the change can be undone"
+        );
+    }
+
     /// End the current gesture so the next edit starts a fresh undo step.
     pub fn end_gesture(&mut self) {
         self.history.break_coalescing();

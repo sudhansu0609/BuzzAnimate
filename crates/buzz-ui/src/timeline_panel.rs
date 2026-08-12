@@ -26,6 +26,8 @@ pub struct TimelineResponse {
     pub select_layer: Option<LayerId>,
     /// A frame operation was requested.
     pub action: Option<FrameAction>,
+    /// A tween was created or removed from the frame menu.
+    pub tween: Option<TweenRequest>,
     pub toggle_play: bool,
     pub toggle_onion: bool,
     pub go_to_start: bool,
@@ -66,6 +68,30 @@ impl FrameAction {
             Self::InsertKeyframe => "F6",
             Self::InsertBlankKeyframe => "F7",
             Self::ClearKeyframe => "Shift+F6",
+        }
+    }
+}
+
+/// A tween asked for from the frame menu.
+///
+/// Kept separate from [`crate::Command`] for the same reason [`FrameAction`]
+/// is: the panel describes what the user did to a frame, and the shell decides
+/// which command that becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TweenRequest {
+    Motion,
+    Shape,
+    Classic,
+    Remove,
+}
+
+impl TweenRequest {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Motion => "Create Motion Tween",
+            Self::Shape => "Create Shape Tween",
+            Self::Classic => "Create Classic Tween",
+            Self::Remove => "Remove Tween",
         }
     }
 }
@@ -276,38 +302,134 @@ fn layer_row(
 
     // -- frame grid --------------------------------------------------------
     let grid_left = rect.min.x + LAYER_COLUMN;
+    let length = layer.length();
     for frame in 0..columns {
         let x = grid_left + frame as f32 * Metrics::FRAME_WIDTH;
         let cell = egui::Rect::from_min_size(
             egui::pos2(x, rect.min.y),
             egui::vec2(Metrics::FRAME_WIDTH, height),
         );
-        draw_frame_cell(&painter, cell, layer.frame_kind(frame), frame == state.current_frame);
+        draw_frame_cell(
+            &painter,
+            cell,
+            layer.frame_kind(frame),
+            tween_cell(layer, frame, length),
+            frame == state.current_frame,
+        );
     }
 
-    if response.clicked()
-        && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
-    {
-        out.select_layer = Some(layer.id);
-        if pos.x >= grid_left {
+    let clicked_frame = |ui: &Ui| -> Option<u32> {
+        let pos = ui.ctx().input(|i| i.pointer.interact_pos())?;
+        (pos.x >= grid_left).then(|| {
             let frame = ((pos.x - grid_left) / Metrics::FRAME_WIDTH).floor().max(0.0) as u32;
-            out.scrub_to = Some(frame.min(columns.saturating_sub(1)));
+            frame.min(columns.saturating_sub(1))
+        })
+    };
+
+    if response.clicked() {
+        out.select_layer = Some(layer.id);
+        if let Some(frame) = clicked_frame(ui) {
+            out.scrub_to = Some(frame);
+        }
+    }
+
+    // Animate's right-click frame menu. Opening it moves the playhead first,
+    // so the command that follows lands on the frame the user pointed at
+    // rather than wherever the playhead happened to be.
+    response.context_menu(|ui| {
+        out.select_layer = Some(layer.id);
+        if let Some(frame) = clicked_frame(ui)
+            && out.scrub_to.is_none()
+        {
+            out.scrub_to = Some(frame);
+        }
+        frame_context_menu(ui, out);
+    });
+}
+
+/// The tween drawn in one cell, if any.
+///
+/// `None` for a frame with no tween, which is the overwhelmingly common case
+/// and costs one keyframe lookup.
+fn tween_cell(layer: &buzz_scene::Layer, frame: u32, length: u32) -> Option<TweenCell> {
+    let span = layer.frames.tween_span_at(frame)?;
+    let (r, g, b) = span.tween.kind.timeline_tint()?;
+    Some(TweenCell {
+        tint: Color32::from_rgb(r, g, b),
+        complete: span.is_complete(),
+        // The arrowhead sits on the last frame the tween covers, so the span
+        // reads as one arrow running between its two keyframes.
+        arrow: frame == span.last_frame(length) && frame > span.start,
+    })
+}
+
+/// How a single cell participates in a tween span.
+#[derive(Debug, Clone, Copy)]
+struct TweenCell {
+    tint: Color32,
+    /// False when the tween has no keyframe to run to. Drawn dashed, because
+    /// nothing will actually move.
+    complete: bool,
+    /// Draw the arrowhead here.
+    arrow: bool,
+}
+
+/// Animate's right-click menu on a frame.
+fn frame_context_menu(ui: &mut Ui, out: &mut TimelineResponse) {
+    for action in [
+        FrameAction::InsertFrame,
+        FrameAction::RemoveFrame,
+        FrameAction::InsertKeyframe,
+        FrameAction::InsertBlankKeyframe,
+        FrameAction::ClearKeyframe,
+    ] {
+        let button = egui::Button::new(action.label()).shortcut_text(action.shortcut_text());
+        if ui.add(button).clicked() {
+            out.action = Some(action);
+            ui.close();
+        }
+    }
+
+    ui.separator();
+
+    for tween in [
+        TweenRequest::Motion,
+        TweenRequest::Shape,
+        TweenRequest::Classic,
+        TweenRequest::Remove,
+    ] {
+        if ui.button(tween.label()).clicked() {
+            out.tween = Some(tween);
+            ui.close();
         }
     }
 }
 
 /// Draw one frame cell using Animate's conventions.
-fn draw_frame_cell(painter: &egui::Painter, cell: egui::Rect, kind: FrameKind, playhead: bool) {
+fn draw_frame_cell(
+    painter: &egui::Painter,
+    cell: egui::Rect,
+    kind: FrameKind,
+    tween: Option<TweenCell>,
+    playhead: bool,
+) {
     let grid = Stroke::new(1.0, Palette::BORDER);
 
-    // Occupied frames get a lighter background than empty ones.
-    let background = match kind {
-        FrameKind::Empty => Palette::PANEL,
-        FrameKind::BlankKeyframe => Palette::PANEL,
+    // Occupied frames get a lighter background than empty ones — unless a
+    // tween covers them, in which case Animate tints the whole span in the
+    // tween's colour, which is how you tell the three kinds apart at a glance.
+    let background = match (kind, tween) {
+        (FrameKind::Empty, _) => Palette::PANEL,
+        (_, Some(t)) => t.tint,
+        (FrameKind::BlankKeyframe, None) => Palette::PANEL,
         _ => Color32::from_rgb(0x44, 0x4A, 0x52),
     };
     painter.rect_filled(cell, 0.0, background);
     painter.rect_stroke(cell, 0.0, grid, StrokeKind::Inside);
+
+    if let Some(t) = tween {
+        draw_tween_mark(painter, cell, t);
+    }
 
     let centre = cell.center();
     let dot = 3.0;
@@ -344,6 +466,45 @@ fn draw_frame_cell(painter: &egui::Painter, cell: egui::Rect, kind: FrameKind, p
             Stroke::new(1.0, Palette::SELECTION),
             StrokeKind::Inside,
         );
+    }
+}
+
+/// The line an animator reads a tween by: solid with an arrowhead when the
+/// tween runs between two keyframes, dashed when it has nowhere to go.
+fn draw_tween_mark(painter: &egui::Painter, cell: egui::Rect, tween: TweenCell) {
+    let y = cell.center().y;
+    let stroke = Stroke::new(1.0, Palette::TEXT);
+
+    if tween.complete {
+        painter.line_segment(
+            [egui::pos2(cell.min.x, y), egui::pos2(cell.max.x, y)],
+            stroke,
+        );
+    } else {
+        // Animate's broken-tween dashes. Two short strokes per cell is enough
+        // to read as dashed at this width without any dash-pattern support.
+        let quarter = cell.width() / 4.0;
+        for i in 0..2 {
+            let x0 = cell.min.x + (i as f32 * 2.0 + 0.5) * quarter;
+            painter.line_segment(
+                [egui::pos2(x0, y), egui::pos2(x0 + quarter, y)],
+                stroke,
+            );
+        }
+    }
+
+    if tween.arrow {
+        let tip = egui::pos2(cell.max.x - 1.0, y);
+        let back = 4.0;
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                tip,
+                egui::pos2(tip.x - back, y - 3.0),
+                egui::pos2(tip.x - back, y + 3.0),
+            ],
+            Palette::TEXT,
+            Stroke::NONE,
+        ));
     }
 }
 
@@ -395,6 +556,73 @@ mod tests {
             FrameAction::ClearKeyframe,
         ] {
             assert!(!action.label().is_empty());
+        }
+    }
+
+    /// Animate's three tween colours are how an animator tells the kinds apart
+    /// without clicking anything, so each must reach the cell distinctly.
+    #[test]
+    fn each_tween_kind_tints_its_span_in_its_own_colour() {
+        use buzz_scene::{Tween, TweenKind};
+
+        let mut seen = Vec::new();
+        for (tween, kind) in [
+            (Tween::motion(), TweenKind::Motion),
+            (Tween::classic(), TweenKind::Classic),
+            (Tween::shape(), TweenKind::Shape),
+        ] {
+            let mut scene = Scene::default();
+            let id = scene.layers().iter().next().unwrap().id;
+            scene.update_layer(id, |l| {
+                l.frames.insert_frame(19);
+                l.frames.insert_keyframe(10);
+                l.frames.set_tween(0, tween);
+            });
+            let layer = scene.layers().get(id).unwrap();
+
+            let cell = tween_cell(layer, 5, layer.length()).expect("frame 5 is inside the tween");
+            assert!(cell.complete, "{kind:?} runs to the keyframe at 10");
+            assert!(!cell.arrow, "the arrowhead belongs at the end of the span");
+
+            assert!(
+                tween_cell(layer, 10, layer.length()).is_none(),
+                "the span stops at the next keyframe"
+            );
+            let end = tween_cell(layer, 9, layer.length()).expect("frame 9 ends the tween");
+            assert!(end.arrow, "{kind:?} needs an arrowhead on its last frame");
+
+            seen.push(cell.tint);
+        }
+
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "the three tween colours must all differ");
+    }
+
+    /// A tween that cannot run is drawn differently from one that can — this is
+    /// the first thing to look at when a new tween appears to do nothing.
+    #[test]
+    fn a_tween_with_nowhere_to_go_is_marked_incomplete() {
+        let mut scene = Scene::default();
+        let id = scene.layers().iter().next().unwrap().id;
+        scene.update_layer(id, |l| {
+            l.frames.insert_frame(9);
+            l.frames.set_tween(0, buzz_scene::Tween::classic());
+        });
+        let layer = scene.layers().get(id).unwrap();
+
+        let cell = tween_cell(layer, 5, layer.length()).expect("the tween is set");
+        assert!(!cell.complete, "there is no keyframe after frame 0");
+    }
+
+    #[test]
+    fn an_untweened_frame_has_no_tween_mark() {
+        let scene = scene_with_frames();
+        let layer = scene.layers().iter().next().unwrap();
+        for frame in 0..24 {
+            assert!(
+                tween_cell(layer, frame, layer.length()).is_none(),
+                "frame {frame} carries no tween"
+            );
         }
     }
 

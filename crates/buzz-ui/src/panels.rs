@@ -69,6 +69,10 @@ pub fn menu_bar(
                 item(ui, c, true, &mut raised);
             }
             ui.separator();
+            for c in [Command::ImportToStage, Command::ImportToLibrary] {
+                item(ui, c, true, &mut raised);
+            }
+            ui.separator();
             for c in [Command::Save, Command::SaveAs] {
                 item(ui, c, true, &mut raised);
             }
@@ -90,6 +94,17 @@ pub fn menu_bar(
             item(ui, Command::DuplicateSelection, has_selection, &mut raised);
             item(ui, Command::SelectAll, true, &mut raised);
             item(ui, Command::Deselect, has_selection, &mut raised);
+            ui.separator();
+            // Animate's Edit menu is also where you step in and out of a
+            // symbol. Edit Symbol works on a selected instance; Edit Document
+            // only means anything when a symbol is actually open.
+            item(ui, Command::EditSymbol, has_selection, &mut raised);
+            item(
+                ui,
+                Command::EditDocument,
+                !scene.edit_path().is_empty(),
+                &mut raised,
+            );
         });
 
         ui.menu_button("View", |ui| {
@@ -123,10 +138,24 @@ pub fn menu_bar(
         });
 
         ui.menu_button("Insert", |ui| {
-            for c in [Command::NewLayer, Command::NewLayerFolder] {
+            item(ui, Command::NewSymbol, true, &mut raised);
+            ui.separator();
+            // Tweens are left enabled whatever the playhead is on: the editor
+            // is the one that knows whether the frame is a keyframe, and it
+            // says so in the status bar. A greyed-out item with no explanation
+            // teaches the user less than a message that names the reason.
+            for c in [
+                Command::CreateMotionTween,
+                Command::CreateShapeTween,
+                Command::CreateClassicTween,
+                Command::RemoveTween,
+            ] {
                 item(ui, c, true, &mut raised);
             }
             ui.separator();
+            for c in [Command::NewLayer, Command::NewLayerFolder] {
+                item(ui, c, true, &mut raised);
+            }
             item(
                 ui,
                 Command::DeleteLayer,
@@ -188,6 +217,11 @@ pub fn menu_bar(
         });
 
         ui.menu_button("Modify", |ui| {
+            // Animate puts Convert to Symbol at the top of Modify, not under
+            // Insert — Insert's entry is New Symbol, which is a different
+            // thing: one wraps a selection, the other starts from nothing.
+            item(ui, Command::ConvertToSymbol, has_selection, &mut raised);
+            ui.separator();
             item(ui, Command::GroupSelection, has_selection, &mut raised);
             item(ui, Command::UngroupSelection, has_selection, &mut raised);
             ui.separator();
@@ -320,6 +354,215 @@ fn well(ui: &mut Ui, label: &str, color: &mut Color, enabled: &mut bool) {
     });
 }
 
+/// The selected object, if exactly one is selected and it is an instance.
+fn single_selected_instance(scene: &Scene, selection: &Selection) -> Option<buzz_scene::ObjectId> {
+    let mut ids = selection.iter();
+    let id = ids.next()?;
+    if ids.next().is_some() {
+        return None;
+    }
+    let (_, object) = scene.find_object(id)?;
+    object.instance().map(|_| id)
+}
+
+/// Animate's Properties panel for a symbol instance.
+///
+/// Everything here is a property of the *placement*, not of the symbol: two
+/// instances of one symbol can start on different frames, loop differently and
+/// carry different colour effects, which is what makes symbols worth using.
+fn instance_properties(ui: &mut Ui, scene: &mut Scene, id: buzz_scene::ObjectId) -> bool {
+    use buzz_scene::{ColorEffect, LoopMode};
+
+    let Some((_, object)) = scene.find_object(id) else {
+        return false;
+    };
+    let Some(instance) = object.instance() else {
+        return false;
+    };
+    let instance = instance.clone();
+
+    let Some(symbol) = scene.library().get(instance.symbol) else {
+        ui.add_space(8.0);
+        ui.label(RichText::new("Symbol Instance").strong());
+        ui.label(
+            RichText::new("The symbol this instance refers to is no longer in the library.")
+                .weak()
+                .italics(),
+        );
+        return false;
+    };
+    let (symbol_name, symbol_kind, symbol_length) =
+        (symbol.name.clone(), symbol.kind, symbol.length());
+
+    // Collected first, applied after the widgets, so the scene is not borrowed
+    // while the panel is drawn.
+    let mut new_first_frame = instance.first_frame;
+    let mut new_loop = instance.loop_mode;
+    let mut new_color = instance.color;
+    let mut edited = false;
+
+    ui.add_space(8.0);
+    ui.label(RichText::new("Symbol Instance").strong());
+
+    egui::Grid::new("instance-props")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("Symbol");
+            ui.label(RichText::new(&symbol_name).strong())
+                .on_hover_text(symbol_kind.label());
+            ui.end_row();
+
+            ui.label("Frames");
+            ui.label(RichText::new(format!("{symbol_length}")).weak());
+            ui.end_row();
+
+            ui.label("First frame");
+            // Frames are shown one-based, as Animate numbers them, while the
+            // model counts from zero.
+            let mut shown = new_first_frame + 1;
+            if ui
+                .add(egui::DragValue::new(&mut shown).range(1..=symbol_length.max(1)))
+                .changed()
+            {
+                new_first_frame = shown.saturating_sub(1);
+                edited = true;
+            }
+            ui.end_row();
+
+            // Only a graphic follows the parent playhead, so only a graphic has
+            // anything to loop. Showing the control for a movie clip would
+            // promise behaviour that cannot happen.
+            if symbol_kind.follows_parent_timeline() {
+                ui.label("Looping");
+                egui::ComboBox::from_id_salt("instance-loop")
+                    .selected_text(new_loop.label())
+                    .show_ui(ui, |ui| {
+                        for mode in [LoopMode::Loop, LoopMode::PlayOnce, LoopMode::SingleFrame] {
+                            if ui
+                                .selectable_value(&mut new_loop, mode, mode.label())
+                                .clicked()
+                            {
+                                edited = true;
+                            }
+                        }
+                    });
+                ui.end_row();
+            }
+        });
+
+    // -- colour effect ------------------------------------------------------
+    let effect = ColorEffect::from_transform(&instance.color);
+
+    ui.label(RichText::new("Color Effect").small().weak());
+    egui::Grid::new("instance-color")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("Style");
+            egui::ComboBox::from_id_salt("instance-effect")
+                .selected_text(effect.label())
+                .show_ui(ui, |ui| {
+                    // Switching style starts that effect at a visible amount,
+                    // rather than at zero where it would look broken.
+                    let options = [
+                        ColorEffect::None,
+                        ColorEffect::Brightness(0.0),
+                        ColorEffect::Tint {
+                            color: Color::from_rgba8(0xFF, 0x00, 0x00, 0xFF),
+                            amount: 0.5,
+                        },
+                        ColorEffect::Alpha(1.0),
+                    ];
+                    for option in options {
+                        let selected = std::mem::discriminant(&option)
+                            == std::mem::discriminant(&effect);
+                        if ui.selectable_label(selected, option.label()).clicked()
+                            && !selected
+                            && let Some(t) = option.to_transform()
+                        {
+                            new_color = t;
+                            edited = true;
+                        }
+                    }
+                });
+            ui.end_row();
+
+            match effect {
+                ColorEffect::Brightness(amount) => {
+                    ui.label("Brightness");
+                    let mut percent = amount * 100.0;
+                    if ui
+                        .add(egui::Slider::new(&mut percent, -100.0..=100.0).suffix("%"))
+                        .changed()
+                    {
+                        new_color = buzz_scene::ColorTransform::brightness(percent / 100.0);
+                        edited = true;
+                    }
+                    ui.end_row();
+                }
+                ColorEffect::Alpha(amount) => {
+                    ui.label("Alpha");
+                    let mut percent = amount * 100.0;
+                    if ui
+                        .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
+                        .changed()
+                    {
+                        new_color = buzz_scene::ColorTransform::alpha(percent / 100.0);
+                        edited = true;
+                    }
+                    ui.end_row();
+                }
+                ColorEffect::Tint { color, amount } => {
+                    let mut tint = to_egui(color);
+                    let mut percent = amount * 100.0;
+
+                    ui.label("Tint");
+                    if ui.color_edit_button_srgba(&mut tint).changed() {
+                        new_color =
+                            buzz_scene::ColorTransform::tint(from_egui(tint), percent / 100.0);
+                        edited = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Amount");
+                    if ui
+                        .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
+                        .changed()
+                    {
+                        new_color =
+                            buzz_scene::ColorTransform::tint(from_egui(tint), percent / 100.0);
+                        edited = true;
+                    }
+                    ui.end_row();
+                }
+                ColorEffect::Advanced => {
+                    ui.label("Advanced");
+                    ui.label(
+                        RichText::new("Set by a tween or an import")
+                            .small()
+                            .weak(),
+                    )
+                    .on_hover_text(
+                        "This colour effect is not one of Animate's four named ones. \
+                         Choosing a style above replaces it.",
+                    );
+                    ui.end_row();
+                }
+                ColorEffect::None => {}
+            }
+        });
+
+    if edited {
+        scene.update_object(id, |o| {
+            if let buzz_scene::ObjectKind::Instance(i) = &mut o.kind {
+                i.first_frame = new_first_frame;
+                i.loop_mode = new_loop;
+                i.color = new_color;
+            }
+        });
+    }
+    edited
+}
+
 /// Contextual properties for the current selection.
 pub fn properties_panel(
     ui: &mut Ui,
@@ -386,6 +629,13 @@ pub fn properties_panel(
             ui.label(format!("{:.2}", bounds.height()));
             ui.end_row();
         });
+    }
+
+    // A single selected instance gets Animate's instance properties. More than
+    // one would need a multi-edit model that Animate itself does not have here,
+    // so the section only appears for one.
+    if let Some(id) = single_selected_instance(scene, selection) {
+        changed |= instance_properties(ui, scene, id);
     }
 
     ui.add_space(8.0);
@@ -711,6 +961,79 @@ mod tests {
             color_panel(ui, &mut style);
             let _ = layers_panel(ui, &mut scene, &mut selection);
             timeline_placeholder(ui, &scene);
+        });
+    }
+
+    /// The instance section only appears for exactly one selected instance —
+    /// a shape, a mixed selection, or two instances all get the plain
+    /// selection properties instead.
+    #[test]
+    fn the_instance_section_appears_for_one_selected_instance() {
+        use buzz_geom::{Affine, Shape as _};
+        use buzz_scene::{ShapeData, SymbolKind};
+        use kurbo::Rect as KRect;
+
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().unwrap().id;
+        let symbol = scene.add_symbol("Hero", SymbolKind::Graphic, None);
+        let instance = scene
+            .add_instance_at(layer, 0, symbol, Affine::IDENTITY)
+            .unwrap();
+        let shape = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(KRect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9), Color::WHITE),
+            )
+            .unwrap();
+
+        let mut selection = Selection::new();
+        selection.select_one(instance);
+        assert_eq!(
+            single_selected_instance(&scene, &selection),
+            Some(instance),
+            "one instance selected"
+        );
+
+        selection.select_one(shape);
+        assert_eq!(
+            single_selected_instance(&scene, &selection),
+            None,
+            "a shape is not an instance"
+        );
+
+        selection.set([instance, shape]);
+        assert_eq!(
+            single_selected_instance(&scene, &selection),
+            None,
+            "a mixed selection has no single instance to describe"
+        );
+    }
+
+    /// A dangling instance must render an explanation rather than panic —
+    /// deleting a symbol that is still placed is a thing users do.
+    #[test]
+    fn the_instance_section_survives_a_deleted_symbol() {
+        use buzz_geom::Affine;
+        use buzz_scene::SymbolKind;
+
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().unwrap().id;
+        let symbol = scene.add_symbol("Gone", SymbolKind::Graphic, None);
+        let instance = scene
+            .add_instance_at(layer, 0, symbol, Affine::IDENTITY)
+            .unwrap();
+        scene.library_mut().remove(symbol);
+
+        let mut selection = Selection::new();
+        selection.select_one(instance);
+        let mut style = DrawStyle::default();
+        let mut view = ViewSettings::default();
+
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let _ = properties_panel(ui, &mut scene, &selection, &mut style, &mut view);
         });
     }
 

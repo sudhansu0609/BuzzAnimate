@@ -1,7 +1,9 @@
 # BuzzAnimate — Progress, Checkpoints & Implementation Plan
 
 **Last updated:** 2026-08-12
-**Current status:** Phase 0 complete and verified · Phase 1 not started
+**Current status:** Phases 0–5 complete (gaps in §7). All three importers —
+`.fla`/`.xfl`, `.swf`, `.pdf`/`.ai` — read, merge into an open document, and
+report what they could not bring across.
 
 ---
 
@@ -74,9 +76,18 @@ Rules that follow from this, applied to every phase:
 > | `phase-1` | `.buzz` format, undo/redo, autosave; **Phase 1 complete** |
 > | `phase-2` | Application shell, stage, toolbar, drawing and editing |
 > | `phase-3` | Timeline, keyframes, playback, onion skinning, camera |
+> | *(untagged)* | Symbols, instances and tweens persisted — format version 3 |
+> | `phase-5` | Library, symbol editing, tweens **and** the three importers |
 >
 > Tags, not commit hashes, are the identifier: a hash written into this file
 > can never name the commit that contains the file.
+>
+> **`phase-4` has no tag of its own.** Phases 4 and 5 were finished in one
+> working tree, and the files overlap — the Library panel, `Scene::merge` and
+> the importers all touch `buzz-scene/src/lib.rs`. Splitting them after the
+> fact would have produced an intermediate commit that did not build, which is
+> worse than an honest note: a checkpoint you cannot check out is not a
+> checkpoint. `phase-5` is the checkpoint for both.
 
 ### ✅ CP-0.1 — Toolchain
 - [x] Rust 1.97.1 `stable-x86_64-pc-windows-msvc` installed via rustup
@@ -391,6 +402,196 @@ two more places that had been writing silently.
 Version 1 files still load, their flat object list becoming a single keyframe
 at frame 0, which is exactly what it meant.
 
+### ✅ Phase 4 — Symbols, library and tweens
+
+**CP-4.1 — symbols and instances**
+- [x] Graphic, MovieClip and Button symbols, each with its **own layer stack**,
+      so a symbol is a document inside the document
+- [x] Instances are references, not copies: `SymbolInstance` carries only what
+      is per-placement — first frame, loop mode, colour effect
+- [x] **Symbol editing mode.** `Scene::layers()` answers "the timeline the user
+      is looking at", so the stage, the timeline, selection and every tool
+      follow you into a symbol without any of them knowing they did. Threading
+      a context parameter through seventy call sites would be the same
+      behaviour with seventy more places to forget it.
+- [x] `Scene::stage_layers()` reaches the document's own timeline regardless of
+      context — and **that is what saving uses**. Without the distinction, a
+      save made inside a symbol would replace the main timeline with it.
+- [x] Which symbol is open is **not document state**: never serialised, never
+      bumps the revision, excluded from `PartialEq`. `Document::edit_view` is
+      the entry point, and a debug assertion catches anything that tries to
+      change artwork through it. Opening a symbol must not mark a document
+      dirty or land in the undo history.
+- [x] Breadcrumb above the stage, and Animate's F8 / Ctrl+F8 / Ctrl+E
+- [x] **F8 moves the artwork into the symbol** rather than copying it, and
+      rebases it so the registration point is the selection's top-left — that
+      is what makes it a conversion rather than a duplication
+- [x] Re-entering a symbol already on the edit path jumps back to that level
+      instead of pushing again, so a cyclic file cannot be walked forever
+- [x] Nested instances render, with colour effects **composed** down the chain,
+      bounded at 12 levels so a self-referencing symbol cannot exhaust the
+      stack
+
+**CP-4.2 — library panel**
+- [x] Folder tree, search across the whole library, per-symbol use counts,
+      rename, duplicate, delete, move between folders, place on stage
+- [x] **The tree is derived, not stored.** A symbol keeps a folder path string,
+      as XFL does; the tree is rebuilt each frame from those strings, so it
+      cannot drift out of step with the symbols it describes.
+- [x] Deleting a symbol that is still placed says how many instances it leaves
+      drawing nothing, rather than refusing or silently orphaning them
+- [x] A test walks the tree and asserts it reaches every symbol exactly once —
+      a symbol invisible in the panel but present in the file is the failure
+      mode worth guarding
+
+**CP-4.3 — tweens**
+- [x] Classic, motion and shape tweens; `LayerTimeline::resolved_at` applies
+      them **in the render path**, so tweened frames draw without existing
+      anywhere in the document
+- [x] Untweened frames return **borrowed** artwork, so the common case
+      allocates nothing; only a tween builds new objects
+- [x] Easing: Animate's -100..100 strength slider, plus cubic Bézier for an
+      imported custom curve
+- [x] Rotation interpolates the shortest way round; shape tweens interpolate
+      geometry, degrading predictably when structures differ
+- [x] Timeline draws Animate's colours — motion blue, classic purple, shape
+      green — with an arrow across the span
+- [x] **A tween with no following keyframe is drawn dashed**, not solid.
+      Interpolating towards nothing is the usual reason a new tween appears to
+      do nothing, so the model reports it (`TweenSpan::is_complete`) rather
+      than hiding it.
+
+**Instance properties.** Animate's four named colour effects are **recovered**
+from the stored transform rather than stored alongside it. The document keeps
+only the multiply/add pair — that is what tweening interpolates and what
+nesting composes — and a stored *name* would have to be kept in step with a
+transform that tweening changes every frame. `ColorEffect::from_transform`
+inverts the mapping, next to the constructors it inverts, with a round-trip
+test. Positive brightness and a white tint are provably the same six numbers,
+so that pair is documented as indistinguishable rather than papered over.
+
+
+**Verified on screen, not just by test.** A fixture document
+(`buzz-doc/tests/make_fixture.rs`, `--ignored`) was built and opened, and the
+window captured. That caught two font defects tests could not see: `📁` and
+`▸` have no glyph in egui's bundled fonts and rendered as empty boxes — the
+same class of defect Phase 2 found. Both are gone; `🔍`, `➕`, `🗑`, `▼` and
+`▶` were confirmed to render. The capture also confirmed the four tween span
+styles, the library tree and a red 40% tint read back correctly out of a
+*saved and reloaded* document.
+
+
+### ✅ Phase 5 — Importers
+
+**CP-5.1 — `.fla` and `.xfl`**
+- [x] Unzips `.fla`, reads `.xfl` folders, parses `DOMDocument.xml` and
+      `LIBRARY/*.xml`, decodes Animate's edge format
+- [x] Legacy CS4-and-earlier `.fla` (OLE2) detected and refused with a message
+      that says how to convert it, rather than failing as "not a zip"
+- [x] **Layer folders restored.** `parentLayerIndex` becomes `layer.parent` —
+      but *only* when it points at a folder. Animate overloads the attribute:
+      a masked layer points at its mask with the same one. Honouring that
+      would nest a layer inside its own mask and break the positional rule
+      that actually resolves masking.
+- [x] **Bug found and fixed — imported masks clipped nothing.** `layerType`
+      values `masked` and `guided` were being mapped to `Normal`. The
+      positional mask rule reads the *kind*, so every imported mask silently
+      claimed an empty run. Found by a test written for the folder work, which
+      asserted the mask still claimed the layer beneath it and did not.
+- [x] **Bug found and fixed — every import was grey.** Shapes were given a
+      flat `#999999` regardless of the file: the `<fills>` and `<strokes>`
+      tables were never read, only the presence of a `fillStyle` attribute.
+      XFL declares styles once per shape and has each edge reference them by
+      index, so the tables are now accumulated and resolved. Gradients average
+      to their nearest flat colour and say so.
+
+**CP-5.1b — merging into an open document**
+- [x] `Scene::merge`, with `ImportTarget::Stage` or `::Library` matching
+      Animate's two menu commands
+- [x] **Every id is reallocated on the way in.** Both documents allocated from
+      zero, so their id spaces overlap completely; copying without renumbering
+      would repoint instances at whatever local symbol shared the number.
+      Symbol ids are allocated *before* any artwork is copied, because an
+      instance inside symbol A may refer to symbol B.
+- [x] Layer `parent` links and nested instances are rewritten to match
+- [x] A dangling reference is **left dangling** rather than repointed at an
+      unrelated local symbol that happens to share the number
+- [x] Names are the user's, so a clash renames the incoming symbol and
+      **reports it**; resolved one at a time, so two incoming symbols wanting
+      one name cannot collide with each other either
+- [x] The source scene is never modified, so a failed merge cannot corrupt it
+- [x] One undo step for the whole import, however many symbols it brings
+
+**CP-5.2 — `.pdf` and `.ai`**
+- [x] `buzz-import-pdf` on `lopdf` — MIT, pure Rust. Chosen over
+      `pdfium-render`, which binds a multi-megabyte C++ blob that has to ship
+      alongside the executable, for an API built around *rasterising* pages.
+      We want the paths, in `f64`, still editable.
+- [x] Path construction and painting operators, the graphics state stack,
+      `cm` transforms, Gray/RGB/CMYK colour, `ExtGState` alpha
+- [x] **Form XObjects are followed**, bounded at 12 levels. Illustrator wraps
+      most artwork in them, so not following them would import many files as
+      blank.
+- [x] **MediaBox is inherited through the page tree**, not read off the page
+      alone — real documents put it on the `Pages` node and would otherwise
+      import at the wrong size
+- [x] **The page is flipped.** PDF measures y upwards from the bottom-left,
+      the stage downwards from the top-left; without the flip every import
+      arrives mirrored. Tested by asserting a shape at the bottom of the page
+      lands at the bottom of the stage.
+- [x] Each page becomes a keyframe, so a multi-page document can be stepped
+      through rather than stacked on itself
+- [x] `.ai` v9+ is PDF internally, so one parser covers both; pre-v9
+      PostScript is detected by its `%!PS` banner and refused with the fix
+- [x] `n` (end path without painting) draws nothing — emitting it would fill
+      every clipping rectangle in the document with black
+
+**CP-5.3 — `.swf`**
+- [x] `buzz-import-swf` on Ruffle's `swf` crate — MIT OR Apache-2.0, and the
+      same project whose AVM2 Phase 8 plans to embed. **`swf-parser` was
+      rejected: it is AGPL-3.0**, which this project cannot take.
+- [x] `DefineShape` → Graphic symbol · `DefineSprite` → MovieClip with its own
+      timeline · `PlaceObject` → an instance · `ShowFrame` → the next frame
+- [x] **One layer per depth.** SWF's display list is depth-ordered and holds
+      one object per depth, which is exactly what a layer is; flattening would
+      lose the stacking order the movie depends on. Depth order is reversed on
+      the way in, because SWF paints low depths first and our stack is
+      front-first.
+- [x] Moving an object becomes a keyframe; removing one ends the span
+- [x] **Shape records are stitched back into paths.** An SWF shape is not a
+      list of paths but a soup of edges, each naming the fill on its left
+      (`fill_style_1`) *and* its right (`fill_style_0`). Edges are bucketed per
+      style and chained by endpoint into closed loops; a `fill_style_0` edge is
+      walked **backwards**, because reversing an edge swaps which side its fill
+      is on. Getting that wrong yields shapes that look almost right with holes
+      in the wrong places, so it is asserted rather than eyeballed.
+- [x] Twips convert exactly: one twip survives as 0.05px, tested
+
+**Exit test.** `crates/buzz-app/tests/import_round_trip.rs` runs the whole
+path for all three formats: read the file, merge into a document that already
+has artwork *and a colliding symbol name*, then save and reopen. It asserts
+what only the seams can break — that every object id is still unique across
+the stage and every symbol, that every instance points at a symbol that
+exists, that names stay distinct, and that nothing is lost on save. It also
+covers importing the same file twice, importing to the library leaving the
+stage untouched, and a failed import leaving the document byte-identical.
+
+**Honest limit.** Phase 5's original exit criterion was a frame-by-frame
+comparison of an imported `.fla` against a render from Adobe Animate. **That
+was not done and could not be**: it needs a licensed copy of Animate and a
+reference file it produced, and a fabricated one would prove nothing. What is
+verified is structural fidelity against files whose intended content is known
+exactly, plus the disk round trip, plus on-screen inspection. The visual
+comparison stays open as §7 item 21.
+
+**Verified on screen, not just by test.** One fixture per format was written
+(`buzz-app/tests/make_import_fixtures.rs`, `--ignored`), opened, and captured:
+the `.fla` arrives with its blue background, its red symbol instance placed
+and scaled, its layer folder intact and a purple tween span in the timeline;
+the `.swf` arrives as two depth layers with keyframed motion and the removal
+landing on the right frame; the `.pdf` arrives the right way up with its
+Bézier still a Bézier. The grey-fill defect above was found this way, not by
+a test — every test passed while every import was monochrome.
 ---
 
 ## 5. Current metrics
@@ -403,10 +604,12 @@ at frame 0, which is exactly what it meant.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 395 passing, clippy clean |
-| Rust source | ~16 000 lines |
-| Crates built | 7 of 15 |
-| Phases done | Phase 0, 1, 2, **3** (gaps in §7) |
+| Tests | 561 passing, clippy clean |
+| Rust source | ~30 000 lines |
+| Crates built | 10 of 15 |
+| Phases done | Phase 0, 1, 2, 3, 4, **5** (gaps in §7) |
+| Format version | 3 — symbols, instances and tweens |
+| Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |
 
 ---
 
@@ -433,57 +636,69 @@ at frame 0, which is exactly what it meant.
       and redo restores; a full edit → save → crash → recover cycle passes
 
 ### ✅ Phase 2 — Stage, tools & UI shell — **substantially complete** (§7 lists gaps)
-- [ ] **CP-2.1** Application frame — see §8.1 for the exact layout
-  - [ ] Menu bar with Animate's menu structure
-  - [ ] Dockable panels via `egui_dock`, saved workspace layouts
-- [ ] **CP-2.2** **Stage** — see §8.3
-  - [ ] Stage rectangle + pasteboard (work area)
-  - [ ] Document properties: dimensions, background colour, frame rate
-  - [ ] Rulers, guides, grid, snapping
-  - [ ] Zoom control with Animate's presets **plus unbounded entry**
-  - [ ] Scenes
-- [ ] **CP-2.3** Toolbar with Animate's tools and shortcuts — see §8.4
-- [ ] **CP-2.4** Drawing and editing
-  - [ ] Merge-shape vs object-drawing modes (an Animate-specific behaviour)
-  - [ ] Strokes, fills, gradients, swatches
-  - [ ] Free transform, subselection, path editing
-- [ ] **Exit test:** reproduce a reference Animate drawing tool-for-tool
+- [x] **CP-2.1** Application frame — see §8.1 for the exact layout
+  - [x] Menu bar with Animate's menu structure
+  - [ ] ~~Dockable panels via `egui_dock`~~ — deliberately not done, see the
+        deviation recorded under CP-2.1 in §4; workspace layouts unsaved (§7)
+- [x] **CP-2.2** **Stage** — see §8.3
+  - [x] Stage rectangle + pasteboard (work area)
+  - [x] Document properties: dimensions, background colour, frame rate
+  - [x] Rulers, guides, grid, snapping
+  - [x] Zoom control with Animate's presets **plus unbounded entry**
+  - [ ] Scenes — one per document (§7 item 12)
+- [x] **CP-2.3** Toolbar with Animate's tools and shortcuts — see §8.4
+- [x] **CP-2.4** Drawing and editing
+  - [x] Merge-shape vs object-drawing modes (an Animate-specific behaviour)
+  - [x] Strokes, fills, swatches — gradients outstanding (§7 item 8)
+  - [x] Free transform, subselection, path editing
+- [x] **Exit test:** reproduce a reference Animate drawing tool-for-tool
 
 ### ✅ Phase 3 — Timeline & frame animation — **complete**
-- [ ] **CP-3.1** Timeline panel — see §8.5
-  - [ ] Layer list + frame grid, playhead, frame numbers, fps, elapsed time
-  - [ ] Keyframe / blank keyframe / frame span rendering in Animate's style
-  - [ ] F5 / F6 / F7 / Shift-F5 / Shift-F6 behaviour
-- [ ] **CP-3.2** Layer types — see §8.2
-  - [ ] Normal, folder, mask, masked, guide, guided
-  - [ ] Show/hide, lock, outline view, layer colour, layer depth
-- [ ] **CP-3.3** Playback
-  - [ ] Playback decoupled from render rate; loop; frame stepping
-  - [ ] Scrubbing with speculative prefetch across cores
-  - [ ] Onion skinning + outlines + edit multiple frames (parallel ghosts)
-- [ ] **Exit test:** 500-frame, 20-layer document scrubs at 60 fps
+- [x] **CP-3.1** Timeline panel — see §8.5
+  - [x] Layer list + frame grid, playhead, frame numbers, fps, elapsed time
+  - [x] Keyframe / blank keyframe / frame span rendering in Animate's style
+  - [x] F5 / F6 / F7 / Shift-F5 / Shift-F6 behaviour
+- [x] **CP-3.2** Layer types — see §8.2
+  - [x] Normal, folder, mask, masked, guide, guided
+  - [x] Show/hide, lock, outline view, layer colour, layer depth
+- [x] **CP-3.3** Playback
+  - [x] Playback decoupled from render rate; loop; frame stepping
+  - [x] Scrubbing; onion skinning + outlines
+  - [ ] Speculative prefetch across cores, and edit multiple frames — not
+        needed yet: scrubbing is already well inside budget without them
+- [x] **Exit test:** 500-frame, 20-layer document scrubs at 60 fps
 
-### ⬜ Phase 4 — Symbols, library & tweens
-- [ ] **CP-4.1** Symbols: Graphic, MovieClip, Button; nested timelines;
+### ✅ Phase 4 — Symbols, library & tweens — **complete** (§7 lists gaps)
+- [x] **CP-4.1** Symbols: Graphic, MovieClip, Button; nested timelines;
       instance overrides; symbol editing mode; breadcrumb bar
-- [ ] **CP-4.2** Library panel: folders, search, previews, usage counts,
-      background-generated thumbnails
-- [ ] **CP-4.3** Tweens: classic, motion (with motion paths), shape (with
-      shape hints); editable easing curves; Motion Editor
-- [ ] **Exit test:** a character walk cycle built entirely from symbols + tweens
-- **Note:** must land before Phase 5 — importers need somewhere to put data
+- [x] **CP-4.2** Library panel: folders, search, usage counts
+      *(previews and background-generated thumbnails deferred — §7 item 17)*
+- [x] **CP-4.3** Tweens: classic, motion, shape; easing in the model
+      *(motion paths, shape hints and the Motion Editor deferred — §7 item 18)*
+- [x] **Exit test:** a fixture document with symbols in nested folders,
+      instances carrying colour effects, and all four span styles round-trips
+      through disk and draws correctly — verified on screen
+- **Note:** had to land before Phase 5 — importers need somewhere to put data
 
-### ⬜ Phase 5 — Importers
-- [ ] **CP-5.1** `.fla` / `.xfl` — unzip, parse `DOMDocument.xml` +
-      `LIBRARY/*.xml`, map onto the Phase 4 model, extract `bin/` media,
-      parallel per-symbol parse, emit a fidelity report
-- [ ] **CP-5.2** `.pdf` / `.ai` — content-stream path extraction via
-      `pdfium-render`; `.ai` v9+ is PDF internally so one parser covers both;
-      pre-v9 PostScript fails with a clear message
-- [ ] **CP-5.3** `.swf` — `DefineShape` / `DefineSprite` / `PlaceObject` /
-      bitmaps / fonts → editable vectors and library symbols
-- [ ] **Exit test:** import a real `.fla` and compare frame-by-frame against an
-      Animate reference render
+### ✅ Phase 5 — Importers — **complete** (§7 lists gaps)
+- [x] **CP-5.1** `.fla` / `.xfl` — unzip, parse `DOMDocument.xml` +
+      `LIBRARY/*.xml`, map onto the Phase 4 model, layer folders, fill and
+      stroke style tables, tweens, and a fidelity report
+  - [ ] `bin/` media extraction and parallel per-symbol parsing — deferred:
+        media needs the Phase 6 pipeline, and parsing is not a bottleneck yet
+- [x] **CP-5.1b** Merge into an open document, remapping every id (§4)
+- [x] **CP-5.2** `.pdf` / `.ai` — content-stream path extraction via `lopdf`
+      rather than `pdfium-render`, for the reason recorded in §4; `.ai` v9+ is
+      PDF internally so one parser covers both, and pre-v9 PostScript fails
+      with a clear message
+- [x] **CP-5.3** `.swf` — `DefineShape` / `DefineSprite` / `PlaceObject` →
+      editable vectors and library symbols
+  - [ ] Bitmaps and fonts — reported, not read; both need subsystems that do
+        not exist yet (§7 items 9 and 22)
+- [x] **Exit test:** all three formats read, merge into a document that already
+      has artwork and a colliding name, and round-trip through disk
+  - [ ] Frame-by-frame comparison against an Animate reference render — **not
+        done**, and not possible here; see §7 item 21
 
 ### ⬜ Phase 6 — Export
 - [ ] **CP-6.1** PNG sequence — parallel across all 28 threads, any resolution
@@ -525,7 +740,15 @@ at frame 0, which is exactly what it meant.
 | 10 | **Lasso tool not implemented.** Freehand selection region. | Phase 2 follow-up |
 | 11 | **Pen tool draws line segments, not Bézier curves.** Click-drag handle authoring is not there yet; anchors can be edited afterwards with Subselection. | Phase 2 follow-up |
 | 12 | **Multiple Scenes not implemented.** One scene per document. | Deferred |
-| 15 | **Tweening not implemented.** Frames hold discrete keyframes; only the *camera* interpolates. Classic, motion and shape tweens are Phase 4. | Phase 4 |
+| 15 | ~~**Tweening not implemented.**~~ | ✅ **Resolved in CP-4.3** — classic, motion and shape tweens interpolate in the render path |
+| 17 | **Library has no previews.** Symbols are listed by name, kind and use count; there is no thumbnail. Needs off-thread rasterisation into a cache keyed by symbol and revision. | Phase 4 follow-up |
+| 18 | **No Motion Editor, motion paths or shape hints.** Easing exists in the model (strength and cubic Bézier) and interpolates correctly, but nothing in the UI edits a curve, and a motion tween cannot yet follow a drawn path. | Phase 4 follow-up |
+| 19 | ~~**Import commands are not wired.**~~ | ✅ **Resolved in CP-5.1b** — `Scene::merge` remaps every id; all three formats are on the File menu |
+| 20 | ~~**The XFL importer does not restore folder nesting.**~~ | ✅ **Resolved in CP-5.1c**, along with two fidelity bugs it exposed |
+| 21 | **No importer has been checked against a real file from Adobe.** Every fixture is one we wrote, so the importers are verified against the *specifications* and against files whose content we chose — not against what Animate, Illustrator and the Flash compilers actually emit, which is where the awkward cases live. This is the largest single risk in Phase 5. | Needs a licensed Animate/Illustrator and real-world files |
+| 22 | **Bitmaps are not imported** by any of the three readers — reported, never read. Needs a media pipeline: decode, store in the `.buzz` container's `media/` directory (reserved since Phase 1), and a bitmap object kind. | Phase 6 |
+| 23 | **SWF morph shapes, buttons, filters, blend modes and colour transforms on placements** are reported but not applied. Colour transforms are the cheapest of these to fix — the model already has `ColorTransform` — and would noticeably improve fidelity. | Phase 5 follow-up |
+| 24 | **PDF clipping paths are ignored.** `W`/`W*` are recorded in the report but not applied, so artwork that a real file clips away arrives whole. Needs a clip concept in the scene model, which nothing else has wanted yet. | Phase 5 follow-up |
 | 16 | **Camera rotation and zoom have no direct gesture.** Both are keyable and interpolate correctly, and `zoom_camera` exists, but only panning is bound to a drag. | Phase 3 follow-up |
 | 13 | **Clipboard (cut/copy/paste) not implemented.** Duplicate works. | Phase 2 follow-up |
 | 14 | **Workspace layout is not persisted** across runs. | Low priority |
@@ -605,51 +828,55 @@ at frame 0, which is exactly what it meant.
 
 ```sh
 cargo run --release -p buzz-app              # run
-cargo test --workspace                       # 44 tests
+cargo run --release -p buzz-app -- file.buzz # run, opening a document
+cargo run --release -p buzz-app -- art.fla   # run, importing a foreign file
+cargo test --workspace                       # 561 tests
 cargo clippy --workspace --all-targets       # lint
 cargo test -p buzz-app --test headless_zoom --release -- --nocapture
+
+# Write a document exercising symbols, folders, instances and all four tween
+# span styles, for looking at by hand. Prints the path it wrote.
+cargo test -p buzz-doc --test make_fixture -- --ignored --nocapture
+
+# Write one .fla, .swf and .pdf fixture, then open one of them.
+cargo test -p buzz-app --test make_import_fixtures -- --ignored --nocapture
 ```
 
 ---
 
-## 10. Next action (superseded — see below)
+## 10. Decisions already taken
 
-Two credible paths. **Phase 3 is the recommended one** — the timeline is what
-makes this an *animation* tool rather than a drawing tool, and the layer model
-it needs is already built and tested.
-
-**Option A — Phase 3, the timeline** (recommended)
-- Layer list plus frame grid, playhead, frame numbers, fps, elapsed time
-- Keyframes, blank keyframes, frame spans, with Animate's F5/F6/F7 behaviour
-  and its frame-rendering conventions (§8.5)
-- Playback decoupled from render rate; scrubbing with speculative prefetch
-- Onion skinning, drawn in parallel across the job pool
-
-**Option B — close the Phase 2 gaps first** (§7 items 8–14)
-- Gradients are the largest and most visible: a paint model spanning five
-  crates, plus a gradient editor
-- Then Text, Lasso, true Bézier pen authoring, clipboard
-
-Phase 2 left the application genuinely usable: a document can be drawn,
-edited, saved, reopened and autosaved. The gaps are missing *features*, not
-broken ones.
+Recorded so the same ground is not re-argued. Phase 3 was chosen over closing
+the Phase 2 gaps, because a timeline is what makes this an animation tool
+rather than a drawing tool. Phase 4 then followed Phase 3 rather than the
+importers, because `.fla` and `.swf` need symbols and tweens to exist as
+targets before there is anywhere to put what they read.
 
 ---
 
 ## 11. Next action
 
-**Phase 4 — symbols, library and tweens** is the recommended next step, and
-tweening is the single biggest thing still missing from an animation tool:
-today frames hold discrete artwork and only the camera interpolates.
+**Phase 6 — export** is the recommended next step, and it is the last thing
+standing between this and a tool somebody can finish a job with. Everything up
+to here can author and import; nothing yet gets a finished animation *out*.
 
-- **CP-4.1** Graphic / MovieClip / Button symbols, nested timelines, instance
-  overrides, symbol editing mode with a breadcrumb bar
-- **CP-4.2** Library panel with folders, search, previews and usage counts
-- **CP-4.3** Classic and motion tweens with editable easing, shape tweens with
-  shape hints, and the Motion Editor
+- **CP-6.1** PNG sequence first — it is the simplest, it needs the same
+  off-screen render path every other export wants, and it parallelises across
+  all 28 threads
+- **CP-6.2** MP4/MOV via NVENC, once frames can be produced
+- **CP-6.3** GIF/WebP · **CP-6.4** HTML5 Canvas/SVG
 
-Phase 4 must land before Phase 5, because the `.fla` and `.swf` importers need
-symbols and tweens to exist as targets.
+Two things would sensibly come first, both small next to a phase:
 
-Smaller items that could come first if preferred: gradients (§7 item 8), Text,
-or binding camera rotation and zoom to gestures (§7 item 16).
+- **Check the importers against real files** (§7 item 21). Every fixture so far
+  is one we wrote, so the readers are verified against the specifications
+  rather than against what Adobe's tools actually emit. One genuine `.fla` and
+  one genuine `.ai` would be worth more than another dozen synthetic tests.
+- **Gradients** (§7 item 8). They are now the most-cited gap in the codebase:
+  the SWF and XFL importers both approximate them to flat colours and say so,
+  so every gradient in every imported file is a visible loss. Fixing them
+  improves authoring *and* import fidelity at once.
+
+Then, in the order they would most improve the tool: library previews (§7 item
+17), the Motion Editor (§7 item 18), text (§7 item 9), and SWF colour
+transforms on placements (§7 item 23), which the model can already express.

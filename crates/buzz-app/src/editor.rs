@@ -10,9 +10,9 @@ use std::sync::Arc;
 use buzz_doc::Document;
 use buzz_geom::{Affine, BezPath, Camera, Point, Rect, Shape as _, Size, Vec2};
 use buzz_scene::{
-    FillSpec, LayerId, LayerKind, Object, ObjectId, ObjectKind, Scene, ShapeData, StrokeSpec,
+    FillSpec, LayerId, LayerKind, Object, ObjectId, ObjectKind, Scene, ShapeData, StrokeSpec, Tween,
 };
-use buzz_ui::{Command, DrawStyle, DrawingMode, Selection, ToolId, ViewSettings};
+use buzz_ui::{Command, DrawStyle, DrawingMode, LibraryState, Selection, ToolId, ViewSettings};
 use peniko::Color;
 
 use crate::tools::{Mods, Preview, ToolAction, ToolContext, ToolMachine};
@@ -38,6 +38,14 @@ pub struct Editor {
     pub playback: Playback,
     /// Onion skinning.
     pub onion: Onion,
+    /// Library panel state: what is selected, what is open, what is typed in
+    /// the search box. View state, so it lives here and not in the document.
+    pub library: LibraryState,
+    /// The fidelity report from the last import, while it is still on screen.
+    ///
+    /// View state, not document state: dismissing it is not an edit, and it
+    /// must not be saved or undone.
+    pub import_summary: Option<crate::import::ImportSummary>,
     /// Set when the user asks to quit.
     pub should_quit: bool,
     /// Transient message for the status bar.
@@ -116,6 +124,8 @@ impl Editor {
             current_frame: 0,
             playback: Playback::default(),
             onion: Onion::default(),
+            library: LibraryState::default(),
+            import_summary: None,
             should_quit: false,
             status: None,
         }
@@ -730,8 +740,311 @@ impl Editor {
                 });
             }
 
+            // -- symbols and library -----------------------------------------
+            ConvertToSymbol => self.convert_selection_to_symbol(),
+            NewSymbol => self.new_symbol(),
+            EditSymbol => self.edit_selected_symbol(),
+            EditDocument => {
+                if !self.doc.scene().edit_path().is_empty() {
+                    self.doc.edit_view(|scene| scene.edit_document());
+                    self.after_context_change();
+                }
+            }
+            PlaceInstance => self.place_library_instance(),
+            DuplicateSymbol => self.duplicate_library_symbol(),
+            DeleteSymbol => self.delete_library_symbol(),
+            NewLibraryFolder => self.new_library_folder(),
+
+            // -- tweens ------------------------------------------------------
+            CreateClassicTween => self.set_tween(Tween::classic()),
+            CreateMotionTween => self.set_tween(Tween::motion()),
+            CreateShapeTween => self.set_tween(Tween::shape()),
+            RemoveTween => self.set_tween(Tween::default()),
+
+            ImportToLibrary | ImportToStage => {
+                // Handled by the shell, which owns the file dialog, as with
+                // Open and Save. Reaching here means a code path raised the
+                // command without going through `App::dispatch`.
+                debug_assert!(false, "{command:?} must be dispatched by the shell");
+            }
+
             SelectTool(tool) => self.set_tool(tool),
         }
+    }
+
+    // -- symbols -------------------------------------------------------------
+
+    /// Everything the Library panel needs the editor to remember.
+    pub fn library_selection(&self) -> Option<buzz_scene::SymbolId> {
+        self.library.selected
+    }
+
+    /// Re-settle the editor after entering or leaving a symbol.
+    ///
+    /// The symbol's timeline is a different length and holds different
+    /// objects, so a playhead and a selection from the old context would both
+    /// be meaningless.
+    fn after_context_change(&mut self) {
+        self.selection.clear();
+        self.selection.set_active_layer(None);
+        self.selection.ensure_active_layer(self.doc.scene());
+        self.set_frame(0);
+        self.playback.playing = false;
+    }
+
+    /// Animate's F8: replace the selection with an instance of a new symbol.
+    ///
+    /// The artwork moves *into* the symbol rather than being copied, which is
+    /// what makes F8 a conversion rather than a duplication.
+    fn convert_selection_to_symbol(&mut self) {
+        if self.selection.is_empty() {
+            self.status = Some("Select artwork first, then Convert to Symbol".into());
+            return;
+        }
+        let Some(target_layer) = self.active_layer() else {
+            return;
+        };
+        let ids: Vec<ObjectId> = self.selection.iter().collect();
+        let frame = self.current_frame;
+        let folder = self.library.selected_folder.clone();
+        let kind = self.library.new_symbol_kind;
+
+        // The instance's origin is the selection's top-left, so the artwork
+        // does not jump when it is replaced.
+        let origin = self
+            .selection
+            .bounds(self.doc.scene())
+            .map(|b| b.origin())
+            .unwrap_or(Point::ZERO);
+
+        let mut placed = None;
+        self.doc.edit("Convert to Symbol", |scene| {
+            let symbol = scene.add_symbol("Symbol", kind, folder.as_deref());
+            let Some(inner_layer) = scene
+                .library()
+                .get(symbol)
+                .and_then(|s| s.layers.iter().next())
+                .map(|l| l.id)
+            else {
+                return;
+            };
+
+            // Lift the artwork out, rebasing it so the symbol's registration
+            // point sits at its top-left corner.
+            let shift = Affine::translate((-origin.x, -origin.y));
+            let mut lifted = Vec::new();
+            for id in &ids {
+                if let Some(object) = scene.remove_object(*id) {
+                    let mut object = (*object).clone();
+                    object.transform = shift * object.transform;
+                    lifted.push(Arc::new(object));
+                }
+            }
+            if lifted.is_empty() {
+                return;
+            }
+            scene.library_mut().update(symbol, |s| {
+                s.layers.update(inner_layer, |l| {
+                    l.frames.set_objects(0, lifted);
+                });
+            });
+
+            placed = scene.add_instance_at(
+                target_layer,
+                frame,
+                symbol,
+                Affine::translate((origin.x, origin.y)),
+            );
+        });
+
+        match placed {
+            Some(id) => {
+                self.selection.set([id]);
+                self.status = Some("Converted to symbol".into());
+            }
+            None => self.status = Some("Nothing was converted".into()),
+        }
+    }
+
+    /// Animate's Ctrl+F8: an empty symbol, opened for editing.
+    fn new_symbol(&mut self) {
+        let folder = self.library.selected_folder.clone();
+        let kind = self.library.new_symbol_kind;
+        let mut created = None;
+        self.doc.edit("New Symbol", |scene| {
+            created = Some(scene.add_symbol("Symbol", kind, folder.as_deref()));
+        });
+        if let Some(id) = created {
+            self.library.selected = Some(id);
+            self.doc.edit_view(|scene| {
+                scene.enter_symbol(id);
+            });
+            self.after_context_change();
+        }
+    }
+
+    /// Open a symbol: the library selection if there is one, otherwise the
+    /// selected instance's symbol. Animate's Ctrl+E does both.
+    fn edit_selected_symbol(&mut self) {
+        let from_instance = self
+            .selection
+            .iter()
+            .next()
+            .and_then(|id| self.doc.scene().find_object(id))
+            .and_then(|(_, o)| o.instance())
+            .map(|i| i.symbol);
+
+        let Some(id) = self.library.selected.or(from_instance) else {
+            self.status = Some("Select a symbol or an instance first".into());
+            return;
+        };
+
+        let mut entered = false;
+        self.doc.edit_view(|scene| entered = scene.enter_symbol(id));
+        if entered {
+            self.library.selected = Some(id);
+            self.after_context_change();
+        } else {
+            self.status = Some("That symbol is no longer in the library".into());
+        }
+    }
+
+    /// Place an instance of the library selection at the centre of the view.
+    fn place_library_instance(&mut self) {
+        let Some(symbol) = self.library.selected else {
+            self.status = Some("Select a symbol in the Library first".into());
+            return;
+        };
+        let Some(layer) = self.active_layer() else {
+            return;
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return;
+        }
+
+        let at = self.camera.center;
+        let frame = self.current_frame;
+        let mut placed = None;
+        self.doc.edit("Place Instance", |scene| {
+            placed = scene.add_instance_at(layer, frame, symbol, Affine::translate((at.x, at.y)));
+        });
+        match placed {
+            Some(id) => self.selection.set([id]),
+            None => self.status = Some("Could not place the instance here".into()),
+        }
+    }
+
+    fn duplicate_library_symbol(&mut self) {
+        let Some(id) = self.library.selected else {
+            return;
+        };
+        let mut created = None;
+        self.doc.edit("Duplicate Symbol", |scene| {
+            let Some(source) = scene.library().get(id).cloned() else {
+                return;
+            };
+            let new_id = scene.add_symbol(
+                source.name.clone(),
+                source.kind,
+                source.folder.as_deref(),
+            );
+            // Copying the layer stack wholesale shares every `Arc` inside it;
+            // the artwork is only cloned if one of the two is edited.
+            scene.library_mut().update(new_id, |s| {
+                s.layers = source.layers.clone();
+                s.registration = source.registration;
+            });
+            created = Some(new_id);
+        });
+        if let Some(new_id) = created {
+            self.library.selected = Some(new_id);
+        }
+    }
+
+    fn delete_library_symbol(&mut self) {
+        let Some(id) = self.library.selected else {
+            return;
+        };
+        // Animate warns before deleting a symbol that is still placed; the
+        // count is the same one the panel shows, so the warning matches what
+        // the user can already see.
+        let uses = self.doc.scene().symbol_usage().get(&id).copied().unwrap_or(0);
+
+        self.doc.edit("Delete Symbol", |scene| {
+            // Leaving symbol editing first, or the editor would be pointed at
+            // a timeline that no longer exists.
+            scene.edit_document();
+            scene.library_mut().remove(id);
+        });
+        self.library.selected = None;
+        self.after_context_change();
+        if uses > 0 {
+            self.status = Some(format!(
+                "Deleted a symbol that was placed {uses} time(s); those instances now draw nothing"
+            ));
+        }
+    }
+
+    fn new_library_folder(&mut self) {
+        // Nest inside the selected folder, which is how a tree gets built
+        // without a dialog.
+        let parent = self.library.selected_folder.clone();
+        let mut created = None;
+        self.doc.edit("New Library Folder", |scene| {
+            let base = match &parent {
+                Some(p) => format!("{p}/Folder"),
+                None => "Folder".to_string(),
+            };
+            // Distinct from any sibling, so two folders never collide.
+            let mut path = base.clone();
+            for n in 1..1000 {
+                if !scene.library().folders().any(|f| *f == path) {
+                    break;
+                }
+                path = format!("{base} {n}");
+            }
+            scene.library_mut().add_folder(&path);
+            created = Some(path);
+        });
+        self.library.selected_folder = created;
+    }
+
+    /// Set the tween on the keyframe governing the playhead.
+    fn set_tween(&mut self, tween: Tween) {
+        let Some(layer) = self.active_layer() else {
+            return;
+        };
+        let frame = self.current_frame;
+        let mut ok = false;
+        self.doc.edit("Tween", |scene| {
+            scene.update_layer(layer, |l| ok = l.frames.set_tween(frame, tween));
+        });
+        if !ok {
+            self.status = Some("Put the playhead on a keyframe to tween from it".into());
+        } else if tween.is_active() && self.tween_span_length(layer, frame) < 2 {
+            // A tween needs somewhere to go. Saying so beats leaving the user
+            // wondering why nothing moves.
+            self.status =
+                Some("Tween set, but there is no following keyframe to tween towards".into());
+        }
+    }
+
+    /// Frames between this keyframe and the next, for diagnostics.
+    fn tween_span_length(&self, layer: LayerId, frame: u32) -> u32 {
+        let Some(l) = self.doc.scene().layers().get(layer) else {
+            return 0;
+        };
+        let Some(start) = l.frames.keyframe_start(frame) else {
+            return 0;
+        };
+        let next = l
+            .frames
+            .keyframes()
+            .iter()
+            .map(|k| k.start)
+            .find(|s| *s > start);
+        next.map(|n| n - start).unwrap_or(0)
     }
 
     /// Apply a frame operation to the active layer.

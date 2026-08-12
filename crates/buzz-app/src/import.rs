@@ -1,0 +1,148 @@
+//! Reading foreign formats, and telling the user what came across.
+//!
+//! Three importers sit behind one entry point. Which one runs is decided by
+//! the file's extension, because that is what the user chose in the dialog and
+//! what they will blame if it goes wrong — sniffing content would be cleverer
+//! and would make a mis-import harder to explain.
+//!
+//! # The fidelity report is the point
+//!
+//! Every importer returns a list of what it could not bring across. That list
+//! is not a debug aid; it is the deliverable. An import that silently drops a
+//! third of a file is worse than one that refuses, because the user finds out
+//! later, in front of somebody else. So the report is surfaced in a dialog the
+//! user has to dismiss whenever anything was lost.
+
+use std::path::Path;
+
+use buzz_scene::Scene;
+
+/// A file read into a scene, with an account of what was lost.
+#[derive(Debug)]
+pub struct Imported {
+    pub scene: Scene,
+    /// One line per counted category, for the status bar.
+    pub summary: String,
+    /// What did not come across. Empty means a complete import.
+    pub unsupported: Vec<String>,
+}
+
+/// What the user is shown after an import.
+#[derive(Debug, Clone)]
+pub struct ImportSummary {
+    pub title: String,
+    pub what_arrived: String,
+    pub unsupported: Vec<String>,
+}
+
+/// File extensions the importers understand, for the dialog's filter.
+pub const IMPORTABLE: &[&str] = &["fla", "xfl", "swf", "pdf", "ai"];
+
+/// Read a file into a scene.
+///
+/// Errors are already phrased for a person: each importer explains what it
+/// found and, where it can, what to do about it.
+pub fn read(path: &Path) -> Result<Imported, String> {
+    // A `.xfl` document is a folder, so a directory is not an error here.
+    if path.is_dir() {
+        return read_xfl(path);
+    }
+
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match extension.as_str() {
+        "fla" | "xfl" => read_xfl(path),
+        "swf" => read_swf(path),
+        "pdf" | "ai" => read_pdf(path),
+        "" => Err("that file has no extension, so there is no way to tell what it is".into()),
+        other => Err(format!(
+            "BuzzAnimate cannot import .{other} files. It reads .fla and .xfl \
+             from Animate, .swf movies, and .pdf or .ai artwork."
+        )),
+    }
+}
+
+fn read_xfl(path: &Path) -> Result<Imported, String> {
+    let (scene, report) = buzz_import_xfl::import(path).map_err(|e| e.to_string())?;
+    Ok(Imported {
+        scene,
+        summary: report.summary(),
+        unsupported: report.unsupported,
+    })
+}
+
+fn read_swf(path: &Path) -> Result<Imported, String> {
+    let (scene, report) = buzz_import_swf::import(path).map_err(|e| e.to_string())?;
+    Ok(Imported {
+        scene,
+        summary: report.summary(),
+        unsupported: report.unsupported,
+    })
+}
+
+fn read_pdf(path: &Path) -> Result<Imported, String> {
+    let (scene, report) = buzz_import_pdf::import(path).map_err(|e| e.to_string())?;
+    Ok(Imported {
+        scene,
+        summary: report.summary(),
+        unsupported: report.unsupported,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn every_advertised_extension_is_actually_dispatched() {
+        // A missing file is fine: what matters is that the extension is
+        // recognised, so the error is about the file rather than the format.
+        for extension in IMPORTABLE {
+            let path = PathBuf::from(format!("does-not-exist.{extension}"));
+            let error = read(&path).expect_err("the file does not exist");
+            assert!(
+                !error.contains("cannot import"),
+                ".{extension} is offered in the dialog but not dispatched: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_extension_says_what_is_supported() {
+        let error = read(&PathBuf::from("drawing.psd")).unwrap_err();
+        assert!(error.contains(".psd"), "it should name what was refused: {error}");
+        assert!(error.contains(".fla"), "and list what works: {error}");
+    }
+
+    #[test]
+    fn a_file_with_no_extension_is_refused_clearly() {
+        let error = read(&PathBuf::from("mystery")).unwrap_err();
+        assert!(error.contains("no extension"), "{error}");
+    }
+
+    /// The dialog filter and the dispatcher must agree, or the user can pick a
+    /// file the application then refuses.
+    #[test]
+    fn the_filter_list_has_no_duplicates_and_is_lowercase() {
+        let mut seen = std::collections::BTreeSet::new();
+        for extension in IMPORTABLE {
+            assert_eq!(*extension, extension.to_ascii_lowercase());
+            assert!(seen.insert(*extension), "{extension} is listed twice");
+        }
+    }
+
+    /// Extensions arrive from the file system in whatever case the user's
+    /// disk has them, and `.FLA` is still a `.fla`.
+    #[test]
+    fn extensions_are_matched_case_insensitively() {
+        let error = read(&PathBuf::from("Movie.SWF")).unwrap_err();
+        assert!(
+            !error.contains("cannot import"),
+            "an upper-case extension should still dispatch: {error}"
+        );
+    }
+}

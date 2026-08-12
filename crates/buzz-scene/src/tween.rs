@@ -76,20 +76,15 @@ impl TweenKind {
 /// Animate exposes a single -100..100 slider plus custom curves. The slider
 /// maps onto [`Easing::Strength`], which covers the overwhelming majority of
 /// real use; [`Easing::CubicBezier`] carries an imported custom curve.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub enum Easing {
     /// Constant rate.
+    #[default]
     Linear,
     /// Animate's ease slider. Negative eases in, positive eases out.
     Strength(f64),
     /// A custom curve, as CSS and Animate's editor express it.
     CubicBezier { x1: f64, y1: f64, x2: f64, y2: f64 },
-}
-
-impl Default for Easing {
-    fn default() -> Self {
-        Self::Linear
-    }
 }
 
 impl Easing {

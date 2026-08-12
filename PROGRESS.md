@@ -55,6 +55,19 @@ Rules that follow from this, applied to every phase:
 
 ## 4. Checkpoint log — completed
 
+> **Checkpoints are real commits, not just entries here.** Each completed phase
+> is tagged, so any checkpoint can be returned to:
+>
+> ```sh
+> git tag -n                 # list checkpoints
+> git checkout phase-0       # return to one
+> git diff phase-0 HEAD      # what changed since
+> ```
+>
+> | Tag | Commit | Contents |
+> |---|---|---|
+> | `phase-0` | `82a308a` | Engine foundation: unbounded zoom, multicore, GPU |
+
 ### ✅ CP-0.1 — Toolchain
 - [x] Rust 1.97.1 `stable-x86_64-pc-windows-msvc` installed via rustup
 - [x] `%USERPROFILE%\.cargo\bin` added to user PATH

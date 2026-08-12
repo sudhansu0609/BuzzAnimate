@@ -1,0 +1,19 @@
+# Normalise line endings so the repo is byte-identical across machines and
+# commits stop emitting a CRLF warning per file on Windows.
+* text=auto eol=lf
+
+# Cargo.lock is committed (this is an application workspace, not a library)
+# and must never be merged by hand.
+Cargo.lock -merge linguist-generated
+
+# Binary assets, once phases 5 and 6 add fixtures.
+*.png  binary
+*.jpg  binary
+*.gif  binary
+*.webp binary
+*.mp4  binary
+*.mov  binary
+*.swf  binary
+*.fla  binary
+*.pdf  binary
+*.ai   binary

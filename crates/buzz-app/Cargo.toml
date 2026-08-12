@@ -1,0 +1,38 @@
+[package]
+name = "buzz-app"
+description = "BuzzAnimate application shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "buzz_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buzzanimate"
+path = "src/main.rs"
+
+[dependencies]
+buzz-geom.workspace = true
+buzz-jobs.workspace = true
+buzz-render.workspace = true
+
+vello.workspace = true
+kurbo.workspace = true
+peniko.workspace = true
+winit.workspace = true
+
+# egui 0.35 is pinned deliberately: 0.36 requires wgpu 30, which vello 0.9
+# cannot use. See the note in the workspace manifest.
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+
+anyhow.workspace = true
+pollster.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

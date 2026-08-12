@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# BuzzAnimate local state
+/settings.local.json
+/.buzz-cache/
+/out/

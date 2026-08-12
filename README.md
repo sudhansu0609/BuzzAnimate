@@ -1,0 +1,163 @@
+# BuzzAnimate
+
+GPU-accelerated vector animation. A from-scratch alternative to Adobe Animate,
+targeting the three limits Animate inherited from 1996-era Flash:
+
+| | Adobe Animate 2024 | BuzzAnimate |
+|---|---|---|
+| Maximum zoom | 2 000% | **no cap** — verified to 2×10¹⁴% |
+| CPU usage | effectively single-threaded | **work-stealing pool across all cores** |
+| Rasterisation | CPU | **GPU compute shaders (Vello)** |
+
+Built clean-room. No decompilation of Adobe binaries and no reuse of Adobe
+assets, icons, or trademarks. Formats read are published by Adobe (SWF,
+AVM2/ABC), ISO standards (PDF), or plain XML (XFL).
+
+---
+
+## Status: Phase 0 complete
+
+Phase 0 exists to prove the three claims above before any authoring features are
+built on top of them. All three are verified by automated tests against real
+hardware, not asserted.
+
+### Verified results
+
+Measured on an i7-14700K (20C/28T) with an RTX 5060 Ti, via
+`cargo test -p buzz-app --test headless_zoom --release -- --nocapture`:
+
+```
+ gen      zoom  precision    ink%  colours     encode       gpu  drawn/culled
+   0  2e2%   3.64e-13   4.06%       48     0.21ms    10.8ms  43/181
+   5  2e7%    3.64e-8   4.02%       47     0.10ms     0.8ms  70/154
+  10  2e12%   3.64e-3   4.01%       54     0.10ms     0.9ms  70/154
+  12  2e14%   3.64e-1   4.01%       54     0.08ms     0.8ms  72/152
+```
+
+Ink coverage is **constant at ~4% across thirteen decades of zoom** — rendering
+quality is scale-invariant. Generation 0's 10.8 ms is one-off shader warmup; it
+draws fewer items than generation 2, which takes 1.0 ms.
+
+### The zoom mechanism
+
+Animate's 2000% cap is a numeric limit, not a policy: Flash stores coordinates
+as twips (1/20 px fixed point) and rasterises in `f32`. BuzzAnimate stores `f64`
+and splits the view transform into three stages so nothing large ever reaches
+the GPU:
+
+```
+1. CPU, f64:  q = p − anchor        well-conditioned; result is tiny
+2. CPU, f64:  r = q × zoom          result is viewport-sized
+3. GPU, f32:  s = rotate(r) + offset   unit scale; nothing large to lose
+```
+
+**Steps 1 and 2 must not be fused into one matrix.** A composed affine evaluates
+`zoom·p − zoom·anchor`, which is the difference of two huge numbers and destroys
+the answer. Both `buzz-geom` and `buzz-render` carry tests that fail if anyone
+fuses them.
+
+Applying the scale on the CPU (step 2) was not in the original design and was
+added after measurement: leaving that multiply to the GPU cost **25 ms/frame at
+1e12% zoom versus 0.9 ms**, and visibly degraded detail.
+
+### Known precision limit
+
+Rebasing removes catastrophic cancellation, but `f64` storage of an absolute
+document coordinate leaves a floor:
+
+```
+precision_px ≈ |coordinate| × 2.22e-16 × zoom
+```
+
+For coordinates near 1e3 that is sub-pixel out to about **1e12%** — roughly ten
+orders of magnitude past Animate — and degrades linearly rather than collapsing
+after that. `Camera::screen_precision_px()` reports it live in the HUD.
+
+---
+
+## Running it
+
+```sh
+cargo run --release -p buzz-app
+```
+
+| Input | Action |
+|---|---|
+| Mouse wheel | Zoom about the cursor, unbounded |
+| Drag | Pan |
+| `R` | Reset / fit |
+| `Esc` | Quit |
+| HUD buttons | Jump to 2000% / 1e6 / 1e9 / 1e12, stress all cores |
+
+Flags: `--gpu <name-or-index>` forces an adapter, `--integrated` prefers iGPU.
+The adapter table is printed at startup.
+
+### Why adapter selection is real code
+
+This machine enumerates seven adapters, including `Microsoft Basic Render
+Driver` — a CPU rasteriser that would make "the GPU build" slower than Animate,
+silently. Every adapter is scored and the table is logged:
+
+```
+   [0]   1110  NVIDIA GeForce RTX 5060 Ti     DiscreteGpu/Vulkan
+   [1]    390  Intel(R) UHD Graphics 770      IntegratedGpu/Vulkan
+-> [2]   1120  NVIDIA GeForce RTX 5060 Ti     DiscreteGpu/Dx12      <- selected
+   [6]    n/a  Microsoft Basic Render Driver  Cpu/Dx12              <- disqualified
+```
+
+---
+
+## Layout
+
+| Crate | Role |
+|---|---|
+| `buzz-geom` | `f64` geometry; the rebasing camera and precision model |
+| `buzz-jobs` | Two-pool work-stealing job system; per-worker CPU metrics |
+| `buzz-render` | GPU adapter selection; Vello scene building |
+| `buzz-app` | Window, frame loop, HUD, zoom-target artwork |
+
+Remaining crates (`buzz-scene`, `buzz-timeline`, `buzz-import-xfl`,
+`buzz-avm`, …) arrive with their phases; empty placeholders would only be noise.
+
+### Dependency pinning — read before upgrading
+
+`vello 0.9` requires **wgpu ^29**, and `egui-wgpu 0.35` is the newest egui that
+also uses wgpu 29. `egui 0.36` moved to wgpu 30.
+
+Two majors of wgpu in one binary produce structurally distinct `Device` types
+that cannot share a surface. **Do not bump egui past 0.35 until vello moves to
+wgpu 30.** Verify with:
+
+```sh
+grep -A1 '^name = "wgpu"' Cargo.lock   # must list exactly one version
+```
+
+---
+
+## Testing
+
+```sh
+cargo test --workspace            # 44 tests
+cargo clippy --workspace --all-targets
+cargo test -p buzz-app --test headless_zoom --release -- --nocapture
+```
+
+The headless zoom test drives the *same* encoding path the window uses, so what
+is verified offscreen cannot drift from what is drawn. It skips cleanly when no
+GPU is present.
+
+---
+
+## Roadmap
+
+Phase 0 complete. Next: **Phase 1 — geometry and document core** (boolean ops,
+copy-on-write scene graph, R-tree spatial index, `.buzz` format, undo).
+
+Then: drawing tools and UI shell · timeline · symbols and tweens · importers
+(`.fla`/`.xfl`, `.pdf`/`.ai`, `.swf`) · export (MP4 via NVENC, PNG, GIF, HTML5)
+· rigging and IK · scripting and ActionScript.
+
+One item carried forward from Phase 0: oversized paths are currently culled
+rather than clipped, so a shape far larger than the viewport is dropped instead
+of drawn as the near-straight line it would appear as. Proper document-space
+clipping belongs with the Phase 1 geometry work.

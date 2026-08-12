@@ -1,0 +1,25 @@
+[package]
+name = "buzz-render"
+description = "GPU device selection and Vello-backed vector rendering for BuzzAnimate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+buzz-geom.workspace = true
+
+vello.workspace = true
+# Use the wgpu that vello re-exports rather than a second copy: two majors of
+# wgpu in one binary produce structurally distinct Device types that cannot
+# share a surface.
+wgpu.workspace = true
+kurbo.workspace = true
+peniko.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+pollster.workspace = true

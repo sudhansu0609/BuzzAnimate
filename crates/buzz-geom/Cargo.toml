@@ -1,0 +1,12 @@
+[package]
+name = "buzz-geom"
+description = "f64 vector geometry and the rebasing camera that gives BuzzAnimate unbounded zoom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+kurbo.workspace = true
+serde.workspace = true

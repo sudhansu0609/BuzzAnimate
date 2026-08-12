@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+authors = ["Buzzcaf Media"]
+repository = "https://github.com/buzzcaf/buzzanimate"
+
+# ---------------------------------------------------------------------------
+# Pinned GPU stack.
+#
+# vello 0.9 depends on wgpu ^29.0.3 and egui-wgpu 0.35 depends on wgpu ^29.0.
+# These MUST resolve to the same wgpu major or the Vello renderer and the egui
+# UI end up with structurally distinct `wgpu::Device` types and cannot share a
+# surface. egui 0.36 / egui-wgpu 0.36 moved to wgpu 30 and is therefore NOT
+# usable until vello also moves to wgpu 30. Do not bump egui past 0.35 alone.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+wgpu = "29.0.4"
+vello = "0.9.0"
+kurbo = { version = "0.13.1", features = ["serde"] }
+peniko = "0.6.1"
+winit = "0.30.13"
+
+egui = "0.35.0"
+egui-wgpu = "0.35.0"
+egui-winit = "0.35.0"
+egui_dock = "0.20.1"
+
+rayon = "1.12.0"
+parking_lot = "0.12.5"
+arc-swap = "1.9.2"
+crossbeam-channel = "0.5"
+
+anyhow = "1.0.104"
+thiserror = "2"
+pollster = "1.0.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sysinfo = "0.39.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Internal crates
+buzz-geom = { path = "crates/buzz-geom" }
+buzz-jobs = { path = "crates/buzz-jobs" }
+buzz-render = { path = "crates/buzz-render" }
+
+[profile.dev]
+opt-level = 1
+
+# Vello and wgpu are unusably slow when compiled without optimisation, even in
+# a debug build of BuzzAnimate itself.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

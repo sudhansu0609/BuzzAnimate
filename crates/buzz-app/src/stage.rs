@@ -57,6 +57,14 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect) {
     }
 
     draw_frame(&mut builder, scene, frame, camera, None, false);
+
+    // The brush preview is painted here, with the artwork, rather than sketched
+    // as chrome. A brush stroke is the one gesture where the preview *is* the
+    // result: outlining it in the selection colour would show its silhouette
+    // but not its weight, and weight is the whole point of a fluid brush.
+    if let Preview::Ink { path, color } = editor.preview() {
+        builder.fill_shape(&path, color);
+    }
 }
 
 /// Draw one frame's layers.
@@ -414,6 +422,8 @@ fn draw_preview(
 
     match editor.preview() {
         Preview::None => {}
+        // Painted into the Vello scene by `build_scene`, in its real colour.
+        Preview::Ink { .. } => {}
         Preview::Marquee(rect) => {
             let r = egui::Rect::from_two_pos(
                 to_screen(Point::new(rect.x0, rect.y0)),

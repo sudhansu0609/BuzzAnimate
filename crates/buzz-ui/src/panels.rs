@@ -234,6 +234,8 @@ pub fn menu_bar(
                 item(ui, c, has_selection, &mut raised);
             }
             ui.separator();
+            item(ui, Command::BrushFromSelection, has_selection, &mut raised);
+            ui.separator();
             ui.label(RichText::new("Shape").small().weak());
             for c in [
                 Command::ConvertLinesToFills,
@@ -563,6 +565,199 @@ fn instance_properties(ui: &mut Ui, scene: &mut Scene, id: buzz_scene::ObjectId)
     edited
 }
 
+/// Brush settings, with a live preview of the pattern being stamped.
+///
+/// Animate puts these in the tool options strip under the toolbar. They are
+/// here in Properties because that is where this application's contextual
+/// settings already live, and splitting them across two places would be worse
+/// than the deviation.
+fn brush_properties(ui: &mut Ui, style: &mut DrawStyle) {
+    use crate::brush::{BrushKind, PatternShape};
+
+    ui.add_space(8.0);
+    ui.label(RichText::new("Brush").strong());
+
+    egui::Grid::new("brush-props").num_columns(2).show(ui, |ui| {
+        ui.label("Type");
+        egui::ComboBox::from_id_salt("brush-kind")
+            .selected_text(style.brush.kind.label())
+            .show_ui(ui, |ui| {
+                for kind in [BrushKind::Fluid, BrushKind::Pattern, BrushKind::Art] {
+                    ui.selectable_value(&mut style.brush.kind, kind, kind.label())
+                        .on_hover_text(kind.description());
+                }
+            });
+        ui.end_row();
+
+        ui.label("Size");
+        ui.add(
+            egui::Slider::new(&mut style.brush.size, 1.0..=200.0)
+                .logarithmic(true)
+                .suffix(" px"),
+        );
+        ui.end_row();
+
+        ui.label("Smoothing");
+        ui.add(egui::Slider::new(&mut style.brush.smoothing, 0.0..=1.0))
+            .on_hover_text("Steadies a shaky hand. The ends never move.");
+        ui.end_row();
+
+        if style.brush.kind == BrushKind::Fluid {
+            ui.label("Thinnest");
+            ui.add(egui::Slider::new(&mut style.brush.min_ratio, 0.0..=1.0))
+                .on_hover_text("How thin the stroke gets at full speed or lightest pressure");
+            ui.end_row();
+
+            ui.label("Taper");
+            ui.add(egui::Slider::new(&mut style.brush.taper, 0.0..=0.5))
+                .on_hover_text("How much of each end narrows to a point");
+            ui.end_row();
+
+            ui.label("Pressure");
+            ui.checkbox(&mut style.brush.use_pressure, "")
+                .on_hover_text(
+                    "Follow pen pressure instead of speed. A mouse reports no \
+                     pressure, so with this on a mouse paints a constant width.",
+                );
+            ui.end_row();
+
+            if !style.brush.use_pressure {
+                ui.label("Fastest at");
+                ui.add(
+                    egui::Slider::new(&mut style.brush.reference_speed, 100.0..=4000.0)
+                        .suffix(" px/s"),
+                )
+                .on_hover_text("The speed at which the stroke reaches its thinnest");
+                ui.end_row();
+            }
+        }
+
+        if style.brush.kind.uses_pattern() {
+            ui.label("Shape");
+            egui::ComboBox::from_id_salt("brush-pattern")
+                .selected_text(style.brush.pattern.label())
+                .show_ui(ui, |ui| {
+                    for shape in PatternShape::BUILT_IN {
+                        ui.selectable_value(&mut style.brush.pattern, shape, shape.label());
+                    }
+                    // Only offered once there is something to offer.
+                    if style.brush.custom_pattern.is_some() {
+                        ui.selectable_value(
+                            &mut style.brush.pattern,
+                            PatternShape::Custom,
+                            PatternShape::Custom.label(),
+                        );
+                    }
+                });
+            ui.end_row();
+
+            if style.brush.kind == BrushKind::Pattern {
+                ui.label("Spacing");
+                ui.add(
+                    egui::Slider::new(&mut style.brush.spacing, 0.5..=200.0)
+                        .logarithmic(true)
+                        .suffix(" px"),
+                )
+                .on_hover_text(
+                    "Distance between stamps. Very close spacing on a long \
+                     stroke is widened automatically so the drawing stays \
+                     responsive.",
+                );
+                ui.end_row();
+            }
+        }
+    });
+
+    if style.brush.kind.uses_pattern() {
+        brush_pattern_preview(ui, style);
+    }
+}
+
+/// Draw the pattern as it will be stamped, along a short sample stroke.
+///
+/// Worth the few lines: the difference between spacing 4 and spacing 40 is
+/// obvious in a picture and almost meaningless as a number.
+fn brush_pattern_preview(ui: &mut Ui, style: &DrawStyle) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().min(220.0), 46.0),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, Palette::PANEL);
+
+    let Some(source) = style.brush.pattern_path() else {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "No shape yet",
+            egui::FontId::proportional(11.0),
+            Palette::TEXT_DIM,
+        );
+        return;
+    };
+
+    // A gentle S, so the rotation of the stamps is visible.
+    let span = rect.width() as f64 - 16.0;
+    let spine = buzz_geom::catmull_rom(&[
+        buzz_geom::Point::new(0.0, 6.0),
+        buzz_geom::Point::new(span * 0.33, -6.0),
+        buzz_geom::Point::new(span * 0.66, 6.0),
+        buzz_geom::Point::new(span, -6.0),
+    ]);
+
+    // The preview budget, because this is drawn every frame the panel is open.
+    let stamped = buzz_geom::stamp_along(
+        &spine,
+        &source,
+        style.brush.fit(),
+        &buzz_geom::BrushBudget::preview(),
+    );
+
+    // Fit whatever came out into the strip.
+    let bounds = buzz_geom::Shape::bounding_box(&stamped.path);
+    if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+        return;
+    }
+    let scale = ((rect.width() as f64 - 12.0) / bounds.width())
+        .min((rect.height() as f64 - 12.0) / bounds.height())
+        .min(1.0);
+
+    let colour = to_egui(style.fill_for_new_shape().unwrap_or(Color::BLACK));
+    let to_screen = |p: buzz_geom::Point| -> egui::Pos2 {
+        egui::pos2(
+            rect.center().x + ((p.x - bounds.center().x) * scale) as f32,
+            rect.center().y + ((p.y - bounds.center().y) * scale) as f32,
+        )
+    };
+
+    // Each subpath is one stamp, so they are drawn separately rather than
+    // joined into a single polyline that would connect them all together.
+    let mut current: Vec<egui::Pos2> = Vec::new();
+    let flush = |points: &mut Vec<egui::Pos2>| {
+        if points.len() >= 3 {
+            painter.add(egui::Shape::convex_polygon(
+                std::mem::take(points),
+                colour,
+                egui::Stroke::NONE,
+            ));
+        } else {
+            points.clear();
+        }
+    };
+    kurbo::flatten(stamped.path.iter(), 0.2 / scale.max(1e-6), |element| {
+        match element {
+            kurbo::PathEl::MoveTo(p) => {
+                flush(&mut current);
+                current.push(to_screen(p));
+            }
+            kurbo::PathEl::LineTo(p) => current.push(to_screen(p)),
+            kurbo::PathEl::ClosePath => flush(&mut current),
+            _ => {}
+        }
+    });
+    flush(&mut current);
+}
+
 /// Contextual properties for the current selection.
 pub fn properties_panel(
     ui: &mut Ui,
@@ -637,6 +832,8 @@ pub fn properties_panel(
     if let Some(id) = single_selected_instance(scene, selection) {
         changed |= instance_properties(ui, scene, id);
     }
+
+    brush_properties(ui, style);
 
     ui.add_space(8.0);
     ui.label(RichText::new("Stroke and Fill").strong());

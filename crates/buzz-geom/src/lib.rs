@@ -8,6 +8,7 @@
 //! See [`camera`] for the mechanism that makes unbounded zoom actually work.
 
 pub mod boolean;
+pub mod brush;
 pub mod camera;
 pub mod clip;
 pub mod edit;
@@ -15,6 +16,10 @@ pub mod hit;
 pub mod path_edit;
 
 pub use boolean::{BoolOp, BooleanOptions, FillMode, boolean, boolean_many, union_all};
+pub use brush::{
+    BrushBudget, BrushOutput, BrushProfile, PatternFit, StrokeSample, WidthResponse,
+    catmull_rom, centreline, fluid_outline, stamp_along,
+};
 pub use camera::{Camera, RebasedTransform, RenderSplit};
 pub use clip::RenderClip;
 pub use edit::{StrokeStyle, expand_fill, outline_stroke, smooth, straighten};

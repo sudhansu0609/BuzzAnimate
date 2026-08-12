@@ -80,6 +80,9 @@ pub enum Command {
     DeleteSymbol,
     NewLibraryFolder,
 
+    /// Adopt the selected artwork as the pattern brush's shape.
+    BrushFromSelection,
+
     // Tweens
     CreateClassicTween,
     CreateMotionTween,
@@ -168,6 +171,8 @@ impl Command {
             DuplicateSymbol => "Duplicate Symbol",
             DeleteSymbol => "Delete Symbol",
             NewLibraryFolder => "New Library Folder",
+
+            BrushFromSelection => "Create Brush From Selection",
 
             CreateClassicTween => "Create Classic Tween",
             CreateMotionTween => "Create Motion Tween",
@@ -266,6 +271,8 @@ impl Command {
             DeleteSymbol => None,
             NewLibraryFolder => None,
 
+            BrushFromSelection => None,
+
             CreateClassicTween => None,
             CreateMotionTween => None,
             CreateShapeTween => None,
@@ -315,6 +322,7 @@ impl Command {
                 | SmoothSelection
                 | StraightenSelection
                 | ConvertToSymbol
+                | BrushFromSelection
         )
     }
 }
@@ -352,7 +360,7 @@ mod tests {
             ResetCamera, ImportToLibrary, ImportToStage, ConvertToSymbol, NewSymbol,
             EditSymbol, EditDocument, PlaceInstance, DuplicateSymbol, DeleteSymbol,
             NewLibraryFolder, CreateClassicTween, CreateMotionTween, CreateShapeTween,
-            RemoveTween,
+            RemoveTween, BrushFromSelection,
         ]
     }
 

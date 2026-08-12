@@ -1,9 +1,9 @@
 # BuzzAnimate — Progress, Checkpoints & Implementation Plan
 
 **Last updated:** 2026-08-12
-**Current status:** Phases 0–5 complete (gaps in §7). All three importers —
-`.fla`/`.xfl`, `.swf`, `.pdf`/`.ai` — read, merge into an open document, and
-report what they could not bring across.
+**Current status:** Phases 0–5 complete (gaps in §7), plus fluid, pattern and
+art brushes. All three importers — `.fla`/`.xfl`, `.swf`, `.pdf`/`.ai` — read,
+merge into an open document, and report what they could not bring across.
 
 ---
 
@@ -481,6 +481,72 @@ styles, the library tree and a red 40% tint read back correctly out of a
 *saved and reloaded* document.
 
 
+### ✅ Brushes — fluid, pattern and art
+
+A Phase 2 follow-up, taken out of order because the brush is the tool an
+animator spends the most time holding.
+
+**The fluid brush** (`buzz-geom::brush`)
+- [x] Width varies along the stroke: with pen pressure where the device
+      reports it, and with **speed** where it does not
+- [x] Speed is the default, and the reason matters: a mouse reports a constant
+      pressure of 1.0, so a pressure-driven brush on a mouse paints a dead
+      constant width. Speed is what makes a *mouse* stroke look drawn.
+- [x] Tapered ends, on a square-root curve rather than linear — a linear taper
+      reads as a wedge; a brush end is closer to an ellipse
+- [x] Smoothing that is **symmetric**, so it does not lag the pointer, and
+      never moves the endpoints
+- [x] A tap paints a dot, as Animate does
+- **Design decision — Catmull-Rom, not a curve fit.** Curves are built by the
+  closed-form Catmull-Rom-to-Bezier construction, which passes exactly through
+  every input point and *cannot* overshoot. CP-1.1c found kurbo's fitter
+  turning a correct path spanning `-5..105` into one spanning `-5..1071` when
+  handed input that was not smooth — and freehand input never is. Fewer
+  segments would not be worth a brush stroke that occasionally explodes.
+- **Self-intersections are left alone.** A stroke that doubles back merges with
+  itself under the non-zero fill rule, which is what paint does. Resolving
+  them would cost a boolean per stroke for no visible difference.
+
+**Pattern and art brushes**
+- [x] Six built-in shapes — dot, dash, leaf, star, arrow, diamond — plus
+      **Create Brush From Selection**, Animate's own way of making one
+- [x] Stamps rotate to follow the tangent, and are centred on the stroke
+- [x] Art brushes stretch one copy over the whole stroke
+- [x] A live preview strip in the panel, because the difference between
+      spacing 4 and spacing 40 is obvious as a picture and meaningless as a
+      number
+
+**Staying responsive, which was the explicit requirement**
+- [x] **Arc lengths are measured once** into a cumulative table; each stamp
+      finds its place by binary search. The obvious implementation asks the
+      path for the point at each fraction, which re-measures every segment for
+      every stamp — `O(stamps x segments)`, and exactly how this kind of
+      feature freezes a window. A test asserts that quadrupling the stroke
+      does not quadruple-squared the time.
+- [x] **The budget widens the spacing rather than refusing or truncating.** A
+      10 000-unit stroke at 0.01 spacing asks for a million stamps; it gets
+      4 000, spread over the whole stroke, and the caller is told the spacing
+      moved. The user keeps their whole stroke at the density the machine can
+      carry.
+- [x] **The live preview has its own, much smaller budget.** It runs on every
+      pointer move, so it is where a hang would actually appear.
+- [x] The preview is painted by the *artwork* renderer in the real colour,
+      not sketched as chrome — for a brush, the preview is the result.
+
+**Measured, release build, on the 14700K:**
+
+| What | Time |
+|---|---|
+| One preview frame, 6 000-sample pattern stroke at 0.5 spacing | **0.57 ms** |
+| Committing a 40 000-unit pattern stroke at 0.25 spacing | **3.5 ms** |
+| 120 pattern strokes with a live preview on every move | **237 ms** |
+
+**Verified on screen:** a fluid stroke drawn slowly then quickly comes out
+tapered and visibly thinner where it sped up; a dot pattern stamps evenly
+along a wave; thirty leaf-pattern strokes drawn over each other leave the
+window at **56 fps**.
+
+
 ### ✅ Phase 5 — Importers
 
 **CP-5.1 — `.fla` and `.xfl`**
@@ -604,12 +670,13 @@ a test — every test passed while every import was monochrome.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 561 passing, clippy clean |
-| Rust source | ~30 000 lines |
+| Tests | 599 passing, clippy clean |
+| Rust source | ~32 000 lines |
 | Crates built | 10 of 15 |
 | Phases done | Phase 0, 1, 2, 3, 4, **5** (gaps in §7) |
 | Format version | 3 — symbols, instances and tweens |
 | Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |
+| Brush preview frame | 0.57 ms at 6 000 samples and 0.5 spacing |
 
 ---
 
@@ -748,6 +815,8 @@ a test — every test passed while every import was monochrome.
 | 21 | **No importer has been checked against a real file from Adobe.** Every fixture is one we wrote, so the importers are verified against the *specifications* and against files whose content we chose — not against what Animate, Illustrator and the Flash compilers actually emit, which is where the awkward cases live. This is the largest single risk in Phase 5. | Needs a licensed Animate/Illustrator and real-world files |
 | 22 | **Bitmaps are not imported** by any of the three readers — reported, never read. Needs a media pipeline: decode, store in the `.buzz` container's `media/` directory (reserved since Phase 1), and a bitmap object kind. | Phase 6 |
 | 23 | **SWF morph shapes, buttons, filters, blend modes and colour transforms on placements** are reported but not applied. Colour transforms are the cheapest of these to fix — the model already has `ColorTransform` — and would noticeably improve fidelity. | Phase 5 follow-up |
+| 25 | **Pen pressure is plumbed through but never supplied.** The brush reads `StrokeSample::pressure` and the setting is in the panel, but winit 0.30 gives no tablet pressure on Windows, so every sample arrives at 1.0 and the pressure option paints a constant width. Speed is the default response for exactly this reason. Needs a platform tablet backend (Windows Ink / Wintab). | Brush follow-up |
+| 26 | **Brush strokes do not merge with what is under them.** Each stroke is its own shape even in Merge Shape mode; Animate would fuse same-coloured overlapping paint. The booleans exist (CP-1.1b) — this is a matter of routing brush output through them, which was left out because a boolean per stroke would undo the responsiveness work unless it is done off the interactive thread. | Brush follow-up |
 | 24 | **PDF clipping paths are ignored.** `W`/`W*` are recorded in the report but not applied, so artwork that a real file clips away arrives whole. Needs a clip concept in the scene model, which nothing else has wanted yet. | Phase 5 follow-up |
 | 16 | **Camera rotation and zoom have no direct gesture.** Both are keyable and interpolate correctly, and `zoom_camera` exists, but only panning is bound to a drag. | Phase 3 follow-up |
 | 13 | **Clipboard (cut/copy/paste) not implemented.** Duplicate works. | Phase 2 follow-up |
@@ -856,27 +925,25 @@ targets before there is anywhere to put what they read.
 
 ## 11. Next action
 
-**Phase 6 — export** is the recommended next step, and it is the last thing
-standing between this and a tool somebody can finish a job with. Everything up
-to here can author and import; nothing yet gets a finished animation *out*.
+**Phase 6 — export** is the recommended next step. Everything up to here can
+author and import; nothing yet gets a finished animation *out*, and that is
+the last thing standing between this and a tool somebody can finish a job with.
 
-- **CP-6.1** PNG sequence first — it is the simplest, it needs the same
-  off-screen render path every other export wants, and it parallelises across
-  all 28 threads
-- **CP-6.2** MP4/MOV via NVENC, once frames can be produced
-- **CP-6.3** GIF/WebP · **CP-6.4** HTML5 Canvas/SVG
+- **CP-6.1** PNG sequence first — simplest, needs the same off-screen render
+  path every other export wants, and parallelises across all 28 threads
+- **CP-6.2** MP4/MOV via NVENC · **CP-6.3** GIF/WebP · **CP-6.4** HTML5/SVG
 
-Two things would sensibly come first, both small next to a phase:
+Closest to the brushes just landed, if that thread is worth continuing:
 
-- **Check the importers against real files** (§7 item 21). Every fixture so far
-  is one we wrote, so the readers are verified against the specifications
-  rather than against what Adobe's tools actually emit. One genuine `.fla` and
-  one genuine `.ai` would be worth more than another dozen synthetic tests.
-- **Gradients** (§7 item 8). They are now the most-cited gap in the codebase:
-  the SWF and XFL importers both approximate them to flat colours and say so,
-  so every gradient in every imported file is a visible loss. Fixing them
-  improves authoring *and* import fidelity at once.
+- **Merge-shape brush strokes** (§7 item 26). Paint that does not fuse with the
+  paint under it is the most Animate-unlike thing about the new brushes. The
+  booleans are built; the work is doing them off the interactive thread so the
+  fix does not cost the responsiveness the brushes were designed around.
+- **Tablet pressure** (§7 item 25). The brush already reads pressure; nothing
+  supplies it. A Windows Ink backend would make the pressure setting real.
+- **Gradients** (§7 item 8), still the most-cited gap in the codebase: the SWF
+  and XFL importers both approximate them to flat colours, and a pattern brush
+  cannot stamp a gradient-filled shape either.
 
-Then, in the order they would most improve the tool: library previews (§7 item
-17), the Motion Editor (§7 item 18), text (§7 item 9), and SWF colour
-transforms on placements (§7 item 23), which the model can already express.
+Then: library previews (§7 item 17), the Motion Editor (§7 item 18), text
+(§7 item 9), and checking the importers against real Adobe files (§7 item 21).

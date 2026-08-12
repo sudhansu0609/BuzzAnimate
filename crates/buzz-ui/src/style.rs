@@ -78,6 +78,9 @@ pub struct DrawStyle {
     pub hairline: bool,
     pub stroke_kind: StrokeKind,
     pub drawing_mode: DrawingMode,
+    /// Brush tool settings. Kept here rather than on the tool so that
+    /// switching tools and coming back does not reset them.
+    pub brush: crate::brush::BrushSettings,
     /// Recently used colours, most recent first.
     pub swatches: Vec<Color>,
 }
@@ -109,6 +112,7 @@ impl Default for DrawStyle {
             hairline: false,
             stroke_kind: StrokeKind::Solid,
             drawing_mode: DrawingMode::default(),
+            brush: crate::brush::BrushSettings::default(),
             swatches: default_swatches(),
         }
     }

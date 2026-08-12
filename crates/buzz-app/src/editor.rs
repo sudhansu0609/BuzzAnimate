@@ -742,6 +742,7 @@ impl Editor {
 
             // -- symbols and library -----------------------------------------
             ConvertToSymbol => self.convert_selection_to_symbol(),
+            BrushFromSelection => self.brush_from_selection(),
             NewSymbol => self.new_symbol(),
             EditSymbol => self.edit_selected_symbol(),
             EditDocument => {
@@ -790,6 +791,51 @@ impl Editor {
         self.selection.ensure_active_layer(self.doc.scene());
         self.set_frame(0);
         self.playback.playing = false;
+    }
+
+    /// Animate's *Create Brush From Selection*: adopt the selected artwork as
+    /// the shape a pattern brush stamps.
+    ///
+    /// The shape is recentred on its own origin, because stamps are placed
+    /// centred on the stroke — artwork drawn at (400, 300) would otherwise
+    /// stamp 500 units away from the pointer.
+    fn brush_from_selection(&mut self) {
+        let mut combined = buzz_geom::BezPath::new();
+        for id in self.selection.iter() {
+            let Some((_, object)) = self.doc.scene().find_object(id) else {
+                continue;
+            };
+            // Flattening resolves groups and applies each object's transform,
+            // so a brush made from a group comes out as it looked on stage.
+            let mut parts = Vec::new();
+            object.flatten(buzz_geom::Affine::IDENTITY, &mut parts);
+            for (transform, shape) in parts {
+                for element in (transform * shape.path).elements() {
+                    combined.push(*element);
+                }
+            }
+        }
+
+        if combined.elements().is_empty() {
+            self.status = Some("Select some artwork to make a brush from".into());
+            return;
+        }
+
+        let bounds = buzz_geom::Shape::bounding_box(&combined);
+        if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+            self.status = Some("That selection has no area to make a brush from".into());
+            return;
+        }
+        let centred = buzz_geom::Affine::translate(-bounds.center().to_vec2()) * combined;
+
+        // Selecting the brush too: making a brush and not being given it is a
+        // step the user would always have to take next.
+        self.style.brush.set_custom_pattern(centred);
+        if !self.style.brush.kind.uses_pattern() {
+            self.style.brush.kind = buzz_ui::BrushKind::Pattern;
+        }
+        self.set_tool(ToolId::Brush);
+        self.status = Some("Brush created from the selection".into());
     }
 
     /// Animate's F8: replace the selection with an instance of a new symbol.

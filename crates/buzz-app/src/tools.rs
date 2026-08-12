@@ -70,6 +70,11 @@ pub enum Preview {
     Marquee(Rect),
     /// Freehand stroke so far.
     Stroke { path: BezPath, width: f64 },
+    /// Brush artwork as it will actually be painted, in its real colour.
+    ///
+    /// Drawn by the artwork renderer rather than the chrome, because for a
+    /// brush the preview is the result.
+    Ink { path: BezPath, color: Color },
 }
 
 /// State shared with a tool for the duration of a gesture.
@@ -91,14 +96,38 @@ enum Gesture {
     Idle,
     /// Press-drag-release from a fixed origin.
     Dragging { origin: Point, current: Point, mods: Mods },
-    /// Accumulating freehand points.
-    Freehand { points: Vec<Point> },
+    /// Accumulating freehand samples.
+    ///
+    /// Samples rather than bare points because a brush needs *when* as well as
+    /// where: the width of a fluid stroke follows how fast it was drawn.
+    Freehand { samples: Vec<buzz_geom::StrokeSample> },
     /// Dragging one anchor of a path.
     Anchor {
         element: usize,
         origin: Point,
         current: Point,
     },
+}
+
+/// Where stroke timing comes from.
+///
+/// Wall time in the running application. A test needs the other arm: a brush
+/// whose width follows *speed* cannot be tested against a clock that runs at
+/// whatever pace the machine happens to manage, so a test supplies the times
+/// itself and gets the same answer every run.
+#[derive(Debug, Clone, Copy)]
+enum Clock {
+    Wall(std::time::Instant),
+    Manual(f64),
+}
+
+impl Clock {
+    fn now(&self) -> f64 {
+        match self {
+            Self::Wall(start) => start.elapsed().as_secs_f64(),
+            Self::Manual(t) => *t,
+        }
+    }
 }
 
 /// Drives one tool through a gesture.
@@ -108,6 +137,7 @@ pub struct ToolMachine {
     gesture: Gesture,
     /// Screen-space position, for the navigation tools.
     last_screen: Point,
+    clock: Clock,
 }
 
 /// A drag shorter than this is a click, not a drag.
@@ -125,7 +155,16 @@ impl ToolMachine {
             tool,
             gesture: Gesture::Idle,
             last_screen: Point::ORIGIN,
+            clock: Clock::Wall(std::time::Instant::now()),
         }
+    }
+
+    /// Drive stroke timing from a supplied clock instead of wall time.
+    ///
+    /// For tests of speed-dependent behaviour, which cannot use a real clock
+    /// and stay reproducible.
+    pub fn set_time(&mut self, seconds: f64) {
+        self.clock = Clock::Manual(seconds);
     }
 
     pub fn tool(&self) -> ToolId {
@@ -157,7 +196,9 @@ impl ToolMachine {
         self.last_screen = screen;
         match self.tool {
             ToolId::Pencil | ToolId::Brush | ToolId::Eraser => {
-                self.gesture = Gesture::Freehand { points: vec![doc] };
+                self.gesture = Gesture::Freehand {
+                    samples: vec![buzz_geom::StrokeSample::new(doc, self.clock.now())],
+                };
             }
             // Subselection grabs an anchor if one is close enough; otherwise it
             // falls through to ordinary selection behaviour.
@@ -205,11 +246,16 @@ impl ToolMachine {
                 *current = doc;
                 ToolAction::None
             }
-            Gesture::Freehand { points } => {
-                // Drop points that add nothing, so a slow drag does not build a
-                // path with thousands of coincident vertices.
-                if points.last().is_none_or(|p| (doc - *p).hypot() > f64::EPSILON) {
-                    points.push(doc);
+            Gesture::Freehand { samples } => {
+                // Drop samples that add nothing, so a slow drag does not build
+                // a path with thousands of coincident vertices. The brush
+                // decimates properly later; this is only to stop the list
+                // growing without bound while the pointer sits still.
+                if samples
+                    .last()
+                    .is_none_or(|s| (doc - s.point).hypot() > f64::EPSILON)
+                {
+                    samples.push(buzz_geom::StrokeSample::new(doc, self.clock.now()));
                 }
                 ToolAction::None
             }
@@ -248,11 +294,11 @@ impl ToolMachine {
                     ToolAction::MoveAnchor { element, delta }
                 }
             }
-            Gesture::Freehand { mut points } => {
-                if points.last().is_none_or(|p| *p != doc) {
-                    points.push(doc);
+            Gesture::Freehand { mut samples } => {
+                if samples.last().is_none_or(|s| s.point != doc) {
+                    samples.push(buzz_geom::StrokeSample::new(doc, self.clock.now()));
                 }
-                self.finish_freehand(points, ctx)
+                self.finish_freehand(samples, ctx)
             }
             Gesture::Dragging { origin, mods, .. } => {
                 self.finish_drag(origin, doc, mods, ctx)
@@ -267,13 +313,36 @@ impl ToolMachine {
             // The stage already draws anchors for the selected path; a
             // rubber-band line here would just add noise.
             Gesture::Anchor { .. } => Preview::None,
-            Gesture::Freehand { points } => match self.tool {
+            Gesture::Freehand { samples } => match self.tool {
                 ToolId::Eraser => Preview::Stroke {
-                    path: polyline(points),
+                    path: centreline_of(samples),
                     width: ctx.style.stroke_width.max(1.0) * 4.0,
                 },
+                // The brush previews what it will actually paint, under the
+                // *preview* budget. That budget is what keeps a long stroke
+                // interactive: this runs on every pointer move, so it has to
+                // cost a fraction of the committed geometry, and a pattern
+                // brush at close spacing would otherwise place thousands of
+                // stamps per frame.
+                ToolId::Brush => {
+                    let budget = buzz_geom::BrushBudget::preview();
+                    let color = ctx
+                        .style
+                        .fill_for_new_shape()
+                        .unwrap_or(Color::BLACK)
+                        // Slightly transparent, so the preview reads as
+                        // provisional without misrepresenting its shape.
+                        .multiply_alpha(0.85);
+                    match build_brush_path(samples, ctx.style, &budget) {
+                        Some(path) => Preview::Ink { path, color },
+                        None => Preview::Stroke {
+                            path: centreline_of(samples),
+                            width: ctx.style.brush.size.max(1.0),
+                        },
+                    }
+                }
                 _ => Preview::Stroke {
-                    path: polyline(points),
+                    path: centreline_of(samples),
                     width: brush_width(self.tool, ctx.style),
                 },
             },
@@ -292,28 +361,36 @@ impl ToolMachine {
         }
     }
 
-    fn finish_freehand(&self, points: Vec<Point>, ctx: &ToolContext<'_>) -> ToolAction {
-        if points.len() < 2 {
+    fn finish_freehand(
+        &self,
+        samples: Vec<buzz_geom::StrokeSample>,
+        ctx: &ToolContext<'_>,
+    ) -> ToolAction {
+        // A brush tap paints a dot, so one sample is enough for it; every
+        // other freehand tool needs a real drag.
+        let is_brush = self.tool == ToolId::Brush;
+        if samples.len() < 2 && !is_brush {
             return ToolAction::None;
         }
-        let path = polyline(&points);
+
         match self.tool {
             ToolId::Eraser => ToolAction::Erase {
-                path,
+                path: centreline_of(&samples),
                 width: ctx.style.stroke_width.max(1.0) * 4.0,
             },
             ToolId::Brush => {
                 // The brush paints a filled stroke, so its colour comes from
                 // the fill swatch — as in Animate.
-                let width = brush_width(self.tool, ctx.style);
-                let outline = buzz_geom::outline_stroke(
-                    &path,
-                    buzz_geom::StrokeStyle::new(width),
-                    (width / 40.0).max(1e-4),
-                );
+                let budget = buzz_geom::BrushBudget::default();
+                let Some(path) = build_brush_path(&samples, ctx.style, &budget) else {
+                    return ToolAction::None;
+                };
+                if path.elements().is_empty() {
+                    return ToolAction::None;
+                }
                 ToolAction::AddShape {
                     shape: ShapeData::filled(
-                        outline,
+                        path,
                         ctx.style.fill_for_new_shape().unwrap_or(Color::BLACK),
                     ),
                     label: "Brush",
@@ -326,7 +403,7 @@ impl ToolMachine {
                     .unwrap_or((Color::BLACK, 1.0, false));
                 ToolAction::AddShape {
                     shape: ShapeData {
-                        path,
+                        path: centreline_of(&samples),
                         fill: None,
                         stroke: Some(buzz_scene::StrokeSpec {
                             color,
@@ -448,20 +525,55 @@ fn shape_label(tool: ToolId) -> &'static str {
 fn brush_width(tool: ToolId, style: &DrawStyle) -> f64 {
     match tool {
         // Animate's brush is much fatter than the pencil at the same setting.
-        ToolId::Brush => (style.stroke_width * 5.0).max(2.0),
+        ToolId::Brush => style.brush.size.max(2.0),
         _ => style.stroke_width.max(0.1),
     }
 }
 
-fn polyline(points: &[Point]) -> BezPath {
-    let mut path = BezPath::new();
-    if let Some(first) = points.first() {
-        path.move_to(*first);
-        for p in &points[1..] {
-            path.line_to(*p);
+/// A smooth curve through the samples.
+///
+/// Used by the pencil, the eraser and every brush preview that is not painting
+/// its own artwork. Smoothing is applied first, so the pencil gets the same
+/// steadying the brush does — Animate's Pencil has a Smoothing setting for the
+/// same reason.
+fn centreline_of(samples: &[buzz_geom::StrokeSample]) -> BezPath {
+    buzz_geom::centreline(samples)
+}
+
+/// Build what the brush will paint, whichever brush is selected.
+///
+/// Shared by the preview and the committed geometry so the two cannot drift
+/// apart; they differ only in the budget they are given.
+///
+/// Returns `None` when a pattern brush has no source shape — a custom pattern
+/// the user has not made yet — so the caller can fall back to something
+/// visible rather than painting nothing.
+fn build_brush_path(
+    samples: &[buzz_geom::StrokeSample],
+    style: &DrawStyle,
+    budget: &buzz_geom::BrushBudget,
+) -> Option<BezPath> {
+    let settings = &style.brush;
+
+    match settings.kind {
+        buzz_ui::BrushKind::Fluid => {
+            Some(buzz_geom::fluid_outline(samples, &settings.profile(), budget).path)
+        }
+        buzz_ui::BrushKind::Pattern | buzz_ui::BrushKind::Art => {
+            let source = settings.pattern_path()?;
+            // The stroke is conditioned first, so stamps follow the smoothed
+            // curve rather than the jitter of the raw pointer.
+            let conditioned = buzz_geom::brush::condition(samples, settings.smoothing, budget);
+            if conditioned.len() < 2 {
+                // A tap with a pattern brush lays down a single stamp, which
+                // is what a stamp tool should do.
+                let at = conditioned.first()?.point;
+                return Some(kurbo::Affine::translate(at.to_vec2()) * source);
+            }
+            let spine = buzz_geom::centreline(&conditioned);
+            Some(buzz_geom::stamp_along(&spine, &source, settings.fit(), budget).path)
         }
     }
-    path
 }
 
 fn contains(rect: Rect, p: Point) -> bool {
@@ -803,6 +915,260 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    /// Drive a whole stroke through the machine, with controlled timing.
+    ///
+    /// `seconds` is how long the stroke takes, which is what a speed-driven
+    /// brush answers to. Real wall time would make these tests depend on how
+    /// busy the machine is.
+    fn draw_stroke(
+        machine: &mut ToolMachine,
+        style: &DrawStyle,
+        points: &[Point],
+        seconds: f64,
+    ) -> ToolAction {
+        let last = points.len().saturating_sub(1).max(1) as f64;
+        machine.set_time(0.0);
+        machine.pointer_down(points[0], points[0], Mods::default(), &ctx(style));
+        for (i, p) in points.iter().enumerate().skip(1) {
+            machine.set_time(i as f64 / last * seconds);
+            machine.pointer_move(*p, *p, Mods::default());
+        }
+        machine.set_time(seconds);
+        let end = *points.last().expect("a stroke has points");
+        machine.pointer_up(end, end, &ctx(style))
+    }
+
+    fn wavy(count: usize, length: f64) -> Vec<Point> {
+        (0..count)
+            .map(|i| {
+                let t = i as f64 / (count - 1).max(1) as f64;
+                Point::new(t * length, (t * 12.0).sin() * 40.0)
+            })
+            .collect()
+    }
+
+    /// The fluid brush's whole reason for existing: the same path drawn faster
+    /// paints a thinner stroke.
+    #[test]
+    fn a_fast_brush_stroke_is_thinner_than_a_slow_one() {
+        let style = DrawStyle::default();
+        let points: Vec<Point> = (0..60)
+            .map(|i| Point::new(i as f64 * 10.0, 0.0))
+            .collect();
+
+        let area_for = |seconds: f64| -> f64 {
+            let mut m = ToolMachine::new(ToolId::Brush);
+            match draw_stroke(&mut m, &style, &points, seconds) {
+                ToolAction::AddShape { shape, .. } => shape.path.area().abs(),
+                other => panic!("got {other:?}"),
+            }
+        };
+
+        let slow = area_for(6.0);
+        let fast = area_for(0.3);
+        assert!(
+            fast < slow * 0.8,
+            "a fast stroke should lay down less ink: fast {fast:.1} vs slow {slow:.1}"
+        );
+        assert!(fast > 0.0);
+    }
+
+    /// A pattern brush must produce many separate stamps, not one blob.
+    #[test]
+    fn the_pattern_brush_stamps_its_shape_along_the_stroke() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Pattern;
+        style.brush.pattern = buzz_ui::PatternShape::Star;
+        style.brush.spacing = 20.0;
+        style.brush.size = 14.0;
+
+        let mut m = ToolMachine::new(ToolId::Brush);
+        match draw_stroke(&mut m, &style, &wavy(60, 400.0), 1.0) {
+            ToolAction::AddShape { shape, label } => {
+                assert_eq!(label, "Brush");
+                assert!(shape.fill.is_some(), "stamps are filled artwork");
+
+                let stamps = shape
+                    .path
+                    .elements()
+                    .iter()
+                    .filter(|e| matches!(e, kurbo::PathEl::MoveTo(_)))
+                    .count();
+                assert!(
+                    stamps > 10,
+                    "a 400-unit stroke at 20 apart should stamp many times, got {stamps}"
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// The art brush lays down exactly one stretched copy.
+    #[test]
+    fn the_art_brush_lays_down_a_single_stretched_shape() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Art;
+        style.brush.pattern = buzz_ui::PatternShape::Leaf;
+
+        let mut m = ToolMachine::new(ToolId::Brush);
+        match draw_stroke(&mut m, &style, &wavy(40, 300.0), 1.0) {
+            ToolAction::AddShape { shape, .. } => {
+                let stamps = shape
+                    .path
+                    .elements()
+                    .iter()
+                    .filter(|e| matches!(e, kurbo::PathEl::MoveTo(_)))
+                    .count();
+                assert_eq!(stamps, 1, "an art brush places one copy");
+                assert!(shape.path.bounding_box().width() > 250.0, "stretched to fit");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A pattern brush with no shape chosen must not paint an empty object
+    /// into the document.
+    #[test]
+    fn a_pattern_brush_with_no_shape_yet_paints_nothing() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Pattern;
+        style.brush.pattern = buzz_ui::PatternShape::Custom; // never made
+
+        let mut m = ToolMachine::new(ToolId::Brush);
+        assert_eq!(
+            draw_stroke(&mut m, &style, &wavy(20, 100.0), 1.0),
+            ToolAction::None
+        );
+    }
+
+    /// Tapping the brush leaves a dot, as Animate does. The other freehand
+    /// tools still need a real drag.
+    #[test]
+    fn tapping_the_brush_paints_a_dot() {
+        let style = DrawStyle::default();
+        let p = Point::new(4.0, 4.0);
+
+        let mut brush = ToolMachine::new(ToolId::Brush);
+        brush.pointer_down(p, p, Mods::default(), &ctx(&style));
+        match brush.pointer_up(p, p, &ctx(&style)) {
+            ToolAction::AddShape { shape, .. } => {
+                assert!(shape.path.area().abs() > 0.0, "a tap should leave a mark");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// The live preview is what runs on every pointer move, so it is where a
+    /// hang would actually show up. It must stay far inside a frame even when
+    /// the stroke is already enormous and the spacing is absurd.
+    #[test]
+    fn the_live_preview_stays_within_a_frame_budget_on_a_huge_stroke() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Pattern;
+        style.brush.pattern = buzz_ui::PatternShape::Star;
+        style.brush.spacing = 0.5; // asks for thousands of stamps
+
+        let mut m = ToolMachine::new(ToolId::Brush);
+        let points = wavy(6_000, 20_000.0);
+
+        m.set_time(0.0);
+        m.pointer_down(points[0], points[0], Mods::default(), &ctx(&style));
+        for (i, p) in points.iter().enumerate().skip(1) {
+            m.set_time(i as f64 * 0.001);
+            m.pointer_move(*p, *p, Mods::default());
+        }
+
+        // The worst case: the preview for the longest the stroke ever gets.
+        let started = std::time::Instant::now();
+        let preview = m.preview(&ctx(&style));
+        let elapsed = started.elapsed();
+
+        assert!(matches!(preview, Preview::Ink { .. }), "got {preview:?}");
+        assert!(
+            elapsed.as_millis() < 16,
+            "one preview frame of a 6000-sample pattern stroke took {elapsed:?}; \
+             at 60 fps that is a stutter the user would feel"
+        );
+    }
+
+    /// And the committed geometry, which runs once on release, must also stay
+    /// well short of anything a user would call a freeze.
+    #[test]
+    fn committing_a_huge_pattern_stroke_does_not_hang() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Pattern;
+        style.brush.pattern = buzz_ui::PatternShape::Leaf;
+        style.brush.spacing = 0.25;
+
+        let mut m = ToolMachine::new(ToolId::Brush);
+        let points = wavy(8_000, 40_000.0);
+
+        let started = std::time::Instant::now();
+        let action = draw_stroke(&mut m, &style, &points, 4.0);
+        let elapsed = started.elapsed();
+
+        match action {
+            ToolAction::AddShape { shape, .. } => {
+                assert!(!shape.path.elements().is_empty());
+                // Bounded, so the document does not grow without limit either.
+                assert!(
+                    shape.path.elements().len() < 250_000,
+                    "the committed path has {} elements",
+                    shape.path.elements().len()
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(
+            elapsed.as_millis() < 1_500,
+            "committing a 40 000-unit pattern stroke took {elapsed:?}"
+        );
+    }
+
+    /// Drawing a whole picture's worth of pattern strokes, one after another,
+    /// with a preview on every move — the realistic worst case.
+    #[test]
+    fn drawing_many_pattern_strokes_in_a_row_stays_responsive() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Pattern;
+        style.brush.pattern = buzz_ui::PatternShape::Dot;
+        style.brush.spacing = 6.0;
+
+        let started = std::time::Instant::now();
+        let mut painted = 0usize;
+
+        for stroke in 0..120 {
+            let mut m = ToolMachine::new(ToolId::Brush);
+            let points: Vec<Point> = (0..80)
+                .map(|i| {
+                    let t = i as f64;
+                    Point::new(t * 6.0, stroke as f64 * 4.0 + (t * 0.3).sin() * 25.0)
+                })
+                .collect();
+
+            m.set_time(0.0);
+            m.pointer_down(points[0], points[0], Mods::default(), &ctx(&style));
+            for (i, p) in points.iter().enumerate().skip(1) {
+                m.set_time(i as f64 * 0.01);
+                m.pointer_move(*p, *p, Mods::default());
+                // A preview every move, exactly as the window does.
+                let _ = m.preview(&ctx(&style));
+            }
+            let end = *points.last().unwrap();
+            m.set_time(1.0);
+            if let ToolAction::AddShape { .. } = m.pointer_up(end, end, &ctx(&style)) {
+                painted += 1;
+            }
+        }
+
+        let elapsed = started.elapsed();
+        assert_eq!(painted, 120, "every stroke should have painted something");
+        assert!(
+            elapsed.as_secs_f64() < 8.0,
+            "120 pattern strokes with live previews took {elapsed:?}"
+        );
     }
 
     #[test]

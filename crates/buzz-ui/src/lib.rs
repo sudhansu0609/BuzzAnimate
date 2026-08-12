@@ -5,6 +5,7 @@
 //! window, including the shortcut map, the snapping arithmetic and the panels
 //! themselves.
 
+pub mod brush;
 pub mod command;
 pub mod library_panel;
 pub mod panels;
@@ -15,6 +16,7 @@ pub mod timeline_panel;
 pub mod tools;
 pub mod view;
 
+pub use brush::{BrushKind, BrushSettings, PatternShape};
 pub use command::Command;
 pub use library_panel::{LibraryState, library_panel};
 pub use selection::Selection;

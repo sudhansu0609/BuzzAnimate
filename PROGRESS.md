@@ -72,6 +72,7 @@ Rules that follow from this, applied to every phase:
 > | `cp-1.1-complete` | Path editing and parallel hit-testing; CP-1.1 done |
 > | `cp-1.2` | Document model: COW scene, Animate layers, R-tree index |
 > | `phase-1` | `.buzz` format, undo/redo, autosave; **Phase 1 complete** |
+> | `phase-2` | Application shell, stage, toolbar, drawing and editing |
 >
 > Tags, not commit hashes, are the identifier: a hash written into this file
 > can never name the commit that contains the file.
@@ -283,6 +284,56 @@ Rules that follow from this, applied to every phase:
       change the document without recording undo
 - [x] 56 tests, including a full edit → save → crash → recover cycle
 
+### ✅ Phase 2 — Application shell, stage, tools and drawing
+*Substantially complete. Remaining gaps are listed explicitly in §7.*
+
+**CP-2.1 — window frame**
+- [x] `buzz-ui` crate: theme, command/shortcut map, tool catalogue, snapping,
+      draw style, selection — all testable without a window
+- [x] Menu bar with Animate's structure (File · Edit · View · Insert · Modify)
+- [x] Layout: toolbar left, stage centre, timeline bottom, panels right,
+      status bar with the unbounded zoom field
+- **Deviation:** uses egui's own panels, not `egui_dock`. Animate's arrangement
+  is fixed, and a generic tab-docking UI reads as *less* like Animate, not
+  more. `egui_dock` was dropped from the dependencies.
+
+**CP-2.2 — stage**
+- [x] Stage rectangle on a grey pasteboard, document properties (size, fps,
+      background)
+- [x] Rulers with adaptive tick spacing; drag off a ruler to create a guide
+- [x] Guides (lockable), grid with zoom-adaptive spacing
+- [x] Snapping to guides / grid / objects / pixels
+- [x] Zoom presets **plus** an unbounded field, and a live precision readout
+- [x] Grid and ruler drawing is bounded, so extreme zoom cannot try to draw
+      millions of lines
+
+**CP-2.3 — toolbar**
+- [x] All 21 Animate tools with their letter shortcuts (V A Q L P T N R O Y B
+      M K S I E C H Z), verified against Animate by test
+- [x] Unavailable tools are greyed with a tooltip saying which phase brings
+      them — a tool that looks available but does nothing is worse
+- [x] Stroke/fill colour wells with swap (X) and default (D)
+
+**CP-2.4 — drawing and editing**
+- [x] Rectangle, Oval, PolyStar, Line, Pencil, Brush, Eraser
+- [x] Shift constrains squares, circles and 45° lines
+- [x] Selection, marquee, move, Free Transform with anchored scaling
+- [x] **Subselection with anchor editing** — dragging an anchor carries both
+      adjacent Bézier handles, so the curve slides instead of kinking
+- [x] Paint Bucket, Ink Bottle, Eyedropper, Hand, Zoom
+- [x] **Merge Shape vs Object Drawing** — same-coloured fills fuse, a different
+      colour cuts. This is what CP-1.1b's booleans were built for.
+- [x] Group/ungroup, arrange (front/forward/backward/back), delete, duplicate
+- [x] Convert Lines to Fills, Expand Fill, Smooth, Straighten
+- [x] Layers, Properties and Color panels, swatches with recent colours
+- [x] Open/Save/Save As dialogs; autosave running on the background pool
+
+**Verified by screenshot, not just by test:** the window was captured and
+inspected. That caught two defects tests could not — most tool glyphs rendered
+as empty boxes because egui's bundled fonts lack those symbols, and the status
+bar sat under the taskbar. Buttons now show their shortcut letter, which always
+renders and teaches the keyboard at the same time.
+
 ---
 
 ## 5. Current metrics
@@ -295,10 +346,10 @@ Rules that follow from this, applied to every phase:
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 213 passing, clippy clean |
-| Rust source | ~8 700 lines |
-| Crates built | 6 of 15 |
-| Phases done | Phase 0 and **Phase 1 complete** |
+| Tests | 340 passing, clippy clean |
+| Rust source | ~13 400 lines |
+| Crates built | 7 of 15 |
+| Phases done | Phase 0, Phase 1, **Phase 2 (gaps in §7)** |
 
 ---
 
@@ -324,7 +375,7 @@ Rules that follow from this, applied to every phase:
 - [x] **Exit test:** documents round-trip through disk; undo returns to empty
       and redo restores; a full edit → save → crash → recover cycle passes
 
-### ⬜ Phase 2 — Stage, tools & UI shell *(Animate parity begins)*
+### ✅ Phase 2 — Stage, tools & UI shell — **substantially complete** (§7 lists gaps)
 - [ ] **CP-2.1** Application frame — see §8.1 for the exact layout
   - [ ] Menu bar with Animate's menu structure
   - [ ] Dockable panels via `egui_dock`, saved workspace layouts
@@ -412,6 +463,13 @@ Rules that follow from this, applied to every phase:
 | # | Item | Status |
 |---|---|---|
 | 1 | ~~**Oversized paths culled, not clipped.**~~ | ✅ **Resolved in CP-1.1** by `RenderClip` |
+| 8 | **Gradients not implemented.** Fills are solid colours only; the Gradient Transform tool is inert. Touches five crates (paint model, renderer brush, serialisation, editor UI). | Phase 2 follow-up |
+| 9 | **Text tool not implemented.** Needs font loading, shaping and a text-editing caret — a subsystem in its own right. | Phase 2 follow-up |
+| 10 | **Lasso tool not implemented.** Freehand selection region. | Phase 2 follow-up |
+| 11 | **Pen tool draws line segments, not Bézier curves.** Click-drag handle authoring is not there yet; anchors can be edited afterwards with Subselection. | Phase 2 follow-up |
+| 12 | **Multiple Scenes not implemented.** One scene per document. | With Phase 3 timeline |
+| 13 | **Clipboard (cut/copy/paste) not implemented.** Duplicate works. | Phase 2 follow-up |
+| 14 | **Workspace layout is not persisted** across runs. | Low priority |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |
@@ -497,22 +555,22 @@ cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 
 ## 10. Next action
 
-**Begin Phase 2 — the application shell.** This is where BuzzAnimate stops
-being libraries and starts being Animate. Everything underneath is now in
-place: geometry, document model, persistence, and a proven renderer.
+Two credible paths. **Phase 3 is the recommended one** — the timeline is what
+makes this an *animation* tool rather than a drawing tool, and the layer model
+it needs is already built and tested.
 
-Recommended order, each step leaving something usable:
+**Option A — Phase 3, the timeline** (recommended)
+- Layer list plus frame grid, playhead, frame numbers, fps, elapsed time
+- Keyframes, blank keyframes, frame spans, with Animate's F5/F6/F7 behaviour
+  and its frame-rendering conventions (§8.5)
+- Playback decoupled from render rate; scrubbing with speculative prefetch
+- Onion skinning, drawn in parallel across the job pool
 
-1. **CP-2.1 — window frame.** Menu bar with Animate's menu structure, and the
-   `egui_dock` panel layout from §8.1: toolbar left, stage centre, timeline
-   bottom, panels right.
-2. **CP-2.2 — the stage** (§8.3). Stage rectangle on the grey pasteboard,
-   rulers, guides, grid, snapping, and the zoom control with Animate's presets
-   *plus* the unbounded field Phase 0 earned.
-3. **CP-2.3 — the toolbar** (§8.4) with Animate's tools and letter shortcuts.
-4. **CP-2.4 — drawing**, including Animate's merge-shape versus object-drawing
-   distinction, which the CP-1.1b booleans exist to support.
+**Option B — close the Phase 2 gaps first** (§7 items 8–14)
+- Gradients are the largest and most visible: a paint model spanning five
+  crates, plus a gradient editor
+- Then Text, Lasso, true Bézier pen authoring, clipboard
 
-**The first visible milestone** is CP-2.2: at that point the app opens on a
-recognisable Animate stage that can be panned, zoomed without limit, and
-saved — the whole stack working end to end.
+Phase 2 left the application genuinely usable: a document can be drawn,
+edited, saved, reopened and autosaved. The gaps are missing *features*, not
+broken ones.

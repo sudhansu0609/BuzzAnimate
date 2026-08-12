@@ -15,7 +15,25 @@ AVM2/ABC), ISO standards (PDF), or plain XML (XFL).
 
 ---
 
-## Status: Phase 0 complete
+## Status: Phases 0–2 complete
+
+BuzzAnimate is now a working editor. It opens on an Animate-shaped window —
+menu bar, tool strip, rulers around a white stage on a grey pasteboard, layers
+and properties on the right, timeline along the bottom — and you can draw,
+select, transform, edit anchor points, arrange, group, save, reopen and rely on
+autosave.
+
+Animate's **Merge Shape** model works as it should: overlapping fills of the
+same colour fuse, a different colour cuts. Object Drawing is the alternative,
+on the `J` toggle.
+
+Not yet implemented, and honestly marked as such in the toolbar: gradients,
+Text, Lasso, Bézier pen authoring, multiple Scenes, clipboard. Frames and
+tweening arrive in Phase 3. See `PROGRESS.md` §7 for the full list.
+
+---
+
+## The engine, verified in Phase 0
 
 Phase 0 exists to prove the three claims above before any authoring features are
 built on top of them. All three are verified by automated tests against real
@@ -111,10 +129,13 @@ silently. Every adapter is scored and the table is logged:
 
 | Crate | Role |
 |---|---|
-| `buzz-geom` | `f64` geometry; the rebasing camera and precision model |
+| `buzz-geom` | `f64` geometry: rebasing camera, clipping, booleans, hit-testing, path editing |
 | `buzz-jobs` | Two-pool work-stealing job system; per-worker CPU metrics |
 | `buzz-render` | GPU adapter selection; Vello scene building |
-| `buzz-app` | Window, frame loop, HUD, zoom-target artwork |
+| `buzz-scene` | Copy-on-write document model; Animate's six layer types; R-tree index |
+| `buzz-doc` | `.buzz` format, undo history, autosave |
+| `buzz-ui` | Theme, menus, shortcut map, tool catalogue, panels, snapping |
+| `buzz-app` | Window, frame loop, editor state, tool behaviour, stage rendering |
 
 Remaining crates (`buzz-scene`, `buzz-timeline`, `buzz-import-xfl`,
 `buzz-avm`, …) arrive with their phases; empty placeholders would only be noise.
@@ -137,7 +158,7 @@ grep -A1 '^name = "wgpu"' Cargo.lock   # must list exactly one version
 ## Testing
 
 ```sh
-cargo test --workspace            # 56 tests
+cargo test --workspace            # 340 tests
 cargo clippy --workspace --all-targets
 cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 ```

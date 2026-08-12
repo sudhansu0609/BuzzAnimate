@@ -1,12 +1,12 @@
-//! Tool behaviour.
+﻿//! Tool behaviour.
 //!
-//! [`buzz_ui::tools`] is the catalogue — names, glyphs, shortcuts. This is what
+//! [`buzz_ui::tools`] is the catalogue â€” names, glyphs, shortcuts. This is what
 //! the tools actually *do*.
 //!
 //! # Shape of the design
 //!
 //! A gesture is three events: press, drag, release. [`ToolAction`] is what a
-//! tool asks for, and the editor carries it out — tools never touch the
+//! tool asks for, and the editor carries it out â€” tools never touch the
 //! document directly. That keeps undo labelling, layer locking and the
 //! merge-shape rules in one place instead of repeated in every tool, where one
 //! of them would inevitably be forgotten.
@@ -40,6 +40,8 @@ pub enum ToolAction {
     MoveSelection { delta: Vec2 },
     /// Scale the selection about a fixed corner.
     TransformSelection { transform: Affine },
+    /// Drag one anchor of the selected path â€” Animate's Subselection tool.
+    MoveAnchor { element: usize, delta: Vec2 },
     /// Erase within a stroked path.
     Erase { path: BezPath, width: f64 },
     /// Fill whatever is under the point with the current fill colour.
@@ -74,6 +76,11 @@ pub struct ToolContext<'a> {
     /// Document units per screen pixel, for size-independent thresholds.
     pub zoom: f64,
     pub selection_bounds: Option<Rect>,
+    /// Anchors of the single selected shape, in document space.
+    ///
+    /// Supplied by the editor because only it can see the scene; empty unless
+    /// exactly one shape is selected.
+    pub anchors: &'a [buzz_geom::Anchor],
 }
 
 /// A gesture in progress.
@@ -84,6 +91,12 @@ enum Gesture {
     Dragging { origin: Point, current: Point, mods: Mods },
     /// Accumulating freehand points.
     Freehand { points: Vec<Point> },
+    /// Dragging one anchor of a path.
+    Anchor {
+        element: usize,
+        origin: Point,
+        current: Point,
+    },
 }
 
 /// Drives one tool through a gesture.
@@ -100,6 +113,9 @@ pub struct ToolMachine {
 /// In *screen* pixels, converted using the zoom, so the threshold feels the
 /// same at every magnification.
 const CLICK_SLOP_PX: f64 = 3.0;
+
+/// How close, in screen pixels, a click must come to grab an anchor.
+const ANCHOR_GRAB_PX: f64 = 7.0;
 
 impl ToolMachine {
     pub fn new(tool: ToolId) -> Self {
@@ -129,11 +145,42 @@ impl ToolMachine {
         self.gesture = Gesture::Idle;
     }
 
-    pub fn pointer_down(&mut self, doc: Point, screen: Point, mods: Mods) -> ToolAction {
+    pub fn pointer_down(
+        &mut self,
+        doc: Point,
+        screen: Point,
+        mods: Mods,
+        ctx: &ToolContext<'_>,
+    ) -> ToolAction {
         self.last_screen = screen;
         match self.tool {
             ToolId::Pencil | ToolId::Brush | ToolId::Eraser => {
                 self.gesture = Gesture::Freehand { points: vec![doc] };
+            }
+            // Subselection grabs an anchor if one is close enough; otherwise it
+            // falls through to ordinary selection behaviour.
+            ToolId::Subselection => {
+                let tolerance = ANCHOR_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+                let grabbed = ctx
+                    .anchors
+                    .iter()
+                    .map(|a| (a, (a.point - doc).hypot()))
+                    .filter(|(_, d)| *d <= tolerance)
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(a, _)| *a);
+
+                self.gesture = match grabbed {
+                    Some(anchor) => Gesture::Anchor {
+                        element: anchor.element,
+                        origin: doc,
+                        current: doc,
+                    },
+                    None => Gesture::Dragging {
+                        origin: doc,
+                        current: doc,
+                        mods,
+                    },
+                };
             }
             _ => {
                 self.gesture = Gesture::Dragging {
@@ -152,6 +199,10 @@ impl ToolMachine {
 
         match &mut self.gesture {
             Gesture::Idle => ToolAction::None,
+            Gesture::Anchor { current, .. } => {
+                *current = doc;
+                ToolAction::None
+            }
             Gesture::Freehand { points } => {
                 // Drop points that add nothing, so a slow drag does not build a
                 // path with thousands of coincident vertices.
@@ -177,6 +228,14 @@ impl ToolMachine {
 
         match gesture {
             Gesture::Idle => ToolAction::None,
+            Gesture::Anchor { element, origin, .. } => {
+                let delta = doc - origin;
+                if delta.hypot() <= f64::EPSILON {
+                    ToolAction::None
+                } else {
+                    ToolAction::MoveAnchor { element, delta }
+                }
+            }
             Gesture::Freehand { mut points } => {
                 if points.last().is_none_or(|p| *p != doc) {
                     points.push(doc);
@@ -193,6 +252,9 @@ impl ToolMachine {
     pub fn preview(&self, ctx: &ToolContext<'_>) -> Preview {
         match &self.gesture {
             Gesture::Idle => Preview::None,
+            // The stage already draws anchors for the selected path; a
+            // rubber-band line here would just add noise.
+            Gesture::Anchor { .. } => Preview::None,
             Gesture::Freehand { points } => match self.tool {
                 ToolId::Eraser => Preview::Stroke {
                     path: polyline(points),
@@ -230,7 +292,7 @@ impl ToolMachine {
             },
             ToolId::Brush => {
                 // The brush paints a filled stroke, so its colour comes from
-                // the fill swatch — as in Animate.
+                // the fill swatch â€” as in Animate.
                 let width = brush_width(self.tool, ctx.style);
                 let outline = buzz_geom::outline_stroke(
                     &path,
@@ -395,7 +457,7 @@ fn contains(rect: Rect, p: Point) -> bool {
 
 /// Build the path for a drag-created shape.
 ///
-/// Shift constrains: squares, circles, and lines to 45° steps — all Animate
+/// Shift constrains: squares, circles, and lines to 45Â° steps â€” all Animate
 /// behaviours a user will reach for without thinking.
 fn build_shape_path(tool: ToolId, origin: Point, end: Point, mods: Mods) -> Option<BezPath> {
     let mut end = end;
@@ -528,11 +590,12 @@ mod tests {
             style,
             zoom: 1.0,
             selection_bounds: None,
+            anchors: &[],
         }
     }
 
     fn drag(machine: &mut ToolMachine, from: Point, to: Point, ctx: &ToolContext<'_>) -> ToolAction {
-        machine.pointer_down(from, from, Mods::default());
+        machine.pointer_down(from, from, Mods::default(), ctx);
         machine.pointer_move(to, to, Mods::default());
         machine.pointer_up(to, to, ctx)
     }
@@ -617,12 +680,12 @@ mod tests {
 
         // At 1x, 2 document units is under the 3 px slop: a click.
         let mut m = ToolMachine::new(ToolId::Rectangle);
-        let zoomed_out = ToolContext { style: &style, zoom: 1.0, selection_bounds: None };
+        let zoomed_out = ToolContext { style: &style, zoom: 1.0, selection_bounds: None, anchors: &[] };
         assert_eq!(drag(&mut m, from, to, &zoomed_out), ToolAction::None);
 
         // At 10x, the same 2 units is 20 px: a real drag.
         let mut m = ToolMachine::new(ToolId::Rectangle);
-        let zoomed_in = ToolContext { style: &style, zoom: 10.0, selection_bounds: None };
+        let zoomed_in = ToolContext { style: &style, zoom: 10.0, selection_bounds: None, anchors: &[] };
         assert!(matches!(
             drag(&mut m, from, to, &zoomed_in),
             ToolAction::AddShape { .. }
@@ -649,7 +712,7 @@ mod tests {
         let mut m = ToolMachine::new(ToolId::Selection);
         let p = Point::new(5.0, 5.0);
         let mods = Mods { shift: true, ..Default::default() };
-        m.pointer_down(p, p, mods);
+        m.pointer_down(p, p, mods, &ctx(&style));
         match m.pointer_up(p, p, &ctx(&style)) {
             ToolAction::PickAt { additive, .. } => assert!(additive),
             other => panic!("got {other:?}"),
@@ -669,7 +732,7 @@ mod tests {
     }
 
     /// Dragging from *inside* the selection moves it instead of starting a new
-    /// marquee — the behaviour that makes the Selection tool feel right.
+    /// marquee â€” the behaviour that makes the Selection tool feel right.
     #[test]
     fn dragging_from_inside_the_selection_moves_it() {
         let style = DrawStyle::default();
@@ -677,6 +740,7 @@ mod tests {
             style: &style,
             zoom: 1.0,
             selection_bounds: Some(Rect::new(0.0, 0.0, 100.0, 100.0)),
+            anchors: &[],
         };
         let mut m = ToolMachine::new(ToolId::Selection);
         match drag(&mut m, Point::new(50.0, 50.0), Point::new(80.0, 90.0), &c) {
@@ -691,7 +755,7 @@ mod tests {
     fn freehand_tools_accumulate_a_path() {
         let style = DrawStyle::default();
         let mut m = ToolMachine::new(ToolId::Pencil);
-        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default());
+        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default(), &ctx(&style));
         for i in 1..20 {
             let p = Point::new(i as f64, (i as f64).sin() * 5.0);
             m.pointer_move(p, p, Mods::default());
@@ -706,13 +770,13 @@ mod tests {
         }
     }
 
-    /// The brush paints a filled outline, not a stroke — Animate's behaviour,
+    /// The brush paints a filled outline, not a stroke â€” Animate's behaviour,
     /// and why it uses the fill colour.
     #[test]
     fn the_brush_produces_a_filled_outline() {
         let style = DrawStyle::default();
         let mut m = ToolMachine::new(ToolId::Brush);
-        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default());
+        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default(), &ctx(&style));
         for i in 1..10 {
             let p = Point::new(i as f64 * 5.0, 0.0);
             m.pointer_move(p, p, Mods::default());
@@ -733,14 +797,14 @@ mod tests {
         let style = DrawStyle::default();
         let mut m = ToolMachine::new(ToolId::Pencil);
         let p = Point::new(1.0, 1.0);
-        m.pointer_down(p, p, Mods::default());
+        m.pointer_down(p, p, Mods::default(), &ctx(&style));
         assert_eq!(m.pointer_up(p, p, &ctx(&style)), ToolAction::None);
     }
 
     #[test]
     fn the_hand_tool_pans_while_dragging() {
         let mut m = ToolMachine::new(ToolId::Hand);
-        m.pointer_down(Point::ORIGIN, Point::new(100.0, 100.0), Mods::default());
+        m.pointer_down(Point::ORIGIN, Point::new(100.0, 100.0), Mods::default(), &ctx(&DrawStyle::default()));
         match m.pointer_move(Point::ORIGIN, Point::new(120.0, 90.0), Mods::default()) {
             ToolAction::PanView { delta_screen } => {
                 assert!((delta_screen.x - 20.0).abs() < 1e-9);
@@ -756,7 +820,7 @@ mod tests {
         let p = Point::new(10.0, 10.0);
 
         let mut m = ToolMachine::new(ToolId::Zoom);
-        m.pointer_down(p, p, Mods::default());
+        m.pointer_down(p, p, Mods::default(), &ctx(&style));
         match m.pointer_up(p, p, &ctx(&style)) {
             ToolAction::ZoomView { factor, .. } => assert!(factor > 1.0),
             other => panic!("got {other:?}"),
@@ -764,7 +828,7 @@ mod tests {
 
         let mut m = ToolMachine::new(ToolId::Zoom);
         let alt = Mods { alt: true, ..Default::default() };
-        m.pointer_down(p, p, alt);
+        m.pointer_down(p, p, alt, &ctx(&style));
         match m.pointer_up(p, p, &ctx(&style)) {
             ToolAction::ZoomView { factor, .. } => assert!(factor < 1.0),
             other => panic!("got {other:?}"),
@@ -778,7 +842,7 @@ mod tests {
         let mut m = ToolMachine::new(ToolId::Oval);
         assert_eq!(m.preview(&c), Preview::None);
 
-        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default());
+        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default(), &ctx(&style));
         m.pointer_move(Point::new(40.0, 30.0), Point::ORIGIN, Mods::default());
         assert!(matches!(m.preview(&c), Preview::Shape(_)));
 
@@ -788,8 +852,9 @@ mod tests {
 
     #[test]
     fn escape_cancels_a_gesture_without_creating_anything() {
+        let style = DrawStyle::default();
         let mut m = ToolMachine::new(ToolId::Rectangle);
-        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default());
+        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default(), &ctx(&style));
         m.pointer_move(Point::new(50.0, 50.0), Point::ORIGIN, Mods::default());
         assert!(m.is_active());
 
@@ -805,7 +870,7 @@ mod tests {
     #[test]
     fn changing_tool_abandons_the_gesture() {
         let mut m = ToolMachine::new(ToolId::Rectangle);
-        m.pointer_down(Point::ORIGIN, Point::ORIGIN, Mods::default());
+        m.pointer_down(Point::ORIGIN, Point::ORIGIN, Mods::default(), &ctx(&DrawStyle::default()));
         m.set_tool(ToolId::Oval);
         assert!(!m.is_active());
         assert_eq!(m.tool(), ToolId::Oval);
@@ -858,6 +923,108 @@ mod tests {
         let c = t.as_coeffs();
         assert!(c[0].abs() > 0.0 && c[3].abs() > 0.0);
         assert!(c[0].is_finite() && c[3].is_finite());
+    }
+
+    /// Subselection grabs a nearby anchor rather than starting a marquee.
+    #[test]
+    fn subselection_grabs_an_anchor_within_reach() {
+        let style = DrawStyle::default();
+        let anchors = [
+            buzz_geom::Anchor {
+                element: 1,
+                point: Point::new(100.0, 0.0),
+            },
+            buzz_geom::Anchor {
+                element: 2,
+                point: Point::new(50.0, 80.0),
+            },
+        ];
+        let ctx = ToolContext {
+            style: &style,
+            zoom: 1.0,
+            selection_bounds: Some(Rect::new(0.0, 0.0, 100.0, 80.0)),
+            anchors: &anchors,
+        };
+
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        let start = Point::new(102.0, 2.0);
+        let end = Point::new(140.0, 20.0);
+        m.pointer_down(start, start, Mods::default(), &ctx);
+        m.pointer_move(end, end, Mods::default());
+
+        match m.pointer_up(end, end, &ctx) {
+            ToolAction::MoveAnchor { element, delta } => {
+                assert_eq!(element, 1, "should have grabbed the nearest anchor");
+                assert!((delta.x - 38.0).abs() < 1e-9, "delta was {delta:?}");
+            }
+            other => panic!("expected an anchor drag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subselection_falls_back_to_selection_away_from_anchors() {
+        let style = DrawStyle::default();
+        let anchors = [buzz_geom::Anchor {
+            element: 1,
+            point: Point::new(100.0, 0.0),
+        }];
+        let ctx = ToolContext {
+            style: &style,
+            zoom: 1.0,
+            selection_bounds: None,
+            anchors: &anchors,
+        };
+
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        let start = Point::new(300.0, 300.0);
+        let end = Point::new(400.0, 400.0);
+        m.pointer_down(start, start, Mods::default(), &ctx);
+        m.pointer_move(end, end, Mods::default());
+
+        assert!(
+            matches!(m.pointer_up(end, end, &ctx), ToolAction::PickInRect { .. }),
+            "far from any anchor it should marquee-select"
+        );
+    }
+
+    /// The grab radius is in screen pixels, so it must tighten as you zoom in.
+    #[test]
+    fn the_anchor_grab_radius_scales_with_zoom() {
+        let style = DrawStyle::default();
+        let anchors = [buzz_geom::Anchor {
+            element: 1,
+            point: Point::new(100.0, 0.0),
+        }];
+        let start = Point::new(105.0, 0.0);
+        let end = Point::new(120.0, 0.0);
+
+        // At 1x, 5 document units is within the 7 px grab radius.
+        let near = ToolContext {
+            style: &style,
+            zoom: 1.0,
+            selection_bounds: None,
+            anchors: &anchors,
+        };
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        m.pointer_down(start, start, Mods::default(), &near);
+        assert!(matches!(
+            m.pointer_up(end, end, &near),
+            ToolAction::MoveAnchor { .. }
+        ));
+
+        // At 10x it is 50 px away, far outside the radius.
+        let far = ToolContext {
+            style: &style,
+            zoom: 10.0,
+            selection_bounds: None,
+            anchors: &anchors,
+        };
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        m.pointer_down(start, start, Mods::default(), &far);
+        assert!(!matches!(
+            m.pointer_up(end, end, &far),
+            ToolAction::MoveAnchor { .. }
+        ));
     }
 
     #[test]

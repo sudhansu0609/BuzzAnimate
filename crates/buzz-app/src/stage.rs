@@ -250,6 +250,24 @@ fn draw_selection(
         StrokeKind::Outside,
     );
 
+    // Subselection shows the path's anchors instead of a transform box, which
+    // is what makes individual points grabbable.
+    if editor.tool() == buzz_ui::ToolId::Subselection {
+        const ANCHOR: f32 = 5.0;
+        for anchor in editor.selected_anchors() {
+            let at = to_screen(anchor.point);
+            let square = egui::Rect::from_center_size(at, egui::vec2(ANCHOR, ANCHOR));
+            painter.rect_filled(square, 0.0, Palette::HANDLE_FILL);
+            painter.rect_stroke(
+                square,
+                0.0,
+                Stroke::new(1.0, Palette::SELECTION),
+                StrokeKind::Outside,
+            );
+        }
+        return;
+    }
+
     // Handles only for the tool that can use them.
     if editor.tool() != buzz_ui::ToolId::FreeTransform {
         return;

@@ -82,7 +82,37 @@ impl Editor {
             style: &self.style,
             zoom: self.camera.zoom,
             selection_bounds: self.selection.bounds(self.doc.scene()),
+            anchors: &[],
         }
+    }
+
+    /// Anchors of the single selected shape, in world space.
+    ///
+    /// Empty unless exactly one shape is selected, matching Animate: the
+    /// Subselection tool edits one path at a time.
+    pub fn selected_anchors(&self) -> Vec<buzz_geom::Anchor> {
+        if self.selection.len() != 1 {
+            return Vec::new();
+        }
+        let Some(id) = self.selection.iter().next() else {
+            return Vec::new();
+        };
+        let Some((_, object)) = self.doc.scene().find_object(id) else {
+            return Vec::new();
+        };
+        let ObjectKind::Shape(shape) = &object.kind else {
+            return Vec::new();
+        };
+
+        // Reported in world space so hit-testing can compare against the
+        // pointer without the caller knowing about the object's transform.
+        buzz_geom::anchors(&shape.path)
+            .into_iter()
+            .map(|a| buzz_geom::Anchor {
+                element: a.element,
+                point: object.transform * a.point,
+            })
+            .collect()
     }
 
     pub fn preview(&self) -> Preview {
@@ -99,7 +129,17 @@ impl Editor {
     pub fn pointer_down(&mut self, screen: Point, mods: Mods) {
         let doc = self.camera.screen_to_doc(screen);
         let doc = self.snap(doc);
-        self.machine.pointer_down(doc, screen, mods);
+
+        let anchors = self.selected_anchors();
+        let selection_bounds = self.selection.bounds(self.doc.scene());
+        let zoom = self.camera.zoom;
+        let ctx = ToolContext {
+            style: &self.style,
+            zoom,
+            selection_bounds,
+            anchors: &anchors,
+        };
+        self.machine.pointer_down(doc, screen, mods, &ctx);
     }
 
     pub fn pointer_move(&mut self, screen: Point, mods: Mods) {
@@ -113,12 +153,14 @@ impl Editor {
 
         // Built from disjoint fields rather than via `tool_context`, which
         // would borrow all of `self` and conflict with `&mut self.machine`.
+        let anchors = self.selected_anchors();
         let selection_bounds = self.selection.bounds(self.doc.scene());
         let zoom = self.camera.zoom;
         let ctx = ToolContext {
             style: &self.style,
             zoom,
             selection_bounds,
+            anchors: &anchors,
         };
         let action = self.machine.pointer_up(doc, screen, &ctx);
 
@@ -190,6 +232,27 @@ impl Editor {
 
             ToolAction::TransformSelection { transform } => {
                 self.transform_selection(transform, "Transform");
+            }
+
+            ToolAction::MoveAnchor { element, delta } => {
+                let Some(id) = self.selection.iter().next() else {
+                    return;
+                };
+                // The anchor was grabbed in world space, but the path lives in
+                // the object's local space, so the delta has to come back
+                // through the transform or a rotated shape would move wrongly.
+                let local_delta = self
+                    .doc
+                    .scene()
+                    .find_object(id)
+                    .and_then(|(_, o)| invert(o.transform).map(|inv| inv.deref_vector(delta)))
+                    .unwrap_or(delta);
+
+                self.doc.edit("Move Anchor", |scene| {
+                    update_shape(scene, id, |s| {
+                        buzz_geom::move_anchor(&mut s.path, element, local_delta);
+                    });
+                });
             }
 
             ToolAction::Erase { path, width } => self.erase(path, width),
@@ -777,6 +840,19 @@ fn invert(t: Affine) -> Option<Affine> {
     (determinant.abs() > 1e-12).then(|| t.inverse())
 }
 
+/// Extension for transforming a *direction* rather than a position.
+trait DerefVector {
+    /// Apply the linear part only, ignoring translation.
+    fn deref_vector(&self, v: buzz_geom::Vec2) -> buzz_geom::Vec2;
+}
+
+impl DerefVector for Affine {
+    fn deref_vector(&self, v: buzz_geom::Vec2) -> buzz_geom::Vec2 {
+        let c = self.as_coeffs();
+        buzz_geom::Vec2::new(c[0] * v.x + c[2] * v.y, c[1] * v.x + c[3] * v.y)
+    }
+}
+
 /// Add a shape using Animate's **merge shape** rules.
 ///
 /// Same-coloured fills fuse into one shape; a different colour cuts a hole.
@@ -1304,6 +1380,74 @@ mod tests {
         e.set_tool(ToolId::Bone);
         assert_ne!(e.tool(), ToolId::Bone);
         assert!(e.status.is_some());
+    }
+
+    #[test]
+    fn anchors_are_reported_only_for_a_single_selected_shape() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let a = draw_square(&mut e, 0.0, 0.0, 50.0, Color::WHITE).unwrap();
+        let b = draw_square(&mut e, 100.0, 0.0, 50.0, Color::WHITE).unwrap();
+
+        // Object drawing leaves the new shape selected, so clear it first.
+        e.selection.clear();
+        assert!(e.selected_anchors().is_empty(), "nothing selected");
+
+        e.selection.select_one(a);
+        assert!(!e.selected_anchors().is_empty(), "one shape gives anchors");
+
+        e.selection.set([a, b]);
+        assert!(
+            e.selected_anchors().is_empty(),
+            "Subselection edits one path at a time"
+        );
+    }
+
+    /// Anchors are reported in world space, so a transformed object's points
+    /// still line up with the cursor.
+    #[test]
+    fn anchors_account_for_the_object_transform() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 50.0, Color::WHITE).unwrap();
+        e.selection.select_one(id);
+
+        let before = e.selected_anchors();
+        e.apply(ToolAction::MoveSelection {
+            delta: Vec2::new(100.0, 0.0),
+        });
+        let after = e.selected_anchors();
+
+        assert_eq!(before.len(), after.len());
+        assert!(
+            (after[0].point.x - before[0].point.x - 100.0).abs() < 1e-9,
+            "anchors should follow the transform"
+        );
+    }
+
+    #[test]
+    fn dragging_an_anchor_reshapes_the_path_and_is_undoable() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 50.0, Color::WHITE).unwrap();
+        e.selection.select_one(id);
+
+        let before = e.scene().find_object(id).unwrap().1.bounds();
+        let anchor = e.selected_anchors()[1];
+        e.apply(ToolAction::MoveAnchor {
+            element: anchor.element,
+            delta: Vec2::new(40.0, 0.0),
+        });
+
+        let after = e.scene().find_object(id).unwrap().1.bounds();
+        assert!(
+            after.width() > before.width(),
+            "moving a corner outwards should widen the shape: {before:?} -> {after:?}"
+        );
+
+        e.run(Command::Undo);
+        let restored = e.scene().find_object(id).unwrap().1.bounds();
+        assert!((restored.width() - before.width()).abs() < 1e-9);
     }
 
     #[test]

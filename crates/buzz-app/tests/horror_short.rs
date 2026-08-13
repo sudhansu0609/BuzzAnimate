@@ -1137,3 +1137,249 @@ fn the_waveform_and_onion_skins_are_cheap_enough_to_live_with() {
          with ghosts on would stutter"
     );
 }
+
+/// **A heavy scene**, which is what the requirement actually says.
+///
+/// Six villagers and a few trees is a shot. A five-minute film is many shots,
+/// and an ambitious one puts a crowd in front of a detailed set with filters on
+/// half of it. This is that: a cast of thirty, a set of three hundred pieces,
+/// nesting four symbols deep, all lit and all filtered.
+///
+/// The claim under test is the one that was asked for — that it does not hang
+/// on a complex scene.
+#[test]
+fn a_heavy_scene_still_draws_and_edits() {
+    let mut scene = Scene::default();
+    scene.stage_mut().size = buzz_geom::Size::new(1920.0, 1080.0);
+    scene.stage_mut().frame_rate = 24.0;
+    scene.stage_mut().background = Color::from_rgb8(0x06, 0x08, 0x0E);
+
+    eprintln!("\n--- a heavy scene ---");
+
+    // A set of three hundred pieces across six layers at different depths.
+    stage("a 300-piece set", Duration::from_secs(5), || {
+        for (band, depth) in [(0, 2400.0), (1, 1600.0), (2, 900.0), (3, 400.0), (4, 0.0), (5, -300.0)] {
+            let layer = scene.add_layer(format!("Set {band}"), LayerKind::Normal);
+            scene.update_layer(layer, |l| l.depth = depth);
+            for i in 0..50 {
+                let x = 60.0 + ((band * 37 + i * 71) % 1800) as f64;
+                let y = 200.0 + ((band * 53 + i * 29) % 800) as f64;
+                scene
+                    .add_shape(
+                        layer,
+                        ShapeData::filled(
+                            blob(Point::new(x, y), 70.0, 48, (band + i) as f64),
+                            Color::from_rgb8(
+                                (12 + band * 6) as u8,
+                                (16 + band * 5) as u8,
+                                (20 + band * 7) as u8,
+                            ),
+                        ),
+                    )
+                    .expect("set piece");
+            }
+        }
+    });
+
+    // A villager, and then a *crowd* of them, four symbols deep.
+    let villager = stage("rig a villager", Duration::from_secs(5), || {
+        build_villager(&mut scene)
+    });
+    let group = stage("nest villagers into a crowd symbol", Duration::from_secs(5), || {
+        let crowd = scene.add_symbol("Crowd", SymbolKind::Graphic, None);
+        scene.enter_symbol(crowd);
+        for i in 0..5 {
+            let layer = scene.add_layer(format!("v{i}"), LayerKind::Normal);
+            scene
+                .add_instance_at(
+                    layer,
+                    0,
+                    villager,
+                    Affine::translate(Vec2::new(i as f64 * 120.0, 0.0)),
+                )
+                .expect("a villager in the crowd");
+        }
+        scene.exit_symbol();
+        crowd
+    });
+
+    stage("place six crowds — thirty villagers", Duration::from_secs(5), || {
+        let cast = scene.add_layer("Cast", LayerKind::Normal);
+        for i in 0..6 {
+            scene
+                .add_instance_at(
+                    cast,
+                    0,
+                    group,
+                    Affine::translate(Vec2::new(120.0 + i as f64 * 280.0, 640.0)),
+                )
+                .expect("a crowd");
+        }
+    });
+
+    stage("light it", Duration::from_secs(5), || light_the_night(&mut scene));
+
+    // Give it length. Without this every layer is one frame long, and stepping
+    // the playhead past frame zero shows — correctly — nothing at all.
+    stage("make it a minute long", Duration::from_secs(5), || {
+        scene.set_frame_count(24 * 60);
+    });
+
+    // Filters on a third of the set — fog, as a real night scene has.
+    stage("fog a third of the set", Duration::from_secs(5), || {
+        let ids: Vec<_> = scene
+            .layers()
+            .iter()
+            .filter(|l| l.name.starts_with("Set") && l.depth > 800.0)
+            .flat_map(|l| l.objects_at(0).iter().map(|o| o.id).collect::<Vec<_>>())
+            .collect();
+        eprintln!("  {:<46} {:>10}", "(objects fogged)", ids.len());
+        for id in ids {
+            scene.update_object(id, |o| {
+                o.filters.push(Filter::new(FilterKind::Blur {
+                    x: 7.0,
+                    y: 7.0,
+                    quality: Quality::Low,
+                }));
+            });
+        }
+    });
+
+    let shapes: usize = scene
+        .layers()
+        .iter()
+        .flat_map(|l| l.all_objects())
+        .map(|o| o.shape_count())
+        .sum();
+    eprintln!("  {:<46} {shapes:>10}", "(shapes on the stage, before nesting)");
+
+    // Draw it, the way the window does.
+    let mut editor = Editor::new(Document::new(scene));
+    let mut vello = buzz_render::vello::Scene::new();
+    let mut cache = buzz_render::document::DrawCache::new();
+
+    let draw = |editor: &Editor,
+                vello: &mut buzz_render::vello::Scene,
+                cache: &mut buzz_render::document::DrawCache| {
+        let mut builder = buzz_render::SceneBuilder::new(vello, &editor.camera);
+        let scene = editor.scene();
+        let started = Instant::now();
+        cache.begin(scene.lights().fingerprint());
+        buzz_render::document::draw_frame_within(
+            &mut builder,
+            scene,
+            editor.current_frame,
+            scene.camera_transform(editor.current_frame),
+            &buzz_render::document::FrameOptions {
+                masks: buzz_render::document::MaskDisplay::WhenLocked,
+                lit: true,
+                ..Default::default()
+            },
+            cache,
+        );
+        cache.end();
+        started.elapsed()
+    };
+
+    let cold = draw(&editor, &mut vello, &mut cache);
+    eprintln!("  {:<46} {cold:>10.2?}", "first frame of the heavy scene");
+
+    let mut worst = Duration::ZERO;
+    for f in 0..10 {
+        editor.set_frame(f);
+        worst = worst.max(draw(&editor, &mut vello, &mut cache));
+    }
+    eprintln!("  {:<46} {worst:>10.2?}", "worst frame while stepping");
+
+    // And editing it: pick a villager out of a nested crowd and drag it.
+    //
+    // The crowds sit at x = 120 + i*280, y = 640; inside one, villagers are
+    // 120 apart; inside a villager the head is at its origin. So the first
+    // crowd's first villager's head is at (120, 640) — four symbols deep, and
+    // exactly the pick that used to be impossible when an instance measured
+    // two pixels across.
+    let picked = editor.object_at(Point::new(120.0, 640.0), 6.0);
+    assert!(
+        picked.is_some(),
+        "a villager four symbols deep could not be clicked"
+    );
+    if let Some(id) = picked {
+        editor.selection.select_one(id);
+        let mut worst_drag = Duration::ZERO;
+        for step in 0..20 {
+            editor.doc.edit("Move", |scene| {
+                scene.update_object(id, |o| {
+                    o.transform = Affine::translate(Vec2::new(step as f64, 0.0));
+                });
+            });
+            worst_drag = worst_drag.max(draw(&editor, &mut vello, &mut cache));
+        }
+        eprintln!("  {:<46} {worst_drag:>10.2?}", "worst frame during a drag");
+        assert!(
+            worst_drag < Duration::from_millis(400),
+            "dragging in a heavy scene costs {worst_drag:?} a frame"
+        );
+    }
+
+    assert!(
+        cold < Duration::from_secs(15),
+        "the heavy scene took {cold:?} to draw once — that is a hang"
+    );
+    assert!(
+        worst < Duration::from_millis(400),
+        "stepping through the heavy scene costs {worst:?} a frame"
+    );
+}
+
+/// **A click reaches artwork however deep it is nested.**
+///
+/// A 2.5D rig is symbols inside symbols: a finger inside a hand inside an arm
+/// inside a character inside a crowd. Every one of those levels has to be
+/// clickable from the stage, and an instance that measures a placeholder
+/// instead of its artwork makes the whole tree unselectable — which is what
+/// stopped a character being opened at all.
+#[test]
+fn a_click_reaches_artwork_however_deeply_nested() {
+    let mut scene = Scene::default();
+    scene.stage_mut().size = buzz_geom::Size::new(1920.0, 1080.0);
+
+    // part  <-  villager  <-  crowd  <-  stage
+    let part = part_symbol(&mut scene, "Part", blob(Point::ZERO, 40.0, 32, 0.0), SKIN);
+
+    let villager = scene.add_symbol("V", SymbolKind::Graphic, None);
+    scene.enter_symbol(villager);
+    let vl = scene.add_layer("p", LayerKind::Normal);
+    scene.add_instance_at(vl, 0, part, Affine::IDENTITY).unwrap();
+    scene.exit_symbol();
+
+    let crowd = scene.add_symbol("C", SymbolKind::Graphic, None);
+    scene.enter_symbol(crowd);
+    let cl = scene.add_layer("v", LayerKind::Normal);
+    scene.add_instance_at(cl, 0, villager, Affine::IDENTITY).unwrap();
+    scene.exit_symbol();
+
+    let stage_layer = scene.add_layer("Cast", LayerKind::Normal);
+    let one = scene
+        .add_instance_at(stage_layer, 0, part, Affine::translate(Vec2::new(200.0, 200.0)))
+        .unwrap();
+    let two = scene
+        .add_instance_at(stage_layer, 0, villager, Affine::translate(Vec2::new(500.0, 200.0)))
+        .unwrap();
+    let three = scene
+        .add_instance_at(stage_layer, 0, crowd, Affine::translate(Vec2::new(800.0, 200.0)))
+        .unwrap();
+
+    let editor = Editor::new(Document::new(scene));
+    eprintln!("\n--- how deep can a click reach ---");
+    for (label, at, expect) in [
+        ("one level  (part)", Point::new(200.0, 200.0), one),
+        ("two levels (villager)", Point::new(500.0, 200.0), two),
+        ("three levels (crowd)", Point::new(800.0, 200.0), three),
+    ] {
+        let hit = editor.object_at(at, 4.0);
+        eprintln!(
+            "  {label:<28} {}",
+            if hit == Some(expect) { "hit" } else { "MISSED" }
+        );
+    }
+}

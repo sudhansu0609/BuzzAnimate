@@ -2613,6 +2613,83 @@ object carries its gradient with it**; a radial gradient cools in all four
 directions; stop offsets put the colour where the file says; Reflect mirrors
 where Pad holds; and a solid fill still comes back exactly solid.
 
+### ✅ A five-minute horror short, built and measured — and four defects
+
+Every other section here records a feature. This one records an **exercise**:
+building what a rural horror short actually needs, at the scale it actually
+reaches, and putting a stopwatch on every stage. A tool can pass every unit
+test and still be unusable, because the failures that stop a production are
+not wrong answers — they are things that take four minutes when they should
+take four seconds, on a document the size a real film gets to.
+
+`buzz-app/tests/horror_short.rs` builds a villager rigged out of reusable
+part-symbols, a night exterior on depth-separated layers, a moon and a lantern
+casting shadows, fog and glow as filters, a vignette as an inverse mask, an
+armature posed with IK, five minutes of dialogue lip-synced — 7 200 frames —
+and then *works on it*. It also writes the frame out, because numbers say a
+render is fast and only a picture says it is right.
+
+**Four defects came out of it, three of them severe.**
+
+**1. Lighting rebuilt the whole film on every mouse move.** Generated lighting
+geometry is cached, and the cache was thrown away whenever the *document's*
+revision changed — which bumps on every edit, and on every mouse move of a
+drag. Dragging one hand rebuilt the shading crescent and cast shadow of every
+shape in the film, once per frame, for as long as the drag lasted: **770 ms a
+frame**, measured. `LightRig::fingerprint` keys the cache on the lights
+themselves, so an edit to artwork keeps it and only the objects that actually
+moved miss. **770 ms → 17 ms.**
+
+**2. A symbol instance cast no shadow at all.** The note in `cast_shadows` said
+so and it reads as a small gap; it is not. A document imported from Animate is
+*entirely* symbol instances, so a real film cast no shadows whatever —
+switching shadows on did visibly nothing, which looks like a broken feature
+rather than an unfinished one.
+
+**3. A mask painted itself into the film.** A mask layer's artwork was skipped
+only when the mask was actually clipping something, so a mask added before the
+layer beneath it had been set to Masked was drawn as ordinary artwork — opaque,
+full size, over everything. The natural order of work walks straight into it:
+you draw the stencil first and say what it masks second. On the vignette here
+it covered the entire frame. A mask that claims nothing is still a mask; the
+only case where one should show its own artwork is Animate's editing rule, so
+the skip is unconditional for an export and conditional only for the stage.
+
+**4. Onion skinning rebuilt every blur, six times a frame.** One frame on
+screen is a dozen draws — the scene behind an opened symbol, every keyframe
+under Edit Multiple Frames, the ghosts either side, and the live frame. Each
+opened and closed the caches on its own, and both evict anything not drawn
+within three generations, so seven passes over one screen frame aged the first
+out before the last had finished. **257 ms a frame** with three ghosts either
+side: four frames a second, in the mode an animator spends most of their time
+in. The generation now belongs to the *screen* frame. **257 ms → 5.0 ms.**
+
+**What it measures, on the 14700K and the 5060 Ti:**
+
+| Stage | Time |
+|---|---|
+| Build the five-minute document | 1 ms |
+| Scrub anywhere in it | under 3 µs |
+| Select a layer's artwork | 6 µs |
+| Click a villager, go inside it | 40 µs |
+| Analyse five minutes of dialogue | 198 ms (7 200 viseme frames) |
+| Write 1 799 mouth keyframes | 1 ms |
+| Waveform for the whole take | 14 ms |
+| First lit frame, everything cold | 52 ms |
+| Worst frame during a lit 30-step drag | **1.35 ms** |
+| Worst frame while scrubbing the film | 1.12 ms |
+| Worst onion-skinned frame, 6 ghosts | 5.0 ms |
+| Merge-shape stroke on a busy layer | 1.7 ms |
+| Sixty mouth swaps | 157 µs |
+| Undo a whole drag | 36 µs |
+| Save the film / reopen it | 11 ms / 7 ms |
+| Export the whole film, NVENC | 103 s |
+
+**And a heavy scene**, which is what "must not hang on complex scenes" actually
+means: a cast of thirty nested four symbols deep, a three-hundred-piece set,
+a hundred and fifty fogged objects, all lit. First frame 305 ms, then **6 ms**
+a frame, and **12.7 ms** a frame while dragging.
+
 ---
 
 ## 5. Current metrics
@@ -2625,7 +2702,7 @@ where Pad holds; and a solid fill still comes back exactly solid.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 288 passing, clippy clean |
+| Tests | 1 365 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
@@ -2911,6 +2988,10 @@ down here has not been finished.
 | 133 | **The brush and pattern previews are drawn in one colour.** They are egui chrome, redrawn on every pointer move, and egui's painter has no gradient brush; the committed stroke gets the real gradient. What the preview is for — spacing and stamp size — is unaffected. | By design |
 | 134 | **PDF gradients are still flattened.** PDF expresses them as shading dictionaries and Pattern colour spaces, which is a subsystem rather than an attribute — seven shading types, of which two are function-driven meshes. The XFL road brings gradients in; the PDF one still averages them. | Phase 5 follow-up |
 | 135 | **A gradient and a solid do not tween into each other.** Two gradients interpolate stop by stop when they correspond; a solid tweening to a gradient switches at the halfway point instead, because moving a colour and then jumping to a ramp reads as a glitch rather than a transition. Two gradients with different stop counts switch for the same reason. | By design |
+| 153 | **An armature layer is not marked, so a rigged film looks like any other.** §7 item 33 already records that a rig is an object rather than an armature layer; building the horror short confirmed the cost — with thirty rigged characters there is nothing in the timeline that says which layers hold rigs. | Phase 7 follow-up |
+| 154 | **Lighting geometry is single-threaded.** Booleans, hit-testing, IK and export encoding all use the cores; shading crescents and cast shadows are built one shape at a time. It does not matter yet — the first lit frame of a heavy scene is 305 ms and every frame after it is 6 ms — but it is the largest remaining single-threaded cost in the draw walk. | Follow-up |
+| 155 | **The first frame of a heavy scene costs 305 ms**, because every crescent, shadow and blur is built before anything appears. It is paid once and then cached, but opening a complex document shows nothing for a third of a second. Building the geometry on the background pool and drawing unlit until it arrives would hide it. | Follow-up |
+| 156 | **A layer that is one frame long shows nothing past frame zero**, which is correct and is also a trap: setting a document's length is a separate action (`set_frame_count`, Animate's F5), and a scene built without it appears to lose all its artwork the moment the playhead moves. Nothing in the interface says so. | Follow-up |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |

@@ -2653,6 +2653,67 @@ full strength — a fade-out arriving as no fade at all. A `Modify` placement
 with no colour of its own inherits the one before it, which is what makes a
 fade keyed only on the frames that move it work.
 
+### ✅ Sound: a panel, honest Event sync, and a resampler — §7 items 38–40
+
+Three gaps that all came from the same place. The model has carried four sync
+modes, a volume and a repeat count since sound landed; the interface edited
+none of them and the player honoured one.
+
+**The Sound panel** (§7 item 38). Which clip is on this keyframe, its sync
+mode, its volume, and how many times it repeats — everything `SoundRef` holds
+and nothing more. Attaching a sound used to mean "the newest import, at full
+volume, on Stream", with no way to say otherwise.
+
+- **A panel of its own, not a section of Properties.** Animate puts sound in
+  Properties, whose contents follow the selection. A sound belongs to a
+  *keyframe*, and an animator lining dialogue up against a walk cycle has
+  artwork selected the whole time — a section that vanished the moment they
+  clicked a leg would be unusable for the one job it has.
+- Selecting **None** is how a sound comes off a frame, as in Animate, rather
+  than a separate delete button
+- Swapping the clip **keeps the settings**, so auditioning two takes of a line
+  does not reset the volume and sync each time
+- A frame that is not a keyframe says so and says what to press, instead of
+  presenting controls that would do nothing
+- Each sync mode carries a line explaining what it does, because the difference
+  between Event and Stream is the whole reason the setting exists
+
+**Honest Event sync** (§7 item 39). Every cue used to be positioned by the
+playhead, so a sound effect stopped the instant playback did.
+
+- The mixer now has **two clocks**, and that is the whole of it. `position` is
+  where the playhead is: it jumps when you scrub and stands still when you
+  stop. `clock` only ever goes forwards. A Stream is timed against the first
+  and a triggered sound against the second.
+- So an Event sound **finishes when the film stops**, and **does not move when
+  the playhead is scrubbed** — a door slam is not a position in the film.
+- Voices are rendered even while paused, which is what makes that true rather
+  than merely intended
+- A trigger is timed from where in the buffer it actually fell, so an effect is
+  not quantised to the audio buffer size
+
+**Bug found by its own test — Start suppressed nothing.** Animate's Start mode
+declines to stack a second copy on one already sounding. The first version
+compared *cue indices*, and two Start cues of one footstep a frame apart have
+different indices — which is exactly the case the mode exists to suppress. The
+test is the same **sound**: clips come from the document's cache, so one asset
+is one `Arc` and pointer equality is the identity.
+
+**A real resampler** (§7 item 40). Nearest-neighbour held each source sample
+for a run of output samples and then jumped, which is a staircase — and a
+staircase is broadband noise, heard as aliasing and a pitch not quite right.
+Linear interpolation between neighbours costs one multiply and removes most of
+it. The source position is still computed from the absolute output position
+rather than accumulated, so a stream still cannot drift from the picture
+however long it runs.
+
+**The test that tells the two apart is a ramp.** Nearest-neighbour resampling
+of a rising ramp comes out with *repeated* consecutive values — that is what a
+staircase is. An interpolating one repeats nothing. So the assertion is that no
+two consecutive output samples are equal, which no nearest-neighbour
+implementation can satisfy, plus that the odd samples land exactly halfway
+between their neighbours.
+
 ---
 
 ## 5. Current metrics
@@ -2665,7 +2726,7 @@ fade keyed only on the frames that move it work.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 295 passing, clippy clean |
+| Tests | 1 304 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
@@ -2846,9 +2907,9 @@ down here has not been finished.
 | 25 | **Pen pressure is plumbed through but never supplied.** The brush reads `StrokeSample::pressure` and the setting is in the panel, but winit 0.30 gives no tablet pressure on Windows, so every sample arrives at 1.0 and the pressure option paints a constant width. Speed is the default response for exactly this reason. Needs a platform tablet backend (Windows Ink / Wintab). | Brush follow-up |
 | 26 | **Brush strokes do not merge with what is under them.** Each stroke is its own shape even in Merge Shape mode; Animate would fuse same-coloured overlapping paint. The booleans exist (CP-1.1b) — this is a matter of routing brush output through them, which was left out because a boolean per stroke would undo the responsiveness work unless it is done off the interactive thread. | Brush follow-up |
 | 24 | **PDF clipping paths are ignored.** `W`/`W*` are recorded in the report but not applied, so artwork that a real file clips away arrives whole. Needs a clip concept in the scene model, which nothing else has wanted yet. | Phase 5 follow-up |
-| 38 | **Sound has no Properties panel.** Attaching a sound puts the newest import on the current keyframe with Animate's Stream sync; there is no picker, no per-sound volume or effect, and no way to choose Event/Start/Stop from the interface. The model carries all four sync modes and a volume — nothing edits them yet. | Sound follow-up |
-| 39 | **Only Stream sync actually differs.** Event, Start and Stop are stored, saved and reported, but the player treats every cue as timeline-positioned. An Event sound that should carry on past its keyframe stops with the playhead. | Sound follow-up |
-| 40 | **Resampling is nearest-neighbour.** A 44.1 kHz file on a 48 kHz device plays in the right place and at the right length, but the pitch is not exactly right and there is aliasing on bright material. Fine for animating to dialogue; not fine for a finished mix. | Sound follow-up |
+| 38 | ~~**Sound has no Properties panel.**~~ | ✅ **Resolved** — a Sound panel picks the clip, the sync mode, the volume and the repeat count |
+| 39 | ~~**Only Stream sync actually differs.**~~ | ✅ **Resolved** — the mixer keeps a second clock, so a triggered sound finishes after the playhead stops and does not move when it is scrubbed |
+| 40 | ~~**Resampling is nearest-neighbour.**~~ | ✅ **Resolved** — linear interpolation between neighbours, with the source position still computed from the absolute output position so a stream cannot drift |
 | 41 | **No sound in exports.** PNG sequences have no audio by definition; video export (CP-6.2) is where a soundtrack has to be muxed in, and that is not built yet. | Phase 6 |
 | 42 | **Lip sync is signal analysis, not phoneme recognition.** It distinguishes silence, open and rounded vowels, and fricatives; it cannot distinguish `p`/`b`/`m` or `l`/`n`, which land on the closed and tongue shapes. Animate uses a trained model here. Recorded as a limitation rather than sold as parity. | By design |
 | 43 | **Scripting cannot reach sound.** `fl.getDocumentDOM()` exposes no sounds, no lip sync and no playback, so none of this can be driven from the Actions panel. | Phase 8 follow-up |
@@ -2951,6 +3012,10 @@ down here has not been finished.
 | 133 | **The brush and pattern previews are drawn in one colour.** They are egui chrome, redrawn on every pointer move, and egui's painter has no gradient brush; the committed stroke gets the real gradient. What the preview is for — spacing and stamp size — is unaffected. | By design |
 | 134 | **PDF gradients are still flattened.** PDF expresses them as shading dictionaries and Pattern colour spaces, which is a subsystem rather than an attribute — seven shading types, of which two are function-driven meshes. The XFL road brings gradients in; the PDF one still averages them. | Phase 5 follow-up |
 | 135 | **A gradient and a solid do not tween into each other.** Two gradients interpolate stop by stop when they correspond; a solid tweening to a gradient switches at the halfway point instead, because moving a colour and then jumping to a ramp reads as a glitch rather than a transition. Two gradients with different stop counts switch for the same reason. | By design |
+| 136 | **Sound is its own panel, not a section of Properties.** Animate puts it in Properties, which follows the selection; here it is a panel of its own, because a sound belongs to a keyframe and an animator working to dialogue has artwork selected the whole time. Same controls, always reachable. | By design |
+| 137 | **The repeat count is stored and not yet honoured.** `SoundRef::loops` is edited by the panel, saved and reloaded, but the mixer plays a cue once. Looping a triggered sound means the voice restarting itself; looping a stream means the timeline position wrapping within the clip. Both are small, and neither is built. | Sound follow-up |
+| 138 | **Stop sync silences a sound by not sending it**, rather than by cutting one already playing. `stage_cues` drops a Stop cue, so a Stream sound stops because nothing positions it — which is right — but a triggered Event already sounding runs to its end. Animate cuts it. | Sound follow-up |
+| 139 | **Downsampling is interpolated, not filtered.** Linear interpolation fixes the staircase, which is what made 44.1 kHz on a 48 kHz device sound wrong; playing a 48 kHz file on a 44.1 kHz device still folds anything above the new Nyquist limit back down, because there is no low-pass ahead of it. Audible only on very bright material, and the common direction is upsampling. | Sound follow-up |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |

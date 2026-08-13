@@ -38,6 +38,7 @@ pub enum PanelId {
     Rig,
     Filters,
     Lighting,
+    Sound,
     Library,
     Assets,
     Timeline,
@@ -57,6 +58,7 @@ impl PanelId {
             Self::Rig => "Armature",
             Self::Filters => "Filters",
             Self::Lighting => "Lighting",
+            Self::Sound => "Sound",
             Self::Library => "Library",
             Self::Assets => "Assets",
             Self::Timeline => "Timeline",
@@ -73,7 +75,7 @@ impl PanelId {
         !matches!(self, Self::Tools | Self::Timeline)
     }
 
-    pub const ALL: [PanelId; 13] = [
+    pub const ALL: [PanelId; 14] = [
         PanelId::Tools,
         PanelId::Layers,
         PanelId::Properties,
@@ -83,6 +85,7 @@ impl PanelId {
         PanelId::Rig,
         PanelId::Filters,
         PanelId::Lighting,
+        PanelId::Sound,
         PanelId::Library,
         PanelId::Assets,
         PanelId::Timeline,
@@ -257,6 +260,7 @@ impl Workspace {
                 slot(PanelId::Rig, Dock::Right, 5, Dock::Right),
                 slot(PanelId::Filters, Dock::Right, 6, Dock::Right),
                 slot(PanelId::Lighting, Dock::Right, 7, Dock::Right),
+                slot(PanelId::Sound, Dock::Right, 8, Dock::Right),
                 slot(PanelId::Library, Dock::RightOuter, 0, Dock::RightOuter),
                 // Beside the Library, which is the panel it is most often
                 // compared with: one holds this film's symbols, the other

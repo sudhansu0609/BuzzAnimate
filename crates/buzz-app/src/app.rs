@@ -994,6 +994,7 @@ impl App {
             Rig => self.rig_panel(ui),
             Filters => self.filter_panel(ui),
             Lighting => self.light_panel(ui),
+            Sound => self.sound_panel(ui),
 
             Library => {
                 let editor = &mut self.editor;
@@ -1180,6 +1181,62 @@ impl App {
     ///
     /// Each change is its own undo step with its own label, so warming a key
     /// light and then swinging it are two things to undo rather than one.
+    /// The Sound panel, and the edits it asks for.
+    ///
+    /// Everything it changes is one field of the `SoundRef` on one keyframe, so
+    /// it is applied as an ordinary document edit and undoes in one step — and
+    /// the cues are rebuilt afterwards, because changing a sync mode or a
+    /// volume that the player never heard about would be a setting that
+    /// appeared to do nothing.
+    fn sound_panel(&mut self, ui: &mut egui::Ui) {
+        let editor = &mut self.editor;
+        let frame = editor.current_frame;
+        let layer = editor.selection.active_layer();
+
+        let library: Vec<buzz_ui::SoundChoice> = editor
+            .doc
+            .scene()
+            .sounds()
+            .iter()
+            .map(|s| buzz_ui::SoundChoice {
+                id: s.id,
+                name: s.name.clone(),
+                seconds: s.duration_seconds(),
+            })
+            .collect();
+
+        // The keyframe the playhead is on, and whether it is one at all. A
+        // sound lives on a keyframe, so a frame inside a span has nowhere to
+        // put one — and saying so is more use than an inert panel.
+        let (current, on_keyframe) = match layer
+            .and_then(|id| editor.doc.scene().stage_layers().get(id))
+            .and_then(|l| l.frames.keyframes().iter().find(|k| k.start == frame))
+        {
+            Some(keyframe) => (keyframe.sound, true),
+            None => (None, false),
+        };
+
+        let response = buzz_ui::sound_panel(ui, &library, current, on_keyframe, frame);
+
+        if let Some(reference) = response.set
+            && let Some(layer) = layer
+        {
+            editor.doc.edit("Sound Settings", |scene| {
+                scene.set_frame_sound(layer, frame, reference);
+            });
+            editor.doc.end_gesture();
+            let scene = editor.doc.scene().clone();
+            editor.sound.refresh(&scene);
+        }
+
+        if response.import {
+            self.dispatch(Command::ImportSound);
+        }
+        if response.lip_sync {
+            self.dispatch(Command::LipSync);
+        }
+    }
+
     fn light_panel(&mut self, ui: &mut egui::Ui) {
         let editor = &mut self.editor;
         let state = &mut editor.light_panel;

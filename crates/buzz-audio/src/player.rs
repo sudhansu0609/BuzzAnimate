@@ -37,6 +37,27 @@ pub enum PlayerState {
     Paused,
 }
 
+/// How a cue relates to the playhead.
+///
+/// The audio side's own copy of Animate's sync modes, deliberately: the mixer
+/// must not have to understand a document to fill a buffer, and `Stop` never
+/// reaches here — a stopped sound is one the document does not send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CueSync {
+    /// **Tied to the timeline.** The frame decides the position, so scrubbing
+    /// moves the sound and playback cannot drift from the picture. Dialogue.
+    #[default]
+    Stream,
+    /// **Triggered, then independent.** Crossing its frame starts it, and from
+    /// then on it runs on its own clock to its own end — it does not stop when
+    /// the playhead does, and it does not move when the playhead is scrubbed.
+    /// A door slam is not a position in the film; it is an event.
+    Event,
+    /// Like [`Self::Event`], except that triggering it again while it is
+    /// already sounding does nothing, rather than starting a second copy.
+    Start,
+}
+
 /// One sound queued for playback, positioned on the timeline.
 #[derive(Debug, Clone)]
 pub struct Cue {
@@ -44,6 +65,16 @@ pub struct Cue {
     /// The animation frame this sound starts on.
     pub start_frame: u32,
     pub volume: f32,
+    pub sync: CueSync,
+}
+
+/// An event sound that has been triggered and is running on its own clock.
+#[derive(Debug, Clone)]
+struct Voice {
+    clip: Arc<Clip>,
+    volume: f32,
+    /// The mixer clock reading at which this voice began.
+    began: u64,
 }
 
 /// The state the audio callback and the editor share.
@@ -61,20 +92,75 @@ struct Mixer {
     position: u64,
     playing: bool,
     volume: f32,
+    /// A clock that only ever goes forwards, in output sample frames.
+    ///
+    /// **Distinct from `position`, and that is the whole of honest Event
+    /// sync.** `position` is where the *playhead* is: it jumps when you scrub
+    /// and stands still when you stop. A triggered sound effect does neither,
+    /// so it is timed against this instead.
+    clock: u64,
+    /// Event and Start sounds currently running on their own clock.
+    voices: Vec<Voice>,
+}
+
+/// One channel of a clip, sampled at a fractional position.
+///
+/// **Linear interpolation, not nearest-neighbour.** Nearest holds each source
+/// sample for a whole run of output samples and then jumps, which is a
+/// staircase — and a staircase is broadband noise, heard as the aliasing and
+/// the not-quite-right pitch §7 item 40 recorded. Interpolating between the two
+/// neighbouring samples costs one multiply and removes most of it.
+///
+/// The position is a `f64` computed from the absolute output position by the
+/// caller, never accumulated, so this cannot drift however long it runs.
+fn sample_at(clip: &Clip, position: f64, channel: usize, clip_channels: usize) -> f32 {
+    let frames = clip.len();
+    if frames == 0 || position < 0.0 {
+        return 0.0;
+    }
+    let i = position.floor();
+    let t = (position - i) as f32;
+    let i = i as usize;
+    if i + 1 >= frames {
+        // The last sample has no neighbour to interpolate towards; holding it
+        // is correct and is one sample long.
+        return if i < frames {
+            clip.samples[i * clip_channels + channel]
+        } else {
+            0.0
+        };
+    }
+    let a = clip.samples[i * clip_channels + channel];
+    let b = clip.samples[(i + 1) * clip_channels + channel];
+    a + (b - a) * t
 }
 
 impl Mixer {
     /// Fill `output` with whatever the cues have at the current position.
     fn render(&mut self, output: &mut [f32]) {
         output.fill(0.0);
-        if !self.playing || self.cues.is_empty() {
+        let channels = self.channels.max(1) as usize;
+        let frames = output.len() / channels;
+        if frames == 0 {
             return;
         }
 
-        let channels = self.channels.max(1) as usize;
-        let frames = output.len() / channels;
+        // **Event voices are rendered even when the playhead is stopped.**
+        // That is what makes them events rather than positions: pressing stop
+        // ends the film, not the door slam that was already sounding.
+        if !self.playing && self.voices.is_empty() {
+            self.clock += frames as u64;
+            return;
+        }
+
+        if self.playing {
+            self.trigger_events(frames);
+        }
 
         for cue in &self.cues {
+            if cue.sync != CueSync::Stream || !self.playing {
+                continue;
+            }
             let clip = &cue.clip;
             // Where this cue begins, in *output* sample frames.
             let start = if self.fps > 0.0 {
@@ -91,23 +177,44 @@ impl Mixer {
                 if at < start {
                     continue;
                 }
-                // Nearest-neighbour resampling. A proper resampler belongs
-                // here eventually; for scrubbing dialogue against picture,
-                // pitch accuracy matters far less than being in the right
-                // place, and this cannot drift because every sample's source
-                // index is computed from its absolute position.
-                let source = (((at - start) as f64) * ratio) as usize;
-                if source >= clip.len() {
+                // Computed from the absolute position every time, so a stream
+                // cannot drift from the picture however long it plays.
+                let source = ((at - start) as f64) * ratio;
+                if source >= clip.len() as f64 {
                     continue;
                 }
                 for c in 0..channels {
-                    let sample = clip.samples
-                        [source * clip_channels + c.min(clip_channels - 1)]
-                        * gain;
+                    let sample =
+                        sample_at(clip, source, c.min(clip_channels - 1), clip_channels) * gain;
                     output[i * channels + c] += sample;
                 }
             }
         }
+
+        // The triggered sounds, each on its own clock.
+        let (clock, sample_rate, master) = (self.clock, self.sample_rate, self.volume);
+        self.voices.retain(|voice| {
+            let clip = &voice.clip;
+            let ratio = clip.sample_rate as f64 / sample_rate.max(1) as f64;
+            let clip_channels = clip.channels.max(1) as usize;
+            let gain = voice.volume * master;
+            let mut alive = false;
+
+            for i in 0..frames {
+                let at = clock + i as u64;
+                let source = (at.saturating_sub(voice.began) as f64) * ratio;
+                if source >= clip.len() as f64 {
+                    break;
+                }
+                alive = true;
+                for c in 0..channels {
+                    let sample =
+                        sample_at(clip, source, c.min(clip_channels - 1), clip_channels) * gain;
+                    output[i * channels + c] += sample;
+                }
+            }
+            alive
+        });
 
         // Sum without clipping to a hard edge: two loud cues together would
         // otherwise square off into audible distortion.
@@ -115,7 +222,52 @@ impl Mixer {
             *sample = sample.clamp(-1.0, 1.0);
         }
 
-        self.position += frames as u64;
+        if self.playing {
+            self.position += frames as u64;
+        }
+        self.clock += frames as u64;
+    }
+
+    /// Start any Event or Start cue the playhead crosses in this buffer.
+    fn trigger_events(&mut self, frames: usize) {
+        if self.fps <= 0.0 {
+            return;
+        }
+        let (from, to) = (self.position, self.position + frames as u64);
+        for cue in &self.cues {
+            if cue.sync == CueSync::Stream {
+                continue;
+            }
+            let start =
+                (cue.start_frame as f64 / self.fps * self.sample_rate as f64) as u64;
+            if start < from || start >= to {
+                continue;
+            }
+            // Start's one difference from Event: it declines to stack a
+            // second copy on one already sounding.
+            //
+            // **The test is the same *sound*, not the same cue.** Animate's
+            // rule is about the clip: two Start cues of one footstep a frame
+            // apart are exactly the case the mode exists to suppress, and
+            // comparing cue indices — which differ — suppresses nothing. The
+            // clips are shared out of the document's sound cache, so one
+            // asset is one `Arc` and pointer equality is the identity test.
+            if cue.sync == CueSync::Start
+                && self
+                    .voices
+                    .iter()
+                    .any(|v| Arc::ptr_eq(&v.clip, &cue.clip))
+            {
+                continue;
+            }
+            self.voices.push(Voice {
+                clip: Arc::clone(&cue.clip),
+                volume: cue.volume,
+                // Timed from where in *this buffer* the trigger fell, so a
+                // sound effect is not quantised to the buffer size.
+                began: self.clock + (start - from),
+            });
+        }
     }
 }
 
@@ -161,9 +313,27 @@ impl Player {
     }
 
     /// Replace what is queued. Safe to call while playing.
+    ///
+    /// Sounds already triggered keep going — they carry their own clip, and
+    /// cutting a sound effect off because the document was edited would be
+    /// exactly the behaviour Event sync exists to avoid.
     pub fn set_cues(&mut self, cues: Vec<Cue>) {
         if let Ok(mut mixer) = self.mixer.lock() {
             mixer.cues = cues;
+        }
+    }
+
+    /// Silence everything, including sounds already triggered.
+    ///
+    /// Distinct from [`Self::pause`], which only stops the playhead: a paused
+    /// film still lets a door slam finish. This is for closing a document.
+    pub fn silence(&mut self) {
+        if let Ok(mut mixer) = self.mixer.lock() {
+            mixer.playing = false;
+            mixer.voices.clear();
+        }
+        if self.state == PlayerState::Playing {
+            self.state = PlayerState::Paused;
         }
     }
 
@@ -335,6 +505,183 @@ mod tests {
         }
     }
 
+    fn cue(clip: Arc<Clip>, start_frame: u32, sync: CueSync) -> Cue {
+        Cue {
+            clip,
+            start_frame,
+            volume: 1.0,
+            sync,
+        }
+    }
+
+    /// How loud a buffer is, so a test can say "it is sounding" without naming
+    /// a sample.
+    fn loudness(out: &[f32]) -> f32 {
+        out.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    /// **§7 item 39, the whole of it.** An Event sound is triggered by the
+    /// playhead crossing its frame, and from then on runs on its own clock —
+    /// so stopping the film does not stop it. Before this every cue was
+    /// timeline-positioned, and a sound effect died the instant playback did.
+    #[test]
+    fn an_event_sound_carries_on_after_the_playhead_stops() {
+        let mut mixer = mixer(24.0);
+        mixer.cues = vec![cue(clip(1.0, 0.5), 0, CueSync::Event)];
+        mixer.playing = true;
+
+        let mut out = vec![0.0f32; 512];
+        mixer.render(&mut out);
+        assert!(loudness(&out) > 0.4, "the event should have triggered");
+
+        // Stop the film. The effect is barely started and must finish, which
+        // is what Animate does.
+        mixer.playing = false;
+        let mut out = vec![0.0f32; 512];
+        mixer.render(&mut out);
+        assert!(
+            loudness(&out) > 0.4,
+            "an event sound must not stop with the playhead"
+        );
+    }
+
+    /// A Stream sound does the opposite, and must keep doing it: it *is* a
+    /// position in the film, so stopping the film stops it.
+    #[test]
+    fn a_stream_sound_stops_with_the_playhead() {
+        let mut mixer = mixer(24.0);
+        mixer.cues = vec![cue(clip(1.0, 0.5), 0, CueSync::Stream)];
+        mixer.playing = true;
+
+        let mut out = vec![0.0f32; 512];
+        mixer.render(&mut out);
+        assert!(loudness(&out) > 0.4);
+
+        mixer.playing = false;
+        let mut out = vec![0.0f32; 512];
+        mixer.render(&mut out);
+        assert_eq!(loudness(&out), 0.0, "a stream is a position, not an event");
+    }
+
+    /// Scrubbing moves a stream and leaves an event where it is.
+    #[test]
+    fn scrubbing_does_not_move_a_sounding_event() {
+        let mut mixer = mixer(24.0);
+        mixer.cues = vec![cue(clip(1.0, 0.5), 0, CueSync::Event)];
+        mixer.playing = true;
+
+        let mut out = vec![0.0f32; 512];
+        mixer.render(&mut out);
+        assert_eq!(mixer.voices.len(), 1, "one voice should be sounding");
+        let began = mixer.voices[0].began;
+
+        // Scrub somewhere else entirely.
+        mixer.position = 40_000;
+        let mut out = vec![0.0f32; 512];
+        mixer.render(&mut out);
+        assert_eq!(
+            mixer.voices[0].began, began,
+            "the event's own clock must be untouched by the playhead"
+        );
+    }
+
+    /// An event ends when its clip does, rather than sounding for ever.
+    #[test]
+    fn an_event_voice_retires_at_the_end_of_its_clip() {
+        let mut mixer = mixer(24.0);
+        // A twentieth of a second: 2 400 sample frames.
+        mixer.cues = vec![cue(clip(0.05, 0.5), 0, CueSync::Event)];
+        mixer.playing = true;
+
+        let mut out = vec![0.0f32; 512];
+        mixer.render(&mut out);
+        assert_eq!(mixer.voices.len(), 1);
+
+        for _ in 0..40 {
+            let mut out = vec![0.0f32; 512];
+            mixer.render(&mut out);
+        }
+        assert!(mixer.voices.is_empty(), "the voice should have retired");
+    }
+
+    /// Start's one difference from Event: it will not stack a second copy on
+    /// one already sounding.
+    #[test]
+    fn start_does_not_overlap_itself_but_event_does() {
+        let source = clip(1.0, 0.5);
+
+        let mut m = mixer(24.0);
+        m.cues = vec![
+            cue(Arc::clone(&source), 0, CueSync::Start),
+            cue(Arc::clone(&source), 1, CueSync::Start),
+        ];
+        m.playing = true;
+        // 24 fps at 48 kHz is 2 000 samples a frame, so this buffer crosses
+        // both cues in one go.
+        let mut out = vec![0.0f32; 8192 * 2];
+        m.render(&mut out);
+        assert_eq!(
+            m.voices.len(),
+            1,
+            "Start must not stack a second copy on one already sounding"
+        );
+
+        let mut m = mixer(24.0);
+        m.cues = vec![
+            cue(Arc::clone(&source), 0, CueSync::Event),
+            cue(source, 1, CueSync::Event),
+        ];
+        m.playing = true;
+        let mut out = vec![0.0f32; 8192 * 2];
+        m.render(&mut out);
+        assert_eq!(m.voices.len(), 2, "two Events overlap, as they should");
+    }
+
+    /// **§7 item 40.** A clip at another rate is resampled by interpolating
+    /// between neighbours rather than by holding the nearest.
+    ///
+    /// A ramp tells the two apart: nearest-neighbour comes out as a staircase,
+    /// whose steps show up as *repeated* consecutive values. An interpolating
+    /// resampler climbs smoothly and repeats nothing. So the assertion is that
+    /// no two consecutive output samples are equal — which no staircase can
+    /// satisfy.
+    #[test]
+    fn resampling_interpolates_rather_than_repeating_the_nearest_sample() {
+        // A ramp at 24 kHz played out at 48 kHz, so every other output sample
+        // falls exactly between two source samples.
+        let ramp: Vec<f32> = (0..2400).map(|i| i as f32 / 2400.0).collect();
+        let clip = Arc::new(Clip::new("Ramp", 24_000, 1, ramp).expect("a clip"));
+
+        let mut m = Mixer {
+            sample_rate: 48_000,
+            channels: 1,
+            fps: 24.0,
+            volume: 1.0,
+            ..Mixer::default()
+        };
+        m.cues = vec![cue(clip, 0, CueSync::Stream)];
+        m.playing = true;
+
+        let mut out = vec![0.0f32; 256];
+        m.render(&mut out);
+
+        let repeats = out.windows(2).filter(|p| p[0] == p[1]).count();
+        assert_eq!(
+            repeats, 0,
+            "the output repeats samples — this is still nearest-neighbour"
+        );
+
+        // And it really is the ramp: rising, and halfway between the source
+        // samples at the odd positions.
+        assert!(out[2] > out[0], "the ramp should rise");
+        let midpoint = (out[0] + out[2]) * 0.5;
+        assert!(
+            (out[1] - midpoint).abs() < 1e-6,
+            "expected the midpoint {midpoint}, got {}",
+            out[1]
+        );
+    }
+
     #[test]
     fn nothing_queued_renders_silence() {
         let mut mixer = mixer(24.0);
@@ -351,6 +698,7 @@ mod tests {
             clip: clip(1.0, 0.5),
             start_frame: 0,
             volume: 1.0,
+            sync: CueSync::Stream,
         }];
         let mut out = vec![0.0f32; 256];
         mixer.render(&mut out);
@@ -367,6 +715,7 @@ mod tests {
             clip: clip(1.0, 0.5),
             start_frame: 0,
             volume: 1.0,
+            sync: CueSync::Stream,
         }];
 
         let mut out = vec![0.0f32; 512];
@@ -385,6 +734,7 @@ mod tests {
             clip: clip(1.0, 0.5),
             start_frame: 12,
             volume: 1.0,
+            sync: CueSync::Stream,
         }];
 
         // Frame 0: nothing yet.
@@ -410,11 +760,13 @@ mod tests {
                 clip: clip(1.0, 0.7),
                 start_frame: 0,
                 volume: 1.0,
+                sync: CueSync::Stream,
             },
             Cue {
                 clip: clip(1.0, 0.7),
                 start_frame: 0,
                 volume: 1.0,
+                sync: CueSync::Stream,
             },
         ];
 
@@ -436,6 +788,7 @@ mod tests {
             clip: clip(1.0, 0.8),
             start_frame: 0,
             volume: 0.5,
+            sync: CueSync::Stream,
         }];
 
         let mut out = vec![0.0f32; 64];
@@ -454,6 +807,7 @@ mod tests {
             clip,
             start_frame: 0,
             volume: 1.0,
+            sync: CueSync::Stream,
         }];
 
         // Half a second in, the clip (one second long) is still sounding.
@@ -478,6 +832,7 @@ mod tests {
             clip: clip(10.0, 0.5),
             start_frame: 0,
             volume: 1.0,
+            sync: CueSync::Stream,
         }];
 
         let mut out = vec![0.0f32; 480];
@@ -501,6 +856,7 @@ mod tests {
             clip: clip(0.1, 0.2),
             start_frame: 0,
             volume: 1.0,
+            sync: CueSync::Stream,
         }]);
         assert!(player.has_sound());
 
@@ -560,6 +916,7 @@ mod device_tests {
             clip,
             start_frame: 0,
             volume: 1.0,
+            sync: CueSync::Stream,
         }]);
 
         player.play(0).expect("play");

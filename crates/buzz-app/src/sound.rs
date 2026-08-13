@@ -128,6 +128,15 @@ impl SoundBank {
                     clip: Arc::clone(clip),
                     start_frame: cue.start_frame,
                     volume: cue.volume,
+                    // Stop never reaches the player at all — `stage_cues`
+                    // drops it — so the remaining three map straight across.
+                    sync: match cue.sync {
+                        buzz_scene::SoundSync::Stream => buzz_audio::player::CueSync::Stream,
+                        buzz_scene::SoundSync::Start => buzz_audio::player::CueSync::Start,
+                        buzz_scene::SoundSync::Event | buzz_scene::SoundSync::Stop => {
+                            buzz_audio::player::CueSync::Event
+                        }
+                    },
                 })
             })
             .collect();

@@ -121,6 +121,33 @@ impl DrawCache {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Open a **window frame**, which may draw several document frames.
+    ///
+    /// # Why this is not per document frame
+    ///
+    /// One frame on screen can be a dozen draws: the onion-skin ghosts either
+    /// side, every keyframe under Edit Multiple Frames, the scene behind an
+    /// opened symbol, and the live frame itself. Each of those used to open and
+    /// close the cache on its own, and both caches evict anything not drawn
+    /// within a few generations — so seven passes over one screen frame aged
+    /// the first pass out before the last had finished, and every ghost rebuilt
+    /// every blur from nothing. Six ghosts of a foggy scene cost a quarter of a
+    /// second a frame, which is four frames a second to step through.
+    ///
+    /// The generation belongs to the *screen* frame. Everything drawn within
+    /// one shares it, which is what the eviction budget was written for — the
+    /// comment on `KEEP_FRAMES` says "enough to cover onion skinning" and this
+    /// is what finally makes that true.
+    pub fn begin(&mut self, lights: u64) {
+        self.lights.begin(lights);
+        self.filters.begin();
+    }
+
+    pub fn end(&mut self) {
+        self.lights.end();
+        self.filters.end();
+    }
 }
 
 /// Draw one frame, reusing lighting geometry between frames.
@@ -160,21 +187,29 @@ pub fn draw_frame_cached(
     options: &FrameOptions,
     cache: &mut DrawCache,
 ) {
-    // **The lights' own fingerprint, not the document's revision.** A
-    // revision bumps on every edit and a drag bumps it on every mouse move, so
-    // keying on it threw away every crescent and every shadow in the film once
-    // per frame for as long as a drag lasted — which on a real character is
-    // seconds a frame, and looks exactly like the application hanging. See
-    // `LightRig::fingerprint`.
-    cache.lights.begin(if options.lit {
+    cache.begin(if options.lit {
         scene.lights().fingerprint()
     } else {
         0
     });
-    cache.filters.begin();
+    draw_frame_within(builder, scene, frame, camera, options, cache);
+    cache.end();
+}
+
+/// Draw one frame **inside** a window frame already opened on the cache.
+///
+/// For callers that draw several document frames per screen frame — ghosts,
+/// Edit Multiple Frames, the scene behind an opened symbol — so that all of
+/// them share one cache generation. See [`DrawCache::begin`].
+pub fn draw_frame_within(
+    builder: &mut SceneBuilder<'_>,
+    scene: &Scene,
+    frame: u32,
+    camera: Affine,
+    options: &FrameOptions,
+    cache: &mut DrawCache,
+) {
     draw_layers(builder, scene, scene.layers(), frame, camera, options, cache);
-    cache.lights.end();
-    cache.filters.end();
 }
 
 /// Draw the **document's own timeline**, whatever symbol is open.
@@ -197,8 +232,8 @@ pub fn draw_stage_context(
     if scene.edit_path().is_empty() {
         return;
     }
-    cache.lights.begin(0);
-    cache.filters.begin();
+    // No begin/end: this is one pass of a screen frame the caller has already
+    // opened on the cache. See `DrawCache::begin`.
     draw_layers(
         builder,
         scene,
@@ -208,8 +243,6 @@ pub fn draw_stage_context(
         options,
         cache,
     );
-    cache.lights.end();
-    cache.filters.end();
 }
 
 /// Draw one layer stack — the stage's, or a symbol's.

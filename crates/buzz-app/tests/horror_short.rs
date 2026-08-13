@@ -715,7 +715,7 @@ fn an_animator_can_work_on_the_finished_film() {
     let mut cache = buzz_render::document::DrawCache::new();
 
     // Draw one frame the way the window does, and report how long it took.
-    let mut draw = |editor: &Editor,
+    let draw = |editor: &Editor,
                     vello: &mut buzz_render::vello::Scene,
                     cache: &mut buzz_render::document::DrawCache| {
         let mut builder = buzz_render::SceneBuilder::new(vello, &editor.camera);
@@ -846,4 +846,294 @@ fn the_film_exports_at_a_usable_rate() {
             }
         }
     }
+}
+
+/// **Drawing on the film.** The part of the job that happens most.
+///
+/// Merge Shape is Animate's default and the expensive one: every new shape is
+/// booleaned against the shapes it overlaps on the same layer. On a layer with
+/// a lot of artwork that is where drawing goes from instant to unusable, so it
+/// is measured on a layer that has some.
+#[test]
+fn drawing_stays_instant_on_a_busy_layer() {
+    let scene = build_film();
+    let mut editor = Editor::new(Document::new(scene));
+
+    eprintln!("\n--- drawing ---");
+
+    // Work on the near trees, which already hold artwork that a new stroke
+    // will overlap.
+    let busy = editor
+        .scene()
+        .layers()
+        .iter()
+        .find(|l| l.name == "Near trees")
+        .map(|l| l.id)
+        .expect("the near trees");
+    editor.selection.set_active_layer(Some(busy));
+
+    // Object Drawing first: each shape stays its own, so this is the floor.
+    editor.style.drawing_mode = buzz_ui::DrawingMode::ObjectDrawing;
+    let started = Instant::now();
+    let mut worst = Duration::ZERO;
+    for i in 0..40 {
+        let t = Instant::now();
+        editor.apply(buzz_app::tools::ToolAction::AddShape {
+            shape: ShapeData::filled(
+                blob(Point::new(200.0 + i as f64 * 30.0, 700.0), 40.0, 32, i as f64),
+                CLOTH,
+            ),
+            label: "Draw",
+        });
+        worst = worst.max(t.elapsed());
+    }
+    eprintln!("  {:<46} {:>10.2?}", "40 shapes, Object Drawing", started.elapsed());
+    eprintln!("  {:<46} {worst:>10.2?}", "worst single shape");
+
+    // Merge Shape: the same again, but each stroke fuses or cuts against what
+    // it overlaps. This is Animate's default and what an animator actually
+    // draws in.
+    editor.style.drawing_mode = buzz_ui::DrawingMode::MergeShape;
+    let started = Instant::now();
+    let mut worst_merge = Duration::ZERO;
+    for i in 0..40 {
+        let t = Instant::now();
+        editor.apply(buzz_app::tools::ToolAction::AddShape {
+            shape: ShapeData::filled(
+                blob(Point::new(220.0 + i as f64 * 28.0, 690.0), 44.0, 32, i as f64 + 0.5),
+                CLOTH,
+            ),
+            label: "Draw",
+        });
+        worst_merge = worst_merge.max(t.elapsed());
+    }
+    eprintln!("  {:<46} {:>10.2?}", "40 shapes, Merge Shape", started.elapsed());
+    eprintln!("  {:<46} {worst_merge:>10.2?}", "worst single shape");
+
+    assert!(
+        worst_merge < Duration::from_millis(300),
+        "one merge-shape stroke took {worst_merge:?} — drawing would stutter"
+    );
+}
+
+/// **Swapping a part**, which is how a mouth and a pair of eyes are animated.
+///
+/// A talking head is one instance whose symbol changes frame by frame. If
+/// swapping is not cheap and not undoable, dialogue animation is not possible.
+#[test]
+fn a_mouth_can_be_swapped_frame_by_frame() {
+    let mut scene = build_film();
+
+    // Two more mouth shapes to swap between.
+    let open = part_symbol(&mut scene, "Mouth open", blob(Point::ZERO, 14.0, 24, 0.7), Color::BLACK);
+    let wide = part_symbol(&mut scene, "Mouth wide", blob(Point::ZERO, 18.0, 24, 1.3), Color::BLACK);
+
+    let mut editor = Editor::new(Document::new(scene));
+    eprintln!("\n--- swapping a mouth ---");
+
+    // Find the mouth instance inside the villager symbol.
+    let villager = editor
+        .scene()
+        .library()
+        .iter()
+        .find(|s| s.name == "Villager")
+        .map(|s| s.id)
+        .expect("the villager");
+    editor.doc.edit_view(|s| {
+        s.enter_symbol(villager);
+    });
+
+    let mouth_instance = editor
+        .scene()
+        .layers()
+        .iter()
+        .find(|l| l.name == "mouth")
+        .and_then(|l| l.objects_at(0).first().map(|o| o.id))
+        .expect("the mouth instance");
+
+    let started = Instant::now();
+    for (i, symbol) in [open, wide].into_iter().cycle().take(60).enumerate() {
+        editor.doc.edit("Swap Symbol", |scene| {
+            scene.update_object(mouth_instance, |o| {
+                if let buzz_scene::ObjectKind::Instance(instance) = &mut o.kind {
+                    instance.symbol = symbol;
+                }
+            });
+        });
+        let _ = i;
+    }
+    let taken = started.elapsed();
+    eprintln!("  {:<46} {taken:>10.2?}", "60 mouth swaps");
+    assert!(
+        taken < ACTION_BUDGET,
+        "swapping a mouth 60 times took {taken:?}"
+    );
+
+    // And it undoes, which is what makes it safe to try shapes.
+    assert!(editor.doc.undo(), "a swap should be undoable");
+}
+
+/// **Saving the film and opening it again.**
+///
+/// Everything else is worthless if a five-minute document cannot be written to
+/// disk and read back intact. This measures both, and checks the film that
+/// comes back is the film that went in — the counts that would silently drop
+/// artwork if the format lost something.
+#[test]
+fn the_film_survives_a_save_and_reopen() {
+    let scene = build_film();
+
+    let layers = scene.layers().iter().count();
+    let symbols = scene.library().len();
+    let frames = scene.frame_count();
+    let lights = scene.lights().lights.len();
+    let filters: usize = scene
+        .layers()
+        .iter()
+        .flat_map(|l| l.all_objects())
+        .map(|o| o.filters.len())
+        .sum();
+    let masks = scene
+        .layers()
+        .iter()
+        .filter(|l| l.kind.is_mask() || l.kind == LayerKind::Masked)
+        .count();
+
+    eprintln!("\n--- save and reopen ---");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("horror.buzz");
+
+    let mut doc = Document::new(scene);
+    stage("save the five-minute film", Duration::from_secs(10), || {
+        doc.save_as(&path).expect("the film saves");
+    });
+    let size = std::fs::metadata(&path).expect("it is there").len();
+    eprintln!("  {:<46} {:>10}", "file size (bytes)", size);
+
+    let reopened = stage("open it again", Duration::from_secs(10), || {
+        Document::open(&path).expect("the film opens")
+    });
+    let back = reopened.scene();
+
+    assert_eq!(back.layers().iter().count(), layers, "layers were lost");
+    assert_eq!(back.library().len(), symbols, "symbols were lost");
+    assert_eq!(back.frame_count(), frames, "the film changed length");
+    assert_eq!(back.lights().lights.len(), lights, "lights were lost");
+    assert!(back.lights().enabled, "the lighting was switched off");
+    let filters_back: usize = back
+        .layers()
+        .iter()
+        .flat_map(|l| l.all_objects())
+        .map(|o| o.filters.len())
+        .sum();
+    assert_eq!(filters_back, filters, "filters were lost");
+    let masks_back = back
+        .layers()
+        .iter()
+        .filter(|l| l.kind.is_mask() || l.kind == LayerKind::Masked)
+        .count();
+    assert_eq!(masks_back, masks, "the mask setup was lost");
+
+    eprintln!(
+        "  {:<46} {layers} layers, {symbols} symbols, {frames} frames, {lights} lights, {filters} filters",
+        "intact"
+    );
+}
+
+/// **Sound scrubbing and onion skinning**, the two things that run on every
+/// single frame an animator looks at.
+///
+/// The waveform is redrawn as the timeline is drawn, and onion skinning
+/// multiplies the whole draw walk by however many ghosts are showing. Both are
+/// per-frame costs on top of everything else, so both belong in the budget.
+#[test]
+fn the_waveform_and_onion_skins_are_cheap_enough_to_live_with() {
+    use buzz_audio::Clip;
+
+    eprintln!("\n--- scrubbing aids ---");
+
+    // Five minutes of audio, as the timeline would hold.
+    let rate = 44_100u32;
+    let clip = Clip::new(
+        "Narration",
+        rate,
+        1,
+        (0..rate as usize * 60 * 5)
+            .map(|i| ((i as f64 / 300.0).sin() * 0.5) as f32)
+            .collect(),
+    )
+    .expect("a clip");
+
+    let levels = stage("waveform for five minutes of dialogue", ACTION_BUDGET, || {
+        clip.frame_levels(24.0)
+    });
+    eprintln!("  {:<46} {:>10}", "(levels)", levels.len());
+    assert!(
+        levels.len() >= FILM_FRAMES as usize,
+        "the waveform should cover the whole take, got {}",
+        levels.len()
+    );
+
+    // Onion skinning: the live frame plus ghosts either side, all drawn.
+    let scene = build_film();
+    let mut editor = Editor::new(Document::new(scene));
+    editor.set_frame(FILM_FRAMES / 2);
+    editor.onion.enabled = true;
+    editor.onion.before = 3;
+    editor.onion.after = 3;
+
+    let mut vello = buzz_render::vello::Scene::new();
+    let mut cache = buzz_render::document::DrawCache::new();
+
+    let draw = |editor: &Editor,
+                vello: &mut buzz_render::vello::Scene,
+                cache: &mut buzz_render::document::DrawCache| {
+        let mut builder = buzz_render::SceneBuilder::new(vello, &editor.camera);
+        let scene = editor.scene();
+        let started = Instant::now();
+        // One cache generation for the whole screen frame, as the stage does.
+        cache.begin(scene.lights().fingerprint());
+        for ghost in editor.onion_frames() {
+            buzz_render::document::draw_frame_within(
+                &mut builder,
+                scene,
+                ghost,
+                scene.camera_transform(ghost),
+                &buzz_render::document::FrameOptions {
+                    ghost: Some(0.3),
+                    masks: buzz_render::document::MaskDisplay::WhenLocked,
+                    ..Default::default()
+                },
+                cache,
+            );
+        }
+        buzz_render::document::draw_frame_within(
+            &mut builder,
+            scene,
+            editor.current_frame,
+            scene.camera_transform(editor.current_frame),
+            &buzz_render::document::FrameOptions {
+                masks: buzz_render::document::MaskDisplay::WhenLocked,
+                lit: true,
+                ..Default::default()
+            },
+            cache,
+        );
+        cache.end();
+        started.elapsed()
+    };
+
+    let cold = draw(&editor, &mut vello, &mut cache);
+    let mut worst = Duration::ZERO;
+    for f in 0..20 {
+        editor.set_frame(FILM_FRAMES / 2 + f);
+        worst = worst.max(draw(&editor, &mut vello, &mut cache));
+    }
+    eprintln!("  {:<46} {cold:>10.2?}", "first onion-skinned frame");
+    eprintln!("  {:<46} {worst:>10.2?}", "worst onion-skinned frame while stepping");
+    assert!(
+        worst < Duration::from_millis(200),
+        "an onion-skinned frame costs {worst:?}; stepping through a scene \
+         with ghosts on would stutter"
+    );
 }

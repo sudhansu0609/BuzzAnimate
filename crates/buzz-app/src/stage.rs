@@ -14,7 +14,7 @@
 use buzz_geom::{Point, Rect, Vec2};
 use buzz_render::SceneBuilder;
 use buzz_render::document::{
-    DrawCache, FrameOptions, MaskDisplay, draw_frame, draw_frame_cached, draw_stage_context,
+    DrawCache, FrameOptions, MaskDisplay, draw_frame_within, draw_stage_context,
 };
 use buzz_ui::{Metrics, Orientation, Palette};
 use egui::{Align2, Color32, FontId, Sense, Stroke, StrokeKind, Ui};
@@ -40,6 +40,14 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
         SceneBuilder::new(vello, &editor.camera).with_viewport_offset(Vec2::new(area.x0, area.y0));
 
     let scene = editor.scene();
+
+    // **One cache generation for the whole screen frame.** What follows can be
+    // a dozen draws — the context behind an opened symbol, every keyframe under
+    // Edit Multiple Frames, the onion-skin ghosts either side, and the live
+    // frame. Opening the cache once around the lot is what lets them share
+    // generated geometry; before this each pass opened its own, aged the
+    // others out, and rebuilt every blur from nothing.
+    cache.begin(scene.lights().fingerprint());
 
     // The stage rectangle. Everything outside it is pasteboard, which the
     // window's clear colour already provides.
@@ -90,7 +98,7 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
             place,
             ..FrameOptions::default()
         };
-        draw_frame(&mut builder, scene, other, camera, &options);
+        draw_frame_within(&mut builder, scene, other, camera, &options, cache);
     }
 
     // Onion skin ghosts first, so the live frame draws over them.
@@ -106,7 +114,7 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
             // faded copy of another frame read as dirt on the stage.
             lit: false,
         };
-        draw_frame(&mut builder, scene, ghost_frame, camera, &options);
+        draw_frame_within(&mut builder, scene, ghost_frame, camera, &options, cache);
     }
 
     // Animate shows the mask effect only once the mask layer is locked,
@@ -118,7 +126,7 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
         place,
         ..FrameOptions::default()
     };
-    draw_frame_cached(&mut builder, scene, frame, camera, &live, cache);
+    draw_frame_within(&mut builder, scene, frame, camera, &live, cache);
 
     // The brush preview is painted here, with the artwork, rather than sketched
     // as chrome. A brush stroke is the one gesture where the preview *is* the
@@ -127,6 +135,9 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
     if let Preview::Ink { path, color } = editor.preview() {
         builder.fill_shape(&path, color);
     }
+
+    // The screen frame is finished; anything not drawn in it can go.
+    cache.end();
 }
 
 /// Draw the chrome over the rendered stage.

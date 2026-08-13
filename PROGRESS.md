@@ -2865,7 +2865,7 @@ the only tool left in the palette that is not implemented.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 337 passing, clippy clean |
+| Tests | 1 342 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
@@ -3171,6 +3171,8 @@ down here has not been finished.
 | 148 | **A translucent fill still shows the seam.** Sealing it would composite its rim twice and draw a darker outline, which is worse. Fixing it properly means drawing adjacent translucent shapes into one isolation group, which is a different compositing model. | Follow-up |
 | 149 | **An even-odd fill is sealed on its inner boundary too**, so a hole in a ring is half a pixel smaller than the path says. The seal strokes the whole path and cannot tell an outer boundary from an inner one without winding analysis. | Follow-up |
 | 150 | **Selecting a layer selecting its artwork is Animate's behaviour; Free Transform selecting it is not.** Animate's Q draws no handles until something is picked. Here, choosing it with an empty selection takes the active layer's contents, and opening a symbol does the same — because arriving with nothing selected means a click before any work can start, every time. It never touches an existing selection. | By design |
+| 151 | **A `.fla` is found by searching for `DOMDocument.xml`, not by assuming the root.** Animate writes it at the top of the archive, but a `.fla` repacked from an unzipped folder — which is how one gets moved between machines — carries everything a level down, and the old reader found nothing and called it "not an Animate document". The shallowest match wins, and the library is read from beside it. | By design |
+| 152 | **A library symbol that will not decode is skipped and logged, not fatal.** Losing one damaged symbol costs that symbol; refusing the document costs the film. The document itself failing to decode is still fatal, and now says so rather than reporting itself as missing. | By design |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |

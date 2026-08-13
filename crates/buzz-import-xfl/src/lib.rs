@@ -56,8 +56,27 @@ pub enum ImportError {
          File > Save As and choose Uncompressed Document (.xfl)."
     )]
     LegacyBinaryFla,
-    #[error("could not find DOMDocument.xml; this does not look like an Animate document")]
-    MissingDocument,
+    /// No `DOMDocument.xml` in the archive — and **what was there instead**.
+    ///
+    /// The bare message was a dead end: told that a file does not look like an
+    /// Animate document, there is nothing to do but believe it. Naming the
+    /// entries that *are* in the archive turns it into something actionable —
+    /// a `.fla` saved by a different tool, an archive of something else
+    /// entirely, or a nested folder are all obvious at a glance and
+    /// indistinguishable without it.
+    #[error(
+        "could not find DOMDocument.xml, so this does not look like an Animate \
+         document. The archive holds: {0}"
+    )]
+    MissingDocument(String),
+    /// It is there and could not be read as text.
+    ///
+    /// Distinct from [`Self::MissingDocument`] because the two want opposite
+    /// things done about them, and reporting this one as "not an Animate
+    /// document" — which is what silently ignoring the read failure did — sends
+    /// the user looking for a problem with the wrong file.
+    #[error("DOMDocument.xml is in the archive but could not be read as text: {0}")]
+    UnreadableDocument(String),
     #[error("malformed XML: {0}")]
     Xml(String),
 }
@@ -156,22 +175,55 @@ pub fn import(path: impl AsRef<Path>) -> Result<(Scene, ImportReport), ImportErr
 pub fn import_fla_bytes(bytes: &[u8]) -> Result<(Scene, ImportReport), ImportError> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
 
-    let document = read_entry(&mut archive, "DOMDocument.xml")
-        .ok_or(ImportError::MissingDocument)?;
+    // **Found by name, not assumed at the root.** Animate writes
+    // `DOMDocument.xml` at the top of the archive, but a `.fla` that has been
+    // through a zip tool — repacked, or built from an unzipped folder — often
+    // carries the whole document inside a directory, and `by_name` on the bare
+    // name then finds nothing at all. The file is the same file; only the
+    // prefix differs, so the prefix is what is searched for and then carried
+    // through to the library.
+    let document_entry = (0..archive.len())
+        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+        .filter(|name| {
+            name.rsplit('/')
+                .next()
+                .is_some_and(|leaf| leaf.eq_ignore_ascii_case("DOMDocument.xml"))
+        })
+        // The shallowest one, so a document that happens to hold another
+        // document deeper down still opens as itself.
+        .min_by_key(|name| name.matches('/').count());
 
-    // Symbol definitions live in LIBRARY/, one file each.
+    let Some(document_entry) = document_entry else {
+        return Err(ImportError::MissingDocument(archive_listing(&mut archive)));
+    };
+
+    let document = read_entry(&mut archive, &document_entry)?
+        .ok_or_else(|| ImportError::MissingDocument(archive_listing(&mut archive)))?;
+
+    // Symbol definitions live in LIBRARY/, one file each — beside the document,
+    // wherever that turned out to be.
+    let prefix = match document_entry.rfind('/') {
+        Some(at) => &document_entry[..=at],
+        None => "",
+    };
+    let wanted = format!("{}library/", prefix.to_ascii_lowercase());
     let library_names: Vec<String> = (0..archive.len())
         .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
         .filter(|name| {
             let lower = name.to_ascii_lowercase();
-            lower.starts_with("library/") && lower.ends_with(".xml")
+            lower.starts_with(&wanted) && lower.ends_with(".xml")
         })
         .collect();
 
     let mut library_files = Vec::new();
     for name in library_names {
-        if let Some(text) = read_entry(&mut archive, &name) {
-            library_files.push((name, text));
+        // **A symbol that will not read is reported, not fatal.** Losing one
+        // damaged symbol costs that symbol; refusing the document costs the
+        // film. The same judgement §4 records for malformed XML inside one.
+        match read_entry(&mut archive, &name) {
+            Ok(Some(text)) => library_files.push((name, text)),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("skipping library entry {name}: {e}"),
         }
     }
 
@@ -182,9 +234,27 @@ pub fn import_fla_bytes(bytes: &[u8]) -> Result<(Scene, ImportReport), ImportErr
 pub fn import_xfl_folder(folder: &Path) -> Result<(Scene, ImportReport), ImportError> {
     let document_path = folder.join("DOMDocument.xml");
     if !document_path.exists() {
-        return Err(ImportError::MissingDocument);
+        // The same courtesy the archive path gets: say what is there instead.
+        let listing = std::fs::read_dir(folder)
+            .map(|entries| {
+                let mut names: Vec<String> = entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect();
+                names.sort();
+                names.truncate(8);
+                if names.is_empty() {
+                    "nothing at all".to_string()
+                } else {
+                    names.join(", ")
+                }
+            })
+            .unwrap_or_else(|e| format!("(unreadable: {e})"));
+        return Err(ImportError::MissingDocument(listing));
     }
-    let document = std::fs::read_to_string(&document_path)?;
+    // Decoded rather than required to be UTF-8, so a byte order mark does not
+    // reach the parser as content.
+    let document = decode_xml(&std::fs::read(&document_path)?)?;
 
     let mut library_files = Vec::new();
     let library_dir = folder.join("LIBRARY");
@@ -218,14 +288,81 @@ fn collect_library(
     Ok(())
 }
 
+/// Read one archive entry as text.
+///
+/// `Ok(None)` means it is not in the archive; `Err` means it is and could not
+/// be read. Collapsing those two into one answer is what made a damaged
+/// document report itself as not being an Animate document at all.
+///
+/// **The bytes are decoded rather than required to be UTF-8.** A UTF-8 byte
+/// order mark is stripped, because `quick_xml` treats it as content and the
+/// document then begins with a character no parser expects; and a UTF-16 file —
+/// which Animate does not write, but which a conversion tool might — is decoded
+/// from its mark instead of being refused as invalid UTF-8.
 fn read_entry<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
-) -> Option<String> {
-    let mut file = archive.by_name(name).ok()?;
-    let mut text = String::new();
-    file.read_to_string(&mut text).ok()?;
-    Some(text)
+) -> Result<Option<String>, ImportError> {
+    let mut file = match archive.by_name(name) {
+        Ok(file) => file,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(ImportError::Archive(e.to_string())),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| ImportError::UnreadableDocument(e.to_string()))?;
+    decode_xml(&bytes).map(Some)
+}
+
+/// Turn XML bytes into text, honouring a byte order mark.
+fn decode_xml(bytes: &[u8]) -> Result<String, ImportError> {
+    // UTF-16, which is rare and is still a real file when it appears.
+    if bytes.len() >= 2 {
+        let wide = match (bytes[0], bytes[1]) {
+            (0xFF, 0xFE) => Some(false),
+            (0xFE, 0xFF) => Some(true),
+            _ => None,
+        };
+        if let Some(big_endian) = wide {
+            let units: Vec<u16> = bytes[2..]
+                .chunks_exact(2)
+                .map(|c| {
+                    if big_endian {
+                        u16::from_be_bytes([c[0], c[1]])
+                    } else {
+                        u16::from_le_bytes([c[0], c[1]])
+                    }
+                })
+                .collect();
+            return String::from_utf16(&units)
+                .map_err(|e| ImportError::UnreadableDocument(e.to_string()));
+        }
+    }
+
+    let without_bom = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    String::from_utf8(without_bom.to_vec())
+        .map_err(|e| ImportError::UnreadableDocument(e.to_string()))
+}
+
+/// A few entry names from the archive, for a message that says what was found.
+fn archive_listing<R: std::io::Read + std::io::Seek>(archive: &mut zip::ZipArchive<R>) -> String {
+    let mut names: Vec<String> = (0..archive.len().min(400))
+        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+        // Directory entries say nothing useful about what the file is.
+        .filter(|n| !n.ends_with('/'))
+        .collect();
+    if names.is_empty() {
+        return "nothing at all".to_string();
+    }
+    names.sort();
+    let total = names.len();
+    names.truncate(8);
+    let listed = names.join(", ");
+    if total > 8 {
+        format!("{listed}, and {} more", total - 8)
+    } else {
+        listed
+    }
 }
 
 /// Assemble a scene from the document and its library files.
@@ -1543,6 +1680,117 @@ fn parse_symbol(
 mod tests {
     use super::*;
 
+    /// Zip a set of named entries into `.fla` bytes.
+    fn zip_up(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buffer);
+            for (name, bytes) in entries {
+                zip.start_file::<_, ()>(*name, Default::default()).unwrap();
+                use std::io::Write as _;
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buffer.into_inner()
+    }
+
+    /// **A `.fla` whose contents sit inside a folder still opens.**
+    ///
+    /// Animate writes `DOMDocument.xml` at the top of the archive, but a `.fla`
+    /// that has been repacked — zipped from an unzipped folder, which is how
+    /// one gets moved between machines — carries everything one level down.
+    /// Looking only at the root found nothing and reported the file as not
+    /// being an Animate document, which is both wrong and a dead end.
+    #[test]
+    fn a_repacked_fla_with_everything_in_a_folder_still_opens() {
+        let bytes = zip_up(&[
+            ("MyFilm/DOMDocument.xml", MINIMAL_DOCUMENT.as_bytes()),
+            ("MyFilm/LIBRARY/hero.xml", HERO_SYMBOL.as_bytes()),
+        ]);
+
+        let (scene, report) = import_fla_bytes(&bytes).expect("it should open");
+        assert_eq!(scene.stage().size, buzz_geom::Size::new(640.0, 480.0));
+        assert_eq!(
+            scene.library().len(),
+            1,
+            "the library beside the document should have been found too: {}",
+            report.summary()
+        );
+    }
+
+    /// A byte order mark is stripped rather than handed to the parser, which
+    /// treats it as content and then fails on a document that begins with a
+    /// character no parser expects.
+    #[test]
+    fn a_utf8_byte_order_mark_does_not_stop_the_parse() {
+        let mut document = vec![0xEF, 0xBB, 0xBF];
+        document.extend_from_slice(MINIMAL_DOCUMENT.as_bytes());
+
+        let bytes = zip_up(&[
+            ("DOMDocument.xml", &document),
+            ("LIBRARY/hero.xml", HERO_SYMBOL.as_bytes()),
+        ]);
+
+        let (scene, _) = import_fla_bytes(&bytes).expect("a BOM is not a failure");
+        assert_eq!(scene.stage().size, buzz_geom::Size::new(640.0, 480.0));
+    }
+
+    /// **The message names what was in the archive.** Told only that a file
+    /// does not look like an Animate document there is nothing to do but
+    /// believe it; told what the archive actually holds, the answer is usually
+    /// obvious.
+    #[test]
+    fn a_missing_document_says_what_the_archive_held_instead() {
+        let bytes = zip_up(&[
+            ("readme.txt", b"nothing to see"),
+            ("art/drawing.png", b"\x89PNG"),
+        ]);
+
+        let Err(e) = import_fla_bytes(&bytes) else {
+            panic!("an archive with no document should not open")
+        };
+        let message = e.to_string();
+        assert!(message.contains("readme.txt"), "{message}");
+        assert!(message.contains("drawing.png"), "{message}");
+    }
+
+    /// One damaged symbol costs that symbol, not the film. The document still
+    /// opens and everything else in it survives.
+    #[test]
+    fn a_library_entry_that_will_not_decode_is_skipped_not_fatal() {
+        // A lone continuation byte: not valid UTF-8 anywhere.
+        let broken: &[u8] = &[0x3C, 0x3F, 0x78, 0x6D, 0x6C, 0xFF, 0xFE_u8.wrapping_add(1)];
+        let bytes = zip_up(&[
+            ("DOMDocument.xml", MINIMAL_DOCUMENT.as_bytes()),
+            ("LIBRARY/hero.xml", HERO_SYMBOL.as_bytes()),
+            ("LIBRARY/broken.xml", broken),
+        ]);
+
+        let (scene, _) = import_fla_bytes(&bytes).expect("one bad symbol is not fatal");
+        assert_eq!(
+            scene.library().len(),
+            1,
+            "the good symbol should still be there"
+        );
+    }
+
+    /// A document that is present and cannot be decoded says *that*, rather
+    /// than claiming the file is not an Animate document — which sent the user
+    /// looking for a problem with the wrong file.
+    #[test]
+    fn an_undecodable_document_is_not_reported_as_missing() {
+        let bytes = zip_up(&[("DOMDocument.xml", &[0xF8, 0xA1, 0xA1, 0xA1])]);
+
+        let Err(e) = import_fla_bytes(&bytes) else {
+            panic!("it should not have opened")
+        };
+        assert!(
+            matches!(e, ImportError::UnreadableDocument(_)),
+            "expected an unreadable document, got: {e}"
+        );
+    }
+
     const MINIMAL_DOCUMENT: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
 <DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="640" height="480"
              frameRate="30" backgroundColor="#336699">
@@ -2174,7 +2422,7 @@ mod tests {
         }
         assert!(matches!(
             import_fla_bytes(&buffer.into_inner()),
-            Err(ImportError::MissingDocument)
+            Err(ImportError::MissingDocument(_))
         ));
     }
 

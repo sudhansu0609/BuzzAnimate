@@ -2249,6 +2249,7 @@ impl App {
                     title: "Imported from Animate".to_string(),
                     what_arrived: format!("{imported} assets"),
                     unsupported: failed,
+                    failed: false,
                 });
             }
         }
@@ -2515,6 +2516,7 @@ impl App {
                 title: format!("Imported {name}"),
                 what_arrived: format!("{} — {}", imported.summary, merge.summary()),
                 unsupported,
+                failed: false,
             });
         }
     }
@@ -2615,7 +2617,21 @@ impl App {
         let imported = match crate::import::read(path) {
             Ok(imported) => imported,
             Err(message) => {
-                self.editor.status = Some(format!("Could not open: {message}"));
+                // **In front of the user, not in the status bar.** A file that
+                // will not open is the whole of what they were trying to do,
+                // and the reason is usually specific enough to act on — but
+                // only if it is read.
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.editor.status = Some(format!("Could not open {name}: {message}"));
+                self.editor.import_summary = Some(crate::import::ImportSummary {
+                    title: format!("Could not open {name}"),
+                    what_arrived: message.clone(),
+                    unsupported: Vec::new(),
+                    failed: true,
+                });
                 return;
             }
         };
@@ -2643,6 +2659,7 @@ impl App {
                 title: format!("Opened {name}"),
                 what_arrived: imported.summary.clone(),
                 unsupported: imported.unsupported.clone(),
+                failed: false,
             });
         }
     }

@@ -687,10 +687,59 @@ impl Scene {
     /// the library, so it returns a placeholder; anything that needs real
     /// extents for an instance comes here.
     pub fn instance_bounds(&self, object: &Object) -> Option<Rect> {
+        self.instance_bounds_within(object, 0)
+    }
+
+    /// How deep symbol nesting is followed when measuring.
+    ///
+    /// A symbol that contains an instance of itself is a cycle, and measuring
+    /// it would recurse until the stack ran out. Animate refuses to create one;
+    /// an imported or hand-edited file can contain one anyway. The same limit
+    /// the renderer uses, for the same reason.
+    const MAX_MEASURE_DEPTH: usize = 12;
+
+    fn instance_bounds_within(&self, object: &Object, depth: usize) -> Option<Rect> {
+        if depth >= Self::MAX_MEASURE_DEPTH {
+            return None;
+        }
         let instance = object.instance()?;
         let symbol = self.library.get(instance.symbol)?;
-        let local = symbol.bounds()?;
+        let local = self.symbol_bounds_within(symbol, depth + 1)?;
         Some(object::transform_rect(object.transform, local))
+    }
+
+    /// What a symbol's artwork actually covers, resolved through the library.
+    ///
+    /// # Why this cannot be `Symbol::bounds`
+    ///
+    /// [`Symbol::bounds`] measures its layers with [`Object::bounds`], and an
+    /// object has no way to reach the library — so a nested instance measures
+    /// as its placeholder, a two-unit box about the origin.
+    ///
+    /// **That is every Animate character.** A rig is a symbol whose layers hold
+    /// one part-symbol each: a head, a hand, a body. Measured without the
+    /// library, the whole character came out two units across, which made it
+    /// clickable only at a dot on its own origin — so it could not be selected,
+    /// could not be double-clicked into, drew its transform handles in a
+    /// pinpoint, and put its transformation point in the wrong place. The
+    /// symptom is "I cannot get inside my character", and the cause is here.
+    pub fn symbol_bounds(&self, symbol: SymbolId) -> Option<Rect> {
+        let symbol = self.library.get(symbol)?;
+        self.symbol_bounds_within(symbol, 0)
+    }
+
+    fn symbol_bounds_within(&self, symbol: &Symbol, depth: usize) -> Option<Rect> {
+        if depth >= Self::MAX_MEASURE_DEPTH {
+            return None;
+        }
+        // Across every frame, as `Symbol::bounds` does: a symbol's extent is
+        // what it covers over its whole timeline, not what one frame shows.
+        symbol
+            .layers
+            .iter()
+            .flat_map(|l| l.all_objects())
+            .map(|o| self.resolved_bounds_within(o, depth))
+            .reduce(|a, b| a.union(b))
     }
 
     /// Bounds of an object, resolving instances through the library.
@@ -736,14 +785,21 @@ impl Scene {
     }
 
     pub fn resolved_bounds(&self, object: &Object) -> Rect {
+        self.resolved_bounds_within(object, 0)
+    }
+
+    fn resolved_bounds_within(&self, object: &Object, depth: usize) -> Rect {
         match &object.kind {
             ObjectKind::Instance(_) => self
-                .instance_bounds(object)
+                .instance_bounds_within(object, depth)
                 .unwrap_or_else(|| object.bounds()),
             ObjectKind::Group(children) => children
                 .iter()
                 .map(|c| {
-                    object::transform_rect(object.transform, self.resolved_bounds(c))
+                    object::transform_rect(
+                        object.transform,
+                        self.resolved_bounds_within(c, depth),
+                    )
                 })
                 .reduce(|a, b| a.union(b))
                 .unwrap_or_else(|| object.bounds()),

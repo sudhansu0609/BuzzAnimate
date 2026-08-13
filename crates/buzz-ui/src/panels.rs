@@ -1435,7 +1435,17 @@ fn swatch_chip(ui: &mut Ui, color: Color, name: &str) -> bool {
 }
 
 /// The layer list. Returns a command if the user asked for one.
-pub fn layers_panel(ui: &mut Ui, scene: &mut Scene, selection: &mut Selection) -> Option<Command> {
+/// The Layers panel.
+///
+/// `frame` is the playhead's, because clicking a layer selects what is on it
+/// *now* — a layer's artwork is different on different frames, and selecting
+/// frame zero's while looking at frame forty would select things not on screen.
+pub fn layers_panel(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    selection: &mut Selection,
+    frame: u32,
+) -> Option<Command> {
     let mut command = None;
 
     ui.horizontal(|ui| {
@@ -1549,7 +1559,9 @@ pub fn layers_panel(ui: &mut Ui, scene: &mut Scene, selection: &mut Selection) -
                         .selectable_label(active == Some(id), format!("{mark}{name}"))
                         .clicked()
                     {
-                        selection.set_active_layer(Some(id));
+                        // Animate selects the layer's artwork with it, so the
+                        // obvious next move needs no second gesture.
+                        selection.select_layer(scene, id, frame);
                     }
                 });
 
@@ -1891,7 +1903,7 @@ mod tests {
                 EditAt::exact(0),
             );
             color_panel(ui, &scene, &mut style);
-            let _ = layers_panel(ui, &mut scene, &mut selection);
+            let _ = layers_panel(ui, &mut scene, &mut selection, 0);
             timeline_placeholder(ui, &scene);
         });
     }
@@ -2026,7 +2038,7 @@ mod tests {
                 &mut view,
                 EditAt::exact(0),
             );
-            let _ = layers_panel(ui, &mut scene, &mut selection);
+            let _ = layers_panel(ui, &mut scene, &mut selection, 0);
         });
     }
 }

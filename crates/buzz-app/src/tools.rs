@@ -422,7 +422,6 @@ impl ToolMachine {
                 | ToolId::Pen => build_shape_path(self.tool, *origin, *current, *mods)
                     .map(Preview::Shape)
                     .unwrap_or(Preview::None),
-                ToolId::Lasso => Preview::Marquee(Rect::from_points(*origin, *current)),
                 ToolId::Zoom => Preview::Marquee(Rect::from_points(*origin, *current)),
 
                 // The transformation point, wherever it can be grabbed. Only

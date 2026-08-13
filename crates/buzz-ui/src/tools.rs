@@ -17,7 +17,6 @@ pub enum ToolId {
     Subselection,
     FreeTransform,
     GradientTransform,
-    Lasso,
     Pen,
     Text,
     Line,
@@ -58,7 +57,6 @@ impl ToolId {
             Subselection => "Subselection",
             FreeTransform => "Free Transform",
             GradientTransform => "Gradient Transform",
-            Lasso => "Lasso",
             Pen => "Pen",
             Text => "Text",
             Line => "Line",
@@ -86,7 +84,6 @@ impl ToolId {
             Selection => Some(Key::V),
             Subselection => Some(Key::A),
             FreeTransform => Some(Key::Q),
-            Lasso => Some(Key::L),
             Pen => Some(Key::P),
             Text => Some(Key::T),
             Line => Some(Key::N),
@@ -131,7 +128,6 @@ impl ToolId {
             // No shortcut in Animate; both of these render correctly.
             GradientTransform => "◑",
             PolyStar => "☆",
-            Lasso => "L",
             Pen => "P",
             Text => "T",
             Line => "N",
@@ -159,7 +155,6 @@ impl ToolId {
             | Pencil | Brush | Eraser | PaintBucket | InkBottle | Eyedropper | Hand | Zoom
             | Pen | Camera | Bone | AssetWarp | GradientTransform => ToolStatus::Ready,
             Text => ToolStatus::Planned("Text arrives with Phase 2 follow-up"),
-            Lasso => ToolStatus::Planned("Lasso arrives with Phase 2 follow-up"),
         }
     }
 
@@ -199,7 +194,6 @@ pub const TOOL_GROUPS: &[&[ToolId]] = &[
         ToolId::Subselection,
         ToolId::FreeTransform,
         ToolId::GradientTransform,
-        ToolId::Lasso,
     ],
     &[ToolId::Pen, ToolId::Text],
     &[
@@ -243,8 +237,47 @@ mod tests {
             unique.len(),
             "a tool appears in more than one group"
         );
-        // 21 through Phase 5, plus Asset Warp when rigging landed in Phase 7.
-        assert_eq!(tools.len(), 22, "unexpected tool count");
+        // 21 through Phase 5, plus Asset Warp when rigging landed in Phase 7,
+        // less the Lasso — see the test below.
+        assert_eq!(tools.len(), 21, "unexpected tool count");
+    }
+
+    /// **Two selection tools, and only two.** Animate's palette groups
+    /// Selection and Subselection with the two transform tools; the Lasso was
+    /// here as a third, greyed out, doing nothing. A tool that cannot be used
+    /// is worse than one that is absent — it takes a place in the palette and
+    /// a letter on the keyboard for a promise it does not keep.
+    #[test]
+    fn there_are_exactly_two_selection_tools() {
+        let selection: Vec<ToolId> = all_tools()
+            .into_iter()
+            .filter(|t| matches!(t, ToolId::Selection | ToolId::Subselection))
+            .collect();
+        assert_eq!(selection.len(), 2);
+
+        // And the first group is those two plus the transform tools, which is
+        // what Animate's first group is.
+        assert_eq!(
+            TOOL_GROUPS[0],
+            &[
+                ToolId::Selection,
+                ToolId::Subselection,
+                ToolId::FreeTransform,
+                ToolId::GradientTransform,
+            ]
+        );
+    }
+
+    /// Every tool in the palette does something. The Lasso was the last one
+    /// that did not; `Text` remains, and is the only permitted exception until
+    /// the font subsystem lands.
+    #[test]
+    fn only_text_is_still_unimplemented() {
+        let waiting: Vec<ToolId> = all_tools()
+            .into_iter()
+            .filter(|t| !t.is_ready())
+            .collect();
+        assert_eq!(waiting, vec![ToolId::Text], "unexpected inert tools");
     }
 
     /// Muscle memory: these letters must do what an Animate user expects.
@@ -254,7 +287,6 @@ mod tests {
             (Key::V, ToolId::Selection),
             (Key::A, ToolId::Subselection),
             (Key::Q, ToolId::FreeTransform),
-            (Key::L, ToolId::Lasso),
             (Key::P, ToolId::Pen),
             (Key::T, ToolId::Text),
             (Key::N, ToolId::Line),
@@ -318,7 +350,6 @@ mod tests {
     #[test]
     fn unimplemented_tools_declare_themselves() {
         assert!(matches!(ToolId::Text.status(), ToolStatus::Planned(_)));
-        assert!(matches!(ToolId::Lasso.status(), ToolStatus::Planned(_)));
         assert!(ToolId::Selection.is_ready());
         assert!(ToolId::Rectangle.is_ready());
         assert!(ToolId::Camera.is_ready(), "the camera arrived in Phase 3");

@@ -841,7 +841,7 @@ impl App {
         let response = buzz_ui::depth_panel(ui, self.editor.doc.scene(), active);
 
         if let Some(layer) = response.select_layer {
-            self.editor.selection.set_active_layer(Some(layer));
+            self.editor.select_layer(layer);
         }
 
         if let Some((layer, depth)) = response.set_depth {
@@ -933,9 +933,10 @@ impl App {
             Layers => {
                 let editor = &mut self.editor;
                 let selection = &mut editor.selection;
+                let frame = editor.current_frame;
                 let mut raised = None;
                 editor.doc.edit("Layer Properties", |scene| {
-                    raised = panels::layers_panel(ui, scene, selection);
+                    raised = panels::layers_panel(ui, scene, selection, frame);
                 });
                 if let Some(command) = raised {
                     commands.push(command);
@@ -1364,7 +1365,8 @@ impl App {
             self.editor.set_frame(frame);
         }
         if let Some(layer) = response.select_layer {
-            self.editor.selection.set_active_layer(Some(layer));
+            // As in the Layers panel: the layer's artwork comes with it.
+            self.editor.select_layer(layer);
             // Clicking a layer takes the camera row's highlight away, as
             // clicking any row takes it from the one before.
             self.editor.camera_selected = false;

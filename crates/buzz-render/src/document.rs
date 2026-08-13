@@ -1093,9 +1093,16 @@ fn draw_shape(
         // isolation group, opened by `draw_frame`, is what keeps that sum away
         // from the stage behind it.
         if shape.blend.is_additive() {
+            // Build-up paint is *summing* into an isolation group, so growing
+            // the edge would add to the accumulation there rather than merely
+            // covering a seam — a darker rim round every stroke, which is the
+            // one thing that mode exists to avoid.
             builder.fill_shape_paint_additive(&path, &paint, brush_to_doc);
         } else {
-            builder.fill_shape_paint(&path, &paint, brush_to_doc);
+            // Sealed: artwork that shares a boundary with the shape beside it
+            // must not leave a pale line along the join. See
+            // `SceneBuilder::fill_shape_paint_sealed`.
+            builder.fill_shape_paint_sealed(&path, &paint, brush_to_doc);
         }
 
         // Then the modelling: the terminator away from the key light, and the

@@ -171,6 +171,26 @@ fn blend_mode(blend: buzz_fx::Blend) -> peniko::BlendMode {
     peniko::BlendMode::new(mix, compose)
 }
 
+/// How far a filled shape is grown to close the seam against its neighbour,
+/// in **screen pixels**. See [`SceneBuilder::fill_shape_paint_sealed`].
+///
+/// A stroke is centred on the path, so this width pushes the edge out by half
+/// of itself; two neighbours therefore overlap by the whole of it. Just under a
+/// pixel of overlap is enough to bring a shared boundary to full coverage, and
+/// going wider only disturbs more of the silhouette.
+const SEAM_SEAL_PX: f64 = 0.9;
+
+/// Is this paint fully opaque everywhere?
+///
+/// A gradient has to be checked stop by stop: one transparent stop is enough to
+/// make sealing it draw a dark rim, and the average would hide that.
+fn is_opaque(paint: &Paint) -> bool {
+    match paint {
+        Paint::Solid(c) => c.components[3] >= 1.0,
+        Paint::Gradient(g) => g.stops().iter().all(|s| s.color.components[3] >= 1.0),
+    }
+}
+
 /// precision collapse that caps Animate at 2000%. See `buzz_geom::camera`.
 pub struct SceneBuilder<'a> {
     scene: &'a mut Scene,
@@ -348,6 +368,51 @@ impl<'a> SceneBuilder<'a> {
             brush_transform,
             &path,
         );
+    }
+
+    /// Fill a shape and **seal its edge**, so it does not leave a pale seam
+    /// against the shape beside it.
+    ///
+    /// # The defect this exists for
+    ///
+    /// Two filled shapes that share an edge should meet with nothing between
+    /// them. They do not. Every path is antialiased independently, so along a
+    /// shared boundary each shape covers about *half* of every pixel — and
+    /// compositing one over the other gives `0.5 + 0.5 × (1 − 0.5) = 0.75`, not
+    /// `1.0`. The remaining quarter is the stage showing through, and it reads
+    /// as a thin pale line tracing every border in the drawing. It is worst on
+    /// imported artwork, because Flash drew a shape as a *soup of edges* that
+    /// were scan-converted together in one pass, so every region in a `.fla`
+    /// shares its boundary exactly with its neighbour. This is the well-known
+    /// conflation artifact, and it is a property of compositing paths
+    /// separately rather than a bug in any one of them.
+    ///
+    /// # The fix, and why it is a stroke
+    ///
+    /// The shape is stroked with **its own paint**, a hair under a pixel wide.
+    /// That pushes its coverage half a pixel outwards, so two neighbours now
+    /// overlap across the boundary instead of meeting exactly on it, and the
+    /// pixel sums to full. Growing the geometry with a boolean would be exact
+    /// and would cost an offset per shape per frame; a stroke is one extra path
+    /// and the difference is half a pixel of silhouette.
+    ///
+    /// # When it must not happen
+    ///
+    /// **Only for opaque paint.** A translucent fill stroked with itself
+    /// composites twice around its rim, which draws a visible darker outline —
+    /// turning a subtle seam into an obvious border. Translucent artwork keeps
+    /// the seam, which is the lesser of the two.
+    pub fn fill_shape_paint_sealed(&mut self, shape: &impl Shape, paint: &Paint, to_doc: Affine) {
+        self.fill_shape_paint(shape, paint, to_doc);
+        if !is_opaque(paint) {
+            return;
+        }
+        // In screen pixels: the seam is a property of the *rasteriser*, not of
+        // the document, so it is the same width at every zoom. Slightly under a
+        // pixel — a full pixel of overlap is enough to close the gap, and less
+        // silhouette is disturbed than a wider stroke would disturb.
+        let width = SEAM_SEAL_PX / self.view_scale().max(f64::MIN_POSITIVE);
+        self.stroke_shape_paint(shape, paint, width, to_doc);
     }
 
     /// Stroke a document-space shape with a paint, which may be a gradient.

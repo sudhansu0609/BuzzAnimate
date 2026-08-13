@@ -231,10 +231,25 @@ fn draw_layers(
     let mut open: Option<OpenMask> = None;
 
     for layer in layers.drawable_at(frame) {
-        // A mask layer's own artwork is never drawn: it is a stencil, and
-        // Animate hides it for the same reason. It still has to be *found*,
-        // which is what `active_masks` did.
-        if layer.kind.is_mask() && masks.values().any(|m| *m == layer.id) {
+        // A mask layer's own artwork is never drawn in the finished picture:
+        // it is a stencil, and Animate hides it for the same reason. It still
+        // has to be *found*, which is what `active_masks` did.
+        //
+        // **A mask that claims nothing is still a mask.** It used to be drawn
+        // as ordinary artwork, on the grounds that it was not clipping
+        // anything — so a mask layer added before the layer under it had been
+        // set to Masked splattered its stencil across the whole frame, opaque
+        // and full size. That is a shape nobody drew to be seen, and on a
+        // vignette or a torchlight cone it covers the film.
+        //
+        // The one case where a mask *should* show its own artwork is Animate's
+        // editing rule: on the stage, an unlocked mask is not in force and its
+        // contents are visible so they can be drawn. That is `WhenLocked`, and
+        // it is the only reason this is not an unconditional skip.
+        let is_stencil = layer.kind.is_mask()
+            && (options.masks == MaskDisplay::Always
+                || masks.values().any(|m| *m == layer.id));
+        if is_stencil {
             continue;
         }
 
@@ -934,7 +949,9 @@ fn draw_object_inner(
             let mut open: Option<OpenMask> = None;
 
             for layer in symbol.layers.drawable_at(inner) {
-                if layer.kind.is_mask() && masks.values().any(|m| *m == layer.id) {
+                // Inside a symbol masks are always in force (see above), so a
+                // mask layer here is always a stencil and never artwork.
+                if layer.kind.is_mask() {
                     continue;
                 }
 

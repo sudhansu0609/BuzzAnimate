@@ -503,3 +503,71 @@ fn a_mask_inside_a_symbol_clips_its_instance() {
         );
     });
 }
+
+/// **A mask layer never paints itself into the finished film.**
+///
+/// A mask is a stencil. It used to be skipped only when it was actually
+/// clipping something, which meant a mask layer added before the layer beneath
+/// it had been set to Masked was drawn as ordinary artwork — opaque, full size,
+/// over everything. On a vignette or a torchlight cone that is the whole frame
+/// covered by a shape nobody drew to be seen, and the natural order of work
+/// (draw the mask, then set what it masks) walks straight into it.
+///
+/// Found while building a night scene: the vignette's stencil covered the film.
+#[test]
+fn a_mask_that_clips_nothing_is_still_not_drawn() {
+    with_exporter(|exporter| {
+        let mut scene = Scene::default();
+        scene.stage_mut().background = Color::WHITE;
+
+        // Artwork underneath, on an ordinary layer.
+        let art = scene.add_layer("Art", LayerKind::Normal);
+        scene.add_shape(
+            art,
+            ShapeData::filled(Rect::new(0.0, 0.0, 550.0, 400.0).to_path(1e-9), BLUE),
+        );
+
+        // A mask on top that claims nothing, because nothing below it has been
+        // set to Masked yet.
+        let mask = scene.add_layer("Stencil", LayerKind::Mask);
+        scene.add_shape(
+            mask,
+            ShapeData::filled(Rect::new(0.0, 0.0, 550.0, 400.0).to_path(1e-9), RED),
+        );
+
+        let frame = exporter.render(&scene, 0, &ExportSettings::for_stage(&scene)).expect("render");
+
+        assert!(
+            is(frame.pixel(275, 200), BLUE),
+            "the stencil painted itself over the artwork: {:?}",
+            frame.pixel(275, 200)
+        );
+    });
+}
+
+/// The same for an inverse mask, which is the one a vignette actually uses.
+#[test]
+fn an_inverse_mask_that_clips_nothing_is_not_drawn_either() {
+    with_exporter(|exporter| {
+        let mut scene = Scene::default();
+        scene.stage_mut().background = Color::WHITE;
+
+        let art = scene.add_layer("Art", LayerKind::Normal);
+        scene.add_shape(
+            art,
+            ShapeData::filled(Rect::new(0.0, 0.0, 550.0, 400.0).to_path(1e-9), BLUE),
+        );
+        let mask = scene.add_layer("Hole", LayerKind::InverseMask);
+        scene.add_shape(
+            mask,
+            ShapeData::filled(Rect::new(0.0, 0.0, 550.0, 400.0).to_path(1e-9), RED),
+        );
+
+        let frame = exporter.render(&scene, 0, &ExportSettings::for_stage(&scene)).expect("render");
+        assert!(
+            is(frame.pixel(275, 200), BLUE),
+            "the inverse stencil painted itself: {:?}",
+            frame.pixel(275, 200)
+        );
+    });
+}

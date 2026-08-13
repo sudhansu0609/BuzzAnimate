@@ -26,6 +26,7 @@
 //! tell whether what it holds is current instead of trusting it blindly.
 
 pub mod camera_track;
+pub mod gradient;
 pub mod index;
 pub mod layer;
 pub mod looping;
@@ -45,12 +46,15 @@ use peniko::Color;
 use serde::{Deserialize, Serialize};
 
 pub use camera_track::{CameraKey, CameraTrack, MAX_TILT};
+pub use gradient::{
+    Gradient, GradientHandles, GradientKind, GradientSpread, GradientStop, MAX_STOPS, lerp_color,
+};
 pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
 pub use looping::{LoopRegion, MAX_REPEATS};
 pub use merge::{ImportTarget, MergeReport};
 pub use object::{
-    FillSpec, Object, ObjectId, ObjectKind, PaintBlend, ShapeData, Spatial, StrokeSpec,
+    FillSpec, Object, ObjectId, ObjectKind, Paint, PaintBlend, ShapeData, Spatial, StrokeSpec,
 };
 pub use rig::{ArmatureData, RigBinding, RigPart, WarpData};
 pub use sound::{SoundAsset, SoundCue, SoundId, SoundLibrary, SoundRef, SoundSync};

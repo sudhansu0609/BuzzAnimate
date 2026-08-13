@@ -4,13 +4,15 @@
 //! Nothing here owns editor state, so the same panel can be driven by tests or
 //! by the running application.
 
-use buzz_scene::{EditAt, LayerId, LayerKind, Scene};
+use buzz_scene::{
+    EditAt, Gradient, GradientKind, GradientSpread, GradientStop, LayerId, LayerKind, Scene,
+};
 use egui::{Color32, RichText, Ui};
 use peniko::Color;
 
 use crate::command::{Command, shortcut_text};
 use crate::selection::Selection;
-use crate::style::{DrawStyle, DrawingMode, StrokeKind};
+use crate::style::{DrawStyle, DrawingMode, FillKind, StrokeKind};
 use crate::theme::{Metrics, Palette};
 use crate::tools::{TOOL_GROUPS, ToolId, ToolStatus};
 use crate::view::ViewSettings;
@@ -965,7 +967,14 @@ fn brush_pattern_preview(ui: &mut Ui, style: &DrawStyle) {
         .min((rect.height() as f64 - 12.0) / bounds.height())
         .min(1.0);
 
-    let colour = to_egui(style.fill_for_new_shape().unwrap_or(Color::BLACK));
+    // The brush preview is chrome drawn with egui's painter, which has no
+    // gradient brush — one colour standing in for the ramp is enough to judge
+    // spacing and stamp size, which is what this strip is for.
+    let colour = to_egui(if style.fill_enabled {
+        style.fill_color_for_preview()
+    } else {
+        Color::BLACK
+    });
     let to_screen = |p: buzz_geom::Point| -> egui::Pos2 {
         egui::pos2(
             rect.center().x + ((p.x - bounds.center().x) * scale) as f32,
@@ -1199,17 +1208,34 @@ pub fn color_panel(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
     });
     ui.horizontal(|ui| {
         ui.label("Fill");
-        let mut c = to_egui(style.fill_color);
-        if ui.color_edit_button_srgba(&mut c).changed() {
-            style.fill_color = from_egui(c);
-            style.fill_enabled = true;
-            let remembered = style.fill_color;
-            style.remember(remembered);
-        }
-        if let Some(swatch) = scene.swatches().find_color(style.fill_color) {
-            ui.label(RichText::new(&swatch.name).small().weak());
-        }
+        egui::ComboBox::from_id_salt("fill kind")
+            .selected_text(style.fill_kind.label())
+            .width(140.0)
+            .show_ui(ui, |ui| {
+                for kind in [FillKind::Solid, FillKind::Linear, FillKind::Radial] {
+                    ui.selectable_value(&mut style.fill_kind, kind, kind.label());
+                }
+            });
     });
+
+    if style.fill_kind == FillKind::Solid {
+        ui.horizontal(|ui| {
+            ui.add_space(38.0);
+            let mut c = to_egui(style.fill_color);
+            if ui.color_edit_button_srgba(&mut c).changed() {
+                style.fill_color = from_egui(c);
+                style.fill_enabled = true;
+                let remembered = style.fill_color;
+                style.remember(remembered);
+            }
+            if let Some(swatch) = scene.swatches().find_color(style.fill_color) {
+                ui.label(RichText::new(&swatch.name).small().weak());
+            }
+        });
+    } else {
+        gradient_editor(ui, &mut style.fill_gradient);
+        style.fill_enabled = true;
+    }
 
     let mut picked: Option<(Color, bool)> = None;
 
@@ -1257,6 +1283,138 @@ pub fn color_panel(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
         }
         style.remember(color);
     }
+}
+
+/// Edit a gradient: the ramp, its stops, and how it behaves past the ends.
+///
+/// The ramp is drawn as the ramp, not described in numbers, for the reason the
+/// brush preview strip exists: the difference between two stop layouts is
+/// obvious as a picture and nearly meaningless as a list of offsets.
+///
+/// Returns whether anything changed.
+pub fn gradient_editor(ui: &mut Ui, gradient: &mut Gradient) -> bool {
+    let mut changed = false;
+
+    // The ramp. egui has no gradient brush, so it is drawn as a column of thin
+    // filled rectangles — one per pixel of width, sampled from the model. That
+    // is the same `sample` the renderer's stops come from, so what is shown
+    // here and what lands on the stage cannot disagree about the colours.
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::click());
+    let steps = (rect.width().round() as usize).clamp(1, 512);
+    for i in 0..steps {
+        let t0 = i as f32 / steps as f32;
+        let t1 = (i + 1) as f32 / steps as f32;
+        let band = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + rect.width() * t0, rect.top()),
+            egui::pos2(rect.left() + rect.width() * t1, rect.bottom()),
+        );
+        ui.painter()
+            .rect_filled(band, 0.0, to_egui(gradient.sample(f64::from(t0))));
+    }
+    ui.painter().rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, Palette::border()),
+        egui::StrokeKind::Inside,
+    );
+
+    // Clicking the ramp adds a stop there, in the colour the ramp already has
+    // at that point — so a new stop never changes the picture until it is
+    // dragged or recoloured. Animate's gradient bar behaves the same way.
+    if response.clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let t = f64::from((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+        let mut stops = gradient.stops().to_vec();
+        if stops.len() < buzz_scene::MAX_STOPS {
+            stops.push(GradientStop::new(t, gradient.sample(t)));
+            gradient.set_stops(stops);
+            changed = true;
+        }
+    }
+
+    ui.add_space(2.0);
+
+    // The stops, as rows. A row per stop rather than draggable pips on the bar
+    // because a colour needs a picker beside it, and a picker cannot live on a
+    // 24-pixel strip.
+    let mut stops = gradient.stops().to_vec();
+    let mut remove: Option<usize> = None;
+    let count = stops.len();
+    for (i, stop) in stops.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            let mut c = to_egui(stop.color);
+            if ui.color_edit_button_srgba(&mut c).changed() {
+                stop.color = from_egui(c);
+                changed = true;
+            }
+            if ui
+                .add(
+                    egui::DragValue::new(&mut stop.offset)
+                        .speed(0.005)
+                        .range(0.0..=1.0)
+                        .fixed_decimals(3),
+                )
+                .changed()
+            {
+                changed = true;
+            }
+            // Two stops are the fewest a ramp can have; removing below that
+            // would leave a gradient that is a colour, and the model would
+            // silently pad it back.
+            if count > 2 && ui.small_button("\u{1F5D1}").on_hover_text("Remove stop").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        stops.remove(i);
+        changed = true;
+    }
+    if changed {
+        gradient.set_stops(stops);
+    }
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Overflow").small().weak());
+        egui::ComboBox::from_id_salt("gradient spread")
+            .selected_text(gradient.spread.label())
+            .width(100.0)
+            .show_ui(ui, |ui| {
+                for s in [
+                    GradientSpread::Pad,
+                    GradientSpread::Reflect,
+                    GradientSpread::Repeat,
+                ] {
+                    if ui
+                        .selectable_value(&mut gradient.spread, s, s.label())
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                }
+            });
+    });
+
+    if gradient.kind == GradientKind::Radial {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Focal").small().weak());
+            if ui
+                .add(
+                    egui::Slider::new(&mut gradient.focal, -1.0..=1.0)
+                        .fixed_decimals(2)
+                        .show_value(true),
+                )
+                .on_hover_text("Where the hot spot sits along the ramp's own axis")
+                .changed()
+            {
+                changed = true;
+            }
+        });
+    }
+
+    changed
 }
 
 /// One colour square. Returns whether it was clicked.

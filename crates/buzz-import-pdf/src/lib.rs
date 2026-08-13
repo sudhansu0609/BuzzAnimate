@@ -704,8 +704,8 @@ mod tests {
 
         let shapes = shapes(&scene);
         assert_eq!(shapes.len(), 1);
-        let fill = shapes[0].fill.expect("it is filled");
-        assert_eq!(fill.color.to_rgba8().to_u8_array()[..3], [255, 0, 0]);
+        let fill = shapes[0].fill.as_ref().expect("it is filled");
+        assert_eq!(fill.color().to_rgba8().to_u8_array()[..3], [255, 0, 0]);
     }
 
     /// The single most common way to get an import subtly wrong: PDF measures
@@ -774,9 +774,9 @@ mod tests {
         let shapes = shapes(&scene);
         assert_eq!(shapes.len(), 2);
 
-        assert_eq!(shapes[0].fill.unwrap().color.to_rgba8().to_u8_array()[..3], [255, 0, 0]);
+        assert_eq!(shapes[0].fill.as_ref().unwrap().color().to_rgba8().to_u8_array()[..3], [255, 0, 0]);
         assert_eq!(
-            shapes[1].fill.unwrap().color.to_rgba8().to_u8_array()[..3],
+            shapes[1].fill.as_ref().unwrap().color().to_rgba8().to_u8_array()[..3],
             [0, 0, 0],
             "Q must restore the colour set before q"
         );
@@ -798,8 +798,8 @@ mod tests {
         let pdf = pdf_with("0 0 0 1 k\n0 0 10 10 re\nf\n0 0 0 0 k\n0 0 10 10 re\nf", "[0 0 612 792]");
         let (scene, _) = import_bytes(&pdf).unwrap();
         let shapes = shapes(&scene);
-        assert_eq!(shapes[0].fill.unwrap().color.to_rgba8().to_u8_array()[..3], [0, 0, 0]);
-        assert_eq!(shapes[1].fill.unwrap().color.to_rgba8().to_u8_array()[..3], [255, 255, 255]);
+        assert_eq!(shapes[0].fill.as_ref().unwrap().color().to_rgba8().to_u8_array()[..3], [0, 0, 0]);
+        assert_eq!(shapes[1].fill.as_ref().unwrap().color().to_rgba8().to_u8_array()[..3], [255, 255, 255]);
     }
 
     #[test]
@@ -812,7 +812,7 @@ mod tests {
 
         let shape = &shapes(&scene)[0];
         assert!(shape.fill.is_some() && shape.stroke.is_some());
-        assert_eq!(shape.stroke.unwrap().width, 5.0);
+        assert_eq!(shape.stroke.as_ref().unwrap().width, 5.0);
     }
 
     /// `n` ends a path without painting it. Emitting it anyway would fill

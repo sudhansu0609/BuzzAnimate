@@ -376,6 +376,10 @@ fn draw_selection(
     // point is drawn for the selection tools as well, because they can move it
     // (see `tools::finish_drag`), and a control you can grab and cannot see is
     // worse than one that is not there.
+    if editor.tool() == buzz_ui::ToolId::GradientTransform {
+        draw_gradient_handles(painter, editor, &to_screen);
+        return;
+    }
     if editor.tool() != buzz_ui::ToolId::FreeTransform {
         draw_pivot(painter, editor, &to_screen);
         return;
@@ -432,6 +436,73 @@ fn draw_pivot(
     painter.circle_filled(at, 4.5, Palette::handle_fill());
     painter.circle_stroke(at, 4.5, Stroke::new(1.0, Palette::handle_stroke()));
     painter.circle_filled(at, 1.5, Palette::handle_stroke());
+}
+
+/// Animate's gradient widget: the ramp drawn as a line, with a grip on each
+/// end of it and one across.
+///
+/// **Chrome, not artwork**, like the bones below — drawn here in screen space,
+/// so it can never reach an exported frame.
+///
+/// Each grip is a different shape rather than a different colour, because they
+/// sit close together and two of them coincide on a gradient nobody has
+/// adjusted: a square end, a diamond across, a triangle for the focus. Shape
+/// survives being four pixels wide in a way that hue does not.
+fn draw_gradient_handles(
+    painter: &egui::Painter,
+    editor: &Editor,
+    to_screen: &impl Fn(Point) -> egui::Pos2,
+) {
+    let Some((handles, kind)) = editor.selected_gradient_handles() else {
+        return;
+    };
+    let stroke = Stroke::new(1.0, Palette::handle_stroke());
+    let (centre, end, across) = (
+        to_screen(handles.center),
+        to_screen(handles.end),
+        to_screen(handles.width),
+    );
+
+    // The two axes, so the shape of the gradient is legible before anything is
+    // grabbed — for a radial one this is the ellipse's two radii.
+    painter.line_segment([centre, end], stroke);
+    painter.line_segment([centre, across], Stroke::new(1.0, Palette::handle_fill()));
+
+    // The centre: a hollow circle, as the transformation point is, because it
+    // means the same thing — the point everything else is measured from.
+    painter.circle_filled(centre, 4.5, Palette::handle_fill());
+    painter.circle_stroke(centre, 4.5, stroke);
+
+    let square = egui::Rect::from_center_size(end, egui::vec2(7.0, 7.0));
+    painter.rect_filled(square, 0.0, Palette::handle_fill());
+    painter.rect_stroke(square, 0.0, stroke, StrokeKind::Outside);
+
+    let diamond = egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(across.x, across.y - 5.0),
+            egui::pos2(across.x + 5.0, across.y),
+            egui::pos2(across.x, across.y + 5.0),
+            egui::pos2(across.x - 5.0, across.y),
+        ],
+        Palette::handle_fill(),
+        stroke,
+    );
+    painter.add(diamond);
+
+    // The focus belongs to a radial gradient only: a linear ramp has no centre
+    // for a hot spot to sit off.
+    if kind == buzz_scene::GradientKind::Radial {
+        let f = to_screen(handles.focus);
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(f.x, f.y - 6.0),
+                egui::pos2(f.x + 5.0, f.y + 4.0),
+                egui::pos2(f.x - 5.0, f.y + 4.0),
+            ],
+            Palette::handle_fill(),
+            stroke,
+        ));
+    }
 }
 
 /// Live feedback for the gesture in progress.

@@ -157,10 +157,9 @@ impl ToolId {
         match self {
             Selection | Subselection | FreeTransform | Line | Rectangle | Oval | PolyStar
             | Pencil | Brush | Eraser | PaintBucket | InkBottle | Eyedropper | Hand | Zoom
-            | Pen | Camera | Bone | AssetWarp => ToolStatus::Ready,
+            | Pen | Camera | Bone | AssetWarp | GradientTransform => ToolStatus::Ready,
             Text => ToolStatus::Planned("Text arrives with Phase 2 follow-up"),
             Lasso => ToolStatus::Planned("Lasso arrives with Phase 2 follow-up"),
-            GradientTransform => ToolStatus::Planned("Gradients arrive with the Color panel"),
         }
     }
 

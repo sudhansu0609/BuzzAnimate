@@ -35,8 +35,8 @@ use std::path::Path;
 
 use buzz_geom::Affine;
 use buzz_scene::{
-    FillSpec, Layer, LayerId, LayerKind, Object, ObjectId, Scene, ShapeData, StrokeSpec, Symbol,
-    SymbolId, SymbolKind, Tween,
+    FillSpec, Gradient, GradientKind, GradientSpread, GradientStop, Layer, LayerId, LayerKind,
+    Object, ObjectId, Paint, Scene, ShapeData, StrokeSpec, Symbol, SymbolId, SymbolKind, Tween,
 };
 use peniko::Color;
 use quick_xml::events::Event;
@@ -866,12 +866,21 @@ struct FrameContext {
     placing: bool,
 }
 
+/// Flash's gradients are declared in a fixed square 32 768 twips across —
+/// 1 638.4 pixels, running from −819.2 to +819.2 — and the matrix in the file
+/// maps *that* onto the artwork. Our own unit space is −1 to 1, so this is the
+/// factor between them.
+///
+/// It is the single number that decides whether an imported gradient is the
+/// right size, which is why it is named rather than written inline.
+const XFL_GRADIENT_HALF_BOX: f64 = 819.2;
+
 /// The fills and strokes declared by one `DOMShape`.
 #[derive(Default)]
 struct ShapeStyleTable {
-    fills: HashMap<u32, Color>,
-    /// Index to (colour, weight).
-    strokes: HashMap<u32, (Color, f64)>,
+    fills: HashMap<u32, Paint>,
+    /// Index to (paint, weight).
+    strokes: HashMap<u32, (Paint, f64)>,
     /// Which style the elements now arriving belong to.
     ///
     /// `SolidColor` appears under both `FillStyle` and `StrokeStyle`, so the
@@ -879,8 +888,27 @@ struct ShapeStyleTable {
     /// The document is walked as a flat event stream, so this is how nesting
     /// is recovered.
     current: Option<StyleSlot>,
-    /// Colours seen so far in the gradient being read, if any.
-    gradient: Vec<Color>,
+    /// The gradient being read, if one is open.
+    ///
+    /// Built up as its parts arrive and written to the style table after each,
+    /// because this is a flat walk that never sees a closing tag. XFL puts the
+    /// `<Matrix>` before the `<GradientEntry>` list, so the placement is
+    /// usually known before the first stop — but nothing here depends on that
+    /// order.
+    gradient: Option<Gradient>,
+    /// The stops as the *file* gave them.
+    ///
+    /// Kept apart from the gradient's own list because [`Gradient::set_stops`]
+    /// pads a list of fewer than two up to two, so a gradient that has been
+    /// committed once already holds stops the file never wrote — and reading
+    /// them back to append the next one counts the padding as real.
+    gradient_stops: Vec<GradientStop>,
+    /// A gradient is open and has not yet been given its matrix.
+    ///
+    /// `<Matrix>` means several different things in XFL depending on what
+    /// encloses it; this is how the gradient's own is told apart from the one
+    /// that places a symbol instance.
+    gradient_wants_matrix: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -894,19 +922,30 @@ impl ShapeStyleTable {
         self.fills.clear();
         self.strokes.clear();
         self.current = None;
-        self.gradient.clear();
+        self.end_gradient();
+    }
+
+    fn end_gradient(&mut self) {
+        self.gradient = None;
+        self.gradient_stops.clear();
+        self.gradient_wants_matrix = false;
     }
 
     /// Record a solid colour against whichever style is being read.
     fn set_color(&mut self, color: Color) {
+        self.set_paint(Paint::Solid(color));
+    }
+
+    /// Record a paint against whichever style is being read.
+    fn set_paint(&mut self, paint: Paint) {
         match self.current {
             Some(StyleSlot::Fill(index)) => {
-                self.fills.insert(index, color);
+                self.fills.insert(index, paint);
             }
             Some(StyleSlot::Stroke(index)) => {
                 // Keep whatever weight `SolidStroke` already recorded.
                 let width = self.strokes.get(&index).map(|(_, w)| *w).unwrap_or(1.0);
-                self.strokes.insert(index, (color, width));
+                self.strokes.insert(index, (paint, width));
             }
             None => {}
         }
@@ -914,38 +953,86 @@ impl ShapeStyleTable {
 
     fn set_stroke_width(&mut self, width: f64) {
         if let Some(StyleSlot::Stroke(index)) = self.current {
-            let color = self
+            let paint = self
                 .strokes
                 .get(&index)
-                .map(|(c, _)| *c)
-                .unwrap_or(Color::BLACK);
-            self.strokes.insert(index, (color, width));
+                .map(|(p, _)| p.clone())
+                .unwrap_or(Paint::Solid(Color::BLACK));
+            self.strokes.insert(index, (paint, width));
         }
     }
 
-    /// Add a gradient stop and set the style to the running average.
+    /// Open a gradient. Its stops and its matrix arrive as later elements.
+    fn begin_gradient(&mut self, kind: GradientKind, spread: GradientSpread, focal: f64) {
+        self.gradient_stops.clear();
+        let mut g = Gradient::new(kind, Vec::new());
+        g.spread = spread;
+        g.focal = focal;
+        // Until the matrix arrives the gradient stands at unit size, which is
+        // 2 pixels across. A file that omits the matrix is malformed, and a
+        // tiny ramp is a visible symptom rather than a silent one — but Flash's
+        // own default is the full gradient box, so that is what is used.
+        g.transform = Affine::scale(XFL_GRADIENT_HALF_BOX);
+        self.gradient = Some(g);
+        self.gradient_wants_matrix = true;
+        self.commit_gradient();
+    }
+
+    /// Place the open gradient with the matrix from the file.
     ///
-    /// Gradients are not implemented yet, so the closest flat colour is used.
-    /// Averaging as each stop arrives avoids needing to see the closing tag,
-    /// which this flat walk never observes.
-    fn add_gradient_stop(&mut self, color: Color) {
-        self.gradient.push(color);
-        let n = self.gradient.len() as u32;
-        let mut sum = [0u32; 4];
-        for stop in &self.gradient {
-            let [r, g, b, a] = stop.to_rgba8().to_u8_array();
-            sum[0] += r as u32;
-            sum[1] += g as u32;
-            sum[2] += b as u32;
-            sum[3] += a as u32;
+    /// Returns whether the matrix was claimed, so the caller knows not to treat
+    /// it as an instance placement.
+    fn place_gradient(&mut self, m: Affine) -> bool {
+        if !self.gradient_wants_matrix {
+            return false;
         }
-        let average = Color::from_rgba8(
-            (sum[0] / n) as u8,
-            (sum[1] / n) as u8,
-            (sum[2] / n) as u8,
-            (sum[3] / n) as u8,
-        );
-        self.set_color(average);
+        self.gradient_wants_matrix = false;
+        if let Some(g) = &mut self.gradient {
+            // The file's matrix maps Flash's gradient square; ours maps the
+            // unit one. Scaling first turns the second into the first, and then
+            // the file's matrix puts it on the artwork.
+            g.transform = m * Affine::scale(XFL_GRADIENT_HALF_BOX);
+        }
+        self.commit_gradient();
+        true
+    }
+
+    /// Add a stop to the open gradient.
+    ///
+    /// Falls back to treating the colour as solid when no gradient is open,
+    /// which is what a `<GradientEntry>` outside one would otherwise be: lost.
+    fn add_gradient_stop(&mut self, color: Color, ratio: f64) {
+        if self.gradient.is_none() {
+            self.set_color(color);
+            return;
+        }
+        self.gradient_stops.push(GradientStop::new(ratio, color));
+        let stops = self.gradient_stops.clone();
+        if let Some(g) = &mut self.gradient {
+            g.set_stops(stops);
+        }
+        self.commit_gradient();
+    }
+
+    /// Write the gradient as it currently stands into the style table.
+    ///
+    /// Done after every part because this walk never sees a closing tag: the
+    /// style has to be correct after each element in case that element was the
+    /// last one.
+    fn commit_gradient(&mut self) {
+        if let Some(g) = self.gradient.clone() {
+            self.set_paint(Paint::Gradient(std::sync::Arc::new(g)));
+        }
+    }
+}
+
+/// XFL's `spreadMethod`, which is Animate's Extend / Reflect / Repeat.
+fn parse_spread(attrs: &HashMap<String, String>) -> GradientSpread {
+    match attrs.get("spreadMethod").map(String::as_str) {
+        Some("reflect") => GradientSpread::Reflect,
+        Some("repeat") => GradientSpread::Repeat,
+        // "extend" is Animate's default and what it omits when writing.
+        _ => GradientSpread::Pad,
     }
 }
 
@@ -1004,8 +1091,8 @@ impl FrameContext {
 
         let mut made = 0usize;
         let mut push = |path: buzz_geom::BezPath,
-                        fill: Option<Color>,
-                        stroke: Option<(Color, f64)>| {
+                        fill: Option<Paint>,
+                        stroke: Option<(Paint, f64)>| {
             if path.elements().is_empty() {
                 return;
             }
@@ -1013,8 +1100,15 @@ impl FrameContext {
                 ObjectId(ids.take()),
                 ShapeData {
                     path,
-                    fill: fill.map(FillSpec::solid),
-                    stroke: stroke.map(|(c, w)| StrokeSpec::new(c, w)),
+                    fill: fill.map(|paint| FillSpec {
+                        paint,
+                        rule: buzz_geom::FillMode::NonZero,
+                    }),
+                    stroke: stroke.map(|(paint, width)| StrokeSpec {
+                        paint,
+                        width,
+                        hairline: false,
+                    }),
                     // No source format expresses build-up paint, so imported
                     // artwork always composites normally.
                     blend: buzz_scene::PaintBlend::Normal,
@@ -1027,23 +1121,23 @@ impl FrameContext {
         for (index, path) in fills {
             // A fill referencing a style the file never declared still has to
             // be visible, or artwork silently vanishes.
-            let color = self
+            let paint = self
                 .styles
                 .fills
                 .get(&index)
-                .copied()
-                .unwrap_or(Color::from_rgb8(0x99, 0x99, 0x99));
-            push(path, Some(color), None);
+                .cloned()
+                .unwrap_or(Paint::Solid(Color::from_rgb8(0x99, 0x99, 0x99)));
+            push(path, Some(paint), None);
         }
 
         for (index, path) in edge::assemble_strokes(&records) {
-            let (color, width) = self
+            let (paint, width) = self
                 .styles
                 .strokes
                 .get(&index)
-                .copied()
-                .unwrap_or((Color::BLACK, 1.0));
-            push(path, None, Some((color, width)));
+                .cloned()
+                .unwrap_or((Paint::Solid(Color::BLACK), 1.0));
+            push(path, None, Some((paint, width)));
         }
 
         // Counted after the closure has finished with `report`.
@@ -1114,11 +1208,11 @@ impl FrameContext {
 
             "FillStyle" => {
                 self.styles.current = Some(StyleSlot::Fill(attr_index(attrs)));
-                self.styles.gradient.clear();
+                self.styles.end_gradient();
             }
             "StrokeStyle" => {
                 self.styles.current = Some(StyleSlot::Stroke(attr_index(attrs)));
-                self.styles.gradient.clear();
+                self.styles.end_gradient();
             }
             // Every stroke kind carries its weight the same way; the dash and
             // stipple variants differ only in decoration we cannot draw yet.
@@ -1129,14 +1223,32 @@ impl FrameContext {
                     report.note_unsupported("a decorated stroke, imported as a plain one");
                 }
             }
-            "SolidColor" => self.styles.set_color(parse_color(attrs, "color", "alpha")),
-            "LinearGradient" | "RadialGradient" => {
-                self.styles.gradient.clear();
-                report.note_unsupported("a gradient, imported as a flat colour");
+            "SolidColor" => {
+                self.styles.end_gradient();
+                self.styles.set_color(parse_color(attrs, "color", "alpha"));
             }
-            "GradientEntry" => self
-                .styles
-                .add_gradient_stop(parse_color(attrs, "color", "alpha")),
+            "LinearGradient" => {
+                self.styles
+                    .begin_gradient(GradientKind::Linear, parse_spread(attrs), 0.0);
+            }
+            "RadialGradient" => {
+                // Animate's focal point, which slides the hot spot along the
+                // ramp's own axis. Written as a ratio of the radius, which is
+                // exactly what our unit space wants.
+                let focal = attr_f64(attrs, "focalPointRatio", 0.0);
+                self.styles
+                    .begin_gradient(GradientKind::Radial, parse_spread(attrs), focal);
+            }
+            "GradientEntry" => {
+                // **The ratio is the stop's place on the ramp.** It was ignored
+                // while gradients were flattened to one colour, because an
+                // average does not care where its terms sit. It matters now: a
+                // file whose ratios are 0, 0.2 and 1 draws nothing like the
+                // same gradient with them evenly spread.
+                let ratio = attr_f64(attrs, "ratio", 0.0);
+                self.styles
+                    .add_gradient_stop(parse_color(attrs, "color", "alpha"), ratio);
+            }
             "BitmapFill" => {
                 report.note_unsupported("a bitmap fill, imported as a flat colour");
                 self.styles.set_color(Color::from_rgb8(0x80, 0x80, 0x80));
@@ -1209,14 +1321,19 @@ impl FrameContext {
             "DOMVideoInstance" => report.note_unsupported("video"),
             "DOMSoundItem" => report.note_unsupported("sound"),
             "Matrix" => {
-                // **Only the one that places an instance.** `<Matrix>` appears
-                // in several places in XFL, and the others are not placements
-                // at all: a gradient fill carries one to say where its ramp
-                // runs, a bitmap fill to say how its image is laid down. Taken
-                // as a placement, a gradient's matrix moved whichever object
-                // happened to be last — which is how a hut ends up across the
-                // stage from its village. Anything not expecting a matrix
-                // ignores this one.
+                // **A gradient's matrix is its own.** It says where the ramp
+                // runs, and it is claimed here before anything else can mistake
+                // it for a placement.
+                if self.styles.place_gradient(parse_matrix(attrs)) {
+                    return;
+                }
+                // **Otherwise, only the one that places an instance.**
+                // `<Matrix>` appears in several places in XFL, and the others
+                // are not placements at all: a bitmap fill carries one to say
+                // how its image is laid down. Taken as a placement, a
+                // gradient's matrix moved whichever object happened to be last
+                // — which is how a hut ends up across the stage from its
+                // village. Anything not expecting a matrix ignores this one.
                 if !self.placing {
                     return;
                 }
@@ -2249,7 +2366,7 @@ mod tests {
         let shapes = shapes_of(&scene);
         assert_eq!(shapes.len(), 3);
 
-        let first = shapes[0].fill.expect("the first edge is filled").color;
+        let first = shapes[0].fill.as_ref().expect("the first edge is filled").color();
         assert_eq!(
             first.to_rgba8().to_u8_array(),
             [0x33, 0x66, 0xCC, 0xFF],
@@ -2262,7 +2379,7 @@ mod tests {
     #[test]
     fn a_fill_referenced_by_fill_style_zero_is_resolved_too() {
         let (scene, _) = build(STYLED_SHAPES, &[]).unwrap();
-        let second = shapes_of(&scene)[1].fill.expect("filled").color;
+        let second = shapes_of(&scene)[1].fill.as_ref().expect("filled").color();
         let [r, g, b, a] = second.to_rgba8().to_u8_array();
         assert_eq!([r, g, b], [0xFF, 0x00, 0x00]);
         assert_eq!(a, 128, "the alpha attribute must be honoured");
@@ -2271,15 +2388,19 @@ mod tests {
     #[test]
     fn a_stroke_style_supplies_both_colour_and_weight() {
         let (scene, _) = build(STYLED_SHAPES, &[]).unwrap();
-        let stroke = shapes_of(&scene)[2].stroke.expect("the third edge is stroked");
-        assert_eq!(stroke.color.to_rgba8().to_u8_array(), [0x00, 0xFF, 0x00, 0xFF]);
+        let shapes = shapes_of(&scene);
+        let stroke = shapes[2]
+            .stroke
+            .as_ref()
+            .expect("the third edge is stroked");
+        assert_eq!(stroke.color().to_rgba8().to_u8_array(), [0x00, 0xFF, 0x00, 0xFF]);
         assert_eq!(stroke.width, 4.0);
     }
 
-    /// A gradient cannot be drawn yet. Averaging its stops keeps the artwork
-    /// visible and roughly right, and the loss is reported.
+    /// A gradient now arrives as a gradient, with its stops where the file put
+    /// them — not as the average colour it used to be flattened to.
     #[test]
-    fn a_gradient_fill_becomes_its_average_colour_and_is_reported() {
+    fn a_linear_gradient_fill_arrives_as_a_gradient() {
         const GRADIENT: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
 <DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
   <timelines><DOMTimeline name="Scene 1"><layers>
@@ -2288,7 +2409,9 @@ mod tests {
         <fills>
           <FillStyle index="1">
             <LinearGradient>
+              <matrix><Matrix a="0.1" d="0.1" tx="50" ty="50"/></matrix>
               <GradientEntry color="#000000" ratio="0"/>
+              <GradientEntry color="#FF0000" ratio="0.25"/>
               <GradientEntry color="#FFFFFF" ratio="1"/>
             </LinearGradient>
           </FillStyle>
@@ -2299,17 +2422,112 @@ mod tests {
   </layers></DOMTimeline></timelines>
 </DOMDocument>"##;
 
-        let (scene, report) = build(GRADIENT, &[]).unwrap();
-        let fill = shapes_of(&scene)[0].fill.expect("filled").color;
-        assert_eq!(
-            fill.to_rgba8().to_u8_array()[0],
-            127,
-            "black to white averages to mid grey"
+        let (scene, _) = build(GRADIENT, &[]).unwrap();
+        let shapes = shapes_of(&scene);
+        let fill = shapes[0].fill.as_ref().expect("filled");
+        let g = fill.paint.gradient().expect("it should be a gradient");
+
+        assert_eq!(g.kind, GradientKind::Linear);
+        assert_eq!(g.stops().len(), 3);
+        // **The ratios are the point.** These were thrown away entirely while
+        // gradients were averaged, and a file whose middle stop sits at a
+        // quarter draws nothing like one where it sits halfway.
+        assert!((g.stops()[1].offset - 0.25).abs() < 1e-9, "{:?}", g.stops());
+        assert_eq!(g.stops()[1].color.to_rgba8().to_u8_array()[..3], [255, 0, 0]);
+
+        // The matrix maps Flash's 1638.4-pixel gradient box, so a scale of 0.1
+        // puts the ramp's end 81.92 pixels from its centre at (50, 50).
+        let h = g.handles();
+        assert!((h.center.x - 50.0).abs() < 1e-6, "centre {:?}", h.center);
+        assert!(
+            (h.end.x - (50.0 + 81.92)).abs() < 1e-6,
+            "the gradient box should be 1638.4px wide, got end {:?}",
+            h.end
+        );
+    }
+
+    /// The spread mode and a radial gradient's focal point both come across.
+    #[test]
+    fn a_radial_gradient_keeps_its_spread_and_focal_point() {
+        const GRADIENT: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
+  <timelines><DOMTimeline name="Scene 1"><layers>
+    <DOMLayer name="Art"><frames><DOMFrame index="0" duration="1"><elements>
+      <DOMShape>
+        <fills>
+          <FillStyle index="1">
+            <RadialGradient spreadMethod="reflect" focalPointRatio="0.5">
+              <matrix><Matrix a="0.1" d="0.1"/></matrix>
+              <GradientEntry color="#FF0000" ratio="0"/>
+              <GradientEntry color="#0000FF" ratio="1"/>
+            </RadialGradient>
+          </FillStyle>
+        </fills>
+        <edges><Edge fillStyle1="1" edges="!0 0|2000 0|2000 2000|0 2000|0 0"/></edges>
+      </DOMShape>
+    </elements></DOMFrame></frames></DOMLayer>
+  </layers></DOMTimeline></timelines>
+</DOMDocument>"##;
+
+        let (scene, _) = build(GRADIENT, &[]).unwrap();
+        let shapes = shapes_of(&scene);
+        let fill = shapes[0].fill.as_ref().expect("filled");
+        let g = fill.paint.gradient().expect("it should be a gradient");
+
+        assert_eq!(g.kind, GradientKind::Radial);
+        assert_eq!(g.spread, GradientSpread::Reflect);
+        assert!((g.focal - 0.5).abs() < 1e-9, "focal was {}", g.focal);
+    }
+
+    /// **The gradient's matrix must not place an instance.** It is the bug the
+    /// `Matrix` arm's comment describes, from the other side: now that a
+    /// gradient claims its own matrix, an instance that follows one must still
+    /// get its own rather than the gradient's fraction-of-a-percent scale.
+    #[test]
+    fn a_gradients_matrix_is_not_taken_as_a_placement() {
+        const MIXED: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
+  <symbols><Include href="hero.xml"/></symbols>
+  <timelines><DOMTimeline name="Scene 1"><layers>
+    <DOMLayer name="Art"><frames><DOMFrame index="0" duration="1"><elements>
+      <DOMShape>
+        <fills>
+          <FillStyle index="1">
+            <LinearGradient>
+              <matrix><Matrix a="0.05" d="0.05" tx="10" ty="10"/></matrix>
+              <GradientEntry color="#000000" ratio="0"/>
+              <GradientEntry color="#FFFFFF" ratio="1"/>
+            </LinearGradient>
+          </FillStyle>
+        </fills>
+        <edges><Edge fillStyle1="1" edges="!0 0|2000 0|2000 2000|0 2000|0 0"/></edges>
+      </DOMShape>
+      <DOMSymbolInstance libraryItemName="hero">
+        <matrix><Matrix a="1" d="1" tx="200" ty="100"/></matrix>
+      </DOMSymbolInstance>
+    </elements></DOMFrame></frames></DOMLayer>
+  </layers></DOMTimeline></timelines>
+</DOMDocument>"##;
+
+        let (scene, _) = build(
+            MIXED,
+            &[("LIBRARY/hero.xml".to_string(), HERO_SYMBOL.to_string())],
+        )
+        .unwrap();
+        let layers = scene.layers();
+        let objects = layers.iter().next().expect("one layer").objects_at(0);
+        let instance = objects
+            .iter()
+            .find(|o| matches!(o.kind, buzz_scene::ObjectKind::Instance(_)))
+            .expect("the instance should be placed");
+        let c = instance.transform.as_coeffs();
+        assert!(
+            (c[4] - 200.0).abs() < 1e-9 && (c[5] - 100.0).abs() < 1e-9,
+            "the instance took the wrong matrix: {c:?}"
         );
         assert!(
-            report.unsupported.iter().any(|u| u.contains("gradient")),
-            "the approximation must be reported: {:?}",
-            report.unsupported
+            (c[0] - 1.0).abs() < 1e-9,
+            "the instance collapsed to the gradient's scale: {c:?}"
         );
     }
 
@@ -2337,13 +2555,13 @@ mod tests {
         assert_eq!(shapes.len(), 2);
 
         assert_eq!(
-            shapes[0].fill.unwrap().color.to_rgba8().to_u8_array(),
+            shapes[0].fill.as_ref().unwrap().color().to_rgba8().to_u8_array(),
             [0x11, 0x22, 0x33, 0xFF]
         );
         // The second shape declares no styles, so it falls back to the visible
         // default rather than inheriting the first shape's blue.
         assert_ne!(
-            shapes[1].fill.unwrap().color.to_rgba8().to_u8_array(),
+            shapes[1].fill.as_ref().unwrap().color().to_rgba8().to_u8_array(),
             [0x11, 0x22, 0x33, 0xFF],
             "the second shape must not inherit the first shape's fill table"
         );

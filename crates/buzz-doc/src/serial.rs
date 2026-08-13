@@ -25,9 +25,9 @@ use std::sync::Arc;
 
 use buzz_geom::{Affine, BezPath, FillMode, Size};
 use buzz_scene::{
-    ColorTransform, FillSpec, Layer, LayerHeight, LayerId, LayerKind, LoopMode, Object, ObjectId,
-    ObjectKind, PaintBlend, Scene, ShapeData, StageProperties, StrokeSpec, Symbol, SymbolId,
-    SymbolInstance, SymbolKind, Tween,
+    ColorTransform, FillSpec, Gradient, GradientKind, GradientSpread, Layer, LayerHeight, LayerId,
+    LayerKind, LoopMode, Object, ObjectId, ObjectKind, Paint, PaintBlend, Scene, ShapeData,
+    StageProperties, StrokeSpec, Symbol, SymbolId, SymbolInstance, SymbolKind, Tween,
 };
 use peniko::Color;
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,14 @@ use serde::{Deserialize, Serialize};
 /// * **13** — named swatches, in folders: the document's palette.
 /// * **14** — a transformation point per object.
 /// * **15** — the inverse mask: a layer kind that hides what it covers.
+/// * **16** — gradients: a fill or a stroke can be a ramp rather than a colour.
+///
+/// Version 16 makes `color` optional on a fill and a stroke, and adds a
+/// `gradient` beside it, of which exactly one is ever written. Older files
+/// always carry `color` and never carry `gradient`, which is exactly what a
+/// solid paint deserialises to — so every one of them still loads, and a
+/// document that uses no gradient is written byte-identically to what version
+/// 15 wrote.
 ///
 /// Version 15 is a new *value*, not a new field: a document that has no
 /// inverse mask is byte-identical to the one version 14 wrote. The bump is
@@ -56,7 +64,7 @@ use serde::{Deserialize, Serialize};
 /// keyframe at frame 0, which is exactly what it meant; version 2 simply has
 /// no library and no tweens, and both default to empty. Keeping those paths is
 /// cheap and it exercises the version check for real rather than in theory.
-pub const FORMAT_VERSION: u32 = 15;
+pub const FORMAT_VERSION: u32 = 16;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -843,19 +851,190 @@ pub struct ColorTransformDto {
     pub add: [f32; 4],
 }
 
+/// One colour at one place along a gradient's ramp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GradientStopDto {
+    pub offset: f64,
+    /// `#RRGGBB` or `#RRGGBBAA`, as every other colour in this format.
+    pub color: String,
+}
+
+/// A gradient, in the unit space the model defines, plus where it goes.
+///
+/// The transform is stored as the six affine coefficients rather than as a
+/// centre, an angle and a size. It is what the model holds, what SWF and XFL
+/// hold, and what Animate's Gradient Transform tool edits — decomposing it into
+/// named parts on the way out and recomposing on the way in would lose a skewed
+/// gradient and gain nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GradientDto {
+    /// "linear" or "radial".
+    pub kind: String,
+    pub stops: Vec<GradientStopDto>,
+    /// Unit space to the object's own space: `[a, b, c, d, e, f]`.
+    pub transform: [f64; 6],
+    /// "pad", "reflect" or "repeat". Absent means "pad", which is Animate's
+    /// default and the only one that cannot show a seam.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread: Option<String>,
+    /// Radial only: where the hot spot sits along the unit x axis.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub focal: f64,
+}
+
+/// A fill. **Exactly one of `color` and `gradient` is written.**
+///
+/// `color` is an `Option` so that a gradient fill does not also carry a flat
+/// colour that means nothing and could disagree with the ramp. Older files
+/// always have it, so they still load: a missing `gradient` and a present
+/// `color` is precisely what every file before version 16 contains.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FillDto {
-    pub color: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Version 16.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gradient: Option<GradientDto>,
     #[serde(default)]
     pub rule: FillMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrokeDto {
-    pub color: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Version 16.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gradient: Option<GradientDto>,
     pub width: f64,
     #[serde(default)]
     pub hairline: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Paint <-> DTO
+// ---------------------------------------------------------------------------
+
+fn gradient_to_dto(g: &Gradient) -> GradientDto {
+    GradientDto {
+        kind: match g.kind {
+            GradientKind::Linear => "linear",
+            GradientKind::Radial => "radial",
+        }
+        .to_string(),
+        stops: g
+            .stops()
+            .iter()
+            .map(|s| GradientStopDto {
+                offset: s.offset,
+                color: color_to_hex(s.color),
+            })
+            .collect(),
+        transform: g.transform.as_coeffs(),
+        spread: match g.spread {
+            GradientSpread::Pad => None,
+            GradientSpread::Reflect => Some("reflect".to_string()),
+            GradientSpread::Repeat => Some("repeat".to_string()),
+        },
+        focal: g.focal,
+    }
+}
+
+fn gradient_from_dto(dto: &GradientDto) -> Result<Gradient, SerialError> {
+    let kind = match dto.kind.as_str() {
+        "linear" => GradientKind::Linear,
+        "radial" => GradientKind::Radial,
+        other => {
+            return Err(SerialError::Unsupported(format!(
+                "unknown gradient kind {other:?}"
+            )));
+        }
+    };
+    let spread = match dto.spread.as_deref() {
+        None | Some("pad") => GradientSpread::Pad,
+        Some("reflect") => GradientSpread::Reflect,
+        Some("repeat") => GradientSpread::Repeat,
+        Some(other) => {
+            return Err(SerialError::Unsupported(format!(
+                "unknown gradient spread {other:?}"
+            )));
+        }
+    };
+    let stops = dto
+        .stops
+        .iter()
+        .map(|s| {
+            Ok(buzz_scene::GradientStop {
+                offset: s.offset,
+                color: color_from_hex(&s.color)?,
+            })
+        })
+        .collect::<Result<Vec<_>, SerialError>>()?;
+
+    let mut g = Gradient::new(kind, stops);
+    g.transform = Affine::new(dto.transform);
+    g.spread = spread;
+    g.focal = dto.focal;
+    Ok(g)
+}
+
+/// Write a paint out as the pair of optional fields the DTOs carry.
+fn paint_to_dto(paint: &Paint) -> (Option<String>, Option<GradientDto>) {
+    match paint {
+        Paint::Solid(c) => (Some(color_to_hex(*c)), None),
+        Paint::Gradient(g) => (None, Some(gradient_to_dto(g))),
+    }
+}
+
+/// Read a paint back.
+///
+/// A file with neither field is not an error: it is a shape whose colour is
+/// missing, and refusing to open the whole document over one absent fill would
+/// lose everything else in it. Black is what an unpainted fill has always
+/// meant.
+fn paint_from_dto(
+    color: Option<&String>,
+    gradient: Option<&GradientDto>,
+) -> Result<Paint, SerialError> {
+    match (gradient, color) {
+        (Some(g), _) => Ok(Paint::Gradient(std::sync::Arc::new(gradient_from_dto(g)?))),
+        (None, Some(c)) => Ok(Paint::Solid(color_from_hex(c)?)),
+        (None, None) => Ok(Paint::Solid(Color::BLACK)),
+    }
+}
+
+fn fill_to_dto(f: &FillSpec) -> FillDto {
+    let (color, gradient) = paint_to_dto(&f.paint);
+    FillDto {
+        color,
+        gradient,
+        rule: f.rule,
+    }
+}
+
+fn fill_from_dto(f: &FillDto) -> Result<FillSpec, SerialError> {
+    Ok(FillSpec {
+        paint: paint_from_dto(f.color.as_ref(), f.gradient.as_ref())?,
+        rule: f.rule,
+    })
+}
+
+fn stroke_to_dto(s: &StrokeSpec) -> StrokeDto {
+    let (color, gradient) = paint_to_dto(&s.paint);
+    StrokeDto {
+        color,
+        gradient,
+        width: s.width,
+        hairline: s.hairline,
+    }
+}
+
+fn stroke_from_dto(s: &StrokeDto) -> Result<StrokeSpec, SerialError> {
+    Ok(StrokeSpec {
+        paint: paint_from_dto(s.color.as_ref(), s.gradient.as_ref())?,
+        width: s.width,
+        hairline: s.hairline,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1288,15 +1467,8 @@ impl ObjectDto {
         let kind = match &object.kind {
             ObjectKind::Shape(s) => ObjectKindDto::Shape {
                 path: s.path.to_svg(),
-                fill: s.fill.map(|f| FillDto {
-                    color: color_to_hex(f.color),
-                    rule: f.rule,
-                }),
-                stroke: s.stroke.map(|s| StrokeDto {
-                    color: color_to_hex(s.color),
-                    width: s.width,
-                    hairline: s.hairline,
-                }),
+                fill: s.fill.as_ref().map(fill_to_dto),
+                stroke: s.stroke.as_ref().map(stroke_to_dto),
                 blend: s.blend,
             },
             ObjectKind::Group(children) => ObjectKindDto::Group {
@@ -1350,15 +1522,8 @@ impl ObjectDto {
             },
             ObjectKind::Warp(warp) => ObjectKindDto::Warp {
                 path: warp.shape.path.to_svg(),
-                fill: warp.shape.fill.map(|f| FillDto {
-                    color: color_to_hex(f.color),
-                    rule: f.rule,
-                }),
-                stroke: warp.shape.stroke.map(|s| StrokeDto {
-                    color: color_to_hex(s.color),
-                    width: s.width,
-                    hairline: s.hairline,
-                }),
+                fill: warp.shape.fill.as_ref().map(fill_to_dto),
+                stroke: warp.shape.stroke.as_ref().map(stroke_to_dto),
                 blend: warp.shape.blend,
                 handles: warp
                     .handles
@@ -1411,25 +1576,8 @@ impl ObjectDto {
                     BezPath::from_svg(path).map_err(|e| SerialError::BadPath(e.to_string()))?;
                 ObjectKind::Shape(ShapeData {
                     path: parsed,
-                    fill: fill
-                        .as_ref()
-                        .map(|f| {
-                            Ok::<_, SerialError>(FillSpec {
-                                color: color_from_hex(&f.color)?,
-                                rule: f.rule,
-                            })
-                        })
-                        .transpose()?,
-                    stroke: stroke
-                        .as_ref()
-                        .map(|s| {
-                            Ok::<_, SerialError>(StrokeSpec {
-                                color: color_from_hex(&s.color)?,
-                                width: s.width,
-                                hairline: s.hairline,
-                            })
-                        })
-                        .transpose()?,
+                    fill: fill.as_ref().map(fill_from_dto).transpose()?,
+                    stroke: stroke.as_ref().map(stroke_from_dto).transpose()?,
                     blend: *blend,
                 })
             }
@@ -1497,25 +1645,8 @@ impl ObjectDto {
                     BezPath::from_svg(path).map_err(|e| SerialError::BadPath(e.to_string()))?;
                 let shape = ShapeData {
                     path: parsed,
-                    fill: fill
-                        .as_ref()
-                        .map(|f| {
-                            Ok::<_, SerialError>(FillSpec {
-                                color: color_from_hex(&f.color)?,
-                                rule: f.rule,
-                            })
-                        })
-                        .transpose()?,
-                    stroke: stroke
-                        .as_ref()
-                        .map(|s| {
-                            Ok::<_, SerialError>(StrokeSpec {
-                                color: color_from_hex(&s.color)?,
-                                width: s.width,
-                                hairline: s.hairline,
-                            })
-                        })
-                        .transpose()?,
+                    fill: fill.as_ref().map(fill_from_dto).transpose()?,
+                    stroke: stroke.as_ref().map(stroke_from_dto).transpose()?,
                     blend: *blend,
                 };
                 let mut warp = buzz_scene::WarpData::new(shape);
@@ -1776,6 +1907,146 @@ mod tests {
         let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
         let (_, object) = back.find_object(id).expect("the object");
         assert_eq!(object.pivot, Some(buzz_geom::Point::new(0.0, 10.0)));
+    }
+
+    /// Every part of a gradient comes back: the stops with their offsets, the
+    /// placement matrix, the spread and the focal point.
+    #[test]
+    fn a_gradient_survives_a_round_trip() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+
+        let mut gradient = buzz_scene::Gradient::new(
+            buzz_scene::GradientKind::Radial,
+            vec![
+                buzz_scene::GradientStop::new(0.0, Color::from_rgb8(0xFF, 0x00, 0x00)),
+                buzz_scene::GradientStop::new(0.3, Color::from_rgba8(0x00, 0xFF, 0x00, 0x80)),
+                buzz_scene::GradientStop::new(1.0, Color::from_rgb8(0x00, 0x00, 0xFF)),
+            ],
+        );
+        gradient.transform = Affine::new([2.0, 0.5, -0.25, 3.0, 40.0, 60.0]);
+        gradient.spread = buzz_scene::GradientSpread::Reflect;
+        gradient.focal = -0.4;
+
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData {
+                    path: kurbo::Rect::new(0.0, 0.0, 80.0, 20.0).to_path(1e-9),
+                    fill: Some(buzz_scene::FillSpec::gradient(gradient.clone())),
+                    stroke: None,
+                    blend: PaintBlend::Normal,
+                },
+            )
+            .expect("a shape");
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        let (_, object) = back.find_object(id).expect("the object");
+        let ObjectKind::Shape(shape) = &object.kind else {
+            panic!("expected a shape")
+        };
+        let read = shape
+            .fill
+            .as_ref()
+            .expect("filled")
+            .paint
+            .gradient()
+            .expect("it should still be a gradient");
+
+        assert_eq!(read, &gradient);
+    }
+
+    /// A gradient fill writes **no** `color`, and a solid fill writes no
+    /// `gradient`. Writing both would put two answers in the file for one
+    /// question, and the day they disagreed the document would be wrong in a
+    /// way nothing could adjudicate.
+    #[test]
+    fn a_fill_writes_a_colour_or_a_gradient_and_never_both() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let square = kurbo::Rect::new(0.0, 0.0, 10.0, 10.0);
+        scene
+            .add_shape(
+                layer,
+                ShapeData::filled(square.to_path(1e-9), Color::WHITE),
+            )
+            .expect("a shape");
+
+        let solid = serde_json::to_string(&DocumentDto::from_scene(&scene)).unwrap();
+        assert!(
+            !solid.contains("gradient"),
+            "a document with no gradient should not mention one: {solid}"
+        );
+
+        let mut with_ramp = Scene::empty();
+        let layer = with_ramp.add_layer("Art", LayerKind::Normal);
+        with_ramp
+            .add_shape(
+                layer,
+                ShapeData {
+                    path: square.to_path(1e-9),
+                    fill: Some(buzz_scene::FillSpec::gradient(
+                        buzz_scene::Gradient::linear(Color::BLACK, Color::WHITE, square),
+                    )),
+                    stroke: None,
+                    blend: PaintBlend::Normal,
+                },
+            )
+            .expect("a shape");
+
+        let dto = DocumentDto::from_scene(&with_ramp);
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains("gradient"), "{json}");
+
+        // The fill object itself carries the gradient and no colour.
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let fill = find_fill(&value).expect("a fill in the document");
+        assert!(fill.get("gradient").is_some(), "{fill:?}");
+        assert!(
+            fill.get("color").is_none(),
+            "a gradient fill must not also carry a flat colour: {fill:?}"
+        );
+    }
+
+    /// Walk the serialised document for the first `fill` object.
+    fn find_fill(v: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        match v {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Object(fill)) = map.get("fill") {
+                    return Some(fill);
+                }
+                map.values().find_map(find_fill)
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(find_fill),
+            _ => None,
+        }
+    }
+
+    /// **Every file written before version 16 still loads.** They carry `color`
+    /// and no `gradient`, which is exactly what a solid paint reads back as.
+    #[test]
+    fn a_pre_gradient_file_still_loads_its_fills() {
+        let older = serde_json::json!({
+            "color": "#FF8800",
+            "rule": "NonZero",
+        });
+        let dto: FillDto = serde_json::from_value(older).expect("version 15's shape still parses");
+        let fill = fill_from_dto(&dto).expect("it should read");
+        assert_eq!(
+            fill.color().to_rgba8().to_u8_array(),
+            [0xFF, 0x88, 0x00, 0xFF]
+        );
+        assert!(!fill.paint.is_gradient());
+    }
+
+    /// A fill with neither field is a damaged file, not a reason to refuse the
+    /// whole document — losing every other shape over one missing colour would
+    /// be the worse outcome.
+    #[test]
+    fn a_fill_with_no_paint_at_all_reads_as_black() {
+        let dto: FillDto = serde_json::from_value(serde_json::json!({})).expect("parses");
+        let fill = fill_from_dto(&dto).expect("it should read");
+        assert_eq!(fill.color().to_rgba8().to_u8_array(), [0, 0, 0, 255]);
     }
 
     /// An object nobody has touched writes no point at all, so a document that

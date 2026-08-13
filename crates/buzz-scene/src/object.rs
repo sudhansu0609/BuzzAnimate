@@ -10,30 +10,143 @@ use buzz_geom::{Affine, BezPath, FillMode, Point, Rect, Shape as _};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
+use crate::gradient::Gradient;
+
 /// Stable identity for an object, preserved across edits and undo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObjectId(pub u64);
 
+/// What a fill or a stroke is painted with.
+///
+/// # Why the gradient is behind an `Arc`
+///
+/// A gradient carries a list of stops, so it is not `Copy`, and a fill is read
+/// on every shape of every frame. Sharing it means a `Paint` is a tag and a
+/// pointer however many stops it has, and — because artwork is immutable once
+/// shared (see the module header) — copying a shape shares its gradient rather
+/// than duplicating it. Editing one goes through [`Arc::make_mut`], exactly as
+/// editing an object does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Paint {
+    Solid(Color),
+    Gradient(Arc<Gradient>),
+}
+
+impl Paint {
+    /// One colour standing in for this paint.
+    ///
+    /// Everything that can only work in one colour goes through here: the
+    /// lighting model, outline view, the Swatches panel, the colour wells. For
+    /// a gradient it is the ramp's weighted mean — see
+    /// [`Gradient::average_color`].
+    pub fn color(&self) -> Color {
+        match self {
+            Self::Solid(c) => *c,
+            Self::Gradient(g) => g.average_color(),
+        }
+    }
+
+    pub fn gradient(&self) -> Option<&Gradient> {
+        match self {
+            Self::Solid(_) => None,
+            Self::Gradient(g) => Some(g),
+        }
+    }
+
+    pub fn is_gradient(&self) -> bool {
+        matches!(self, Self::Gradient(_))
+    }
+
+    /// The same paint with every colour in it passed through `f`.
+    ///
+    /// A colour effect, an Adjust Color filter and an onion-skin ghost are all
+    /// defined as functions of one colour; this is how they reach a gradient,
+    /// which is a list of them.
+    pub fn map_colors(&self, f: impl Fn(Color) -> Color) -> Self {
+        match self {
+            Self::Solid(c) => Self::Solid(f(*c)),
+            Self::Gradient(g) => Self::Gradient(Arc::new(g.map_colors(f))),
+        }
+    }
+
+    /// The same paint carried through a transform, so a gradient stays where it
+    /// was painted when the artwork moves.
+    ///
+    /// A solid colour is unaffected, which is why this can be applied blindly.
+    pub fn transformed(&self, t: Affine) -> Self {
+        match self {
+            Self::Solid(c) => Self::Solid(*c),
+            Self::Gradient(g) => Self::Gradient(Arc::new(g.transformed(t))),
+        }
+    }
+
+    /// Interpolate towards `other`, for a tween.
+    pub fn lerp(&self, other: &Self, t: f64) -> Self {
+        match (self, other) {
+            (Self::Solid(a), Self::Solid(b)) => {
+                Self::Solid(crate::gradient::lerp_color(*a, *b, t))
+            }
+            (Self::Gradient(a), Self::Gradient(b)) => Self::Gradient(Arc::new(a.lerp(b, t))),
+            // A solid tweening to a gradient, or the reverse. Interpolating the
+            // flat colour towards the gradient's average would move the colour
+            // and then jump to a ramp at the far end, which reads as a glitch
+            // rather than as a transition. It switches instead, at the halfway
+            // point, the way the spread mode does.
+            (a, b) => {
+                if t < 0.5 {
+                    a.clone()
+                } else {
+                    b.clone()
+                }
+            }
+        }
+    }
+}
+
+impl From<Color> for Paint {
+    fn from(c: Color) -> Self {
+        Self::Solid(c)
+    }
+}
+
+impl From<Gradient> for Paint {
+    fn from(g: Gradient) -> Self {
+        Self::Gradient(Arc::new(g))
+    }
+}
+
 /// How a shape is painted inside.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FillSpec {
-    pub color: Color,
+    pub paint: Paint,
     pub rule: FillMode,
 }
 
 impl FillSpec {
     pub fn solid(color: Color) -> Self {
         Self {
-            color,
+            paint: Paint::Solid(color),
             rule: FillMode::NonZero,
         }
+    }
+
+    pub fn gradient(gradient: Gradient) -> Self {
+        Self {
+            paint: Paint::Gradient(Arc::new(gradient)),
+            rule: FillMode::NonZero,
+        }
+    }
+
+    /// The one colour this fill stands for. See [`Paint::color`].
+    pub fn color(&self) -> Color {
+        self.paint.color()
     }
 }
 
 /// How a shape's outline is painted.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StrokeSpec {
-    pub color: Color,
+    pub paint: Paint,
     /// Width in document units.
     pub width: f64,
     /// Animate's "hairline": always one pixel regardless of zoom.
@@ -43,7 +156,15 @@ pub struct StrokeSpec {
 impl StrokeSpec {
     pub fn new(color: Color, width: f64) -> Self {
         Self {
-            color,
+            paint: Paint::Solid(color),
+            width,
+            hairline: false,
+        }
+    }
+
+    pub fn gradient(gradient: Gradient, width: f64) -> Self {
+        Self {
+            paint: Paint::Gradient(Arc::new(gradient)),
             width,
             hairline: false,
         }
@@ -51,10 +172,15 @@ impl StrokeSpec {
 
     pub fn hairline(color: Color) -> Self {
         Self {
-            color,
+            paint: Paint::Solid(color),
             width: 0.0,
             hairline: true,
         }
+    }
+
+    /// The one colour this stroke stands for. See [`Paint::color`].
+    pub fn color(&self) -> Color {
+        self.paint.color()
     }
 }
 

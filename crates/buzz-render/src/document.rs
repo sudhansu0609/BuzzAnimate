@@ -693,6 +693,53 @@ impl DrawCtx<'_> {
             None => c,
         }
     }
+
+    /// The same as [`Self::colour`], for a paint that may be a gradient.
+    ///
+    /// A colour effect, a filter's Adjust Color and the ghost alpha are all
+    /// functions of one colour, so a gradient takes them stop by stop. That is
+    /// what makes a tinted instance of a gradient-filled symbol tint the whole
+    /// ramp rather than flatten it.
+    fn paint(&self, paint: &buzz_scene::Paint) -> buzz_scene::Paint {
+        paint.map_colors(|c| self.colour(c))
+    }
+
+    /// The projection expressed as an affine, for placing a brush.
+    ///
+    /// A brush transform is a matrix; a tilted camera is a projection, and the
+    /// two are only the same thing when there is no tilt. Where the projection
+    /// *is* affine — which is every document that has not tilted its camera —
+    /// this is exact and free.
+    ///
+    /// Where it is not, an affine is fitted to three corners of the shape's own
+    /// bounding box mapped through the real projection. That is exact at those
+    /// three points and close between them, which for a ramp across one shape
+    /// is not a visible difference; the alternative is dropping to a flat
+    /// colour, which is. Recorded as a deviation in PROGRESS.md §7.
+    fn brush_projection(&self, bounds: buzz_geom::Rect) -> Affine {
+        if let Some(a) = self.projection.as_affine() {
+            return a;
+        }
+        let (w, h) = (bounds.width(), bounds.height());
+        // A shape with no extent in one axis gives no second point to fit
+        // against, and dividing by it would put NaN into the matrix.
+        if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
+            return Affine::IDENTITY;
+        }
+        let o = bounds.origin();
+        let corner = |p: buzz_geom::Point| self.projection.map_point(p);
+        let (Some(p0), Some(px), Some(py)) = (
+            corner(o),
+            corner(buzz_geom::Point::new(o.x + w, o.y)),
+            corner(buzz_geom::Point::new(o.x, o.y + h)),
+        ) else {
+            // Behind the camera. Nothing will be drawn anyway.
+            return Affine::IDENTITY;
+        };
+        let cx = (px - p0) / w;
+        let cy = (py - p0) / h;
+        Affine::new([cx.x, cx.y, cy.x, cy.y, p0.x, p0.y])
+    }
 }
 
 /// Draw one object.
@@ -988,15 +1035,22 @@ fn draw_shape(
         .lighting
         .map(|(stage_height, depth)| ctx.scene.lights().illuminate(here, depth, stage_height));
 
-    if let Some(fill) = shape.fill {
+    // Where a gradient's unit space lands. The gradient is stored in the
+    // shape's own coordinates, so `doc` puts it in the document, and the
+    // projection puts it on the frame — the same two steps the path took above.
+    let brush_to_doc = ctx.brush_projection(placed.bounding_box()) * doc;
+
+    if let Some(fill) = &shape.fill {
         // The light reaches the fill first: this is the tint that makes a warm
         // key look warm and a blue sky fill look cold, before any geometry is
-        // drawn on top of it.
+        // drawn on top of it. A gradient takes it stop by stop, so a lit ramp
+        // stays a ramp.
         let base = match &light {
-            Some(light) => light.apply(fill.color),
-            None => fill.color,
+            Some(light) => fill.paint.map_colors(|c| light.apply(c)),
+            None => fill.paint.clone(),
         };
-        let color = ctx.colour(base);
+        let paint = ctx.paint(&base);
+        let color = paint.color();
 
         // A blur replaces the fill rather than joining it: the artwork *is*
         // the soft stack of copies, and drawing the sharp shape as well would
@@ -1012,7 +1066,7 @@ fn draw_shape(
                 builder.tolerance(),
             );
             crate::filters::draw_ops(builder, &ops, &ctx.projection.pre_affine(doc), 1.0);
-            if let Some(stroke) = shape.stroke {
+            if let Some(stroke) = &shape.stroke {
                 // A stroke under a blur is softened as its own outline, so a
                 // blurred drawing keeps its lines instead of losing them.
                 let outline = buzz_geom::outline_stroke(
@@ -1021,8 +1075,8 @@ fn draw_shape(
                     builder.tolerance(),
                 );
                 let colour = ctx.colour(match &light {
-                    Some(light) => light.apply(stroke.color),
-                    None => stroke.color,
+                    Some(light) => light.apply(stroke.color()),
+                    None => stroke.color(),
                 });
                 let ops = buzz_fx::blur_ops(
                     &outline,
@@ -1039,9 +1093,9 @@ fn draw_shape(
         // isolation group, opened by `draw_frame`, is what keeps that sum away
         // from the stage behind it.
         if shape.blend.is_additive() {
-            builder.fill_shape_additive(&path, color);
+            builder.fill_shape_paint_additive(&path, &paint, brush_to_doc);
         } else {
-            builder.fill_shape(&path, color);
+            builder.fill_shape_paint(&path, &paint, brush_to_doc);
         }
 
         // Then the modelling: the terminator away from the key light, and the
@@ -1072,32 +1126,39 @@ fn draw_shape(
                 modelling,
             );
 
+            // The crescents take the fill's paint stop by stop as well, so the
+            // shaded side of a gradient-filled shape is that gradient darkened
+            // rather than one flat colour laid over it.
             if let Some(shade) = &geometry.shade {
-                let shaded = light.apply_shaded(fill.color);
+                let shaded = ctx.paint(&fill.paint.map_colors(|c| light.apply_shaded(c)));
                 let drawn = ctx.project(shade, builder.tolerance());
-                builder.fill_shape(&drawn, ctx.colour(shaded));
+                builder.fill_shape_paint(&drawn, &shaded, brush_to_doc);
             }
             if let Some(highlight) = &geometry.highlight {
-                let glint = light.highlight(fill.color, key.color, modelling);
+                let glint =
+                    ctx.paint(&fill.paint.map_colors(|c| light.highlight(c, key.color, modelling)));
                 let drawn = ctx.project(highlight, builder.tolerance());
-                builder.fill_shape(&drawn, ctx.colour(glint));
+                builder.fill_shape_paint(&drawn, &glint, brush_to_doc);
             }
         }
     }
 
-    if let Some(stroke) = shape.stroke {
+    if let Some(stroke) = &shape.stroke {
         // A stroke is lit but never shaded: a terminator across a one-pixel
         // line is noise, and an outline that changed width with the light
         // would read as a drawing mistake.
         let base = match &light {
-            Some(light) => light.apply(stroke.color),
-            None => stroke.color,
+            Some(light) => stroke.paint.map_colors(|c| light.apply(c)),
+            None => stroke.paint.clone(),
         };
-        let color = ctx.colour(base);
+        let paint = ctx.paint(&base);
         if stroke.hairline {
-            builder.stroke_hairline(&path, color, 1.0);
+            // A hairline is one pixel wide at every zoom, so its width is set
+            // in screen space rather than document space and it cannot go
+            // through the paint path. One pixel of a ramp is one colour anyway.
+            builder.stroke_hairline(&path, paint.color(), 1.0);
         } else {
-            builder.stroke_shape(&path, color, stroke.width);
+            builder.stroke_shape_paint(&path, &paint, stroke.width, brush_to_doc);
         }
     }
 }

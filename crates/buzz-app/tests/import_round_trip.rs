@@ -472,14 +472,14 @@ fn pdf_artwork_imports_merges_and_round_trips() {
     let filled = objects
         .iter()
         .filter_map(|o| match &o.kind {
-            buzz_scene::ObjectKind::Shape(s) => s.fill.map(|f| f.color),
+            buzz_scene::ObjectKind::Shape(s) => s.fill.as_ref().map(|f| f.color()),
             _ => None,
         })
         .find(|c| c.to_rgba8().to_u8_array()[..3] == [255, 0, 0]);
     assert!(filled.is_some(), "the red fill survived the merge");
 
     let stroked = objects.iter().any(|o| match &o.kind {
-        buzz_scene::ObjectKind::Shape(s) => s.stroke.is_some_and(|st| st.width == 3.0),
+        buzz_scene::ObjectKind::Shape(s) => s.stroke.as_ref().is_some_and(|st| st.width == 3.0),
         _ => false,
     });
     assert!(stroked, "the 3-unit stroke survived the merge");

@@ -1,6 +1,6 @@
 # BuzzAnimate — Progress, Checkpoints & Implementation Plan
 
-**Last updated:** 2026-08-13
+**Last updated:** 2026-08-14
 **Current status:** Phases 0–5 complete (gaps in §7), plus fluid, pattern and
 art brushes. All three importers — `.fla`/`.xfl`, `.swf`, `.pdf`/`.ai` — read,
 merge into an open document, and report what they could not bring across.
@@ -2522,6 +2522,97 @@ a type per layer with a line of explanation on each, and masking stays
 positional — set one layer to Mask or Inverse Mask, the ones under it to
 Masked, and the stack does the rest.
 
+### ✅ Gradients — §7 item 8, the most-cited gap, closed
+
+Every fill and every stroke in the program was one colour. Now a fill or a
+stroke is a **paint**: either a colour or a ramp.
+
+**The model** (`buzz-scene::gradient`)
+- [x] `Paint::Solid` or `Paint::Gradient`, on `FillSpec` and `StrokeSpec` alike
+- [x] Linear and radial, with stops, a spread mode (Animate's Extend, Reflect
+      and Repeat) and a radial focal point
+- [x] **A unit gradient plus a matrix, not two points on the stage.** The ramp
+      runs from `x = −1` to `x = 1` in its own space and a transform puts it
+      where it belongs. That is what SWF and XFL both store, because it is what
+      Flash compiled; it is what Animate's Gradient Transform tool edits —
+      three grips *are* a matrix; and it makes a squashed radial gradient free
+      rather than a second radius and a rotation bolted on.
+- [x] `Paint::color()` — one colour standing in for a ramp, weighted by how
+      much of the ramp each span occupies, so a gradient that is red for nine
+      tenths of its length averages to red rather than to the midpoint. This is
+      what the lighting model, outline view and the colour wells read.
+- [x] Degenerate input is **repaired, not refused**: no stops, one stop, forty
+      stops, coincident stops and a NaN offset all produce something drawable.
+      A gradient that renders as nothing is a silently invisible shape.
+
+**Bug found by its own test — `f64::clamp` propagates NaN.** `offset.clamp(0.0,
+1.0)` on a NaN leaves the NaN, so a damaged file's stop offset passed straight
+into the model, where `partition_point` then returned whatever it liked. The
+sort was already safe (`total_cmp`, chosen for exactly this reason); the clamp
+beside it was not.
+
+**In the renderer**
+- [x] The gradient is handed to Vello as a **brush transform**, composed in
+      `f64` from the object's placement, the camera and the render split — the
+      same chain the path takes. Vello multiplies it by the same `gpu_view` the
+      path is drawn with, so the ramp cannot drift off its artwork at any zoom.
+- [x] Colour effects, Adjust Color and the onion-skin ghost reach a gradient
+      **stop by stop**, so a tinted instance of a gradient-filled symbol tints
+      the whole ramp instead of flattening it
+- [x] The lighting crescents take the fill's paint stop by stop too: the shaded
+      side of a gradient-filled shape is that gradient darkened
+
+**In the file** — format version 16. A fill writes `color` **or** `gradient`
+and never both, so there are not two answers in the file to one question.
+Every older file still loads: they carry `color` and no `gradient`, which is
+exactly what a solid paint deserialises to, and a document using no gradient is
+written byte-identically to what version 15 wrote.
+
+**In the importer.** XFL gradients arrive as gradients. Two things had to be
+right: the `ratio` on each `<GradientEntry>`, which was **discarded entirely**
+while gradients were averaged — an average does not care where its terms sit,
+and a file whose middle stop is at a quarter draws nothing like one where it is
+at a half — and Flash's gradient box, a fixed square 1 638.4 pixels across that
+the file's matrix maps onto the artwork. A test pins that number, because it is
+the one value that decides whether an imported gradient is the right size. The
+gradient's own `<Matrix>` is claimed before anything else can mistake it for a
+placement, and a test asserts an instance following a gradient still gets its
+own matrix — the failure that used to collapse a lantern to a point.
+
+**In the interface**
+- [x] The Color panel has Animate's fill type — Solid, Linear, Radial — with a
+      live ramp, stops that can be added by clicking the ramp, dragged and
+      recoloured, the spread mode and the focal point
+- [x] A new stop takes **the colour the ramp already has there**, so adding one
+      never changes the picture until it is moved
+- [x] The gradient is fitted to the shape being drawn, so drawing a rectangle
+      with a gradient selected produces a ramp across that rectangle. The Paint
+      Bucket fits it to the shape it is poured into — a ramp laid across
+      somebody else's bounds shows one flat colour and reads as the tool having
+      done nothing.
+- [x] **The Gradient Transform tool works**, which §7 item 8 recorded as inert.
+      The grips are the matrix's own parts — the centre is its translation, the
+      end of the ramp its first column, the width handle its second — so
+      dragging one is a write to two numbers rather than a decomposition into
+      an angle and a scale. A skewed gradient therefore stays skewed when it is
+      dragged, which a rebuild-from-parts implementation quietly straightens.
+- [x] The focus is tested for **before** the centre, because on every gradient
+      nobody has adjusted the two coincide: its default is zero. Testing the
+      centre first makes the focus unreachable.
+- [x] Merge-shape fusion asks whether two paints match, not whether two colours
+      do. A red-to-blue ramp and a blue-to-red one share an average, and fusing
+      them would throw one away.
+
+**Proved on the GPU.** `headless_gradients.rs` renders through the same path the
+window uses and reads the pixels back. The assertions are about *where* each
+colour lands, because the path is pre-transformed on the CPU while the brush is
+placed by a matrix Vello composes on the GPU — two routes to the same pixel, and
+a gradient that slides off its artwork is what a disagreement looks like. Six
+tests: a linear ramp runs the right way and never doubles back; a **moved
+object carries its gradient with it**; a radial gradient cools in all four
+directions; stop offsets put the colour where the file says; Reflect mirrors
+where Pad holds; and a solid fill still comes back exactly solid.
+
 ---
 
 ## 5. Current metrics
@@ -2534,11 +2625,11 @@ Masked, and the stack does the rest.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 250 passing, clippy clean |
+| Tests | 1 288 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
-| Format version | 15 — adds the inverse mask |
+| Format version | 16 — adds gradients |
 | Formats heard | `.wav`, `.mp3`, `.ogg`, `.flac`, `.m4a`, `.aac` |
 | IK budget | 50 six-bone rigs solved in parallel, well inside one frame |
 | Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |
@@ -2690,7 +2781,7 @@ down here has not been finished.
 | # | Item | Status |
 |---|---|---|
 | 1 | ~~**Oversized paths culled, not clipped.**~~ | ✅ **Resolved in CP-1.1** by `RenderClip` |
-| 8 | **Gradients not implemented.** Fills are solid colours only; the Gradient Transform tool is inert. Touches five crates (paint model, renderer brush, serialisation, editor UI). | Phase 2 follow-up |
+| 8 | ~~**Gradients not implemented.**~~ | ✅ **Resolved** — linear and radial gradients on fills and strokes, a working Gradient Transform tool, format version 16 |
 | 9 | **Text tool not implemented.** Needs font loading, shaping and a text-editing caret — a subsystem in its own right. | Phase 2 follow-up |
 | 10 | **Lasso tool not implemented.** Freehand selection region. | Phase 2 follow-up |
 | 11 | **Pen tool draws line segments, not Bézier curves.** Click-drag handle authoring is not there yet; anchors can be edited afterwards with Subselection. | Phase 2 follow-up |
@@ -2732,7 +2823,7 @@ down here has not been finished.
 | 52 | **Filters are geometry, not a raster pass**, for the reason §7 item 46 gives for lighting. A real blur mixes a shape with what is *inside* it; these build from the outline, so a two-colour drawing blurs each shape against its own edge rather than into its neighbour. Very close for flat vector artwork, which is what this program makes. | By design |
 | 53 | **Filters can go on any object and on a layer.** Animate allows them on movie clips, buttons and text only, because a raster filter needs a surface to cache. There is nothing to cache here, so the restriction would be arbitrary — and "blur the background layer" is a thing animators ask for constantly. | By design |
 | 54 | **Four blend modes are missing**: Subtract, Invert, Alpha and Erase. They are Flash's own compositing operators rather than the PDF/CSS mixing modes — Alpha and Erase use the *parent* clip's alpha as a mask, which is a compositing model rather than one equation. Left out rather than mapped onto something that looks nearly right. | Needs a compositing model |
-| 55 | **Gradient Glow and Gradient Bevel are not implemented**, because gradients are not (§7 item 8). Both are the plain Glow and Bevel with a ramp instead of a colour, so they arrive with gradients. | Blocked on gradients |
+| 55 | **Gradient Glow and Gradient Bevel are still not implemented**, though gradients now exist (§7 item 8). Both are the plain Glow and Bevel with a ramp instead of a colour; what is missing is the ramp reaching the filter's band geometry, which builds its colours per band rather than taking a paint. | Follow-up |
 | 50 | **A followed layer's motion is read off its first object.** A layer has no transform of its own; Animate tracks one for the layer itself. Here the first object on the layer leads, which is exact for the one-symbol-per-layer rigs layer parenting exists to serve, and approximate for a layer of loose artwork. | By design |
 | 51 | **Artwork on a followed layer is edited in its own space.** Clicking and marquee selection are mapped through the inherited transform, so a parented limb is clickable where it is drawn; a *drag* is still applied in the layer's own frame, so dragging artwork whose parent is rotated or scaled moves it along the layer's axes rather than the parent's. Layer depth has the same limitation, from the same cause. | Follow-up |
 | 47 | **Lights are not keyframed.** The rig belongs to the document, not to the timeline, so a sun cannot swing across a shot the way a camera can pan. Needs the light rig on the same tween path the camera already uses. | Lighting follow-up |
@@ -2812,6 +2903,14 @@ down here has not been finished.
 | 125 | **A graphic's loop is resolved from its layer's keyframe**, not from when the instance itself appeared. They differ when a keyframe holds several instances placed at different times — rare, and the pose is then one cycle out. | Follow-up |
 | 126 | **The transformation point can be moved with the Selection tools, which Animate does not allow.** Animate reserves it for Free Transform (Q). Here a *drag* that starts on the circle moves it from the Selection and Subselection tools as well; a click still selects. A deviation, on the grounds that changing tools to move a pivot and changing back is a step for nothing. | By design |
 | 127 | **Edit in place does not move the symbol under its instance.** Animate draws the opened symbol where the instance sits; here it is drawn at the symbol's own origin with the scene paled behind. The context is right, the registration is not. | Follow-up |
+| 128 | **The Gradient Transform tool has one grip where Animate has two.** Animate puts scale and rotation on separate handles a few pixels apart on the same line; here dragging the end of the ramp does both, so the ramp's end goes where the pointer is. One grip instead of two adjacent ones, and never a question of which was grabbed. | By design |
+| 129 | **A gradient under a tilted camera is placed by an approximated affine.** A brush transform is a matrix and a perspective projection is not. Where the projection is affine — every document that has not tilted its camera — the placement is exact; where it is not, an affine is fitted to three corners of the shape's own bounding box mapped through the real projection, which is exact at those points and close between them. Same class as §7 item 62. | Follow-up |
+| 130 | **A gradient under a blur falls back to one colour.** `buzz_fx::blur_ops` builds its soft edge from bands, each a stroke of a single colour, so a blurred gradient-filled shape blurs its average. Fixing it means the band geometry taking a paint rather than a colour — which is also what §7 item 55 needs. | Follow-up |
+| 131 | **A hairline stroke cannot carry a gradient.** Its width is one pixel at every zoom, so it is set in screen space and does not go through the paint path. One pixel of a ramp is one colour, so what is lost is a ramp *along* the line. | By design |
+| 132 | **The eyedropper samples a gradient to one colour.** Animate's picks up the whole ramp and loads it into the Color panel; here the colour well takes the ramp's average. The gradient is still on the artwork — what is missing is copying it from one shape to another. | Follow-up |
+| 133 | **The brush and pattern previews are drawn in one colour.** They are egui chrome, redrawn on every pointer move, and egui's painter has no gradient brush; the committed stroke gets the real gradient. What the preview is for — spacing and stamp size — is unaffected. | By design |
+| 134 | **PDF gradients are still flattened.** PDF expresses them as shading dictionaries and Pattern colour spaces, which is a subsystem rather than an attribute — seven shading types, of which two are function-driven meshes. The XFL road brings gradients in; the PDF one still averages them. | Phase 5 follow-up |
+| 135 | **A gradient and a solid do not tween into each other.** Two gradients interpolate stop by stop when they correspond; a solid tweening to a gradient switches at the halfway point instead, because moving a colour and then jumping to a ramp reads as a glitch rather than a transition. Two gradients with different stop counts switch for the same reason. | By design |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |
@@ -3010,8 +3109,6 @@ Closest to the drawing and depth work before it:
 - **3D object rotation** (§7 item 28) — the other half of "3D" in Animate:
   rotating an individual movie clip in space, rather than arranging whole
   layers in it. Needs a real projection in the renderer rather than an affine.
-- **Gradients** (§7 item 8), still the most-cited gap: both importers
-  approximate them to flat colours, and a pattern brush cannot stamp one.
 - **Tablet pressure** (§7 item 25). The brush already reads pressure; nothing
   supplies it.
 

@@ -19,6 +19,7 @@ pub mod lighting;
 
 use anyhow::{Context, Result};
 use buzz_geom::{Affine, BezPath, Camera, RenderClip, RenderSplit, Shape};
+use buzz_scene::{GradientKind, GradientSpread, Paint};
 use peniko::{Color, Fill};
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 use wgpu::{Device, Instance, Queue, TextureFormat, TextureView};
@@ -264,6 +265,127 @@ impl<'a> SceneBuilder<'a> {
         let path = self.to_render_space(shape);
         self.scene
             .fill(Fill::NonZero, self.split.gpu_view, color, None, &path);
+    }
+
+    /// The affine that carries document space into render space.
+    ///
+    /// The same anchor-then-scale the geometry takes in [`Self::to_render_space`],
+    /// without the clip — a brush has no segments to bound.
+    fn doc_to_render(&self) -> Affine {
+        Affine::scale(self.split.scale) * Affine::translate(-self.split.anchor.to_vec2())
+    }
+
+    /// Turn a document paint into a Vello brush, plus the transform that puts
+    /// it where the artwork is.
+    ///
+    /// # Why the brush transform, and not gradient coordinates in render space
+    ///
+    /// The gradient is defined in unit space, so everything that positions it —
+    /// the object's placement, the camera, and the render split — is one
+    /// matrix. Handing Vello that matrix as the brush transform means the
+    /// gradient goes through *exactly* what the path went through, composed in
+    /// `f64` here rather than accumulated separately. Vello's own encoding
+    /// multiplies it by the same `gpu_view` the path is drawn with (see
+    /// `Scene::fill`), so the ramp cannot drift away from the shape it fills at
+    /// any zoom.
+    fn brush_for(&self, paint: &Paint, to_doc: Affine) -> (peniko::Brush, Option<Affine>) {
+        let Some(g) = paint.gradient() else {
+            return (peniko::Brush::Solid(paint.color()), None);
+        };
+
+        let stops: Vec<peniko::ColorStop> = g
+            .stops()
+            .iter()
+            .map(|s| peniko::ColorStop::from((s.offset as f32, s.color)))
+            .collect();
+
+        let kind = match g.kind {
+            GradientKind::Linear => peniko::GradientKind::Linear(
+                peniko::LinearGradientPosition::new((-1.0, 0.0), (1.0, 0.0)),
+            ),
+            // The focal point is Animate's: the hot spot slides along the unit
+            // x axis while the outer circle stays put. A two-point radial with
+            // a zero inner radius is exactly that, and is what SWF's focal
+            // gradients mean as well.
+            GradientKind::Radial => {
+                peniko::GradientKind::Radial(peniko::RadialGradientPosition::new_two_point(
+                    (g.focal.clamp(-1.0, 1.0), 0.0),
+                    0.0,
+                    (0.0, 0.0),
+                    1.0,
+                ))
+            }
+        };
+
+        let mut brush = peniko::Gradient {
+            kind,
+            ..Default::default()
+        };
+        brush.extend = match g.spread {
+            GradientSpread::Pad => peniko::Extend::Pad,
+            GradientSpread::Reflect => peniko::Extend::Reflect,
+            GradientSpread::Repeat => peniko::Extend::Repeat,
+        };
+        brush.stops = stops.as_slice().into();
+
+        let placed = self.doc_to_render() * to_doc * g.transform;
+        (peniko::Brush::Gradient(brush), Some(placed))
+    }
+
+    /// Fill a document-space shape with a paint, which may be a gradient.
+    ///
+    /// `to_doc` maps the paint's own space — the object's — into document
+    /// space. It is the accumulated placement the caller already has, and it is
+    /// what keeps a gradient stuck to its artwork when the artwork is moved,
+    /// scaled or turned.
+    pub fn fill_shape_paint(&mut self, shape: &impl Shape, paint: &Paint, to_doc: Affine) {
+        let path = self.to_render_space(shape);
+        let (brush, brush_transform) = self.brush_for(paint, to_doc);
+        self.scene.fill(
+            Fill::NonZero,
+            self.split.gpu_view,
+            &brush,
+            brush_transform,
+            &path,
+        );
+    }
+
+    /// Stroke a document-space shape with a paint, which may be a gradient.
+    pub fn stroke_shape_paint(
+        &mut self,
+        shape: &impl Shape,
+        paint: &Paint,
+        width: f64,
+        to_doc: Affine,
+    ) {
+        let path = self.to_render_space(shape);
+        let render_width = self.split.scale_length(width).max(f64::MIN_POSITIVE);
+        let (brush, brush_transform) = self.brush_for(paint, to_doc);
+        self.scene.stroke(
+            &kurbo::Stroke::new(render_width),
+            self.split.gpu_view,
+            &brush,
+            brush_transform,
+            &path,
+        );
+    }
+
+    /// Fill additively with a paint. See [`Self::fill_shape_additive`], which
+    /// this is the gradient-capable form of.
+    pub fn fill_shape_paint_additive(&mut self, shape: &impl Shape, paint: &Paint, to_doc: Affine) {
+        let path = self.to_render_space(shape);
+        let (brush, brush_transform) = self.brush_for(paint, to_doc);
+        let blend = peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Plus);
+        self.scene
+            .push_layer(Fill::NonZero, blend, 1.0, self.split.gpu_view, &path);
+        self.scene.fill(
+            Fill::NonZero,
+            self.split.gpu_view,
+            &brush,
+            brush_transform,
+            &path,
+        );
+        self.scene.pop_layer();
     }
 
     /// Fill a shape so that its opacity **adds** to whatever is under it.

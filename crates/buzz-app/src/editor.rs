@@ -10,7 +10,7 @@ use std::sync::Arc;
 use buzz_doc::Document;
 use buzz_geom::{Affine, BezPath, Camera, Point, Rect, Shape as _, Size, Vec2};
 use buzz_scene::{
-    EditAt, FillSpec, LayerId, LayerKind, Object, ObjectId, ObjectKind, Scene, ShapeData,
+    EditAt, FillSpec, LayerId, LayerKind, Object, ObjectId, ObjectKind, Paint, Scene, ShapeData,
     StrokeSpec, Tween,
 };
 use buzz_ui::{
@@ -645,6 +645,7 @@ impl Editor {
             selection_bounds: self.selection.bounds(self.doc.scene()),
             anchors: &[],
             pivot: self.pivot(),
+            gradient: self.selected_gradient_handles(),
         }
     }
 
@@ -675,6 +676,82 @@ impl Editor {
                 point: object.transform * a.point,
             })
             .collect()
+    }
+
+    /// The grips of the selected shape's gradient fill, in world space.
+    ///
+    /// `None` unless exactly one shape is selected and its fill is a gradient
+    /// — which is exactly when the Gradient Transform tool has anything to
+    /// grab. Reported in world space for the same reason the anchors are: the
+    /// tool compares them against the pointer and should not have to know about
+    /// the object's own transform.
+    pub fn selected_gradient_handles(
+        &self,
+    ) -> Option<(buzz_scene::GradientHandles, buzz_scene::GradientKind)> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let id = self.selection.iter().next()?;
+        let (_, object) = self.doc.scene().find_object(id)?;
+        let ObjectKind::Shape(shape) = &object.kind else {
+            return None;
+        };
+        let g = shape.fill.as_ref()?.paint.gradient()?;
+        let local = g.handles();
+        Some((
+            buzz_scene::GradientHandles {
+                center: object.transform * local.center,
+                end: object.transform * local.end,
+                width: object.transform * local.width,
+                focus: object.transform * local.focus,
+            },
+            g.kind,
+        ))
+    }
+
+    /// Apply a Gradient Transform drag to the selected shape.
+    ///
+    /// The pointer arrives in world space and the gradient lives in the
+    /// object's own, so the drag is carried back through the object's inverse
+    /// transform. Without that a gradient on a rotated or scaled shape would
+    /// jump away from the pointer the moment it was grabbed.
+    fn drag_gradient(&mut self, grip: crate::tools::GradientGrip, to: Point) {
+        let Some(id) = self.selection.iter().next() else {
+            return;
+        };
+        let Some((_, object)) = self.doc.scene().find_object(id) else {
+            return;
+        };
+        // A shape scaled to nothing has no inverse, and there would be no
+        // sensible place to put the grip anyway.
+        let det = {
+            let c = object.transform.as_coeffs();
+            c[0] * c[3] - c[1] * c[2]
+        };
+        if det.abs() <= f64::MIN_POSITIVE {
+            return;
+        }
+        let local = object.transform.inverse() * to;
+        let at = self.edit_at();
+
+        self.doc.edit("Gradient Transform", |scene| {
+            update_shape(scene, at, id, |s| {
+                let Some(fill) = &mut s.fill else { return };
+                let Paint::Gradient(g) = &mut fill.paint else {
+                    return;
+                };
+                // Copy-on-write: the gradient is shared with every snapshot
+                // that still references this shape, exactly as the object
+                // itself is.
+                let g = std::sync::Arc::make_mut(g);
+                match grip {
+                    crate::tools::GradientGrip::Center => g.set_center(local),
+                    crate::tools::GradientGrip::End => g.set_end(local),
+                    crate::tools::GradientGrip::Width => g.set_width_handle(local),
+                    crate::tools::GradientGrip::Focus => g.set_focus(local),
+                }
+            });
+        });
     }
 
     pub fn preview(&self) -> Preview {
@@ -733,12 +810,14 @@ impl Editor {
         let selection_bounds = self.selection.bounds(self.doc.scene());
         let pivot = self.pivot();
         let zoom = self.camera.zoom;
+        let gradient = self.selected_gradient_handles();
         let ctx = ToolContext {
             style: &self.style,
             zoom,
             selection_bounds,
             anchors: &anchors,
             pivot,
+            gradient,
         };
         self.machine.pointer_down(doc, screen, mods, &ctx);
     }
@@ -785,12 +864,14 @@ impl Editor {
         let selection_bounds = self.selection.bounds(self.doc.scene());
         let pivot = self.pivot();
         let zoom = self.camera.zoom;
+        let gradient = self.selected_gradient_handles();
         let ctx = ToolContext {
             style: &self.style,
             zoom,
             selection_bounds,
             anchors: &anchors,
             pivot,
+            gradient,
         };
         let action = self.machine.pointer_up(doc, screen, &ctx);
 
@@ -891,11 +972,25 @@ impl Editor {
 
             ToolAction::BucketFill { point } => {
                 let tolerance = self.pick_tolerance();
-                let color = self.style.fill_color;
+                let style = self.style.clone();
                 if let Some(id) = self.object_at(point, tolerance) {
                     let at = self.edit_at();
                     self.doc.edit("Paint Bucket", |scene| {
-                        update_shape(scene, at, id, |s| s.fill = Some(FillSpec::solid(color)));
+                        update_shape(scene, at, id, |s| {
+                            // **The bucket is how a gradient reaches artwork
+                            // that already exists**, so it fits the ramp to the
+                            // shape it is poured into rather than to the shape
+                            // the panel last drew. A gradient laid across
+                            // somebody else's bounds shows one flat colour, and
+                            // reads as the tool having done nothing.
+                            let bounds = buzz_geom::Shape::bounding_box(&s.path);
+                            if let Some(paint) = style.fill_for_new_shape(bounds) {
+                                s.fill = Some(FillSpec {
+                                    paint,
+                                    rule: buzz_geom::FillMode::NonZero,
+                                });
+                            }
+                        });
                     });
                 }
             }
@@ -910,7 +1005,7 @@ impl Editor {
                     self.doc.edit("Ink Bottle", |scene| {
                         update_shape(scene, at, id, |s| {
                             s.stroke = Some(StrokeSpec {
-                                color,
+                                paint: Paint::Solid(color),
                                 width,
                                 hairline,
                             })
@@ -925,14 +1020,19 @@ impl Editor {
                     && let Some((_, object)) = self.doc.scene().find_object(id)
                     && let ObjectKind::Shape(shape) = &object.kind
                 {
-                    if let Some(fill) = shape.fill {
-                        self.style.fill_color = fill.color;
+                    // The eyedropper picks up a colour, so a gradient is
+                    // sampled to the one colour it stands for rather than
+                    // loading the whole ramp into the colour well. Animate's
+                    // eyedropper does copy a gradient; ours does not yet, and
+                    // it is recorded in PROGRESS.md §7.
+                    if let Some(fill) = &shape.fill {
+                        self.style.fill_color = fill.color();
                         self.style.fill_enabled = true;
-                        self.style.remember(fill.color);
-                    } else if let Some(stroke) = shape.stroke {
-                        self.style.stroke_color = stroke.color;
+                        self.style.remember(fill.color());
+                    } else if let Some(stroke) = &shape.stroke {
+                        self.style.stroke_color = stroke.color();
                         self.style.stroke_enabled = true;
-                        self.style.remember(stroke.color);
+                        self.style.remember(stroke.color());
                     }
                 }
             }
@@ -949,6 +1049,7 @@ impl Editor {
 
             ToolAction::SetTransformPoint { at } => self.set_pivot(at),
             ToolAction::ResetTransformPoint => self.reset_pivot(),
+            ToolAction::DragGradient { grip, to } => self.drag_gradient(grip, to),
         }
     }
 
@@ -2742,7 +2843,7 @@ impl Editor {
         self.doc.edit("Convert Lines to Fills", |scene| {
             for id in ids {
                 update_shape(scene, at, id, |s| {
-                    let Some(stroke) = s.stroke else { return };
+                    let Some(stroke) = s.stroke.clone() else { return };
                     let width = if stroke.hairline { 1.0 } else { stroke.width };
                     let outline = buzz_geom::outline_stroke(
                         &s.path,
@@ -2753,7 +2854,14 @@ impl Editor {
                         return;
                     }
                     s.path = outline;
-                    s.fill = Some(FillSpec::solid(stroke.color));
+                    // The outline keeps the stroke's paint, gradient and all:
+                    // Convert Lines to Fills turns a line into the shape of
+                    // that line, and a gradient-stroked line becomes a
+                    // gradient-filled outline of itself.
+                    s.fill = Some(FillSpec {
+                        paint: stroke.paint.clone(),
+                        rule: buzz_geom::FillMode::NonZero,
+                    });
                     s.stroke = None;
                 });
             }
@@ -3035,7 +3143,7 @@ fn object_contains(
             {
                 return true;
             }
-            match shape.stroke {
+            match &shape.stroke {
                 Some(stroke) => {
                     let width = if stroke.hairline { 0.0 } else { stroke.width };
                     buzz_geom::hit::stroke_contains(&shape.path, local, width, tolerance)
@@ -3128,9 +3236,20 @@ fn merge_shape_into_layer(
     let bb = incoming.path.bounding_box();
     let opts = buzz_geom::BooleanOptions::for_shape_size(bb.width().hypot(bb.height()));
     let same_color = |a: Color, b: Color| a.to_rgba8().to_u8_array() == b.to_rgba8().to_u8_array();
+    // Merge-shape fusion asks "is this the same paint?", and for a gradient
+    // that cannot be answered by one colour. Two different ramps can share an
+    // average — a red-to-blue and a blue-to-red have the same one — and fusing
+    // them would silently throw one of the two away. So a gradient fuses only
+    // with a gradient it matches outright: same stops, same placement, same
+    // spread. A gradient and a solid never fuse.
+    let same_paint = |a: &Paint, b: &Paint| match (a, b) {
+        (Paint::Solid(a), Paint::Solid(b)) => same_color(*a, *b),
+        (Paint::Gradient(a), Paint::Gradient(b)) => a == b,
+        _ => false,
+    };
 
     // Existing filled shapes that overlap the new one.
-    let candidates: Vec<(ObjectId, Color, BezPath)> = scene
+    let candidates: Vec<(ObjectId, Paint, BezPath)> = scene
         .layers()
         .get(layer)
         .map(|l| {
@@ -3138,7 +3257,10 @@ fn merge_shape_into_layer(
                 .iter()
                 .filter(|o| o.visible && !o.locked)
                 .filter_map(|o| match &o.kind {
-                    ObjectKind::Shape(s) => s.fill.map(|f| (o.id, f.color, s.path.clone())),
+                    ObjectKind::Shape(s) => s
+                        .fill
+                        .as_ref()
+                        .map(|f| (o.id, f.paint.clone(), s.path.clone())),
                     // Merge-shape rules apply to raw shapes only. Groups,
                     // symbol instances and rigged artwork are objects: in
                     // Animate they sit above the merge layer and never fuse
@@ -3158,8 +3280,8 @@ fn merge_shape_into_layer(
     let mut merged = incoming.path.clone();
     let mut absorbed = Vec::new();
 
-    for (id, color, path) in candidates {
-        if same_color(color, new_fill.color) {
+    for (id, paint, path) in candidates {
+        if same_paint(&paint, &new_fill.paint) {
             merged = buzz_geom::boolean(&merged, &path, buzz_geom::BoolOp::Union, opts);
             absorbed.push(id);
         } else {
@@ -3348,7 +3470,10 @@ mod tests {
             .flat_map(|l| l.objects_at(0).iter())
             .find_map(|o| match &o.kind {
                 ObjectKind::Shape(s)
-                    if s.fill.map(|f| f.color.to_rgba8().to_u8_array()[0]) == Some(255) =>
+                    if s.fill
+                        .as_ref()
+                        .map(|f| f.color().to_rgba8().to_u8_array()[0])
+                        == Some(255) =>
                 {
                     Some(s.path.area().abs())
                 }
@@ -3558,7 +3683,10 @@ mod tests {
         let ObjectKind::Shape(shape) = &object.kind else {
             panic!("expected a shape")
         };
-        assert_eq!(shape.fill.unwrap().color.to_rgba8().to_u8_array()[0], 255);
+        assert_eq!(
+            shape.fill.as_ref().unwrap().color().to_rgba8().to_u8_array()[0],
+            255
+        );
     }
 
     #[test]
@@ -3575,6 +3703,124 @@ mod tests {
         assert_eq!(
             e.style.fill_color.to_rgba8().to_u8_array(),
             target.to_rgba8().to_u8_array()
+        );
+    }
+
+    /// Draw a gradient-filled square and select it, which is the state the
+    /// Gradient Transform tool needs to do anything.
+    fn draw_gradient_square(e: &mut Editor, size: f64) -> ObjectId {
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        e.style.stroke_enabled = false;
+        let area = buzz_geom::Rect::new(0.0, 0.0, size, size);
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData {
+                path: square(0.0, 0.0, size),
+                fill: Some(FillSpec::gradient(buzz_scene::Gradient::linear(
+                    Color::BLACK,
+                    Color::WHITE,
+                    area,
+                ))),
+                stroke: None,
+                blend: buzz_scene::PaintBlend::Normal,
+            },
+            label: "Draw",
+        });
+        let id = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .map(|o| o.id)
+            .last()
+            .expect("a shape");
+        e.selection.select_one(id);
+        id
+    }
+
+    fn gradient_of(e: &Editor, id: ObjectId) -> buzz_scene::Gradient {
+        let (_, object) = e.scene().find_object(id).expect("the object");
+        let ObjectKind::Shape(shape) = &object.kind else {
+            panic!("expected a shape")
+        };
+        shape
+            .fill
+            .as_ref()
+            .expect("filled")
+            .paint
+            .gradient()
+            .expect("a gradient")
+            .clone()
+    }
+
+    /// The Gradient Transform tool moves the ramp, and the move is one undo
+    /// step like every other gesture.
+    #[test]
+    fn the_gradient_transform_tool_moves_the_ramp() {
+        let mut e = editor();
+        let id = draw_gradient_square(&mut e, 100.0);
+
+        let before = gradient_of(&e, id).handles();
+        assert!((before.center.x - 50.0).abs() < 1e-9, "{before:?}");
+
+        e.apply(ToolAction::DragGradient {
+            grip: crate::tools::GradientGrip::Center,
+            to: Point::new(80.0, 20.0),
+        });
+        let after = gradient_of(&e, id).handles();
+        assert!(
+            (after.center - Point::new(80.0, 20.0)).hypot() < 1e-9,
+            "the centre did not follow the drag: {after:?}"
+        );
+
+        e.doc.undo();
+        let undone = gradient_of(&e, id).handles();
+        assert!(
+            (undone.center - before.center).hypot() < 1e-9,
+            "the drag should undo in one step"
+        );
+    }
+
+    /// **The drag is carried into the object's own space.** A gradient on a
+    /// moved shape must land under the pointer, not offset by wherever the
+    /// object happens to sit — which is what happens if the pointer's world
+    /// coordinates are written into the gradient directly.
+    #[test]
+    fn a_gradient_drag_lands_under_the_pointer_on_a_moved_shape() {
+        let mut e = editor();
+        draw_gradient_square(&mut e, 100.0);
+
+        // Move the object itself, so world space and the object's own space
+        // are no longer the same thing.
+        e.apply(ToolAction::MoveSelection {
+            delta: buzz_geom::Vec2::new(300.0, 200.0),
+        });
+
+        let target = Point::new(340.0, 260.0);
+        e.apply(ToolAction::DragGradient {
+            grip: crate::tools::GradientGrip::Center,
+            to: target,
+        });
+
+        // Reported back in world space, which is where the pointer was.
+        let (handles, _) = e
+            .selected_gradient_handles()
+            .expect("the selected shape has a gradient");
+        assert!(
+            (handles.center - target).hypot() < 1e-9,
+            "the grip should be where the pointer was, got {:?}",
+            handles.center
+        );
+    }
+
+    /// The handles are offered only when there is a gradient to grab.
+    #[test]
+    fn no_gradient_means_no_handles() {
+        let mut e = editor();
+        let id = draw_square(&mut e, 0.0, 0.0, 60.0, Color::WHITE).expect("a shape");
+        e.selection.select_one(id);
+        assert!(
+            e.selected_gradient_handles().is_none(),
+            "a solid fill has no gradient to transform"
         );
     }
 

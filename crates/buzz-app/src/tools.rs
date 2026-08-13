@@ -65,6 +65,35 @@ pub enum ToolAction {
     SetTransformPoint { at: Point },
     /// Put it back at the centre of the selection.
     ResetTransformPoint,
+    /// Drag one grip of the selected shape's gradient — Animate's Gradient
+    /// Transform tool.
+    DragGradient { grip: GradientGrip, to: Point },
+}
+
+/// Which handle of a gradient is being dragged.
+///
+/// # Why these four, and why the end grip does two things
+///
+/// Animate draws four grips on a gradient and gives *scale* and *rotate* one
+/// each, on the same line. Here the end of the ramp does both at once: dragging
+/// it puts the ramp's end where the pointer is. It is one grip instead of two
+/// adjacent ones a few pixels apart, and there is never a question of which was
+/// grabbed. Recorded as a deviation in PROGRESS.md §7.
+///
+/// The grips are the matrix's own parts, which is what makes this exact rather
+/// than a decomposition: the centre is its translation, the end is its first
+/// column and the width is its second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GradientGrip {
+    /// Move the whole gradient.
+    Center,
+    /// The end of the ramp: its direction and its length together.
+    End,
+    /// How thick the ramp is across its own axis. For a radial gradient this
+    /// is what makes it an ellipse.
+    Width,
+    /// Radial only: the hot spot, sliding along the ramp's axis.
+    Focus,
 }
 
 /// Live feedback while a gesture is in progress.
@@ -110,6 +139,13 @@ pub struct ToolContext<'a> {
     /// The selection's transformation point, in document space — what a
     /// rotation or a skew turns about. `None` when nothing is selected.
     pub pivot: Option<Point>,
+    /// The grips of the selected shape's gradient fill, in document space.
+    ///
+    /// `None` unless exactly one shape is selected and its fill is a gradient,
+    /// which is precisely when the Gradient Transform tool has something to do.
+    /// Supplied by the editor for the same reason the anchors are: only it can
+    /// see the scene.
+    pub gradient: Option<(buzz_scene::GradientHandles, buzz_scene::GradientKind)>,
 }
 
 /// A gesture in progress.
@@ -352,10 +388,12 @@ impl ToolMachine {
                 // stamps per frame.
                 ToolId::Brush => {
                     let budget = buzz_geom::BrushBudget::preview();
+                    // The preview is drawn in one colour: it is redrawn on
+                    // every pointer move, and the stroke it previews has no
+                    // final bounds yet to lay a ramp across.
                     let color = ctx
                         .style
-                        .fill_for_new_shape()
-                        .unwrap_or(Color::BLACK)
+                        .fill_color_for_preview()
                         // Slightly transparent, so the preview reads as
                         // provisional without misrepresenting its shape.
                         .multiply_alpha(0.85);
@@ -442,12 +480,21 @@ impl ToolMachine {
                 if path.elements().is_empty() {
                     return ToolAction::None;
                 }
+                let bounds = buzz_geom::Shape::bounding_box(&path);
+                let paint = ctx
+                    .style
+                    .fill_for_new_shape(bounds)
+                    .unwrap_or(buzz_scene::Paint::Solid(Color::BLACK));
                 ToolAction::AddShape {
-                    shape: ShapeData::filled(
+                    shape: ShapeData {
                         path,
-                        ctx.style.fill_for_new_shape().unwrap_or(Color::BLACK),
-                    )
-                    .with_blend(ctx.style.brush.blend()),
+                        fill: Some(buzz_scene::FillSpec {
+                            paint,
+                            rule: buzz_geom::FillMode::NonZero,
+                        }),
+                        stroke: None,
+                        blend: ctx.style.brush.blend(),
+                    },
                     label: "Brush",
                 }
             }
@@ -461,7 +508,7 @@ impl ToolMachine {
                         path: centreline_of(&samples),
                         fill: None,
                         stroke: Some(buzz_scene::StrokeSpec {
-                            color,
+                            paint: buzz_scene::Paint::Solid(color),
                             width,
                             hairline,
                         }),
@@ -501,6 +548,20 @@ impl ToolMachine {
         }
 
         match self.tool {
+            // Animate's Gradient Transform: grab a grip and the ramp follows.
+            // With nothing gradient-filled selected it selects, so picking the
+            // shape you meant to adjust does not need a trip back to the
+            // Selection tool.
+            ToolId::GradientTransform => {
+                let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+                match ctx.gradient.and_then(|(h, kind)| grip_at(h, kind, origin, grab)) {
+                    Some(grip) => ToolAction::DragGradient { grip, to: end },
+                    None => ToolAction::PickAt {
+                        point: end,
+                        additive: mods.shift,
+                    },
+                }
+            }
             ToolId::Selection | ToolId::Subselection => {
                 if was_click {
                     ToolAction::PickAt {
@@ -574,19 +635,25 @@ impl ToolMachine {
                     return ToolAction::None;
                 };
                 let filled = self.tool != ToolId::Line && self.tool != ToolId::Pen;
+                // The shape's own extent is what a gradient fill is laid
+                // across, so it has to be measured before the shape is built.
+                let bounds = buzz_geom::Shape::bounding_box(&path);
                 ToolAction::AddShape {
                     shape: ShapeData {
                         path,
                         fill: filled
-                            .then(|| ctx.style.fill_for_new_shape())
+                            .then(|| ctx.style.fill_for_new_shape(bounds))
                             .flatten()
-                            .map(buzz_scene::FillSpec::solid),
+                            .map(|paint| buzz_scene::FillSpec {
+                                paint,
+                                rule: buzz_geom::FillMode::NonZero,
+                            }),
                         blend: buzz_scene::PaintBlend::Normal,
                         stroke: ctx
                             .style
                             .stroke_for_new_shape()
                             .map(|(color, width, hairline)| buzz_scene::StrokeSpec {
-                                color,
+                                paint: buzz_scene::Paint::Solid(color),
                                 width,
                                 hairline,
                             }),
@@ -791,6 +858,37 @@ enum TransformZone {
 /// it sits inside, a corner wins over the ring around it, and the ring wins
 /// over the edges it overlaps at the ends — otherwise the corner of a small
 /// selection would be three things at once.
+/// Which gradient grip is within `grab` of `at`, if any.
+///
+/// **The centre is tested last**, deliberately. All four grips sit on the ramp
+/// and the focus starts *on top of* the centre when the focal point is zero —
+/// which is its default, so it is the usual case. Testing the centre first
+/// would make the focus unreachable on every gradient that had not already been
+/// adjusted. Nearest-wins would flicker between them when they coincide; an
+/// explicit order does not.
+pub fn grip_at(
+    handles: buzz_scene::GradientHandles,
+    kind: buzz_scene::GradientKind,
+    at: Point,
+    grab: f64,
+) -> Option<GradientGrip> {
+    let near = |p: Point| (at - p).hypot() <= grab;
+
+    if kind == buzz_scene::GradientKind::Radial && near(handles.focus) {
+        return Some(GradientGrip::Focus);
+    }
+    if near(handles.end) {
+        return Some(GradientGrip::End);
+    }
+    if near(handles.width) {
+        return Some(GradientGrip::Width);
+    }
+    if near(handles.center) {
+        return Some(GradientGrip::Center);
+    }
+    None
+}
+
 fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> TransformZone {
     // A little more forgiving than a handle: the circle is small, it is often
     // parked over artwork you are looking at rather than over a corner, and
@@ -985,6 +1083,7 @@ mod tests {
             selection_bounds: None,
             anchors: &[],
             pivot: None,
+            gradient: None,
         }
     }
 
@@ -1216,6 +1315,7 @@ mod tests {
             selection_bounds: None,
             anchors: &[],
             pivot: None,
+            gradient: None,
         };
         assert_eq!(drag(&mut m, from, to, &zoomed_out), ToolAction::None);
 
@@ -1227,6 +1327,7 @@ mod tests {
             selection_bounds: None,
             anchors: &[],
             pivot: None,
+            gradient: None,
         };
         assert!(matches!(
             drag(&mut m, from, to, &zoomed_in),
@@ -1292,6 +1393,7 @@ mod tests {
             selection_bounds: Some(Rect::new(0.0, 0.0, 100.0, 100.0)),
             anchors: &[],
             pivot: None,
+            gradient: None,
         };
         let mut m = ToolMachine::new(ToolId::Selection);
         match drag(&mut m, Point::new(50.0, 50.0), Point::new(80.0, 90.0), &c) {
@@ -1812,6 +1914,7 @@ mod tests {
             selection_bounds: Some(Rect::new(0.0, 0.0, 100.0, 80.0)),
             anchors: &anchors,
             pivot: None,
+            gradient: None,
         };
 
         let mut m = ToolMachine::new(ToolId::Subselection);
@@ -1842,6 +1945,7 @@ mod tests {
             selection_bounds: None,
             anchors: &anchors,
             pivot: None,
+            gradient: None,
         };
 
         let mut m = ToolMachine::new(ToolId::Subselection);
@@ -1874,6 +1978,7 @@ mod tests {
             selection_bounds: None,
             anchors: &anchors,
             pivot: None,
+            gradient: None,
         };
         let mut m = ToolMachine::new(ToolId::Subselection);
         m.pointer_down(start, start, Mods::default(), &near);
@@ -1889,6 +1994,7 @@ mod tests {
             selection_bounds: None,
             anchors: &anchors,
             pivot: None,
+            gradient: None,
         };
         let mut m = ToolMachine::new(ToolId::Subselection);
         m.pointer_down(start, start, Mods::default(), &far);
@@ -1901,12 +2007,7 @@ mod tests {
     #[test]
     fn unimplemented_tools_do_nothing_rather_than_misbehave() {
         let style = DrawStyle::default();
-        for tool in [
-            ToolId::Bone,
-            ToolId::Camera,
-            ToolId::Text,
-            ToolId::GradientTransform,
-        ] {
+        for tool in [ToolId::Bone, ToolId::Camera, ToolId::Text] {
             let mut m = ToolMachine::new(tool);
             let action = drag(
                 &mut m,
@@ -1916,5 +2017,102 @@ mod tests {
             );
             assert_eq!(action, ToolAction::None, "{tool:?} should be inert");
         }
+    }
+
+    /// With nothing gradient-filled selected, the Gradient Transform tool
+    /// selects — so clicking the shape you meant to adjust does not need a trip
+    /// back to the Selection tool and back again.
+    #[test]
+    fn gradient_transform_selects_when_there_is_no_gradient_to_grab() {
+        let style = DrawStyle::default();
+        let mut m = ToolMachine::new(ToolId::GradientTransform);
+        let action = drag(
+            &mut m,
+            Point::new(0.0, 0.0),
+            Point::new(50.0, 50.0),
+            &ctx(&style),
+        );
+        assert_eq!(
+            action,
+            ToolAction::PickAt {
+                point: Point::new(50.0, 50.0),
+                additive: false,
+            }
+        );
+    }
+
+    fn handles(centre: Point, end: Point, width: Point, focus: Point) -> buzz_scene::GradientHandles {
+        buzz_scene::GradientHandles {
+            center: centre,
+            end,
+            width,
+            focus,
+        }
+    }
+
+    /// Each grip is grabbed by starting the drag on it, and the drag reports
+    /// where it ended.
+    #[test]
+    fn each_gradient_grip_can_be_grabbed() {
+        let style = DrawStyle::default();
+        let h = handles(
+            Point::new(100.0, 100.0),
+            Point::new(200.0, 100.0),
+            Point::new(100.0, 200.0),
+            Point::new(150.0, 100.0),
+        );
+
+        for (start, expected) in [
+            (Point::new(100.0, 100.0), GradientGrip::Center),
+            (Point::new(200.0, 100.0), GradientGrip::End),
+            (Point::new(100.0, 200.0), GradientGrip::Width),
+            (Point::new(150.0, 100.0), GradientGrip::Focus),
+        ] {
+            let mut c = ctx(&style);
+            c.gradient = Some((h, buzz_scene::GradientKind::Radial));
+            let mut m = ToolMachine::new(ToolId::GradientTransform);
+            let action = drag(&mut m, start, Point::new(400.0, 400.0), &c);
+            assert_eq!(
+                action,
+                ToolAction::DragGradient {
+                    grip: expected,
+                    to: Point::new(400.0, 400.0),
+                },
+                "starting at {start:?} should grab {expected:?}"
+            );
+        }
+    }
+
+    /// **The focus wins where it coincides with the centre**, which is where it
+    /// sits on every gradient nobody has adjusted — its default is zero. Test
+    /// the centre first and the focus can never be grabbed at all.
+    #[test]
+    fn the_focus_is_reachable_when_it_sits_on_the_centre() {
+        let style = DrawStyle::default();
+        let centre = Point::new(100.0, 100.0);
+        let h = handles(centre, Point::new(200.0, 100.0), Point::new(100.0, 200.0), centre);
+
+        let mut c = ctx(&style);
+        c.gradient = Some((h, buzz_scene::GradientKind::Radial));
+        let mut m = ToolMachine::new(ToolId::GradientTransform);
+        assert_eq!(
+            drag(&mut m, centre, Point::new(160.0, 100.0), &c),
+            ToolAction::DragGradient {
+                grip: GradientGrip::Focus,
+                to: Point::new(160.0, 100.0),
+            }
+        );
+
+        // A *linear* gradient has no focus, so the same press grabs the centre.
+        let mut c = ctx(&style);
+        c.gradient = Some((h, buzz_scene::GradientKind::Linear));
+        let mut m = ToolMachine::new(ToolId::GradientTransform);
+        assert_eq!(
+            drag(&mut m, centre, Point::new(160.0, 100.0), &c),
+            ToolAction::DragGradient {
+                grip: GradientGrip::Center,
+                to: Point::new(160.0, 100.0),
+            }
+        );
     }
 }

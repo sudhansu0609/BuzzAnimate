@@ -16,6 +16,8 @@
 //! Getting this wrong would make the drawing tools feel like a different
 //! program.
 
+use buzz_geom::Rect;
+use buzz_scene::{Gradient, GradientKind, GradientStop, Paint};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
@@ -64,11 +66,53 @@ impl StrokeKind {
     }
 }
 
+/// Animate's Color panel "type": what a new fill is painted with.
+///
+/// Animate's list also has None and Bitmap fill. None is the `fill_enabled`
+/// flag this already had, and bitmaps are not imported at all (PROGRESS.md §7
+/// item 22), so they would be a menu entry that could not be honoured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FillKind {
+    #[default]
+    Solid,
+    Linear,
+    Radial,
+}
+
+impl FillKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Solid => "Solid",
+            Self::Linear => "Linear gradient",
+            Self::Radial => "Radial gradient",
+        }
+    }
+
+    pub fn gradient_kind(self) -> Option<GradientKind> {
+        match self {
+            Self::Solid => None,
+            Self::Linear => Some(GradientKind::Linear),
+            Self::Radial => Some(GradientKind::Radial),
+        }
+    }
+}
+
 /// The stroke and fill new shapes are drawn with.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrawStyle {
     pub stroke_color: Color,
     pub fill_color: Color,
+    /// What a new fill is painted with.
+    pub fill_kind: FillKind,
+    /// The ramp a new gradient fill is given.
+    ///
+    /// Held **without a placement**: a gradient in the panel has no shape to
+    /// sit on yet, so only the colours, their offsets and the spread mean
+    /// anything. The transform is set when the gradient reaches a shape, by
+    /// fitting it to that shape's bounds — which is what makes "draw a
+    /// rectangle" produce a ramp across the rectangle rather than a ramp
+    /// somewhere near the origin.
+    pub fill_gradient: Gradient,
     /// `None` means the "no stroke" swatch.
     pub stroke_enabled: bool,
     /// `None` means the "no fill" swatch.
@@ -106,6 +150,17 @@ impl Default for DrawStyle {
         Self {
             stroke_color: Color::BLACK,
             fill_color: Color::from_rgb8(0x00, 0x66, 0xCC),
+            fill_kind: FillKind::Solid,
+            // The fill colour fading to nothing: switching to a gradient then
+            // shows the colour that was already chosen, rather than replacing
+            // it with two arbitrary ones.
+            fill_gradient: Gradient::new(
+                GradientKind::Linear,
+                vec![
+                    GradientStop::new(0.0, Color::from_rgb8(0x00, 0x66, 0xCC)),
+                    GradientStop::new(1.0, Color::WHITE),
+                ],
+            ),
             stroke_enabled: true,
             fill_enabled: true,
             stroke_width: 1.0,
@@ -150,8 +205,36 @@ impl DrawStyle {
         ))
     }
 
-    pub fn fill_for_new_shape(&self) -> Option<Color> {
-        self.fill_enabled.then_some(self.fill_color)
+    /// The paint a new shape covering `bounds` should be filled with.
+    ///
+    /// The bounds are what a gradient needs and a colour does not: a ramp has
+    /// to be laid across *something*, and the shape being drawn is the only
+    /// sensible thing. Animate does the same — draw a rectangle with a gradient
+    /// selected and the ramp spans the rectangle.
+    pub fn fill_for_new_shape(&self, bounds: Rect) -> Option<Paint> {
+        if !self.fill_enabled {
+            return None;
+        }
+        Some(match self.fill_kind.gradient_kind() {
+            None => Paint::Solid(self.fill_color),
+            Some(kind) => {
+                let mut g = self.fill_gradient.clone();
+                g.kind = kind;
+                g.fit_to(bounds);
+                Paint::Gradient(std::sync::Arc::new(g))
+            }
+        })
+    }
+
+    /// The colour a new fill would use, ignoring gradients.
+    ///
+    /// For the places that genuinely want one colour — the tool previews drawn
+    /// as chrome, and the "can this fuse with what it overlaps" question.
+    pub fn fill_color_for_preview(&self) -> Color {
+        match self.fill_kind {
+            FillKind::Solid => self.fill_color,
+            _ => self.fill_gradient.average_color(),
+        }
     }
 
     /// A shape with neither stroke nor fill would be invisible and
@@ -241,11 +324,56 @@ mod tests {
     #[test]
     fn new_shape_style_respects_the_disabled_swatches() {
         let mut s = DrawStyle::default();
+        let area = Rect::new(0.0, 0.0, 100.0, 50.0);
         assert!(s.stroke_for_new_shape().is_some());
-        assert!(s.fill_for_new_shape().is_some());
+        assert!(s.fill_for_new_shape(area).is_some());
 
         s.stroke_enabled = false;
         assert!(s.stroke_for_new_shape().is_none());
+
+        s.fill_enabled = false;
+        assert!(s.fill_for_new_shape(area).is_none());
+    }
+
+    /// A gradient fill is laid across the shape being drawn, not left at the
+    /// origin — which is what makes drawing a rectangle with a gradient
+    /// selected produce a ramp across that rectangle.
+    #[test]
+    fn a_new_gradient_fill_is_fitted_to_the_shape() {
+        let s = DrawStyle {
+            fill_kind: FillKind::Linear,
+            ..Default::default()
+        };
+
+        let area = Rect::new(100.0, 200.0, 300.0, 400.0);
+        let paint = s.fill_for_new_shape(area).expect("filled");
+        let g = paint.gradient().expect("it should be a gradient");
+        let h = g.handles();
+
+        assert!((h.center.x - 200.0).abs() < 1e-9, "centre {:?}", h.center);
+        assert!((h.center.y - 300.0).abs() < 1e-9, "centre {:?}", h.center);
+        assert!((h.end.x - 300.0).abs() < 1e-9, "the ramp should reach the right edge");
+    }
+
+    /// Switching the type switches the paint, and switching back gets the
+    /// solid colour that was there before rather than a colour from the ramp.
+    #[test]
+    fn the_fill_type_selects_between_a_colour_and_a_ramp() {
+        let mut s = DrawStyle::default();
+        let area = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let solid = s.fill_for_new_shape(area).expect("filled");
+        assert!(!solid.is_gradient());
+
+        s.fill_kind = FillKind::Radial;
+        let radial = s.fill_for_new_shape(area).expect("filled");
+        assert_eq!(
+            radial.gradient().map(|g| g.kind),
+            Some(GradientKind::Radial),
+            "the panel's kind must reach the shape"
+        );
+
+        s.fill_kind = FillKind::Solid;
+        assert_eq!(s.fill_for_new_shape(area), Some(solid));
     }
 
     #[test]

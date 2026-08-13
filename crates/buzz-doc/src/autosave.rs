@@ -527,11 +527,29 @@ mod tests {
         );
     }
 
+    /// The crash slot is **one per process**, which is what it has to be —
+    /// there is one panic hook and one thing to write. That makes the three
+    /// tests below share a single piece of state, and `cargo test` runs them on
+    /// separate threads: without this lock, `forgetting_leaves_nothing_to_write`
+    /// can clear the slot between another test's two flushes, and the failure
+    /// looks exactly like a bug in the code under test.
+    static CRASH_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the crash slot, surviving a panic in an earlier test.
+    ///
+    /// A failed assertion while holding the lock poisons it, and every later
+    /// test would then fail on the lock rather than on its own assertion —
+    /// turning one real failure into three misleading ones.
+    fn crash_slot() -> std::sync::MutexGuard<'static, ()> {
+        CRASH_SLOT.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// **The two minutes autosave cannot cover.** A crash between autosaves
     /// would cost everything drawn since the last one; the snapshot kept for
     /// that moment is written instead.
     #[test]
     fn the_crash_snapshot_is_written_when_asked_for() {
+        let _slot = crash_slot();
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("crash.recovery.buzz");
         let mut scene = Scene::default();
@@ -553,6 +571,7 @@ mod tests {
     /// panic inside the panic hook from writing twice.
     #[test]
     fn the_crash_snapshot_is_only_written_once() {
+        let _slot = crash_slot();
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("once.recovery.buzz");
         remember_for_crash(&Scene::default(), path);
@@ -565,6 +584,7 @@ mod tests {
     /// would offer to restore work the user already has on disk.
     #[test]
     fn forgetting_leaves_nothing_to_write() {
+        let _slot = crash_slot();
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("saved.recovery.buzz");
         remember_for_crash(&Scene::default(), path.clone());

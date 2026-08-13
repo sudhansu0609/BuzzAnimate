@@ -48,7 +48,6 @@ pub fn tool_shapes(rect: Rect, tool: ToolId, color: Color32) -> Vec<Shape> {
         Subselection => arrow(&d, false),
         FreeTransform => free_transform(&d),
         GradientTransform => gradient_transform(&d),
-        Lasso => lasso(&d),
         Pen => pen(&d),
         Text => text(&d),
         Line => line_tool(&d),
@@ -213,18 +212,6 @@ fn gradient_transform(d: &Draw) {
 }
 
 /// A loop with a tail: freehand selection.
-fn lasso(d: &Draw) {
-    let mut pts = Vec::new();
-    let steps = 24;
-    for i in 0..=steps {
-        let t = i as f32 / steps as f32 * std::f32::consts::TAU * 0.92 - 1.2;
-        pts.push((0.5 + 0.26 * t.cos(), 0.44 + 0.24 * t.sin()));
-    }
-    d.curve(&pts);
-    d.curve(&[(0.62, 0.63), (0.60, 0.78), (0.52, 0.88)]);
-}
-
-/// A nib: the triangle with a slit up the middle.
 fn pen(d: &Draw) {
     d.outline(&[(0.5, 0.12), (0.70, 0.56), (0.5, 0.72), (0.30, 0.56)]);
     d.hairline((0.5, 0.30), (0.5, 0.72));

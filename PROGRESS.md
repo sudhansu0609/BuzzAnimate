@@ -328,8 +328,9 @@ Rules that follow from this, applied to every phase:
       millions of lines
 
 **CP-2.3 — toolbar**
-- [x] All 21 Animate tools with their letter shortcuts (V A Q L P T N R O Y B
-      M K S I E C H Z), verified against Animate by test
+- [x] Animate's tools with their letter shortcuts (V A Q P T N R O Y B M K S I
+      E C H Z), verified against Animate by test. The Lasso was later removed:
+      see §7 item 10.
 - [x] Unavailable tools are greyed with a tooltip saying which phase brings
       them — a tool that looks available but does nothing is worse
 - [x] Stroke/fill colour wells with swap (X) and default (D)
@@ -2783,6 +2784,65 @@ it; a cancelled export leaving nothing; an odd size refused; a soundtrack muxed
 at its cue with the delay verified by its duration; and the audio checkbox
 really leaving it out.
 
+### ✅ Four from using it: seams, selecting a layer, two selection tools
+
+Reported from actually animating with it, which is where the useful defects
+come from.
+
+**The pale lines between imported shapes.** Every path is antialiased on its
+own, so along a shared boundary each shape covers about *half* of every pixel —
+and one composited over the other gives `0.5 + 0.5 × (1 − 0.5) = 0.75`, not
+`1.0`. The remaining quarter is the stage showing through, and it draws a thin
+pale line along every join in the drawing. Imported artwork shows it everywhere,
+because Flash stored a shape as a soup of edges scan-converted *together*, so
+every region in a `.fla` shares its boundary exactly with its neighbour. This is
+the well-known conflation artifact: a property of compositing paths separately,
+not a bug in any one of them.
+
+- [x] A filled shape is now **sealed** — stroked with its own paint, a hair
+      under a pixel wide, which pushes its coverage half a pixel outwards so two
+      neighbours overlap across the boundary instead of meeting exactly on it
+- [x] The width is in **screen** pixels, because the seam is a property of the
+      rasteriser rather than of the document — the same at every zoom
+- [x] **Only opaque paint.** A translucent fill stroked with itself composites
+      twice around its rim and draws a visible darker outline, turning a faint
+      seam into an obvious border. Translucent artwork keeps the seam, which is
+      the lesser of the two. Onion-skin ghosts and guide-layer artwork are
+      translucent, so they are excluded by the same rule without a special case.
+- [x] **Not build-up paint**, which is summing into an isolation group: growing
+      the edge there would add to the accumulation rather than merely cover a
+      seam, and put a dark rim round every stroke
+
+**Measured, not argued about.** `headless_seams.rs` renders two touching
+rectangles on a white stage and looks for white along the join — including at
+*fractional* splits, because a join that lands on a whole pixel can hide the
+defect by giving one shape the whole pixel. With the seal removed the stage is
+**35% visible** along the seam; with it, under 25% nowhere, and three further
+tests pin that the colours do not bleed into each other, that the silhouette
+moves by less than a pixel, and that a translucent shape gets no dark rim.
+
+**Selecting a layer selects its artwork.** Clicking a layer used to move the
+highlight and nothing more, so the obvious next move — transform the lot —
+needed a marquee first. Now the layer's contents come with it, as in Animate.
+All three routes to "the user clicked a layer" go through one method, so the
+Layers panel, the timeline's layer column and the Layer Depth view agree.
+Locked and hidden artwork is skipped by the same rule hit-testing uses, and a
+locked layer still becomes *active* while selecting nothing — selecting artwork
+that cannot then be moved would be an empty promise, and a delete would take it.
+The frame matters and is passed in: a layer's artwork differs frame to frame.
+
+**Free Transform arrives with something to transform.** Pressing Q with nothing
+selected takes the active layer's artwork, so the tool is usable the moment it
+is chosen. It only ever adds to an *empty* selection, so choosing Q after
+picking one leg of a character cannot silently grab the whole layer. Opening a
+symbol does the same, for the same reason: a symbol is usually one drawing on
+one layer, and the reason for going in is almost always to work on it.
+
+**Two selection tools, not three.** The Lasso sat in the palette greyed out,
+holding a place and the letter `L` for a promise it did not keep. It is gone;
+Selection and Subselection are the two, and a test now asserts that `Text` is
+the only tool left in the palette that is not implemented.
+
 ---
 
 ## 5. Current metrics
@@ -2795,7 +2855,7 @@ really leaving it out.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 318 passing, clippy clean |
+| Tests | 1 335 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
@@ -2958,7 +3018,7 @@ down here has not been finished.
 | 1 | ~~**Oversized paths culled, not clipped.**~~ | ✅ **Resolved in CP-1.1** by `RenderClip` |
 | 8 | ~~**Gradients not implemented.**~~ | ✅ **Resolved** — linear and radial gradients on fills and strokes, a working Gradient Transform tool, format version 16 |
 | 9 | **Text tool not implemented.** Needs font loading, shaping and a text-editing caret — a subsystem in its own right. | Phase 2 follow-up |
-| 10 | **Lasso tool not implemented.** Freehand selection region. | Phase 2 follow-up |
+| 10 | **Lasso tool removed from the palette.** It was there greyed out, holding a place and the letter `L` for a promise it did not keep. Animate's freehand selection region is still worth having; it will come back when it works rather than before. | Deferred |
 | 11 | **Pen tool draws line segments, not Bézier curves.** Click-drag handle authoring is not there yet; anchors can be edited afterwards with Subselection. | Phase 2 follow-up |
 | 12 | **Multiple Scenes not implemented.** One scene per document. | Deferred |
 | 15 | ~~**Tweening not implemented.**~~ | ✅ **Resolved in CP-4.3** — classic, motion and shape tweens interpolate in the render path |
@@ -3096,6 +3156,11 @@ down here has not been finished.
 | 143 | **A sound that starts before the exported range is dropped, not trimmed into.** Exporting from frame 100 loses a line of dialogue that began on frame 90 and is still running, rather than starting it part-way through. Trimming needs `-ss` on that input and is a small piece of work; sliding it to zero would put it somewhere it never was, which is why it is dropped instead. | Follow-up |
 | 144 | **There is no bit-rate control, only constant quality.** ffmpeg's CRF and NVENC's CQ, presented as one "Quality" slider the right way round — ffmpeg's scale runs backwards. Animate offers a target bit rate as well, which is what you want when a file has to fit a limit. | Follow-up |
 | 145 | **Video export is not in the scripting API**, as sound and lighting are not (§7 items 43 and 49). | Phase 8 follow-up |
+| 146 | **Every opaque fill is drawn twice** — once filled, once stroked with its own paint to seal the seam against its neighbour. That is one extra path per shape, and the honest cost of the fix. A boolean-based outset would be exact and would cost an offset per shape per frame instead, which is far worse. | By design |
+| 147 | **Sealing grows a silhouette by half a pixel.** Two shapes that were *meant* to have a hairline gap between them lose it at low zoom, and an exported outline is half a pixel fatter than the geometry says. Sub-pixel in both cases, against a seam that was plainly visible. | By design |
+| 148 | **A translucent fill still shows the seam.** Sealing it would composite its rim twice and draw a darker outline, which is worse. Fixing it properly means drawing adjacent translucent shapes into one isolation group, which is a different compositing model. | Follow-up |
+| 149 | **An even-odd fill is sealed on its inner boundary too**, so a hole in a ring is half a pixel smaller than the path says. The seal strokes the whole path and cannot tell an outer boundary from an inner one without winding analysis. | Follow-up |
+| 150 | **Selecting a layer selecting its artwork is Animate's behaviour; Free Transform selecting it is not.** Animate's Q draws no handles until something is picked. Here, choosing it with an empty selection takes the active layer's contents, and opening a symbol does the same — because arriving with nothing selected means a click before any work can start, every time. It never touches an existing selection. | By design |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |

@@ -633,6 +633,13 @@ impl Editor {
     pub fn set_tool(&mut self, tool: ToolId) {
         if tool.is_ready() {
             self.machine.set_tool(tool);
+            // Free Transform needs something to put handles on. Picking it up
+            // with nothing selected takes the active layer's artwork, so the
+            // tool is usable the moment it is chosen — which is what going into
+            // a symbol and pressing Q is for.
+            if tool == ToolId::FreeTransform {
+                self.select_active_layer_contents();
+            }
         } else {
             self.status = Some(format!("{} is not available yet", tool.name()));
         }
@@ -2133,6 +2140,42 @@ impl Editor {
         self.selection.ensure_active_layer(self.doc.scene());
         self.set_frame(0);
         self.playback.playing = false;
+
+        // **Opening a symbol selects what is in it.** A symbol is usually one
+        // drawing on one layer, and the reason for going in is almost always to
+        // move, scale or turn that drawing. Arriving with nothing selected — and
+        // no layer lit in the timeline — means a click before any work can
+        // start, every time. A deviation from Animate, recorded in §7.
+        if let Some(layer) = self.selection.active_layer() {
+            self.selection
+                .select_layer(self.doc.scene(), layer, self.current_frame);
+        }
+    }
+
+    /// Make `layer` active and select the artwork on it.
+    ///
+    /// Every route to "the user clicked a layer" goes through here — the Layers
+    /// panel, the timeline's layer column and the Layer Depth view — so all
+    /// three agree about what a click does.
+    pub fn select_layer(&mut self, layer: LayerId) {
+        self.selection
+            .select_layer(self.doc.scene(), layer, self.current_frame);
+    }
+
+    /// Give a transform tool something to work on.
+    ///
+    /// Free Transform with nothing selected has nothing to draw handles round,
+    /// so reaching for it is always followed by a click on the artwork. Where
+    /// the active layer has artwork and nothing is selected, that click is
+    /// foregone: the layer's contents are selected, which is what the user was
+    /// about to do. It only ever *adds* a selection — an existing one is left
+    /// exactly as it is, so this can never take a chosen object away.
+    fn select_active_layer_contents(&mut self) {
+        if !self.selection.is_empty() {
+            return;
+        }
+        self.selection
+            .select_active_layer_contents(self.doc.scene(), self.current_frame);
     }
 
     /// Animate's *Create Brush From Selection*: adopt the selected artwork as
@@ -5216,6 +5259,119 @@ mod tests {
         e.pointer_down(e.camera.doc_to_screen(moved), Mods::default());
         e.pointer_up(e.camera.doc_to_screen(moved));
         assert_eq!(e.pivot(), before, "a click must not disturb it");
+    }
+
+    /// **Clicking a layer selects its artwork**, through the editor's own
+    /// entry point — which is what the Layers panel, the timeline and the
+    /// Layer Depth view all call.
+    #[test]
+    fn selecting_a_layer_selects_the_artwork_on_it() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let first = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a square");
+        let second = draw_square(&mut e, 100.0, 0.0, 40.0, Color::WHITE).expect("a square");
+        let layer = e.selection.active_layer().expect("a layer");
+
+        e.selection.clear();
+        e.select_layer(layer);
+
+        assert!(e.selection.contains(first));
+        assert!(e.selection.contains(second));
+        assert_eq!(e.selection.active_layer(), Some(layer));
+    }
+
+    /// **Free Transform arrives with something to transform.** Reaching for Q
+    /// with nothing selected used to draw no handles at all, so the tool did
+    /// nothing until the artwork was clicked as well.
+    #[test]
+    fn free_transform_selects_the_active_layers_artwork() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a square");
+        e.selection.clear();
+
+        e.set_tool(ToolId::FreeTransform);
+
+        assert!(
+            e.selection.contains(id),
+            "Q should have taken the layer's artwork"
+        );
+        assert!(
+            e.selection.bounds(e.scene()).is_some(),
+            "there should now be handles to draw"
+        );
+    }
+
+    /// It only ever *adds* to an empty selection. Choosing Q after picking one
+    /// leg of a character must not select the whole layer and transform the
+    /// lot.
+    #[test]
+    fn free_transform_leaves_an_existing_selection_alone() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let first = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a square");
+        let _second = draw_square(&mut e, 100.0, 0.0, 40.0, Color::WHITE).expect("a square");
+
+        e.selection.select_one(first);
+        e.set_tool(ToolId::FreeTransform);
+
+        assert_eq!(
+            e.selection.ids(),
+            vec![first],
+            "the chosen object must stay the only one"
+        );
+    }
+
+    /// Another tool does not grab the layer. Only Free Transform needs
+    /// something to put handles on; a brush picking the artwork up would be
+    /// baffling.
+    #[test]
+    fn other_tools_do_not_select_the_layer() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let _ = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a square");
+        e.selection.clear();
+
+        e.set_tool(ToolId::Brush);
+        assert!(e.selection.is_empty(), "the Brush selected the layer");
+
+        e.set_tool(ToolId::Selection);
+        assert!(e.selection.is_empty(), "the Selection tool selected the layer");
+    }
+
+    /// **Going into a symbol arrives with its artwork selected and its layer
+    /// lit.** A symbol is usually one drawing on one layer, and the reason for
+    /// going in is almost always to work on that drawing.
+    #[test]
+    fn opening_a_symbol_selects_what_is_inside_it() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 100.0, 100.0, 200.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        e.run(Command::ConvertToSymbol);
+        e.run(Command::EditSymbol);
+
+        assert!(
+            !e.scene().edit_path().is_empty(),
+            "the symbol should have opened"
+        );
+        assert!(
+            e.selection.active_layer().is_some(),
+            "a layer should be lit in the timeline"
+        );
+        assert!(
+            !e.selection.is_empty(),
+            "the symbol's own artwork should be selected"
+        );
+
+        // And every selected object really is inside the symbol, not left over
+        // from the stage.
+        for object in e.selection.iter() {
+            assert!(
+                e.scene().find_object(object).is_some(),
+                "{object:?} is not in the open symbol"
+            );
+        }
     }
 
     /// The same for a **symbol instance**, which is the case that matters:

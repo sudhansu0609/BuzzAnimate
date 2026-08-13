@@ -166,6 +166,46 @@ impl Selection {
             .reduce(|a, b| a.union(b))
     }
 
+    /// Make `layer` the active one **and select what is on it** at `frame`.
+    ///
+    /// This is what clicking a layer does in Animate: the layer becomes the one
+    /// new artwork goes on, and everything already on it is selected — so the
+    /// obvious next move, transforming or colouring the lot, needs no second
+    /// gesture. Before this, clicking a layer only moved the highlight, and the
+    /// artwork had to be marquee-selected afterwards.
+    ///
+    /// **Locked and hidden artwork is skipped**, and a locked or hidden *layer*
+    /// selects nothing at all — the same rule hit-testing uses. Selecting
+    /// something that cannot then be moved would be an empty promise, and
+    /// worse, a delete would take it.
+    pub fn select_layer(&mut self, scene: &Scene, layer: LayerId, frame: u32) {
+        self.active_layer = Some(layer);
+        self.objects.clear();
+
+        // `selectable` is the same rule hit-testing uses — editable, visible
+        // through its folders, and not locked through them either. Reusing it
+        // rather than re-deriving it is what keeps clicking a layer and
+        // clicking its artwork agreeing about what can be had.
+        let Some(target) = scene.layers().selectable().find(|l| l.id == layer) else {
+            return;
+        };
+        for object in target.objects_at(frame).iter() {
+            if object.visible && !object.locked {
+                self.objects.insert(object.id);
+            }
+        }
+    }
+
+    /// Select what is on the active layer, if anything is.
+    ///
+    /// Used when a tool is chosen that needs something to work on: see
+    /// `Editor::select_active_layer_contents`.
+    pub fn select_active_layer_contents(&mut self, scene: &Scene, frame: u32) {
+        if let Some(layer) = self.active_layer {
+            self.select_layer(scene, layer, frame);
+        }
+    }
+
     /// Description for the Properties panel header.
     pub fn describe(&self, scene: &Scene) -> String {
         match self.objects.len() {
@@ -227,6 +267,110 @@ mod tests {
             })
             .collect();
         (scene, layer, ids)
+    }
+
+    /// Clicking a layer selects what is on it — the whole point of the change.
+    #[test]
+    fn selecting_a_layer_selects_its_artwork() {
+        let (scene, layer, ids) = scene_with(3);
+        let mut selection = Selection::new();
+
+        selection.select_layer(&scene, layer, 0);
+
+        assert_eq!(selection.active_layer(), Some(layer));
+        assert_eq!(selection.len(), 3);
+        for id in ids {
+            assert!(selection.contains(id), "{id:?} should have been selected");
+        }
+    }
+
+    /// It **replaces** rather than adds, so clicking one layer and then another
+    /// leaves only the second's artwork selected.
+    #[test]
+    fn selecting_another_layer_replaces_the_selection() {
+        let (mut scene, first, _) = scene_with(2);
+        let second = scene.add_layer("Second", LayerKind::Normal);
+        let other = scene
+            .add_shape(
+                second,
+                ShapeData::filled(KRect::new(0.0, 0.0, 5.0, 5.0).to_path(1e-9), Color::WHITE),
+            )
+            .unwrap();
+
+        let mut selection = Selection::new();
+        selection.select_layer(&scene, first, 0);
+        assert_eq!(selection.len(), 2);
+
+        selection.select_layer(&scene, second, 0);
+        assert_eq!(selection.ids(), vec![other]);
+        assert_eq!(selection.active_layer(), Some(second));
+    }
+
+    /// A locked layer becomes active — you can still aim at it — but nothing on
+    /// it is selected. Selecting artwork that cannot then be moved would be an
+    /// empty promise, and a delete would take it anyway.
+    #[test]
+    fn a_locked_layer_is_made_active_but_selects_nothing() {
+        let (mut scene, layer, _) = scene_with(2);
+        scene.update_layer(layer, |l| l.locked = true);
+
+        let mut selection = Selection::new();
+        selection.select_layer(&scene, layer, 0);
+
+        assert_eq!(selection.active_layer(), Some(layer));
+        assert!(selection.is_empty(), "a locked layer selected its artwork");
+    }
+
+    #[test]
+    fn a_hidden_layer_selects_nothing_either() {
+        let (mut scene, layer, _) = scene_with(2);
+        scene.update_layer(layer, |l| l.visible = false);
+
+        let mut selection = Selection::new();
+        selection.select_layer(&scene, layer, 0);
+        assert!(selection.is_empty());
+    }
+
+    /// The frame matters: a layer's artwork is different on different frames,
+    /// so clicking it while the playhead is at forty must not select frame
+    /// zero's drawing.
+    #[test]
+    fn the_artwork_selected_is_the_artwork_on_that_frame() {
+        let (mut scene, layer, ids) = scene_with(1);
+        // A second keyframe further along, with its own drawing.
+        scene.update_layer(layer, |l| {
+            l.frames.insert_blank_keyframe(10);
+        });
+        let later = scene
+            .add_shape_at(
+                layer,
+                10,
+                ShapeData::filled(KRect::new(0.0, 0.0, 5.0, 5.0).to_path(1e-9), Color::WHITE),
+            )
+            .unwrap();
+
+        let mut selection = Selection::new();
+        selection.select_layer(&scene, layer, 0);
+        assert_eq!(selection.ids(), ids);
+
+        selection.select_layer(&scene, layer, 10);
+        assert_eq!(selection.ids(), vec![later]);
+    }
+
+    /// A layer with nothing on it selects nothing, and does not keep whatever
+    /// was selected before.
+    #[test]
+    fn an_empty_layer_clears_the_selection() {
+        let (mut scene, layer, _) = scene_with(2);
+        let empty = scene.add_layer("Empty", LayerKind::Normal);
+
+        let mut selection = Selection::new();
+        selection.select_layer(&scene, layer, 0);
+        assert_eq!(selection.len(), 2);
+
+        selection.select_layer(&scene, empty, 0);
+        assert!(selection.is_empty());
+        assert_eq!(selection.active_layer(), Some(empty));
     }
 
     #[test]

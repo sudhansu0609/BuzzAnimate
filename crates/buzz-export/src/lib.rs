@@ -37,6 +37,13 @@ use rayon::prelude::*;
 /// test suites like to use avoid it.
 const COPY_ALIGNMENT: u32 = 256;
 
+pub mod video;
+
+pub use video::{
+    AudioTrack, VideoCodec, VideoContainer, VideoReport, VideoSettings, export_video,
+    ffmpeg_available,
+};
+
 /// What to render, and how large.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExportSettings {

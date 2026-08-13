@@ -2064,6 +2064,7 @@ impl App {
             Command::LipSync => self.open_lip_sync(),
             Command::ExportImage => self.open_export(buzz_ui::ExportKind::Image),
             Command::ExportSequence => self.open_export(buzz_ui::ExportKind::Sequence),
+            Command::ExportVideo => self.open_export(buzz_ui::ExportKind::Video),
             Command::Open => self.open_dialog(),
             Command::Save => self.save(false),
             Command::SaveAs => self.save(true),
@@ -2257,19 +2258,26 @@ impl App {
             self.editor.status = Some("An export is already running".into());
             return;
         }
-        let scene = self.editor.scene();
-        let size = scene.stage().size;
+        // Checked as the dialog opens rather than when Export is pressed, so
+        // the missing dependency is visible while the settings are still being
+        // chosen instead of after a file name has been picked.
+        let has_ffmpeg = kind != buzz_ui::ExportKind::Video || buzz_export::ffmpeg_available();
+        let (size, length) = {
+            let scene = self.editor.scene();
+            // The length of the **film**, not of the timeline: a looping
+            // section is repeated into the export, so the default range has to
+            // reach the end of what will actually be written. Without a loop
+            // region the two are the same number.
+            (scene.stage().size, scene.rendered_frame_count())
+        };
+        self.editor.export.ffmpeg = has_ffmpeg;
         self.editor.export.open(
             kind,
             (
                 size.width.round().max(1.0) as u32,
                 size.height.round().max(1.0) as u32,
             ),
-            // The length of the **film**, not of the timeline: a looping
-            // section is repeated into the export, so the default range has to
-            // reach the end of what will actually be written. Without a loop
-            // region the two are the same number.
-            scene.rendered_frame_count(),
+            length,
         );
     }
 
@@ -2338,6 +2346,37 @@ impl App {
                     directory,
                     stem,
                     settings,
+                    self.preference.clone(),
+                )
+            }
+            buzz_ui::ExportKind::Video => {
+                let options = self.editor.export.video;
+                let extension = options.container.extension();
+                let picked = rfd::FileDialog::new()
+                    .add_filter(options.container.label(), &[extension])
+                    .set_file_name(format!("{stem}.{extension}"))
+                    .save_file();
+                let Some(path) = picked else { return };
+
+                crate::export_job::ExportJob::video(
+                    scene,
+                    self.editor.export.range(),
+                    path,
+                    settings,
+                    buzz_export::VideoSettings {
+                        codec: match options.codec {
+                            buzz_ui::VideoChoice::H264 => buzz_export::VideoCodec::H264,
+                            buzz_ui::VideoChoice::Hevc => buzz_export::VideoCodec::Hevc,
+                            buzz_ui::VideoChoice::Av1 => buzz_export::VideoCodec::Av1,
+                        },
+                        container: match options.container {
+                            buzz_ui::ContainerChoice::Mp4 => buzz_export::VideoContainer::Mp4,
+                            buzz_ui::ContainerChoice::Mov => buzz_export::VideoContainer::Mov,
+                        },
+                        quality: options.quality,
+                        hardware: options.hardware,
+                        audio: options.audio,
+                    },
                     self.preference.clone(),
                 )
             }

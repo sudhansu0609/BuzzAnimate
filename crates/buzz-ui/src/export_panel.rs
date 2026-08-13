@@ -15,6 +15,8 @@ pub enum ExportKind {
     Image,
     /// A numbered PNG per frame.
     Sequence,
+    /// An MP4 or MOV. CP-6.2.
+    Video,
 }
 
 impl ExportKind {
@@ -22,7 +24,13 @@ impl ExportKind {
         match self {
             ExportKind::Image => "Export Image",
             ExportKind::Sequence => "Export PNG Sequence",
+            ExportKind::Video => "Export Video",
         }
+    }
+
+    /// Does this export cover a range of frames rather than one?
+    pub fn is_range(self) -> bool {
+        matches!(self, Self::Sequence | Self::Video)
     }
 }
 
@@ -47,6 +55,87 @@ pub struct ExportState {
     stage: (u32, u32),
     /// A run in progress: frames done, frames total.
     pub progress: Option<(u32, u32)>,
+    /// Video settings. Remembered between exports, unlike the size — a codec
+    /// choice is a preference about the machine, not about the document, so
+    /// resetting it every time would be an annoyance rather than a safeguard.
+    pub video: VideoOptions,
+    /// Whether this machine has an ffmpeg to encode with, checked when the
+    /// dialog opens rather than when Export is pressed.
+    pub ffmpeg: bool,
+}
+
+/// The video choices the dialog offers.
+///
+/// A plain mirror of `buzz_export::VideoSettings`, kept here so `buzz-ui` does
+/// not depend on the exporter — the same separation every other panel has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoOptions {
+    pub codec: VideoChoice,
+    pub container: ContainerChoice,
+    pub quality: u32,
+    pub hardware: bool,
+    pub audio: bool,
+}
+
+impl Default for VideoOptions {
+    fn default() -> Self {
+        Self {
+            codec: VideoChoice::H264,
+            container: ContainerChoice::Mp4,
+            quality: 20,
+            hardware: true,
+            audio: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoChoice {
+    H264,
+    Hevc,
+    Av1,
+}
+
+impl VideoChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC (H.265)",
+            Self::Av1 => "AV1",
+        }
+    }
+
+    /// What this codec is for, in one line — the difference matters and is not
+    /// guessable from the name.
+    pub fn help(self) -> &'static str {
+        match self {
+            Self::H264 => "Plays everywhere. Choose this unless you have a reason not to.",
+            Self::Hevc => "Smaller at the same quality; not every player opens it.",
+            Self::Av1 => "Smaller again, and needs a recent player.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerChoice {
+    Mp4,
+    Mov,
+}
+
+impl ContainerChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mp4 => "MP4",
+            Self::Mov => "MOV",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Mp4 => "mp4",
+            Self::Mov => "mov",
+        }
+    }
 }
 
 impl Default for ExportState {
@@ -61,6 +150,8 @@ impl Default for ExportState {
             to_frame: 0,
             stage: (550, 400),
             progress: None,
+            video: VideoOptions::default(),
+            ffmpeg: true,
         }
     }
 }
@@ -236,7 +327,75 @@ fn settings_view(
     ui.checkbox(&mut state.transparent, "Transparent background")
         .on_hover_text("Leave the stage colour out, so the artwork can be composited elsewhere");
 
-    if kind == ExportKind::Sequence {
+    if kind == ExportKind::Video {
+        ui.add_space(4.0);
+        ui.separator();
+
+        if !state.ffmpeg {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 120, 90),
+                "No ffmpeg found on this machine.",
+            );
+            ui.label(
+                RichText::new(
+                    "Video export needs one. On Windows: winget install Gyan.FFmpeg",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add_space(4.0);
+        }
+
+        egui::Grid::new("export-video")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Format");
+                egui::ComboBox::from_id_salt("container")
+                    .selected_text(state.video.container.label())
+                    .width(90.0)
+                    .show_ui(ui, |ui| {
+                        for c in [ContainerChoice::Mp4, ContainerChoice::Mov] {
+                            ui.selectable_value(&mut state.video.container, c, c.label());
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Codec");
+                egui::ComboBox::from_id_salt("codec")
+                    .selected_text(state.video.codec.label())
+                    .width(140.0)
+                    .show_ui(ui, |ui| {
+                        for c in [VideoChoice::H264, VideoChoice::Hevc, VideoChoice::Av1] {
+                            ui.selectable_value(&mut state.video.codec, c, c.label())
+                                .on_hover_text(c.help());
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Quality");
+                // ffmpeg's scale runs backwards — lower is better — which is
+                // the opposite of what a slider labelled "quality" implies. So
+                // the slider is shown the way round a user expects and
+                // inverted here, rather than asking them to learn ffmpeg's.
+                let mut quality = 51u32.saturating_sub(state.video.quality);
+                if ui
+                    .add(egui::Slider::new(&mut quality, 10..=45).show_value(false))
+                    .on_hover_text("Higher is better and larger")
+                    .changed()
+                {
+                    state.video.quality = 51u32.saturating_sub(quality);
+                }
+                ui.end_row();
+            });
+
+        ui.label(RichText::new(state.video.codec.help()).small().weak());
+        ui.checkbox(&mut state.video.hardware, "Encode on the GPU")
+            .on_hover_text("Use NVENC where the machine has it. Falls back to the CPU otherwise.");
+        ui.checkbox(&mut state.video.audio, "Include the soundtrack");
+    }
+
+    if kind.is_range() {
         ui.add_space(4.0);
         ui.separator();
         ui.horizontal(|ui| {
@@ -245,7 +404,12 @@ fn settings_view(
             ui.label("to");
             ui.add(egui::DragValue::new(&mut state.to_frame).range(0..=u32::MAX));
             let count = state.range().len();
-            ui.label(RichText::new(format!("({count} files)")).small().weak());
+            let what = if kind == ExportKind::Video {
+                format!("({count} frames)")
+            } else {
+                format!("({count} files)")
+            };
+            ui.label(RichText::new(what).small().weak());
         });
     }
 

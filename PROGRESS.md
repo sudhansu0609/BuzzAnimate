@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-08-14
 **Current status:** Phases 0–5 complete (gaps in §7), plus fluid, pattern and
-art brushes. All three importers — `.fla`/`.xfl`, `.swf`, `.pdf`/`.ai` — read,
+art brushes, gradients, and video export with sound. All three importers — `.fla`/`.xfl`, `.swf`, `.pdf`/`.ai` — read,
 merge into an open document, and report what they could not bring across.
 **Phase 7 is done:** armatures, FABRIK inverse kinematics with joint limits and
 pins, skinning, puppet warp, and poses that tween. **Phase 8 started out of
@@ -2714,6 +2714,75 @@ two consecutive output samples are equal, which no nearest-neighbour
 implementation can satisfy, plus that the odd samples land exactly halfway
 between their neighbours.
 
+### ✅ CP-6.2 — video comes out, with the sound
+
+Stills came out and movement did not. Nobody publishes an animation as 500
+PNGs, and §7 item 41 recorded that a soundtrack had nowhere to go. Both are
+closed: `File ▸ Export ▸ Export Video…` writes an MP4 or a MOV, encoded on the
+GPU, with the document's sound muxed in.
+
+**ffmpeg is a child process, not a linked library.** The alternatives were a
+Rust binding to libav — shipping and linking a large C library and matching its
+version to the machine's — and `ffmpeg-sidecar`, which downloads an ffmpeg
+build over the network on first use. A creative tool that quietly fetches an
+executable and runs it is not something to build on, and bundling ffmpeg raises
+its own licensing question, H.264 in particular. So this drives the ffmpeg
+already on the machine, over a pipe. Absent, it says so and says how to install
+one, checked when the dialog *opens* rather than after a file name has been
+chosen.
+
+**Frames are piped, not written and re-read.** A 500-frame 1080p export is 4 GB
+of PNG on the way past; sending raw frames down ffmpeg's stdin as they are
+rendered means the export holds one frame in memory and the disk sees only the
+finished file.
+
+**NVENC, honestly reported.** `h264_nvenc`, `hevc_nvenc` and `av1_nvenc`, each
+naming a software encoder to fall back to — because an export that *failed* for
+want of an NVIDIA card would be a bad trade for the speed. The fallback is in
+the status line rather than hidden: an animator who believes they are using the
+GPU and is not should be told. Asking for software deliberately is not reported
+as a fallback, which is a distinction the report would otherwise lose.
+
+**The soundtrack** (§7 item 41). Every cue in the exported range is written out
+as the bytes it was imported as — ffmpeg decodes an MP3 better than we hand it
+our decode — then delayed to its own frame and mixed. Three decisions, each
+load-bearing: offsets are measured from **the start of the exported range**, so
+exporting from frame 100 with a sound cued to frame 100 begins with the sound
+rather than four seconds of silence; a cue that ends before the range starts is
+**dropped rather than slid to zero**; and `amix` is given `normalize=0`, because
+its default divides by the number of inputs and adding one footstep would
+quietly halve the dialogue.
+
+**Bug found by its own test — the safety measure broke the encode.** An export
+writes to a `.part` temporary and renames it into place, so an interrupted
+encode cannot leave a broken file where the render was. ffmpeg infers its
+container from the output's extension, has no idea what a `.part` is, and
+refused to open it at all — a failure caused entirely by the precaution. The
+format is now named outright, which makes the two independent.
+
+**A cancelled video export leaves nothing**, unlike a cancelled PNG sequence
+where the frames already written are worth keeping. Half an MP4 has no index
+and will not open, so a file that looks like a render and is not would be worse
+than no file at all.
+
+**An odd width is refused with a reason.** H.264 and HEVC subsample chroma by
+two and reject an odd dimension outright. Animate's own 550 × 400 stage is
+even, a scaled export is not reliably so, and "550 works and 551 fails" is a
+baffling thing to meet mid-deadline.
+
+**Proved on the real machine.** `headless_video.rs` renders, encodes, and then
+**reads the result back with ffprobe and decodes a frame out of it** — because
+a file being written is not the claim. ffmpeg will happily produce a zero-frame
+MP4 from a broken pipe, and a video that is the wrong length, size or colour is
+worse than one that failed, since nobody finds out until they watch it. Ten
+tests: the size and the exact frame count; the frame rate is the document's 24
+and not ffmpeg's default 25; a decoded frame has the artwork in the right place
+and the right colour, which is what would catch RGBA arriving as BGRA; MOV as
+well as MP4; software encoding standing on its own; NVENC where the machine has
+it; a cancelled export leaving nothing; an odd size refused; a soundtrack muxed
+at its cue with the delay verified by its duration; and the audio checkbox
+really leaving it out.
+
 ---
 
 ## 5. Current metrics
@@ -2726,7 +2795,7 @@ between their neighbours.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 304 passing, clippy clean |
+| Tests | 1 318 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
@@ -2734,6 +2803,8 @@ between their neighbours.
 | Formats heard | `.wav`, `.mp3`, `.ogg`, `.flac`, `.m4a`, `.aac` |
 | IK budget | 50 six-bone rigs solved in parallel, well inside one frame |
 | Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |
+| Formats written | `.buzz`, `.png`, PNG sequence, `.mp4`, `.mov` |
+| Video encoders | `h264_nvenc`, `hevc_nvenc`, `av1_nvenc`, with x264/x265/SVT-AV1 fallbacks |
 | Brush preview frame | 0.57 ms at 6 000 samples and 0.5 spacing |
 | Lights | Sun, Sky, Lamp; shading, highlights and cast shadows as vector geometry |
 
@@ -2826,12 +2897,15 @@ between their neighbours.
   - [ ] Frame-by-frame comparison against an Animate reference render — **not
         done**, and not possible here; see §7 item 21
 
-### 🟡 Phase 6 — Export — **CP-6.1 done**
+### 🟡 Phase 6 — Export — **CP-6.1 and CP-6.2 done**
 - [x] **CP-6.1** PNG image and PNG sequence — any resolution, transparent
       background optional, encoded across every core, on a background thread
       with progress and cancel (§4)
-- [ ] **CP-6.2** MP4 / MOV — NVENC (`h264_nvenc` / `hevc_nvenc` / `av1_nvenc`)
-      via `ffmpeg-sidecar`, N frames in flight
+- [x] **CP-6.2** MP4 / MOV — NVENC (`h264_nvenc` / `hevc_nvenc` / `av1_nvenc`)
+      with software fallbacks, frames piped to the machine's own ffmpeg, and
+      the document's soundtrack muxed in (§4). **Deviation from the plan:**
+      `ffmpeg-sidecar` was rejected because it downloads an ffmpeg build over
+      the network on first use — see §4 and §7 item 140.
 - [ ] **CP-6.3** GIF / WebP — palette quantisation, animated WebP
 - [ ] **CP-6.4** HTML5 Canvas / SVG — scene graph → JS + small runtime player
 - [ ] **Exit test:** one document exported to all four, all four play correctly
@@ -2910,7 +2984,7 @@ down here has not been finished.
 | 38 | ~~**Sound has no Properties panel.**~~ | ✅ **Resolved** — a Sound panel picks the clip, the sync mode, the volume and the repeat count |
 | 39 | ~~**Only Stream sync actually differs.**~~ | ✅ **Resolved** — the mixer keeps a second clock, so a triggered sound finishes after the playhead stops and does not move when it is scrubbed |
 | 40 | ~~**Resampling is nearest-neighbour.**~~ | ✅ **Resolved** — linear interpolation between neighbours, with the source position still computed from the absolute output position so a stream cannot drift |
-| 41 | **No sound in exports.** PNG sequences have no audio by definition; video export (CP-6.2) is where a soundtrack has to be muxed in, and that is not built yet. | Phase 6 |
+| 41 | ~~**No sound in exports.**~~ | ✅ **Resolved in CP-6.2** — every cue in the range is delayed to its frame and mixed into the video |
 | 42 | **Lip sync is signal analysis, not phoneme recognition.** It distinguishes silence, open and rounded vowels, and fricatives; it cannot distinguish `p`/`b`/`m` or `l`/`n`, which land on the closed and tongue shapes. Animate uses a trained model here. Recorded as a limitation rather than sold as parity. | By design |
 | 43 | **Scripting cannot reach sound.** `fl.getDocumentDOM()` exposes no sounds, no lip sync and no playback, so none of this can be driven from the Actions panel. | Phase 8 follow-up |
 | 33 | **An armature is an object, not an armature layer.** Animate moves rigged artwork onto its own layer whose keyframes are poses, and refuses to let you draw there. Here a rig is an object on an ordinary layer, which is why keyframes, tweens, undo, symbols and importing all work on it with no second code path — but the timeline does not mark the layer, and nothing stops you drawing on it. Recorded as a deviation, with the reason, in §4. | By design |
@@ -3016,6 +3090,12 @@ down here has not been finished.
 | 137 | **The repeat count is stored and not yet honoured.** `SoundRef::loops` is edited by the panel, saved and reloaded, but the mixer plays a cue once. Looping a triggered sound means the voice restarting itself; looping a stream means the timeline position wrapping within the clip. Both are small, and neither is built. | Sound follow-up |
 | 138 | **Stop sync silences a sound by not sending it**, rather than by cutting one already playing. `stage_cues` drops a Stop cue, so a Stream sound stops because nothing positions it — which is right — but a triggered Event already sounding runs to its end. Animate cuts it. | Sound follow-up |
 | 139 | **Downsampling is interpolated, not filtered.** Linear interpolation fixes the staircase, which is what made 44.1 kHz on a 48 kHz device sound wrong; playing a 48 kHz file on a 44.1 kHz device still folds anything above the new Nyquist limit back down, because there is no low-pass ahead of it. Audible only on very bright material, and the common direction is upsampling. | Sound follow-up |
+| 140 | **Video export needs an ffmpeg on the machine**, and does not ship one. `ffmpeg-sidecar`, which the plan named, downloads a build over the network on first use; a creative tool that quietly fetches an executable and runs it is not something to build on, and bundling ffmpeg raises a licensing question of its own. The dialog checks when it opens and says how to install one. | By design |
+| 141 | **Frames are encoded one at a time, not N in flight.** The plan said N; in practice the GPU renders a frame in about a millisecond and NVENC swallows it, so the pipe is never the bottleneck and a queue would add complexity for nothing measurable. Worth revisiting if a software encode of a long film proves otherwise. | By design |
+| 142 | **A looping section repeats the picture, not the sound.** The playlist is resolved for the frames, so the pictures repeat; each audio cue is muxed once, at its first occurrence. Repeating it means either looping the input or emitting the cue once per repeat, and the second is right — it is not built. | Follow-up |
+| 143 | **A sound that starts before the exported range is dropped, not trimmed into.** Exporting from frame 100 loses a line of dialogue that began on frame 90 and is still running, rather than starting it part-way through. Trimming needs `-ss` on that input and is a small piece of work; sliding it to zero would put it somewhere it never was, which is why it is dropped instead. | Follow-up |
+| 144 | **There is no bit-rate control, only constant quality.** ffmpeg's CRF and NVENC's CQ, presented as one "Quality" slider the right way round — ffmpeg's scale runs backwards. Animate offers a target bit rate as well, which is what you want when a file has to fit a limit. | Follow-up |
+| 145 | **Video export is not in the scripting API**, as sound and lighting are not (§7 items 43 and 49). | Phase 8 follow-up |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |
@@ -3159,63 +3239,40 @@ targets before there is anywhere to put what they read.
 
 ## 11. Next action
 
-**Finishing Phase 6** is the recommended next step. Stills come out now, and
-the off-screen render path every other export needs is built and tested — what
-is missing is *movement*: nobody publishes an animation as 500 PNGs.
+**Finishing Phase 6** is what is left of it. Stills, sequences and video all
+come out now; two output paths remain:
 
-- **CP-6.2** MP4/MOV via NVENC (`h264_nvenc` / `hevc_nvenc` / `av1_nvenc`)
-  through `ffmpeg-sidecar`, feeding it the frames `buzz-export` already
-  produces, N in flight
 - **CP-6.3** GIF/WebP — palette quantisation, animated WebP
 - **CP-6.4** HTML5 Canvas / SVG — scene graph to JS plus a small runtime
 
-Closest to the sound work just landed:
+Closest to the gradients just landed:
 
-- **A sound Properties panel** (§7 items 38 and 39): choosing which sound goes
-  on a keyframe, its volume, and its sync mode. The model carries all of it and
-  nothing edits it.
-- **Honest Event sync** — a sound effect that carries on past its keyframe
-  instead of stopping with the playhead.
-- **A resampler** (§7 item 40). Nearest-neighbour is fine for animating to
-  dialogue and wrong for a finished mix.
+- **Gradient Glow and Gradient Bevel** (§7 item 55), which were blocked on
+  gradients and are now blocked only on the filter's band geometry taking a
+  paint rather than a colour — the same change §7 item 130 needs for blurring a
+  gradient-filled shape.
+- **PDF gradients** (§7 item 134). The XFL and SWF roads bring them in; the PDF
+  one still averages them, because PDF expresses a gradient as a shading
+  dictionary rather than as an attribute.
+- **Copying a gradient with the eyedropper** (§7 item 132), which Animate does
+  and which is the natural way to reuse one across a drawing.
 
-Closest to the rigging work before it:
+Closest to the video export:
 
-- **A Bind tool** (§7 item 34) — painting weights by hand. Automatic weights
-  are right most of the time and wrong exactly where a character creases.
-- **Editing a rig** (§7 item 35): deleting a bone, reparenting one, moving a
-  joint without posing it. Building is additive today.
-- **F6 past the end of a span** (§7 item 37) — a small, real deviation from
-  Animate found while animating a rig, and one that costs an animator a frame
-  of artwork every time they meet it.
+- **A bit-rate target** (§7 item 144), for when a file has to fit a limit.
+- **Repeating the sound with a looping section** (§7 item 142) and **trimming
+  into a sound that starts before the exported range** (§7 item 143). Both are
+  small; both are wrong today in ways an animator would meet.
 
-Closest to the scripting work before it:
+Still the largest open risks and gaps:
 
-- **Frame scripts** (§7 item 30). A script that lives in the panel is a tool; a
-  script that lives on a keyframe is what makes a document interactive — and it
-  is the thing CP-8.3's AS3 runtime will need somewhere to put.
-- **Syntax highlighting in the Actions panel** (§6, CP-8.2). The panel is
-  usable and plain; a keyword colour and an error squiggle are what stop it
-  feeling like a text box.
-
-Closest to the lighting work just landed:
-
-- **Keyframed lights** (§7 item 47) — a sun that swings across a shot. The
-  camera already tweens; the rig would take the same path.
-- **Lighting in the scripting API** (§7 item 49), so a rig can be built and
-  aimed from a script the way shapes and layers already can.
-
-Closest to the drawing and depth work before it:
-
-- **Merge-shape brush strokes** (§7 item 26). Paint that does not fuse with the
-  paint under it is the most Animate-unlike thing about the new brushes. The
-  booleans are built; the work is doing them off the interactive thread so the
-  fix does not cost the responsiveness the brushes were designed around.
-- **3D object rotation** (§7 item 28) — the other half of "3D" in Animate:
-  rotating an individual movie clip in space, rather than arranging whole
-  layers in it. Needs a real projection in the renderer rather than an affine.
-- **Tablet pressure** (§7 item 25). The brush already reads pressure; nothing
-  supplies it.
-
-Then: library previews (§7 item 17), the Motion Editor (§7 item 18), text
-(§7 item 9), and checking the importers against real Adobe files (§7 item 21).
+- **Bitmaps** (§7 item 22) — no reader imports them, which is the one thing
+  stopping an Animate library arriving whole (§7 item 116).
+- **Text** (§7 item 9), a subsystem in its own right: font loading, shaping and
+  a caret.
+- **Checking the importers against real Adobe files** (§7 item 21), still the
+  largest single risk in Phase 5.
+- **Frame scripts** (§7 item 30) — a script on a keyframe is what makes a
+  document interactive, and is where CP-8.3's AS3 runtime will need to put one.
+- **Tablet pressure** (§7 item 25), **library previews** (§7 item 17) and the
+  **Motion Editor** (§7 item 18).

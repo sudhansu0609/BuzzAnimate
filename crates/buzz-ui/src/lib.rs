@@ -37,7 +37,7 @@ pub use brush::{BrushKind, BrushSettings, PatternShape};
 pub use camera_panel::{CameraResponse, camera_panel};
 pub use command::Command;
 pub use depth_panel::{DepthResponse, depth_panel};
-pub use export_panel::{ExportKind, ExportResponse, ExportState, export_dialog};
+pub use export_panel::{ContainerChoice, VideoChoice, VideoOptions,ExportKind, ExportResponse, ExportState, export_dialog};
 pub use filter_panel::{FilterPanelState, FilterResponse, FilterTarget, filter_panel};
 pub use about::{AboutState, about_dialog};
 pub use assets_panel::{AssetAction, AssetPanelState, assets_panel};

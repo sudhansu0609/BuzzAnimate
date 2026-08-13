@@ -123,6 +123,19 @@ fn write_archive<W: Write + Seek>(writer: &mut W, scene: &Scene) -> Result<(), D
     let dto = DocumentDto::from_scene(scene);
     zip.write_all(&serde_json::to_vec_pretty(&dto)?)?;
 
+    // Sounds go in `media/`, byte for byte as they were imported — the
+    // directory the container reserved for exactly this in Phase 1.
+    //
+    // **Stored, not deflated.** MP3 and compressed WAV do not compress again;
+    // deflating them costs time on every save and autosave and gives back a
+    // fraction of a percent. An uncompressed entry also means an unzip
+    // recovers a playable file directly.
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    for sound in scene.sounds().iter() {
+        zip.start_file(format!("media/{}", sound.file_name()), stored)?;
+        zip.write_all(&sound.data)?;
+    }
+
     zip.finish()?;
     Ok(())
 }
@@ -145,7 +158,37 @@ pub fn from_bytes(bytes: &[u8]) -> Result<Scene, DocError> {
     archive.by_name(ENTRY_DOCUMENT)?.read_to_string(&mut document)?;
 
     let dto: DocumentDto = serde_json::from_str(&document)?;
-    Ok(dto.to_scene()?)
+    let mut scene = dto.to_scene()?;
+
+    // Reunite each sound with its bytes. A sound whose file is missing keeps
+    // its entry — name, duration and every keyframe that references it — and
+    // simply plays nothing. Dropping it instead would silently delete the
+    // user's edits along with it, and they would have no way to tell what the
+    // document used to sound like.
+    let names: Vec<(buzz_scene::SoundId, String)> = scene
+        .sounds()
+        .iter()
+        .map(|s| (s.id, format!("media/{}", s.file_name())))
+        .collect();
+    for (id, name) in names {
+        let mut bytes = Vec::new();
+        match archive.by_name(&name) {
+            Ok(mut entry) => {
+                entry.read_to_end(&mut bytes)?;
+            }
+            Err(_) => {
+                tracing::warn!("{name} is missing from the document; that sound will be silent");
+                continue;
+            }
+        }
+        if let Some(asset) = scene.sounds_mut().get(id).cloned() {
+            let mut updated = (*asset).clone();
+            updated.data = std::sync::Arc::new(bytes);
+            scene.sounds_mut().insert(updated);
+        }
+    }
+
+    Ok(scene)
 }
 
 /// Read the metadata without loading the artwork.

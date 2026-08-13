@@ -6,8 +6,16 @@
 //!   workstation with virtual display drivers installed.
 //! * [`GpuContext`] — the device, queue and Vello renderer, plus the scene
 //!   building that honours the rebasing contract from `buzz-geom`.
+//! * [`document`] — the walk that turns a [`buzz_scene::Scene`] into Vello
+//!   drawing commands. It sits here rather than in the application because the
+//!   window, the exporter and the headless tests must all encode a document
+//!   the same way; an export that does not match the screen is the worst bug
+//!   an animation tool can have.
 
 pub mod adapter;
+pub mod document;
+pub mod filters;
+pub mod lighting;
 
 use anyhow::{Context, Result};
 use buzz_geom::{Affine, BezPath, Camera, RenderClip, RenderSplit, Shape};
@@ -17,7 +25,9 @@ use wgpu::{Device, Instance, Queue, TextureFormat, TextureView};
 
 pub use adapter::{GpuPreference, Selection, SelectionError};
 // Re-export the wgpu that vello uses, so downstream crates cannot accidentally
-// link a second, incompatible copy.
+// link a second, incompatible copy. Vello itself goes with it, for the same
+// reason: the exporter builds scenes and must build *these* scenes.
+pub use vello;
 pub use vello::wgpu;
 
 /// Everything needed to rasterise a scene on the GPU.
@@ -138,6 +148,28 @@ pub const RENDER_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 /// Geometry is rebased into anchor-relative space **in `f64` on the CPU**, and
 /// only then handed to Vello along with the small-magnitude view transform.
 /// Passing document-space geometry with a fused transform would reintroduce the
+/// How Animate's blend list maps onto Vello's.
+///
+/// Nine of the ten are one of Vello's mixing modes; Add is a *compositing*
+/// operator rather than a mixing one — `Plus` sums the two, which is what
+/// Animate's Add does. Layer means "composite as a group first", which is the
+/// group itself, so it needs no equation at all.
+fn blend_mode(blend: buzz_fx::Blend) -> peniko::BlendMode {
+    use buzz_fx::Blend;
+    let (mix, compose) = match blend {
+        Blend::Normal | Blend::Layer => (peniko::Mix::Normal, peniko::Compose::SrcOver),
+        Blend::Darken => (peniko::Mix::Darken, peniko::Compose::SrcOver),
+        Blend::Multiply => (peniko::Mix::Multiply, peniko::Compose::SrcOver),
+        Blend::Lighten => (peniko::Mix::Lighten, peniko::Compose::SrcOver),
+        Blend::Screen => (peniko::Mix::Screen, peniko::Compose::SrcOver),
+        Blend::Overlay => (peniko::Mix::Overlay, peniko::Compose::SrcOver),
+        Blend::HardLight => (peniko::Mix::HardLight, peniko::Compose::SrcOver),
+        Blend::Difference => (peniko::Mix::Difference, peniko::Compose::SrcOver),
+        Blend::Add => (peniko::Mix::Normal, peniko::Compose::Plus),
+    };
+    peniko::BlendMode::new(mix, compose)
+}
+
 /// precision collapse that caps Animate at 2000%. See `buzz_geom::camera`.
 pub struct SceneBuilder<'a> {
     scene: &'a mut Scene,
@@ -267,6 +299,66 @@ impl<'a> SceneBuilder<'a> {
         self.scene.pop_layer();
     }
 
+    /// Fill a shape with the **even-odd** rule.
+    ///
+    /// What a ring is drawn with: an outer boundary and an inner one in the
+    /// same path, with the hole between them. Non-zero would fill the lot.
+    pub fn fill_shape_even_odd(&mut self, shape: &impl Shape, color: Color) {
+        let path = self.to_render_space(shape);
+        self.scene
+            .fill(Fill::EvenOdd, self.split.gpu_view, color, None, &path);
+    }
+
+    /// Stroke a shape with an extra transform applied to the **pen** as well as
+    /// the path.
+    ///
+    /// This is what draws an elliptical soft edge: `buzz-fx` squashes the path
+    /// so the blur is round, and the transform stretches path and pen back
+    /// together. A round pen scaled by a width would stay round.
+    ///
+    /// The transform is applied in document space, before the render split, so
+    /// it is subject to the same magnification as everything else.
+    pub fn stroke_transformed(
+        &mut self,
+        shape: &impl Shape,
+        color: Color,
+        width: f64,
+        transform: Affine,
+    ) {
+        // The path is carried into the transformed space by hand; the pen is
+        // carried by handing Vello the transform, which strokes under it.
+        let path = self.to_render_space(shape);
+        let render_width = self.split.scale_length(width).max(f64::MIN_POSITIVE);
+
+        // Render space is the document scaled about an anchor, so a transform
+        // meant for document space has to be conjugated into it: shift to the
+        // anchor, scale, apply, and undo. For the scale-only transforms this
+        // is used with, that reduces to the transform itself.
+        self.scene.stroke(
+            &kurbo::Stroke::new(render_width),
+            self.split.gpu_view * transform,
+            color,
+            None,
+            &(transform.inverse() * path),
+        );
+    }
+
+    /// Begin a group that composites with what is behind it using `blend`.
+    ///
+    /// Animate's blend modes need a backdrop to blend *with*, and without a
+    /// group that backdrop is the entire stage — so every mode but Normal is
+    /// drawn into one of these.
+    pub fn push_blend(&mut self, bounds: buzz_geom::Rect, blend: buzz_fx::Blend) {
+        let path = self.to_render_space(&bounds);
+        self.scene.push_layer(
+            Fill::NonZero,
+            blend_mode(blend),
+            1.0,
+            self.split.gpu_view,
+            &path,
+        );
+    }
+
     /// Begin a transparent group that later drawing composites into.
     ///
     /// Ordinary source-over drawing is unaffected by being inside one — an
@@ -290,6 +382,28 @@ impl<'a> SceneBuilder<'a> {
     /// Close the group opened by [`Self::push_isolation`].
     pub fn pop_isolation(&mut self) {
         self.scene.pop_layer();
+    }
+
+    /// Clip everything drawn until the next [`Self::pop_isolation`] to `shape`.
+    ///
+    /// This is what a mask layer does: the shape is the mask's own artwork, and
+    /// the layers it claims show only where that artwork covers them.
+    ///
+    /// **Non-zero fill, deliberately.** A mask drawn as several separate blobs
+    /// shows through all of them; under even-odd, two overlapping blobs would
+    /// punch a hole where they cross, which is not what anybody drawing a mask
+    /// means. The shape goes through the same document-space clipping and
+    /// rebasing as artwork, so a mask survives extreme zoom like everything
+    /// else.
+    pub fn push_clip(&mut self, shape: &impl Shape) {
+        let path = self.to_render_space(shape);
+        self.scene.push_layer(
+            Fill::NonZero,
+            peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::SrcOver),
+            1.0,
+            self.split.gpu_view,
+            &path,
+        );
     }
 
     /// Stroke a document-space shape with a width in document units.

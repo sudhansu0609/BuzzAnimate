@@ -816,6 +816,8 @@ impl FrameContext {
             objects: std::sync::Arc::new(frame.objects),
             label: frame.label,
             tween: frame.tween,
+            // Imported formats carry no sound yet (PROGRESS §7).
+            sound: None,
         });
     }
 

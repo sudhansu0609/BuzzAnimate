@@ -168,12 +168,7 @@ impl ViewSettings {
     ///
     /// `object_edges` are candidate coordinates from nearby geometry; the
     /// caller supplies them because only it knows what is on screen.
-    pub fn snap_point(
-        &self,
-        point: Point,
-        zoom: f64,
-        object_edges: &[Rect],
-    ) -> Snapped {
+    pub fn snap_point(&self, point: Point, zoom: f64, object_edges: &[Rect]) -> Snapped {
         if !self.snap.any() || !(zoom.is_finite() && zoom > 0.0) {
             return Snapped::unchanged(point);
         }
@@ -354,13 +349,22 @@ mod tests {
         });
 
         // At 1x, 8 px of tolerance is 8 document units, so 5 away snaps.
-        assert_eq!(v.snap_point(Point::new(105.0, 0.0), 1.0, &[]).point.x, 100.0);
+        assert_eq!(
+            v.snap_point(Point::new(105.0, 0.0), 1.0, &[]).point.x,
+            100.0
+        );
 
         // At 10x, 8 px is 0.8 units, so 5 away is far too distant.
-        assert_eq!(v.snap_point(Point::new(105.0, 0.0), 10.0, &[]).point.x, 105.0);
+        assert_eq!(
+            v.snap_point(Point::new(105.0, 0.0), 10.0, &[]).point.x,
+            105.0
+        );
 
         // But 0.5 away does snap at 10x.
-        assert_eq!(v.snap_point(Point::new(100.5, 0.0), 10.0, &[]).point.x, 100.0);
+        assert_eq!(
+            v.snap_point(Point::new(100.5, 0.0), 10.0, &[]).point.x,
+            100.0
+        );
     }
 
     #[test]
@@ -396,11 +400,20 @@ mod tests {
         let rect = Rect::new(0.0, 0.0, 100.0, 50.0);
 
         // Left edge.
-        assert_eq!(v.snap_point(Point::new(2.0, 200.0), 1.0, &[rect]).point.x, 0.0);
+        assert_eq!(
+            v.snap_point(Point::new(2.0, 200.0), 1.0, &[rect]).point.x,
+            0.0
+        );
         // Centre.
-        assert_eq!(v.snap_point(Point::new(48.0, 200.0), 1.0, &[rect]).point.x, 50.0);
+        assert_eq!(
+            v.snap_point(Point::new(48.0, 200.0), 1.0, &[rect]).point.x,
+            50.0
+        );
         // Right edge.
-        assert_eq!(v.snap_point(Point::new(103.0, 200.0), 1.0, &[rect]).point.x, 100.0);
+        assert_eq!(
+            v.snap_point(Point::new(103.0, 200.0), 1.0, &[rect]).point.x,
+            100.0
+        );
     }
 
     #[test]
@@ -424,7 +437,10 @@ mod tests {
             position: 100.0,
             orientation: Orientation::Vertical,
         });
-        assert_eq!(v.snap_point(Point::new(101.0, 0.0), 1.0, &[]).point.x, 101.0);
+        assert_eq!(
+            v.snap_point(Point::new(101.0, 0.0), 1.0, &[]).point.x,
+            101.0
+        );
     }
 
     #[test]
@@ -436,8 +452,14 @@ mod tests {
         });
         assert_eq!(v.guides.len(), 1);
 
-        assert!(!v.remove_guide_near(Orientation::Vertical, 50.0, 3.0), "wrong axis");
-        assert!(!v.remove_guide_near(Orientation::Horizontal, 90.0, 3.0), "too far");
+        assert!(
+            !v.remove_guide_near(Orientation::Vertical, 50.0, 3.0),
+            "wrong axis"
+        );
+        assert!(
+            !v.remove_guide_near(Orientation::Horizontal, 90.0, 3.0),
+            "too far"
+        );
         assert!(v.remove_guide_near(Orientation::Horizontal, 51.0, 3.0));
         assert!(v.guides.is_empty());
     }

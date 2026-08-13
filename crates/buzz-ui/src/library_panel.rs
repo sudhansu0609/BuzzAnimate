@@ -107,6 +107,7 @@ pub fn library_panel(ui: &mut Ui, scene: &mut Scene, state: &mut LibraryState) -
     let usage = scene.symbol_usage();
 
     egui::ScrollArea::vertical()
+        .id_salt("library-items")
         .auto_shrink([false, false])
         .max_height(ui.available_height() - 60.0)
         .show(ui, |ui| {
@@ -157,7 +158,12 @@ fn draw_folder_contents(
 
         ui.horizontal(|ui| {
             ui.add_space(indent);
-            if ui.small_button(if open { "▼" } else { "▶" }).clicked() {
+            // `⏷` rather than `▼`: the bundled fonts have a glyph for U+23F7
+            // and none for U+25BC, so an expanded folder used to be marked
+            // with an empty box. `▶` for a closed one does render. Found by
+            // screenshot while checking the Actions panel, not by a test —
+            // a missing glyph is invisible to every assertion we can write.
+            if ui.small_button(if open { "⏷" } else { "▶" }).clicked() {
                 state.toggle(&folder);
             }
             // "F", not a folder emoji: egui's bundled fonts have no glyph for
@@ -193,7 +199,10 @@ fn draw_folder_contents(
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "internal row painter, not an API")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal row painter, not an API"
+)]
 fn draw_symbol_row(
     ui: &mut Ui,
     scene: &mut Scene,
@@ -276,12 +285,11 @@ fn draw_symbol_row(
             // Zero uses is worth noticing — it is the safe-to-delete signal.
             let text = RichText::new(format!("{uses}")).small();
             let text = if uses == 0 { text.weak() } else { text };
-            ui.label(text)
-                .on_hover_text(if uses == 0 {
-                    "Not used anywhere".to_string()
-                } else {
-                    format!("Used {uses} time(s), including inside other symbols")
-                });
+            ui.label(text).on_hover_text(if uses == 0 {
+                "Not used anywhere".to_string()
+            } else {
+                format!("Used {uses} time(s), including inside other symbols")
+            });
         });
     });
 }
@@ -302,11 +310,19 @@ fn draw_footer(
             .selected_text(RichText::new(state.new_symbol_kind.label()).small())
             .width(72.0)
             .show_ui(ui, |ui| {
-                for kind in [SymbolKind::Graphic, SymbolKind::MovieClip, SymbolKind::Button] {
+                for kind in [
+                    SymbolKind::Graphic,
+                    SymbolKind::MovieClip,
+                    SymbolKind::Button,
+                ] {
                     ui.selectable_value(&mut state.new_symbol_kind, kind, kind.label());
                 }
             });
-        if ui.small_button("➕").on_hover_text(Command::NewSymbol.label()).clicked() {
+        if ui
+            .small_button("➕")
+            .on_hover_text(Command::NewSymbol.label())
+            .clicked()
+        {
             *command = Some(Command::NewSymbol);
         }
         if ui
@@ -371,7 +387,9 @@ fn draw_footer(
             });
 
         if let Some(destination) = target {
-            scene.library_mut().move_to_folder(id, destination.as_deref());
+            scene
+                .library_mut()
+                .move_to_folder(id, destination.as_deref());
         }
 
         ui.label(

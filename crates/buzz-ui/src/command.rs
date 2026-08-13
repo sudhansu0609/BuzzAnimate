@@ -23,6 +23,20 @@ pub enum Command {
     ImportToLibrary,
     /// Import an Animate document onto the stage as well as the library.
     ImportToStage,
+    /// Write the current frame out as a PNG.
+    ExportImage,
+    /// Write a numbered PNG for every frame in a range.
+    ExportSequence,
+    /// Bring a sound file into the library.
+    ImportSound,
+    /// Put the library's selected sound on the current keyframe.
+    AttachSound,
+    /// Take the sound off the current keyframe.
+    RemoveSound,
+    /// Open the Lip Sync dialog for the document's soundtrack.
+    LipSync,
+    /// Make a mouth symbol with a frame per shape, to draw over.
+    NewMouthSymbol,
 
     // Edit
     Undo,
@@ -83,6 +97,32 @@ pub enum Command {
     /// Adopt the selected artwork as the pattern brush's shape.
     BrushFromSelection,
 
+    // Workspace
+    /// Show or hide a panel.
+    TogglePanel(super::workspace::PanelId),
+    /// Stop the layout being rearranged by accident.
+    ToggleLayoutLock,
+    /// Put every panel back where it started.
+    ResetWorkspace,
+
+    // Lighting
+    /// Add a sun: one direction for the whole stage.
+    AddSun,
+    /// Add a sky: ambient fill, casting nothing.
+    AddSky,
+    /// Add a lamp: a point on the stage, with falloff.
+    AddLamp,
+    /// Show or hide the light handles on the stage.
+    ToggleLightGizmos,
+
+    // Commands (scripting)
+    /// Show or hide the Actions panel.
+    ToggleActionsPanel,
+    /// Run what is in the Actions panel against this document.
+    RunScript,
+    /// Empty the Actions panel's Output area.
+    ClearScriptOutput,
+
     // Tweens
     CreateClassicTween,
     CreateMotionTween,
@@ -125,6 +165,13 @@ impl Command {
             Quit => "Exit",
             ImportToLibrary => "Import to Library…",
             ImportToStage => "Import to Stage…",
+            ExportImage => "Export Image…",
+            ExportSequence => "Export PNG Sequence…",
+            ImportSound => "Import Sound…",
+            AttachSound => "Attach Sound to Frame",
+            RemoveSound => "Remove Sound from Frame",
+            LipSync => "Lip Sync…",
+            NewMouthSymbol => "New Mouth Symbol",
 
             Undo => "Undo",
             Redo => "Redo",
@@ -174,6 +221,19 @@ impl Command {
 
             BrushFromSelection => "Create Brush From Selection",
 
+            TogglePanel(_) => "Panel",
+            ToggleLayoutLock => "Lock Layout",
+            ResetWorkspace => "Reset Layout",
+
+            AddSun => "Sun",
+            AddSky => "Sky",
+            AddLamp => "Lamp",
+            ToggleLightGizmos => "Light Handles",
+
+            ToggleActionsPanel => "Actions",
+            RunScript => "Run Script",
+            ClearScriptOutput => "Clear Output",
+
             CreateClassicTween => "Create Classic Tween",
             CreateMotionTween => "Create Motion Tween",
             CreateShapeTween => "Create Shape Tween",
@@ -219,6 +279,12 @@ impl Command {
             // Animate's import bindings.
             ImportToStage => sc(ctrl, Key::R),
             ImportToLibrary => sc(ctrl_shift, Key::R),
+            // Animate has no default binding for Export Image, and inventing
+            // one risks colliding with a habit rather than serving it.
+            ExportImage => None,
+            ExportSequence => None,
+            // Animate has no default binding for any of these.
+            ImportSound | AttachSound | RemoveSound | LipSync | NewMouthSymbol => None,
 
             Undo => sc(ctrl, Key::Z),
             // Animate accepts both; Ctrl+Y is also handled by the key map.
@@ -272,6 +338,25 @@ impl Command {
             NewLibraryFolder => None,
 
             BrushFromSelection => None,
+
+            // Adding a light is a deliberate, occasional act; the handles get
+            // a key because they are turned off to see the picture clean and
+            // straight back on to keep working.
+            TogglePanel(_) | ResetWorkspace => None,
+            // Animate has no shortcut for this; it is a settle-down-and-work
+            // action, and Ctrl+Alt+L is free here.
+            ToggleLayoutLock => sc(ctrl.plus(Modifiers::ALT), Key::L),
+
+            AddSun | AddSky | AddLamp => None,
+            ToggleLightGizmos => sc(ctrl_shift, Key::L),
+
+            // F9 is Animate's own Actions panel key on Windows.
+            ToggleActionsPanel => sc(Modifiers::NONE, Key::F9),
+            // Ctrl+Enter is what every code editor runs on, and plain Enter is
+            // already Animate's Play/Pause — which a script author would hit
+            // constantly by accident if running were bound to it.
+            RunScript => sc(ctrl, Key::Enter),
+            ClearScriptOutput => None,
 
             CreateClassicTween => None,
             CreateMotionTween => None,
@@ -331,6 +416,104 @@ fn ctrl_semicolon() -> Modifiers {
     Modifiers::CTRL
 }
 
+/// Every command that carries a keyboard shortcut.
+///
+/// Exposed so the application can assert that each one is actually bound: a
+/// shortcut in this map is a *promise*, and the code that reads the keyboard
+/// is a separate list that has to keep it.
+pub fn all_with_shortcuts() -> Vec<Command> {
+    use Command::*;
+    [
+        New,
+        Open,
+        Save,
+        SaveAs,
+        Close,
+        Quit,
+        Undo,
+        Redo,
+        Cut,
+        Copy,
+        Paste,
+        Delete,
+        SelectAll,
+        Deselect,
+        DuplicateSelection,
+        ZoomIn,
+        ZoomOut,
+        ZoomActual,
+        ZoomFitInWindow,
+        ZoomShowFrame,
+        ZoomShowAll,
+        ToggleRulers,
+        ToggleGrid,
+        ToggleGuides,
+        ToggleSnapping,
+        TogglePasteboard,
+        GroupSelection,
+        UngroupSelection,
+        BringToFront,
+        BringForward,
+        SendBackward,
+        SendToBack,
+        ConvertLinesToFills,
+        ExpandFill,
+        SmoothSelection,
+        StraightenSelection,
+        NewLayer,
+        NewLayerFolder,
+        DeleteLayer,
+        InsertFrame,
+        RemoveFrame,
+        InsertKeyframe,
+        InsertBlankKeyframe,
+        ClearKeyframe,
+        PlayPause,
+        NextFrame,
+        PreviousFrame,
+        FirstFrame,
+        LastFrame,
+        ToggleOnionSkin,
+        ToggleCamera,
+        AddCameraKeyframe,
+        RemoveCameraKeyframe,
+        ResetCamera,
+        ImportToLibrary,
+        ImportToStage,
+        ConvertToSymbol,
+        NewSymbol,
+        EditSymbol,
+        EditDocument,
+        PlaceInstance,
+        DuplicateSymbol,
+        DeleteSymbol,
+        NewLibraryFolder,
+        CreateClassicTween,
+        CreateMotionTween,
+        CreateShapeTween,
+        RemoveTween,
+        BrushFromSelection,
+        AddSun,
+        AddSky,
+        AddLamp,
+        ToggleLightGizmos,
+        ToggleLayoutLock,
+        ToggleActionsPanel,
+        RunScript,
+        ClearScriptOutput,
+        ExportImage,
+        ExportSequence,
+        ImportSound,
+        AttachSound,
+        RemoveSound,
+        LipSync,
+        NewMouthSymbol,
+    ]
+    .into_iter()
+    .filter(|c| c.shortcut().is_some())
+    .collect()
+}
+
 /// Format a shortcut the way a menu shows it.
 pub fn shortcut_text(ctx: &egui::Context, command: Command) -> String {
     command
@@ -348,19 +531,90 @@ mod tests {
     fn all_commands() -> Vec<Command> {
         use Command::*;
         vec![
-            New, Open, Save, SaveAs, Close, Quit, Undo, Redo, Cut, Copy, Paste, Delete,
-            SelectAll, Deselect, DuplicateSelection, ZoomIn, ZoomOut, ZoomActual,
-            ZoomFitInWindow, ZoomShowFrame, ZoomShowAll, ToggleRulers, ToggleGrid,
-            ToggleGuides, ToggleSnapping, TogglePasteboard, GroupSelection, UngroupSelection,
-            BringToFront, BringForward, SendBackward, SendToBack, ConvertLinesToFills,
-            ExpandFill, SmoothSelection, StraightenSelection, NewLayer, NewLayerFolder,
-            DeleteLayer, InsertFrame, RemoveFrame, InsertKeyframe, InsertBlankKeyframe,
-            ClearKeyframe, PlayPause, NextFrame, PreviousFrame, FirstFrame, LastFrame,
-            ToggleOnionSkin, ToggleCamera, AddCameraKeyframe, RemoveCameraKeyframe,
-            ResetCamera, ImportToLibrary, ImportToStage, ConvertToSymbol, NewSymbol,
-            EditSymbol, EditDocument, PlaceInstance, DuplicateSymbol, DeleteSymbol,
-            NewLibraryFolder, CreateClassicTween, CreateMotionTween, CreateShapeTween,
-            RemoveTween, BrushFromSelection,
+            New,
+            Open,
+            Save,
+            SaveAs,
+            Close,
+            Quit,
+            Undo,
+            Redo,
+            Cut,
+            Copy,
+            Paste,
+            Delete,
+            SelectAll,
+            Deselect,
+            DuplicateSelection,
+            ZoomIn,
+            ZoomOut,
+            ZoomActual,
+            ZoomFitInWindow,
+            ZoomShowFrame,
+            ZoomShowAll,
+            ToggleRulers,
+            ToggleGrid,
+            ToggleGuides,
+            ToggleSnapping,
+            TogglePasteboard,
+            GroupSelection,
+            UngroupSelection,
+            BringToFront,
+            BringForward,
+            SendBackward,
+            SendToBack,
+            ConvertLinesToFills,
+            ExpandFill,
+            SmoothSelection,
+            StraightenSelection,
+            NewLayer,
+            NewLayerFolder,
+            DeleteLayer,
+            InsertFrame,
+            RemoveFrame,
+            InsertKeyframe,
+            InsertBlankKeyframe,
+            ClearKeyframe,
+            PlayPause,
+            NextFrame,
+            PreviousFrame,
+            FirstFrame,
+            LastFrame,
+            ToggleOnionSkin,
+            ToggleCamera,
+            AddCameraKeyframe,
+            RemoveCameraKeyframe,
+            ResetCamera,
+            ImportToLibrary,
+            ImportToStage,
+            ConvertToSymbol,
+            NewSymbol,
+            EditSymbol,
+            EditDocument,
+            PlaceInstance,
+            DuplicateSymbol,
+            DeleteSymbol,
+            NewLibraryFolder,
+            CreateClassicTween,
+            CreateMotionTween,
+            CreateShapeTween,
+            RemoveTween,
+            BrushFromSelection,
+            AddSun,
+            AddSky,
+            AddLamp,
+            ToggleLightGizmos,
+            ToggleLayoutLock,
+            ToggleActionsPanel,
+            RunScript,
+            ClearScriptOutput,
+            ExportImage,
+            ExportSequence,
+            ImportSound,
+            AttachSound,
+            RemoveSound,
+            LipSync,
+            NewMouthSymbol,
         ]
     }
 
@@ -396,7 +650,9 @@ mod tests {
     #[test]
     fn the_frame_shortcuts_match_animate() {
         let expect = |c: Command, m: Modifiers, k: Key| {
-            let sc = c.shortcut().unwrap_or_else(|| panic!("{c:?} has no shortcut"));
+            let sc = c
+                .shortcut()
+                .unwrap_or_else(|| panic!("{c:?} has no shortcut"));
             assert_eq!((sc.modifiers, sc.logical_key), (m, k), "{c:?}");
         };
 
@@ -413,7 +669,9 @@ mod tests {
     #[test]
     fn the_symbol_shortcuts_match_animate() {
         let expect = |c: Command, m: Modifiers, k: Key| {
-            let sc = c.shortcut().unwrap_or_else(|| panic!("{c:?} has no shortcut"));
+            let sc = c
+                .shortcut()
+                .unwrap_or_else(|| panic!("{c:?} has no shortcut"));
             assert_eq!((sc.modifiers, sc.logical_key), (m, k), "{c:?}");
         };
 
@@ -425,7 +683,9 @@ mod tests {
     #[test]
     fn the_familiar_shortcuts_are_what_a_user_expects() {
         let expect = |c: Command, m: Modifiers, k: Key| {
-            let sc = c.shortcut().unwrap_or_else(|| panic!("{c:?} has no shortcut"));
+            let sc = c
+                .shortcut()
+                .unwrap_or_else(|| panic!("{c:?} has no shortcut"));
             assert_eq!(sc.modifiers, m, "{c:?} modifiers");
             assert_eq!(sc.logical_key, k, "{c:?} key");
         };

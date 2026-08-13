@@ -114,7 +114,10 @@ mod tests {
     #[test]
     fn an_unknown_extension_says_what_is_supported() {
         let error = read(&PathBuf::from("drawing.psd")).unwrap_err();
-        assert!(error.contains(".psd"), "it should name what was refused: {error}");
+        assert!(
+            error.contains(".psd"),
+            "it should name what was refused: {error}"
+        );
         assert!(error.contains(".fla"), "and list what works: {error}");
     }
 

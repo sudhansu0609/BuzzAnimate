@@ -143,8 +143,11 @@ impl DrawStyle {
 
     /// Effective stroke for a new shape, if it has one.
     pub fn stroke_for_new_shape(&self) -> Option<(Color, f64, bool)> {
-        self.stroke_enabled
-            .then_some((self.stroke_color, self.stroke_width.max(0.0), self.hairline))
+        self.stroke_enabled.then_some((
+            self.stroke_color,
+            self.stroke_width.max(0.0),
+            self.hairline,
+        ))
     }
 
     pub fn fill_for_new_shape(&self) -> Option<Color> {
@@ -195,7 +198,10 @@ mod tests {
         let before = s.swatches.len();
 
         s.remember(red);
-        assert_eq!(s.swatches[0].to_rgba8().to_u8_array(), red.to_rgba8().to_u8_array());
+        assert_eq!(
+            s.swatches[0].to_rgba8().to_u8_array(),
+            red.to_rgba8().to_u8_array()
+        );
         assert_eq!(
             s.swatches.len(),
             before,
@@ -213,7 +219,11 @@ mod tests {
         for i in 0..200u8 {
             s.remember(Color::from_rgb8(i, i, i));
         }
-        assert!(s.swatches.len() <= 24, "swatches grew to {}", s.swatches.len());
+        assert!(
+            s.swatches.len() <= 24,
+            "swatches grew to {}",
+            s.swatches.len()
+        );
     }
 
     #[test]

@@ -93,7 +93,8 @@ fn write_importable_fixtures() {
         let options = zip::write::SimpleFileOptions::default();
         zip.start_file("DOMDocument.xml", options).unwrap();
         zip.write_all(DOCUMENT.as_bytes()).unwrap();
-        zip.start_file("LIBRARY/characters/hero.xml", options).unwrap();
+        zip.start_file("LIBRARY/characters/hero.xml", options)
+            .unwrap();
         zip.write_all(SYMBOL.as_bytes()).unwrap();
         zip.finish().unwrap();
     }
@@ -131,10 +132,18 @@ fn write_importable_fixtures() {
                         line_style: None,
                         new_styles: None,
                     })),
-                    ShapeRecord::StraightEdge { delta: d(size, 0.0) },
-                    ShapeRecord::StraightEdge { delta: d(0.0, size) },
-                    ShapeRecord::StraightEdge { delta: d(-size, 0.0) },
-                    ShapeRecord::StraightEdge { delta: d(0.0, -size) },
+                    ShapeRecord::StraightEdge {
+                        delta: d(size, 0.0),
+                    },
+                    ShapeRecord::StraightEdge {
+                        delta: d(0.0, size),
+                    },
+                    ShapeRecord::StraightEdge {
+                        delta: d(-size, 0.0),
+                    },
+                    ShapeRecord::StraightEdge {
+                        delta: d(0.0, -size),
+                    },
                 ],
             })
         };
@@ -175,9 +184,32 @@ fn write_importable_fixtures() {
         };
 
         let tags = vec![
-            Tag::SetBackgroundColor(swf::Color { r: 0xEE, g: 0xEE, b: 0xF4, a: 255 }),
-            shape(1, 60.0, swf::Color { r: 0xCC, g: 0x33, b: 0x33, a: 255 }),
-            shape(2, 40.0, swf::Color { r: 0x33, g: 0xAA, b: 0x55, a: 255 }),
+            Tag::SetBackgroundColor(swf::Color {
+                r: 0xEE,
+                g: 0xEE,
+                b: 0xF4,
+                a: 255,
+            }),
+            shape(
+                1,
+                60.0,
+                swf::Color {
+                    r: 0xCC,
+                    g: 0x33,
+                    b: 0x33,
+                    a: 255,
+                },
+            ),
+            shape(
+                2,
+                40.0,
+                swf::Color {
+                    r: 0x33,
+                    g: 0xAA,
+                    b: 0x55,
+                    a: 255,
+                },
+            ),
             place(1, 1, 20.0, 20.0, PlaceObjectAction::Place(1)),
             place(2, 2, 200.0, 40.0, PlaceObjectAction::Place(2)),
             Tag::ShowFrame,
@@ -185,7 +217,10 @@ fn write_importable_fixtures() {
             Tag::ShowFrame,
             place(1, 1, 140.0, 100.0, PlaceObjectAction::Modify),
             Tag::ShowFrame,
-            Tag::RemoveObject(RemoveObject { depth: 2, character_id: None }),
+            Tag::RemoveObject(RemoveObject {
+                depth: 2,
+                character_id: None,
+            }),
             Tag::ShowFrame,
         ];
 
@@ -216,7 +251,10 @@ S";
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
             "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 280] >>".to_string(),
             "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << >> >>".to_string(),
-            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
         ];
 
         let mut out = String::from("%PDF-1.7\n");
@@ -226,7 +264,10 @@ S";
             out.push_str(&format!("{} 0 obj\n{body}\nendobj\n", i + 1));
         }
         let xref = out.len();
-        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+        out.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
         for offset in &offsets {
             out.push_str(&format!("{offset:010} 00000 n \n"));
         }

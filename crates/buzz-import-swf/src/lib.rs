@@ -417,6 +417,8 @@ impl Track {
                     objects: std::sync::Arc::new(Vec::new()),
                     label: None,
                     tween: buzz_scene::Tween::default(),
+                    // Imported formats carry no sound yet (PROGRESS §7).
+                    sound: None,
                 });
             }
 
@@ -441,6 +443,8 @@ impl Track {
                 objects: std::sync::Arc::new(objects),
                 label: None,
                 tween: buzz_scene::Tween::default(),
+                // Imported formats carry no sound yet (PROGRESS §7).
+                sound: None,
             });
             end = finish;
         }
@@ -480,6 +484,8 @@ fn build_shape_symbol(id: CharacterId, paths: &[StyledPath], ids: &mut IdSource)
             objects: std::sync::Arc::new(objects),
             label: None,
             tween: buzz_scene::Tween::default(),
+            // Imported formats carry no sound yet (PROGRESS §7).
+            sound: None,
         }],
         1,
     );

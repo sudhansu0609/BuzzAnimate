@@ -160,14 +160,9 @@ fn distinct_colours(pixels: &[u8]) -> usize {
 fn zoom_sweep_stays_clean_to_one_trillion_percent() {
     let Some(mut h) = Harness::new() else { return };
 
-    println!(
-        "GPU: {}\n",
-        h.gpu.selection.chosen.info.name
-    );
+    println!("GPU: {}\n", h.gpu.selection.chosen.info.name);
     // Column widths match the row format below.
-    println!(
-        " gen      zoom  precision    ink%  colours     encode       gpu  drawn/culled"
-    );
+    println!(" gen      zoom  precision    ink%  colours     encode       gpu  drawn/culled");
 
     let artwork = ZoomTarget::default();
     let viewport = Size::new(W as f64, H as f64);
@@ -267,9 +262,7 @@ fn detail_survives_far_beyond_animates_ceiling() {
         "at 1e12% the image had only {at_trillion} distinct colours; \
          detail did not survive"
     );
-    println!(
-        "distinct colours — at 2000%: {at_animate_max}, at ~1e12%: {at_trillion}"
-    );
+    println!("distinct colours — at 2000%: {at_animate_max}, at ~1e12%: {at_trillion}");
 }
 
 /// Regression test for the Phase 0 limitation retired in CP-1.1.
@@ -378,7 +371,8 @@ fn rendering_is_deterministic_at_extreme_zoom() {
     let second = h.render_and_read(&scene);
 
     assert_eq!(
-        first, second,
+        first,
+        second,
         "identical input produced different pixels at {:.0e}%",
         camera.zoom_percent()
     );

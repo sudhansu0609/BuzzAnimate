@@ -1,0 +1,19 @@
+[package]
+name = "buzz-script"
+description = "JSFL-equivalent scripting: a sandboxed JavaScript API over the document"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+buzz-geom.workspace = true
+buzz-scene.workspace = true
+
+kurbo.workspace = true
+peniko.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+rquickjs = { version = "0.12.2", features = ["classes", "properties"] }

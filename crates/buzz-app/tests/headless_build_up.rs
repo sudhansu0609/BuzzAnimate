@@ -208,8 +208,7 @@ fn crossing_bars(alpha_a: f64, alpha_b: f64, blend: PaintBlend) -> Document {
     ] {
         document.add_shape(
             layer,
-            ShapeData::filled(buzz_geom::Shape::to_path(&rect, 1e-9), ink(alpha))
-                .with_blend(blend),
+            ShapeData::filled(buzz_geom::Shape::to_path(&rect, 1e-9), ink(alpha)).with_blend(blend),
         );
     }
     document
@@ -230,7 +229,7 @@ fn render(harness: &mut Harness, document: &Document) -> Vec<u8> {
         // The stage rectangle, so the paint has something to sit on — exactly
         // as `stage::build_scene` does.
         builder.fill_shape(&document.stage().stage_rect(), document.stage().background);
-        buzz_app::stage::draw_document(&mut builder, document, 0);
+        buzz_render::document::draw_document(&mut builder, document, 0);
     }
 
     harness.render_and_read(&scene)
@@ -240,7 +239,6 @@ fn render(harness: &mut Harness, document: &Document) -> Vec<u8> {
 #[test]
 fn two_build_up_strokes_at_alpha_02_and_03_overlap_at_05() {
     with_harness(|harness| {
-
         let document = crossing_bars(0.2, 0.3, PaintBlend::Additive);
         let pixels = render(harness, &document);
         let levels = alpha_levels(&pixels);
@@ -269,7 +267,6 @@ fn two_build_up_strokes_at_alpha_02_and_03_overlap_at_05() {
 #[test]
 fn without_build_up_the_same_strokes_overlap_at_044() {
     with_harness(|harness| {
-
         let document = crossing_bars(0.2, 0.3, PaintBlend::Normal);
         let pixels = render(harness, &document);
         let levels = alpha_levels(&pixels);
@@ -294,7 +291,6 @@ fn without_build_up_the_same_strokes_overlap_at_044() {
 #[test]
 fn build_up_paint_does_not_dissolve_into_a_light_background() {
     with_harness(|harness| {
-
         let document = crossing_bars(0.25, 0.25, PaintBlend::Additive);
         let pixels = render(harness, &document);
         let levels = alpha_levels(&pixels);
@@ -315,7 +311,6 @@ fn build_up_paint_does_not_dissolve_into_a_light_background() {
 #[test]
 fn a_normal_shape_on_a_build_up_layer_still_composites_normally() {
     with_harness(|harness| {
-
         let mut document = Document::default();
         let layer = document.layers().iter().next().unwrap().id;
 
@@ -343,7 +338,6 @@ fn a_normal_shape_on_a_build_up_layer_still_composites_normally() {
 
         let pixels = render(harness, &document);
 
-
         let levels = alpha_levels(&pixels);
         assert!(
             has_level(&levels, 0.36),
@@ -362,7 +356,6 @@ fn a_normal_shape_on_a_build_up_layer_still_composites_normally() {
 #[test]
 fn build_up_does_not_cross_between_layers() {
     with_harness(|harness| {
-
         let mut document = Document::default();
         let lower = document.layers().iter().next().unwrap().id;
         let upper = document.add_layer("Upper", LayerKind::Normal);
@@ -379,7 +372,6 @@ fn build_up_does_not_cross_between_layers() {
         }
 
         let pixels = render(harness, &document);
-
 
         let levels = alpha_levels(&pixels);
         assert!(
@@ -400,7 +392,6 @@ fn build_up_does_not_cross_between_layers() {
 #[test]
 fn many_build_up_strokes_still_render_quickly() {
     with_harness(|harness| {
-
         let mut document = Document::default();
         let layer = document.layers().iter().next().unwrap().id;
         let ink = Color::from_rgba8(0, 0, 0, 26); // ~0.1
@@ -560,6 +551,9 @@ fn panning_the_camera_shifts_layers_by_their_depth() {
             far < focal && focal < near,
             "a pan should sweep near layers furthest and distant ones least:              near {near:.1}px, focal {focal:.1}px, far {far:.1}px"
         );
-        assert!(far > 0.0, "but the distant layer should still move a little");
+        assert!(
+            far > 0.0,
+            "but the distant layer should still move a little"
+        );
     });
 }

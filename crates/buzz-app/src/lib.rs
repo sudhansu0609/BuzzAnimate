@@ -7,7 +7,12 @@
 pub mod app;
 pub mod demo;
 pub mod editor;
+pub mod export_job;
 pub mod hud;
 pub mod import;
+pub mod lights;
+pub mod lipsync;
+pub mod rigging;
+pub mod sound;
 pub mod stage;
 pub mod tools;

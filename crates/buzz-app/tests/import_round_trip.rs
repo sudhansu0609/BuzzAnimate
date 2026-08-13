@@ -301,10 +301,18 @@ fn write_swf(dir: &std::path::Path) -> std::path::PathBuf {
                 line_style: None,
                 new_styles: None,
             })),
-            ShapeRecord::StraightEdge { delta: d(30.0, 0.0) },
-            ShapeRecord::StraightEdge { delta: d(0.0, 30.0) },
-            ShapeRecord::StraightEdge { delta: d(-30.0, 0.0) },
-            ShapeRecord::StraightEdge { delta: d(0.0, -30.0) },
+            ShapeRecord::StraightEdge {
+                delta: d(30.0, 0.0),
+            },
+            ShapeRecord::StraightEdge {
+                delta: d(0.0, 30.0),
+            },
+            ShapeRecord::StraightEdge {
+                delta: d(-30.0, 0.0),
+            },
+            ShapeRecord::StraightEdge {
+                delta: d(0.0, -30.0),
+            },
         ],
     });
 
@@ -397,7 +405,10 @@ fn write_pdf(dir: &std::path::Path) -> std::path::PathBuf {
         "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
         "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 150] >>".to_string(),
         "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << >> >>".to_string(),
-        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        ),
     ];
 
     let mut out = String::from("%PDF-1.7\n");
@@ -407,7 +418,10 @@ fn write_pdf(dir: &std::path::Path) -> std::path::PathBuf {
         out.push_str(&format!("{} 0 obj\n{body}\nendobj\n", i + 1));
     }
     let xref = out.len();
-    out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+    out.push_str(&format!(
+        "xref\n0 {}\n0000000000 65535 f \n",
+        objects.len() + 1
+    ));
     for offset in &offsets {
         out.push_str(&format!("{offset:010} 00000 n \n"));
     }
@@ -497,7 +511,12 @@ fn importing_to_the_library_never_touches_the_stage() {
 
         let report = document.merge(&imported.scene, ImportTarget::Library);
 
-        assert_eq!(report.layers, 0, "{}: no layers should arrive", path.display());
+        assert_eq!(
+            report.layers,
+            0,
+            "{}: no layers should arrive",
+            path.display()
+        );
         assert_eq!(document.stage_layers().len(), layers_before);
 
         let objects_after: Vec<u64> = document

@@ -64,6 +64,9 @@ struct Remapper<'a> {
     /// Old symbol id to new. Built before any artwork is copied, because an
     /// instance may refer to a symbol defined later in the file.
     symbols: HashMap<SymbolId, SymbolId>,
+    /// Old sound id to new, for the same reason: a keyframe's sound reference
+    /// is a number, and two documents both numbering from one would collide.
+    sounds: HashMap<crate::sound::SoundId, crate::sound::SoundId>,
     objects: usize,
 }
 
@@ -114,6 +117,15 @@ impl Remapper<'_> {
                 ),
                 label: k.label.clone(),
                 tween: k.tween,
+                // Sound ids are remapped by the caller alongside symbol ids;
+                // a merge that kept the source's id would point at whichever
+                // local sound happened to share the number.
+                sound: k.sound.map(|mut reference| {
+                    if let Some(new) = self.sounds.get(&reference.sound) {
+                        reference.sound = *new;
+                    }
+                    reference
+                }),
             })
             .collect();
         LayerTimeline::from_parts(keyframes, source.length())
@@ -144,9 +156,22 @@ impl Remapper<'_> {
                     }
                     ObjectKind::Instance(copy)
                 }
+                // A rig's parts are objects in their own right, so they are
+                // renumbered too — otherwise an imported armature would hold
+                // artwork whose ids collide with the document's own.
+                ObjectKind::Armature(rig) => {
+                    let mut copy = rig.clone();
+                    for part in &mut copy.parts {
+                        part.artwork = std::sync::Arc::new(self.object(&part.artwork));
+                    }
+                    ObjectKind::Armature(copy)
+                }
+                ObjectKind::Warp(warp) => ObjectKind::Warp(warp.clone()),
             },
             locked: source.locked,
             visible: source.visible,
+            filters: source.filters.clone(),
+            blend: source.blend,
         }
     }
 }
@@ -169,9 +194,27 @@ impl Scene {
             symbols.insert(symbol.id, SymbolId(self.ids.take()));
         }
 
+        // Sounds are renumbered the same way, and copied across: a document
+        // whose keyframes referred to sounds that did not come with them would
+        // play silence and give no clue why.
+        let mut sounds = HashMap::new();
+        let mut incoming_sounds = Vec::new();
+        for sound in other.sounds.iter() {
+            let id = crate::sound::SoundId(self.ids.take());
+            sounds.insert(sound.id, id);
+            let mut copy = (**sound).clone();
+            copy.id = id;
+            copy.name = self.sounds.unique_name(&copy.name);
+            incoming_sounds.push(copy);
+        }
+        for sound in incoming_sounds {
+            self.sounds.insert(sound);
+        }
+
         let mut remap = Remapper {
             ids: &mut self.ids,
             symbols,
+            sounds,
             objects: 0,
         };
 

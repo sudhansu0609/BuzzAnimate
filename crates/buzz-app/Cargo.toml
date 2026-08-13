@@ -25,6 +25,10 @@ buzz-ui.workspace = true
 buzz-import-xfl.workspace = true
 buzz-import-pdf.workspace = true
 buzz-import-swf.workspace = true
+buzz-script.workspace = true
+buzz-export.workspace = true
+buzz-rig.workspace = true
+buzz-audio.workspace = true
 
 vello.workspace = true
 kurbo.workspace = true
@@ -38,6 +42,8 @@ egui-wgpu.workspace = true
 egui-winit.workspace = true
 
 anyhow.workspace = true
+thiserror.workspace = true
+crossbeam-channel.workspace = true
 pollster.workspace = true
 rayon.workspace = true
 rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "tokio"] }
@@ -46,5 +52,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+hound = "3.5"
 zip.workspace = true
 swf.workspace = true

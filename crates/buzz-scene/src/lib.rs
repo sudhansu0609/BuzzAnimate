@@ -30,6 +30,8 @@ pub mod index;
 pub mod layer;
 pub mod merge;
 pub mod object;
+pub mod rig;
+pub mod sound;
 pub mod symbol;
 pub mod timeline;
 pub mod tween;
@@ -45,6 +47,10 @@ pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
 pub use merge::{ImportTarget, MergeReport};
 pub use object::{FillSpec, Object, ObjectId, ObjectKind, PaintBlend, ShapeData, StrokeSpec};
+pub use rig::{ArmatureData, RigBinding, RigPart, WarpData};
+pub use sound::{SoundAsset, SoundCue, SoundId, SoundLibrary, SoundRef, SoundSync};
+pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, Quality};
+pub use buzz_light::{Light, LightId, LightKind, LightRig};
 pub use symbol::{
     ColorEffect, ColorTransform, Library, LoopMode, Symbol, SymbolId, SymbolInstance, SymbolKind,
 };
@@ -119,6 +125,11 @@ pub struct Scene {
     camera: CameraTrack,
     /// Reusable symbols, organised into folders. Private for the same reason.
     library: Library,
+    /// Imported sounds. Private for the same reason as the library.
+    sounds: SoundLibrary,
+    /// The lights. Private for the same reason: changing one has to bump the
+    /// revision, or the renderer would keep drawing yesterday's shadows.
+    lights: LightRig,
     layers: LayerStack,
     ids: IdAllocator,
     revision: u64,
@@ -149,6 +160,8 @@ impl PartialEq for Scene {
         self.stage == other.stage
             && self.camera == other.camera
             && self.library == other.library
+            && self.sounds == other.sounds
+            && self.lights == other.lights
             && self.layers == other.layers
             && self.ids == other.ids
             && self.revision == other.revision
@@ -161,6 +174,8 @@ impl Default for Scene {
             stage: StageProperties::default(),
             camera: CameraTrack::new(),
             library: Library::new(),
+            sounds: SoundLibrary::default(),
+            lights: LightRig::default(),
             layers: LayerStack::new(),
             ids: IdAllocator::default(),
             revision: 0,
@@ -181,6 +196,8 @@ impl Scene {
             stage: StageProperties::default(),
             camera: CameraTrack::new(),
             library: Library::new(),
+            sounds: SoundLibrary::default(),
+            lights: LightRig::default(),
             layers: LayerStack::new(),
             ids: IdAllocator::default(),
             revision: 0,
@@ -286,6 +303,180 @@ impl Scene {
         &mut self.library
     }
 
+    // -- lighting ------------------------------------------------------------
+
+    /// The document's lights.
+    pub fn lights(&self) -> &LightRig {
+        &self.lights
+    }
+
+    /// Mutable lights. Bumps the revision, so moving a light is undoable and
+    /// invalidates whatever the renderer had cached.
+    pub fn lights_mut(&mut self) -> &mut LightRig {
+        self.revision += 1;
+        &mut self.lights
+    }
+
+    /// Add a light, with a fresh id and a name that is not taken.
+    pub fn add_light(&mut self, kind: LightKind) -> LightId {
+        let id = LightId(self.ids.take());
+        let base = kind.label();
+        let mut name = base.to_string();
+        for n in 2..10_000 {
+            if !self.lights.lights.iter().any(|l| l.name == name) {
+                break;
+            }
+            name = format!("{base} {n}");
+        }
+
+        let light = Light::new(id, name, kind);
+        let rig = self.lights_mut();
+        rig.lights.push(light);
+        // Adding the first light switches the rig on: an animator who asks for
+        // a sun means to see one, and a light that does nothing until a second
+        // switch is found is a bug report waiting to happen.
+        rig.enabled = true;
+        id
+    }
+
+    /// How far artwork on `layer` stands above the surface its shadow falls
+    /// on, for a given light.
+    ///
+    /// Flat artwork has no thickness, so the light's standing height is the
+    /// base; a layer pushed towards the camera really is further in front of
+    /// the background, and its shadow lengthens by exactly that much.
+    pub fn shadow_height(&self, layer_depth: f64, light: &Light) -> f64 {
+        let receiver = self.receiving_depth();
+        (light.standing_height + (receiver - layer_depth)).max(0.0)
+    }
+
+    /// The depth of the surface shadows fall on: the furthest layer back.
+    pub fn receiving_depth(&self) -> f64 {
+        self.stage_layers()
+            .iter()
+            .map(|l| l.depth)
+            .fold(0.0f64, f64::max)
+    }
+
+    // -- sound ---------------------------------------------------------------
+
+    /// Imported sounds.
+    pub fn sounds(&self) -> &SoundLibrary {
+        &self.sounds
+    }
+
+    /// Mutable sound library. Bumps the revision, so importing is undoable.
+    pub fn sounds_mut(&mut self) -> &mut SoundLibrary {
+        self.revision += 1;
+        &mut self.sounds
+    }
+
+    /// Import a sound, giving it a unique name and a fresh id.
+    pub fn add_sound(
+        &mut self,
+        name: &str,
+        data: std::sync::Arc<Vec<u8>>,
+        format: &str,
+        sample_rate: u32,
+        channels: u16,
+        length: u64,
+    ) -> SoundId {
+        let id = SoundId(self.ids.take());
+        let name = self.sounds.unique_name(name);
+        self.sounds_mut().insert(SoundAsset {
+            id,
+            name,
+            data,
+            format: format.to_ascii_lowercase(),
+            sample_rate,
+            channels,
+            length,
+        });
+        id
+    }
+
+    /// Attach a sound to the keyframe governing `frame` on `layer`.
+    ///
+    /// Animate attaches sound to a *keyframe*, not to a layer, so one layer
+    /// can carry a whole scene's effects. Returns whether there was a keyframe
+    /// to attach it to.
+    pub fn set_frame_sound(
+        &mut self,
+        layer: LayerId,
+        frame: u32,
+        sound: Option<SoundRef>,
+    ) -> bool {
+        let mut attached = false;
+        self.update_layer(layer, |l| {
+            if let Some(keyframe) = l.frames.keyframe_at_mut(frame) {
+                keyframe.sound = sound;
+                attached = true;
+            }
+        });
+        attached
+    }
+
+    /// The sound on the keyframe governing `frame`.
+    pub fn frame_sound(&self, layer: LayerId, frame: u32) -> Option<SoundRef> {
+        self.layers()
+            .get(layer)?
+            .frames
+            .keyframe_at(frame)
+            .and_then(|k| k.sound)
+    }
+
+    /// Every sound on the **document's own timeline**, with the frame it
+    /// starts on.
+    ///
+    /// # Why this reads the stage timeline, always
+    ///
+    /// This is what plays. It deliberately ignores which symbol is open for
+    /// editing, so the dialogue on the root timeline keeps sounding when you
+    /// step into a character to animate its walk — and when you step from
+    /// there into its head to animate the mouth. The sound belongs to the
+    /// document; the symbol you are inside is a view of it.
+    ///
+    /// It is the same distinction saving makes, for the same reason.
+    pub fn stage_cues(&self) -> Vec<SoundCue> {
+        let mut cues = Vec::new();
+        for layer in self.stage_layers().iter() {
+            // A hidden layer is still heard: hiding a layer hides *artwork*,
+            // and an animator hides layers constantly while working. Losing
+            // the soundtrack because a layer was hidden would be surprising in
+            // exactly the way this whole design is trying to avoid.
+            for keyframe in layer.frames.keyframes() {
+                let Some(sound) = keyframe.sound else { continue };
+                if sound.sync == SoundSync::Stop {
+                    continue;
+                }
+                cues.push(SoundCue {
+                    sound: sound.sound,
+                    start_frame: keyframe.start,
+                    volume: sound.volume,
+                    sync: sound.sync,
+                });
+            }
+        }
+        cues.sort_by_key(|c| c.start_frame);
+        cues
+    }
+
+    /// Sounds placed anywhere, including inside symbols, for the Library
+    /// panel's use count.
+    pub fn sound_usage(&self) -> std::collections::BTreeMap<SoundId, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        let stage = self.stage_layers().iter();
+        let nested = self.library.iter().flat_map(|s| s.layers.iter());
+        for layer in stage.chain(nested) {
+            for keyframe in layer.frames.keyframes() {
+                if let Some(sound) = keyframe.sound {
+                    *counts.entry(sound.sound).or_insert(0) += 1;
+                }
+            }
+        }
+        counts
+    }
+
     /// Add a symbol, giving it a unique name and a fresh id.
     pub fn add_symbol(
         &mut self,
@@ -345,7 +536,8 @@ impl Scene {
                 })
                 .reduce(|a, b| a.union(b))
                 .unwrap_or_else(|| object.bounds()),
-            ObjectKind::Shape(_) => object.bounds(),
+            // Rigged artwork measures itself, posed, and needs no library.
+            ObjectKind::Shape(_) | ObjectKind::Armature(_) | ObjectKind::Warp(_) => object.bounds(),
         }
     }
 
@@ -365,7 +557,14 @@ impl Scene {
                         walk(c, counts);
                     }
                 }
-                ObjectKind::Shape(_) => {}
+                // A symbol rigged to an armature is still in use, and deleting
+                // it would leave the rig drawing nothing.
+                ObjectKind::Armature(rig) => {
+                    for part in &rig.parts {
+                        walk(&part.artwork, counts);
+                    }
+                }
+                ObjectKind::Shape(_) | ObjectKind::Warp(_) => {}
             }
         }
 
@@ -433,6 +632,14 @@ impl Scene {
     pub fn remove_layer(&mut self, id: LayerId) -> Option<Arc<Layer>> {
         let removed = self.active_layers_mut().remove(id);
         if removed.is_some() {
+            // Anything that followed it is released rather than left pointing
+            // at a layer that is gone: a dangling link resolves to identity, so
+            // the artwork would be right, but the Parent column would show a
+            // name for a layer the user cannot find.
+            let orphans = self.layers().followers_of(id);
+            for orphan in orphans {
+                self.active_layers_mut().update(orphan, |l| l.follows = None);
+            }
             self.bump();
         }
         removed
@@ -600,6 +807,63 @@ impl Scene {
         changed
     }
 
+    /// Edit an object **on the keyframe that owns `frame`**.
+    ///
+    /// # Why this exists next to [`Self::update_object`]
+    ///
+    /// Pressing F6 duplicates a keyframe by cloning the `Arc` around its
+    /// objects, so the *same object id* legitimately appears on several
+    /// keyframes of one layer. `update_object` edits the first one it finds,
+    /// which is the earliest — so moving artwork with the playhead on frame 12
+    /// would silently change frame 0 instead, and leave frame 12 exactly as it
+    /// was. Anything that knows where the playhead is should come here.
+    ///
+    /// Falls back to searching every keyframe when the object is not on the
+    /// one owning `frame`: an object selected on another layer, or held on a
+    /// keyframe beyond the span, should still be editable rather than
+    /// mysteriously immovable.
+    pub fn update_object_at(
+        &mut self,
+        frame: u32,
+        id: ObjectId,
+        f: impl FnOnce(&mut Object),
+    ) -> bool {
+        let Some((layer_id, _)) = self.find_object(id) else {
+            return false;
+        };
+        let mut f = Some(f);
+        let mut changed = false;
+
+        self.active_layers_mut().update(layer_id, |layer| {
+            if let Some(keyframe) = layer.frames.keyframe_at_mut(frame) {
+                let objects = Arc::make_mut(&mut keyframe.objects);
+                if let Some(object) = objects.iter_mut().find(|o| o.id == id)
+                    && let Some(f) = f.take()
+                {
+                    f(Arc::make_mut(object));
+                    changed = true;
+                    return;
+                }
+            }
+
+            for keyframe in layer.frames.keyframes_mut() {
+                let objects = Arc::make_mut(&mut keyframe.objects);
+                if let Some(object) = objects.iter_mut().find(|o| o.id == id) {
+                    if let Some(f) = f.take() {
+                        f(Arc::make_mut(object));
+                        changed = true;
+                    }
+                    break;
+                }
+            }
+        });
+
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
     pub fn remove_object(&mut self, id: ObjectId) -> Option<Arc<Object>> {
         let layer_id = self.find_object(id).map(|(l, _)| l)?;
         let mut removed = None;
@@ -650,6 +914,10 @@ impl Scene {
         let mut entries = Vec::new();
         let mut depth = 0usize;
         for layer in self.layers().drawable_at(frame) {
+            // A followed layer's artwork is drawn somewhere other than where
+            // its geometry says it is, so the index has to agree — otherwise a
+            // parented limb is visible but unclickable.
+            let follows = self.layers().inherited_transform(layer.id, frame);
             for object in layer.objects_at(frame) {
                 if !object.visible {
                     continue;
@@ -657,7 +925,7 @@ impl Scene {
                 entries.push(IndexEntry {
                     object: object.id,
                     layer: layer.id,
-                    bounds: object.bounds(),
+                    bounds: crate::object::transform_rect(follows, object.bounds()),
                     depth,
                 });
                 depth += 1;
@@ -1129,6 +1397,79 @@ mod tests {
 
         assert!(!scene.update_object(ObjectId(9999), |o| o.visible = false));
         assert_eq!(scene.revision(), before);
+    }
+
+    /// **The defect `update_object_at` exists for.** F6 duplicates a keyframe
+    /// by cloning the `Arc` around its objects, so one id appears on several
+    /// keyframes. Editing "the object" without saying *when* changed the
+    /// earliest keyframe — so posing a rig or dragging a shape on frame 12
+    /// silently damaged frame 0 and appeared to do nothing.
+    #[test]
+    fn editing_an_object_lands_on_the_keyframe_the_playhead_is_in() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+
+        // Extend the span, then duplicate the keyframe at frame 10.
+        scene.update_layer(layer, |l| {
+            for _ in 0..10 {
+                l.frames.insert_frame(0);
+            }
+            l.frames.insert_keyframe(10);
+        });
+
+        assert!(scene.update_object_at(10, id, |o| {
+            o.transform = Affine::translate((100.0, 0.0));
+        }));
+
+        let at = |frame: u32| {
+            scene
+                .layers()
+                .iter()
+                .flat_map(|l| l.objects_at(frame).iter())
+                .find(|o| o.id == id)
+                .map(|o| o.transform.translation().x)
+                .expect("the shape")
+        };
+
+        assert_eq!(at(10), 100.0, "the edited frame did not change");
+        assert_eq!(at(0), 0.0, "frame 0 was changed instead");
+    }
+
+    /// An object that is not on the keyframe owning the frame — because the
+    /// playhead is somewhere else entirely — is still editable rather than
+    /// mysteriously immovable.
+    #[test]
+    fn editing_falls_back_when_the_playhead_is_off_the_object() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+
+        // Frame 500 is far beyond the one-frame span.
+        assert!(scene.update_object_at(500, id, |o| o.visible = false));
+        assert!(
+            scene
+                .layers()
+                .iter()
+                .flat_map(|l| l.objects_at(0).iter())
+                .any(|o| o.id == id && !o.visible)
+        );
     }
 
     /// Snapshots must not see later edits — the guarantee the whole

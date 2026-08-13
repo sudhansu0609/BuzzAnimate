@@ -27,6 +27,8 @@ pub enum ToolId {
     Pencil,
     Brush,
     Bone,
+    /// Animate's Asset Warp: handles dropped on artwork, dragged to deform it.
+    AssetWarp,
     PaintBucket,
     InkBottle,
     Eyedropper,
@@ -66,6 +68,7 @@ impl ToolId {
             Pencil => "Pencil",
             Brush => "Brush",
             Bone => "Bone",
+            AssetWarp => "Asset Warp",
             PaintBucket => "Paint Bucket",
             InkBottle => "Ink Bottle",
             Eyedropper => "Eyedropper",
@@ -92,6 +95,8 @@ impl ToolId {
             Pencil => Some(Key::Y),
             Brush => Some(Key::B),
             Bone => Some(Key::M),
+            // Animate's own letter for Asset Warp.
+            AssetWarp => Some(Key::W),
             PaintBucket => Some(Key::K),
             InkBottle => Some(Key::S),
             Eyedropper => Some(Key::I),
@@ -135,6 +140,7 @@ impl ToolId {
             Pencil => "Y",
             Brush => "B",
             Bone => "M",
+            AssetWarp => "W",
             PaintBucket => "K",
             InkBottle => "S",
             Eyedropper => "I",
@@ -151,11 +157,10 @@ impl ToolId {
         match self {
             Selection | Subselection | FreeTransform | Line | Rectangle | Oval | PolyStar
             | Pencil | Brush | Eraser | PaintBucket | InkBottle | Eyedropper | Hand | Zoom
-            | Pen | Camera => ToolStatus::Ready,
+            | Pen | Camera | Bone | AssetWarp => ToolStatus::Ready,
             Text => ToolStatus::Planned("Text arrives with Phase 2 follow-up"),
             Lasso => ToolStatus::Planned("Lasso arrives with Phase 2 follow-up"),
             GradientTransform => ToolStatus::Planned("Gradients arrive with the Color panel"),
-            Bone => ToolStatus::Planned("Rigging arrives in Phase 7"),
         }
     }
 
@@ -205,8 +210,13 @@ pub const TOOL_GROUPS: &[&[ToolId]] = &[
         ToolId::PolyStar,
     ],
     &[ToolId::Pencil, ToolId::Brush],
-    &[ToolId::Bone],
-    &[ToolId::PaintBucket, ToolId::InkBottle, ToolId::Eyedropper, ToolId::Eraser],
+    &[ToolId::Bone, ToolId::AssetWarp],
+    &[
+        ToolId::PaintBucket,
+        ToolId::InkBottle,
+        ToolId::Eyedropper,
+        ToolId::Eraser,
+    ],
     &[ToolId::Camera, ToolId::Hand, ToolId::Zoom],
 ];
 
@@ -234,7 +244,8 @@ mod tests {
             unique.len(),
             "a tool appears in more than one group"
         );
-        assert_eq!(tools.len(), 21, "unexpected tool count");
+        // 21 through Phase 5, plus Asset Warp when rigging landed in Phase 7.
+        assert_eq!(tools.len(), 22, "unexpected tool count");
     }
 
     /// Muscle memory: these letters must do what an Animate user expects.
@@ -253,6 +264,7 @@ mod tests {
             (Key::Y, ToolId::Pencil),
             (Key::B, ToolId::Brush),
             (Key::M, ToolId::Bone),
+            (Key::W, ToolId::AssetWarp),
             (Key::K, ToolId::PaintBucket),
             (Key::S, ToolId::InkBottle),
             (Key::I, ToolId::Eyedropper),
@@ -306,11 +318,13 @@ mod tests {
     /// A tool that is not implemented must say so rather than look available.
     #[test]
     fn unimplemented_tools_declare_themselves() {
-        assert!(matches!(ToolId::Bone.status(), ToolStatus::Planned(_)));
         assert!(matches!(ToolId::Text.status(), ToolStatus::Planned(_)));
+        assert!(matches!(ToolId::Lasso.status(), ToolStatus::Planned(_)));
         assert!(ToolId::Selection.is_ready());
         assert!(ToolId::Rectangle.is_ready());
         assert!(ToolId::Camera.is_ready(), "the camera arrived in Phase 3");
+        assert!(ToolId::Bone.is_ready(), "rigging arrived in Phase 7");
+        assert!(ToolId::AssetWarp.is_ready(), "and so did the warp");
     }
 
     /// The camera edits the document, so it must not be classed as navigation

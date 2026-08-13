@@ -22,6 +22,9 @@ use crate::theme::{Metrics, Palette};
 pub struct TimelineResponse {
     /// The playhead was moved here.
     pub scrub_to: Option<u32>,
+    /// The camera row was clicked: select the camera, as Animate does when you
+    /// click its layer.
+    pub select_camera: bool,
     /// A layer row was clicked.
     pub select_layer: Option<LayerId>,
     /// A frame operation was requested.
@@ -100,8 +103,27 @@ impl TweenRequest {
 pub struct TimelineState {
     pub current_frame: u32,
     pub active_layer: Option<LayerId>,
+    /// The camera row is the selected one, so the camera is what the Camera
+    /// menu's keyframe commands act on.
+    pub camera_selected: bool,
     pub playing: bool,
     pub onion_enabled: bool,
+    /// Loudness per frame for each layer carrying a sound, so the timeline can
+    /// draw the waveform where the sound actually sits.
+    ///
+    /// Supplied by the editor rather than read from the document, because the
+    /// document stores the *file* and the envelope only exists once it has
+    /// been decoded — which is view state, and belongs outside the model.
+    pub waveforms: std::collections::BTreeMap<LayerId, Waveform>,
+}
+
+/// A sound's envelope, positioned on the timeline.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Waveform {
+    /// The frame the sound starts on.
+    pub start_frame: u32,
+    /// Loudness per frame, `0.0..=1.0`.
+    pub levels: Vec<f32>,
 }
 
 /// Width reserved for the layer-name column.
@@ -120,9 +142,15 @@ pub fn timeline_panel(ui: &mut Ui, scene: &Scene, state: &TimelineState) -> Time
     let columns = (frame_count + 40).min(9_999);
 
     egui::ScrollArea::both()
+        .id_salt("timeline-grid")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ruler(ui, columns, state, &mut response);
+
+            // The camera sits above every layer, as it does in Animate.
+            if scene.camera().enabled {
+                camera_row(ui, scene, columns, state, &mut response);
+            }
 
             let layer_ids: Vec<LayerId> = scene.layers().iter().map(|l| l.id).collect();
             for id in layer_ids {
@@ -236,7 +264,9 @@ fn ruler(ui: &mut Ui, columns: u32, state: &TimelineState, out: &mut TimelineRes
         && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
         && pos.x >= grid_left
     {
-        let frame = ((pos.x - grid_left) / Metrics::FRAME_WIDTH).floor().max(0.0) as u32;
+        let frame = ((pos.x - grid_left) / Metrics::FRAME_WIDTH)
+            .floor()
+            .max(0.0) as u32;
         out.scrub_to = Some(frame.min(columns.saturating_sub(1)));
     }
 }
@@ -248,6 +278,85 @@ fn draw_playhead(painter: &egui::Painter, rect: egui::Rect, grid_left: f32, fram
         egui::vec2(Metrics::FRAME_WIDTH, rect.height()),
     );
     painter.rect_filled(head, 0.0, Palette::SELECTION);
+}
+
+/// The camera's row, above every layer.
+///
+/// Its cells are the camera's own keyframes: a key where the shot is set, a
+/// tinted run between two keys where it is being interpolated. That is the
+/// point of showing it at all — an animator reads a camera move off the
+/// timeline the same way they read a character's.
+///
+/// **It is not a `Layer`.** It holds no objects and cannot be drawn on, and
+/// smuggling it into the layer stack would mean every piece of code that walks
+/// layers had to know to skip it. Animate shows it as a layer; underneath, it
+/// is the camera.
+fn camera_row(
+    ui: &mut Ui,
+    scene: &Scene,
+    columns: u32,
+    state: &TimelineState,
+    out: &mut TimelineResponse,
+) {
+    let height = Metrics::LAYER_ROW;
+    let width = columns as f32 * Metrics::FRAME_WIDTH;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(LAYER_COLUMN + width, height), Sense::click());
+    let painter = ui.painter_at(rect);
+
+    if state.camera_selected {
+        painter.rect_filled(rect, 0.0, Palette::RAISED);
+    }
+
+    painter.text(
+        egui::pos2(rect.min.x + 4.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        "Camera",
+        FontId::proportional(11.0),
+        Palette::TEXT,
+    );
+
+    let camera = scene.camera();
+    let last = camera.last_frame();
+    let grid_left = rect.min.x + LAYER_COLUMN;
+    let tint = Color32::from_rgb(0x3A, 0x4A, 0x60);
+
+    for frame in 0..columns {
+        let x = grid_left + frame as f32 * Metrics::FRAME_WIDTH;
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(x, rect.min.y),
+            egui::vec2(Metrics::FRAME_WIDTH, height),
+        );
+
+        let kind = if camera.has_key_at(frame) {
+            FrameKind::Keyframe
+        } else if !camera.is_empty() && frame < last {
+            FrameKind::Span
+        } else if !camera.is_empty() && frame == last {
+            FrameKind::SpanEnd
+        } else {
+            FrameKind::Empty
+        };
+        let tween = (!camera.is_empty() && frame <= last && !camera.has_key_at(frame)).then_some(
+            TweenCell {
+                tint,
+                complete: true,
+                arrow: false,
+            },
+        );
+
+        draw_frame_cell(&painter, cell, kind, tween, frame == state.current_frame);
+    }
+
+    if response.clicked() {
+        out.select_camera = true;
+        if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
+            && pos.x > grid_left
+        {
+            let frame = ((pos.x - grid_left) / Metrics::FRAME_WIDTH) as u32;
+            out.scrub_to = Some(frame.min(columns.saturating_sub(1)));
+        }
+    }
 }
 
 /// One layer's row: name on the left, frames on the right.
@@ -303,6 +412,7 @@ fn layer_row(
     // -- frame grid --------------------------------------------------------
     let grid_left = rect.min.x + LAYER_COLUMN;
     let length = layer.length();
+
     for frame in 0..columns {
         let x = grid_left + frame as f32 * Metrics::FRAME_WIDTH;
         let cell = egui::Rect::from_min_size(
@@ -318,10 +428,23 @@ fn layer_row(
         );
     }
 
+    // A sound layer draws its waveform across the frames the sound covers.
+    // This is what makes a soundtrack usable: an animator finds the accents by
+    // *looking* at where the loud parts are, then keys on them.
+    //
+    // Drawn **over** the frame cells, translucently. Underneath it was
+    // invisible: every cell paints its own background, so the envelope was
+    // covered by the very frames it describes.
+    if let Some(waveform) = state.waveforms.get(&layer.id) {
+        draw_waveform(&painter, waveform, grid_left, rect, height, columns);
+    }
+
     let clicked_frame = |ui: &Ui| -> Option<u32> {
         let pos = ui.ctx().input(|i| i.pointer.interact_pos())?;
         (pos.x >= grid_left).then(|| {
-            let frame = ((pos.x - grid_left) / Metrics::FRAME_WIDTH).floor().max(0.0) as u32;
+            let frame = ((pos.x - grid_left) / Metrics::FRAME_WIDTH)
+                .floor()
+                .max(0.0) as u32;
             frame.min(columns.saturating_sub(1))
         })
     };
@@ -405,6 +528,41 @@ fn frame_context_menu(ui: &mut Ui, out: &mut TimelineResponse) {
     }
 }
 
+/// Draw a sound's envelope across the frames it covers.
+///
+/// Drawn as a bar per frame, mirrored about the middle — the shape of the
+/// sound, in the same units as the frames beside it, so what you see lines up
+/// with what you can key.
+fn draw_waveform(
+    painter: &egui::Painter,
+    waveform: &Waveform,
+    grid_left: f32,
+    row: egui::Rect,
+    height: f32,
+    columns: u32,
+) {
+    let middle = row.center().y;
+    let half = (height * 0.5 - 2.0).max(1.0);
+    let colour = Color32::from_rgba_unmultiplied(120, 215, 255, 150);
+
+    for (i, level) in waveform.levels.iter().enumerate() {
+        let frame = waveform.start_frame + i as u32;
+        if frame >= columns {
+            break;
+        }
+        let x = grid_left + frame as f32 * Metrics::FRAME_WIDTH;
+        let amplitude = (level.clamp(0.0, 1.0) * half).max(0.5);
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x + 0.5, middle - amplitude),
+                egui::pos2(x + Metrics::FRAME_WIDTH - 0.5, middle + amplitude),
+            ),
+            0.0,
+            colour,
+        );
+    }
+}
+
 /// Draw one frame cell using Animate's conventions.
 fn draw_frame_cell(
     painter: &egui::Painter,
@@ -455,7 +613,12 @@ fn draw_frame_cell(
                 egui::pos2(centre.x, cell.max.y - 5.0),
                 egui::vec2(5.0, 5.0),
             );
-            painter.rect_stroke(end, 0.0, Stroke::new(1.0, Palette::TEXT_DIM), StrokeKind::Inside);
+            painter.rect_stroke(
+                end,
+                0.0,
+                Stroke::new(1.0, Palette::TEXT_DIM),
+                StrokeKind::Inside,
+            );
         }
     }
 
@@ -486,10 +649,7 @@ fn draw_tween_mark(painter: &egui::Painter, cell: egui::Rect, tween: TweenCell) 
         let quarter = cell.width() / 4.0;
         for i in 0..2 {
             let x0 = cell.min.x + (i as f32 * 2.0 + 0.5) * quarter;
-            painter.line_segment(
-                [egui::pos2(x0, y), egui::pos2(x0 + quarter, y)],
-                stroke,
-            );
+            painter.line_segment([egui::pos2(x0, y), egui::pos2(x0 + quarter, y)], stroke);
         }
     }
 
@@ -534,11 +694,75 @@ mod tests {
 
     fn state() -> TimelineState {
         TimelineState {
+            waveforms: Default::default(),
             current_frame: 4,
             active_layer: None,
+            camera_selected: false,
             playing: false,
             onion_enabled: false,
         }
+    }
+
+    /// The camera row appears only once the camera is switched on — which is
+    /// exactly when Animate adds it.
+    #[test]
+    fn the_camera_row_appears_with_the_camera() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+
+        let mut scene = Scene::default();
+        assert!(!scene.camera().enabled, "the camera starts off");
+
+        // Off: the panel draws the layers and nothing else.
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let _ = timeline_panel(ui, &scene, &state());
+        });
+
+        scene.camera_mut().enabled = true;
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let _ = timeline_panel(ui, &scene, &state());
+        });
+    }
+
+    /// With the camera row selected the panel still draws every layer: the
+    /// camera is another row, not a mode.
+    #[test]
+    fn the_camera_row_draws_selected() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+
+        let mut scene = Scene::default();
+        scene.camera_mut().enabled = true;
+        scene
+            .camera_mut()
+            .set_key(buzz_scene::CameraKey::new(0, buzz_geom::Point::new(0.0, 0.0)));
+        scene
+            .camera_mut()
+            .set_key(buzz_scene::CameraKey::new(12, buzz_geom::Point::new(80.0, 0.0)));
+
+        let selected = TimelineState {
+            camera_selected: true,
+            ..state()
+        };
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let _ = timeline_panel(ui, &scene, &selected);
+        });
+    }
+
+    /// A response starts with nothing selected, so drawing the panel cannot
+    /// silently steal the selection from a layer.
+    #[test]
+    fn drawing_the_camera_row_selects_nothing() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut scene = Scene::default();
+        scene.camera_mut().enabled = true;
+
+        let mut response = TimelineResponse::default();
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            response = timeline_panel(ui, &scene, &state());
+        });
+        assert!(!response.select_camera);
     }
 
     #[test]
@@ -689,6 +913,9 @@ mod tests {
     fn the_document_length_is_the_longest_layer() {
         let scene = scene_with_frames();
         assert_eq!(scene.frame_count(), 24);
-        assert!((scene.duration_seconds() - 1.0).abs() < 0.001, "24 frames at 24 fps");
+        assert!(
+            (scene.duration_seconds() - 1.0).abs() < 0.001,
+            "24 frames at 24 fps"
+        );
     }
 }

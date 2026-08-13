@@ -73,6 +73,12 @@ buzz-ui = { path = "crates/buzz-ui" }
 buzz-import-xfl = { path = "crates/buzz-import-xfl" }
 buzz-import-pdf = { path = "crates/buzz-import-pdf" }
 buzz-import-swf = { path = "crates/buzz-import-swf" }
+buzz-script = { path = "crates/buzz-script" }
+buzz-export = { path = "crates/buzz-export" }
+buzz-rig = { path = "crates/buzz-rig" }
+buzz-audio = { path = "crates/buzz-audio" }
+buzz-light = { path = "crates/buzz-light" }
+buzz-fx = { path = "crates/buzz-fx" }
 
 [profile.dev]
 opt-level = 1

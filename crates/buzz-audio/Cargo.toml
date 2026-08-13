@@ -1,0 +1,29 @@
+[package]
+name = "buzz-audio"
+description = "Sound: decoding, waveforms, playback, and lip-sync analysis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+# WAV, decoded in-process. Apache-2.0/MIT, tiny, and the format an animator's
+# dialogue almost always arrives in.
+hound = "3.5"
+
+# MP3 and the rest. MPL-2.0 — file-level copyleft, which permits use as a
+# library; noted here because this project refuses AGPL dependencies and the
+# distinction matters.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "pcm", "ogg", "vorbis", "flac", "isomp4", "aac"] }
+
+# Audio output. Apache-2.0.
+cpal = "0.15"
+
+[dev-dependencies]
+tempfile = "3"

@@ -10,6 +10,8 @@ authors.workspace = true
 [dependencies]
 buzz-geom.workspace = true
 buzz-scene.workspace = true
+buzz-rig.workspace = true
+buzz-light.workspace = true
 
 kurbo.workspace = true
 peniko.workspace = true

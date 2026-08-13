@@ -161,6 +161,14 @@ pub enum ObjectKind {
     /// Instances carry no artwork of their own — that lives in the library —
     /// so editing the symbol updates every instance at once.
     Instance(crate::symbol::SymbolInstance),
+    /// Artwork rigged to a skeleton — Animate's Bone tool.
+    ///
+    /// The deformed artwork is derived from the pose rather than stored, so a
+    /// keyframe holds a handful of angles and there is only ever one answer to
+    /// what the rig looks like. See [`crate::rig`].
+    Armature(crate::rig::ArmatureData),
+    /// Artwork with warp handles on it — Animate's Asset Warp tool.
+    Warp(crate::rig::WarpData),
 }
 
 /// An object placed on a layer.
@@ -175,6 +183,22 @@ pub struct Object {
     /// Animate lets you lock individual objects as well as layers.
     pub locked: bool,
     pub visible: bool,
+
+    /// Filters on this object — blur, drop shadow, glow, bevel, adjust colour.
+    ///
+    /// Animate allows these on movie clips, buttons and text only, because a
+    /// raster filter needs a cached surface to work on. These are geometry
+    /// (see `buzz-fx`), so there is nothing to cache and no reason to refuse
+    /// them on a plain shape. Recorded as a deviation rather than an oversight.
+    ///
+    /// Empty for almost every object ever made, and an empty `Vec` allocates
+    /// nothing.
+    pub filters: Vec<buzz_fx::Filter>,
+
+    /// How this object combines with what is painted behind it — Animate's
+    /// Blend list. Distinct from [`ShapeData::blend`], which is about how one
+    /// brush stroke accumulates with the next.
+    pub blend: buzz_fx::Blend,
 }
 
 impl Object {
@@ -186,6 +210,8 @@ impl Object {
             kind: ObjectKind::Shape(shape),
             locked: false,
             visible: true,
+            filters: Vec::new(),
+            blend: buzz_fx::Blend::Normal,
         }
     }
 
@@ -197,6 +223,8 @@ impl Object {
             kind: ObjectKind::Group(children),
             locked: false,
             visible: true,
+            filters: Vec::new(),
+            blend: buzz_fx::Blend::Normal,
         }
     }
 
@@ -235,6 +263,11 @@ impl Object {
             // through `Scene::instance_bounds`; this keeps hit-testing and
             // culling from silently treating an instance as empty.
             ObjectKind::Instance(_) => Rect::new(-1.0, -1.0, 1.0, 1.0),
+            // Rigged artwork is measured **posed**: the bounds of a bent arm
+            // are not the bounds it was drawn at, and selection handles left
+            // behind where the artwork used to be are worse than none.
+            ObjectKind::Armature(rig) => rig.local_bounds(),
+            ObjectKind::Warp(warp) => warp.local_bounds(),
         }
     }
 
@@ -267,6 +300,15 @@ impl Object {
             // Instances need the library to resolve, so they are skipped here
             // and expanded by the renderer, which has it.
             ObjectKind::Instance(_) => {}
+            // Rigged artwork flattens to what it currently *looks* like, which
+            // is what every caller means: the renderer, hit-testing and
+            // culling all want the posed artwork, never the drawn one.
+            ObjectKind::Armature(rig) => {
+                for part in rig.posed() {
+                    part.flatten(world, out);
+                }
+            }
+            ObjectKind::Warp(warp) => out.push((world, warp.warped())),
         }
     }
 
@@ -276,6 +318,8 @@ impl Object {
             ObjectKind::Shape(_) => 1,
             ObjectKind::Group(children) => children.iter().map(|c| c.shape_count()).sum(),
             ObjectKind::Instance(_) => 1,
+            ObjectKind::Armature(rig) => rig.parts.iter().map(|p| p.artwork.shape_count()).sum(),
+            ObjectKind::Warp(_) => 1,
         }
     }
 
@@ -296,6 +340,8 @@ impl Object {
             kind: ObjectKind::Instance(crate::symbol::SymbolInstance::new(symbol)),
             locked: false,
             visible: true,
+            filters: Vec::new(),
+            blend: buzz_fx::Blend::Normal,
         }
     }
 }

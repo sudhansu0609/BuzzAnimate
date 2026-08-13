@@ -273,6 +273,39 @@ fn interpolate_object(start: &Object, end: &Object, tween: &Tween, t: f64) -> Ob
     {
         target.color = a.color.lerp(&b.color, t as f32);
     }
+
+    // Filters tween, which is how a glow grows or a shadow swings across a
+    // shot. Matched by position in the stack and by kind: Animate holds a
+    // filter that has no counterpart rather than interpolating towards
+    // nothing, and so does this.
+    if !start.filters.is_empty() {
+        out.filters = start
+            .filters
+            .iter()
+            .enumerate()
+            .map(|(i, filter)| match end.filters.get(i) {
+                Some(target) => filter.lerp(target, t),
+                None => filter.clone(),
+            })
+            .collect();
+    }
+
+    // **Armature poses tween.** This is what makes rigging an animation tool
+    // rather than a posing tool: two keyframes holding the same rig in
+    // different poses, and every frame between them interpolated joint by
+    // joint. The pose is a handful of angles, so this is arithmetic rather
+    // than geometry — and each joint turns the shortest way round, as
+    // everything else that interpolates an angle here does.
+    if let (ObjectKind::Armature(a), ObjectKind::Armature(b)) = (&start.kind, &end.kind) {
+        out.kind = ObjectKind::Armature(crate::rig::tween_armature(a, b, t));
+    }
+
+    // Warp handles tween the same way, which is how a puppet-warped drawing is
+    // animated: place the handles once, move them, and the frames between are
+    // the handle positions between.
+    if let (ObjectKind::Warp(a), ObjectKind::Warp(b)) = (&start.kind, &end.kind) {
+        out.kind = ObjectKind::Warp(crate::rig::tween_warp(a, b, t));
+    }
     out
 }
 
@@ -285,6 +318,17 @@ fn interpolate_shape_object(start: &Object, end: &Object, t: f64) -> Object {
         && let ObjectKind::Shape(target) = &mut out.kind
     {
         target.path = interpolate_path(&a.path, &b.path, t);
+    }
+
+    // A shape tween over rigged artwork interpolates the *rig*, not the
+    // vertices. Blending the deformed outlines of two poses would fight the
+    // skeleton and produce shapes no pose could make; moving the bones between
+    // the two poses is both cheaper and the only answer that stays a rig.
+    if let (ObjectKind::Armature(a), ObjectKind::Armature(b)) = (&start.kind, &end.kind) {
+        out.kind = ObjectKind::Armature(crate::rig::tween_armature(a, b, t));
+    }
+    if let (ObjectKind::Warp(a), ObjectKind::Warp(b)) = (&start.kind, &end.kind) {
+        out.kind = ObjectKind::Warp(crate::rig::tween_warp(a, b, t));
     }
     out
 }
@@ -819,5 +863,108 @@ mod tests {
             "200 shape-tween frames took {:?}",
             started.elapsed()
         );
+    }
+
+    // -- rigging ------------------------------------------------------------
+
+    fn rigged(elbow: f64) -> Object {
+        let mut armature = buzz_rig::Armature::new(Point::ZERO);
+        armature.push(buzz_rig::Bone::new("upper", None, 50.0, 0.0));
+        armature.push(buzz_rig::Bone::new("fore", Some(0), 50.0, elbow));
+
+        let mut rig = crate::rig::ArmatureData::new(armature);
+        rig.bind_shape(Arc::new(Object::shape(
+            ObjectId(7),
+            ShapeData::filled(Rect::new(0.0, -8.0, 100.0, 8.0).to_path(1e-9), Color::WHITE),
+        )));
+
+        Object {
+            id: ObjectId(7),
+            name: None,
+            transform: Affine::IDENTITY,
+            kind: ObjectKind::Armature(rig),
+            locked: false,
+            visible: true,
+            filters: Vec::new(),
+            blend: Default::default(),
+        }
+    }
+
+    /// The point of Phase 7: two keyframes holding poses, and every frame
+    /// between them interpolated joint by joint.
+    #[test]
+    fn a_tween_between_two_poses_bends_the_rig_halfway() {
+        let start = rigged(0.0);
+        let end = rigged(1.0);
+
+        let mid = interpolate_object(&start, &end, &Tween::classic(), 0.5);
+        let ObjectKind::Armature(rig) = &mid.kind else {
+            panic!("expected an armature");
+        };
+        assert!((rig.armature.bones[1].angle - 0.5).abs() < 1e-9);
+    }
+
+    /// The artwork must follow the interpolated pose, not stay where it was
+    /// drawn: a tween that moves the bones and leaves the drawing behind is
+    /// exactly the failure this is guarding.
+    #[test]
+    fn tweened_artwork_follows_the_tweened_bones() {
+        let start = rigged(0.0);
+        let end = rigged(std::f64::consts::FRAC_PI_2);
+
+        let straight = interpolate_object(&start, &end, &Tween::classic(), 0.0);
+        let bent = interpolate_object(&start, &end, &Tween::classic(), 1.0);
+
+        let extent = |object: &Object| object.bounds();
+        assert!(
+            extent(&bent).y1 > extent(&straight).y1 + 20.0,
+            "the artwork did not bend with the rig: {:?} vs {:?}",
+            extent(&straight),
+            extent(&bent)
+        );
+    }
+
+    /// A shape tween over a rig interpolates the skeleton rather than blending
+    /// two deformed outlines, which would produce shapes no pose could make.
+    #[test]
+    fn a_shape_tween_over_a_rig_interpolates_the_pose() {
+        let start = rigged(0.0);
+        let end = rigged(0.8);
+
+        let mid = interpolate_shape_object(&start, &end, 0.5);
+        let ObjectKind::Armature(rig) = &mid.kind else {
+            panic!("expected an armature");
+        };
+        assert!((rig.armature.bones[1].angle - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_tween_between_warps_moves_the_handles() {
+        let shape = ShapeData::filled(Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9), Color::WHITE);
+        let start_warp = crate::rig::WarpData::new(shape).with_grid(2, 2);
+        let mut end_warp = start_warp.clone();
+        end_warp.handles[0].current = Point::new(-100.0, -100.0);
+
+        let object = |warp: crate::rig::WarpData| Object {
+            id: ObjectId(3),
+            name: None,
+            transform: Affine::IDENTITY,
+            kind: ObjectKind::Warp(warp),
+            locked: false,
+            visible: true,
+            filters: Vec::new(),
+            blend: Default::default(),
+        };
+
+        let mid = interpolate_object(
+            &object(start_warp),
+            &object(end_warp),
+            &Tween::classic(),
+            0.5,
+        );
+        let ObjectKind::Warp(warp) = &mid.kind else {
+            panic!("expected a warp");
+        };
+        assert!((warp.handles[0].current.x - -50.0).abs() < 1e-9);
     }
 }

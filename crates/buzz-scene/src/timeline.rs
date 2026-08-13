@@ -36,6 +36,9 @@ pub struct Keyframe {
     pub label: Option<String>,
     /// A tween running from here to the next keyframe.
     pub tween: crate::tween::Tween,
+    /// A sound starting here — Animate attaches sound to a keyframe rather
+    /// than to a layer, so one layer can carry a whole scene's effects.
+    pub sound: Option<crate::sound::SoundRef>,
 }
 
 impl Keyframe {
@@ -45,6 +48,7 @@ impl Keyframe {
             objects: Arc::new(Vec::new()),
             label: None,
             tween: crate::tween::Tween::default(),
+            sound: None,
         }
     }
 
@@ -137,6 +141,20 @@ impl ResolvedFrame<'_> {
         match self {
             Self::Stored(objects) => Box::new(objects.iter().map(|o| &**o)),
             Self::Tweened(objects) => Box::new(objects.iter()),
+        }
+    }
+
+    /// Iterate, and say whether each object has a **stable identity**.
+    ///
+    /// Stored artwork is shared behind an `Arc` that survives every snapshot
+    /// it is not edited in, so anything derived from it can be cached against
+    /// that address. Tweened artwork is built fresh for the frame being drawn
+    /// and has no identity to cache against — which is correct, because it is
+    /// different geometry on every frame.
+    pub fn iter_owned(&self) -> Box<dyn Iterator<Item = (&Object, Option<&Arc<Object>>)> + '_> {
+        match self {
+            Self::Stored(objects) => Box::new(objects.iter().map(|o| (&**o, Some(o)))),
+            Self::Tweened(objects) => Box::new(objects.iter().map(|o| (o, None))),
         }
     }
 }
@@ -368,6 +386,10 @@ impl LayerTimeline {
             objects,
             label: None,
             tween: crate::tween::Tween::default(),
+            // A duplicated keyframe does *not* duplicate its sound: F6 on a
+            // dialogue layer would otherwise start the whole take again from
+            // the new frame, on top of the one already playing.
+            sound: None,
         });
         true
     }

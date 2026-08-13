@@ -150,7 +150,11 @@ impl Selection {
     pub fn bounds(&self, scene: &Scene) -> Option<Rect> {
         self.objects
             .iter()
-            .filter_map(|id| scene.find_object(*id).map(|(_, o)| scene.resolved_bounds(o)))
+            .filter_map(|id| {
+                scene
+                    .find_object(*id)
+                    .map(|(_, o)| scene.resolved_bounds(o))
+            })
             .reduce(|a, b| a.union(b))
     }
 
@@ -170,6 +174,15 @@ impl Selection {
                                 Some(s) => format!("{} — {}", s.kind.label(), s.name),
                                 None => "Missing Symbol".to_string(),
                             }
+                        }
+                        // Animate calls rigged artwork an armature and says how
+                        // many bones it has, which is the number you need when
+                        // deciding whether you are looking at the right rig.
+                        buzz_scene::ObjectKind::Armature(rig) => {
+                            format!("Armature ({} bones)", rig.armature.len())
+                        }
+                        buzz_scene::ObjectKind::Warp(w) => {
+                            format!("Warp ({} handles)", w.handles.len())
                         }
                     },
                     None => "Shape".to_string(),

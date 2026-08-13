@@ -11,12 +11,11 @@
 //! which is exactly the distinction Animate draws between the stage and what
 //! gets published.
 
-use buzz_geom::{Affine, Point, Rect, Vec2};
+use buzz_geom::{Point, Rect, Vec2};
 use buzz_render::SceneBuilder;
-use buzz_scene::{ColorTransform, LayerKind, Object, ObjectKind};
+use buzz_render::document::{DrawCache, FrameOptions, MaskDisplay, draw_frame, draw_frame_cached};
 use buzz_ui::{Metrics, Orientation, Palette};
 use egui::{Align2, Color32, FontId, Sense, Stroke, StrokeKind, Ui};
-use peniko::Color;
 
 use crate::editor::Editor;
 use crate::tools::Preview;
@@ -34,9 +33,9 @@ pub struct ChromeResponse {
 ///
 /// `area` is the region of the window the stage occupies; the camera's viewport
 /// carries its size and this supplies its origin.
-pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect) {
-    let mut builder = SceneBuilder::new(vello, &editor.camera)
-        .with_viewport_offset(Vec2::new(area.x0, area.y0));
+pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache: &mut DrawCache) {
+    let mut builder =
+        SceneBuilder::new(vello, &editor.camera).with_viewport_offset(Vec2::new(area.x0, area.y0));
 
     let scene = editor.scene();
 
@@ -53,10 +52,26 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect) {
     for ghost_frame in editor.onion_frames() {
         let distance = ghost_frame.abs_diff(frame).max(1) as f64;
         let strength = (0.30 / distance).clamp(0.05, 0.30);
-        draw_frame(&mut builder, scene, ghost_frame, camera, Some(strength), editor.onion.outlines);
+        let options = FrameOptions {
+            ghost: Some(strength),
+            ghost_outlines: editor.onion.outlines,
+            masks: MaskDisplay::WhenLocked,
+            // Ghosts are reference, not picture: shading and cast shadows on a
+            // faded copy of another frame read as dirt on the stage.
+            lit: false,
+        };
+        draw_frame(&mut builder, scene, ghost_frame, camera, &options);
     }
 
-    draw_frame(&mut builder, scene, frame, camera, None, false);
+    // Animate shows the mask effect only once the mask layer is locked,
+    // because you cannot draw inside a region you cannot see. An export
+    // always masks; this is the stage.
+    let live = FrameOptions {
+        masks: MaskDisplay::WhenLocked,
+        lit: true,
+        ..FrameOptions::default()
+    };
+    draw_frame_cached(&mut builder, scene, frame, camera, &live, cache);
 
     // The brush preview is painted here, with the artwork, rather than sketched
     // as chrome. A brush stroke is the one gesture where the preview *is* the
@@ -65,256 +80,6 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect) {
     if let Preview::Ink { path, color } = editor.preview() {
         builder.fill_shape(&path, color);
     }
-}
-
-/// Draw a document's artwork for one frame, with its camera: no onion skins,
-/// no preview, no editor chrome.
-///
-/// Exposed so a test can render a document through exactly the path the window
-/// uses. A test that reimplemented the walk would be testing its own copy, and
-/// compositing and perspective bugs are precisely the kind that hide in the
-/// difference. The document camera is applied for the same reason — a helper
-/// that quietly skipped it would report that a camera pan moves nothing.
-pub fn draw_document(builder: &mut SceneBuilder<'_>, scene: &buzz_scene::Scene, frame: u32) {
-    let camera = scene.camera_transform(frame);
-    draw_frame(builder, scene, frame, camera, None, false);
-}
-
-/// Draw one frame's layers.
-///
-/// `ghost` fades everything for onion skinning; `None` draws normally.
-fn draw_frame(
-    builder: &mut SceneBuilder<'_>,
-    scene: &buzz_scene::Scene,
-    frame: u32,
-    camera: Affine,
-    ghost: Option<f64>,
-    ghost_outlines: bool,
-) {
-    for layer in scene.layers().drawable_at(frame) {
-        // Layer depth: artwork further from the camera is drawn smaller and
-        // slides less as the camera pans. A layer at or behind the camera is
-        // skipped entirely rather than magnified into a wall of colour.
-        //
-        // `camera` is passed in already resolved for depth zero; a layer off
-        // the focal plane needs its own, so this replaces it.
-        let camera = if layer.depth == 0.0 {
-            camera
-        } else {
-            match scene.camera_transform_at_depth(frame, layer.depth) {
-                Some(transform) => transform,
-                None => continue,
-            }
-        };
-
-        // Guides are authoring aids: visible on stage, never exported.
-        let outline = layer.outline || (ghost.is_some() && ghost_outlines);
-        let tint = outline.then_some(layer.color);
-        let faded = layer.kind == LayerKind::Guide;
-
-        // Resolve tweens: what is drawn between two keyframes exists nowhere
-        // in the document and has to be interpolated.
-        let ctx = DrawCtx { scene, frame, tint, faded, ghost, effect: ColorTransform::default(), depth: 0 };
-        let resolved = layer.frames.resolved_at(frame);
-
-        // A layer holding build-up paint is drawn into its own transparent
-        // group. Additive compositing sums with the destination, and without
-        // the group the destination would include the stage — a dark stroke on
-        // a white background would sum to white and disappear. Inside, the sum
-        // starts from nothing and means what it should.
-        //
-        // The group is skipped entirely when nothing on the layer is additive,
-        // because every group is a render target and they are not free.
-        let accumulates = resolved
-            .iter()
-            .any(|object| has_additive_paint(object, scene, 0));
-
-        if accumulates {
-            // Bounded to the layer's own artwork: an unbounded group would
-            // cost a full-viewport buffer whatever the layer contains.
-            //
-            // Through the camera, because that is where the artwork actually
-            // lands — a layer moved by depth or by a camera pan would
-            // otherwise be clipped against where its geometry used to be.
-            let bounds = layer
-                .bounds_at(frame)
-                .map(|b| buzz_scene::object::transform_rect(camera, b).inflate(2.0, 2.0))
-                .unwrap_or_else(|| builder.clip_bounds());
-            builder.push_isolation(bounds.intersect(builder.clip_bounds()));
-        }
-
-        for object in resolved.iter() {
-            draw_object(builder, object, camera, &ctx);
-        }
-
-        if accumulates {
-            builder.pop_isolation();
-        }
-    }
-}
-
-/// Does this object, or anything inside it, paint additively?
-///
-/// Instances are followed into the library, because a symbol full of build-up
-/// paint placed on a layer still needs that layer isolated.
-fn has_additive_paint(object: &Object, scene: &buzz_scene::Scene, depth: usize) -> bool {
-    if depth >= MAX_SYMBOL_DEPTH {
-        return false;
-    }
-    match &object.kind {
-        ObjectKind::Shape(shape) => shape.blend.is_additive(),
-        ObjectKind::Group(children) => children
-            .iter()
-            .any(|child| has_additive_paint(child, scene, depth + 1)),
-        ObjectKind::Instance(instance) => scene
-            .library()
-            .get(instance.symbol)
-            .is_some_and(|symbol| {
-                symbol.layers.iter().any(|layer| {
-                    layer
-                        .all_objects()
-                        .any(|child| has_additive_paint(child, scene, depth + 1))
-                })
-            }),
-    }
-}
-
-/// How deep a symbol may nest before we stop.
-///
-/// A symbol containing an instance of itself is a cycle; without a limit the
-/// renderer would recurse until the stack ran out. Animate refuses to create
-/// one, but an imported or hand-edited file can contain it.
-const MAX_SYMBOL_DEPTH: usize = 12;
-
-/// State the draw walk carries down through groups and nested symbols.
-///
-/// Descending into an instance changes nearly all of it — the frame, the
-/// colour effect, the depth — so it travels as one value rather than as a
-/// growing argument list.
-#[derive(Clone)]
-struct DrawCtx<'a> {
-    scene: &'a buzz_scene::Scene,
-    /// Which frame of *this* timeline is being drawn. A nested graphic symbol
-    /// runs on its own frame number, not the stage's.
-    frame: u32,
-    /// Outline view: draw silhouettes in this colour instead of the artwork.
-    tint: Option<Color>,
-    /// Guide layer.
-    faded: bool,
-    /// Onion-skin ghost alpha.
-    ghost: Option<f64>,
-    /// Accumulated colour effect from every enclosing instance.
-    effect: ColorTransform,
-    depth: usize,
-}
-
-impl DrawCtx<'_> {
-    /// Final colour for a fill or stroke, with every modifier applied.
-    ///
-    /// Instance effects come first because they are part of the artwork; the
-    /// guide fade and ghost alpha are authoring overlays applied on top.
-    fn colour(&self, c: Color) -> Color {
-        self.overlay(self.effect.apply(c))
-    }
-
-    /// Apply only the authoring overlays.
-    ///
-    /// Outline view draws in the layer's identifying colour, which is chrome
-    /// rather than artwork — running it through an instance's tint would
-    /// defeat the point of colour-coding layers.
-    fn overlay(&self, c: Color) -> Color {
-        let c = if self.faded { fade(c) } else { c };
-        match self.ghost {
-            Some(alpha) => c.multiply_alpha(alpha as f32),
-            None => c,
-        }
-    }
-}
-
-fn draw_object(builder: &mut SceneBuilder<'_>, object: &Object, parent: Affine, ctx: &DrawCtx<'_>) {
-    if !object.visible {
-        return;
-    }
-    let world = parent * object.transform;
-
-    match &object.kind {
-        ObjectKind::Group(children) => {
-            for child in children {
-                draw_object(builder, child, world, ctx);
-            }
-        }
-
-        ObjectKind::Instance(instance) => {
-            if ctx.depth >= MAX_SYMBOL_DEPTH {
-                return;
-            }
-            let Some(symbol) = ctx.scene.library().get(instance.symbol) else {
-                // A dangling reference draws nothing rather than crashing; the
-                // Library panel is where a missing symbol gets reported.
-                return;
-            };
-
-            // A graphic follows the parent playhead; a movie clip shows its
-            // first frame while authoring.
-            let inner = instance.resolve_frame(symbol.kind, ctx.frame, symbol.length());
-
-            let mut inner_ctx = ctx.clone();
-            inner_ctx.frame = inner;
-            inner_ctx.depth += 1;
-            // Compose rather than replace: a tinted symbol inside a faded one
-            // must show both effects.
-            inner_ctx.effect = instance.color.compose(&ctx.effect);
-
-            for layer in symbol.layers.drawable_at(inner) {
-                // An outline already in force wins — the stage layer's outline
-                // toggle applies to everything it contains.
-                let layer_ctx = DrawCtx {
-                    tint: ctx.tint.or_else(|| layer.outline.then_some(layer.color)),
-                    faded: ctx.faded || layer.kind == LayerKind::Guide,
-                    ..inner_ctx.clone()
-                };
-                for child in layer.frames.resolved_at(inner).iter() {
-                    draw_object(builder, child, world, &layer_ctx);
-                }
-            }
-        }
-
-        ObjectKind::Shape(shape) => {
-            let path = world * shape.path.clone();
-
-            // Outline view: draw the silhouette in the layer colour instead of
-            // the artwork, which is what the timeline's outline column does.
-            if let Some(color) = ctx.tint {
-                builder.stroke_hairline(&path, ctx.overlay(color), 1.0);
-                return;
-            }
-
-            if let Some(fill) = shape.fill {
-                let color = ctx.colour(fill.color);
-                // Build-up paint sums its opacity with what is under it. The
-                // enclosing isolation group, opened by `draw_frame`, is what
-                // keeps that sum away from the stage behind it.
-                if shape.blend.is_additive() {
-                    builder.fill_shape_additive(&path, color);
-                } else {
-                    builder.fill_shape(&path, color);
-                }
-            }
-            if let Some(stroke) = shape.stroke {
-                let color = ctx.colour(stroke.color);
-                if stroke.hairline {
-                    builder.stroke_hairline(&path, color, 1.0);
-                } else {
-                    builder.stroke_shape(&path, color, stroke.width);
-                }
-            }
-        }
-    }
-}
-
-/// Guide layers draw faintly, so they read as reference rather than artwork.
-fn fade(color: Color) -> Color {
-    color.multiply_alpha(0.35)
 }
 
 /// Draw the chrome over the rendered stage.
@@ -354,6 +119,8 @@ pub fn draw_chrome(ui: &mut Ui, editor: &Editor, area: egui::Rect) -> ChromeResp
     }
 
     draw_selection(&painter, editor, to_screen);
+    draw_rigs(&painter, editor, to_screen);
+    draw_lights(&painter, editor, to_screen);
     draw_preview(&painter, editor, to_screen);
 
     if view.show_rulers {
@@ -387,9 +154,14 @@ fn draw_grid(
     let last_x = (visible.x1 / spacing).ceil() as i64;
     if last_x.saturating_sub(first_x) <= MAX_LINES {
         for i in first_x..=last_x {
-            let x = camera.doc_to_screen(Point::new(i as f64 * spacing, visible.y0)).x;
+            let x = camera
+                .doc_to_screen(Point::new(i as f64 * spacing, visible.y0))
+                .x;
             let x = area.min.x + x as f32;
-            painter.line_segment([egui::pos2(x, area.min.y), egui::pos2(x, area.max.y)], stroke);
+            painter.line_segment(
+                [egui::pos2(x, area.min.y), egui::pos2(x, area.max.y)],
+                stroke,
+            );
         }
     }
 
@@ -397,9 +169,14 @@ fn draw_grid(
     let last_y = (visible.y1 / spacing).ceil() as i64;
     if last_y.saturating_sub(first_y) <= MAX_LINES {
         for i in first_y..=last_y {
-            let y = camera.doc_to_screen(Point::new(visible.x0, i as f64 * spacing)).y;
+            let y = camera
+                .doc_to_screen(Point::new(visible.x0, i as f64 * spacing))
+                .y;
             let y = area.min.y + y as f32;
-            painter.line_segment([egui::pos2(area.min.x, y), egui::pos2(area.max.x, y)], stroke);
+            painter.line_segment(
+                [egui::pos2(area.min.x, y), egui::pos2(area.max.x, y)],
+                stroke,
+            );
         }
     }
 }
@@ -507,11 +284,159 @@ fn draw_selection(
 }
 
 /// Live feedback for the gesture in progress.
-fn draw_preview(
-    painter: &egui::Painter,
-    editor: &Editor,
-    to_screen: impl Fn(Point) -> egui::Pos2,
-) {
+/// Draw armatures and warp handles over the artwork.
+///
+/// **Chrome, not artwork** — bones are drawn here, with egui, in screen space,
+/// so they are never part of an exported frame. A skeleton visible in the
+/// finished animation would be an unmistakable bug, and keeping it on this
+/// side of the split makes that impossible rather than merely unlikely.
+///
+/// Bones are drawn as Animate draws them: a tapered quadrilateral, widest a
+/// quarter of the way along, so which end is the head can be read at a glance.
+fn draw_rigs(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point) -> egui::Pos2) {
+    let frame = editor.current_frame;
+    let scene = editor.scene();
+    let selected = |id: buzz_scene::ObjectId| editor.selection.contains(id);
+
+    for (object, segments) in crate::rigging::stage_segments(scene, frame) {
+        let colour = if selected(object) {
+            Palette::SELECTION
+        } else {
+            Color32::from_rgba_unmultiplied(255, 210, 90, 170)
+        };
+
+        for (head, tip) in segments {
+            let outline = crate::rigging::bone_outline(head, tip, bone_width(editor, head, tip));
+            let points: Vec<egui::Pos2> = outline.iter().map(|p| to_screen(*p)).collect();
+            painter.add(egui::Shape::convex_polygon(
+                points,
+                Color32::from_rgba_unmultiplied(255, 210, 90, 60),
+                Stroke::new(1.0, colour),
+            ));
+            // The joint at the head, which is what the bone turns about.
+            painter.circle_stroke(to_screen(head), 3.0, Stroke::new(1.0, colour));
+        }
+    }
+
+    for (object, handles) in crate::rigging::stage_handles(scene, frame) {
+        let colour = if selected(object) {
+            Palette::SELECTION
+        } else {
+            Color32::from_rgba_unmultiplied(120, 220, 255, 200)
+        };
+        for (at, moved) in handles {
+            let screen = to_screen(at);
+            // A moved handle is filled, an untouched one hollow, so it is
+            // obvious at a glance which handles are holding the deformation.
+            if moved {
+                painter.circle_filled(screen, 4.0, colour);
+            } else {
+                painter.circle_stroke(screen, 4.0, Stroke::new(1.5, colour));
+            }
+        }
+    }
+
+    // The bone being dragged out, before it exists in the document.
+    if let Some((head, current)) = editor.rig_preview() {
+        painter.line_segment(
+            [to_screen(head), to_screen(current)],
+            Stroke::new(1.5, Palette::SELECTION),
+        );
+        painter.circle_stroke(to_screen(head), 3.0, Stroke::new(1.0, Palette::SELECTION));
+    }
+}
+
+/// The light handles, drawn as chrome so they can never be exported.
+///
+/// A sun is a handle on a dial about the middle of the stage: which way round
+/// it sits is the direction the light comes from, and how far out it sits is
+/// how low the sun is. The dark spoke opposite the handle is where the shadow
+/// falls — the thing the animator is really choosing — so the gizmo shows the
+/// consequence rather than the angle.
+///
+/// A lamp is drawn where it is, inside a ring showing its reach.
+fn draw_lights(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point) -> egui::Pos2) {
+    if !editor.light_panel.gizmos {
+        return;
+    }
+
+    if !editor.scene().lights().enabled {
+        // Handles for a rig that is switched off would promise an effect the
+        // document is not applying.
+        return;
+    }
+
+    for gizmo in crate::lights::gizmos(editor.scene()) {
+        let [r, g, b, _] = gizmo.color.to_rgba8().to_u8_array();
+        // A switched-off light still shows, dimmed: a handle that vanished
+        // would leave a light nobody can find again.
+        let alpha = if gizmo.enabled { 255 } else { 110 };
+        let colour = Color32::from_rgba_unmultiplied(r, g, b, alpha);
+        // Structure is drawn in ink, not in the light's own colour. A warm key
+        // is very nearly white, and a near-white gizmo on a white stage is
+        // invisible — which is exactly how the first version of this looked.
+        let ink = Color32::from_rgba_unmultiplied(0, 0, 0, alpha);
+        let ghost = Color32::from_rgba_unmultiplied(0, 0, 0, alpha / 5);
+        let selected = editor.light_panel.selected == Some(gizmo.id);
+        let ring = if selected { Palette::SELECTION } else { ink };
+
+        match gizmo.kind {
+            crate::lights::GizmoKind::Sun {
+                centre,
+                dial,
+                handle,
+                shadow,
+            } => {
+                let middle = to_screen(centre);
+                let rim = to_screen(centre + Vec2::new(dial, 0.0));
+                painter.circle_stroke(middle, rim.x - middle.x, Stroke::new(1.0, ghost));
+
+                // Where the shadow runs, and how far. Drawn heavier than the
+                // arm towards the light because it is the consequence the
+                // animator is actually choosing.
+                painter.line_segment([middle, to_screen(shadow)], Stroke::new(2.0, ink));
+                painter.line_segment([middle, to_screen(handle)], Stroke::new(1.0, ghost));
+
+                let at = to_screen(handle);
+                let size = if selected { 7.0 } else { 5.5 };
+                painter.circle_filled(at, size, colour);
+                painter.circle_stroke(at, size, Stroke::new(1.5, ring));
+
+                // Rays, so a sun is not mistaken for a lamp at a glance.
+                for step in 0..8 {
+                    let angle = step as f32 * std::f32::consts::TAU / 8.0;
+                    let dir = egui::vec2(angle.cos(), angle.sin());
+                    painter.line_segment(
+                        [at + dir * (size + 3.0), at + dir * (size + 6.0)],
+                        Stroke::new(1.5, ink),
+                    );
+                }
+            }
+
+            crate::lights::GizmoKind::Lamp { at, radius } => {
+                let middle = to_screen(at);
+                let edge = to_screen(at + Vec2::new(radius, 0.0));
+                // The reach ring, which is also a drag handle.
+                painter.circle_stroke(middle, edge.x - middle.x, Stroke::new(1.0, ghost));
+
+                let size = if selected { 6.0 } else { 5.0 };
+                painter.circle_filled(middle, size, colour);
+                painter.circle_stroke(middle, size, Stroke::new(1.5, ink));
+                painter.circle_stroke(middle, size + 4.0, Stroke::new(1.0, ring));
+            }
+        }
+    }
+}
+
+/// How wide to draw a bone: a fraction of its length, bounded in *screen*
+/// pixels so a long bone is not a wedge and a short one is still visible.
+fn bone_width(editor: &Editor, head: Point, tip: Point) -> f64 {
+    let zoom = editor.camera.zoom.max(f64::MIN_POSITIVE);
+    let length = (tip - head).hypot();
+    (length * 0.12).clamp(2.0 / zoom, 14.0 / zoom)
+}
+
+fn draw_preview(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point) -> egui::Pos2) {
     let stroke = Stroke::new(1.0, Palette::SELECTION);
 
     match editor.preview() {
@@ -666,9 +591,10 @@ fn format_ruler(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buzz_geom::Shape as _;
+    use buzz_geom::{Affine, Shape as _};
     use buzz_scene::ShapeData;
     use kurbo::Rect as KRect;
+    use peniko::Color;
 
     fn editor_with_art() -> Editor {
         let mut e = Editor::default();
@@ -702,7 +628,12 @@ mod tests {
     fn a_scene_can_be_built_without_panicking() {
         let editor = editor_with_art();
         let mut vello = vello::Scene::new();
-        build_scene(&mut vello, &editor, Rect::new(0.0, 0.0, 1000.0, 800.0));
+        build_scene(
+            &mut vello,
+            &editor,
+            Rect::new(0.0, 0.0, 1000.0, 800.0),
+            &mut DrawCache::new(),
+        );
         assert!(
             vello.encoding().n_paths > 0,
             "the stage and artwork should both encode"
@@ -718,7 +649,12 @@ mod tests {
 
         for percent in [1.0, 100.0, 2000.0, 1e6, 1e9, 1e12] {
             editor.camera.set_zoom_percent(percent);
-            build_scene(&mut vello, &editor, Rect::new(0.0, 0.0, 1000.0, 800.0));
+            build_scene(
+                &mut vello,
+                &editor,
+                Rect::new(0.0, 0.0, 1000.0, 800.0),
+                &mut DrawCache::new(),
+            );
             assert!(
                 vello.encoding().n_paths > 0,
                 "nothing encoded at {percent}%"
@@ -732,14 +668,24 @@ mod tests {
         let layer = editor.selection.active_layer().unwrap();
 
         let mut visible_scene = vello::Scene::new();
-        build_scene(&mut visible_scene, &editor, Rect::new(0.0, 0.0, 800.0, 600.0));
+        build_scene(
+            &mut visible_scene,
+            &editor,
+            Rect::new(0.0, 0.0, 800.0, 600.0),
+            &mut DrawCache::new(),
+        );
         let with_art = visible_scene.encoding().n_paths;
 
         editor.doc.edit("Hide", |s| {
             s.update_layer(layer, |l| l.visible = false);
         });
         let mut hidden_scene = vello::Scene::new();
-        build_scene(&mut hidden_scene, &editor, Rect::new(0.0, 0.0, 800.0, 600.0));
+        build_scene(
+            &mut hidden_scene,
+            &editor,
+            Rect::new(0.0, 0.0, 800.0, 600.0),
+            &mut DrawCache::new(),
+        );
 
         assert!(
             hidden_scene.encoding().n_paths < with_art,
@@ -756,7 +702,12 @@ mod tests {
         });
 
         let mut vello = vello::Scene::new();
-        build_scene(&mut vello, &editor, Rect::new(0.0, 0.0, 800.0, 600.0));
+        build_scene(
+            &mut vello,
+            &editor,
+            Rect::new(0.0, 0.0, 800.0, 600.0),
+            &mut DrawCache::new(),
+        );
         assert!(vello.encoding().n_paths > 0);
     }
 
@@ -778,8 +729,16 @@ mod tests {
         });
 
         let mut vello = vello::Scene::new();
-        build_scene(&mut vello, &editor, Rect::new(0.0, 0.0, 800.0, 600.0));
-        assert!(vello.encoding().n_paths > 1, "the group's leaf should encode");
+        build_scene(
+            &mut vello,
+            &editor,
+            Rect::new(0.0, 0.0, 800.0, 600.0),
+            &mut DrawCache::new(),
+        );
+        assert!(
+            vello.encoding().n_paths > 1,
+            "the group's leaf should encode"
+        );
     }
 
     #[test]

@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use buzz_geom::Affine;
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
@@ -108,7 +109,22 @@ pub struct Layer {
     pub name: String,
     pub kind: LayerKind,
     /// Enclosing folder, if any.
+    ///
+    /// This is timeline *nesting* — the folder the layer is filed under. It is
+    /// not [`Self::follows`], which is a different relationship entirely.
     pub parent: Option<LayerId>,
+
+    /// The layer this one **follows**: Animate's Layer Parenting.
+    ///
+    /// When the followed layer's artwork moves, this layer's artwork moves with
+    /// it — a head layer parented to a body layer, an arm to a shoulder. It is
+    /// how a character is rigged without bones, and it is what Animate's Parent
+    /// column in the timeline sets.
+    ///
+    /// Deliberately separate from [`Self::parent`]: a layer can be filed in a
+    /// folder and follow a layer in a different one, and Animate keeps the two
+    /// apart for exactly that reason.
+    pub follows: Option<LayerId>,
 
     /// The eye column.
     pub visible: bool,
@@ -134,6 +150,16 @@ pub struct Layer {
     /// Folders only: whether children are hidden in the timeline. Purely a UI
     /// state — it never affects rendering.
     pub collapsed: bool,
+
+    /// Filters applied to everything on this layer, as one subject.
+    ///
+    /// **Animate has no layer filters** — there, filters belong to a movie clip
+    /// instance, and blurring a whole layer means selecting it all and
+    /// converting it to a symbol first. These are geometry rather than a
+    /// cached raster surface (see `buzz-fx`), so a layer costs no more than an
+    /// object does, and "blur the background" is a thing animators ask for
+    /// constantly. Recorded as a deviation, with the reason.
+    pub filters: Vec<buzz_fx::Filter>,
 
     /// The layer's frames. Artwork lives in keyframes, not on the layer.
     pub frames: LayerTimeline,
@@ -169,6 +195,7 @@ impl Layer {
             name: name.into(),
             kind,
             parent: None,
+            follows: None,
             visible: true,
             locked: false,
             outline: false,
@@ -176,6 +203,7 @@ impl Layer {
             // On the focal plane, so a new layer is unaffected by perspective.
             depth: 0.0,
             collapsed: false,
+            filters: Vec::new(),
             frames: LayerTimeline::new(),
         }
     }
@@ -377,6 +405,116 @@ impl LayerStack {
             layer = parent;
         }
         true
+    }
+
+    // -- layer parenting ------------------------------------------------------
+
+    /// What a layer's artwork inherits from the layer it follows.
+    ///
+    /// Animate's Layer Parenting: move the body and the head goes with it. The
+    /// inherited transform is the **motion** of every layer above this one in
+    /// the follow chain — how far each has travelled from its own first
+    /// keyframe — composed outermost first.
+    ///
+    /// Motion, not position, is what is inherited. A head drawn in the right
+    /// place must stay in the right place the moment it is parented; inheriting
+    /// the body's absolute transform would fling it across the stage as soon as
+    /// the link was made, which is not what parenting means to an animator.
+    pub fn inherited_transform(&self, id: LayerId, frame: u32) -> Affine {
+        let mut chain = Vec::new();
+        let mut current = self.get(id).and_then(|l| l.follows);
+        // Bounded by the layer count: a corrupt file can hold a follow cycle,
+        // and this must terminate rather than hang the renderer.
+        for _ in 0..self.layers.len() {
+            let Some(next) = current else { break };
+            if chain.contains(&next) {
+                break;
+            }
+            chain.push(next);
+            current = self.get(next).and_then(|l| l.follows);
+        }
+
+        // Outermost first: the grandparent's motion applies to the parent's,
+        // and both apply to this layer.
+        let mut out = Affine::IDENTITY;
+        for followed in chain.iter().rev() {
+            out *= self.motion_of(*followed, frame);
+        }
+        out
+    }
+
+    /// How far a layer's artwork has moved from where it started.
+    ///
+    /// # Which transform is "the layer's"
+    ///
+    /// A layer has no transform of its own — its objects do. This takes the
+    /// **first object on the layer** as the thing that represents it, because
+    /// layer parenting is used with one symbol per layer: that is how a rig is
+    /// built in Animate, and the Parent column exists to serve it. A layer
+    /// holding loose artwork can still be followed; it is the first object that
+    /// leads.
+    ///
+    /// Recorded as a deviation rather than hidden: Animate tracks a
+    /// transformation for the layer itself.
+    pub fn motion_of(&self, id: LayerId, frame: u32) -> Affine {
+        let Some(layer) = self.get(id) else {
+            return Affine::IDENTITY;
+        };
+        let Some(rest_frame) = layer.frames.keyframes().first().map(|k| k.start) else {
+            return Affine::IDENTITY;
+        };
+
+        let anchor = |at: u32| {
+            layer
+                .frames
+                .resolved_at(at)
+                .iter()
+                .next()
+                .map(|object| object.transform)
+        };
+        let (Some(now), Some(rest)) = (anchor(frame), anchor(rest_frame)) else {
+            return Affine::IDENTITY;
+        };
+
+        // A rest pose scaled to nothing has no inverse; a layer like that
+        // simply passes nothing on, rather than scattering its children.
+        let c = rest.as_coeffs();
+        let determinant = c[0] * c[3] - c[1] * c[2];
+        if determinant.abs() < 1e-12 {
+            return Affine::IDENTITY;
+        }
+        now * rest.inverse()
+    }
+
+    /// May `layer` follow `target` without making a cycle?
+    ///
+    /// A cycle would be a layer that follows itself through some chain, and the
+    /// renderer would have nothing sensible to draw. Refusing the link is
+    /// friendlier than resolving it arbitrarily.
+    pub fn can_follow(&self, layer: LayerId, target: LayerId) -> bool {
+        if layer == target || self.get(target).is_none() {
+            return false;
+        }
+        // Walk up from the target: if this layer is already above it, linking
+        // would close the loop.
+        let mut current = Some(target);
+        for _ in 0..self.layers.len() {
+            let Some(id) = current else { return true };
+            if id == layer {
+                return false;
+            }
+            current = self.get(id).and_then(|l| l.follows);
+        }
+        false
+    }
+
+    /// Every layer that follows `id`, directly.
+    pub fn followers_of(&self, id: LayerId) -> Vec<LayerId> {
+        self.layers
+            .iter()
+            .filter(|l| l.follows == Some(id))
+            .map(|l| l.id)
+            .collect()
     }
 
     /// Locked directly, or inside a locked folder.
@@ -708,5 +846,141 @@ mod tests {
         );
         assert_eq!(snapshot.get(LayerId(1)).unwrap().name, "A");
         assert_eq!(a.get(LayerId(1)).unwrap().name, "renamed");
+    }
+    // -- layer parenting -----------------------------------------------------
+
+    /// A layer holding one square, keyed at frame 0 and moved by `(dx, dy)` at
+    /// frame 10, with a classic tween between them.
+    fn moving_layer(id: u64, name: &str, dx: f64, dy: f64) -> Layer {
+        use crate::object::{Object, ObjectId, ShapeData};
+        use buzz_geom::{Rect, Shape as _};
+
+        let mut layer = Layer::normal(LayerId(id), name);
+        let art = || {
+            Arc::new(Object::shape(
+                ObjectId(id * 100),
+                ShapeData::filled(
+                    Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9),
+                    Color::BLACK,
+                ),
+            ))
+        };
+        layer.frames.set_objects(0, vec![art()]);
+        layer.frames.insert_keyframe(10);
+        layer.frames.set_objects(
+            10,
+            vec![Arc::new(
+                Object::shape(
+                    ObjectId(id * 100),
+                    ShapeData::filled(
+                        Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9),
+                        Color::BLACK,
+                    ),
+                )
+                .with_transform(Affine::translate((dx, dy))),
+            )],
+        );
+        layer
+    }
+
+    /// The point of the feature: move the body, and the head goes with it.
+    #[test]
+    fn a_following_layer_inherits_the_motion_of_the_one_it_follows() {
+        let mut s = LayerStack::new();
+        s.push_front(moving_layer(1, "Body", 60.0, 0.0));
+        s.push_front(Layer::normal(LayerId(2), "Head"));
+        s.update(LayerId(2), |l| l.follows = Some(LayerId(1)));
+
+        // At the first keyframe the body has not moved, so nothing is inherited
+        // — a layer must not jump the moment it is parented.
+        let at_rest = s.inherited_transform(LayerId(2), 0);
+        assert_eq!(at_rest, Affine::IDENTITY);
+
+        // At frame 10 the body has travelled 60 to the right, and so has the
+        // head — without anything having been keyed on the head at all.
+        let moved = s.inherited_transform(LayerId(2), 10);
+        assert_eq!(moved, Affine::translate((60.0, 0.0)));
+    }
+
+    /// Motion accumulates down a chain: hand follows arm follows body.
+    #[test]
+    fn motion_accumulates_down_a_chain() {
+        let mut s = LayerStack::new();
+        s.push_front(moving_layer(1, "Body", 10.0, 0.0));
+        s.push_front(moving_layer(2, "Arm", 0.0, 5.0));
+        s.push_front(Layer::normal(LayerId(3), "Hand"));
+        s.update(LayerId(2), |l| l.follows = Some(LayerId(1)));
+        s.update(LayerId(3), |l| l.follows = Some(LayerId(2)));
+
+        let hand = s.inherited_transform(LayerId(3), 10);
+        assert_eq!(hand, Affine::translate((10.0, 5.0)));
+
+        // The arm inherits only the body's motion; its own is already in its
+        // artwork and must not be applied twice.
+        assert_eq!(
+            s.inherited_transform(LayerId(2), 10),
+            Affine::translate((10.0, 0.0))
+        );
+    }
+
+    /// A layer that follows nothing is untouched, which is what keeps every
+    /// document that predates the feature drawing exactly as it did.
+    #[test]
+    fn a_layer_that_follows_nothing_inherits_nothing() {
+        let s = stack(&[(1, "a", LayerKind::Normal), (2, "b", LayerKind::Normal)]);
+        assert_eq!(s.inherited_transform(LayerId(1), 7), Affine::IDENTITY);
+    }
+
+    #[test]
+    fn a_layer_cannot_follow_itself_or_close_a_loop() {
+        let mut s = LayerStack::new();
+        s.push_front(Layer::normal(LayerId(1), "a"));
+        s.push_front(Layer::normal(LayerId(2), "b"));
+        s.push_front(Layer::normal(LayerId(3), "c"));
+
+        assert!(!s.can_follow(LayerId(1), LayerId(1)), "itself");
+        assert!(s.can_follow(LayerId(2), LayerId(1)));
+        s.update(LayerId(2), |l| l.follows = Some(LayerId(1)));
+        s.update(LayerId(3), |l| l.follows = Some(LayerId(2)));
+
+        // 1 following 3 would close 1 -> 3 -> 2 -> 1.
+        assert!(!s.can_follow(LayerId(1), LayerId(3)));
+        assert!(!s.can_follow(LayerId(1), LayerId(2)));
+    }
+
+    /// A corrupt file can hold a cycle anyway; resolving it must terminate.
+    #[test]
+    fn a_follow_cycle_does_not_hang() {
+        let mut s = LayerStack::new();
+        s.push_front(Layer::normal(LayerId(1), "a"));
+        s.push_front(Layer::normal(LayerId(2), "b"));
+        s.update(LayerId(1), |l| l.follows = Some(LayerId(2)));
+        s.update(LayerId(2), |l| l.follows = Some(LayerId(1)));
+
+        let _ = s.inherited_transform(LayerId(1), 3);
+        let _ = s.inherited_transform(LayerId(2), 3);
+    }
+
+    /// Following a layer that has since been deleted is harmless.
+    #[test]
+    fn following_a_missing_layer_inherits_nothing() {
+        let mut s = LayerStack::new();
+        s.push_front(Layer::normal(LayerId(1), "a"));
+        s.update(LayerId(1), |l| l.follows = Some(LayerId(99)));
+        assert_eq!(s.inherited_transform(LayerId(1), 4), Affine::IDENTITY);
+    }
+
+    #[test]
+    fn followers_are_found_so_a_deleted_layer_can_release_them() {
+        let mut s = LayerStack::new();
+        s.push_front(Layer::normal(LayerId(1), "body"));
+        s.push_front(Layer::normal(LayerId(2), "head"));
+        s.push_front(Layer::normal(LayerId(3), "hat"));
+        s.update(LayerId(2), |l| l.follows = Some(LayerId(1)));
+        s.update(LayerId(3), |l| l.follows = Some(LayerId(1)));
+
+        let mut found = s.followers_of(LayerId(1));
+        found.sort_by_key(|l| l.0);
+        assert_eq!(found, vec![LayerId(2), LayerId(3)]);
     }
 }

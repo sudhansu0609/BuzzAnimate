@@ -12,7 +12,9 @@ use buzz_geom::{Affine, BezPath, Camera, Point, Rect, Shape as _, Size, Vec2};
 use buzz_scene::{
     FillSpec, LayerId, LayerKind, Object, ObjectId, ObjectKind, Scene, ShapeData, StrokeSpec, Tween,
 };
-use buzz_ui::{Command, DrawStyle, DrawingMode, LibraryState, Selection, ToolId, ViewSettings};
+use buzz_ui::{
+    ActionsState, Command, DrawStyle, DrawingMode, LibraryState, Selection, ToolId, ViewSettings,
+};
 use peniko::Color;
 
 use crate::tools::{Mods, Preview, ToolAction, ToolContext, ToolMachine};
@@ -23,6 +25,13 @@ const PICK_TOLERANCE_PX: f64 = 4.0;
 /// Upper bound on the playhead. Roughly 11 hours at 24 fps — far past anything
 /// real, but finite so a stray value cannot produce an absurd timeline.
 const MAX_FRAME: u32 = 999_999;
+
+/// The shortest drag that counts as drawing a bone, in screen pixels.
+///
+/// A click with the Bone tool is far more likely to be a misfire than a
+/// request for a zero-length bone — which would be a joint that can never be
+/// grabbed again, because there is nothing of it to click.
+const MIN_BONE_LENGTH: f64 = 6.0;
 
 /// The whole editor.
 pub struct Editor {
@@ -41,11 +50,47 @@ pub struct Editor {
     /// Library panel state: what is selected, what is open, what is typed in
     /// the search box. View state, so it lives here and not in the document.
     pub library: LibraryState,
+    /// The Actions panel: the script being written and what the last run said.
+    /// View state — a script is not part of the artwork.
+    pub actions: ActionsState,
+    /// The Export dialog: size, transparency and frame range. View state, and
+    /// deliberately re-derived from the document each time it opens.
+    pub export: buzz_ui::ExportState,
     /// The fidelity report from the last import, while it is still on screen.
     ///
     /// View state, not document state: dismissing it is not an edit, and it
     /// must not be saved or undone.
     pub import_summary: Option<crate::import::ImportSummary>,
+    /// A rigging drag in progress: building a bone, posing one, or moving a
+    /// warp handle. Held here rather than in the tool machine because it began
+    /// with a question about the document.
+    pub rig_gesture: Option<crate::rigging::RigGesture>,
+    /// The Lighting panel: which light is being edited, and whether the
+    /// on-stage handles are drawn. View state — which light you happen to have
+    /// selected is not part of the artwork.
+    pub light_panel: buzz_ui::LightPanelState,
+    /// The Filters panel: which target and which row. View state.
+    pub filter_panel: buzz_ui::FilterPanelState,
+    /// The camera row is the selected one in the timeline.
+    ///
+    /// Animate's camera is shown as a layer and selected like one, but it is
+    /// not a layer — so which row is current cannot live in `Selection`, which
+    /// addresses layers and objects.
+    pub camera_selected: bool,
+    /// Where the panels are. View state, saved beside the preferences rather
+    /// than in the document: a layout belongs to the person, not to the film.
+    pub workspace: buzz_ui::Workspace,
+    /// A light handle being dragged, for the same reason as `rig_gesture`: it
+    /// began with a question about the document that the tool machine cannot
+    /// ask.
+    pub light_gesture: Option<crate::lights::LightGesture>,
+    /// Decoded sound and the output stream.
+    ///
+    /// View state: which sounds happen to be decoded is not part of the
+    /// document, and the document is the authority on what should be heard.
+    pub sound: crate::sound::SoundBank,
+    /// The Lip Sync dialog.
+    pub lip_sync: buzz_ui::LipSyncState,
     /// Set when the user asks to quit.
     pub should_quit: bool,
     /// Transient message for the status bar.
@@ -113,6 +158,7 @@ impl Editor {
 
         let mut selection = Selection::new();
         selection.ensure_active_layer(doc.scene());
+        let stage_fps = doc.scene().stage().frame_rate;
 
         Self {
             doc,
@@ -125,6 +171,16 @@ impl Editor {
             playback: Playback::default(),
             onion: Onion::default(),
             library: LibraryState::default(),
+            actions: ActionsState::default(),
+            export: buzz_ui::ExportState::default(),
+            rig_gesture: None,
+            light_panel: buzz_ui::LightPanelState::default(),
+            filter_panel: buzz_ui::FilterPanelState::default(),
+            camera_selected: false,
+            workspace: buzz_ui::Workspace::load(),
+            light_gesture: None,
+            sound: crate::sound::SoundBank::new(stage_fps),
+            lip_sync: buzz_ui::LipSyncState::default(),
             import_summary: None,
             should_quit: false,
             status: None,
@@ -146,7 +202,8 @@ impl Editor {
         self.current_frame = frame.min(MAX_FRAME);
         // A selection made on another frame refers to objects that may not be
         // present here.
-        self.selection.prune_to_frame(self.doc.scene(), self.current_frame);
+        self.selection
+            .prune_to_frame(self.doc.scene(), self.current_frame);
     }
 
     pub fn step_frame(&mut self, delta: i64) {
@@ -160,6 +217,32 @@ impl Editor {
             return;
         }
         let fps = self.doc.scene().stage().frame_rate.max(0.01);
+
+        // **The audio clock wins while it is running.** A dropped video frame
+        // must not nudge the dialogue: if the picture followed its own clock,
+        // every stall would push the two apart a little further, and lip sync
+        // drifting out over a long take is the one defect an audience always
+        // notices. So when sound is playing the playhead is *told* where the
+        // sound has reached.
+        if let Some(frame) = self.sound.playing_frame() {
+            let count = self.doc.scene().frame_count();
+            if frame >= count {
+                if self.playback.looping {
+                    self.sound.seek(0);
+                    self.current_frame = 0;
+                } else {
+                    self.playback.playing = false;
+                    self.sound.stop();
+                    self.current_frame = count.saturating_sub(1);
+                }
+            } else {
+                self.current_frame = frame;
+            }
+            self.selection
+                .prune_to_frame(self.doc.scene(), self.current_frame);
+            return;
+        }
+
         self.playback.accumulator += elapsed.max(0.0);
 
         // Frames advanced is capped rather than elapsed time, so a normal
@@ -201,6 +284,26 @@ impl Editor {
     pub fn toggle_playback(&mut self) {
         self.playback.playing = !self.playback.playing;
         self.playback.accumulator = 0.0;
+
+        // Sound follows the transport, and does so from the *document's*
+        // timeline — so pressing Enter inside a character symbol plays the
+        // root dialogue you are animating to, not silence.
+        if self.playback.playing {
+            let frame = self.current_frame;
+            let scene = self.doc.scene().clone();
+            self.sound.play(&scene, frame);
+        } else {
+            self.sound.stop();
+        }
+    }
+
+    /// Move the sound to wherever the playhead now is.
+    ///
+    /// Scrubbing counts: dragging the playhead over dialogue should let you
+    /// hear roughly where you are, and at minimum must not leave the sound
+    /// playing from where it used to be.
+    pub fn sync_sound_to_playhead(&mut self) {
+        self.sound.seek(self.current_frame);
     }
 
     /// Frames to draw as onion-skin ghosts, nearest first.
@@ -294,6 +397,26 @@ impl Editor {
         let doc = self.camera.screen_to_doc(screen);
         let doc = self.snap(doc);
 
+        // Rigging asks what is *under* the pointer before the drag begins —
+        // a question the tool machine deliberately cannot answer, because it
+        // cannot reach the document. So it is answered here first.
+        //
+        // **From the raw point, not the snapped one.** Snapping pulls a click
+        // towards artwork edges, and a bone lies *inside* its artwork: with
+        // snapping on, clicking a bone near the edge of the limb it drives
+        // would silently jump the click onto that edge and miss the bone. What
+        // is under the pointer is decided by where the pointer is.
+        if self.begin_rig_gesture(self.camera.screen_to_doc(screen)) {
+            return;
+        }
+
+        // A light handle, for the same reason and unsnapped for the same
+        // reason: a handle is where it is drawn, and a click that jumped to
+        // the nearest artwork edge would miss it.
+        if self.begin_light_gesture(self.camera.screen_to_doc(screen)) {
+            return;
+        }
+
         let anchors = self.selected_anchors();
         let selection_bounds = self.selection.bounds(self.doc.scene());
         let zoom = self.camera.zoom;
@@ -307,12 +430,39 @@ impl Editor {
     }
 
     pub fn pointer_move(&mut self, screen: Point, mods: Mods) {
+        if self.rig_gesture.is_some() {
+            // Unsnapped, for the same reason: an IK target that jumped to the
+            // nearest edge would make posing feel like it was fighting back.
+            self.update_rig_gesture(self.camera.screen_to_doc(screen));
+            return;
+        }
+        if let Some(gesture) = self.light_gesture {
+            let doc = self.camera.screen_to_doc(screen);
+            self.doc.edit(gesture.label(), |scene| {
+                crate::lights::drag(scene, gesture, doc);
+            });
+            return;
+        }
         let doc = self.snap(self.camera.screen_to_doc(screen));
         let action = self.machine.pointer_move(doc, screen, mods);
         self.apply(action);
     }
 
     pub fn pointer_up(&mut self, screen: Point) {
+        if self.rig_gesture.is_some() {
+            self.finish_rig_gesture(self.camera.screen_to_doc(screen));
+            self.doc.end_gesture();
+            return;
+        }
+        if let Some(gesture) = self.light_gesture.take() {
+            let doc = self.camera.screen_to_doc(screen);
+            self.doc.edit(gesture.label(), |scene| {
+                crate::lights::drag(scene, gesture, doc);
+            });
+            // One drag, one undo step — as with every other gesture.
+            self.doc.end_gesture();
+            return;
+        }
         let doc = self.snap(self.camera.screen_to_doc(screen));
 
         // Built from disjoint fields rather than via `tool_context`, which
@@ -400,6 +550,7 @@ impl Editor {
             }
 
             ToolAction::MoveAnchor { element, delta } => {
+                let frame = self.current_frame;
                 let Some(id) = self.selection.iter().next() else {
                     return;
                 };
@@ -414,7 +565,7 @@ impl Editor {
                     .unwrap_or(delta);
 
                 self.doc.edit("Move Anchor", |scene| {
-                    update_shape(scene, id, |s| {
+                    update_shape(scene, frame, id, |s| {
                         buzz_geom::move_anchor(&mut s.path, element, local_delta);
                     });
                 });
@@ -423,23 +574,25 @@ impl Editor {
             ToolAction::Erase { path, width } => self.erase(path, width),
 
             ToolAction::BucketFill { point } => {
+                let frame = self.current_frame;
                 let tolerance = self.pick_tolerance();
                 let color = self.style.fill_color;
                 if let Some(id) = self.object_at(point, tolerance) {
                     self.doc.edit("Paint Bucket", |scene| {
-                        update_shape(scene, id, |s| s.fill = Some(FillSpec::solid(color)));
+                        update_shape(scene, frame, id, |s| s.fill = Some(FillSpec::solid(color)));
                     });
                 }
             }
 
             ToolAction::ApplyStroke { point } => {
+                let frame = self.current_frame;
                 let tolerance = self.pick_tolerance();
                 let stroke = self.style.stroke_for_new_shape();
                 if let (Some(id), Some((color, width, hairline))) =
                     (self.object_at(point, tolerance), stroke)
                 {
                     self.doc.edit("Ink Bottle", |scene| {
-                        update_shape(scene, id, |s| {
+                        update_shape(scene, frame, id, |s| {
                             s.stroke = Some(StrokeSpec {
                                 color,
                                 width,
@@ -527,9 +680,10 @@ impl Editor {
             return;
         }
         let ids = self.selection.ids();
+        let frame = self.current_frame;
         self.doc.edit(label, |scene| {
             for id in ids {
-                update_object(scene, id, |o| o.transform = transform * o.transform);
+                update_object(scene, frame, id, |o| o.transform = transform * o.transform);
             }
         });
     }
@@ -551,7 +705,10 @@ impl Editor {
             return;
         }
         let opts = buzz_geom::BooleanOptions::for_shape_size(
-            cutter.bounding_box().width().hypot(cutter.bounding_box().height()),
+            cutter
+                .bounding_box()
+                .width()
+                .hypot(cutter.bounding_box().height()),
         );
 
         let frame = self.current_frame;
@@ -564,13 +721,9 @@ impl Editor {
 
             for id in ids {
                 let mut became_empty = false;
-                update_shape(scene, id, |s| {
-                    s.path = buzz_geom::boolean(
-                        &s.path,
-                        &cutter,
-                        buzz_geom::BoolOp::Difference,
-                        opts,
-                    );
+                update_shape(scene, frame, id, |s| {
+                    s.path =
+                        buzz_geom::boolean(&s.path, &cutter, buzz_geom::BoolOp::Difference, opts);
                     became_empty = s.path.elements().is_empty();
                 });
                 if became_empty {
@@ -599,6 +752,12 @@ impl Editor {
                 // At or behind the camera: not drawn, so not selectable.
                 continue;
             };
+            // Layer parenting moves artwork for the same reason depth does, so
+            // the click is moved back the same way.
+            let local = match invert(scene.layers().inherited_transform(layer.id, frame)) {
+                Some(back) => back * local,
+                None => local,
+            };
             // The tolerance is a distance, so it shrinks with the layer.
             let local_tolerance = match scene.camera().depth_scale(layer.depth) {
                 Some(scale) if scale > 0.0 => tolerance / scale,
@@ -620,15 +779,23 @@ impl Editor {
     /// Objects fully inside `rect`, matching Animate's marquee.
     pub fn objects_in(&self, rect: Rect) -> Vec<ObjectId> {
         let frame = self.current_frame;
-        self.doc
-            .scene()
-            .layers()
-            .selectable()
-            .flat_map(|l| l.objects_at(frame).iter())
-            .filter(|o| o.visible && !o.locked)
-            .filter(|o| rect.contains_rect(o.bounds()))
-            .map(|o| o.id)
-            .collect()
+        let scene = self.doc.scene();
+        let mut out = Vec::new();
+        for layer in scene.layers().selectable() {
+            // Marquee against where the artwork is drawn, which for a followed
+            // layer is not where its geometry sits.
+            let follows = scene.layers().inherited_transform(layer.id, frame);
+            for object in layer.objects_at(frame) {
+                if !object.visible || object.locked {
+                    continue;
+                }
+                let bounds = buzz_scene::object::transform_rect(follows, object.bounds());
+                if rect.contains_rect(bounds) {
+                    out.push(object.id);
+                }
+            }
+        }
+        out
     }
 
     // -- commands ------------------------------------------------------------
@@ -758,6 +925,36 @@ impl Editor {
             // -- symbols and library -----------------------------------------
             ConvertToSymbol => self.convert_selection_to_symbol(),
             BrushFromSelection => self.brush_from_selection(),
+
+            // -- lighting -----------------------------------------------------
+            AddSun => self.add_light(buzz_scene::LightKind::sun()),
+            AddSky => self.add_light(buzz_scene::LightKind::sky()),
+            AddLamp => self.add_light(buzz_scene::LightKind::lamp(self.camera.center)),
+            TogglePanel(panel) => {
+                self.workspace.toggle(panel);
+                self.workspace.save();
+            }
+            ToggleLayoutLock => {
+                self.workspace.locked = !self.workspace.locked;
+                self.status = Some(
+                    if self.workspace.locked {
+                        "Layout locked"
+                    } else {
+                        "Layout unlocked"
+                    }
+                    .into(),
+                );
+                self.workspace.save();
+            }
+            ResetWorkspace => {
+                self.workspace = buzz_ui::Workspace::animate();
+                self.workspace.save();
+                self.status = Some("Layout reset".into());
+            }
+
+            ToggleLightGizmos => {
+                self.light_panel.gizmos = !self.light_panel.gizmos;
+            }
             NewSymbol => self.new_symbol(),
             EditSymbol => self.edit_selected_symbol(),
             EditDocument => {
@@ -777,6 +974,13 @@ impl Editor {
             CreateShapeTween => self.set_tween(Tween::shape()),
             RemoveTween => self.set_tween(Tween::default()),
 
+            ExportImage | ExportSequence => {
+                // The shell owns the file dialog and the exporting thread, as
+                // with Open and Save. Reaching here means a code path raised
+                // the command without going through `App::dispatch`.
+                debug_assert!(false, "{command:?} must be dispatched by the shell");
+            }
+
             ImportToLibrary | ImportToStage => {
                 // Handled by the shell, which owns the file dialog, as with
                 // Open and Save. Reaching here means a code path raised the
@@ -784,8 +988,585 @@ impl Editor {
                 debug_assert!(false, "{command:?} must be dispatched by the shell");
             }
 
+            ImportSound | LipSync => {
+                // The shell owns the file dialog and the modal window, as with
+                // Open and Export.
+                debug_assert!(false, "{command:?} must be dispatched by the shell");
+            }
+            AttachSound => self.attach_sound_to_frame(),
+            RemoveSound => self.remove_sound_from_frame(),
+            NewMouthSymbol => {
+                let symbol = self.new_mouth_symbol();
+                self.lip_sync.mouth = Some(symbol.0);
+            }
+
+            ToggleActionsPanel => {
+                self.workspace.toggle(buzz_ui::PanelId::Actions);
+                self.workspace.save();
+            }
+            RunScript => {
+                // Running from the menu or the keyboard while the panel is
+                // closed would put the output somewhere the user cannot see it.
+                if !self.workspace.is_open(buzz_ui::PanelId::Actions) {
+                    self.workspace.toggle(buzz_ui::PanelId::Actions);
+                }
+                self.run_script();
+            }
+            ClearScriptOutput => self.actions.clear_output(),
+
             SelectTool(tool) => self.set_tool(tool),
         }
+    }
+
+    // -- lights ---------------------------------------------------------------
+
+    /// Add a light, select it, and say so.
+    ///
+    /// Selecting it is the point: the Lighting panel then shows the new
+    /// light's own settings rather than whichever one was there before.
+    ///
+    /// A lamp arrives in the middle of the view whatever position the request
+    /// carried. A lamp is the one light with a place on the stage, and one
+    /// dropped off-screen — at the origin, say, which is the top-left corner of
+    /// the artwork — looks exactly like nothing having happened.
+    pub fn add_light(&mut self, kind: buzz_scene::LightKind) {
+        let kind = match kind {
+            buzz_scene::LightKind::Lamp { height, radius, .. } => buzz_scene::LightKind::Lamp {
+                position: self.camera.center,
+                height,
+                radius,
+            },
+            other => other,
+        };
+
+        let label = kind.label();
+        let mut added = None;
+        self.doc.edit(format!("Add {label}"), |scene| {
+            added = Some(scene.add_light(kind));
+        });
+        self.light_panel.selected = added;
+        // The handles come back on with a new light: adding one you cannot see
+        // and cannot grab would look like nothing happened.
+        self.light_panel.gizmos = true;
+        self.status = Some(format!("Added a {}", label.to_lowercase()));
+    }
+
+    /// Start a light drag, if a handle is under the pointer.
+    ///
+    /// Only with the Selection tool. On-stage handles belong to Selection the
+    /// way transform handles do; a lamp sitting over the canvas must not
+    /// swallow a brush stroke aimed at the artwork beneath it.
+    fn begin_light_gesture(&mut self, doc: Point) -> bool {
+        // The same three conditions the stage draws under, so what can be
+        // grabbed is exactly what can be seen.
+        if !self.light_panel.gizmos
+            || !self.doc.scene().lights().enabled
+            || self.tool() != ToolId::Selection
+        {
+            return false;
+        }
+
+        let tolerance = crate::lights::GRAB_PX / self.camera.zoom.max(f64::MIN_POSITIVE);
+        let Some(gesture) = crate::lights::target_at(self.doc.scene(), doc, tolerance) else {
+            return false;
+        };
+
+        // Grabbing a light selects it, so the panel is already showing the one
+        // being dragged by the time the drag ends.
+        self.light_panel.selected = Some(gesture.light());
+        self.light_gesture = Some(gesture);
+        tracing::debug!(?doc, ?gesture, "light gesture");
+        true
+    }
+
+    // -- rigging -------------------------------------------------------------
+
+    /// Start a rigging drag, if the active tool and what is under the pointer
+    /// call for one. Returns whether the gesture was taken.
+    fn begin_rig_gesture(&mut self, doc: Point) -> bool {
+        use crate::rigging::{RigGesture, RigTarget};
+
+        let tool = self.tool();
+        if !matches!(tool, ToolId::Bone | ToolId::AssetWarp) {
+            return false;
+        }
+
+        let tolerance = crate::rigging::GRAB_PX / self.camera.zoom.max(f64::MIN_POSITIVE);
+        let target =
+            crate::rigging::target_at(self.doc.scene(), self.current_frame, doc, tolerance);
+        // Rigging is the one gesture whose outcome depends on what was under
+        // the pointer, so what it found is worth being able to see.
+        tracing::debug!(?tool, ?doc, tolerance, ?target, "rig gesture");
+
+        self.rig_gesture = match (tool, target) {
+            // -- the Bone tool ---------------------------------------------
+            (ToolId::Bone, RigTarget::BoneTip(object, bone)) => Some(RigGesture::Building {
+                object: Some(object),
+                parent: Some(bone),
+                head: doc,
+                current: doc,
+            }),
+            (ToolId::Bone, RigTarget::Bone(object, bone)) => {
+                self.selection.set([object]);
+                Some(RigGesture::Posing {
+                    object,
+                    bone,
+                    current: doc,
+                })
+            }
+            (ToolId::Bone, RigTarget::Artwork(object)) => Some(RigGesture::Building {
+                object: Some(object),
+                parent: None,
+                head: doc,
+                current: doc,
+            }),
+            (ToolId::Bone, RigTarget::Handle(..) | RigTarget::Nothing) => {
+                self.status = Some("Draw a bone across some artwork to rig it".into());
+                None
+            }
+
+            // -- the Asset Warp tool ---------------------------------------
+            (ToolId::AssetWarp, RigTarget::Handle(object, handle)) => Some(RigGesture::Warping {
+                object,
+                handle,
+                current: doc,
+            }),
+            (ToolId::AssetWarp, RigTarget::Artwork(object)) => {
+                // Animate turns the artwork into a warp object the moment you
+                // touch it with the tool, and puts a starting grid on it — a
+                // tool that needed handles placed one at a time before doing
+                // anything would look broken.
+                let mut warped = false;
+                let frame = self.current_frame;
+                self.doc.edit("Add Warp Handles", |scene| {
+                    warped = crate::rigging::warp_object(scene, frame, object, 3, 3);
+                });
+                self.status = Some(if warped {
+                    "Drag a handle to warp the artwork".into()
+                } else {
+                    "Only a single shape can be warped; ungroup it first".to_string()
+                });
+                if warped {
+                    self.selection.set([object]);
+                }
+                None
+            }
+            (ToolId::AssetWarp, _) => None,
+            _ => None,
+        };
+
+        self.rig_gesture.is_some()
+    }
+
+    /// Follow the pointer during a rigging drag.
+    ///
+    /// Posing and warping are applied live, so the user sees the rig follow
+    /// their hand. Both are `Document::edit`s with a stable label, so the
+    /// hundreds of moves in one drag coalesce into a single undo step — the
+    /// same mechanism that makes dragging a shape one Ctrl+Z.
+    fn update_rig_gesture(&mut self, doc: Point) {
+        use crate::rigging::RigGesture;
+
+        match self.rig_gesture.clone() {
+            Some(RigGesture::Building {
+                object,
+                parent,
+                head,
+                ..
+            }) => {
+                self.rig_gesture = Some(RigGesture::Building {
+                    object,
+                    parent,
+                    head,
+                    current: doc,
+                });
+            }
+            Some(RigGesture::Posing { object, bone, .. }) => {
+                let frame = self.current_frame;
+                self.doc.edit("Pose", |scene| {
+                    crate::rigging::pose_bone(scene, frame, object, bone, doc);
+                });
+                self.rig_gesture = Some(RigGesture::Posing {
+                    object,
+                    bone,
+                    current: doc,
+                });
+            }
+            Some(RigGesture::Warping { object, handle, .. }) => {
+                let frame = self.current_frame;
+                self.doc.edit("Warp", |scene| {
+                    crate::rigging::move_handle(scene, frame, object, handle, doc);
+                });
+                self.rig_gesture = Some(RigGesture::Warping {
+                    object,
+                    handle,
+                    current: doc,
+                });
+            }
+            None => {}
+        }
+    }
+
+    /// Commit a rigging drag.
+    fn finish_rig_gesture(&mut self, doc: Point) {
+        use crate::rigging::RigGesture;
+
+        let Some(gesture) = self.rig_gesture.take() else {
+            return;
+        };
+
+        if let RigGesture::Building {
+            object,
+            parent,
+            head,
+            ..
+        } = gesture
+        {
+            // A click rather than a drag: too short to be a bone, and a
+            // zero-length bone is a joint that can never be found again.
+            if (doc - head).hypot() < MIN_BONE_LENGTH / self.camera.zoom.max(f64::MIN_POSITIVE) {
+                self.status = Some("Drag to set the bone's length".into());
+                return;
+            }
+            let Some(object) = object else { return };
+
+            let is_new_rig = parent.is_none();
+            let mut rigged = false;
+            let frame = self.current_frame;
+            self.doc.edit(
+                if is_new_rig {
+                    "Create Armature"
+                } else {
+                    "Add Bone"
+                },
+                |scene| {
+                    rigged = if is_new_rig {
+                        crate::rigging::rig_object(scene, frame, object, head, doc)
+                    } else {
+                        crate::rigging::add_bone(scene, frame, object, parent, head, doc);
+                        true
+                    };
+                },
+            );
+
+            if rigged {
+                self.selection.set([object]);
+                self.status = Some(if is_new_rig {
+                    "Armature created — drag from the bone's tip to add another".into()
+                } else {
+                    "Bone added".to_string()
+                });
+            } else {
+                self.status = Some("That artwork cannot be rigged".into());
+            }
+        }
+    }
+
+    /// The rig being dragged out, for the stage to draw as a preview.
+    pub fn rig_preview(&self) -> Option<(Point, Point)> {
+        match &self.rig_gesture {
+            Some(crate::rigging::RigGesture::Building { head, current, .. }) => {
+                Some((*head, *current))
+            }
+            _ => None,
+        }
+    }
+
+    // -- sound ---------------------------------------------------------------
+
+    /// Bring a sound file into the library.
+    pub fn import_sound(&mut self, path: &std::path::Path) -> anyhow::Result<String> {
+        // Decoded once here to learn its shape and to fail *before* the
+        // document is touched: a file that cannot be decoded should not leave
+        // an entry in the library that plays nothing.
+        let clip = buzz_audio::Clip::open(path)?;
+        let bytes = std::sync::Arc::new(std::fs::read(path)?);
+        let format = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_else(|| "wav".to_string());
+        let name = clip.name.clone();
+        let (rate, channels, length) = (clip.sample_rate, clip.channels, clip.len() as u64);
+
+        let mut imported = None;
+        self.doc.edit("Import Sound", |scene| {
+            imported = Some(scene.add_sound(&name, bytes, &format, rate, channels, length));
+        });
+        self.doc.end_gesture();
+
+        let scene = self.doc.scene().clone();
+        self.sound.refresh(&scene);
+
+        Ok(imported
+            .and_then(|id| scene.sounds().get(id).map(|s| s.name.clone()))
+            .unwrap_or(name))
+    }
+
+    /// Put the most recently imported sound on the current keyframe.
+    ///
+    /// Animate attaches a sound to the keyframe the playhead is on, chosen
+    /// from the Properties panel. There is no sound picker yet (PROGRESS §7),
+    /// so the newest import is used — which is the one an animator has just
+    /// brought in.
+    fn attach_sound_to_frame(&mut self) {
+        let Some(layer) = self.selection.active_layer() else {
+            self.status = Some("Select a layer to put the sound on".into());
+            return;
+        };
+        let Some(sound) = self.doc.scene().sounds().iter().last().map(|s| s.id) else {
+            self.status = Some("Import a sound first: File > Import Sound".into());
+            return;
+        };
+
+        let frame = self.current_frame;
+        let mut attached = false;
+        self.doc.edit("Attach Sound", |scene| {
+            attached =
+                scene.set_frame_sound(layer, frame, Some(buzz_scene::SoundRef::stream(sound)));
+        });
+        self.doc.end_gesture();
+
+        self.status = Some(if attached {
+            "Sound attached - press Enter to play".into()
+        } else {
+            "That frame is not a keyframe; press F6 first".to_string()
+        });
+        let scene = self.doc.scene().clone();
+        self.sound.refresh(&scene);
+    }
+
+    fn remove_sound_from_frame(&mut self) {
+        let Some(layer) = self.selection.active_layer() else {
+            return;
+        };
+        let frame = self.current_frame;
+        self.doc.edit("Remove Sound", |scene| {
+            scene.set_frame_sound(layer, frame, None);
+        });
+        self.doc.end_gesture();
+        let scene = self.doc.scene().clone();
+        self.sound.refresh(&scene);
+        self.status = Some("Sound removed from the frame".into());
+    }
+
+    /// Waveforms for the timeline, one per layer carrying a sound.
+    pub fn waveforms(&self) -> std::collections::BTreeMap<LayerId, buzz_ui::Waveform> {
+        let fps = self.doc.scene().stage().frame_rate;
+        let mut out = std::collections::BTreeMap::new();
+
+        for layer in self.doc.scene().stage_layers().iter() {
+            for keyframe in layer.frames.keyframes() {
+                let Some(reference) = keyframe.sound else {
+                    continue;
+                };
+                let Some(clip) = self.sound.clip(reference.sound) else {
+                    continue;
+                };
+                out.insert(
+                    layer.id,
+                    buzz_ui::Waveform {
+                        start_frame: keyframe.start,
+                        levels: clip.frame_levels(fps),
+                    },
+                );
+            }
+        }
+        out
+    }
+
+    /// Make a mouth symbol with a frame per shape.
+    pub fn new_mouth_symbol(&mut self) -> buzz_scene::SymbolId {
+        let mut made = None;
+        self.doc.edit("New Mouth Symbol", |scene| {
+            made = Some(crate::lipsync::placeholder_mouth(scene, "Mouth"));
+        });
+        self.doc.end_gesture();
+        self.status = Some("Made a mouth symbol - draw each shape on its own frame".into());
+        made.expect("the symbol was made inside the edit")
+    }
+
+    /// What the Lip Sync dialog should offer: the soundtrack, the mouth
+    /// symbols, and the layers.
+    pub fn lip_sync_choices(&self) -> (Option<String>, Vec<buzz_ui::Choice>, Vec<buzz_ui::Choice>) {
+        let scene = self.doc.scene();
+
+        // The soundtrack comes from the document's own timeline, whichever
+        // symbol is open — which is the whole point, and is why it is named in
+        // the dialog rather than left implicit.
+        let track = self.sound.stage_track(scene).map(|(id, start, clip)| {
+            let name = scene
+                .sounds()
+                .get(id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| clip.name.clone());
+            format!(
+                "{name} - {:.1}s, from frame {start}",
+                clip.duration_seconds()
+            )
+        });
+
+        let needed = buzz_audio::Viseme::COUNT;
+        let mouths = scene
+            .library()
+            .iter()
+            .map(|symbol| {
+                let length = symbol.length();
+                buzz_ui::Choice {
+                    id: symbol.id.0,
+                    name: symbol.name.clone(),
+                    detail: if length >= needed {
+                        format!("{length} frames")
+                    } else {
+                        format!("{length} frames, needs {needed}")
+                    },
+                    usable: length >= needed,
+                }
+            })
+            .collect();
+
+        // The layers offered are those of the timeline being *edited*: the
+        // mouth goes where you are working, which may be several symbols deep.
+        let layers = scene
+            .layers()
+            .iter()
+            .map(|layer| buzz_ui::Choice {
+                id: layer.id.0,
+                name: layer.name.clone(),
+                detail: String::new(),
+                usable: layer.kind.holds_artwork(),
+            })
+            .collect();
+
+        (track, mouths, layers)
+    }
+
+    /// Run lip sync with whatever the dialog has been set to.
+    pub fn run_lip_sync(&mut self) {
+        let scene = self.doc.scene().clone();
+        let Some((_, start, clip)) = self.sound.stage_track(&scene) else {
+            self.lip_sync.result = Some("There is no sound on the main timeline".into());
+            return;
+        };
+        let (Some(mouth), Some(layer)) = (self.lip_sync.mouth, self.lip_sync.layer) else {
+            self.lip_sync.result = Some("Choose a mouth symbol and a layer".into());
+            return;
+        };
+
+        let options = buzz_audio::LipSyncOptions {
+            silence: self.lip_sync.silence,
+            hold: self.lip_sync.hold,
+        };
+
+        // The mouth is placed where the layer's existing artwork is, and only
+        // falls back to the middle of the stage when there is none. A mouth
+        // landing at the origin, off the character's face, would be the first
+        // thing to fix by hand every single time.
+        let placement = self
+            .doc
+            .scene()
+            .layers()
+            .get(buzz_scene::LayerId(layer))
+            .and_then(|l| l.bounds_at(self.current_frame))
+            .map(|b| Affine::translate(b.center().to_vec2()))
+            .unwrap_or_else(|| {
+                let stage = self.doc.scene().stage().stage_rect();
+                Affine::translate(stage.center().to_vec2())
+            });
+
+        let mut outcome = None;
+        self.doc.edit("Lip Sync", |scene| {
+            outcome = Some(crate::lipsync::apply(
+                scene,
+                &clip,
+                start,
+                buzz_scene::LayerId(layer),
+                buzz_scene::SymbolId(mouth),
+                placement,
+                &options,
+            ));
+        });
+        self.doc.end_gesture();
+
+        match outcome {
+            Some(Ok(report)) => {
+                self.lip_sync.result = Some(report.message.clone());
+                self.status = Some(report.message);
+            }
+            Some(Err(e)) => {
+                self.lip_sync.result = Some(e.to_string());
+                self.status = Some(e.to_string());
+            }
+            None => {}
+        }
+    }
+
+    // -- scripting -----------------------------------------------------------
+
+    /// Run what is in the Actions panel against this document.
+    ///
+    /// # One run is one undo step
+    ///
+    /// The script works on a *clone* of the scene and the result is committed
+    /// in a single [`Document::edit`], so a script that draws four hundred
+    /// rectangles is one Ctrl+Z. `end_gesture` follows it, because two runs in
+    /// quick succession share an undo label and would otherwise coalesce into
+    /// one step — for a drag that is the point, but two runs of a script are
+    /// two deliberate acts.
+    ///
+    /// # A failed script keeps what it managed
+    ///
+    /// Whatever the script did before it failed is committed too, and the error
+    /// is reported alongside. Discarding an hour of generated artwork because
+    /// the last line had a typo would be indefensible, and Animate does not do
+    /// it either.
+    ///
+    /// # It edits what the user is looking at
+    ///
+    /// The scene answers `layers()` for the timeline currently open, so a
+    /// script run inside a symbol edits that symbol. That is the same rule
+    /// every tool and panel follows, and the breadcrumb above the stage is what
+    /// says which one is open.
+    pub fn run_script(&mut self) {
+        if !self.actions.has_source() {
+            self.status = Some("Write a script in the Actions panel first".into());
+            return;
+        }
+
+        let source = self.actions.source.clone();
+        let context = buzz_script::ScriptContext {
+            current_frame: self.current_frame,
+            selection: self.selection.ids(),
+            active_layer: self.selection.active_layer(),
+        };
+
+        let mut working = self.doc.scene().clone();
+        let outcome = buzz_script::run(
+            &mut working,
+            context,
+            &source,
+            &buzz_script::Limits::default(),
+        );
+
+        if outcome.changed {
+            self.doc.edit("Run Script", |scene| *scene = working);
+            self.doc.end_gesture();
+        }
+
+        let summary = outcome.summary();
+
+        // The script's view of the editor becomes the editor's, so
+        // `t.currentFrame = 5` moves the playhead the user can see and
+        // `d.selectAll()` leaves the artwork actually selected.
+        self.set_frame(outcome.context.current_frame);
+        self.selection.set(outcome.context.selection);
+        self.selection.prune(self.doc.scene());
+        if let Some(layer) = outcome.context.active_layer {
+            self.selection.set_active_layer(Some(layer));
+        }
+        self.selection.ensure_active_layer(self.doc.scene());
+
+        self.status = Some(summary.clone());
+        self.actions.report(outcome.trace, outcome.error, summary);
     }
 
     // -- symbols -------------------------------------------------------------
@@ -1005,11 +1786,8 @@ impl Editor {
             let Some(source) = scene.library().get(id).cloned() else {
                 return;
             };
-            let new_id = scene.add_symbol(
-                source.name.clone(),
-                source.kind,
-                source.folder.as_deref(),
-            );
+            let new_id =
+                scene.add_symbol(source.name.clone(), source.kind, source.folder.as_deref());
             // Copying the layer stack wholesale shares every `Arc` inside it;
             // the artwork is only cloned if one of the two is edited.
             scene.library_mut().update(new_id, |s| {
@@ -1030,7 +1808,13 @@ impl Editor {
         // Animate warns before deleting a symbol that is still placed; the
         // count is the same one the panel shows, so the warning matches what
         // the user can already see.
-        let uses = self.doc.scene().symbol_usage().get(&id).copied().unwrap_or(0);
+        let uses = self
+            .doc
+            .scene()
+            .symbol_usage()
+            .get(&id)
+            .copied()
+            .unwrap_or(0);
 
         self.doc.edit("Delete Symbol", |scene| {
             // Leaving symbol editing first, or the editor would be pointed at
@@ -1151,7 +1935,9 @@ impl Editor {
             if scene.camera().enabled && scene.camera().is_empty() {
                 // Without a key the camera would be enabled but inert, which
                 // looks like a bug.
-                scene.camera_mut().set_key(buzz_scene::CameraKey::new(frame, centre));
+                scene
+                    .camera_mut()
+                    .set_key(buzz_scene::CameraKey::new(frame, centre));
             }
         });
         let on = self.doc.scene().camera().enabled;
@@ -1169,9 +1955,9 @@ impl Editor {
         let current = self.doc.scene().camera().state_at(frame);
         self.doc.edit("Camera Keyframe", |scene| {
             scene.camera_mut().enabled = true;
-            let key = current.map(|s| buzz_scene::CameraKey { frame, ..s }).unwrap_or(
-                buzz_scene::CameraKey::new(frame, centre),
-            );
+            let key = current
+                .map(|s| buzz_scene::CameraKey { frame, ..s })
+                .unwrap_or(buzz_scene::CameraKey::new(frame, centre));
             scene.camera_mut().set_key(key);
         });
     }
@@ -1236,7 +2022,8 @@ impl Editor {
         });
         self.selection.set_active_layer(None);
         self.selection.prune(self.doc.scene());
-        self.selection.ensure_active_layer(&self.doc.scene().clone());
+        self.selection
+            .ensure_active_layer(&self.doc.scene().clone());
     }
 
     fn delete_selection(&mut self) {
@@ -1372,9 +2159,10 @@ impl Editor {
 
     fn convert_lines_to_fills(&mut self) {
         let ids = self.selection.ids();
+        let frame = self.current_frame;
         self.doc.edit("Convert Lines to Fills", |scene| {
             for id in ids {
-                update_shape(scene, id, |s| {
+                update_shape(scene, frame, id, |s| {
                     let Some(stroke) = s.stroke else { return };
                     let width = if stroke.hairline { 1.0 } else { stroke.width };
                     let outline = buzz_geom::outline_stroke(
@@ -1395,9 +2183,10 @@ impl Editor {
 
     fn expand_selection(&mut self, amount: f64) {
         let ids = self.selection.ids();
+        let frame = self.current_frame;
         self.doc.edit("Expand Fill", |scene| {
             for id in ids {
-                update_shape(scene, id, |s| {
+                update_shape(scene, frame, id, |s| {
                     let bb = s.path.bounding_box();
                     let opts =
                         buzz_geom::BooleanOptions::for_shape_size(bb.width().hypot(bb.height()));
@@ -1409,13 +2198,14 @@ impl Editor {
 
     fn reshape_selection(&mut self, how: Reshape) {
         let ids = self.selection.ids();
+        let frame = self.current_frame;
         let label = match how {
             Reshape::Smooth => "Smooth",
             Reshape::Straighten => "Straighten",
         };
         self.doc.edit(label, |scene| {
             for id in ids {
-                update_shape(scene, id, |s| {
+                update_shape(scene, frame, id, |s| {
                     let bb = s.path.bounding_box();
                     let amount = (bb.width().hypot(bb.height()) / 200.0).clamp(0.01, 10.0);
                     s.path = match how {
@@ -1479,27 +2269,20 @@ impl FrameOp {
     }
 }
 
-/// Edit an object in place.
-fn update_object(scene: &mut Scene, id: ObjectId, f: impl FnOnce(&mut Object)) {
-    let Some((layer, _)) = scene.find_object(id) else {
-        return;
-    };
-    scene.update_layer(layer, |l| {
-        // The object may live on any keyframe, so search them all rather than
-        // assuming the current one.
-        for keyframe in l.frames.keyframes_mut() {
-            let objects = Arc::make_mut(&mut keyframe.objects);
-            if let Some(slot) = objects.iter_mut().find(|o| o.id == id) {
-                f(Arc::make_mut(slot));
-                return;
-            }
-        }
-    });
+/// Edit an object in place, on the keyframe the playhead is inside.
+///
+/// **The frame matters.** F6 duplicates a keyframe by cloning the `Arc` around
+/// its objects, so one id legitimately appears on several keyframes. Editing
+/// the first one found would move the artwork on frame 0 while the user was
+/// looking at frame 12 — the change would seem to do nothing, and would
+/// quietly damage a frame they were not editing.
+fn update_object(scene: &mut Scene, frame: u32, id: ObjectId, f: impl FnOnce(&mut Object)) {
+    scene.update_object_at(frame, id, f);
 }
 
 /// Edit a shape in place, ignoring groups.
-fn update_shape(scene: &mut Scene, id: ObjectId, f: impl FnOnce(&mut ShapeData)) {
-    update_object(scene, id, |o| {
+fn update_shape(scene: &mut Scene, frame: u32, id: ObjectId, f: impl FnOnce(&mut ShapeData)) {
+    update_object(scene, frame, id, |o| {
         if let ObjectKind::Shape(shape) = &mut o.kind {
             f(shape);
         }
@@ -1571,6 +2354,20 @@ fn object_contains(
                 .flat_map(|l| l.objects_at(inner))
                 .any(|c| object_contains(scene, c, local, tolerance, inner, depth + 1))
         }
+
+        // Rigged artwork is hit **where it is drawn**, not where it was drawn.
+        // The posed geometry is what the user sees, so it is what they must be
+        // able to click: testing the rest pose would make a bent arm
+        // selectable only along the straight one it started as.
+        ObjectKind::Armature(_) | ObjectKind::Warp(_) => {
+            let Some(paths) = buzz_scene::rig::posed_paths(&object.kind) else {
+                return false;
+            };
+            paths.iter().any(|path| {
+                buzz_geom::hit::fill_contains(path, local, buzz_geom::FillMode::NonZero)
+                    || buzz_geom::hit::stroke_contains(path, local, 0.0, tolerance)
+            })
+        }
     }
 }
 
@@ -1632,10 +2429,16 @@ fn merge_shape_into_layer(
                 .filter(|o| o.visible && !o.locked)
                 .filter_map(|o| match &o.kind {
                     ObjectKind::Shape(s) => s.fill.map(|f| (o.id, f.color, s.path.clone())),
-                    // Merge-shape rules apply to raw shapes only. Groups and
-                    // symbol instances are objects: in Animate they sit above
-                    // the merge layer and never fuse with what they overlap.
-                    ObjectKind::Group(_) | ObjectKind::Instance(_) => None,
+                    // Merge-shape rules apply to raw shapes only. Groups,
+                    // symbol instances and rigged artwork are objects: in
+                    // Animate they sit above the merge layer and never fuse
+                    // with what they overlap. Merging a rig would be worse
+                    // than useless — it would fuse the artwork away from the
+                    // skeleton that deforms it.
+                    ObjectKind::Group(_)
+                    | ObjectKind::Instance(_)
+                    | ObjectKind::Armature(_)
+                    | ObjectKind::Warp(_) => None,
                 })
                 .filter(|(_, _, path)| path.bounding_box().overlaps(bb))
                 .collect()
@@ -1652,7 +2455,7 @@ fn merge_shape_into_layer(
         } else {
             // Different colour: the new shape cuts into the old one.
             let mut emptied = false;
-            update_shape(scene, id, |s| {
+            update_shape(scene, frame, id, |s| {
                 s.path = buzz_geom::boolean(
                     &s.path,
                     &incoming.path,
@@ -1812,7 +2615,9 @@ mod tests {
             .iter()
             .flat_map(|l| l.objects_at(0).iter())
             .find_map(|o| match &o.kind {
-                ObjectKind::Shape(s) if s.fill.map(|f| f.color.to_rgba8().to_u8_array()[0]) == Some(255) => {
+                ObjectKind::Shape(s)
+                    if s.fill.map(|f| f.color.to_rgba8().to_u8_array()[0]) == Some(255) =>
+                {
                     Some(s.path.area().abs())
                 }
                 _ => None,
@@ -1879,14 +2684,22 @@ mod tests {
         e.style.drawing_mode = DrawingMode::ObjectDrawing;
         draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE);
         let layer = e.selection.active_layer().unwrap();
-        e.doc.edit("Lock", |s| s.update_layer(layer, |l| l.locked = true).then_some(()).map(|_| ()).unwrap_or(()));
+        e.doc.edit("Lock", |s| {
+            s.update_layer(layer, |l| l.locked = true)
+                .then_some(())
+                .map(|_| ())
+                .unwrap_or(())
+        });
         e.selection.clear();
 
         e.apply(ToolAction::PickAt {
             point: Point::new(50.0, 50.0),
             additive: false,
         });
-        assert!(e.selection.is_empty(), "a locked layer must not be clickable");
+        assert!(
+            e.selection.is_empty(),
+            "a locked layer must not be clickable"
+        );
     }
 
     #[test]
@@ -1931,11 +2744,21 @@ mod tests {
 
         e.run(Command::GroupSelection);
         assert_eq!(e.scene().shape_count(), 2, "the leaves still exist");
-        let top_level = e.scene().layers().iter().map(|l| l.objects_at(0).len()).sum::<usize>();
+        let top_level = e
+            .scene()
+            .layers()
+            .iter()
+            .map(|l| l.objects_at(0).len())
+            .sum::<usize>();
         assert_eq!(top_level, 1, "they should be inside one group");
 
         e.run(Command::UngroupSelection);
-        let top_level = e.scene().layers().iter().map(|l| l.objects_at(0).len()).sum::<usize>();
+        let top_level = e
+            .scene()
+            .layers()
+            .iter()
+            .map(|l| l.objects_at(0).len())
+            .sum::<usize>();
         assert_eq!(top_level, 2, "ungrouping should free both");
     }
 
@@ -1981,7 +2804,11 @@ mod tests {
         });
 
         e.run(Command::SelectAll);
-        assert_eq!(e.selection.len(), 1, "the hidden layer's shape must be skipped");
+        assert_eq!(
+            e.selection.len(),
+            1,
+            "the hidden layer's shape must be skipped"
+        );
     }
 
     #[test]
@@ -2035,7 +2862,10 @@ mod tests {
         });
 
         let after = shape_area(&e);
-        assert!(after < before, "erasing should remove area: {after} vs {before}");
+        assert!(
+            after < before,
+            "erasing should remove area: {after} vs {before}"
+        );
     }
 
     #[test]
@@ -2112,7 +2942,10 @@ mod tests {
         };
         assert!(shape.fill.is_some(), "should now be filled");
         assert!(shape.stroke.is_none(), "the stroke should be gone");
-        assert!(shape.path.area().abs() > 100.0, "the outline should enclose area");
+        assert!(
+            shape.path.area().abs() > 100.0,
+            "the outline should enclose area"
+        );
     }
 
     #[test]
@@ -2132,9 +2965,20 @@ mod tests {
     #[test]
     fn an_unavailable_tool_is_refused_with_a_message() {
         let mut e = editor();
-        e.set_tool(ToolId::Bone);
-        assert_ne!(e.tool(), ToolId::Bone);
+        // Text is still to come; the Bone tool used to be here and arrived
+        // with Phase 7.
+        e.set_tool(ToolId::Text);
+        assert_ne!(e.tool(), ToolId::Text);
         assert!(e.status.is_some());
+    }
+
+    #[test]
+    fn the_rigging_tools_are_selectable() {
+        let mut e = editor();
+        e.set_tool(ToolId::Bone);
+        assert_eq!(e.tool(), ToolId::Bone);
+        e.set_tool(ToolId::AssetWarp);
+        assert_eq!(e.tool(), ToolId::AssetWarp);
     }
 
     #[test]
@@ -2255,7 +3099,11 @@ mod tests {
         e.set_frame(7);
         draw_square(&mut e, 0.0, 0.0, 20.0, Color::WHITE);
 
-        assert_eq!(e.scene().shape_count_at(0), 1, "the edit belongs to frame 0");
+        assert_eq!(
+            e.scene().shape_count_at(0),
+            1,
+            "the edit belongs to frame 0"
+        );
         assert_eq!(e.scene().shape_count_at(7), 1);
     }
 
@@ -2467,7 +3315,15 @@ mod tests {
         });
 
         e.run(Command::InsertKeyframe);
-        assert_eq!(e.scene().layers().get(layer).unwrap().frames.keyframe_count(), 1);
+        assert_eq!(
+            e.scene()
+                .layers()
+                .get(layer)
+                .unwrap()
+                .frames
+                .keyframe_count(),
+            1
+        );
         assert!(e.status.is_some());
     }
 
@@ -2487,8 +3343,8 @@ mod tests {
     /// An editor with one square on a layer whose depth can be set.
     fn editor_with_deep_square(depth: f64) -> (Editor, ObjectId) {
         let mut e = editor();
-        let id = draw_square(&mut e, 200.0, 125.0, 150.0, Color::WHITE)
-            .expect("the square is placed");
+        let id =
+            draw_square(&mut e, 200.0, 125.0, 150.0, Color::WHITE).expect("the square is placed");
 
         let layer = e.scene().layers().iter().next().unwrap().id;
         e.doc.edit("Depth", |scene| {
@@ -2522,7 +3378,10 @@ mod tests {
 
         // The centre is on the square at any depth, which is a useful control:
         // it shows the test is not simply missing everything.
-        assert_eq!(deep.object_at(Point::new(275.0, 200.0), tolerance), Some(id));
+        assert_eq!(
+            deep.object_at(Point::new(275.0, 200.0), tolerance),
+            Some(id)
+        );
     }
 
     /// A layer on the focal plane must pick exactly as it always did.
@@ -2560,5 +3419,518 @@ mod tests {
         ] {
             assert_eq!(behind.object_at(probe, 0.5), None, "at {probe:?}");
         }
+    }
+
+    // -- scripting ----------------------------------------------------------
+
+    fn scripted(source: &str) -> Editor {
+        let mut e = editor();
+        e.actions.source = source.to_string();
+        e.run(Command::RunScript);
+        e
+    }
+
+    /// The promise the whole feature is sold on: however much a script draws,
+    /// it is one Ctrl+Z.
+    #[test]
+    fn a_script_that_draws_forty_shapes_is_one_undo_step() {
+        let mut e = scripted(
+            "var d = fl.getDocumentDOM();
+             d.setFillColor('#FF0000');
+             for (var i = 0; i < 40; i++) {
+                 d.addNewRectangle({left: i, top: 0, right: i + 5, bottom: 5});
+             }",
+        );
+
+        assert_eq!(e.scene().shape_count(), 40);
+        assert!(e.doc.can_undo());
+
+        e.run(Command::Undo);
+        assert_eq!(
+            e.scene().shape_count(),
+            0,
+            "one undo should reverse all of it"
+        );
+    }
+
+    /// Two runs are two deliberate acts, so they must not coalesce into one
+    /// undo step the way the moves of a single drag do.
+    #[test]
+    fn two_runs_are_two_undo_steps() {
+        let mut e =
+            scripted("fl.getDocumentDOM().addNewRectangle({left:0, top:0, right:10, bottom:10});");
+        e.run(Command::RunScript);
+        assert_eq!(e.scene().shape_count(), 2);
+
+        e.run(Command::Undo);
+        assert_eq!(
+            e.scene().shape_count(),
+            1,
+            "the second run should undo alone"
+        );
+    }
+
+    /// The editor adopts what the script left behind, or `d.selectAll()` and
+    /// `t.currentFrame = 3` would appear to do nothing.
+    #[test]
+    fn the_editor_adopts_the_selection_and_playhead_a_script_left() {
+        let e = scripted(
+            "var d = fl.getDocumentDOM();
+             d.addNewRectangle({left:0, top:0, right:10, bottom:10});
+             d.selectAll();
+             d.getTimeline().insertFrames(5);
+             d.getTimeline().currentFrame = 3;",
+        );
+
+        assert_eq!(
+            e.selection.len(),
+            1,
+            "the drawn rectangle should be selected"
+        );
+        assert_eq!(e.frame(), 3);
+    }
+
+    /// A failing script keeps what it managed and says what went wrong, in the
+    /// Output area rather than only in the status bar.
+    #[test]
+    fn a_failing_script_keeps_its_work_and_reports_the_error() {
+        let e = scripted(
+            "fl.trace('starting');
+             fl.getDocumentDOM().addNewRectangle({left:0, top:0, right:10, bottom:10});
+             throw new Error('deliberate');",
+        );
+
+        assert_eq!(e.scene().shape_count(), 1, "work before the error survives");
+        assert_eq!(e.actions.output, vec!["starting".to_string()]);
+        assert!(
+            e.actions
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("deliberate"),
+            "{:?}",
+            e.actions.error
+        );
+    }
+
+    /// Running from the menu with the panel shut would put the output where
+    /// nobody can read it.
+    #[test]
+    fn running_opens_the_panel_and_an_empty_script_says_so() {
+        let mut e = editor();
+        assert!(
+            !e.workspace.is_open(buzz_ui::PanelId::Actions),
+            "the panel starts closed"
+        );
+
+        e.run(Command::RunScript);
+        assert!(e.workspace.is_open(buzz_ui::PanelId::Actions));
+        assert!(
+            e.status.as_deref().unwrap_or_default().contains("Actions"),
+            "{:?}",
+            e.status
+        );
+        assert!(!e.doc.can_undo(), "an empty script is not an edit");
+    }
+
+    /// Reading the document is not editing it: a script that only traces must
+    /// leave the document clean, or every inspection would mark it dirty.
+    #[test]
+    fn a_reading_script_leaves_the_document_unchanged() {
+        let e = scripted("fl.trace(fl.getDocumentDOM().width);");
+
+        assert!(!e.doc.can_undo());
+        assert_eq!(e.actions.output, vec!["550".to_string()]);
+    }
+
+    /// F9 is Animate's key for the Actions panel, and it has to work both ways.
+    #[test]
+    fn the_actions_panel_toggles() {
+        let mut e = editor();
+        e.run(Command::ToggleActionsPanel);
+        assert!(e.workspace.is_open(buzz_ui::PanelId::Actions));
+        e.run(Command::ToggleActionsPanel);
+        assert!(!e.workspace.is_open(buzz_ui::PanelId::Actions));
+    }
+
+    // -- rigging ------------------------------------------------------------
+
+    /// Drag with the pointer, in document coordinates, as the window does.
+    fn drag(e: &mut Editor, from: Point, to: Point) {
+        let camera = e.camera;
+        let screen = |p: Point| {
+            let s = camera.doc_to_screen(p);
+            Point::new(s.x, s.y)
+        };
+        let (a, b) = (screen(from), screen(to));
+        e.pointer_down(a, Mods::default());
+        e.pointer_move(b, Mods::default());
+        e.pointer_up(b);
+    }
+
+    /// A limb to rig: a bar from (0, 90) to (200, 110).
+    fn editor_with_limb() -> (Editor, ObjectId) {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        e.style.fill_color = Color::WHITE;
+        e.style.stroke_enabled = false;
+        let id = {
+            let layer = e.selection.active_layer().expect("a layer");
+            let mut made = None;
+            e.doc.edit("Draw", |scene| {
+                made = scene.add_shape(
+                    layer,
+                    ShapeData::filled(
+                        buzz_geom::Rect::new(0.0, 90.0, 200.0, 110.0).to_path(1e-9),
+                        Color::WHITE,
+                    ),
+                );
+            });
+            made.expect("a shape")
+        };
+        e.selection.clear();
+        (e, id)
+    }
+
+    fn armature_of(e: &Editor, id: ObjectId) -> buzz_rig::Armature {
+        let (_, object) = e.scene().find_object(id).expect("the object");
+        match &object.kind {
+            ObjectKind::Armature(rig) => rig.armature.clone(),
+            other => panic!("expected an armature, found {other:?}"),
+        }
+    }
+
+    /// The first gesture of Phase 7: drag the Bone tool across artwork and it
+    /// becomes a rig.
+    #[test]
+    fn dragging_the_bone_tool_across_artwork_rigs_it() {
+        let (mut e, id) = editor_with_limb();
+        e.set_tool(ToolId::Bone);
+
+        drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
+
+        let armature = armature_of(&e, id);
+        assert_eq!(armature.len(), 1);
+        assert!(
+            (armature.bones[0].length - 100.0).abs() < 1.0,
+            "{armature:?}"
+        );
+        assert!(e.doc.can_undo(), "rigging must be undoable");
+    }
+
+    /// Building a chain: each drag from the previous bone's tip adds the next.
+    #[test]
+    fn dragging_from_a_bone_tip_adds_a_child_bone() {
+        let (mut e, id) = editor_with_limb();
+        e.set_tool(ToolId::Bone);
+
+        drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
+        drag(&mut e, Point::new(100.0, 100.0), Point::new(200.0, 100.0));
+
+        let armature = armature_of(&e, id);
+        assert_eq!(
+            armature.len(),
+            2,
+            "the second drag should have added a bone"
+        );
+        assert_eq!(armature.bones[1].parent, Some(0));
+    }
+
+    /// Dragging a bone poses the rig, and the artwork follows.
+    #[test]
+    fn dragging_a_bone_poses_the_rig_and_moves_the_artwork() {
+        let (mut e, id) = editor_with_limb();
+        e.set_tool(ToolId::Bone);
+        drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
+        drag(&mut e, Point::new(100.0, 100.0), Point::new(200.0, 100.0));
+
+        let before = e.scene().find_object(id).expect("there").1.bounds();
+        // Grab the second bone in the middle and pull it downwards.
+        drag(&mut e, Point::new(150.0, 100.0), Point::new(120.0, 190.0));
+        let after = e.scene().find_object(id).expect("there").1.bounds();
+
+        assert!(
+            after.y1 > before.y1 + 20.0,
+            "the artwork did not follow the pose: {before:?} then {after:?}"
+        );
+    }
+
+    /// A whole posing drag is one undo step, like every other drag.
+    #[test]
+    fn a_posing_drag_is_a_single_undo_step() {
+        let (mut e, id) = editor_with_limb();
+        e.set_tool(ToolId::Bone);
+        drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
+        drag(&mut e, Point::new(100.0, 100.0), Point::new(200.0, 100.0));
+
+        let posed_from = armature_of(&e, id).pose();
+
+        // A drag with several moves in it, as a real one has.
+        let camera = e.camera;
+        let screen = |p: Point| {
+            let s = camera.doc_to_screen(p);
+            Point::new(s.x, s.y)
+        };
+        e.pointer_down(screen(Point::new(150.0, 100.0)), Mods::default());
+        for y in [120.0, 150.0, 180.0, 190.0] {
+            e.pointer_move(screen(Point::new(130.0, y)), Mods::default());
+        }
+        e.pointer_up(screen(Point::new(130.0, 190.0)));
+
+        assert_ne!(armature_of(&e, id).pose(), posed_from, "nothing moved");
+        e.run(Command::Undo);
+        assert_eq!(
+            armature_of(&e, id).pose(),
+            posed_from,
+            "one undo should reverse the whole drag"
+        );
+    }
+
+    /// A click is not a bone: a zero-length bone is a joint that can never be
+    /// grabbed again.
+    #[test]
+    fn a_click_with_the_bone_tool_does_not_make_a_bone() {
+        let (mut e, id) = editor_with_limb();
+        e.set_tool(ToolId::Bone);
+
+        drag(&mut e, Point::new(50.0, 100.0), Point::new(50.2, 100.1));
+
+        assert!(
+            matches!(
+                &e.scene().find_object(id).expect("there").1.kind,
+                ObjectKind::Shape(_)
+            ),
+            "a click should have left the artwork alone"
+        );
+        assert!(e.status.is_some(), "and said why");
+    }
+
+    #[test]
+    fn the_asset_warp_tool_puts_handles_on_artwork_and_drags_them() {
+        let (mut e, id) = editor_with_limb();
+        e.set_tool(ToolId::AssetWarp);
+
+        // The first touch turns the shape into warped artwork with a grid.
+        let camera = e.camera;
+        let screen = |p: Point| {
+            let s = camera.doc_to_screen(p);
+            Point::new(s.x, s.y)
+        };
+        e.pointer_down(screen(Point::new(100.0, 100.0)), Mods::default());
+        e.pointer_up(screen(Point::new(100.0, 100.0)));
+
+        let handles = match &e.scene().find_object(id).expect("there").1.kind {
+            ObjectKind::Warp(warp) => warp.handles.len(),
+            other => panic!("expected warped artwork, found {other:?}"),
+        };
+        assert_eq!(handles, 9);
+
+        // Now drag the middle handle, which sits at the centre of the artwork.
+        let before = e.scene().find_object(id).expect("there").1.bounds();
+        drag(&mut e, Point::new(100.0, 100.0), Point::new(100.0, 200.0));
+        let after = e.scene().find_object(id).expect("there").1.bounds();
+
+        assert!(
+            after.y1 > before.y1 + 10.0,
+            "the warp did not take: {before:?} then {after:?}"
+        );
+    }
+
+    /// Rigging moves the artwork into the armature rather than copying it —
+    /// two copies of one drawing, one rigged and one not, is not what anybody
+    /// means by rigging.
+    #[test]
+    fn rigging_does_not_duplicate_the_artwork() {
+        let (mut e, _) = editor_with_limb();
+        let before = e.scene().shape_count();
+        e.set_tool(ToolId::Bone);
+        drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
+
+        assert_eq!(e.scene().shape_count(), before);
+    }
+
+    /// A script run inside a symbol edits that symbol, because the scene
+    /// answers `layers()` for whichever timeline is open. The document's own
+    /// timeline must be left alone.
+    #[test]
+    fn a_script_run_inside_a_symbol_draws_into_the_symbol() {
+        let mut e = editor();
+        e.run(Command::NewSymbol);
+        assert!(
+            !e.scene().edit_path().is_empty(),
+            "should be inside a symbol"
+        );
+
+        e.actions.source =
+            "fl.getDocumentDOM().addNewRectangle({left:0, top:0, right:20, bottom:20});".into();
+        e.run(Command::RunScript);
+
+        assert_eq!(e.scene().shape_count(), 1, "drawn inside the symbol");
+
+        e.run(Command::EditDocument);
+        assert_eq!(
+            e.scene().shape_count(),
+            0,
+            "the main timeline should be untouched"
+        );
+    }
+
+    // -- lighting ------------------------------------------------------------
+
+    fn sun_of(e: &Editor) -> (f64, f64) {
+        match e.scene().lights().lights.first().expect("a light").kind {
+            buzz_scene::LightKind::Sun { azimuth, elevation } => (azimuth, elevation),
+            other => panic!("not a sun: {other:?}"),
+        }
+    }
+
+    /// Adding a light from the menu puts one in the document, switches the rig
+    /// on, and leaves it selected so the panel is already showing it.
+    #[test]
+    fn adding_a_sun_lights_the_document_and_selects_it() {
+        let mut e = editor();
+        assert!(
+            !e.scene().lights().is_active(),
+            "a new document has no lights"
+        );
+
+        e.run(Command::AddSun);
+
+        assert_eq!(e.scene().lights().lights.len(), 1);
+        assert!(e.scene().lights().is_active(), "the rig should switch on");
+        assert!(
+            e.light_panel.selected.is_some(),
+            "the new light should be selected"
+        );
+        assert!(e.doc.can_undo(), "adding a light must be undoable");
+
+        e.run(Command::Undo);
+        assert!(e.scene().lights().lights.is_empty());
+    }
+
+    /// A lamp arrives where the user is looking, not at the origin — which is
+    /// off the top-left of the stage and would look like nothing happened.
+    #[test]
+    fn a_lamp_arrives_in_the_middle_of_the_view() {
+        let mut e = editor();
+        e.camera.center = Point::new(640.0, 360.0);
+        e.run(Command::AddLamp);
+
+        match e.scene().lights().lights[0].kind {
+            buzz_scene::LightKind::Lamp { position, .. } => {
+                assert_eq!(position, Point::new(640.0, 360.0));
+            }
+            other => panic!("not a lamp: {other:?}"),
+        }
+    }
+
+    /// The gesture the whole gizmo exists for: drag the sun's handle across
+    /// the stage and the light now points from where it was dropped.
+    #[test]
+    fn dragging_the_sun_handle_swings_the_light() {
+        let mut e = editor();
+        e.run(Command::AddSun);
+        e.set_tool(ToolId::Selection);
+
+        let stage = e.scene().stage().stage_rect();
+        let (azimuth, elevation) = sun_of(&e);
+        let handle = crate::lights::sun_handle(stage, azimuth, elevation);
+
+        // Straight left of the middle of the stage, half way to the rim: the
+        // sun ends up in the west, half way up.
+        let centre = stage.center();
+        let target = Point::new(
+            centre.x - stage.width().min(stage.height()) * 0.21,
+            centre.y,
+        );
+        drag(&mut e, handle, target);
+
+        let (azimuth, elevation) = sun_of(&e);
+        assert!(
+            (azimuth.abs() - std::f64::consts::PI).abs() < 1e-6,
+            "the sun should now lie to the west: {azimuth}"
+        );
+        assert!(
+            (elevation - std::f64::consts::FRAC_PI_2 * 0.5).abs() < 1e-6,
+            "and half way up: {elevation}"
+        );
+    }
+
+    /// One drag, one undo step — not one per mouse-move.
+    #[test]
+    fn aiming_the_sun_is_a_single_undo_step() {
+        let mut e = editor();
+        e.run(Command::AddSun);
+        e.set_tool(ToolId::Selection);
+        let stage = e.scene().stage().stage_rect();
+        let (azimuth, elevation) = sun_of(&e);
+        let handle = crate::lights::sun_handle(stage, azimuth, elevation);
+
+        // A drag with several intermediate moves, as a real one has.
+        let camera = e.camera;
+        let screen = |p: Point| {
+            let s = camera.doc_to_screen(p);
+            Point::new(s.x, s.y)
+        };
+        e.pointer_down(screen(handle), Mods::default());
+        for step in 1..=6 {
+            let at = handle + Vec2::new(-8.0 * step as f64, 4.0 * step as f64);
+            e.pointer_move(screen(at), Mods::default());
+        }
+        let end = handle + Vec2::new(-48.0, 24.0);
+        e.pointer_up(screen(end));
+
+        let after = sun_of(&e);
+        e.run(Command::Undo);
+        assert_ne!(
+            sun_of(&e),
+            after,
+            "one undo should take the whole drag back"
+        );
+        assert_eq!(
+            sun_of(&e),
+            (azimuth, elevation),
+            "and land exactly where the sun started"
+        );
+    }
+
+    /// A light handle must not eat a brush stroke aimed at artwork beneath it.
+    #[test]
+    fn light_handles_are_only_grabbed_with_the_selection_tool() {
+        let mut e = editor();
+        e.run(Command::AddLamp);
+        let at = match e.scene().lights().lights[0].kind {
+            buzz_scene::LightKind::Lamp { position, .. } => position,
+            other => panic!("{other:?}"),
+        };
+
+        e.set_tool(ToolId::Rectangle);
+        drag(&mut e, at, at + Vec2::new(60.0, 60.0));
+
+        match e.scene().lights().lights[0].kind {
+            buzz_scene::LightKind::Lamp { position, .. } => {
+                assert_eq!(position, at, "the rectangle drag moved the lamp");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(e.scene().shape_count(), 1, "and it should have drawn one");
+    }
+
+    /// Hiding the handles hides them from the pointer too: a hidden handle
+    /// that still swallowed clicks would be a ghost.
+    #[test]
+    fn hidden_handles_cannot_be_grabbed() {
+        let mut e = editor();
+        e.run(Command::AddSun);
+        e.set_tool(ToolId::Selection);
+        e.run(Command::ToggleLightGizmos);
+        assert!(!e.light_panel.gizmos);
+
+        let stage = e.scene().stage().stage_rect();
+        let before = sun_of(&e);
+        let handle = crate::lights::sun_handle(stage, before.0, before.1);
+        drag(&mut e, handle, stage.center());
+
+        assert_eq!(sun_of(&e), before, "a hidden handle was still grabbed");
     }
 }

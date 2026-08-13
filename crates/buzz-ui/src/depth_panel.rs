@@ -106,6 +106,7 @@ pub fn depth_panel(ui: &mut Ui, scene: &Scene, active: Option<LayerId>) -> Depth
 
     // -- per-layer depth ----------------------------------------------------
     egui::ScrollArea::vertical()
+        .id_salt("depth-layers")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let rows: Vec<(LayerId, String, f64, Color32)> = scene
@@ -128,10 +129,7 @@ pub fn depth_panel(ui: &mut Ui, scene: &Scene, active: Option<LayerId>) -> Depth
                         ui.allocate_exact_size(egui::vec2(7.0, 12.0), egui::Sense::hover());
                     ui.painter().rect_filled(chip, 1.0, colour);
 
-                    if ui
-                        .selectable_label(active == Some(id), &name)
-                        .clicked()
-                    {
+                    if ui.selectable_label(active == Some(id), &name).clicked() {
                         response.select_layer = Some(id);
                     }
 
@@ -241,10 +239,7 @@ fn perspective_view(ui: &mut Ui, scene: &Scene, active: Option<LayerId>, out: &m
         let colour = Color32::from_rgba_unmultiplied(r, g, b, if selected { 255 } else { 170 });
 
         painter.line_segment(
-            [
-                egui::pos2(x, axis_y - half),
-                egui::pos2(x, axis_y + half),
-            ],
+            [egui::pos2(x, axis_y - half), egui::pos2(x, axis_y + half)],
             egui::Stroke::new(if selected { 3.0 } else { 2.0 }, colour),
         );
         // Sight lines from the camera to the plane's edges, which is what makes

@@ -179,6 +179,8 @@ fn build(doc: &PdfDocument) -> Result<(Scene, ImportReport), ImportError> {
             objects: std::sync::Arc::new(objects),
             label: None,
             tween: buzz_scene::Tween::default(),
+            // Imported formats carry no sound yet (PROGRESS §7).
+            sound: None,
         });
     }
 

@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 
 use buzz_geom::{BezPath, Point};
+use buzz_scene::{Gradient, GradientKind, GradientSpread, GradientStop, Paint};
 use swf::{FillStyle, LineStyle, ShapeRecord, ShapeStyles};
 
 /// One edge in absolute pixel coordinates.
@@ -58,10 +59,10 @@ impl Edge {
 #[derive(Debug, Clone)]
 pub struct StyledPath {
     pub path: BezPath,
-    pub fill: Option<peniko::Color>,
-    pub stroke: Option<(peniko::Color, f64)>,
-    /// True when the fill referenced something this importer cannot express,
-    /// such as a gradient or a bitmap.
+    pub fill: Option<Paint>,
+    pub stroke: Option<(Paint, f64)>,
+    /// True when the fill referenced something this importer cannot express.
+    /// Only a bitmap fill now: gradients come across as gradients.
     pub approximated_fill: bool,
 }
 
@@ -165,12 +166,12 @@ pub fn convert(styles: &ShapeStyles, records: &[ShapeRecord]) -> Vec<StyledPath>
         else {
             continue;
         };
-        let (color, approximated) = fill_colour(style);
+        let (paint, approximated) = fill_paint(style);
         let path = stitch(edges, true);
         if !path.is_empty() {
             out.push(StyledPath {
                 path,
-                fill: Some(color),
+                fill: Some(paint),
                 stroke: None,
                 approximated_fill: approximated,
             });
@@ -193,7 +194,7 @@ pub fn convert(styles: &ShapeStyles, records: &[ShapeRecord]) -> Vec<StyledPath>
             out.push(StyledPath {
                 path,
                 fill: None,
-                stroke: Some((line_colour(style), style.width().to_pixels())),
+                stroke: Some((line_paint(style), style.width().to_pixels())),
                 approximated_fill: false,
             });
         }
@@ -304,51 +305,88 @@ fn colour(c: swf::Color) -> peniko::Color {
     peniko::Color::from_rgba8(c.r, c.g, c.b, c.a)
 }
 
-/// The colour to draw a fill style in, and whether that is an approximation.
+/// Flash's gradients are declared in a fixed square 32 768 twips across —
+/// 1 638.4 pixels, from −819.2 to +819.2 — which the style's matrix maps onto
+/// the artwork. Our unit space is −1 to 1, so this is the factor between them.
 ///
-/// Gradients and bitmap fills cannot be expressed yet (§7: gradients are still
-/// outstanding), so they become a representative flat colour rather than
-/// nothing at all — a visible shape in roughly the right colour is far easier
-/// to fix by hand than an invisible one. The caller reports the approximation.
-fn fill_colour(style: &FillStyle) -> (peniko::Color, bool) {
+/// The same number the XFL reader uses, and for the same reason: XFL is Animate
+/// writing out what it would have compiled into a SWF.
+const GRADIENT_HALF_BOX: f64 = 819.2;
+
+/// The paint to draw a fill style in, and whether that is an approximation.
+///
+/// Gradients now come across as gradients. A **bitmap** fill still cannot be
+/// expressed — no reader here imports bitmaps (§7 item 22) — so it becomes a
+/// representative flat colour rather than nothing at all: a visible shape in
+/// roughly the right colour is far easier to fix by hand than an invisible one.
+/// The caller reports the approximation.
+fn fill_paint(style: &FillStyle) -> (Paint, bool) {
     match style {
-        FillStyle::Color(c) => (colour(*c), false),
-        FillStyle::LinearGradient(g) | FillStyle::RadialGradient(g) => {
-            (average_gradient(g), true)
-        }
-        FillStyle::FocalGradient { gradient, .. } => (average_gradient(gradient), true),
+        FillStyle::Color(c) => (Paint::Solid(colour(*c)), false),
+        FillStyle::LinearGradient(g) => (gradient(g, GradientKind::Linear, 0.0), false),
+        FillStyle::RadialGradient(g) => (gradient(g, GradientKind::Radial, 0.0), false),
+        FillStyle::FocalGradient {
+            gradient: g,
+            focal_point,
+        } => (
+            gradient(g, GradientKind::Radial, focal_point.to_f64()),
+            false,
+        ),
         // A representative grey: a bitmap fill has no single colour, and
         // guessing one from the image would need the image decoded.
-        FillStyle::Bitmap { .. } => (peniko::Color::from_rgba8(0x80, 0x80, 0x80, 0xFF), true),
+        FillStyle::Bitmap { .. } => (
+            Paint::Solid(peniko::Color::from_rgba8(0x80, 0x80, 0x80, 0xFF)),
+            true,
+        ),
     }
 }
 
-/// The mean of a gradient's stops, which is the flat colour closest to it.
-fn average_gradient(gradient: &swf::Gradient) -> peniko::Color {
-    if gradient.records.is_empty() {
-        return peniko::Color::from_rgba8(0x80, 0x80, 0x80, 0xFF);
-    }
-    let n = gradient.records.len() as u32;
-    let mut sum = [0u32; 4];
-    for record in &gradient.records {
-        sum[0] += record.color.r as u32;
-        sum[1] += record.color.g as u32;
-        sum[2] += record.color.b as u32;
-        sum[3] += record.color.a as u32;
-    }
-    peniko::Color::from_rgba8(
-        (sum[0] / n) as u8,
-        (sum[1] / n) as u8,
-        (sum[2] / n) as u8,
-        (sum[3] / n) as u8,
-    )
+/// One of SWF's gradients, as one of ours.
+fn gradient(g: &swf::Gradient, kind: GradientKind, focal: f64) -> Paint {
+    let stops = g
+        .records
+        .iter()
+        .map(|r| {
+            // SWF's ratio is a byte across the whole ramp, so 255 is the end —
+            // not 256. Dividing by the wrong one leaves the last stop a
+            // fraction short of the end, which shows as a thin band of the
+            // wrong colour at the rim of every radial gradient.
+            GradientStop::new(f64::from(r.ratio) / 255.0, colour(r.color))
+        })
+        .collect();
+
+    let mut out = Gradient::new(kind, stops);
+    out.spread = match g.spread {
+        swf::GradientSpread::Pad => GradientSpread::Pad,
+        swf::GradientSpread::Reflect => GradientSpread::Reflect,
+        swf::GradientSpread::Repeat => GradientSpread::Repeat,
+    };
+    out.focal = focal.clamp(-1.0, 1.0);
+    // The style's matrix maps Flash's gradient square; ours maps the unit one.
+    out.transform = to_affine(g.matrix) * buzz_geom::Affine::scale(GRADIENT_HALF_BOX);
+    Paint::Gradient(std::sync::Arc::new(out))
 }
 
-fn line_colour(style: &LineStyle) -> peniko::Color {
-    match style.fill_style() {
-        FillStyle::Color(c) => colour(*c),
-        other => fill_colour(other).0,
-    }
+/// SWF's matrix, in twips, as a transform in pixels.
+///
+/// The same conversion the timeline uses for a placement — kept here rather
+/// than shared because a gradient's matrix is read while converting a shape,
+/// before any placement exists.
+fn to_affine(m: swf::Matrix) -> buzz_geom::Affine {
+    buzz_geom::Affine::new([
+        m.a.to_f64(),
+        m.b.to_f64(),
+        m.c.to_f64(),
+        m.d.to_f64(),
+        m.tx.to_pixels(),
+        m.ty.to_pixels(),
+    ])
+}
+
+/// A stroke's paint. SWF v4+ lets a line be filled with anything a shape can
+/// be, gradients included.
+fn line_paint(style: &LineStyle) -> Paint {
+    fill_paint(style.fill_style()).0
 }
 
 #[cfg(test)]
@@ -414,8 +452,8 @@ mod tests {
         let bounds = kurbo::Shape::bounding_box(path);
         assert_eq!((bounds.width(), bounds.height()), (10.0, 10.0));
 
-        let fill = paths[0].fill.expect("it is filled");
-        assert_eq!(fill.to_rgba8().to_u8_array(), [255, 0, 0, 255]);
+        let fill = paths[0].fill.as_ref().expect("it is filled");
+        assert_eq!(fill.color().to_rgba8().to_u8_array(), [255, 0, 0, 255]);
         assert!(!paths[0].approximated_fill);
     }
 
@@ -541,19 +579,16 @@ mod tests {
 
         let paths = convert(&styles, &records);
         assert_eq!(paths.len(), 1);
-        let (color, width) = paths[0].stroke.expect("it is stroked");
-        assert_eq!(width, 3.0);
-        assert_eq!(color.to_rgba8().to_u8_array(), [0, 0, 255, 255]);
+        let (color, width) = paths[0].stroke.as_ref().expect("it is stroked");
+        assert_eq!(*width, 3.0);
+        assert_eq!(color.color().to_rgba8().to_u8_array(), [0, 0, 255, 255]);
         assert!(paths[0].fill.is_none());
     }
 
-    /// A gradient cannot be represented yet, so it becomes a flat colour —
-    /// and says so, rather than importing as an invisible shape.
-    #[test]
-    fn a_gradient_fill_becomes_a_flat_colour_and_is_flagged() {
-        let gradient = swf::Gradient {
-            matrix: swf::Matrix::IDENTITY,
-            spread: swf::GradientSpread::Pad,
+    fn ramp(spread: swf::GradientSpread, matrix: swf::Matrix) -> swf::Gradient {
+        swf::Gradient {
+            matrix,
+            spread,
             interpolation: swf::GradientInterpolation::Rgb,
             records: vec![
                 swf::GradientRecord {
@@ -561,28 +596,142 @@ mod tests {
                     color: swf::Color { r: 0, g: 0, b: 0, a: 255 },
                 },
                 swf::GradientRecord {
+                    ratio: 128,
+                    color: swf::Color { r: 255, g: 0, b: 0, a: 255 },
+                },
+                swf::GradientRecord {
                     ratio: 255,
                     color: swf::Color { r: 255, g: 255, b: 255, a: 255 },
                 },
             ],
-        };
-        let styles = ShapeStyles {
-            fill_styles: vec![FillStyle::LinearGradient(gradient)],
-            line_styles: vec![],
-        };
-        let records = vec![
+        }
+    }
+
+    fn a_square() -> Vec<ShapeRecord> {
+        vec![
             move_to(0.0, 0.0, Some(1)),
             line(10.0, 0.0),
             line(0.0, 10.0),
             line(-10.0, 0.0),
             line(0.0, -10.0),
-        ];
+        ]
+    }
 
-        let paths = convert(&styles, &records);
+    /// A gradient arrives as a gradient, with its stops where the file put
+    /// them and its spread mode intact.
+    #[test]
+    fn a_gradient_fill_arrives_as_a_gradient() {
+        let styles = ShapeStyles {
+            fill_styles: vec![FillStyle::LinearGradient(ramp(
+                swf::GradientSpread::Reflect,
+                swf::Matrix::IDENTITY,
+            ))],
+            line_styles: vec![],
+        };
+
+        let paths = convert(&styles, &a_square());
+        assert_eq!(paths.len(), 1);
+        assert!(
+            !paths[0].approximated_fill,
+            "a gradient is no longer an approximation"
+        );
+
+        let g = paths[0]
+            .fill
+            .as_ref()
+            .unwrap()
+            .gradient()
+            .expect("it should be a gradient");
+        assert_eq!(g.kind, GradientKind::Linear);
+        assert_eq!(g.spread, GradientSpread::Reflect);
+        assert_eq!(g.stops().len(), 3);
+
+        // **SWF's ratio is a byte across the whole ramp, so 255 is the end.**
+        // Dividing by 256 would leave the last stop a fraction short and put a
+        // thin band of the wrong colour at the rim of every radial gradient.
+        assert!((g.stops()[2].offset - 1.0).abs() < 1e-9, "{:?}", g.stops());
+        assert!(
+            (g.stops()[1].offset - 128.0 / 255.0).abs() < 1e-9,
+            "{:?}",
+            g.stops()
+        );
+        assert_eq!(g.stops()[1].color.to_rgba8().to_u8_array()[..3], [255, 0, 0]);
+    }
+
+    /// The gradient's matrix maps Flash's fixed square, 1 638.4 pixels across.
+    /// It is the one number that decides whether an imported gradient is the
+    /// right size.
+    #[test]
+    fn a_gradients_matrix_maps_flashs_gradient_box() {
+        let mut matrix = swf::Matrix::IDENTITY;
+        matrix.a = swf::Fixed16::from_f64(0.05);
+        matrix.d = swf::Fixed16::from_f64(0.05);
+        matrix.tx = Twips::from_pixels(30.0);
+        matrix.ty = Twips::from_pixels(40.0);
+
+        let styles = ShapeStyles {
+            fill_styles: vec![FillStyle::RadialGradient(ramp(
+                swf::GradientSpread::Pad,
+                matrix,
+            ))],
+            line_styles: vec![],
+        };
+
+        let paths = convert(&styles, &a_square());
+        let g = paths[0].fill.as_ref().unwrap().gradient().unwrap();
+        assert_eq!(g.kind, GradientKind::Radial);
+
+        let h = g.handles();
+        assert!((h.center.x - 30.0).abs() < 1e-6, "centre {:?}", h.center);
+        assert!((h.center.y - 40.0).abs() < 1e-6, "centre {:?}", h.center);
+        // Half the gradient box, scaled by the matrix — read back from the
+        // matrix rather than written out, because `Fixed16` cannot hold 0.05
+        // exactly and the expected value has to be the one the file really
+        // carries.
+        let expected = 30.0 + 819.2 * matrix.a.to_f64();
+        assert!(
+            (h.end.x - expected).abs() < 1e-9,
+            "the gradient box is the wrong size: end {:?}, expected {expected}",
+            h.end
+        );
+    }
+
+    /// A focal gradient's hot spot comes across. SWF stores it as a fixed-point
+    /// ratio of the radius, which is what our unit space wants.
+    #[test]
+    fn a_focal_gradient_keeps_its_hot_spot() {
+        let styles = ShapeStyles {
+            fill_styles: vec![FillStyle::FocalGradient {
+                gradient: ramp(swf::GradientSpread::Pad, swf::Matrix::IDENTITY),
+                focal_point: Fixed8::from_f64(-0.75),
+            }],
+            line_styles: vec![],
+        };
+
+        let paths = convert(&styles, &a_square());
+        let g = paths[0].fill.as_ref().unwrap().gradient().unwrap();
+        assert_eq!(g.kind, GradientKind::Radial);
+        assert!((g.focal + 0.75).abs() < 1e-6, "focal was {}", g.focal);
+    }
+
+    /// A **bitmap** fill is still an approximation, and still says so — no
+    /// reader here imports bitmaps (PROGRESS.md §7 item 22).
+    #[test]
+    fn a_bitmap_fill_is_still_a_flat_colour_and_is_flagged() {
+        let styles = ShapeStyles {
+            fill_styles: vec![FillStyle::Bitmap {
+                id: 7,
+                matrix: swf::Matrix::IDENTITY,
+                is_smoothed: false,
+                is_repeating: false,
+            }],
+            line_styles: vec![],
+        };
+
+        let paths = convert(&styles, &a_square());
         assert_eq!(paths.len(), 1);
         assert!(paths[0].approximated_fill, "the loss must be reported");
-        let c = paths[0].fill.unwrap().to_rgba8().to_u8_array();
-        assert_eq!(c[0], 127, "black to white averages to mid grey");
+        assert!(!paths[0].fill.as_ref().unwrap().is_gradient());
     }
 
     #[test]

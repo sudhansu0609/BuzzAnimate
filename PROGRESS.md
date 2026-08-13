@@ -2613,6 +2613,46 @@ object carries its gradient with it**; a radial gradient cools in all four
 directions; stop offsets put the colour where the file says; Reflect mirrors
 where Pad holds; and a solid fill still comes back exactly solid.
 
+### ✅ The `.swf` road in, caught up — §7 item 121a
+
+The SWF reader stopped at Phase 5 while the XFL one had a rewrite. Three
+things were wrong with it, and the first was the one §7 recorded.
+
+**Bug found and fixed — a placement on the last frame drew nothing.** Closing a
+span used one rule for two situations that mean opposite things. Being
+*replaced* on the frame you arrived on means you never showed, so the span is
+dropped rather than left as a zero-length keyframe. Still being on screen when
+the film *ends* means the reverse — you showed right up to the last frame. Both
+went through the same test, so anything placed after the final `ShowFrame` was
+discarded: no span, therefore no layer, therefore no artwork, and nothing
+anywhere to say so. `close_at_end` is now its own method with its own rule.
+
+**The test that would have caught it, and why none did.** Every test here
+counted symbols, layers, shapes and instances — every one of which a file can
+have while drawing nothing at all. `drawn_shapes` walks the scene, follows each
+instance into its symbol, and counts the shapes that would really be painted,
+over every frame rather than only the first. That is the claim §7 item 121a was
+actually making, and nothing was asserting it.
+
+**Gradients come across.** Now that the model has them, `LinearGradient`,
+`RadialGradient` and `FocalGradient` all arrive intact — stops, spread mode and
+the focal point — rather than being averaged to one flat colour. Two details
+are pinned by tests because both fail quietly: SWF's stop ratio is a byte
+across the whole ramp, so the divisor is **255 and not 256** (256 leaves the
+last stop a fraction short, which shows as a thin band of the wrong colour at
+the rim of every radial gradient), and the style's matrix maps Flash's fixed
+gradient square of 1 638.4 pixels — the same constant the XFL reader uses,
+because XFL is Animate writing out what it would have compiled into a SWF. A
+bitmap fill is still a flat colour and still says so; that is §7 item 22.
+
+**Colour transforms on placements**, §7 item 23's cheapest fidelity win. The
+multiply terms line up with ours exactly; the add terms are SWF's signed 8-bit
+offsets and ours are in 0..1 units, so the whole of the difference is a divide
+by 255. Ignoring them imported every faded, tinted and darkened instance at
+full strength — a fade-out arriving as no fade at all. A `Modify` placement
+with no colour of its own inherits the one before it, which is what makes a
+fade keyed only on the frames that move it work.
+
 ---
 
 ## 5. Current metrics
@@ -2625,7 +2665,7 @@ where Pad holds; and a solid fill still comes back exactly solid.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 288 passing, clippy clean |
+| Tests | 1 295 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
@@ -2793,7 +2833,7 @@ down here has not been finished.
 | 20 | ~~**The XFL importer does not restore folder nesting.**~~ | ✅ **Resolved in CP-5.1c**, along with two fidelity bugs it exposed |
 | 21 | **No importer has been checked against a real file from Adobe.** Every fixture is one we wrote, so the importers are verified against the *specifications* and against files whose content we chose — not against what Animate, Illustrator and the Flash compilers actually emit, which is where the awkward cases live. This is the largest single risk in Phase 5. | Needs a licensed Animate/Illustrator and real-world files |
 | 22 | **Bitmaps are not imported** by any of the three readers — reported, never read. Needs a media pipeline: decode, store in the `.buzz` container's `media/` directory (reserved since Phase 1), and a bitmap object kind. | Phase 6 |
-| 23 | **SWF morph shapes, buttons, filters, blend modes and colour transforms on placements** are reported but not applied. Colour transforms are the cheapest of these to fix — the model already has `ColorTransform` — and would noticeably improve fidelity. | Phase 5 follow-up |
+| 23 | **SWF morph shapes, buttons, filters and blend modes** are reported but not applied. Colour transforms on placements, which this row used to name as the cheapest fix, now come across. | Phase 5 follow-up |
 | 28 | ~~**No 3D object rotation.**~~ | ✅ **Resolved** — `Spatial` on every object, rendered through its own plane, format version 11 |
 | 63 | **3D rotation is allowed on every object.** Animate restricts it to movie clip instances, because there it is a property of a display object with a cached surface. Here it is a plane in a projection and costs nothing extra, so a shape, a group or a rigged character may have it too. | By design |
 | 64 | **A turned object is set by numbers, not by a gimbal.** Animate drags coloured rings on the stage; here the angles are sliders in the Properties panel. The model is the same; what is missing is the on-stage widget and its drag. | Follow-up |
@@ -2896,7 +2936,7 @@ down here has not been finished.
 | 119 | **The inverse mask is ours, not Animate's.** A `.fla` has no way to express it, so a document using one exports and saves correctly here and cannot be round-tripped through Animate. Format version 15 records it. | By design |
 | 120 | **An inverse mask is bounded by what it hides.** The group is a render target, sized to the masked layers' artwork plus a margin; artwork that reaches further than that margin — a very wide blur under an inverse mask — would be clipped at the edge of the group. | Follow-up |
 | 121 | **The timeline's zoom is not Animate's menu.** Animate offers Tiny/Small/Normal/Medium/Large and Short/Normal/Tall; these are two sliders over the same ranges. The names are gone; the sizes are continuous. | By design |
-| 121a | **The `.swf` road in is far behind the `.fla` one.** A published SWF carries geometry Animate has already resolved, and the reader is Ruffle's — so it should be the easier path. It is not yet: a sample SWF imports its instances and draws nothing, because the SWF importer stopped at Phase 5 and the XFL one has had a rewrite since. Worth finishing, and not worth recommending today. | Follow-up |
+| 121a | ~~**The `.swf` road in is far behind the `.fla` one.**~~ | ✅ **Resolved** — a placement on the last frame was being dropped as zero-length; gradients and colour transforms now come across |
 | 122 | ~~**Long thin strays cross some imported frames.**~~ | ✅ **Fixed** — they were unsigned hex coordinates: one point per shape at eight hundred thousand pixels, drawing a spike from the artwork to it. Signed now, and the strays and the stretched limbs went together. |
 | 123 | **A rig is baked, not linked.** The parent's rest pose is multiplied into the child at import, so editing the parent's *rest* pose afterwards moves the parent alone. Animate keeps the relationship live. The rig animates correctly; it is re-rigging that would need the link. | By design |
 | 124 | **`rigPropagationMatrix` is ignored.** Animate stores how much of a parent's transform reaches each child; here all of it does. A rig that leans on partial propagation will arrive stiffer than it was. | Follow-up |

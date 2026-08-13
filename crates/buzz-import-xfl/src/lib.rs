@@ -1197,6 +1197,20 @@ impl FrameContext {
             self.placing = false;
         }
 
+        // **And a gradient claims only the matrix immediately inside it**, by
+        // exactly the same discipline and for exactly the same reason.
+        //
+        // Adobe writes `<matrix>` as the first child of a gradient, before the
+        // `<GradientEntry>` list, so anything else arriving first means this
+        // gradient has none. Leaving the claim armed was the same bug the
+        // comment above describes, running the other way: a gradient without a
+        // matrix would swallow the matrix of the *next symbol instance* in the
+        // file, and that instance — and every one after it whose gradient did
+        // the same — collapsed to the origin.
+        if !matches!(name, "matrix" | "Matrix") {
+            self.styles.gradient_wants_matrix = false;
+        }
+
         match name {
             // A new shape starts a new set of style tables — and finishes any
             // shape still open, so a file that nests one inside a group still
@@ -2477,6 +2491,153 @@ mod tests {
         assert_eq!(g.kind, GradientKind::Radial);
         assert_eq!(g.spread, GradientSpread::Reflect);
         assert!((g.focal - 0.5).abs() < 1e-9, "focal was {}", g.focal);
+    }
+
+    /// **A gradient without a matrix must not swallow the next instance's.**
+    ///
+    /// Adobe writes `<matrix>` as a gradient's first child, so a gradient that
+    /// has none never gets one — but the claim used to stay armed, and the next
+    /// `<Matrix>` in the file belongs to a symbol instance. Every instance
+    /// after such a gradient collapsed to the origin, which on a real film is
+    /// most of the artwork piled into one corner.
+    ///
+    /// This is the mirror of the bug the `Matrix` arm's comment describes, and
+    /// it was introduced by the fix for the other direction.
+    #[test]
+    fn a_gradient_without_a_matrix_does_not_steal_the_next_instances() {
+        const NO_MATRIX: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
+  <symbols><Include href="hero.xml"/></symbols>
+  <timelines><DOMTimeline name="Scene 1"><layers>
+    <DOMLayer name="Art"><frames><DOMFrame index="0" duration="1"><elements>
+      <DOMShape>
+        <fills>
+          <FillStyle index="1">
+            <RadialGradient>
+              <GradientEntry color="#FFDD55" ratio="0"/>
+              <GradientEntry color="#FF8800" ratio="1"/>
+            </RadialGradient>
+          </FillStyle>
+        </fills>
+        <edges><Edge fillStyle1="1" edges="!0 0|2000 0|2000 2000|0 2000|0 0"/></edges>
+      </DOMShape>
+      <DOMSymbolInstance libraryItemName="hero">
+        <matrix><Matrix a="1" d="1" tx="320" ty="240"/></matrix>
+      </DOMSymbolInstance>
+    </elements></DOMFrame></frames></DOMLayer>
+  </layers></DOMTimeline></timelines>
+</DOMDocument>"##;
+
+        let (scene, _) = build(
+            NO_MATRIX,
+            &[("LIBRARY/hero.xml".to_string(), HERO_SYMBOL.to_string())],
+        )
+        .unwrap();
+
+        let layers = scene.layers();
+        let objects = layers.iter().next().expect("one layer").objects_at(0);
+        let instance = objects
+            .iter()
+            .find(|o| matches!(o.kind, buzz_scene::ObjectKind::Instance(_)))
+            .expect("the instance should be placed");
+        let c = instance.transform.as_coeffs();
+        assert!(
+            (c[4] - 320.0).abs() < 1e-9 && (c[5] - 240.0).abs() < 1e-9,
+            "the gradient swallowed the instance's matrix: {c:?}"
+        );
+
+        // And the gradient itself is still a gradient — disarming the claim
+        // must not have thrown the fill away.
+        let shape = objects
+            .iter()
+            .find_map(|o| match &o.kind {
+                buzz_scene::ObjectKind::Shape(s) => Some(s),
+                _ => None,
+            })
+            .expect("the gradient-filled shape");
+        assert!(
+            shape.fill.as_ref().is_some_and(|f| f.paint.is_gradient()),
+            "the gradient fill was lost"
+        );
+    }
+
+    /// A gradient **with** a matrix still gets it, and only it — the claim is
+    /// spent on the first one and the instance that follows keeps its own.
+    /// Both halves in one file, which is the arrangement a real film has.
+    #[test]
+    fn one_gradient_with_a_matrix_and_one_without_both_behave() {
+        const MIXED: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
+  <symbols><Include href="hero.xml"/></symbols>
+  <timelines><DOMTimeline name="Scene 1"><layers>
+    <DOMLayer name="Art"><frames><DOMFrame index="0" duration="1"><elements>
+      <DOMShape>
+        <fills>
+          <FillStyle index="1">
+            <LinearGradient>
+              <matrix><Matrix a="0.1" d="0.1" tx="10" ty="10"/></matrix>
+              <GradientEntry color="#000000" ratio="0"/>
+              <GradientEntry color="#FFFFFF" ratio="1"/>
+            </LinearGradient>
+          </FillStyle>
+          <FillStyle index="2">
+            <RadialGradient>
+              <GradientEntry color="#FF0000" ratio="0"/>
+              <GradientEntry color="#0000FF" ratio="1"/>
+            </RadialGradient>
+          </FillStyle>
+        </fills>
+        <edges>
+          <Edge fillStyle1="1" edges="!0 0|2000 0|2000 2000|0 2000|0 0"/>
+          <Edge fillStyle1="2" edges="!4000 0|6000 0|6000 2000|4000 2000|4000 0"/>
+        </edges>
+      </DOMShape>
+      <DOMSymbolInstance libraryItemName="hero">
+        <matrix><Matrix a="1" d="1" tx="150" ty="250"/></matrix>
+      </DOMSymbolInstance>
+    </elements></DOMFrame></frames></DOMLayer>
+  </layers></DOMTimeline></timelines>
+</DOMDocument>"##;
+
+        let (scene, _) = build(
+            MIXED,
+            &[("LIBRARY/hero.xml".to_string(), HERO_SYMBOL.to_string())],
+        )
+        .unwrap();
+
+        let layers = scene.layers();
+        let objects = layers.iter().next().expect("one layer").objects_at(0);
+
+        let instance = objects
+            .iter()
+            .find(|o| matches!(o.kind, buzz_scene::ObjectKind::Instance(_)))
+            .expect("the instance should be placed");
+        let c = instance.transform.as_coeffs();
+        assert!(
+            (c[4] - 150.0).abs() < 1e-9 && (c[5] - 250.0).abs() < 1e-9,
+            "the instance took the wrong matrix: {c:?}"
+        );
+
+        // The gradient that *did* have a matrix is placed by it: a scale of 0.1
+        // over Flash's 1638.4-pixel box puts the ramp's end 81.92 from centre.
+        let placed = objects
+            .iter()
+            .find_map(|o| match &o.kind {
+                buzz_scene::ObjectKind::Shape(s) => s
+                    .fill
+                    .as_ref()
+                    .and_then(|f| f.paint.gradient())
+                    .filter(|g| g.kind == GradientKind::Linear),
+                _ => None,
+            })
+            .expect("the linear gradient");
+        let h = placed.handles();
+        assert!((h.center.x - 10.0).abs() < 1e-6, "centre {:?}", h.center);
+        assert!(
+            (h.end.x - (10.0 + 81.92)).abs() < 1e-6,
+            "the gradient with a matrix lost it: end {:?}",
+            h.end
+        );
     }
 
     /// **The gradient's matrix must not place an instance.** It is the bug the

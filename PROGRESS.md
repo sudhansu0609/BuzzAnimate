@@ -2569,6 +2569,16 @@ Every older file still loads: they carry `color` and no `gradient`, which is
 exactly what a solid paint deserialises to, and a document using no gradient is
 written byte-identically to what version 15 wrote.
 
+**Bug found and fixed — a matrix-less gradient stole the next instance's
+placement.** Adobe writes `<matrix>` as a gradient's first child, so a gradient
+that has none never gets one; the claim was left armed, and the next `<Matrix>`
+in the file belongs to a symbol instance. Every instance after such a gradient
+collapsed to the origin, which on a real film is most of the artwork piled into
+one corner — and reads as the file failing to open at all. This is the exact
+mirror of the bug the `Matrix` arm's own comment describes, reintroduced by the
+fix for the other direction, so the gradient now disarms on any element that is
+not a matrix, by the same discipline an instance already used.
+
 **In the importer.** XFL gradients arrive as gradients. Two things had to be
 right: the `ratio` on each `<GradientEntry>`, which was **discarded entirely**
 while gradients were averaged — an average does not care where its terms sit,
@@ -2855,7 +2865,7 @@ the only tool left in the palette that is not implemented.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 335 passing, clippy clean |
+| Tests | 1 337 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |

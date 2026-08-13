@@ -261,16 +261,11 @@ fn add_effects(scene: &mut Scene) {
     // so a black sheet, holed out in the middle, leaves darkness at the edges
     // and clear glass over the action.
     //
-    // **Masking is positional**, as it is in Animate: the mask claims the
-    // unbroken run of `Masked` layers under it. The mask goes on top and the
-    // sheet below it is the layer that gets holed.
-    let hole = scene.add_layer("Vignette hole", LayerKind::InverseMask);
-    scene
-        .add_shape(
-            hole,
-            ShapeData::filled(blob(Point::new(960.0, 540.0), 700.0, 48, 0.0), Color::WHITE),
-        )
-        .expect("the hole");
+    // **Masking is positional**, as it is in Animate: a mask claims the
+    // unbroken run of `Masked` layers *under* it. And `add_layer` puts each new
+    // layer in front, so the masked sheet has to be added **first** and the
+    // mask second — do it the other way round and the mask ends up underneath,
+    // claims nothing, and the sheet draws flat over the whole film.
     let vignette = scene.add_layer("Vignette", LayerKind::Masked);
     scene
         .add_shape(
@@ -278,6 +273,13 @@ fn add_effects(scene: &mut Scene) {
             ShapeData::filled(square(-200.0, -200.0, 2320.0, 1480.0), Color::from_rgba8(0, 0, 0, 210)),
         )
         .expect("the vignette");
+    let hole = scene.add_layer("Vignette hole", LayerKind::InverseMask);
+    scene
+        .add_shape(
+            hole,
+            ShapeData::filled(blob(Point::new(960.0, 540.0), 700.0, 48, 0.0), Color::WHITE),
+        )
+        .expect("the hole");
 }
 
 /// The whole film, built once and measured stage by stage.
@@ -1382,4 +1384,71 @@ fn a_click_reaches_artwork_however_deeply_nested() {
             if hit == Some(expect) { "hit" } else { "MISSED" }
         );
     }
+}
+
+/// **The vignette must reach the edge of the frame.**
+///
+/// An inverse mask draws the run it hides into a group and punches the mask
+/// out of it, and that group is a render target sized to what the masked
+/// layers cover plus a margin (PROGRESS.md §7 item 120). If the margin is
+/// short, the darkening stops before the frame does and leaves a bright strip
+/// down the edge — which on a horror short is the one place the eye goes.
+#[test]
+fn the_vignette_reaches_every_edge_of_the_frame() {
+    let Ok(mut exporter) = buzz_export::Exporter::new(&buzz_render::GpuPreference::Automatic)
+    else {
+        eprintln!("skipping: no usable GPU");
+        return;
+    };
+    let scene = build_film();
+    let settings = buzz_export::ExportSettings::for_stage(&scene);
+    let frame = exporter.render(&scene, 0, &settings).expect("render");
+
+    let luma = |p: [u8; 4]| 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
+    let brightest_in = |xs: std::ops::Range<u32>| {
+        let mut worst = 0.0f32;
+        let mut at = (0, 0);
+        for x in xs {
+            for y in (0..frame.height).step_by(7) {
+                let l = luma(frame.pixel(x, y));
+                if l > worst {
+                    worst = l;
+                    at = (x, y);
+                }
+            }
+        }
+        (worst, at)
+    };
+
+    eprintln!("\n--- layer order, front to back ---");
+    for l in scene.layers().iter() {
+        eprintln!("  {:<16} {:?}", l.name, l.kind);
+    }
+    for g in scene.layers().mask_groups() {
+        eprintln!(
+            "  mask group: inverted={} claims {} layers",
+            g.inverted,
+            g.masked.len()
+        );
+    }
+
+    eprintln!("\n--- the frame's edges ---");
+    let (left, left_at) = brightest_in(0..24);
+    let (right, right_at) = brightest_in(frame.width - 24..frame.width);
+    let (middle, _) = brightest_in(940..980);
+    eprintln!("  {:<28} {left:>8.1} at {left_at:?}", "brightest left edge");
+    eprintln!("  {:<28} {right:>8.1} at {right_at:?}", "brightest right edge");
+    eprintln!("  {:<28} {middle:>8.1}", "brightest centre");
+
+    // The corners of a vignetted frame are the darkest part of the picture.
+    // They must not be brighter than the middle, which is the bit left clear.
+    assert!(
+        right < middle.max(30.0),
+        "the right edge is brighter ({right:.1}) than the middle ({middle:.1}) \
+         at {right_at:?} — the vignette does not reach the frame edge"
+    );
+    assert!(
+        left < middle.max(30.0),
+        "the left edge is brighter ({left:.1}) than the middle ({middle:.1})"
+    );
 }

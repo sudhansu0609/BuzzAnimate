@@ -140,7 +140,7 @@ pub fn draw_chrome(ui: &mut Ui, editor: &Editor, area: egui::Rect) -> ChromeResp
         draw_guides(&painter, area, view, to_screen);
     }
 
-    draw_selection(&painter, editor, to_screen_art);
+    draw_selection(&painter, editor, to_screen_art, to_screen);
     draw_rigs(&painter, editor, to_screen_art);
     draw_lights(&painter, editor, to_screen_art);
     draw_preview(&painter, editor, to_screen_art);
@@ -245,14 +245,35 @@ fn draw_selection(
     painter: &egui::Painter,
     editor: &Editor,
     to_screen: impl Fn(Point) -> egui::Pos2,
+    to_screen_view: impl Fn(Point) -> egui::Pos2,
 ) {
     let Some(bounds) = editor.selection.bounds(editor.scene()) else {
         return;
     };
 
-    // The four corners where the lens puts them. Under a tilted camera the
-    // selection is a **quadrilateral**, not a rectangle, and drawing a box
-    // round it would be a box round something that is not there.
+    // Each selected object outlined where it is **drawn**. Under a tilted
+    // camera, or on an object turned in space, that is a *quadrilateral* — and
+    // a box drawn round it would be a box round something that is not there.
+    //
+    // Asked object by object rather than once for the selection's bounds,
+    // because two objects turned different ways have no common quad.
+    let mut drawn_any = false;
+    for id in editor.selection.iter() {
+        let Some(quad) = editor.object_quad(id) else {
+            continue;
+        };
+        let corners = quad.map(&to_screen_view);
+        let mut outline: Vec<egui::Pos2> = corners.to_vec();
+        outline.push(corners[0]);
+        painter.add(egui::Shape::line(
+            outline,
+            Stroke::new(1.0, Palette::SELECTION),
+        ));
+        drawn_any = true;
+    }
+
+    // The corners of the whole selection, for the handles below — and the
+    // outline itself when nothing could be asked object by object.
     let corners = [
         Point::new(bounds.x0, bounds.y0),
         Point::new(bounds.x1, bounds.y0),
@@ -261,12 +282,14 @@ fn draw_selection(
     ]
     .map(&to_screen);
 
-    let mut outline: Vec<egui::Pos2> = corners.to_vec();
-    outline.push(corners[0]);
-    painter.add(egui::Shape::line(
-        outline,
-        Stroke::new(1.0, Palette::SELECTION),
-    ));
+    if !drawn_any {
+        let mut outline: Vec<egui::Pos2> = corners.to_vec();
+        outline.push(corners[0]);
+        painter.add(egui::Shape::line(
+            outline,
+            Stroke::new(1.0, Palette::SELECTION),
+        ));
+    }
 
     // The box the handles hang off. With no tilt it is exactly the old
     // rectangle; with tilt it is the quad's extent, which is the honest

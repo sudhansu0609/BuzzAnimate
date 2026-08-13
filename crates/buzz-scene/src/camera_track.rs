@@ -325,6 +325,86 @@ impl CameraTrack {
         )
     }
 
+    /// How an object that faces its own way is projected onto the frame.
+    ///
+    /// `pivot` is the point the object turns about, in document space, and
+    /// `depth` is its layer's. The object's plane passes through the pivot,
+    /// tipped by its own angles and pushed by its own `z`.
+    ///
+    /// With a flat object this is exactly [`Self::projection_at_depth`] — the
+    /// test says so — which is what keeps every document that does not use 3D
+    /// rendering through the transform it always did.
+    ///
+    /// `None` when the object is at or behind the camera, or exactly edge-on.
+    pub fn projection_for_object(
+        &self,
+        frame: u32,
+        stage: Size,
+        depth: f64,
+        pivot: Point,
+        spatial: &crate::object::Spatial,
+    ) -> Option<Projection> {
+        if spatial.is_flat() {
+            return self.projection_at_depth(frame, stage, depth);
+        }
+
+        let state = self.state_at(frame).map(CameraKey::clamped);
+        let (camera_centre, zoom, rotation, pitch, yaw) = match state {
+            Some(s) => (s.center, s.zoom, s.rotation, s.pitch, s.yaw),
+            None => (
+                Point::new(stage.width / 2.0, stage.height / 2.0),
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+            ),
+        };
+
+        let focal = self.focal_distance.max(NEAR_PLANE);
+        let distance = focal + depth;
+        if distance < NEAR_PLANE {
+            return None;
+        }
+
+        // Where the camera is, relative to the plane the layer lies in: behind
+        // its target by `distance`, along its own view axis.
+        let (sy, cy) = yaw.sin_cos();
+        let (sp, cp) = pitch.sin_cos();
+        let forward = [sy * cp, -sp, cy * cp];
+
+        // The object's origin, seen from the camera: the pivot's offset within
+        // the layer, its own push in depth, and the camera's stand-off.
+        let offset = pivot - camera_centre.to_vec2();
+        let to_origin = [
+            offset.x + distance * forward[0],
+            offset.y + distance * forward[1],
+            spatial.z + distance * forward[2],
+        ];
+
+        let (ex, ey) = spatial.basis();
+        let lens = Projection::plane_in_view(ex, ey, to_origin, focal, pitch, yaw)?;
+
+        // The object's own coordinates are measured **from its pivot** — the
+        // point its plane passes through — and the result is placed on the
+        // stage with the shot's zoom and roll.
+        //
+        // From the pivot's *absolute* position, not from its offset to the
+        // camera: `to_origin` already says where the pivot is relative to the
+        // lens, so subtracting the offset here as well would leave the artwork
+        // measured from the stage's origin and draw it distorted and tiny. It
+        // did, and the GPU test that pushes an object towards the camera and
+        // expects it to grow is what caught it.
+        let centre = buzz_geom::Vec2::new(stage.width / 2.0, stage.height / 2.0);
+        Some(
+            lens.pre_affine(Affine::translate(-pivot.to_vec2()))
+                .then_affine(
+                    Affine::translate(centre)
+                        * Affine::rotate(-rotation)
+                        * Affine::scale(zoom.max(f64::MIN_POSITIVE)),
+                ),
+        )
+    }
+
     /// Is any part of the shot tilted, at any frame?
     ///
     /// Lets the renderer and the editor skip the whole perspective path for

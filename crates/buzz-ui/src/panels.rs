@@ -975,6 +975,12 @@ pub fn properties_panel(
         changed |= instance_properties(ui, scene, id);
     }
 
+    // Which way the selection faces in space. Animate keeps this for movie
+    // clips; here any object can have it.
+    if let Some(id) = selection.iter().next() {
+        changed |= spatial_properties(ui, scene, id);
+    }
+
     brush_properties(ui, style);
 
     ui.add_space(8.0);
@@ -1299,6 +1305,106 @@ pub fn layers_panel(ui: &mut Ui, scene: &mut Scene, selection: &mut Selection) -
     }
 
     command
+}
+
+/// Animate's 3D Rotation and 3D Translation, for the selected object.
+///
+/// # What it is for
+///
+/// A flat drawing turned in space is still flat — but a *few* flat drawings at
+/// different angles read as one solid thing when the camera moves past them.
+/// Three cards for a tree, four walls for a house, a figure built of a body
+/// card and two arm cards: turn each a little and a camera move discovers the
+/// shape instead of sliding it.
+fn spatial_properties(ui: &mut Ui, scene: &mut Scene, id: buzz_scene::ObjectId) -> bool {
+    let Some((_, object)) = scene.find_object(id) else {
+        return false;
+    };
+    let mut spatial = object.spatial;
+    let before = spatial;
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("3D").strong());
+        if !spatial.is_flat() {
+            ui.label(RichText::new("turned").small().weak());
+        }
+    });
+
+    // Bounded a little short of edge-on. A card exactly side-on has no image
+    // at all, and one past it shows its back — legal, and rarely what somebody
+    // reaching for a slider meant.
+    const LIMIT: f64 = 85.0;
+    let angle = |ui: &mut Ui, label: &str, value: &mut f64, hint: &str| {
+        let mut degrees = value.to_degrees();
+        let mut touched = false;
+        ui.horizontal(|ui| {
+            ui.label(label);
+            if ui
+                .add(
+                    egui::Slider::new(&mut degrees, -LIMIT..=LIMIT)
+                        .suffix("\u{b0}")
+                        .fixed_decimals(0),
+                )
+                .on_hover_text(hint)
+                .changed()
+            {
+                *value = degrees.to_radians();
+                touched = true;
+            }
+        });
+        touched
+    };
+
+    let mut changed = false;
+    changed |= angle(
+        ui,
+        "Rotate X",
+        &mut spatial.rotation_x,
+        "Tip the object away from the viewer, about the horizontal",
+    );
+    changed |= angle(
+        ui,
+        "Rotate Y",
+        &mut spatial.rotation_y,
+        "Turn the object about the vertical — the one that makes a card read \
+         as a wall when the camera passes it",
+    );
+    changed |= angle(
+        ui,
+        "Rotate Z",
+        &mut spatial.rotation_z,
+        "Spin it in its own plane",
+    );
+
+    ui.horizontal(|ui| {
+        ui.label("Z");
+        if ui
+            .add(
+                egui::Slider::new(&mut spatial.z, -800.0..=800.0)
+                    .suffix(" px")
+                    .fixed_decimals(0),
+            )
+            .on_hover_text(
+                "How far in front of or behind its layer the object sits. \
+                 Negative is towards the camera.",
+            )
+            .changed()
+        {
+            changed = true;
+        }
+    });
+
+    if !spatial.is_flat() && ui.small_button("Flatten").clicked() {
+        spatial = buzz_scene::Spatial::default();
+        changed = true;
+    }
+
+    if changed && spatial != before {
+        scene.update_object(id, |o| o.spatial = spatial);
+        return true;
+    }
+    false
 }
 
 /// Placeholder for the timeline, which arrives in Phase 3.

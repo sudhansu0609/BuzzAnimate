@@ -768,12 +768,53 @@ impl Editor {
                 if !object.visible || object.locked {
                     continue;
                 }
+                // An object turned in space is drawn on a plane of its own, so
+                // the click has to be carried back onto that plane before it
+                // can be tested against the artwork — the same reverse trip
+                // depth and camera tilt already need, one level further in.
+                let local = match unturn(scene, object, frame, layer.depth, local) {
+                    Some(point) => point,
+                    // Edge-on: nothing on screen to click.
+                    None => continue,
+                };
                 if object_contains(scene, object, local, local_tolerance, frame, 0) {
                     hit = Some(object.id);
                 }
             }
         }
         hit
+    }
+
+    /// The four corners of an object, where they are **drawn**.
+    ///
+    /// Through the camera *and* the object's own facing, so chrome sits on a
+    /// turned object rather than on the rectangle it would occupy if it were
+    /// flat. In stage space — the caller adds the view.
+    ///
+    /// `None` when the object is edge-on or behind the camera, and there is
+    /// nothing on screen to put a handle on.
+    pub fn object_quad(&self, id: ObjectId) -> Option<[Point; 4]> {
+        let scene = self.doc.scene();
+        let (layer, object) = scene.find_object(id)?;
+        let depth = scene.layers().get(layer).map(|l| l.depth).unwrap_or(0.0);
+
+        let bounds = scene.resolved_bounds(object);
+        let pivot =
+            buzz_scene::object::transform_rect(object.transform, object.local_bounds()).center();
+        let projection = scene.camera().projection_for_object(
+            self.current_frame,
+            scene.stage().size,
+            depth,
+            pivot,
+            &object.spatial,
+        )?;
+
+        // Layer parenting moves the artwork as well, and it happens in the
+        // plane, before the lens.
+        let follows = scene
+            .layers()
+            .inherited_transform(layer, self.current_frame);
+        projection.pre_affine(follows).map_rect(bounds)
     }
 
     /// Objects fully inside `rect`, matching Animate's marquee.
@@ -2295,6 +2336,40 @@ fn update_shape(scene: &mut Scene, frame: u32, id: ObjectId, f: impl FnOnce(&mut
 /// library, not in the object; without it an instance could only be tested
 /// against a placeholder rectangle. `frame` is the timeline position the
 /// object is being tested at, which nested graphic symbols inherit.
+/// Carry a point from where a turned object is *drawn* back onto its own
+/// plane.
+///
+/// Returns the point unchanged for the overwhelming majority of objects, which
+/// are flat. `None` when the object is edge-on or behind the camera, and there
+/// is nothing on screen to click.
+fn unturn(
+    scene: &Scene,
+    object: &Object,
+    frame: u32,
+    layer_depth: f64,
+    point: Point,
+) -> Option<Point> {
+    if object.spatial.is_flat() {
+        return Some(point);
+    }
+
+    let stage = scene.stage().size;
+    let pivot =
+        buzz_scene::object::transform_rect(object.transform, object.local_bounds()).center();
+
+    // Where the object is drawn, against where it *would* be drawn flat. The
+    // difference between the two is what the click travels back through; the
+    // turned projection alone would also undo the camera, which the caller has
+    // already undone.
+    let turned =
+        scene
+            .camera()
+            .projection_for_object(frame, stage, layer_depth, pivot, &object.spatial)?;
+    let flat = scene.camera().projection_at_depth(frame, stage, layer_depth)?;
+
+    flat.then(&turned.inverse()?).map_point(point)
+}
+
 fn object_contains(
     scene: &Scene,
     object: &Object,

@@ -46,7 +46,9 @@ pub use camera_track::{CameraKey, CameraTrack, MAX_TILT};
 pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
 pub use merge::{ImportTarget, MergeReport};
-pub use object::{FillSpec, Object, ObjectId, ObjectKind, PaintBlend, ShapeData, StrokeSpec};
+pub use object::{
+    FillSpec, Object, ObjectId, ObjectKind, PaintBlend, ShapeData, Spatial, StrokeSpec,
+};
 pub use rig::{ArmatureData, RigBinding, RigPart, WarpData};
 pub use sound::{SoundAsset, SoundCue, SoundId, SoundLibrary, SoundRef, SoundSync};
 pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, Quality};

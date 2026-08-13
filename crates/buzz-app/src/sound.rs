@@ -270,6 +270,7 @@ mod tests {
                         visible: true,
                         filters: Vec::new(),
                         blend: Default::default(),
+                        spatial: Default::default(),
                     })],
                 );
             });

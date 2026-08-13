@@ -43,7 +43,8 @@ colour) and blend modes, and **layer parenting**, so a head layer follows a
 body layer without a bone in sight. Every panel docks, floats, closes and
 locks, and the arrangement is still there next time. The camera is **spatial**:
 pitch and yaw it and the stage tips away in real perspective, a rectangle drawn
-as a trapezoid.
+as a trapezoid — and **objects turn too**, so three flat cards at different
+angles make a tree the camera discovers rather than slides past.
 
 Not yet implemented, and honestly marked as such in the toolbar: gradients,
 Text, Lasso, Bézier pen authoring, multiple Scenes, clipboard. Video export
@@ -185,7 +186,7 @@ grep -A1 '^name = "wgpu"' Cargo.lock   # must list exactly one version
 ## Testing
 
 ```sh
-cargo test --workspace            # 1 070 tests
+cargo test --workspace            # 1 084 tests
 cargo clippy --workspace --all-targets
 cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 ```
@@ -202,7 +203,7 @@ Done: engine foundation · geometry and document core · drawing tools and the
 application shell · timeline · symbols, library and tweens · importers ·
 rigging and IK · PNG export · the scripting API · lighting · filters and
 blend modes · layer parenting · a workspace you arrange · a camera that
-tilts.
+tilts · 3D rotation.
 
 Next: **the rest of Phase 6 — video export** (MP4/MOV via NVENC, GIF/WebP,
 HTML5 Canvas/SVG), then Phase 8's ActionScript runtime and compiler.

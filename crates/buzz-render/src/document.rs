@@ -340,6 +340,8 @@ fn draw_layer(
             effect: ColorTransform::default(),
             adjust: None,
             blur: None,
+            stage_frame: frame,
+            stage_size: scene.stage().size,
             depth: 0,
             lighting,
             layer_depth: layer.depth,
@@ -502,6 +504,15 @@ struct DrawCtx<'a> {
     /// A blur inherited from a filter, applied to each shape as it is drawn.
     blur: Option<(f64, f64, buzz_fx::Quality)>,
     depth: usize,
+    /// The frame the **stage** is on.
+    ///
+    /// Distinct from `frame`, which is the timeline being drawn — a graphic
+    /// symbol runs on its own. The camera belongs to the document, so it is
+    /// always read at this one; a symbol on its fourth frame must not be seen
+    /// through the camera's fourth.
+    stage_frame: u32,
+    /// The layer's own size, for the camera's arithmetic.
+    stage_size: buzz_geom::Size,
     /// Whether this layer is lit, and what the lights need to know about it:
     /// the stage's height, for the sky's gradient, and the layer's depth.
     ///
@@ -658,6 +669,36 @@ fn draw_object_inner(
     cache: &mut DrawCache,
 ) {
     let doc = doc * object.transform;
+
+    // **An object may face its own way.** Rotated in space, it lies on a plane
+    // of its own rather than in its layer's, so it is drawn through a
+    // projection of its own — and so is everything inside it, which is what
+    // makes turning a group turn the whole group rather than each piece about
+    // its own middle.
+    //
+    // Everything below this point then proceeds exactly as before: the plane
+    // it is drawn on has changed, and nothing else has.
+    let turned;
+    let ctx = if object.spatial.is_flat() {
+        ctx
+    } else {
+        let pivot = buzz_scene::object::transform_rect(doc, object.local_bounds()).center();
+        let Some(projection) = ctx.scene.camera().projection_for_object(
+            ctx.stage_frame,
+            ctx.stage_size,
+            ctx.layer_depth,
+            pivot,
+            &object.spatial,
+        ) else {
+            // Edge-on, or behind the camera: there is nothing to draw.
+            return;
+        };
+        turned = DrawCtx {
+            projection,
+            ..ctx.clone()
+        };
+        &turned
+    };
 
     match &object.kind {
         ObjectKind::Group(children) => {

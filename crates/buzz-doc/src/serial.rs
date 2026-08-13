@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 /// keyframe at frame 0, which is exactly what it meant; version 2 simply has
 /// no library and no tweens, and both default to empty. Keeping those paths is
 /// cheap and it exercises the version check for real rather than in theory.
-pub const FORMAT_VERSION: u32 = 10;
+pub const FORMAT_VERSION: u32 = 11;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -461,6 +461,19 @@ impl FilterDto {
     }
 }
 
+/// An object's facing in space. Version 11.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct SpatialDto {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rotation_x: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rotation_y: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rotation_z: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub z: f64,
+}
+
 /// The document library: symbols plus the folder tree they sit in.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LibraryDto {
@@ -549,6 +562,12 @@ fn one() -> u32 {
 
 fn is_zero(value: &f64) -> bool {
     *value == 0.0
+}
+
+/// An angle from a file, made safe. A corrupt one must not turn an object into
+/// a NaN and take the whole frame with it.
+fn sane_angle(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -653,6 +672,10 @@ pub struct ObjectDto {
     /// How it blends with what is behind it. Version 9.
     #[serde(default, skip_serializing_if = "str::is_empty")]
     pub blend: String,
+    /// Which way it faces in space — Animate's 3D Rotation and 3D Translation.
+    /// Version 11; absent means flat, which is every object written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spatial: Option<SpatialDto>,
     pub kind: ObjectKindDto,
 }
 
@@ -1267,6 +1290,14 @@ impl ObjectDto {
             } else {
                 blend_name(object.blend).to_string()
             },
+            // Omitted entirely when the object is flat, so a document that
+            // does not use 3D is not a byte larger than it was.
+            spatial: (!object.spatial.is_flat()).then_some(SpatialDto {
+                rotation_x: object.spatial.rotation_x,
+                rotation_y: object.spatial.rotation_y,
+                rotation_z: object.spatial.rotation_z,
+                z: object.spatial.z,
+            }),
             kind,
         }
     }
@@ -1417,6 +1448,15 @@ impl ObjectDto {
             visible: self.visible,
             filters,
             blend: blend_from(&self.blend),
+            spatial: self
+                .spatial
+                .map(|s| buzz_scene::Spatial {
+                    rotation_x: sane_angle(s.rotation_x),
+                    rotation_y: sane_angle(s.rotation_y),
+                    rotation_z: sane_angle(s.rotation_z),
+                    z: if s.z.is_finite() { s.z } else { 0.0 },
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -2011,6 +2051,7 @@ mod tests {
             visible: true,
             filters: Vec::new(),
             blend: Default::default(),
+            spatial: Default::default(),
         });
         scene
     }
@@ -2122,6 +2163,7 @@ mod tests {
             visible: true,
             filters: Vec::new(),
             blend: Default::default(),
+            spatial: Default::default(),
         });
 
         let json = serde_json::to_string(&DocumentDto::from_scene(&scene)).expect("serialise");

@@ -93,6 +93,7 @@ fn character_with_head(editor: &mut Editor) -> (buzz_scene::SymbolId, buzz_scene
                         visible: true,
                         filters: Vec::new(),
                         blend: Default::default(),
+                        spatial: Default::default(),
                     })],
                 );
             });

@@ -171,6 +171,84 @@ pub enum ObjectKind {
     Warp(crate::rig::WarpData),
 }
 
+/// Where an object sits and faces **in space** — Animate's 3D Rotation and 3D
+/// Translation, on one object.
+///
+/// # What this is for
+///
+/// Layer depth arranges whole layers in space, and the camera can now tilt; but
+/// every object still lies flat in its layer's plane, so a camera move slides
+/// the layers past each other without ever turning anything. That reads as
+/// cards sliding, which is what it is.
+///
+/// Giving an object its own angles makes it a plane of its own. Build a tree
+/// out of three cards at slightly different angles and the camera passing it
+/// turns them past each other; do the same with the walls of a house and it
+/// has corners. It is still flat artwork — but flat artwork that faces
+/// somewhere.
+///
+/// # Deliberately on every object
+///
+/// Animate allows 3D only on movie clip instances, because its 3D is a
+/// property of a display object with a cached surface. Here it is a plane in a
+/// projection, which costs nothing extra, so any object may have it: a shape, a
+/// group, a symbol, a rigged character. Recorded as a deviation in §7.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Spatial {
+    /// Tip about the horizontal axis, in radians. Animate's rotationX.
+    pub rotation_x: f64,
+    /// Turn about the vertical axis. Animate's rotationY.
+    pub rotation_y: f64,
+    /// Spin in the object's own plane. Animate's rotationZ.
+    ///
+    /// This one is a plain rotation and stays affine, but it belongs here
+    /// rather than in [`Object::transform`] because it happens *after* the
+    /// other two: spinning a card and then tipping it is not the same as
+    /// tipping it and then spinning it.
+    pub rotation_z: f64,
+    /// How far in front of or behind its layer the object sits, in document
+    /// units. Animate's translationZ. Negative is towards the camera.
+    pub z: f64,
+}
+
+impl Spatial {
+    /// Does this leave the object flat in its layer, exactly as it was before
+    /// there was any such thing?
+    ///
+    /// The render path, the hit test and the format all take the old route when
+    /// this is true — which is every object in every document that does not use
+    /// it.
+    pub fn is_flat(&self) -> bool {
+        self.rotation_x == 0.0 && self.rotation_y == 0.0 && self.rotation_z == 0.0 && self.z == 0.0
+    }
+
+    /// The object's plane, as two basis vectors.
+    pub fn basis(&self) -> ([f64; 3], [f64; 3]) {
+        buzz_geom::Projection::rotated_basis(self.rotation_x, self.rotation_y, self.rotation_z)
+    }
+
+    /// Interpolate, so a motion tween can turn an object as it moves.
+    pub fn lerp(&self, other: &Self, t: f64) -> Self {
+        // Angles take the short way round, as every other angle here does.
+        let turn = |a: f64, b: f64| {
+            let full = std::f64::consts::TAU;
+            let mut delta = (b - a) % full;
+            if delta > full / 2.0 {
+                delta -= full;
+            } else if delta < -full / 2.0 {
+                delta += full;
+            }
+            a + delta * t
+        };
+        Self {
+            rotation_x: turn(self.rotation_x, other.rotation_x),
+            rotation_y: turn(self.rotation_y, other.rotation_y),
+            rotation_z: turn(self.rotation_z, other.rotation_z),
+            z: self.z + (other.z - self.z) * t,
+        }
+    }
+}
+
 /// An object placed on a layer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Object {
@@ -199,6 +277,9 @@ pub struct Object {
     /// Blend list. Distinct from [`ShapeData::blend`], which is about how one
     /// brush stroke accumulates with the next.
     pub blend: buzz_fx::Blend,
+
+    /// Which way this object faces in space. Flat by default.
+    pub spatial: Spatial,
 }
 
 impl Object {
@@ -212,6 +293,7 @@ impl Object {
             visible: true,
             filters: Vec::new(),
             blend: buzz_fx::Blend::Normal,
+            spatial: Default::default(),
         }
     }
 
@@ -225,6 +307,7 @@ impl Object {
             visible: true,
             filters: Vec::new(),
             blend: buzz_fx::Blend::Normal,
+            spatial: Default::default(),
         }
     }
 
@@ -342,6 +425,7 @@ impl Object {
             visible: true,
             filters: Vec::new(),
             blend: buzz_fx::Blend::Normal,
+            spatial: Default::default(),
         }
     }
 }

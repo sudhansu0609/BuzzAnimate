@@ -378,6 +378,77 @@ impl Projection {
         Some(bounds)
     }
 
+    /// A camera looking at **any plane in space**.
+    ///
+    /// The general form, and the one everything else here is written in terms
+    /// of. A plane is an origin and two basis vectors: the point at plane
+    /// coordinates `(s, t)` is `origin + s·ex + t·ey`. `to_origin` is the
+    /// vector from the camera to that origin.
+    ///
+    /// Why bother with the general case: a **layer** is a plane facing the
+    /// camera, and an **object rotated in space** is a plane that is not. Both
+    /// are one matrix, built the same way, and neither needs a depth buffer —
+    /// the perspective image of a plane is a homography of that plane, whatever
+    /// angle it sits at.
+    ///
+    /// `pitch` and `yaw` are the camera's, and `focal` is its lens.
+    pub fn plane_in_view(
+        ex: [f64; 3],
+        ey: [f64; 3],
+        to_origin: [f64; 3],
+        focal: f64,
+        pitch: f64,
+        yaw: f64,
+    ) -> Option<Self> {
+        if !focal.is_finite() || focal <= 0.0 {
+            return None;
+        }
+        for v in [&ex, &ey, &to_origin] {
+            if !v.iter().all(|c| c.is_finite()) {
+                return None;
+            }
+        }
+
+        let (sy, cy) = yaw.sin_cos();
+        let (sp, cp) = pitch.sin_cos();
+
+        // The camera's axes in world terms — the rows of its rotation
+        // transposed, which is what carries a world offset into its frame.
+        let right = [cy, 0.0, -sy];
+        let up = [sy * sp, cp, cy * sp];
+        let forward = [sy * cp, -sp, cy * cp];
+
+        let dot = |a: &[f64; 3], b: &[f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+        let m = [
+            focal * dot(&right, &ex),
+            focal * dot(&right, &ey),
+            focal * dot(&right, &to_origin),
+            focal * dot(&up, &ex),
+            focal * dot(&up, &ey),
+            focal * dot(&up, &to_origin),
+            dot(&forward, &ex),
+            dot(&forward, &ey),
+            dot(&forward, &to_origin),
+        ];
+        // Exactly edge-on, the plane projects to a line and there is nothing
+        // to draw. **Past** edge-on is allowed: that is the back of the plane,
+        // and a card turned right round should show its back — mirrored, which
+        // is what the negative determinant gives — rather than vanish.
+        let normal = [
+            ex[1] * ey[2] - ex[2] * ey[1],
+            ex[2] * ey[0] - ex[0] * ey[2],
+            ex[0] * ey[1] - ex[1] * ey[0],
+        ];
+        if dot(&forward, &normal).abs() <= NEAR_W {
+            return None;
+        }
+
+        let projection = Self { m };
+        // And the plane's origin has to be in front of the camera at all.
+        (projection.depth_at(Point::ZERO) > NEAR_W).then(|| projection.normalised())
+    }
+
     /// A camera **looking at** a plane from `distance` away.
     ///
     /// `pitch` tilts it down, `yaw` turns it to the right, and `focal` is the
@@ -409,33 +480,51 @@ impl Projection {
             return None;
         }
 
+        // The layer's plane faces the camera, so its basis is the plain one,
+        // and the camera sits `distance` behind its target along its own view
+        // axis — which is what makes it orbit rather than swivel.
         let (sy, cy) = yaw.sin_cos();
         let (sp, cp) = pitch.sin_cos();
-
-        // The camera's axes in world terms — the rows of R transposed, which is
-        // what carries a world offset into the camera's frame.
-        let right = [cy, 0.0];
-        let up = [sy * sp, cp];
         let forward = [sy * cp, -sp, cy * cp];
+        let to_origin = [
+            distance * forward[0],
+            distance * forward[1],
+            distance * forward[2],
+        ];
 
-        // Turned to edge-on or past it: the plane projects to a line, or
-        // mirrored. Refusing is better than drawing it inside out.
+        // A **layer** must face the camera. Past edge-on means the camera has
+        // swung round behind the artwork, which for a whole layer is the shot
+        // going wrong rather than an effect anybody asked for — unlike a single
+        // rotated card, which is allowed to show its back.
         if forward[2] <= NEAR_W {
             return None;
         }
 
-        let m = [
-            focal * right[0],
-            focal * right[1],
-            0.0,
-            focal * up[0],
-            focal * up[1],
-            0.0,
-            forward[0],
-            forward[1],
-            distance,
-        ];
-        Some(Self { m }.normalised())
+        Self::plane_in_view([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], to_origin, focal, pitch, yaw)
+    }
+
+    /// The basis of a plane rotated about its own axes.
+    ///
+    /// `x` tips it away from the viewer, `y` turns it about the vertical, `z`
+    /// spins it in its own plane. Applied in that order — the order Animate's
+    /// 3D Rotation tool uses, so a value copied from there means the same
+    /// thing here.
+    pub fn rotated_basis(x: f64, y: f64, z: f64) -> ([f64; 3], [f64; 3]) {
+        let (sx, cx) = x.sin_cos();
+        let (sy, cy) = y.sin_cos();
+        let (sz, cz) = z.sin_cos();
+
+        // R = Ry · Rx · Rz, applied to the plane's own axes.
+        let column = |a: f64, b: f64, c: f64| -> [f64; 3] {
+            // Rz first.
+            let (a, b, c) = (a, b, c);
+            // Rx about the horizontal.
+            let (a, b, c) = (a, b * cx - c * sx, b * sx + c * cx);
+            // Ry about the vertical.
+            (a * cy + c * sy, b, -a * sy + c * cy).into()
+        };
+
+        (column(cz, sz, 0.0), column(-sz, cz, 0.0))
     }
 }
 
@@ -690,6 +779,137 @@ mod tests {
     /// leans on, so it is asserted as the invariant rather than as a direction:
     /// which way `+y` leans depends on a sign convention, and the first version
     /// of this test guessed it wrong.
+    /// A plane facing the camera, expressed the general way, is the same
+    /// projection the layer case builds — so an object with no rotation is
+    /// drawn exactly as it was before there was such a thing.
+    #[test]
+    fn an_unrotated_plane_matches_the_layer_case() {
+        let distance = 1200.0;
+        let focal = 1000.0;
+        for (pitch, yaw) in [(0.0, 0.0), (0.4, 0.0), (0.0, -0.3), (0.25, 0.35)] {
+            let layer = Projection::look_at_plane(distance, focal, pitch, yaw).expect("in front");
+
+            let (sy, cy) = yaw.sin_cos();
+            let (sp, cp) = pitch.sin_cos();
+            let forward = [sy * cp, -sp, cy * cp];
+            let to_origin = [
+                distance * forward[0],
+                distance * forward[1],
+                distance * forward[2],
+            ];
+            let (ex, ey) = Projection::rotated_basis(0.0, 0.0, 0.0);
+            let general =
+                Projection::plane_in_view(ex, ey, to_origin, focal, pitch, yaw).expect("in front");
+
+            for (a, b) in layer.coeffs().iter().zip(general.coeffs().iter()) {
+                assert!(
+                    (a - b).abs() < 1e-9,
+                    "pitch {pitch} yaw {yaw}: {:?} vs {:?}",
+                    layer.coeffs(),
+                    general.coeffs()
+                );
+            }
+        }
+    }
+
+    /// An unrotated basis is the plain one — the identity case has to be exact,
+    /// because everything that does not use 3D goes through it.
+    #[test]
+    fn an_unrotated_basis_is_the_plain_one() {
+        let (ex, ey) = Projection::rotated_basis(0.0, 0.0, 0.0);
+        assert_eq!(ex, [1.0, 0.0, 0.0]);
+        assert_eq!(ey, [0.0, 1.0, 0.0]);
+    }
+
+    /// Turning a card about the vertical tips one side away from the camera:
+    /// its far edge is drawn shorter than its near one.
+    #[test]
+    fn a_card_turned_about_the_vertical_is_foreshortened() {
+        let (ex, ey) = Projection::rotated_basis(0.0, 0.6, 0.0);
+        let projection = Projection::plane_in_view(ex, ey, [0.0, 0.0, 1000.0], 1000.0, 0.0, 0.0)
+            .expect("in front");
+
+        assert!(!projection.is_affine(), "a turned card is not an affine");
+
+        let corners = projection
+            .map_rect(Rect::new(-100.0, -100.0, 100.0, 100.0))
+            .expect("in front");
+        let left = (corners[3] - corners[0]).hypot();
+        let right = (corners[2] - corners[1]).hypot();
+        assert!(
+            (left - right).abs() > 4.0,
+            "the two sides should differ: {left} vs {right}"
+        );
+    }
+
+    /// And about the horizontal, the top and bottom differ instead.
+    #[test]
+    fn a_card_tipped_about_the_horizontal_is_foreshortened() {
+        let (ex, ey) = Projection::rotated_basis(0.6, 0.0, 0.0);
+        let projection = Projection::plane_in_view(ex, ey, [0.0, 0.0, 1000.0], 1000.0, 0.0, 0.0)
+            .expect("in front");
+
+        let corners = projection
+            .map_rect(Rect::new(-100.0, -100.0, 100.0, 100.0))
+            .expect("in front");
+        let top = (corners[1] - corners[0]).hypot();
+        let bottom = (corners[2] - corners[3]).hypot();
+        assert!((top - bottom).abs() > 4.0, "{top} vs {bottom}");
+    }
+
+    /// Spinning a card in its own plane is a *rotation*, not a perspective: it
+    /// stays an affine, because the plane has not moved.
+    #[test]
+    fn spinning_a_card_in_its_own_plane_stays_affine() {
+        let (ex, ey) = Projection::rotated_basis(0.0, 0.0, 0.7);
+        let projection = Projection::plane_in_view(ex, ey, [0.0, 0.0, 1000.0], 1000.0, 0.0, 0.0)
+            .expect("in front");
+        assert!(projection.is_affine(), "{projection:?}");
+    }
+
+    /// A card turned exactly edge-on has no image at all.
+    #[test]
+    fn an_edge_on_card_is_refused() {
+        let (ex, ey) = Projection::rotated_basis(0.0, std::f64::consts::FRAC_PI_2, 0.0);
+        assert!(Projection::plane_in_view(ex, ey, [0.0, 0.0, 1000.0], 1000.0, 0.0, 0.0).is_none());
+    }
+
+    /// Turned past edge-on it shows its **back**, mirrored — which is what the
+    /// back of a card looks like, and better than having it vanish.
+    #[test]
+    fn a_card_turned_right_round_shows_its_back() {
+        let (ex, ey) = Projection::rotated_basis(0.0, 2.6, 0.0);
+        let projection = Projection::plane_in_view(ex, ey, [0.0, 0.0, 1000.0], 1000.0, 0.0, 0.0)
+            .expect("the back is still a picture");
+
+        // Mirrored: the corner that was on the left is now on the right.
+        let corners = projection
+            .map_rect(Rect::new(-100.0, -100.0, 100.0, 100.0))
+            .expect("in front");
+        assert!(
+            corners[0].x > corners[1].x,
+            "the back of a card should be mirrored: {corners:?}"
+        );
+    }
+
+    /// A card pushed away along its own depth is drawn smaller — which is what
+    /// makes the near cards of a tree sweep past the far ones.
+    #[test]
+    fn a_card_pushed_back_is_drawn_smaller() {
+        let (ex, ey) = Projection::rotated_basis(0.0, 0.0, 0.0);
+        let size = |z: f64| {
+            let projection =
+                Projection::plane_in_view(ex, ey, [0.0, 0.0, 1000.0 + z], 1000.0, 0.0, 0.0)
+                    .expect("in front");
+            projection
+                .map_rect_bounds(Rect::new(-100.0, -100.0, 100.0, 100.0))
+                .expect("in front")
+                .width()
+        };
+        assert!(size(400.0) < size(0.0), "further should be smaller");
+        assert!(size(-400.0) > size(0.0), "nearer should be bigger");
+    }
+
     #[test]
     fn magnification_rises_as_the_plane_comes_nearer() {
         let projection = Projection::look_at_plane(1000.0, 1000.0, 0.8, 0.0).expect("in front");

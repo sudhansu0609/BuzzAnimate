@@ -274,6 +274,10 @@ fn interpolate_object(start: &Object, end: &Object, tween: &Tween, t: f64) -> Ob
         target.color = a.color.lerp(&b.color, t as f32);
     }
 
+    // An object's facing tweens, which is how a card turns as the camera
+    // passes it — the thing 3D rotation is for.
+    out.spatial = start.spatial.lerp(&end.spatial, t);
+
     // Filters tween, which is how a glow grows or a shadow swings across a
     // shot. Matched by position in the stack and by kind: Animate holds a
     // filter that has no counterpart rather than interpolating towards
@@ -887,6 +891,7 @@ mod tests {
             visible: true,
             filters: Vec::new(),
             blend: Default::default(),
+            spatial: Default::default(),
         }
     }
 
@@ -954,6 +959,7 @@ mod tests {
             visible: true,
             filters: Vec::new(),
             blend: Default::default(),
+            spatial: Default::default(),
         };
 
         let mid = interpolate_object(

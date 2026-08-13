@@ -1162,6 +1162,58 @@ bundled fonts have, **and that is wrong**: a probe row rendered
 what made the claim look right). The Library panel had been drawing an expanded
 folder as an empty box for the same reason since Phase 4, and now uses `⏷`.
 No test can see this; only a picture can.
+### ✅ 3D rotation on an object — §7 item 28, closed
+
+An object can now be **turned in space**: rotated about its own three axes and
+pushed forward or back along its own Z. Animate's 3D Rotation and 3D
+Translation, and the last thing the spatial camera unblocked.
+
+**Why it matters more than it sounds.** With layer depth and a tilting camera,
+a camera move slides layers past each other — which reads as *cards sliding*,
+because that is what it is. Giving an object its own angles makes it a plane of
+its own, so the same camera move turns it. Three cards at different angles make
+a tree that a camera discovers rather than passes; four make a house with a
+corner; a body card and two arm cards make a figure that is not a sticker.
+
+- [x] `Spatial` on every object: `rotation_x`, `rotation_y`, `rotation_z` and
+      `z`, tweened, saved as format version 11
+- [x] Rendered through the object's own plane — and so is **everything inside
+      it**, so turning a group turns the group rather than each piece about its
+      own middle
+- [x] Hit-testing carries the click back onto that plane, so a turned object is
+      clickable where it is drawn
+- [x] Chrome follows: the selection outline of a turned object is its
+      **quadrilateral**, not a box round it
+- [x] A flat object renders **pixel-identically** to one from before the
+      feature existed — asserted on the GPU
+- [x] Exactly edge-on is refused; **past** edge-on shows the card's back,
+      mirrored, because that is what the back of a card looks like
+
+**Deliberately on every object.** Animate allows 3D on movie clip instances
+only, because its 3D belongs to a display object with a cached surface. Here it
+is a plane in a projection and costs nothing extra, so a shape, a group, a
+symbol or a rigged character may all have it (§7 item 63).
+
+**A bug the tests caught, and the shape of it.** The object's plane coordinates
+are measured from its **pivot**, and `to_origin` already says where that pivot
+is relative to the lens. The first version subtracted the pivot's offset *to
+the camera* as well, so the artwork ended up measured from the stage's origin
+and was drawn distorted and about a twentieth of its size. It looked plausible
+in a still — a smaller card is a card — and it was the GPU test that pushes an
+object towards the camera and expects it to **grow** that failed.
+
+**Verified by pixels**, in `buzz-export`'s `headless_object_3d` tests: a flat
+object is byte-identical, turning a card foreshortens one side, reversing the
+rotation reverses which side, tipping it foreshortens top and bottom instead,
+pushing it back draws it smaller and pulling it forward draws it bigger — and a
+tree of three turned cards *changes shape* when the camera moves, which a flat
+drawing cannot do.
+
+**Verified on screen**: a house whose two walls are turned to make a corner,
+with the selection outline sitting on the turned wall rather than round it.
+
+---
+
 ### ✅ A spatial camera — pitch, yaw, and a real projection
 
 The camera can now **tilt**. Not pan, zoom and roll over a flat picture — tilt,
@@ -1553,11 +1605,11 @@ test could see:
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 070 passing, clippy clean |
+| Tests | 1 084 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
-| Format version | 10 — adds camera pitch and yaw |
+| Format version | 11 — adds 3D rotation on objects |
 | Formats heard | `.wav`, `.mp3`, `.ogg`, `.flac`, `.m4a`, `.aac` |
 | IK budget | 50 six-bone rigs solved in parallel, well inside one frame |
 | Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |
@@ -1715,7 +1767,10 @@ test could see:
 | 21 | **No importer has been checked against a real file from Adobe.** Every fixture is one we wrote, so the importers are verified against the *specifications* and against files whose content we chose — not against what Animate, Illustrator and the Flash compilers actually emit, which is where the awkward cases live. This is the largest single risk in Phase 5. | Needs a licensed Animate/Illustrator and real-world files |
 | 22 | **Bitmaps are not imported** by any of the three readers — reported, never read. Needs a media pipeline: decode, store in the `.buzz` container's `media/` directory (reserved since Phase 1), and a bitmap object kind. | Phase 6 |
 | 23 | **SWF morph shapes, buttons, filters, blend modes and colour transforms on placements** are reported but not applied. Colour transforms are the cheapest of these to fix — the model already has `ColorTransform` — and would noticeably improve fidelity. | Phase 5 follow-up |
-| 28 | **No 3D object rotation.** Animate's 3D Rotation and 3D Translation tools give a *movie clip* rotationX/Y/Z and a translationZ. The **projection this needed now exists** — `buzz_geom::Projection`, built for the spatial camera — so what is left is per-object rather than per-layer planes, and a gimbal widget to turn them with. | Unblocked; needs the tool |
+| 28 | ~~**No 3D object rotation.**~~ | ✅ **Resolved** — `Spatial` on every object, rendered through its own plane, format version 11 |
+| 63 | **3D rotation is allowed on every object.** Animate restricts it to movie clip instances, because there it is a property of a display object with a cached surface. Here it is a plane in a projection and costs nothing extra, so a shape, a group or a rigged character may have it too. | By design |
+| 64 | **A turned object is set by numbers, not by a gimbal.** Animate drags coloured rings on the stage; here the angles are sliders in the Properties panel. The model is the same; what is missing is the on-stage widget and its drag. | Follow-up |
+| 65 | **Turned objects do not sort by depth against each other.** Paint order is still the timeline's, so two cards that cross in space draw one wholly in front of the other. Correct sorting needs a depth buffer or a per-frame sort, and the timeline being the authority on what is in front is the rule everywhere else here. | By design |
 | 60 | **A tilted camera does not sort layers by depth.** Paint order is the timeline's, exactly as it is without tilt, so two layers that would cross in space still draw one wholly in front of the other. Animate has the same rule and for the same reason: the timeline is the authority on what is in front. | By design |
 | 61 | **Free Transform handles on a tilted camera hang off the quad's extent**, not off the quad. The selection outline is drawn as the true quadrilateral, but the eight handles sit on its bounding box — a transform gizmo that lives in perspective is a piece of work in its own right. | Follow-up |
 | 62 | **A soft-edged filter under a tilted camera uses a flat pen.** The bands of a shadow or glow are strokes, and Vello strokes under an affine only, so their width does not widen towards the viewer. Visible only on a steeply tilted layer with a large blur. Fixing it means outlining every band into a fill and paying a boolean for each. | Follow-up |
@@ -1838,7 +1893,7 @@ cargo run --release -p buzz-app -- art.fla   # run, importing a foreign file
 # Run a script over the document at startup, as Animate's command line does.
 # The Actions panel opens with the script still in it.
 cargo run --release -p buzz-app -- file.buzz --script grid.js
-cargo test --workspace                       # 1 070 tests
+cargo test --workspace                       # 1 084 tests
 cargo clippy --workspace --all-targets       # lint
 cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 
@@ -1863,6 +1918,9 @@ cargo test -p buzz-export --test headless_filters -- --nocapture
 
 # Prove the spatial camera on the GPU: tilt turns a rectangle into a trapezoid.
 cargo test -p buzz-export --test headless_camera_3d -- --nocapture
+
+# Prove 3D rotation: a tree of turned cards changes shape as the camera moves.
+cargo test -p buzz-export --test headless_object_3d -- --nocapture
 
 # Phase 7's exit test: rig an arm, key two poses, tween, save, reopen, export.
 cargo test -p buzz-app --test rig_exit_test -- --nocapture

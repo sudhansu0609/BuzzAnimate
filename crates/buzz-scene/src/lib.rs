@@ -42,7 +42,7 @@ use buzz_geom::{Affine, Point, Rect, Size};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
-pub use camera_track::{CameraKey, CameraTrack};
+pub use camera_track::{CameraKey, CameraTrack, MAX_TILT};
 pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
 pub use merge::{ImportTarget, MergeReport};
@@ -731,6 +731,31 @@ impl Scene {
             .transform_at_depth(frame, self.stage().size, depth)
     }
 
+    /// How a layer at `depth` is projected onto the frame.
+    ///
+    /// A homography rather than an affine, because a tilted camera turns a
+    /// layer's rectangle into a trapezoid. With no tilt it *is* an affine —
+    /// exactly [`Self::camera_transform_at_depth`] — so the render path takes
+    /// the same route it always did for the documents that do not use this.
+    ///
+    /// `None` when the layer is at or behind the camera.
+    pub fn camera_projection_at_depth(
+        &self,
+        frame: u32,
+        depth: f64,
+    ) -> Option<buzz_geom::Projection> {
+        self.camera()
+            .projection_at_depth(frame, self.stage().size, depth)
+    }
+
+    /// Does the shot tilt at all?
+    ///
+    /// Lets the renderer and the editor take the flat path when nothing in the
+    /// document has ever asked for perspective.
+    pub fn camera_has_tilt(&self) -> bool {
+        self.camera().has_tilt()
+    }
+
     /// Move a point from where the user sees it into a layer's own
     /// coordinates.
     ///
@@ -743,15 +768,20 @@ impl Scene {
     /// Returns the point unchanged for a layer on the focal plane, which is
     /// every layer in a document that does not use depth.
     pub fn view_to_layer(&self, frame: u32, depth: f64, point: Point) -> Option<Point> {
-        if depth == 0.0 {
+        if depth == 0.0 && !self.camera_has_tilt() {
             return Some(point);
         }
-        let with_depth = self.camera_transform_at_depth(frame, depth)?;
+
+        // Through the projection, not the affine: with the camera tilted, the
+        // artwork is not merely scaled but foreshortened, and a click has to be
+        // carried back through the same perspective it was drawn with — or
+        // tilted artwork is visible and unclickable.
+        let with_depth = self.camera_projection_at_depth(frame, depth)?;
         // Relative to the depth-zero transform, because that is the space the
         // rest of the editor already works in.
-        let base = self.camera_transform(frame);
-        let combined = base * with_depth.inverse();
-        Some(combined * point)
+        let base = buzz_geom::Projection::from_affine(self.camera_transform(frame));
+        let combined = with_depth.inverse()?.then(&base);
+        combined.map_point(point)
     }
 
     /// Allocate an id without attaching anything to the document yet.

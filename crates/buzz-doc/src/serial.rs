@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 /// keyframe at frame 0, which is exactly what it meant; version 2 simply has
 /// no library and no tweens, and both default to empty. Keeping those paths is
 /// cheap and it exercises the version check for real rather than in theory.
-pub const FORMAT_VERSION: u32 = 9;
+pub const FORMAT_VERSION: u32 = 10;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -626,6 +626,13 @@ pub struct CameraKeyDto {
     pub y: f64,
     pub zoom: f64,
     pub rotation: f64,
+    /// Tilt up and down, in radians. Version 10; absent means looking straight
+    /// at the stage, which is every camera written before this.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pitch: f64,
+    /// Turn left and right, in radians. Version 10.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub yaw: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -959,6 +966,8 @@ impl DocumentDto {
                         y: k.center.y,
                         zoom: k.zoom,
                         rotation: k.rotation,
+                        pitch: k.pitch,
+                        yaw: k.yaw,
                     })
                     .collect(),
             }),
@@ -1066,11 +1075,19 @@ impl DocumentDto {
                 camera
                     .keys
                     .iter()
-                    .map(|k| buzz_scene::CameraKey {
-                        frame: k.frame,
-                        center: buzz_geom::Point::new(k.x, k.y),
-                        zoom: k.zoom,
-                        rotation: k.rotation,
+                    .map(|k| {
+                        // Clamped on the way in: a corrupt or hand-edited tilt
+                        // must not produce a camera looking through the back of
+                        // the scene.
+                        buzz_scene::CameraKey {
+                            frame: k.frame,
+                            center: buzz_geom::Point::new(k.x, k.y),
+                            zoom: k.zoom,
+                            rotation: k.rotation,
+                            pitch: k.pitch,
+                            yaw: k.yaw,
+                        }
+                        .clamped()
                     })
                     .collect(),
                 camera.enabled,

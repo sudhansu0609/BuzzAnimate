@@ -13,7 +13,7 @@
 //! arrives in Phase 4. Rotation interpolates by shortest angular path, so a
 //! camera turning from 350° to 10° goes forward 20° rather than backwards 340°.
 
-use buzz_geom::{Affine, Point, Size};
+use buzz_geom::{Affine, Point, Projection, Size};
 use serde::{Deserialize, Serialize};
 
 /// The camera's state at one keyframe.
@@ -24,9 +24,28 @@ pub struct CameraKey {
     pub center: Point,
     /// Magnification. 1.0 shows the stage at its natural size.
     pub zoom: f64,
-    /// Rotation in radians.
+    /// Rotation in radians. Roll, in camera terms: the horizon tipping.
     pub rotation: f64,
+
+    /// Tilt up and down, in radians — the camera nodding.
+    ///
+    /// This is what makes the camera **spatial** rather than a pan-and-zoom
+    /// over a flat picture: with pitch, a layer's far edge really is further
+    /// away than its near edge, so a rectangle is drawn as a trapezoid. Zero
+    /// is looking straight at the stage, which is where every document that
+    /// does not use this stays.
+    pub pitch: f64,
+    /// Turn left and right, in radians.
+    pub yaw: f64,
 }
+
+/// How far the camera may tilt.
+///
+/// Past this a layer plane is nearly edge-on: it occupies a sliver of the
+/// frame, the flattening tolerance collapses, and the picture is no longer
+/// something anybody meant. Animate has no equivalent because Animate has no
+/// tilt; the bound is here because the arithmetic needs one.
+pub const MAX_TILT: f64 = 1.3;
 
 impl CameraKey {
     pub fn new(frame: u32, center: Point) -> Self {
@@ -35,7 +54,24 @@ impl CameraKey {
             center,
             zoom: 1.0,
             rotation: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
         }
+    }
+
+    /// Is the camera looking straight at the stage?
+    ///
+    /// The render path leans on this: an untilted camera is an affine, and
+    /// takes exactly the route it always did.
+    pub fn is_flat(&self) -> bool {
+        self.pitch == 0.0 && self.yaw == 0.0
+    }
+
+    /// The same key with its tilt brought into range.
+    pub fn clamped(mut self) -> Self {
+        self.pitch = self.pitch.clamp(-MAX_TILT, MAX_TILT);
+        self.yaw = self.yaw.clamp(-MAX_TILT, MAX_TILT);
+        self
     }
 }
 
@@ -218,6 +254,11 @@ impl CameraTrack {
             // accelerates.
             zoom: lerp_zoom(a.zoom, b.zoom, t),
             rotation: lerp_angle(a.rotation, b.rotation, t),
+            // Tilt interpolates like rotation — the short way round — so a
+            // camera swinging from one side of straight-ahead to the other
+            // does not take the long route through the back of the scene.
+            pitch: lerp_angle(a.pitch, b.pitch, t),
+            yaw: lerp_angle(a.yaw, b.yaw, t),
         })
     }
 
@@ -237,6 +278,59 @@ impl CameraTrack {
             * Affine::rotate(-state.rotation)
             * Affine::scale(state.zoom.max(f64::MIN_POSITIVE))
             * Affine::translate(-state.center.to_vec2())
+    }
+
+    /// How a layer at `depth` is projected onto the frame.
+    ///
+    /// This is [`Self::transform_at_depth`] generalised: with no tilt it is
+    /// exactly that affine, and the render path takes the same route it always
+    /// did. With pitch or yaw it is a homography, and the layer's plane is
+    /// drawn in perspective — a rectangle becomes a trapezoid.
+    ///
+    /// `None` when the layer is at or behind the camera, or turned so far past
+    /// edge-on that it would be drawn inside out.
+    pub fn projection_at_depth(&self, frame: u32, stage: Size, depth: f64) -> Option<Projection> {
+        let state = self.state_at(frame).map(CameraKey::clamped);
+
+        // Flat is the common case and must stay bit-exact, so it does not go
+        // near the homography at all.
+        if state.is_none_or(|s| s.is_flat()) {
+            return self
+                .transform_at_depth(frame, stage, depth)
+                .map(Projection::from_affine);
+        }
+        let state = state?;
+
+        let focal = self.focal_distance.max(NEAR_PLANE);
+        let distance = focal + depth;
+        if distance < NEAR_PLANE {
+            return None;
+        }
+
+        // The lens looks at the layer's plane...
+        let lens = Projection::look_at_plane(distance, focal, state.pitch, state.yaw)?;
+
+        // ...about the point the camera is centred on, and the result is
+        // placed on the stage with the zoom and roll the shot asks for. The
+        // order matters: the camera's centre has to be subtracted *before* the
+        // projection, because that is the point the lens is pointed at.
+        let centre = buzz_geom::Vec2::new(stage.width / 2.0, stage.height / 2.0);
+        Some(
+            lens.pre_affine(Affine::translate(-state.center.to_vec2()))
+                .then_affine(
+                    Affine::translate(centre)
+                        * Affine::rotate(-state.rotation)
+                        * Affine::scale(state.zoom.max(f64::MIN_POSITIVE)),
+                ),
+        )
+    }
+
+    /// Is any part of the shot tilted, at any frame?
+    ///
+    /// Lets the renderer and the editor skip the whole perspective path for
+    /// the documents — nearly all of them — that never tilt.
+    pub fn has_tilt(&self) -> bool {
+        self.enabled && self.keys.iter().any(|k| !k.is_flat())
     }
 
     /// Rebuild from parts, for loading and importing.
@@ -331,12 +425,16 @@ mod tests {
             center: Point::ORIGIN,
             zoom: 1.0,
             rotation: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
         });
         t.set_key(CameraKey {
             frame: 10,
             center: Point::ORIGIN,
             zoom: 4.0,
             rotation: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
         });
 
         let mid = t.state_at(5).unwrap();
@@ -357,12 +455,16 @@ mod tests {
             center: Point::ORIGIN,
             zoom: 1.0,
             rotation: deg(350.0),
+            pitch: 0.0,
+            yaw: 0.0,
         });
         t.set_key(CameraKey {
             frame: 10,
             center: Point::ORIGIN,
             zoom: 1.0,
             rotation: deg(10.0),
+            pitch: 0.0,
+            yaw: 0.0,
         });
 
         let mid = t.state_at(5).unwrap().rotation.to_degrees();
@@ -435,6 +537,8 @@ mod tests {
             center: Point::new(275.0, 200.0),
             zoom: 2.0,
             rotation: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
         });
 
         let transform = t.transform_at(0, stage);
@@ -456,6 +560,8 @@ mod tests {
                 center: Point::ORIGIN,
                 zoom,
                 rotation: 0.0,
+                pitch: 0.0,
+                yaw: 0.0,
             });
             let coeffs = t.transform_at(0, Size::new(550.0, 400.0)).as_coeffs();
             // NaN in, NaN out is acceptable for the value itself, but the
@@ -625,5 +731,175 @@ mod tests {
         }
         let good = CameraTrack::from_parts(Vec::new(), false, 750.0);
         assert_eq!(good.focal_distance, 750.0);
+    }
+
+    // -- a spatial camera ----------------------------------------------------
+
+    fn stage() -> Size {
+        Size::new(550.0, 400.0)
+    }
+
+    fn tilted(pitch: f64, yaw: f64) -> CameraTrack {
+        let mut track = CameraTrack::new();
+        track.enabled = true;
+        track.set_key(CameraKey {
+            frame: 0,
+            center: Point::new(275.0, 200.0),
+            zoom: 1.0,
+            rotation: 0.0,
+            pitch,
+            yaw,
+        });
+        track
+    }
+
+    /// The promise every document depends on: a camera that does not tilt
+    /// produces exactly the affine it always did.
+    #[test]
+    fn an_untilted_camera_gives_exactly_the_old_transform() {
+        let track = tilted(0.0, 0.0);
+        for depth in [0.0, 500.0, -300.0, 2000.0] {
+            let affine = track.transform_at_depth(0, stage(), depth);
+            let projection = track.projection_at_depth(0, stage(), depth);
+
+            match (affine, projection) {
+                (Some(a), Some(p)) => {
+                    assert!(p.is_affine(), "depth {depth} stopped being affine");
+                    assert_eq!(
+                        p.as_affine().unwrap().as_coeffs(),
+                        a.as_coeffs(),
+                        "depth {depth} changed"
+                    );
+                }
+                (None, None) => {}
+                other => panic!("depth {depth} disagreed: {other:?}"),
+            }
+        }
+    }
+
+    /// And so does a camera that is switched off, or has no keys at all.
+    #[test]
+    fn a_camera_with_no_keys_still_projects() {
+        let track = CameraTrack::new();
+        let projection = track.projection_at_depth(0, stage(), 0.0).expect("in front");
+        assert!(projection.is_affine());
+    }
+
+    /// The point of the whole exercise: pitch turns the stage into a trapezoid.
+    #[test]
+    fn pitch_makes_the_stage_a_trapezoid() {
+        let track = tilted(0.4, 0.0);
+        let projection = track
+            .projection_at_depth(0, stage(), 0.0)
+            .expect("in front");
+        assert!(!projection.is_affine());
+
+        let corners = projection
+            .map_rect(buzz_geom::Rect::new(0.0, 0.0, 550.0, 400.0))
+            .expect("all four corners in front");
+        let top = (corners[1] - corners[0]).hypot();
+        let bottom = (corners[2] - corners[3]).hypot();
+        assert!(
+            (top - bottom).abs() > 5.0,
+            "the stage should be a trapezoid: {top} vs {bottom}"
+        );
+    }
+
+    /// Yaw does the same thing about the other axis — the left and right edges
+    /// differ instead of the top and bottom.
+    #[test]
+    fn yaw_makes_the_stage_a_trapezoid_the_other_way() {
+        let projection = tilted(0.0, 0.4)
+            .projection_at_depth(0, stage(), 0.0)
+            .expect("in front");
+
+        let corners = projection
+            .map_rect(buzz_geom::Rect::new(0.0, 0.0, 550.0, 400.0))
+            .expect("in front");
+        let left = (corners[3] - corners[0]).hypot();
+        let right = (corners[2] - corners[1]).hypot();
+        assert!(
+            (left - right).abs() > 5.0,
+            "the sides should differ: {left} vs {right}"
+        );
+    }
+
+    /// A tilted camera still respects depth: a layer further away is still
+    /// drawn smaller, so tilt and parallax compose rather than replacing each
+    /// other.
+    #[test]
+    fn tilt_and_depth_work_together() {
+        let track = tilted(0.35, 0.0);
+        let area = |depth: f64| {
+            let projection = track.projection_at_depth(0, stage(), depth).expect("in front");
+            let bounds = projection
+                .map_rect_bounds(buzz_geom::Rect::new(0.0, 0.0, 550.0, 400.0))
+                .expect("in front");
+            bounds.width() * bounds.height()
+        };
+        assert!(
+            area(1000.0) < area(0.0),
+            "a further layer should still be smaller"
+        );
+    }
+
+    /// Tilt is bounded. A camera turned past edge-on has nothing sensible to
+    /// draw, and a corrupt file must not produce one.
+    #[test]
+    fn tilt_is_clamped_into_range() {
+        let key = CameraKey {
+            frame: 0,
+            center: Point::ZERO,
+            zoom: 1.0,
+            rotation: 0.0,
+            pitch: 99.0,
+            yaw: -99.0,
+        }
+        .clamped();
+        assert!(key.pitch <= MAX_TILT && key.yaw >= -MAX_TILT);
+
+        // And the projection is built from the clamped value, so it exists.
+        let mut track = CameraTrack::new();
+        track.enabled = true;
+        track.set_key(CameraKey {
+            pitch: 99.0,
+            ..CameraKey::new(0, Point::new(275.0, 200.0))
+        });
+        assert!(track.projection_at_depth(0, stage(), 0.0).is_some());
+    }
+
+    /// Tilt interpolates between keys, the short way round.
+    #[test]
+    fn tilt_interpolates_between_keys() {
+        let mut track = CameraTrack::new();
+        track.enabled = true;
+        track.set_key(CameraKey {
+            pitch: 0.0,
+            ..CameraKey::new(0, Point::new(275.0, 200.0))
+        });
+        track.set_key(CameraKey {
+            pitch: 0.8,
+            ..CameraKey::new(10, Point::new(275.0, 200.0))
+        });
+
+        let middle = track.state_at(5).expect("keyed");
+        assert!(
+            (middle.pitch - 0.4).abs() < 1e-9,
+            "half way should be half the tilt: {}",
+            middle.pitch
+        );
+    }
+
+    /// `has_tilt` is what lets the renderer skip the perspective path for the
+    /// documents that never use it.
+    #[test]
+    fn a_flat_shot_reports_no_tilt() {
+        assert!(!tilted(0.0, 0.0).has_tilt());
+        assert!(tilted(0.3, 0.0).has_tilt());
+        assert!(tilted(0.0, -0.3).has_tilt());
+
+        let mut off = tilted(0.5, 0.5);
+        off.enabled = false;
+        assert!(!off.has_tilt(), "a camera switched off tilts nothing");
     }
 }

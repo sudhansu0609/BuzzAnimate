@@ -90,10 +90,32 @@ pub fn draw_chrome(ui: &mut Ui, editor: &Editor, area: egui::Rect) -> ChromeResp
     let view = &editor.view;
 
     // Document point to screen position within `area`.
+    //
+    // This is the *view* — where the user has scrolled and zoomed — and nothing
+    // to do with the document's camera. The stage rectangle, the rulers, the
+    // grid and the guides are drawn through it, because none of them move when
+    // the shot does.
     let to_screen = |p: Point| {
         let s = camera.doc_to_screen(p);
         egui::pos2(area.min.x + s.x as f32, area.min.y + s.y as f32)
     };
+
+    // Where the *artwork* lands: the document camera, then the view.
+    //
+    // Selection handles, bones, warp handles and light gizmos all mark where
+    // something is, so they have to travel with it. Before this they were drawn
+    // straight through the view, which was already subtly wrong whenever the
+    // camera panned — and glaring the moment it could tilt, because the
+    // selection box sat squarely where the artwork used to be.
+    //
+    // A point the lens cannot see falls back to its unprojected place rather
+    // than vanishing: a handle in the wrong spot is recoverable, a handle that
+    // is not there at all is not.
+    let shot = editor
+        .scene()
+        .camera_projection_at_depth(editor.current_frame, 0.0)
+        .unwrap_or(buzz_geom::Projection::IDENTITY);
+    let to_screen_art = |p: Point| to_screen(shot.map_point(p).unwrap_or(p));
 
     let visible = camera.visible_doc_rect();
 
@@ -118,10 +140,10 @@ pub fn draw_chrome(ui: &mut Ui, editor: &Editor, area: egui::Rect) -> ChromeResp
         draw_guides(&painter, area, view, to_screen);
     }
 
-    draw_selection(&painter, editor, to_screen);
-    draw_rigs(&painter, editor, to_screen);
-    draw_lights(&painter, editor, to_screen);
-    draw_preview(&painter, editor, to_screen);
+    draw_selection(&painter, editor, to_screen_art);
+    draw_rigs(&painter, editor, to_screen_art);
+    draw_lights(&painter, editor, to_screen_art);
+    draw_preview(&painter, editor, to_screen_art);
 
     if view.show_rulers {
         response.new_guide = draw_rulers(ui, area, editor);
@@ -227,17 +249,33 @@ fn draw_selection(
     let Some(bounds) = editor.selection.bounds(editor.scene()) else {
         return;
     };
-    let rect = egui::Rect::from_two_pos(
-        to_screen(Point::new(bounds.x0, bounds.y0)),
-        to_screen(Point::new(bounds.x1, bounds.y1)),
-    );
 
-    painter.rect_stroke(
-        rect,
-        0.0,
+    // The four corners where the lens puts them. Under a tilted camera the
+    // selection is a **quadrilateral**, not a rectangle, and drawing a box
+    // round it would be a box round something that is not there.
+    let corners = [
+        Point::new(bounds.x0, bounds.y0),
+        Point::new(bounds.x1, bounds.y0),
+        Point::new(bounds.x1, bounds.y1),
+        Point::new(bounds.x0, bounds.y1),
+    ]
+    .map(&to_screen);
+
+    let mut outline: Vec<egui::Pos2> = corners.to_vec();
+    outline.push(corners[0]);
+    painter.add(egui::Shape::line(
+        outline,
         Stroke::new(1.0, Palette::SELECTION),
-        StrokeKind::Outside,
-    );
+    ));
+
+    // The box the handles hang off. With no tilt it is exactly the old
+    // rectangle; with tilt it is the quad's extent, which is the honest
+    // approximation — a transform handle on a perspective quad wants a gizmo
+    // of its own, and that is recorded in §7 rather than faked here.
+    let mut rect = egui::Rect::from_two_pos(corners[0], corners[2]);
+    for corner in corners {
+        rect = rect.union(egui::Rect::from_two_pos(corner, corner));
+    }
 
     // Subselection shows the path's anchors instead of a transform box, which
     // is what makes individual points grabbable.

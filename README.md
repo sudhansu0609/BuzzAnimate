@@ -41,7 +41,9 @@ dragging it, with the artwork's colours, highlights and shadow direction all
 following where it is put — **filters** (blur, drop shadow, glow, bevel, adjust
 colour) and blend modes, and **layer parenting**, so a head layer follows a
 body layer without a bone in sight. Every panel docks, floats, closes and
-locks, and the arrangement is still there next time.
+locks, and the arrangement is still there next time. The camera is **spatial**:
+pitch and yaw it and the stage tips away in real perspective, a rectangle drawn
+as a trapezoid.
 
 Not yet implemented, and honestly marked as such in the toolbar: gradients,
 Text, Lasso, Bézier pen authoring, multiple Scenes, clipboard. Video export
@@ -147,7 +149,7 @@ silently. Every adapter is scored and the table is logged:
 
 | Crate | Role |
 |---|---|
-| `buzz-geom` | `f64` geometry: rebasing camera, clipping, booleans, hit-testing, path editing |
+| `buzz-geom` | `f64` geometry: rebasing camera, perspective projection, clipping, booleans, hit-testing, path editing |
 | `buzz-jobs` | Two-pool work-stealing job system; per-worker CPU metrics |
 | `buzz-render` | GPU adapter selection; Vello scene building |
 | `buzz-scene` | Copy-on-write document model; Animate's six layer types; R-tree index |
@@ -183,7 +185,7 @@ grep -A1 '^name = "wgpu"' Cargo.lock   # must list exactly one version
 ## Testing
 
 ```sh
-cargo test --workspace            # 1 037 tests
+cargo test --workspace            # 1 070 tests
 cargo clippy --workspace --all-targets
 cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 ```
@@ -199,7 +201,8 @@ GPU is present.
 Done: engine foundation · geometry and document core · drawing tools and the
 application shell · timeline · symbols, library and tweens · importers ·
 rigging and IK · PNG export · the scripting API · lighting · filters and
-blend modes · layer parenting · a workspace you arrange.
+blend modes · layer parenting · a workspace you arrange · a camera that
+tilts.
 
 Next: **the rest of Phase 6 — video export** (MP4/MOV via NVENC, GIF/WebP,
 HTML5 Canvas/SVG), then Phase 8's ActionScript runtime and compiler.

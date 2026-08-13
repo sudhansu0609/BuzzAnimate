@@ -13,7 +13,7 @@
 //! the brush preview are authoring aids drawn in screen space by the
 //! application, and they must never reach an exported frame.
 
-use buzz_geom::{Affine, Shape as _};
+use buzz_geom::{Affine, Projection, Shape as _};
 use buzz_scene::{ColorTransform, LayerKind, Object, ObjectKind, Scene};
 use peniko::Color;
 
@@ -183,7 +183,16 @@ fn draw_layers(
                 open_mask = None;
             }
             if let Some(mask_id) = wanted
-                && let Some(path) = mask_geometry(layers, mask_id, frame, camera)
+                && let Some(path) = mask_geometry(
+                    layers,
+                    mask_id,
+                    frame,
+                    Affine::IDENTITY,
+                    &scene
+                        .camera_projection_at_depth(frame, 0.0)
+                        .unwrap_or_else(|| Projection::from_affine(camera)),
+                    builder.tolerance(),
+                )
             {
                 builder.push_clip(&path);
                 open_mask = Some(mask_id);
@@ -232,15 +241,20 @@ fn mask_geometry(
     layers: &buzz_scene::LayerStack,
     mask: buzz_scene::LayerId,
     frame: u32,
-    camera: Affine,
+    place: Affine,
+    projection: &Projection,
+    tolerance: f64,
 ) -> Option<buzz_geom::BezPath> {
     let layer = layers.get(mask)?;
     let mut combined = buzz_geom::BezPath::new();
-    let camera = camera * layers.inherited_transform(mask, frame);
+    // Built in document space and projected once, like everything else: a mask
+    // on a tilted layer has to be foreshortened by exactly the same lens as the
+    // artwork it clips, or it would clip the wrong region.
+    let place = place * layers.inherited_transform(mask, frame);
 
     for object in layer.frames.resolved_at(frame).iter() {
         let mut flat = Vec::new();
-        object.flatten(camera, &mut flat);
+        object.flatten(place, &mut flat);
         for (transform, shape) in flat {
             if shape.fill.is_none() {
                 continue;
@@ -251,7 +265,11 @@ fn mask_geometry(
         }
     }
 
-    (!combined.elements().is_empty()).then_some(combined)
+    if combined.elements().is_empty() {
+        return None;
+    }
+    let mapped = projection.map_path(&combined, tolerance);
+    (!mapped.elements().is_empty()).then_some(mapped)
 }
 
 /// Draw one layer's artwork.
@@ -270,17 +288,22 @@ fn draw_layer(
     cache: &mut DrawCache,
 ) {
     {
-        // Layer depth: artwork further from the camera is drawn smaller and
-        // slides less as the camera pans. A layer at or behind the camera is
-        // skipped entirely rather than magnified into a wall of colour.
+        // How this layer is projected onto the frame.
         //
-        // `camera` arrives already resolved for depth zero; a layer off the
-        // focal plane needs its own, so this replaces it.
-        let camera = if layer.depth == 0.0 {
-            camera
+        // Layer depth draws artwork further from the camera smaller, and slides
+        // it less as the camera pans; a **tilted** camera also foreshortens it,
+        // turning the layer's rectangle into a trapezoid. Both fall out of the
+        // same projection. A layer at or behind the camera, or turned past
+        // edge-on, is skipped rather than drawn inside out.
+        //
+        // `camera` arrives already resolved for depth zero and is used as-is
+        // when the shot is flat — which keeps every untilted document rendering
+        // through exactly the affine it always did, down to the bit.
+        let projection = if layer.depth == 0.0 && !scene.camera_has_tilt() {
+            Projection::from_affine(camera)
         } else {
-            match scene.camera_transform_at_depth(frame, layer.depth) {
-                Some(transform) => transform,
+            match scene.camera_projection_at_depth(frame, layer.depth) {
+                Some(projection) => projection,
                 None => return,
             }
         };
@@ -305,6 +328,9 @@ fn draw_layer(
         // each other, which is a sun pretending to be a lamp.
         let lighting = lit.then_some((stage_height, layer.depth));
 
+        // Layer parenting happens in the plane, before the lens.
+        let projection = projection.pre_affine(follows);
+
         let ctx = DrawCtx {
             scene,
             frame,
@@ -317,7 +343,7 @@ fn draw_layer(
             depth: 0,
             lighting,
             layer_depth: layer.depth,
-            camera,
+            projection,
         };
         let resolved = layer.frames.resolved_at(frame);
 
@@ -335,8 +361,7 @@ fn draw_layer(
                     builder,
                     object,
                     owner,
-                    camera * follows,
-                    follows,
+                    Affine::IDENTITY,
                     key,
                     height,
                     layer.depth,
@@ -367,7 +392,8 @@ fn draw_layer(
             // otherwise be clipped against where its geometry used to be.
             let bounds = layer
                 .bounds_at(frame)
-                .map(|b| buzz_scene::object::transform_rect(camera * follows, b).inflate(2.0, 2.0))
+                .and_then(|b| ctx.projection.map_rect_bounds(b))
+                .map(|b| b.inflate(2.0, 2.0))
                 .unwrap_or_else(|| builder.clip_bounds());
             builder.push_isolation(bounds.intersect(builder.clip_bounds()));
         }
@@ -378,13 +404,13 @@ fn draw_layer(
         let layer_fx = (!layer.filters.is_empty()).then(|| {
             let mut silhouette = buzz_geom::BezPath::new();
             for object in resolved.iter() {
-                append_silhouette(object, follows, &mut silhouette);
+                append_silhouette(object, Affine::IDENTITY, &mut silhouette);
             }
             buzz_fx::build(&layer.filters, &silhouette)
         });
 
         if let Some(fx) = &layer_fx {
-            crate::filters::draw_ops(builder, &fx.behind, camera, ctx.ghost.unwrap_or(1.0));
+            crate::filters::draw_ops(builder, &fx.behind, &ctx.projection, ctx.ghost.unwrap_or(1.0));
         }
 
         let layer_ctx = match layer_fx.as_ref().and_then(|fx| fx.adjust) {
@@ -404,8 +430,7 @@ fn draw_layer(
                     builder,
                     object,
                     owner,
-                    camera * follows,
-                    follows,
+                    Affine::IDENTITY,
                     &object_ctx,
                     cache,
                 );
@@ -413,7 +438,7 @@ fn draw_layer(
         }
 
         if let Some(fx) = &layer_fx {
-            crate::filters::draw_ops(builder, &fx.over, camera, ctx.ghost.unwrap_or(1.0));
+            crate::filters::draw_ops(builder, &fx.over, &ctx.projection, ctx.ghost.unwrap_or(1.0));
         }
 
         if accumulates {
@@ -488,14 +513,17 @@ struct DrawCtx<'a> {
     /// The depth of the layer being drawn, which sets how far a lamp is from
     /// it and how long its shadow runs.
     layer_depth: f64,
-    /// The camera alone, without any object's placement.
+    /// How this layer's plane lands on the frame: depth, tilt, the camera's
+    /// pan and zoom, and layer parenting, all in one.
     ///
-    /// Lighting geometry is generated in **document** space — that is where
-    /// the lights are — so it is drawn through this and not through `world`.
-    /// Drawing it through `world` applies the object's own transform twice,
-    /// which puts a shape's shading somewhere else entirely; the crescents
-    /// simply vanished off-stage, which is how this was found.
-    camera: Affine,
+    /// **Everything is drawn through this and nothing else.** Geometry is
+    /// accumulated in *document* space on the way down — an object's placement,
+    /// a group's, a symbol's — and projected once at the leaf. Carrying a
+    /// pre-multiplied "world" transform alongside was what let lighting
+    /// geometry be drawn through the object's own placement twice, and it
+    /// cannot happen now: there is one transform, and it is applied in one
+    /// place.
+    projection: Projection,
 }
 
 impl DrawCtx<'_> {
@@ -509,6 +537,15 @@ impl DrawCtx<'_> {
             None => c,
         };
         self.overlay(self.effect.apply(adjusted))
+    }
+
+    /// Put document-space geometry where the lens says it goes.
+    ///
+    /// The single place a projection is applied. With no tilt it is an affine
+    /// and the path keeps its curves; with tilt the path is flattened and
+    /// mapped, and anything behind the camera is clipped away.
+    fn project(&self, path: &buzz_geom::BezPath, tolerance: f64) -> buzz_geom::BezPath {
+        self.projection.map_path(path, tolerance)
     }
 
     /// Apply only the authoring overlays.
@@ -536,7 +573,6 @@ fn draw_object(
     builder: &mut SceneBuilder<'_>,
     object: &Object,
     owner: Option<&Arc<Object>>,
-    parent: Affine,
     doc: Affine,
     ctx: &DrawCtx<'_>,
     cache: &mut DrawCache,
@@ -550,11 +586,11 @@ fn draw_object(
     // symbol, which is what makes "blur this character" mean the character
     // rather than each of its pieces.
     if !object.filters.is_empty() || object.blend.needs_group() {
-        draw_filtered(builder, object, owner, parent, doc, ctx, cache);
+        draw_filtered(builder, object, owner, doc, ctx, cache);
         return;
     }
 
-    draw_object_inner(builder, object, owner, parent, doc, ctx, cache);
+    draw_object_inner(builder, object, owner, doc, ctx, cache);
 }
 
 /// Draw an object that carries filters, a blend mode, or both.
@@ -565,14 +601,14 @@ fn draw_filtered(
     builder: &mut SceneBuilder<'_>,
     object: &Object,
     owner: Option<&Arc<Object>>,
-    parent: Affine,
     doc: Affine,
     ctx: &DrawCtx<'_>,
     cache: &mut DrawCache,
 ) {
-    // The subject's outline, in the space the filter ops will be drawn in.
+    // The subject's outline, in document space — the space the filter ops are
+    // built in and projected from.
     let mut silhouette = buzz_geom::BezPath::new();
-    append_silhouette(object, object.transform, &mut silhouette);
+    append_silhouette(object, doc * object.transform, &mut silhouette);
     let painted = buzz_fx::build(&object.filters, &silhouette);
 
     // A blend mode needs a group to blend against; so does anything the filter
@@ -585,13 +621,16 @@ fn draw_filtered(
         .fold(0.0f64, f64::max);
     let grouped = object.blend.needs_group();
     if grouped {
-        let bounds = buzz_scene::object::transform_rect(parent, object.bounds())
-            .inflate(reach + 2.0, reach + 2.0);
+        let bounds = ctx
+            .projection
+            .map_rect_bounds(buzz_scene::object::transform_rect(doc, object.bounds()))
+            .map(|b| b.inflate(reach + 2.0, reach + 2.0))
+            .unwrap_or_else(|| builder.clip_bounds());
         builder.push_blend(bounds.intersect(builder.clip_bounds()), object.blend);
     }
 
     let alpha = ctx.ghost.unwrap_or(1.0);
-    crate::filters::draw_ops(builder, &painted.behind, parent, alpha);
+    crate::filters::draw_ops(builder, &painted.behind, &ctx.projection, alpha);
 
     if !painted.hide_subject {
         let inner = DrawCtx {
@@ -599,10 +638,10 @@ fn draw_filtered(
             blur: painted.blur.or(ctx.blur),
             ..ctx.clone()
         };
-        draw_object_inner(builder, object, owner, parent, doc, &inner, cache);
+        draw_object_inner(builder, object, owner, doc, &inner, cache);
     }
 
-    crate::filters::draw_ops(builder, &painted.over, parent, alpha);
+    crate::filters::draw_ops(builder, &painted.over, &ctx.projection, alpha);
 
     if grouped {
         builder.pop_isolation();
@@ -614,18 +653,16 @@ fn draw_object_inner(
     builder: &mut SceneBuilder<'_>,
     object: &Object,
     owner: Option<&Arc<Object>>,
-    parent: Affine,
     doc: Affine,
     ctx: &DrawCtx<'_>,
     cache: &mut DrawCache,
 ) {
-    let world = parent * object.transform;
     let doc = doc * object.transform;
 
     match &object.kind {
         ObjectKind::Group(children) => {
             for child in children {
-                draw_object(builder, child, Some(child), world, doc, ctx, cache);
+                draw_object(builder, child, Some(child), doc, ctx, cache);
             }
         }
 
@@ -637,12 +674,12 @@ fn draw_object_inner(
             for part in rig.posed() {
                 // Posed rig artwork is rebuilt from the bones every frame, so
                 // like a tween it has no identity worth caching against.
-                draw_object(builder, &part, None, world, doc, ctx, cache);
+                draw_object(builder, &part, None, doc, ctx, cache);
             }
         }
 
         ObjectKind::Warp(warp) => {
-            draw_shape(builder, owner, 1, &warp.warped(), world, doc, ctx, cache);
+            draw_shape(builder, owner, 1, &warp.warped(), doc, ctx, cache);
         }
 
         ObjectKind::Instance(instance) => {
@@ -685,7 +722,14 @@ fn draw_object_inner(
                         open_mask = None;
                     }
                     if let Some(mask_id) = wanted
-                        && let Some(path) = mask_geometry(&symbol.layers, mask_id, inner, world)
+                        && let Some(path) = mask_geometry(
+                            &symbol.layers,
+                            mask_id,
+                            inner,
+                            doc,
+                            &ctx.projection,
+                            builder.tolerance(),
+                        )
                     {
                         builder.push_clip(&path);
                         open_mask = Some(mask_id);
@@ -703,15 +747,7 @@ fn draw_object_inner(
                 // how a character symbol is rigged inside itself.
                 let follows = symbol.layers.inherited_transform(layer.id, inner);
                 for (child, owner) in layer.frames.resolved_at(inner).iter_owned() {
-                    draw_object(
-                        builder,
-                        child,
-                        owner,
-                        world * follows,
-                        doc * follows,
-                        &layer_ctx,
-                        cache,
-                    );
+                    draw_object(builder, child, owner, doc * follows, &layer_ctx, cache);
                 }
             }
 
@@ -720,9 +756,7 @@ fn draw_object_inner(
             }
         }
 
-        ObjectKind::Shape(shape) => {
-            draw_shape(builder, owner, 0, shape, world, doc, ctx, cache)
-        }
+        ObjectKind::Shape(shape) => draw_shape(builder, owner, 0, shape, doc, ctx, cache),
     }
 }
 
@@ -753,12 +787,16 @@ fn draw_shape(
     owner: Option<&Arc<Object>>,
     index: u16,
     shape: &buzz_scene::ShapeData,
-    world: Affine,
     doc: Affine,
     ctx: &DrawCtx<'_>,
     cache: &mut DrawCache,
 ) {
-    let path = world * shape.path.clone();
+    // The shape where it sits in the document, and where the lens puts it.
+    // Everything drawn below goes through the second; everything *measured* —
+    // lighting, which is a property of the scene rather than of the view — uses
+    // the first.
+    let placed = doc * shape.path.clone();
+    let path = ctx.project(&placed, builder.tolerance());
 
     // Outline view: draw the silhouette in the layer colour instead of the
     // artwork, which is what the timeline's outline column does.
@@ -769,7 +807,7 @@ fn draw_shape(
 
     // Where this shape sits in the document, which is what the lights are
     // measured against.
-    let here = (doc * shape.path.clone()).bounding_box().center();
+    let here = placed.bounding_box().center();
     let light = ctx
         .lighting
         .map(|(stage_height, depth)| ctx.scene.lights().illuminate(here, depth, stage_height));
@@ -797,7 +835,7 @@ fn draw_shape(
                 quality,
                 builder.tolerance(),
             );
-            crate::filters::draw_ops(builder, &ops, world, 1.0);
+            crate::filters::draw_ops(builder, &ops, &ctx.projection.pre_affine(doc), 1.0);
             if let Some(stroke) = shape.stroke {
                 // A stroke under a blur is softened as its own outline, so a
                 // blurred drawing keeps its lines instead of losing them.
@@ -817,7 +855,7 @@ fn draw_shape(
                     quality,
                     builder.tolerance(),
                 );
-                crate::filters::draw_ops(builder, &ops, world, 1.0);
+                crate::filters::draw_ops(builder, &ops, &ctx.projection.pre_affine(doc), 1.0);
             }
             return;
         }
@@ -860,11 +898,13 @@ fn draw_shape(
 
             if let Some(shade) = &geometry.shade {
                 let shaded = light.apply_shaded(fill.color);
-                builder.fill_shape(&(ctx.camera * shade.clone()), ctx.colour(shaded));
+                let drawn = ctx.project(shade, builder.tolerance());
+                builder.fill_shape(&drawn, ctx.colour(shaded));
             }
             if let Some(highlight) = &geometry.highlight {
                 let glint = light.highlight(fill.color, key.color, modelling);
-                builder.fill_shape(&(ctx.camera * highlight.clone()), ctx.colour(glint));
+                let drawn = ctx.project(highlight, builder.tolerance());
+                builder.fill_shape(&drawn, ctx.colour(glint));
             }
         }
     }
@@ -892,7 +932,6 @@ fn cast_shadows(
     builder: &mut SceneBuilder<'_>,
     object: &Object,
     owner: Option<&Arc<Object>>,
-    parent: Affine,
     doc: Affine,
     key: &buzz_light::Light,
     height: f64,
@@ -906,7 +945,6 @@ fn cast_shadows(
     if !object.visible {
         return;
     }
-    let world = parent * object.transform;
     let doc = doc * object.transform;
 
     match &object.kind {
@@ -923,17 +961,18 @@ fn cast_shadows(
                     0,
                     (key.shadow_strength.clamp(0.0, 1.0) * 255.0) as u8,
                 );
-                builder.fill_shape(&(ctx.camera * cast.clone()), ctx.overlay(shadow));
+                let drawn = ctx.project(cast, builder.tolerance());
+                builder.fill_shape(&drawn, ctx.overlay(shadow));
             }
         }
         ObjectKind::Group(children) => {
             for child in children {
-                cast_shadows(builder, child, Some(child), world, doc, key, height, depth, cache, ctx);
+                cast_shadows(builder, child, Some(child), doc, key, height, depth, cache, ctx);
             }
         }
         ObjectKind::Armature(rig) => {
             for part in rig.posed() {
-                cast_shadows(builder, &part, None, world, doc, key, height, depth, cache, ctx);
+                cast_shadows(builder, &part, None, doc, key, height, depth, cache, ctx);
             }
         }
         ObjectKind::Warp(warp) => {
@@ -949,7 +988,8 @@ fn cast_shadows(
                     0,
                     (key.shadow_strength.clamp(0.0, 1.0) * 255.0) as u8,
                 );
-                builder.fill_shape(&(ctx.camera * cast.clone()), ctx.overlay(shadow));
+                let drawn = ctx.project(cast, builder.tolerance());
+                builder.fill_shape(&drawn, ctx.overlay(shadow));
             }
         }
         // A symbol's shadow is the shadow of what it contains, which needs the

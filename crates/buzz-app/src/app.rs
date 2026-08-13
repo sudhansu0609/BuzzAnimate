@@ -750,6 +750,14 @@ impl App {
             }
 
             Properties => {
+                // Selecting the Camera row makes this the camera's properties,
+                // as it does in Animate: one panel, showing whatever is
+                // currently selected.
+                if self.editor.camera_selected {
+                    self.camera_panel(ui);
+                    return;
+                }
+
                 let editor = &mut self.editor;
                 let selection = &editor.selection;
                 let style = &mut editor.style;
@@ -799,6 +807,43 @@ impl App {
                     commands.push(Command::RunScript);
                 }
             }
+        }
+    }
+
+    /// The camera's properties, shown when the Camera row is selected.
+    ///
+    /// Every control keys the camera at the playhead — the same rule the
+    /// Camera tool follows when it is dragged, so aiming the camera by hand
+    /// and typing a number into a box do the same thing.
+    fn camera_panel(&mut self, ui: &mut egui::Ui) {
+        let frame = self.editor.current_frame;
+        let response = buzz_ui::camera_panel(ui, self.editor.scene().camera(), frame);
+
+        if response.toggle {
+            self.editor.run(Command::ToggleCamera);
+        }
+
+        if let Some(key) = response.set {
+            self.editor.doc.edit("Camera", |scene| {
+                scene.camera_mut().enabled = true;
+                scene.camera_mut().set_key(key.clamped());
+            });
+        }
+
+        if let Some(distance) = response.set_focal_distance {
+            self.editor.doc.edit("Camera Depth", |scene| {
+                scene.camera_mut().focal_distance = distance;
+            });
+        }
+
+        if response.add_key {
+            self.editor.run(Command::AddCameraKeyframe);
+        }
+        if response.remove_key {
+            self.editor.run(Command::RemoveCameraKeyframe);
+        }
+        if response.reset {
+            self.editor.run(Command::ResetCamera);
         }
     }
 

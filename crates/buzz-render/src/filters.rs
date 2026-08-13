@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use buzz_fx::{Op, Quality};
-use buzz_geom::{Affine, BezPath};
+use buzz_geom::{BezPath, Projection};
 use buzz_scene::Object;
 use peniko::Color;
 
@@ -149,13 +149,21 @@ impl std::fmt::Debug for FilterCache {
     }
 }
 
-/// Draw a list of filter ops through `world`.
+/// Draw a list of filter ops through `projection`.
 ///
-/// The ops arrive in the subject's own space; `world` puts them where the
-/// artwork is. Clips are balanced by `buzz-fx` — it is tested — but this
-/// counts them anyway and closes any that are left, because an unbalanced clip
-/// would swallow the rest of the frame rather than fail visibly.
-pub fn draw_ops(builder: &mut SceneBuilder<'_>, ops: &[Op], world: Affine, alpha: f64) {
+/// The ops arrive in document space; the projection puts them where the lens
+/// does. Clips are balanced by `buzz-fx` — it is tested — but this counts them
+/// anyway and closes any that are left, because an unbalanced clip would
+/// swallow the rest of the frame rather than fail visibly.
+///
+/// **A stroked op under a tilted camera is drawn with a flat pen.** A pen
+/// carried through a perspective ought to widen towards the viewer, and Vello
+/// strokes under an affine only. The soft edge of a shadow on a steeply tilted
+/// layer is therefore slightly too even — recorded in PROGRESS.md §7 rather
+/// than pretended away, because the alternative is outlining every band into a
+/// fill and paying a boolean for it.
+pub fn draw_ops(builder: &mut SceneBuilder<'_>, ops: &[Op], projection: &Projection, alpha: f64) {
+    let tolerance = builder.tolerance();
     let mut open = 0usize;
 
     for op in ops {
@@ -166,10 +174,11 @@ pub fn draw_ops(builder: &mut SceneBuilder<'_>, ops: &[Op], world: Affine, alpha
                 even_odd,
             } => {
                 let colour = fade(*color, alpha);
+                let drawn = projection.map_path(path, tolerance);
                 if *even_odd {
-                    builder.fill_shape_even_odd(&(world * path.clone()), colour);
+                    builder.fill_shape_even_odd(&drawn, colour);
                 } else {
-                    builder.fill_shape(&(world * path.clone()), colour);
+                    builder.fill_shape(&drawn, colour);
                 }
             }
             Op::Stroke {
@@ -178,15 +187,23 @@ pub fn draw_ops(builder: &mut SceneBuilder<'_>, ops: &[Op], world: Affine, alpha
                 width,
                 transform,
             } => {
+                // The pen's own squash, and whatever the lens does to it. With
+                // no tilt this is exact; with tilt the pen keeps the size the
+                // middle of the shape would give it.
+                let pen = projection
+                    .as_affine()
+                    .map(|a| a * *transform)
+                    .unwrap_or(*transform);
+                let placed = projection.map_path(&(*transform * path.clone()), tolerance);
                 builder.stroke_transformed(
-                    &(world * *transform * path.clone()),
+                    &(pen.inverse() * placed),
                     fade(*color, alpha),
                     *width,
-                    world * *transform,
+                    pen,
                 );
             }
             Op::PushClip(path) => {
-                builder.push_clip(&(world * path.clone()));
+                builder.push_clip(&projection.map_path(path, tolerance));
                 open += 1;
             }
             Op::PopClip => {

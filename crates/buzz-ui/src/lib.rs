@@ -7,6 +7,7 @@
 
 pub mod actions_panel;
 pub mod brush;
+pub mod camera_panel;
 pub mod command;
 pub mod depth_panel;
 pub mod export_panel;
@@ -27,6 +28,7 @@ pub mod workspace;
 
 pub use actions_panel::{ActionsResponse, ActionsState, SampleEntry, actions_panel};
 pub use brush::{BrushKind, BrushSettings, PatternShape};
+pub use camera_panel::{CameraResponse, camera_panel};
 pub use command::Command;
 pub use depth_panel::{DepthResponse, depth_panel};
 pub use export_panel::{ExportKind, ExportResponse, ExportState, export_dialog};

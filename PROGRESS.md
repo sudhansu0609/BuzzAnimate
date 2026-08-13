@@ -1162,6 +1162,73 @@ bundled fonts have, **and that is wrong**: a probe row rendered
 what made the claim look right). The Library panel had been drawing an expanded
 folder as an empty box for the same reason since Phase 4, and now uses `⏷`.
 No test can see this; only a picture can.
+### ✅ A spatial camera — pitch, yaw, and a real projection
+
+The camera can now **tilt**. Not pan, zoom and roll over a flat picture — tilt,
+so a layer's far edge really is further away than its near edge and a rectangle
+is drawn as a *trapezoid*. §7 item 28 named the missing piece: a projection
+rather than an affine. This is that piece.
+
+**Why an affine could never do it.** An affine preserves parallelism by
+definition, and perspective is exactly the failure of parallelism: parallel
+lines converge. What does it is a **homography** — a 3×3 matrix on homogeneous
+coordinates with a divide at the end. And the reason one 3×3 is enough, rather
+than the 4×4 and depth buffer a 3D engine needs, is that every layer here is
+**flat**: the perspective image of a plane is precisely a homography of that
+plane. No depth buffer, no z-fighting, no sorting beyond the layer order the
+timeline already gives.
+
+- [x] `buzz_geom::Projection` — compose with affines both sides, map points and
+      paths, invert, and report whether the divide does anything
+- [x] **With `g = h = 0` it *is* an affine**, and the render path takes exactly
+      the route it always did. That property is load-bearing: it is what makes
+      this safe to put under every document ever made
+- [x] A projective map turns a cubic into a *rational* cubic, which kurbo
+      cannot store, so a tilted path is flattened and mapped — straight edges
+      stay exactly straight, which is what makes a trapezoid a trapezoid
+- [x] The parts of a path **behind the camera are clipped at the horizon**
+      rather than folded back into the frame inside out
+- [x] `CameraKey` gains `pitch` and `yaw`, interpolated the short way round and
+      bounded well short of edge-on. Format version 10
+- [x] Hit-testing and the marquee go through the **inverse** projection, so
+      tilted artwork is clickable where it is drawn
+
+**The camera orbits its target; it does not swivel in place.** These are two
+different cameras and the difference is the whole feel of the tool. A camera
+that swivels keeps its position and turns, so the thing it was looking at
+slides out of frame — tilt, and the shot leaves. A camera that orbits stays
+pointed at its target, so tilting tips the plane away while what matters stays
+in the middle of the frame. The first version swivelled, every GPU test came
+back with an empty white frame, and building the camera *behind* its target was
+the whole fix. It made the arithmetic simpler too.
+
+**One transform, applied once.** The draw walk used to carry a pre-multiplied
+"world" transform alongside the document-space one, and that is what let
+lighting geometry be drawn through an object's placement *twice* (§4, the
+lighting section). It cannot happen now: geometry accumulates in document space
+on the way down and is projected once, at the leaf, by the layer's own
+projection. Masks, filters, cast shadows and shading crescents all go the same
+way.
+
+**Chrome follows the shot.** Selection handles, bones, warp handles and light
+gizmos mark *where something is*, so they are drawn through the document camera
+too — and under a tilted camera the selection is a **quadrilateral**, not a
+rectangle. This was already subtly wrong whenever the camera panned; it took
+tilt to make it obvious. The grid, guides, rulers and stage border describe the
+*stage*, which the camera does not move, so they stay where they are.
+
+**Verified by pixels**, in `buzz-export`'s `headless_camera_3d` tests: an
+untilted camera is byte-identical, pitch makes one edge measurably wider than
+the other, reversing the tilt reverses which edge, yaw converges across the
+frame instead of down it, depth still shrinks a far layer *and* still puts it
+in perspective, and a camera clamped at the limit still draws a picture.
+
+**Verified on screen**: pitch 55° and yaw 38° together, with the stage in
+genuine two-axis perspective — rectangles as quadrilaterals, circles as tilted
+ellipses — and the artwork still selectable by clicking where it is drawn.
+
+---
+
 ### ✅ The camera has a row in the timeline
 
 Animate shows the camera as a layer above every other, and that is where an
@@ -1486,11 +1553,11 @@ test could see:
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 037 passing, clippy clean |
+| Tests | 1 070 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
-| Format version | 9 — adds filters, blend modes and layer parenting |
+| Format version | 10 — adds camera pitch and yaw |
 | Formats heard | `.wav`, `.mp3`, `.ogg`, `.flac`, `.m4a`, `.aac` |
 | IK budget | 50 six-bone rigs solved in parallel, well inside one frame |
 | Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |
@@ -1648,7 +1715,10 @@ test could see:
 | 21 | **No importer has been checked against a real file from Adobe.** Every fixture is one we wrote, so the importers are verified against the *specifications* and against files whose content we chose — not against what Animate, Illustrator and the Flash compilers actually emit, which is where the awkward cases live. This is the largest single risk in Phase 5. | Needs a licensed Animate/Illustrator and real-world files |
 | 22 | **Bitmaps are not imported** by any of the three readers — reported, never read. Needs a media pipeline: decode, store in the `.buzz` container's `media/` directory (reserved since Phase 1), and a bitmap object kind. | Phase 6 |
 | 23 | **SWF morph shapes, buttons, filters, blend modes and colour transforms on placements** are reported but not applied. Colour transforms are the cheapest of these to fix — the model already has `ColorTransform` — and would noticeably improve fidelity. | Phase 5 follow-up |
-| 28 | **No 3D object rotation.** Animate's 3D Rotation and 3D Translation tools give a *movie clip* rotationX/Y/Z and a translationZ, with a document perspective angle and vanishing point. Layer depth arranges whole layers in space; rotating an individual object in three dimensions is a separate subsystem — it needs a real projection in the renderer rather than an affine, and a gimbal widget. | Not started |
+| 28 | **No 3D object rotation.** Animate's 3D Rotation and 3D Translation tools give a *movie clip* rotationX/Y/Z and a translationZ. The **projection this needed now exists** — `buzz_geom::Projection`, built for the spatial camera — so what is left is per-object rather than per-layer planes, and a gimbal widget to turn them with. | Unblocked; needs the tool |
+| 60 | **A tilted camera does not sort layers by depth.** Paint order is the timeline's, exactly as it is without tilt, so two layers that would cross in space still draw one wholly in front of the other. Animate has the same rule and for the same reason: the timeline is the authority on what is in front. | By design |
+| 61 | **Free Transform handles on a tilted camera hang off the quad's extent**, not off the quad. The selection outline is drawn as the true quadrilateral, but the eight handles sit on its bounding box — a transform gizmo that lives in perspective is a piece of work in its own right. | Follow-up |
+| 62 | **A soft-edged filter under a tilted camera uses a flat pen.** The bands of a shadow or glow are strokes, and Vello strokes under an affine only, so their width does not widen towards the viewer. Visible only on a steeply tilted layer with a large blur. Fixing it means outlining every band into a fill and paying a boolean for each. | Follow-up |
 | 29 | **Depth does not blur.** Animate's camera has a depth-of-field effect; layers off the focal plane are sharp here however far away they are. Needs a blur in the render path. | Follow-up |
 | 27 | **Build-up paint is a deliberate deviation from Animate**, which has no such mode: its shapes always composite source-over. It is off by default, so a document that does not ask for it behaves exactly as Animate would. Added because overlapping translucent strokes that deepen is what a brush *should* do, and because the request was explicit. | By design |
 | 25 | **Pen pressure is plumbed through but never supplied.** The brush reads `StrokeSample::pressure` and the setting is in the panel, but winit 0.30 gives no tablet pressure on Windows, so every sample arrives at 1.0 and the pressure option paints a constant width. Speed is the default response for exactly this reason. Needs a platform tablet backend (Windows Ink / Wintab). | Brush follow-up |
@@ -1768,7 +1838,7 @@ cargo run --release -p buzz-app -- art.fla   # run, importing a foreign file
 # Run a script over the document at startup, as Animate's command line does.
 # The Actions panel opens with the script still in it.
 cargo run --release -p buzz-app -- file.buzz --script grid.js
-cargo test --workspace                       # 1 037 tests
+cargo test --workspace                       # 1 070 tests
 cargo clippy --workspace --all-targets       # lint
 cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 
@@ -1790,6 +1860,9 @@ cargo test -p buzz-export --test headless_parenting -- --nocapture
 
 # Prove the filters on the GPU: shadows, glows, blur, blend modes.
 cargo test -p buzz-export --test headless_filters -- --nocapture
+
+# Prove the spatial camera on the GPU: tilt turns a rectangle into a trapezoid.
+cargo test -p buzz-export --test headless_camera_3d -- --nocapture
 
 # Phase 7's exit test: rig an arm, key two poses, tween, save, reopen, export.
 cargo test -p buzz-app --test rig_exit_test -- --nocapture

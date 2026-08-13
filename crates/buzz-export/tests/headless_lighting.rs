@@ -300,3 +300,70 @@ fn a_sky_fills_without_casting() {
         );
     });
 }
+
+/// **A symbol instance casts a shadow.**
+///
+/// It used to cast nothing at all, and the note in the renderer said so. That
+/// reads as a small gap and is not one: a document imported from Animate is
+/// *entirely* symbol instances, so "an instance casts nothing" means a real
+/// film casts no shadows whatever — switching shadows on did visibly nothing,
+/// which looks like the feature being broken rather than unfinished.
+///
+/// The same square as every other test here, placed as an instance of a symbol
+/// instead of drawn loose, and asserted the same way: darker on the far side
+/// from the sun.
+#[test]
+fn a_symbol_instance_casts_a_shadow_like_loose_artwork() {
+    with_exporter(|exporter| {
+        let mut scene = Scene::default();
+        scene.stage_mut().background = Color::WHITE;
+
+        // The artwork, inside a symbol. `layers()` follows the open symbol, so
+        // drawing into one is the same call as drawing on the stage.
+        let symbol = scene.add_symbol("Block", buzz_scene::SymbolKind::Graphic, None);
+        assert!(scene.enter_symbol(symbol));
+        let inner = scene
+            .layers()
+            .iter()
+            .next()
+            .expect("a new symbol has a layer")
+            .id;
+        scene
+            .add_shape(
+                inner,
+                ShapeData::filled(Rect::new(0.0, 0.0, 150.0, 150.0).to_path(1e-9), ART),
+            )
+            .expect("the artwork");
+        scene.exit_symbol();
+
+        // Placed where `document()` draws its loose square.
+        let layer = scene.add_layer("Cast", LayerKind::Normal);
+        scene
+            .add_instance_at(
+                layer,
+                0,
+                symbol,
+                buzz_geom::Affine::translate((200.0, 150.0)),
+            )
+            .expect("the instance");
+
+        let id = scene.add_light(LightKind::Sun {
+            azimuth: 0.0,
+            elevation: 0.45,
+        });
+        {
+            let sun = scene.lights_mut().get_mut(id).expect("the sun");
+            sun.standing_height = 60.0;
+            sun.shadow_strength = 0.8;
+        }
+
+        let frame = render(exporter, &scene);
+        let left_of = luma(frame.pixel(170, 225));
+        let right_of = luma(frame.pixel(380, 225));
+        assert!(
+            left_of < right_of - 20.0,
+            "an instance should cast a shadow to the left just as loose artwork \
+             does: {left_of} vs {right_of}"
+        );
+    });
+}

@@ -160,7 +160,17 @@ pub fn draw_frame_cached(
     options: &FrameOptions,
     cache: &mut DrawCache,
 ) {
-    cache.lights.begin(if options.lit { scene.revision() } else { 0 });
+    // **The lights' own fingerprint, not the document's revision.** A
+    // revision bumps on every edit and a drag bumps it on every mouse move, so
+    // keying on it threw away every crescent and every shadow in the film once
+    // per frame for as long as a drag lasted — which on a real character is
+    // seconds a frame, and looks exactly like the application hanging. See
+    // `LightRig::fingerprint`.
+    cache.lights.begin(if options.lit {
+        scene.lights().fingerprint()
+    } else {
+        0
+    });
     cache.filters.begin();
     draw_layers(builder, scene, scene.layers(), frame, camera, options, cache);
     cache.lights.end();
@@ -1183,6 +1193,27 @@ fn cast_shadows(
     cache: &mut DrawCache,
     ctx: &DrawCtx<'_>,
 ) {
+    cast_shadows_within(builder, object, owner, doc, key, height, depth, cache, ctx, 0);
+}
+
+/// [`cast_shadows`], carrying how deep into nested symbols it has gone.
+///
+/// `depth_limit` is the *nesting* count and is nothing to do with `depth`,
+/// which is the layer's distance from the camera. A symbol containing an
+/// instance of itself would otherwise recurse until the stack ran out.
+#[allow(clippy::too_many_arguments, reason = "one call path")]
+fn cast_shadows_within(
+    builder: &mut SceneBuilder<'_>,
+    object: &Object,
+    owner: Option<&Arc<Object>>,
+    doc: Affine,
+    key: &buzz_light::Light,
+    height: f64,
+    depth: f64,
+    cache: &mut DrawCache,
+    ctx: &DrawCtx<'_>,
+    depth_limit: usize,
+) {
     // Asked for with modelling on so the entry this builds is the same one
     // `draw_shape` will look up: one set of booleans, used by both passes.
     let modelling = ctx.scene.lights().modelling;
@@ -1211,12 +1242,17 @@ fn cast_shadows(
         }
         ObjectKind::Group(children) => {
             for child in children {
-                cast_shadows(builder, child, Some(child), doc, key, height, depth, cache, ctx);
+                cast_shadows_within(
+                    builder, child, Some(child), doc, key, height, depth, cache, ctx,
+                    depth_limit,
+                );
             }
         }
         ObjectKind::Armature(rig) => {
             for part in rig.posed() {
-                cast_shadows(builder, &part, None, doc, key, height, depth, cache, ctx);
+                cast_shadows_within(
+                    builder, &part, None, doc, key, height, depth, cache, ctx, depth_limit,
+                );
             }
         }
         ObjectKind::Warp(warp) => {
@@ -1236,10 +1272,53 @@ fn cast_shadows(
                 builder.fill_shape(&drawn, ctx.overlay(shadow));
             }
         }
-        // A symbol's shadow is the shadow of what it contains, which needs the
-        // library and the instance's own frame — the same walk `draw_object`
-        // does. Left for now: an instance casts nothing (PROGRESS §7).
-        ObjectKind::Instance(_) => {}
+        // **A symbol's shadow is the shadow of what it contains.**
+        //
+        // This used to do nothing, and the note here said so. That is a much
+        // bigger hole than it reads as: a document imported from Animate is
+        // *entirely* symbol instances, so "an instance casts nothing" means a
+        // real film casts no shadows at all. Switching shadows on did visibly
+        // nothing, which looks like the feature being broken rather than
+        // unfinished.
+        //
+        // The walk is `draw_object`'s, reduced to what a shadow needs — no
+        // masks, no colour effects, no filters, because a shadow is a
+        // silhouette and none of those change its shape. What it does need is
+        // the instance's own frame, so a symbol on its fourth frame casts the
+        // shadow of the drawing on that frame rather than of its first.
+        ObjectKind::Instance(instance) => {
+            if depth_limit >= MAX_SYMBOL_DEPTH {
+                return;
+            }
+            let Some(symbol) = ctx.scene.library().get(instance.symbol) else {
+                return;
+            };
+            let inner = instance.resolve_frame(symbol.kind, ctx.elapsed, symbol.length());
+
+            for layer in symbol.layers.drawable_at(inner) {
+                // A mask layer is not artwork and casts nothing; the layers it
+                // clips still cast their own, which is a simplification — the
+                // shadow of a masked drawing should be the shadow of the part
+                // that survives the mask. Recorded in PROGRESS.md §7.
+                if layer.kind.is_mask() {
+                    continue;
+                }
+                for child in layer.objects_at(inner) {
+                    cast_shadows_within(
+                        builder,
+                        child,
+                        Some(child),
+                        doc,
+                        key,
+                        height,
+                        depth,
+                        cache,
+                        ctx,
+                        depth_limit + 1,
+                    );
+                }
+            }
+        }
     }
 }
 

@@ -260,6 +260,84 @@ pub struct LightRig {
     pub modelling: f32,
 }
 
+impl LightRig {
+    /// A number that changes when — and only when — the lighting changes.
+    ///
+    /// # Why this is not the document's revision
+    ///
+    /// Generated lighting geometry is cached, and the cache is thrown away
+    /// whenever the lights move, because every crescent and every shadow is
+    /// then wrong. It used to be thrown away whenever the **document**'s
+    /// revision changed, which is a different thing entirely: a revision bumps
+    /// on every edit, and a drag bumps it on every mouse move.
+    ///
+    /// So dragging one hand rebuilt the shading and the cast shadow of every
+    /// shape in the film, once per frame, for as long as the drag lasted. On a
+    /// few rectangles that is invisible; on a real character it is seconds per
+    /// frame, which is indistinguishable from the application having hung —
+    /// and it made lit artwork impossible to pose, which is the one thing
+    /// lighting is for.
+    ///
+    /// Keyed on the lights themselves, an edit to *artwork* keeps the whole
+    /// cache; the objects that actually moved miss it on their own account,
+    /// because the entries are keyed by the object's shared pointer and a
+    /// changed object has a new one.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+        // Floats are hashed by their bits: two rigs that differ only in a
+        // colour or an angle must not collide, and `f64` is not `Hash`.
+        fn f(hasher: &mut impl Hasher, v: f64) {
+            v.to_bits().hash(hasher);
+        }
+        fn colour(hasher: &mut impl Hasher, c: Color) {
+            for channel in c.components {
+                channel.to_bits().hash(hasher);
+            }
+        }
+
+        self.enabled.hash(&mut hasher);
+        colour(&mut hasher, self.base);
+        self.modelling.to_bits().hash(&mut hasher);
+        self.lights.len().hash(&mut hasher);
+
+        for light in &self.lights {
+            light.id.0.hash(&mut hasher);
+            colour(&mut hasher, light.color);
+            light.intensity.to_bits().hash(&mut hasher);
+            light.enabled.hash(&mut hasher);
+            light.shadows.hash(&mut hasher);
+            light.shadow_strength.to_bits().hash(&mut hasher);
+            f(&mut hasher, light.standing_height);
+            f(&mut hasher, light.softness);
+            match &light.kind {
+                LightKind::Sun { azimuth, elevation } => {
+                    0u8.hash(&mut hasher);
+                    f(&mut hasher, *azimuth);
+                    f(&mut hasher, *elevation);
+                }
+                LightKind::Sky { horizon } => {
+                    1u8.hash(&mut hasher);
+                    colour(&mut hasher, *horizon);
+                }
+                LightKind::Lamp {
+                    position,
+                    height,
+                    radius,
+                } => {
+                    2u8.hash(&mut hasher);
+                    f(&mut hasher, position.x);
+                    f(&mut hasher, position.y);
+                    f(&mut hasher, *height);
+                    f(&mut hasher, *radius);
+                }
+            }
+        }
+        hasher.finish()
+    }
+}
+
 impl Default for LightRig {
     fn default() -> Self {
         Self {

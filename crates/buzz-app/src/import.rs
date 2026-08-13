@@ -33,6 +33,14 @@ pub struct ImportSummary {
     pub title: String,
     pub what_arrived: String,
     pub unsupported: Vec<String>,
+    /// This is a *failure*, not a partial success.
+    ///
+    /// The same dialog serves both, because the question a user has is the
+    /// same either way — what happened to my file? — and a failure that only
+    /// writes a line into the status bar is one nobody reads. It is worded
+    /// differently and it does not claim that everything else imported
+    /// normally, because nothing did.
+    pub failed: bool,
 }
 
 /// File extensions the importers understand, for the dialog's filter.

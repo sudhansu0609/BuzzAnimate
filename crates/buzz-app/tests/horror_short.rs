@@ -612,3 +612,238 @@ fn bisect_the_render() {
         eprintln!("  {name:<14} {:>8} bright px  {}", lit, path.display());
     }
 }
+
+/// **Dialogue: a five-minute take, analysed and lip-synced.**
+///
+/// A horror short is carried by its narration, and lip sync is the step that
+/// turns five minutes of audio into a few thousand mouth keyframes. It runs on
+/// the whole take at once, so it is the single most likely place for the tool
+/// to sit and think for minutes with nothing on screen.
+#[test]
+fn five_minutes_of_dialogue_can_be_analysed_and_lip_synced() {
+    use buzz_audio::Clip;
+
+    eprintln!("\n--- dialogue ---");
+
+    // Five minutes of speech-like audio: bursts of noise with gaps, which is
+    // what the analyser actually has to segment. Silence would be free and
+    // would prove nothing.
+    let rate = 44_100;
+    let clip = stage("synthesise a five-minute take", Duration::from_secs(10), || {
+        let samples: Vec<f32> = (0..rate * 60 * 5)
+            .map(|i| {
+                let t = i as f64 / rate as f64;
+                // A word every half second, with a pause between.
+                let speaking = (t * 2.0).fract() < 0.6;
+                if !speaking {
+                    return 0.0;
+                }
+                let tone = (t * 220.0 * std::f64::consts::TAU).sin();
+                let formant = (t * 900.0 * std::f64::consts::TAU).sin() * 0.4;
+                ((tone + formant) * 0.4) as f32
+            })
+            .collect();
+        Clip::new("Narration", rate as u32, 1, samples).expect("a clip")
+    });
+
+    let mut scene = build_film();
+
+    let track = stage("analyse it for visemes", Duration::from_secs(20), || {
+        buzz_audio::analysis::analyse_visemes(
+            &clip,
+            24.0,
+            &buzz_audio::analysis::LipSyncOptions::default(),
+        )
+    });
+    eprintln!("  {:<46} {:>10}", "(viseme frames)", track.len());
+    assert!(
+        track.len() > 6000,
+        "a five-minute take should analyse to about 7 200 frames, got {}",
+        track.len()
+    );
+
+    // A mouth symbol with one frame per shape, and a layer to put it on.
+    let mouth = buzz_app::lipsync::placeholder_mouth(&mut scene, "Mouth shapes");
+    let layer = scene.add_layer("Lip sync", LayerKind::Normal);
+
+    stage("write the mouth keyframes", Duration::from_secs(20), || {
+        buzz_app::lipsync::write_track(
+            &mut scene,
+            &track,
+            0,
+            layer,
+            mouth,
+            Affine::translate(Vec2::new(300.0, 716.0)),
+        )
+    });
+
+    let keys = scene
+        .layers()
+        .get(layer)
+        .map(|l| l.frames.keyframes().len())
+        .unwrap_or(0);
+    eprintln!("  {:<46} {keys:>10}", "(mouth keyframes written)");
+    assert!(keys > 100, "only {keys} mouth keyframes over five minutes");
+
+    // And the document still works afterwards: scrubbing through a film with
+    // thousands of keyframes on a layer is the thing that has to stay quick.
+    let mut editor = Editor::new(Document::new(scene));
+    stage("scrub through the lip-synced film", ACTION_BUDGET, || {
+        for f in (0..FILM_FRAMES).step_by(97) {
+            editor.set_frame(f);
+        }
+    });
+}
+
+/// **A working session on the finished film.**
+///
+/// This is what an animator actually does: scrub to a frame, pick a part, drag
+/// it, key it, undo, draw a correction, repeat — on a document that is already
+/// lit, filtered, masked and five minutes long. Each of those must stay
+/// instant, and the one that matters most is *dragging with the lights on*,
+/// because that is where the tool used to rebuild every crescent and shadow in
+/// the film once per mouse move.
+///
+/// The window keeps one `DrawCache` across frames, so this drives that rather
+/// than the exporter's fresh-cache-per-call path.
+#[test]
+fn an_animator_can_work_on_the_finished_film() {
+    let scene = build_film();
+    let mut editor = Editor::new(Document::new(scene));
+
+    let mut vello = buzz_render::vello::Scene::new();
+    let mut cache = buzz_render::document::DrawCache::new();
+
+    // Draw one frame the way the window does, and report how long it took.
+    let mut draw = |editor: &Editor,
+                    vello: &mut buzz_render::vello::Scene,
+                    cache: &mut buzz_render::document::DrawCache| {
+        let mut builder = buzz_render::SceneBuilder::new(vello, &editor.camera);
+        let scene = editor.scene();
+        let options = buzz_render::document::FrameOptions {
+            masks: buzz_render::document::MaskDisplay::WhenLocked,
+            lit: true,
+            place: scene.edit_place(),
+            ..Default::default()
+        };
+        let started = Instant::now();
+        buzz_render::document::draw_frame_cached(
+            &mut builder,
+            scene,
+            editor.current_frame,
+            scene.camera_transform(editor.current_frame),
+            &options,
+            cache,
+        );
+        started.elapsed()
+    };
+
+    eprintln!("\n--- a working session ---");
+
+    let cold = draw(&editor, &mut vello, &mut cache);
+    eprintln!("  {:<46} {cold:>10.2?}", "first frame");
+
+    // Pick a villager and drag it thirty times, as one gesture does.
+    let id = editor
+        .object_at(Point::new(300.0, 700.0), 4.0)
+        .expect("a villager under the pointer");
+    editor.selection.select_one(id);
+
+    let mut worst = Duration::ZERO;
+    let started = Instant::now();
+    for step in 0..30 {
+        editor.doc.edit("Move", |scene| {
+            scene.update_object(id, |o| {
+                o.transform = Affine::translate(Vec2::new(300.0 + step as f64, 700.0));
+            });
+        });
+        worst = worst.max(draw(&editor, &mut vello, &mut cache));
+    }
+    let drag = started.elapsed();
+    eprintln!("  {:<46} {drag:>10.2?}", "a 30-step drag, lit, redrawn each step");
+    eprintln!("  {:<46} {worst:>10.2?}", "worst single frame during the drag");
+
+    assert!(
+        worst < Duration::from_millis(120),
+        "a frame during a drag took {worst:?} — at that rate posing lit \
+         artwork is impossible, which is the one thing lighting is for"
+    );
+
+    // Scrubbing across the film, redrawing each time.
+    let started = Instant::now();
+    let mut worst_scrub = Duration::ZERO;
+    for f in (0..FILM_FRAMES).step_by(FILM_FRAMES as usize / 24) {
+        editor.set_frame(f);
+        worst_scrub = worst_scrub.max(draw(&editor, &mut vello, &mut cache));
+    }
+    eprintln!("  {:<46} {:>10.2?}", "scrub across the film, redrawn", started.elapsed());
+    eprintln!("  {:<46} {worst_scrub:>10.2?}", "worst single frame while scrubbing");
+    assert!(
+        worst_scrub < Duration::from_millis(250),
+        "scrubbing costs {worst_scrub:?} a frame; the playhead will not keep up"
+    );
+
+    // Undo the whole drag.
+    let started = Instant::now();
+    for _ in 0..30 {
+        editor.doc.undo();
+    }
+    eprintln!("  {:<46} {:>10.2?}", "undo the whole drag", started.elapsed());
+}
+
+/// **Getting the film out.** Ten seconds of it, encoded, and extrapolated.
+///
+/// A five-minute export is minutes of work by definition; what matters is that
+/// it is *linear* and that it uses the machine. Encoding a chunk and scaling up
+/// says whether the full film is half an hour or half a day.
+#[test]
+fn the_film_exports_at_a_usable_rate() {
+    if !buzz_export::ffmpeg_available() {
+        eprintln!("skipping export test: no ffmpeg");
+        return;
+    }
+    let scene = build_film();
+    let settings = buzz_export::ExportSettings::for_stage(&scene);
+    let dir = std::env::temp_dir();
+    let path = dir.join("buzz-horror-clip.mp4");
+
+    eprintln!("\n--- export ---");
+    let chunk = 240; // ten seconds
+    let started = Instant::now();
+    let report = buzz_export::export_video(
+        &scene,
+        0..chunk,
+        &path,
+        &settings,
+        &buzz_export::VideoSettings::default(),
+        &buzz_render::GpuPreference::Automatic,
+        &[],
+        |_, _| true,
+    );
+    let taken = started.elapsed();
+
+    match report {
+        Ok(report) => {
+            let per_frame = taken / chunk;
+            let whole = per_frame * FILM_FRAMES;
+            eprintln!("  {:<46} {taken:>10.2?}", "ten seconds of film, encoded");
+            eprintln!("  {:<46} {per_frame:>10.2?}", "per frame");
+            eprintln!("  {:<46} {whole:>10.1?}", "the whole five minutes would take");
+            eprintln!("  {:<46} {:>10}", "encoder", report.encoder);
+            assert_eq!(report.frames, chunk);
+            assert!(
+                whole < Duration::from_secs(20 * 60),
+                "the whole film would take {whole:?} to export"
+            );
+        }
+        Err(e) => {
+            let message = format!("{e:#}");
+            if message.contains("GPU") || message.contains("adapter") || message.contains("device")
+            {
+                eprintln!("skipping: {message}");
+            } else {
+                panic!("export failed: {message}");
+            }
+        }
+    }
+}

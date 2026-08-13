@@ -55,6 +55,10 @@ png = "0.18"
 # Animate's asset manifests are JSON.
 serde_json.workspace = true
 
+# The soundtrack is written out for the video encoder to read, into a directory
+# that lives exactly as long as the encode does.
+tempfile = "3"
+
 [build-dependencies]
 # Embeds the icon into the .exe, so Explorer and the taskbar show it too.
 # The build script tolerates its absence rather than failing.

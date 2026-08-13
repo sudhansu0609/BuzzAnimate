@@ -29,8 +29,8 @@
 //! ActionScript, sounds, video, embedded fonts and text, and bitmaps are
 //! recorded in the [`ImportReport`] rather than silently dropped. Bytecode is
 //! Phase 8's business; text needs the font subsystem; bitmaps need the media
-//! pipeline. Gradients become flat colours, which is visible and fixable
-//! rather than invisible and mysterious.
+//! pipeline. A bitmap *fill* becomes a flat colour, which is visible and
+//! fixable rather than invisible and mysterious.
 
 pub mod shape;
 
@@ -39,8 +39,8 @@ use std::path::Path;
 
 use buzz_geom::Affine;
 use buzz_scene::{
-    FillSpec, Layer, LayerId, LayerStack, Object, ObjectId, Scene, ShapeData, StrokeSpec, Symbol,
-    SymbolId, SymbolKind,
+    ColorTransform, FillSpec, Layer, LayerId, LayerStack, Object, ObjectId, Scene, ShapeData,
+    StrokeSpec, Symbol, SymbolId, SymbolKind,
 };
 use swf::{CharacterId, Tag};
 
@@ -74,7 +74,8 @@ pub struct ImportReport {
     pub shapes: usize,
     pub sprites: usize,
     pub instances: usize,
-    /// Fills replaced by a flat colour because they are gradients or bitmaps.
+    /// Fills replaced by a flat colour. Bitmap fills only: gradients come
+    /// across as gradients.
     pub approximated_fills: usize,
     /// Features present in the file that this importer does not handle.
     pub unsupported: Vec<String>,
@@ -184,6 +185,8 @@ struct Placed {
     character: CharacterId,
     transform: Affine,
     name: Option<String>,
+    /// The placement's colour effect, if it has one.
+    colour: ColorTransform,
     /// Frame this placement began on.
     since: u32,
 }
@@ -213,7 +216,7 @@ fn run_timeline(
                 let approximated = paths.iter().filter(|p| p.approximated_fill).count();
                 if approximated > 0 {
                     report.approximated_fills += approximated;
-                    report.note_unsupported("a gradient or bitmap fill, imported as a flat colour");
+                    report.note_unsupported("a bitmap fill, imported as a flat colour");
                 }
 
                 let symbol = build_shape_symbol(s.id, &paths, ids);
@@ -255,6 +258,13 @@ fn run_timeline(
                 let track = tracks.entry(place.depth).or_insert_with(|| Track::new(place.depth));
                 let matrix = place.matrix.map(to_affine).unwrap_or(Affine::IDENTITY);
                 let name = place.name.map(|n| n.to_string_lossy(swf::UTF_8));
+                // A colour transform on the placement is Animate's colour
+                // effect, and our model already holds exactly this pair. It was
+                // reported as unsupported while nothing read it; ignoring it
+                // imported every faded, tinted and darkened instance at full
+                // strength, which is a fidelity loss on almost every real
+                // movie — a fade-out arrives as no fade at all.
+                let colour = place.color_transform.map(to_color_transform);
 
                 match place.action {
                     swf::PlaceObjectAction::Place(id) | swf::PlaceObjectAction::Replace(id) => {
@@ -265,6 +275,7 @@ fn run_timeline(
                             character: id,
                             transform: matrix,
                             name,
+                            colour: colour.unwrap_or_default(),
                             since: frame,
                         });
                     }
@@ -278,20 +289,22 @@ fn run_timeline(
                                 // No matrix means "leave it where it was".
                                 None => existing.transform,
                             };
+                            // Same rule for the colour: absent means unchanged,
+                            // which is what makes a fade keyed only on the
+                            // frames that move it work at all.
+                            let previous_colour = existing.colour;
                             track.close(frame);
                             track.current = Some(Placed {
                                 character,
                                 transform,
                                 name: name.or(previous_name),
+                                colour: colour.unwrap_or(previous_colour),
                                 since: frame,
                             });
                         }
                     }
                 }
 
-                if place.color_transform.is_some() {
-                    report.note_unsupported("a colour transform on a placement");
-                }
                 if place.filters.as_ref().is_some_and(|f| !f.is_empty()) {
                     report.note_unsupported("a filter effect");
                 }
@@ -348,8 +361,12 @@ fn run_timeline(
     // The movie ends; every open span ends with it.
     let end = frame.max(1);
     let mut layers = Vec::new();
+    let mut end = end;
     for (_depth, mut track) in tracks {
-        track.close(end);
+        track.close_at_end(end);
+        // A span that had to be stretched past the last `ShowFrame` makes the
+        // timeline longer than the frame count did.
+        end = end.max(track.spans.last().map(|(_, f, _)| *f).unwrap_or(0));
         if let Some(layer) = track.into_layer(dictionary, ids, report) {
             layers.push(layer);
         }
@@ -383,13 +400,30 @@ impl Track {
     }
 
     /// End whatever is placed, if anything, at `frame`.
+    ///
+    /// A placement replaced on the same frame it began never showed, so it is
+    /// dropped rather than left as a zero-length keyframe.
     fn close(&mut self, frame: u32) {
+        if let Some(placed) = self.current.take()
+            && frame > placed.since
+        {
+            self.spans.push((placed.since, frame, placed));
+        }
+    }
+
+    /// End whatever is still placed when the movie does.
+    ///
+    /// **Not the same rule as [`Self::close`], and that is the point.** Being
+    /// replaced on the frame you arrived means you never showed. Still being on
+    /// screen when the film ends means the opposite — you showed until the
+    /// last frame. Running both through the zero-length test dropped anything
+    /// placed after the final `ShowFrame`, so a file whose last tag is a
+    /// placement imported its instances and drew nothing: no span, therefore
+    /// no layer, therefore no artwork, and no complaint anywhere to say so.
+    fn close_at_end(&mut self, end: u32) {
         if let Some(placed) = self.current.take() {
-            // A placement replaced on the same frame it began never showed;
-            // dropping it avoids a zero-length keyframe.
-            if frame > placed.since {
-                self.spans.push((placed.since, frame, placed));
-            }
+            // At least one frame long, however the file ended.
+            self.spans.push((placed.since, end.max(placed.since + 1), placed));
         }
     }
 
@@ -427,6 +461,9 @@ impl Track {
                     let mut object = Object::instance_of(ObjectId(ids.take()), *symbol);
                     object.transform = placed.transform;
                     object.name = placed.name;
+                    if let buzz_scene::ObjectKind::Instance(instance) = &mut object.kind {
+                        instance.color = placed.colour;
+                    }
                     report.instances += 1;
                     vec![std::sync::Arc::new(object)]
                 }
@@ -467,10 +504,15 @@ fn build_shape_symbol(id: CharacterId, paths: &[StyledPath], ids: &mut IdSource)
         .map(|styled| {
             let shape = ShapeData {
                 path: styled.path.clone(),
-                fill: styled.fill.map(FillSpec::solid),
-                stroke: styled
-                    .stroke
-                    .map(|(color, width)| StrokeSpec::new(color, width)),
+                fill: styled.fill.clone().map(|paint| FillSpec {
+                    paint,
+                    rule: buzz_geom::FillMode::NonZero,
+                }),
+                stroke: styled.stroke.clone().map(|(paint, width)| StrokeSpec {
+                    paint,
+                    width,
+                    hairline: false,
+                }),
                 blend: buzz_scene::PaintBlend::Normal,
             };
             std::sync::Arc::new(Object::shape(ObjectId(ids.take()), shape))
@@ -491,6 +533,30 @@ fn build_shape_symbol(id: CharacterId, paths: &[StyledPath], ids: &mut IdSource)
     );
     symbol.layers.push_front(layer);
     symbol
+}
+
+/// SWF's colour transform as ours.
+///
+/// The multiply terms line up exactly. The **add** terms do not: SWF stores
+/// them as signed 8-bit offsets, −255 to 255, while ours are in 0..1 units
+/// like the colours they are added to. Dividing by 255 is the whole of the
+/// difference, and getting it wrong would make every tinted instance either
+/// invisible or blown out.
+fn to_color_transform(c: swf::ColorTransform) -> ColorTransform {
+    ColorTransform {
+        multiply: [
+            c.r_multiply.to_f32(),
+            c.g_multiply.to_f32(),
+            c.b_multiply.to_f32(),
+            c.a_multiply.to_f32(),
+        ],
+        add: [
+            f32::from(c.r_add) / 255.0,
+            f32::from(c.g_add) / 255.0,
+            f32::from(c.b_add) / 255.0,
+            f32::from(c.a_add) / 255.0,
+        ],
+    }
 }
 
 /// SWF's matrix, in twips, as a document transform in pixels.
@@ -837,6 +903,184 @@ mod tests {
         ] {
             let _ = import_bytes(bytes);
         }
+    }
+
+    /// Walk the whole scene and count the shapes that would actually be drawn,
+    /// following instances into their symbols.
+    ///
+    /// **This is the question §7 item 121a asked and nothing answered.** Every
+    /// test here counted symbols, layers and instances — all of which a file
+    /// can have while drawing nothing at all. Reaching artwork through a
+    /// placement is a different claim, and it is the one that matters.
+    fn drawn_shapes(scene: &Scene) -> usize {
+        /// Every frame, not only the first: a placement that arrives part way
+        /// through the movie is still artwork, and a helper that looked at
+        /// frame 0 alone would call it missing.
+        fn over_time(scene: &Scene, layer: &Layer, depth: usize) -> usize {
+            (0..layer.frames.length().max(1))
+                .map(|f| walk(scene, layer.objects_at(f), depth))
+                .max()
+                .unwrap_or(0)
+        }
+
+        fn walk(scene: &Scene, objects: &[std::sync::Arc<Object>], depth: usize) -> usize {
+            if depth > 8 {
+                return 0;
+            }
+            objects
+                .iter()
+                .map(|o| match &o.kind {
+                    buzz_scene::ObjectKind::Shape(_) => 1,
+                    buzz_scene::ObjectKind::Group(children) => walk(scene, children, depth + 1),
+                    buzz_scene::ObjectKind::Instance(i) => scene
+                        .library()
+                        .get(i.symbol)
+                        .map(|s| {
+                            s.layers
+                                .iter()
+                                .map(|l| over_time(scene, l, depth + 1))
+                                .sum()
+                        })
+                        .unwrap_or(0),
+                    _ => 0,
+                })
+                .sum()
+        }
+        scene
+            .layers()
+            .iter()
+            .map(|l| over_time(scene, l, 0))
+            .sum()
+    }
+
+    /// A sprite holding a shape, placed on the root — which is how Flash
+    /// actually emits a movie, and what a hand-written single shape at the root
+    /// never exercised.
+    #[test]
+    fn a_sprite_on_the_root_draws_the_shape_inside_it() {
+        let sprite = Tag::DefineSprite(swf::Sprite {
+            id: 2,
+            num_frames: 1,
+            tags: vec![square(1, 20.0), place(1, 1, 0.0), Tag::ShowFrame],
+        });
+        let bytes = write_swf(
+            vec![sprite, place(1, 2, 100.0), Tag::ShowFrame],
+            1,
+        );
+        let (scene, report) = import_bytes(&bytes).expect("the SWF parses");
+
+        assert_eq!(report.sprites, 1, "the sprite should arrive");
+        assert!(report.instances >= 1, "the sprite should be placed");
+        assert_eq!(
+            drawn_shapes(&scene),
+            1,
+            "the shape inside the sprite must actually be reachable: {}",
+            report.summary()
+        );
+    }
+
+    /// **A placement that is never followed by `ShowFrame` still shows.**
+    ///
+    /// The zero-length rule exists so that a character replaced on the frame it
+    /// arrived on does not leave an empty keyframe behind. Applied to the end
+    /// of the movie it says something quite different and quite wrong: the last
+    /// thing placed never showed. A file whose final tag is a placement — and
+    /// tools other than Flash do emit them — imported its instances and drew
+    /// nothing at all.
+    #[test]
+    fn a_placement_on_the_last_frame_is_not_dropped() {
+        let bytes = write_swf(
+            vec![
+                square(1, 20.0),
+                Tag::ShowFrame,
+                // Placed after the last ShowFrame: the span opens at frame 1
+                // and the movie also ends at frame 1.
+                place(1, 1, 0.0),
+            ],
+            1,
+        );
+        let (scene, report) = import_bytes(&bytes).expect("the SWF parses");
+        assert_eq!(
+            drawn_shapes(&scene),
+            1,
+            "the placement was dropped as zero-length: {}",
+            report.summary()
+        );
+    }
+
+    /// A sprite whose tags carry no `ShowFrame` at all — one frame, implicitly.
+    #[test]
+    fn a_sprite_with_no_showframe_still_draws() {
+        let sprite = Tag::DefineSprite(swf::Sprite {
+            id: 2,
+            num_frames: 1,
+            tags: vec![place(1, 1, 0.0)],
+        });
+        let bytes = write_swf(
+            vec![square(1, 20.0), sprite, place(1, 2, 0.0), Tag::ShowFrame],
+            1,
+        );
+        let (scene, report) = import_bytes(&bytes).expect("the SWF parses");
+        assert_eq!(
+            drawn_shapes(&scene),
+            1,
+            "the sprite came through empty: {}",
+            report.summary()
+        );
+    }
+
+    /// A placement's colour transform reaches the instance.
+    ///
+    /// Half alpha and a red offset: the multiply lines up with ours exactly,
+    /// and the add is SWF's signed 8-bit offset divided by 255 into the 0..1
+    /// units our model uses. Getting that divisor wrong makes every tinted
+    /// instance either invisible or blown out.
+    #[test]
+    fn a_colour_transform_on_a_placement_reaches_the_instance() {
+        let mut placed = match place(1, 1, 0.0) {
+            Tag::PlaceObject(p) => p,
+            _ => unreachable!(),
+        };
+        placed.color_transform = Some(swf::ColorTransform {
+            r_multiply: Fixed8::ONE,
+            g_multiply: Fixed8::ONE,
+            b_multiply: Fixed8::ONE,
+            a_multiply: Fixed8::from_f64(0.5),
+            r_add: 51,
+            g_add: 0,
+            b_add: 0,
+            a_add: 0,
+        });
+
+        let bytes = write_swf(
+            vec![square(1, 20.0), Tag::PlaceObject(placed), Tag::ShowFrame],
+            1,
+        );
+        let (scene, _) = import_bytes(&bytes).expect("the SWF parses");
+
+        let layers = scene.layers();
+        let layer = layers.iter().next().expect("one layer");
+        let objects = layer.objects_at(0);
+        let buzz_scene::ObjectKind::Instance(instance) =
+            &objects.first().expect("an instance").kind
+        else {
+            panic!("expected an instance")
+        };
+
+        assert!(
+            (instance.color.multiply[3] - 0.5).abs() < 0.01,
+            "alpha multiply was {}",
+            instance.color.multiply[3]
+        );
+        assert!(
+            (instance.color.add[0] - 51.0 / 255.0).abs() < 1e-6,
+            "the red offset was {} — SWF's 8-bit units were not converted",
+            instance.color.add[0]
+        );
+        assert!(
+            !instance.color.is_identity(),
+            "the effect must not be dropped"
+        );
     }
 
     /// Ids handed out by the importer must not be reissued by later editing.

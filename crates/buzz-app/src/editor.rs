@@ -1524,7 +1524,7 @@ impl Editor {
             CreateShapeTween => self.set_tween(Tween::shape()),
             RemoveTween => self.set_tween(Tween::default()),
 
-            ExportImage | ExportSequence => {
+            ExportImage | ExportSequence | ExportVideo => {
                 // The shell owns the file dialog and the exporting thread, as
                 // with Open and Save. Reaching here means a code path raised
                 // the command without going through `App::dispatch`.
@@ -1854,10 +1854,13 @@ impl Editor {
 
     /// Put the most recently imported sound on the current keyframe.
     ///
-    /// Animate attaches a sound to the keyframe the playhead is on, chosen
-    /// from the Properties panel. There is no sound picker yet (PROGRESS §7),
-    /// so the newest import is used — which is the one an animator has just
-    /// brought in.
+    /// Put the newest import on the keyframe the playhead is on.
+    ///
+    /// The menu command's quick path, kept deliberately: the sound an animator
+    /// has just brought in is the one they mean, and importing then attaching
+    /// should not need a trip through a panel. The Sound panel is where a
+    /// *different* clip, the sync mode, the volume and the repeat count are
+    /// chosen — it edits what this creates.
     fn attach_sound_to_frame(&mut self) {
         let Some(layer) = self.selection.active_layer() else {
             self.status = Some("Select a layer to put the sound on".into());

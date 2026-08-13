@@ -1,4 +1,6 @@
-# BuzzAnimate
+<img src="assets/banner.png" alt="Spilled Coffee Studios" width="100%">
+
+# <img src="assets/logo-64.png" width="28" align="top"> BuzzAnimate
 
 GPU-accelerated vector animation. A from-scratch alternative to Adobe Animate,
 targeting the three limits Animate inherited from 1996-era Flash:
@@ -116,17 +118,41 @@ after that. `Camera::screen_precision_px()` reports it live in the HUD.
 
 ## Running it
 
+**Windows: double-click `BuzzAnimate.bat`.** It builds first when the sources
+have changed — a no-op once the build is warm — and then starts the editor. A
+launcher that quietly ran last week's binary would be a confusing thing to own.
+
+```bat
+BuzzAnimate.bat                        an empty document
+BuzzAnimate.bat "C:\work\Scene.buzz"    open a document
+BuzzAnimate.bat --gpu NVIDIA           choose a graphics adapter by name
+BuzzAnimate.bat --script tidy.js       run a script at startup
+BuzzAnimate.bat --dev                  the debug build: quicker to compile,
+                                       slower to draw
+```
+
+`Create Desktop Shortcut.bat` puts a shortcut on the desktop. It points at the
+launcher rather than at the binary, so it keeps working across a rebuild, a
+`cargo clean`, and switching between the release and debug builds.
+
+The console window that appears belongs to the editor: the adapter table is
+printed there at startup, and so is the message telling you where your work was
+written if the program ever crashes. Closing it closes the editor.
+
+From a terminal, on any platform:
+
 ```sh
 cargo run --release -p buzz-app
 ```
 
+Moving around the stage, whatever tool is selected:
+
 | Input | Action |
 |---|---|
 | Mouse wheel | Zoom about the cursor, unbounded |
-| Drag | Pan |
-| `R` | Reset / fit |
-| `Esc` | Quit |
-| HUD buttons | Jump to 2000% / 1e6 / 1e9 / 1e12, stress all cores |
+| Space + drag | Pan |
+| Middle-button drag | Pan |
+| Zoom control, top right of the stage | Zoom out / in, a draggable percentage, presets, Fit in Window |
 
 Flags: `--gpu <name-or-index>` forces an adapter, `--integrated` prefers iGPU.
 The adapter table is printed at startup.

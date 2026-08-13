@@ -13,7 +13,12 @@ pub mod depth_panel;
 pub mod export_panel;
 pub mod filter_panel;
 pub mod icons;
+pub mod about;
+pub mod assets_panel;
 pub mod library_panel;
+pub mod new_document;
+pub mod recovery_panel;
+pub mod swatch_panel;
 pub mod light_panel;
 pub mod lipsync_panel;
 pub mod panels;
@@ -33,7 +38,14 @@ pub use command::Command;
 pub use depth_panel::{DepthResponse, depth_panel};
 pub use export_panel::{ExportKind, ExportResponse, ExportState, export_dialog};
 pub use filter_panel::{FilterPanelState, FilterResponse, FilterTarget, filter_panel};
+pub use about::{AboutState, about_dialog};
+pub use assets_panel::{AssetAction, AssetPanelState, assets_panel};
 pub use library_panel::{LibraryState, library_panel};
+pub use recovery_panel::{RecoveryChoice, RecoveryEntry, RecoveryState, recovery_dialog};
+pub use new_document::{
+    DocumentSetup, NewDocumentResponse, NewDocumentState, new_document_dialog,
+};
+pub use swatch_panel::{SwatchState, swatch_panel};
 pub use light_panel::{LightPanelState, LightResponse, light_panel};
 pub use lipsync_panel::{Choice, LipSyncResponse, LipSyncState, lip_sync_dialog};
 pub use rig_panel::{RigResponse, rig_panel};

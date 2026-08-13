@@ -271,6 +271,7 @@ mod tests {
                         filters: Vec::new(),
                         blend: Default::default(),
                         spatial: Default::default(),
+                        pivot: None,
                     })],
                 );
             });

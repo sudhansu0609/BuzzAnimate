@@ -358,6 +358,85 @@ fn a_mask_of_several_shapes_shows_through_all_of_them() {
     });
 }
 
+/// An inverse mask hides what it covers and leaves the rest — the exact
+/// opposite of the test above, drawn with the same two shapes.
+#[test]
+fn an_inverse_mask_hides_what_it_covers() {
+    with_exporter(|exporter| {
+        let mut scene = Scene::default();
+        scene.stage_mut().background = Color::WHITE;
+
+        let art = scene.add_layer("Art", LayerKind::Masked);
+        scene.add_shape(
+            art,
+            ShapeData::filled(Rect::new(0.0, 0.0, 550.0, 400.0).to_path(1e-9), BLUE),
+        );
+        let mask = scene.add_layer("Hole", LayerKind::InverseMask);
+        scene.add_shape(
+            mask,
+            ShapeData::filled(Rect::new(0.0, 0.0, 137.0, 400.0).to_path(1e-9), RED),
+        );
+
+        let settings = ExportSettings::for_stage(&scene);
+        let frame = exporter.render(&scene, 0, &settings).expect("render");
+
+        assert!(
+            is(frame.pixel(60, 200), Color::WHITE),
+            "under the mask the artwork should be punched away"
+        );
+        assert!(
+            is(frame.pixel(300, 200), BLUE),
+            "everywhere else it should show"
+        );
+        assert!(
+            !is(frame.pixel(60, 200), RED),
+            "the mask's own artwork must not be drawn, either way round"
+        );
+    });
+}
+
+/// Two overlapping blobs in an inverse mask cut *one* hole.
+///
+/// This is the case the obvious implementation gets wrong: reversing the
+/// subpaths inside a big rectangle makes the overlap wind back to filled, and
+/// the middle of the hole would show the artwork again.
+#[test]
+fn overlapping_shapes_in_an_inverse_mask_cut_one_hole() {
+    with_exporter(|exporter| {
+        let mut scene = Scene::default();
+        scene.stage_mut().background = Color::WHITE;
+
+        let art = scene.add_layer("Art", LayerKind::Masked);
+        scene.add_shape(
+            art,
+            ShapeData::filled(Rect::new(0.0, 0.0, 550.0, 400.0).to_path(1e-9), BLUE),
+        );
+        let mask = scene.add_layer("Hole", LayerKind::InverseMask);
+        scene.add_shape(
+            mask,
+            ShapeData::filled(Rect::new(40.0, 40.0, 260.0, 360.0).to_path(1e-9), RED),
+        );
+        scene.add_shape(
+            mask,
+            ShapeData::filled(Rect::new(160.0, 40.0, 380.0, 360.0).to_path(1e-9), RED),
+        );
+
+        let settings = ExportSettings::for_stage(&scene);
+        let frame = exporter.render(&scene, 0, &settings).expect("render");
+
+        assert!(
+            is(frame.pixel(200, 200), Color::WHITE),
+            "where the two shapes overlap the hole must still be a hole"
+        );
+        assert!(is(frame.pixel(80, 200), Color::WHITE), "and in the first");
+        assert!(is(frame.pixel(340, 200), Color::WHITE), "and in the second");
+        assert!(
+            is(frame.pixel(460, 200), BLUE),
+            "beyond both, the artwork is untouched"
+        );
+    });
+}
+
 /// A masked layer inside a symbol is clipped by that symbol's own mask,
 /// wherever the instance is placed.
 #[test]

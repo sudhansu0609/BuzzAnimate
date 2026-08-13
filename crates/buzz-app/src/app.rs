@@ -34,14 +34,141 @@ use crate::editor::Editor;
 use crate::stage;
 use crate::tools::{Mods, ToolAction};
 
-/// The pasteboard, which is also the window clear colour.
-const PASTEBOARD: Color = Color::from_rgb8(0x53, 0x53, 0x53);
+/// Decode one of the packaged logos into an icon.
+///
+/// Decoded from the PNG rather than shipped as raw pixels: 64\u00d764 RGBA is
+/// 16 KB of source file, and the PNG is a fifth of that and can be opened in
+/// any image editor when somebody wants to change it.
+///
+/// Returns `None` rather than failing: a window with the default icon is a
+/// working window.
+fn icon_from_png(bytes: &[u8]) -> Option<winit::window::Icon> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+        .read_info()
+        .ok()?;
+    let mut pixels = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut pixels).ok()?;
+    if info.color_type != png::ColorType::Rgba {
+        return None;
+    }
+    pixels.truncate(info.buffer_size());
+    winit::window::Icon::from_rgba(pixels, info.width, info.height).ok()
+}
+
+/// The icon in the title bar, drawn at 16 pixels — 24 at this machine's
+/// scaling — so the 32-pixel drawing is the one that lands closest to its own
+/// size rather than being reduced to a quarter.
+fn window_icon() -> Option<winit::window::Icon> {
+    icon_from_png(include_bytes!("../../../assets/logo-32.png"))
+}
+
+/// The icon on the taskbar button, drawn at 32 pixels and more at high DPI.
+///
+/// Windows keeps *two* icons per window \u2014 the small one beside the title and
+/// the big one the taskbar and Alt+Tab use \u2014 and winit's `window_icon` sets
+/// only the small. Leaving the big one unset is why the taskbar button showed
+/// a blank sheet of paper while the title bar showed the logo.
+#[cfg(windows)]
+fn taskbar_icon() -> Option<winit::window::Icon> {
+    icon_from_png(include_bytes!("../../../assets/logo-128.png"))
+}
+
+/// Tell Windows this process is an application in its own right.
+///
+/// Without an explicit identity the taskbar files a window under whatever
+/// launched it — `buzzanimate.exe` reached through a batch file and a command
+/// prompt — and draws that entry's icon, which is how the button ended up
+/// showing a blank sheet of paper while the window itself carried the logo.
+/// The same identity is what pinning and jump lists key off, so a pinned
+/// button and a running one become the same button.
+///
+/// Failure is ignored: an unnamed process still runs, it is just filed under
+/// its executable.
+#[cfg(windows)]
+fn name_this_application() {
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SetCurrentProcessExplicitAppUserModelID(id: *const u16) -> i32;
+    }
+
+    let id: Vec<u16> = "BuzzcafMedia.BuzzAnimate\0".encode_utf16().collect();
+    // SAFETY: the pointer is to a NUL-terminated UTF-16 buffer that outlives
+    // the call, which is the whole of this function's contract.
+    unsafe {
+        SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
+    }
+}
+
+/// Is this one of our own documents, or something to translate on the way in?
+///
+/// By extension, and case-insensitively: `SCENE.FLA` off somebody's server is
+/// the same file as `scene.fla`.
+fn opens_as_document(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(buzz_doc::EXTENSION))
+}
+
+/// Where a scrollbar's thumb goes, and how much of the extent is on screen.
+///
+/// Kept as a function of the four numbers rather than a method so it can be
+/// tested without a window: a thumb that is the wrong size or in the wrong
+/// place is the whole failure mode of a scrollbar.
+fn thumb_of(
+    track: egui::Rect,
+    extent_start: f64,
+    extent_end: f64,
+    visible_start: f64,
+    visible_end: f64,
+    horizontal: bool,
+) -> (egui::Rect, f32) {
+    let extent = (extent_end - extent_start).max(1e-9);
+    let shown = ((visible_end - visible_start) / extent).clamp(0.02, 1.0) as f32;
+    let at = (((visible_start - extent_start) / extent) as f32).clamp(0.0, 1.0 - shown);
+
+    if horizontal {
+        let width = (track.width() * shown).max(24.0);
+        let travel = (track.width() - width).max(0.0);
+        let left = track.left() + travel * (at / (1.0 - shown).max(1e-6)).clamp(0.0, 1.0);
+        (
+            egui::Rect::from_min_size(
+                egui::pos2(left, track.top() + 1.0),
+                egui::vec2(width, track.height() - 2.0),
+            ),
+            shown,
+        )
+    } else {
+        let height = (track.height() * shown).max(24.0);
+        let travel = (track.height() - height).max(0.0);
+        let top = track.top() + travel * (at / (1.0 - shown).max(1e-6)).clamp(0.0, 1.0);
+        (
+            egui::Rect::from_min_size(
+                egui::pos2(track.left() + 1.0, top),
+                egui::vec2(track.width() - 2.0, height),
+            ),
+            shown,
+        )
+    }
+}
+
+/// The pasteboard, which is also the colour the stage is cleared to.
+///
+/// Taken from the theme rather than fixed, so the surround follows the
+/// interface — and converted here because Vello wants a `peniko::Color` while
+/// the palette speaks egui's.
+fn pasteboard() -> Color {
+    let c = Palette::pasteboard();
+    Color::from_rgba8(c.r(), c.g(), c.b(), 255)
+}
 
 /// One wheel notch.
 const WHEEL_ZOOM_STEP: f64 = 1.18;
 
 /// How often autosave is offered a chance to run.
-const AUTOSAVE_POLL: Duration = Duration::from_secs(5);
+///
+/// Once a second: the check itself compares two integers, and the policy it
+/// feeds writes after a pause in drawing, which a five-second poll would blunt
+/// into "up to ten seconds".
+const AUTOSAVE_POLL: Duration = Duration::from_secs(1);
 
 struct TargetTexture {
     #[allow(dead_code, reason = "kept alive so the view stays valid")]
@@ -87,18 +214,42 @@ pub struct App {
     /// geometry that cost a boolean to build has to be owned out here, by
     /// something that outlives frames.
     lights: buzz_render::document::DrawCache,
+    /// Autosaves found on launch, while the prompt is still up.
+    recovery: buzz_ui::RecoveryState,
+    /// The revision the crash snapshot was last taken at.
+    last_crash_revision: Option<u64>,
+    /// An Animate asset import running on its own thread.
+    animate_import: Option<crossbeam_channel::Receiver<crate::animate_assets::Progress>>,
 }
 
 impl App {
     pub fn new(preference: GpuPreference) -> Self {
-        Self {
+        // The window opens on the size the user last asked for, not on a
+        // built-in one: "these settings become the default for the next
+        // document" has to include the one the program opens with, or the
+        // promise is only half kept.
+        let mut editor = Editor::default();
+        let remembered = editor.workspace.new_document;
+        editor.create_document(remembered);
+        editor.status = None;
+
+        // Written before anything else can go wrong: from here on a panic
+        // takes the artwork with it only if this fails.
+        buzz_doc::autosave::install_crash_guard();
+
+        let mut app = Self {
             active: None,
-            editor: Editor::default(),
+            editor,
             jobs: Arc::new(JobSystem::new()),
             preference,
             export: None,
             lights: buzz_render::document::DrawCache::new(),
-        }
+            recovery: buzz_ui::RecoveryState::default(),
+            last_crash_revision: None,
+            animate_import: None,
+        };
+        app.recovery = app.find_recoveries();
+        app
     }
 
     /// Open a document at startup.
@@ -129,10 +280,21 @@ impl App {
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<Active> {
+        // Before the window exists: the taskbar reads the identity when the
+        // button is created, and a name arriving afterwards is too late.
+        #[cfg(windows)]
+        name_this_application();
+
         let attrs = Window::default_attributes()
             .with_title("BuzzAnimate")
+            .with_window_icon(window_icon())
             // Sized to leave the status bar clear of a bottom taskbar.
             .with_inner_size(winit::dpi::LogicalSize::new(1560.0, 880.0));
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows as _;
+            attrs.with_taskbar_icon(taskbar_icon())
+        };
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
@@ -174,6 +336,9 @@ impl App {
         let blitter = wgpu::util::TextureBlitter::new(&gpu.device, format);
 
         let egui_ctx = egui::Context::default();
+        // The saved layout carries the interface theme, so the window opens in
+        // whichever the user was last using rather than flashing dark first.
+        theme::set_theme(buzz_ui::Workspace::load().theme);
         theme::apply(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -349,6 +514,10 @@ const KEYBOARD_COMMANDS: &[Command] = &[
     Command::BringForward,
     Command::SendBackward,
     Command::SendToBack,
+    // Modify ▸ Transform. Animate binds the two rotations and leaves the
+    // flips to the menu.
+    Command::RotateClockwise,
+    Command::RotateAnticlockwise,
     Command::NewLayer,
     Command::NewLayerFolder,
     // Symbols. **F8 is the most-pressed key in a symbol-based workflow**
@@ -371,6 +540,11 @@ const KEYBOARD_COMMANDS: &[Command] = &[
     Command::RemoveFrame,
     Command::InsertKeyframe,
     Command::InsertBlankKeyframe,
+    // Animate's frame clipboard, on Animate's keys.
+    Command::CutFrames,
+    Command::CopyFrames,
+    Command::PasteFrames,
+    Command::ClearFrames,
     Command::ClearKeyframe,
     Command::PlayPause,
     Command::NextFrame,
@@ -450,7 +624,7 @@ impl App {
         let stage_area = {
             // egui 0.35 unified the panel types into `Panel::top/bottom/left/right`.
             egui::Panel::top("menu")
-                .frame(egui::Frame::new().fill(Palette::CHROME).inner_margin(2))
+                .frame(egui::Frame::new().fill(Palette::chrome()).inner_margin(2))
                 .show(ui, |ui| {
                     commands.extend(panels::menu_bar(
                         ui,
@@ -467,7 +641,7 @@ impl App {
                 });
 
             egui::Panel::bottom("status")
-                .frame(egui::Frame::new().fill(Palette::CHROME).inner_margin(3))
+                .frame(egui::Frame::new().fill(Palette::chrome()).inner_margin(3))
                 .show(ui, |ui| self.status_bar(ui));
 
             // Every panel is placed by the workspace rather than nailed to a
@@ -488,17 +662,21 @@ impl App {
                     240.0
                 };
                 let response = egui::Panel::bottom(egui::Id::new(("dock-bottom", id)))
-                    .resizable(!locked)
-                    .default_size(height)
+                    // **Exact, not default.** egui keeps a size of its own per
+                    // panel, and a `default_size` is only consulted when it has
+                    // none — so the workspace's number and egui's could
+                    // disagree, and the panel would spring back to whichever
+                    // one won. The workspace is the single source of truth, and
+                    // the splitters below are what move it.
+                    .resizable(false)
+                    .exact_size(height)
                     .show(ui, |ui| {
                         if let Some(dock) = panel_header(ui, id, locked, !id.draws_own_title(), &mut reorders) {
                             moves.push((id, dock));
                         }
                         self.draw_panel(ui, id, &mut commands);
                     });
-                if id == buzz_ui::PanelId::Timeline {
-                    self.editor.workspace.bottom_height = response.response.rect.height();
-                }
+                let _ = &response;
             }
 
             for (dock, id_name, width) in [
@@ -509,12 +687,12 @@ impl App {
                     continue;
                 }
                 let response = egui::Panel::left(id_name)
-                    .resizable(!locked)
-                    .default_size(width)
+                    .resizable(false)
+                    .exact_size(width)
                     .show(ui, |ui| {
                         self.draw_column(ui, &panels, locked, &mut moves, &mut reorders, &mut commands);
                     });
-                self.editor.workspace.left_width = response.response.rect.width();
+                let _ = &response;
             }
 
             for (dock, id_name, width) in [
@@ -526,17 +704,12 @@ impl App {
                     continue;
                 }
                 let response = egui::Panel::right(id_name)
-                    .resizable(!locked)
-                    .default_size(width)
+                    .resizable(false)
+                    .exact_size(width)
                     .show(ui, |ui| {
                         self.draw_column(ui, &panels, locked, &mut moves, &mut reorders, &mut commands);
                     });
-                let measured = response.response.rect.width();
-                if dock == buzz_ui::Dock::Right {
-                    self.editor.workspace.right_width = measured;
-                } else {
-                    self.editor.workspace.right_outer_width = measured;
-                }
+                let _ = &response;
             }
 
             // Floating panels are windows over the stage, movable and resizable
@@ -591,7 +764,7 @@ impl App {
             // let them hide their only way out of a symbol.
             if !self.editor.scene().edit_path().is_empty() {
                 egui::Panel::top("breadcrumb")
-                    .frame(egui::Frame::new().fill(Palette::CHROME).inner_margin(3))
+                    .frame(egui::Frame::new().fill(Palette::chrome()).inner_margin(3))
                     .show(ui, |ui| {
                         if let Some(command) = self.breadcrumb(ui) {
                             commands.push(command);
@@ -615,6 +788,10 @@ impl App {
                     if let Some(guide) = response.new_guide {
                         self.editor.view.add_guide(guide);
                     }
+                    // Over the artwork, after the chrome, so it is never drawn
+                    // under a ruler or a selection outline.
+                    self.stage_scrollbars(ui, area);
+                    self.stage_zoom_overlay(ui, area);
                     area
                 })
                 .inner
@@ -624,16 +801,32 @@ impl App {
         // reaches the screen. The repaint request is what keeps the progress
         // bar moving on a document that is otherwise still.
         self.poll_export();
+        self.poll_animate_import();
         if self.export.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.export_dialog(&ctx);
         self.lip_sync_dialog(&ctx);
+        self.recovery_dialog(&ctx);
+        buzz_ui::about_dialog(&ctx, &mut self.editor.about);
+
+        // File ▸ New asks before it acts, and the answer is remembered.
+        let new_document = buzz_ui::new_document_dialog(&ctx, &mut self.editor.new_document);
+        if let Some(setup) = new_document.create {
+            self.editor.create_document(setup);
+        }
 
         commands.extend(keyboard_commands(&ctx, &self.editor));
         for command in commands {
             self.dispatch(command);
         }
+
+        // The dock splitters, after everything else has had its say.
+        self.dock_splitters(ui, stage_area);
+
+        // The brand's band across the top, last and over everything: it is the
+        // window's masthead, not any panel's decoration.
+        buzz_ui::theme::top_banner(&ctx, ui.min_rect().union(ui.max_rect()));
 
         stage_area
     }
@@ -759,15 +952,44 @@ impl App {
                 }
 
                 let editor = &mut self.editor;
+                let at = editor.edit_at();
                 let selection = &editor.selection;
                 let style = &mut editor.style;
                 let view = &mut editor.view;
                 editor.doc.edit("Document Properties", |scene| {
-                    panels::properties_panel(ui, scene, selection, style, view);
+                    panels::properties_panel(ui, scene, selection, style, view, at);
                 });
             }
 
-            Color => panels::color_panel(ui, &mut self.editor.style),
+            Color => {
+                let editor = &mut self.editor;
+                panels::color_panel(ui, editor.doc.scene(), &mut editor.style);
+            }
+
+            Assets => {
+                let can_add = !self.editor.selection.is_empty();
+                let action = buzz_ui::assets_panel(
+                    ui,
+                    &self.editor.assets,
+                    &mut self.editor.assets_panel,
+                    can_add,
+                );
+                if let Some(action) = action {
+                    self.apply_asset_action(action);
+                }
+            }
+
+            Swatches => {
+                // Naming a colour and moving one between folders are edits to
+                // the document, so the panel runs inside an undo step — the
+                // same arrangement the Library panel uses.
+                let editor = &mut self.editor;
+                let state = &mut editor.swatch_panel;
+                let style = &mut editor.style;
+                editor.doc.edit("Swatches", |scene| {
+                    buzz_ui::swatch_panel(ui, scene, state, style);
+                });
+            }
             Depth => self.depth_panel(ui),
             Rig => self.rig_panel(ui),
             Filters => self.filter_panel(ui),
@@ -792,6 +1014,12 @@ impl App {
                     camera_selected: self.editor.camera_selected,
                     playing: self.editor.playback.playing,
                     onion_enabled: self.editor.onion.enabled,
+                    auto_keyframe: self.editor.auto_keyframe,
+                    edit_multiple: self.editor.edit_multiple,
+                    onion_before: self.editor.onion.before,
+                    onion_after: self.editor.onion.after,
+                    frame_width: self.editor.workspace.frame_width,
+                    row_scale: self.editor.workspace.row_scale,
                     waveforms: self.editor.waveforms(),
                 };
                 let response = buzz_ui::timeline_panel(ui, self.editor.scene(), &state);
@@ -1170,6 +1398,16 @@ impl App {
         if response.toggle_onion {
             commands.push(Command::ToggleOnionSkin);
         }
+        if response.toggle_auto_keyframe {
+            commands.push(Command::ToggleAutoKeyframe);
+        }
+        if response.toggle_edit_multiple {
+            commands.push(Command::ToggleEditMultipleFrames);
+        }
+        if let Some((before, after)) = response.set_onion_range {
+            self.editor.onion.before = before;
+            self.editor.onion.after = after;
+        }
         if response.go_to_start {
             commands.push(Command::FirstFrame);
         }
@@ -1179,6 +1417,412 @@ impl App {
         if response.step != 0 {
             self.editor.step_frame(response.step);
         }
+        if let Some(region) = response.set_loop {
+            self.editor.set_loop_region(region);
+        }
+        if let Some(frames) = response.set_frame_count {
+            self.editor.set_frame_count(frames);
+        }
+        if let Some(command) = response.command {
+            commands.push(command);
+        }
+        // The timeline's own zooms: workspace state, saved with the layout
+        // rather than with the film, and clamped here so a hand-edited
+        // workspace file cannot ask for a one-pixel frame.
+        if let Some(width) = response.set_frame_width {
+            self.editor.workspace.frame_width = width.clamp(
+                *buzz_ui::workspace::FRAME_WIDTH_RANGE.start(),
+                *buzz_ui::workspace::FRAME_WIDTH_RANGE.end(),
+            );
+            self.editor.workspace.save();
+        }
+        if let Some(scale) = response.set_row_scale {
+            self.editor.workspace.row_scale = scale.clamp(
+                *buzz_ui::workspace::ROW_SCALE_RANGE.start(),
+                *buzz_ui::workspace::ROW_SCALE_RANGE.end(),
+            );
+            self.editor.workspace.save();
+        }
+    }
+
+    /// Drag handles on the boundaries between the stage and the docks.
+    ///
+    /// # Why these exist rather than egui's own
+    ///
+    /// `Panel::resizable(true)` puts its handle on the panel's edge and
+    /// registers the interaction when the panel is drawn. The stage is a
+    /// central panel drawn *after* every dock, and its own click-and-drag
+    /// interaction covers the whole area — so it claimed the pixels the handle
+    /// needed, and dragging a boundary did nothing at all. (What the user sees
+    /// is a panel that "resizes and springs back", because a live drag over the
+    /// stage is still panning or marqueeing underneath.)
+    ///
+    /// These are drawn last, in a foreground layer, so nothing can take them,
+    /// and they move the **workspace's** own numbers — which the panels are
+    /// then laid out from exactly. One source of truth, and it is the one that
+    /// gets saved.
+    fn dock_splitters(&mut self, ui: &mut egui::Ui, stage: egui::Rect) {
+        if self.editor.workspace.locked || stage.width() < 40.0 || stage.height() < 40.0 {
+            return;
+        }
+
+        /// How wide a boundary is to grab, in points. Wider than it looks: a
+        /// two-pixel target is a fight, and the handle is invisible until the
+        /// pointer is on it anyway.
+        const GRAB: f32 = 6.0;
+
+        let mut changed = false;
+        let workspace = self.editor.workspace.clone();
+
+        // (id, the strip to grab, vertical?, which way widening runs)
+        let mut handles: Vec<(&'static str, egui::Rect, bool, f32)> = Vec::new();
+
+        if !workspace.on(buzz_ui::Dock::Left).is_empty() {
+            handles.push((
+                "split-left",
+                egui::Rect::from_min_max(
+                    egui::pos2(stage.left() - GRAB * 0.5, stage.top()),
+                    egui::pos2(stage.left() + GRAB * 0.5, stage.bottom()),
+                ),
+                true,
+                1.0,
+            ));
+        }
+        if !workspace.on(buzz_ui::Dock::Right).is_empty() {
+            handles.push((
+                "split-right",
+                egui::Rect::from_min_max(
+                    egui::pos2(stage.right() - GRAB * 0.5, stage.top()),
+                    egui::pos2(stage.right() + GRAB * 0.5, stage.bottom()),
+                ),
+                true,
+                -1.0,
+            ));
+        }
+        if !workspace.on(buzz_ui::Dock::Bottom).is_empty() {
+            handles.push((
+                "split-bottom",
+                egui::Rect::from_min_max(
+                    egui::pos2(stage.left(), stage.bottom() - GRAB * 0.5),
+                    egui::pos2(stage.right(), stage.bottom() + GRAB * 0.5),
+                ),
+                false,
+                -1.0,
+            ));
+        }
+
+        for (name, rect, vertical, direction) in handles {
+            let response = ui.interact(
+                rect,
+                egui::Id::new(name),
+                egui::Sense::click_and_drag(),
+            );
+            if response.hovered() || response.dragged() {
+                ui.ctx().set_cursor_icon(if vertical {
+                    egui::CursorIcon::ResizeHorizontal
+                } else {
+                    egui::CursorIcon::ResizeVertical
+                });
+                // Only shown while it matters, so the window is not striped
+                // with handles nobody asked about.
+                ui.painter().rect_filled(
+                    rect.shrink2(if vertical {
+                        egui::vec2(2.0, 0.0)
+                    } else {
+                        egui::vec2(0.0, 2.0)
+                    }),
+                    1.0,
+                    buzz_ui::Palette::active(),
+                );
+            }
+            if response.dragged() {
+                let delta = response.drag_delta();
+                let moved = if vertical { delta.x } else { delta.y } * direction;
+                let workspace = &mut self.editor.workspace;
+                match name {
+                    "split-left" => {
+                        workspace.left_width = (workspace.left_width + moved).clamp(40.0, 400.0)
+                    }
+                    "split-right" => {
+                        workspace.right_width = (workspace.right_width + moved).clamp(120.0, 900.0)
+                    }
+                    _ => {
+                        workspace.bottom_height =
+                            (workspace.bottom_height + moved).clamp(80.0, 900.0)
+                    }
+                }
+                changed = true;
+            }
+            if response.drag_stopped() {
+                // Saved when the drag ends rather than on every pixel of it.
+                self.editor.workspace.save();
+            }
+        }
+
+        if changed {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Scrollbars along the bottom and right of the stage.
+    ///
+    /// # Why the stage has them at all
+    ///
+    /// Panning is by the wheel, space-drag, middle-drag or the Hand tool, and
+    /// Ctrl+wheel zooms. All of that is fine once you know it, and none of it
+    /// tells you
+    /// *where you are*: with the view somewhere off the pasteboard there was
+    /// nothing on screen to say which way the artwork lay. A scrollbar is the
+    /// one control that answers that without being asked — the thumb's size is
+    /// how much of the work is on screen, and its position is where.
+    ///
+    /// # What they scroll over
+    ///
+    /// The stage rectangle and everything drawn on this frame, plus a stage's
+    /// worth of margin so there is somewhere to put artwork that is still being
+    /// moved into place. The extent therefore grows with the drawing rather
+    /// than being a fixed canvas the way Animate's is.
+    fn stage_scrollbars(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
+        const THICKNESS: f32 = 10.0;
+        if area.width() < 120.0 || area.height() < 120.0 {
+            return;
+        }
+
+        let camera = &self.editor.camera;
+        let visible = camera.visible_doc_rect();
+        let extent = self.scrollable_extent(visible);
+
+        // Nothing to scroll: the whole extent is on screen.
+        let horizontal = extent.width() > visible.width() + 1.0;
+        let vertical = extent.height() > visible.height() + 1.0;
+        if !horizontal && !vertical {
+            return;
+        }
+
+        let track_colour = buzz_ui::Palette::chrome();
+        let thumb_colour = buzz_ui::Palette::raised();
+        let thumb_hot = buzz_ui::Palette::active();
+
+        let mut moved: Option<(f64, f64)> = None;
+
+        if horizontal {
+            let track = egui::Rect::from_min_max(
+                egui::pos2(area.left(), area.bottom() - THICKNESS),
+                egui::pos2(area.right() - if vertical { THICKNESS } else { 0.0 }, area.bottom()),
+            );
+            let response = ui.interact(
+                track,
+                egui::Id::new("stage-scroll-x"),
+                egui::Sense::click_and_drag(),
+            );
+            let (thumb, fraction) = thumb_of(track, extent.x0, extent.x1, visible.x0, visible.x1, true);
+            ui.painter().rect_filled(track, 0.0, track_colour);
+            ui.painter().rect_filled(
+                thumb,
+                2.0,
+                if response.hovered() || response.dragged() {
+                    thumb_hot
+                } else {
+                    thumb_colour
+                },
+            );
+
+            // Dragging the thumb, or clicking anywhere on the track, puts the
+            // view where the pointer is — the behaviour every scrollbar has.
+            if (response.dragged() || response.clicked())
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let t = ((pos.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0) as f64;
+                let span = extent.width() - visible.width();
+                let x = extent.x0 + span * t + visible.width() / 2.0;
+                moved = Some((x, camera.center.y));
+            }
+            let _ = fraction;
+        }
+
+        if vertical {
+            let track = egui::Rect::from_min_max(
+                egui::pos2(area.right() - THICKNESS, area.top()),
+                egui::pos2(area.right(), area.bottom() - if horizontal { THICKNESS } else { 0.0 }),
+            );
+            let response = ui.interact(
+                track,
+                egui::Id::new("stage-scroll-y"),
+                egui::Sense::click_and_drag(),
+            );
+            let (thumb, _) = thumb_of(track, extent.y0, extent.y1, visible.y0, visible.y1, false);
+            ui.painter().rect_filled(track, 0.0, track_colour);
+            ui.painter().rect_filled(
+                thumb,
+                2.0,
+                if response.hovered() || response.dragged() {
+                    thumb_hot
+                } else {
+                    thumb_colour
+                },
+            );
+
+            if (response.dragged() || response.clicked())
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let t = ((pos.y - track.top()) / track.height().max(1.0)).clamp(0.0, 1.0) as f64;
+                let span = extent.height() - visible.height();
+                let y = extent.y0 + span * t + visible.height() / 2.0;
+                let x = moved.map(|(x, _)| x).unwrap_or(self.editor.camera.center.x);
+                moved = Some((x, y));
+            }
+        }
+
+        if let Some((x, y)) = moved {
+            self.editor.camera.center = buzz_geom::Point::new(x, y);
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Everything worth scrolling over: the stage, the artwork, and a margin.
+    fn scrollable_extent(&self, visible: buzz_geom::Rect) -> buzz_geom::Rect {
+        let scene = self.editor.scene();
+        let mut extent = scene.stage().stage_rect();
+
+        for layer in scene.layers().iter() {
+            for object in layer.objects_at(self.editor.current_frame) {
+                let bounds = scene.resolved_bounds(object);
+                if bounds.width().is_finite() && bounds.height().is_finite() {
+                    extent = extent.union(bounds);
+                }
+            }
+        }
+
+        // A stage's worth of air on every side, so there is somewhere to put
+        // artwork that is on its way somewhere.
+        let margin = buzz_geom::Vec2::new(
+            scene.stage().size.width * 0.5,
+            scene.stage().size.height * 0.5,
+        );
+        extent = buzz_geom::Rect::new(
+            extent.x0 - margin.x,
+            extent.y0 - margin.y,
+            extent.x1 + margin.x,
+            extent.y1 + margin.y,
+        );
+
+        // And never smaller than what is on screen, or the thumb would be
+        // longer than its track.
+        extent.union(visible)
+    }
+
+    /// The zoom control that sits on the stage itself, top right.
+    ///
+    /// # Why here as well as in the status bar
+    ///
+    /// The status bar is where a *number* belongs, and it is the last place
+    /// anybody looks while drawing. Zoom is used constantly and with the
+    /// pointer already over the artwork, so the control belongs where the eye
+    /// already is — which is what every other creative tool has settled on,
+    /// Animate included.
+    ///
+    /// Drawn as an overlay rather than as another panel: it must float above
+    /// the artwork without taking a strip of the stage away from it.
+    fn stage_zoom_overlay(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
+        if area.width() < 160.0 || area.height() < 80.0 {
+            return;
+        }
+
+        // Inset from the corner, and clear of the ruler along the top edge.
+        let top = area.min.y + if self.editor.view.show_rulers { 24.0 } else { 8.0 };
+        let anchor = egui::pos2(area.max.x - 8.0, top);
+
+        egui::Area::new(egui::Id::new("stage-zoom"))
+            .fixed_pos(anchor)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .order(egui::Order::Middle)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(Palette::panel())
+                    .inner_margin(egui::Margin::symmetric(6, 3))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .small_button("\u{2212}")
+                                .on_hover_text("Zoom out (Ctrl+- or Ctrl+wheel)")
+                                .clicked()
+                            {
+                                self.editor.zoom_by(1.0 / WHEEL_ZOOM_STEP.powi(3));
+                            }
+
+                            // The percentage is also the drag: pulling it is
+                            // the fastest way across a wide range, and the
+                            // speed is proportional so one gesture works at
+                            // 50% and at a trillion.
+                            let mut percent = self.editor.camera.zoom_percent();
+                            let speed = percent.max(1.0) * 0.02;
+                            let response = ui.add(
+                                egui::DragValue::new(&mut percent)
+                                    .speed(speed)
+                                    .range(0.001..=f64::MAX)
+                                    .suffix(" %"),
+                            );
+                            if response.changed() {
+                                self.editor.camera.set_zoom_percent(percent);
+                            }
+
+                            if ui
+                                .small_button("+")
+                                .on_hover_text("Zoom in (Ctrl+= or Ctrl+wheel)")
+                                .clicked()
+                            {
+                                self.editor.zoom_by(WHEEL_ZOOM_STEP.powi(3));
+                            }
+
+                            // `⏷`, not `▾`: egui's bundled fonts have the first and
+                            // not the second, which drew as an empty box in the very
+                            // first screenshot of this control.
+                            ui.menu_button("\u{23F7}", |ui| {
+                                for preset in [25.0, 50.0, 100.0, 200.0, 400.0, 800.0] {
+                                    if ui.button(format!("{preset:.0}%")).clicked() {
+                                        self.editor.camera.set_zoom_percent(preset);
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                if ui.button("Fit in Window").clicked() {
+                                    self.editor.run(Command::ZoomFitInWindow);
+                                    ui.close();
+                                }
+                                if ui.button("Show All").clicked() {
+                                    self.editor.run(Command::ZoomShowAll);
+                                    ui.close();
+                                }
+                                if ui.button("Show Frame").clicked() {
+                                    self.editor.run(Command::ZoomShowFrame);
+                                    ui.close();
+                                }
+                            })
+                            .response
+                            .on_hover_text("Zoom presets");
+
+                            ui.separator();
+
+                            // Pan, for anybody who has not met the space bar.
+                            let panning = self.editor.tool() == buzz_ui::ToolId::Hand;
+                            if ui
+                                .selectable_label(panning, "\u{270B}")
+                                .on_hover_text(
+                                    "Pan the view \u{2014} or hold the space bar, or drag with \
+                                     the middle button, whatever the tool",
+                                )
+                                .clicked()
+                            {
+                                let next = if panning {
+                                    buzz_ui::ToolId::Selection
+                                } else {
+                                    buzz_ui::ToolId::Hand
+                                };
+                                self.editor.run(Command::SelectTool(next));
+                            }
+                        });
+                    });
+            });
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -1263,15 +1907,31 @@ impl App {
         let local =
             |p: egui::Pos2| Point::new((p.x - area.min.x) as f64, (p.y - area.min.y) as f64);
 
-        // Wheel zooms about the cursor; unbounded in both directions.
+        // **Ctrl+wheel zooms; the wheel alone scrolls.** Animate's arrangement,
+        // and every drawing program's — a wheel that zooms by itself makes a
+        // long timeline impossible to walk down, and it was surprising in the
+        // other direction too: with a modifier held the wheel still zoomed,
+        // because any scroll at all did.
+        //
+        // egui has already turned Ctrl+wheel (and a trackpad pinch) into a zoom
+        // factor and taken it out of the scroll delta, so the two cannot fight.
         if response.hovered() {
-            let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0
+            let (zoom, scroll) =
+                ctx.input(|i| (i.zoom_delta() as f64, i.smooth_scroll_delta));
+
+            if zoom != 1.0
                 && let Some(pos) = ctx.input(|i| i.pointer.hover_pos())
             {
-                self.editor
-                    .camera
-                    .zoom_by_at(WHEEL_ZOOM_STEP.powf(scroll as f64 / 50.0), local(pos));
+                // About the pointer, so the thing under it stays under it.
+                self.editor.camera.zoom_by_at(zoom, local(pos));
+            } else if scroll != egui::Vec2::ZERO {
+                // Taken as it comes: egui has already applied Shift for
+                // horizontal and Alt for vertical, which is where the old
+                // behaviour came from — Alt forces the wheel onto the vertical
+                // axis, and anything on that axis used to zoom.
+                self.editor.apply(ToolAction::PanView {
+                    delta_screen: buzz_geom::Vec2::new(scroll.x as f64, scroll.y as f64),
+                });
             }
         }
 
@@ -1324,6 +1984,18 @@ impl App {
             self.editor.pointer_up(local(pos));
         }
 
+        // **Double-click goes in and out of a symbol**, which is how anybody
+        // who has used Animate navigates: double-click an instance to edit it
+        // where it stands, double-click past the artwork to come back out.
+        // Without it a nested character could only be opened through the
+        // Library, one level at a time.
+        if response.double_clicked()
+            && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
+            && !pan_override
+        {
+            self.editor.enter_or_leave_at(local(pos));
+        }
+
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.editor.machine.cancel();
         }
@@ -1345,6 +2017,183 @@ impl App {
         }
     }
 
+    /// Act on what the Assets panel asked for.
+    ///
+    /// The panel raises intentions and this performs them, because writing
+    /// files and merging documents is the shell's business — and placing an
+    /// asset has to land in an undo step, which the panel knows nothing about.
+    fn apply_asset_action(&mut self, action: buzz_ui::AssetAction) {
+        use buzz_ui::AssetAction::*;
+        match action {
+            Place(asset) => {
+                let library = self.editor.assets.clone();
+                let mut outcome = None;
+                self.editor.doc.edit("Place Asset", |scene| {
+                    outcome = Some(library.place(&asset, scene));
+                });
+                match outcome {
+                    Some(Ok(report)) => {
+                        // The placed artwork is what the user now wants to move,
+                        // exactly as it is after an import.
+                        self.editor.selection.clear();
+                        self.editor
+                            .selection
+                            .ensure_active_layer(self.editor.doc.scene());
+                        self.editor.status = Some(format!(
+                            "Placed {} — {} layers, {} symbols",
+                            asset.name, report.layers, report.symbols
+                        ));
+                    }
+                    Some(Err(e)) => {
+                        // The edit above recorded an undo step for a merge that
+                        // did not happen; take it back rather than leaving a
+                        // "Place Asset" in the history that changed nothing.
+                        self.editor.doc.undo();
+                        self.editor.status = Some(format!("Could not place {}: {e}", asset.name));
+                    }
+                    None => {}
+                }
+            }
+
+            Add { folder } => {
+                let ids = self.editor.selection.ids();
+                if ids.is_empty() {
+                    self.editor.status = Some("Select artwork to keep as an asset".into());
+                    return;
+                }
+                let asset = self.editor.doc.scene().extract(self.editor.current_frame, &ids);
+                let name = self.editor.assets.unique_name("Asset", &folder);
+                match self.editor.assets.save(&name, &folder, &asset) {
+                    Ok(saved) => {
+                        self.editor.status =
+                            Some(format!("Kept {} in Assets", saved.label()));
+                    }
+                    Err(e) => self.editor.status = Some(format!("Could not save the asset: {e}")),
+                }
+            }
+
+            NewFolder => {
+                let existing: Vec<String> = self.editor.assets.folders().to_vec();
+                let mut name = "Folder".to_string();
+                for n in 2..1000 {
+                    if !existing.contains(&name) {
+                        break;
+                    }
+                    name = format!("Folder {n}");
+                }
+                if let Err(e) = self.editor.assets.create_folder(&name) {
+                    self.editor.status = Some(format!("Could not make the folder: {e}"));
+                } else {
+                    self.editor.assets_panel.selected_folder = name;
+                }
+            }
+
+            Rename { asset, name } => {
+                if let Err(e) = self.editor.assets.rename(&asset, &name) {
+                    self.editor.status = Some(format!("Could not rename: {e}"));
+                }
+            }
+
+            Delete(asset) => {
+                if let Err(e) = self.editor.assets.delete(&asset) {
+                    self.editor.status = Some(format!("Could not delete: {e}"));
+                }
+            }
+
+            Rescan => {
+                self.editor.assets.rescan();
+                self.editor.status = Some(format!("{} assets", self.editor.assets.len()));
+            }
+
+            ImportFromAnimate => self.import_animate_assets(),
+        }
+    }
+
+    /// Bring an Animate asset library across, all of it.
+    ///
+    /// The folder picker opens on this machine's Animate assets folder when
+    /// there is one: the path is long, buried under `Documents`, and nobody
+    /// should have to remember it.
+    fn import_animate_assets(&mut self) {
+        if self.animate_import.is_some() {
+            self.editor.status = Some("An Animate import is already running".into());
+            return;
+        }
+
+        let mut picker = rfd::FileDialog::new();
+        if let Some(root) = crate::animate_assets::likely_roots().first() {
+            picker = picker.set_directory(root);
+        }
+        let Some(root) = picker.pick_folder() else { return };
+
+        let found = crate::animate_assets::scan(&root);
+        if found.is_empty() {
+            self.editor.status = Some(format!(
+                "No Animate assets in {} \u{2014} expected a folder with Custom/ in it",
+                root.display()
+            ));
+            return;
+        }
+
+        let total = found.len();
+        self.editor.assets_panel.importing = Some((0, total));
+        self.editor.status = Some(format!("Importing {total} assets from Animate\u{2026}"));
+        self.animate_import = Some(crate::animate_assets::import_all(
+            found,
+            self.editor.assets.clone(),
+        ));
+    }
+
+    /// Move an Animate import along, if one is running.
+    ///
+    /// Polled rather than pushed for the same reason an export is: the work is
+    /// on another thread, and the window redraws when it feels like it.
+    fn poll_animate_import(&mut self) {
+        let Some(progress) = &self.animate_import else {
+            return;
+        };
+
+        let mut finished = None;
+        while let Ok(message) = progress.try_recv() {
+            match message {
+                crate::animate_assets::Progress::Working { done, total } => {
+                    self.editor.assets_panel.importing = Some((done, total));
+                }
+                crate::animate_assets::Progress::Finished {
+                    imported,
+                    skipped,
+                    failed,
+                } => {
+                    finished = Some((imported, skipped, failed));
+                }
+            }
+        }
+
+        if let Some((imported, skipped, failed)) = finished {
+            self.animate_import = None;
+            self.editor.assets_panel.importing = None;
+            self.editor.assets.rescan();
+            let mut message = format!("Imported {imported} assets from Animate");
+            if skipped > 0 {
+                // Bitmaps, almost always: see §7 item 22.
+                message.push_str(&format!("; {skipped} skipped"));
+            }
+            if !failed.is_empty() {
+                message.push_str(&format!("; {} could not be read", failed.len()));
+            }
+            self.editor.status = Some(message);
+            if !failed.is_empty() {
+                // Named rather than counted: which ones failed is the only
+                // useful thing to know afterwards.
+                self.editor.import_summary = Some(crate::import::ImportSummary {
+                    title: "Imported from Animate".to_string(),
+                    what_arrived: format!("{imported} assets"),
+                    unsupported: failed,
+                });
+            }
+        }
+    }
+
     /// Open the Export dialog, sized to the document as it is now.
     fn open_export(&mut self, kind: buzz_ui::ExportKind) {
         if self.export.is_some() {
@@ -1359,7 +2208,11 @@ impl App {
                 size.width.round().max(1.0) as u32,
                 size.height.round().max(1.0) as u32,
             ),
-            scene.frame_count(),
+            // The length of the **film**, not of the timeline: a looping
+            // section is repeated into the export, so the default range has to
+            // reach the end of what will actually be written. Without a loop
+            // region the two are the same number.
+            scene.rendered_frame_count(),
         );
     }
 
@@ -1614,19 +2467,85 @@ impl App {
     }
 
     fn open_dialog(&mut self) {
+        // **Everything openable, not only our own format.** The importers have
+        // existed since Phase 5 but were reachable only through File ▸ Import,
+        // so File ▸ Open refused an Animate document — the very file somebody
+        // coming from Animate would reach for first.
+        let mut everything = vec![buzz_doc::EXTENSION];
+        everything.extend_from_slice(crate::import::IMPORTABLE);
+
         let picked = rfd::FileDialog::new()
+            .add_filter("Everything BuzzAnimate can open", &everything)
             .add_filter("BuzzAnimate document", &[buzz_doc::EXTENSION])
+            .add_filter("Animate document", &["fla", "xfl"])
+            .add_filter("Flash movie", &["swf"])
+            .add_filter("PDF or Illustrator artwork", &["pdf", "ai"])
             .pick_file();
         let Some(path) = picked else { return };
 
-        match Document::open(&path) {
+        if opens_as_document(&path) {
+            self.open_buzz(&path);
+        } else {
+            self.open_imported(&path);
+        }
+    }
+
+    /// Open one of our own documents.
+    fn open_buzz(&mut self, path: &std::path::Path) {
+        match Document::open(path) {
             Ok(doc) => {
+                let workspace = std::mem::take(&mut self.editor.workspace);
                 self.editor = Editor::new(doc);
+                self.editor.workspace = workspace;
+                self.remember_document_directory(path);
                 self.editor.status = Some(format!("Opened {}", path.display()));
             }
             Err(e) => {
                 self.editor.status = Some(format!("Could not open: {e}"));
             }
+        }
+    }
+
+    /// Open a foreign file — `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` — as a new
+    /// document.
+    ///
+    /// **Not as the document's own path.** What comes back is a *translation*,
+    /// however good; saving it must ask for a `.buzz` file rather than write
+    /// back over somebody's Animate source, which this program cannot produce
+    /// and would therefore destroy.
+    fn open_imported(&mut self, path: &std::path::Path) {
+        let imported = match crate::import::read(path) {
+            Ok(imported) => imported,
+            Err(message) => {
+                self.editor.status = Some(format!("Could not open: {message}"));
+                return;
+            }
+        };
+
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+
+        let workspace = std::mem::take(&mut self.editor.workspace);
+        self.editor = Editor::new(Document::new(imported.scene.clone()));
+        self.editor.workspace = workspace;
+        self.editor.doc.mark_clean();
+        self.editor
+            .selection
+            .ensure_active_layer(self.editor.doc.scene());
+        self.editor.zoom_fit();
+        self.remember_document_directory(path);
+        self.editor.status = Some(format!("Opened {name} — {}", imported.summary));
+
+        // What did not survive the translation is worth interrupting for: it is
+        // the difference between the file they had and the one they now have.
+        if !imported.unsupported.is_empty() {
+            self.editor.import_summary = Some(crate::import::ImportSummary {
+                title: format!("Opened {name}"),
+                what_arrived: imported.summary.clone(),
+                unsupported: imported.unsupported.clone(),
+            });
         }
     }
 
@@ -1642,8 +2561,124 @@ impl App {
         let Some(path) = path else { return };
 
         match self.editor.doc.save_as(&path) {
-            Ok(()) => self.editor.status = Some(format!("Saved {}", path.display())),
+            Ok(()) => {
+                // Saved: there is nothing left to recover, and the crash
+                // snapshot must not offer to restore what is now on disk.
+                buzz_doc::autosave::forget_crash_snapshot();
+                self.remember_document_directory(&path);
+                self.editor.status = Some(format!("Saved {}", path.display()));
+            }
             Err(e) => self.editor.status = Some(format!("Could not save: {e}")),
+        }
+    }
+
+    /// Note where a document lives, so a crash can be recovered from there.
+    fn remember_document_directory(&mut self, path: &std::path::Path) {
+        if let Some(directory) = path.parent() {
+            self.editor.workspace.remember_directory(directory);
+            self.editor.workspace.save();
+        }
+    }
+
+    /// Look for autosaves left behind by a crash.
+    ///
+    /// The application's own recovery directory holds work that was never
+    /// saved; the remembered directories hold copies written beside documents
+    /// that were. Both are offered together, most recent first.
+    fn find_recoveries(&self) -> buzz_ui::RecoveryState {
+        let mut directories = vec![buzz_doc::autosave::recovery_dir()];
+        directories.extend(self.editor.workspace.recovery_dirs.iter().cloned());
+        directories.dedup();
+
+        let now = std::time::SystemTime::now();
+        let mut found = Vec::new();
+        for directory in directories {
+            for recovery in buzz_doc::find_recoveries(&directory) {
+                let age_seconds = recovery
+                    .modified
+                    .and_then(|m| now.duration_since(m).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                found.push(buzz_ui::RecoveryEntry {
+                    path: recovery.path,
+                    document: recovery.document,
+                    age_seconds,
+                });
+            }
+        }
+        found.sort_by_key(|e| e.age_seconds);
+        buzz_ui::RecoveryState { found }
+    }
+
+    /// Draw the recovery prompt and act on what was chosen.
+    fn recovery_dialog(&mut self, ctx: &egui::Context) {
+        match buzz_ui::recovery_dialog(ctx, &self.recovery) {
+            buzz_ui::RecoveryChoice::None => {}
+            buzz_ui::RecoveryChoice::Recover(entry) => {
+                match Document::open(&entry.path) {
+                    Ok(mut doc) => {
+                        // Detached from the file it came from: Save must ask
+                        // where to put it rather than writing back over a
+                        // recovery, and this session's own autosave must not
+                        // land on the file it was recovered from.
+                        doc.forget_path();
+                        let workspace = std::mem::take(&mut self.editor.workspace);
+                        self.editor = Editor::new(doc);
+                        self.editor.workspace = workspace;
+
+                        // Moved aside rather than deleted: the prompt should
+                        // not offer it again every launch, and a copy on disk
+                        // costs nothing next to the work it holds.
+                        let aside = entry.path.with_file_name(format!(
+                            "{}.recovered.buzz",
+                            entry
+                                .path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().replace(".recovery.buzz", ""))
+                                .unwrap_or_else(|| "untitled".into())
+                        ));
+                        let _ = std::fs::rename(&entry.path, &aside);
+                        // Opened *as* the recovery file, and deliberately
+                        // without adopting the original document's path: Save
+                        // must not overwrite the file on disk until the user
+                        // has looked at what came back and chosen to.
+                        self.editor.status = Some(format!(
+                            "Recovered {} \u{2014} save it somewhere to keep it",
+                            entry.title()
+                        ));
+                        self.recovery.found.retain(|e| e.path != entry.path);
+                    }
+                    Err(e) => {
+                        self.editor.status = Some(format!("Could not recover: {e}"));
+                        self.recovery.found.retain(|e| e.path != entry.path);
+                    }
+                }
+            }
+            buzz_ui::RecoveryChoice::Discard(entry) => {
+                let _ = std::fs::remove_file(&entry.path);
+                self.recovery.found.retain(|e| e.path != entry.path);
+            }
+            buzz_ui::RecoveryChoice::Later => self.recovery.found.clear(),
+        }
+    }
+
+    /// Keep the snapshot a crash would be recovered from.
+    ///
+    /// Autosave runs every couple of minutes; this runs every frame the
+    /// document changes, and costs a pointer copy \u2014 a scene is a tree of
+    /// `Arc`s, so cloning one copies pointers rather than artwork. It is what
+    /// turns "up to two minutes lost" into "nothing lost".
+    fn keep_crash_snapshot(&mut self) {
+        let revision = self.editor.doc.scene().revision();
+        if self.last_crash_revision == Some(revision) {
+            return;
+        }
+        self.last_crash_revision = Some(revision);
+        if self.editor.doc.is_dirty() {
+            buzz_doc::autosave::remember_for_crash(
+                self.editor.doc.scene(),
+                self.editor.doc.recovery_path(),
+            );
         }
     }
 
@@ -1687,6 +2722,13 @@ impl App {
 
         let raw_input = active.egui_state.take_egui_input(&active.window);
         let egui_ctx = active.egui_ctx.clone();
+
+        // A theme change asked for last frame: restyle before anything is
+        // drawn, so the whole window changes at once rather than a panel at a
+        // time.
+        if std::mem::take(&mut self.editor.restyle) {
+            theme::apply(&egui_ctx);
+        }
         let window = active.window.clone();
 
         // `run_ui` rather than `begin_pass`/`end_pass`: egui 0.35 roots the UI
@@ -1697,6 +2739,15 @@ impl App {
             // Floats above the panels, so it is drawn after them.
             self.import_report_window(ui.ctx());
         });
+
+        // A theme change is asked for from *inside* the frame that is being
+        // built, so the restyle happens at the top of the next one — and there
+        // has to *be* a next one. egui only redraws when something asks it to,
+        // and without this the window keeps the old chrome until the pointer
+        // moves.
+        if self.editor.restyle {
+            egui_ctx.request_repaint();
+        }
 
         let Some(active) = self.active.as_mut() else {
             return Ok(());
@@ -1740,7 +2791,7 @@ impl App {
         let (w, h) = (active.surface_config.width, active.surface_config.height);
         active.ensure_target();
         let target = &active.target.as_ref().expect("ensure_target ran").view;
-        active.gpu.render(&active.vello, target, w, h, PASTEBOARD)?;
+        active.gpu.render(&active.vello, target, w, h, pasteboard())?;
 
         let mut encoder =
             active
@@ -1803,6 +2854,7 @@ impl App {
             active.egui_renderer.free_texture(id);
         }
 
+        self.keep_crash_snapshot();
         self.poll_autosave();
         Ok(())
     }
@@ -1906,7 +2958,7 @@ fn panel_header(
             ui.label(
                 egui::RichText::new(id.title())
                     .small()
-                    .color(Palette::TEXT_DIM),
+                    .color(Palette::text_dim()),
             );
         }
 
@@ -2009,5 +3061,111 @@ mod tests {
                 "{command:?} appears twice in the keyboard list"
             );
         }
+    }
+
+    /// Both icons decode, and the taskbar's is the larger of the two.
+    ///
+    /// The taskbar draws its button from the *big* icon; ours was never set,
+    /// so Windows fell back to a blank sheet of paper. A test rather than a
+    /// look, because the failure is silent — the title bar keeps showing the
+    /// logo while the taskbar does not.
+    #[test]
+    fn the_window_carries_a_small_icon_and_a_large_one() {
+        let small = icon_from_png(include_bytes!("../../../assets/logo-32.png"));
+        let big = icon_from_png(include_bytes!("../../../assets/logo-128.png"));
+        assert!(small.is_some(), "the title bar icon did not decode");
+        assert!(big.is_some(), "the taskbar icon did not decode");
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    #[test]
+    fn our_own_documents_open_directly_and_the_rest_are_imported() {
+        let document = |name: &str| opens_as_document(std::path::Path::new(name));
+
+        assert!(document("scene.buzz"));
+        assert!(document("SCENE.BUZZ"), "the extension is not case-sensitive");
+        assert!(!document("scene.fla"), "an Animate document is translated");
+        assert!(!document("scene.xfl"));
+        assert!(!document("movie.swf"));
+        assert!(!document("art.ai"));
+        assert!(!document("no-extension"));
+    }
+
+    fn track() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(500.0, 10.0))
+    }
+
+    /// The thumb says how much of the work is on screen. Half the extent
+    /// visible is half a track; a tenth is a tenth.
+    #[test]
+    fn the_thumb_is_as_long_as_the_view_is_wide() {
+        let (half, _) = thumb_of(track(), 0.0, 1000.0, 0.0, 500.0, true);
+        assert!(
+            (half.width() - 250.0).abs() < 1.0,
+            "half the extent should be half the track: {half:?}"
+        );
+
+        let (tenth, _) = thumb_of(track(), 0.0, 1000.0, 0.0, 100.0, true);
+        assert!((tenth.width() - 50.0).abs() < 1.0, "{tenth:?}");
+    }
+
+    /// And where it sits says where you are.
+    #[test]
+    fn the_thumb_sits_where_the_view_is() {
+        let (start, _) = thumb_of(track(), 0.0, 1000.0, 0.0, 500.0, true);
+        assert!((start.left() - track().left()).abs() < 1.0, "{start:?}");
+
+        let (end, _) = thumb_of(track(), 0.0, 1000.0, 500.0, 1000.0, true);
+        assert!(
+            (end.right() - track().right()).abs() < 1.0,
+            "the far end of the extent should put the thumb at the far end: {end:?}"
+        );
+
+        let (middle, _) = thumb_of(track(), 0.0, 1000.0, 250.0, 750.0, true);
+        assert!(
+            (middle.center().x - track().center().x).abs() < 1.0,
+            "{middle:?}"
+        );
+    }
+
+    /// A thumb must always be grabbable, however little of the work is showing
+    /// — at a trillion per cent zoom the honest proportion is a fraction of a
+    /// pixel, and a scrollbar you cannot catch is not a scrollbar.
+    #[test]
+    fn the_thumb_never_shrinks_to_nothing() {
+        let (tiny, _) = thumb_of(track(), 0.0, 1e12, 0.0, 1.0, true);
+        assert!(tiny.width() >= 24.0, "{tiny:?}");
+        assert!(track().contains_rect(tiny.shrink(0.5)), "{tiny:?}");
+    }
+
+    /// Vertical works the same way, on the other axis.
+    #[test]
+    fn the_vertical_thumb_matches() {
+        let track = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 400.0));
+        let (thumb, _) = thumb_of(track, 0.0, 800.0, 400.0, 800.0, false);
+        assert!((thumb.height() - 200.0).abs() < 1.0, "{thumb:?}");
+        assert!((thumb.bottom() - track.bottom()).abs() < 1.0, "{thumb:?}");
+    }
+
+    /// Degenerate numbers arrive from a fresh document and from a window being
+    /// dragged to nothing; neither may panic or produce a NaN.
+    #[test]
+    fn a_degenerate_scrollbar_is_harmless() {
+        let (thumb, shown) = thumb_of(track(), 0.0, 0.0, 0.0, 0.0, true);
+        assert!(thumb.width().is_finite() && shown.is_finite());
+
+        let (thumb, _) = thumb_of(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(0.0, 0.0)),
+            0.0,
+            100.0,
+            0.0,
+            10.0,
+            true,
+        );
+        assert!(thumb.width().is_finite());
     }
 }

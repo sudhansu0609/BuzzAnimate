@@ -135,6 +135,399 @@ pub fn parse_edges_closed(edges: &str) -> Result<BezPath, EdgeError> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Shape assembly
+//
+// **A `DOMShape` is not a set of closed outlines.** It is a soup of boundary
+// pieces, and each piece says which fill lies on its *left* (`fillStyle1`) and
+// which on its *right* (`fillStyle0`). Animate writes them in whatever order
+// the drawing was made in, split across several `<Edge>` elements, and a piece
+// is usually two points long — a real bush arrives as several hundred of them.
+//
+// Treating one `<Edge>` as one filled outline, which is the obvious reading,
+// produces exactly what it sounds like: hundreds of two-point slivers instead
+// of a bush. The pieces have to be *reassembled* — for each fill, take every
+// piece with that fill on its left, plus every piece with it on the right
+// turned round, and chain them end to start into closed loops. That is what
+// this section does, and it is the difference between an Animate document
+// importing and an Animate document arriving as streaks.
+// ---------------------------------------------------------------------------
+
+/// One step along a boundary piece.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Step {
+    Line(Point),
+    /// Control point, then anchor.
+    Quad(Point, Point),
+}
+
+impl Step {
+    fn anchor(self) -> Point {
+        match self {
+            Self::Line(p) | Self::Quad(_, p) => p,
+        }
+    }
+}
+
+/// A boundary piece: where it starts, and the steps that follow it.
+///
+/// One `!` command and everything up to the next one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Segment {
+    pub start: Point,
+    pub steps: Vec<Step>,
+}
+
+impl Segment {
+    pub fn end(&self) -> Point {
+        self.steps.last().map(|s| s.anchor()).unwrap_or(self.start)
+    }
+
+    /// The same piece walked the other way.
+    ///
+    /// Needed because a fill on a piece's *right* becomes a fill on its left
+    /// once the piece is reversed, and a loop can only be chained out of
+    /// pieces that all run the same way round.
+    pub fn reversed(&self) -> Self {
+        let mut steps = Vec::with_capacity(self.steps.len());
+        let mut anchor = self.end();
+        for (index, step) in self.steps.iter().enumerate().rev() {
+            let previous = if index == 0 {
+                self.start
+            } else {
+                self.steps[index - 1].anchor()
+            };
+            steps.push(match step {
+                // A quadratic reversed keeps its control point and swaps ends.
+                Step::Quad(control, _) => Step::Quad(*control, previous),
+                Step::Line(_) => Step::Line(previous),
+            });
+            anchor = previous;
+        }
+        let _ = anchor;
+        Self {
+            start: self.end(),
+            steps,
+        }
+    }
+
+    fn append(&self, path: &mut BezPath) {
+        for step in &self.steps {
+            match *step {
+                Step::Line(p) => path.line_to(p),
+                Step::Quad(c, p) => path.quad_to(c, p),
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// Which way the piece sets off from its start.
+    fn out_tangent(&self) -> buzz_geom::Vec2 {
+        let Some(step) = self.steps.first() else {
+            return buzz_geom::Vec2::ZERO;
+        };
+        let target = match *step {
+            Step::Line(p) => p,
+            // The control point leads, unless it sits exactly on the start.
+            Step::Quad(c, p) => {
+                if (c - self.start).hypot() > 1e-9 {
+                    c
+                } else {
+                    p
+                }
+            }
+        };
+        target - self.start
+    }
+
+    /// Which way it is travelling as it arrives at its end.
+    fn in_tangent(&self) -> buzz_geom::Vec2 {
+        let Some(step) = self.steps.last() else {
+            return buzz_geom::Vec2::ZERO;
+        };
+        let previous = if self.steps.len() >= 2 {
+            self.steps[self.steps.len() - 2].anchor()
+        } else {
+            self.start
+        };
+        match *step {
+            Step::Line(p) => p - previous,
+            Step::Quad(c, p) => {
+                if (p - c).hypot() > 1e-9 {
+                    p - c
+                } else {
+                    p - previous
+                }
+            }
+        }
+    }
+}
+
+/// How far anticlockwise `to` lies from `from`, in `0..2π`.
+///
+/// Used to pick which boundary to follow where several meet, so a loop turns
+/// the corner rather than setting off along whichever piece happened to be
+/// stored first.
+fn turn(from: buzz_geom::Vec2, to: buzz_geom::Vec2) -> f64 {
+    let angle = to.y.atan2(to.x) - from.y.atan2(from.x);
+    let full = std::f64::consts::TAU;
+    ((angle % full) + full) % full
+}
+
+/// Points are matched by their exact stored value.
+///
+/// Coordinates arrive as twips, or as hex fixed point in 256ths of a twip, so
+/// this key is lossless for both — and exactness matters: chaining by
+/// approximate position would join pieces that only nearly touch, and the loop
+/// would wander off across the drawing.
+type Key = (i64, i64);
+
+fn key(p: Point) -> Key {
+    const UNITS: f64 = TWIPS_PER_PIXEL * 256.0;
+    ((p.x * UNITS).round() as i64, (p.y * UNITS).round() as i64)
+}
+
+/// One `<Edge>` element: its styles, and the pieces it carries.
+#[derive(Debug, Clone)]
+pub struct EdgeRecord {
+    /// `fillStyle1` — the fill on the left of the piece as it is written.
+    pub fill_left: Option<u32>,
+    /// `fillStyle0` — the fill on its right.
+    pub fill_right: Option<u32>,
+    pub stroke: Option<u32>,
+    pub segments: Vec<Segment>,
+}
+
+/// Split an edge string into its boundary pieces.
+pub fn parse_segments(edges: &str) -> Result<Vec<Segment>, EdgeError> {
+    let mut parser = Parser {
+        bytes: edges.as_bytes(),
+        at: 0,
+    };
+    let mut out: Vec<Segment> = Vec::new();
+    let mut current: Option<Segment> = None;
+    // A curve command before any `!` continues from the origin, as in
+    // `parse_edges`.
+    let mut cursor = Point::ORIGIN;
+
+    loop {
+        parser.skip_space();
+        let Some(command) = parser.peek() else { break };
+
+        match command {
+            b'!' => {
+                parser.at += 1;
+                let p = parser.point()?;
+                if let Some(segment) = current.take()
+                    && !segment.is_empty()
+                {
+                    out.push(segment);
+                }
+                cursor = p;
+                current = Some(Segment {
+                    start: p,
+                    steps: Vec::new(),
+                });
+            }
+            b'|' | b'/' => {
+                parser.at += 1;
+                let p = parser.point()?;
+                current
+                    .get_or_insert_with(|| Segment {
+                        start: cursor,
+                        steps: Vec::new(),
+                    })
+                    .steps
+                    .push(Step::Line(p));
+                cursor = p;
+            }
+            b'[' | b']' => {
+                parser.at += 1;
+                let control = parser.point()?;
+                let anchor = parser.point()?;
+                current
+                    .get_or_insert_with(|| Segment {
+                        start: cursor,
+                        steps: Vec::new(),
+                    })
+                    .steps
+                    .push(Step::Quad(control, anchor));
+                cursor = anchor;
+            }
+            b'S' => {
+                parser.at += 1;
+                parser.skip_digits();
+            }
+            other => {
+                return Err(EdgeError::Unexpected {
+                    found: other as char,
+                    at: parser.at,
+                });
+            }
+        }
+    }
+
+    if let Some(segment) = current
+        && !segment.is_empty()
+    {
+        out.push(segment);
+    }
+    Ok(out)
+}
+
+/// Every fill in the shape, as a closed path, in ascending style order.
+///
+/// Ascending because Animate draws its fills in style order and overlapping
+/// fills must land in the same order they did there.
+pub fn assemble_fills(records: &[EdgeRecord]) -> Vec<(u32, BezPath)> {
+    assemble_fills_counted(records).0
+}
+
+/// The same, and how many loops had to be closed across a gap.
+///
+/// A fill's boundary in a well-formed file closes on itself; one that does not
+/// is either damaged or beyond this reader, and closing it draws a straight
+/// line across the artwork. The count is how that gets noticed rather than
+/// shipped.
+pub fn assemble_fills_counted(records: &[EdgeRecord]) -> (Vec<(u32, BezPath)>, usize) {
+    let mut by_fill: std::collections::BTreeMap<u32, Vec<Segment>> =
+        std::collections::BTreeMap::new();
+
+    for record in records {
+        for segment in &record.segments {
+            if let Some(fill) = record.fill_left.filter(|f| *f != 0) {
+                by_fill.entry(fill).or_default().push(segment.clone());
+            }
+            if let Some(fill) = record.fill_right.filter(|f| *f != 0) {
+                // On the right of this piece is on the left of its reverse.
+                by_fill.entry(fill).or_default().push(segment.reversed());
+            }
+        }
+    }
+
+    let mut gaps = 0;
+    let paths = by_fill
+        .into_iter()
+        .filter_map(|(fill, segments)| {
+            let (path, open) = chain_counted(segments, true);
+            gaps += open;
+            (!path.elements().is_empty()).then_some((fill, path))
+        })
+        .collect();
+    (paths, gaps)
+}
+
+/// Every stroke in the shape, as an open path, in ascending style order.
+pub fn assemble_strokes(records: &[EdgeRecord]) -> Vec<(u32, BezPath)> {
+    let mut by_stroke: std::collections::BTreeMap<u32, Vec<Segment>> =
+        std::collections::BTreeMap::new();
+
+    for record in records {
+        let Some(stroke) = record.stroke.filter(|s| *s != 0) else {
+            continue;
+        };
+        for segment in &record.segments {
+            by_stroke.entry(stroke).or_default().push(segment.clone());
+        }
+    }
+
+    by_stroke
+        .into_iter()
+        .filter_map(|(stroke, segments)| {
+            let path = chain(segments, false);
+            (!path.elements().is_empty()).then_some((stroke, path))
+        })
+        .collect()
+}
+
+/// Chain pieces end-to-start into as few subpaths as possible.
+///
+/// Greedy, and deliberately so: at a point where three boundaries meet — which
+/// is every place two filled shapes touch — any of them continues the loop,
+/// and picking one and going on is both what Animate's own renderer does and
+/// the only way to stay linear on a drawing with a hundred thousand pieces.
+/// A piece that leads nowhere ends its subpath, which is closed if it is a
+/// fill and left open if it is a stroke.
+fn chain(segments: Vec<Segment>, close: bool) -> BezPath {
+    chain_counted(segments, close).0
+}
+
+/// The same, and how many subpaths ended somewhere other than where they
+/// started.
+fn chain_counted(segments: Vec<Segment>, close: bool) -> (BezPath, usize) {
+    use std::collections::HashMap;
+
+    let mut open_loops = 0;
+    let mut from: HashMap<Key, Vec<usize>> = HashMap::new();
+    for (index, segment) in segments.iter().enumerate() {
+        from.entry(key(segment.start)).or_default().push(index);
+    }
+
+    let mut used = vec![false; segments.len()];
+    let mut path = BezPath::new();
+
+    for start_index in 0..segments.len() {
+        if used[start_index] {
+            continue;
+        }
+        used[start_index] = true;
+
+        let first = &segments[start_index];
+        let opening = key(first.start);
+        path.move_to(first.start);
+        first.append(&mut path);
+
+        let mut at = key(first.end());
+        let mut arriving = first.in_tangent();
+        while at != opening {
+            // **Which boundary to follow where several meet.** Blades of grass
+            // drawn from a common root, two shapes sharing an edge, a leaf on
+            // a stem: at that point three or four pieces start, and taking
+            // whichever was stored first walks the loop off into the
+            // neighbouring shape and back, which draws as a long thin spike
+            // across the artwork.
+            //
+            // The piece to take is the one that turns furthest *back* towards
+            // where the loop came from — the tightest turn that keeps the fill
+            // on the same side all the way round. That is the standard rule
+            // for tracing a face of a planar subdivision, and it is what makes
+            // a hundred grass blades come out as a hundred grass blades.
+            let candidates = from.get(&at);
+            let next = candidates.and_then(|list| {
+                let unused = list.iter().copied().filter(|i| !used[*i]);
+                if list.len() <= 1 {
+                    return unused.clone().next();
+                }
+                let back = -arriving;
+                unused.min_by(|a, b| {
+                    let ta = turn(back, segments[*a].out_tangent());
+                    let tb = turn(back, segments[*b].out_tangent());
+                    ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
+                })
+            });
+            let Some(next) = next else {
+                break;
+            };
+            used[next] = true;
+            segments[next].append(&mut path);
+            arriving = segments[next].in_tangent();
+            at = key(segments[next].end());
+        }
+
+        if at != opening {
+            open_loops += 1;
+        }
+        if close {
+            path.close_path();
+        }
+    }
+
+    (path, open_loops)
+}
+
 struct Parser<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -194,7 +587,8 @@ impl Parser<'_> {
         Ok(signed / TWIPS_PER_PIXEL)
     }
 
-    /// `#RRRR.FF` — hex twips, optionally with a hex fraction in 256ths.
+    /// `#RRRR.FF` — hex twips, signed, optionally with a hex fraction in
+    /// 256ths.
     fn hex_fixed_point(&mut self, start: usize) -> Result<f64, EdgeError> {
         let integer_start = self.at;
         while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit()) {
@@ -203,11 +597,27 @@ impl Parser<'_> {
         if self.at == integer_start {
             return Err(EdgeError::ExpectedNumber { at: start });
         }
-        let integer = i64::from_str_radix(
-            std::str::from_utf8(&self.bytes[integer_start..self.at]).unwrap_or("0"),
-            16,
-        )
-        .map_err(|_| EdgeError::ExpectedNumber { at: start })?;
+        let digits = std::str::from_utf8(&self.bytes[integer_start..self.at]).unwrap_or("0");
+        let raw = i64::from_str_radix(digits, 16)
+            .map_err(|_| EdgeError::ExpectedNumber { at: start })?;
+
+        // **Hex coordinates are two's complement, and Animate writes the sign
+        // by using the full width.** `#FFFFFA.21` is not eight hundred
+        // thousand pixels away; it is minus six twips. Read as unsigned, one
+        // such point stretched a character's shin to four hundred thousand
+        // units wide and its leg across the stage — which is exactly what a
+        // real film looked like.
+        //
+        // Short forms stay positive: `#82` is 130 twips, not -126. Animate
+        // only writes the leading `F`s when it means a negative number, so the
+        // width *is* the sign, and six digits is where it starts.
+        let bits = digits.len() * 4;
+        let integer = if digits.len() >= 6 && bits <= 63 {
+            let span = 1i64 << bits;
+            if raw >= span / 2 { raw - span } else { raw }
+        } else {
+            raw
+        };
 
         let mut fraction = 0.0;
         if self.peek() == Some(b'.') {
@@ -283,6 +693,31 @@ mod tests {
     fn coordinates_convert_from_twips_to_pixels() {
         let path = parse_edges("!20 40").unwrap();
         assert_eq!(points(&path)[0], Point::new(1.0, 2.0));
+    }
+
+    /// **A hex coordinate is signed, and the width carries the sign.**
+    ///
+    /// `#FFFFFA.21` is minus six twips, not eight hundred thousand pixels.
+    /// Read as unsigned, one point like this stretched a character's shin to
+    /// four hundred thousand units and threw a spike across every frame it
+    /// appeared in — the single most damaging thing in a real film's import.
+    #[test]
+    fn a_wide_hex_coordinate_is_negative() {
+        let path = parse_edges("!0 0|#FFFFFA.21 #5C9.4B").unwrap();
+        let p = points(&path)[1];
+        // -6 twips plus 0x21/256 of a twip, in pixels.
+        assert!((p.x - (-5.871_093_75 / 20.0)).abs() < 1e-9, "x was {}", p.x);
+        assert!((p.y - (1481.293 / 20.0)).abs() < 0.01, "y was {}", p.y);
+    }
+
+    /// And a short one is not: `#82` is 130 twips, not minus 126. Animate
+    /// writes the leading `F`s only when it means a negative number.
+    #[test]
+    fn a_short_hex_coordinate_stays_positive() {
+        let path = parse_edges("!#82.5D #3AF.E1").unwrap();
+        let p = points(&path)[0];
+        assert!(p.x > 6.0 && p.x < 6.6, "x was {}", p.x);
+        assert!(p.y > 47.0 && p.y < 47.3, "y was {}", p.y);
     }
 
     #[test]

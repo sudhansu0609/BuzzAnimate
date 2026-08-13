@@ -30,7 +30,7 @@ use std::sync::Arc;
 pub const MAX_SYMBOL_DEPTH: usize = 12;
 
 /// Modifiers for drawing one frame.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameOptions {
     /// Onion-skin ghost alpha. `None` draws the frame normally.
     pub ghost: Option<f64>,
@@ -44,6 +44,25 @@ pub struct FrameOptions {
     /// check. Off is for the authoring passes that want the artwork as drawn —
     /// onion-skin ghosts, which are reference rather than picture.
     pub lit: bool,
+    /// Where this stack sits in the document's space.
+    ///
+    /// Identity for the document's own timeline. Editing a symbol **in place**
+    /// draws its contents through the transform of the instance that was
+    /// opened, so a head stays on the shoulders it belongs to instead of
+    /// jumping to the origin — see [`buzz_scene::Scene::edit_place`].
+    pub place: Affine,
+}
+
+impl Default for FrameOptions {
+    fn default() -> Self {
+        Self {
+            ghost: None,
+            ghost_outlines: false,
+            masks: MaskDisplay::default(),
+            lit: false,
+            place: Affine::IDENTITY,
+        }
+    }
 }
 
 /// When mask layers clip the layers they claim.
@@ -148,6 +167,41 @@ pub fn draw_frame_cached(
     cache.filters.end();
 }
 
+/// Draw the **document's own timeline**, whatever symbol is open.
+///
+/// This is the context behind Animate's Edit in Place: the scene the symbol
+/// was opened from, drawn where it stands so the artwork inside the symbol can
+/// be judged against what surrounds it. The caller veils it afterwards; here
+/// it is simply the other stack.
+///
+/// It draws nothing when the document itself is what is open, so a caller need
+/// not check first.
+pub fn draw_stage_context(
+    builder: &mut SceneBuilder<'_>,
+    scene: &Scene,
+    frame: u32,
+    camera: Affine,
+    options: &FrameOptions,
+    cache: &mut DrawCache,
+) {
+    if scene.edit_path().is_empty() {
+        return;
+    }
+    cache.lights.begin(0);
+    cache.filters.begin();
+    draw_layers(
+        builder,
+        scene,
+        scene.stage_layers(),
+        frame,
+        camera,
+        options,
+        cache,
+    );
+    cache.lights.end();
+    cache.filters.end();
+}
+
 /// Draw one layer stack — the stage's, or a symbol's.
 ///
 /// Masks are resolved here rather than by the caller because the rule is
@@ -164,24 +218,21 @@ fn draw_layers(
 ) {
     // Which mask, if any, clips each layer, and whether that mask is in force.
     let masks = active_masks(layers, options.masks);
-    let mut open_mask: Option<buzz_scene::LayerId> = None;
+    let mut open: Option<OpenMask> = None;
 
     for layer in layers.drawable_at(frame) {
         // A mask layer's own artwork is never drawn: it is a stencil, and
         // Animate hides it for the same reason. It still has to be *found*,
         // which is what `active_masks` did.
-        if layer.kind == LayerKind::Mask && masks.values().any(|m| *m == layer.id) {
+        if layer.kind.is_mask() && masks.values().any(|m| *m == layer.id) {
             continue;
         }
 
         // Masked layers arrive in one unbroken run per mask, so the clip is
         // opened once for the run rather than once per layer.
         let wanted = masks.get(&layer.id).copied();
-        if wanted != open_mask {
-            if open_mask.is_some() {
-                builder.pop_isolation();
-                open_mask = None;
-            }
+        if wanted != open.as_ref().map(|o| o.mask) {
+            close_mask(builder, open.take());
             if let Some(mask_id) = wanted
                 && let Some(path) = mask_geometry(
                     layers,
@@ -190,12 +241,14 @@ fn draw_layers(
                     Affine::IDENTITY,
                     &scene
                         .camera_projection_at_depth(frame, 0.0)
-                        .unwrap_or_else(|| Projection::from_affine(camera)),
+                        .unwrap_or_else(|| Projection::from_affine(camera))
+                        // The mask travels with the stack it belongs to, or it
+                        // would clip the wrong part of the stage.
+                        .pre_affine(options.place),
                     builder.tolerance(),
                 )
             {
-                builder.push_clip(&path);
-                open_mask = Some(mask_id);
+                open = open_mask(builder, layers, mask_id, &masks, frame, path);
             }
         }
 
@@ -205,8 +258,61 @@ fn draw_layers(
         draw_layer(builder, scene, layer, frame, camera, follows, options, cache);
     }
 
-    if open_mask.is_some() {
-        builder.pop_isolation();
+    close_mask(builder, open);
+}
+
+/// A mask group being drawn, and how it is closed.
+struct OpenMask {
+    mask: buzz_scene::LayerId,
+    /// The mask's geometry, kept only for an inverted mask: it is punched out
+    /// of the group when the group closes.
+    punch: Option<buzz_geom::BezPath>,
+}
+
+/// Begin a mask group, whichever way round it works.
+///
+/// An ordinary mask is a clip and costs nothing to bound. An inverted one is a
+/// group that gets a hole punched in it, and a group is a render target — so
+/// it has to be bounded by what the masked layers actually draw. When they
+/// draw nothing there is nothing to hide, and the group is skipped entirely.
+fn open_mask(
+    builder: &mut SceneBuilder<'_>,
+    layers: &buzz_scene::LayerStack,
+    mask: buzz_scene::LayerId,
+    masks: &std::collections::BTreeMap<buzz_scene::LayerId, buzz_scene::LayerId>,
+    frame: u32,
+    path: buzz_geom::BezPath,
+) -> Option<OpenMask> {
+    let inverted = layers.get(mask).is_some_and(|l| l.kind.is_inverted_mask());
+    if !inverted {
+        builder.push_clip(&path);
+        return Some(OpenMask { mask, punch: None });
+    }
+
+    let covered = masks
+        .iter()
+        .filter(|(_, m)| **m == mask)
+        .filter_map(|(id, _)| layers.get(*id))
+        .filter_map(|l| l.bounds_at(frame))
+        .reduce(|a, b| a.union(b))?;
+
+    // A margin, because a stroke is drawn about its path and a filter reaches
+    // past the artwork it blurs; a group cut exactly to the bounds would clip
+    // both off at the edge.
+    builder.push_inverse_clip(covered.inflate(64.0, 64.0));
+    Some(OpenMask {
+        mask,
+        punch: Some(path),
+    })
+}
+
+fn close_mask(builder: &mut SceneBuilder<'_>, open: Option<OpenMask>) {
+    match open {
+        Some(OpenMask {
+            punch: Some(path), ..
+        }) => builder.pop_inverse_clip(&path),
+        Some(OpenMask { punch: None, .. }) => builder.pop_isolation(),
+        None => {}
     }
 }
 
@@ -328,12 +434,20 @@ fn draw_layer(
         // each other, which is a sun pretending to be a lamp.
         let lighting = lit.then_some((stage_height, layer.depth));
 
-        // Layer parenting happens in the plane, before the lens.
-        let projection = projection.pre_affine(follows);
+        // Where this stack sits — identity unless a symbol is open in place —
+        // and then layer parenting, both in the plane, before the lens.
+        let projection = projection.pre_affine(options.place).pre_affine(follows);
 
         let ctx = DrawCtx {
             scene,
             frame,
+            elapsed: frame
+                - layer
+                    .frames
+                    .keyframe_at(frame)
+                    .map(|k| k.start)
+                    .unwrap_or(0)
+                    .min(frame),
             tint,
             faded,
             ghost: options.ghost,
@@ -490,6 +604,14 @@ struct DrawCtx<'a> {
     /// Which frame of *this* timeline is being drawn. A nested graphic symbol
     /// runs on its own frame number, not the stage's.
     frame: u32,
+    /// How long the keyframe holding this artwork has been on screen.
+    ///
+    /// This, not `frame`, is what a graphic instance plays against: a symbol
+    /// placed at frame 300 starts at *its* first frame, not three hundred
+    /// frames into a cycle. Reading the timeline's own frame number instead
+    /// puts every instance at an arbitrary point in its loop — which looks
+    /// like animation, and is why it survived so long.
+    elapsed: u32,
     /// Outline view: draw silhouettes in this colour instead of the artwork.
     tint: Option<Color>,
     /// Guide layer.
@@ -682,7 +804,9 @@ fn draw_object_inner(
     let ctx = if object.spatial.is_flat() {
         ctx
     } else {
-        let pivot = buzz_scene::object::transform_rect(doc, object.local_bounds()).center();
+        // **Its transformation point**, not the middle of its box: a door
+        // with its pivot on the hinge swings on the hinge.
+        let pivot = doc * ctx.scene.pivot_local_of(object);
         let Some(projection) = ctx.scene.camera().projection_for_object(
             ctx.stage_frame,
             ctx.stage_size,
@@ -733,9 +857,10 @@ fn draw_object_inner(
                 return;
             };
 
-            // A graphic follows the parent playhead; a movie clip shows its
+            // A graphic follows the parent playhead — from where it was
+            // placed, not from the start of the film; a movie clip shows its
             // first frame while authoring.
-            let inner = instance.resolve_frame(symbol.kind, ctx.frame, symbol.length());
+            let inner = instance.resolve_frame(symbol.kind, ctx.elapsed, symbol.length());
 
             let mut inner_ctx = ctx.clone();
             inner_ctx.frame = inner;
@@ -749,19 +874,16 @@ fn draw_object_inner(
             // is about editing the mask, and you are not editing this one —
             // you are looking at an instance of it placed somewhere else.
             let masks = active_masks(&symbol.layers, MaskDisplay::Always);
-            let mut open_mask: Option<buzz_scene::LayerId> = None;
+            let mut open: Option<OpenMask> = None;
 
             for layer in symbol.layers.drawable_at(inner) {
-                if layer.kind == LayerKind::Mask && masks.values().any(|m| *m == layer.id) {
+                if layer.kind.is_mask() && masks.values().any(|m| *m == layer.id) {
                     continue;
                 }
 
                 let wanted = masks.get(&layer.id).copied();
-                if wanted != open_mask {
-                    if open_mask.is_some() {
-                        builder.pop_isolation();
-                        open_mask = None;
-                    }
+                if wanted != open.as_ref().map(|o| o.mask) {
+                    close_mask(builder, open.take());
                     if let Some(mask_id) = wanted
                         && let Some(path) = mask_geometry(
                             &symbol.layers,
@@ -772,8 +894,14 @@ fn draw_object_inner(
                             builder.tolerance(),
                         )
                     {
-                        builder.push_clip(&path);
-                        open_mask = Some(mask_id);
+                        open = open_mask(
+                            builder,
+                            &symbol.layers,
+                            mask_id,
+                            &masks,
+                            inner,
+                            path,
+                        );
                     }
                 }
 
@@ -782,6 +910,15 @@ fn draw_object_inner(
                 let layer_ctx = DrawCtx {
                     tint: ctx.tint.or_else(|| layer.outline.then_some(layer.color)),
                     faded: ctx.faded || layer.kind == LayerKind::Guide,
+                    // Each layer inside the symbol counts from its own
+                    // keyframe, exactly as the stage's layers do.
+                    elapsed: inner
+                        - layer
+                            .frames
+                            .keyframe_at(inner)
+                            .map(|k| k.start)
+                            .unwrap_or(0)
+                            .min(inner),
                     ..inner_ctx.clone()
                 };
                 // A symbol's layers can follow each other too, which is
@@ -792,9 +929,7 @@ fn draw_object_inner(
                 }
             }
 
-            if open_mask.is_some() {
-                builder.pop_isolation();
-            }
+            close_mask(builder, open);
         }
 
         ObjectKind::Shape(shape) => draw_shape(builder, owner, 0, shape, doc, ctx, cache),

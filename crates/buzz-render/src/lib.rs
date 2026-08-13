@@ -406,6 +406,46 @@ impl<'a> SceneBuilder<'a> {
         );
     }
 
+    /// Hide, rather than reveal: everything drawn until the matching
+    /// [`Self::pop_inverse_clip`] is kept *except* where the shape covers it.
+    ///
+    /// **Why this is not a clip.** The obvious inverse — a huge rectangle with
+    /// the mask's subpaths reversed inside it — is wrong for any mask made of
+    /// overlapping blobs: under the non-zero rule two reversed overlapping
+    /// shapes wind back to a filled region, and the overlap would show through
+    /// the hole it is supposed to be part of. So the run is drawn into a group
+    /// of its own and the mask is then *punched out* of it with `DestOut`,
+    /// which is exact whatever the geometry does.
+    ///
+    /// `bounds` must cover everything the group draws: it is the group's
+    /// render target, and artwork outside it is cut off.
+    pub fn push_inverse_clip(&mut self, bounds: buzz_geom::Rect) {
+        self.push_isolation(bounds);
+    }
+
+    /// Close the group opened by [`Self::push_inverse_clip`], punching `shape`
+    /// out of it.
+    pub fn pop_inverse_clip(&mut self, shape: &impl Shape) {
+        let path = self.to_render_space(shape);
+        let punch = peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::DestOut);
+
+        // The shape is its own clip, so the layer that composites with
+        // `DestOut` covers exactly the region to remove.
+        self.scene
+            .push_layer(Fill::NonZero, punch, 1.0, self.split.gpu_view, &path);
+        self.scene.fill(
+            Fill::NonZero,
+            self.split.gpu_view,
+            // Any opaque colour: `DestOut` reads the source's alpha only.
+            Color::BLACK,
+            None,
+            &path,
+        );
+        self.scene.pop_layer();
+
+        self.pop_isolation();
+    }
+
     /// Stroke a document-space shape with a width in document units.
     pub fn stroke_shape(&mut self, shape: &impl Shape, color: Color, width: f64) {
         let path = self.to_render_space(shape);

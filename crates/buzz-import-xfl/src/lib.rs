@@ -86,6 +86,8 @@ pub struct ImportReport {
     pub instances: usize,
     pub symbols: usize,
     pub tweens: usize,
+    /// Keyframes on Animate's camera layer.
+    pub camera_keys: usize,
     /// Features present in the file that this importer does not handle.
     pub unsupported: Vec<String>,
 }
@@ -115,10 +117,16 @@ impl ImportReport {
 
     /// A short summary for the status bar.
     pub fn summary(&self) -> String {
-        format!(
+        let mut line = format!(
             "{} layers, {} keyframes, {} shapes, {} instances, {} symbols",
             self.layers, self.keyframes, self.shapes, self.instances, self.symbols
-        )
+        );
+        // Only when there is a camera: most documents have none, and a
+        // permanent "0 camera keys" teaches the reader to skip the line.
+        if self.camera_keys > 0 {
+            line.push_str(&format!(", {} camera keys", self.camera_keys));
+        }
+        line
     }
 }
 
@@ -229,15 +237,35 @@ fn build(
     let mut report = ImportReport::default();
     let mut ids = IdSource::default();
 
-    // Symbols first: the stage's instances refer to them by name.
+    // **Two passes over the library, and the reason matters.**
+    //
+    // A symbol's timeline contains instances of *other* symbols — a character
+    // is a torso holding an arm holding a hand — and in a real document most
+    // of them are defined in a file that has not been read yet. Parsing each
+    // symbol against the symbols already parsed therefore resolves almost
+    // nothing: an Animate document of any size imported with every nested
+    // instance dropped and a page of "instance of unknown symbol" against it.
+    //
+    // So names and ids are collected first, from every file, and only then are
+    // the timelines read — by which point every symbol can see every other,
+    // whatever order the archive happens to store them in.
     let mut by_name: HashMap<String, SymbolId> = HashMap::new();
+    let mut pending: Vec<(&String, &String, SymbolId)> = Vec::new();
     for (path, xml) in library_files {
-        match parse_symbol(xml, path, &mut ids, &mut report) {
+        let id = SymbolId(ids.take());
+        for key in library_keys(xml, path) {
+            // First writer wins: a name that appears twice keeps the symbol
+            // whose own file is named after it, rather than a later
+            // like-named one from another folder.
+            by_name.entry(key).or_insert(id);
+        }
+        pending.push((path, xml, id));
+    }
+
+    for (path, xml, id) in pending {
+        match parse_symbol(xml, path, id, &by_name, &mut ids, &mut report) {
             Ok(symbol) => {
-                let name = symbol.name.clone();
-                let id = symbol.id;
                 scene.library_mut().insert(symbol);
-                by_name.insert(name, id);
                 report.symbols += 1;
             }
             Err(e) => report.note_unsupported(format!("symbol {path}: {e}")),
@@ -381,6 +409,67 @@ fn parse_tween(attrs: &HashMap<String, String>) -> Tween {
 }
 
 /// Parse `DOMDocument.xml` into the scene's main timeline.
+/// Animate's camera layer, read as it goes past.
+///
+/// The camera is a layer of type `camera` holding one instance of a symbol
+/// called `__Camera__` per keyframe, and that symbol is not in the library —
+/// it is Animate's own. Read naively it produced a page of "instance of
+/// unknown symbol __Camera__" and the document imported without its moves,
+/// which for a documentary shot on a camera move is most of the animation.
+///
+/// The matrix on the instance places the *camera*, so the view is its inverse:
+/// a camera scaled to 0.5 shows half as much stage, which is a zoom of 2.
+#[derive(Default)]
+struct CameraCapture {
+    /// Inside a camera layer.
+    active: bool,
+    /// Whether the file said the camera is switched on.
+    enabled: bool,
+    frame: u32,
+    /// Whether the span starting at `frame` is tweened.
+    tweened: bool,
+    /// A `__Camera__` instance is waiting for its `<Matrix>`.
+    pending: bool,
+    /// Each key, and whether the span after it moves.
+    keys: Vec<(buzz_scene::CameraKey, bool)>,
+}
+
+impl CameraCapture {
+    fn element(&mut self, name: &str, attrs: &HashMap<String, String>, stage: buzz_geom::Size) {
+        match name {
+            "DOMSymbolInstance" => {
+                if attrs.get("libraryItemName").map(String::as_str) != Some("__Camera__") {
+                    return;
+                }
+                // Recorded now, at rest: a camera keyframe with no matrix of
+                // its own means the camera sits at the middle of the stage.
+                self.keys.push((
+                    buzz_scene::CameraKey::new(
+                        self.frame,
+                        buzz_geom::Point::new(stage.width / 2.0, stage.height / 2.0),
+                    ),
+                    self.tweened,
+                ));
+                self.pending = true;
+            }
+            "Matrix" if self.pending => {
+                self.pending = false;
+                let Some((key, _)) = self.keys.last_mut() else {
+                    return;
+                };
+                let c = parse_matrix(attrs).as_coeffs();
+                let scale = (c[0] * c[0] + c[1] * c[1]).sqrt();
+                key.center = buzz_geom::Point::new(c[4], c[5]);
+                // The inverse, and guarded: a degenerate camera matrix would
+                // otherwise divide by zero and take the whole view with it.
+                key.zoom = if scale > 1e-9 { 1.0 / scale } else { 1.0 };
+                key.rotation = c[1].atan2(c[0]);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn parse_document(
     xml: &str,
     scene: &mut Scene,
@@ -396,6 +485,7 @@ fn parse_document(
 
     let mut layers: Vec<PendingLayer> = Vec::new();
     let mut context = FrameContext::default();
+    let mut camera = CameraCapture::default();
     let mut open_elements = 0usize;
     // Only the first timeline is the main one; symbol timelines live in
     // LIBRARY and are parsed separately.
@@ -435,16 +525,38 @@ fn parse_document(
                         stage.frame_rate = attr_f64(&attrs, "frameRate", 24.0);
                         stage.background = parse_color(&attrs, "backgroundColor", "__none");
                     }
-                    "DOMTimeline" => timeline_depth += 1,
+                    "DOMTimeline" => {
+                        timeline_depth += 1;
+                        if timeline_depth == 1 {
+                            camera.enabled = attr_bool(&attrs, "cameraLayerEnabled", false);
+                        }
+                    }
                     "DOMLayer" if timeline_depth <= 1 => {
                         context.flush_layer(&mut layers, report);
-                        context.begin_layer(&attrs, ids);
+                        // The camera layer is not artwork: Animate hides it,
+                        // and importing it as a layer would put an empty one
+                        // at the top of every document that has a camera.
+                        camera.active =
+                            attrs.get("layerType").map(String::as_str) == Some("camera");
+                        if !camera.active {
+                            context.begin_layer(&attrs, ids);
+                        }
                     }
                     "DOMFrame" if timeline_depth <= 1 => {
-                        context.begin_frame(&attrs, report);
+                        if camera.active {
+                            camera.frame = attr_u32(&attrs, "index", 0);
+                            camera.tweened =
+                                attrs.get("tweenType").map(String::as_str) == Some("motion");
+                        } else {
+                            context.begin_frame(&attrs, report);
+                        }
                     }
                     _ if timeline_depth <= 1 => {
-                        context.element(&name, &attrs, symbols, ids, report);
+                        if camera.active {
+                            camera.element(&name, &attrs, scene.stage().size);
+                        } else {
+                            context.element(&name, &attrs, symbols, ids, report);
+                        }
                     }
                     _ => {}
                 }
@@ -454,6 +566,11 @@ fn parse_document(
                 if name == "DOMTimeline" {
                     timeline_depth = timeline_depth.saturating_sub(1);
                 }
+                // The one closing tag that matters: a shape is only a shape
+                // once every one of its edges has been read.
+                if name == "DOMShape" && timeline_depth <= 1 {
+                    context.finish_shape(ids, report);
+                }
             }
             Err(e) => return Err(ImportError::Xml(e.to_string())),
             _ => {}
@@ -462,14 +579,54 @@ fn parse_document(
 
     context.flush_layer(&mut layers, report);
 
+    // The camera, if the document had one. `enabled` follows the file: a
+    // document that switched its camera off should not open with it on.
+    if !camera.keys.is_empty() {
+        let track = scene.camera_mut();
+        track.enabled = camera.enabled;
+
+        // **A camera keyframe that is not tweened holds until the next one.**
+        // Ours interpolate between every pair of keys, which is right for a
+        // tweened move and wrong for the other nineteen spans in a real film:
+        // a shot that should sit still for ten seconds and then cut was
+        // instead drifting the whole way, arriving at the next shot's framing
+        // just as the next shot began. A held span is written as a second key
+        // with the same values at its last frame, so the hold is in the track
+        // rather than in a rule somebody has to remember.
+        for (index, (key, tweened)) in camera.keys.iter().enumerate() {
+            report.camera_keys += 1;
+            track.set_key(*key);
+
+            let Some((next, _)) = camera.keys.get(index + 1) else {
+                continue;
+            };
+            if !tweened && next.frame > key.frame + 1 {
+                let mut hold = *key;
+                hold.frame = next.frame - 1;
+                track.set_key(hold);
+            }
+        }
+    }
+
     resolve_layer_parents(&mut layers);
 
-    // Animate writes layers bottom-first; our stack is front-first.
-    layers.reverse();
+    // **The file's order is the timeline's order, top first.** This was read
+    // backwards for five phases and the list was being reversed, which put
+    // every document inside out: the sky in front of the artwork, a
+    // background drawn over the characters standing on it, and — quietly
+    // worse — every mask *below* the layers it claims, so masking did
+    // nothing at all.
+    //
+    // The camera layer settles it. Animate keeps it pinned to the top of the
+    // timeline and writes it as the first `<DOMLayer>`; and in every real file
+    // a mask layer is written immediately *before* the layers it masks, which
+    // is where Animate shows it — above them.
     if layers.is_empty() {
         layers.push(PendingLayer {
             layer: Layer::normal(LayerId(ids.take()), "Layer_1"),
             parent_index: None,
+            rig_index: None,
+            rig_parent: None,
         });
     }
     for (index, pending) in layers.into_iter().enumerate() {
@@ -479,12 +636,17 @@ fn parse_document(
     Ok(())
 }
 
-/// A layer, plus the `parentLayerIndex` it was written with.
+/// A layer, plus the links it was written with, which cannot be resolved
+/// until every layer has been seen and given an id.
 struct PendingLayer {
     layer: Layer,
-    /// Index into the layer list **in document order**, which is why this is
-    /// resolved before the list is reversed.
+    /// The layer's own `parentLayerIndex`: the folder it sits in, or the mask
+    /// that claims it. An index into the layer list in document order.
     parent_index: Option<usize>,
+    /// This layer's `layerRiggingIndex`, which is how children name it.
+    rig_index: Option<u32>,
+    /// The rigging index of the layer this one follows, from its frames.
+    rig_parent: Option<u32>,
 }
 
 /// Turn Animate's `parentLayerIndex` into our `parent` links.
@@ -498,16 +660,25 @@ struct PendingLayer {
 /// of layers beneath it, which is Animate's own rule and what the rest of the
 /// engine already implements.
 ///
-/// So a pointer at a folder becomes a `parent`, and a pointer at anything else
-/// is deliberately dropped. Honouring it would put a masked layer *inside* its
-/// mask, which is not what the file means and would break the positional
-/// resolution that does the real work.
+/// So a pointer at a folder becomes a `parent`, and a pointer at a **mask**
+/// becomes the masked *kind* — which is the same relationship written the way
+/// our positional rule can read it. Honouring the mask pointer as parenting
+/// would put a masked layer inside its own mask and break that resolution.
+///
+/// # `layerType="masked"` is not what Animate writes
+///
+/// The format has the value, and current Animate does not use it: a masked
+/// layer is an ordinary layer whose `parentLayerIndex` points at the mask
+/// above it, exactly as a layer in a folder points at the folder. Waiting for
+/// `layerType="masked"` meant every mask in every real document claimed
+/// nothing and clipped nothing.
 fn resolve_layer_parents(layers: &mut [PendingLayer]) {
     let ids: Vec<LayerId> = layers.iter().map(|p| p.layer.id).collect();
     let is_folder: Vec<bool> = layers
         .iter()
         .map(|p| p.layer.kind == LayerKind::Folder)
         .collect();
+    let is_mask: Vec<bool> = layers.iter().map(|p| p.layer.kind.is_mask()).collect();
 
     for (index, pending) in layers.iter_mut().enumerate() {
         let Some(parent) = pending.parent_index else {
@@ -515,10 +686,153 @@ fn resolve_layer_parents(layers: &mut [PendingLayer]) {
         };
         // A layer cannot contain itself, and an index past the end is a
         // corrupt file rather than a relationship.
-        if parent == index || parent >= ids.len() || !is_folder[parent] {
+        if parent == index || parent >= ids.len() {
             continue;
         }
-        pending.layer.parent = Some(ids[parent]);
+        if is_folder[parent] {
+            pending.layer.parent = Some(ids[parent]);
+        } else if is_mask[parent] && pending.layer.kind == LayerKind::Normal {
+            pending.layer.kind = LayerKind::Masked;
+        }
+    }
+
+    // **Layer Parenting is a different attribute, on the frame.** Animate's
+    // rig links a layer to the one it follows with `layerRiggingIndex` on the
+    // parent and `parentLayerIndex` on the child's *frame* — the link can
+    // change over time, which is why it lives there. It is not the layer's own
+    // `parentLayerIndex`, which is the folder it sits in.
+    //
+    // Without this a rigged character arrives in pieces: every part's matrix
+    // is relative to the part it hangs off, so a head with a small offset from
+    // its torso is drawn at that small offset from the *origin* instead, and
+    // the character comes apart across the frame.
+    let by_rig: HashMap<u32, LayerId> = layers
+        .iter()
+        .filter_map(|p| p.rig_index.map(|r| (r, p.layer.id)))
+        .collect();
+    for pending in layers.iter_mut() {
+        let Some(parent) = pending.rig_parent else {
+            continue;
+        };
+        let Some(id) = by_rig.get(&parent) else {
+            continue;
+        };
+        if *id != pending.layer.id {
+            pending.layer.follows = Some(*id);
+        }
+    }
+
+    bake_rig_offsets(layers);
+}
+
+/// Turn Animate's *relative* rig transforms into absolute ones, frame by
+/// frame.
+///
+/// # Two conventions for the same picture
+///
+/// In a rigged Animate character a part's matrix is written **relative to the
+/// part it hangs off**: a head on a torso is `(49, -156)`, not a position; a
+/// shin is a rotation about the knee, in the thigh's own space. Animate draws
+/// it as `parent_now * child_now`, straight down the chain.
+///
+/// Our model does something different and deliberately so — a child's
+/// transform is absolute, and layer parenting propagates only the parent's
+/// *motion* away from its rest pose, which is what Animate's editor does when
+/// you parent two layers that already sit where you want them.
+///
+/// Reconciling the two by baking the parent's **rest** pose into the child is
+/// exact for one level and wrong for two, because matrices do not commute: by
+/// the shin the two products disagree, and a leg comes out stretched. So the
+/// chain is composed here **per keyframe** instead:
+///
+/// ```text
+/// child_world(f) = parent_world(f) * child_relative(f)
+/// ```
+///
+/// Parents are baked before their children, so `parent_world` is read straight
+/// off the parent's own already-absolute keyframes. The rig link is then
+/// dropped: the artwork carries the pose, and propagating the parent's motion
+/// a second time would double every move.
+fn bake_rig_offsets(layers: &mut [PendingLayer]) {
+    use std::collections::HashMap;
+
+    let follows: HashMap<LayerId, LayerId> = layers
+        .iter()
+        .filter_map(|p| p.layer.follows.map(|f| (p.layer.id, f)))
+        .collect();
+    if follows.is_empty() {
+        return;
+    }
+
+    // How deep each layer hangs, so parents are baked before their children.
+    // Bounded by the layer count, so a cycle in a corrupt file cannot spin.
+    let count = layers.len();
+    let depth = |id: LayerId| -> usize {
+        let mut seen = Vec::new();
+        let mut current = follows.get(&id).copied();
+        for _ in 0..count {
+            let Some(next) = current else { break };
+            if seen.contains(&next) {
+                break;
+            }
+            seen.push(next);
+            current = follows.get(&next).copied();
+        }
+        seen.len()
+    };
+
+    let mut order: Vec<usize> = (0..layers.len()).collect();
+    order.sort_by_key(|i| depth(layers[*i].layer.id));
+
+    for index in order {
+        let Some(parent) = layers[index].layer.follows else {
+            continue;
+        };
+        let Some(parent_index) = layers.iter().position(|p| p.layer.id == parent) else {
+            layers[index].layer.follows = None;
+            continue;
+        };
+
+        // What the parent is doing at each of this layer's keyframes, read
+        // from the parent as it now stands — already absolute.
+        let at_parent = |frame: u32| -> Affine {
+            layers[parent_index]
+                .layer
+                .frames
+                .resolved_at(frame)
+                .iter()
+                .next()
+                .map(|object| object.transform)
+                .unwrap_or(Affine::IDENTITY)
+        };
+
+        let moved: Vec<buzz_scene::Keyframe> = layers[index]
+            .layer
+            .frames
+            .keyframes()
+            .iter()
+            .map(|keyframe| {
+                let parent_now = at_parent(keyframe.start);
+                let objects: Vec<std::sync::Arc<Object>> = keyframe
+                    .objects
+                    .iter()
+                    .map(|object| {
+                        let mut copy = (**object).clone();
+                        copy.transform = parent_now * copy.transform;
+                        std::sync::Arc::new(copy)
+                    })
+                    .collect();
+                buzz_scene::Keyframe {
+                    objects: std::sync::Arc::new(objects),
+                    ..keyframe.clone()
+                }
+            })
+            .collect();
+
+        let length = layers[index].layer.frames.length();
+        layers[index].layer.frames = buzz_scene::LayerTimeline::from_parts(moved, length);
+        // The pose is in the artwork now; keeping the link would move it twice.
+        layers[index].layer.follows = None;
     }
 }
 
@@ -532,12 +846,24 @@ struct FrameContext {
     /// The `parentLayerIndex` of the layer being read, kept beside it because
     /// it cannot be resolved until every layer has been seen and given an id.
     parent_index: Option<usize>,
+    /// The layer's `layerRiggingIndex`, and the rigging index of whatever its
+    /// frames say it follows. Both wait for the same reason.
+    rig_index: Option<u32>,
+    rig_parent: Option<u32>,
     /// Style tables for the `DOMShape` currently being read.
     ///
     /// XFL declares fills and strokes once per shape and then has each edge
     /// reference them by index, so the tables have to be accumulated before
     /// the edges that use them can be coloured.
     styles: ShapeStyleTable,
+    /// The boundary pieces of the `DOMShape` currently being read.
+    ///
+    /// Held for the same reason as the styles, and a stronger one: a fill's
+    /// outline is spread across several edges and none of them is a shape on
+    /// its own.
+    edges: Vec<edge::EdgeRecord>,
+    /// An instance has just been pushed and is waiting for its `<Matrix>`.
+    placing: bool,
 }
 
 /// The fills and strokes declared by one `DOMShape`.
@@ -649,12 +975,94 @@ impl FrameContext {
         self.parent_index = attrs
             .get("parentLayerIndex")
             .and_then(|v| v.trim().parse::<usize>().ok());
+        // How this layer is named by the children that follow it.
+        self.rig_index = attrs
+            .get("layerRiggingIndex")
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        self.rig_parent = None;
         self.keyframes.clear();
         self.length = 0;
     }
 
+    /// Turn the edges collected since the last `DOMShape` into artwork.
+    ///
+    /// One object per fill and one per stroke, rather than one per `<Edge>`:
+    /// a fill's boundary is spread across the edges, so an edge on its own is
+    /// a fragment of an outline and not a shape at all.
+    ///
+    /// **Fills first, then strokes**, which is Animate's own order and the
+    /// reason a drawn line sits on top of the colour it encloses rather than
+    /// half under it.
+    fn finish_shape(&mut self, ids: &mut IdSource, report: &mut ImportReport) {
+        let records = std::mem::take(&mut self.edges);
+        if records.is_empty() {
+            return;
+        }
+        let Some(frame) = self.current.as_mut() else {
+            return;
+        };
+
+        let mut made = 0usize;
+        let mut push = |path: buzz_geom::BezPath,
+                        fill: Option<Color>,
+                        stroke: Option<(Color, f64)>| {
+            if path.elements().is_empty() {
+                return;
+            }
+            frame.objects.push(std::sync::Arc::new(Object::shape(
+                ObjectId(ids.take()),
+                ShapeData {
+                    path,
+                    fill: fill.map(FillSpec::solid),
+                    stroke: stroke.map(|(c, w)| StrokeSpec::new(c, w)),
+                    // No source format expresses build-up paint, so imported
+                    // artwork always composites normally.
+                    blend: buzz_scene::PaintBlend::Normal,
+                },
+            )));
+            made += 1;
+        };
+
+        let (fills, gaps) = edge::assemble_fills_counted(&records);
+        for (index, path) in fills {
+            // A fill referencing a style the file never declared still has to
+            // be visible, or artwork silently vanishes.
+            let color = self
+                .styles
+                .fills
+                .get(&index)
+                .copied()
+                .unwrap_or(Color::from_rgb8(0x99, 0x99, 0x99));
+            push(path, Some(color), None);
+        }
+
+        for (index, path) in edge::assemble_strokes(&records) {
+            let (color, width) = self
+                .styles
+                .strokes
+                .get(&index)
+                .copied()
+                .unwrap_or((Color::BLACK, 1.0));
+            push(path, None, Some((color, width)));
+        }
+
+        // Counted after the closure has finished with `report`.
+        report.shapes += made;
+        if gaps > 0 {
+            report.note_unsupported("a fill outline that does not close on itself");
+        }
+    }
+
     fn begin_frame(&mut self, attrs: &HashMap<String, String>, report: &mut ImportReport) {
         self.finish_frame();
+        // Which layer this one follows, by rigging index. Animate keeps it on
+        // the frame because a rig can be re-parented part way through a shot;
+        // our model has one link per layer, so the first one stated wins.
+        if self.rig_parent.is_none() {
+            self.rig_parent = attrs
+                .get("parentLayerIndex")
+                .and_then(|v| v.trim().parse::<u32>().ok());
+        }
         let start = attr_u32(attrs, "index", 0);
         let duration = attr_u32(attrs, "duration", 1).max(1);
         let tween = parse_tween(attrs);
@@ -683,9 +1091,26 @@ impl FrameContext {
             return;
         };
 
+        // **An instance claims only the matrix that immediately follows it.**
+        // `<matrix>` is the first child of `<DOMSymbolInstance>`, so anything
+        // else arriving first means this instance has no matrix of its own and
+        // sits at the origin. Letting the claim stand was the worse bug: the
+        // next `<Matrix>` in the file is usually a *gradient's*, whose scale is
+        // a fraction of a percent, and the instance collapsed to a point — a
+        // lantern, a bed and a cot vanishing from a shot while the layer
+        // reported them present.
+        if !matches!(name, "matrix" | "Matrix" | "DOMSymbolInstance") {
+            self.placing = false;
+        }
+
         match name {
-            // A new shape starts a new set of style tables.
-            "DOMShape" => self.styles.begin_shape(),
+            // A new shape starts a new set of style tables — and finishes any
+            // shape still open, so a file that nests one inside a group still
+            // draws both.
+            "DOMShape" => {
+                self.finish_shape(ids, report);
+                self.styles.begin_shape();
+            }
 
             "FillStyle" => {
                 self.styles.current = Some(StyleSlot::Fill(attr_index(attrs)));
@@ -718,54 +1143,19 @@ impl FrameContext {
             }
 
             "Edge" => {
-                // The geometry, referencing the styles declared above it.
+                // Collected, not drawn. A shape's outlines are spread across
+                // its edges and only make sense once all of them are in —
+                // `finish_shape` is where they become artwork.
                 let Some(data) = attrs.get("edges") else { return };
-                match parse_edges_closed(data) {
-                    Ok(path) if !path.elements().is_empty() => {
-                        // Either fill reference means "this edge bounds that
-                        // fill"; which side it lies on does not change the
-                        // colour, only the winding, which the path already
-                        // carries.
-                        let fill = ["fillStyle0", "fillStyle1"]
-                            .iter()
-                            .filter_map(|k| attrs.get(*k))
-                            .filter_map(|v| v.trim().parse::<u32>().ok())
-                            .find_map(|index| self.styles.fills.get(&index).copied());
-                        let stroke = attrs
-                            .get("strokeStyle")
-                            .and_then(|v| v.trim().parse::<u32>().ok())
-                            .and_then(|index| self.styles.strokes.get(&index).copied());
-
-                        // A shape referencing a style the file never declared
-                        // still has to be visible, or artwork silently vanishes.
-                        let referenced_fill = attrs.contains_key("fillStyle0")
-                            || attrs.contains_key("fillStyle1");
-                        let fill = fill.or_else(|| {
-                            referenced_fill.then_some(Color::from_rgb8(0x99, 0x99, 0x99))
+                let index = |k: &str| attrs.get(k).and_then(|v| v.trim().parse::<u32>().ok());
+                match edge::parse_segments(data) {
+                    Ok(segments) if !segments.is_empty() => {
+                        self.edges.push(edge::EdgeRecord {
+                            fill_left: index("fillStyle1"),
+                            fill_right: index("fillStyle0"),
+                            stroke: index("strokeStyle"),
+                            segments,
                         });
-                        let stroke = stroke.or_else(|| {
-                            (!referenced_fill && attrs.contains_key("strokeStyle"))
-                                .then_some((Color::BLACK, 1.0))
-                        });
-                        // An edge with no style at all is a hairline outline,
-                        // which is what Animate shows for one.
-                        let (fill, stroke) = match (fill, stroke) {
-                            (None, None) => (None, Some((Color::BLACK, 1.0))),
-                            other => other,
-                        };
-
-                        let shape = ShapeData {
-                            path,
-                            fill: fill.map(FillSpec::solid),
-                            stroke: stroke.map(|(c, w)| StrokeSpec::new(c, w)),
-                            // No source format expresses build-up paint, so
-                            // imported artwork always composites normally.
-                            blend: buzz_scene::PaintBlend::Normal,
-                        };
-                        frame
-                            .objects
-                            .push(std::sync::Arc::new(Object::shape(ObjectId(ids.take()), shape)));
-                        report.shapes += 1;
                     }
                     Ok(_) => {}
                     Err(e) => report.note_unsupported(format!("edge data ({e})")),
@@ -776,13 +1166,36 @@ impl FrameContext {
                     return;
                 };
                 // Animate stores the library path; the symbol's own name is
-                // the last segment.
+                // the last segment. The full path is tried first — two folders
+                // may each hold a "head", and the bare name would pick
+                // whichever was read first.
                 let short = library_name.rsplit('/').next().unwrap_or(library_name);
-                match symbols.get(short).or_else(|| symbols.get(library_name)) {
+                match symbols.get(library_name).or_else(|| symbols.get(short)) {
                     Some(symbol) => {
-                        let object = Object::instance_of(ObjectId(ids.take()), *symbol);
+                        let mut object = Object::instance_of(ObjectId(ids.take()), *symbol);
+                        // **How this instance plays.** Animate keeps it on the
+                        // instance, not on the symbol: the same drawing placed
+                        // twice can loop in one shot and hold a single pose in
+                        // the next, and half a rigged character is placed as a
+                        // held pose. Ignoring these two attributes ran every
+                        // held pose through its whole timeline and started
+                        // every cycle at its first frame — the drawing was
+                        // right and the pose was wrong.
+                        if let buzz_scene::ObjectKind::Instance(placed) = &mut object.kind {
+                            placed.first_frame = attr_u32(attrs, "firstFrame", 0);
+                            placed.loop_mode = match attrs.get("loop").map(String::as_str) {
+                                Some("single frame") => buzz_scene::LoopMode::SingleFrame,
+                                Some("play once") => buzz_scene::LoopMode::PlayOnce,
+                                // Animate's default, and what it writes for
+                                // everything else.
+                                _ => buzz_scene::LoopMode::Loop,
+                            };
+                        }
                         frame.objects.push(std::sync::Arc::new(object));
                         report.instances += 1;
+                        // The next `<Matrix>` places this instance. Nothing
+                        // else may claim it — see the `Matrix` arm.
+                        self.placing = true;
                     }
                     None => report
                         .note_unsupported(format!("instance of unknown symbol {library_name}")),
@@ -796,7 +1209,18 @@ impl FrameContext {
             "DOMVideoInstance" => report.note_unsupported("video"),
             "DOMSoundItem" => report.note_unsupported("sound"),
             "Matrix" => {
-                // Applies to the element most recently pushed.
+                // **Only the one that places an instance.** `<Matrix>` appears
+                // in several places in XFL, and the others are not placements
+                // at all: a gradient fill carries one to say where its ramp
+                // runs, a bitmap fill to say how its image is laid down. Taken
+                // as a placement, a gradient's matrix moved whichever object
+                // happened to be last — which is how a hut ends up across the
+                // stage from its village. Anything not expecting a matrix
+                // ignores this one.
+                if !self.placing {
+                    return;
+                }
+                self.placing = false;
                 if let Some(last) = frame.objects.last_mut() {
                     let transform = parse_matrix(attrs);
                     std::sync::Arc::make_mut(last).transform = transform;
@@ -833,14 +1257,67 @@ impl FrameContext {
         layers.push(PendingLayer {
             layer,
             parent_index: self.parent_index.take(),
+            rig_index: self.rig_index.take(),
+            rig_parent: self.rig_parent.take(),
         });
     }
 }
 
+/// The name a `DOMSymbolInstance` would use to refer to this file's symbol.
+///
+/// Animate writes the *library path* — `characters/hero` — in both the
+/// symbol's own `name` attribute and the file's position under `LIBRARY/`, and
+/// the two do not always agree: the file name is escaped for the file system
+/// while the attribute is not. Both are offered as keys, along with the last
+/// segment of each, since a document written before the symbol was moved into
+/// a folder refers to it by the bare name.
+fn library_keys(xml: &str, path: &str) -> Vec<String> {
+    let from_path = path
+        .trim_start_matches("LIBRARY/")
+        .trim_start_matches("library/")
+        .trim_end_matches(".xml")
+        .to_string();
+
+    let mut keys: Vec<String> = Vec::new();
+    for full in [library_name_of(xml), Some(from_path)].into_iter().flatten() {
+        let short = full.rsplit('/').next().unwrap_or(&full).to_string();
+        for key in [full.clone(), short] {
+            if !key.is_empty() && !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// The `name` attribute of the file's `DOMSymbolItem`, without reading the
+/// timeline underneath it.
+fn library_name_of(xml: &str) -> Option<String> {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if e.name().as_ref() == b"DOMSymbolItem" {
+                    return attributes(&e).get("name").cloned();
+                }
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
 /// Parse one `LIBRARY/*.xml` symbol definition.
+///
+/// The id is handed in rather than taken here: every symbol's id is allocated
+/// before any timeline is read, so a symbol can hold an instance of one whose
+/// file comes later in the archive.
 fn parse_symbol(
     xml: &str,
     path: &str,
+    id: SymbolId,
+    symbols: &HashMap<String, SymbolId>,
     ids: &mut IdSource,
     report: &mut ImportReport,
 ) -> Result<Symbol, ImportError> {
@@ -858,12 +1335,11 @@ fn parse_symbol(
         None => (None, trimmed.to_string()),
     };
 
-    let mut symbol = Symbol::new(SymbolId(ids.take()), file_name, SymbolKind::Graphic);
+    let mut symbol = Symbol::new(id, file_name, SymbolKind::Graphic);
     symbol.folder = folder;
 
     let mut context = FrameContext::default();
     let mut layers: Vec<PendingLayer> = Vec::new();
-    let empty_symbols = HashMap::new();
 
     loop {
         match reader.read_event() {
@@ -889,23 +1365,41 @@ fn parse_symbol(
                         context.begin_layer(&attrs, ids);
                     }
                     "DOMFrame" => context.begin_frame(&attrs, report),
-                    _ => context.element(&name, &attrs, &empty_symbols, ids, report),
+                    _ => context.element(&name, &attrs, symbols, ids, report),
                 }
             }
-            Err(e) => return Err(ImportError::Xml(e.to_string())),
+            Ok(Event::End(e)) if e.name().as_ref() == b"DOMShape" => {
+                context.finish_shape(ids, report);
+            }
+            Err(e) => {
+                // **Animate itself writes broken symbol files.** Real
+                // documents on this machine contain `<DOMShape` with no
+                // closing bracket, immediately followed by `</DOMShape>` —
+                // the puppet-warp shapes, saved damaged. Refusing the file
+                // threw away every other frame in the symbol along with the
+                // bad one, and the symbol then vanished from every scene that
+                // used it. What reads is kept, and the truncation is named.
+                report.note_unsupported(format!(
+                    "damaged XML in the symbol {}, read as far as it goes ({e})",
+                    symbol.name
+                ));
+                break;
+            }
             _ => {}
         }
     }
     context.flush_layer(&mut layers, report);
 
-    // A symbol's timeline has layer folders just as the document's does.
+    // A symbol's timeline has layer folders and masks just as the document's
+    // does, and the same top-first order.
     resolve_layer_parents(&mut layers);
 
-    layers.reverse();
     if layers.is_empty() {
         layers.push(PendingLayer {
             layer: Layer::normal(LayerId(ids.take()), "Layer_1"),
             parent_index: None,
+            rig_index: None,
+            rig_parent: None,
         });
     }
     for (index, pending) in layers.into_iter().enumerate() {
@@ -924,6 +1418,18 @@ mod tests {
   <timelines>
     <DOMTimeline name="Scene 1">
       <layers>
+        <DOMLayer name="Foreground" visible="false" locked="true">
+          <frames>
+            <DOMFrame index="0" duration="5" tweenType="motion" acceleration="50">
+              <elements>
+                <DOMSymbolInstance libraryItemName="hero">
+                  <matrix><Matrix a="2" d="2" tx="100" ty="50"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+            <DOMFrame index="5" duration="5"/>
+          </frames>
+        </DOMLayer>
         <DOMLayer name="Background" color="#4FFF4F" visible="true" locked="false">
           <frames>
             <DOMFrame index="0" duration="10" name="start">
@@ -935,18 +1441,6 @@ mod tests {
                 </DOMShape>
               </elements>
             </DOMFrame>
-          </frames>
-        </DOMLayer>
-        <DOMLayer name="Foreground" visible="false" locked="true">
-          <frames>
-            <DOMFrame index="0" duration="5" tweenType="motion" acceleration="50">
-              <elements>
-                <DOMSymbolInstance libraryItemName="hero">
-                  <matrix><Matrix a="2" d="2" tx="100" ty="50"/></matrix>
-                </DOMSymbolInstance>
-              </elements>
-            </DOMFrame>
-            <DOMFrame index="5" duration="5"/>
           </frames>
         </DOMLayer>
       </layers>
@@ -1010,15 +1504,23 @@ mod tests {
         assert!(background.visible);
     }
 
-    /// Animate writes layers bottom-first; ours are front-first.
+    /// **Animate writes layers top-first**, and so do we — the order in the
+    /// file is the order down the timeline.
+    ///
+    /// This was read backwards for five phases, and the list was reversed on
+    /// the way in. Every document imported inside out: skies over artwork,
+    /// backgrounds over the characters standing on them, and every mask
+    /// underneath the layers it was supposed to clip. The camera layer is the
+    /// proof — Animate pins it to the top of the timeline and writes it
+    /// first.
     #[test]
-    fn layer_order_is_reversed_to_match_our_stack() {
+    fn layer_order_matches_the_file() {
         let (scene, _) = import_sample();
         let names: Vec<&str> = scene.layers().iter().map(|l| l.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["Foreground", "Background"],
-            "the last layer in the file should be at the front"
+            "the first layer in the file is the front one"
         );
     }
 
@@ -1108,6 +1610,366 @@ mod tests {
         assert!(
             scene.library().folders().any(|f| f == "characters"),
             "parent folders should exist too"
+        );
+    }
+
+    /// A symbol built out of other symbols — which is what a rigged character
+    /// is — must find them whatever order the library is read in.
+    ///
+    /// This is the defect that made a real Animate document import as a page
+    /// of "instance of unknown symbol": each symbol was parsed against only
+    /// the symbols parsed before it, so a torso holding an arm found nothing
+    /// unless the arm's file happened to come first. Here the container is
+    /// read *first*, and both its parts are referenced by their library path.
+    #[test]
+    fn a_symbol_finds_the_symbols_inside_it_whatever_the_order() {
+        const CHARACTER: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="parts/character" symbolType="movie clip">
+  <timeline>
+    <DOMTimeline name="character">
+      <layers>
+        <DOMLayer name="Layer 1">
+          <frames>
+            <DOMFrame index="0" duration="1">
+              <elements>
+                <DOMSymbolInstance libraryItemName="parts/torso"/>
+                <DOMSymbolInstance libraryItemName="parts/arm"/>
+                <DOMSymbolInstance libraryItemName="hero"/>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timeline>
+</DOMSymbolItem>"##;
+
+        let part = |name: &str| {
+            format!(
+                r##"<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="parts/{name}"
+                     symbolType="graphic"><timeline><DOMTimeline name="{name}"><layers>
+                     <DOMLayer name="Layer 1"><frames><DOMFrame index="0" duration="1"/>
+                     </frames></DOMLayer></layers></DOMTimeline></timeline></DOMSymbolItem>"##
+            )
+        };
+
+        let (scene, report) = build(
+            MINIMAL_DOCUMENT,
+            &[
+                ("LIBRARY/parts/character.xml".to_string(), CHARACTER.to_string()),
+                ("LIBRARY/parts/torso.xml".to_string(), part("torso")),
+                ("LIBRARY/parts/arm.xml".to_string(), part("arm")),
+                ("LIBRARY/hero.xml".to_string(), HERO_SYMBOL.to_string()),
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            !report.unsupported.iter().any(|u| u.contains("unknown symbol")),
+            "every nested instance should resolve: {:?}",
+            report.unsupported
+        );
+
+        let character = scene.library().find_by_name("character").unwrap();
+        let inside = character.layers.iter().next().unwrap().objects_at(0);
+        assert_eq!(inside.len(), 3, "all three instances should be kept");
+
+        // And each points at the right symbol, not merely at *a* symbol.
+        let torso = scene.library().find_by_name("torso").unwrap().id;
+        assert!(
+            inside
+                .iter()
+                .any(|o| o.instance().map(|i| i.symbol) == Some(torso)),
+            "the torso instance should reference the torso symbol"
+        );
+    }
+
+    /// **A fill's outline is spread across several edges**, and each edge is a
+    /// fragment rather than a shape.
+    ///
+    /// This is how Animate really writes artwork: a soup of two-point pieces,
+    /// each saying which fill is on its left and which on its right. Read as
+    /// one closed outline per `<Edge>`, a bush arrives as several hundred
+    /// slivers — which is what a real document looked like before the pieces
+    /// were reassembled.
+    #[test]
+    fn a_fill_spread_across_edges_is_reassembled_into_one_outline() {
+        // A 100x100 square, written as four separate one-segment edges, in a
+        // deliberately unhelpful order and with one of them the wrong way
+        // round (its fill on the right instead of the left).
+        const SOUP: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
+  <timelines>
+    <DOMTimeline name="Scene 1">
+      <layers>
+        <DOMLayer name="Art">
+          <frames>
+            <DOMFrame index="0" duration="1">
+              <elements>
+                <DOMShape>
+                  <fills>
+                    <FillStyle index="1"><SolidColor color="#3366CC"/></FillStyle>
+                  </fills>
+                  <edges>
+                    <Edge fillStyle1="1" edges="!2000 0|2000 2000"/>
+                    <Edge fillStyle0="1" edges="!0 0|2000 0"/>
+                    <Edge fillStyle1="1" edges="!0 2000|0 0"/>
+                    <Edge fillStyle1="1" edges="!2000 2000|0 2000"/>
+                  </edges>
+                </DOMShape>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timelines>
+</DOMDocument>"##;
+
+        let (scene, _) = build(SOUP, &[]).unwrap();
+        let objects = scene.layers().iter().next().unwrap().objects_at(0);
+        assert_eq!(
+            objects.len(),
+            1,
+            "one fill, one object \u{2014} not one per edge: {:?}",
+            objects.len()
+        );
+
+        // 2000 twips is 100 pixels, and the square is closed and whole.
+        let bounds = objects[0].bounds();
+        assert!(
+            (bounds.width() - 100.0).abs() < 0.01 && (bounds.height() - 100.0).abs() < 0.01,
+            "the four fragments should close into the whole square, got {bounds:?}"
+        );
+    }
+
+    /// A rigged character's parts are stored *relative* to the part they hang
+    /// off, and have to be made absolute on the way in.
+    #[test]
+    fn a_rigged_layer_follows_its_parent_and_keeps_its_place() {
+        const RIG: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="figure" symbolType="graphic">
+  <timeline>
+    <DOMTimeline name="figure">
+      <layers>
+        <DOMLayer name="head" layerRiggingIndex="9">
+          <frames>
+            <DOMFrame index="0" duration="1" parentLayerIndex="5">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="10" ty="-20"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+        <DOMLayer name="body" layerRiggingIndex="5">
+          <frames>
+            <DOMFrame index="0" duration="1">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="300" ty="400"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timeline>
+</DOMSymbolItem>"##;
+
+        const PART: &str = r##"<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="part"
+             symbolType="graphic"><timeline><DOMTimeline name="part"><layers>
+             <DOMLayer name="Layer_1"><frames><DOMFrame index="0" duration="1"/>
+             </frames></DOMLayer></layers></DOMTimeline></timeline></DOMSymbolItem>"##;
+
+        let (scene, _) = build(
+            MINIMAL_DOCUMENT,
+            &[
+                ("LIBRARY/figure.xml".to_string(), RIG.to_string()),
+                ("LIBRARY/part.xml".to_string(), PART.to_string()),
+            ],
+        )
+        .unwrap();
+
+        let figure = scene.library().find_by_name("figure").unwrap();
+        let head = figure.layers.iter().find(|l| l.name == "head").unwrap();
+        let body = figure.layers.iter().find(|l| l.name == "body").unwrap();
+
+        // The link is read and then *spent*: the child's pose is composed
+        // with the parent's, frame by frame, and the artwork carries it from
+        // there. Keeping the link as well would move the head twice.
+        assert_eq!(head.follows, None, "the rig is baked, not left live");
+        assert_eq!(body.follows, None);
+
+        // Relative (10, -20) on a body at (300, 400) is (310, 380) absolute.
+        let placed = head.objects_at(0)[0].transform.as_coeffs();
+        assert!(
+            (placed[4] - 310.0).abs() < 1e-9 && (placed[5] - 380.0).abs() < 1e-9,
+            "the parent's rest pose should be baked in, got {:?}",
+            (placed[4], placed[5])
+        );
+    }
+
+    /// Animate's camera layer becomes our camera, not an error.
+    #[test]
+    fn the_camera_layer_is_imported_as_the_camera() {
+        const WITH_CAMERA: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="1920" height="1080" frameRate="24">
+  <timelines>
+    <DOMTimeline name="Scene 1" cameraLayerEnabled="true">
+      <layers>
+        <DOMLayer name="Camera" layerType="camera">
+          <frames>
+            <DOMFrame index="0" duration="50">
+              <elements>
+                <DOMSymbolInstance libraryItemName="__Camera__" name="___camera___instance">
+                  <matrix><Matrix tx="960" ty="540"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+            <DOMFrame index="50">
+              <elements>
+                <DOMSymbolInstance libraryItemName="__Camera__" name="___camera___instance">
+                  <matrix><Matrix a="0.5" d="0.5" tx="400" ty="300"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+        <DOMLayer name="Art">
+          <frames><DOMFrame index="0" duration="1"/></frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timelines>
+</DOMDocument>"##;
+
+        let (scene, report) = build(WITH_CAMERA, &[]).unwrap();
+
+        assert!(
+            !report.unsupported.iter().any(|u| u.contains("__Camera__")),
+            "the camera is not an unknown symbol: {:?}",
+            report.unsupported
+        );
+        assert_eq!(report.camera_keys, 2);
+        assert_eq!(
+            scene.layers().len(),
+            1,
+            "the camera layer is the camera, not a layer of artwork"
+        );
+
+        let camera = scene.camera();
+        assert!(camera.enabled, "the file said the camera is on");
+        let keys = camera.keys();
+        assert_eq!(keys[0].center, buzz_geom::Point::new(960.0, 540.0));
+        assert!((keys[0].zoom - 1.0).abs() < 1e-9);
+
+        // **The first span is not tweened, so it holds.** Written as a second
+        // key with the same values at the span's last frame, which is how a
+        // track that interpolates everything expresses a cut.
+        assert_eq!(keys.len(), 3, "a held span gains a key at its end");
+        assert_eq!(keys[1].frame, 49);
+        assert!((keys[1].zoom - 1.0).abs() < 1e-9, "the hold must not drift");
+
+        // A camera scaled to half shows half the stage: a zoom of two.
+        assert_eq!(keys[2].frame, 50);
+        assert!((keys[2].zoom - 2.0).abs() < 1e-9, "zoom was {}", keys[2].zoom);
+        assert_eq!(keys[2].center, buzz_geom::Point::new(400.0, 300.0));
+    }
+
+    /// A *tweened* camera span must not gain a hold: it moves the whole way.
+    #[test]
+    fn a_tweened_camera_span_keeps_moving() {
+        const TWEENED: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="1920" height="1080">
+  <timelines>
+    <DOMTimeline name="Scene 1" cameraLayerEnabled="true">
+      <layers>
+        <DOMLayer name="Camera" layerType="camera">
+          <frames>
+            <DOMFrame index="0" duration="30" tweenType="motion">
+              <elements>
+                <DOMSymbolInstance libraryItemName="__Camera__">
+                  <matrix><Matrix tx="960" ty="540"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+            <DOMFrame index="30">
+              <elements>
+                <DOMSymbolInstance libraryItemName="__Camera__">
+                  <matrix><Matrix a="0.5" d="0.5" tx="960" ty="540"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timelines>
+</DOMDocument>"##;
+
+        let (scene, _) = build(TWEENED, &[]).unwrap();
+        assert_eq!(scene.camera().keys().len(), 2, "no hold on a tweened span");
+        let middle = scene.camera().state_at(15).expect("a state halfway");
+        assert!(
+            middle.zoom > 1.2 && middle.zoom < 1.8,
+            "the move should be underway at halfway, not held: {}",
+            middle.zoom
+        );
+    }
+
+    /// Animate writes damaged symbol files, and one bad frame must not cost
+    /// the whole symbol.
+    #[test]
+    fn a_symbol_with_broken_xml_keeps_what_reads() {
+        // `<DOMShape` with no closing bracket, exactly as Animate saved it.
+        const DAMAGED: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="hurt" symbolType="graphic">
+  <timeline>
+    <DOMTimeline name="hurt">
+      <layers>
+        <DOMLayer name="Layer 1">
+          <frames>
+            <DOMFrame index="0" duration="1">
+              <elements>
+                <DOMShape>
+                  <edges><Edge fillStyle0="1" edges="!0 0|2000 0|2000 2000|0 2000|0 0"/></edges>
+                </DOMShape>
+              </elements>
+            </DOMFrame>
+            <DOMFrame index="1" duration="1">
+              <elements>
+                <DOMShape
+                </DOMShape>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timeline>
+</DOMSymbolItem>"##;
+
+        let (scene, report) = build(
+            MINIMAL_DOCUMENT,
+            &[("LIBRARY/hurt.xml".to_string(), DAMAGED.to_string())],
+        )
+        .unwrap();
+
+        let hurt = scene
+            .library()
+            .find_by_name("hurt")
+            .expect("the symbol should survive its bad frame");
+        assert!(
+            hurt.bounds().is_some(),
+            "the artwork before the damage should still be there"
+        );
+        assert!(
+            report.unsupported.iter().any(|u| u.contains("damaged XML")),
+            "and the damage should be named: {:?}",
+            report.unsupported
         );
     }
 
@@ -1272,16 +2134,17 @@ mod tests {
     }
 
     /// Animate overloads `parentLayerIndex`: a **masked** layer points at its
-    /// mask with the same attribute a nested layer uses for its folder. Our
-    /// model resolves masking positionally, so honouring it here would nest a
-    /// layer inside its own mask and break that resolution.
+    /// mask with the same attribute a nested layer uses for its folder — and
+    /// it does *not* write `layerType="masked"`, whatever the format allows.
+    /// This is copied from a real file: the mask first, the layer it claims
+    /// after it, pointing back at it.
     const MASKED_LAYERS: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
 <DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400">
   <timelines>
     <DOMTimeline name="Scene 1">
       <layers>
-        <DOMLayer name="Masked" layerType="masked" parentLayerIndex="1"/>
-        <DOMLayer name="TheMask" layerType="mask"/>
+        <DOMLayer name="TheMask" layerType="mask" outline="true"/>
+        <DOMLayer name="Masked" parentLayerIndex="0"/>
       </layers>
     </DOMTimeline>
   </timelines>
@@ -1298,7 +2161,7 @@ mod tests {
         assert_eq!(
             masked.kind,
             LayerKind::Masked,
-            "the kind is what the positional rule reads; as Normal the mask clips nothing"
+            "a layer pointing at a mask is masked, whatever its layerType says"
         );
         assert_eq!(
             masked.parent, None,

@@ -422,6 +422,45 @@ impl LayerTimeline {
     }
 
     /// Set the artwork of the keyframe governing `frame`.
+    /// **Clear Frames** \u2014 empty the artwork here, keeping the frames.
+    ///
+    /// Distinct from [`Self::clear_keyframe`], which removes the keyframe
+    /// itself and hands the frames back to the one before it. This keeps the
+    /// keyframe and empties it: the span is unchanged and what was drawn is
+    /// gone, which is what Animate's Clear Frames does.
+    pub fn clear_frames(&mut self, frame: u32) -> bool {
+        match self.keyframe_at_mut(frame) {
+            Some(keyframe) if !keyframe.objects.is_empty() => {
+                keyframe.objects = Arc::new(Vec::new());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// **Reverse Frames** \u2014 play this layer's keyframes back to front.
+    ///
+    /// The artwork of the first keyframe ends up on the last, and so on. The
+    /// keyframes stay where they are; it is their *contents* that swap, so the
+    /// timing an animator built is kept and only the order changes \u2014 which is
+    /// what Animate does, and what makes it useful for a cycle.
+    pub fn reverse_frames(&mut self) -> bool {
+        if self.keyframes.len() < 2 {
+            return false;
+        }
+        let contents: Vec<Arc<Vec<Arc<Object>>>> =
+            self.keyframes.iter().map(|k| k.objects.clone()).collect();
+        for (keyframe, objects) in self.keyframes.iter_mut().zip(contents.into_iter().rev()) {
+            keyframe.objects = objects;
+        }
+        true
+    }
+
+    /// The artwork on the keyframe governing `frame`, for copying.
+    pub fn frame_contents(&self, frame: u32) -> Option<Vec<Arc<Object>>> {
+        self.keyframe_at(frame).map(|k| k.objects.as_ref().clone())
+    }
+
     pub fn set_objects(&mut self, frame: u32, objects: Vec<Arc<Object>>) -> bool {
         match self.keyframe_at_mut(frame) {
             Some(k) => {

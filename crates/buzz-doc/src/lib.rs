@@ -6,6 +6,7 @@
 //! without also recording an undo step — the usual way undo quietly develops
 //! holes.
 
+pub mod assets;
 pub mod autosave;
 pub mod format;
 pub mod history;
@@ -15,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use buzz_scene::Scene;
 
+pub use assets::{Asset, AssetLibrary};
 pub use autosave::{Autosave, AutosavePlan, Recovery, find_recoveries};
 pub use format::{DocError, EXTENSION, MIMETYPE, Meta};
 pub use history::{History, UndoLabel};
@@ -37,7 +39,9 @@ impl Default for Document {
 impl Document {
     /// A new, unsaved document.
     pub fn new(scene: Scene) -> Self {
-        let autosave = Autosave::untitled(std::env::temp_dir());
+        // Work that has never been saved recovers from the application's own
+        // directory rather than the system temp, which is swept.
+        let autosave = Autosave::untitled(crate::autosave::recovery_dir());
         Self {
             scene,
             history: History::default(),
@@ -74,6 +78,17 @@ impl Document {
     }
 
     /// Has the document changed since it was last saved?
+    /// Treat the document as it stands as unmodified.
+    ///
+    /// For a document that was *made* rather than opened: a new file is not a
+    /// changed one, and there is nothing to save yet. Without this a brand new
+    /// document reports unsaved changes from the moment it appears, because
+    /// building a scene bumps its revision.
+    pub fn mark_clean(&mut self) {
+        let revision = self.scene.revision();
+        self.history.mark_saved(revision);
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.history.is_dirty(self.scene.revision())
     }
@@ -186,6 +201,19 @@ impl Document {
         let _ = self.autosave.discard_recovery();
         self.path = Some(path);
         Ok(())
+    }
+
+    /// Forget where this document came from: it becomes untitled.
+    ///
+    /// For a recovered autosave. The recovery file is *evidence of a crash*,
+    /// not a document the user chose to keep, and Save must ask where to put
+    /// the result rather than writing back over it — and the new document's
+    /// own autosave must go somewhere else, or it would overwrite the very
+    /// file it was recovered from.
+    pub fn forget_path(&mut self) {
+        self.path = None;
+        self.autosave
+            .reset_to_untitled(crate::autosave::recovery_dir());
     }
 
     /// Build an autosave job if one is due.

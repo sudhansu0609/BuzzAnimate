@@ -42,12 +42,21 @@ use serde::{Deserialize, Serialize};
 /// * **6** — armatures and warped artwork: rigging, in Phase 7.
 /// * **7** — sound: a library of clips, and sounds attached to keyframes.
 /// * **8** — lights: a sun, a sky and lamps, and the shading they imply.
+/// * **12** — a looping section: a range of frames the export repeats.
+/// * **13** — named swatches, in folders: the document's palette.
+/// * **14** — a transformation point per object.
+/// * **15** — the inverse mask: a layer kind that hides what it covers.
+///
+/// Version 15 is a new *value*, not a new field: a document that has no
+/// inverse mask is byte-identical to the one version 14 wrote. The bump is
+/// still right, because a version 14 build reading a file that uses one would
+/// fail on the unknown layer kind, and the version number is how it says so.
 ///
 /// Every older version still loads. Version 1's flat list becomes a single
 /// keyframe at frame 0, which is exactly what it meant; version 2 simply has
 /// no library and no tweens, and both default to empty. Keeping those paths is
 /// cheap and it exercises the version check for real rather than in theory.
-pub const FORMAT_VERSION: u32 = 11;
+pub const FORMAT_VERSION: u32 = 15;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -118,6 +127,36 @@ pub struct DocumentDto {
     /// any document that has none — which is most of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lights: Option<LightRigDto>,
+    /// The looping section. Version 12. Absent in older files and in any
+    /// document that does not loop, which is most of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub looping: Option<LoopDto>,
+    /// The palette. Version 13. Absent in older files, which get the default
+    /// palette on the way in — which is what they effectively had.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub swatches: Vec<SwatchDto>,
+    /// Palette folders, including empty ones. Version 13.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub swatch_folders: Vec<String>,
+}
+
+/// A named colour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwatchDto {
+    pub id: u64,
+    pub name: String,
+    /// `#RRGGBB` or `#RRGGBBAA`, as every other colour in this format.
+    pub color: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+}
+
+/// A range of frames that repeats, in playback and in the finished film.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopDto {
+    pub start: u32,
+    pub end: u32,
+    pub repeats: u32,
 }
 
 /// The document's lights.
@@ -676,6 +715,11 @@ pub struct ObjectDto {
     /// Version 11; absent means flat, which is every object written before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spatial: Option<SpatialDto>,
+    /// The transformation point, in the object's own coordinates. Version 14;
+    /// absent means the centre of the artwork, which is what every object
+    /// written before it used and what an untouched one still uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pivot: Option<[f64; 2]>,
     pub kind: ObjectKindDto,
 }
 
@@ -1010,6 +1054,22 @@ impl DocumentDto {
                     }
                 })
                 .collect(),
+            swatches: scene
+                .swatches()
+                .iter()
+                .map(|s| SwatchDto {
+                    id: s.id.0,
+                    name: s.name.clone(),
+                    color: color_to_hex(s.color),
+                    folder: s.folder.clone(),
+                })
+                .collect(),
+            swatch_folders: scene.swatches().folders().cloned().collect(),
+            looping: scene.looping().enabled.then(|| LoopDto {
+                start: scene.looping().start,
+                end: scene.looping().end,
+                repeats: scene.looping().repeats,
+            }),
             lights: (!scene.lights().lights.is_empty()).then(|| LightRigDto {
                 enabled: scene.lights().enabled,
                 base: color_to_hex(scene.lights().base),
@@ -1131,6 +1191,40 @@ impl DocumentDto {
                 channels: sound.channels,
                 length: sound.length,
             });
+        }
+
+        // The palette. A file written before version 13 has none, and gets
+        // the default one — the ten colours the Color panel always offered,
+        // which is what such a document effectively had.
+        if self.swatches.is_empty() && self.swatch_folders.is_empty() {
+            *scene.swatches_mut() = buzz_scene::default_swatches();
+        } else {
+            let palette = scene.swatches_mut();
+            for folder in &self.swatch_folders {
+                palette.add_folder(folder);
+            }
+            for dto in &self.swatches {
+                let mut swatch = buzz_scene::Swatch::new(
+                    buzz_scene::SwatchId(dto.id),
+                    dto.name.clone(),
+                    color_from_hex(&dto.color)?,
+                );
+                swatch.folder = dto.folder.clone();
+                palette.insert(swatch);
+            }
+        }
+
+        if let Some(region) = &self.looping {
+            // Clamped on the way in: a file hand-edited to loop frames that no
+            // longer exist must not make the exporter read past the end.
+            let frames = scene.frame_count();
+            *scene.looping_mut() = buzz_scene::LoopRegion {
+                enabled: true,
+                start: region.start,
+                end: region.end,
+                repeats: region.repeats,
+            }
+            .clamped(frames);
         }
 
         if let Some(rig) = &self.lights {
@@ -1298,6 +1392,9 @@ impl ObjectDto {
                 rotation_z: object.spatial.rotation_z,
                 z: object.spatial.z,
             }),
+            // Likewise omitted when it is the centre, which is every object
+            // nobody has moved a transformation point on.
+            pivot: object.pivot.map(|p| [p.x, p.y]),
             kind,
         }
     }
@@ -1457,6 +1554,12 @@ impl ObjectDto {
                     z: if s.z.is_finite() { s.z } else { 0.0 },
                 })
                 .unwrap_or_default(),
+            // A point that is not a number would put the artwork nowhere the
+            // moment it was rotated; treat it as "not set" and use the centre.
+            pivot: self
+                .pivot
+                .filter(|p| p[0].is_finite() && p[1].is_finite())
+                .map(|p| buzz_geom::Point::new(p[0], p[1])),
         })
     }
 }
@@ -1650,6 +1753,165 @@ mod tests {
             None,
             "the layer at the top of the chain follows nothing"
         );
+    }
+
+    /// The transformation point is part of the artwork's description: a hinge
+    /// that moved back to the middle when the file was reopened would silently
+    /// change every rotation after it.
+    #[test]
+    fn a_transformation_point_survives_a_round_trip() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 80.0, 20.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        scene.set_pivot_at(0, id, buzz_geom::Point::new(0.0, 10.0));
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        let (_, object) = back.find_object(id).expect("the object");
+        assert_eq!(object.pivot, Some(buzz_geom::Point::new(0.0, 10.0)));
+    }
+
+    /// An object nobody has touched writes no point at all, so a document that
+    /// does not use the feature is byte-for-byte what it always was.
+    #[test]
+    fn an_untouched_object_writes_no_transformation_point() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 80.0, 20.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+
+        let json = serde_json::to_string(&DocumentDto::from_scene(&scene)).unwrap();
+        assert!(!json.contains("pivot"), "{json}");
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        assert!(back.layers().iter().all(|l| l
+            .objects_at(0)
+            .iter()
+            .all(|o| o.pivot.is_none())));
+    }
+
+    /// The palette is part of the document: names, colours and the folders
+    /// they are filed in all have to come back.
+    #[test]
+    fn the_palette_survives_a_round_trip() {
+        let mut scene = Scene::default();
+        scene.swatches_mut().add_folder("Hero/Skin");
+        let id = scene.add_swatch(
+            "Skin Shadow",
+            Color::from_rgb8(0xC0, 0x8A, 0x6E),
+            Some("Hero/Skin".into()),
+        );
+        let before = scene.swatches().len();
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+
+        assert_eq!(back.swatches().len(), before);
+        let swatch = back.swatches().get(id).expect("the named colour");
+        assert_eq!(swatch.name, "Skin Shadow");
+        assert_eq!(swatch.folder.as_deref(), Some("Hero/Skin"));
+        assert_eq!(swatch.color.to_rgba8().to_u8_array()[0], 0xC0);
+    }
+
+    /// An empty folder is a decision too — made in advance of the colours that
+    /// will go in it — so it must not be dropped by a save.
+    #[test]
+    fn an_empty_palette_folder_survives() {
+        let mut scene = Scene::default();
+        scene.swatches_mut().add_folder("Backgrounds");
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        assert!(back.swatches().folders().any(|f| f == "Backgrounds"));
+    }
+
+    /// A file written before version 13 has no palette at all, and gets the
+    /// default one — which is what such a document effectively had, since the
+    /// Color panel always offered those ten colours.
+    #[test]
+    fn a_document_without_a_palette_gets_the_default_one() {
+        let scene = Scene::default();
+        let mut json = serde_json::to_value(DocumentDto::from_scene(&scene)).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("swatches");
+        object.remove("swatch_folders");
+
+        let dto: DocumentDto = serde_json::from_value(json).unwrap();
+        let back = dto.to_scene().unwrap();
+
+        assert_eq!(back.swatches().len(), buzz_scene::default_palette().len());
+        assert!(back.swatches().find_color(Color::BLACK).is_some());
+    }
+
+    /// The looping section is part of the document, so it has to survive being
+    /// saved — a loop that only lasts as long as the session would mean the
+    /// exported film changes depending on whether the file was reopened.
+    #[test]
+    fn a_looping_section_survives_a_round_trip() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(9);
+        });
+        *scene.looping_mut() = buzz_scene::LoopRegion {
+            enabled: true,
+            start: 2,
+            end: 5,
+            repeats: 4,
+        };
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        assert_eq!(*back.looping(), *scene.looping());
+        assert_eq!(back.rendered_frame_count(), scene.rendered_frame_count());
+    }
+
+    /// Most documents do not loop, and those must be byte-for-byte what they
+    /// always were: no key in the JSON, and nothing looping on the way back.
+    #[test]
+    fn a_document_that_does_not_loop_writes_no_loop() {
+        let mut scene = Scene::empty();
+        scene.add_layer("Art", LayerKind::Normal);
+
+        let json = serde_json::to_value(DocumentDto::from_scene(&scene)).unwrap();
+        assert!(
+            json.get("looping").is_none(),
+            "a document with no loop should not mention one: {json}"
+        );
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        assert!(!back.looping().enabled);
+        assert_eq!(back.rendered_frame_count(), back.frame_count());
+    }
+
+    /// A file hand-edited (or written by a future build) to loop frames this
+    /// document does not have must not make the exporter read past the end.
+    #[test]
+    fn a_loop_past_the_end_of_the_document_is_brought_back() {
+        let mut scene = Scene::empty();
+        scene.add_layer("Art", LayerKind::Normal);
+        *scene.looping_mut() = buzz_scene::LoopRegion {
+            enabled: true,
+            start: 400,
+            end: 900,
+            repeats: 3,
+        };
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        let last = back.frame_count().saturating_sub(1);
+        assert!(back.looping().end <= last, "{:?}", back.looping());
+        assert!(back.playlist().iter().all(|f| *f < back.frame_count()));
     }
 
     /// A document written before layer parenting existed has no such field,
@@ -2052,6 +2314,7 @@ mod tests {
             filters: Vec::new(),
             blend: Default::default(),
             spatial: Default::default(),
+            pivot: None,
         });
         scene
     }
@@ -2164,6 +2427,7 @@ mod tests {
             filters: Vec::new(),
             blend: Default::default(),
             spatial: Default::default(),
+            pivot: None,
         });
 
         let json = serde_json::to_string(&DocumentDto::from_scene(&scene)).expect("serialise");

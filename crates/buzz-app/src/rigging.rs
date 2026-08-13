@@ -177,6 +177,7 @@ pub fn rig_object(
             filters: Vec::new(),
             blend: buzz_scene::Blend::Normal,
             spatial: Default::default(),
+            pivot: None,
         };
 
         let mut rig = ArmatureData::new(armature);

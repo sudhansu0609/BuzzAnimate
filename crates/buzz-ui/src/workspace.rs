@@ -33,11 +33,13 @@ pub enum PanelId {
     Layers,
     Properties,
     Color,
+    Swatches,
     Depth,
     Rig,
     Filters,
     Lighting,
     Library,
+    Assets,
     Timeline,
     Actions,
 }
@@ -50,11 +52,13 @@ impl PanelId {
             Self::Layers => "Layers",
             Self::Properties => "Properties",
             Self::Color => "Color",
+            Self::Swatches => "Swatches",
             Self::Depth => "Layer Depth",
             Self::Rig => "Armature",
             Self::Filters => "Filters",
             Self::Lighting => "Lighting",
             Self::Library => "Library",
+            Self::Assets => "Assets",
             Self::Timeline => "Timeline",
             Self::Actions => "Actions",
         }
@@ -69,16 +73,18 @@ impl PanelId {
         !matches!(self, Self::Tools | Self::Timeline)
     }
 
-    pub const ALL: [PanelId; 11] = [
+    pub const ALL: [PanelId; 13] = [
         PanelId::Tools,
         PanelId::Layers,
         PanelId::Properties,
         PanelId::Color,
+        PanelId::Swatches,
         PanelId::Depth,
         PanelId::Rig,
         PanelId::Filters,
         PanelId::Lighting,
         PanelId::Library,
+        PanelId::Assets,
         PanelId::Timeline,
         PanelId::Actions,
     ];
@@ -158,11 +164,60 @@ pub struct Workspace {
     pub slots: Vec<Slot>,
     /// Nothing can be moved or resized while this is set.
     pub locked: bool,
+    /// Directories documents have been opened from or saved to, most recent
+    /// first, so a crash can be recovered from wherever the work was.
+    ///
+    /// Autosave writes its recovery copy *beside the document*, which is the
+    /// right place for it and an impossible place to find again from a fresh
+    /// launch — the program has no idea what was open. This is that memory,
+    /// and it is capped because it is a convenience, not a document history.
+    #[serde(default)]
+    pub recovery_dirs: Vec<std::path::PathBuf>,
+    /// What the last new document was made with, so the next one opens on it.
+    ///
+    /// Kept here for the same reason the theme is: it belongs to the person,
+    /// not to any one film, and must not travel inside a `.buzz` file.
+    #[serde(default)]
+    pub new_document: crate::new_document::DocumentSetup,
+    /// Dark or light chrome.
+    ///
+    /// Kept with the layout because it is the same kind of thing: a preference
+    /// belonging to the person rather than to the film, and one that must not
+    /// travel inside a `.buzz` file handed to somebody else.
+    #[serde(default)]
+    pub theme: crate::theme::Theme,
     /// Widths and heights of the four sides, in points.
     pub left_width: f32,
     pub right_width: f32,
     pub right_outer_width: f32,
     pub bottom_height: f32,
+    /// How wide one frame cell is drawn, in points.
+    ///
+    /// Animate offers Tiny through Large from the timeline's menu; this is the
+    /// same idea as a number, because the useful setting depends on the film —
+    /// a four-thousand-frame timeline wants narrow cells and a twelve-frame
+    /// cycle wants wide ones. Here rather than in the document because it is
+    /// how somebody looks at the film, not part of it.
+    #[serde(default = "default_frame_width")]
+    pub frame_width: f32,
+    /// Row height, as a multiple of the standard row.
+    #[serde(default = "default_row_scale")]
+    pub row_scale: f32,
+}
+
+/// Bounds for the timeline's two zooms.
+///
+/// Below the minimum a cell is thinner than the line drawn around it and the
+/// grid turns to mush; above the maximum a handful of frames fills the panel.
+pub const FRAME_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 4.0..=40.0;
+pub const ROW_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.6..=2.5;
+
+fn default_frame_width() -> f32 {
+    crate::theme::Metrics::FRAME_WIDTH
+}
+
+fn default_row_scale() -> f32 {
+    1.0
 }
 
 impl Default for Workspace {
@@ -194,21 +249,37 @@ impl Workspace {
                 slot(PanelId::Layers, Dock::Right, 0, Dock::Right),
                 slot(PanelId::Properties, Dock::Right, 1, Dock::Right),
                 slot(PanelId::Color, Dock::Right, 2, Dock::Right),
-                slot(PanelId::Depth, Dock::Right, 3, Dock::Right),
-                slot(PanelId::Rig, Dock::Right, 4, Dock::Right),
-                slot(PanelId::Filters, Dock::Right, 5, Dock::Right),
-                slot(PanelId::Lighting, Dock::Right, 6, Dock::Right),
+                // Beside the colour controls, which is where a palette is
+                // reached for. Animate docks Swatches with Color for the same
+                // reason.
+                slot(PanelId::Swatches, Dock::Right, 3, Dock::Right),
+                slot(PanelId::Depth, Dock::Right, 4, Dock::Right),
+                slot(PanelId::Rig, Dock::Right, 5, Dock::Right),
+                slot(PanelId::Filters, Dock::Right, 6, Dock::Right),
+                slot(PanelId::Lighting, Dock::Right, 7, Dock::Right),
                 slot(PanelId::Library, Dock::RightOuter, 0, Dock::RightOuter),
+                // Beside the Library, which is the panel it is most often
+                // compared with: one holds this film's symbols, the other
+                // what outlives the film.
+                slot(PanelId::Assets, Dock::RightOuter, 1, Dock::RightOuter),
                 slot(PanelId::Timeline, Dock::Bottom, 0, Dock::Bottom),
                 // Closed until F9 asks for it — and it belongs at the bottom,
                 // under the stage, where Animate keeps it.
                 slot(PanelId::Actions, Dock::Hidden, 1, Dock::Bottom),
             ],
             locked: false,
-            left_width: 58.0,
+            theme: crate::theme::Theme::default(),
+            new_document: crate::new_document::DocumentSetup::default(),
+            recovery_dirs: Vec::new(),
+            // One tool column and its padding — the strip is Animate's
+            // narrow one, and the extra half-column of empty space beside it
+            // was the first thing anybody noticed.
+            left_width: 46.0,
             right_width: 300.0,
             right_outer_width: 240.0,
             bottom_height: 170.0,
+            frame_width: default_frame_width(),
+            row_scale: default_row_scale(),
         }
     }
 
@@ -217,6 +288,20 @@ impl Workspace {
         let mut found: Vec<&Slot> = self.slots.iter().filter(|s| s.dock == dock).collect();
         found.sort_by_key(|s| s.order);
         found.iter().map(|s| s.id).collect()
+    }
+
+    /// Note that documents live here, for crash recovery to look at later.
+    pub fn remember_directory(&mut self, directory: impl Into<std::path::PathBuf>) {
+        /// Enough to cover the projects somebody is actually moving between.
+        const KEEP: usize = 8;
+
+        let directory = directory.into();
+        if directory.as_os_str().is_empty() {
+            return;
+        }
+        self.recovery_dirs.retain(|d| *d != directory);
+        self.recovery_dirs.insert(0, directory);
+        self.recovery_dirs.truncate(KEEP);
     }
 
     pub fn slot(&self, id: PanelId) -> Option<&Slot> {
@@ -350,6 +435,13 @@ fn default_home() -> Dock {
 /// workspace belongs to the person, not to the film, and a `.buzz` file handed
 /// to somebody else must not rearrange their window.
 pub fn workspace_path() -> std::path::PathBuf {
+    // An explicit override, which is what a test uses so that running the
+    // suite cannot rewrite the layout of whoever is running it — and what
+    // anybody wanting a second, separate arrangement can use too.
+    if let Some(path) = std::env::var_os("BUZZANIMATE_WORKSPACE") {
+        return std::path::PathBuf::from(path);
+    }
+
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .map(std::path::PathBuf::from)

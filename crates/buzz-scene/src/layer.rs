@@ -41,6 +41,15 @@ pub enum LayerKind {
     Folder,
     /// Its artwork defines what is visible on the masked layers beneath it.
     Mask,
+    /// The same, inverted: its artwork defines what is **hidden**.
+    ///
+    /// Animate has no such layer — a hole is cut there by drawing the mask as
+    /// a shape with a hole in it, which means redrawing the mask whenever the
+    /// artwork under it moves. This is the same region used the other way
+    /// round, and it is the honest way to do a spotlight in reverse: a
+    /// character walking behind a foreground element, a scratch-off, smoke
+    /// eating a title.
+    InverseMask,
     /// Clipped by the nearest mask layer above.
     Masked,
     /// Reference geometry. Visible while authoring, never exported.
@@ -55,7 +64,24 @@ impl LayerKind {
     /// Folders have no artwork, and guides are authoring aids that Animate
     /// deliberately excludes from published output.
     pub fn paints_to_output(self) -> bool {
-        matches!(self, Self::Normal | Self::Mask | Self::Masked | Self::Guided)
+        matches!(
+            self,
+            Self::Normal | Self::Mask | Self::InverseMask | Self::Masked | Self::Guided
+        )
+    }
+
+    /// Does this layer clip the run of masked layers below it?
+    ///
+    /// Both kinds of mask do; they differ only in which side of the region
+    /// survives. Every positional rule reads this rather than naming the two
+    /// kinds, so a third would not have to be chased through the code.
+    pub fn is_mask(self) -> bool {
+        matches!(self, Self::Mask | Self::InverseMask)
+    }
+
+    /// Does the mask hide what it covers rather than reveal it?
+    pub fn is_inverted_mask(self) -> bool {
+        matches!(self, Self::InverseMask)
     }
 
     /// Is this layer visible on the stage while authoring?
@@ -76,6 +102,7 @@ impl LayerKind {
             Self::Normal => "Normal",
             Self::Folder => "Folder",
             Self::Mask => "Mask",
+            Self::InverseMask => "Inverse Mask",
             Self::Masked => "Masked",
             Self::Guide => "Guide",
             Self::Guided => "Guided",
@@ -282,6 +309,8 @@ pub struct MaskGroup {
     pub mask: LayerId,
     /// Clipped layers, front to back, as stored.
     pub masked: Vec<LayerId>,
+    /// The mask hides what it covers instead of revealing it.
+    pub inverted: bool,
 }
 
 /// The ordered stack of layers in a scene or symbol timeline.
@@ -548,7 +577,7 @@ impl LayerStack {
     pub fn mask_groups(&self) -> Vec<MaskGroup> {
         let mut groups = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
-            if layer.kind != LayerKind::Mask {
+            if !layer.kind.is_mask() {
                 continue;
             }
             let mut masked = Vec::new();
@@ -561,6 +590,7 @@ impl LayerStack {
             groups.push(MaskGroup {
                 mask: layer.id,
                 masked,
+                inverted: layer.kind.is_inverted_mask(),
             });
         }
         groups
@@ -705,6 +735,34 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].masked, vec![LayerId(2)]);
         assert_eq!(groups[1].masked, vec![LayerId(4)]);
+    }
+
+    /// An inverse mask claims its run by exactly the same positional rule,
+    /// and says which way round it works.
+    #[test]
+    fn an_inverse_mask_claims_the_run_below_it_and_is_marked_inverted() {
+        let s = stack(&[
+            (1, "Hole", LayerKind::InverseMask),
+            (2, "Masked A", LayerKind::Masked),
+            (3, "Masked B", LayerKind::Masked),
+            (4, "Normal", LayerKind::Normal),
+        ]);
+        let groups = s.mask_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].masked, vec![LayerId(2), LayerId(3)]);
+        assert!(groups[0].inverted, "the group must know it is inverted");
+        assert_eq!(s.mask_for(LayerId(2)), Some(LayerId(1)));
+    }
+
+    /// And an ordinary mask is not marked inverted, which is the half of the
+    /// pair that a wrong default would break silently.
+    #[test]
+    fn an_ordinary_mask_is_not_inverted() {
+        let s = stack(&[
+            (1, "Mask", LayerKind::Mask),
+            (2, "Masked", LayerKind::Masked),
+        ]);
+        assert!(!s.mask_groups()[0].inverted);
     }
 
     #[test]

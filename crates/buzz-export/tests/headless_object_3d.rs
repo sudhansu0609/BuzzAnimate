@@ -83,6 +83,75 @@ fn a_flat_object_renders_exactly_as_before() {
     });
 }
 
+/// **A door hinges on its hinge.** With the transformation point moved to the
+/// card's left edge, turning it about the vertical leaves that edge where it
+/// was and swings the rest away. Turned about the default centre, the same
+/// rotation foreshortens the card towards its middle, so its left edge pulls
+/// inwards instead.
+///
+/// Only pixels can settle this: the arithmetic is the same projection either
+/// way, and what changed is which point it is measured from.
+#[test]
+fn a_card_turns_about_its_transformation_point() {
+    with_exporter(|exporter| {
+        let mut turned = |pivot: Option<Point>| {
+            let (mut scene, id) = document();
+            scene.update_object(id, |o| {
+                o.pivot = pivot;
+                o.spatial = Spatial {
+                    rotation_y: 0.9,
+                    ..Default::default()
+                };
+            });
+            render(exporter, &scene)
+        };
+
+        // The card is 175..375 across. Its left edge as a hinge.
+        let hinged = turned(Some(Point::new(175.0, 200.0)));
+        let centred = turned(None);
+
+        let leftmost = |frame: &Frame| {
+            (0..frame.width)
+                .find(|x| height_at(frame, *x) > 0)
+                .expect("the card vanished")
+        };
+
+        let hinge_left = leftmost(&hinged);
+        let centre_left = leftmost(&centred);
+
+        assert!(
+            hinge_left.abs_diff(175) <= 2,
+            "the hinge should have held the left edge at 175, not {hinge_left}"
+        );
+        assert!(
+            centre_left > hinge_left + 5,
+            "turned about its centre the card foreshortens towards its middle, \
+             so its left edge should end up to the right of the hinged one: \
+             {centre_left} against {hinge_left}"
+        );
+    });
+}
+
+/// A transformation point changes nothing at all while the object is flat.
+/// Every render feature here has to leave documents that do not use it alone,
+/// and this is that invariant for the pivot.
+#[test]
+fn a_transformation_point_alone_changes_nothing() {
+    with_exporter(|exporter| {
+        let (scene, id) = document();
+        let before = render(exporter, &scene);
+
+        let mut moved = scene.clone();
+        moved.update_object(id, |o| o.pivot = Some(Point::new(175.0, 80.0)));
+
+        assert_eq!(
+            before.pixels,
+            render(exporter, &moved).pixels,
+            "moving the transformation point of a flat object redrew it"
+        );
+    });
+}
+
 /// The point of it: turn a card about the vertical and one side is drawn
 /// shorter than the other — it is standing at an angle, not merely scaled.
 #[test]

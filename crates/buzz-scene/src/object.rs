@@ -280,6 +280,21 @@ pub struct Object {
 
     /// Which way this object faces in space. Flat by default.
     pub spatial: Spatial,
+
+    /// **The transformation point** — what this object rotates, skews and
+    /// turns in space about. Animate's white circle on the Free Transform
+    /// gizmo.
+    ///
+    /// In the object's **own** coordinates, before [`Object::transform`], so
+    /// it stays where it was put on the artwork however the object is then
+    /// moved, scaled or rotated. `None` means the centre of what the object
+    /// actually covers, which is where Animate starts one and what everything
+    /// here did before there was such a field — so a document that never
+    /// touches it behaves exactly as it always did.
+    ///
+    /// Resolving `None` needs the library for an instance, so ask the scene:
+    /// [`crate::Scene::pivot_of`].
+    pub pivot: Option<Point>,
 }
 
 impl Object {
@@ -294,6 +309,7 @@ impl Object {
             filters: Vec::new(),
             blend: buzz_fx::Blend::Normal,
             spatial: Default::default(),
+            pivot: None,
         }
     }
 
@@ -308,6 +324,7 @@ impl Object {
             filters: Vec::new(),
             blend: buzz_fx::Blend::Normal,
             spatial: Default::default(),
+            pivot: None,
         }
     }
 
@@ -355,6 +372,16 @@ impl Object {
     }
 
     /// Bounds after this object's own transform.
+    /// The transformation point in the object's own space, when it does not
+    /// need the library to work out.
+    ///
+    /// An instance measures nothing on its own — [`Object::local_bounds`]
+    /// returns a placeholder for one — so anything holding a scene should use
+    /// [`crate::Scene::pivot_local_of`], which resolves it properly.
+    pub fn pivot_local(&self) -> Point {
+        self.pivot.unwrap_or_else(|| self.local_bounds().center())
+    }
+
     pub fn bounds(&self) -> Rect {
         let local = self.local_bounds();
         if local == Rect::ZERO {
@@ -426,6 +453,7 @@ impl Object {
             filters: Vec::new(),
             blend: buzz_fx::Blend::Normal,
             spatial: Default::default(),
+            pivot: None,
         }
     }
 }

@@ -382,8 +382,8 @@ fn sun_dial(ui: &mut Ui, azimuth: &mut f64, elevation: &mut f64) -> bool {
     let painter = ui.painter_at(rect);
     let centre = egui::pos2(rect.left() + RADIUS + 6.0, rect.center().y);
 
-    painter.circle_filled(centre, RADIUS, Palette::PANEL);
-    painter.circle_stroke(centre, RADIUS, egui::Stroke::new(1.0, Palette::BORDER));
+    painter.circle_filled(centre, RADIUS, Palette::panel());
+    painter.circle_stroke(centre, RADIUS, egui::Stroke::new(1.0, Palette::border()));
     // The horizon ring: the sun on it is level with the stage, at the middle
     // it is straight overhead.
     painter.circle_stroke(
@@ -420,7 +420,7 @@ fn sun_dial(ui: &mut Ui, azimuth: &mut f64, elevation: &mut f64) -> bool {
     );
     painter.line_segment(
         [centre, centre + arm],
-        egui::Stroke::new(1.5, Palette::BORDER),
+        egui::Stroke::new(1.5, Palette::border()),
     );
     painter.circle_filled(centre + arm, 5.0, Color32::from_rgb(0xFF, 0xD9, 0x6A));
 
@@ -429,14 +429,14 @@ fn sun_dial(ui: &mut Ui, azimuth: &mut f64, elevation: &mut f64) -> bool {
         egui::Align2::LEFT_CENTER,
         format!("{:.0}\u{b0}", azimuth.to_degrees()),
         egui::FontId::proportional(11.0),
-        Palette::TEXT,
+        Palette::text(),
     );
     painter.text(
         egui::pos2(centre.x + RADIUS + 12.0, rect.center().y + 8.0),
         egui::Align2::LEFT_CENTER,
         format!("{:.0}\u{b0} up", elevation.to_degrees()),
         egui::FontId::proportional(11.0),
-        Palette::TEXT_DIM,
+        Palette::text_dim(),
     );
 
     changed

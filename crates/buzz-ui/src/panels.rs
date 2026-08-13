@@ -4,7 +4,7 @@
 //! Nothing here owns editor state, so the same panel can be driven by tests or
 //! by the running application.
 
-use buzz_scene::{LayerId, LayerKind, Scene};
+use buzz_scene::{EditAt, LayerId, LayerKind, Scene};
 use egui::{Color32, RichText, Ui};
 use peniko::Color;
 
@@ -187,6 +187,20 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             }
             ui.separator();
 
+            // The interface theme. Animate keeps this in Preferences; there
+            // is no Preferences dialog here, and the Window menu is where the
+            // rest of the chrome's own settings already live.
+            let lit = crate::theme::theme() == crate::theme::Theme::Light;
+            let mark = if lit { "\u{2714} " } else { "   " };
+            if ui
+                .button(format!("{mark}{}", Command::ToggleTheme.label()))
+                .clicked()
+            {
+                raised.push(Command::ToggleTheme);
+                ui.close();
+            }
+            ui.separator();
+
             let mark = if workspace.locked { "\u{2714} " } else { "   " };
             let shortcut = shortcut_text(ui.ctx(), Command::ToggleLayoutLock);
             if ui
@@ -268,7 +282,20 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 item(ui, c, true, &mut raised);
             }
             ui.separator();
+            // Animate keeps the frame clipboard with the frame commands.
+            for c in [
+                Command::CutFrames,
+                Command::CopyFrames,
+                Command::PasteFrames,
+                Command::ClearFrames,
+                Command::ReverseFrames,
+            ] {
+                item(ui, c, true, &mut raised);
+            }
+            ui.separator();
             item(ui, Command::ToggleOnionSkin, true, &mut raised);
+            item(ui, Command::ToggleAutoKeyframe, true, &mut raised);
+            item(ui, Command::ToggleEditMultipleFrames, true, &mut raised);
             ui.separator();
             // Animate keeps sound on the frame it starts from, so its commands
             // sit with the other frame commands.
@@ -347,9 +374,28 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 Command::ExpandFill,
                 Command::SmoothSelection,
                 Command::StraightenSelection,
+                Command::RecogniseShape,
             ] {
                 item(ui, c, has_selection, &mut raised);
             }
+
+            // Animate keeps these in a Transform submenu of Modify.
+            ui.separator();
+            ui.menu_button("Transform", |ui| {
+                for c in [
+                    Command::FlipHorizontal,
+                    Command::FlipVertical,
+                    Command::RotateClockwise,
+                    Command::RotateAnticlockwise,
+                ] {
+                    item(ui, c, has_selection, &mut raised);
+                }
+            });
+        });
+
+        // Last, as it is everywhere.
+        ui.menu_button("Help", |ui| {
+            item(ui, Command::About, true, &mut raised);
         });
     });
 
@@ -370,6 +416,16 @@ pub fn tool_bar(ui: &mut Ui, active: ToolId, style: &mut DrawStyle) -> Option<To
         .id_salt("tool-strip")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            // **As many columns as it has been given room for.** One column
+            // is Animate's strip and what the default width holds; widen the
+            // dock and the tools flow into two or three rather than leaving a
+            // column of empty space beside them.
+            let spacing = ui.spacing().item_spacing.x;
+            let per_row = ((ui.available_width() + spacing)
+                / (Metrics::TOOL_BUTTON + spacing))
+                .floor()
+                .clamp(1.0, 8.0) as usize;
+
             ui.vertical_centered(|ui| {
                 for (index, group) in TOOL_GROUPS.iter().enumerate() {
                     if index > 0 {
@@ -377,10 +433,14 @@ pub fn tool_bar(ui: &mut Ui, active: ToolId, style: &mut DrawStyle) -> Option<To
                         ui.separator();
                         ui.add_space(2.0);
                     }
-                    for tool in group.iter().copied() {
-                        if tool_button(ui, tool, tool == active) {
-                            chosen = Some(tool);
-                        }
+                    for row in group.chunks(per_row) {
+                        ui.horizontal(|ui| {
+                            for tool in row.iter().copied() {
+                                if tool_button(ui, tool, tool == active) {
+                                    chosen = Some(tool);
+                                }
+                            }
+                        });
                     }
                 }
 
@@ -402,9 +462,9 @@ fn tool_button(ui: &mut Ui, tool: ToolId, active: bool) -> bool {
     // is drawn geometry rather than a character — see [`crate::icons`] — so it
     // cannot come out as an empty box the way a missing glyph does.
     let button = egui::Button::new("").min_size(size).fill(if active {
-        Palette::ACTIVE
+        Palette::active()
     } else {
-        Palette::RAISED
+        Palette::raised()
     });
 
     let response = ui.add_enabled(ready, button);
@@ -412,9 +472,9 @@ fn tool_button(ui: &mut Ui, tool: ToolId, active: bool) -> bool {
     // Bright when it is the tool in hand or under the pointer, dim otherwise —
     // so the strip reads as one active tool rather than twenty-two equals.
     let ink = if ready && (active || response.hovered()) {
-        Palette::TEXT
+        Palette::text()
     } else {
-        Palette::TEXT_DIM
+        Palette::text_dim()
     };
     // Inset, so the symbol does not touch the button's edge.
     crate::icons::tool_icon(ui.painter(), response.rect.shrink(6.0), tool, ink);
@@ -499,7 +559,12 @@ fn single_selected_instance(scene: &Scene, selection: &Selection) -> Option<buzz
 /// Everything here is a property of the *placement*, not of the symbol: two
 /// instances of one symbol can start on different frames, loop differently and
 /// carry different colour effects, which is what makes symbols worth using.
-fn instance_properties(ui: &mut Ui, scene: &mut Scene, id: buzz_scene::ObjectId) -> bool {
+fn instance_properties(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    id: buzz_scene::ObjectId,
+    at: EditAt,
+) -> bool {
     use buzz_scene::{ColorEffect, LoopMode};
 
     let Some((_, object)) = scene.find_object(id) else {
@@ -528,7 +593,16 @@ fn instance_properties(ui: &mut Ui, scene: &mut Scene, id: buzz_scene::ObjectId)
     let mut new_first_frame = instance.first_frame;
     let mut new_loop = instance.loop_mode;
     let mut new_color = instance.color;
+    let mut new_symbol = instance.symbol;
     let mut edited = false;
+
+    // Every other symbol this instance could point at instead.
+    let others: Vec<(buzz_scene::SymbolId, String)> = scene
+        .library()
+        .iter()
+        .filter(|s| s.id != instance.symbol)
+        .map(|s| (s.id, s.name.clone()))
+        .collect();
 
     ui.add_space(8.0);
     ui.label(RichText::new("Symbol Instance").strong());
@@ -537,8 +611,30 @@ fn instance_properties(ui: &mut Ui, scene: &mut Scene, id: buzz_scene::ObjectId)
         .num_columns(2)
         .show(ui, |ui| {
             ui.label("Symbol");
-            ui.label(RichText::new(&symbol_name).strong())
-                .on_hover_text(symbol_kind.label());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&symbol_name).strong())
+                    .on_hover_text(symbol_kind.label());
+
+                // Animate's **Swap**: point this instance at a different
+                // symbol and keep everything else — where it is, how it is
+                // transformed, its colour effect, its looping. Replacing the
+                // instance instead would lose all of that, which is exactly
+                // what the button exists to avoid.
+                ui.menu_button("Swap\u{2026}", |ui| {
+                    if others.is_empty() {
+                        ui.label(RichText::new("no other symbols").small().weak());
+                    }
+                    for (id, name) in &others {
+                        if ui.button(name).clicked() {
+                            new_symbol = *id;
+                            edited = true;
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Point this instance at a different symbol");
+            });
             ui.end_row();
 
             ui.label("Frames");
@@ -677,13 +773,30 @@ fn instance_properties(ui: &mut Ui, scene: &mut Scene, id: buzz_scene::ObjectId)
         });
 
     if edited {
-        scene.update_object(id, |o| {
+        scene.update_object_where(at, id, |o| {
             if let buzz_scene::ObjectKind::Instance(i) = &mut o.kind {
+                i.symbol = new_symbol;
                 i.first_frame = new_first_frame;
                 i.loop_mode = new_loop;
                 i.color = new_color;
             }
         });
+
+        // A swap can leave the instance pointing past the end of its new
+        // symbol, which would show nothing at all. Pull it back rather than
+        // letting the instance go blank.
+        let length = scene
+            .library()
+            .get(new_symbol)
+            .map(|s| s.length())
+            .unwrap_or(1);
+        if new_first_frame >= length {
+            scene.update_object_where(at, id, |o| {
+                if let buzz_scene::ObjectKind::Instance(i) = &mut o.kind {
+                    i.first_frame = length.saturating_sub(1);
+                }
+            });
+        }
     }
     edited
 }
@@ -813,7 +926,7 @@ fn brush_pattern_preview(ui: &mut Ui, style: &DrawStyle) {
         egui::Sense::hover(),
     );
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, Palette::PANEL);
+    painter.rect_filled(rect, 2.0, Palette::panel());
 
     let Some(source) = style.brush.pattern_path() else {
         painter.text(
@@ -821,7 +934,7 @@ fn brush_pattern_preview(ui: &mut Ui, style: &DrawStyle) {
             egui::Align2::CENTER_CENTER,
             "No shape yet",
             egui::FontId::proportional(11.0),
-            Palette::TEXT_DIM,
+            Palette::text_dim(),
         );
         return;
     };
@@ -897,6 +1010,7 @@ pub fn properties_panel(
     selection: &Selection,
     style: &mut DrawStyle,
     view: &mut ViewSettings,
+    at: EditAt,
 ) -> bool {
     let mut changed = false;
 
@@ -972,13 +1086,13 @@ pub fn properties_panel(
     // one would need a multi-edit model that Animate itself does not have here,
     // so the section only appears for one.
     if let Some(id) = single_selected_instance(scene, selection) {
-        changed |= instance_properties(ui, scene, id);
+        changed |= instance_properties(ui, scene, id, at);
     }
 
     // Which way the selection faces in space. Animate keeps this for movie
     // clips; here any object can have it.
     if let Some(id) = selection.iter().next() {
-        changed |= spatial_properties(ui, scene, id);
+        changed |= spatial_properties(ui, scene, id, at);
     }
 
     brush_properties(ui, style);
@@ -1059,8 +1173,14 @@ pub fn properties_panel(
     changed
 }
 
-/// Swatches and recently used colours.
-pub fn color_panel(ui: &mut Ui, style: &mut DrawStyle) {
+/// The document's palette, and the colours most recently used.
+///
+/// **Two rows, because they answer different questions.** The palette is what
+/// this production's colours *are*: named, saved with the file, edited in the
+/// Swatches panel. Recent colours are what this session has been using, which
+/// is worth a row while sketching and worthless tomorrow. Animate has only the
+/// first; the second was here before the palette existed and earns its keep.
+pub fn color_panel(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
     ui.heading("Color");
     ui.separator();
 
@@ -1073,6 +1193,9 @@ pub fn color_panel(ui: &mut Ui, style: &mut DrawStyle) {
             let remembered = style.stroke_color;
             style.remember(remembered);
         }
+        if let Some(swatch) = scene.swatches().find_color(style.stroke_color) {
+            ui.label(RichText::new(&swatch.name).small().weak());
+        }
     });
     ui.horizontal(|ui| {
         ui.label("Fill");
@@ -1083,27 +1206,42 @@ pub fn color_panel(ui: &mut Ui, style: &mut DrawStyle) {
             let remembered = style.fill_color;
             style.remember(remembered);
         }
+        if let Some(swatch) = scene.swatches().find_color(style.fill_color) {
+            ui.label(RichText::new(&swatch.name).small().weak());
+        }
     });
+
+    let mut picked: Option<(Color, bool)> = None;
 
     ui.add_space(6.0);
     ui.label(RichText::new("Swatches").small().weak());
-
-    let swatches = style.swatches.clone();
-    let mut picked: Option<(Color, bool)> = None;
+    let palette: Vec<(String, Color)> = scene
+        .swatches()
+        .iter()
+        .map(|s| (s.path(), s.color))
+        .collect();
     ui.horizontal_wrapped(|ui| {
-        for color in &swatches {
-            let (rect, response) =
-                ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-            ui.painter().rect_filled(rect, 2.0, to_egui(*color));
-            ui.painter().rect_stroke(
-                rect,
-                2.0,
-                egui::Stroke::new(1.0, Palette::BORDER),
-                egui::StrokeKind::Inside,
+        if palette.is_empty() {
+            ui.label(
+                RichText::new("none \u{2014} add colours in the Swatches panel")
+                    .small()
+                    .weak()
+                    .italics(),
             );
+        }
+        for (name, color) in &palette {
+            if swatch_chip(ui, *color, name) {
+                picked = Some((*color, ui.input(|i| i.modifiers.shift)));
+            }
+        }
+    });
 
-            let response = response.on_hover_text("Click sets fill · Shift-click sets stroke");
-            if response.clicked() {
+    ui.add_space(4.0);
+    ui.label(RichText::new("Recent").small().weak());
+    let recent = style.swatches.clone();
+    ui.horizontal_wrapped(|ui| {
+        for color in &recent {
+            if swatch_chip(ui, *color, "Recently used") {
                 picked = Some((*color, ui.input(|i| i.modifiers.shift)));
             }
         }
@@ -1119,6 +1257,23 @@ pub fn color_panel(ui: &mut Ui, style: &mut DrawStyle) {
         }
         style.remember(color);
     }
+}
+
+/// One colour square. Returns whether it was clicked.
+fn swatch_chip(ui: &mut Ui, color: Color, name: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+    ui.painter().rect_filled(rect, 2.0, to_egui(color));
+    ui.painter().rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, Palette::border()),
+        egui::StrokeKind::Inside,
+    );
+    response
+        .on_hover_text(format!(
+            "{name}\nClick sets fill \u{b7} Shift-click sets stroke"
+        ))
+        .clicked()
 }
 
 /// The layer list. Returns a command if the user asked for one.
@@ -1166,6 +1321,7 @@ pub fn layers_panel(ui: &mut Ui, scene: &mut Scene, selection: &mut Selection) -
         })
         .collect();
     let mut set_follows: Option<(LayerId, Option<LayerId>)> = None;
+    let mut set_kind: Option<(LayerId, LayerKind)> = None;
 
     egui::ScrollArea::vertical()
         .id_salt("layer-list")
@@ -1221,6 +1377,11 @@ pub fn layers_panel(ui: &mut Ui, scene: &mut Scene, selection: &mut Selection) -
                     let mark = match kind {
                         LayerKind::Folder => "F ",
                         LayerKind::Mask => "M ",
+                        // The mask that hides rather than reveals. Marked with
+                        // a letter rather than a struck-through M: a combining
+                        // stroke is one of the glyphs the interface font does
+                        // not have, and would draw as a box.
+                        LayerKind::InverseMask => "iM ",
                         LayerKind::Masked => ". ",
                         LayerKind::Guide => "G ",
                         LayerKind::Guided => ". ",
@@ -1288,6 +1449,38 @@ pub fn layers_panel(ui: &mut Ui, scene: &mut Scene, selection: &mut Selection) -
                             "Layer Parenting: this layer's artwork moves with the \
                              layer it follows",
                         );
+
+                    // **What kind of layer this is.** Masking is positional —
+                    // a mask claims the run of masked layers directly below it
+                    // — so this is the only control it needs: set one layer to
+                    // Mask, the ones under it to Masked, and the stack does the
+                    // rest. Folders are not offered: a folder holds layers, and
+                    // turning one into a drawing layer would orphan them.
+                    if kind != LayerKind::Folder {
+                        egui::ComboBox::from_id_salt(("layer-kind", id.0))
+                            .selected_text(RichText::new(kind.display_name()).small())
+                            .width(92.0)
+                            .show_ui(ui, |ui| {
+                                for choice in [
+                                    LayerKind::Normal,
+                                    LayerKind::Mask,
+                                    LayerKind::InverseMask,
+                                    LayerKind::Masked,
+                                    LayerKind::Guide,
+                                    LayerKind::Guided,
+                                ] {
+                                    if ui
+                                        .selectable_label(kind == choice, choice.display_name())
+                                        .on_hover_text(layer_kind_hint(choice))
+                                        .clicked()
+                                    {
+                                        set_kind = Some((id, choice));
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(layer_kind_hint(kind));
+                    }
                 });
 
                 if set_visible != visible || set_locked != locked || set_outline != outline {
@@ -1303,8 +1496,32 @@ pub fn layers_panel(ui: &mut Ui, scene: &mut Scene, selection: &mut Selection) -
     if let Some((layer, follows)) = set_follows {
         scene.update_layer(layer, |l| l.follows = follows);
     }
+    if let Some((layer, kind)) = set_kind {
+        scene.update_layer(layer, |l| l.kind = kind);
+    }
 
     command
+}
+
+/// What each layer type does, in one line.
+///
+/// Written out because five of the six are only meaningful in relation to the
+/// layers around them, and a list of bare names says nothing about that.
+fn layer_kind_hint(kind: LayerKind) -> &'static str {
+    match kind {
+        LayerKind::Normal => "An ordinary drawing layer",
+        LayerKind::Mask => {
+            "Its artwork is a stencil: the masked layers below show only where it covers them"
+        }
+        LayerKind::InverseMask => {
+            "The stencil, inverted: the masked layers below are hidden where it covers them, \
+             and show everywhere else"
+        }
+        LayerKind::Masked => "Clipped by the mask layer above",
+        LayerKind::Guide => "Reference artwork \u{2014} visible here, never in the film",
+        LayerKind::Guided => "Follows the motion guide on the guide layer above",
+        LayerKind::Folder => "Holds other layers, and draws nothing itself",
+    }
 }
 
 /// Animate's 3D Rotation and 3D Translation, for the selected object.
@@ -1316,7 +1533,12 @@ pub fn layers_panel(ui: &mut Ui, scene: &mut Scene, selection: &mut Selection) -
 /// Three cards for a tree, four walls for a house, a figure built of a body
 /// card and two arm cards: turn each a little and a camera move discovers the
 /// shape instead of sliding it.
-fn spatial_properties(ui: &mut Ui, scene: &mut Scene, id: buzz_scene::ObjectId) -> bool {
+fn spatial_properties(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    id: buzz_scene::ObjectId,
+    at: EditAt,
+) -> bool {
     let Some((_, object)) = scene.find_object(id) else {
         return false;
     };
@@ -1401,7 +1623,7 @@ fn spatial_properties(ui: &mut Ui, scene: &mut Scene, id: buzz_scene::ObjectId) 
     }
 
     if changed && spatial != before {
-        scene.update_object(id, |o| o.spatial = spatial);
+        scene.update_object_where(at, id, |o| o.spatial = spatial);
         return true;
     }
     false
@@ -1502,8 +1724,15 @@ mod tests {
                 },
             );
             let _ = tool_bar(ui, ToolId::Selection, &mut style);
-            let _ = properties_panel(ui, &mut scene, &selection, &mut style, &mut view);
-            color_panel(ui, &mut style);
+            let _ = properties_panel(
+                ui,
+                &mut scene,
+                &selection,
+                &mut style,
+                &mut view,
+                EditAt::exact(0),
+            );
+            color_panel(ui, &scene, &mut style);
             let _ = layers_panel(ui, &mut scene, &mut selection);
             timeline_placeholder(ui, &scene);
         });
@@ -1578,7 +1807,14 @@ mod tests {
         let mut view = ViewSettings::default();
 
         let _ = ctx.run_ui(Default::default(), |ui| {
-            let _ = properties_panel(ui, &mut scene, &selection, &mut style, &mut view);
+            let _ = properties_panel(
+                ui,
+                &mut scene,
+                &selection,
+                &mut style,
+                &mut view,
+                EditAt::exact(0),
+            );
         });
     }
 
@@ -1624,7 +1860,14 @@ mod tests {
                     light_gizmos: false,
                 },
             );
-            let _ = properties_panel(ui, &mut scene, &selection, &mut style, &mut view);
+            let _ = properties_panel(
+                ui,
+                &mut scene,
+                &selection,
+                &mut style,
+                &mut view,
+                EditAt::exact(0),
+            );
             let _ = layers_panel(ui, &mut scene, &mut selection);
         });
     }

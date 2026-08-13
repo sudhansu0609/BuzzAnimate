@@ -67,6 +67,9 @@ pub struct ViewSettings {
     pub guides: Vec<Guide>,
     /// How close, in *screen pixels*, a drag must come before it snaps.
     pub snap_tolerance_px: f64,
+    /// How rough a drawing may be and still be recognised as a circle, a
+    /// rectangle or a line. Animate keeps the same choice in Preferences.
+    pub shape_tolerance: buzz_geom::Tolerance,
 }
 
 impl Default for ViewSettings {
@@ -78,6 +81,7 @@ impl Default for ViewSettings {
             lock_guides: false,
             show_pasteboard: true,
             snap: SnapSettings::default(),
+            shape_tolerance: buzz_geom::Tolerance::Normal,
             // Animate's default grid.
             grid_spacing: 10.0,
             guides: Vec::new(),

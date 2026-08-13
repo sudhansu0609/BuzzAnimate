@@ -73,6 +73,17 @@ pub enum Command {
     ExpandFill,
     SmoothSelection,
     StraightenSelection,
+    /// Modify ▸ Shape ▸ Recognise Shape: turn a drawn wobble into the circle,
+    /// rectangle or line it was meant to be.
+    RecogniseShape,
+    /// Modify ▸ Transform ▸ Flip Horizontal.
+    FlipHorizontal,
+    /// Modify ▸ Transform ▸ Flip Vertical.
+    FlipVertical,
+    /// Modify ▸ Transform ▸ Rotate 90° Clockwise.
+    RotateClockwise,
+    /// Modify ▸ Transform ▸ Rotate 90° Counter-clockwise.
+    RotateAnticlockwise,
 
     // Insert
     NewLayer,
@@ -102,6 +113,10 @@ pub enum Command {
     TogglePanel(super::workspace::PanelId),
     /// Stop the layout being rearranged by accident.
     ToggleLayoutLock,
+    /// Switch between the dark and the light interface.
+    ToggleTheme,
+    /// Help ▸ About BuzzAnimate.
+    About,
     /// Put every panel back where it started.
     ResetWorkspace,
 
@@ -140,7 +155,19 @@ pub enum Command {
     PreviousFrame,
     FirstFrame,
     LastFrame,
+    /// Animate's Cut Frames.
+    CutFrames,
+    /// Animate's Copy Frames.
+    CopyFrames,
+    /// Animate's Paste Frames.
+    PasteFrames,
+    /// Empty the frames here, keeping the span — Animate's Clear Frames.
+    ClearFrames,
+    /// Play this layer's keyframes back to front.
+    ReverseFrames,
     ToggleOnionSkin,
+    ToggleAutoKeyframe,
+    ToggleEditMultipleFrames,
 
     // Camera
     ToggleCamera,
@@ -205,6 +232,11 @@ impl Command {
             ExpandFill => "Expand Fill…",
             SmoothSelection => "Smooth",
             StraightenSelection => "Straighten",
+            RecogniseShape => "Recognise Shape",
+            FlipHorizontal => "Flip Horizontal",
+            FlipVertical => "Flip Vertical",
+            RotateClockwise => "Rotate 90\u{b0} CW",
+            RotateAnticlockwise => "Rotate 90\u{b0} CCW",
 
             NewLayer => "New Layer",
             NewLayerFolder => "New Folder",
@@ -223,6 +255,8 @@ impl Command {
 
             TogglePanel(_) => "Panel",
             ToggleLayoutLock => "Lock Layout",
+            ToggleTheme => "Light Interface",
+            About => "About BuzzAnimate",
             ResetWorkspace => "Reset Layout",
 
             AddSun => "Sun",
@@ -249,7 +283,14 @@ impl Command {
             PreviousFrame => "Previous Frame",
             FirstFrame => "First Frame",
             LastFrame => "Last Frame",
+            CutFrames => "Cut Frames",
+            CopyFrames => "Copy Frames",
+            PasteFrames => "Paste Frames",
+            ClearFrames => "Clear Frames",
+            ReverseFrames => "Reverse Frames",
             ToggleOnionSkin => "Onion Skin",
+            ToggleAutoKeyframe => "Auto Keyframe",
+            ToggleEditMultipleFrames => "Edit Multiple Frames",
 
             ToggleCamera => "Enable Camera",
             AddCameraKeyframe => "Add Camera Keyframe",
@@ -320,7 +361,13 @@ impl Command {
             ExpandFill => None,
             ConvertLinesToFills => None,
             SmoothSelection => None,
+            RecogniseShape => None,
             StraightenSelection => None,
+            // Animate's own: Ctrl+Shift+9 and Ctrl+Shift+7 rotate; the flips
+            // have no default there, and none is invented here.
+            FlipHorizontal | FlipVertical => None,
+            RotateClockwise => sc(ctrl_shift, Key::Num9),
+            RotateAnticlockwise => sc(ctrl_shift, Key::Num7),
 
             NewLayer => sc(ctrl_alt, Key::N),
             NewLayerFolder => sc(ctrl_alt, Key::F),
@@ -346,6 +393,8 @@ impl Command {
             // Animate has no shortcut for this; it is a settle-down-and-work
             // action, and Ctrl+Alt+L is free here.
             ToggleLayoutLock => sc(ctrl.plus(Modifiers::ALT), Key::L),
+            ToggleTheme => None,
+            About => None,
 
             AddSun | AddSky | AddLamp => None,
             ToggleLightGizmos => sc(ctrl_shift, Key::L),
@@ -374,7 +423,15 @@ impl Command {
             PreviousFrame => sc(Modifiers::NONE, Key::Comma),
             FirstFrame => sc(Modifiers::NONE, Key::Home),
             LastFrame => sc(Modifiers::NONE, Key::End),
+            // Animate's own keys for the frame clipboard.
+            CutFrames => sc(ctrl_alt, Key::X),
+            CopyFrames => sc(ctrl_alt, Key::C),
+            PasteFrames => sc(ctrl_alt, Key::V),
+            ClearFrames => sc(Modifiers::ALT, Key::Backspace),
+            ReverseFrames => None,
             ToggleOnionSkin => None,
+            ToggleAutoKeyframe => None,
+            ToggleEditMultipleFrames => None,
 
             ToggleCamera => None,
             AddCameraKeyframe => None,
@@ -405,6 +462,7 @@ impl Command {
                 | ConvertLinesToFills
                 | ExpandFill
                 | SmoothSelection
+                | RecogniseShape
                 | StraightenSelection
                 | ConvertToSymbol
                 | BrushFromSelection
@@ -460,6 +518,11 @@ pub fn all_with_shortcuts() -> Vec<Command> {
         ExpandFill,
         SmoothSelection,
         StraightenSelection,
+        RecogniseShape,
+        FlipHorizontal,
+        FlipVertical,
+        RotateClockwise,
+        RotateAnticlockwise,
         NewLayer,
         NewLayerFolder,
         DeleteLayer,
@@ -473,7 +536,14 @@ pub fn all_with_shortcuts() -> Vec<Command> {
         PreviousFrame,
         FirstFrame,
         LastFrame,
+        CutFrames,
+        CopyFrames,
+        PasteFrames,
+        ClearFrames,
+        ReverseFrames,
         ToggleOnionSkin,
+        ToggleAutoKeyframe,
+        ToggleEditMultipleFrames,
         ToggleCamera,
         AddCameraKeyframe,
         RemoveCameraKeyframe,
@@ -498,6 +568,8 @@ pub fn all_with_shortcuts() -> Vec<Command> {
         AddLamp,
         ToggleLightGizmos,
         ToggleLayoutLock,
+        ToggleTheme,
+        About,
         ToggleActionsPanel,
         RunScript,
         ClearScriptOutput,
@@ -567,6 +639,11 @@ mod tests {
             ExpandFill,
             SmoothSelection,
             StraightenSelection,
+            RecogniseShape,
+            FlipHorizontal,
+            FlipVertical,
+            RotateClockwise,
+            RotateAnticlockwise,
             NewLayer,
             NewLayerFolder,
             DeleteLayer,
@@ -580,7 +657,14 @@ mod tests {
             PreviousFrame,
             FirstFrame,
             LastFrame,
+            CutFrames,
+            CopyFrames,
+            PasteFrames,
+            ClearFrames,
+            ReverseFrames,
             ToggleOnionSkin,
+            ToggleAutoKeyframe,
+            ToggleEditMultipleFrames,
             ToggleCamera,
             AddCameraKeyframe,
             RemoveCameraKeyframe,
@@ -605,6 +689,8 @@ mod tests {
             AddLamp,
             ToggleLightGizmos,
             ToggleLayoutLock,
+            ToggleTheme,
+            About,
             ToggleActionsPanel,
             RunScript,
             ClearScriptOutput,

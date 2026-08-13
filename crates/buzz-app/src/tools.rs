@@ -61,6 +61,10 @@ pub enum ToolAction {
     ZoomView { factor: f64, at_screen: Point },
     /// Clear the selection.
     Deselect,
+    /// Put the transformation point here — Animate's white circle, dragged.
+    SetTransformPoint { at: Point },
+    /// Put it back at the centre of the selection.
+    ResetTransformPoint,
 }
 
 /// Live feedback while a gesture is in progress.
@@ -84,6 +88,12 @@ pub enum Preview {
         path: BezPath,
         color: Color,
     },
+    /// The transformation point being dragged, where the pointer has it.
+    ///
+    /// The point only *moves* when the drag ends — it is one edit, not one per
+    /// pixel — so without this the circle sat still under a moving pointer and
+    /// the gesture looked as though it had not taken.
+    Pivot(Point),
 }
 
 /// State shared with a tool for the duration of a gesture.
@@ -97,6 +107,9 @@ pub struct ToolContext<'a> {
     /// Supplied by the editor because only it can see the scene; empty unless
     /// exactly one shape is selected.
     pub anchors: &'a [buzz_geom::Anchor],
+    /// The selection's transformation point, in document space — what a
+    /// rotation or a skew turns about. `None` when nothing is selected.
+    pub pivot: Option<Point>,
 }
 
 /// A gesture in progress.
@@ -371,10 +384,32 @@ impl ToolMachine {
                 | ToolId::Pen => build_shape_path(self.tool, *origin, *current, *mods)
                     .map(Preview::Shape)
                     .unwrap_or(Preview::None),
-                ToolId::Selection | ToolId::Lasso | ToolId::Subselection => {
-                    Preview::Marquee(Rect::from_points(*origin, *current))
-                }
+                ToolId::Lasso => Preview::Marquee(Rect::from_points(*origin, *current)),
                 ToolId::Zoom => Preview::Marquee(Rect::from_points(*origin, *current)),
+
+                // The transformation point, wherever it can be grabbed. Only
+                // when the drag *began* on the circle: anywhere else is a
+                // marquee, a move, or — on Free Transform — a scale, rotate or
+                // skew, and those preview by moving nothing until committed.
+                ToolId::FreeTransform | ToolId::Selection | ToolId::Subselection => {
+                    let on_pivot = match (ctx.pivot, ctx.selection_bounds) {
+                        (Some(pivot), Some(bounds)) => {
+                            let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+                            matches!(
+                                transform_zone(bounds, pivot, *origin, grab),
+                                TransformZone::Pivot
+                            )
+                        }
+                        _ => false,
+                    };
+                    if on_pivot {
+                        Preview::Pivot(*current)
+                    } else if self.tool == ToolId::FreeTransform {
+                        Preview::None
+                    } else {
+                        Preview::Marquee(Rect::from_points(*origin, *current))
+                    }
+                }
                 _ => Preview::None,
             },
         }
@@ -448,6 +483,23 @@ impl ToolMachine {
         let slop = CLICK_SLOP_PX / ctx.zoom.max(f64::MIN_POSITIVE);
         let was_click = (end - origin).hypot() <= slop;
 
+        // **The transformation point can be dragged with the selection tools
+        // too**, not only with Free Transform.
+        //
+        // A deviation from Animate, and a deliberate one: the point is what a
+        // rotation, a skew and an Alt-scale all turn about, and having to
+        // change tools to move it — then change back to carry on selecting —
+        // is a step nobody thanks you for. Only a **drag** counts, so clicking
+        // the middle of a shape still selects and moves it as before.
+        if matches!(self.tool, ToolId::Selection | ToolId::Subselection)
+            && !was_click
+            && let Some(pivot) = ctx.pivot
+            && ctx.selection_bounds.is_some()
+            && (origin - pivot).hypot() <= (TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE)) * 1.5
+        {
+            return ToolAction::SetTransformPoint { at: end };
+        }
+
         match self.tool {
             ToolId::Selection | ToolId::Subselection => {
                 if was_click {
@@ -468,16 +520,51 @@ impl ToolMachine {
                 }
             }
 
-            ToolId::FreeTransform => match ctx.selection_bounds {
-                Some(bounds) if !was_click => ToolAction::TransformSelection {
-                    transform: scale_about_corner(bounds, origin, end, mods.shift),
-                },
-                Some(_) => ToolAction::None,
-                None => ToolAction::PickAt {
-                    point: end,
-                    additive: false,
-                },
-            },
+            ToolId::FreeTransform => {
+                let Some(bounds) = ctx.selection_bounds else {
+                    return ToolAction::PickAt {
+                        point: end,
+                        additive: false,
+                    };
+                };
+                let pivot = ctx.pivot.unwrap_or_else(|| bounds.center());
+                let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+
+                // Which part of the gizmo the drag *started* on decides what
+                // it does, exactly as in Animate: the pointer's shape there is
+                // the promise, and changing the answer half way through a drag
+                // would break it.
+                match transform_zone(bounds, pivot, origin, grab) {
+                    TransformZone::Pivot => {
+                        if was_click {
+                            // A click on the circle without moving it means
+                            // "put it back", which is Animate's double-click.
+                            ToolAction::ResetTransformPoint
+                        } else {
+                            ToolAction::SetTransformPoint { at: end }
+                        }
+                    }
+                    _ if was_click => ToolAction::None,
+                    TransformZone::Corner => ToolAction::TransformSelection {
+                        transform: if mods.alt {
+                            // Animate's Alt: scale about the transformation
+                            // point rather than the opposite corner.
+                            scale_about(pivot, bounds, origin, end, mods.shift)
+                        } else {
+                            scale_about_corner(bounds, origin, end, mods.shift)
+                        },
+                    },
+                    TransformZone::Rotate => ToolAction::TransformSelection {
+                        transform: rotate_about(pivot, origin, end, mods.shift),
+                    },
+                    TransformZone::Edge(horizontal) => ToolAction::TransformSelection {
+                        transform: skew_about(pivot, bounds, origin, end, horizontal),
+                    },
+                    TransformZone::Inside => ToolAction::MoveSelection {
+                        delta: end - origin,
+                    },
+                }
+            }
 
             ToolId::Rectangle | ToolId::Oval | ToolId::PolyStar | ToolId::Line | ToolId::Pen => {
                 if was_click {
@@ -680,6 +767,169 @@ fn star_path(center: Point, radius: f64, points: usize) -> BezPath {
 }
 
 /// Scale the selection by dragging, anchored at the opposite corner.
+/// How far from a handle a grab still counts, in screen pixels.
+const TRANSFORM_GRAB_PX: f64 = 8.0;
+
+/// Which part of the Free Transform gizmo a drag started on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransformZone {
+    /// The transformation point itself.
+    Pivot,
+    /// A corner handle: scale.
+    Corner,
+    /// Just outside a corner: rotate.
+    Rotate,
+    /// An edge: skew. `true` for a horizontal edge, which shears in x.
+    Edge(bool),
+    /// Anywhere else within the selection: move it.
+    Inside,
+}
+
+/// Work out what a drag starting at `at` means.
+///
+/// The order matters and matches what is drawn: the circle wins over the box
+/// it sits inside, a corner wins over the ring around it, and the ring wins
+/// over the edges it overlaps at the ends — otherwise the corner of a small
+/// selection would be three things at once.
+fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> TransformZone {
+    // A little more forgiving than a handle: the circle is small, it is often
+    // parked over artwork you are looking at rather than over a corner, and
+    // missing it silently *moves the artwork* instead — which is the one
+    // outcome worth spending a few pixels to avoid.
+    if (at - pivot).hypot() <= grab * 1.5 {
+        return TransformZone::Pivot;
+    }
+
+    let corners = [
+        Point::new(bounds.x0, bounds.y0),
+        Point::new(bounds.x1, bounds.y0),
+        Point::new(bounds.x1, bounds.y1),
+        Point::new(bounds.x0, bounds.y1),
+    ];
+    let nearest = corners
+        .iter()
+        .map(|c| (*c - at).hypot())
+        .fold(f64::INFINITY, f64::min);
+    if nearest <= grab {
+        return TransformZone::Corner;
+    }
+    // Animate's rotate ring: just *outside* a corner, where the pointer turns
+    // into the rotation cursor.
+    if nearest <= grab * 3.0 && !contains(bounds, at) {
+        return TransformZone::Rotate;
+    }
+
+    // An edge, but not near a corner: skew along it.
+    let near_vertical_edge =
+        ((at.x - bounds.x0).abs() <= grab || (at.x - bounds.x1).abs() <= grab)
+            && at.y > bounds.y0 + grab
+            && at.y < bounds.y1 - grab;
+    let near_horizontal_edge =
+        ((at.y - bounds.y0).abs() <= grab || (at.y - bounds.y1).abs() <= grab)
+            && at.x > bounds.x0 + grab
+            && at.x < bounds.x1 - grab;
+    if near_horizontal_edge {
+        return TransformZone::Edge(true);
+    }
+    if near_vertical_edge {
+        return TransformZone::Edge(false);
+    }
+
+    TransformZone::Inside
+}
+
+/// Rotation about a point, by the angle the drag swept.
+///
+/// With Shift the angle snaps to 45°, as Animate does.
+fn rotate_about(pivot: Point, origin: Point, end: Point, snap: bool) -> Affine {
+    let from = origin - pivot;
+    let to = end - pivot;
+    // A drag that began on the pivot has no direction to measure from.
+    if from.hypot() < 1e-9 || to.hypot() < 1e-9 {
+        return Affine::IDENTITY;
+    }
+    let mut angle = to.y.atan2(to.x) - from.y.atan2(from.x);
+    if snap {
+        let step = std::f64::consts::FRAC_PI_4;
+        angle = (angle / step).round() * step;
+    }
+    Affine::translate(pivot.to_vec2())
+        * Affine::rotate(angle)
+        * Affine::translate(-pivot.to_vec2())
+}
+
+/// Scale about an arbitrary point rather than the opposite corner.
+fn scale_about(pivot: Point, bounds: Rect, origin: Point, end: Point, uniform: bool) -> Affine {
+    let before = origin - pivot;
+    let after = end - pivot;
+    let safe = |a: f64, b: f64, extent: f64| {
+        // Dragging a handle that is *on* the pivot's own row or column has no
+        // ratio to take; fall back on the selection's size so the drag still
+        // does something predictable rather than nothing.
+        if b.abs() > 1e-9 {
+            a / b
+        } else if extent.abs() > 1e-9 {
+            1.0 + a / extent
+        } else {
+            1.0
+        }
+    };
+    let mut sx = safe(after.x, before.x, bounds.width());
+    let mut sy = safe(after.y, before.y, bounds.height());
+    if uniform {
+        let s = (sx.abs() + sy.abs()) / 2.0;
+        sx = s * sx.signum();
+        sy = s * sy.signum();
+    }
+    const MIN: f64 = 1e-4;
+    if sx.abs() < MIN {
+        sx = MIN * if sx < 0.0 { -1.0 } else { 1.0 };
+    }
+    if sy.abs() < MIN {
+        sy = MIN * if sy < 0.0 { -1.0 } else { 1.0 };
+    }
+    Affine::translate(pivot.to_vec2())
+        * Affine::scale_non_uniform(sx, sy)
+        * Affine::translate(-pivot.to_vec2())
+}
+
+/// Skew about a point: dragging a horizontal edge shears in x, a vertical one
+/// in y, in proportion to the distance from the transformation point.
+fn skew_about(pivot: Point, bounds: Rect, origin: Point, end: Point, horizontal: bool) -> Affine {
+    let extent = if horizontal {
+        bounds.height()
+    } else {
+        bounds.width()
+    };
+    if extent.abs() < 1e-9 {
+        return Affine::IDENTITY;
+    }
+    // The lever is how far the grabbed edge is from the pivot: an edge through
+    // the transformation point cannot shear about it, which is the geometry
+    // rather than a special case.
+    let lever = if horizontal {
+        origin.y - pivot.y
+    } else {
+        origin.x - pivot.x
+    };
+    if lever.abs() < 1e-9 {
+        return Affine::IDENTITY;
+    }
+    let (shear_x, shear_y) = if horizontal {
+        ((end.x - origin.x) / lever, 0.0)
+    } else {
+        (0.0, (end.y - origin.y) / lever)
+    };
+
+    const LIMIT: f64 = 20.0;
+    let shear_x = shear_x.clamp(-LIMIT, LIMIT);
+    let shear_y = shear_y.clamp(-LIMIT, LIMIT);
+
+    Affine::translate(pivot.to_vec2())
+        * Affine::new([1.0, shear_y, shear_x, 1.0, 0.0, 0.0])
+        * Affine::translate(-pivot.to_vec2())
+}
+
 fn scale_about_corner(bounds: Rect, origin: Point, end: Point, uniform: bool) -> Affine {
     // Whichever corner the drag started nearest stays put... its opposite does.
     let anchor = Point::new(
@@ -734,6 +984,7 @@ mod tests {
             zoom: 1.0,
             selection_bounds: None,
             anchors: &[],
+            pivot: None,
         }
     }
 
@@ -746,6 +997,121 @@ mod tests {
         machine.pointer_down(from, from, Mods::default(), ctx);
         machine.pointer_move(to, to, Mods::default());
         machine.pointer_up(to, to, ctx)
+    }
+
+    // -- the Free Transform gizmo ------------------------------------------
+
+    fn box_10() -> Rect {
+        Rect::new(0.0, 0.0, 100.0, 100.0)
+    }
+
+    /// Which part of the gizmo a drag lands on. Getting this wrong means a
+    /// rotation where the user asked for a scale, which is the sort of thing
+    /// that loses work.
+    #[test]
+    fn the_gizmo_reads_the_zone_a_drag_starts_in() {
+        let bounds = box_10();
+        let pivot = Point::new(50.0, 50.0);
+        let grab = 8.0;
+        let zone = |x: f64, y: f64| transform_zone(bounds, pivot, Point::new(x, y), grab);
+
+        assert_eq!(zone(50.0, 50.0), TransformZone::Pivot, "on the circle");
+        assert_eq!(zone(0.0, 0.0), TransformZone::Corner, "on a corner");
+        assert_eq!(
+            zone(-12.0, -12.0),
+            TransformZone::Rotate,
+            "just outside a corner"
+        );
+        assert_eq!(zone(50.0, 0.0), TransformZone::Edge(true), "a top edge");
+        assert_eq!(zone(0.0, 50.0), TransformZone::Edge(false), "a left edge");
+        assert_eq!(zone(30.0, 30.0), TransformZone::Inside, "the middle");
+    }
+
+    /// The circle wins over everything under it: a transformation point parked
+    /// on a corner must still be draggable.
+    #[test]
+    fn the_transformation_point_wins_over_the_handle_it_sits_on() {
+        let bounds = box_10();
+        let corner = Point::new(0.0, 0.0);
+        assert_eq!(
+            transform_zone(bounds, corner, corner, 8.0),
+            TransformZone::Pivot
+        );
+    }
+
+    /// A quarter turn about a point, and Shift snapping to 45°.
+    #[test]
+    fn rotation_turns_about_the_transformation_point() {
+        let pivot = Point::new(0.0, 0.0);
+        let turned = rotate_about(pivot, Point::new(10.0, 0.0), Point::new(0.0, 10.0), false);
+        let moved = turned * Point::new(10.0, 0.0);
+        assert!(
+            (moved - Point::new(0.0, 10.0)).hypot() < 1e-9,
+            "expected a quarter turn, got {moved:?}"
+        );
+
+        // 30° asked for, 45° snapped to.
+        let snapped = rotate_about(
+            pivot,
+            Point::new(10.0, 0.0),
+            Point::new(10.0_f64.to_radians().cos() * 10.0, 5.0),
+            true,
+        );
+        let angle = {
+            let p = snapped * Point::new(1.0, 0.0);
+            p.y.atan2(p.x)
+        };
+        assert!(
+            (angle - std::f64::consts::FRAC_PI_4).abs() < 1e-9 || angle.abs() < 1e-9,
+            "expected a multiple of 45°, got {}",
+            angle.to_degrees()
+        );
+    }
+
+    /// Rotating about a point leaves that point exactly where it was — the one
+    /// property the whole feature rests on.
+    #[test]
+    fn rotation_leaves_the_transformation_point_alone() {
+        let pivot = Point::new(37.0, -11.0);
+        let turned = rotate_about(pivot, Point::new(50.0, 0.0), Point::new(0.0, 50.0), false);
+        assert!((turned * pivot - pivot).hypot() < 1e-9);
+    }
+
+    /// Skew shears along the edge that was grabbed, in proportion to the
+    /// distance from the transformation point.
+    #[test]
+    fn skew_shears_about_the_transformation_point() {
+        let bounds = box_10();
+        let pivot = Point::new(50.0, 100.0);
+        // Grab the top edge and pull it 50 to the right: the top leans over,
+        // the bottom — which is on the pivot's own line — does not move.
+        let sheared = skew_about(
+            pivot,
+            bounds,
+            Point::new(50.0, 0.0),
+            Point::new(100.0, 0.0),
+            true,
+        );
+
+        let top = sheared * Point::new(50.0, 0.0);
+        let bottom = sheared * Point::new(50.0, 100.0);
+        assert!((top.x - 100.0).abs() < 1e-9, "the top should lean: {top:?}");
+        assert!(
+            (bottom - Point::new(50.0, 100.0)).hypot() < 1e-9,
+            "the pivot's own line should not move: {bottom:?}"
+        );
+    }
+
+    /// Scaling about the transformation point keeps it fixed, which is what
+    /// Alt-dragging a handle is for.
+    #[test]
+    fn alt_scaling_keeps_the_transformation_point_fixed() {
+        let bounds = box_10();
+        let pivot = Point::new(50.0, 50.0);
+        let scaled = scale_about(pivot, bounds, Point::new(100.0, 100.0), Point::new(150.0, 150.0), false);
+        assert!((scaled * pivot - pivot).hypot() < 1e-9);
+        let corner = scaled * Point::new(100.0, 100.0);
+        assert!((corner - Point::new(150.0, 150.0)).hypot() < 1e-9);
     }
 
     #[test]
@@ -849,6 +1215,7 @@ mod tests {
             zoom: 1.0,
             selection_bounds: None,
             anchors: &[],
+            pivot: None,
         };
         assert_eq!(drag(&mut m, from, to, &zoomed_out), ToolAction::None);
 
@@ -859,6 +1226,7 @@ mod tests {
             zoom: 10.0,
             selection_bounds: None,
             anchors: &[],
+            pivot: None,
         };
         assert!(matches!(
             drag(&mut m, from, to, &zoomed_in),
@@ -923,6 +1291,7 @@ mod tests {
             zoom: 1.0,
             selection_bounds: Some(Rect::new(0.0, 0.0, 100.0, 100.0)),
             anchors: &[],
+            pivot: None,
         };
         let mut m = ToolMachine::new(ToolId::Selection);
         match drag(&mut m, Point::new(50.0, 50.0), Point::new(80.0, 90.0), &c) {
@@ -1442,6 +1811,7 @@ mod tests {
             zoom: 1.0,
             selection_bounds: Some(Rect::new(0.0, 0.0, 100.0, 80.0)),
             anchors: &anchors,
+            pivot: None,
         };
 
         let mut m = ToolMachine::new(ToolId::Subselection);
@@ -1471,6 +1841,7 @@ mod tests {
             zoom: 1.0,
             selection_bounds: None,
             anchors: &anchors,
+            pivot: None,
         };
 
         let mut m = ToolMachine::new(ToolId::Subselection);
@@ -1502,6 +1873,7 @@ mod tests {
             zoom: 1.0,
             selection_bounds: None,
             anchors: &anchors,
+            pivot: None,
         };
         let mut m = ToolMachine::new(ToolId::Subselection);
         m.pointer_down(start, start, Mods::default(), &near);
@@ -1516,6 +1888,7 @@ mod tests {
             zoom: 10.0,
             selection_bounds: None,
             anchors: &anchors,
+            pivot: None,
         };
         let mut m = ToolMachine::new(ToolId::Subselection);
         m.pointer_down(start, start, Mods::default(), &far);

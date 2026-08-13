@@ -4,6 +4,7 @@
 //! same scene-encoding path the window uses, rather than a reimplementation of
 //! it that could silently drift.
 
+pub mod animate_assets;
 pub mod app;
 pub mod demo;
 pub mod editor;

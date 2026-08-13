@@ -50,6 +50,16 @@ rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "t
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# The window icon is decoded at startup from the PNG in `assets/`.
+png = "0.18"
+# Animate's asset manifests are JSON.
+serde_json.workspace = true
+
+[build-dependencies]
+# Embeds the icon into the .exe, so Explorer and the taskbar show it too.
+# The build script tolerates its absence rather than failing.
+winresource = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 hound = "3.5"

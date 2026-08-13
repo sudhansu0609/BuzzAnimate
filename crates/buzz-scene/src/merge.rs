@@ -173,6 +173,7 @@ impl Remapper<'_> {
             filters: source.filters.clone(),
             blend: source.blend,
             spatial: source.spatial,
+            pivot: source.pivot,
         }
     }
 }

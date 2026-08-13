@@ -101,6 +101,14 @@ impl Selection {
         }
     }
 
+    /// Keep only the objects a caller says are still on screen.
+    ///
+    /// Edit Multiple Frames decides that against a *range* of frames rather
+    /// than one, so the rule lives with the caller and this only applies it.
+    pub fn retain(&mut self, keep: impl Fn(ObjectId) -> bool) {
+        self.objects.retain(|id| keep(*id));
+    }
+
     /// Drop anything not visible at `frame`.
     ///
     /// Moving the playhead can leave the selection pointing at artwork on a

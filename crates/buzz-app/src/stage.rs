@@ -13,7 +13,9 @@
 
 use buzz_geom::{Point, Rect, Vec2};
 use buzz_render::SceneBuilder;
-use buzz_render::document::{DrawCache, FrameOptions, MaskDisplay, draw_frame, draw_frame_cached};
+use buzz_render::document::{
+    DrawCache, FrameOptions, MaskDisplay, draw_frame, draw_frame_cached, draw_stage_context,
+};
 use buzz_ui::{Metrics, Orientation, Palette};
 use egui::{Align2, Color32, FontId, Sense, Stroke, StrokeKind, Ui};
 
@@ -48,6 +50,49 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
     // stage rectangle the artwork sits on.
     let camera = scene.camera_transform(frame);
 
+    // **Edit in place.** Inside a symbol, the scene it was opened from is drawn
+    // first and then veiled: the artwork being edited has to be judged against
+    // what surrounds it — a head against the shoulders it sits on — and an
+    // empty grey stage says nothing about whether the drawing is right.
+    //
+    // Animate pales the context rather than hiding it, and the pale is the
+    // point: everything solid on screen is then the thing you are editing.
+    if !scene.edit_path().is_empty() {
+        let context = FrameOptions {
+            masks: MaskDisplay::WhenLocked,
+            // Not lit: shading and cast shadows on artwork that is only there
+            // for reference read as dirt on the stage.
+            lit: false,
+            ..FrameOptions::default()
+        };
+        draw_stage_context(&mut builder, scene, frame, camera, &context, cache);
+
+        // The veil, over everything visible rather than over the stage
+        // rectangle: the context runs off the edges of the stage as freely as
+        // the artwork does, and a veil that stopped at the stage would leave a
+        // bright ring of unveiled drawing around it.
+        let seen = editor.camera.visible_doc_rect();
+        builder.fill_shape(
+            &seen.inflate(seen.width(), seen.height()),
+            peniko::Color::from_rgba8(0xFF, 0xFF, 0xFF, 0xC4),
+        );
+    }
+
+    // Edit Multiple Frames draws the other keyframes **solid**, under the live
+    // frame. Ghosting them would be onion skinning, and the difference between
+    // the two modes is exactly that these drawings are the thing being edited
+    // rather than a reference to work against.
+    let place = scene.edit_place();
+    for other in editor.multi_frames() {
+        let options = FrameOptions {
+            masks: MaskDisplay::WhenLocked,
+            lit: true,
+            place,
+            ..FrameOptions::default()
+        };
+        draw_frame(&mut builder, scene, other, camera, &options);
+    }
+
     // Onion skin ghosts first, so the live frame draws over them.
     for ghost_frame in editor.onion_frames() {
         let distance = ghost_frame.abs_diff(frame).max(1) as f64;
@@ -56,6 +101,7 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
             ghost: Some(strength),
             ghost_outlines: editor.onion.outlines,
             masks: MaskDisplay::WhenLocked,
+            place,
             // Ghosts are reference, not picture: shading and cast shadows on a
             // faded copy of another frame read as dirt on the stage.
             lit: false,
@@ -69,6 +115,7 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
     let live = FrameOptions {
         masks: MaskDisplay::WhenLocked,
         lit: true,
+        place,
         ..FrameOptions::default()
     };
     draw_frame_cached(&mut builder, scene, frame, camera, &live, cache);
@@ -115,7 +162,14 @@ pub fn draw_chrome(ui: &mut Ui, editor: &Editor, area: egui::Rect) -> ChromeResp
         .scene()
         .camera_projection_at_depth(editor.current_frame, 0.0)
         .unwrap_or(buzz_geom::Projection::IDENTITY);
-    let to_screen_art = |p: Point| to_screen(shot.map_point(p).unwrap_or(p));
+    // And through the place, so that inside a symbol opened *in place* the
+    // handles, bones and the transformation point land on the artwork rather
+    // than at the origin the artwork is no longer drawn at.
+    let place = editor.scene().edit_place();
+    let to_screen_art = |p: Point| {
+        let p = place * p;
+        to_screen(shot.map_point(p).unwrap_or(p))
+    };
 
     let visible = camera.visible_doc_rect();
 
@@ -132,7 +186,7 @@ pub fn draw_chrome(ui: &mut Ui, editor: &Editor, area: egui::Rect) -> ChromeResp
     painter.rect_stroke(
         stage_rect,
         0.0,
-        Stroke::new(1.0, Palette::STAGE_BORDER),
+        Stroke::new(1.0, Palette::stage_border()),
         StrokeKind::Outside,
     );
 
@@ -170,7 +224,7 @@ fn draw_grid(
 
     // Bounded so a pathological zoom cannot try to draw millions of lines.
     const MAX_LINES: i64 = 4_000;
-    let stroke = Stroke::new(1.0, Palette::GRID);
+    let stroke = Stroke::new(1.0, Palette::grid());
 
     let first_x = (visible.x0 / spacing).floor() as i64;
     let last_x = (visible.x1 / spacing).ceil() as i64;
@@ -210,9 +264,9 @@ fn draw_guides(
     to_screen: impl Fn(Point) -> egui::Pos2,
 ) {
     let color = if view.lock_guides {
-        Palette::GUIDE_LOCKED
+        Palette::guide_locked()
     } else {
-        Palette::GUIDE
+        Palette::guide()
     };
     let stroke = Stroke::new(1.0, color);
 
@@ -267,7 +321,7 @@ fn draw_selection(
         outline.push(corners[0]);
         painter.add(egui::Shape::line(
             outline,
-            Stroke::new(1.0, Palette::SELECTION),
+            Stroke::new(1.0, Palette::selection()),
         ));
         drawn_any = true;
     }
@@ -287,7 +341,7 @@ fn draw_selection(
         outline.push(corners[0]);
         painter.add(egui::Shape::line(
             outline,
-            Stroke::new(1.0, Palette::SELECTION),
+            Stroke::new(1.0, Palette::selection()),
         ));
     }
 
@@ -307,19 +361,23 @@ fn draw_selection(
         for anchor in editor.selected_anchors() {
             let at = to_screen(anchor.point);
             let square = egui::Rect::from_center_size(at, egui::vec2(ANCHOR, ANCHOR));
-            painter.rect_filled(square, 0.0, Palette::HANDLE_FILL);
+            painter.rect_filled(square, 0.0, Palette::handle_fill());
             painter.rect_stroke(
                 square,
                 0.0,
-                Stroke::new(1.0, Palette::SELECTION),
+                Stroke::new(1.0, Palette::selection()),
                 StrokeKind::Outside,
             );
         }
         return;
     }
 
-    // Handles only for the tool that can use them.
+    // Handles only for the tool that can use them — but the transformation
+    // point is drawn for the selection tools as well, because they can move it
+    // (see `tools::finish_drag`), and a control you can grab and cannot see is
+    // worse than one that is not there.
     if editor.tool() != buzz_ui::ToolId::FreeTransform {
+        draw_pivot(painter, editor, &to_screen);
         return;
     }
     const HANDLE: f32 = 6.0;
@@ -334,14 +392,46 @@ fn draw_selection(
         rect.left_center(),
     ] {
         let handle = egui::Rect::from_center_size(corner, egui::vec2(HANDLE, HANDLE));
-        painter.rect_filled(handle, 0.0, Palette::HANDLE_FILL);
+        painter.rect_filled(handle, 0.0, Palette::handle_fill());
         painter.rect_stroke(
             handle,
             0.0,
-            Stroke::new(1.0, Palette::HANDLE_STROKE),
+            Stroke::new(1.0, Palette::handle_stroke()),
             StrokeKind::Outside,
         );
     }
+
+    // The transformation point: Animate's white circle, and what rotation,
+    // skew and Alt-scale all turn about. Drawn last so it is never hidden
+    // under a handle, and hollow so the artwork underneath stays visible —
+    // it is usually put on a hinge or a joint, which is exactly the part you
+    // need to see while placing it.
+    draw_pivot(painter, editor, &to_screen);
+}
+
+/// The transformation point: Animate's white circle.
+///
+/// Hollow, so the artwork underneath stays visible — it is usually put on a
+/// hinge or a joint, which is exactly the part you need to see while placing
+/// it. While it is being dragged it is drawn under the pointer instead: the
+/// move itself lands when the drag ends, and a circle that sat still until
+/// then made the gesture look as though it had not taken.
+fn draw_pivot(
+    painter: &egui::Painter,
+    editor: &Editor,
+    to_screen: &impl Fn(Point) -> egui::Pos2,
+) {
+    let dragging = match editor.preview() {
+        Preview::Pivot(at) => Some(at),
+        _ => None,
+    };
+    let Some(pivot) = dragging.or_else(|| editor.pivot()) else {
+        return;
+    };
+    let at = to_screen(pivot);
+    painter.circle_filled(at, 4.5, Palette::handle_fill());
+    painter.circle_stroke(at, 4.5, Stroke::new(1.0, Palette::handle_stroke()));
+    painter.circle_filled(at, 1.5, Palette::handle_stroke());
 }
 
 /// Live feedback for the gesture in progress.
@@ -361,7 +451,7 @@ fn draw_rigs(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point)
 
     for (object, segments) in crate::rigging::stage_segments(scene, frame) {
         let colour = if selected(object) {
-            Palette::SELECTION
+            Palette::selection()
         } else {
             Color32::from_rgba_unmultiplied(255, 210, 90, 170)
         };
@@ -381,7 +471,7 @@ fn draw_rigs(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point)
 
     for (object, handles) in crate::rigging::stage_handles(scene, frame) {
         let colour = if selected(object) {
-            Palette::SELECTION
+            Palette::selection()
         } else {
             Color32::from_rgba_unmultiplied(120, 220, 255, 200)
         };
@@ -401,9 +491,9 @@ fn draw_rigs(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point)
     if let Some((head, current)) = editor.rig_preview() {
         painter.line_segment(
             [to_screen(head), to_screen(current)],
-            Stroke::new(1.5, Palette::SELECTION),
+            Stroke::new(1.5, Palette::selection()),
         );
-        painter.circle_stroke(to_screen(head), 3.0, Stroke::new(1.0, Palette::SELECTION));
+        painter.circle_stroke(to_screen(head), 3.0, Stroke::new(1.0, Palette::selection()));
     }
 }
 
@@ -439,7 +529,7 @@ fn draw_lights(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poin
         let ink = Color32::from_rgba_unmultiplied(0, 0, 0, alpha);
         let ghost = Color32::from_rgba_unmultiplied(0, 0, 0, alpha / 5);
         let selected = editor.light_panel.selected == Some(gizmo.id);
-        let ring = if selected { Palette::SELECTION } else { ink };
+        let ring = if selected { Palette::selection() } else { ink };
 
         match gizmo.kind {
             crate::lights::GizmoKind::Sun {
@@ -498,12 +588,14 @@ fn bone_width(editor: &Editor, head: Point, tip: Point) -> f64 {
 }
 
 fn draw_preview(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point) -> egui::Pos2) {
-    let stroke = Stroke::new(1.0, Palette::SELECTION);
+    let stroke = Stroke::new(1.0, Palette::selection());
 
     match editor.preview() {
         Preview::None => {}
         // Painted into the Vello scene by `build_scene`, in its real colour.
         Preview::Ink { .. } => {}
+        // Drawn with the transform gizmo, where the circle belongs.
+        Preview::Pivot(_) => {}
         Preview::Marquee(rect) => {
             let r = egui::Rect::from_two_pos(
                 to_screen(Point::new(rect.x0, rect.y0)),
@@ -537,13 +629,13 @@ fn draw_rulers(ui: &mut Ui, area: egui::Rect, editor: &Editor) -> Option<buzz_ui
     let top = egui::Rect::from_min_size(area.min, egui::vec2(area.width(), thickness));
     let left = egui::Rect::from_min_size(area.min, egui::vec2(thickness, area.height()));
 
-    painter.rect_filled(top, 0.0, Palette::RULER_BG);
-    painter.rect_filled(left, 0.0, Palette::RULER_BG);
+    painter.rect_filled(top, 0.0, Palette::ruler_bg());
+    painter.rect_filled(left, 0.0, Palette::ruler_bg());
 
     let step = editor.view.ruler_step(camera.zoom);
     let visible = camera.visible_doc_rect();
     let font = FontId::proportional(9.0);
-    let tick = Stroke::new(1.0, Palette::RULER_TICK);
+    let tick = Stroke::new(1.0, Palette::ruler_tick());
 
     const MAX_TICKS: i64 = 2_000;
 
@@ -565,7 +657,7 @@ fn draw_rulers(ui: &mut Ui, area: egui::Rect, editor: &Editor) -> Option<buzz_ui
                 Align2::LEFT_TOP,
                 format_ruler(value),
                 font.clone(),
-                Palette::RULER_TEXT,
+                Palette::ruler_text(),
             );
         }
     }
@@ -588,7 +680,7 @@ fn draw_rulers(ui: &mut Ui, area: egui::Rect, editor: &Editor) -> Option<buzz_ui
                 Align2::LEFT_TOP,
                 format_ruler(value),
                 font.clone(),
-                Palette::RULER_TEXT,
+                Palette::ruler_text(),
             );
         }
     }

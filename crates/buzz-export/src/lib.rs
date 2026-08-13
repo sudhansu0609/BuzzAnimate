@@ -456,6 +456,14 @@ pub fn export_sequence(
     if frames.is_empty() {
         bail!("there are no frames in that range to export");
     }
+
+    // **The range is in film frames, not timeline frames.** A document with a
+    // looping section is longer than its timeline, and the whole point of that
+    // feature is that the repeats are in the finished file — so the numbering
+    // the user asked for is resolved through the playlist before anything is
+    // rendered. Without a loop region the playlist is every frame once and
+    // this is exactly what it always was.
+    let playlist = scene.playlist();
     std::fs::create_dir_all(directory)
         .with_context(|| format!("creating {}", directory.display()))?;
 
@@ -463,11 +471,17 @@ pub fn export_sequence(
     let total = frames.len() as u32;
     let mut report = SequenceReport::default();
 
+    // Numbered by their place in the film, drawn from wherever the playlist
+    // says — so a looped section writes several files from one timeline frame.
     let numbers: Vec<u32> = frames.collect();
     for batch in numbers.chunks(BATCH) {
         let mut rendered = Vec::with_capacity(batch.len());
-        for &frame in batch {
-            rendered.push((frame, exporter.render(scene, frame, settings)?));
+        for &index in batch {
+            let frame = playlist
+                .get(index as usize)
+                .copied()
+                .unwrap_or(index.min(scene.frame_count().saturating_sub(1)));
+            rendered.push((index, exporter.render(scene, frame, settings)?));
         }
 
         // Encode and write across every core. This is the part CP-6.1 promised

@@ -278,6 +278,15 @@ fn interpolate_object(start: &Object, end: &Object, tween: &Tween, t: f64) -> Ob
     // passes it — the thing 3D rotation is for.
     out.spatial = start.spatial.lerp(&end.spatial, t);
 
+    // The transformation point tweens with the rest, so a hinge that moves
+    // between two keyframes moves smoothly rather than jumping at the end.
+    // A point set on one keyframe and not the other holds where it is, which
+    // is the same rule the filters below follow.
+    out.pivot = match (start.pivot, end.pivot) {
+        (Some(a), Some(b)) => Some(a.lerp(b, t)),
+        (a, b) => a.or(b),
+    };
+
     // Filters tween, which is how a glow grows or a shadow swings across a
     // shot. Matched by position in the stack and by kind: Animate holds a
     // filter that has no counterpart rather than interpolating towards
@@ -892,6 +901,7 @@ mod tests {
             filters: Vec::new(),
             blend: Default::default(),
             spatial: Default::default(),
+            pivot: None,
         }
     }
 
@@ -960,6 +970,7 @@ mod tests {
             filters: Vec::new(),
             blend: Default::default(),
             spatial: Default::default(),
+            pivot: None,
         };
 
         let mid = interpolate_object(

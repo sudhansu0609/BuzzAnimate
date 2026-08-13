@@ -1162,6 +1162,670 @@ bundled fonts have, **and that is wrong**: a probe row rendered
 what made the claim look right). The Library panel had been drawing an expanded
 folder as an empty box for the same reason since Phase 4, and now uses `⏷`.
 No test can see this; only a picture can.
+### ✅ Animate's frame commands, and importing an Animate asset library
+
+**The frame family, completed.** F5, Shift+F5, F6, F7 and Shift+F6 have been
+here since Phase 3. The rest of Animate's timeline commands now are too, on
+Animate's own keys:
+
+| | |
+|---|---|
+| Cut Frames | Ctrl+Alt+X |
+| Copy Frames | Ctrl+Alt+C |
+| Paste Frames | Ctrl+Alt+V |
+| Clear Frames | Alt+Backspace |
+| Reverse Frames | — |
+
+**Clear Frames is not Clear Keyframe**, and the difference is worth stating:
+Clear Keyframe removes the keyframe and hands its frames back to the one
+before; Clear Frames keeps the keyframe and empties it. Paste Frames makes a
+keyframe where the playhead is before pasting — pasting into the middle of a
+span would otherwise change the artwork from wherever that span began — and
+gives the arriving objects fresh ids, so pasting twice gives two drawings
+rather than one shared between two frames. Reverse Frames swaps the *contents*
+of a layer's keyframes end for end and leaves their timing alone, which is what
+makes it useful on a cycle.
+
+**A test caught the wiring, not a person.** The new shortcuts were in the
+command table and not in the list that actually binds keys, so they would have
+been printed in the menu and done nothing when pressed — exactly the defect
+`every_shortcut_is_reachable_from_the_keyboard` was written for after F8 and
+Ctrl+E did it in Phase 4.
+
+### ✅ Bringing an Animate asset library across
+
+An animator moving here has a library of assets in Animate, and no reason to
+rebuild it. `Documents/Adobe/Animate/<year>/Assets/Custom/<guid>/` holds one
+folder per asset: a `manifest.json` with the name and how Animate files it, the
+asset itself as a `.fla` — which is an XFL container this program has read
+since Phase 5 — and thumbnails. So the import needed no new format work at
+all; what was missing was the walk.
+
+**Assets ▸ From Animate…** picks the folder (opening on this machine's own
+Animate assets folder, newest year first, because the path is long and buried),
+scans it, and imports everything on its own thread with a progress bar. A
+library of a thousand is a thousand zip archives to open, which is a minute or
+two — doing it on the UI thread would freeze the window for all of it.
+
+- Each asset is filed as `Animate/<role>/<subCategory>`, under one folder of
+  its own: Animate's arrangement kept, because that is the one they know, and
+  separate, because dropping a thousand assets among somebody's own would be
+  rude.
+- **One bad file costs one asset.** Failures are named in a summary rather than
+  stopping the run.
+- **Bitmap assets are skipped rather than failed.** Animate's panel takes
+  images as well as symbols and this program does not read bitmaps yet (§7 item
+  22); three hundred "cannot import .png" lines would bury the real problems.
+
+**Measured against the real library on this machine**: 1162 assets found in the
+Animate 2024 folder, 32 of them bitmaps, and 24 of 25 sampled imported cleanly
+— the twenty-fifth being one of those bitmaps.
+
+### ✅ Three fixes: Open takes Animate files, the stage scrolls, docks resize
+
+**File ▸ Open only offered `.buzz`.** The importers have been there since
+Phase 5, but only behind File ▸ Import — so the program refused an Animate
+document, which is the very file somebody coming from Animate reaches for
+first. Open now lists everything it can read: `.buzz`, `.fla`, `.xfl`, `.swf`,
+`.pdf`, `.ai`. A foreign file opens as a **new, untitled** document: what comes
+back is a translation, however good, and Save must ask for a `.buzz` file
+rather than write back over an Animate source this program cannot produce. What
+did not survive the translation is reported in the same summary window an
+import uses. Verified by opening a `.fla` through the dialog: 640×480 stage,
+both shapes, fitted to the window.
+
+**The stage had no scrollbars.** Panning was space-drag, middle-drag or the
+Hand tool, and none of those tells you *where you are*: with the view off the
+pasteboard there was nothing on screen to say which way the artwork lay. There
+is now a bar along the bottom and one down the right. The thumb's length is how
+much of the work is on screen and its position is where — dragged or clicked,
+either moves the view. They scroll over the stage plus everything drawn on this
+frame plus a stage's worth of margin, so the extent grows with the drawing
+rather than being a fixed canvas the way Animate's is. The thumb never shrinks
+below a grabbable size, which matters here more than in most programs: at a
+trillion per cent the honest proportion is a fraction of a pixel.
+
+**The tool strip was wider than the tools.** The left dock opened at 58 points
+for a 30-point button, leaving half a column of empty grey beside every tool.
+It opens at 46 now, and the strip **flows into as many columns as it is given
+room for** — one is Animate's, and widening the dock gives two or three rather
+than more empty space.
+
+**There was no way to say how long the film is.** F5 and Shift+F5 add and
+remove a frame on one layer, which is the right tool inside a scene and a poor
+one for "make this shot four seconds". The transport now reads `Frame 1 of
+[40]`, and that number is the document's length: dragging it extends every
+layer, or trims them from the end. It is one undo step per drag, not one per
+frame passed through, and the playhead is brought back if the document was
+shortened underneath it. Verified on screen: 1 frame to 40, the span redrawn to
+match and the readout going to "1.67 s".
+
+**Dragging a dock's edge did nothing.** `Panel::resizable(true)` puts its handle
+on the panel's edge and registers the interaction as the panel is drawn — but
+the stage is a central panel drawn *after* every dock, and its own
+click-and-drag covers the whole area, so it took the pixels the handle needed.
+What that looks like from the outside is a panel that resizes and springs back,
+because the live drag is panning the stage underneath instead.
+
+The fix moves the authority: the docks are laid out at **exactly** the width the
+workspace says, and the boundaries are our own splitters, drawn last so nothing
+can take them. They move the workspace's numbers, which are what gets saved —
+one source of truth instead of egui's stored size and ours disagreeing. Proved
+by dragging the right dock from x=1020 to x=806 and finding it still there.
+
+### ✅ The program looks like somebody's — icon, banner, About, launcher
+
+**A launcher.** `BuzzAnimate.bat` in the repository root builds if the sources
+have changed — a no-op once warm — and starts the editor, passing a document
+path, `--gpu`, `--script` or `--dev` straight through. It refuses helpfully
+rather than flashing a console and vanishing: no cargo, a failed build or a
+missing binary each print a line and wait. `Create Desktop Shortcut.bat` puts a
+shortcut on the desktop pointing at the *launcher*, so it survives a rebuild, a
+`cargo clean` and switching between the release and debug builds.
+
+**A found bug:** the first version launched through `start`, and the editor
+came up minimised at –32000, –32000 — `start` hands the child whatever window
+state it was itself given, and from a script with no console of its own that is
+"minimised". It runs the binary directly now. Only launching it and looking for
+the window would ever have caught that.
+
+**An icon, from the studio's own artwork.** The character's head, cut from the
+Khayal 3 Baje thumbnail and set on the show's orange: the lettering runs right
+up against the figure, so painting it out takes a bite out of the artwork with
+it, and the head is both clean and the part that still reads at sixteen pixels.
+Seven sizes plus a hand-written `.ico` holding six of them — a taskbar wants the
+small sizes crisp rather than downsampled from 512.
+
+- The **window** icon is decoded from the PNG at startup.
+- The **taskbar** icon is a *second* icon, set separately — see below.
+- The **executable** carries it too, through a build script. That script never
+  fails the build: embedding needs a resource compiler, and a machine without
+  one should still get a working editor.
+
+**The mark was drawn, and then put back.** An attempt at a program mark — a play
+triangle with the onion-skin ghosts of the frames behind it, on the banner's
+orange-through-blue tile — was drawn on the argument that the character's head
+is a *show's* mark and says nothing about what the application does. The
+studio's answer was the character, and the character it is: whose program this
+is was the point. Both drawings are kept, and the icon set is *generated* rather
+than hand-edited: `tools/make-icon.ps1` writes every PNG and the `.ico` from the
+artwork, and `tools/make-icon-alternate-mark.ps1` is the abstract mark, there if
+it is ever wanted. Anyone changing the icon edits a script and re-runs it, which
+is also the only way the seven sizes stay in step with each other.
+
+**And it is lettered BA.** The head sits in the top seven-tenths with a darker
+band of the same orange under it carrying the initials in white. The lettering
+is why every size is now **composed at its own size** rather than reduced from
+one master: two characters shrunk from 512 pixels to 32 are a grey smudge, while
+the same two drawn at 32 keep their stems. The letters are also fitted by
+measurement rather than by a chosen point size — "BA" in a heavy face is wider
+than it is tall, and fitting it by height alone ran the A off the tile.
+
+**Sixteen pixels is the letters alone.** A head and a caption at eight pixels
+each are two smudges; BA by itself still reads. That size goes in the `.ico`,
+for file lists and small views. Arial rather than Arial Black there, since the
+heavy face is too wide to fit two letters across sixteen pixels at all.
+
+**Windows keeps two icons per window, and we were setting one.** The title bar
+draws the *small* icon and the taskbar draws the *big* one, and winit's
+`with_window_icon` sets only the small; the big one stayed null, so the taskbar
+fell back to its blank-sheet-of-paper placeholder while the title bar showed the
+logo perfectly. `with_taskbar_icon` — Windows-only, hence the `cfg` — now sets
+it. Each is fed the drawing nearest its own size: 32 for the title bar (24 at
+this machine's scaling), 128 for the taskbar and Alt+Tab.
+`the_window_carries_a_small_icon_and_a_large_one` guards both, because the
+failure is silent and shows up only on a strip of screen the application does
+not draw.
+
+**The process says who it is.** `SetCurrentProcessExplicitAppUserModelID` names
+it `BuzzcafMedia.BuzzAnimate`. Without that, a window launched through a batch
+file and a command prompt is filed under whatever ran it; the same identity is
+what a pinned button and a running one match on.
+
+**The taskbar draws the *executable's* icon, and the shell caches it.** This is
+the part worth writing down, because it cost an hour. Both window icons can be
+correct — read back from the live window with `WM_GETICON` and photographed —
+and the button still shows the placeholder, because the taskbar resolves the
+icon through the shell, and the shell's cache is keyed on the executable. Every
+rebuild invalidates it and it re-caches as *nothing*. `ie4uinit.exe -show`
+sometimes clears it; restarting Explorer always does. It is a developer's
+problem, not a user's — their executable does not change every four minutes —
+but anyone editing the icon here will see a blank sheet of paper and think the
+change failed.
+
+**Help ▸ About** shows the Spilled Coffee Studios banner, the version — the
+first thing anybody reporting a problem is asked — and what this is built on.
+The banner is uploaded the first time the window opens rather than at startup,
+because a window nobody opens should not cost a texture.
+
+**A brand band across the top of the window**: orange, through grey, to blue.
+It was a frame round all four edges first, and that read as a *highlight* — the
+shape a program uses to say "this window has focus" or "this thing is
+selected". A band along the top is a masthead instead, and nothing at the edge
+of the stage competes with the artwork. A mesh rather than rectangles, because
+a gradient needs a colour per vertex; tests hold it to its three colours, to a
+smooth ramp with no visible banding, and to painting without panicking at any
+window size.
+
+### ✅ Crash recovery — autosave offered back, and a pause that saves
+
+Autosave has existed since Phase 1: a recovery copy written **beside** the
+document rather than over it, atomically, on the background pool, and discarded
+when the document is properly saved. Three things were missing, and without them
+it was an autosave nobody would ever see.
+
+**1. Nothing offered it back.** `find_recoveries` existed and had no caller. On
+launch the program now scans its own recovery directory and every directory a
+document has been opened from or saved to — remembered in the workspace, capped
+at eight, because autosave writes beside the document and a fresh launch has no
+other way to know where that was. What it finds is listed in a prompt: what each
+one is, whether it was ever saved at all, and how long ago it was written
+("never saved · 4 minutes ago"), with **Recover**, **Discard** and **Later**.
+It never opens one by itself — the user may have closed without saving on
+purpose, and replacing a document with a copy of unsaved changes is its own kind
+of data loss.
+
+**2. Unsaved work went to the system temp directory**, which is swept by the
+operating system and by every cleanup tool going. An hour of drawing that was
+never saved is the work most worth keeping, and that was a poor place to keep
+it. It now lives beside the workspace and the asset library, under
+`%APPDATA%/BuzzAnimate/recovery`.
+
+**3. A crash still cost up to two minutes.** Two things were added:
+
+- **A pause writes.** Five seconds of no change and the edit goes to disk. An
+  animator draws in bursts, and the gap between two of them is when writing is
+  free. It survives even a hard kill, where no code of ours runs at all.
+- **A panic writes.** The current scene is kept in a global slot — a pointer
+  copy per change, since a scene is a tree of `Arc`s — and a panic hook writes
+  it before the process dies, printing where it went. The hook wraps whatever
+  was there, so the backtrace is still produced: a crash still needs reporting,
+  it just should not also cost the artwork.
+
+**Two real bugs, found by crashing the program on purpose.**
+
+- Every unsaved document was filed as `untitled.recovery.buzz` in one shared
+  directory, so relaunching after a crash **overwrote the recovery while the
+  prompt offering it was still on screen**. Unsaved work now gets one slot per
+  session (`untitled-<process id>`), and the prompt shows that as "Untitled
+  work" because the number means nothing to the reader.
+- Recovering a file adopted it as the document's path, so its own autosave
+  wrote `…recovery.recovery.buzz` and Save would have written back over the
+  evidence. A recovered document is now **untitled again**: Save asks where to
+  put it, and the file it came from is moved aside as `…recovered.buzz` rather
+  than deleted or offered again.
+
+**Verified by killing the process, not by asserting.** Drew a rectangle in a
+fresh document, waited out the pause, terminated the process outright with no
+chance to run any code, relaunched: the prompt appeared, Recover was pressed,
+and the rectangle was back on the stage.
+
+### ✅ A New Document dialog — Full HD, 24 fps, and remembered
+
+New used to make Animate's default document: 550×400 at 24 fps, which was the
+right answer in 2005 and is the wrong one now. Almost everything made today is
+delivered at 1920×1080 or at a phone's proportions, and changing a document's
+size after the artwork exists means rescaling every layer and every camera
+move. **File ▸ New now asks**, and the answer costs one keypress.
+
+- **Full HD at 24 fps** is the default: the size things are delivered at, and
+  the rate animation is drawn on.
+- Seven presets — Full HD, HD, 4K UHD, Square, Vertical, Film 2K, and Animate's
+  own 550×400 for opening older work at its native size — each with what it is
+  *for* on its tooltip, and the chosen one highlighted.
+- Frame rate as a field plus one-click 12 / 24 / 25 / 30 / 60: on twos, film,
+  the two broadcast rates, and games.
+- The summary line names the ratio the way people say it: `1920 × 1080 · 16:9
+  · 24 fps`.
+- Enter creates, Escape cancels, and the window's own close button counts as
+  cancelling.
+- **Nothing changes until it is answered.** The document on screen is untouched
+  while the dialog is up, which is what makes New safe to have on Ctrl+N.
+
+**The settings are remembered**, kept with the workspace — a preference
+belonging to the person rather than to any film, and one that must not travel
+inside a `.buzz` file. Somebody making a series makes twenty documents at one
+size; the second onwards is Enter. The *window itself* opens on that size too,
+or the promise would only be half kept.
+
+A new document also opens **clean**. `Document::mark_clean` was added for it:
+building a scene bumps its revision, so a freshly made document used to report
+unsaved changes from the moment it appeared — the asterisk in the title bar was
+there before a single mark was made.
+
+**A test was writing the user's own layout.** Saving a preference writes
+`workspace.json`, and `Editor::default()` in a test saves like anything else —
+so running the suite could leave the next launch opening at whatever size a
+test had asked for. `workspace_path()` now honours `BUZZANIMATE_WORKSPACE`, the
+test harness points it at a per-process temp file, and each test editor starts
+from the default layout so one test cannot decide what the next one finds.
+
+### ✅ Shape recognition, and zoom on the stage
+
+**Draw roughly; get the shape you meant.** Animate recognises a hand-drawn
+circle as a circle, four rough strokes as a rectangle and a shaky stroke as a
+straight line. `buzz-geom::recognise` does the same:
+
+- The path is flattened once, and each candidate is fitted and scored by the
+  **worst** distance from a point to the ideal shape, as a fraction of the
+  shape's size. Worst rather than average, because an average hides exactly the
+  case that matters: a circle with one corner pulled out is not a circle, and
+  its average error is tiny.
+- Round is tried before square. A hand-drawn circle passes a loose rectangle
+  test at its corners far more readily than a hand-drawn rectangle passes the
+  circle test, so the other order squares off circles.
+- A rectangle may be **at an angle** — the smallest-area orientation, coarsely
+  searched then refined — and anything within three degrees of the page is
+  snapped to it, because a rectangle returned at 1.4° reads as a mistake rather
+  than as a drawing.
+- Circles and squares are named as such when their two dimensions are close: it
+  is the shape somebody drawing "a circle" meant, not an oval that happens to
+  be nearly round.
+- An **open** path is a line or it is nothing. Closing a drawn arc into an oval
+  would invent a shape the hand did not make.
+- **It never fails into a wrong answer.** A scribble, a star, an arc: `None`,
+  and the artwork is left exactly as drawn, with the status bar saying so.
+  Replacing a drawing with something the animator did not draw is worse than
+  doing nothing.
+
+Three tolerances — Strict, Normal, Tolerant — as Animate's Preferences offer,
+with the same names. **Straighten recognises first**, as Animate's does: it is
+the command reached for after drawing a rough circle, and easing the curve of
+something that could have *been* a circle is a worse answer than the one that
+was wanted. `Modify ▸ Shape ▸ Recognise Shape` asks for it directly.
+
+**Zoom, where the eye already is.** The status bar has carried a zoom field
+since Phase 2, and it is the last place anybody looks while drawing. There is
+now a control in the **stage's own top-right corner**: zoom out, the percentage
+(draggable, at a speed proportional to itself, so one gesture works at 50% and
+at a trillion), zoom in, a presets menu with Animate's steps plus Fit in
+Window / Show All / Show Frame, and a Hand toggle. The mouse could already do
+most of this — the wheel zooms about the cursor, and space or the middle button
+pans whatever the tool — but neither is discoverable, and a control in the
+corner is.
+
+**A missing glyph, caught by looking, for the third time.** The presets button
+used `▾` (U+25BE), which egui's bundled fonts do not have; it drew as an empty
+box in the first screenshot of the control. It is now `⏷`, and both it and
+the `▾` that failed have been added to `theme::font_has`'s inventory — the
+list of what to use, and the list of what never to reach for again.
+
+**Verified on screen**: a deliberately wobbly ring drawn freehand with the
+pencil, selected, and Modify ▸ Shape ▸ Recognise Shape — a clean circle, and
+"Recognised a circle" in the status bar. The zoom control taken from 150% to
+404.93% by its own button, and back to 134.83% by Fit in Window.
+
+### ✅ A light interface
+
+Animate offers a dark and a light interface; this now does too, from the Window
+menu, and the choice is kept with the workspace — a preference belonging to the
+person rather than to the film, so it never travels inside a `.buzz` file handed
+to somebody else.
+
+**One set of names, two answers.** `Palette` was twenty associated constants;
+it is now twenty functions, each holding both values and returning the one for
+the current theme. That is the whole design: no piece of chrome decides for
+itself what "the panel colour" is, so no piece of chrome can be left behind in
+the wrong theme. The current theme is a process-wide atomic rather than a handle
+threaded through every painter — there is one window and the chrome is drawn on
+one thread, and expressing that with a parameter on ninety call sites would be
+ceremony rather than safety.
+
+Three colours are deliberately the *same* in both:
+
+- **The accent blue** and the selection colour. An accent that changes with the
+  theme stops being one.
+- **The pasteboard stays mid-grey.** Its job is to be clearly not the stage, and
+  a white document on a white surround loses the edge of the frame — the one
+  boundary an animator has to see at all times. Animate keeps its light theme's
+  pasteboard grey for the same reason, and a test asserts a white stage cannot
+  disappear into it in either theme.
+
+**A bug found by looking, again.** The first switch left every panel dark while
+the rulers, pasteboard and timeline went light: egui redraws only when
+something asks it to, and the theme change is raised from *inside* the frame
+being built, so the restyle landed at the top of a frame that never came. The
+window now asks for one. Everything driven by the palette directly had already
+changed, which is exactly why the half-changed window was so legible as a
+symptom.
+
+Tests cover both themes rather than whichever happens to be current: text
+against panels, secondary text, ruler numbers against the ruler, the stage
+against the pasteboard — plus one that the light theme is actually *lighter*,
+which a palette that forgot to invert would otherwise pass while looking
+identical to the dark one.
+
+### ✅ The transformation point — and rotate and skew
+
+**Everything could be scaled and nothing could be turned.** The Free Transform
+gizmo's eight handles only ever scaled, about the opposite corner; rotation was
+two menu commands at 90°; and every anchor in the program was *computed* — the
+selection's centre, a corner, an object's bounding box — never chosen. A door
+could not hinge on its edge.
+
+**`Object.pivot`** is Animate's transformation point, stored per object:
+
+- In the object's **own** coordinates, before its transform, so it stays where
+  it was put on the artwork however the object is then moved, scaled or turned.
+  A hinge drawn on a door's edge is still on the edge after the door moves.
+- `None` means the centre of what the object actually covers — which needs the
+  library for an instance, so `Scene::pivot_of` resolves it. That is exactly
+  what every anchor did before, so a document that never touches one behaves
+  as it always did, and an object with a point set but still flat renders
+  pixel-identically (asserted on the GPU).
+- Saved (format version 14), and it **tweens**: a hinge that moves between two
+  keyframes moves smoothly rather than jumping at the end.
+- Several objects selected together have nothing to keep a point on, so the
+  editor holds one for the session — and ignores it the moment the selection is
+  a different set, rather than applying one selection's point to another's
+  artwork.
+
+**The gizmo learned three gestures**, chosen by where the drag *starts*,
+because the pointer's shape there is the promise and changing the answer half
+way through a drag would break it:
+
+| Where the drag starts | What it does |
+|---|---|
+| On the circle | Moves the transformation point — or resets it to the centre, if you press without dragging (Animate's double-click) |
+| On a corner handle | Scales about the opposite corner; **Alt** scales about the transformation point |
+| Just outside a corner | **Rotates** about it. Shift snaps to 45° |
+| On an edge | **Skews** — shears in proportion to the distance from the point, so an edge running through it cannot shear about it |
+| Anywhere inside | Moves the selection |
+
+The circle's grab radius is half again a handle's: it is small, it is usually
+parked over the artwork you are looking at, and missing it silently *moves the
+artwork* instead — the one outcome worth spending a few pixels to avoid.
+
+**3D rotation turns about it too.** `projection_for_object` was already given a
+pivot; it was handed the middle of the object's box. It now gets the
+transformation point, so a card with its point on the left edge swings on that
+edge like a door. Proved on the GPU: hinged, the left edge stays at x=175 while
+the rest swings away; about the centre, the same rotation foreshortens the card
+inwards and that edge moves to 217.
+
+Flip and Rotate 90° use it as well — unchanged for anyone who never touches the
+circle, and hinged where they put it for anyone who does.
+
+**Verified on screen**: the circle drawn at the centre of a selection, dragged
+to the top-left corner (artwork unmoved), the rectangle swung 45° about that
+corner, the point reset with a click, and the top edge dragged sideways into a
+parallelogram.
+
+### ✅ An Assets panel — artwork that outlives the document
+
+The Library holds *this* film's symbols and dies with it. What an animator
+accumulates across a series is different: a tree, a lamp-post, a mouth chart,
+a walk cycle — made once and dropped into whatever file needs them next.
+Without somewhere to keep those, reuse is "open last week's file and copy".
+
+**An asset is a `.buzz` document with one thing in it**, saved under
+`%APPDATA%/BuzzAnimate/assets` — beside the workspace layout, by the same rule,
+so neither feature invents its own home.
+
+**The folders shown are the folders on disk**, and nothing indexes them:
+
+- assets can be added, renamed, moved and shared by dragging files about in the
+  file manager, which is what people do anyway;
+- there is no index to drift out of step with what is on disk, and so no repair
+  path for when it does;
+- an asset is a whole document, so it opens, edits and saves back with no
+  second format to maintain — and *placing* one is `Scene::merge`, which
+  already renumbers every id it brings across. The importers' path exactly.
+
+**Keeping a selection** goes through the new `Scene::extract(frame, ids)`: a
+document holding just those objects, taken **as they are on that frame** (the
+same id sits on several keyframes with different transforms), **with the
+symbols they depend on, recursively**. An instance whose symbol was left behind
+draws nothing, and the asset would look empty on arrival — that is the failure
+this is built to avoid, and a symbol that contains an instance of itself does
+not send the walk round for ever.
+
+The panel raises intentions — Place, Add, New Folder, Rename, Delete, Rescan —
+and the shell performs them, because writing files and merging documents is not
+a panel's business and placing an asset has to land in an undo step. A failed
+place undoes its own step rather than leaving a "Place Asset" in the history
+that changed nothing, and an unreadable library says so: an empty list
+otherwise reads as "you have no assets", which is a different and much worse
+message.
+
+**Verified on screen, end to end.** A rectangle drawn and selected, `+` in the
+Assets panel (which is disabled with "select artwork to add" until something is
+selected), then **File ▸ New** for an empty document, then **Place** — and the
+rectangle is there in a file that never had it.
+
+### ✅ Named swatches, in folders — the document's palette
+
+**A colour needs a name.** A recent-colours row remembers what you last used,
+which is useful for a minute and worthless the next day. A production needs the
+opposite: the colours of a show, agreed once and reachable by name. "Hero Skin
+Shadow" is a decision; `#C08A6E` is a number that looks like three other
+numbers on a swatch strip, and the wrong one gets picked at four in the
+morning.
+
+So the palette is part of the **document** — `Swatches` on the `Scene`, saved
+(format version 13), undoable, and organised into folders exactly as the symbol
+library is:
+
+- `Swatch { id, name, color, folder }`, with folders held as their own set so
+  an empty one made in advance survives a save, and deleting a folder moves its
+  colours to the root rather than deleting them.
+- Ids come from the palette's own counter, not the document's allocator: a
+  palette does not interoperate with objects or symbols, and taking from the
+  shared allocator would have shifted every other id in a new document by
+  however many colours the default palette happens to have.
+- Names are made unique on the way in. Two swatches called "Sky" would defeat
+  the point of naming them.
+- A new document opens with Animate's ten default colours, **named** — Black,
+  White, Red, … Orange. A file written before version 13 gets the same palette
+  on the way in, which is what such a document effectively had.
+
+**The Swatches panel** lists them as folders and named rows: click sets the
+fill, shift-click the stroke, double-click renames, a dropdown per row files it
+in a folder, and the footer adds the current fill colour (straight into a
+rename, because a colour called "Swatch 7" is a hex value with extra steps).
+A Grid view gives Animate's chips for when the names are already known.
+
+**The Color panel now shows the document's palette** above the recent colours,
+and names the fill and stroke when they match a swatch — which is the whole
+point of naming them. Both rows are kept: the palette is what the production's
+colours *are*, the recents are what this session has been using.
+
+**A missing glyph caught, again by looking.** The delete button used `✕`
+(U+2715), which egui's bundled fonts do not have — it drew as an empty box in
+the screenshot. `theme::font_has` has kept a list of the characters this
+project has been caught by since the Actions panel work; `✕` is on it. Now
+the trash can, as the Layers panel uses.
+
+### ✅ Edit Multiple Frames, and the onion markers
+
+**Animate's mode, and the one that makes a scene movable.** With **Edit
+Multiple** on, every keyframe inside the onion markers is drawn *solid* rather
+than ghosted, can be clicked, and is changed together — so a whole scene is
+shifted across, scaled or rotated without opening each drawing in turn. It is
+the difference between "reference to work against" (onion skinning) and "the
+thing I am editing".
+
+- `Scene::update_object_across(first, last, id, f)` changes an object on every
+  keyframe *beginning* in the range. The same id legitimately sits on several
+  keyframes — F6 clones the `Arc` around a keyframe's objects — so all twelve
+  copies of a character drawn on twelve keys move at once. `EditAt` carries the
+  range, so the single choke point that already decided Auto Keyframe decides
+  this too.
+- **Clicking, marquee and Select All all reach the other frames.** A mode that
+  shows a drawing it will not let you select would be a worse trick than not
+  showing it. The playhead's own frame still wins where artwork overlaps.
+- **A selection survives moving the playhead** while the mode is on, because
+  the artwork is still on screen. Ordinary pruning drops what the current frame
+  does not hold, which would throw most of a scene selection away.
+
+**The onion markers got controls, which they never had.** `Onion::before` and
+`after` have existed since Phase 3 with no UI at all, fixed at ±2 — so onion
+skinning could never be widened and Edit Multiple Frames would have been useless
+tied to it. The transport now shows `markers [2] [2] All` whenever either mode
+is on, with **All** covering the whole timeline (Animate's Onion All). Animate
+draws the markers as brackets on the ruler and lets you drag them; these are
+numbers, which is the deviation recorded in §7.
+
+**Verified on screen.** Three keyframes, each with its own square in a
+different place. Edit Multiple on, markers set to All: all three squares appear
+solid on the stage at once. Select All then one drag downwards moves all three
+— and with the mode switched off again, frame 1 and frame 21 each show their
+own square in its new place.
+
+### ✅ Auto Keyframe
+
+**The mode Animate does not have, and every animator working in a span wants.**
+Without it, changing artwork at frame 12 of a span changes the keyframe that
+*owns* the span — the change reaches back to frame 1, where the drawing began.
+That is correct, it is what Animate does, and it is a surprise every single
+time. Animate's answer is "press F6 first"; this is the same thing, done for
+you, and only when you have asked for it.
+
+With **Auto Key** on (a toggle in the timeline transport and on the Insert
+menu), any edit at a frame with no keyframe of its own duplicates the artwork
+onto that frame first, so the change starts where the playhead is.
+
+- `Scene::ensure_keyframe(layer, frame)` is exactly F6, as its own operation,
+  and `Scene::update_object_where(at, id, f)` is the one place that decides
+  whether to call it. `EditAt { frame, auto_key }` carries the two together, so
+  the mode is not a bare `bool` threaded through fifteen editing paths where it
+  would eventually be passed in the wrong order.
+- It covers **everything that changes artwork**: dragging, Free Transform, the
+  flips and rotations, Paint Bucket, Ink Bottle, Erase, Smooth, Straighten,
+  Convert Lines to Fills, Expand Fill, moving an anchor — and *drawing*, since
+  a stroke made on frame 12 belongs to frame 12 rather than to the keyframe on
+  frame 1 where it would otherwise appear from.
+- **One keyframe, one undo step.** The keyframe is made inside the same edit as
+  the change, so moving three objects together makes one keyframe and one undo
+  entry, and undoing takes the keyframe back with the change that caused it. A
+  mode that leaves keyframes behind for you to delete would be worse than not
+  having it.
+- Off by default. A mode that silently adds keyframes must be one the user
+  asked for, and with it off every editing path behaves exactly as it did.
+
+**A real bug fixed on the way.** The Properties panel edited an object *wherever
+its id was first found*, which is the earliest keyframe holding it — so
+changing a 3D angle or swapping a symbol while looking at frame 12 quietly
+changed frame 1's copy instead. `update_object_at`'s own documentation had
+warned about this since Phase 3; the panel was the one caller that had never
+been told which frame was showing. It now takes an `EditAt` like everything
+else.
+
+**Verified on screen.** A rectangle drawn on frame 1 of a 20-frame span, Auto
+Key switched on, playhead to frame 10, rectangle dragged right: a keyframe
+appears on frame 10 in the timeline, frame 10 shows the rectangle in its new
+place, and frame 1 still shows it where it was drawn.
+
+### ✅ Transform, Swap Symbol, and a looping section
+
+Three of Animate's everyday commands, and one deliberate improvement on it.
+
+**Modify ▸ Transform ▸ Flip Horizontal / Flip Vertical / Rotate 90°** — with
+Animate's shortcuts (Ctrl+Shift+9 and Ctrl+Shift+7 for the rotations). Applied
+**about the selection's centre, not each object's**: flipping a pair of ears
+swaps them as well as mirroring each one, which is what Animate does and what
+anybody flipping a pair means. Object by object would mirror each in place and
+leave them the wrong way round. Both delegate to the `transform_selection` the
+Free Transform work already had, so there is one code path that moves a
+selection.
+
+**Swap Symbol** — a `Swap…` menu on the Symbol row of an instance's properties,
+listing every other symbol in the library. It points the instance at a
+different symbol and **keeps everything else**: where it is, its transform, its
+colour effect, its looping, its first frame (pulled back when the new symbol is
+shorter). Replacing the instance would lose all of that, which is the entire
+reason the command exists.
+
+**A looping section — and it is in the finished film.** Animate's loop is a
+preview: the playhead cycles between two markers while you work and the
+published file knows nothing about it. That is right for checking a walk cycle
+and useless for the thing animators want next — a background that loops eight
+times behind a scene, a two-frame flag that flutters for a whole shot — without
+duplicating frames by hand.
+
+So this loop is part of the **document**. `LoopRegion { enabled, start, end,
+repeats }` on the `Scene`, saved (format version 12), and:
+
+- Playback cycles inside it, including while sound is driving the transport —
+  the sound is told to go back with the picture, or the dialogue would run on
+  under a repeating image.
+- `Scene::playlist()` gives the document frame to draw for each frame of the
+  **film**, and `rendered_frame_count()` how long the film is. Without a region
+  the playlist is every frame once, so every caller behaves exactly as it did.
+- The exporter walks that playlist, so an exported sequence really contains the
+  section as many times as asked. The Export dialog's default range is the
+  length of the film, not of the timeline.
+- The timeline shows the range as an amber band with a tick at each end, dimmed
+  when the count is 1 so "on, but doing nothing" is visibly not the same thing.
+  The readout says `film 45` beside the numbers, in frames.
+
+**Proved on the GPU, not asserted in arithmetic.** `headless_looping.rs` builds
+four frames in four colours, sets frames 2–3 to repeat three times, exports the
+sequence, and reads the colour back out of each written PNG: `0 1 2 1 2 1 2 3`.
+A second test asserts a document with no region exports exactly what it always
+did. Screenshots confirm the band, the readout, and the playhead wrapping back
+into the section during playback (frame 18, then frame 9).
+
 ### ✅ 3D rotation on an object — §7 item 28, closed
 
 An object can now be **turned in space**: rotated about its own three axes and
@@ -1593,6 +2257,271 @@ test could see:
    is now drawn in ink — dial, spoke, rays and outline — with the light's
    colour only as the handle's fill, which is what Blender does too.
 
+### ✅ The Animate importer, rewritten against real films
+
+The first pass at this read the format's *documentation*. Pointed at four of
+the studio's own films — 45 to 140 MB, thousands of symbols each — it produced
+streaks. Six defects, each found by rendering a frame and looking at it beside
+the film's own still.
+
+**0. A hex coordinate is signed, and its width carries the sign.** This one
+did more damage than the rest together. XFL writes coordinates in hex twips,
+and a negative number is written at full width in two's complement:
+`#FFFFFA.21` is **minus six twips**. Read as unsigned it is eight hundred
+thousand pixels. One point like that in a shin stretched the leg to four
+hundred thousand units across; every shape holding one threw a straight spike
+across the frame, which is what the "streaks" over every imported film were.
+Short forms stay positive — `#82` is 130 twips, not −126 — because Animate
+only writes the leading `F`s when it means a negative number. On the studio's
+own film this fixed the elongated limbs and every stray line in the same
+change.
+
+**1. A `DOMShape` is not a set of outlines.** It is a soup of boundary pieces,
+each saying which fill lies on its *left* and which on its *right*, written in
+drawing order and split across several `<Edge>` elements; a piece is usually
+two points long. Read as one closed outline per edge — the obvious reading — a
+bush arrives as three hundred slivers. The pieces are now **reassembled**: for
+each fill, every piece with it on the left, plus every piece with it on the
+right turned round, chained end-to-start into closed loops. On one real
+document that is 32 180 fragments becoming 2 033 shapes, and the difference
+between green streaks and a village at night.
+
+**1a. Where several boundaries meet, the loop turns the corner.** Grass blades
+from a common root, two shapes sharing an edge: at that point three or four
+pieces start, and taking whichever was stored first walks the loop into the
+neighbouring shape and back. The piece taken is now the one that turns
+furthest back towards where the loop came from — the standard rule for tracing
+a face of a planar subdivision. Stated plainly: it did **not** visibly change
+any of the four films tested, and it is kept because "first stored" is not a
+rule at all.
+
+**2. The layer order was upside down.** The file's order *is* the timeline's,
+top first; this read it as bottom-first and reversed every stack. Skies drew
+over artwork, backgrounds over the characters standing on them — and every
+mask sat *below* the layers it should clip, so masking did nothing at all
+anywhere. The camera layer proves the order: Animate pins it to the top of the
+timeline and writes it first.
+
+**3. Masked layers are not marked `layerType="masked"`.** Whatever the format
+allows, Animate writes an ordinary layer whose `parentLayerIndex` points at the
+mask above it — the same attribute a layer in a folder uses for its folder.
+Waiting for a value Animate never writes meant every mask in every real
+document claimed nothing.
+
+**4. A rigged character's parts are stored *relative* to what they hang off.**
+Animate's Layer Parenting is a third relationship in a fourth place:
+`layerRiggingIndex` on the parent, `parentLayerIndex` on the child's **frame**
+(it can be re-parented mid-shot). A head is stored as a small offset from its
+torso — `(49, -156)` — not as a position. Our model, following Animate's
+*editing* behaviour, takes a child's transform as absolute and propagates only
+the parent's motion away from rest. Before this every character imported in
+pieces, heads a few hundred units up and left of the shoulders they belong on.
+
+The chain is composed **per keyframe** on the way in — `child_world(f) =
+parent_world(f) * child_relative(f)`, parents baked before children — and the
+link is then dropped. Baking the parent's *rest* pose instead is exact for one
+level and wrong for two, because matrices do not commute: by the shin the two
+products disagree and the leg comes out bent the wrong way.
+
+**5. Only an instance's own matrix places it.** `<Matrix>` appears in several
+places in XFL and most of them are not placements: a gradient carries one to
+say where its ramp runs, a bitmap fill to say how its image lies. Applied to
+"the last object drawn", a gradient's matrix — whose scale is a fraction of a
+percent — collapsed whichever instance preceded it to a point. A lantern, a
+bed and a cot vanished from a shot while the layer still reported them there.
+
+**6. The camera holds between untweened keys.** Ours interpolated between
+every pair, which is right for a tweened move and wrong for the nineteen held
+spans in one real film: a shot that should sit still for ten seconds and cut
+was drifting the whole way. A held span is now written as a second key with the
+same values at its last frame, so the hold lives in the track rather than in a
+rule to remember.
+
+**And two smaller ones.** A graphic instance's `loop` and `firstFrame` were
+ignored, so 535 held poses in one film played through their whole timelines and
+485 first-frame offsets were lost; and instances played against the *timeline's*
+frame number rather than the frames since they were placed, putting every cycle
+at an arbitrary point in itself.
+
+**How any of this can be checked.** Two examples, because import fidelity
+cannot be settled by counting shapes — a drawing that arrives as the right
+number of wrong outlines passes every count there is:
+
+```text
+cargo run -p buzz-import-xfl --example report -- "scene.fla" --layers 600
+cargo run -p buzz-export     --example shot   -- "scene.fla" 600 out.png
+```
+
+The first lists what came across and what each layer holds at a frame; the
+second renders that frame to a PNG, headlessly, so it can be put beside what
+Animate shows.
+
+### ✅ A real Animate document imports — nested symbols, the camera, and damaged files
+
+An animator opened one of their own films and got a page of *instance of unknown
+symbol*, several hundred lines of it. Three separate defects, each found by
+pointing the importer at the real thing rather than at a fixture.
+
+**Symbols could not see each other.** Every symbol was parsed against the
+symbols parsed *before* it, so a torso holding an arm found the arm only if the
+archive happened to store the arm first. In a rigged character almost nothing
+resolves that way: the parts are defined after the thing that holds them.
+Names and ids are now collected from every library file first, and the
+timelines read second, so ordering cannot matter. On one real document that is
+**2 908 instances that used to be dropped**, and the lookup prefers the full
+library path over the bare name so two folders may each hold a `head`.
+
+**Animate's camera was an unknown symbol.** The camera layer holds instances of
+`__Camera__`, which is not in the library — it is Animate's own. Rather than
+special-case it into silence, the camera is now *imported*: the layer's
+keyframes become camera keys, and since the matrix places the camera rather
+than the view, the zoom is its inverse (a camera scaled to a half shows half
+the stage, which is a zoom of two). The camera layer does not become a layer of
+artwork, because in Animate it never was one.
+
+**Animate writes broken files.** Three symbols in one document contain
+`<DOMShape` with no closing bracket, immediately followed by `</DOMShape>` —
+puppet-warp shapes, saved damaged by Animate itself. Refusing the file threw
+away every other frame in the symbol with the bad one, and the symbol then
+vanished from every scene using it. What reads is now kept and the truncation
+is named in the report.
+
+**Measured on four real documents** of 45–140 MB: from hundreds of unknown
+symbols to none. What is still reported is honest — gradients flattened,
+bitmaps skipped — and `cargo run -p buzz-import-xfl --example report -- <file>`
+is how any of it can be checked without opening the window.
+
+### ✅ Edit in place: the scene stays, paled
+
+Inside a symbol the stage used to show the symbol alone against empty grey —
+which says nothing about whether the drawing is right. A head has to be judged
+against the shoulders it sits on. The document's own timeline is now drawn
+first and then veiled in translucent white, with the symbol's contents solid
+on top: everything sharp on screen is the thing being edited, and everything
+pale is where it belongs.
+
+The veil covers the whole visible area rather than the stage rectangle,
+because the scene runs off the edges of the stage as freely as the artwork
+does and a veil that stopped at the stage would leave a bright ring of
+unveiled drawing around it. The context is drawn unlit — shading and cast
+shadows on reference artwork read as dirt on the stage.
+
+### ✅ Double-click goes into a symbol, and out again
+
+Animate's whole navigation, and it was missing: the only way into a symbol was
+the Library, one at a time, with no way to tell which of three like-named heads
+was the one on screen. Double-clicking an instance now edits it where it
+stands, and double-clicking past the artwork comes back out a level. Ctrl+E
+changed with it: the **selection** leads and the Library is the fallback, since
+the Library keeps its highlight for as long as the panel is open and was
+winning every time.
+
+### ✅ Ctrl+wheel zooms; the wheel alone scrolls
+
+The wheel zoomed by itself, which makes a long document impossible to walk
+down — and it zoomed with **Alt** held too, which is where the report came
+from. The cause is worth writing down: egui's `vertical_scroll_modifier` is
+Alt, so holding Alt forces the wheel onto the vertical axis, and the old code
+zoomed on anything that arrived on that axis. Any modifier at all still
+zoomed.
+
+Now the wheel pans and **Ctrl+wheel zooms about the pointer**, which is
+Animate's arrangement and every drawing program's. egui has already turned
+Ctrl+wheel — and a trackpad pinch — into a zoom factor and taken it out of the
+scroll delta, so the two cannot fight over the same event; Shift for
+horizontal comes free from the same place.
+
+Verified by driving the wheel at the window: plain 55.56% → 55.56%, Alt
+55.56% → 55.56%, Ctrl 55.56% → 101.23%.
+
+### ✅ A ruled timeline, not a boxed one
+
+Every frame cell was drawn as a full rectangle, so each grid line was drawn
+**twice** — once as one cell's right edge and again as its neighbour's left —
+and every row carried a line along its top and its bottom. At twelve pixels a
+cell that doubled ink was most of what the timeline showed: rows looked
+separated by a gap they did not have, and the frames were hard to count. One
+hairline down the right of each cell and one along the bottom is Animate's
+grid, and it is half the ink for the same information.
+
+The two sizes now show their numbers as well — `12 px`, `100%` — because a
+bare slider says a size can be changed and not what it is, which is the one
+thing somebody matching two documents needs.
+
+### ✅ The transformation point moves under the pointer
+
+Dragging Animate's white circle worked and looked as though it did not: the
+point is moved by **one** edit when the drag ends — not one per pixel, which
+would fill the undo history with a hundred steps — so the circle sat still
+under a moving pointer until the button came up. It is now drawn where the
+pointer has it for the length of the drag, which is the whole difference
+between a control that works and one a user gives up on.
+
+Three tests pin the behaviour itself: on loose artwork, on a symbol instance
+— the case that matters, since a character turns about a hip or a shoulder and
+both are on an instance — and on the **Selection** tool, which can now move it
+too. That last is a deviation from Animate, and a deliberate one: the point is
+what a rotation, a skew and an Alt-scale all turn about, and having to change
+tools to move it and change back to carry on selecting is a step nobody thanks
+you for. Only a *drag* counts, so clicking the middle of a shape still selects
+and moves it exactly as before, and the circle is drawn for the selection tools
+so that what can be grabbed can be seen.
+
+### ✅ The timeline: layer buttons, a centred transport, and two zooms
+
+**New Layer, New Folder and Delete under the layer names**, at the bottom left
+where Animate keeps them and where the hand goes looking. They raise the same
+three commands as the Insert menu and the Layers panel — a third door onto one
+room, not a third implementation — so undo covers them like anything else.
+
+**The transport is centred.** egui lays widgets out as it draws them, so the
+row's width is not known until it has been drawn; the previous frame's width
+decides the leading space. The contents change about once a session, so the
+one-frame correction is not visible. The frame buttons moved into the row
+rather than staying pinned right, because a right-aligned group takes all the
+remaining width and leaves nothing to centre within.
+
+**The rows touch.** egui's standard item spacing was putting a stripe of panel
+background between every layer, which cost a row of layers for every three
+shown. The cells' own outlines separate them, as they do in Animate.
+
+**Two sliders, because the useful size depends on the film.** A
+four-thousand-frame timeline wants narrow cells; a twelve-frame cycle wants
+wide ones. Frame width and row height are workspace state — saved with the
+layout, not with the film, and deliberately *not* undoable, since Ctrl+Z after
+a zoom should undo the last edit and not the zoom. The ruler thins its labels
+as the cells narrow: every fifth frame, then every tenth, then every twentieth,
+because overlapping numbers are worse than fewer.
+
+### ✅ The inverse mask — a mask that hides what it covers
+
+Animate has no such layer. A hole is cut there by drawing the mask as a shape
+with a hole *in* it, which means redrawing the mask by hand whenever the
+artwork under it moves. `LayerKind::InverseMask` is the same region used the
+other way round: the run of masked layers below shows everywhere **except**
+where the mask covers them. A character walking behind a foreground element, a
+scratch-off, smoke eating a title.
+
+**It is not a reversed clip, and the reason is worth keeping.** The obvious
+implementation — a big rectangle with the mask's subpaths reversed inside it —
+is wrong for any mask made of overlapping blobs: under the non-zero rule two
+reversed overlapping shapes wind back to *filled*, so the overlap would show
+the artwork through the middle of its own hole. Instead the masked run is drawn
+into a group and the mask is punched out of it with `DestOut`, which is exact
+whatever the geometry does. The group is a render target, so it is bounded by
+what the masked layers actually draw, with a margin for strokes and filters.
+
+Both cases are proved on the GPU: one test that the hole is a hole, and one
+with two overlapping shapes that the *middle* of the hole is a hole too — the
+assertion that fails for the reversed-clip implementation.
+
+**And layers can now be given a type at all.** Until this the only way to get a
+mask was to import one: `LayerKind` was in the model, in the renderer and in the
+file format, with nothing in the interface that set it. The Layers panel now has
+a type per layer with a line of explanation on each, and masking stays
+positional — set one layer to Mask or Inverse Mask, the ones under it to
+Masked, and the stack does the rest.
+
 ---
 
 ## 5. Current metrics
@@ -1605,11 +2534,11 @@ test could see:
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 084 passing, clippy clean |
+| Tests | 1 250 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
-| Format version | 11 — adds 3D rotation on objects |
+| Format version | 15 — adds the inverse mask |
 | Formats heard | `.wav`, `.mp3`, `.ogg`, `.flac`, `.m4a`, `.aac` |
 | IK budget | 50 six-bone rigs solved in parallel, well inside one frame |
 | Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |
@@ -1751,6 +2680,13 @@ test could see:
 
 ## 7. Known issues & deviations
 
+**Every iteration lands here.** This file is the project's record: each piece of
+work gets a section in §4 saying what was built and *why it was built that
+way*, and every deviation from Animate — or from what a reasonable person would
+expect — gets a numbered row below, with a status. A change that is not written
+down here has not been finished.
+
+
 | # | Item | Status |
 |---|---|---|
 | 1 | ~~**Oversized paths culled, not clipped.**~~ | ✅ **Resolved in CP-1.1** by `RenderClip` |
@@ -1812,6 +2748,70 @@ test could see:
 | 56 | **Panels are moved by menu, not by dragging them.** Animate lets you drag a panel by its title bar and drop it into a dock, with a highlight showing where it will land. Here the same moves are on each panel's own menu. The model underneath is the same; what is missing is the drag, the hit-testing of drop zones, and the preview. | Follow-up |
 | 57 | **Panels cannot be grouped into tabs.** Animate stacks several panels in one frame with tabs along the top; here they stack vertically down a side. | Follow-up |
 | 58 | **One workspace, not several.** Animate saves named workspaces and switches between them. There is one layout here, plus Reset. | Follow-up |
+| 66 | **The looping section is a deviation from Animate.** Animate's loop is a transport setting and never reaches the published file; this one is in the document and the exporter repeats it. It is off by default and a document without one exports byte-for-byte what it always did, so nothing an Animate user expects is changed by its existence. Added because "even in the final render that section keeps looping" was the request. | By design |
+| 67 | **One looping section per document, and it does not nest.** A section cannot contain another, and a layer cannot loop on its own while the rest of the timeline runs straight. Both are real requests; both need the playlist to become a tree rather than a range, and every frame lookup to go through it. | Follow-up |
+| 68 | **Sound is not repeated with the picture.** Playback seeks the audio back when the section wraps, so it stays in step, but an export writes no audio at all (§7 item 41) and nothing stretches or repeats a soundtrack to match a looped picture. Arrives with video export. | Phase 6 |
+| 69 | **A looping section is not marked on the frames themselves**, only on the ruler. Animate has no equivalent to mark, but a band across the frame grid would read better on a tall timeline where the ruler has scrolled out of sight. | Follow-up |
+| 70 | **Auto Keyframe is a deviation from Animate**, which has no such mode: you press F6 yourself, or your change reaches back to the start of the span. It is off by default and changes nothing when off. Added because it was asked for by name, and because the alternative is a surprise every time an animator edits inside a span. | By design |
+| 71 | **Auto Keyframe does not key a layer the edit does not touch.** Moving a parented limb keys the limb's layer, not the parent's; a camera move is keyed by the Camera menu as before. Animate has no equivalent to compare against. | By design |
+| 72 | **There is no arrow-key nudge.** Selected artwork is moved by dragging or by Free Transform; Animate moves it a pixel per arrow press and eight with Shift. Noticed while driving Auto Keyframe from a script. | Phase 2 follow-up |
+| 73 | **The onion markers are numbers, not brackets on the ruler.** Animate draws two draggable markers over the frame numbers and offers Onion 2/5/All from a menu; here the transport carries two counts and an All button. The model is the same range; what is missing is the drag and the drawn brackets. | Follow-up |
+| 74 | **Edit Multiple Frames does not move keyframes themselves.** It changes the artwork on every keyframe in range; Animate's mode also lets you cut and paste a whole span of frames elsewhere on the timeline. Moving frames as frames is its own feature and is not built. | Follow-up |
+| 75 | **Under Edit Multiple Frames the artwork of other keyframes draws in paint order, not in time order.** Two drawings that overlap on the stage are stacked by layer, so which one appears in front does not follow which frame it belongs to. Animate has the same behaviour. | By design |
+| 76 | **Named swatches in folders are a deviation from Animate**, whose Swatches panel is a flat grid of unnamed chips with `.clr` import. The grid is here as a view; the names and folders are additions, because a production palette is a set of decisions and a decision identified only by its hex value is picked wrongly at four in the morning. | By design |
+| 77 | **A swatch is a colour, not a style.** Changing a swatch does not repaint the artwork that used it — the colour was copied into the shape when it was drawn. Animate behaves the same way. Live colour styles would need shapes to reference the palette, which is a different model. | By design |
+| 78 | **No `.clr`, `.act` or `.ase` palette import or export.** Animate reads Flash and Photoshop palettes; nothing here does, so a palette from another tool is retyped. | Follow-up |
+| 79 | **Swatches are not draggable between folders.** A dropdown per row moves one, exactly as the Library moves a symbol, for the same reason: the drag is a piece of work in its own right. | Follow-up |
+| 80 | **The Assets panel is a deviation from Animate's**, which ships a curated set of animated characters and props and syncs with Creative Cloud Libraries. This is the same idea with none of the service: a folder on this machine, holding `.buzz` documents. Nothing is bundled, and nothing is uploaded anywhere. | By design |
+| 81 | **Assets have no thumbnails**, for the same reason the Library has none (§7 item 17): rendering a preview needs off-thread rasterisation into a cache. An asset is identified by its name and its folder. | Follow-up |
+| 82 | **A placed asset lands where it was drawn**, not under the pointer. Animate drops one at the centre of the stage or where you drag it; here the artwork keeps the coordinates it had when it was kept. Placing then dragging is one extra gesture. | Follow-up |
+| 83 | **The assets folder is not watched.** Adding a file outside the application shows up after the panel's refresh button, not immediately — a file watcher is a thread, a platform API and a class of bug for something a button does. | By design |
+| 84 | **An asset carries its sounds and lights, but not the stage.** `Scene::extract` takes the objects and the symbols they need; frame rate, stage size, camera and lighting stay with the document being placed into, which is what "place a prop" should mean. | By design |
+| 85 | **A symbol's registration point is still inert.** `Symbol.registration` is stored, saved and carried through import and duplication, but nothing edits it and the renderer does not read it — convert-to-symbol rebases the artwork so the registration sits at the origin, and after that the field does nothing. The *object* transformation point is the one that now works. | Follow-up |
+| 86 | **There is no live preview while transforming.** A rotate or skew is applied on release, as scaling always was; Animate redraws the artwork as you drag. The maths is the same either way — what is missing is drawing the in-progress transform. | Follow-up |
+| 87 | **The transform handles still hang off the bounding box.** §7 item 61 already recorded this for a tilted camera; it applies to a rotated object too, so the eight handles sit on the axis-aligned extent of a turned rectangle rather than on its corners. The transformation point itself is drawn where it really is. | Follow-up |
+| 88 | **Skew is not constrained.** Animate holds the opposite edge fixed while shearing; here the shear is about the transformation point, which is the same thing when the point is on that edge and a different thing when it is not. Shear is clamped at 20:1 so a stray drag cannot flatten artwork into a line. | By design |
+| 89 | **Two themes, not a theme editor.** Animate's Preferences offer four interface brightnesses and a separate stage colour; here there is Dark and Light, and the stage colour is the document's own. | By design |
+| 90 | **The theme is a process-wide atomic**, not a value carried through the drawing code. One window, one UI thread; a second window in one process would share the setting. | By design |
+| 91 | **Artwork colours are untouched by the theme**, including onion-skin ghosts and light gizmos, which are drawn in ink against the stage rather than against the chrome. A very dark drawing on a dark stage is as hard to see in either theme — that is the document's business. | By design |
+| 92 | **Shape recognition happens on command, not as you draw.** Animate also recognises a shape the moment the pencil is released, controlled by a Preferences setting per shape kind. Here it is Straighten and Recognise Shape. Recognising as you draw needs the setting, and the decision that a stroke has *ended*, which the brush's smoothing pipeline does not currently expose. | Follow-up |
+| 93 | **Triangles and polygons are not recognised**, and neither is Animate's "connect lines" — two strokes that nearly meet stay two strokes. Circles, ovals, squares, rectangles at any angle, and lines are what an animator draws roughly and wants tidied. | By design |
+| 94 | **A recognised shape replaces the path, not the object.** Fill, stroke, filters, blend and the transformation point are all kept; what changes is the geometry. An open stroke recognised as a line therefore stays a stroke rather than becoming a line *object*. | By design |
+| 95 | **The stage zoom control does not follow the panel layout.** It is an overlay pinned to the stage's top-right corner and cannot be docked, moved or hidden, unlike every panel. It is chrome for the stage, in the way the rulers are. | By design |
+| 96 | **The New Document dialog is not Animate's.** Animate offers document *types* (ActionScript, HTML5 Canvas, WebGL, AIR) with platform-specific defaults; there is one kind of document here, so the dialog asks the three things that actually differ. | By design |
+| 97 | **A new document does not warn about unsaved changes.** File ▸ New replaces what is on screen once the dialog is answered; there is no "save first?" prompt, here or on Open. It is the same gap in both, and needs a modal the shell does not have yet. | Follow-up |
+| 98 | **The remembered setup is per machine, not per project.** A folder of documents at one size and another folder at a different one still share the one default. | By design |
+| 99 | **A hard kill is covered by the pause, not by the panic hook.** `TerminateProcess`, a power cut or an OOM kill run none of our code; what is on disk is whatever the last pause wrote, so at most a few seconds of continuous drawing is at risk. The panic hook covers the crashes a Rust program actually has. | By design |
+| 100 | **Recovery is per directory, not per document.** The prompt scans the application's recovery directory and the last eight directories documents were opened from or saved to. Work saved somewhere else, on a machine that has since forgotten that folder, is not offered — the file is still there, under `…recovery.buzz`, beside the document. | By design |
+| 101 | **There is no autosave interval setting.** Animate's Preferences offer one; here it is two minutes, or five seconds of not drawing, and neither is exposed. The writes are small and off-thread, so the cost of the aggressive setting is not worth a control. | By design |
+| 102 | **A recovered document does not remember what it was.** It opens untitled, so Save asks where to put it; the original document, if there was one, is untouched on disk. Animate reopens the recovery in place of the document. Deliberate: the recovery is evidence of a crash, not a file the user chose to keep. | By design |
+| 103 | **The application icon is a character from another production**, lettered BA. It was replaced with an abstract program mark and then put back on the studio's instruction: whose program this is *is* the point, and the mark it shares with the show is the point of the mark. Noted rather than open — a deliberate choice, not an oversight. | By design |
+| 103a | **BA is unreadable below about 24 pixels when it is under the head.** The 16-pixel drawing drops the head and keeps the letters, so the two sizes of this icon are not the same picture. Deliberate, and the alternative — one picture, illegible at the small end — is worse. | By design |
+| 104 | **The `.ico` is written by hand rather than by a tool.** `System.Drawing` only makes single-size icons, so the PNG sizes are packed into the ICO container directly. It is the documented format and every size opens correctly; it is worth knowing it is not the output of an icon editor. | By design |
+| 105 | **The brand band is three points tall and not configurable.** It sits under the title bar, above the menu, drawn in a foreground layer over everything. Thicker read as decoration; thinner disappeared. | By design |
+| 106 | **The launcher is Windows only.** `BuzzAnimate.bat` and the shortcut maker are batch files; on other platforms it is `cargo run --release -p buzz-app`, which the README gives. | Follow-up |
+| 107 | **An opened `.fla` becomes an untitled document.** Animate reopens its own file in place; here the translation opens unsaved, so Save asks where to put it. Writing `.fla` back is not possible — this program cannot produce one — and quietly holding the path would invite an overwrite that destroyed the original. | By design |
+| 108 | **The stage scrollbars have no arrow buttons and do not page.** Dragging the thumb and clicking the track both move the view; clicking beside the thumb jumps there rather than stepping a page. | By design |
+| 109 | **The scrollable extent is recomputed every frame** from the artwork on the current frame. It is a bounding-box union over the visible objects, which is cheap at the scale documents reach here and would want caching at a hundred thousand objects. | Follow-up |
+| 110 | **The docks resize from our own splitters, not egui's.** `Panel::resizable` is off and the size comes from the workspace, so a panel cannot be resized by any means egui offers — including double-clicking an edge to collapse it, which egui's own handle supports and this does not. | By design |
+| 111 | **The document's length is one number for every layer.** Animate has no global length either — the film is as long as its longest layer — so setting it extends the short layers and trims the long ones. A layer that was deliberately shorter than the rest loses that difference when the length is set. | By design |
+| 112 | **The tool strip flows by width, not by a column count.** There is no "one column / two columns" setting: it fits what it can, which is what makes dragging the dock's edge do something useful. | By design |
+| 113 | **The frame clipboard is one frame, not a span.** Animate's Cut/Copy/Paste Frames work on a *selected range* of frames; the timeline here has no span selection, so these act on the frame the playhead is on. The commands and their keys match Animate; the scope does not. | Follow-up |
+| 114 | **Reverse Frames reverses the whole layer.** Animate reverses the selected span; with no span selection, this reverses every keyframe on the active layer. | Follow-up |
+| 115 | **An imported Animate asset is a document, not an Animate asset.** The manifest's keywords, category and Animate's own thumbnails are not carried across — what arrives is the artwork, filed by role and subcategory. Searching by keyword is Animate's; searching by name is ours. | By design |
+| 116 | **Bitmap assets do not come across at all.** They are counted and reported as skipped. This is §7 item 22 — no reader here imports bitmaps — and it is the one thing that stops an Animate library arriving whole. | Blocked on §7 item 22 |
+| 117 | **The imported camera is linear between keys.** Animate eases its camera with the same tween controls it gives artwork; ours interpolates straight from key to key, so an eased camera move arrives with even timing. The positions and zooms are exact. | Follow-up |
+| 118 | **A damaged symbol is truncated, not repaired.** When Animate has written malformed XML, everything before the damage is kept and everything after it is lost — the reader cannot know what the rest was meant to say. It is named in the report so the symbol can be re-saved from Animate. | By design |
+| 119 | **The inverse mask is ours, not Animate's.** A `.fla` has no way to express it, so a document using one exports and saves correctly here and cannot be round-tripped through Animate. Format version 15 records it. | By design |
+| 120 | **An inverse mask is bounded by what it hides.** The group is a render target, sized to the masked layers' artwork plus a margin; artwork that reaches further than that margin — a very wide blur under an inverse mask — would be clipped at the edge of the group. | Follow-up |
+| 121 | **The timeline's zoom is not Animate's menu.** Animate offers Tiny/Small/Normal/Medium/Large and Short/Normal/Tall; these are two sliders over the same ranges. The names are gone; the sizes are continuous. | By design |
+| 121a | **The `.swf` road in is far behind the `.fla` one.** A published SWF carries geometry Animate has already resolved, and the reader is Ruffle's — so it should be the easier path. It is not yet: a sample SWF imports its instances and draws nothing, because the SWF importer stopped at Phase 5 and the XFL one has had a rewrite since. Worth finishing, and not worth recommending today. | Follow-up |
+| 122 | ~~**Long thin strays cross some imported frames.**~~ | ✅ **Fixed** — they were unsigned hex coordinates: one point per shape at eight hundred thousand pixels, drawing a spike from the artwork to it. Signed now, and the strays and the stretched limbs went together. |
+| 123 | **A rig is baked, not linked.** The parent's rest pose is multiplied into the child at import, so editing the parent's *rest* pose afterwards moves the parent alone. Animate keeps the relationship live. The rig animates correctly; it is re-rigging that would need the link. | By design |
+| 124 | **`rigPropagationMatrix` is ignored.** Animate stores how much of a parent's transform reaches each child; here all of it does. A rig that leans on partial propagation will arrive stiffer than it was. | Follow-up |
+| 125 | **A graphic's loop is resolved from its layer's keyframe**, not from when the instance itself appeared. They differ when a keyframe holds several instances placed at different times — rare, and the pose is then one cycle out. | Follow-up |
+| 126 | **The transformation point can be moved with the Selection tools, which Animate does not allow.** Animate reserves it for Free Transform (Q). Here a *drag* that starts on the circle moves it from the Selection and Subselection tools as well; a click still selects. A deviation, on the grounds that changing tools to move a pivot and changing back is a step for nothing. | By design |
+| 127 | **Edit in place does not move the symbol under its instance.** Animate draws the opened symbol where the instance sits; here it is drawn at the symbol's own origin with the scene paled behind. The context is right, the registration is not. | Follow-up |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |

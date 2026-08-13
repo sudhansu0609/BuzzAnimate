@@ -12,7 +12,7 @@
 //! | Hollow rectangle | Last frame of a span |
 //! | Empty cell | The layer does not reach here |
 
-use buzz_scene::{FrameKind, LayerId, LayerKind, Scene};
+use buzz_scene::{FrameKind, LayerId, LayerKind, LoopRegion, MAX_REPEATS, Scene};
 use egui::{Align2, Color32, FontId, Sense, Stroke, StrokeKind, Ui};
 
 use crate::theme::{Metrics, Palette};
@@ -33,9 +33,30 @@ pub struct TimelineResponse {
     pub tween: Option<TweenRequest>,
     pub toggle_play: bool,
     pub toggle_onion: bool,
+    pub toggle_auto_keyframe: bool,
+    pub toggle_edit_multiple: bool,
+    /// The onion markers were changed: frames before, frames after.
+    pub set_onion_range: Option<(u32, u32)>,
     pub go_to_start: bool,
     pub go_to_end: bool,
     pub step: i64,
+    /// The looping section was changed. Carries the whole region rather than a
+    /// delta, so one undo step covers whatever the user just did to it.
+    pub set_loop: Option<LoopRegion>,
+    /// The document was made longer or shorter, in frames.
+    pub set_frame_count: Option<u32>,
+    /// A command raised by the timeline's own buttons — the layer tools under
+    /// the layer names. Carried as a command so it runs through the same path
+    /// as the menu item and the shortcut, undo included.
+    pub command: Option<crate::Command>,
+    /// The frame cells were made wider or narrower.
+    ///
+    /// Not undoable, and deliberately: how big the timeline is drawn is not a
+    /// change to the film, and having it in the undo history would mean Ctrl+Z
+    /// after a zoom undid the zoom rather than the last edit.
+    pub set_frame_width: Option<f32>,
+    /// The rows were made taller or shorter.
+    pub set_row_scale: Option<f32>,
 }
 
 /// Frame operations, matching Animate's shortcuts.
@@ -108,6 +129,19 @@ pub struct TimelineState {
     pub camera_selected: bool,
     pub playing: bool,
     pub onion_enabled: bool,
+    /// Auto Keyframe: changing artwork at a frame with no keyframe of its own
+    /// makes one first.
+    pub auto_keyframe: bool,
+    /// Edit Multiple Frames: every keyframe in the onion range is editable.
+    pub edit_multiple: bool,
+    /// The onion markers: frames covered before and after the playhead. Shared
+    /// by onion skinning and Edit Multiple Frames, as in Animate.
+    pub onion_before: u32,
+    pub onion_after: u32,
+    /// How wide one frame cell is drawn, and how tall a row is relative to the
+    /// standard one. Both come from the workspace, so they survive a restart.
+    pub frame_width: f32,
+    pub row_scale: f32,
     /// Loudness per frame for each layer carrying a sound, so the timeline can
     /// draw the waveform where the sound actually sits.
     ///
@@ -141,11 +175,27 @@ pub fn timeline_panel(ui: &mut Ui, scene: &Scene, state: &TimelineState) -> Time
     // by clicking, as in Animate.
     let columns = (frame_count + 40).min(9_999);
 
+    // Animate keeps New Layer, New Folder and Delete under the layer names, at
+    // the bottom left of the timeline, and that is where the hand goes looking
+    // for them. Claimed before the grid so the grid takes what is left:
+    // reserving it afterwards would leave the strip fighting the scroll area
+    // for the last row of pixels.
+    egui::Panel::bottom("timeline-layer-tools")
+        .resizable(false)
+        .show(ui, |ui| layer_tools(ui, scene, state, &mut response));
+
     egui::ScrollArea::both()
         .id_salt("timeline-grid")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ruler(ui, columns, state, &mut response);
+            // **No gaps between the rows.** egui puts its standard item spacing
+            // between anything laid out one after another, which here was a
+            // stripe of panel background between every layer — Animate's rows
+            // touch, and the space was costing a row of layers for every three
+            // shown. The cells' own outlines are what separate them.
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+
+            ruler(ui, columns, *scene.looping(), state, &mut response);
 
             // The camera sits above every layer, as it does in Animate.
             if scene.camera().enabled {
@@ -164,9 +214,131 @@ pub fn timeline_panel(ui: &mut Ui, scene: &Scene, state: &TimelineState) -> Time
     response
 }
 
+/// New Layer, New Folder and Delete, under the layer names.
+///
+/// The same three commands the Insert menu and the Layers panel raise — the
+/// buttons are a third door onto one room, not a third implementation. Delete
+/// is disabled at one layer, because a document with no layers is not a state
+/// Animate lets you reach and not one worth supporting here.
+fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut TimelineResponse) {
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        if ui
+            .small_button("➕")
+            .on_hover_text(crate::Command::NewLayer.label())
+            .clicked()
+        {
+            out.command = Some(crate::Command::NewLayer);
+        }
+        if ui
+            .small_button("Fld")
+            .on_hover_text(crate::Command::NewLayerFolder.label())
+            .clicked()
+        {
+            out.command = Some(crate::Command::NewLayerFolder);
+        }
+
+        let can_delete = scene.layers().len() > 1 && state.active_layer.is_some();
+        if ui
+            .add_enabled(can_delete, egui::Button::new("🗑").small())
+            .on_hover_text(crate::Command::DeleteLayer.label())
+            .on_disabled_hover_text(if state.active_layer.is_some() {
+                "The last layer cannot be deleted"
+            } else {
+                "Select a layer first"
+            })
+            .clicked()
+        {
+            out.command = Some(crate::Command::DeleteLayer);
+        }
+
+        // How many, on the same line: the count is the one thing about the
+        // layer stack that is not visible when the list is scrolled.
+        ui.label(
+            egui::RichText::new(format!("{} layers", scene.layers().len()))
+                .small()
+                .weak(),
+        );
+
+        // **The two zooms.** Animate has a Tiny-to-Large menu for the frames
+        // and a Short/Normal/Tall one for the rows; these are the same two
+        // things as sliders, because the useful size depends on the film. A
+        // four-thousand-frame timeline wants narrow cells and a twelve-frame
+        // cycle wants wide ones, and neither is a setting anybody sets once.
+        ui.separator();
+        let mut width = state.frame_width;
+        let mut rows = state.row_scale;
+
+        // **The numbers are shown.** A bare slider says a size can be changed
+        // and not what it currently is, which is the one thing somebody
+        // matching two documents needs.
+        ui.label(egui::RichText::new("frame width").small().weak());
+        if ui
+            .add(
+                egui::Slider::new(&mut width, crate::workspace::FRAME_WIDTH_RANGE)
+                    .suffix(" px")
+                    .fixed_decimals(0)
+                    .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.5 }),
+            )
+            .on_hover_text("How wide one frame is drawn")
+            .changed()
+        {
+            out.set_frame_width = Some(width);
+        }
+
+        ui.label(egui::RichText::new("row height").small().weak());
+        if ui
+            .add(
+                egui::Slider::new(&mut rows, crate::workspace::ROW_SCALE_RANGE)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                    .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.5 }),
+            )
+            .on_hover_text("How tall each layer's row is")
+            .changed()
+        {
+            out.set_row_scale = Some(rows);
+        }
+
+        if ui
+            .small_button("Reset")
+            .on_hover_text("Back to the standard frame and row size")
+            .clicked()
+        {
+            out.set_frame_width = Some(Metrics::FRAME_WIDTH);
+            out.set_row_scale = Some(1.0);
+        }
+    });
+}
+
 /// Playback controls and readouts.
 fn transport(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut TimelineResponse) {
+    // **Centred, and centred a frame late.** egui lays widgets out as it draws
+    // them, so the row's width is not known until it has been drawn; the width
+    // from the previous frame decides the leading space. The row's contents
+    // change rarely — and when they do, by one button — so the correction
+    // lands within a frame and is not visible.
+    let id = ui.id().with("transport-width");
+    let previous: f32 = ui.memory(|m| m.data.get_temp(id)).unwrap_or(0.0);
+    let leading = ((ui.available_width() - previous) * 0.5).max(0.0);
+
     ui.horizontal(|ui| {
+        ui.add_space(leading);
+        let start = ui.cursor().min.x;
+        transport_controls(ui, scene, state, out);
+        let width = ui.cursor().min.x - start;
+        if width > 0.0 {
+            ui.memory_mut(|m| m.data.insert_temp(id, width));
+        }
+    });
+}
+
+fn transport_controls(
+    ui: &mut Ui,
+    scene: &Scene,
+    state: &TimelineState,
+    out: &mut TimelineResponse,
+) {
+    {
         if ui.button("|<").on_hover_text("Go to first frame").clicked() {
             out.go_to_start = true;
         }
@@ -198,11 +370,86 @@ fn transport(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Timeli
             out.toggle_onion = true;
         }
 
+        if ui
+            .selectable_label(state.auto_keyframe, "Auto Key")
+            .on_hover_text(
+                "Auto Keyframe \u{2014} changing anything at a frame that is not a \
+                 keyframe makes one first, so the change starts here rather than \
+                 reaching back to the start of the span",
+            )
+            .clicked()
+        {
+            out.toggle_auto_keyframe = true;
+        }
+
+        if ui
+            .selectable_label(state.edit_multiple, "Edit Multiple")
+            .on_hover_text(
+                "Edit Multiple Frames \u{2014} every keyframe inside the onion markers \
+                 is drawn solid, can be clicked, and moves together",
+            )
+            .clicked()
+        {
+            out.toggle_edit_multiple = true;
+        }
+
+        // The onion markers, which both modes above read. Animate draws them as
+        // brackets on the ruler and lets you drag them; here they are two
+        // numbers, shown only when something is actually using them so the
+        // transport does not carry controls for a mode that is off.
+        if state.onion_enabled || state.edit_multiple {
+            let mut before = state.onion_before;
+            let mut after = state.onion_after;
+            let frames = scene.frame_count().max(1);
+
+            ui.label(egui::RichText::new("markers").small().weak());
+            ui.add(
+                egui::DragValue::new(&mut before)
+                    .range(0..=frames)
+                    .speed(0.2),
+            )
+            .on_hover_text("Frames covered before the playhead");
+            ui.add(egui::DragValue::new(&mut after).range(0..=frames).speed(0.2))
+                .on_hover_text("Frames covered after it");
+            if ui
+                .small_button("All")
+                .on_hover_text("Cover the whole timeline \u{2014} Animate's Onion All")
+                .clicked()
+            {
+                before = frames;
+                after = frames;
+            }
+
+            if (before, after) != (state.onion_before, state.onion_after) {
+                out.set_onion_range = Some((before, after));
+            }
+        }
+
+        loop_controls(ui, scene, out);
+
         ui.separator();
 
         let fps = scene.stage().frame_rate.max(0.01);
         let elapsed = state.current_frame as f64 / fps;
         ui.label(format!("Frame {}", state.current_frame + 1));
+
+        // **How long the film is.** F5 and Shift+F5 add and remove a frame on
+        // one layer at a time, which is the right tool inside a scene and a
+        // poor one for "make this shot four seconds". This is the length
+        // itself: dragging it extends every layer, or trims them.
+        ui.label(egui::RichText::new("of").small().weak());
+        let mut frames = scene.frame_count().max(1);
+        if ui
+            .add(
+                egui::DragValue::new(&mut frames)
+                    .range(1..=16_000)
+                    .speed(0.25),
+            )
+            .on_hover_text("How many frames the document is \u{2014} every layer follows")
+            .changed()
+        {
+            out.set_frame_count = Some(frames);
+        }
         ui.label(
             egui::RichText::new(format!(
                 "{:.0} fps · {elapsed:.2} s of {:.2} s",
@@ -213,71 +460,208 @@ fn transport(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Timeli
             .weak(),
         );
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            for action in [
-                FrameAction::InsertKeyframe,
-                FrameAction::InsertBlankKeyframe,
-                FrameAction::InsertFrame,
-            ] {
-                if ui
-                    .small_button(action.shortcut_text())
-                    .on_hover_text(action.label())
-                    .clicked()
-                {
-                    out.action = Some(action);
-                }
+        // In the row rather than pinned to the right edge: a right-aligned
+        // group takes all the width that is left, which would leave nothing to
+        // centre the row within.
+        ui.separator();
+        for action in [
+            FrameAction::InsertFrame,
+            FrameAction::InsertKeyframe,
+            FrameAction::InsertBlankKeyframe,
+        ] {
+            if ui
+                .small_button(action.shortcut_text())
+                .on_hover_text(action.label())
+                .clicked()
+            {
+                out.action = Some(action);
             }
-        });
-    });
+        }
+    }
+}
+
+/// The looping section's controls.
+///
+/// Animate's loop is a preview toggle. This one is part of the document and
+/// the export repeats it, so the count is here beside the range: what the
+/// numbers say is what the finished film will contain, and the readout says so
+/// in frames rather than leaving it to be worked out.
+fn loop_controls(ui: &mut Ui, scene: &Scene, out: &mut TimelineResponse) {
+    ui.separator();
+
+    let region = *scene.looping();
+    let mut edited = region;
+
+    if ui
+        .selectable_label(region.enabled, "Loop")
+        .on_hover_text("Repeat a section — in playback and in the export")
+        .clicked()
+    {
+        edited.enabled = !region.enabled;
+        // Switching it on with nothing set would loop a single frame, which
+        // reads as a bug. Default to the whole timeline, which is at least
+        // what "loop" plainly means.
+        if edited.enabled && edited.end <= edited.start {
+            edited.start = 0;
+            edited.end = scene.frame_count().saturating_sub(1);
+        }
+    }
+
+    if region.enabled {
+        // Shown one-based, like every other frame number in the timeline.
+        let mut first = region.start + 1;
+        let mut last = region.end + 1;
+        let mut repeats = region.repeats;
+        let frames = scene.frame_count().max(1);
+
+        ui.label(egui::RichText::new("from").small().weak());
+        ui.add(
+            egui::DragValue::new(&mut first)
+                .range(1..=frames)
+                .speed(0.2),
+        )
+        .on_hover_text("First frame of the section");
+        ui.label(egui::RichText::new("to").small().weak());
+        ui.add(egui::DragValue::new(&mut last).range(1..=frames).speed(0.2))
+            .on_hover_text("Last frame, inclusive");
+        ui.label(egui::RichText::new("\u{00D7}").small().weak());
+        ui.add(
+            egui::DragValue::new(&mut repeats)
+                .range(1..=MAX_REPEATS)
+                .speed(0.1),
+        )
+        .on_hover_text("How many times it plays in total");
+
+        edited.start = first.saturating_sub(1);
+        edited.end = last.saturating_sub(1);
+        edited.repeats = repeats;
+
+        let length = edited.clamped(frames).rendered_length(frames);
+        ui.label(
+            egui::RichText::new(format!("film {length}"))
+                .small()
+                .weak(),
+        )
+        .on_hover_text("Length of the exported film, in frames");
+    }
+
+    if edited != region {
+        out.set_loop = Some(edited.clamped(scene.frame_count().max(1)));
+    }
 }
 
 /// The frame-number strip, which also scrubs.
-fn ruler(ui: &mut Ui, columns: u32, state: &TimelineState, out: &mut TimelineResponse) {
-    let width = columns as f32 * Metrics::FRAME_WIDTH;
+fn ruler(
+    ui: &mut Ui,
+    columns: u32,
+    region: LoopRegion,
+    state: &TimelineState,
+    out: &mut TimelineResponse,
+) {
+    let cell_width = state.frame_width;
+    let width = columns as f32 * cell_width;
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(LAYER_COLUMN + width, 16.0),
         Sense::click_and_drag(),
     );
     let painter = ui.painter_at(rect);
 
-    painter.rect_filled(rect, 0.0, Palette::RULER_BG);
+    painter.rect_filled(rect, 0.0, Palette::ruler_bg());
 
     let grid_left = rect.min.x + LAYER_COLUMN;
     let font = FontId::proportional(9.0);
 
-    // Label every fifth frame, as Animate does.
-    for frame in (0..columns).step_by(5) {
-        let x = grid_left + frame as f32 * Metrics::FRAME_WIDTH;
+    // Label every fifth frame, as Animate does — or every tenth, or every
+    // twentieth, once the cells are too narrow for the numbers to fit beside
+    // each other. A ruler whose labels overlap is worse than one with fewer.
+    let step = if cell_width >= 12.0 {
+        5
+    } else if cell_width >= 7.0 {
+        10
+    } else {
+        20
+    };
+    for frame in (0..columns).step_by(step) {
+        let x = grid_left + frame as f32 * cell_width;
         painter.text(
             egui::pos2(x + 1.0, rect.min.y + 2.0),
             Align2::LEFT_TOP,
             format!("{}", frame + 1),
             font.clone(),
-            Palette::RULER_TEXT,
+            Palette::ruler_text(),
         );
     }
 
-    draw_playhead(&painter, rect, grid_left, state.current_frame);
+    draw_loop_band(&painter, rect, grid_left, columns, region, cell_width);
+    draw_playhead(&painter, rect, grid_left, state.current_frame, cell_width);
 
     // Dragging along the ruler scrubs.
     if (response.clicked() || response.dragged())
         && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
         && pos.x >= grid_left
     {
-        let frame = ((pos.x - grid_left) / Metrics::FRAME_WIDTH)
-            .floor()
-            .max(0.0) as u32;
+        let frame = ((pos.x - grid_left) / cell_width).floor().max(0.0) as u32;
         out.scrub_to = Some(frame.min(columns.saturating_sub(1)));
     }
 }
 
-fn draw_playhead(painter: &egui::Painter, rect: egui::Rect, grid_left: f32, frame: u32) {
-    let x = grid_left + frame as f32 * Metrics::FRAME_WIDTH;
+/// The looping section, marked along the ruler.
+///
+/// A bar under the numbers with a tick at each end — enough to see at a glance
+/// which frames repeat, without covering the numbers themselves or competing
+/// with the playhead, which stays the brightest thing on the strip.
+fn draw_loop_band(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    grid_left: f32,
+    columns: u32,
+    region: LoopRegion,
+    cell_width: f32,
+) {
+    if !region.enabled || region.end < region.start {
+        return;
+    }
+    let last = region.end.min(columns.saturating_sub(1));
+    let left = grid_left + region.start as f32 * cell_width;
+    let right = grid_left + (last + 1) as f32 * cell_width;
+    let band = egui::Rect::from_min_max(
+        egui::pos2(left, rect.max.y - 3.0),
+        egui::pos2(right.max(left + 2.0), rect.max.y),
+    );
+
+    // Dimmed when the region would do nothing, so "on, but ×1" is visibly not
+    // the same as a section that really repeats.
+    let color = if region.is_active() {
+        Color32::from_rgb(0xE0, 0x9B, 0x3A)
+    } else {
+        Color32::from_rgb(0x7A, 0x63, 0x3C)
+    };
+    painter.rect_filled(band, 0.0, color);
+    for x in [left, right] {
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x - 1.0, rect.min.y + 2.0),
+                egui::pos2(x + 1.0, rect.max.y),
+            ),
+            0.0,
+            color,
+        );
+    }
+}
+
+fn draw_playhead(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    grid_left: f32,
+    frame: u32,
+    cell_width: f32,
+) {
+    let x = grid_left + frame as f32 * cell_width;
     let head = egui::Rect::from_min_size(
         egui::pos2(x, rect.min.y),
-        egui::vec2(Metrics::FRAME_WIDTH, rect.height()),
+        egui::vec2(cell_width, rect.height()),
     );
-    painter.rect_filled(head, 0.0, Palette::SELECTION);
+    painter.rect_filled(head, 0.0, Palette::selection());
 }
 
 /// The camera's row, above every layer.
@@ -298,14 +682,15 @@ fn camera_row(
     state: &TimelineState,
     out: &mut TimelineResponse,
 ) {
-    let height = Metrics::LAYER_ROW;
-    let width = columns as f32 * Metrics::FRAME_WIDTH;
+    let height = Metrics::LAYER_ROW * state.row_scale;
+    let cell_width = state.frame_width;
+    let width = columns as f32 * cell_width;
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(LAYER_COLUMN + width, height), Sense::click());
     let painter = ui.painter_at(rect);
 
     if state.camera_selected {
-        painter.rect_filled(rect, 0.0, Palette::RAISED);
+        painter.rect_filled(rect, 0.0, Palette::raised());
     }
 
     painter.text(
@@ -313,7 +698,7 @@ fn camera_row(
         Align2::LEFT_CENTER,
         "Camera",
         FontId::proportional(11.0),
-        Palette::TEXT,
+        Palette::text(),
     );
 
     let camera = scene.camera();
@@ -322,10 +707,10 @@ fn camera_row(
     let tint = Color32::from_rgb(0x3A, 0x4A, 0x60);
 
     for frame in 0..columns {
-        let x = grid_left + frame as f32 * Metrics::FRAME_WIDTH;
+        let x = grid_left + frame as f32 * cell_width;
         let cell = egui::Rect::from_min_size(
             egui::pos2(x, rect.min.y),
-            egui::vec2(Metrics::FRAME_WIDTH, height),
+            egui::vec2(cell_width, height),
         );
 
         let kind = if camera.has_key_at(frame) {
@@ -353,7 +738,7 @@ fn camera_row(
         if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
             && pos.x > grid_left
         {
-            let frame = ((pos.x - grid_left) / Metrics::FRAME_WIDTH) as u32;
+            let frame = ((pos.x - grid_left) / cell_width) as u32;
             out.scrub_to = Some(frame.min(columns.saturating_sub(1)));
         }
     }
@@ -367,8 +752,10 @@ fn layer_row(
     state: &TimelineState,
     out: &mut TimelineResponse,
 ) {
-    let height = Metrics::LAYER_ROW * (layer.height.percent() as f32 / 100.0);
-    let width = columns as f32 * Metrics::FRAME_WIDTH;
+    let height =
+        Metrics::LAYER_ROW * state.row_scale * (layer.height.percent() as f32 / 100.0);
+    let cell_width = state.frame_width;
+    let width = columns as f32 * cell_width;
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(LAYER_COLUMN + width, height),
         Sense::click_and_drag(),
@@ -377,7 +764,7 @@ fn layer_row(
 
     let active = state.active_layer == Some(layer.id);
     if active {
-        painter.rect_filled(rect, 0.0, Palette::RAISED);
+        painter.rect_filled(rect, 0.0, Palette::raised());
     }
 
     // -- name column ------------------------------------------------------
@@ -385,6 +772,7 @@ fn layer_row(
     let mark = match layer.kind {
         LayerKind::Folder => "F ",
         LayerKind::Mask => "M ",
+        LayerKind::InverseMask => "iM ",
         LayerKind::Guide => "G ",
         LayerKind::Masked | LayerKind::Guided => ". ",
         LayerKind::Normal => "",
@@ -395,9 +783,9 @@ fn layer_row(
         format!("{mark}{}", layer.name),
         FontId::proportional(11.0),
         if layer.visible {
-            Palette::TEXT
+            Palette::text()
         } else {
-            Palette::TEXT_DIM
+            Palette::text_dim()
         },
     );
 
@@ -414,10 +802,10 @@ fn layer_row(
     let length = layer.length();
 
     for frame in 0..columns {
-        let x = grid_left + frame as f32 * Metrics::FRAME_WIDTH;
+        let x = grid_left + frame as f32 * cell_width;
         let cell = egui::Rect::from_min_size(
             egui::pos2(x, rect.min.y),
-            egui::vec2(Metrics::FRAME_WIDTH, height),
+            egui::vec2(cell_width, height),
         );
         draw_frame_cell(
             &painter,
@@ -436,15 +824,13 @@ fn layer_row(
     // invisible: every cell paints its own background, so the envelope was
     // covered by the very frames it describes.
     if let Some(waveform) = state.waveforms.get(&layer.id) {
-        draw_waveform(&painter, waveform, grid_left, rect, height, columns);
+        draw_waveform(&painter, waveform, grid_left, rect, height, columns, cell_width);
     }
 
     let clicked_frame = |ui: &Ui| -> Option<u32> {
         let pos = ui.ctx().input(|i| i.pointer.interact_pos())?;
         (pos.x >= grid_left).then(|| {
-            let frame = ((pos.x - grid_left) / Metrics::FRAME_WIDTH)
-                .floor()
-                .max(0.0) as u32;
+            let frame = ((pos.x - grid_left) / cell_width).floor().max(0.0) as u32;
             frame.min(columns.saturating_sub(1))
         })
     };
@@ -540,6 +926,7 @@ fn draw_waveform(
     row: egui::Rect,
     height: f32,
     columns: u32,
+    cell_width: f32,
 ) {
     let middle = row.center().y;
     let half = (height * 0.5 - 2.0).max(1.0);
@@ -550,12 +937,12 @@ fn draw_waveform(
         if frame >= columns {
             break;
         }
-        let x = grid_left + frame as f32 * Metrics::FRAME_WIDTH;
+        let x = grid_left + frame as f32 * cell_width;
         let amplitude = (level.clamp(0.0, 1.0) * half).max(0.5);
         painter.rect_filled(
             egui::Rect::from_min_max(
                 egui::pos2(x + 0.5, middle - amplitude),
-                egui::pos2(x + Metrics::FRAME_WIDTH - 0.5, middle + amplitude),
+                egui::pos2(x + cell_width - 0.5, middle + amplitude),
             ),
             0.0,
             colour,
@@ -571,19 +958,34 @@ fn draw_frame_cell(
     tween: Option<TweenCell>,
     playhead: bool,
 ) {
-    let grid = Stroke::new(1.0, Palette::BORDER);
-
     // Occupied frames get a lighter background than empty ones — unless a
     // tween covers them, in which case Animate tints the whole span in the
     // tween's colour, which is how you tell the three kinds apart at a glance.
     let background = match (kind, tween) {
-        (FrameKind::Empty, _) => Palette::PANEL,
+        (FrameKind::Empty, _) => Palette::panel(),
         (_, Some(t)) => t.tint,
-        (FrameKind::BlankKeyframe, None) => Palette::PANEL,
+        (FrameKind::BlankKeyframe, None) => Palette::panel(),
         _ => Color32::from_rgb(0x44, 0x4A, 0x52),
     };
     painter.rect_filled(cell, 0.0, background);
-    painter.rect_stroke(cell, 0.0, grid, StrokeKind::Inside);
+
+    // **Ruled, not boxed.** A full rectangle round every cell draws each line
+    // twice — once as one cell's right edge and again as its neighbour's left
+    // — and at twelve pixels a cell that doubled ink was most of what the
+    // timeline showed: rows looked separated by a gap they did not have, and
+    // the frames themselves were hard to count. One hairline down the right
+    // and one along the bottom is Animate's grid, and it is half the ink.
+    let rule = Palette::border();
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(cell.max.x - 1.0, cell.min.y), cell.max),
+        0.0,
+        rule,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(cell.min.x, cell.max.y - 1.0), cell.max),
+        0.0,
+        rule,
+    );
 
     if let Some(t) = tween {
         draw_tween_mark(painter, cell, t);
@@ -596,14 +998,14 @@ fn draw_frame_cell(
         FrameKind::Empty => {}
         FrameKind::Keyframe => {
             // Filled circle: a keyframe with artwork.
-            painter.circle_filled(egui::pos2(centre.x, cell.max.y - 5.0), dot, Palette::TEXT);
+            painter.circle_filled(egui::pos2(centre.x, cell.max.y - 5.0), dot, Palette::text());
         }
         FrameKind::BlankKeyframe => {
             // Hollow circle: a keyframe that deliberately shows nothing.
             painter.circle_stroke(
                 egui::pos2(centre.x, cell.max.y - 5.0),
                 dot,
-                Stroke::new(1.0, Palette::TEXT_DIM),
+                Stroke::new(1.0, Palette::text_dim()),
             );
         }
         FrameKind::Span => {}
@@ -616,7 +1018,7 @@ fn draw_frame_cell(
             painter.rect_stroke(
                 end,
                 0.0,
-                Stroke::new(1.0, Palette::TEXT_DIM),
+                Stroke::new(1.0, Palette::text_dim()),
                 StrokeKind::Inside,
             );
         }
@@ -626,7 +1028,7 @@ fn draw_frame_cell(
         painter.rect_stroke(
             cell,
             0.0,
-            Stroke::new(1.0, Palette::SELECTION),
+            Stroke::new(1.0, Palette::selection()),
             StrokeKind::Inside,
         );
     }
@@ -636,7 +1038,7 @@ fn draw_frame_cell(
 /// tween runs between two keyframes, dashed when it has nowhere to go.
 fn draw_tween_mark(painter: &egui::Painter, cell: egui::Rect, tween: TweenCell) {
     let y = cell.center().y;
-    let stroke = Stroke::new(1.0, Palette::TEXT);
+    let stroke = Stroke::new(1.0, Palette::text());
 
     if tween.complete {
         painter.line_segment(
@@ -662,7 +1064,7 @@ fn draw_tween_mark(painter: &egui::Painter, cell: egui::Rect, tween: TweenCell) 
                 egui::pos2(tip.x - back, y - 3.0),
                 egui::pos2(tip.x - back, y + 3.0),
             ],
-            Palette::TEXT,
+            Palette::text(),
             Stroke::NONE,
         ));
     }
@@ -700,6 +1102,12 @@ mod tests {
             camera_selected: false,
             playing: false,
             onion_enabled: false,
+            auto_keyframe: false,
+            edit_multiple: false,
+            onion_before: 2,
+            onion_after: 2,
+            frame_width: Metrics::FRAME_WIDTH,
+            row_scale: 1.0,
         }
     }
 

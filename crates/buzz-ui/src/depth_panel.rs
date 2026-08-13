@@ -160,7 +160,7 @@ fn perspective_view(ui: &mut Ui, scene: &Scene, active: Option<LayerId>, out: &m
         egui::Sense::click(),
     );
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 3.0, Palette::PANEL);
+    painter.rect_filled(rect, 3.0, Palette::panel());
 
     let focal = scene.camera().focal_distance.max(1.0);
 
@@ -184,13 +184,13 @@ fn perspective_view(ui: &mut Ui, scene: &Scene, active: Option<LayerId>, out: &m
     };
 
     // The camera, as an eye at the origin of the axis.
-    painter.circle_filled(egui::pos2(left, axis_y), 4.0, Palette::TEXT);
+    painter.circle_filled(egui::pos2(left, axis_y), 4.0, Palette::text());
     painter.text(
         egui::pos2(rect.left() + 4.0, axis_y - 14.0),
         egui::Align2::LEFT_CENTER,
         "cam",
         egui::FontId::proportional(9.0),
-        Palette::TEXT_DIM,
+        Palette::text_dim(),
     );
 
     // The focal plane, dashed, because it is the reference every depth is
@@ -200,7 +200,7 @@ fn perspective_view(ui: &mut Ui, scene: &Scene, active: Option<LayerId>, out: &m
         let y0 = rect.top() + 10.0 + i as f32 * 13.0;
         painter.line_segment(
             [egui::pos2(focal_x, y0), egui::pos2(focal_x, y0 + 6.0)],
-            egui::Stroke::new(1.0, Palette::BORDER),
+            egui::Stroke::new(1.0, Palette::border()),
         );
     }
     painter.text(
@@ -208,7 +208,7 @@ fn perspective_view(ui: &mut Ui, scene: &Scene, active: Option<LayerId>, out: &m
         egui::Align2::CENTER_CENTER,
         "stage",
         egui::FontId::proportional(9.0),
-        Palette::TEXT_DIM,
+        Palette::text_dim(),
     );
 
     // Each layer as a plane, drawn at the height perspective gives it. Front

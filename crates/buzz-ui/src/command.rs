@@ -31,6 +31,8 @@ pub enum Command {
     ExportVideo,
     /// Bring a sound file into the library.
     ImportSound,
+    /// Bring a bitmap onto the stage, already broken apart into artwork.
+    ImportImage,
     /// Put the library's selected sound on the current keyframe.
     AttachSound,
     /// Take the sound off the current keyframe.
@@ -198,6 +200,7 @@ impl Command {
             ExportSequence => "Export PNG Sequence…",
             ExportVideo => "Export Video…",
             ImportSound => "Import Sound…",
+            ImportImage => "Import Image…",
             AttachSound => "Attach Sound to Frame",
             RemoveSound => "Remove Sound from Frame",
             LipSync => "Lip Sync…",
@@ -329,7 +332,9 @@ impl Command {
             ExportSequence => None,
             ExportVideo => None,
             // Animate has no default binding for any of these.
-            ImportSound | AttachSound | RemoveSound | LipSync | NewMouthSymbol => None,
+            ImportSound | ImportImage | AttachSound | RemoveSound | LipSync | NewMouthSymbol => {
+                None
+            }
 
             Undo => sc(ctrl, Key::Z),
             // Animate accepts both; Ctrl+Y is also handled by the key map.
@@ -581,6 +586,7 @@ pub fn all_with_shortcuts() -> Vec<Command> {
         ExportSequence,
         ExportVideo,
         ImportSound,
+        ImportImage,
         AttachSound,
         RemoveSound,
         LipSync,
@@ -703,6 +709,8 @@ mod tests {
             ExportSequence,
             ExportVideo,
             ImportSound,
+            ImportImage,
+        ImportImage,
             AttachSound,
             RemoveSound,
             LipSync,

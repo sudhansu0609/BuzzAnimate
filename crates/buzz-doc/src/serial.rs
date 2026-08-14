@@ -47,6 +47,11 @@ use serde::{Deserialize, Serialize};
 /// * **14** — a transformation point per object.
 /// * **15** — the inverse mask: a layer kind that hides what it covers.
 /// * **16** — gradients: a fill or a stroke can be a ramp rather than a colour.
+/// * **17** — bitmaps: a fill can be an image. The pictures live in `media/`
+///   beside the sounds, one entry each, and a fill refers to one by id — so a
+///   photograph placed forty times is stored once and `document.json` stays a
+///   text file. A document with no bitmap is written exactly as version 16
+///   wrote it.
 ///
 /// Version 16 makes `color` optional on a fill and a stroke, and adds a
 /// `gradient` beside it, of which exactly one is ever written. Older files
@@ -64,7 +69,7 @@ use serde::{Deserialize, Serialize};
 /// keyframe at frame 0, which is exactly what it meant; version 2 simply has
 /// no library and no tweens, and both default to empty. Keeping those paths is
 /// cheap and it exercises the version check for real rather than in theory.
-pub const FORMAT_VERSION: u32 = 16;
+pub const FORMAT_VERSION: u32 = 17;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -146,6 +151,9 @@ pub struct DocumentDto {
     /// Palette folders, including empty ones. Version 13.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub swatch_folders: Vec<String>,
+    /// Imported bitmaps. Version 17. The files live in `media/`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAssetDto>,
 }
 
 /// A named colour.
@@ -895,6 +903,9 @@ pub struct FillDto {
     /// Version 16.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gradient: Option<GradientDto>,
+    /// Version 17.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageFillDto>,
     #[serde(default)]
     pub rule: FillMode,
 }
@@ -906,6 +917,9 @@ pub struct StrokeDto {
     /// Version 16.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gradient: Option<GradientDto>,
+    /// Version 17.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageFillDto>,
     pub width: f64,
     #[serde(default)]
     pub hairline: bool,
@@ -978,11 +992,58 @@ fn gradient_from_dto(dto: &GradientDto) -> Result<Gradient, SerialError> {
     Ok(g)
 }
 
-/// Write a paint out as the pair of optional fields the DTOs carry.
-fn paint_to_dto(paint: &Paint) -> (Option<String>, Option<GradientDto>) {
+/// A bitmap fill: which image, and where it sits.
+///
+/// **The pixels are not here.** The image is written once into the container's
+/// `media/` directory, byte for byte as it was imported, and referred to by id
+/// — the same arrangement sounds have used since version 7, and for the same
+/// reason: a document with one photograph placed forty times must not hold
+/// forty copies of it, and `document.json` must stay a text file a person can
+/// read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageFillDto {
+    pub image: u64,
+    /// Unit square to the object's own space: `[a, b, c, d, e, f]`.
+    pub transform: [f64; 6],
+    /// Absent means smoothed, which is what a photograph wants and what the
+    /// overwhelming majority of images are.
+    #[serde(default = "smoothing_on", skip_serializing_if = "is_smoothing_on")]
+    pub smooth: bool,
+}
+
+fn smoothing_on() -> bool {
+    true
+}
+
+fn is_smoothing_on(v: &bool) -> bool {
+    *v
+}
+
+/// An imported bitmap. The file itself lives in `media/`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageAssetDto {
+    pub id: u64,
+    pub name: String,
+    /// File extension, which is also how the media entry is named.
+    pub format: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Write a paint out as the fields the DTOs carry.
+fn paint_to_dto(paint: &Paint) -> (Option<String>, Option<GradientDto>, Option<ImageFillDto>) {
     match paint {
-        Paint::Solid(c) => (Some(color_to_hex(*c)), None),
-        Paint::Gradient(g) => (None, Some(gradient_to_dto(g))),
+        Paint::Solid(c) => (Some(color_to_hex(*c)), None, None),
+        Paint::Gradient(g) => (None, Some(gradient_to_dto(g)), None),
+        Paint::Image(i) => (
+            None,
+            None,
+            Some(ImageFillDto {
+                image: i.asset.id.0,
+                transform: i.transform.as_coeffs(),
+                smooth: i.smooth,
+            }),
+        ),
     }
 }
 
@@ -995,7 +1056,26 @@ fn paint_to_dto(paint: &Paint) -> (Option<String>, Option<GradientDto>) {
 fn paint_from_dto(
     color: Option<&String>,
     gradient: Option<&GradientDto>,
+    image: Option<&ImageFillDto>,
+    images: &buzz_scene::ImageLibrary,
 ) -> Result<Paint, SerialError> {
+    // **A bitmap whose file is missing falls back to a colour rather than
+    // refusing the document.** A `.buzz` that lost its `media/` entry — copied
+    // out of a zip by hand, or truncated — should still open with everything
+    // else intact; the shape is there, its outline is there, and only the
+    // picture inside it is gone.
+    if let Some(fill) = image {
+        match images.get(buzz_scene::ImageId(fill.image)) {
+            Some(asset) => {
+                return Ok(Paint::Image(Box::new(buzz_scene::ImageFill {
+                    asset: std::sync::Arc::clone(asset),
+                    transform: Affine::new(fill.transform),
+                    smooth: fill.smooth,
+                })));
+            }
+            None => return Ok(Paint::Solid(Color::from_rgb8(0x80, 0x80, 0x80))),
+        }
+    }
     match (gradient, color) {
         (Some(g), _) => Ok(Paint::Gradient(std::sync::Arc::new(gradient_from_dto(g)?))),
         (None, Some(c)) => Ok(Paint::Solid(color_from_hex(c)?)),
@@ -1004,34 +1084,42 @@ fn paint_from_dto(
 }
 
 fn fill_to_dto(f: &FillSpec) -> FillDto {
-    let (color, gradient) = paint_to_dto(&f.paint);
+    let (color, gradient, image) = paint_to_dto(&f.paint);
     FillDto {
         color,
         gradient,
+        image,
         rule: f.rule,
     }
 }
 
-fn fill_from_dto(f: &FillDto) -> Result<FillSpec, SerialError> {
+fn fill_from_dto(
+    f: &FillDto,
+    images: &buzz_scene::ImageLibrary,
+) -> Result<FillSpec, SerialError> {
     Ok(FillSpec {
-        paint: paint_from_dto(f.color.as_ref(), f.gradient.as_ref())?,
+        paint: paint_from_dto(f.color.as_ref(), f.gradient.as_ref(), f.image.as_ref(), images)?,
         rule: f.rule,
     })
 }
 
 fn stroke_to_dto(s: &StrokeSpec) -> StrokeDto {
-    let (color, gradient) = paint_to_dto(&s.paint);
+    let (color, gradient, image) = paint_to_dto(&s.paint);
     StrokeDto {
         color,
         gradient,
+        image,
         width: s.width,
         hairline: s.hairline,
     }
 }
 
-fn stroke_from_dto(s: &StrokeDto) -> Result<StrokeSpec, SerialError> {
+fn stroke_from_dto(
+    s: &StrokeDto,
+    images: &buzz_scene::ImageLibrary,
+) -> Result<StrokeSpec, SerialError> {
     Ok(StrokeSpec {
-        paint: paint_from_dto(s.color.as_ref(), s.gradient.as_ref())?,
+        paint: paint_from_dto(s.color.as_ref(), s.gradient.as_ref(), s.image.as_ref(), images)?,
         width: s.width,
         hairline: s.hairline,
     })
@@ -1084,7 +1172,7 @@ impl LayerDto {
         }
     }
 
-    fn to_layer(&self) -> Result<Layer, SerialError> {
+    fn to_layer(&self, images: &buzz_scene::ImageLibrary) -> Result<Layer, SerialError> {
         let mut layer = Layer::new(LayerId(self.id), self.name.clone(), self.kind);
         layer.parent = self.parent.map(LayerId);
         layer.follows = self.follows.map(LayerId);
@@ -1118,7 +1206,7 @@ impl LayerDto {
         for k in &source {
             let mut objects = Vec::with_capacity(k.objects.len());
             for object in &k.objects {
-                objects.push(Arc::new(object.to_object()?));
+                objects.push(Arc::new(object.to_object(images)?));
             }
             keyframes.push(buzz_scene::Keyframe {
                 start: k.start,
@@ -1155,12 +1243,12 @@ impl SymbolDto {
         }
     }
 
-    fn to_symbol(&self) -> Result<Symbol, SerialError> {
+    fn to_symbol(&self, images: &buzz_scene::ImageLibrary) -> Result<Symbol, SerialError> {
         let mut symbol = Symbol::new(SymbolId(self.id), self.name.clone(), self.kind);
         symbol.folder = self.folder.clone();
         symbol.registration = buzz_geom::Point::new(self.registration[0], self.registration[1]);
         for (index, dto) in self.layers.iter().enumerate() {
-            symbol.layers.insert(index, dto.to_layer()?);
+            symbol.layers.insert(index, dto.to_layer(images)?);
         }
         Ok(symbol)
     }
@@ -1244,6 +1332,20 @@ impl DocumentDto {
                 })
                 .collect(),
             swatch_folders: scene.swatches().folders().cloned().collect(),
+            images: scene
+                .images()
+                .iter()
+                .map(|image| {
+                    max_id = max_id.max(image.id.0);
+                    ImageAssetDto {
+                        id: image.id.0,
+                        name: image.name.clone(),
+                        format: image.format.clone(),
+                        width: image.width,
+                        height: image.height,
+                    }
+                })
+                .collect(),
             looping: scene.looping().enabled.then(|| LoopDto {
                 start: scene.looping().start,
                 end: scene.looping().end,
@@ -1303,7 +1405,24 @@ impl DocumentDto {
     }
 
     /// Rebuild a scene. Fails only on genuinely malformed data.
+    /// Rebuild the document, with no bitmaps.
+    ///
+    /// The container supplies them — they live in `media/` — so anything that
+    /// reads a `.buzz` goes through [`Self::to_scene_with_images`]. This is for
+    /// callers that have only the JSON, chiefly the tests.
     pub fn to_scene(&self) -> Result<Scene, SerialError> {
+        self.to_scene_with_images(buzz_scene::ImageLibrary::default())
+    }
+
+    /// Rebuild the document with its bitmaps already decoded.
+    ///
+    /// The library is built **before** any layer is converted, because a fill
+    /// refers to an image by id and resolves against it as it is read — the
+    /// same ordering the symbol library needs, and for the same reason.
+    pub fn to_scene_with_images(
+        &self,
+        images: buzz_scene::ImageLibrary,
+    ) -> Result<Scene, SerialError> {
         if self.format_version > FORMAT_VERSION {
             return Err(SerialError::UnsupportedVersion {
                 found: self.format_version,
@@ -1312,6 +1431,10 @@ impl DocumentDto {
         }
 
         let mut scene = Scene::empty();
+        // Installed before anything is converted, so a fill can resolve
+        // against it as the layers are read.
+        *scene.images_mut() = images.clone();
+        let images = &images;
         *scene.stage_mut() = StageProperties {
             size: Size::new(self.stage.width, self.stage.height),
             background: color_from_hex(&self.stage.background)?,
@@ -1319,7 +1442,7 @@ impl DocumentDto {
         };
 
         for (index, dto) in self.layers.iter().enumerate() {
-            scene.edit_stage_layers().insert(index, dto.to_layer()?);
+            scene.edit_stage_layers().insert(index, dto.to_layer(images)?);
         }
 
         // The library loads before anything can reference it, so an instance
@@ -1328,7 +1451,7 @@ impl DocumentDto {
             scene.library_mut().add_folder(folder);
         }
         for dto in &self.library.symbols {
-            let symbol = dto.to_symbol()?;
+            let symbol = dto.to_symbol(images)?;
             scene.library_mut().insert(symbol);
         }
 
@@ -1564,7 +1687,7 @@ impl ObjectDto {
         }
     }
 
-    fn to_object(&self) -> Result<Object, SerialError> {
+    fn to_object(&self, images: &buzz_scene::ImageLibrary) -> Result<Object, SerialError> {
         let kind = match &self.kind {
             ObjectKindDto::Shape {
                 path,
@@ -1576,15 +1699,15 @@ impl ObjectDto {
                     BezPath::from_svg(path).map_err(|e| SerialError::BadPath(e.to_string()))?;
                 ObjectKind::Shape(ShapeData {
                     path: parsed,
-                    fill: fill.as_ref().map(fill_from_dto).transpose()?,
-                    stroke: stroke.as_ref().map(stroke_from_dto).transpose()?,
+                    fill: fill.as_ref().map(|f| fill_from_dto(f, images)).transpose()?,
+                    stroke: stroke.as_ref().map(|s| stroke_from_dto(s, images)).transpose()?,
                     blend: *blend,
                 })
             }
             ObjectKindDto::Group { children } => ObjectKind::Group(
                 children
                     .iter()
-                    .map(|c| c.to_object().map(Arc::new))
+                    .map(|c| c.to_object(images).map(Arc::new))
                     .collect::<Result<Vec<_>, _>>()?,
             ),
             ObjectKindDto::Instance {
@@ -1622,7 +1745,7 @@ impl ObjectDto {
 
                 let mut rig = buzz_scene::ArmatureData::new(armature);
                 for part in parts {
-                    let artwork = Arc::new(part.artwork.to_object()?);
+                    let artwork = Arc::new(part.artwork.to_object(images)?);
                     let binding = match part.rigid_bone {
                         Some(bone) => buzz_scene::RigBinding::Rigid(bone),
                         None => buzz_scene::RigBinding::Skin(buzz_rig::SkinBinding {
@@ -1645,8 +1768,8 @@ impl ObjectDto {
                     BezPath::from_svg(path).map_err(|e| SerialError::BadPath(e.to_string()))?;
                 let shape = ShapeData {
                     path: parsed,
-                    fill: fill.as_ref().map(fill_from_dto).transpose()?,
-                    stroke: stroke.as_ref().map(stroke_from_dto).transpose()?,
+                    fill: fill.as_ref().map(|f| fill_from_dto(f, images)).transpose()?,
+                    stroke: stroke.as_ref().map(|s| stroke_from_dto(s, images)).transpose()?,
                     blend: *blend,
                 };
                 let mut warp = buzz_scene::WarpData::new(shape);
@@ -2031,7 +2154,8 @@ mod tests {
             "rule": "NonZero",
         });
         let dto: FillDto = serde_json::from_value(older).expect("version 15's shape still parses");
-        let fill = fill_from_dto(&dto).expect("it should read");
+        let fill = fill_from_dto(&dto, &buzz_scene::ImageLibrary::default())
+            .expect("it should read");
         assert_eq!(
             fill.color().to_rgba8().to_u8_array(),
             [0xFF, 0x88, 0x00, 0xFF]
@@ -2045,7 +2169,8 @@ mod tests {
     #[test]
     fn a_fill_with_no_paint_at_all_reads_as_black() {
         let dto: FillDto = serde_json::from_value(serde_json::json!({})).expect("parses");
-        let fill = fill_from_dto(&dto).expect("it should read");
+        let fill = fill_from_dto(&dto, &buzz_scene::ImageLibrary::default())
+            .expect("it should read");
         assert_eq!(fill.color().to_rgba8().to_u8_array(), [0, 0, 0, 255]);
     }
 

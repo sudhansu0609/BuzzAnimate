@@ -50,6 +50,16 @@ sysinfo = "0.39.6"
 # format is written by the DTO layer in `buzz-doc`, never by these derives.
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+# Bitmap decoding. Default features off: the full crate pulls in a dozen
+# formats and their dependencies, and what an animator imports is a PNG, a
+# JPEG or the odd GIF or WebP.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "bmp",
+    "webp",
+] }
 
 rstar = "0.13.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

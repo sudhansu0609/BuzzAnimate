@@ -2692,6 +2692,82 @@ a frame, and **12.7 ms** a frame while dragging.
 
 ---
 
+### ✅ Bitmaps, the Lasso and the Magic Wand — §7 items 10 and 22 closed
+
+**One decision made all three of these cheap: a bitmap is a shape filled with
+an image.**
+
+The obvious model is a bitmap *object kind* — a picture with a position and a
+size, beside shapes and instances. Every editor that took that road then had to
+add "Break Apart" to escape it, because a placed bitmap can only be moved and
+scaled, and everything an animator actually wants to do to a photograph — cut
+the sky out, rub away an edge, keep the tree — needs it to be artwork.
+
+So there is no bitmap object. There is `Paint::Image`, beside `Paint::Solid`
+and `Paint::Gradient`, and a placed bitmap is an ordinary rectangle filled with
+one. It arrives already broken apart, because there is nothing to break: the
+booleans, the eraser, the subselection anchors, masking, tweening and Convert
+to Symbol all work on it the moment it lands, none of them knowing a picture is
+involved. The fill carries a **unit-square transform**, exactly as a gradient
+does and for the same reason — so cutting the shape does not slide the picture
+about inside what is left. That is `cutting_the_shape_leaves_the_picture_where_it_was`,
+and it is the claim the whole design rests on.
+
+**Import.** File ▸ Import Image, decoding PNG, JPEG, GIF, BMP and WebP into
+straight-alpha RGBA8. The source bytes are kept alongside the decoded pixels so
+a saved document re-writes the file it was given rather than a re-encoding of
+it, in `media/image-N.ext` — the container directory reserved since Phase 1.
+Format version 17. A document whose bitmap has gone missing opens with grey in
+its place rather than refusing to open.
+
+**The Lasso is back, and this time it cuts.** It was taken out of the palette
+in the previous iteration for being a greyed-out promise. A lasso round part of
+a drawing cannot *select* "the left half" — no such object exists — so it makes
+one: the region is cut out of every shape it crosses, and the piece inside is
+selected. Delete then removes it. That is Animate's behaviour on a shape, and
+it is the only reading of the tool that is worth having. Instances and groups
+are picked whole instead, because cutting one would mean cutting the symbol and
+every other instance with it.
+
+**The Magic Wand** floods from the clicked pixel, traces the boundary of what
+it took, and hands back a **path** — not a pixel mask, which there would be
+nowhere to keep and nothing to do with. Three steps, each with a reason:
+
+- **Flood** by scanlines, not by neighbours: a run per stack entry rather than
+  a pixel, because the recursive version overflows the stack on any real
+  photograph. Tolerance judges alpha separately from colour, so the wand
+  spreads across the transparent part of a cut-out — where the RGB under a
+  transparent pixel is whatever the encoder happened to leave.
+- **Trace** as unit lattice edges chained into loops. Holes come out wound the
+  opposite way from outlines, so a non-zero fill leaves them open with no extra
+  bookkeeping — `a_ring_traces_with_its_hole_open`.
+- **Simplify**, because the honest answer is a hundred thousand segments for a
+  sky and every boolean afterwards would pay for it. Collinear runs collapse
+  exactly; Douglas–Peucker takes the rest. The epsilon *doubles until the path
+  fits a 20 000-point budget* — a guarantee rather than a hope, because a grainy
+  photograph at a high tolerance makes every pixel a corner and no fixed epsilon
+  tames it.
+
+On vector artwork the wand selects the shape, because a region of one colour
+*is* the shape someone drew. A user who does not know which kind of artwork
+they clicked gets the right answer either way.
+
+**What it measures:**
+
+| Operation | Time |
+|---|---|
+| Wand on a four-megapixel photograph | **under 30 ms**, click to cut path |
+| Trace of that region, simplified | under 20 000 points, guaranteed |
+| Lasso cut on a placed bitmap | under 1 ms |
+| Import, decode and place a PNG | 1 ms at 128², 12 ms at 2048² |
+
+23 tools in the palette now, and still exactly two that pick objects: the Lasso
+and the Magic Wand sit in their own group because they mark out a *region*
+rather than pointing at a thing, and putting them beside Selection would undo
+the point of the two-tool rule.
+
+---
+
 ## 5. Current metrics
 
 | Measure | Value |
@@ -2860,7 +2936,7 @@ down here has not been finished.
 | 1 | ~~**Oversized paths culled, not clipped.**~~ | ✅ **Resolved in CP-1.1** by `RenderClip` |
 | 8 | ~~**Gradients not implemented.**~~ | ✅ **Resolved** — linear and radial gradients on fills and strokes, a working Gradient Transform tool, format version 16 |
 | 9 | **Text tool not implemented.** Needs font loading, shaping and a text-editing caret — a subsystem in its own right. | Phase 2 follow-up |
-| 10 | **Lasso tool not implemented.** Freehand selection region. | Phase 2 follow-up |
+| 10 | ~~**Lasso tool not implemented.**~~ | ✅ **Resolved** — freehand region that *cuts* the artwork it crosses, plus a Magic Wand beside it |
 | 11 | **Pen tool draws line segments, not Bézier curves.** Click-drag handle authoring is not there yet; anchors can be edited afterwards with Subselection. | Phase 2 follow-up |
 | 12 | **Multiple Scenes not implemented.** One scene per document. | Deferred |
 | 15 | ~~**Tweening not implemented.**~~ | ✅ **Resolved in CP-4.3** — classic, motion and shape tweens interpolate in the render path |
@@ -2869,7 +2945,7 @@ down here has not been finished.
 | 19 | ~~**Import commands are not wired.**~~ | ✅ **Resolved in CP-5.1b** — `Scene::merge` remaps every id; all three formats are on the File menu |
 | 20 | ~~**The XFL importer does not restore folder nesting.**~~ | ✅ **Resolved in CP-5.1c**, along with two fidelity bugs it exposed |
 | 21 | **No importer has been checked against a real file from Adobe.** Every fixture is one we wrote, so the importers are verified against the *specifications* and against files whose content we chose — not against what Animate, Illustrator and the Flash compilers actually emit, which is where the awkward cases live. This is the largest single risk in Phase 5. | Needs a licensed Animate/Illustrator and real-world files |
-| 22 | **Bitmaps are not imported** by any of the three readers — reported, never read. Needs a media pipeline: decode, store in the `.buzz` container's `media/` directory (reserved since Phase 1), and a bitmap object kind. | Phase 6 |
+| 22 | ~~**Bitmaps are not imported.**~~ | ✅ **Resolved** — `Paint::Image` rather than a bitmap object kind, File ▸ Import Image, `media/` storage, format version 17. The three *importers* still do not carry their bitmaps across — see item 158 |
 | 23 | **SWF morph shapes, buttons, filters, blend modes and colour transforms on placements** are reported but not applied. Colour transforms are the cheapest of these to fix — the model already has `ColorTransform` — and would noticeably improve fidelity. | Phase 5 follow-up |
 | 28 | ~~**No 3D object rotation.**~~ | ✅ **Resolved** — `Spatial` on every object, rendered through its own plane, format version 11 |
 | 63 | **3D rotation is allowed on every object.** Animate restricts it to movie clip instances, because there it is a property of a display object with a cached surface. Here it is a plane in a projection and costs nothing extra, so a shape, a group or a rigged character may have it too. | By design |
@@ -2993,6 +3069,12 @@ down here has not been finished.
 | 155 | **The first frame of a heavy scene costs 305 ms**, because every crescent, shadow and blur is built before anything appears. It is paid once and then cached, but opening a complex document shows nothing for a third of a second. Building the geometry on the background pool and drawing unlit until it arrives would hide it. | Follow-up |
 | 157 | **A mask added before the layer it masks ends up underneath it and claims nothing**, and the sheet it should have holed then draws flat across the whole film. Masking is positional and `add_layer` puts each new layer in front, so the masked layer has to be created *first*. Animate's order of work is the same — draw the content, then add a mask above it — but nothing here says so, and the symptom (an evenly darkened film) looks like a lighting problem rather than a layer-order one. | Follow-up |
 | 156 | **A layer that is one frame long shows nothing past frame zero**, which is correct and is also a trap: setting a document's length is a separate action (`set_frame_count`, Animate's F5), and a scene built without it appears to lose all its artwork the moment the playhead moves. Nothing in the interface says so. | Follow-up |
+| 158 | **The XFL, SWF and PDF readers still do not bring their bitmaps across.** The pipeline they needed now exists — decode, library, `media/` storage, a paint that draws them — so each reader has only to call it where it currently logs "bitmap ignored". Doing so needs the DefineBits/JPEGTables chain for SWF and the `<DOMBitmapItem>` road for XFL. | Phase 5 follow-up |
+| 159 | **The Magic Wand has its own letter, `G`.** Animate has no letter for it, because there it is a mode of the Lasso in the property inspector rather than a tool. Here it is its own tool with its own icon, so it takes the free letter next to the Lasso's `L`. Every other letter follows Animate exactly. | By design |
+| 160 | **An imported picture larger than the stage is scaled to fit it.** Animate places at natural size, so a phone photograph lands mostly off the pasteboard and the first thing anyone does is scale it down by hand. Aspect ratio is kept and one Free Transform drag undoes it. A picture that already fits is placed untouched, so pixel-exact artwork stays pixel-exact. | By design |
+| 161 | **The wand's traced region is polygonal, not curved.** The boundary of a flood fill is a staircase; simplification straightens it, and nothing refits Béziers to it afterwards. At any sane zoom the difference is invisible, and a curve fit would have to decide which corners are real — a photograph's edge has both kinds. Modify ▸ Smooth works on the result if a curve is wanted. | By design |
+| 162 | **A wand region has no feather.** Photoshop grows and softens a selection; here the cut edge is a vector boundary, antialiased by the renderer, which is most of what feathering was for. What is missing is deliberately blurring the join between a cut-out and what is behind it. | Follow-up |
+| 163 | **The Lasso has no polygon mode.** Animate's lasso has a straight-segment mode on a modifier; here every gesture is freehand. The region is a polygon either way — what is missing is the click-click-click way of drawing one. | Follow-up |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |

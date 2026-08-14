@@ -2063,6 +2063,7 @@ impl App {
     fn dispatch(&mut self, command: Command) {
         match command {
             Command::ImportSound => self.import_sound_dialog(),
+            Command::ImportImage => self.import_image_dialog(),
             Command::LipSync => self.open_lip_sync(),
             Command::ExportImage => self.open_export(buzz_ui::ExportKind::Image),
             Command::ExportSequence => self.open_export(buzz_ui::ExportKind::Sequence),
@@ -2387,6 +2388,23 @@ impl App {
 
         self.editor.export.progress = Some(job.progress);
         self.export = Some(job);
+    }
+
+    /// Animate's File ▸ Import Image.
+    fn import_image_dialog(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("Image", &["png", "jpg", "jpeg", "gif", "bmp", "webp"])
+            .pick_file();
+        let Some(path) = picked else { return };
+
+        match self.editor.import_image(&path) {
+            Ok(name) => {
+                self.editor.status = Some(format!(
+                    "Imported {name} — it is artwork now: the Lasso and the Magic Wand cut it"
+                ))
+            }
+            Err(e) => self.editor.status = Some(format!("Could not import that image: {e:#}")),
+        }
     }
 
     /// Animate's File ▸ Import Sound.

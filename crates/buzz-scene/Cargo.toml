@@ -18,4 +18,6 @@ peniko.workspace = true
 rstar.workspace = true
 rayon.workspace = true
 serde.workspace = true
+image.workspace = true
+thiserror.workspace = true
 tracing.workspace = true

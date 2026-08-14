@@ -31,4 +31,4 @@ pub use projection::Projection;
 pub use recognise::{Recognised, Tolerance, recognise};
 
 /// Re-exported so downstream crates share one `kurbo` and one notion of `Point`.
-pub use kurbo::{Affine, BezPath, Circle, Line, Point, Rect, Shape, Size, Vec2};
+pub use kurbo::{Affine, BezPath, Circle, Line, PathEl, Point, Rect, Shape, Size, Vec2};

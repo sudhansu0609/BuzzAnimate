@@ -27,6 +27,7 @@
 
 pub mod camera_track;
 pub mod gradient;
+pub mod image;
 pub mod index;
 pub mod layer;
 pub mod looping;
@@ -38,6 +39,7 @@ pub mod swatch;
 pub mod symbol;
 pub mod timeline;
 pub mod tween;
+pub mod wand;
 
 use std::sync::Arc;
 
@@ -49,6 +51,7 @@ pub use camera_track::{CameraKey, CameraTrack, MAX_TILT};
 pub use gradient::{
     Gradient, GradientHandles, GradientKind, GradientSpread, GradientStop, MAX_STOPS, lerp_color,
 };
+pub use image::{ImageAsset, ImageFill, ImageId, ImageLibrary};
 pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
 pub use looping::{LoopRegion, MAX_REPEATS};
@@ -66,6 +69,7 @@ pub use symbol::{
 };
 pub use timeline::{FrameKind, Keyframe, LayerTimeline, ResolvedFrame, TweenSpan};
 pub use tween::{Easing, Tween, TweenKind};
+pub use wand::{WandOptions, region_at as wand_region};
 
 /// Stage setup, matching Animate's Document Properties dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -167,6 +171,8 @@ pub struct Scene {
     library: Library,
     /// Imported sounds. Private for the same reason as the library.
     sounds: SoundLibrary,
+    /// Bitmaps the document holds. See [`crate::image`].
+    images: ImageLibrary,
     /// The lights. Private for the same reason: changing one has to bump the
     /// revision, or the renderer would keep drawing yesterday's shadows.
     lights: LightRig,
@@ -261,6 +267,7 @@ impl Default for Scene {
             camera: CameraTrack::new(),
             library: Library::new(),
             sounds: SoundLibrary::default(),
+            images: ImageLibrary::default(),
             lights: LightRig::default(),
             looping: LoopRegion::default(),
             // A new document opens with Animate's default palette, named.
@@ -287,6 +294,7 @@ impl Scene {
             camera: CameraTrack::new(),
             library: Library::new(),
             sounds: SoundLibrary::default(),
+            images: ImageLibrary::default(),
             lights: LightRig::default(),
             looping: LoopRegion::default(),
             // No palette: an importer builds the document, and whatever
@@ -533,6 +541,80 @@ impl Scene {
     /// Imported sounds.
     pub fn sounds(&self) -> &SoundLibrary {
         &self.sounds
+    }
+
+    /// The document's bitmaps.
+    pub fn images(&self) -> &ImageLibrary {
+        &self.images
+    }
+
+    /// Mutable bitmap library. Bumps the revision, so importing is undoable.
+    pub fn images_mut(&mut self) -> &mut ImageLibrary {
+        self.revision += 1;
+        &mut self.images
+    }
+
+    /// Decode a bitmap file into the library, giving it a fresh id and a name
+    /// no other bitmap has.
+    ///
+    /// Decoding here rather than in the caller means a file that cannot be read
+    /// fails *before* the document is touched — the same rule sound import
+    /// follows, and for the same reason: a library entry that shows nothing is
+    /// worse than a refused import.
+    pub fn add_image(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<std::sync::Arc<ImageAsset>, crate::image::ImageError> {
+        let id = ImageId(self.ids.take());
+        let name = self.images.unique_name(name);
+        let asset = ImageAsset::decode(id, name, bytes)?;
+        Ok(self.images_mut().insert(asset))
+    }
+
+    /// Import a bitmap and place it as a shape filled with it.
+    ///
+    /// **This is Animate's Import *and* its Break Apart in one step**, and
+    /// deliberately so. A placed bitmap that is not yet artwork can only be
+    /// moved and scaled; every other thing an animator wants to do to it —
+    /// cut the sky out, rub away an edge, keep the tree — needs it broken
+    /// apart first. Arriving already broken apart skips a step nobody ever
+    /// wants to skip, and costs nothing, because the shape it makes is an
+    /// ordinary rectangle that behaves exactly as a drawn one does.
+    pub fn place_image(
+        &mut self,
+        layer: LayerId,
+        frame: u32,
+        asset: std::sync::Arc<ImageAsset>,
+        at: Point,
+    ) -> Option<ObjectId> {
+        let natural = crate::image::ImageFill::natural_rect(&asset);
+        let rect = Rect::new(
+            at.x,
+            at.y,
+            at.x + natural.width(),
+            at.y + natural.height(),
+        );
+        self.place_image_in(layer, frame, asset, rect)
+    }
+
+    /// Place a bitmap filling an exact rectangle, as [`Scene::place_image`]
+    /// does at its natural size.
+    pub fn place_image_in(
+        &mut self,
+        layer: LayerId,
+        frame: u32,
+        asset: std::sync::Arc<ImageAsset>,
+        rect: Rect,
+    ) -> Option<ObjectId> {
+        let fill = crate::image::ImageFill::new(asset, rect);
+        let shape = ShapeData {
+            path: buzz_geom::Shape::to_path(&rect, 1e-9),
+            fill: Some(FillSpec::image(fill)),
+            stroke: None,
+            blend: PaintBlend::Normal,
+        };
+        self.add_shape_at(layer, frame, shape)
     }
 
     /// Mutable sound library. Bumps the revision, so importing is undoable.

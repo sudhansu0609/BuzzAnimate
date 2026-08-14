@@ -39,6 +39,18 @@ pub enum ToolAction {
     PickAt { point: Point, additive: bool },
     /// Select everything intersecting the rectangle.
     PickInRect { rect: Rect, additive: bool },
+    /// Select everything inside a freehand region — and, where that region cuts
+    /// across artwork, cut the artwork along it and select the part inside.
+    ///
+    /// The cutting is what makes this the Lasso rather than a bendy marquee,
+    /// and it is what Animate's Lasso does to a shape.
+    PickInRegion { region: BezPath, additive: bool },
+    /// Take everything the colour of what is under the point — the Magic Wand.
+    ///
+    /// The region cannot be worked out here, because it depends on the pixels
+    /// of whatever was hit, and this module cannot see the scene. So the
+    /// editor is handed the click and does the flood fill itself.
+    WandAt { point: Point, additive: bool },
     /// Move the current selection.
     MoveSelection { delta: Vec2 },
     /// Scale the selection about a fixed corner.
@@ -164,6 +176,12 @@ enum Gesture {
     /// where: the width of a fluid stroke follows how fast it was drawn.
     Freehand {
         samples: Vec<buzz_geom::StrokeSample>,
+        /// What was held when the gesture began.
+        ///
+        /// Only the Lasso reads it — Shift adds to the selection there, as it
+        /// does for a marquee — but it costs nothing to record for all of them
+        /// and saves a second gesture variant that differs in one field.
+        mods: Mods,
     },
     /// Dragging one anchor of a path.
     Anchor {
@@ -259,9 +277,10 @@ impl ToolMachine {
     ) -> ToolAction {
         self.last_screen = screen;
         match self.tool {
-            ToolId::Pencil | ToolId::Brush | ToolId::Eraser => {
+            ToolId::Pencil | ToolId::Brush | ToolId::Eraser | ToolId::Lasso => {
                 self.gesture = Gesture::Freehand {
                     samples: vec![buzz_geom::StrokeSample::new(doc, self.clock.now())],
+                    mods,
                 };
             }
             // Subselection grabs an anchor if one is close enough; otherwise it
@@ -310,7 +329,7 @@ impl ToolMachine {
                 *current = doc;
                 ToolAction::None
             }
-            Gesture::Freehand { samples } => {
+            Gesture::Freehand { samples, .. } => {
                 // Drop samples that add nothing, so a slow drag does not build
                 // a path with thousands of coincident vertices. The brush
                 // decimates properly later; this is only to stop the list
@@ -358,11 +377,11 @@ impl ToolMachine {
                     ToolAction::MoveAnchor { element, delta }
                 }
             }
-            Gesture::Freehand { mut samples } => {
+            Gesture::Freehand { mut samples, mods } => {
                 if samples.last().is_none_or(|s| s.point != doc) {
                     samples.push(buzz_geom::StrokeSample::new(doc, self.clock.now()));
                 }
-                self.finish_freehand(samples, ctx)
+                self.finish_freehand(samples, mods, ctx)
             }
             Gesture::Dragging { origin, mods, .. } => self.finish_drag(origin, doc, mods, ctx),
         }
@@ -375,7 +394,14 @@ impl ToolMachine {
             // The stage already draws anchors for the selected path; a
             // rubber-band line here would just add noise.
             Gesture::Anchor { .. } => Preview::None,
-            Gesture::Freehand { samples } => match self.tool {
+            Gesture::Freehand { samples, .. } => match self.tool {
+                // The lasso previews the region it is enclosing, closed, so the
+                // user can see what is about to be caught rather than only the
+                // line they have drawn so far.
+                ToolId::Lasso => match lasso_region(samples) {
+                    Some(path) => Preview::Shape(path),
+                    None => Preview::None,
+                },
                 ToolId::Eraser => Preview::Stroke {
                     path: centreline_of(samples),
                     width: ctx.style.stroke_width.max(1.0) * 4.0,
@@ -455,6 +481,7 @@ impl ToolMachine {
     fn finish_freehand(
         &self,
         samples: Vec<buzz_geom::StrokeSample>,
+        mods: Mods,
         ctx: &ToolContext<'_>,
     ) -> ToolAction {
         // A brush tap paints a dot, so one sample is enough for it; every
@@ -465,6 +492,13 @@ impl ToolMachine {
         }
 
         match self.tool {
+            ToolId::Lasso => match lasso_region(&samples) {
+                Some(region) => ToolAction::PickInRegion {
+                    region,
+                    additive: mods.shift,
+                },
+                None => ToolAction::None,
+            },
             ToolId::Eraser => ToolAction::Erase {
                 path: centreline_of(&samples),
                 width: ctx.style.stroke_width.max(1.0) * 4.0,
@@ -661,6 +695,14 @@ impl ToolMachine {
                 }
             }
 
+            // A wand click, wherever the pointer let go. There is nothing
+            // useful a *drag* could mean for it, and treating a small
+            // accidental drag as a miss would be a tool that ignores you.
+            ToolId::MagicWand => ToolAction::WandAt {
+                point: end,
+                additive: mods.shift,
+            },
+
             ToolId::PaintBucket => ToolAction::BucketFill { point: end },
             ToolId::InkBottle => ToolAction::ApplyStroke { point: end },
             ToolId::Eyedropper => ToolAction::SampleColor { point: end },
@@ -712,6 +754,41 @@ fn brush_width(tool: ToolId, style: &DrawStyle) -> f64 {
 /// same reason.
 fn centreline_of(samples: &[buzz_geom::StrokeSample]) -> BezPath {
     buzz_geom::centreline(samples)
+}
+
+/// The closed region a lasso gesture has drawn.
+///
+/// The user is not asked to return to where they began: releasing the button
+/// closes the loop with a straight line back to the start, which is what every
+/// lasso in every editor does and what makes the tool usable at all.
+///
+/// `None` for a gesture too small to enclose anything — a stray click with the
+/// Lasso selected should deselect, not cut a sliver out of the artwork under
+/// the pointer.
+fn lasso_region(samples: &[buzz_geom::StrokeSample]) -> Option<BezPath> {
+    if samples.len() < 3 {
+        return None;
+    }
+    let mut path = BezPath::new();
+    path.move_to(samples[0].point);
+    for s in &samples[1..] {
+        path.line_to(s.point);
+    }
+    path.close_path();
+
+    // Twice the enclosed area, by the shoelace formula. A gesture that went out
+    // and came straight back encloses nothing, however long it was.
+    let mut area = 0.0;
+    for pair in samples.windows(2) {
+        let (a, b) = (pair[0].point, pair[1].point);
+        area += a.x * b.y - b.x * a.y;
+    }
+    let (first, last) = (samples[0].point, samples[samples.len() - 1].point);
+    area += last.x * first.y - first.x * last.y;
+    if (area / 2.0).abs() < 1.0 {
+        return None;
+    }
+    Some(path)
 }
 
 /// Build what the brush will paint, whichever brush is selected.

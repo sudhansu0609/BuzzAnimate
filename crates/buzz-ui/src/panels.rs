@@ -95,6 +95,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             for c in [Command::ImportToStage, Command::ImportToLibrary] {
                 item(ui, c, true, &mut raised);
             }
+            item(ui, Command::ImportImage, true, &mut raised);
             item(ui, Command::ImportSound, true, &mut raised);
             // Animate keeps Export in a submenu of File, one entry per output.
             ui.menu_button("Export", |ui| {
@@ -807,6 +808,39 @@ fn instance_properties(
     edited
 }
 
+/// Magic Wand settings.
+///
+/// Two dials, both of which change the answer completely, and neither of which
+/// can be guessed from a result — a wand that took too little and one that took
+/// too much look the same until you look at what is left. So they sit beside
+/// the brush settings, in the same place, rather than behind a menu.
+fn wand_properties(ui: &mut Ui, style: &mut DrawStyle) {
+    ui.add_space(8.0);
+    ui.label(RichText::new("Magic Wand").strong());
+
+    egui::Grid::new("wand-props").num_columns(2).show(ui, |ui| {
+        ui.label("Tolerance");
+        // Shown 0–255, which is the scale every other editor uses and the one
+        // the numbers in people's heads are in.
+        let mut tolerance = style.wand.tolerance * 255.0;
+        if ui
+            .add(egui::Slider::new(&mut tolerance, 0.0..=255.0).fixed_decimals(0))
+            .on_hover_text("How far a colour may differ from the one clicked and still be taken")
+            .changed()
+        {
+            style.wand.tolerance = tolerance / 255.0;
+        }
+        ui.end_row();
+
+        ui.label("Contiguous");
+        ui.checkbox(&mut style.wand.contiguous, "").on_hover_text(
+            "Take only what joins on to the click. Off takes every matching \
+             colour in the picture — all of the sky, even where a tree divides it.",
+        );
+        ui.end_row();
+    });
+}
+
 /// Brush settings, with a live preview of the pattern being stamped.
 ///
 /// Animate puts these in the tool options strip under the toolbar. They are
@@ -1109,6 +1143,7 @@ pub fn properties_panel(
     }
 
     brush_properties(ui, style);
+    wand_properties(ui, style);
 
     ui.add_space(8.0);
     ui.label(RichText::new("Stroke and Fill").strong());

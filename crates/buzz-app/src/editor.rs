@@ -945,6 +945,12 @@ impl Editor {
                 self.selection.extend(hits);
             }
 
+            ToolAction::PickInRegion { region, additive } => {
+                self.pick_in_region(&region, additive)
+            }
+
+            ToolAction::WandAt { point, additive } => self.wand_at(point, additive),
+
             ToolAction::MoveSelection { delta } => {
                 self.transform_selection(Affine::translate(delta), "Move");
             }
@@ -1305,6 +1311,240 @@ impl Editor {
         out
     }
 
+    // -- region selection: the Lasso and the Magic Wand ----------------------
+
+    /// Take everything inside a freehand region — **and cut the artwork along
+    /// it**.
+    ///
+    /// # Why cutting, and not merely selecting
+    ///
+    /// This is what Animate's Lasso does to a shape, and it is the only reading
+    /// that makes the tool useful. A lasso round the left half of a drawing
+    /// cannot select "the left half" — no such object exists — so either the
+    /// tool selects the whole thing, in which case it is a worse Selection
+    /// tool, or it makes the half real. Making it real is what lets the next
+    /// keystroke delete it, move it, colour it or convert it to a symbol.
+    ///
+    /// An instance or a group is not cut: it is picked if its middle is inside
+    /// the region. Cutting one would mean cutting the symbol it refers to, and
+    /// every other instance with it.
+    fn pick_in_region(&mut self, region: &BezPath, additive: bool) {
+        let scene = self.doc.scene().clone();
+        let frame = self.current_frame;
+        let region_bounds = buzz_geom::Shape::bounding_box(region);
+
+        // Worked out entirely before the document is touched: `doc.edit` gets a
+        // list of things to do, so a lasso that catches nothing is not an undo
+        // step and the scene is not borrowed while it is being inspected.
+        let mut cuts: Vec<(LayerId, ObjectId, BezPath)> = Vec::new();
+        let mut picks: Vec<ObjectId> = Vec::new();
+
+        for layer in scene.layers().selectable() {
+            // The region carried back the way a click is: through the camera's
+            // projection at this layer's depth, then through whatever the layer
+            // is parented to. A projective map takes straight lines to straight
+            // lines, so moving the corners of a polygon moves the polygon.
+            let Some(in_layer) = map_path(region, |p| {
+                let p = scene.view_to_layer(frame, layer.depth, p)?;
+                Some(match invert(scene.layers().inherited_transform(layer.id, frame)) {
+                    Some(back) => back * p,
+                    None => p,
+                })
+            }) else {
+                continue;
+            };
+
+            for object in layer.objects_at(frame) {
+                if !object.visible || object.locked {
+                    continue;
+                }
+                let bounds = scene.resolved_bounds(object);
+                if bounds.intersect(region_bounds).is_zero_area()
+                    && !region_bounds.contains_rect(bounds)
+                {
+                    continue;
+                }
+                // An object turned in space is drawn on its own plane, so the
+                // region travels onto that plane before it can cut anything.
+                let Some(in_object) = map_path(&in_layer, |p| {
+                    let p = unturn(&scene, object, frame, layer.depth, p)?;
+                    invert(object.transform).map(|back| back * p)
+                }) else {
+                    continue;
+                };
+
+                match &object.kind {
+                    ObjectKind::Shape(_) => cuts.push((layer.id, object.id, in_object)),
+                    // Not cuttable: picked whole, if its middle is inside.
+                    _ => {
+                        if in_object.contains(invert(object.transform).map_or(
+                            bounds.center(),
+                            |back| back * bounds.center(),
+                        )) {
+                            picks.push(object.id);
+                        }
+                    }
+                }
+            }
+        }
+
+        let taken = self.cut_and_collect(cuts, "Lasso");
+        if !additive {
+            self.selection.clear();
+        }
+        self.selection.extend(taken);
+        self.selection.extend(picks);
+    }
+
+    /// Cut each shape along its region, and report what to select.
+    ///
+    /// A shape entirely inside its region is selected whole rather than cut in
+    /// two, because cutting it would leave an empty husk behind.
+    fn cut_and_collect(
+        &mut self,
+        cuts: Vec<(LayerId, ObjectId, BezPath)>,
+        label: &'static str,
+    ) -> Vec<ObjectId> {
+        if cuts.is_empty() {
+            return Vec::new();
+        }
+        let frame = self.current_frame;
+        let mut taken = Vec::new();
+        self.doc.edit(label, |scene| {
+            for (layer, id, region) in cuts {
+                let Some(object) = scene.find_object(id).map(|(_, o)| Arc::clone(o)) else {
+                    continue;
+                };
+                let ObjectKind::Shape(shape) = &object.kind else {
+                    continue;
+                };
+                let size = buzz_geom::Shape::bounding_box(&shape.path);
+                let opts = buzz_geom::BooleanOptions::for_shape_size(
+                    size.width().hypot(size.height()).max(1.0),
+                );
+                let inside = buzz_geom::boolean(
+                    &shape.path,
+                    &region,
+                    buzz_geom::BoolOp::Intersect,
+                    opts,
+                );
+                if inside.is_empty() {
+                    continue;
+                }
+                let outside = buzz_geom::boolean(
+                    &shape.path,
+                    &region,
+                    buzz_geom::BoolOp::Difference,
+                    opts,
+                );
+                if outside.is_empty() {
+                    // The whole shape was caught: nothing to cut.
+                    taken.push(id);
+                    continue;
+                }
+
+                // The part that stays keeps the object — and so keeps its
+                // name, its filters and anything referring to it by id.
+                scene.update_object(id, |o| {
+                    if let ObjectKind::Shape(s) = &mut o.kind {
+                        s.path = outside;
+                    }
+                });
+                // The part that was taken becomes a new object with the same
+                // paint. An image or gradient fill travels with it unchanged,
+                // which is exactly why the picture does not slide about inside
+                // a cut bitmap: the fill's transform is in this same space.
+                let cut = ShapeData {
+                    path: inside,
+                    ..shape.clone()
+                };
+                if let Some(new_id) = scene.add_shape_at(layer, frame, cut) {
+                    scene.update_object(new_id, |o| {
+                        o.transform = object.transform;
+                        o.blend = object.blend;
+                        o.spatial = object.spatial;
+                        o.filters = object.filters.clone();
+                    });
+                    taken.push(new_id);
+                }
+            }
+        });
+        self.doc.end_gesture();
+        taken
+    }
+
+    /// The Magic Wand: take everything the colour of what was clicked.
+    ///
+    /// On a bitmap this is a flood fill through the pixels, traced to a path
+    /// and cut out — see [`buzz_scene::wand`]. On ordinary vector artwork the
+    /// answer is already a shape: a region of one colour *is* the shape that
+    /// was drawn, so the wand selects it whole. Both readings are the same
+    /// sentence — "everything joined to this that looks like this" — and a user
+    /// who does not know which kind of artwork they clicked gets the right
+    /// answer either way.
+    fn wand_at(&mut self, point: Point, additive: bool) {
+        let scene = self.doc.scene().clone();
+        let frame = self.current_frame;
+        let Some(id) = self.object_at(point, self.pick_tolerance()) else {
+            if !additive {
+                self.selection.clear();
+            }
+            return;
+        };
+        let Some((layer, object)) = scene.find_object(id).map(|(l, o)| (l, o.clone())) else {
+            return;
+        };
+
+        // The click, carried into the object's own space the same way the hit
+        // test carried it.
+        let depth = scene
+            .layers()
+            .get(layer)
+            .map(|l| l.depth)
+            .unwrap_or_default();
+        let local = scene
+            .view_to_layer(frame, depth, point)
+            .map(|p| match invert(scene.layers().inherited_transform(layer, frame)) {
+                Some(back) => back * p,
+                None => p,
+            })
+            .and_then(|p| unturn(&scene, &object, frame, depth, p))
+            .and_then(|p| invert(object.transform).map(|back| back * p));
+        let Some(local) = local else { return };
+
+        let region = match &object.kind {
+            ObjectKind::Shape(shape) => match shape.fill.as_ref().map(|f| &f.paint) {
+                Some(buzz_scene::Paint::Image(fill)) => {
+                    buzz_scene::wand_region(fill, local, self.style.wand)
+                }
+                // Not a picture: one flat colour, and the shape is its own
+                // region.
+                _ => None,
+            },
+            _ => None,
+        };
+
+        match region {
+            Some(region) => {
+                let taken = self.cut_and_collect(vec![(layer, id, region)], "Magic Wand");
+                if !additive {
+                    self.selection.clear();
+                }
+                if taken.is_empty() {
+                    self.status = Some("Nothing there matched closely enough".into());
+                }
+                self.selection.extend(taken);
+            }
+            None => {
+                if additive {
+                    self.selection.toggle(id);
+                } else {
+                    self.selection.select_one(id);
+                }
+            }
+        }
+    }
+
     // -- commands ------------------------------------------------------------
 
     pub fn run(&mut self, command: Command) {
@@ -1538,7 +1778,7 @@ impl Editor {
                 debug_assert!(false, "{command:?} must be dispatched by the shell");
             }
 
-            ImportSound | LipSync => {
+            ImportSound | ImportImage | LipSync => {
                 // The shell owns the file dialog and the modal window, as with
                 // Open and Export.
                 debug_assert!(false, "{command:?} must be dispatched by the shell");
@@ -1850,6 +2090,83 @@ impl Editor {
         Ok(imported
             .and_then(|id| scene.sounds().get(id).map(|s| s.name.clone()))
             .unwrap_or(name))
+    }
+
+    /// Animate's File ▸ Import Image, arriving already broken apart.
+    ///
+    /// Returns the name it took in the library.
+    ///
+    /// # Two deliberate departures from Animate
+    ///
+    /// **It arrives as artwork, not as a placed bitmap.** See
+    /// [`buzz_scene::Scene::place_image`]: every interesting thing an animator
+    /// does to a photograph needs it broken apart first, and breaking apart
+    /// costs nothing here because a bitmap *is* a shape with an image fill.
+    ///
+    /// **A picture larger than the stage is scaled to fit it.** Animate places
+    /// at natural size, so a phone photograph lands mostly off the pasteboard
+    /// and the first thing anyone does is scale it down by hand. Aspect ratio
+    /// is kept, and Free Transform undoes it in one drag if the natural size
+    /// was wanted. A picture that already fits is placed untouched, at its own
+    /// size, so pixel-exact artwork stays pixel-exact.
+    pub fn import_image(&mut self, path: &std::path::Path) -> anyhow::Result<String> {
+        // Read and decode before the document is touched, so a file that is
+        // not really a picture leaves no library entry behind.
+        let bytes = std::fs::read(path)?;
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Bitmap".to_string());
+
+        let Some(layer) = self.active_layer() else {
+            anyhow::bail!("no layer available to place it on");
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            anyhow::bail!("the active layer is locked");
+        }
+
+        let stage = self.doc.scene().stage().size;
+        let centre = self.camera.center;
+        let frame = self.current_frame;
+
+        let mut placed: Option<(String, ObjectId)> = None;
+        let mut failure: Option<String> = None;
+        self.doc.edit("Import Image", |scene| {
+            let asset = match scene.add_image(&name, &bytes) {
+                Ok(a) => a,
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    return;
+                }
+            };
+            let (w, h) = (asset.width as f64, asset.height as f64);
+            let fit = (stage.width / w).min(stage.height / h).min(1.0);
+            let (w, h) = (w * fit, h * fit);
+            let rect = buzz_geom::Rect::new(
+                centre.x - w / 2.0,
+                centre.y - h / 2.0,
+                centre.x + w / 2.0,
+                centre.y + h / 2.0,
+            );
+            let asset_name = asset.name.clone();
+            if let Some(id) = scene.place_image_in(layer, frame, asset, rect) {
+                placed = Some((asset_name, id));
+            }
+        });
+
+        if let Some(e) = failure {
+            // The failed `add_image` left the revision bumped but nothing
+            // usable; drop it so the user's undo stack is not littered with
+            // imports that did not happen.
+            self.doc.undo();
+            anyhow::bail!(e);
+        }
+        let Some((name, id)) = placed else {
+            anyhow::bail!("could not place it on this frame");
+        };
+        self.doc.end_gesture();
+        self.selection.set([id]);
+        Ok(name)
     }
 
     /// Put the most recently imported sound on the current keyframe.
@@ -3132,6 +3449,32 @@ fn update_shape(scene: &mut Scene, at: EditAt, id: ObjectId, mut f: impl FnMut(&
 /// Returns the point unchanged for the overwhelming majority of objects, which
 /// are flat. `None` when the object is edge-on or behind the camera, and there
 /// is nothing on screen to click.
+/// Carry every point of a path through `f`.
+///
+/// For the Lasso, whose region is drawn in view space and has to be cut out of
+/// artwork living several transforms further in. `None` if any point cannot be
+/// carried — a layer behind the camera, or a collapsed transform — because half
+/// a region is worse than none.
+///
+/// Control points go through the same map as the on-curve points, which is
+/// exact for the affine and projective maps used here in the case that matters:
+/// both the Lasso and the Magic Wand produce paths of straight lines, and a
+/// straight line stays straight through both.
+fn map_path(path: &BezPath, mut f: impl FnMut(Point) -> Option<Point>) -> Option<BezPath> {
+    use buzz_geom::PathEl::*;
+    let mut out = BezPath::new();
+    for el in path.elements() {
+        out.push(match *el {
+            MoveTo(p) => MoveTo(f(p)?),
+            LineTo(p) => LineTo(f(p)?),
+            QuadTo(a, b) => QuadTo(f(a)?, f(b)?),
+            CurveTo(a, b, c) => CurveTo(f(a)?, f(b)?, f(c)?),
+            ClosePath => ClosePath,
+        });
+    }
+    Some(out)
+}
+
 fn unturn(
     scene: &Scene,
     object: &Object,

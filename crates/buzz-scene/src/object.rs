@@ -11,6 +11,7 @@ use peniko::Color;
 use serde::{Deserialize, Serialize};
 
 use crate::gradient::Gradient;
+use crate::image::ImageFill;
 
 /// Stable identity for an object, preserved across edits and undo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -26,10 +27,19 @@ pub struct ObjectId(pub u64);
 /// shared (see the module header) — copying a shape shares its gradient rather
 /// than duplicating it. Editing one goes through [`Arc::make_mut`], exactly as
 /// editing an object does.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// **Not `Serialize`.** A paint can now hold a bitmap, and deriving the format
+/// off the runtime type would embed a decoded photograph — tens of megabytes of
+/// pixels — inside `document.json`. The `.buzz` format is written by the DTO
+/// layer in `buzz-doc`, which stores the image once in `media/` and refers to
+/// it by id; see the module header there for why that separation exists at all.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Paint {
     Solid(Color),
     Gradient(Arc<Gradient>),
+    /// A bitmap. See [`crate::image`] for why an image is a fill rather than
+    /// a kind of object — in short, because that is what Animate's Break Apart
+    /// produces, and it makes every vector tool work on a photograph.
+    Image(Box<ImageFill>),
 }
 
 impl Paint {
@@ -43,18 +53,31 @@ impl Paint {
         match self {
             Self::Solid(c) => *c,
             Self::Gradient(g) => g.average_color(),
+            Self::Image(i) => i.average_color(),
         }
     }
 
     pub fn gradient(&self) -> Option<&Gradient> {
         match self {
-            Self::Solid(_) => None,
             Self::Gradient(g) => Some(g),
+            _ => None,
         }
     }
 
     pub fn is_gradient(&self) -> bool {
         matches!(self, Self::Gradient(_))
+    }
+
+    /// The bitmap this paint draws, if it is one.
+    pub fn image(&self) -> Option<&ImageFill> {
+        match self {
+            Self::Image(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    pub fn is_image(&self) -> bool {
+        matches!(self, Self::Image(_))
     }
 
     /// The same paint with every colour in it passed through `f`.
@@ -66,6 +89,11 @@ impl Paint {
         match self {
             Self::Solid(c) => Self::Solid(f(*c)),
             Self::Gradient(g) => Self::Gradient(Arc::new(g.map_colors(f))),
+            // A bitmap's colours are its pixels, and rewriting thirty million
+            // of them for a tint would cost more than the frame it is drawn
+            // in. The renderer applies the effect as an alpha and a blend
+            // instead; recorded in PROGRESS.md §7.
+            Self::Image(i) => Self::Image(i.clone()),
         }
     }
 
@@ -77,6 +105,7 @@ impl Paint {
         match self {
             Self::Solid(c) => Self::Solid(*c),
             Self::Gradient(g) => Self::Gradient(Arc::new(g.transformed(t))),
+            Self::Image(i) => Self::Image(Box::new(i.transformed(t))),
         }
     }
 
@@ -116,7 +145,7 @@ impl From<Gradient> for Paint {
 }
 
 /// How a shape is painted inside.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FillSpec {
     pub paint: Paint,
     pub rule: FillMode,
@@ -137,6 +166,14 @@ impl FillSpec {
         }
     }
 
+    /// A shape filled with a bitmap — what Break Apart produces.
+    pub fn image(image: ImageFill) -> Self {
+        Self {
+            paint: Paint::Image(Box::new(image)),
+            rule: FillMode::NonZero,
+        }
+    }
+
     /// The one colour this fill stands for. See [`Paint::color`].
     pub fn color(&self) -> Color {
         self.paint.color()
@@ -144,7 +181,7 @@ impl FillSpec {
 }
 
 /// How a shape's outline is painted.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StrokeSpec {
     pub paint: Paint,
     /// Width in document units.

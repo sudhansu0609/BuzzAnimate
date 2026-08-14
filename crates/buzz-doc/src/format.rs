@@ -136,6 +136,24 @@ fn write_archive<W: Write + Seek>(writer: &mut W, scene: &Scene) -> Result<(), D
         zip.write_all(&sound.data)?;
     }
 
+    // Bitmaps, the same way and for the same reasons. PNG and JPEG are already
+    // compressed, so these are stored rather than deflated too.
+    //
+    // A bitmap that was *painted* here has no source file, so its current
+    // pixels are encoded as a PNG — see `ImageAsset::bytes_for_storage`. An
+    // image that cannot be written is reported and skipped rather than losing
+    // the whole save: the artwork that references it keeps its shape and its
+    // place, and reopening shows a grey fill where the picture was.
+    for image in scene.images().iter() {
+        match image.bytes_for_storage() {
+            Ok(bytes) => {
+                zip.start_file(format!("media/{}", image.file_name()), stored)?;
+                zip.write_all(&bytes)?;
+            }
+            Err(e) => tracing::warn!("could not store {}: {e}", image.name),
+        }
+    }
+
     zip.finish()?;
     Ok(())
 }
@@ -158,7 +176,36 @@ pub fn from_bytes(bytes: &[u8]) -> Result<Scene, DocError> {
     archive.by_name(ENTRY_DOCUMENT)?.read_to_string(&mut document)?;
 
     let dto: DocumentDto = serde_json::from_str(&document)?;
-    let mut scene = dto.to_scene()?;
+
+    // **Bitmaps are decoded before the scene is built**, because a fill refers
+    // to one by id and resolves against it as the layers are read. Sounds can
+    // be reunited afterwards — nothing points *into* them — but an image fill
+    // with no image is a shape with no picture, so the library has to exist
+    // first.
+    let mut images = buzz_scene::ImageLibrary::default();
+    for entry in &dto.images {
+        let name = format!("media/image-{}.{}", entry.id, entry.format);
+        let mut bytes = Vec::new();
+        match archive.by_name(&name) {
+            Ok(mut file) => file.read_to_end(&mut bytes)?,
+            Err(_) => {
+                tracing::warn!("{name} is missing from the document; that image will be blank");
+                continue;
+            }
+        };
+        match buzz_scene::ImageAsset::decode(
+            buzz_scene::ImageId(entry.id),
+            entry.name.clone(),
+            &bytes,
+        ) {
+            Ok(asset) => {
+                images.insert(asset);
+            }
+            Err(e) => tracing::warn!("{name} could not be decoded: {e}"),
+        }
+    }
+
+    let mut scene = dto.to_scene_with_images(images)?;
 
     // Reunite each sound with its bytes. A sound whose file is missing keeps
     // its entry — name, duration and every keyframe that references it — and
@@ -254,6 +301,136 @@ pub fn load(path: impl AsRef<Path>) -> Result<Scene, DocError> {
 
 #[cfg(test)]
 mod tests {
+    /// **A bitmap survives a save and reopen**, pixels and placement both.
+    ///
+    /// The picture goes into `media/` once and the fill refers to it by id, so
+    /// this is really two claims: that the file comes back byte-identical, and
+    /// that the shape which was filled with it still is.
+    #[test]
+    fn a_bitmap_round_trips_through_the_container() {
+        use buzz_scene::{FillSpec, ImageAsset, ImageFill, ImageId, LayerKind, ShapeData};
+
+        // A small painted canvas, encoded as a real PNG.
+        let mut canvas = ImageAsset::blank(ImageId(7), "Canvas", 8, 6);
+        {
+            let pixels = std::sync::Arc::make_mut(&mut canvas.pixels);
+            for (i, chunk) in pixels.chunks_exact_mut(4).enumerate() {
+                chunk.copy_from_slice(&[(i * 7) as u8, (i * 3) as u8, 200, 255]);
+            }
+        }
+        let png = canvas.encode_png().expect("it encodes");
+        let asset = ImageAsset::decode(ImageId(7), "Canvas", &png).expect("it decodes");
+        let (width, height) = (asset.width, asset.height);
+        let sample = asset.pixel(3, 2);
+
+        let mut scene = Scene::empty();
+        let stored = scene.images_mut().insert(asset);
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let area = buzz_geom::Rect::new(40.0, 20.0, 140.0, 95.0);
+        scene
+            .add_shape(
+                layer,
+                ShapeData {
+                    path: buzz_geom::Shape::to_path(&area, 1e-9),
+                    fill: Some(FillSpec::image(ImageFill::new(stored, area))),
+                    stroke: None,
+                    blend: buzz_scene::PaintBlend::Normal,
+                },
+            )
+            .expect("the image shape");
+
+        let bytes = to_bytes(&scene).expect("it saves");
+        let back = from_bytes(&bytes).expect("it opens");
+
+        assert_eq!(back.images().len(), 1, "the bitmap was lost");
+        let reopened = back
+            .images()
+            .get(ImageId(7))
+            .expect("the bitmap should still be there");
+        assert_eq!((reopened.width, reopened.height), (width, height));
+        assert_eq!(
+            reopened.pixel(3, 2),
+            sample,
+            "the pixels changed on the way through"
+        );
+
+        // And the shape still refers to it, in the same place.
+        let fill = back
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0))
+            .find_map(|o| match &o.kind {
+                buzz_scene::ObjectKind::Shape(shape) => {
+                    shape.fill.as_ref().and_then(|f| f.paint.image().cloned())
+                }
+                _ => None,
+            })
+            .expect("the fill should still be an image");
+        assert_eq!(fill.asset.id, ImageId(7));
+        let placed = fill.transform * buzz_geom::Point::new(0.0, 0.0);
+        assert!(
+            (placed.x - 40.0).abs() < 1e-9 && (placed.y - 20.0).abs() < 1e-9,
+            "the picture moved: {placed:?}"
+        );
+    }
+
+    /// A document whose `media/` entry has gone keeps the artwork and loses
+    /// only the picture. Refusing to open would throw away everything else.
+    #[test]
+    fn a_missing_bitmap_leaves_the_artwork_standing() {
+        use buzz_scene::{FillSpec, ImageAsset, ImageFill, ImageId, LayerKind, ShapeData};
+
+        let canvas = ImageAsset::blank(ImageId(9), "Gone", 4, 4);
+        let png = canvas.encode_png().expect("encodes");
+        let asset = ImageAsset::decode(ImageId(9), "Gone", &png).expect("decodes");
+
+        let mut scene = Scene::empty();
+        let stored = scene.images_mut().insert(asset);
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let area = buzz_geom::Rect::new(0.0, 0.0, 50.0, 50.0);
+        scene
+            .add_shape(
+                layer,
+                ShapeData {
+                    path: buzz_geom::Shape::to_path(&area, 1e-9),
+                    fill: Some(FillSpec::image(ImageFill::new(stored, area))),
+                    stroke: None,
+                    blend: buzz_scene::PaintBlend::Normal,
+                },
+            )
+            .expect("the shape");
+
+        // Save, then rebuild the archive without the media entry.
+        let bytes = to_bytes(&scene).expect("saves");
+        let mut stripped = Vec::new();
+        {
+            let mut source = zip::ZipArchive::new(Cursor::new(&bytes)).expect("readable");
+            let mut out = zip::ZipWriter::new(Cursor::new(&mut stripped));
+            for i in 0..source.len() {
+                let mut entry = source.by_index(i).expect("an entry");
+                let name = entry.name().to_string();
+                if name.starts_with("media/") {
+                    continue;
+                }
+                let mut data = Vec::new();
+                entry.read_to_end(&mut data).expect("readable");
+                out.start_file::<_, ()>(name, SimpleFileOptions::default())
+                    .expect("writable");
+                out.write_all(&data).expect("written");
+            }
+            out.finish().expect("finished");
+        }
+
+        let back = from_bytes(&stripped).expect("it should still open");
+        let shapes: usize = back
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0))
+            .filter(|o| matches!(o.kind, buzz_scene::ObjectKind::Shape(_)))
+            .count();
+        assert_eq!(shapes, 1, "the artwork was thrown away with the picture");
+    }
+
     use super::*;
     use buzz_geom::Shape as _;
     use buzz_scene::{LayerKind, ShapeData};

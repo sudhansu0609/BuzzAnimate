@@ -46,6 +46,8 @@ pub fn tool_shapes(rect: Rect, tool: ToolId, color: Color32) -> Vec<Shape> {
     match tool {
         Selection => arrow(&d, true),
         Subselection => arrow(&d, false),
+        Lasso => lasso(&d),
+        MagicWand => magic_wand(&d),
         FreeTransform => free_transform(&d),
         GradientTransform => gradient_transform(&d),
         Pen => pen(&d),
@@ -173,6 +175,42 @@ fn arrow(d: &Draw, solid: bool) {
         d.solid(&[(0.45, 0.65), (0.55, 0.86), (0.66, 0.80), (0.56, 0.60)]);
     }
     d.outline(&body);
+}
+
+/// A drawn loop that does not quite close, with its tail hanging.
+///
+/// The gap and the tail are the whole symbol: a closed circle would be the Oval
+/// tool, and a lasso is recognised by being a line that came back near where it
+/// started rather than a shape.
+fn lasso(d: &Draw) {
+    d.curve(&[
+        (0.32, 0.44),
+        (0.26, 0.30),
+        (0.38, 0.19),
+        (0.58, 0.17),
+        (0.74, 0.26),
+        (0.75, 0.40),
+        (0.62, 0.50),
+        (0.42, 0.51),
+        (0.33, 0.45),
+    ]);
+    // The rope, falling away from the knot.
+    d.curve(&[(0.33, 0.45), (0.31, 0.62), (0.38, 0.74), (0.34, 0.86)]);
+}
+
+/// A wand at an angle with sparks off its tip.
+fn magic_wand(d: &Draw) {
+    d.line((0.28, 0.80), (0.63, 0.38));
+    // The tip, and three sparks leaving it — enough to read as "magic" and few
+    // enough to stay legible at sixteen pixels.
+    d.circle((0.66, 0.34), 0.05, true);
+    for (a, b) in [
+        ((0.66, 0.20), (0.66, 0.11)),
+        ((0.78, 0.30), (0.86, 0.26)),
+        ((0.76, 0.19), (0.83, 0.13)),
+    ] {
+        d.hairline(a, b);
+    }
 }
 
 /// A box with corner handles: the transform frame Animate puts round a

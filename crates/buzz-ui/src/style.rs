@@ -125,6 +125,12 @@ pub struct DrawStyle {
     /// Brush tool settings. Kept here rather than on the tool so that
     /// switching tools and coming back does not reset them.
     pub brush: crate::brush::BrushSettings,
+    /// Magic Wand settings — tolerance and whether it spreads.
+    ///
+    /// Beside the brush settings and for the same reason: they belong to the
+    /// user's way of working, not to a moment, so switching tools and coming
+    /// back does not reset them.
+    pub wand: buzz_scene::WandOptions,
     /// Recently used colours, most recent first.
     pub swatches: Vec<Color>,
 }
@@ -168,6 +174,7 @@ impl Default for DrawStyle {
             stroke_kind: StrokeKind::Solid,
             drawing_mode: DrawingMode::default(),
             brush: crate::brush::BrushSettings::default(),
+            wand: buzz_scene::WandOptions::default(),
             swatches: default_swatches(),
         }
     }

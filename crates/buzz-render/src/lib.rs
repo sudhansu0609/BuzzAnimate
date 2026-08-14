@@ -20,6 +20,7 @@ pub mod lighting;
 use anyhow::{Context, Result};
 use buzz_geom::{Affine, BezPath, Camera, RenderClip, RenderSplit, Shape};
 use buzz_scene::{GradientKind, GradientSpread, Paint};
+use std::sync::Arc;
 use peniko::{Color, Fill};
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 use wgpu::{Device, Instance, Queue, TextureFormat, TextureView};
@@ -188,6 +189,12 @@ fn is_opaque(paint: &Paint) -> bool {
     match paint {
         Paint::Solid(c) => c.components[3] >= 1.0,
         Paint::Gradient(g) => g.stops().iter().all(|s| s.color.components[3] >= 1.0),
+        // **Never sealed.** A photograph is opaque in the middle and its
+        // interesting edges are where it is not; a cut-out is transparent over
+        // most of its own rectangle. Growing either by half a pixel would
+        // smear the border pixels outwards, which is exactly the fringe that
+        // makes a composite look pasted on.
+        Paint::Image(_) => false,
     }
 }
 
@@ -309,6 +316,54 @@ impl<'a> SceneBuilder<'a> {
     /// `Scene::fill`), so the ramp cannot drift away from the shape it fills at
     /// any zoom.
     fn brush_for(&self, paint: &Paint, to_doc: Affine) -> (peniko::Brush, Option<Affine>) {
+        // A bitmap is a brush too, placed by the same chain — the object's
+        // own space, then the camera, then the render split — so a photograph
+        // stays stuck to the shape it fills at any zoom, exactly as a gradient
+        // does. Vello samples the image over the unit square, which is the
+        // space `ImageFill::transform` is defined in, so the two agree with no
+        // conversion at all.
+        if let Some(fill) = paint.image() {
+            let asset = &fill.asset;
+            let data = peniko::ImageData {
+                // The same allocation the document holds, not a copy: an
+                // `Arc<Vec<u8>>` coerces to the trait object Blob wants, so a
+                // 4K photograph is shared with the scene rather than cloned
+                // into every frame.
+                data: peniko::Blob::new(
+                    Arc::clone(&asset.pixels) as Arc<dyn AsRef<[u8]> + Send + Sync>
+                ),
+                format: peniko::ImageFormat::Rgba8,
+                // Straight alpha, as the model stores it and as PNG does.
+                alpha_type: peniko::ImageAlphaType::Alpha,
+                width: asset.width,
+                height: asset.height,
+            };
+            let quality = if fill.smooth {
+                peniko::ImageQuality::Medium
+            } else {
+                peniko::ImageQuality::Low
+            };
+            let brush = peniko::ImageBrush {
+                image: data,
+                sampler: peniko::ImageSampler {
+                    x_extend: peniko::Extend::Pad,
+                    y_extend: peniko::Extend::Pad,
+                    quality,
+                    alpha: 1.0,
+                },
+            };
+            // Vello samples in *pixel* space, so the unit square has to be
+            // scaled up to the image's own size before the placement is
+            // applied. Getting this the wrong way round draws one pixel of the
+            // photograph across the whole shape.
+            let to_pixels = Affine::scale_non_uniform(
+                1.0 / f64::from(asset.width).max(1.0),
+                1.0 / f64::from(asset.height).max(1.0),
+            );
+            let placed = self.doc_to_render() * to_doc * fill.transform * to_pixels;
+            return (peniko::Brush::Image(brush), Some(placed));
+        }
+
         let Some(g) = paint.gradient() else {
             return (peniko::Brush::Solid(paint.color()), None);
         };

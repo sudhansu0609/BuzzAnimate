@@ -15,6 +15,10 @@ use egui::Key;
 pub enum ToolId {
     Selection,
     Subselection,
+    /// Freehand region select — and, on artwork, a freehand cut.
+    Lasso,
+    /// Click a colour and take everything like it.
+    MagicWand,
     FreeTransform,
     GradientTransform,
     Pen,
@@ -55,6 +59,8 @@ impl ToolId {
         match self {
             Selection => "Selection",
             Subselection => "Subselection",
+            Lasso => "Lasso",
+            MagicWand => "Magic Wand",
             FreeTransform => "Free Transform",
             GradientTransform => "Gradient Transform",
             Pen => "Pen",
@@ -83,6 +89,11 @@ impl ToolId {
         match self {
             Selection => Some(Key::V),
             Subselection => Some(Key::A),
+            Lasso => Some(Key::L),
+            // Animate has no letter for the Magic Wand — it is a mode of the
+            // Lasso there, not a tool. Here it is its own tool and takes the
+            // free letter next to it. Recorded in PROGRESS.md §7.
+            MagicWand => Some(Key::G),
             FreeTransform => Some(Key::Q),
             Pen => Some(Key::P),
             Text => Some(Key::T),
@@ -124,6 +135,8 @@ impl ToolId {
         match self {
             Selection => "V",
             Subselection => "A",
+            Lasso => "L",
+            MagicWand => "G",
             FreeTransform => "Q",
             // No shortcut in Animate; both of these render correctly.
             GradientTransform => "◑",
@@ -151,9 +164,11 @@ impl ToolId {
     pub fn status(self) -> ToolStatus {
         use ToolId::*;
         match self {
-            Selection | Subselection | FreeTransform | Line | Rectangle | Oval | PolyStar
-            | Pencil | Brush | Eraser | PaintBucket | InkBottle | Eyedropper | Hand | Zoom
-            | Pen | Camera | Bone | AssetWarp | GradientTransform => ToolStatus::Ready,
+            Selection | Subselection | Lasso | MagicWand | FreeTransform | Line | Rectangle
+            | Oval | PolyStar | Pencil | Brush | Eraser | PaintBucket | InkBottle | Eyedropper
+            | Hand | Zoom | Pen | Camera | Bone | AssetWarp | GradientTransform => {
+                ToolStatus::Ready
+            }
             Text => ToolStatus::Planned("Text arrives with Phase 2 follow-up"),
         }
     }
@@ -195,6 +210,7 @@ pub const TOOL_GROUPS: &[&[ToolId]] = &[
         ToolId::FreeTransform,
         ToolId::GradientTransform,
     ],
+    &[ToolId::Lasso, ToolId::MagicWand],
     &[ToolId::Pen, ToolId::Text],
     &[
         ToolId::Line,
@@ -238,15 +254,20 @@ mod tests {
             "a tool appears in more than one group"
         );
         // 21 through Phase 5, plus Asset Warp when rigging landed in Phase 7,
-        // less the Lasso — see the test below.
-        assert_eq!(tools.len(), 21, "unexpected tool count");
+        // plus the Lasso and the Magic Wand once bitmaps arrived and there was
+        // something for them to cut.
+        assert_eq!(tools.len(), 23, "unexpected tool count");
     }
 
-    /// **Two selection tools, and only two.** Animate's palette groups
-    /// Selection and Subselection with the two transform tools; the Lasso was
-    /// here as a third, greyed out, doing nothing. A tool that cannot be used
-    /// is worse than one that is absent — it takes a place in the palette and
-    /// a letter on the keyboard for a promise it does not keep.
+    /// **Two *object* selection tools, and only two.** Animate's first group is
+    /// Selection and Subselection with the two transform tools, and that is
+    /// what this one is.
+    ///
+    /// The Lasso and the Magic Wand sit in their own group, deliberately. They
+    /// do not pick objects: they mark out a *region* and cut artwork along it.
+    /// Putting them beside Selection would suggest a third and fourth way to
+    /// click on a thing, which is exactly the confusion the two-tool rule was
+    /// there to prevent.
     #[test]
     fn there_are_exactly_two_selection_tools() {
         let selection: Vec<ToolId> = all_tools()
@@ -268,9 +289,11 @@ mod tests {
         );
     }
 
-    /// Every tool in the palette does something. The Lasso was the last one
-    /// that did not; `Text` remains, and is the only permitted exception until
-    /// the font subsystem lands.
+    /// Every tool in the palette does something. `Text` is the only permitted
+    /// exception, until the font subsystem lands.
+    ///
+    /// The Lasso was once here as a greyed-out promise and was taken out for
+    /// it; it is back because it now cuts.
     #[test]
     fn only_text_is_still_unimplemented() {
         let waiting: Vec<ToolId> = all_tools()
@@ -286,6 +309,7 @@ mod tests {
         let cases = [
             (Key::V, ToolId::Selection),
             (Key::A, ToolId::Subselection),
+            (Key::L, ToolId::Lasso),
             (Key::Q, ToolId::FreeTransform),
             (Key::P, ToolId::Pen),
             (Key::T, ToolId::Text),

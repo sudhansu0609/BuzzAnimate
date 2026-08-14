@@ -173,6 +173,17 @@ pub struct Slot {
 /// The whole arrangement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
+    /// Which build's idea of a layout this file holds.
+    ///
+    /// Not a file format version — the layout is plain JSON and every field
+    /// has a default. This is for the one thing defaults cannot express: a
+    /// change to what a *sensible* arrangement looks like. A saved layout from
+    /// before panels could be rolled up has every panel open, which is
+    /// indistinguishable from a user who opened them all, and is also exactly
+    /// the wall of nine panels the roll-up was added to fix. Bumping this
+    /// adopts the new arrangement once, and never touches it again.
+    #[serde(default)]
+    pub version: u32,
     /// What the user called this arrangement.
     pub name: String,
     pub slots: Vec<Slot>,
@@ -262,6 +273,7 @@ impl Workspace {
         };
 
         Self {
+            version: LAYOUT_VERSION,
             name: "Animator".into(),
             slots: vec![
                 slot(PanelId::Tools, Dock::Left, 0, Dock::Left),
@@ -443,6 +455,19 @@ impl Workspace {
     /// reports that a panel "does not exist".
     pub fn fill_gaps(&mut self) {
         let defaults = Self::animate();
+
+        // A layout from before panels could be rolled up: adopt which ones
+        // start rolled, once. Everything else the user arranged is left alone
+        // — their docks, their widths, their order.
+        if self.version < LAYOUT_VERSION {
+            for slot in &mut self.slots {
+                if let Some(default) = defaults.slot(slot.id) {
+                    slot.collapsed = default.collapsed;
+                }
+            }
+            self.version = LAYOUT_VERSION;
+        }
+
         for id in PanelId::ALL {
             if self.slot(id).is_none()
                 && let Some(slot) = defaults.slot(id)
@@ -465,6 +490,10 @@ impl Workspace {
 // ---------------------------------------------------------------------------
 // Keeping it between runs
 // ---------------------------------------------------------------------------
+
+/// Bumped when the *default arrangement* changes in a way a saved layout
+/// should adopt. See [`Workspace::version`].
+pub const LAYOUT_VERSION: u32 = 1;
 
 /// The home a slot takes when a saved layout predates the field.
 fn default_home() -> Dock {
@@ -738,6 +767,82 @@ mod tests {
         }
         for dock in Dock::CHOICES {
             assert!(!dock.label().is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// **A layout saved before panels could be rolled up adopts the new
+    /// arrangement — once, and without disturbing anything else.**
+    ///
+    /// The failure this prevents is quiet: the user's file has every panel
+    /// open, which is what a file from an older build looks like *and* what a
+    /// user who opened them all looks like. Without a version to tell them
+    /// apart, the fix would never reach anybody who had already run the
+    /// program — which is everybody it was reported by.
+    #[test]
+    fn an_older_layout_adopts_the_new_default_roll_ups() {
+        let mut saved = Workspace::animate();
+        saved.version = 0;
+        // As an older file has it: nothing rolled up.
+        for slot in &mut saved.slots {
+            slot.collapsed = false;
+        }
+        // And an arrangement of their own, which must survive.
+        saved.right_width = 444.0;
+        saved.move_to(PanelId::Sound, Dock::Float);
+
+        saved.fill_gaps();
+
+        assert_eq!(saved.version, LAYOUT_VERSION);
+        assert!(
+            saved.is_collapsed(PanelId::Depth),
+            "the occasional panels should now start rolled up"
+        );
+        assert!(
+            !saved.is_collapsed(PanelId::Layers),
+            "the panels lived in must stay open"
+        );
+        assert_eq!(saved.right_width, 444.0, "their column width was disturbed");
+        assert_eq!(
+            saved.dock_of(PanelId::Sound),
+            Dock::Float,
+            "their arrangement was disturbed"
+        );
+    }
+
+    /// And it happens once: a panel the user rolls open stays open.
+    #[test]
+    fn a_layout_already_migrated_is_left_alone() {
+        let mut saved = Workspace::animate();
+        saved.toggle_collapsed(PanelId::Depth); // the user opens it
+        assert!(!saved.is_collapsed(PanelId::Depth));
+
+        saved.fill_gaps();
+
+        assert!(
+            !saved.is_collapsed(PanelId::Depth),
+            "a panel the user opened was rolled up again on the next launch"
+        );
+    }
+
+    /// The Library and the Assets panel are both reachable in the default
+    /// arrangement — which is the complaint that started this.
+    #[test]
+    fn the_library_and_the_assets_panel_share_a_column_and_neither_is_hidden() {
+        let workspace = Workspace::animate();
+        let outer = workspace.on(Dock::RightOuter);
+        assert!(outer.contains(&PanelId::Library));
+        assert!(outer.contains(&PanelId::Assets));
+        for id in [PanelId::Library, PanelId::Assets] {
+            assert!(
+                !workspace.is_collapsed(id),
+                "{id:?} starts rolled up, so it still looks missing"
+            );
+            assert_ne!(workspace.dock_of(id), Dock::Hidden);
         }
     }
 }

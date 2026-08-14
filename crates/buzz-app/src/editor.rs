@@ -363,14 +363,10 @@ impl Editor {
     /// showing, so without this they edit the earliest keyframe holding that
     /// id — which is frame 0's copy of artwork the user is looking at on
     /// frame 12.
-    pub fn edit_object(
-        &mut self,
-        label: &'static str,
-        id: ObjectId,
-        f: impl FnMut(&mut Object),
-    ) {
+    pub fn edit_object(&mut self, label: &'static str, id: ObjectId, f: impl FnMut(&mut Object)) {
         let at = self.edit_at();
-        self.doc.edit(label, |scene| update_object(scene, at, id, f));
+        self.doc
+            .edit(label, |scene| update_object(scene, at, id, f));
     }
 
     /// Make a new document with these settings, and remember them.
@@ -945,9 +941,9 @@ impl Editor {
                 self.selection.extend(hits);
             }
 
-            ToolAction::PickInRegion { region, additive } => {
-                self.pick_in_region(&region, additive)
-            }
+            ToolAction::PickInRegion { region, additive } => self.pick_in_region(&region, additive),
+
+            ToolAction::PaintRaster { canvas, brush } => self.paint_raster(&canvas, &brush),
 
             ToolAction::WandAt { point, additive } => self.wand_at(point, additive),
 
@@ -1311,6 +1307,67 @@ impl Editor {
         out
     }
 
+    /// Place a soft-brush stroke as artwork.
+    ///
+    /// The painted pixels go into the document's bitmap library and the stroke
+    /// becomes an ordinary rectangle filled with them — so from this moment it
+    /// is a shape like any other: selectable, movable, tweenable, cuttable by
+    /// the Lasso, and convertible to a symbol to be reused.
+    ///
+    /// # Why each stroke is its own bitmap
+    ///
+    /// The alternative is a stage-sized canvas per layer that every stroke
+    /// paints into, which is what Photoshop does. It would cost a full-canvas
+    /// copy on every pointer move — eight megabytes at 1080p, sixty times a
+    /// second — because the document is copy-on-write and undo holds the
+    /// previous state. A stroke-sized bitmap costs what was painted: a dab is
+    /// a few kilobytes. What is given up is painting *across* strokes, which
+    /// §7 records.
+    fn paint_raster(&mut self, canvas: &buzz_scene::Canvas, brush: &buzz_scene::SoftBrush) {
+        let Some(layer) = self.active_layer() else {
+            self.status = Some("No layer available to paint on".into());
+            return;
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return;
+        }
+
+        let frame = self.current_frame;
+        let auto = self.auto_keyframe;
+        let area = canvas.area();
+        let mut painted = None;
+        self.doc.edit("Brush", |scene| {
+            if auto {
+                scene.ensure_keyframe(layer, frame);
+            }
+            let id = scene.next_image_id();
+            let name = scene.images().unique_name("Paint");
+            let asset = scene.images_mut().insert(canvas.to_asset(id, name, brush));
+
+            let mut fill = buzz_scene::ImageFill::new(asset, area);
+            // The canvas is already at the document's own pixel scale, so it
+            // is drawn one painted pixel to one document unit. Smoothing it
+            // would blur paint against the grid it was painted on.
+            fill.smooth = false;
+            painted = scene.add_shape_at(
+                layer,
+                frame,
+                ShapeData {
+                    path: buzz_geom::Shape::to_path(&area, 1e-9),
+                    fill: Some(buzz_scene::FillSpec::image(fill)),
+                    stroke: None,
+                    blend: self.style.brush.blend(),
+                },
+            );
+        });
+        self.doc.end_gesture();
+        match painted {
+            Some(id) => self.selection.set([id]),
+            None => self.status = Some("Could not paint on this frame".into()),
+        }
+    }
+
     // -- region selection: the Lasso and the Magic Wand ----------------------
 
     /// Take everything inside a freehand region — **and cut the artwork along
@@ -1346,10 +1403,12 @@ impl Editor {
             // lines, so moving the corners of a polygon moves the polygon.
             let Some(in_layer) = map_path(region, |p| {
                 let p = scene.view_to_layer(frame, layer.depth, p)?;
-                Some(match invert(scene.layers().inherited_transform(layer.id, frame)) {
-                    Some(back) => back * p,
-                    None => p,
-                })
+                Some(
+                    match invert(scene.layers().inherited_transform(layer.id, frame)) {
+                        Some(back) => back * p,
+                        None => p,
+                    },
+                )
             }) else {
                 continue;
             };
@@ -1377,10 +1436,10 @@ impl Editor {
                     ObjectKind::Shape(_) => cuts.push((layer.id, object.id, in_object)),
                     // Not cuttable: picked whole, if its middle is inside.
                     _ => {
-                        if in_object.contains(invert(object.transform).map_or(
-                            bounds.center(),
-                            |back| back * bounds.center(),
-                        )) {
+                        if in_object.contains(
+                            invert(object.transform)
+                                .map_or(bounds.center(), |back| back * bounds.center()),
+                        ) {
                             picks.push(object.id);
                         }
                     }
@@ -1422,21 +1481,13 @@ impl Editor {
                 let opts = buzz_geom::BooleanOptions::for_shape_size(
                     size.width().hypot(size.height()).max(1.0),
                 );
-                let inside = buzz_geom::boolean(
-                    &shape.path,
-                    &region,
-                    buzz_geom::BoolOp::Intersect,
-                    opts,
-                );
+                let inside =
+                    buzz_geom::boolean(&shape.path, &region, buzz_geom::BoolOp::Intersect, opts);
                 if inside.is_empty() {
                     continue;
                 }
-                let outside = buzz_geom::boolean(
-                    &shape.path,
-                    &region,
-                    buzz_geom::BoolOp::Difference,
-                    opts,
-                );
+                let outside =
+                    buzz_geom::boolean(&shape.path, &region, buzz_geom::BoolOp::Difference, opts);
                 if outside.is_empty() {
                     // The whole shape was caught: nothing to cut.
                     taken.push(id);
@@ -1504,10 +1555,12 @@ impl Editor {
             .unwrap_or_default();
         let local = scene
             .view_to_layer(frame, depth, point)
-            .map(|p| match invert(scene.layers().inherited_transform(layer, frame)) {
-                Some(back) => back * p,
-                None => p,
-            })
+            .map(
+                |p| match invert(scene.layers().inherited_transform(layer, frame)) {
+                    Some(back) => back * p,
+                    None => p,
+                },
+            )
             .and_then(|p| unturn(&scene, &object, frame, depth, p))
             .and_then(|p| invert(object.transform).map(|back| back * p));
         let Some(local) = local else { return };
@@ -3206,7 +3259,9 @@ impl Editor {
         self.doc.edit("Convert Lines to Fills", |scene| {
             for id in ids {
                 update_shape(scene, at, id, |s| {
-                    let Some(stroke) = s.stroke.clone() else { return };
+                    let Some(stroke) = s.stroke.clone() else {
+                        return;
+                    };
                     let width = if stroke.hairline { 1.0 } else { stroke.width };
                     let outline = buzz_geom::outline_stroke(
                         &s.path,
@@ -3272,10 +3327,7 @@ impl Editor {
         } else {
             "Flip Vertical"
         };
-        self.transform_selection(
-            Affine::translate(c) * scale * Affine::translate(-c),
-            label,
-        );
+        self.transform_selection(Affine::translate(c) * scale * Affine::translate(-c), label);
     }
 
     /// Modify ▸ Transform ▸ Rotate 90°, about the selection's centre.
@@ -3344,9 +3396,7 @@ impl Editor {
         self.doc.edit(label, |scene| {
             for id in ids {
                 update_shape(scene, at, id, |s| {
-                    if recognise
-                        && let Some((path, _)) = buzz_geom::recognise(&s.path, tolerance)
-                    {
+                    if recognise && let Some((path, _)) = buzz_geom::recognise(&s.path, tolerance) {
                         s.path = path;
                         return;
                     }
@@ -3497,7 +3547,9 @@ fn unturn(
         scene
             .camera()
             .projection_for_object(frame, stage, layer_depth, pivot, &object.spatial)?;
-    let flat = scene.camera().projection_at_depth(frame, stage, layer_depth)?;
+    let flat = scene
+        .camera()
+        .projection_at_depth(frame, stage, layer_depth)?;
 
     flat.then(&turned.inverse()?).map_point(point)
 }
@@ -4073,7 +4125,13 @@ mod tests {
             panic!("expected a shape")
         };
         assert_eq!(
-            shape.fill.as_ref().unwrap().color().to_rgba8().to_u8_array()[0],
+            shape
+                .fill
+                .as_ref()
+                .unwrap()
+                .color()
+                .to_rgba8()
+                .to_u8_array()[0],
             255
         );
     }
@@ -4565,7 +4623,10 @@ mod tests {
                 e.current_frame
             );
         }
-        assert!(e.playback.playing, "a looping section does not end playback");
+        assert!(
+            e.playback.playing,
+            "a looping section does not end playback"
+        );
     }
 
     /// Setting the section is one undo step and survives being undone.
@@ -4682,7 +4743,10 @@ mod tests {
         let mut e = editor();
         e.run(Command::PasteFrames);
         assert!(
-            e.status.as_deref().unwrap_or_default().contains("clipboard"),
+            e.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("clipboard"),
             "{:?}",
             e.status
         );
@@ -4790,7 +4854,10 @@ mod tests {
         assert_eq!(stage.background.to_rgba8().to_u8_array()[..3], [0, 0, 0]);
         assert!(!e.doc.is_dirty(), "a new document opens clean");
         assert_eq!(e.current_frame, 0);
-        assert!(e.selection.active_layer().is_some(), "and has a layer to draw on");
+        assert!(
+            e.selection.active_layer().is_some(),
+            "and has a layer to draw on"
+        );
     }
 
     /// And the settings become the default for the next one — the second
@@ -4911,7 +4978,10 @@ mod tests {
         path.move_to(Point::new(0.0, 0.0));
         for i in 1..24 {
             let t = i as f64;
-            path.line_to(Point::new(t * 9.0, (t * 0.9).sin() * 70.0 + (t * 2.7).cos() * 25.0));
+            path.line_to(Point::new(
+                t * 9.0,
+                (t * 0.9).sin() * 70.0 + (t * 2.7).cos() * 25.0,
+            ));
         }
         let mut id = None;
         e.doc.edit("Draw", |s| {
@@ -5099,7 +5169,13 @@ mod tests {
 
         let layer = e.selection.active_layer().unwrap();
         assert_eq!(
-            e.scene().layers().get(layer).unwrap().frames.keyframes().len(),
+            e.scene()
+                .layers()
+                .get(layer)
+                .unwrap()
+                .frames
+                .keyframes()
+                .len(),
             1,
             "no keyframe should have been made"
         );
@@ -5161,7 +5237,13 @@ mod tests {
 
         let layer = e.selection.active_layer().unwrap();
         assert_eq!(
-            e.scene().layers().get(layer).unwrap().frames.keyframes().len(),
+            e.scene()
+                .layers()
+                .get(layer)
+                .unwrap()
+                .frames
+                .keyframes()
+                .len(),
             2,
             "frame 0 and frame 5, and nothing else"
         );
@@ -5204,7 +5286,13 @@ mod tests {
 
         let layer = e.selection.active_layer().unwrap();
         assert_eq!(
-            e.scene().layers().get(layer).unwrap().frames.keyframes().len(),
+            e.scene()
+                .layers()
+                .get(layer)
+                .unwrap()
+                .frames
+                .keyframes()
+                .len(),
             1
         );
     }
@@ -5246,7 +5334,10 @@ mod tests {
         let after = x_on_each(&e, id);
         assert!((after[1] - before[1] - 100.0).abs() < 1e-9, "frame 5 moved");
         assert!((after[0] - before[0]).abs() < 1e-9, "frame 0 must not move");
-        assert!((after[2] - before[2]).abs() < 1e-9, "frame 10 must not move");
+        assert!(
+            (after[2] - before[2]).abs() < 1e-9,
+            "frame 10 must not move"
+        );
     }
 
     /// **On — every keyframe in the range moves together.** The point of the
@@ -5679,7 +5770,10 @@ mod tests {
         assert!(e.selection.is_empty(), "the Brush selected the layer");
 
         e.set_tool(ToolId::Selection);
-        assert!(e.selection.is_empty(), "the Selection tool selected the layer");
+        assert!(
+            e.selection.is_empty(),
+            "the Selection tool selected the layer"
+        );
     }
 
     /// **Going into a symbol arrives with its artwork selected and its layer
@@ -5736,7 +5830,11 @@ mod tests {
         e.style.drawing_mode = DrawingMode::ObjectDrawing;
 
         let mut parts = Vec::new();
-        for (x, y, size) in [(260.0, 150.0, 40.0), (200.0, 270.0, 30.0), (240.0, 210.0, 70.0)] {
+        for (x, y, size) in [
+            (260.0, 150.0, 40.0),
+            (200.0, 270.0, 30.0),
+            (240.0, 210.0, 70.0),
+        ] {
             let drawn = draw_square(e, x, y, size, Color::WHITE).expect("a square");
             e.selection.select_one(drawn);
             e.run(Command::ConvertToSymbol);

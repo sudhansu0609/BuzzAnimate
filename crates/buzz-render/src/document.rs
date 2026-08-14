@@ -103,7 +103,14 @@ pub fn draw_frame(
     camera: Affine,
     options: &FrameOptions,
 ) {
-    draw_frame_lit(builder, scene, frame, camera, options, &mut LightCache::new());
+    draw_frame_lit(
+        builder,
+        scene,
+        frame,
+        camera,
+        options,
+        &mut LightCache::new(),
+    );
 }
 
 /// Everything the draw walk keeps between frames.
@@ -209,7 +216,15 @@ pub fn draw_frame_within(
     options: &FrameOptions,
     cache: &mut DrawCache,
 ) {
-    draw_layers(builder, scene, scene.layers(), frame, camera, options, cache);
+    draw_layers(
+        builder,
+        scene,
+        scene.layers(),
+        frame,
+        camera,
+        options,
+        cache,
+    );
 }
 
 /// Draw the **document's own timeline**, whatever symbol is open.
@@ -280,8 +295,7 @@ fn draw_layers(
         // contents are visible so they can be drawn. That is `WhenLocked`, and
         // it is the only reason this is not an unconditional skip.
         let is_stencil = layer.kind.is_mask()
-            && (options.masks == MaskDisplay::Always
-                || masks.values().any(|m| *m == layer.id));
+            && (options.masks == MaskDisplay::Always || masks.values().any(|m| *m == layer.id));
         if is_stencil {
             continue;
         }
@@ -313,7 +327,9 @@ fn draw_layers(
         // Layer parenting: what this layer inherits from the layer it
         // follows. Resolved here because only the stack knows the chain.
         let follows = layers.inherited_transform(layer.id, frame);
-        draw_layer(builder, scene, layer, frame, camera, follows, options, cache);
+        draw_layer(
+            builder, scene, layer, frame, camera, follows, options, cache,
+        );
     }
 
     close_mask(builder, open);
@@ -437,7 +453,10 @@ fn mask_geometry(
 }
 
 /// Draw one layer's artwork.
-#[allow(clippy::too_many_arguments, reason = "one call site; a struct would only move the arguments")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call site; a struct would only move the arguments"
+)]
 fn draw_layer(
     builder: &mut SceneBuilder<'_>,
     scene: &Scene,
@@ -526,9 +545,7 @@ fn draw_layer(
         // each one just before its own shape would let a character's shadow
         // land on the character standing next to it on the same layer, which
         // is never what a flat drawing means.
-        if lit
-            && let Some(key) = rig.key()
-        {
+        if lit && let Some(key) = rig.key() {
             let height = scene.shadow_height(layer.depth, key);
             for (object, owner) in resolved.iter_owned() {
                 cast_shadows(
@@ -584,7 +601,12 @@ fn draw_layer(
         });
 
         if let Some(fx) = &layer_fx {
-            crate::filters::draw_ops(builder, &fx.behind, &ctx.projection, ctx.ghost.unwrap_or(1.0));
+            crate::filters::draw_ops(
+                builder,
+                &fx.behind,
+                &ctx.projection,
+                ctx.ghost.unwrap_or(1.0),
+            );
         }
 
         let layer_ctx = match layer_fx.as_ref().and_then(|fx| fx.adjust) {
@@ -600,14 +622,7 @@ fn draw_layer(
                 let mut object_ctx = layer_ctx.clone();
                 // A layer blur applies to every shape on the layer.
                 object_ctx.blur = layer_fx.as_ref().and_then(|fx| fx.blur);
-                draw_object(
-                    builder,
-                    object,
-                    owner,
-                    Affine::IDENTITY,
-                    &object_ctx,
-                    cache,
-                );
+                draw_object(builder, object, owner, Affine::IDENTITY, &object_ctx, cache);
             }
         }
 
@@ -1001,14 +1016,7 @@ fn draw_object_inner(
                             builder.tolerance(),
                         )
                     {
-                        open = open_mask(
-                            builder,
-                            &symbol.layers,
-                            mask_id,
-                            &masks,
-                            inner,
-                            path,
-                        );
+                        open = open_mask(builder, &symbol.layers, mask_id, &masks, inner, path);
                     }
                 }
 
@@ -1064,7 +1072,10 @@ fn append_silhouette(object: &Object, transform: Affine, out: &mut buzz_geom::Be
 }
 
 /// Paint one shape's fill and stroke, lit.
-#[allow(clippy::too_many_arguments, reason = "one call path; a struct would only move the arguments")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call path; a struct would only move the arguments"
+)]
 fn draw_shape(
     builder: &mut SceneBuilder<'_>,
     owner: Option<&Arc<Object>>,
@@ -1138,13 +1149,8 @@ fn draw_shape(
                     Some(light) => light.apply(stroke.color()),
                     None => stroke.color(),
                 });
-                let ops = buzz_fx::blur_ops(
-                    &outline,
-                    colour,
-                    (rx, ry),
-                    quality,
-                    builder.tolerance(),
-                );
+                let ops =
+                    buzz_fx::blur_ops(&outline, colour, (rx, ry), quality, builder.tolerance());
                 crate::filters::draw_ops(builder, &ops, &ctx.projection.pre_affine(doc), 1.0);
             }
             return;
@@ -1202,8 +1208,11 @@ fn draw_shape(
                 builder.fill_shape_paint(&drawn, &shaded, brush_to_doc);
             }
             if let Some(highlight) = &geometry.highlight {
-                let glint =
-                    ctx.paint(&fill.paint.map_colors(|c| light.highlight(c, key.color, modelling)));
+                let glint = ctx.paint(
+                    &fill
+                        .paint
+                        .map_colors(|c| light.highlight(c, key.color, modelling)),
+                );
                 let drawn = ctx.project(highlight, builder.tolerance());
                 builder.fill_shape_paint(&drawn, &glint, brush_to_doc);
             }
@@ -1243,7 +1252,9 @@ fn cast_shadows(
     cache: &mut DrawCache,
     ctx: &DrawCtx<'_>,
 ) {
-    cast_shadows_within(builder, object, owner, doc, key, height, depth, cache, ctx, 0);
+    cast_shadows_within(
+        builder, object, owner, doc, key, height, depth, cache, ctx, 0,
+    );
 }
 
 /// [`cast_shadows`], carrying how deep into nested symbols it has gone.
@@ -1278,14 +1289,12 @@ fn cast_shadows_within(
                 // An unfilled outline has nothing to block the light with.
                 return;
             }
-            let geometry = cache.lights.shade(owner, 0, shape, doc, key, height, depth, modelling);
+            let geometry = cache
+                .lights
+                .shade(owner, 0, shape, doc, key, height, depth, modelling);
             if let Some(cast) = &geometry.cast {
-                let shadow = Color::from_rgba8(
-                    0,
-                    0,
-                    0,
-                    (key.shadow_strength.clamp(0.0, 1.0) * 255.0) as u8,
-                );
+                let shadow =
+                    Color::from_rgba8(0, 0, 0, (key.shadow_strength.clamp(0.0, 1.0) * 255.0) as u8);
                 let drawn = ctx.project(cast, builder.tolerance());
                 builder.fill_shape(&drawn, ctx.overlay(shadow));
             }
@@ -1293,7 +1302,15 @@ fn cast_shadows_within(
         ObjectKind::Group(children) => {
             for child in children {
                 cast_shadows_within(
-                    builder, child, Some(child), doc, key, height, depth, cache, ctx,
+                    builder,
+                    child,
+                    Some(child),
+                    doc,
+                    key,
+                    height,
+                    depth,
+                    cache,
+                    ctx,
                     depth_limit,
                 );
             }
@@ -1301,7 +1318,16 @@ fn cast_shadows_within(
         ObjectKind::Armature(rig) => {
             for part in rig.posed() {
                 cast_shadows_within(
-                    builder, &part, None, doc, key, height, depth, cache, ctx, depth_limit,
+                    builder,
+                    &part,
+                    None,
+                    doc,
+                    key,
+                    height,
+                    depth,
+                    cache,
+                    ctx,
+                    depth_limit,
                 );
             }
         }
@@ -1310,14 +1336,12 @@ fn cast_shadows_within(
             if shape.fill.is_none() {
                 return;
             }
-            let geometry = cache.lights.shade(owner, 1, &shape, doc, key, height, depth, modelling);
+            let geometry = cache
+                .lights
+                .shade(owner, 1, &shape, doc, key, height, depth, modelling);
             if let Some(cast) = &geometry.cast {
-                let shadow = Color::from_rgba8(
-                    0,
-                    0,
-                    0,
-                    (key.shadow_strength.clamp(0.0, 1.0) * 255.0) as u8,
-                );
+                let shadow =
+                    Color::from_rgba8(0, 0, 0, (key.shadow_strength.clamp(0.0, 1.0) * 255.0) as u8);
                 let drawn = ctx.project(cast, builder.tolerance());
                 builder.fill_shape(&drawn, ctx.overlay(shadow));
             }

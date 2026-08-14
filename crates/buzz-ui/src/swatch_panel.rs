@@ -58,7 +58,12 @@ impl SwatchState {
 /// Takes the scene mutably because naming a colour, moving it between folders
 /// and deleting it are edits to the document; the caller wraps this in an undo
 /// step, and a frame in which nothing changed records nothing.
-pub fn swatch_panel(ui: &mut Ui, scene: &mut Scene, state: &mut SwatchState, style: &mut DrawStyle) {
+pub fn swatch_panel(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    state: &mut SwatchState,
+    style: &mut DrawStyle,
+) {
     ui.horizontal(|ui| {
         ui.heading("Swatches");
         ui.label(
@@ -168,7 +173,10 @@ fn draw_folder(
         ui.horizontal(|ui| {
             ui.add_space(indent);
             // `⏷` and `▶`: the two arrows egui's bundled fonts actually have.
-            if ui.small_button(if open { "\u{23F7}" } else { "\u{25B6}" }).clicked() {
+            if ui
+                .small_button(if open { "\u{23F7}" } else { "\u{25B6}" })
+                .clicked()
+            {
                 state.toggle(&folder);
             }
             ui.label(RichText::new("F").small().weak())
@@ -229,14 +237,18 @@ fn chip_button(
     name: &str,
     picked: &mut Option<(peniko::Color, bool)>,
 ) {
-    let response = chip(ui, color, 18.0)
-        .on_hover_text(format!("{name}\nClick sets fill \u{b7} Shift-click sets stroke"));
+    let response = chip(ui, color, 18.0).on_hover_text(format!(
+        "{name}\nClick sets fill \u{b7} Shift-click sets stroke"
+    ));
     if response.clicked() {
         *picked = Some((color, ui.input(|i| i.modifiers.shift)));
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "internal row painter, not an API")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal row painter, not an API"
+)]
 fn swatch_row(
     ui: &mut Ui,
     scene: &mut Scene,
@@ -282,7 +294,11 @@ fn swatch_row(
             // glyph in egui's bundled fonts and draws as an empty box — this
             // project has been caught by it before, and `theme::font_has`
             // keeps a list of the characters that are not available.
-            if ui.small_button("\u{1F5D1}").on_hover_text("Delete").clicked() {
+            if ui
+                .small_button("\u{1F5D1}")
+                .on_hover_text("Delete")
+                .clicked()
+            {
                 scene.swatches_mut().remove(id);
             }
 
@@ -305,14 +321,14 @@ fn swatch_row(
                 .selected_text(label)
                 .width(64.0)
                 .show_ui(ui, |ui| {
-                    if ui.selectable_label(current.is_empty(), "\u{2014} root").clicked() {
+                    if ui
+                        .selectable_label(current.is_empty(), "\u{2014} root")
+                        .clicked()
+                    {
                         scene.swatches_mut().update(id, |s| s.folder = None);
                     }
                     for folder in folders {
-                        if ui
-                            .selectable_label(current == folder, &folder)
-                            .clicked()
-                        {
+                        if ui.selectable_label(current == folder, &folder).clicked() {
                             scene
                                 .swatches_mut()
                                 .update(id, |s| s.folder = Some(folder.clone()));
@@ -343,11 +359,7 @@ fn footer(ui: &mut Ui, scene: &mut Scene, state: &mut SwatchState, style: &DrawS
             state.renaming = Some((id, name));
         }
 
-        if ui
-            .small_button("Fld")
-            .on_hover_text("New folder")
-            .clicked()
-        {
+        if ui.small_button("Fld").on_hover_text("New folder").clicked() {
             let base = "Folder";
             let mut name = base.to_string();
             let existing: Vec<String> = scene.swatches().folders().cloned().collect();
@@ -419,6 +431,9 @@ mod tests {
         let id = scene.add_swatch("Swatch", peniko::Color::WHITE, None);
 
         assert_eq!(scene.swatches().len(), before + 1);
-        assert_eq!(scene.swatches().get(id).map(|s| s.name.as_str()), Some("Swatch"));
+        assert_eq!(
+            scene.swatches().get(id).map(|s| s.name.as_str()),
+            Some("Swatch")
+        );
     }
 }

@@ -290,7 +290,10 @@ fn a_sky_fills_without_casting() {
 
         let frame = render(exporter, &scene);
 
-        assert!(luma(frame.pixel(275, 225)) > 20.0, "the sky should light it");
+        assert!(
+            luma(frame.pixel(275, 225)) > 20.0,
+            "the sky should light it"
+        );
 
         let left = luma(frame.pixel(170, 225));
         let right = luma(frame.pixel(380, 225));

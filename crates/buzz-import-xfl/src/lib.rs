@@ -275,7 +275,10 @@ fn collect_library(
         let path = entry.path();
         if path.is_dir() {
             collect_library(root, &path, out)?;
-        } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("xml")) {
+        } else if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("xml"))
+        {
             // Keep the path relative to LIBRARY so folder structure survives.
             let relative = path
                 .strip_prefix(root)
@@ -479,7 +482,10 @@ fn attr_bool(attrs: &HashMap<String, String>, key: &str, default: bool) -> bool 
 
 /// Animate writes colours as `#RRGGBB` with a separate alpha attribute.
 fn parse_color(attrs: &HashMap<String, String>, color_key: &str, alpha_key: &str) -> Color {
-    let hex = attrs.get(color_key).map(String::as_str).unwrap_or("#000000");
+    let hex = attrs
+        .get(color_key)
+        .map(String::as_str)
+        .unwrap_or("#000000");
     let hex = hex.trim_start_matches('#');
     let value = u32::from_str_radix(hex, 16).unwrap_or(0);
     let alpha = attrs
@@ -1227,32 +1233,31 @@ impl FrameContext {
         };
 
         let mut made = 0usize;
-        let mut push = |path: buzz_geom::BezPath,
-                        fill: Option<Paint>,
-                        stroke: Option<(Paint, f64)>| {
-            if path.elements().is_empty() {
-                return;
-            }
-            frame.objects.push(std::sync::Arc::new(Object::shape(
-                ObjectId(ids.take()),
-                ShapeData {
-                    path,
-                    fill: fill.map(|paint| FillSpec {
-                        paint,
-                        rule: buzz_geom::FillMode::NonZero,
-                    }),
-                    stroke: stroke.map(|(paint, width)| StrokeSpec {
-                        paint,
-                        width,
-                        hairline: false,
-                    }),
-                    // No source format expresses build-up paint, so imported
-                    // artwork always composites normally.
-                    blend: buzz_scene::PaintBlend::Normal,
-                },
-            )));
-            made += 1;
-        };
+        let mut push =
+            |path: buzz_geom::BezPath, fill: Option<Paint>, stroke: Option<(Paint, f64)>| {
+                if path.elements().is_empty() {
+                    return;
+                }
+                frame.objects.push(std::sync::Arc::new(Object::shape(
+                    ObjectId(ids.take()),
+                    ShapeData {
+                        path,
+                        fill: fill.map(|paint| FillSpec {
+                            paint,
+                            rule: buzz_geom::FillMode::NonZero,
+                        }),
+                        stroke: stroke.map(|(paint, width)| StrokeSpec {
+                            paint,
+                            width,
+                            hairline: false,
+                        }),
+                        // No source format expresses build-up paint, so imported
+                        // artwork always composites normally.
+                        blend: buzz_scene::PaintBlend::Normal,
+                    },
+                )));
+                made += 1;
+            };
 
         let (fills, gaps) = edge::assemble_fills_counted(&records);
         for (index, path) in fills {
@@ -1409,7 +1414,9 @@ impl FrameContext {
                 // Collected, not drawn. A shape's outlines are spread across
                 // its edges and only make sense once all of them are in —
                 // `finish_shape` is where they become artwork.
-                let Some(data) = attrs.get("edges") else { return };
+                let Some(data) = attrs.get("edges") else {
+                    return;
+                };
                 let index = |k: &str| attrs.get(k).and_then(|v| v.trim().parse::<u32>().ok());
                 match edge::parse_segments(data) {
                     Ok(segments) if !segments.is_empty() => {
@@ -1466,9 +1473,7 @@ impl FrameContext {
             }
             "DOMGroup" => report.groups += 1,
             "DOMBitmapInstance" => report.note_unsupported("bitmap"),
-            "DOMStaticText" | "DOMDynamicText" | "DOMInputText" => {
-                report.note_unsupported("text")
-            }
+            "DOMStaticText" | "DOMDynamicText" | "DOMInputText" => report.note_unsupported("text"),
             "DOMVideoInstance" => report.note_unsupported("video"),
             "DOMSoundItem" => report.note_unsupported("sound"),
             "Matrix" => {
@@ -1547,7 +1552,10 @@ fn library_keys(xml: &str, path: &str) -> Vec<String> {
         .to_string();
 
     let mut keys: Vec<String> = Vec::new();
-    for full in [library_name_of(xml), Some(from_path)].into_iter().flatten() {
+    for full in [library_name_of(xml), Some(from_path)]
+        .into_iter()
+        .flatten()
+    {
         let short = full.rsplit('/').next().unwrap_or(&full).to_string();
         for key in [full.clone(), short] {
             if !key.is_empty() && !keys.contains(&key) {
@@ -2035,7 +2043,10 @@ mod tests {
         let (scene, report) = build(
             MINIMAL_DOCUMENT,
             &[
-                ("LIBRARY/parts/character.xml".to_string(), CHARACTER.to_string()),
+                (
+                    "LIBRARY/parts/character.xml".to_string(),
+                    CHARACTER.to_string(),
+                ),
                 ("LIBRARY/parts/torso.xml".to_string(), part("torso")),
                 ("LIBRARY/parts/arm.xml".to_string(), part("arm")),
                 ("LIBRARY/hero.xml".to_string(), HERO_SYMBOL.to_string()),
@@ -2044,7 +2055,10 @@ mod tests {
         .unwrap();
 
         assert!(
-            !report.unsupported.iter().any(|u| u.contains("unknown symbol")),
+            !report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("unknown symbol")),
             "every nested instance should resolve: {:?}",
             report.unsupported
         );
@@ -2254,7 +2268,11 @@ mod tests {
 
         // A camera scaled to half shows half the stage: a zoom of two.
         assert_eq!(keys[2].frame, 50);
-        assert!((keys[2].zoom - 2.0).abs() < 1e-9, "zoom was {}", keys[2].zoom);
+        assert!(
+            (keys[2].zoom - 2.0).abs() < 1e-9,
+            "zoom was {}",
+            keys[2].zoom
+        );
         assert_eq!(keys[2].center, buzz_geom::Point::new(400.0, 300.0));
     }
 
@@ -2378,7 +2396,11 @@ mod tests {
             report.note_unsupported("bitmap");
         }
         assert_eq!(report.unsupported.len(), 1, "one line, with a count");
-        assert!(report.unsupported[0].contains("x50"), "{:?}", report.unsupported);
+        assert!(
+            report.unsupported[0].contains("x50"),
+            "{:?}",
+            report.unsupported
+        );
     }
 
     #[test]
@@ -2401,7 +2423,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old.fla");
         // OLE2 compound document signature.
-        std::fs::write(&path, [0xD0u8, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0, 0]).unwrap();
+        std::fs::write(
+            &path,
+            [0xD0u8, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0, 0],
+        )
+        .unwrap();
 
         match import(&path) {
             Err(ImportError::LegacyBinaryFla) => {}
@@ -2438,7 +2464,11 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(scene.layers().len(), 1, "a document needs somewhere to draw");
+        assert_eq!(
+            scene.layers().len(),
+            1,
+            "a document needs somewhere to draw"
+        );
     }
 
     #[test]
@@ -2628,7 +2658,11 @@ mod tests {
         let shapes = shapes_of(&scene);
         assert_eq!(shapes.len(), 3);
 
-        let first = shapes[0].fill.as_ref().expect("the first edge is filled").color();
+        let first = shapes[0]
+            .fill
+            .as_ref()
+            .expect("the first edge is filled")
+            .color();
         assert_eq!(
             first.to_rgba8().to_u8_array(),
             [0x33, 0x66, 0xCC, 0xFF],
@@ -2655,7 +2689,10 @@ mod tests {
             .stroke
             .as_ref()
             .expect("the third edge is stroked");
-        assert_eq!(stroke.color().to_rgba8().to_u8_array(), [0x00, 0xFF, 0x00, 0xFF]);
+        assert_eq!(
+            stroke.color().to_rgba8().to_u8_array(),
+            [0x00, 0xFF, 0x00, 0xFF]
+        );
         assert_eq!(stroke.width, 4.0);
     }
 
@@ -2695,7 +2732,10 @@ mod tests {
         // gradients were averaged, and a file whose middle stop sits at a
         // quarter draws nothing like one where it sits halfway.
         assert!((g.stops()[1].offset - 0.25).abs() < 1e-9, "{:?}", g.stops());
-        assert_eq!(g.stops()[1].color.to_rgba8().to_u8_array()[..3], [255, 0, 0]);
+        assert_eq!(
+            g.stops()[1].color.to_rgba8().to_u8_array()[..3],
+            [255, 0, 0]
+        );
 
         // The matrix maps Flash's 1638.4-pixel gradient box, so a scale of 0.1
         // puts the ramp's end 81.92 pixels from its centre at (50, 50).
@@ -2964,13 +3004,25 @@ mod tests {
         assert_eq!(shapes.len(), 2);
 
         assert_eq!(
-            shapes[0].fill.as_ref().unwrap().color().to_rgba8().to_u8_array(),
+            shapes[0]
+                .fill
+                .as_ref()
+                .unwrap()
+                .color()
+                .to_rgba8()
+                .to_u8_array(),
             [0x11, 0x22, 0x33, 0xFF]
         );
         // The second shape declares no styles, so it falls back to the visible
         // default rather than inheriting the first shape's blue.
         assert_ne!(
-            shapes[1].fill.as_ref().unwrap().color().to_rgba8().to_u8_array(),
+            shapes[1]
+                .fill
+                .as_ref()
+                .unwrap()
+                .color()
+                .to_rgba8()
+                .to_u8_array(),
             [0x11, 0x22, 0x33, 0xFF],
             "the second shape must not inherit the first shape's fill table"
         );

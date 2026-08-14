@@ -186,7 +186,11 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         // Animate's Window menu: what is on screen, and where.
         ui.menu_button("Window", |ui| {
             for id in crate::workspace::PanelId::ALL {
-                let mark = if workspace.is_open(id) { "\u{2714} " } else { "   " };
+                let mark = if workspace.is_open(id) {
+                    "\u{2714} "
+                } else {
+                    "   "
+                };
                 if ui.button(format!("{mark}{}", id.title())).clicked() {
                     raised.push(Command::TogglePanel(id));
                     ui.close();
@@ -211,9 +215,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             let mark = if workspace.locked { "\u{2714} " } else { "   " };
             let shortcut = shortcut_text(ui.ctx(), Command::ToggleLayoutLock);
             if ui
-                .add(
-                    egui::Button::new(format!("{mark}Lock Layout")).shortcut_text(shortcut),
-                )
+                .add(egui::Button::new(format!("{mark}Lock Layout")).shortcut_text(shortcut))
                 .on_hover_text("Stop panels being dragged, resized or moved")
                 .clicked()
             {
@@ -428,8 +430,7 @@ pub fn tool_bar(ui: &mut Ui, active: ToolId, style: &mut DrawStyle) -> Option<To
             // dock and the tools flow into two or three rather than leaving a
             // column of empty space beside them.
             let spacing = ui.spacing().item_spacing.x;
-            let per_row = ((ui.available_width() + spacing)
-                / (Metrics::TOOL_BUTTON + spacing))
+            let per_row = ((ui.available_width() + spacing) / (Metrics::TOOL_BUTTON + spacing))
                 .floor()
                 .clamp(1.0, 8.0) as usize;
 
@@ -884,6 +885,21 @@ fn brush_properties(ui: &mut Ui, style: &mut DrawStyle) {
                 "Opacity adds where strokes overlap: 20% crossing 30% gives                  50%, not 44%. Paint deepens as you work over it, the way ink                  does.",
             );
         ui.end_row();
+
+        if style.brush.kind == BrushKind::Raster {
+            ui.label("Hardness");
+            ui.add(egui::Slider::new(&mut style.brush.hardness, 0.0..=1.0))
+                .on_hover_text(
+                    "Where the edge starts to fade. 1 is a hard edge; 0 fades \
+                     from the very middle, as an airbrush does.",
+                );
+            ui.end_row();
+
+            ui.label("Flow");
+            ui.add(egui::Slider::new(&mut style.brush.flow, 0.05..=1.0))
+                .on_hover_text("How much paint the stroke lays down");
+            ui.end_row();
+        }
 
         if style.brush.kind == BrushKind::Fluid {
             ui.label("Thinnest");
@@ -1402,7 +1418,12 @@ pub fn gradient_editor(ui: &mut Ui, gradient: &mut Gradient) -> bool {
             // Two stops are the fewest a ramp can have; removing below that
             // would leave a gradient that is a colour, and the model would
             // silently pad it back.
-            if count > 2 && ui.small_button("\u{1F5D1}").on_hover_text("Remove stop").clicked() {
+            if count > 2
+                && ui
+                    .small_button("\u{1F5D1}")
+                    .on_hover_text("Remove stop")
+                    .clicked()
+            {
                 remove = Some(i);
             }
         });
@@ -1620,9 +1641,9 @@ pub fn layers_panel(
                     ui.add_space(depth as f32 * 12.0 + 18.0);
                     ui.label(RichText::new("follows").small().weak());
 
-                    let label = match follows.and_then(|f| {
-                        names.iter().find(|(other, _, _)| *other == f)
-                    }) {
+                    let label = match follows
+                        .and_then(|f| names.iter().find(|(other, _, _)| *other == f))
+                    {
                         Some((_, name, _)) => name.clone(),
                         // An em dash reads as "nothing" without needing a word
                         // for it, and this line is repeated on every layer.
@@ -1640,15 +1661,11 @@ pub fn layers_panel(
                                 set_follows = Some((id, None));
                             }
                             for other in &choices {
-                                let Some((_, name, _)) =
-                                    names.iter().find(|(o, _, _)| o == other)
+                                let Some((_, name, _)) = names.iter().find(|(o, _, _)| o == other)
                                 else {
                                     continue;
                                 };
-                                if ui
-                                    .selectable_label(follows == Some(*other), name)
-                                    .clicked()
-                                {
+                                if ui.selectable_label(follows == Some(*other), name).clicked() {
                                     set_follows = Some((id, Some(*other)));
                                 }
                             }

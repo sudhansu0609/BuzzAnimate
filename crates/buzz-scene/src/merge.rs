@@ -50,9 +50,15 @@ pub struct MergeReport {
 impl MergeReport {
     /// A sentence for the status bar.
     pub fn summary(&self) -> String {
-        let mut s = format!("{} symbols, {} layers, {} objects", self.symbols, self.layers, self.objects);
+        let mut s = format!(
+            "{} symbols, {} layers, {} objects",
+            self.symbols, self.layers, self.objects
+        );
         if !self.renamed.is_empty() {
-            s.push_str(&format!("; {} renamed to avoid a clash", self.renamed.len()));
+            s.push_str(&format!(
+                "; {} renamed to avoid a clash",
+                self.renamed.len()
+            ));
         }
         s
     }
@@ -83,11 +89,7 @@ impl Remapper<'_> {
 
         let mut out = LayerStack::new();
         for (index, layer) in source.iter().enumerate() {
-            let mut copy = Layer::new(
-                layer_ids[&layer.id],
-                layer.name.clone(),
-                layer.kind,
-            );
+            let mut copy = Layer::new(layer_ids[&layer.id], layer.name.clone(), layer.kind);
             // A parent outside this stack cannot be honoured, so the layer
             // becomes top-level rather than pointing at a foreign document.
             copy.parent = layer.parent.and_then(|p| layer_ids.get(&p).copied());
@@ -298,7 +300,15 @@ mod tests {
         let outer = scene.add_symbol(format!("{name} Outer"), SymbolKind::Graphic, None);
 
         // Artwork in the inner symbol.
-        let inner_layer = scene.library().get(inner).unwrap().layers.iter().next().unwrap().id;
+        let inner_layer = scene
+            .library()
+            .get(inner)
+            .unwrap()
+            .layers
+            .iter()
+            .next()
+            .unwrap()
+            .id;
         let art = Object::shape(scene.next_object_id(), shape(size));
         scene.library_mut().update(inner, |s| {
             s.layers.update(inner_layer, |l| {
@@ -307,7 +317,15 @@ mod tests {
         });
 
         // An instance of the inner symbol, inside the outer one.
-        let outer_layer = scene.library().get(outer).unwrap().layers.iter().next().unwrap().id;
+        let outer_layer = scene
+            .library()
+            .get(outer)
+            .unwrap()
+            .layers
+            .iter()
+            .next()
+            .unwrap()
+            .id;
         let nested = Object::instance_of(scene.next_object_id(), inner);
         scene.library_mut().update(outer, |s| {
             s.layers.update(outer_layer, |l| {
@@ -330,7 +348,10 @@ mod tests {
         // The two documents genuinely do collide before merging.
         let host_ids: Vec<u64> = host.library().iter().map(|s| s.id.0).collect();
         let guest_ids: Vec<u64> = guest.library().iter().map(|s| s.id.0).collect();
-        assert_eq!(host_ids, guest_ids, "the id spaces must overlap for this test to mean anything");
+        assert_eq!(
+            host_ids, guest_ids,
+            "the id spaces must overlap for this test to mean anything"
+        );
 
         host.merge(&guest, ImportTarget::Stage);
 
@@ -348,11 +369,21 @@ mod tests {
             .find_map(|o| o.instance().map(|i| i.symbol))
             .expect("the nested instance came across");
 
-        let target = host.library().get(nested).expect("it points at a real symbol");
-        assert_eq!(target.name, "Guest Inner", "the nested instance was repointed");
+        let target = host
+            .library()
+            .get(nested)
+            .expect("it points at a real symbol");
+        assert_eq!(
+            target.name, "Guest Inner",
+            "the nested instance was repointed"
+        );
 
         let bounds = target.bounds().expect("the inner symbol has artwork");
-        assert_eq!(bounds.width(), 99.0, "and at the guest's artwork, not the host's");
+        assert_eq!(
+            bounds.width(),
+            99.0,
+            "and at the guest's artwork, not the host's"
+        );
     }
 
     /// The host's own artwork must be exactly as it was.
@@ -399,7 +430,11 @@ mod tests {
 
         let report = host.merge(&guest, ImportTarget::Library);
 
-        assert_eq!(host.stage_layers().len(), layers_before, "the stage must not change");
+        assert_eq!(
+            host.stage_layers().len(),
+            layers_before,
+            "the stage must not change"
+        );
         assert_eq!(report.layers, 0);
         assert_eq!(host.library().len(), symbols_before + report.symbols);
     }
@@ -415,7 +450,10 @@ mod tests {
         assert!(report.layers > 0);
 
         let top = host.stage_layers().iter().next().unwrap();
-        assert_ne!(top.name, "Host Layer", "the imported layer goes above the existing one");
+        assert_ne!(
+            top.name, "Host Layer",
+            "the imported layer goes above the existing one"
+        );
     }
 
     /// A name the user already used is theirs; the incoming one moves aside,
@@ -491,7 +529,11 @@ mod tests {
             .iter()
             .flat_map(|s| s.layers.iter().flat_map(|l| l.all_objects()));
         for object in stage.chain(nested) {
-            assert!(seen.insert(object.id.0), "object id {} appears twice", object.id.0);
+            assert!(
+                seen.insert(object.id.0),
+                "object id {} appears twice",
+                object.id.0
+            );
         }
     }
 
@@ -523,7 +565,10 @@ mod tests {
             Some(copied_folder.id),
             "the child must point at the copied folder"
         );
-        assert_ne!(copied_folder.id, folder, "and the folder must have been renumbered");
+        assert_ne!(
+            copied_folder.id, folder,
+            "and the folder must have been renumbered"
+        );
     }
 
     /// An instance whose symbol is not in the file cannot be repaired, and

@@ -192,9 +192,8 @@ fn a_decoded_frame_holds_the_artwork_where_it_was_drawn() {
         .expect("ffmpeg runs");
     assert!(status.success(), "the video could not be decoded");
 
-    let decoded = std::io::BufReader::new(
-        std::fs::File::open(&out).expect("the frame was written"),
-    );
+    let decoded =
+        std::io::BufReader::new(std::fs::File::open(&out).expect("the frame was written"));
     let mut reader = png::Decoder::new(decoded).read_info().expect("valid PNG");
     let mut buffer = vec![0; reader.output_buffer_size().expect("a size")];
     let info = reader.next_frame(&mut buffer).expect("a frame");
@@ -240,7 +239,10 @@ fn mov_is_written_as_well_as_mp4() {
 
     assert_eq!(path.extension().unwrap(), "mov");
     assert_eq!(report.frames, 4);
-    assert!(probe(&path, "stream=width").is_some(), "the MOV will not open");
+    assert!(
+        probe(&path, "stream=width").is_some(),
+        "the MOV will not open"
+    );
 }
 
 /// Software encoding is the fallback every machine has, and it must work on

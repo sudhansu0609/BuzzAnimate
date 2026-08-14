@@ -90,7 +90,10 @@ fn a_linear_gradient_runs_across_the_shape_it_fills() {
         let right = redness(frame.pixel(440, y));
 
         assert!(left > 0.8, "the left edge should be red, was {left:.3}");
-        assert!(right < -0.8, "the right edge should be blue, was {right:.3}");
+        assert!(
+            right < -0.8,
+            "the right edge should be blue, was {right:.3}"
+        );
         assert!(
             mid.abs() < 0.25,
             "the middle should be halfway, was {mid:.3}"

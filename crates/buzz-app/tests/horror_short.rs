@@ -35,9 +35,7 @@ use std::time::{Duration, Instant};
 use buzz_app::editor::Editor;
 use buzz_doc::Document;
 use buzz_geom::{Affine, Point, Rect, Shape as _, Vec2};
-use buzz_scene::{
-    Filter, FilterKind, LayerKind, LightKind, Quality, Scene, ShapeData, SymbolKind,
-};
+use buzz_scene::{Filter, FilterKind, LayerKind, LightKind, Quality, Scene, ShapeData, SymbolKind};
 use peniko::Color;
 
 /// Five minutes at 24fps.
@@ -122,9 +120,24 @@ fn part_symbol(
 /// parts are loose artwork.
 fn build_villager(scene: &mut Scene) -> buzz_scene::SymbolId {
     let head = part_symbol(scene, "Head", blob(Point::ZERO, 34.0, 48, 0.4), SKIN);
-    let eye_l = part_symbol(scene, "Eye L", blob(Point::ZERO, 7.0, 20, 1.0), Color::WHITE);
-    let eye_r = part_symbol(scene, "Eye R", blob(Point::ZERO, 7.0, 20, 2.0), Color::WHITE);
-    let mouth = part_symbol(scene, "Mouth", blob(Point::ZERO, 10.0, 24, 0.2), Color::BLACK);
+    let eye_l = part_symbol(
+        scene,
+        "Eye L",
+        blob(Point::ZERO, 7.0, 20, 1.0),
+        Color::WHITE,
+    );
+    let eye_r = part_symbol(
+        scene,
+        "Eye R",
+        blob(Point::ZERO, 7.0, 20, 2.0),
+        Color::WHITE,
+    );
+    let mouth = part_symbol(
+        scene,
+        "Mouth",
+        blob(Point::ZERO, 10.0, 24, 0.2),
+        Color::BLACK,
+    );
     let body = part_symbol(scene, "Body", blob(Point::ZERO, 52.0, 56, 1.7), CLOTH);
     let hand_l = part_symbol(scene, "Hand L", blob(Point::ZERO, 13.0, 28, 0.9), SKIN);
     let hand_r = part_symbol(scene, "Hand R", blob(Point::ZERO, 13.0, 28, 1.4), SKIN);
@@ -156,10 +169,31 @@ fn build_set(scene: &mut Scene) {
     // Back to front, each further layer pushed away so a camera move separates
     // them — the cheapest thing that makes a flat drawing read as a place.
     for (name, depth, colour, count, radius, y) in [
-        ("Sky", 2400.0, Color::from_rgb8(0x0B, 0x10, 0x1E), 1, 1400.0, 300.0),
-        ("Far trees", 1200.0, Color::from_rgb8(0x10, 0x16, 0x18), 14, 90.0, 520.0),
+        (
+            "Sky",
+            2400.0,
+            Color::from_rgb8(0x0B, 0x10, 0x1E),
+            1,
+            1400.0,
+            300.0,
+        ),
+        (
+            "Far trees",
+            1200.0,
+            Color::from_rgb8(0x10, 0x16, 0x18),
+            14,
+            90.0,
+            520.0,
+        ),
         ("Hut", 400.0, HUT, 3, 160.0, 620.0),
-        ("Near trees", -200.0, Color::from_rgb8(0x08, 0x0C, 0x0A), 6, 150.0, 700.0),
+        (
+            "Near trees",
+            -200.0,
+            Color::from_rgb8(0x08, 0x0C, 0x0A),
+            6,
+            150.0,
+            700.0,
+        ),
         ("Ground", 0.0, GROUND, 1, 1600.0, 980.0),
     ] {
         let layer = scene.add_layer(name, LayerKind::Normal);
@@ -203,10 +237,7 @@ fn light_the_night(scene: &mut Scene) {
         height: 90.0,
         radius: 420.0,
     });
-    let light = scene
-        .lights_mut()
-        .get_mut(lantern)
-        .expect("the lantern");
+    let light = scene.lights_mut().get_mut(lantern).expect("the lantern");
     light.color = Color::from_rgb8(0xFF, 0xB0, 0x50);
     light.intensity = 1.1;
     light.shadows = true;
@@ -241,7 +272,10 @@ fn add_effects(scene: &mut Scene) {
     let halo = scene
         .add_shape(
             glow_layer,
-            ShapeData::filled(blob(Point::new(1180.0, 640.0), 26.0, 28, 0.0), Color::from_rgb8(0xFF, 0xC8, 0x70)),
+            ShapeData::filled(
+                blob(Point::new(1180.0, 640.0), 26.0, 28, 0.0),
+                Color::from_rgb8(0xFF, 0xC8, 0x70),
+            ),
         )
         .expect("the lantern");
     scene.update_object(halo, |o| {
@@ -270,7 +304,10 @@ fn add_effects(scene: &mut Scene) {
     scene
         .add_shape(
             vignette,
-            ShapeData::filled(square(-200.0, -200.0, 2320.0, 1480.0), Color::from_rgba8(0, 0, 0, 210)),
+            ShapeData::filled(
+                square(-200.0, -200.0, 2320.0, 1480.0),
+                Color::from_rgba8(0, 0, 0, 210),
+            ),
         )
         .expect("the vignette");
     let hole = scene.add_layer("Vignette hole", LayerKind::InverseMask);
@@ -290,9 +327,11 @@ fn build_film() -> Scene {
     scene.stage_mut().background = Color::from_rgb8(0x06, 0x08, 0x0E);
 
     stage("build the set", ACTION_BUDGET, || build_set(&mut scene));
-    let villager = stage("rig the villager out of part symbols", ACTION_BUDGET, || {
-        build_villager(&mut scene)
-    });
+    let villager = stage(
+        "rig the villager out of part symbols",
+        ACTION_BUDGET,
+        || build_villager(&mut scene),
+    );
 
     // The cast: the villager placed several times over the film, which is what
     // a five-minute short with a few shots actually holds.
@@ -310,8 +349,12 @@ fn build_film() -> Scene {
         }
     });
 
-    stage("light the night", ACTION_BUDGET, || light_the_night(&mut scene));
-    stage("fog, glow and vignette", ACTION_BUDGET, || add_effects(&mut scene));
+    stage("light the night", ACTION_BUDGET, || {
+        light_the_night(&mut scene)
+    });
+    stage("fog, glow and vignette", ACTION_BUDGET, || {
+        add_effects(&mut scene)
+    });
 
     // Five minutes of film. Keyframes every half second on the cast layer, as
     // an animator working on twos-and-fours would leave behind.
@@ -428,7 +471,9 @@ fn the_film_draws_fast_enough_to_animate_against() {
     eprintln!("\n--- drawing the film ---");
 
     let started = Instant::now();
-    let frame = exporter.render(&scene, 0, &settings).expect("the first frame");
+    let frame = exporter
+        .render(&scene, 0, &settings)
+        .expect("the first frame");
     let cold = started.elapsed();
 
     // Written out so the film can be *looked at*. Numbers say it is fast;
@@ -512,7 +557,10 @@ fn an_arm_can_be_rigged_posed_and_keyed() {
     // Pose it by reaching, which is what IK is for — and key the pose, twice,
     // so it tweens.
     stage("solve IK and key two poses", ACTION_BUDGET, || {
-        for (frame, target) in [(0u32, Point::new(420.0, 560.0)), (48, Point::new(240.0, 720.0))] {
+        for (frame, target) in [
+            (0u32, Point::new(420.0, 560.0)),
+            (48, Point::new(240.0, 720.0)),
+        ] {
             scene.ensure_keyframe(cast, frame);
             scene.update_object_at(frame, arm, |o| {
                 if let buzz_scene::ObjectKind::Armature(rig) = &mut o.kind {
@@ -529,13 +577,17 @@ fn an_arm_can_be_rigged_posed_and_keyed() {
         }
     });
 
-    stage("resolve the tween halfway between the poses", ACTION_BUDGET, || {
-        let _ = scene
-            .layers()
-            .get(cast)
-            .map(|l| l.objects_at(24).len())
-            .unwrap_or(0);
-    });
+    stage(
+        "resolve the tween halfway between the poses",
+        ACTION_BUDGET,
+        || {
+            let _ = scene
+                .layers()
+                .get(cast)
+                .map(|l| l.objects_at(24).len())
+                .unwrap_or(0);
+        },
+    );
 }
 
 /// Where everything actually is, printed. A picture that is wrong says so;
@@ -557,10 +609,7 @@ fn report_where_the_artwork_is() {
             layer.depth,
             objects.len(),
             match bounds {
-                Some(b) => format!(
-                    "{:.0},{:.0} .. {:.0},{:.0}",
-                    b.x0, b.y0, b.x1, b.y1
-                ),
+                Some(b) => format!("{:.0},{:.0} .. {:.0},{:.0}", b.x0, b.y0, b.x1, b.y1),
                 None => "empty".to_string(),
             }
         );
@@ -581,25 +630,41 @@ fn bisect_the_render() {
     type Variant = (&'static str, Box<dyn Fn(&mut Scene)>);
     let variants: Vec<Variant> = vec![
         ("00-full", Box::new(|_: &mut Scene| {})),
-        ("01-nolight", Box::new(|s: &mut Scene| { s.lights_mut().enabled = false; })),
-        ("02-noeffects", Box::new(|s: &mut Scene| {
-            for name in ["Vignette", "Vignette hole", "Lantern"] {
-                let found = s.layers().iter().find(|l| l.name == name).map(|l| l.id);
+        (
+            "01-nolight",
+            Box::new(|s: &mut Scene| {
+                s.lights_mut().enabled = false;
+            }),
+        ),
+        (
+            "02-noeffects",
+            Box::new(|s: &mut Scene| {
+                for name in ["Vignette", "Vignette hole", "Lantern"] {
+                    let found = s.layers().iter().find(|l| l.name == name).map(|l| l.id);
+                    if let Some(id) = found {
+                        s.remove_layer(id);
+                    }
+                }
+            }),
+        ),
+        (
+            "03-nodepth",
+            Box::new(|s: &mut Scene| {
+                let ids: Vec<_> = s.layers().iter().map(|l| l.id).collect();
+                for id in ids {
+                    s.update_layer(id, |l| l.depth = 0.0);
+                }
+            }),
+        ),
+        (
+            "04-nocast",
+            Box::new(|s: &mut Scene| {
+                let found = s.layers().iter().find(|l| l.name == "Cast").map(|l| l.id);
                 if let Some(id) = found {
                     s.remove_layer(id);
                 }
-            }
-        })),
-        ("03-nodepth", Box::new(|s: &mut Scene| {
-            let ids: Vec<_> = s.layers().iter().map(|l| l.id).collect();
-            for id in ids { s.update_layer(id, |l| l.depth = 0.0); }
-        })),
-        ("04-nocast", Box::new(|s: &mut Scene| {
-            let found = s.layers().iter().find(|l| l.name == "Cast").map(|l| l.id);
-            if let Some(id) = found {
-                s.remove_layer(id);
-            }
-        })),
+            }),
+        ),
     ];
 
     for (name, tweak) in variants {
@@ -610,7 +675,11 @@ fn bisect_the_render() {
         let path = dir.join(format!("buzz-horror-{name}.png"));
         frame.write_png(&path).expect("write");
         // A crude signature: how much of the frame is not background.
-        let lit = frame.pixels.chunks_exact(4).filter(|p| p[0] > 40 || p[1] > 40 || p[2] > 40).count();
+        let lit = frame
+            .pixels
+            .chunks_exact(4)
+            .filter(|p| p[0] > 40 || p[1] > 40 || p[2] > 40)
+            .count();
         eprintln!("  {name:<14} {:>8} bright px  {}", lit, path.display());
     }
 }
@@ -631,22 +700,26 @@ fn five_minutes_of_dialogue_can_be_analysed_and_lip_synced() {
     // what the analyser actually has to segment. Silence would be free and
     // would prove nothing.
     let rate = 44_100;
-    let clip = stage("synthesise a five-minute take", Duration::from_secs(10), || {
-        let samples: Vec<f32> = (0..rate * 60 * 5)
-            .map(|i| {
-                let t = i as f64 / rate as f64;
-                // A word every half second, with a pause between.
-                let speaking = (t * 2.0).fract() < 0.6;
-                if !speaking {
-                    return 0.0;
-                }
-                let tone = (t * 220.0 * std::f64::consts::TAU).sin();
-                let formant = (t * 900.0 * std::f64::consts::TAU).sin() * 0.4;
-                ((tone + formant) * 0.4) as f32
-            })
-            .collect();
-        Clip::new("Narration", rate as u32, 1, samples).expect("a clip")
-    });
+    let clip = stage(
+        "synthesise a five-minute take",
+        Duration::from_secs(10),
+        || {
+            let samples: Vec<f32> = (0..rate * 60 * 5)
+                .map(|i| {
+                    let t = i as f64 / rate as f64;
+                    // A word every half second, with a pause between.
+                    let speaking = (t * 2.0).fract() < 0.6;
+                    if !speaking {
+                        return 0.0;
+                    }
+                    let tone = (t * 220.0 * std::f64::consts::TAU).sin();
+                    let formant = (t * 900.0 * std::f64::consts::TAU).sin() * 0.4;
+                    ((tone + formant) * 0.4) as f32
+                })
+                .collect();
+            Clip::new("Narration", rate as u32, 1, samples).expect("a clip")
+        },
+    );
 
     let mut scene = build_film();
 
@@ -718,8 +791,8 @@ fn an_animator_can_work_on_the_finished_film() {
 
     // Draw one frame the way the window does, and report how long it took.
     let draw = |editor: &Editor,
-                    vello: &mut buzz_render::vello::Scene,
-                    cache: &mut buzz_render::document::DrawCache| {
+                vello: &mut buzz_render::vello::Scene,
+                cache: &mut buzz_render::document::DrawCache| {
         let mut builder = buzz_render::SceneBuilder::new(vello, &editor.camera);
         let scene = editor.scene();
         let options = buzz_render::document::FrameOptions {
@@ -762,8 +835,14 @@ fn an_animator_can_work_on_the_finished_film() {
         worst = worst.max(draw(&editor, &mut vello, &mut cache));
     }
     let drag = started.elapsed();
-    eprintln!("  {:<46} {drag:>10.2?}", "a 30-step drag, lit, redrawn each step");
-    eprintln!("  {:<46} {worst:>10.2?}", "worst single frame during the drag");
+    eprintln!(
+        "  {:<46} {drag:>10.2?}",
+        "a 30-step drag, lit, redrawn each step"
+    );
+    eprintln!(
+        "  {:<46} {worst:>10.2?}",
+        "worst single frame during the drag"
+    );
 
     assert!(
         worst < Duration::from_millis(120),
@@ -778,8 +857,15 @@ fn an_animator_can_work_on_the_finished_film() {
         editor.set_frame(f);
         worst_scrub = worst_scrub.max(draw(&editor, &mut vello, &mut cache));
     }
-    eprintln!("  {:<46} {:>10.2?}", "scrub across the film, redrawn", started.elapsed());
-    eprintln!("  {:<46} {worst_scrub:>10.2?}", "worst single frame while scrubbing");
+    eprintln!(
+        "  {:<46} {:>10.2?}",
+        "scrub across the film, redrawn",
+        started.elapsed()
+    );
+    eprintln!(
+        "  {:<46} {worst_scrub:>10.2?}",
+        "worst single frame while scrubbing"
+    );
     assert!(
         worst_scrub < Duration::from_millis(250),
         "scrubbing costs {worst_scrub:?} a frame; the playhead will not keep up"
@@ -790,7 +876,11 @@ fn an_animator_can_work_on_the_finished_film() {
     for _ in 0..30 {
         editor.doc.undo();
     }
-    eprintln!("  {:<46} {:>10.2?}", "undo the whole drag", started.elapsed());
+    eprintln!(
+        "  {:<46} {:>10.2?}",
+        "undo the whole drag",
+        started.elapsed()
+    );
 }
 
 /// **Getting the film out.** Ten seconds of it, encoded, and extrapolated.
@@ -830,7 +920,10 @@ fn the_film_exports_at_a_usable_rate() {
             let whole = per_frame * FILM_FRAMES;
             eprintln!("  {:<46} {taken:>10.2?}", "ten seconds of film, encoded");
             eprintln!("  {:<46} {per_frame:>10.2?}", "per frame");
-            eprintln!("  {:<46} {whole:>10.1?}", "the whole five minutes would take");
+            eprintln!(
+                "  {:<46} {whole:>10.1?}",
+                "the whole five minutes would take"
+            );
             eprintln!("  {:<46} {:>10}", "encoder", report.encoder);
             assert_eq!(report.frames, chunk);
             assert!(
@@ -882,14 +975,23 @@ fn drawing_stays_instant_on_a_busy_layer() {
         let t = Instant::now();
         editor.apply(buzz_app::tools::ToolAction::AddShape {
             shape: ShapeData::filled(
-                blob(Point::new(200.0 + i as f64 * 30.0, 700.0), 40.0, 32, i as f64),
+                blob(
+                    Point::new(200.0 + i as f64 * 30.0, 700.0),
+                    40.0,
+                    32,
+                    i as f64,
+                ),
                 CLOTH,
             ),
             label: "Draw",
         });
         worst = worst.max(t.elapsed());
     }
-    eprintln!("  {:<46} {:>10.2?}", "40 shapes, Object Drawing", started.elapsed());
+    eprintln!(
+        "  {:<46} {:>10.2?}",
+        "40 shapes, Object Drawing",
+        started.elapsed()
+    );
     eprintln!("  {:<46} {worst:>10.2?}", "worst single shape");
 
     // Merge Shape: the same again, but each stroke fuses or cuts against what
@@ -902,14 +1004,23 @@ fn drawing_stays_instant_on_a_busy_layer() {
         let t = Instant::now();
         editor.apply(buzz_app::tools::ToolAction::AddShape {
             shape: ShapeData::filled(
-                blob(Point::new(220.0 + i as f64 * 28.0, 690.0), 44.0, 32, i as f64 + 0.5),
+                blob(
+                    Point::new(220.0 + i as f64 * 28.0, 690.0),
+                    44.0,
+                    32,
+                    i as f64 + 0.5,
+                ),
                 CLOTH,
             ),
             label: "Draw",
         });
         worst_merge = worst_merge.max(t.elapsed());
     }
-    eprintln!("  {:<46} {:>10.2?}", "40 shapes, Merge Shape", started.elapsed());
+    eprintln!(
+        "  {:<46} {:>10.2?}",
+        "40 shapes, Merge Shape",
+        started.elapsed()
+    );
     eprintln!("  {:<46} {worst_merge:>10.2?}", "worst single shape");
 
     assert!(
@@ -927,8 +1038,18 @@ fn a_mouth_can_be_swapped_frame_by_frame() {
     let mut scene = build_film();
 
     // Two more mouth shapes to swap between.
-    let open = part_symbol(&mut scene, "Mouth open", blob(Point::ZERO, 14.0, 24, 0.7), Color::BLACK);
-    let wide = part_symbol(&mut scene, "Mouth wide", blob(Point::ZERO, 18.0, 24, 1.3), Color::BLACK);
+    let open = part_symbol(
+        &mut scene,
+        "Mouth open",
+        blob(Point::ZERO, 14.0, 24, 0.7),
+        Color::BLACK,
+    );
+    let wide = part_symbol(
+        &mut scene,
+        "Mouth wide",
+        blob(Point::ZERO, 18.0, 24, 1.3),
+        Color::BLACK,
+    );
 
     let mut editor = Editor::new(Document::new(scene));
     eprintln!("\n--- swapping a mouth ---");
@@ -1066,9 +1187,11 @@ fn the_waveform_and_onion_skins_are_cheap_enough_to_live_with() {
     )
     .expect("a clip");
 
-    let levels = stage("waveform for five minutes of dialogue", ACTION_BUDGET, || {
-        clip.frame_levels(24.0)
-    });
+    let levels = stage(
+        "waveform for five minutes of dialogue",
+        ACTION_BUDGET,
+        || clip.frame_levels(24.0),
+    );
     eprintln!("  {:<46} {:>10}", "(levels)", levels.len());
     assert!(
         levels.len() >= FILM_FRAMES as usize,
@@ -1132,7 +1255,10 @@ fn the_waveform_and_onion_skins_are_cheap_enough_to_live_with() {
         worst = worst.max(draw(&editor, &mut vello, &mut cache));
     }
     eprintln!("  {:<46} {cold:>10.2?}", "first onion-skinned frame");
-    eprintln!("  {:<46} {worst:>10.2?}", "worst onion-skinned frame while stepping");
+    eprintln!(
+        "  {:<46} {worst:>10.2?}",
+        "worst onion-skinned frame while stepping"
+    );
     assert!(
         worst < Duration::from_millis(200),
         "an onion-skinned frame costs {worst:?}; stepping through a scene \
@@ -1160,7 +1286,14 @@ fn a_heavy_scene_still_draws_and_edits() {
 
     // A set of three hundred pieces across six layers at different depths.
     stage("a 300-piece set", Duration::from_secs(5), || {
-        for (band, depth) in [(0, 2400.0), (1, 1600.0), (2, 900.0), (3, 400.0), (4, 0.0), (5, -300.0)] {
+        for (band, depth) in [
+            (0, 2400.0),
+            (1, 1600.0),
+            (2, 900.0),
+            (3, 400.0),
+            (4, 0.0),
+            (5, -300.0),
+        ] {
             let layer = scene.add_layer(format!("Set {band}"), LayerKind::Normal);
             scene.update_layer(layer, |l| l.depth = depth);
             for i in 0..50 {
@@ -1187,39 +1320,49 @@ fn a_heavy_scene_still_draws_and_edits() {
     let villager = stage("rig a villager", Duration::from_secs(5), || {
         build_villager(&mut scene)
     });
-    let group = stage("nest villagers into a crowd symbol", Duration::from_secs(5), || {
-        let crowd = scene.add_symbol("Crowd", SymbolKind::Graphic, None);
-        scene.enter_symbol(crowd);
-        for i in 0..5 {
-            let layer = scene.add_layer(format!("v{i}"), LayerKind::Normal);
-            scene
-                .add_instance_at(
-                    layer,
-                    0,
-                    villager,
-                    Affine::translate(Vec2::new(i as f64 * 120.0, 0.0)),
-                )
-                .expect("a villager in the crowd");
-        }
-        scene.exit_symbol();
-        crowd
-    });
+    let group = stage(
+        "nest villagers into a crowd symbol",
+        Duration::from_secs(5),
+        || {
+            let crowd = scene.add_symbol("Crowd", SymbolKind::Graphic, None);
+            scene.enter_symbol(crowd);
+            for i in 0..5 {
+                let layer = scene.add_layer(format!("v{i}"), LayerKind::Normal);
+                scene
+                    .add_instance_at(
+                        layer,
+                        0,
+                        villager,
+                        Affine::translate(Vec2::new(i as f64 * 120.0, 0.0)),
+                    )
+                    .expect("a villager in the crowd");
+            }
+            scene.exit_symbol();
+            crowd
+        },
+    );
 
-    stage("place six crowds — thirty villagers", Duration::from_secs(5), || {
-        let cast = scene.add_layer("Cast", LayerKind::Normal);
-        for i in 0..6 {
-            scene
-                .add_instance_at(
-                    cast,
-                    0,
-                    group,
-                    Affine::translate(Vec2::new(120.0 + i as f64 * 280.0, 640.0)),
-                )
-                .expect("a crowd");
-        }
-    });
+    stage(
+        "place six crowds — thirty villagers",
+        Duration::from_secs(5),
+        || {
+            let cast = scene.add_layer("Cast", LayerKind::Normal);
+            for i in 0..6 {
+                scene
+                    .add_instance_at(
+                        cast,
+                        0,
+                        group,
+                        Affine::translate(Vec2::new(120.0 + i as f64 * 280.0, 640.0)),
+                    )
+                    .expect("a crowd");
+            }
+        },
+    );
 
-    stage("light it", Duration::from_secs(5), || light_the_night(&mut scene));
+    stage("light it", Duration::from_secs(5), || {
+        light_the_night(&mut scene)
+    });
 
     // Give it length. Without this every layer is one frame long, and stepping
     // the playhead past frame zero shows — correctly — nothing at all.
@@ -1253,7 +1396,10 @@ fn a_heavy_scene_still_draws_and_edits() {
         .flat_map(|l| l.all_objects())
         .map(|o| o.shape_count())
         .sum();
-    eprintln!("  {:<46} {shapes:>10}", "(shapes on the stage, before nesting)");
+    eprintln!(
+        "  {:<46} {shapes:>10}",
+        "(shapes on the stage, before nesting)"
+    );
 
     // Draw it, the way the window does.
     let mut editor = Editor::new(Document::new(scene));
@@ -1351,24 +1497,43 @@ fn a_click_reaches_artwork_however_deeply_nested() {
     let villager = scene.add_symbol("V", SymbolKind::Graphic, None);
     scene.enter_symbol(villager);
     let vl = scene.add_layer("p", LayerKind::Normal);
-    scene.add_instance_at(vl, 0, part, Affine::IDENTITY).unwrap();
+    scene
+        .add_instance_at(vl, 0, part, Affine::IDENTITY)
+        .unwrap();
     scene.exit_symbol();
 
     let crowd = scene.add_symbol("C", SymbolKind::Graphic, None);
     scene.enter_symbol(crowd);
     let cl = scene.add_layer("v", LayerKind::Normal);
-    scene.add_instance_at(cl, 0, villager, Affine::IDENTITY).unwrap();
+    scene
+        .add_instance_at(cl, 0, villager, Affine::IDENTITY)
+        .unwrap();
     scene.exit_symbol();
 
     let stage_layer = scene.add_layer("Cast", LayerKind::Normal);
     let one = scene
-        .add_instance_at(stage_layer, 0, part, Affine::translate(Vec2::new(200.0, 200.0)))
+        .add_instance_at(
+            stage_layer,
+            0,
+            part,
+            Affine::translate(Vec2::new(200.0, 200.0)),
+        )
         .unwrap();
     let two = scene
-        .add_instance_at(stage_layer, 0, villager, Affine::translate(Vec2::new(500.0, 200.0)))
+        .add_instance_at(
+            stage_layer,
+            0,
+            villager,
+            Affine::translate(Vec2::new(500.0, 200.0)),
+        )
         .unwrap();
     let three = scene
-        .add_instance_at(stage_layer, 0, crowd, Affine::translate(Vec2::new(800.0, 200.0)))
+        .add_instance_at(
+            stage_layer,
+            0,
+            crowd,
+            Affine::translate(Vec2::new(800.0, 200.0)),
+        )
         .unwrap();
 
     let editor = Editor::new(Document::new(scene));
@@ -1437,7 +1602,10 @@ fn the_vignette_reaches_every_edge_of_the_frame() {
     let (right, right_at) = brightest_in(frame.width - 24..frame.width);
     let (middle, _) = brightest_in(940..980);
     eprintln!("  {:<28} {left:>8.1} at {left_at:?}", "brightest left edge");
-    eprintln!("  {:<28} {right:>8.1} at {right_at:?}", "brightest right edge");
+    eprintln!(
+        "  {:<28} {right:>8.1} at {right_at:?}",
+        "brightest right edge"
+    );
     eprintln!("  {:<28} {middle:>8.1}", "brightest centre");
 
     // The corners of a vignetted frame are the darkest part of the picture.

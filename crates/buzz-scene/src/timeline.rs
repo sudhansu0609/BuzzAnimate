@@ -273,9 +273,7 @@ impl LayerTimeline {
 
     /// The tween on the keyframe governing `frame`.
     pub fn tween_at(&self, frame: u32) -> crate::tween::Tween {
-        self.keyframe_at(frame)
-            .map(|k| k.tween)
-            .unwrap_or_default()
+        self.keyframe_at(frame).map(|k| k.tween).unwrap_or_default()
     }
 
     /// The tween governing `frame`, together with the frames it runs between.

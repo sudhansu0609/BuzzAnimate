@@ -359,7 +359,10 @@ mod tests {
 
         assert!((h.center.x - 200.0).abs() < 1e-9, "centre {:?}", h.center);
         assert!((h.center.y - 300.0).abs() < 1e-9, "centre {:?}", h.center);
-        assert!((h.end.x - 300.0).abs() < 1e-9, "the ramp should reach the right edge");
+        assert!(
+            (h.end.x - 300.0).abs() < 1e-9,
+            "the ramp should reach the right edge"
+        );
     }
 
     /// Switching the type switches the paint, and switching back gets the

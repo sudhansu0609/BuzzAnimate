@@ -150,8 +150,7 @@ fn a_following_layer_moves_with_a_tween() {
         let (mut scene, body, head) = character();
         scene.update_layer(head, |l| l.follows = Some(body));
         scene.update_layer(body, |l| {
-            l.frames
-                .set_tween(0, buzz_scene::Tween::classic());
+            l.frames.set_tween(0, buzz_scene::Tween::classic());
         });
 
         let middle = render(exporter, &scene, 5);

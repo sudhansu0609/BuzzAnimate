@@ -635,7 +635,9 @@ impl LayerStack {
     /// Layers the user can currently select on.
     pub fn selectable(&self) -> impl Iterator<Item = &Arc<Layer>> {
         self.paint_order().filter(|l| {
-            l.is_editable() && self.is_effectively_visible(l.id) && !self.is_effectively_locked(l.id)
+            l.is_editable()
+                && self.is_effectively_visible(l.id)
+                && !self.is_effectively_locked(l.id)
         })
     }
 }
@@ -681,7 +683,10 @@ mod tests {
     #[test]
     fn only_folders_are_excluded_from_stage_painting() {
         assert!(LayerKind::Normal.paints_on_stage());
-        assert!(LayerKind::Guide.paints_on_stage(), "guides show while authoring");
+        assert!(
+            LayerKind::Guide.paints_on_stage(),
+            "guides show while authoring"
+        );
         assert!(!LayerKind::Folder.paints_on_stage());
     }
 
@@ -691,7 +696,10 @@ mod tests {
         assert!(LayerKind::Mask.paints_to_output());
         assert!(LayerKind::Masked.paints_to_output());
         assert!(LayerKind::Guided.paints_to_output());
-        assert!(!LayerKind::Guide.paints_to_output(), "guides are authoring aids");
+        assert!(
+            !LayerKind::Guide.paints_to_output(),
+            "guides are authoring aids"
+        );
         assert!(!LayerKind::Folder.paints_to_output());
     }
 
@@ -861,7 +869,10 @@ mod tests {
         // Out-of-range clamps rather than panicking.
         assert!(s.reorder(LayerId(3), 99));
         assert_eq!(s.iter().last().unwrap().id, LayerId(3));
-        assert!(!s.reorder(LayerId(404), 0), "unknown layer should report failure");
+        assert!(
+            !s.reorder(LayerId(404), 0),
+            "unknown layer should report failure"
+        );
     }
 
     #[test]
@@ -888,10 +899,7 @@ mod tests {
     /// Editing one layer must not deep-copy the others.
     #[test]
     fn updating_one_layer_leaves_the_rest_shared() {
-        let mut a = stack(&[
-            (1, "A", LayerKind::Normal),
-            (2, "B", LayerKind::Normal),
-        ]);
+        let mut a = stack(&[(1, "A", LayerKind::Normal), (2, "B", LayerKind::Normal)]);
         let snapshot = a.clone();
 
         let untouched_before = Arc::as_ptr(snapshot.get(LayerId(2)).unwrap());
@@ -917,10 +925,7 @@ mod tests {
         let art = || {
             Arc::new(Object::shape(
                 ObjectId(id * 100),
-                ShapeData::filled(
-                    Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9),
-                    Color::BLACK,
-                ),
+                ShapeData::filled(Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9), Color::BLACK),
             ))
         };
         layer.frames.set_objects(0, vec![art()]);
@@ -930,10 +935,7 @@ mod tests {
             vec![Arc::new(
                 Object::shape(
                     ObjectId(id * 100),
-                    ShapeData::filled(
-                        Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9),
-                        Color::BLACK,
-                    ),
+                    ShapeData::filled(Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9), Color::BLACK),
                 )
                 .with_transform(Affine::translate((dx, dy))),
             )],

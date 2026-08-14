@@ -598,8 +598,8 @@ impl Parser<'_> {
             return Err(EdgeError::ExpectedNumber { at: start });
         }
         let digits = std::str::from_utf8(&self.bytes[integer_start..self.at]).unwrap_or("0");
-        let raw = i64::from_str_radix(digits, 16)
-            .map_err(|_| EdgeError::ExpectedNumber { at: start })?;
+        let raw =
+            i64::from_str_radix(digits, 16).map_err(|_| EdgeError::ExpectedNumber { at: start })?;
 
         // **Hex coordinates are two's complement, and Animate writes the sign
         // by using the full width.** `#FFFFFA.21` is not eight hundred
@@ -627,8 +627,8 @@ impl Parser<'_> {
                 self.at += 1;
             }
             if self.at > fraction_start {
-                let digits = std::str::from_utf8(&self.bytes[fraction_start..self.at])
-                    .unwrap_or("0");
+                let digits =
+                    std::str::from_utf8(&self.bytes[fraction_start..self.at]).unwrap_or("0");
                 let value = i64::from_str_radix(digits, 16).unwrap_or(0);
                 // Each hex digit is a further 1/16th.
                 let scale = 16f64.powi(digits.len() as i32);
@@ -823,7 +823,10 @@ mod tests {
 
         let closed = parse_edges_closed("!0 0|2000 0|2000 2000|0 2000").unwrap();
         assert!(
-            closed.elements().iter().any(|e| matches!(e, PathEl::ClosePath)),
+            closed
+                .elements()
+                .iter()
+                .any(|e| matches!(e, PathEl::ClosePath)),
             "a filled shape should be explicitly closed"
         );
         assert!((closed.area().abs() - 10_000.0).abs() < 1.0, "100x100 px");

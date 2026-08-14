@@ -112,9 +112,7 @@ impl Paint {
     /// Interpolate towards `other`, for a tween.
     pub fn lerp(&self, other: &Self, t: f64) -> Self {
         match (self, other) {
-            (Self::Solid(a), Self::Solid(b)) => {
-                Self::Solid(crate::gradient::lerp_color(*a, *b, t))
-            }
+            (Self::Solid(a), Self::Solid(b)) => Self::Solid(crate::gradient::lerp_color(*a, *b, t)),
             (Self::Gradient(a), Self::Gradient(b)) => Self::Gradient(Arc::new(a.lerp(b, t))),
             // A solid tweening to a gradient, or the reverse. Interpolating the
             // flat colour towards the gradient's average would move the colour
@@ -660,15 +658,17 @@ mod tests {
     fn shape_bounds_follow_the_transform() {
         let o = shape_at(1, 0.0, 0.0).with_transform(Affine::translate((100.0, 50.0)));
         let bb = o.bounds();
-        assert!((bb.x0 - 100.0).abs() < 1e-9 && (bb.y0 - 50.0).abs() < 1e-9, "{bb:?}");
+        assert!(
+            (bb.x0 - 100.0).abs() < 1e-9 && (bb.y0 - 50.0).abs() < 1e-9,
+            "{bb:?}"
+        );
         assert!((bb.width() - 10.0).abs() < 1e-9);
     }
 
     /// A rotated rectangle's bounds must cover all four corners.
     #[test]
     fn rotation_expands_bounds_correctly() {
-        let o = shape_at(1, -5.0, -5.0)
-            .with_transform(Affine::rotate(std::f64::consts::FRAC_PI_4));
+        let o = shape_at(1, -5.0, -5.0).with_transform(Affine::rotate(std::f64::consts::FRAC_PI_4));
         let bb = o.bounds();
         let expected = 10.0 * std::f64::consts::SQRT_2;
         assert!(
@@ -744,7 +744,10 @@ mod tests {
         let mut alpha = 0.0;
         for expected in [0.2, 0.4, 0.6, 0.8, 1.0] {
             alpha = PaintBlend::Additive.combine_alpha(alpha, 0.2);
-            assert!((alpha - expected).abs() < 1e-12, "got {alpha}, want {expected}");
+            assert!(
+                (alpha - expected).abs() < 1e-12,
+                "got {alpha}, want {expected}"
+            );
         }
         // The sixth stroke can add nothing; it is already opaque.
         assert_eq!(PaintBlend::Additive.combine_alpha(alpha, 0.2), 1.0);
@@ -786,7 +789,10 @@ mod tests {
             ],
         );
         let bb = g.bounds();
-        assert!((bb.x0 - 0.0).abs() < 1e-9 && (bb.x1 - 110.0).abs() < 1e-9, "{bb:?}");
+        assert!(
+            (bb.x0 - 0.0).abs() < 1e-9 && (bb.x1 - 110.0).abs() < 1e-9,
+            "{bb:?}"
+        );
     }
 
     #[test]

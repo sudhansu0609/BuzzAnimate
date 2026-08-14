@@ -527,10 +527,7 @@ pub struct ColorAdjust {
 impl ColorAdjust {
     /// Does this change anything at all?
     pub fn is_identity(&self) -> bool {
-        self.brightness == 0.0
-            && self.contrast == 0.0
-            && self.saturation == 0.0
-            && self.hue == 0.0
+        self.brightness == 0.0 && self.contrast == 0.0 && self.saturation == 0.0 && self.hue == 0.0
     }
 
     /// Apply it to one colour.
@@ -544,11 +541,7 @@ impl ColorAdjust {
             return color;
         }
         let [r, g, b, a] = color.to_rgba8().to_u8_array();
-        let (mut r, mut g, mut b) = (
-            r as f64 / 255.0,
-            g as f64 / 255.0,
-            b as f64 / 255.0,
-        );
+        let (mut r, mut g, mut b) = (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
 
         // Brightness: a straight offset, as Flash's is.
         if self.brightness != 0.0 {
@@ -639,13 +632,12 @@ fn shortest_turn(from: f64, to: f64) -> f64 {
 fn lerp_color(a: Color, b: Color, t: f64) -> Color {
     let [ar, ag, ab, aa] = a.to_rgba8().to_u8_array();
     let [br, bg, bb, ba] = b.to_rgba8().to_u8_array();
-    let mix = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * t).round().clamp(0.0, 255.0) as u8;
-    Color::from_rgba8(
-        mix(ar, br),
-        mix(ag, bg),
-        mix(ab, bb),
-        mix(aa, ba),
-    )
+    let mix = |x: u8, y: u8| {
+        (x as f64 + (y as f64 - x as f64) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::from_rgba8(mix(ar, br), mix(ag, bg), mix(ab, bb), mix(aa, ba))
 }
 
 #[cfg(test)]

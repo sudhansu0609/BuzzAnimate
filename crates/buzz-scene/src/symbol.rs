@@ -158,9 +158,8 @@ impl ColorTransform {
     /// Apply to a colour.
     pub fn apply(&self, color: Color) -> Color {
         let [r, g, b, a] = color.to_rgba8().to_u8_array();
-        let ch = |v: u8, i: usize| {
-            ((v as f32 / 255.0) * self.multiply[i] + self.add[i]).clamp(0.0, 1.0)
-        };
+        let ch =
+            |v: u8, i: usize| ((v as f32 / 255.0) * self.multiply[i] + self.add[i]).clamp(0.0, 1.0);
         Color::from_rgba8(
             (ch(r, 0) * 255.0).round() as u8,
             (ch(g, 1) * 255.0).round() as u8,
@@ -212,7 +211,10 @@ pub enum ColorEffect {
     None,
     /// -1 is black, 1 is white.
     Brightness(f32),
-    Tint { color: Color, amount: f32 },
+    Tint {
+        color: Color,
+        amount: f32,
+    },
     Alpha(f32),
     /// A transform none of the named effects produces — the result of nesting,
     /// of a tween part way through, or of an imported file.
@@ -640,13 +642,19 @@ mod tests {
         let identity = ColorTransform::default();
         assert!(identity.is_identity());
         assert_eq!(
-            identity.apply(Color::from_rgb8(10, 20, 30)).to_rgba8().to_u8_array(),
+            identity
+                .apply(Color::from_rgb8(10, 20, 30))
+                .to_rgba8()
+                .to_u8_array(),
             [10, 20, 30, 255]
         );
 
         // Alpha halves the alpha channel and leaves colour alone.
         let half = ColorTransform::alpha(0.5);
-        let out = half.apply(Color::from_rgb8(200, 100, 50)).to_rgba8().to_u8_array();
+        let out = half
+            .apply(Color::from_rgb8(200, 100, 50))
+            .to_rgba8()
+            .to_u8_array();
         assert_eq!(&out[..3], &[200, 100, 50]);
         assert!((out[3] as i32 - 128).abs() <= 1, "alpha was {}", out[3]);
     }
@@ -672,7 +680,11 @@ mod tests {
             .apply(Color::from_rgb8(0, 0, 255))
             .to_rgba8()
             .to_u8_array();
-        assert_eq!(&full[..3], &[255, 0, 0], "full tint should replace the colour");
+        assert_eq!(
+            &full[..3],
+            &[255, 0, 0],
+            "full tint should replace the colour"
+        );
     }
 
     /// Composing must equal applying one then the other.
@@ -711,7 +723,11 @@ mod tests {
         let a = ColorTransform::default();
         let b = ColorTransform::alpha(0.0);
         let mid = a.lerp(&b, 0.5);
-        assert!((mid.multiply[3] - 0.5).abs() < 1e-6, "got {}", mid.multiply[3]);
+        assert!(
+            (mid.multiply[3] - 0.5).abs() < 1e-6,
+            "got {}",
+            mid.multiply[3]
+        );
     }
 
     #[test]
@@ -860,8 +876,14 @@ mod tests {
                     assert!((a - b).abs() < 1e-3, "alpha {a} came back as {b}");
                 }
                 (
-                    ColorEffect::Tint { color: c1, amount: a1 },
-                    ColorEffect::Tint { color: c2, amount: a2 },
+                    ColorEffect::Tint {
+                        color: c1,
+                        amount: a1,
+                    },
+                    ColorEffect::Tint {
+                        color: c2,
+                        amount: a2,
+                    },
                 ) => {
                     assert!((a1 - a2).abs() < 1e-3, "tint amount {a1} came back as {a2}");
                     // The colour survives an 8-bit round trip through the

@@ -73,7 +73,13 @@ pub fn camera_panel(ui: &mut Ui, camera: &CameraTrack, frame: u32) -> CameraResp
             .changed();
     });
 
-    changed |= angle(ui, "Rotation", &mut key.rotation, 180.0, "Roll: the horizon tipping");
+    changed |= angle(
+        ui,
+        "Rotation",
+        &mut key.rotation,
+        180.0,
+        "Roll: the horizon tipping",
+    );
 
     ui.separator();
     ui.label(RichText::new("Tilt").small().strong());

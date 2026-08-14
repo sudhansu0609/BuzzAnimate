@@ -33,6 +33,7 @@ pub mod layer;
 pub mod looping;
 pub mod merge;
 pub mod object;
+pub mod raster;
 pub mod rig;
 pub mod sound;
 pub mod swatch;
@@ -47,6 +48,8 @@ use buzz_geom::{Affine, Point, Rect, Size};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
+pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, Quality};
+pub use buzz_light::{Light, LightId, LightKind, LightRig};
 pub use camera_track::{CameraKey, CameraTrack, MAX_TILT};
 pub use gradient::{
     Gradient, GradientHandles, GradientKind, GradientSpread, GradientStop, MAX_STOPS, lerp_color,
@@ -59,11 +62,10 @@ pub use merge::{ImportTarget, MergeReport};
 pub use object::{
     FillSpec, Object, ObjectId, ObjectKind, Paint, PaintBlend, ShapeData, Spatial, StrokeSpec,
 };
+pub use raster::{Canvas, SoftBrush};
 pub use rig::{ArmatureData, RigBinding, RigPart, WarpData};
 pub use sound::{SoundAsset, SoundCue, SoundId, SoundLibrary, SoundRef, SoundSync};
 pub use swatch::{Swatch, SwatchId, Swatches, default_palette, default_swatches};
-pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, Quality};
-pub use buzz_light::{Light, LightId, LightKind, LightRig};
 pub use symbol::{
     ColorEffect, ColorTransform, Library, LoopMode, Symbol, SymbolId, SymbolInstance, SymbolKind,
 };
@@ -554,6 +556,13 @@ impl Scene {
         &mut self.images
     }
 
+    /// Allocate a bitmap id without putting anything in the library yet.
+    ///
+    /// For paint, which builds its own pixels rather than decoding a file.
+    pub fn next_image_id(&mut self) -> ImageId {
+        ImageId(self.ids.take())
+    }
+
     /// Decode a bitmap file into the library, giving it a fresh id and a name
     /// no other bitmap has.
     ///
@@ -589,12 +598,7 @@ impl Scene {
         at: Point,
     ) -> Option<ObjectId> {
         let natural = crate::image::ImageFill::natural_rect(&asset);
-        let rect = Rect::new(
-            at.x,
-            at.y,
-            at.x + natural.width(),
-            at.y + natural.height(),
-        );
+        let rect = Rect::new(at.x, at.y, at.x + natural.width(), at.y + natural.height());
         self.place_image_in(layer, frame, asset, rect)
     }
 
@@ -652,12 +656,7 @@ impl Scene {
     /// Animate attaches sound to a *keyframe*, not to a layer, so one layer
     /// can carry a whole scene's effects. Returns whether there was a keyframe
     /// to attach it to.
-    pub fn set_frame_sound(
-        &mut self,
-        layer: LayerId,
-        frame: u32,
-        sound: Option<SoundRef>,
-    ) -> bool {
+    pub fn set_frame_sound(&mut self, layer: LayerId, frame: u32, sound: Option<SoundRef>) -> bool {
         let mut attached = false;
         self.update_layer(layer, |l| {
             if let Some(keyframe) = l.frames.keyframe_at_mut(frame) {
@@ -697,7 +696,9 @@ impl Scene {
             // the soundtrack because a layer was hidden would be surprising in
             // exactly the way this whole design is trying to avoid.
             for keyframe in layer.frames.keyframes() {
-                let Some(sound) = keyframe.sound else { continue };
+                let Some(sound) = keyframe.sound else {
+                    continue;
+                };
                 if sound.sync == SoundSync::Stop {
                     continue;
                 }
@@ -741,7 +742,9 @@ impl Scene {
         let mut symbol = Symbol::new(id, name, kind);
         symbol.folder = folder.map(|f| f.trim_matches('/').to_string());
         // A symbol always needs one layer, or there is nowhere to draw.
-        symbol.layers.push_front(Layer::normal(LayerId(self.ids.take()), "Layer_1"));
+        symbol
+            .layers
+            .push_front(Layer::normal(LayerId(self.ids.take()), "Layer_1"));
         self.library.insert(symbol);
         self.bump();
         id
@@ -878,10 +881,7 @@ impl Scene {
             ObjectKind::Group(children) => children
                 .iter()
                 .map(|c| {
-                    object::transform_rect(
-                        object.transform,
-                        self.resolved_bounds_within(c, depth),
-                    )
+                    object::transform_rect(object.transform, self.resolved_bounds_within(c, depth))
                 })
                 .reduce(|a, b| a.union(b))
                 .unwrap_or_else(|| object.bounds()),
@@ -987,7 +987,8 @@ impl Scene {
             // name for a layer the user cannot find.
             let orphans = self.layers().followers_of(id);
             for orphan in orphans {
-                self.active_layers_mut().update(orphan, |l| l.follows = None);
+                self.active_layers_mut()
+                    .update(orphan, |l| l.follows = None);
             }
             self.bump();
         }
@@ -1031,12 +1032,18 @@ impl Scene {
     }
 
     /// Place an already-built object on a layer at `frame`.
-    pub fn add_object_at(&mut self, layer: LayerId, frame: u32, object: Object) -> Option<ObjectId> {
+    pub fn add_object_at(
+        &mut self,
+        layer: LayerId,
+        frame: u32,
+        object: Object,
+    ) -> Option<ObjectId> {
         let id = object.id;
         self.ids.reserve_above(id.0);
         let mut placed = false;
-        self.active_layers_mut()
-            .update(layer, |l| placed = l.push_object_at(frame, Arc::new(object)));
+        self.active_layers_mut().update(layer, |l| {
+            placed = l.push_object_at(frame, Arc::new(object))
+        });
         placed.then(|| {
             self.bump();
             id
@@ -1455,7 +1462,8 @@ impl Scene {
     pub fn remove_object(&mut self, id: ObjectId) -> Option<Arc<Object>> {
         let layer_id = self.find_object(id).map(|(l, _)| l)?;
         let mut removed = None;
-        self.active_layers_mut().update(layer_id, |l| removed = l.remove_object(id));
+        self.active_layers_mut()
+            .update(layer_id, |l| removed = l.remove_object(id));
         if removed.is_some() {
             self.bump();
         }
@@ -1482,7 +1490,10 @@ impl Scene {
 
     /// Bounds of all artwork across every frame, ignoring the stage rectangle.
     pub fn content_bounds(&self) -> Option<Rect> {
-        self.layers().iter().filter_map(|l| l.bounds()).reduce(|a, b| a.union(b))
+        self.layers()
+            .iter()
+            .filter_map(|l| l.bounds())
+            .reduce(|a, b| a.union(b))
     }
 
     /// Everything the user could reasonably want framed: the stage plus any
@@ -1596,7 +1607,10 @@ mod tests {
         let layer = scene.layers().iter().next().unwrap().id;
 
         let r0 = scene.revision();
-        scene.add_shape(layer, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+        scene.add_shape(
+            layer,
+            ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+        );
         let r1 = scene.revision();
         assert!(r1 > r0);
 
@@ -1619,7 +1633,10 @@ mod tests {
         let (mut scene, layer) = scene_with_shapes(5);
         let extra = scene.add_layer("Another", LayerKind::Normal);
         let shape = scene
-            .add_shape(extra, ShapeData::filled(square(0.0, 0.0, 5.0), Color::WHITE))
+            .add_shape(
+                extra,
+                ShapeData::filled(square(0.0, 0.0, 5.0), Color::WHITE),
+            )
             .unwrap();
 
         assert_ne!(layer.0, extra.0);
@@ -1653,7 +1670,10 @@ mod tests {
         let snapshot = scene.clone();
         let before = snapshot.shape_count();
 
-        scene.add_shape(layer, ShapeData::filled(square(999.0, 0.0, 10.0), Color::WHITE));
+        scene.add_shape(
+            layer,
+            ShapeData::filled(square(999.0, 0.0, 10.0), Color::WHITE),
+        );
         scene.update_layer(layer, |l| l.name = "changed".into());
 
         assert_eq!(snapshot.shape_count(), before, "the snapshot changed");
@@ -1693,7 +1713,15 @@ mod tests {
     #[test]
     fn cloning_a_scene_shares_structure_wholesale() {
         let (scene, layer) = scene_with_shapes(50);
-        let object = Arc::clone(scene.layers().get(layer).unwrap().objects_at(0).first().unwrap());
+        let object = Arc::clone(
+            scene
+                .layers()
+                .get(layer)
+                .unwrap()
+                .objects_at(0)
+                .first()
+                .unwrap(),
+        );
         let before = Arc::strong_count(&object);
 
         let clones: Vec<Scene> = (0..20).map(|_| scene.clone()).collect();
@@ -1732,8 +1760,15 @@ mod tests {
     #[test]
     fn an_edit_touches_only_what_changed() {
         let (mut scene, layer) = scene_with_shapes(20);
-        let untouched_before =
-            Arc::as_ptr(scene.layers().get(layer).unwrap().objects_at(0).last().unwrap());
+        let untouched_before = Arc::as_ptr(
+            scene
+                .layers()
+                .get(layer)
+                .unwrap()
+                .objects_at(0)
+                .last()
+                .unwrap(),
+        );
 
         scene.update_layer(layer, |l| {
             let objects = l.frames.objects_at_mut(0).expect("frame 0 exists");
@@ -1741,8 +1776,15 @@ mod tests {
             first.transform = Affine::translate((5.0, 5.0));
         });
 
-        let untouched_after =
-            Arc::as_ptr(scene.layers().get(layer).unwrap().objects_at(0).last().unwrap());
+        let untouched_after = Arc::as_ptr(
+            scene
+                .layers()
+                .get(layer)
+                .unwrap()
+                .objects_at(0)
+                .last()
+                .unwrap(),
+        );
         assert_eq!(
             untouched_before, untouched_after,
             "an unrelated object was reallocated"
@@ -1773,9 +1815,15 @@ mod tests {
         let visible = scene.add_layer("Visible", LayerKind::Normal);
         let hidden = scene.add_layer("Hidden", LayerKind::Normal);
 
-        scene.add_shape(visible, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+        scene.add_shape(
+            visible,
+            ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+        );
         let ghost = scene
-            .add_shape(hidden, ShapeData::filled(square(50.0, 0.0, 10.0), Color::WHITE))
+            .add_shape(
+                hidden,
+                ShapeData::filled(square(50.0, 0.0, 10.0), Color::WHITE),
+            )
             .unwrap();
         scene.update_layer(hidden, |l| l.visible = false);
 
@@ -1791,7 +1839,10 @@ mod tests {
         let mut scene = Scene::empty();
         let folder = scene.add_layer("Folder", LayerKind::Folder);
         // Even if something were somehow attached to a folder.
-        scene.add_shape(folder, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+        scene.add_shape(
+            folder,
+            ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+        );
         assert!(scene.flatten_for_render().is_empty());
     }
 
@@ -1802,10 +1853,16 @@ mod tests {
         let front = scene.add_layer("Front", LayerKind::Normal);
 
         let back_shape = scene
-            .add_shape(back, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE))
+            .add_shape(
+                back,
+                ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+            )
             .unwrap();
         let front_shape = scene
-            .add_shape(front, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE))
+            .add_shape(
+                front,
+                ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+            )
             .unwrap();
 
         let entries = scene.index_entries();
@@ -1822,7 +1879,10 @@ mod tests {
         let index = scene.build_index();
         assert!(index.is_current_for(scene.revision()));
 
-        scene.add_shape(layer, ShapeData::filled(square(0.0, 500.0, 10.0), Color::WHITE));
+        scene.add_shape(
+            layer,
+            ShapeData::filled(square(0.0, 500.0, 10.0), Color::WHITE),
+        );
         assert!(
             !index.is_current_for(scene.revision()),
             "the index should now report itself stale"
@@ -1887,7 +1947,10 @@ mod tests {
         assert!(scene.remove_object(target).is_some());
         assert!(scene.find_object(target).is_none());
         assert_eq!(scene.shape_count(), 1);
-        assert!(scene.remove_object(target).is_none(), "removing twice is a no-op");
+        assert!(
+            scene.remove_object(target).is_none(),
+            "removing twice is a no-op"
+        );
     }
 
     #[test]
@@ -2417,7 +2480,15 @@ mod tests {
     #[test]
     fn update_object_does_not_reach_into_an_existing_snapshot() {
         let (mut scene, _) = scene_with_shapes(3);
-        let id = scene.layers().iter().next().unwrap().all_objects().next().unwrap().id;
+        let id = scene
+            .layers()
+            .iter()
+            .next()
+            .unwrap()
+            .all_objects()
+            .next()
+            .unwrap()
+            .id;
 
         let snapshot = scene.clone();
         assert!(scene.update_object(id, |o| o.visible = false));

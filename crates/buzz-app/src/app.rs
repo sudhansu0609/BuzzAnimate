@@ -671,7 +671,9 @@ impl App {
                     .resizable(false)
                     .exact_size(height)
                     .show(ui, |ui| {
-                        if let Some(dock) = panel_header(ui, id, locked, !id.draws_own_title(), &mut reorders) {
+                        if let Some(dock) =
+                            panel_header(ui, id, locked, !id.draws_own_title(), &mut reorders)
+                        {
                             moves.push((id, dock));
                         }
                         self.draw_panel(ui, id, &mut commands);
@@ -679,9 +681,8 @@ impl App {
                 let _ = &response;
             }
 
-            for (dock, id_name, width) in [
-                (buzz_ui::Dock::Left, "dock-left", workspace.left_width),
-            ] {
+            for (dock, id_name, width) in [(buzz_ui::Dock::Left, "dock-left", workspace.left_width)]
+            {
                 let panels = workspace.on(dock);
                 if panels.is_empty() {
                     continue;
@@ -690,13 +691,24 @@ impl App {
                     .resizable(false)
                     .exact_size(width)
                     .show(ui, |ui| {
-                        self.draw_column(ui, &panels, locked, &mut moves, &mut reorders, &mut commands);
+                        self.draw_column(
+                            ui,
+                            &panels,
+                            locked,
+                            &mut moves,
+                            &mut reorders,
+                            &mut commands,
+                        );
                     });
                 let _ = &response;
             }
 
             for (dock, id_name, width) in [
-                (buzz_ui::Dock::RightOuter, "dock-right-outer", workspace.right_outer_width),
+                (
+                    buzz_ui::Dock::RightOuter,
+                    "dock-right-outer",
+                    workspace.right_outer_width,
+                ),
                 (buzz_ui::Dock::Right, "dock-right", workspace.right_width),
             ] {
                 let panels = workspace.on(dock);
@@ -707,7 +719,14 @@ impl App {
                     .resizable(false)
                     .exact_size(width)
                     .show(ui, |ui| {
-                        self.draw_column(ui, &panels, locked, &mut moves, &mut reorders, &mut commands);
+                        self.draw_column(
+                            ui,
+                            &panels,
+                            locked,
+                            &mut moves,
+                            &mut reorders,
+                            &mut commands,
+                        );
                     });
                 let _ = &response;
             }
@@ -888,7 +907,6 @@ impl App {
         }
     }
 
-
     /// Draw a column of docked panels, each with its own header.
     fn draw_column(
         &mut self,
@@ -906,7 +924,9 @@ impl App {
                     if index > 0 {
                         ui.separator();
                     }
-                    if let Some(dock) = panel_header(ui, id, locked, !id.draws_own_title(), reorders) {
+                    if let Some(dock) =
+                        panel_header(ui, id, locked, !id.draws_own_title(), reorders)
+                    {
                         moves.push((id, dock));
                     }
                     self.draw_panel(ui, id, commands);
@@ -923,8 +943,7 @@ impl App {
         use buzz_ui::PanelId::*;
         match id {
             Tools => {
-                if let Some(tool) =
-                    panels::tool_bar(ui, self.editor.tool(), &mut self.editor.style)
+                if let Some(tool) = panels::tool_bar(ui, self.editor.tool(), &mut self.editor.style)
                 {
                     commands.push(Command::SelectTool(tool));
                 }
@@ -1090,11 +1109,12 @@ impl App {
         let target = editor.filter_panel.target;
 
         let (filters, blend) = match target {
-            buzz_ui::FilterTarget::Object => match object.and_then(|id| editor.scene().find_object(id))
-            {
-                Some((_, found)) => (found.filters.clone(), Some(found.blend)),
-                None => (Vec::new(), None),
-            },
+            buzz_ui::FilterTarget::Object => {
+                match object.and_then(|id| editor.scene().find_object(id)) {
+                    Some((_, found)) => (found.filters.clone(), Some(found.blend)),
+                    None => (Vec::new(), None),
+                }
+            }
             buzz_ui::FilterTarget::Layer => (
                 layer
                     .and_then(|id| editor.scene().layers().get(id))
@@ -1114,7 +1134,9 @@ impl App {
 
         // Where an edit lands. Both arms write the same `Vec`, so the whole
         // panel is one code path with one place that decides the target.
-        let apply = |editor: &mut Editor, label: &'static str, change: &dyn Fn(&mut Vec<buzz_scene::Filter>)| {
+        let apply = |editor: &mut Editor,
+                     label: &'static str,
+                     change: &dyn Fn(&mut Vec<buzz_scene::Filter>)| {
             match target {
                 buzz_ui::FilterTarget::Object => {
                     let Some(id) = object else { return };
@@ -1571,11 +1593,7 @@ impl App {
         }
 
         for (name, rect, vertical, direction) in handles {
-            let response = ui.interact(
-                rect,
-                egui::Id::new(name),
-                egui::Sense::click_and_drag(),
-            );
+            let response = ui.interact(rect, egui::Id::new(name), egui::Sense::click_and_drag());
             if response.hovered() || response.dragged() {
                 ui.ctx().set_cursor_icon(if vertical {
                     egui::CursorIcon::ResizeHorizontal
@@ -1667,14 +1685,18 @@ impl App {
         if horizontal {
             let track = egui::Rect::from_min_max(
                 egui::pos2(area.left(), area.bottom() - THICKNESS),
-                egui::pos2(area.right() - if vertical { THICKNESS } else { 0.0 }, area.bottom()),
+                egui::pos2(
+                    area.right() - if vertical { THICKNESS } else { 0.0 },
+                    area.bottom(),
+                ),
             );
             let response = ui.interact(
                 track,
                 egui::Id::new("stage-scroll-x"),
                 egui::Sense::click_and_drag(),
             );
-            let (thumb, fraction) = thumb_of(track, extent.x0, extent.x1, visible.x0, visible.x1, true);
+            let (thumb, fraction) =
+                thumb_of(track, extent.x0, extent.x1, visible.x0, visible.x1, true);
             ui.painter().rect_filled(track, 0.0, track_colour);
             ui.painter().rect_filled(
                 thumb,
@@ -1702,7 +1724,10 @@ impl App {
         if vertical {
             let track = egui::Rect::from_min_max(
                 egui::pos2(area.right() - THICKNESS, area.top()),
-                egui::pos2(area.right(), area.bottom() - if horizontal { THICKNESS } else { 0.0 }),
+                egui::pos2(
+                    area.right(),
+                    area.bottom() - if horizontal { THICKNESS } else { 0.0 },
+                ),
             );
             let response = ui.interact(
                 track,
@@ -1788,7 +1813,12 @@ impl App {
         }
 
         // Inset from the corner, and clear of the ruler along the top edge.
-        let top = area.min.y + if self.editor.view.show_rulers { 24.0 } else { 8.0 };
+        let top = area.min.y
+            + if self.editor.view.show_rulers {
+                24.0
+            } else {
+                8.0
+            };
         let anchor = egui::pos2(area.max.x - 8.0, top);
 
         egui::Area::new(egui::Id::new("stage-zoom"))
@@ -1975,8 +2005,7 @@ impl App {
         // egui has already turned Ctrl+wheel (and a trackpad pinch) into a zoom
         // factor and taken it out of the scroll delta, so the two cannot fight.
         if response.hovered() {
-            let (zoom, scroll) =
-                ctx.input(|i| (i.zoom_delta() as f64, i.smooth_scroll_delta));
+            let (zoom, scroll) = ctx.input(|i| (i.zoom_delta() as f64, i.smooth_scroll_delta));
 
             if zoom != 1.0
                 && let Some(pos) = ctx.input(|i| i.pointer.hover_pos())
@@ -2122,12 +2151,15 @@ impl App {
                     self.editor.status = Some("Select artwork to keep as an asset".into());
                     return;
                 }
-                let asset = self.editor.doc.scene().extract(self.editor.current_frame, &ids);
+                let asset = self
+                    .editor
+                    .doc
+                    .scene()
+                    .extract(self.editor.current_frame, &ids);
                 let name = self.editor.assets.unique_name("Asset", &folder);
                 match self.editor.assets.save(&name, &folder, &asset) {
                     Ok(saved) => {
-                        self.editor.status =
-                            Some(format!("Kept {} in Assets", saved.label()));
+                        self.editor.status = Some(format!("Kept {} in Assets", saved.label()));
                     }
                     Err(e) => self.editor.status = Some(format!("Could not save the asset: {e}")),
                 }
@@ -2185,7 +2217,9 @@ impl App {
         if let Some(root) = crate::animate_assets::likely_roots().first() {
             picker = picker.set_directory(root);
         }
-        let Some(root) = picker.pick_folder() else { return };
+        let Some(root) = picker.pick_folder() else {
+            return;
+        };
 
         let found = crate::animate_assets::scan(&root);
         if found.is_empty() {
@@ -2924,7 +2958,9 @@ impl App {
         let (w, h) = (active.surface_config.width, active.surface_config.height);
         active.ensure_target();
         let target = &active.target.as_ref().expect("ensure_target ran").view;
-        active.gpu.render(&active.vello, target, w, h, pasteboard())?;
+        active
+            .gpu
+            .render(&active.vello, target, w, h, pasteboard())?;
 
         let mut encoder =
             active
@@ -3101,11 +3137,7 @@ fn panel_header(
             // assumed, because that assumption has been wrong twice.
             ui.menu_button(egui::RichText::new(PANEL_MENU).small(), |ui| {
                 if locked {
-                    ui.label(
-                        egui::RichText::new("The layout is locked")
-                            .small()
-                            .weak(),
-                    );
+                    ui.label(egui::RichText::new("The layout is locked").small().weak());
                     ui.separator();
                 }
 
@@ -3220,7 +3252,10 @@ mod shell_tests {
         let document = |name: &str| opens_as_document(std::path::Path::new(name));
 
         assert!(document("scene.buzz"));
-        assert!(document("SCENE.BUZZ"), "the extension is not case-sensitive");
+        assert!(
+            document("SCENE.BUZZ"),
+            "the extension is not case-sensitive"
+        );
         assert!(!document("scene.fla"), "an Animate document is translated");
         assert!(!document("scene.xfl"));
         assert!(!document("movie.swf"));

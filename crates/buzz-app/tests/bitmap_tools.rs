@@ -43,6 +43,7 @@ fn disc_picture(size: u32, radius: f64) -> Arc<ImageAsset> {
         width: size,
         height: size,
         pixels: Arc::new(pixels),
+        generation: 0,
     })
 }
 
@@ -172,10 +173,7 @@ fn deleting_what_the_lasso_caught_leaves_the_rest_standing() {
         panic!("the kept piece stopped being a shape");
     };
     assert!(
-        matches!(
-            shape.fill.as_ref().map(|f| &f.paint),
-            Some(Paint::Image(_))
-        ),
+        matches!(shape.fill.as_ref().map(|f| &f.paint), Some(Paint::Image(_))),
         "the picture was lost when the artwork was cut"
     );
 }
@@ -296,7 +294,11 @@ fn the_wand_takes_the_background_and_deleting_it_leaves_the_subject() {
     editor.run(Command::Delete);
 
     let after = objects(&editor);
-    assert_eq!(after.len(), 1, "the ground should be gone and the disc left");
+    assert_eq!(
+        after.len(),
+        1,
+        "the ground should be gone and the disc left"
+    );
     let subject = after[0].1;
     assert!(
         (subject.width() - 120.0).abs() < 4.0,
@@ -344,6 +346,7 @@ fn a_tolerance_of_zero_takes_only_the_exact_colour() {
         width: 64,
         height: 64,
         pixels: Arc::new(pixels),
+        generation: 0,
     });
 
     let area = Rect::new(0.0, 0.0, 64.0, 64.0);
@@ -550,4 +553,273 @@ fn the_wand_is_prompt_on_a_photograph() {
         "the wand took {took:?} on a four-megapixel picture"
     );
     eprintln!("magic wand on 4 megapixels: {took:?}");
+}
+
+// -- the soft brush ----------------------------------------------------------
+
+/// **A soft brush stroke lands as artwork, and it fades at its edge.**
+///
+/// The whole of the request, driven the way the pointer drives it.
+#[test]
+fn a_soft_brush_stroke_paints_a_fading_bitmap() {
+    let mut scene = Scene::default();
+    scene.add_layer("Paint", LayerKind::Normal);
+    let mut editor = Editor::new(Document::new(scene));
+
+    editor.set_tool(ToolId::Brush);
+    editor.style.brush.kind = buzz_ui::BrushKind::Raster;
+    editor.style.brush.size = 40.0;
+    editor.style.brush.hardness = 0.3;
+    editor.style.fill_color = Color::from_rgb8(0x00, 0x00, 0x00);
+
+    let camera = editor.camera;
+    let screen = move |x: f64, y: f64| camera.doc_to_screen(Point::new(x, y));
+    editor.pointer_down(screen(200.0, 300.0), Mods::default());
+    for i in 1..=20 {
+        editor.pointer_move(screen(200.0 + f64::from(i) * 15.0, 300.0), Mods::default());
+    }
+    editor.pointer_up(screen(500.0, 300.0));
+
+    let painted = objects(&editor);
+    assert_eq!(painted.len(), 1, "the stroke should have made one object");
+    assert_eq!(
+        editor.selection.len(),
+        1,
+        "and be selected, as a drawn shape is"
+    );
+
+    let scene = editor.doc.scene();
+    let object = scene.find_object(painted[0].0).unwrap().1;
+    let ObjectKind::Shape(shape) = &object.kind else {
+        panic!("a painted stroke should be a shape");
+    };
+    let Some(Paint::Image(fill)) = shape.fill.as_ref().map(|f| &f.paint) else {
+        panic!("a soft stroke should be filled with the pixels it painted");
+    };
+
+    // Down the middle of the stroke: solid. Out past its edge: nothing. And in
+    // between: neither — which is the soft edge, and the reason for all of it.
+    let read = |x: f64, y: f64| {
+        let p = fill.to_pixel(Point::new(x, y)).expect("a pixel");
+        fill.asset.pixel(p.x as i64, p.y as i64)[3]
+    };
+    let middle = read(350.0, 300.0);
+    let edge = read(350.0, 317.0);
+    let outside = read(350.0, 340.0);
+
+    assert!(
+        middle > 240,
+        "the middle of the stroke is solid, not {middle}"
+    );
+    assert!(
+        edge > 10 && edge < 240,
+        "the edge should be part-transparent, and is {edge}"
+    );
+    assert!(
+        outside < 10,
+        "past the brush there is nothing, not {outside}"
+    );
+
+    // The document holds the pixels, so saving keeps them.
+    assert_eq!(scene.images().len(), 1);
+}
+
+/// A hard raster brush is hard: the same gesture, a different edge.
+#[test]
+fn hardness_changes_the_edge_of_a_painted_stroke() {
+    let paint = |hardness: f64| -> Vec<u8> {
+        let mut scene = Scene::default();
+        scene.add_layer("Paint", LayerKind::Normal);
+        let mut editor = Editor::new(Document::new(scene));
+        editor.set_tool(ToolId::Brush);
+        editor.style.brush.kind = buzz_ui::BrushKind::Raster;
+        editor.style.brush.size = 60.0;
+        editor.style.brush.hardness = hardness;
+
+        let camera = editor.camera;
+        let screen = move |x: f64, y: f64| camera.doc_to_screen(Point::new(x, y));
+        editor.pointer_down(screen(200.0, 300.0), Mods::default());
+        editor.pointer_move(screen(300.0, 300.0), Mods::default());
+        editor.pointer_up(screen(400.0, 300.0));
+
+        let scene = editor.doc.scene();
+        let id = objects(&editor)[0].0;
+        let object = scene.find_object(id).unwrap().1;
+        let ObjectKind::Shape(shape) = &object.kind else {
+            panic!("not a shape");
+        };
+        let Some(Paint::Image(fill)) = shape.fill.as_ref().map(|f| &f.paint) else {
+            panic!("not painted");
+        };
+        // A column across the stroke, from its middle outwards.
+        (0..30)
+            .map(|dy| {
+                let p = fill
+                    .to_pixel(Point::new(300.0, 300.0 + f64::from(dy)))
+                    .expect("a pixel");
+                fill.asset.pixel(p.x as i64, p.y as i64)[3]
+            })
+            .collect()
+    };
+
+    let soft = paint(0.0);
+    let hard = paint(1.0);
+
+    // Two thirds of the way out, a hard brush is still solid and a soft one is
+    // well on its way to nothing.
+    assert!(
+        hard[20] > 240,
+        "a hard brush should be solid at 20, is {}",
+        hard[20]
+    );
+    assert!(
+        soft[20] < 128,
+        "a soft brush should be fading at 20, is {}",
+        soft[20]
+    );
+    // Both stop by the edge of the brush.
+    assert!(hard[29] < 250 && soft[29] < 60);
+}
+
+/// Painting is one undo step, and undoing it takes the picture with it.
+#[test]
+fn a_painted_stroke_undoes_in_one_step() {
+    let mut scene = Scene::default();
+    scene.add_layer("Paint", LayerKind::Normal);
+    let mut editor = Editor::new(Document::new(scene));
+    editor.set_tool(ToolId::Brush);
+    editor.style.brush.kind = buzz_ui::BrushKind::Raster;
+
+    let camera = editor.camera;
+    let screen = move |x: f64, y: f64| camera.doc_to_screen(Point::new(x, y));
+    editor.pointer_down(screen(100.0, 100.0), Mods::default());
+    for i in 1..=10 {
+        editor.pointer_move(screen(100.0 + f64::from(i) * 10.0, 100.0), Mods::default());
+    }
+    editor.pointer_up(screen(200.0, 100.0));
+    assert_eq!(objects(&editor).len(), 1);
+
+    editor.run(Command::Undo);
+    assert!(
+        objects(&editor).is_empty(),
+        "one Ctrl+Z should undo the whole stroke, not one pointer move of it"
+    );
+}
+
+/// **The GPU is not asked to re-upload a picture that has not changed.**
+///
+/// The renderer caches bitmaps by an identifier, and the obvious way of
+/// building one hands out a fresh number every frame — which re-uploads a
+/// four-megapixel photograph sixty times a second for as long as it is on
+/// screen. The identifier must be stable while the pixels are, and must change
+/// the moment they are painted on.
+#[test]
+fn a_bitmaps_identity_is_stable_until_its_pixels_change() {
+    let asset = disc_picture(64, 20.0);
+    let first = asset.blob_id();
+    assert_eq!(first, asset.blob_id(), "asking twice gave two answers");
+
+    let other = disc_picture(64, 20.0);
+    let mut renamed = (*other).clone();
+    renamed.id = ImageId(2);
+    assert_ne!(
+        renamed.blob_id(),
+        first,
+        "two different bitmaps share an identity"
+    );
+
+    let mut painted = (*asset).clone();
+    painted.edit_pixels(|p| p[0] = 0);
+    assert_ne!(
+        painted.blob_id(),
+        first,
+        "painting on a bitmap left the renderer showing the old pixels"
+    );
+}
+
+/// **A brush preview is never mistaken for the one before it.**
+///
+/// The other half of caching by identity: a picture rebuilt every pointer move
+/// must take a new identity each time, or the renderer keeps showing the first
+/// frame of the stroke while the user goes on drawing.
+#[test]
+fn a_preview_bitmap_takes_a_fresh_identity_every_time() {
+    let a = (*disc_picture(16, 4.0)).clone().made_transient();
+    let b = (*disc_picture(16, 4.0)).clone().made_transient();
+    assert_ne!(
+        a.blob_id(),
+        b.blob_id(),
+        "two previews share an identity, so the second would not be drawn"
+    );
+
+    // And a transient never collides with a bitmap that is really in the
+    // document, however many have been imported.
+    let real = disc_picture(16, 4.0);
+    assert_ne!(a.blob_id(), real.blob_id());
+}
+
+/// **Paint survives saving and reopening.**
+///
+/// A painted stroke has no source file to write back — its pixels *are* the
+/// document — so the container has to encode them. If it did not, a night's
+/// painting would open blank.
+#[test]
+fn a_painted_stroke_survives_a_save_and_a_reopen() {
+    let mut scene = Scene::default();
+    scene.add_layer("Paint", LayerKind::Normal);
+    let mut editor = Editor::new(Document::new(scene));
+    editor.set_tool(ToolId::Brush);
+    editor.style.brush.kind = buzz_ui::BrushKind::Raster;
+    editor.style.brush.size = 30.0;
+    editor.style.fill_color = Color::from_rgb8(0xC0, 0x20, 0x20);
+
+    let camera = editor.camera;
+    let screen = move |x: f64, y: f64| camera.doc_to_screen(Point::new(x, y));
+    editor.pointer_down(screen(100.0, 100.0), Mods::default());
+    for i in 1..=8 {
+        editor.pointer_move(screen(100.0 + f64::from(i) * 20.0, 100.0), Mods::default());
+    }
+    editor.pointer_up(screen(260.0, 100.0));
+
+    let before = editor.doc.scene().clone();
+    let painted_id = objects(&editor)[0].0;
+    let sample = {
+        let object = before.find_object(painted_id).unwrap().1;
+        let ObjectKind::Shape(shape) = &object.kind else {
+            panic!("not a shape")
+        };
+        let Some(Paint::Image(fill)) = shape.fill.as_ref().map(|f| &f.paint) else {
+            panic!("not painted")
+        };
+        let p = fill.to_pixel(Point::new(180.0, 100.0)).unwrap();
+        fill.asset.pixel(p.x as i64, p.y as i64)
+    };
+    assert!(sample[3] > 200, "the sample point should be solid paint");
+
+    let dir = std::env::temp_dir().join(format!("buzz-paint-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("painting.buzz");
+    buzz_doc::format::save(&before, &path).expect("save");
+    let reopened = buzz_doc::format::load(&path).expect("open");
+
+    let object = reopened
+        .layers()
+        .iter()
+        .flat_map(|l| l.objects_at(0).iter())
+        .next()
+        .expect("the stroke came back");
+    let ObjectKind::Shape(shape) = &object.kind else {
+        panic!("the stroke stopped being a shape")
+    };
+    let Some(Paint::Image(fill)) = shape.fill.as_ref().map(|f| &f.paint) else {
+        panic!("the paint was lost on save")
+    };
+    let p = fill.to_pixel(Point::new(180.0, 100.0)).unwrap();
+    let after = fill.asset.pixel(p.x as i64, p.y as i64);
+    assert_eq!(
+        after, sample,
+        "the pixels changed across a save and a reopen"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

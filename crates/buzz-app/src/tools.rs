@@ -57,6 +57,14 @@ pub enum ToolAction {
     TransformSelection { transform: Affine },
     /// Drag one anchor of the selected path — Animate's Subselection tool.
     MoveAnchor { element: usize, delta: Vec2 },
+    /// Place a painted stroke: a bitmap, and the rectangle it fills.
+    ///
+    /// The tool cannot make this artwork itself, because a bitmap needs an id
+    /// from the document's library and this module cannot see the document.
+    PaintRaster {
+        canvas: buzz_scene::Canvas,
+        brush: buzz_scene::SoftBrush,
+    },
     /// Erase within a stroked path.
     Erase { path: BezPath, width: f64 },
     /// Fill whatever is under the point with the current fill colour.
@@ -128,6 +136,15 @@ pub enum Preview {
     Ink {
         path: BezPath,
         color: Color,
+    },
+    /// Artwork as it will be painted, in its real paint.
+    ///
+    /// For the soft brush, whose result is a bitmap rather than an outline:
+    /// what it lays down cannot be described by a silhouette, so the preview
+    /// is the bitmap itself, filling the rectangle it will occupy.
+    Painted {
+        area: Rect,
+        paint: buzz_scene::Paint,
     },
     /// The transformation point being dragged, where the pointer has it.
     ///
@@ -412,6 +429,31 @@ impl ToolMachine {
                 // cost a fraction of the committed geometry, and a pattern
                 // brush at close spacing would otherwise place thousands of
                 // stamps per frame.
+                // A soft brush previews its own pixels, because the pixels are
+                // the point: an outline of where the paint would go says
+                // nothing about how it fades.
+                ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Raster => {
+                    match paint_soft_stroke(samples, ctx.style) {
+                        Some((canvas, brush)) => {
+                            let area = canvas.area();
+                            // Transient: rebuilt on every pointer move, so it
+                            // must not share an identity with the move before
+                            // it or the renderer shows the stroke as it was.
+                            let asset = std::sync::Arc::new(
+                                canvas
+                                    .to_asset(buzz_scene::ImageId(0), "preview", &brush)
+                                    .made_transient(),
+                            );
+                            let mut fill = buzz_scene::ImageFill::new(asset, area);
+                            fill.smooth = false;
+                            Preview::Painted {
+                                area,
+                                paint: buzz_scene::Paint::Image(Box::new(fill)),
+                            }
+                        }
+                        None => Preview::None,
+                    }
+                }
                 ToolId::Brush => {
                     let budget = buzz_geom::BrushBudget::preview();
                     // The preview is drawn in one colour: it is redrawn on
@@ -503,6 +545,12 @@ impl ToolMachine {
                 path: centreline_of(&samples),
                 width: ctx.style.stroke_width.max(1.0) * 4.0,
             },
+            ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Raster => {
+                match paint_soft_stroke(&samples, ctx.style) {
+                    Some((canvas, brush)) => ToolAction::PaintRaster { canvas, brush },
+                    None => ToolAction::None,
+                }
+            }
             ToolId::Brush => {
                 // The brush paints a filled stroke, so its colour comes from
                 // the fill swatch — as in Animate.
@@ -575,7 +623,8 @@ impl ToolMachine {
             && !was_click
             && let Some(pivot) = ctx.pivot
             && ctx.selection_bounds.is_some()
-            && (origin - pivot).hypot() <= (TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE)) * 1.5
+            && (origin - pivot).hypot()
+                <= (TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE)) * 1.5
         {
             return ToolAction::SetTransformPoint { at: end };
         }
@@ -587,7 +636,10 @@ impl ToolMachine {
             // Selection tool.
             ToolId::GradientTransform => {
                 let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
-                match ctx.gradient.and_then(|(h, kind)| grip_at(h, kind, origin, grab)) {
+                match ctx
+                    .gradient
+                    .and_then(|(h, kind)| grip_at(h, kind, origin, grab))
+                {
                     Some(grip) => ToolAction::DragGradient { grip, to: end },
                     None => ToolAction::PickAt {
                         point: end,
@@ -756,6 +808,36 @@ fn centreline_of(samples: &[buzz_geom::StrokeSample]) -> BezPath {
     buzz_geom::centreline(samples)
 }
 
+/// The soft brush the current style describes.
+fn soft_brush(style: &DrawStyle) -> buzz_scene::SoftBrush {
+    buzz_scene::SoftBrush {
+        // Size is a *width*, as it is for every other brush and as Animate
+        // shows it; the raster brush works in radii.
+        radius: (style.brush.size.max(0.5)) / 2.0,
+        hardness: style.brush.hardness,
+        flow: style.brush.flow,
+        // The fill swatch, as the vector brush uses — a brush paints a filled
+        // stroke, so its colour is the fill's.
+        color: style.fill_color_for_preview(),
+    }
+}
+
+/// Paint a soft-edged stroke, as artwork: a bitmap and the rectangle it fills.
+///
+/// `None` if the gesture painted nothing at all.
+fn paint_soft_stroke(
+    samples: &[buzz_geom::StrokeSample],
+    style: &DrawStyle,
+) -> Option<(buzz_scene::Canvas, buzz_scene::SoftBrush)> {
+    let brush = soft_brush(style);
+    let points: Vec<Point> = samples.iter().map(|s| s.point).collect();
+    let canvas = buzz_scene::Canvas::for_stroke(&points, &brush)?;
+    if canvas.is_blank() {
+        return None;
+    }
+    Some((canvas, brush))
+}
+
 /// The closed region a lasso gesture has drawn.
 ///
 /// The user is not asked to return to where they began: releasing the button
@@ -810,6 +892,9 @@ fn build_brush_path(
         buzz_ui::BrushKind::Fluid => {
             Some(buzz_geom::fluid_outline(samples, &settings.profile(), budget).path)
         }
+        // Not geometry at all: a soft stroke is pixels, built by
+        // `paint_soft_stroke`. Nothing here can describe it.
+        buzz_ui::BrushKind::Raster => None,
         buzz_ui::BrushKind::Pattern | buzz_ui::BrushKind::Art => {
             let source = settings.pattern_path()?;
             // The stroke is conditioned first, so stamps follow the smoothed
@@ -994,14 +1079,13 @@ fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> Transform
     }
 
     // An edge, but not near a corner: skew along it.
-    let near_vertical_edge =
-        ((at.x - bounds.x0).abs() <= grab || (at.x - bounds.x1).abs() <= grab)
-            && at.y > bounds.y0 + grab
-            && at.y < bounds.y1 - grab;
-    let near_horizontal_edge =
-        ((at.y - bounds.y0).abs() <= grab || (at.y - bounds.y1).abs() <= grab)
-            && at.x > bounds.x0 + grab
-            && at.x < bounds.x1 - grab;
+    let near_vertical_edge = ((at.x - bounds.x0).abs() <= grab || (at.x - bounds.x1).abs() <= grab)
+        && at.y > bounds.y0 + grab
+        && at.y < bounds.y1 - grab;
+    let near_horizontal_edge = ((at.y - bounds.y0).abs() <= grab
+        || (at.y - bounds.y1).abs() <= grab)
+        && at.x > bounds.x0 + grab
+        && at.x < bounds.x1 - grab;
     if near_horizontal_edge {
         return TransformZone::Edge(true);
     }
@@ -1027,9 +1111,7 @@ fn rotate_about(pivot: Point, origin: Point, end: Point, snap: bool) -> Affine {
         let step = std::f64::consts::FRAC_PI_4;
         angle = (angle / step).round() * step;
     }
-    Affine::translate(pivot.to_vec2())
-        * Affine::rotate(angle)
-        * Affine::translate(-pivot.to_vec2())
+    Affine::translate(pivot.to_vec2()) * Affine::rotate(angle) * Affine::translate(-pivot.to_vec2())
 }
 
 /// Scale about an arbitrary point rather than the opposite corner.
@@ -1283,7 +1365,13 @@ mod tests {
     fn alt_scaling_keeps_the_transformation_point_fixed() {
         let bounds = box_10();
         let pivot = Point::new(50.0, 50.0);
-        let scaled = scale_about(pivot, bounds, Point::new(100.0, 100.0), Point::new(150.0, 150.0), false);
+        let scaled = scale_about(
+            pivot,
+            bounds,
+            Point::new(100.0, 100.0),
+            Point::new(150.0, 150.0),
+            false,
+        );
         assert!((scaled * pivot - pivot).hypot() < 1e-9);
         let corner = scaled * Point::new(100.0, 100.0);
         assert!((corner - Point::new(150.0, 150.0)).hypot() < 1e-9);
@@ -2117,7 +2205,12 @@ mod tests {
         );
     }
 
-    fn handles(centre: Point, end: Point, width: Point, focus: Point) -> buzz_scene::GradientHandles {
+    fn handles(
+        centre: Point,
+        end: Point,
+        width: Point,
+        focus: Point,
+    ) -> buzz_scene::GradientHandles {
         buzz_scene::GradientHandles {
             center: centre,
             end,
@@ -2166,7 +2259,12 @@ mod tests {
     fn the_focus_is_reachable_when_it_sits_on_the_centre() {
         let style = DrawStyle::default();
         let centre = Point::new(100.0, 100.0);
-        let h = handles(centre, Point::new(200.0, 100.0), Point::new(100.0, 200.0), centre);
+        let h = handles(
+            centre,
+            Point::new(200.0, 100.0),
+            Point::new(100.0, 200.0),
+            centre,
+        );
 
         let mut c = ctx(&style);
         c.gradient = Some((h, buzz_scene::GradientKind::Radial));

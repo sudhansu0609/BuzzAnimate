@@ -861,7 +861,9 @@ mod tests {
     #[test]
     fn a_camera_with_no_keys_still_projects() {
         let track = CameraTrack::new();
-        let projection = track.projection_at_depth(0, stage(), 0.0).expect("in front");
+        let projection = track
+            .projection_at_depth(0, stage(), 0.0)
+            .expect("in front");
         assert!(projection.is_affine());
     }
 
@@ -911,7 +913,9 @@ mod tests {
     fn tilt_and_depth_work_together() {
         let track = tilted(0.35, 0.0);
         let area = |depth: f64| {
-            let projection = track.projection_at_depth(0, stage(), depth).expect("in front");
+            let projection = track
+                .projection_at_depth(0, stage(), depth)
+                .expect("in front");
             let bounds = projection
                 .map_rect_bounds(buzz_geom::Rect::new(0.0, 0.0, 550.0, 400.0))
                 .expect("in front");

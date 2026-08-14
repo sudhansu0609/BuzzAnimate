@@ -234,10 +234,7 @@ fn body(ui: &mut Ui, state: &mut NewDocumentState, out: &mut NewDocumentResponse
                 );
                 for rate in FRAME_RATES {
                     let chosen = (state.setup.frame_rate - rate).abs() < 0.001;
-                    if ui
-                        .selectable_label(chosen, format!("{rate:.0}"))
-                        .clicked()
-                    {
+                    if ui.selectable_label(chosen, format!("{rate:.0}")).clicked() {
                         state.setup.frame_rate = *rate;
                     }
                 }
@@ -330,8 +327,14 @@ mod tests {
     #[test]
     fn every_preset_is_usable() {
         for preset in PRESETS {
-            assert!(preset.width >= 1.0 && preset.width <= 16_384.0, "{preset:?}");
-            assert!(preset.height >= 1.0 && preset.height <= 16_384.0, "{preset:?}");
+            assert!(
+                preset.width >= 1.0 && preset.width <= 16_384.0,
+                "{preset:?}"
+            );
+            assert!(
+                preset.height >= 1.0 && preset.height <= 16_384.0,
+                "{preset:?}"
+            );
             assert!(
                 preset.frame_rate > 0.0 && preset.frame_rate <= 240.0,
                 "{preset:?}"

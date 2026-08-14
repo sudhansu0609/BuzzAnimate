@@ -139,8 +139,7 @@ impl Frame {
     pub fn write_png(&self, path: &Path) -> Result<()> {
         let encoded = self.to_png()?;
         let temp = path.with_extension("png.part");
-        std::fs::write(&temp, &encoded)
-            .with_context(|| format!("writing {}", temp.display()))?;
+        std::fs::write(&temp, &encoded).with_context(|| format!("writing {}", temp.display()))?;
         std::fs::rename(&temp, path)
             .with_context(|| format!("renaming into {}", path.display()))?;
         Ok(())

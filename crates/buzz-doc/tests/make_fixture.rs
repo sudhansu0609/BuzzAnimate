@@ -7,9 +7,7 @@
 //! is how the font problems in Phase 2 were caught.
 
 use buzz_geom::{Affine, Shape as _};
-use buzz_scene::{
-    LayerKind, Scene, ShapeData, SymbolKind, Tween,
-};
+use buzz_scene::{LayerKind, Scene, ShapeData, SymbolKind, Tween};
 use kurbo::Rect;
 use peniko::Color;
 
@@ -28,11 +26,31 @@ fn write_phase4_fixture() {
 
     // Artwork inside two of them, so their instances draw something.
     for (id, colour, rect) in [
-        (body, Color::from_rgba8(0xE0, 0x70, 0x50, 0xFF), Rect::new(0.0, 0.0, 80.0, 120.0)),
-        (arm, Color::from_rgba8(0x50, 0xA0, 0xE0, 0xFF), Rect::new(0.0, 0.0, 25.0, 90.0)),
-        (button, Color::from_rgba8(0x80, 0xC0, 0x80, 0xFF), Rect::new(0.0, 0.0, 60.0, 30.0)),
+        (
+            body,
+            Color::from_rgba8(0xE0, 0x70, 0x50, 0xFF),
+            Rect::new(0.0, 0.0, 80.0, 120.0),
+        ),
+        (
+            arm,
+            Color::from_rgba8(0x50, 0xA0, 0xE0, 0xFF),
+            Rect::new(0.0, 0.0, 25.0, 90.0),
+        ),
+        (
+            button,
+            Color::from_rgba8(0x80, 0xC0, 0x80, 0xFF),
+            Rect::new(0.0, 0.0, 60.0, 30.0),
+        ),
     ] {
-        let inner = scene.library().get(id).unwrap().layers.iter().next().unwrap().id;
+        let inner = scene
+            .library()
+            .get(id)
+            .unwrap()
+            .layers
+            .iter()
+            .next()
+            .unwrap()
+            .id;
         let object = buzz_scene::Object::shape(
             scene.next_object_id(),
             ShapeData::filled(rect.to_path(1e-9), colour),
@@ -177,12 +195,14 @@ fn write_depth_fixture() {
     // A camera that pans right across two seconds, so the parallax is visible
     // by scrubbing rather than only by moving the depth sliders.
     scene.camera_mut().enabled = true;
-    scene
-        .camera_mut()
-        .set_key(buzz_scene::CameraKey::new(0, buzz_geom::Point::new(275.0, 200.0)));
-    scene
-        .camera_mut()
-        .set_key(buzz_scene::CameraKey::new(48, buzz_geom::Point::new(675.0, 200.0)));
+    scene.camera_mut().set_key(buzz_scene::CameraKey::new(
+        0,
+        buzz_geom::Point::new(275.0, 200.0),
+    ));
+    scene.camera_mut().set_key(buzz_scene::CameraKey::new(
+        48,
+        buzz_geom::Point::new(675.0, 200.0),
+    ));
 
     let mut path = std::env::temp_dir();
     path.push("depth-fixture.buzz");

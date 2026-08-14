@@ -264,7 +264,10 @@ mod tests {
         let fresh = swatches.add("Fresh", Color::BLACK, None);
 
         assert_ne!(fresh, loaded);
-        assert!(fresh.0 > loaded.0, "a later id must not collide with a loaded one");
+        assert!(
+            fresh.0 > loaded.0,
+            "a later id must not collide with a loaded one"
+        );
         let ids: std::collections::BTreeSet<SwatchId> = swatches.iter().map(|s| s.id).collect();
         assert_eq!(ids.len(), swatches.len());
     }
@@ -290,7 +293,10 @@ mod tests {
             vec![&"Hero".to_string()],
             "the parent folder should have been made too"
         );
-        assert_eq!(swatches.child_folders(Some("Hero")), vec![&"Hero/Skin".to_string()]);
+        assert_eq!(
+            swatches.child_folders(Some("Hero")),
+            vec![&"Hero/Skin".to_string()]
+        );
     }
 
     /// An empty folder is a legitimate thing to have made in advance.
@@ -334,9 +340,15 @@ mod tests {
     fn a_colour_can_be_looked_up_by_value() {
         let swatches = palette();
         assert_eq!(
-            swatches.find_color(Color::from_rgb8(0xFF, 0x99, 0x00)).map(|s| s.name.as_str()),
+            swatches
+                .find_color(Color::from_rgb8(0xFF, 0x99, 0x00))
+                .map(|s| s.name.as_str()),
             Some("Orange")
         );
-        assert!(swatches.find_color(Color::from_rgb8(0x12, 0x34, 0x56)).is_none());
+        assert!(
+            swatches
+                .find_color(Color::from_rgb8(0x12, 0x34, 0x56))
+                .is_none()
+        );
     }
 }

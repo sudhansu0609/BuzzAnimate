@@ -250,10 +250,16 @@ pub fn sound_panel(
 /// One line on what each sync mode actually does.
 fn sync_help(sync: SoundSync) -> &'static str {
     match sync {
-        SoundSync::Event => "Starts when the playhead reaches it, then plays out on its own — it does not stop when the film does.",
-        SoundSync::Start => "Like Event, but will not start a second copy while one is already sounding.",
+        SoundSync::Event => {
+            "Starts when the playhead reaches it, then plays out on its own — it does not stop when the film does."
+        }
+        SoundSync::Start => {
+            "Like Event, but will not start a second copy while one is already sounding."
+        }
         SoundSync::Stop => "Silences this sound from this frame on.",
-        SoundSync::Stream => "Tied to the timeline: scrubbing moves it, and it cannot drift from the picture. Dialogue.",
+        SoundSync::Stream => {
+            "Tied to the timeline: scrubbing moves it, and it cannot drift from the picture. Dialogue."
+        }
     }
 }
 

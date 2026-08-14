@@ -1,4 +1,4 @@
-﻿//! The `.buzz` container.
+//! The `.buzz` container.
 //!
 //! A zip archive, laid out so the parts that will grow later already have a
 //! home:
@@ -173,7 +173,9 @@ pub fn from_bytes(bytes: &[u8]) -> Result<Scene, DocError> {
     }
 
     let mut document = String::new();
-    archive.by_name(ENTRY_DOCUMENT)?.read_to_string(&mut document)?;
+    archive
+        .by_name(ENTRY_DOCUMENT)?
+        .read_to_string(&mut document)?;
 
     let dto: DocumentDto = serde_json::from_str(&document)?;
 
@@ -524,7 +526,8 @@ mod tests {
         let mut buffer = Cursor::new(Vec::new());
         {
             let mut zip = ZipWriter::new(&mut buffer);
-            zip.start_file("mimetype", SimpleFileOptions::default()).unwrap();
+            zip.start_file("mimetype", SimpleFileOptions::default())
+                .unwrap();
             zip.write_all(b"application/zip").unwrap();
             zip.finish().unwrap();
         }

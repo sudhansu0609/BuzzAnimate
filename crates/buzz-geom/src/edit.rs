@@ -66,7 +66,12 @@ pub fn outline_stroke(path: &BezPath, style: StrokeStyle, tolerance: f64) -> Bez
         return BezPath::new();
     }
     let tolerance = sane_tolerance(tolerance, path);
-    kurbo::stroke(path.iter(), &style.to_kurbo(), &StrokeOpts::default(), tolerance)
+    kurbo::stroke(
+        path.iter(),
+        &style.to_kurbo(),
+        &StrokeOpts::default(),
+        tolerance,
+    )
 }
 
 /// Grow (positive) or shrink (negative) a filled region by `amount`.
@@ -180,12 +185,7 @@ fn cubic_is_straight(
     distance_to_line(chord, p1).max(distance_to_line(chord, p2)) <= tolerance
 }
 
-fn quad_is_straight(
-    p0: kurbo::Point,
-    c: kurbo::Point,
-    p1: kurbo::Point,
-    tolerance: f64,
-) -> bool {
+fn quad_is_straight(p0: kurbo::Point, c: kurbo::Point, p1: kurbo::Point, tolerance: f64) -> bool {
     distance_to_line(Line::new(p0, p1), c) <= tolerance
 }
 
@@ -287,16 +287,20 @@ mod tests {
 
     #[test]
     fn outlining_degenerate_input_yields_nothing() {
-        assert!(outline_stroke(&BezPath::new(), StrokeStyle::new(4.0), 0.01)
-            .elements()
-            .is_empty());
+        assert!(
+            outline_stroke(&BezPath::new(), StrokeStyle::new(4.0), 0.01)
+                .elements()
+                .is_empty()
+        );
 
         let mut line = BezPath::new();
         line.move_to(Point::new(0.0, 0.0));
         line.line_to(Point::new(10.0, 0.0));
-        assert!(outline_stroke(&line, StrokeStyle::new(0.0), 0.01)
-            .elements()
-            .is_empty());
+        assert!(
+            outline_stroke(&line, StrokeStyle::new(0.0), 0.01)
+                .elements()
+                .is_empty()
+        );
     }
 
     /// Isolates the stroking stage of `expand_fill`, so a bad band is not

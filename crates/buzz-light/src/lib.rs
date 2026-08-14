@@ -71,7 +71,11 @@ pub enum LightKind {
     /// Direction varies across the stage, so shadows radiate outwards and
     /// lengthen with distance — which is exactly how you tell a lamp from a
     /// sun in a finished shot.
-    Lamp { position: Point, height: f64, radius: f64 },
+    Lamp {
+        position: Point,
+        height: f64,
+        radius: f64,
+    },
 }
 
 impl LightKind {
@@ -175,11 +179,8 @@ impl Light {
             } => {
                 // The lamp sits `height` in front of the focal plane; the
                 // surface sits at `depth` behind it.
-                let to_light = Vec3::new(
-                    position.x - point.x,
-                    position.y - point.y,
-                    height + depth,
-                );
+                let to_light =
+                    Vec3::new(position.x - point.x, position.y - point.y, height + depth);
                 let distance = to_light.length();
                 if distance <= f64::EPSILON {
                     return Some((Vec3::new(0.0, 0.0, 1.0), self.intensity));
@@ -372,9 +373,7 @@ impl LightRig {
 
     /// The lights that cast: everything directional and enabled.
     pub fn casters(&self) -> impl Iterator<Item = &Light> {
-        self.lights
-            .iter()
-            .filter(|l| l.enabled && !l.is_ambient())
+        self.lights.iter().filter(|l| l.enabled && !l.is_ambient())
     }
 
     /// The **key light**: the strongest directional one, which is the light
@@ -410,11 +409,7 @@ impl LightRig {
         for light in self.lights.iter().filter(|l| l.enabled) {
             if let Some(colour) = light.ambient_at(point, stage_height) {
                 let c = to_linear(colour);
-                ambient = [
-                    ambient[0] + c[0],
-                    ambient[1] + c[1],
-                    ambient[2] + c[2],
-                ];
+                ambient = [ambient[0] + c[0], ambient[1] + c[1], ambient[2] + c[2]];
             }
         }
 
@@ -574,7 +569,11 @@ mod tests {
         let illumination = rig.illuminate(Point::new(10.0, 10.0), 0.0, 400.0);
         assert!(illumination.is_neutral());
 
-        for colour in [Color::WHITE, Color::BLACK, Color::from_rgb8(0x33, 0x66, 0x99)] {
+        for colour in [
+            Color::WHITE,
+            Color::BLACK,
+            Color::from_rgb8(0x33, 0x66, 0x99),
+        ] {
             assert_eq!(
                 illumination.apply(colour),
                 colour,
@@ -645,10 +644,16 @@ mod tests {
         );
 
         let (left, _) = lamp.towards(Point::new(0.0, 100.0), 0.0).expect("left");
-        assert!(left.x > 0.0, "from the left, the lamp is to the right: {left:?}");
+        assert!(
+            left.x > 0.0,
+            "from the left, the lamp is to the right: {left:?}"
+        );
 
         let (right, _) = lamp.towards(Point::new(200.0, 100.0), 0.0).expect("right");
-        assert!(right.x < 0.0, "from the right, it is to the left: {right:?}");
+        assert!(
+            right.x < 0.0,
+            "from the right, it is to the left: {right:?}"
+        );
 
         // And it is above both of them, which is what makes its shadows
         // radiate outwards rather than run parallel.
@@ -688,10 +693,18 @@ mod tests {
         };
 
         let top = sky.ambient_at(Point::new(0.0, 0.0), 400.0).expect("top");
-        let bottom = sky.ambient_at(Point::new(0.0, 400.0), 400.0).expect("bottom");
+        let bottom = sky
+            .ambient_at(Point::new(0.0, 400.0), 400.0)
+            .expect("bottom");
 
-        assert!(top.to_rgba8().to_u8_array()[2] > 200, "the top is the zenith");
-        assert!(bottom.to_rgba8().to_u8_array()[0] > 200, "the bottom is the horizon");
+        assert!(
+            top.to_rgba8().to_u8_array()[2] > 200,
+            "the top is the zenith"
+        );
+        assert!(
+            bottom.to_rgba8().to_u8_array()[0] > 200,
+            "the bottom is the horizon"
+        );
     }
 
     /// A light low on the horizon fills very little — its energy goes sideways,
@@ -728,7 +741,10 @@ mod tests {
             .illuminate(Point::ZERO, 0.0, 400.0)
             .apply(Color::from_rgb8(0x80, 0x80, 0x80));
         let [r, g, b, _] = lit.to_rgba8().to_u8_array();
-        assert!(r > g && g > b, "an orange light should read orange: {lit:?}");
+        assert!(
+            r > g && g > b,
+            "an orange light should read orange: {lit:?}"
+        );
     }
 
     /// The shaded side takes the *sky's* colour rather than a grey, which is
@@ -811,7 +827,9 @@ mod tests {
     #[test]
     fn colours_mix_in_linear_light() {
         // Halfway between black and white looks like mid grey, not 0x80.
-        let middle = mix(Color::BLACK, Color::WHITE, 0.5).to_rgba8().to_u8_array();
+        let middle = mix(Color::BLACK, Color::WHITE, 0.5)
+            .to_rgba8()
+            .to_u8_array();
         assert!(
             (185..=195).contains(&middle[0]),
             "linear-light midpoint should be about 0xBC, got {middle:?}"

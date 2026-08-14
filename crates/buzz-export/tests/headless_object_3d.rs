@@ -54,12 +54,16 @@ fn is_art(pixel: [u8; 4]) -> bool {
 
 /// How tall the artwork is on one column of pixels.
 fn height_at(frame: &Frame, x: u32) -> u32 {
-    (0..frame.height).filter(|y| is_art(frame.pixel(x, *y))).count() as u32
+    (0..frame.height)
+        .filter(|y| is_art(frame.pixel(x, *y)))
+        .count() as u32
 }
 
 /// How wide it is on one row.
 fn width_at(frame: &Frame, y: u32) -> u32 {
-    (0..frame.width).filter(|x| is_art(frame.pixel(*x, y))).count() as u32
+    (0..frame.width)
+        .filter(|x| is_art(frame.pixel(*x, y)))
+        .count() as u32
 }
 
 /// The promise every document depends on: a flat object is untouched.
@@ -168,7 +172,9 @@ fn turning_a_card_foreshortens_one_side() {
         let frame = render(exporter, &scene);
         // Sample near each end of what is drawn, rather than at fixed columns:
         // the card no longer fills its old footprint.
-        let columns: Vec<u32> = (0..frame.width).filter(|x| height_at(&frame, *x) > 0).collect();
+        let columns: Vec<u32> = (0..frame.width)
+            .filter(|x| height_at(&frame, *x) > 0)
+            .collect();
         assert!(columns.len() > 20, "the card vanished");
 
         let left = height_at(&frame, columns[2]);
@@ -199,8 +205,9 @@ fn the_foreshortening_follows_the_rotation() {
         let other = render(exporter, &turned(-0.8));
 
         let lean = |frame: &Frame| {
-            let columns: Vec<u32> =
-                (0..frame.width).filter(|x| height_at(frame, *x) > 0).collect();
+            let columns: Vec<u32> = (0..frame.width)
+                .filter(|x| height_at(frame, *x) > 0)
+                .collect();
             let left = height_at(frame, columns[2]) as i64;
             let right = height_at(frame, columns[columns.len() - 3]) as i64;
             (left - right).signum()
@@ -227,7 +234,9 @@ fn tipping_a_card_foreshortens_its_top_and_bottom() {
         });
 
         let frame = render(exporter, &scene);
-        let rows: Vec<u32> = (0..frame.height).filter(|y| width_at(&frame, *y) > 0).collect();
+        let rows: Vec<u32> = (0..frame.height)
+            .filter(|y| width_at(&frame, *y) > 0)
+            .collect();
         assert!(rows.len() > 20, "the card vanished");
 
         let top = width_at(&frame, rows[2]);
@@ -253,12 +262,20 @@ fn pushing_an_object_back_draws_it_smaller() {
                 }
             });
             let frame = render(exporter, &scene);
-            (0..frame.height).map(|y| width_at(&frame, y) as usize).sum::<usize>()
+            (0..frame.height)
+                .map(|y| width_at(&frame, y) as usize)
+                .sum::<usize>()
         };
 
         let (far, flat, near) = (painted(600.0), painted(0.0), painted(-300.0));
-        assert!(far < flat, "further should be smaller: {far} against {flat}");
-        assert!(near > flat, "nearer should be bigger: {near} against {flat}");
+        assert!(
+            far < flat,
+            "further should be smaller: {far} against {flat}"
+        );
+        assert!(
+            near > flat,
+            "nearer should be bigger: {near} against {flat}"
+        );
     });
 }
 
@@ -319,9 +336,7 @@ fn a_tree_of_turned_cards_changes_shape_as_the_camera_moves() {
         // Each card's own share of the frame changes, which is the thing a
         // flat drawing cannot do: it would only slide.
         let ink = |frame: &Frame| -> usize {
-            (0..frame.height)
-                .map(|y| width_at(frame, y) as usize)
-                .sum()
+            (0..frame.height).map(|y| width_at(frame, y) as usize).sum()
         };
         let (a, b) = (ink(&straight), ink(&round));
         assert!(

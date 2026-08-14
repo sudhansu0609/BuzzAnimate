@@ -92,7 +92,11 @@ fn read_png(path: &std::path::Path) -> Frame {
         .expect("png header");
     let mut pixels = vec![0u8; reader.output_buffer_size().expect("buffer size")];
     let info = reader.next_frame(&mut pixels).expect("png data");
-    assert_eq!(info.color_type, png::ColorType::Rgba, "expected RGBA output");
+    assert_eq!(
+        info.color_type,
+        png::ColorType::Rgba,
+        "expected RGBA output"
+    );
     pixels.truncate(info.buffer_size());
     Frame {
         width: info.width,
@@ -199,9 +203,7 @@ fn a_document_without_a_loop_is_unchanged() {
 
     for index in 0..4u32 {
         assert_eq!(
-            colour_of(&read_png(
-                &dir.path().join(format!("plain{index:04}.png"))
-            )),
+            colour_of(&read_png(&dir.path().join(format!("plain{index:04}.png")))),
             index as usize,
             "frame {index} of an unlooped document"
         );
@@ -240,8 +242,7 @@ fn a_partial_range_is_numbered_in_film_frames() {
     )
     .expect("sequence");
 
-    let read =
-        |index: u32| colour_of(&read_png(&dir.path().join(format!("part{index:04}.png"))));
+    let read = |index: u32| colour_of(&read_png(&dir.path().join(format!("part{index:04}.png"))));
     assert_eq!(read(3), 1, "film frame 4 is the second pass, first frame");
     assert_eq!(read(4), 2);
 }

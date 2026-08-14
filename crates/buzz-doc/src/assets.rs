@@ -451,7 +451,9 @@ mod tests {
     fn folders_nest() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut library = AssetLibrary::at(dir.path());
-        library.save("Shadow", "Hero/Props", &a_tree()).expect("save");
+        library
+            .save("Shadow", "Hero/Props", &a_tree())
+            .expect("save");
 
         assert_eq!(library.folders(), ["Hero", "Hero/Props"]);
         assert_eq!(library.child_folders(""), [&"Hero".to_string()]);

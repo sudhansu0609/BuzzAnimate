@@ -68,11 +68,7 @@ pub fn filter_panel(
     ui.horizontal(|ui| {
         ui.heading("Filters");
         if !filters.is_empty() {
-            ui.label(
-                RichText::new(format!("{}", filters.len()))
-                    .small()
-                    .weak(),
-            );
+            ui.label(RichText::new(format!("{}", filters.len())).small().weak());
         }
     });
 
@@ -104,10 +100,7 @@ pub fn filter_panel(
                 .width(120.0)
                 .show_ui(ui, |ui| {
                     for mode in Blend::ALL {
-                        if ui
-                            .selectable_label(mode == current, mode.label())
-                            .clicked()
-                        {
+                        if ui.selectable_label(mode == current, mode.label()).clicked() {
                             out.set_blend = Some(mode);
                         }
                     }
@@ -423,7 +416,11 @@ fn adjust_fields(ui: &mut Ui, adjust: &mut ColorAdjust) -> bool {
 mod tests {
     use super::*;
 
-    fn draw(filters: &[Filter], state: &mut FilterPanelState, has_selection: bool) -> FilterResponse {
+    fn draw(
+        filters: &[Filter],
+        state: &mut FilterPanelState,
+        has_selection: bool,
+    ) -> FilterResponse {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
         let mut response = FilterResponse::default();

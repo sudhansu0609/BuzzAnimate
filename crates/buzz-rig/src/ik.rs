@@ -281,8 +281,14 @@ mod tests {
             Point::new(1000.0, -1000.0),
         ] {
             solve(&mut arm, 1, target);
-            assert!((arm.tip(0) - arm.head(0)).hypot() - 50.0 < 1e-9, "upper stretched");
-            assert!((arm.tip(1) - arm.head(1)).hypot() - 40.0 < 1e-9, "forearm stretched");
+            assert!(
+                (arm.tip(0) - arm.head(0)).hypot() - 50.0 < 1e-9,
+                "upper stretched"
+            );
+            assert!(
+                (arm.tip(1) - arm.head(1)).hypot() - 40.0 < 1e-9,
+                "forearm stretched"
+            );
             assert!(arm.pose().iter().all(|a| a.is_finite()), "NaN in the pose");
         }
     }
@@ -304,7 +310,11 @@ mod tests {
 
         assert!(!outcome.reached, "90 units cannot reach 900 away");
         // Straight down, at full extension.
-        assert!((arm.tip(1) - Point::new(100.0, 190.0)).hypot() < 1e-6, "{:?}", arm.tip(1));
+        assert!(
+            (arm.tip(1) - Point::new(100.0, 190.0)).hypot() < 1e-6,
+            "{:?}",
+            arm.tip(1)
+        );
         assert!(
             outcome.iterations == 1,
             "an unreachable target should not burn the iteration budget"
@@ -378,7 +388,10 @@ mod tests {
         arm.push(Bone::new("hand", Some(1), 20.0, 0.6));
 
         solve(&mut arm, 1, Point::new(120.0, 160.0));
-        assert!((arm.bones[2].angle - 0.6).abs() < 1e-12, "the wrist angle changed");
+        assert!(
+            (arm.bones[2].angle - 0.6).abs() < 1e-12,
+            "the wrist angle changed"
+        );
     }
 
     #[test]
@@ -400,7 +413,11 @@ mod tests {
         let root = arm.root;
         solve(&mut arm, 1, root);
         assert!(arm.pose().iter().all(|a| a.is_finite()));
-        assert!(arm.joints().iter().all(|(h, t)| h.is_finite() && t.is_finite()));
+        assert!(
+            arm.joints()
+                .iter()
+                .all(|(h, t)| h.is_finite() && t.is_finite())
+        );
     }
 
     #[test]
@@ -446,7 +463,10 @@ mod tests {
         solve(&mut arm, 1, target);
 
         let moved = wrap_pi(arm.bones[0].angle - before).abs();
-        assert!(moved < 0.5, "the shoulder swung {moved} rad for a tiny drag");
+        assert!(
+            moved < 0.5,
+            "the shoulder swung {moved} rad for a tiny drag"
+        );
     }
 
     /// The exit criterion for CP-7.2: fifty armatures solved in parallel,

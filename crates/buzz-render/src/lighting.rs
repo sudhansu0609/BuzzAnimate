@@ -101,7 +101,10 @@ impl LightCache {
     /// has none — it is rebuilt for the frame being drawn — so its geometry is
     /// generated and not kept, which is right: caching something that changes
     /// every frame only wastes the memory.
-    #[allow(clippy::too_many_arguments, reason = "one call site; naming a struct for it would be worse")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one call site; naming a struct for it would be worse"
+    )]
     pub fn shade(
         &mut self,
         owner: Option<&Arc<Object>>,
@@ -224,10 +227,28 @@ mod tests {
         let light = sun();
 
         cache.begin(1);
-        let first = cache.shade(Some(&object), 0, &shape, Affine::IDENTITY, &light, 40.0, 0.0, 1.0);
+        let first = cache.shade(
+            Some(&object),
+            0,
+            &shape,
+            Affine::IDENTITY,
+            &light,
+            40.0,
+            0.0,
+            1.0,
+        );
         assert_eq!(cache.len(), 1);
 
-        let second = cache.shade(Some(&object), 0, &shape, Affine::IDENTITY, &light, 40.0, 0.0, 1.0);
+        let second = cache.shade(
+            Some(&object),
+            0,
+            &shape,
+            Affine::IDENTITY,
+            &light,
+            40.0,
+            0.0,
+            1.0,
+        );
         assert!(
             Arc::ptr_eq(&first, &second),
             "the second call should return the cached geometry, not rebuild it"
@@ -245,12 +266,30 @@ mod tests {
         let light = sun();
 
         cache.begin(1);
-        let before = cache.shade(Some(&untouched), 0, &shape, Affine::IDENTITY, &light, 40.0, 0.0, 1.0);
+        let before = cache.shade(
+            Some(&untouched),
+            0,
+            &shape,
+            Affine::IDENTITY,
+            &light,
+            40.0,
+            0.0,
+            1.0,
+        );
 
         // Another frame, same document revision for the lights: the object is
         // still the same `Arc`, as it would be after editing something else.
         cache.begin(1);
-        let after = cache.shade(Some(&untouched), 0, &shape, Affine::IDENTITY, &light, 40.0, 0.0, 1.0);
+        let after = cache.shade(
+            Some(&untouched),
+            0,
+            &shape,
+            Affine::IDENTITY,
+            &light,
+            40.0,
+            0.0,
+            1.0,
+        );
 
         assert!(Arc::ptr_eq(&before, &after), "the geometry was rebuilt");
     }
@@ -264,11 +303,23 @@ mod tests {
         let shape = shape_of(&object);
 
         cache.begin(1);
-        cache.shade(Some(&object), 0, &shape, Affine::IDENTITY, &sun(), 40.0, 0.0, 1.0);
+        cache.shade(
+            Some(&object),
+            0,
+            &shape,
+            Affine::IDENTITY,
+            &sun(),
+            40.0,
+            0.0,
+            1.0,
+        );
         assert_eq!(cache.len(), 1);
 
         cache.begin(2);
-        assert!(cache.is_empty(), "a changed rig must throw the geometry away");
+        assert!(
+            cache.is_empty(),
+            "a changed rig must throw the geometry away"
+        );
     }
 
     /// A shape that moves gets new geometry, because a lamp's direction and a
@@ -281,7 +332,16 @@ mod tests {
         let light = sun();
 
         cache.begin(1);
-        cache.shade(Some(&object), 0, &shape, Affine::IDENTITY, &light, 40.0, 0.0, 1.0);
+        cache.shade(
+            Some(&object),
+            0,
+            &shape,
+            Affine::IDENTITY,
+            &light,
+            40.0,
+            0.0,
+            1.0,
+        );
         cache.shade(
             Some(&object),
             0,
@@ -303,7 +363,16 @@ mod tests {
         let shape = shape_of(&object);
 
         cache.begin(1);
-        cache.shade(Some(&object), 0, &shape, Affine::IDENTITY, &sun(), 40.0, 0.0, 1.0);
+        cache.shade(
+            Some(&object),
+            0,
+            &shape,
+            Affine::IDENTITY,
+            &sun(),
+            40.0,
+            0.0,
+            1.0,
+        );
         cache.end();
         assert_eq!(cache.len(), 1, "still fresh");
 
@@ -323,15 +392,36 @@ mod tests {
         let shape = shape_of(&object);
 
         cache.begin(1);
-        cache.shade(Some(&object), 0, &shape, Affine::IDENTITY, &sun(), 40.0, 0.0, 1.0);
+        cache.shade(
+            Some(&object),
+            0,
+            &shape,
+            Affine::IDENTITY,
+            &sun(),
+            40.0,
+            0.0,
+            1.0,
+        );
         cache.end();
 
         cache.begin(1);
         cache.end();
 
         cache.begin(1);
-        let again = cache.shade(Some(&object), 0, &shape, Affine::IDENTITY, &sun(), 40.0, 0.0, 1.0);
-        assert!(!again.is_empty(), "the geometry should still describe a shape");
+        let again = cache.shade(
+            Some(&object),
+            0,
+            &shape,
+            Affine::IDENTITY,
+            &sun(),
+            40.0,
+            0.0,
+            1.0,
+        );
+        assert!(
+            !again.is_empty(),
+            "the geometry should still describe a shape"
+        );
         assert_eq!(cache.len(), 1);
     }
 }

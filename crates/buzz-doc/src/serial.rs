@@ -1093,12 +1093,14 @@ fn fill_to_dto(f: &FillSpec) -> FillDto {
     }
 }
 
-fn fill_from_dto(
-    f: &FillDto,
-    images: &buzz_scene::ImageLibrary,
-) -> Result<FillSpec, SerialError> {
+fn fill_from_dto(f: &FillDto, images: &buzz_scene::ImageLibrary) -> Result<FillSpec, SerialError> {
     Ok(FillSpec {
-        paint: paint_from_dto(f.color.as_ref(), f.gradient.as_ref(), f.image.as_ref(), images)?,
+        paint: paint_from_dto(
+            f.color.as_ref(),
+            f.gradient.as_ref(),
+            f.image.as_ref(),
+            images,
+        )?,
         rule: f.rule,
     })
 }
@@ -1119,7 +1121,12 @@ fn stroke_from_dto(
     images: &buzz_scene::ImageLibrary,
 ) -> Result<StrokeSpec, SerialError> {
     Ok(StrokeSpec {
-        paint: paint_from_dto(s.color.as_ref(), s.gradient.as_ref(), s.image.as_ref(), images)?,
+        paint: paint_from_dto(
+            s.color.as_ref(),
+            s.gradient.as_ref(),
+            s.image.as_ref(),
+            images,
+        )?,
         width: s.width,
         hairline: s.hairline,
     })
@@ -1182,7 +1189,11 @@ impl LayerDto {
         layer.color = color_from_hex(&self.color)?;
         layer.height = self.height;
         // A corrupt value must not put a layer behind the camera for good.
-        layer.depth = if self.depth.is_finite() { self.depth } else { 0.0 };
+        layer.depth = if self.depth.is_finite() {
+            self.depth
+        } else {
+            0.0
+        };
         layer.collapsed = self.collapsed;
         for filter in &self.filters {
             layer.filters.push(filter.to_filter()?);
@@ -1442,7 +1453,9 @@ impl DocumentDto {
         };
 
         for (index, dto) in self.layers.iter().enumerate() {
-            scene.edit_stage_layers().insert(index, dto.to_layer(images)?);
+            scene
+                .edit_stage_layers()
+                .insert(index, dto.to_layer(images)?);
         }
 
         // The library loads before anything can reference it, so an instance
@@ -1699,8 +1712,14 @@ impl ObjectDto {
                     BezPath::from_svg(path).map_err(|e| SerialError::BadPath(e.to_string()))?;
                 ObjectKind::Shape(ShapeData {
                     path: parsed,
-                    fill: fill.as_ref().map(|f| fill_from_dto(f, images)).transpose()?,
-                    stroke: stroke.as_ref().map(|s| stroke_from_dto(s, images)).transpose()?,
+                    fill: fill
+                        .as_ref()
+                        .map(|f| fill_from_dto(f, images))
+                        .transpose()?,
+                    stroke: stroke
+                        .as_ref()
+                        .map(|s| stroke_from_dto(s, images))
+                        .transpose()?,
                     blend: *blend,
                 })
             }
@@ -1768,8 +1787,14 @@ impl ObjectDto {
                     BezPath::from_svg(path).map_err(|e| SerialError::BadPath(e.to_string()))?;
                 let shape = ShapeData {
                     path: parsed,
-                    fill: fill.as_ref().map(|f| fill_from_dto(f, images)).transpose()?,
-                    stroke: stroke.as_ref().map(|s| stroke_from_dto(s, images)).transpose()?,
+                    fill: fill
+                        .as_ref()
+                        .map(|f| fill_from_dto(f, images))
+                        .transpose()?,
+                    stroke: stroke
+                        .as_ref()
+                        .map(|s| stroke_from_dto(s, images))
+                        .transpose()?,
                     blend: *blend,
                 };
                 let mut warp = buzz_scene::WarpData::new(shape);
@@ -1984,7 +2009,10 @@ mod tests {
             restored.transform.as_coeffs(),
             Affine::scale(2.0).as_coeffs()
         );
-        assert_eq!(restored.bounds(), scene.find_object(ObjectId(92)).unwrap().1.bounds());
+        assert_eq!(
+            restored.bounds(),
+            scene.find_object(ObjectId(92)).unwrap().1.bounds()
+        );
     }
 
     /// Layer parenting is a link between layers, and a link is exactly the
@@ -2089,10 +2117,7 @@ mod tests {
         let layer = scene.add_layer("Art", LayerKind::Normal);
         let square = kurbo::Rect::new(0.0, 0.0, 10.0, 10.0);
         scene
-            .add_shape(
-                layer,
-                ShapeData::filled(square.to_path(1e-9), Color::WHITE),
-            )
+            .add_shape(layer, ShapeData::filled(square.to_path(1e-9), Color::WHITE))
             .expect("a shape");
 
         let solid = serde_json::to_string(&DocumentDto::from_scene(&scene)).unwrap();
@@ -2154,8 +2179,8 @@ mod tests {
             "rule": "NonZero",
         });
         let dto: FillDto = serde_json::from_value(older).expect("version 15's shape still parses");
-        let fill = fill_from_dto(&dto, &buzz_scene::ImageLibrary::default())
-            .expect("it should read");
+        let fill =
+            fill_from_dto(&dto, &buzz_scene::ImageLibrary::default()).expect("it should read");
         assert_eq!(
             fill.color().to_rgba8().to_u8_array(),
             [0xFF, 0x88, 0x00, 0xFF]
@@ -2169,8 +2194,8 @@ mod tests {
     #[test]
     fn a_fill_with_no_paint_at_all_reads_as_black() {
         let dto: FillDto = serde_json::from_value(serde_json::json!({})).expect("parses");
-        let fill = fill_from_dto(&dto, &buzz_scene::ImageLibrary::default())
-            .expect("it should read");
+        let fill =
+            fill_from_dto(&dto, &buzz_scene::ImageLibrary::default()).expect("it should read");
         assert_eq!(fill.color().to_rgba8().to_u8_array(), [0, 0, 0, 255]);
     }
 
@@ -2194,10 +2219,11 @@ mod tests {
         assert!(!json.contains("pivot"), "{json}");
 
         let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
-        assert!(back.layers().iter().all(|l| l
-            .objects_at(0)
-            .iter()
-            .all(|o| o.pivot.is_none())));
+        assert!(
+            back.layers()
+                .iter()
+                .all(|l| l.objects_at(0).iter().all(|o| o.pivot.is_none()))
+        );
     }
 
     /// The palette is part of the document: names, colours and the folders
@@ -2472,9 +2498,21 @@ mod tests {
         // An empty folder, and one holding a symbol.
         scene.library_mut().add_folder("Characters/Hero");
         scene.library_mut().add_folder("Unused");
-        let symbol = scene.add_symbol("Ball", buzz_scene::SymbolKind::MovieClip, Some("Characters/Hero"));
+        let symbol = scene.add_symbol(
+            "Ball",
+            buzz_scene::SymbolKind::MovieClip,
+            Some("Characters/Hero"),
+        );
 
-        let inner_layer = scene.library().get(symbol).unwrap().layers.iter().next().unwrap().id;
+        let inner_layer = scene
+            .library()
+            .get(symbol)
+            .unwrap()
+            .layers
+            .iter()
+            .next()
+            .unwrap()
+            .id;
         scene.library_mut().update(symbol, |s| {
             s.layers.update(inner_layer, |l| {
                 l.push_object_at(
@@ -2530,7 +2568,11 @@ mod tests {
         assert_eq!(restored.name, "Ball");
         assert_eq!(restored.kind, buzz_scene::SymbolKind::MovieClip);
         assert_eq!(restored.folder.as_deref(), Some("Characters/Hero"));
-        assert_eq!(restored.objects_at(0).len(), 1, "symbol artwork must survive");
+        assert_eq!(
+            restored.objects_at(0).len(),
+            1,
+            "symbol artwork must survive"
+        );
         let folders: Vec<&String> = back.library().folders().collect();
         assert!(
             folders.iter().any(|f| f.as_str() == "Unused"),
@@ -2577,7 +2619,15 @@ mod tests {
             .unwrap();
         assert!(scene.library().is_empty());
         assert_eq!(scene.layers().get(LayerId(1)).unwrap().frames.length(), 5);
-        assert!(!scene.layers().get(LayerId(1)).unwrap().frames.tween_at(0).is_active());
+        assert!(
+            !scene
+                .layers()
+                .get(LayerId(1))
+                .unwrap()
+                .frames
+                .tween_at(0)
+                .is_active()
+        );
     }
 
     #[test]
@@ -2620,7 +2670,10 @@ mod tests {
 
         // Round-trip through JSON, not just through the DTO.
         let parsed: DocumentDto = serde_json::from_str(&a).unwrap();
-        assert_eq!(parsed.to_scene().unwrap().shape_count(), scene.shape_count());
+        assert_eq!(
+            parsed.to_scene().unwrap().shape_count(),
+            scene.shape_count()
+        );
 
         // Cost is dominated by path data, so measure per segment rather than
         // in absolute bytes — the latter just tracks how detailed the test
@@ -2679,9 +2732,7 @@ mod tests {
 
         let mut armature = buzz_rig::Armature::new(Point::new(100.0, 100.0));
         armature.push(buzz_rig::Bone::new("upper", None, 50.0, 0.2));
-        armature.push(
-            buzz_rig::Bone::new("fore", Some(0), 40.0, -0.4).with_limits(-1.2, 0.1),
-        );
+        armature.push(buzz_rig::Bone::new("fore", Some(0), 40.0, -0.4).with_limits(-1.2, 0.1));
         armature.push(buzz_rig::Bone::new("hand", Some(1), 15.0, 0.1).pinned());
 
         let mut rig = buzz_scene::ArmatureData::new(armature);
@@ -2695,23 +2746,29 @@ mod tests {
         rig.bind_rigid(
             Arc::new(Object::shape(
                 ObjectId(51),
-                ShapeData::filled(Rect::new(190.0, 90.0, 210.0, 110.0).to_path(1e-9), Color::WHITE),
+                ShapeData::filled(
+                    Rect::new(190.0, 90.0, 210.0, 110.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
             )),
             2,
         );
 
-        scene.add_object(layer, Object {
-            id: ObjectId(60),
-            name: Some("Arm".into()),
-            transform: Affine::translate((5.0, 5.0)),
-            kind: ObjectKind::Armature(rig),
-            locked: false,
-            visible: true,
-            filters: Vec::new(),
-            blend: Default::default(),
-            spatial: Default::default(),
-            pivot: None,
-        });
+        scene.add_object(
+            layer,
+            Object {
+                id: ObjectId(60),
+                name: Some("Arm".into()),
+                transform: Affine::translate((5.0, 5.0)),
+                kind: ObjectKind::Armature(rig),
+                locked: false,
+                visible: true,
+                filters: Vec::new(),
+                blend: Default::default(),
+                spatial: Default::default(),
+                pivot: None,
+            },
+        );
         scene
     }
 
@@ -2813,18 +2870,21 @@ mod tests {
         warp.handles[4].current = Point::new(70.0, 10.0);
         warp.rigidity = 1.5;
 
-        scene.add_object(layer, Object {
-            id: ObjectId(9),
-            name: None,
-            transform: Affine::IDENTITY,
-            kind: ObjectKind::Warp(warp),
-            locked: false,
-            visible: true,
-            filters: Vec::new(),
-            blend: Default::default(),
-            spatial: Default::default(),
-            pivot: None,
-        });
+        scene.add_object(
+            layer,
+            Object {
+                id: ObjectId(9),
+                name: None,
+                transform: Affine::IDENTITY,
+                kind: ObjectKind::Warp(warp),
+                locked: false,
+                visible: true,
+                filters: Vec::new(),
+                blend: Default::default(),
+                spatial: Default::default(),
+                pivot: None,
+            },
+        );
 
         let json = serde_json::to_string(&DocumentDto::from_scene(&scene)).expect("serialise");
         let loaded: DocumentDto = serde_json::from_str(&json).expect("deserialise");
@@ -2885,7 +2945,10 @@ mod tests {
             panic!("expected an armature");
         };
 
-        assert_eq!(rig.armature.bones[0].parent, None, "the cycle was not broken");
+        assert_eq!(
+            rig.armature.bones[0].parent, None,
+            "the cycle was not broken"
+        );
         // And it resolves rather than hanging.
         assert_eq!(rig.armature.joints().len(), 2);
     }

@@ -125,7 +125,16 @@ pub fn convert(styles: &ShapeStyles, records: &[ShapeRecord]) -> Vec<StyledPath>
                     to,
                     control: None,
                 };
-                record_edge(edge, fill0, fill1, line, table, key, &mut fills, &mut strokes);
+                record_edge(
+                    edge,
+                    fill0,
+                    fill1,
+                    line,
+                    table,
+                    key,
+                    &mut fills,
+                    &mut strokes,
+                );
                 cursor = to;
             }
 
@@ -146,7 +155,16 @@ pub fn convert(styles: &ShapeStyles, records: &[ShapeRecord]) -> Vec<StyledPath>
                     to,
                     control: Some(control),
                 };
-                record_edge(edge, fill0, fill1, line, table, key, &mut fills, &mut strokes);
+                record_edge(
+                    edge,
+                    fill0,
+                    fill1,
+                    line,
+                    table,
+                    key,
+                    &mut fills,
+                    &mut strokes,
+                );
                 cursor = to;
             }
         }
@@ -203,7 +221,10 @@ pub fn convert(styles: &ShapeStyles, records: &[ShapeRecord]) -> Vec<StyledPath>
     out
 }
 
-#[allow(clippy::too_many_arguments, reason = "internal edge sorter, not an API")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal edge sorter, not an API"
+)]
 fn record_edge(
     edge: Edge,
     fill0: Option<u32>,
@@ -414,7 +435,9 @@ mod tests {
     }
 
     fn line(dx: f64, dy: f64) -> ShapeRecord {
-        ShapeRecord::StraightEdge { delta: delta(dx, dy) }
+        ShapeRecord::StraightEdge {
+            delta: delta(dx, dy),
+        }
     }
 
     fn red_fill() -> ShapeStyles {
@@ -446,7 +469,9 @@ mod tests {
 
         let path = &paths[0].path;
         assert!(
-            path.elements().iter().any(|e| matches!(e, PathEl::ClosePath)),
+            path.elements()
+                .iter()
+                .any(|e| matches!(e, PathEl::ClosePath)),
             "the loop must be closed: {path:?}"
         );
         let bounds = kurbo::Shape::bounding_box(path);
@@ -557,14 +582,16 @@ mod tests {
     fn a_stroke_becomes_a_stroked_path_with_its_width() {
         let styles = ShapeStyles {
             fill_styles: vec![],
-            line_styles: vec![LineStyle::new()
-                .with_width(twips(3.0))
-                .with_color(swf::Color {
-                    r: 0,
-                    g: 0,
-                    b: 255,
-                    a: 255,
-                })],
+            line_styles: vec![
+                LineStyle::new()
+                    .with_width(twips(3.0))
+                    .with_color(swf::Color {
+                        r: 0,
+                        g: 0,
+                        b: 255,
+                        a: 255,
+                    }),
+            ],
         };
         let records = vec![
             ShapeRecord::StyleChange(Box::new(StyleChangeData {
@@ -593,15 +620,30 @@ mod tests {
             records: vec![
                 swf::GradientRecord {
                     ratio: 0,
-                    color: swf::Color { r: 0, g: 0, b: 0, a: 255 },
+                    color: swf::Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
                 },
                 swf::GradientRecord {
                     ratio: 128,
-                    color: swf::Color { r: 255, g: 0, b: 0, a: 255 },
+                    color: swf::Color {
+                        r: 255,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
                 },
                 swf::GradientRecord {
                     ratio: 255,
-                    color: swf::Color { r: 255, g: 255, b: 255, a: 255 },
+                    color: swf::Color {
+                        r: 255,
+                        g: 255,
+                        b: 255,
+                        a: 255,
+                    },
                 },
             ],
         }
@@ -655,7 +697,10 @@ mod tests {
             "{:?}",
             g.stops()
         );
-        assert_eq!(g.stops()[1].color.to_rgba8().to_u8_array()[..3], [255, 0, 0]);
+        assert_eq!(
+            g.stops()[1].color.to_rgba8().to_u8_array()[..3],
+            [255, 0, 0]
+        );
     }
 
     /// The gradient's matrix maps Flash's fixed square, 1 638.4 pixels across.
@@ -753,7 +798,12 @@ mod tests {
     #[test]
     fn an_edge_with_both_a_fill_and_a_stroke_produces_both() {
         let styles = ShapeStyles {
-            fill_styles: vec![FillStyle::Color(swf::Color { r: 1, g: 2, b: 3, a: 255 })],
+            fill_styles: vec![FillStyle::Color(swf::Color {
+                r: 1,
+                g: 2,
+                b: 3,
+                a: 255,
+            })],
             line_styles: vec![LineStyle::new().with_width(twips(2.0))],
         };
         let records = vec![
@@ -782,7 +832,12 @@ mod tests {
         let _ = LineStyleFlag::empty();
 
         let styles = ShapeStyles {
-            fill_styles: vec![FillStyle::Color(swf::Color { r: 9, g: 9, b: 9, a: 255 })],
+            fill_styles: vec![FillStyle::Color(swf::Color {
+                r: 9,
+                g: 9,
+                b: 9,
+                a: 255,
+            })],
             line_styles: vec![LineStyle::new().with_width(twips(1.0))],
         };
         let records = vec![

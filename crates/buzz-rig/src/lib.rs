@@ -443,7 +443,12 @@ mod tests {
         armature.push_dragged("upper", None, Point::new(0.0, 0.0), Point::new(100.0, 0.0));
         // Straight down from the first bone's tip: a quarter turn from the
         // parent's direction, not from the world's.
-        armature.push_dragged("fore", Some(0), Point::new(100.0, 0.0), Point::new(100.0, 60.0));
+        armature.push_dragged(
+            "fore",
+            Some(0),
+            Point::new(100.0, 0.0),
+            Point::new(100.0, 60.0),
+        );
 
         assert!((armature.bones[0].angle - 0.0).abs() < 1e-12);
         assert!((armature.bones[1].angle - FRAC_PI_2).abs() < 1e-12);
@@ -497,7 +502,10 @@ mod tests {
         arm.bones[1].limits = Some(JointLimits::new(-0.5, 0.5));
         arm.set_pose(&[1.0, 2.0]);
 
-        assert_eq!(arm.bones[0].angle, 1.0, "an unlimited joint takes the value");
+        assert_eq!(
+            arm.bones[0].angle, 1.0,
+            "an unlimited joint takes the value"
+        );
         assert_eq!(arm.bones[1].angle, 0.5, "a limited one is clamped");
     }
 
@@ -524,7 +532,10 @@ mod tests {
         assert!(half[1] > 6.1, "should carry on forwards, got {}", half[1]);
 
         let end = Armature::tween_pose(&from, &to, 1.0);
-        assert!((wrap_pi(end[1] - 0.1)).abs() < 1e-12, "and arrive at the target");
+        assert!(
+            (wrap_pi(end[1] - 0.1)).abs() < 1e-12,
+            "and arrive at the target"
+        );
     }
 
     #[test]
@@ -559,9 +570,15 @@ mod tests {
 
         let t = arm.pose_transform(0);
         // The head itself does not move.
-        assert!(close(t * Point::new(100.0, 100.0), Point::new(100.0, 100.0)));
+        assert!(close(
+            t * Point::new(100.0, 100.0),
+            Point::new(100.0, 100.0)
+        ));
         // A point at the tip swings a quarter turn about it.
-        assert!(close(t * Point::new(150.0, 100.0), Point::new(100.0, 150.0)));
+        assert!(close(
+            t * Point::new(150.0, 100.0),
+            Point::new(100.0, 150.0)
+        ));
     }
 
     #[test]

@@ -130,7 +130,9 @@ pub fn cast_shadow(path: &BezPath, light: &Light, at: Point, height: f64) -> Opt
         }
 
         LightKind::Lamp {
-            position, height: lamp_height, ..
+            position,
+            height: lamp_height,
+            ..
         } => {
             // Similar triangles: a point `height` above the floor, lit from
             // `lamp_height` above it, throws its shadow at
@@ -183,7 +185,9 @@ pub fn shade_for(
     let modelled = modelling > 0.01 && planar.hypot() > 1e-6;
 
     ShadeGeometry {
-        shade: modelled.then(|| shade_crescent(path, planar, light.softness)).flatten(),
+        shade: modelled
+            .then(|| shade_crescent(path, planar, light.softness))
+            .flatten(),
         highlight: modelled
             .then(|| highlight_crescent(path, planar, light.softness))
             .flatten(),
@@ -194,8 +198,7 @@ pub fn shade_for(
 /// Boolean difference, with the tolerance derived from the shapes themselves.
 fn difference(a: &BezPath, b: &BezPath) -> Option<BezPath> {
     let bounds = a.bounding_box();
-    let options =
-        buzz_geom::BooleanOptions::for_shape_size(bounds.width().hypot(bounds.height()));
+    let options = buzz_geom::BooleanOptions::for_shape_size(bounds.width().hypot(bounds.height()));
     let result = buzz_geom::boolean(a, b, buzz_geom::BoolOp::Difference, options);
     (!result.elements().is_empty()).then_some(result)
 }
@@ -225,7 +228,10 @@ mod tests {
         let shade = shade_crescent(&square(), Vec2::new(1.0, 0.0), 0.3).expect("a crescent");
         let bounds = shade.bounding_box();
 
-        assert!(bounds.x0 < 1.0, "the crescent should start at the left edge");
+        assert!(
+            bounds.x0 < 1.0,
+            "the crescent should start at the left edge"
+        );
         assert!(
             bounds.x1 < 50.0,
             "and stay on the left half, got {bounds:?}"
@@ -238,8 +244,14 @@ mod tests {
             highlight_crescent(&square(), Vec2::new(1.0, 0.0), 0.3).expect("a crescent");
         let bounds = highlight.bounding_box();
 
-        assert!(bounds.x1 > 99.0, "the highlight should reach the right edge");
-        assert!(bounds.x0 > 50.0, "and stay on the right half, got {bounds:?}");
+        assert!(
+            bounds.x1 > 99.0,
+            "the highlight should reach the right edge"
+        );
+        assert!(
+            bounds.x0 > 50.0,
+            "and stay on the right half, got {bounds:?}"
+        );
     }
 
     /// Swing the light and the crescents swing with it — the property the
@@ -416,7 +428,8 @@ mod tests {
             )
         };
         let far = cast_shadow(&square(), &make(600.0), Point::new(50.0, 50.0), 50.0).expect("far");
-        let near = cast_shadow(&square(), &make(120.0), Point::new(50.0, 50.0), 50.0).expect("near");
+        let near =
+            cast_shadow(&square(), &make(120.0), Point::new(50.0, 50.0), 50.0).expect("near");
 
         assert!(
             near.bounding_box().width() > far.bounding_box().width() * 1.5,
@@ -446,7 +459,10 @@ mod tests {
     fn a_sky_casts_no_shadow_and_shades_nothing() {
         let sky = Light::new(LightId(3), "Sky", LightKind::sky());
         let geometry = shade_for(&square(), &sky, Point::ZERO, 0.0, 50.0, 1.0);
-        assert!(geometry.is_empty(), "ambient light has no direction to shade from");
+        assert!(
+            geometry.is_empty(),
+            "ambient light has no direction to shade from"
+        );
     }
 
     /// A light straight in front produces fill and nothing else — a shape lit
@@ -477,7 +493,10 @@ mod tests {
 
         let hairline = Rect::new(10.0, 10.0, 10.0, 200.0).to_path(1e-9);
         let geometry = shade_for(&hairline, &sun(0.0, 0.7), Point::ZERO, 0.0, 20.0, 1.0);
-        for path in [geometry.shade, geometry.highlight, geometry.cast].into_iter().flatten() {
+        for path in [geometry.shade, geometry.highlight, geometry.cast]
+            .into_iter()
+            .flatten()
+        {
             assert!(
                 path.bounding_box().width().is_finite(),
                 "degenerate input produced non-finite geometry"

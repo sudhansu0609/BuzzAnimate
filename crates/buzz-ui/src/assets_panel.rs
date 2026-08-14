@@ -19,10 +19,15 @@ pub enum AssetAction {
     /// Put this asset into the document.
     Place(Asset),
     /// Keep the current selection as a new asset in this folder.
-    Add { folder: String },
+    Add {
+        folder: String,
+    },
     /// Make a folder under the library root.
     NewFolder,
-    Rename { asset: Asset, name: String },
+    Rename {
+        asset: Asset,
+        name: String,
+    },
     Delete(Asset),
     /// Read the directory again.
     Rescan,
@@ -188,11 +193,7 @@ fn draw_folder(
 ) {
     let indent = depth as f32 * 14.0;
 
-    let folders: Vec<String> = library
-        .child_folders(parent)
-        .into_iter()
-        .cloned()
-        .collect();
+    let folders: Vec<String> = library.child_folders(parent).into_iter().cloned().collect();
 
     for folder in folders {
         let leaf = folder.rsplit('/').next().unwrap_or(&folder).to_string();
@@ -210,7 +211,11 @@ fn draw_folder(
             ui.label(RichText::new("F").small().weak())
                 .on_hover_text("Folder");
             if ui.selectable_label(selected, &leaf).clicked() {
-                state.selected_folder = if selected { String::new() } else { folder.clone() };
+                state.selected_folder = if selected {
+                    String::new()
+                } else {
+                    folder.clone()
+                };
             }
         });
 
@@ -269,7 +274,11 @@ fn asset_row(
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // The trash can: `✕` has no glyph in the bundled fonts.
-            if ui.small_button("\u{1F5D1}").on_hover_text("Delete").clicked() {
+            if ui
+                .small_button("\u{1F5D1}")
+                .on_hover_text("Delete")
+                .clicked()
+            {
                 *action = Some(AssetAction::Delete(asset.clone()));
             }
             if ui

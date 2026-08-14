@@ -132,8 +132,17 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
     // as chrome. A brush stroke is the one gesture where the preview *is* the
     // result: outlining it in the selection colour would show its silhouette
     // but not its weight, and weight is the whole point of a fluid brush.
-    if let Preview::Ink { path, color } = editor.preview() {
-        builder.fill_shape(&path, color);
+    match editor.preview() {
+        Preview::Ink { path, color } => builder.fill_shape(&path, color),
+        // A soft brush's preview is a bitmap filling the rectangle it will
+        // occupy — the same paint, in the same place, as the artwork it is
+        // about to become.
+        Preview::Painted { area, paint } => builder.fill_shape_paint(
+            &buzz_geom::Shape::to_path(&area, 1e-9),
+            &paint,
+            buzz_geom::Affine::IDENTITY,
+        ),
+        _ => {}
     }
 
     // The screen frame is finished; anything not drawn in it can go.
@@ -431,11 +440,7 @@ fn draw_selection(
 /// it. While it is being dragged it is drawn under the pointer instead: the
 /// move itself lands when the drag ends, and a circle that sat still until
 /// then made the gesture look as though it had not taken.
-fn draw_pivot(
-    painter: &egui::Painter,
-    editor: &Editor,
-    to_screen: &impl Fn(Point) -> egui::Pos2,
-) {
+fn draw_pivot(painter: &egui::Painter, editor: &Editor, to_screen: &impl Fn(Point) -> egui::Pos2) {
     let dragging = match editor.preview() {
         Preview::Pivot(at) => Some(at),
         _ => None,
@@ -675,7 +680,7 @@ fn draw_preview(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poi
     match editor.preview() {
         Preview::None => {}
         // Painted into the Vello scene by `build_scene`, in its real colour.
-        Preview::Ink { .. } => {}
+        Preview::Ink { .. } | Preview::Painted { .. } => {}
         // Drawn with the transform gizmo, where the circle belongs.
         Preview::Pivot(_) => {}
         Preview::Marquee(rect) => {

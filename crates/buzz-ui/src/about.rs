@@ -120,7 +120,11 @@ mod tests {
     #[test]
     fn the_banner_decodes() {
         let image = decode(BANNER).expect("the banner should decode");
-        assert!(image.width() > 200 && image.height() > 100, "{:?}", image.size);
+        assert!(
+            image.width() > 200 && image.height() > 100,
+            "{:?}",
+            image.size
+        );
     }
 
     #[test]
@@ -139,6 +143,9 @@ mod tests {
         state.open = true;
         let _ = ctx.run_ui(Default::default(), |ui| about_dialog(ui.ctx(), &mut state));
         assert!(state.open);
-        assert!(state.banner.is_some(), "opening it should upload the banner");
+        assert!(
+            state.banner.is_some(),
+            "opening it should upload the banner"
+        );
     }
 }

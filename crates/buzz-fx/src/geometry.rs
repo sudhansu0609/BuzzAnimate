@@ -142,9 +142,8 @@ pub fn build(filters: &[Filter], silhouette: &BezPath) -> Painted {
                     // clipped to the artwork: the light is blocked everywhere
                     // the offset silhouette does not cover.
                     out.over.push(Op::PushClip(silhouette.clone()));
-                    out.over.extend(inner_edge(
-                        silhouette, &cast, colour, (*x, *y), *quality,
-                    ));
+                    out.over
+                        .extend(inner_edge(silhouette, &cast, colour, (*x, *y), *quality));
                     out.over.push(Op::PopClip);
                 } else {
                     out.behind
@@ -168,8 +167,13 @@ pub fn build(filters: &[Filter], silhouette: &BezPath) -> Painted {
                 let colour = with_strength(*color, *strength);
                 if *inner {
                     out.over.push(Op::PushClip(silhouette.clone()));
-                    out.over
-                        .extend(inner_edge(silhouette, silhouette, colour, (*x, *y), *quality));
+                    out.over.extend(inner_edge(
+                        silhouette,
+                        silhouette,
+                        colour,
+                        (*x, *y),
+                        *quality,
+                    ));
                     out.over.push(Op::PopClip);
                 } else {
                     out.behind
@@ -227,16 +231,32 @@ pub fn build(filters: &[Filter], silhouette: &BezPath) -> Painted {
                     BevelKind::Outer => {
                         // Outside the shape: the same two edges, drawn behind
                         // so the artwork covers the half that falls inside.
-                        out.behind
-                            .extend(soft_edge(&(towards * silhouette.clone()), dark, (*x, *y), *quality));
-                        out.behind
-                            .extend(soft_edge(&(away * silhouette.clone()), lit, (*x, *y), *quality));
+                        out.behind.extend(soft_edge(
+                            &(towards * silhouette.clone()),
+                            dark,
+                            (*x, *y),
+                            *quality,
+                        ));
+                        out.behind.extend(soft_edge(
+                            &(away * silhouette.clone()),
+                            lit,
+                            (*x, *y),
+                            *quality,
+                        ));
                     }
                     BevelKind::Full => {
-                        out.behind
-                            .extend(soft_edge(&(towards * silhouette.clone()), dark, (*x, *y), *quality));
-                        out.behind
-                            .extend(soft_edge(&(away * silhouette.clone()), lit, (*x, *y), *quality));
+                        out.behind.extend(soft_edge(
+                            &(towards * silhouette.clone()),
+                            dark,
+                            (*x, *y),
+                            *quality,
+                        ));
+                        out.behind.extend(soft_edge(
+                            &(away * silhouette.clone()),
+                            lit,
+                            (*x, *y),
+                            *quality,
+                        ));
                         out.over.push(Op::PushClip(silhouette.clone()));
                         out.over.extend(edges);
                         out.over.push(Op::PopClip);
@@ -508,7 +528,10 @@ mod tests {
         let mut last = 0.0;
         for alpha in &alphas {
             reached += alpha * (1.0 - reached);
-            assert!(reached >= last - 1e-12, "coverage went backwards: {alphas:?}");
+            assert!(
+                reached >= last - 1e-12,
+                "coverage went backwards: {alphas:?}"
+            );
             last = reached;
         }
     }
@@ -685,9 +708,24 @@ mod tests {
     fn a_zero_blur_draws_the_shape_unchanged() {
         let ops = blur_ops(&square(), Color::BLACK, (0.0, 0.0), Quality::Low, 0.01);
         assert_eq!(ops.len(), 1);
-        assert!(matches!(ops[0], Op::Fill { even_odd: false, .. }));
+        assert!(matches!(
+            ops[0],
+            Op::Fill {
+                even_odd: false,
+                ..
+            }
+        ));
 
-        assert!(blur_ops(&BezPath::new(), Color::BLACK, (4.0, 4.0), Quality::Low, 0.01).is_empty());
+        assert!(
+            blur_ops(
+                &BezPath::new(),
+                Color::BLACK,
+                (4.0, 4.0),
+                Quality::Low,
+                0.01
+            )
+            .is_empty()
+        );
     }
 
     /// A real blur spreads the shape outwards and fades it: the outermost band
@@ -764,10 +802,7 @@ mod tests {
             (spread_x - 30.0).abs() < 1e-6,
             "the pen should reach 30 across: {spread_x}"
         );
-        assert!(
-            (spread_y - 4.0).abs() < 1e-6,
-            "and 4 down: {spread_y}"
-        );
+        assert!((spread_y - 4.0).abs() < 1e-6, "and 4 down: {spread_y}");
 
         // And the squashed path is taller than it is wide, which is what makes
         // that work.

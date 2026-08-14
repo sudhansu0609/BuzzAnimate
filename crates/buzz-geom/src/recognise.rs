@@ -240,7 +240,11 @@ fn ellipse(
 /// bounding box is smallest — the standard minimum-area rectangle, coarsely
 /// searched then refined, which is plenty for artwork drawn by hand and much
 /// less code than rotating calipers over a convex hull.
-fn rectangle(points: &[Point], allowed: f64, tolerance: Tolerance) -> Option<(BezPath, Recognised)> {
+fn rectangle(
+    points: &[Point],
+    allowed: f64,
+    tolerance: Tolerance,
+) -> Option<(BezPath, Recognised)> {
     let (angle, box_at) = best_angle(points)?;
 
     let rotate = Affine::rotate(-angle);
@@ -367,9 +371,7 @@ pub fn centroid(points: &[Point]) -> Point {
     if points.is_empty() {
         return Point::ORIGIN;
     }
-    let sum = points
-        .iter()
-        .fold(Vec2::ZERO, |acc, p| acc + p.to_vec2());
+    let sum = points.iter().fold(Vec2::ZERO, |acc, p| acc + p.to_vec2());
     (sum / points.len() as f64).to_point()
 }
 
@@ -382,7 +384,10 @@ mod tests {
     fn wobble(i: usize, amount: f64) -> Vec2 {
         let a = (i as f64 * 12.9898).sin() * 43758.5453;
         let b = (i as f64 * 78.233).sin() * 12345.6789;
-        Vec2::new((a.fract() - 0.5) * 2.0 * amount, (b.fract() - 0.5) * 2.0 * amount)
+        Vec2::new(
+            (a.fract() - 0.5) * 2.0 * amount,
+            (b.fract() - 0.5) * 2.0 * amount,
+        )
     }
 
     fn rough_circle(centre: Point, radius: f64, amount: f64) -> BezPath {
@@ -546,7 +551,10 @@ mod tests {
         path.move_to(Point::new(0.0, 0.0));
         for i in 1..30 {
             let t = i as f64;
-            path.line_to(Point::new(t * 7.0, (t * 0.9).sin() * 60.0 + (t * 2.3).cos() * 20.0));
+            path.line_to(Point::new(
+                t * 7.0,
+                (t * 0.9).sin() * 60.0 + (t * 2.3).cos() * 20.0,
+            ));
         }
         assert!(recognise(&path, Tolerance::Normal).is_none());
     }

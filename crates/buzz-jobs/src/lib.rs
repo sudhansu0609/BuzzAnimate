@@ -371,7 +371,10 @@ mod tests {
         let inter_before = js.sample(Pool::Interactive);
 
         js.run(Pool::Background, || {
-            (0..16u64).into_par_iter().map(grind).reduce(|| 0, |a, b| a ^ b)
+            (0..16u64)
+                .into_par_iter()
+                .map(grind)
+                .reduce(|| 0, |a, b| a ^ b)
         });
 
         let inter = js.utilisation_since(Pool::Interactive, &inter_before);

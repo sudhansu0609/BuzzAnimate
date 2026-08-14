@@ -73,7 +73,10 @@ fn an_export_is_the_size_asked_for_and_holds_the_artwork_where_it_belongs() {
         assert_eq!(frame.pixels.len(), 550 * 400 * 4);
 
         // The blue square covers the top-left quarter; the rest is white.
-        assert!(is(frame.pixel(50, 50), BLUE), "top-left should be the square");
+        assert!(
+            is(frame.pixel(50, 50), BLUE),
+            "top-left should be the square"
+        );
         assert!(
             is(frame.pixel(500, 350), Color::WHITE),
             "bottom-right should be background"
@@ -138,7 +141,10 @@ fn scaling_up_keeps_the_composition() {
         // The square still covers the top-left quarter, at twice the size.
         assert!(is(frame.pixel(100, 100), BLUE));
         assert!(is(frame.pixel(540, 380), BLUE), "just inside at 2x");
-        assert!(is(frame.pixel(560, 420), Color::WHITE), "just outside at 2x");
+        assert!(
+            is(frame.pixel(560, 420), Color::WHITE),
+            "just outside at 2x"
+        );
     });
 }
 
@@ -155,7 +161,10 @@ fn a_transparent_export_has_a_clear_background_and_solid_artwork() {
 
         let inside = frame.pixel(50, 50);
         assert_eq!(inside[3], 255, "the artwork stays opaque");
-        assert!(is(inside, BLUE), "and keeps its colour after unpremultiplying");
+        assert!(
+            is(inside, BLUE),
+            "and keeps its colour after unpremultiplying"
+        );
 
         let outside = frame.pixel(500, 350);
         assert_eq!(outside[3], 0, "the background is gone");
@@ -182,7 +191,10 @@ fn a_later_frame_renders_that_frames_artwork() {
 
         let first = exporter.render(&scene, 0, &settings).expect("render 0");
         assert!(is(first.pixel(50, 50), BLUE), "frame 0 has the blue square");
-        assert!(is(first.pixel(400, 300), Color::WHITE), "and not the red one");
+        assert!(
+            is(first.pixel(400, 300), Color::WHITE),
+            "and not the red one"
+        );
 
         let later = exporter.render(&scene, 5, &settings).expect("render 5");
         assert!(is(later.pixel(400, 300), RED), "frame 5 has the red square");
@@ -535,7 +547,9 @@ fn a_mask_that_clips_nothing_is_still_not_drawn() {
             ShapeData::filled(Rect::new(0.0, 0.0, 550.0, 400.0).to_path(1e-9), RED),
         );
 
-        let frame = exporter.render(&scene, 0, &ExportSettings::for_stage(&scene)).expect("render");
+        let frame = exporter
+            .render(&scene, 0, &ExportSettings::for_stage(&scene))
+            .expect("render");
 
         assert!(
             is(frame.pixel(275, 200), BLUE),
@@ -563,7 +577,9 @@ fn an_inverse_mask_that_clips_nothing_is_not_drawn_either() {
             ShapeData::filled(Rect::new(0.0, 0.0, 550.0, 400.0).to_path(1e-9), RED),
         );
 
-        let frame = exporter.render(&scene, 0, &ExportSettings::for_stage(&scene)).expect("render");
+        let frame = exporter
+            .render(&scene, 0, &ExportSettings::for_stage(&scene))
+            .expect("render");
         assert!(
             is(frame.pixel(275, 200), BLUE),
             "the inverse stencil painted itself: {:?}",

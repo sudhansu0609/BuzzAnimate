@@ -409,8 +409,12 @@ fn transport_controls(
                     .speed(0.2),
             )
             .on_hover_text("Frames covered before the playhead");
-            ui.add(egui::DragValue::new(&mut after).range(0..=frames).speed(0.2))
-                .on_hover_text("Frames covered after it");
+            ui.add(
+                egui::DragValue::new(&mut after)
+                    .range(0..=frames)
+                    .speed(0.2),
+            )
+            .on_hover_text("Frames covered after it");
             if ui
                 .small_button("All")
                 .on_hover_text("Cover the whole timeline \u{2014} Animate's Onion All")
@@ -537,12 +541,8 @@ fn loop_controls(ui: &mut Ui, scene: &Scene, out: &mut TimelineResponse) {
         edited.repeats = repeats;
 
         let length = edited.clamped(frames).rendered_length(frames);
-        ui.label(
-            egui::RichText::new(format!("film {length}"))
-                .small()
-                .weak(),
-        )
-        .on_hover_text("Length of the exported film, in frames");
+        ui.label(egui::RichText::new(format!("film {length}")).small().weak())
+            .on_hover_text("Length of the exported film, in frames");
     }
 
     if edited != region {
@@ -708,10 +708,8 @@ fn camera_row(
 
     for frame in 0..columns {
         let x = grid_left + frame as f32 * cell_width;
-        let cell = egui::Rect::from_min_size(
-            egui::pos2(x, rect.min.y),
-            egui::vec2(cell_width, height),
-        );
+        let cell =
+            egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(cell_width, height));
 
         let kind = if camera.has_key_at(frame) {
             FrameKind::Keyframe
@@ -752,8 +750,7 @@ fn layer_row(
     state: &TimelineState,
     out: &mut TimelineResponse,
 ) {
-    let height =
-        Metrics::LAYER_ROW * state.row_scale * (layer.height.percent() as f32 / 100.0);
+    let height = Metrics::LAYER_ROW * state.row_scale * (layer.height.percent() as f32 / 100.0);
     let cell_width = state.frame_width;
     let width = columns as f32 * cell_width;
     let (rect, response) = ui.allocate_exact_size(
@@ -803,10 +800,8 @@ fn layer_row(
 
     for frame in 0..columns {
         let x = grid_left + frame as f32 * cell_width;
-        let cell = egui::Rect::from_min_size(
-            egui::pos2(x, rect.min.y),
-            egui::vec2(cell_width, height),
-        );
+        let cell =
+            egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(cell_width, height));
         draw_frame_cell(
             &painter,
             cell,
@@ -824,7 +819,9 @@ fn layer_row(
     // invisible: every cell paints its own background, so the envelope was
     // covered by the very frames it describes.
     if let Some(waveform) = state.waveforms.get(&layer.id) {
-        draw_waveform(&painter, waveform, grid_left, rect, height, columns, cell_width);
+        draw_waveform(
+            &painter, waveform, grid_left, rect, height, columns, cell_width,
+        );
     }
 
     let clicked_frame = |ui: &Ui| -> Option<u32> {
@@ -1141,12 +1138,14 @@ mod tests {
 
         let mut scene = Scene::default();
         scene.camera_mut().enabled = true;
-        scene
-            .camera_mut()
-            .set_key(buzz_scene::CameraKey::new(0, buzz_geom::Point::new(0.0, 0.0)));
-        scene
-            .camera_mut()
-            .set_key(buzz_scene::CameraKey::new(12, buzz_geom::Point::new(80.0, 0.0)));
+        scene.camera_mut().set_key(buzz_scene::CameraKey::new(
+            0,
+            buzz_geom::Point::new(0.0, 0.0),
+        ));
+        scene.camera_mut().set_key(buzz_scene::CameraKey::new(
+            12,
+            buzz_geom::Point::new(80.0, 0.0),
+        ));
 
         let selected = TimelineState {
             camera_selected: true,

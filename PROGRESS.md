@@ -2768,6 +2768,62 @@ the point of the two-tool rule.
 
 ---
 
+### ✅ A soft brush — and a bitmap the GPU stops re-uploading
+
+**A soft edge is the one thing an outline cannot describe.** Every other brush
+here makes geometry: a silhouette filled with a colour, which scales to any
+zoom and stays editable, and which is the right answer for almost everything. A
+stroke that *fades* is not that. It is a different opacity at every point of a
+region, and approximating it with concentric bands is what `buzz_fx`'s blur
+does — at a boolean per band.
+
+So the soft brush paints pixels, the pixels become a bitmap, and the bitmap is
+a fill. Which means the stroke it makes is an ordinary shape: the Lasso cuts
+it, the Magic Wand picks from it, a mask holes it, a tween moves it, Convert to
+Symbol makes it reusable. Nothing downstream knows it was painted.
+
+**Coverage, one byte a pixel — not colour.** A stroke is one colour, so the only
+thing varying across it is how much of that colour each pixel received. Storing
+coverage alone is a quarter of the memory and makes the rule that matters
+trivial: overlapping stamps within a stroke take the **greater** coverage rather
+than adding. Adding is what produces the beaded string of dark blobs that gives
+away a naive brush, and it is why Photoshop separates flow from opacity.
+
+**Each stroke is its own bitmap, sized to the stroke.** The alternative — a
+stage-sized canvas per layer, as Photoshop has — would cost a full-canvas copy
+on every pointer move, eight megabytes at 1080p, sixty times a second, because
+the document is copy-on-write and undo holds the state before. A stroke-sized
+buffer costs what was painted: a dab is a few kilobytes. What is given up is
+painting across strokes, recorded in §7.
+
+**And a defect in the bitmap work committed an hour before it**, found while
+building this. The GPU keeps its own copy of every bitmap and decides whether
+that copy is still good by comparing an identifier — and `peniko::Blob::new`
+takes a fresh number from a global counter on every call. Building the brush
+per frame therefore made every frame a cache miss: a four-megapixel photograph
+was being re-uploaded sixty times a second for as long as it was on screen. The
+identifier now comes from the asset's own id mixed with a generation counter
+that moves only when the pixels do. A brush preview, which is genuinely new
+pixels every move, opts out explicitly — because with a stable identity the
+renderer would correctly believe it already had that picture and go on showing
+the first frame of the stroke while the user drew.
+
+**What it measures:**
+
+| Operation | Time |
+|---|---|
+| Magic wand on a four-megapixel photograph | **19 ms** |
+| Soft stroke, full width of a 1080p stage, r=20 | **7.8 ms** (1782×482) |
+| A typical dab or short stroke | under 1 ms |
+| Photograph on screen, unchanged | **no upload** (was: the whole picture, per frame) |
+
+Twenty tests in `bitmap_tools.rs` drive the pointer rather than the geometry,
+and one on the real GPU checks that the fade survives straight alpha, the
+unit-square transform, the sampler and the compositor — arriving on screen as a
+stroke that fades into the page, monotonically, with no ring and no fringe.
+
+---
+
 ## 5. Current metrics
 
 | Measure | Value |
@@ -3075,6 +3131,10 @@ down here has not been finished.
 | 161 | **The wand's traced region is polygonal, not curved.** The boundary of a flood fill is a staircase; simplification straightens it, and nothing refits Béziers to it afterwards. At any sane zoom the difference is invisible, and a curve fit would have to decide which corners are real — a photograph's edge has both kinds. Modify ▸ Smooth works on the result if a curve is wanted. | By design |
 | 162 | **A wand region has no feather.** Photoshop grows and softens a selection; here the cut edge is a vector boundary, antialiased by the renderer, which is most of what feathering was for. What is missing is deliberately blurring the join between a cut-out and what is behind it. | Follow-up |
 | 163 | **The Lasso has no polygon mode.** Animate's lasso has a straight-segment mode on a modifier; here every gesture is freehand. The region is a polygon either way — what is missing is the click-click-click way of drawing one. | Follow-up |
+| 164 | **A soft brush cannot paint across strokes.** Each stroke is its own bitmap, sized to itself, so painting over an earlier stroke lays a second bitmap on top rather than adding to the first. Photoshop's model — one canvas per layer that every stroke paints into — would cost a full-canvas copy on every pointer move, because the document is copy-on-write and undo holds the state before. What is lost is smudging and erasing *within* painted pixels; the Eraser still cuts the shape, as it does for any artwork. | By design |
+| 165 | **A soft brush paints at the document's own pixel scale**, one painted pixel to one document unit, because that is the resolution the film exports at. Zoomed to 800% the paint is visibly pixelated, where a vector stroke would still be smooth. Painting finer would need a resolution setting and would make every stroke four or sixteen times the memory. | By design |
+| 166 | **A long soft stroke is rebuilt from scratch on every pointer move** to preview it: 7.8 ms for a sweep the full width of a 1080p stage, against under 1 ms for an ordinary stroke. Within a frame, and the worst case that exists, but an incremental buffer that only stamps the new segment would make it constant. | Follow-up |
+| 167 | **A painted bitmap re-uploads to the GPU on every change.** The whole picture, not the part that changed — which is right for a stroke that arrives complete, and wasteful if painting ever becomes incremental (item 164). Vello has no partial image update, so a dirty-rect upload would mean holding the picture in tiles. | Follow-up |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |

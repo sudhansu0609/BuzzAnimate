@@ -20,8 +20,8 @@ pub mod lighting;
 use anyhow::{Context, Result};
 use buzz_geom::{Affine, BezPath, Camera, RenderClip, RenderSplit, Shape};
 use buzz_scene::{GradientKind, GradientSpread, Paint};
-use std::sync::Arc;
 use peniko::{Color, Fill};
+use std::sync::Arc;
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 use wgpu::{Device, Instance, Queue, TextureFormat, TextureView};
 
@@ -329,8 +329,15 @@ impl<'a> SceneBuilder<'a> {
                 // `Arc<Vec<u8>>` coerces to the trait object Blob wants, so a
                 // 4K photograph is shared with the scene rather than cloned
                 // into every frame.
-                data: peniko::Blob::new(
-                    Arc::clone(&asset.pixels) as Arc<dyn AsRef<[u8]> + Send + Sync>
+                // **A stable identity, not a fresh one.** The GPU caches by
+                // this number, and `Blob::new` takes a new one from a global
+                // counter on every call — so building the brush per frame made
+                // every frame a cache miss and re-uploaded the whole
+                // photograph. `blob_id` is the asset's own id mixed with a
+                // counter that moves only when the pixels do.
+                data: peniko::Blob::from_raw_parts(
+                    Arc::clone(&asset.pixels) as Arc<dyn AsRef<[u8]> + Send + Sync>,
+                    asset.blob_id(),
                 ),
                 format: peniko::ImageFormat::Rgba8,
                 // Straight alpha, as the model stores it and as PNG does.
@@ -860,7 +867,10 @@ mod tests {
                 (on_screen - 0.1).abs() < 1e-9,
                 "tolerance should be ~0.1 px on screen at zoom {zoom}, was {on_screen}"
             );
-            assert!(tol > 0.0 && tol.is_finite(), "bad tolerance {tol} at {zoom}");
+            assert!(
+                tol > 0.0 && tol.is_finite(),
+                "bad tolerance {tol} at {zoom}"
+            );
         }
 
         // The specific failure: at 1e12x the artwork's smallest features are

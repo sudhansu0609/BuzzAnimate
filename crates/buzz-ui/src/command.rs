@@ -710,7 +710,7 @@ mod tests {
             ExportVideo,
             ImportSound,
             ImportImage,
-        ImportImage,
+            ImportImage,
             AttachSound,
             RemoveSound,
             LipSync,

@@ -344,10 +344,11 @@ mod tests {
         let quarter = std::f64::consts::FRAC_PI_2;
         let rotate = |p: Point| {
             let d = p - centre;
-            centre + Vec2::new(
-                d.x * quarter.cos() - d.y * quarter.sin(),
-                d.x * quarter.sin() + d.y * quarter.cos(),
-            )
+            centre
+                + Vec2::new(
+                    d.x * quarter.cos() - d.y * quarter.sin(),
+                    d.x * quarter.sin() + d.y * quarter.cos(),
+                )
         };
         let handles: Vec<WarpHandle> = handles()
             .into_iter()
@@ -392,7 +393,10 @@ mod tests {
     fn a_grid_of_handles_covers_the_bounds_including_the_middle() {
         let grid = grid_handles(Rect::new(0.0, 0.0, 100.0, 50.0), 3, 3);
         assert_eq!(grid.len(), 9);
-        assert!(grid.iter().any(|h| h.rest == Point::new(50.0, 25.0)), "a middle handle");
+        assert!(
+            grid.iter().any(|h| h.rest == Point::new(50.0, 25.0)),
+            "a middle handle"
+        );
         assert!(grid.iter().any(|h| h.rest == Point::new(0.0, 0.0)));
         assert!(grid.iter().any(|h| h.rest == Point::new(100.0, 50.0)));
 
@@ -465,6 +469,9 @@ mod tests {
     #[test]
     fn no_handles_means_no_change() {
         let path = square();
-        assert_eq!(warp_path(&path, &[], DEFAULT_RIGIDITY).to_svg(), path.to_svg());
+        assert_eq!(
+            warp_path(&path, &[], DEFAULT_RIGIDITY).to_svg(),
+            path.to_svg()
+        );
     }
 }

@@ -49,7 +49,11 @@ impl RecoveryEntry {
         if stem.starts_with("untitled") {
             return "Untitled work".to_string();
         }
-        if stem.is_empty() { "Untitled work".to_string() } else { stem }
+        if stem.is_empty() {
+            "Untitled work".to_string()
+        } else {
+            stem
+        }
     }
 
     /// "4 minutes ago", in the terms somebody would judge it by.

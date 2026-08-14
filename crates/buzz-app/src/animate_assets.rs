@@ -146,11 +146,7 @@ fn read_manifest(dir: &Path) -> Option<AnimateAsset> {
         .and_then(|v| v.as_str())
         .filter(|n| !n.trim().is_empty())
         .map(|n| n.to_string())
-        .or_else(|| {
-            source
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-        })?;
+        .or_else(|| source.file_stem().map(|s| s.to_string_lossy().to_string()))?;
 
     Some(AnimateAsset {
         name,
@@ -191,7 +187,10 @@ fn folder_for(manifest: &serde_json::Value) -> String {
 /// Returns immediately. Each asset that fails is *named* in the summary rather
 /// than stopping the run: one unreadable file out of a thousand should cost one
 /// asset, not the import.
-pub fn import_all(assets: Vec<AnimateAsset>, mut library: buzz_doc::AssetLibrary) -> Receiver<Progress> {
+pub fn import_all(
+    assets: Vec<AnimateAsset>,
+    mut library: buzz_doc::AssetLibrary,
+) -> Receiver<Progress> {
     let (tx, rx): (Sender<Progress>, Receiver<Progress>) = crossbeam_channel::unbounded();
 
     std::thread::spawn(move || {
@@ -367,8 +366,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp");
         let custom = dir.path().join("Custom");
         std::fs::create_dir_all(custom.join("image")).expect("dir");
-        std::fs::write(custom.join("image").join("Sky.png"), b"not really a png")
-            .expect("png");
+        std::fs::write(custom.join("image").join("Sky.png"), b"not really a png").expect("png");
         std::fs::write(
             custom.join("image").join("manifest.json"),
             br#"{"assetFile":"Sky.png","name":"Sky","role":"Backgrounds"}"#,

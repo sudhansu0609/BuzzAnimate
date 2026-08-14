@@ -255,7 +255,9 @@ fn run_timeline(
 
             // -- display list -------------------------------------------------
             Tag::PlaceObject(place) => {
-                let track = tracks.entry(place.depth).or_insert_with(|| Track::new(place.depth));
+                let track = tracks
+                    .entry(place.depth)
+                    .or_insert_with(|| Track::new(place.depth));
                 let matrix = place.matrix.map(to_affine).unwrap_or(Affine::IDENTITY);
                 let name = place.name.map(|n| n.to_string_lossy(swf::UTF_8));
                 // A colour transform on the placement is Animate's colour
@@ -308,7 +310,10 @@ fn run_timeline(
                 if place.filters.as_ref().is_some_and(|f| !f.is_empty()) {
                     report.note_unsupported("a filter effect");
                 }
-                if place.blend_mode.is_some_and(|b| b != swf::BlendMode::Normal) {
+                if place
+                    .blend_mode
+                    .is_some_and(|b| b != swf::BlendMode::Normal)
+                {
                     report.note_unsupported("a blend mode");
                 }
                 if place.clip_depth.is_some() {
@@ -423,7 +428,8 @@ impl Track {
     fn close_at_end(&mut self, end: u32) {
         if let Some(placed) = self.current.take() {
             // At least one frame long, however the file ended.
-            self.spans.push((placed.since, end.max(placed.since + 1), placed));
+            self.spans
+                .push((placed.since, end.max(placed.since + 1), placed));
         }
     }
 
@@ -599,7 +605,8 @@ mod tests {
             })],
             line_styles: vec![],
         };
-        let d = |dx: f64, dy: f64| swf::PointDelta::new(Twips::from_pixels(dx), Twips::from_pixels(dy));
+        let d =
+            |dx: f64, dy: f64| swf::PointDelta::new(Twips::from_pixels(dx), Twips::from_pixels(dy));
         Tag::DefineShape(swf::Shape {
             version: 1,
             id,
@@ -615,10 +622,18 @@ mod tests {
                     line_style: None,
                     new_styles: None,
                 })),
-                swf::ShapeRecord::StraightEdge { delta: d(size, 0.0) },
-                swf::ShapeRecord::StraightEdge { delta: d(0.0, size) },
-                swf::ShapeRecord::StraightEdge { delta: d(-size, 0.0) },
-                swf::ShapeRecord::StraightEdge { delta: d(0.0, -size) },
+                swf::ShapeRecord::StraightEdge {
+                    delta: d(size, 0.0),
+                },
+                swf::ShapeRecord::StraightEdge {
+                    delta: d(0.0, size),
+                },
+                swf::ShapeRecord::StraightEdge {
+                    delta: d(-size, 0.0),
+                },
+                swf::ShapeRecord::StraightEdge {
+                    delta: d(0.0, -size),
+                },
             ],
         })
     }
@@ -678,7 +693,12 @@ mod tests {
     fn the_stage_takes_its_size_frame_rate_and_background_from_the_header() {
         let bytes = write_swf(
             vec![
-                Tag::SetBackgroundColor(swf::Color { r: 0x33, g: 0x66, b: 0x99, a: 255 }),
+                Tag::SetBackgroundColor(swf::Color {
+                    r: 0x33,
+                    g: 0x66,
+                    b: 0x99,
+                    a: 255,
+                }),
                 Tag::ShowFrame,
             ],
             1,
@@ -876,18 +896,15 @@ mod tests {
 
     #[test]
     fn actionscript_and_sound_are_reported_rather_than_dropped_silently() {
-        let bytes = write_swf(
-            vec![
-                Tag::DoAction(&[0x00]),
-                Tag::ShowFrame,
-            ],
-            1,
-        );
+        let bytes = write_swf(vec![Tag::DoAction(&[0x00]), Tag::ShowFrame], 1);
         let (_, report) = import_bytes(&bytes).unwrap();
 
         assert!(!report.is_complete());
         assert!(
-            report.unsupported.iter().any(|u| u.contains("ActionScript")),
+            report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("ActionScript")),
             "{:?}",
             report.unsupported
         );
@@ -946,11 +963,7 @@ mod tests {
                 })
                 .sum()
         }
-        scene
-            .layers()
-            .iter()
-            .map(|l| over_time(scene, l, 0))
-            .sum()
+        scene.layers().iter().map(|l| over_time(scene, l, 0)).sum()
     }
 
     /// A sprite holding a shape, placed on the root — which is how Flash
@@ -963,10 +976,7 @@ mod tests {
             num_frames: 1,
             tags: vec![square(1, 20.0), place(1, 1, 0.0), Tag::ShowFrame],
         });
-        let bytes = write_swf(
-            vec![sprite, place(1, 2, 100.0), Tag::ShowFrame],
-            1,
-        );
+        let bytes = write_swf(vec![sprite, place(1, 2, 100.0), Tag::ShowFrame], 1);
         let (scene, report) = import_bytes(&bytes).expect("the SWF parses");
 
         assert_eq!(report.sprites, 1, "the sprite should arrive");

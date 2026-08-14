@@ -296,10 +296,7 @@ mod tests {
     /// it; it is back because it now cuts.
     #[test]
     fn only_text_is_still_unimplemented() {
-        let waiting: Vec<ToolId> = all_tools()
-            .into_iter()
-            .filter(|t| !t.is_ready())
-            .collect();
+        let waiting: Vec<ToolId> = all_tools().into_iter().filter(|t| !t.is_ready()).collect();
         assert_eq!(waiting, vec![ToolId::Text], "unexpected inert tools");
     }
 

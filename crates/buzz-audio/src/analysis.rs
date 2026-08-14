@@ -262,7 +262,11 @@ impl Features {
         // Noisy and bright: a fricative. `f`/`v` are the quiet ones, `s`/`sh`
         // the loud ones, and they take different shapes.
         if self.noisiness > 0.22 && self.brightness > 0.45 {
-            return if loudness < 0.35 { Viseme::FV } else { Viseme::Etc };
+            return if loudness < 0.35 {
+                Viseme::FV
+            } else {
+                Viseme::Etc
+            };
         }
 
         // Voiced, so the shape follows where the energy sits. These bands are
@@ -311,7 +315,9 @@ fn close_the_mouth_between_words(frames: &mut [Viseme], levels: &[f32], silence:
             continue;
         }
         for back in 1..=closure {
-            let Some(slot) = i.checked_sub(back) else { break };
+            let Some(slot) = i.checked_sub(back) else {
+                break;
+            };
             // Only silence becomes a closure: a closure written over the tail
             // of the previous word would swallow it.
             if frames[slot] != Viseme::Rest {
@@ -456,8 +462,13 @@ mod tests {
 
     fn silence(seconds: f64) -> Clip {
         let rate = 44_100;
-        Clip::new("Silence", rate, 1, vec![0.0; (seconds * rate as f64) as usize])
-            .expect("a clip")
+        Clip::new(
+            "Silence",
+            rate,
+            1,
+            vec![0.0; (seconds * rate as f64) as usize],
+        )
+        .expect("a clip")
     }
 
     fn join(clips: &[&Clip]) -> Clip {
@@ -605,11 +616,7 @@ mod tests {
         };
         assert_eq!(
             track.runs(),
-            vec![
-                (0, Viseme::Rest, 2),
-                (2, Viseme::Ai, 3),
-                (5, Viseme::O, 1),
-            ]
+            vec![(0, Viseme::Rest, 2), (2, Viseme::Ai, 3), (5, Viseme::O, 1),]
         );
     }
 
@@ -649,7 +656,9 @@ mod tests {
 
     #[test]
     fn an_impossible_frame_rate_produces_nothing_rather_than_a_panic() {
-        assert!(analyse_visemes(&tone(400.0, 0.2, 0.5), 0.0, &LipSyncOptions::default()).is_empty());
+        assert!(
+            analyse_visemes(&tone(400.0, 0.2, 0.5), 0.0, &LipSyncOptions::default()).is_empty()
+        );
     }
 
     /// The FFT is the one piece of maths here that is easy to get subtly

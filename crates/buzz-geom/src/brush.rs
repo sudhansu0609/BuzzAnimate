@@ -215,7 +215,11 @@ impl BrushOutput {
 /// samples whose tangents are numerical noise; smoothing that noise averages
 /// it into the result instead of removing it. Once the samples are spaced,
 /// smoothing has real motion to work on.
-pub fn condition(samples: &[StrokeSample], smoothing: f64, budget: &BrushBudget) -> Vec<StrokeSample> {
+pub fn condition(
+    samples: &[StrokeSample],
+    smoothing: f64,
+    budget: &BrushBudget,
+) -> Vec<StrokeSample> {
     let decimated = decimate(samples, budget);
     smooth_samples(&decimated, smoothing)
 }
@@ -285,9 +289,8 @@ pub fn smooth_samples(samples: &[StrokeSample], smoothing: f64) -> Vec<StrokeSam
     for _ in 0..passes {
         let previous = current.clone();
         for i in 1..previous.len() - 1 {
-            let neighbour_mean = (previous[i - 1].point.to_vec2()
-                + previous[i + 1].point.to_vec2())
-                / 2.0;
+            let neighbour_mean =
+                (previous[i - 1].point.to_vec2() + previous[i + 1].point.to_vec2()) / 2.0;
             let moved = previous[i].point.to_vec2().lerp(neighbour_mean, alpha);
             current[i].point = moved.to_point();
         }
@@ -398,11 +401,21 @@ pub fn fluid_outline(
     // Join the two sides. With a taper the ends have collapsed to a point and
     // a straight join is invisible; without one this is where a cap belongs.
     if profile.taper <= 0.0 {
-        append_cap(&mut path, conditioned[conditioned.len() - 1].point, left[left.len() - 1], right[0]);
+        append_cap(
+            &mut path,
+            conditioned[conditioned.len() - 1].point,
+            left[left.len() - 1],
+            right[0],
+        );
     }
     append_without_move(&mut path, &back);
     if profile.taper <= 0.0 {
-        append_cap(&mut path, conditioned[0].point, right[right.len() - 1], left[0]);
+        append_cap(
+            &mut path,
+            conditioned[0].point,
+            right[right.len() - 1],
+            left[0],
+        );
     }
     path.close_path();
 
@@ -783,7 +796,11 @@ mod tests {
         let samples = drag(Point::ZERO, Point::new(10.0, 0.0), 1000);
         let kept = decimate(&samples, &BrushBudget::default());
 
-        assert!(kept.len() < 30, "1000 samples over 10 units kept {}", kept.len());
+        assert!(
+            kept.len() < 30,
+            "1000 samples over 10 units kept {}",
+            kept.len()
+        );
         assert_eq!(kept.first().unwrap().point, Point::ZERO);
         assert_eq!(
             kept.last().unwrap().point,
@@ -811,8 +828,14 @@ mod tests {
         samples[10].point.y = 30.0; // a spike in the middle
 
         let smoothed = smooth_samples(&samples, 1.0);
-        assert_eq!(smoothed.first().unwrap().point, samples.first().unwrap().point);
-        assert_eq!(smoothed.last().unwrap().point, samples.last().unwrap().point);
+        assert_eq!(
+            smoothed.first().unwrap().point,
+            samples.first().unwrap().point
+        );
+        assert_eq!(
+            smoothed.last().unwrap().point,
+            samples.last().unwrap().point
+        );
         assert!(
             smoothed[10].point.y < 30.0,
             "the spike should have been pulled in, got {}",
@@ -890,7 +913,10 @@ mod tests {
         );
 
         let bounds = out.path.bounding_box();
-        assert!(bounds.width() >= 99.0, "it should span the drag: {bounds:?}");
+        assert!(
+            bounds.width() >= 99.0,
+            "it should span the drag: {bounds:?}"
+        );
         assert!(bounds.height() > 0.0, "and have width");
     }
 
@@ -953,7 +979,10 @@ mod tests {
                 .height()
         };
 
-        assert!(at(1.0) > at(0.5) * 1.5, "full pressure must be clearly fatter");
+        assert!(
+            at(1.0) > at(0.5) * 1.5,
+            "full pressure must be clearly fatter"
+        );
         assert!(at(0.0) > 0.0, "and zero pressure still leaves a mark");
     }
 
@@ -963,7 +992,10 @@ mod tests {
         let samples = vec![StrokeSample::new(Point::new(5.0, 5.0), 0.0)];
         let out = fluid_outline(&samples, &BrushProfile::default(), &BrushBudget::default());
 
-        assert!(!out.path.elements().is_empty(), "a tap should paint something");
+        assert!(
+            !out.path.elements().is_empty(),
+            "a tap should paint something"
+        );
         let bounds = out.path.bounding_box();
         assert!(bounds.width() > 0.0 && bounds.height() > 0.0);
     }
@@ -1031,10 +1063,16 @@ mod tests {
         );
 
         assert!(out.is_exact());
-        assert_eq!(out.stamps, 11, "100 units at 10 apart, inclusive of both ends");
+        assert_eq!(
+            out.stamps, 11,
+            "100 units at 10 apart, inclusive of both ends"
+        );
 
         let bounds = out.path.bounding_box();
-        assert!(bounds.width() >= 100.0, "the stamps should span the stroke: {bounds:?}");
+        assert!(
+            bounds.width() >= 100.0,
+            "the stamps should span the stroke: {bounds:?}"
+        );
     }
 
     /// A stamp must turn to follow the stroke, or a pattern brush is just a
@@ -1114,7 +1152,10 @@ mod tests {
         );
         let elapsed = started.elapsed();
 
-        assert!(out.spacing_widened, "the budget should have widened the spacing");
+        assert!(
+            out.spacing_widened,
+            "the budget should have widened the spacing"
+        );
         assert!(
             out.stamps <= budget.max_stamps,
             "placed {} stamps against a budget of {}",
@@ -1276,7 +1317,12 @@ mod tests {
         let budget = BrushBudget::default();
         let profile = BrushProfile::default();
 
-        assert!(fluid_outline(&[], &profile, &budget).path.elements().is_empty());
+        assert!(
+            fluid_outline(&[], &profile, &budget)
+                .path
+                .elements()
+                .is_empty()
+        );
 
         // Every sample in the same place.
         let stacked = vec![StrokeSample::new(Point::new(1.0, 1.0), 0.0); 50];
@@ -1291,7 +1337,12 @@ mod tests {
                 .is_empty()
         );
         let dot = catmull_rom(&[Point::ZERO, Point::ZERO]);
-        let _ = stamp_along(&dot, &unit_square(), PatternFit::Repeat { spacing: 1.0 }, &budget);
+        let _ = stamp_along(
+            &dot,
+            &unit_square(),
+            PatternFit::Repeat { spacing: 1.0 },
+            &budget,
+        );
         let _ = stamp_along(&dot, &empty, PatternFit::Stretch, &budget);
 
         // Times that go backwards, which a paused clock can produce.

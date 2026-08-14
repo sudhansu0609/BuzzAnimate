@@ -208,7 +208,10 @@ fn choose_encoder(settings: &VideoSettings) -> (String, bool) {
     if settings.hardware && available.iter().any(|e| e == wanted) {
         return (wanted.to_string(), false);
     }
-    (settings.codec.software_encoder().to_string(), settings.hardware)
+    (
+        settings.codec.software_encoder().to_string(),
+        settings.hardware,
+    )
 }
 
 /// Export a range of frames as a video file.
@@ -400,10 +403,7 @@ fn spawn_ffmpeg(
         for i in 0..audio.len() {
             graph.push_str(&format!("[a{i}]"));
         }
-        graph.push_str(&format!(
-            "amix=inputs={}:normalize=0[aout]",
-            audio.len()
-        ));
+        graph.push_str(&format!("amix=inputs={}:normalize=0[aout]", audio.len()));
 
         command
             .args(["-filter_complex", &graph])

@@ -124,7 +124,10 @@ impl Dock {
 
     /// Is this one of the window's edges?
     pub fn is_docked(self) -> bool {
-        matches!(self, Self::Left | Self::Right | Self::RightOuter | Self::Bottom)
+        matches!(
+            self,
+            Self::Left | Self::Right | Self::RightOuter | Self::Bottom
+        )
     }
 
     /// The choices offered on a panel's own menu, in the order Animate lists
@@ -358,7 +361,14 @@ impl Workspace {
         let hidden = self.dock_of(id) == Dock::Hidden;
         let locked = self.locked;
         self.locked = false;
-        self.move_to(id, if hidden { self.default_dock(id) } else { Dock::Hidden });
+        self.move_to(
+            id,
+            if hidden {
+                self.default_dock(id)
+            } else {
+                Dock::Hidden
+            },
+        );
         self.locked = locked;
     }
 
@@ -521,7 +531,10 @@ mod tests {
 
         assert_eq!(workspace.dock_of(PanelId::Lighting), Dock::Left);
         assert!(!workspace.on(Dock::Right).contains(&PanelId::Lighting));
-        assert_eq!(workspace.on(Dock::Left), vec![PanelId::Tools, PanelId::Lighting]);
+        assert_eq!(
+            workspace.on(Dock::Left),
+            vec![PanelId::Tools, PanelId::Lighting]
+        );
     }
 
     /// The whole point of the lock: with it on, nothing moves.

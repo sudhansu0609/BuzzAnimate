@@ -32,6 +32,12 @@ pub enum BrushKind {
     Pattern,
     /// A single source shape stretched over the whole stroke.
     Art,
+    /// Painted pixels with a soft edge — Photoshop's round brush.
+    ///
+    /// The one brush here that is not geometry, and the only one that can fade
+    /// at its edge: a soft edge is a different opacity at every point of a
+    /// region, which no outline describes. See [`buzz_scene::raster`].
+    Raster,
 }
 
 impl BrushKind {
@@ -40,6 +46,7 @@ impl BrushKind {
             Self::Fluid => "Fluid",
             Self::Pattern => "Pattern",
             Self::Art => "Art",
+            Self::Raster => "Soft",
         }
     }
 
@@ -48,6 +55,7 @@ impl BrushKind {
             Self::Fluid => "A filled stroke that thins as you draw faster",
             Self::Pattern => "Repeats a shape along the stroke",
             Self::Art => "Stretches one shape over the whole stroke",
+            Self::Raster => "Paints pixels with a soft edge, as an airbrush does",
         }
     }
 
@@ -196,6 +204,13 @@ pub struct BrushSettings {
     /// produces, so working over an area deepens it the way ink does.
     /// See [`buzz_scene::PaintBlend::Additive`].
     pub build_up: bool,
+    /// Where a soft brush's fade begins, as a fraction of its radius.
+    ///
+    /// `1.0` is a hard edge, `0.0` fades from the very middle. Photoshop's
+    /// Hardness, and the same numbers. Only [`BrushKind::Raster`] reads it.
+    pub hardness: f64,
+    /// How much paint a soft brush lays down, `0.0`–`1.0`.
+    pub flow: f64,
 }
 
 impl Default for BrushSettings {
@@ -211,6 +226,10 @@ impl Default for BrushSettings {
             pattern: PatternShape::default(),
             spacing: 12.0,
             custom_pattern: None,
+            // Half soft: plainly a soft brush at a glance, and still definite
+            // enough to draw an edge with.
+            hardness: 0.5,
+            flow: 1.0,
             // Off by default: Animate composites normally, and a document
             // whose overlaps silently deepen would surprise anyone who did
             // not ask for it.

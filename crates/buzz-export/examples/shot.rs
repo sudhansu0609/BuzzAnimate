@@ -20,7 +20,9 @@ fn main() -> Result<()> {
     let no_camera = raw.iter().any(|a| a == "--no-camera");
     raw.retain(|a| a != "--no-camera");
     let mut args = raw.into_iter();
-    let path = args.next().context("usage: shot <file> [frame] [out.png]")?;
+    let path = args
+        .next()
+        .context("usage: shot <file> [frame] [out.png]")?;
     let frame: u32 = args.next().and_then(|f| f.parse().ok()).unwrap_or(0);
     let out = args.next().unwrap_or_else(|| "shot.png".to_string());
 

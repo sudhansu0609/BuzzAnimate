@@ -142,21 +142,11 @@ impl RenderClip {
                     // maintain rather than two.
                     let c1 = cursor + (c - cursor) * (2.0 / 3.0);
                     let c2 = p + (c - p) * (2.0 / 3.0);
-                    self.emit_cubic(
-                        CubicBez::new(cursor, c1, c2, p),
-                        0,
-                        &mut out,
-                        &mut budget,
-                    );
+                    self.emit_cubic(CubicBez::new(cursor, c1, c2, p), 0, &mut out, &mut budget);
                     cursor = p;
                 }
                 PathEl::CurveTo(c1, c2, p) => {
-                    self.emit_cubic(
-                        CubicBez::new(cursor, c1, c2, p),
-                        0,
-                        &mut out,
-                        &mut budget,
-                    );
+                    self.emit_cubic(CubicBez::new(cursor, c1, c2, p), 0, &mut out, &mut budget);
                     cursor = p;
                 }
                 PathEl::ClosePath => {

@@ -43,8 +43,7 @@ pub struct Clip {
 impl Clip {
     /// Decode a file, choosing the reader from its contents.
     pub fn open(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let name = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -67,8 +66,8 @@ impl Clip {
     }
 
     fn decode_wav(bytes: &[u8], name: &str) -> Result<Self> {
-        let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))
-            .context("reading the WAV header")?;
+        let mut reader =
+            hound::WavReader::new(std::io::Cursor::new(bytes)).context("reading the WAV header")?;
         let spec = reader.spec();
 
         // Integer PCM is scaled by its own full range rather than by 32768 for
@@ -360,8 +359,8 @@ mod tests {
 
     #[test]
     fn a_file_that_is_not_audio_is_refused_with_a_reason() {
-        let error = Clip::decode(b"this is not a sound file at all", "x")
-            .expect_err("should be refused");
+        let error =
+            Clip::decode(b"this is not a sound file at all", "x").expect_err("should be refused");
         let message = error.to_string();
         assert!(!message.is_empty());
     }
@@ -391,7 +390,11 @@ mod tests {
         let clip = Clip::new("x", 8_000, 1, vec![0.5; 4]).expect("clip");
         let peaks = clip.peaks(100);
         assert_eq!(peaks.len(), 100);
-        assert!(peaks.iter().all(|(min, max)| min.is_finite() && max.is_finite()));
+        assert!(
+            peaks
+                .iter()
+                .all(|(min, max)| min.is_finite() && max.is_finite())
+        );
     }
 
     #[test]
@@ -426,7 +429,11 @@ mod tests {
     fn a_clip_reports_how_many_frames_it_covers() {
         let clip = tone(2.0, 44_100, 1);
         assert_eq!(clip.duration_frames(24.0), 48);
-        assert_eq!(clip.duration_frames(0.0), 0, "an impossible rate is not a panic");
+        assert_eq!(
+            clip.duration_frames(0.0),
+            0,
+            "an impossible rate is not a panic"
+        );
     }
 
     #[test]

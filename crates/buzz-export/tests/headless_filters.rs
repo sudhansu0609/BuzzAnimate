@@ -360,10 +360,7 @@ fn a_layer_filter_applies_to_the_whole_layer() {
         assert_ne!(before.pixels, after.pixels, "the layer filter did nothing");
         for (x, y, which) in [(150, 100, "the small square"), (360, 225, "the big one")] {
             let pixel = after.pixel(x, y);
-            assert!(
-                pixel[0] > pixel[2] + 20,
-                "no glow round {which}: {pixel:?}"
-            );
+            assert!(pixel[0] > pixel[2] + 20, "no glow round {which}: {pixel:?}");
         }
     });
 }

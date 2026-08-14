@@ -59,6 +59,7 @@ fn quadrants() -> Arc<ImageAsset> {
         width: 4,
         height: 4,
         pixels: Arc::new(pixels),
+        generation: 0,
     })
 }
 
@@ -230,6 +231,7 @@ fn a_transparent_bitmap_shows_what_is_behind_it() {
             width: 2,
             height: 2,
             pixels: Arc::new(pixels),
+            generation: 0,
         });
 
         let area = Rect::new(100.0, 50.0, 400.0, 350.0);
@@ -245,5 +247,81 @@ fn a_transparent_bitmap_shows_what_is_behind_it() {
             "the transparent half should show the white stage, got {:?}",
             frame.pixel(250, 280)
         );
+    });
+}
+
+/// **A soft brush stroke fades on the GPU, not only in the buffer.**
+///
+/// The unit tests prove the pixels are right. This proves they survive the
+/// whole journey — straight alpha into the image brush, the unit-square
+/// transform, the sampler's extend mode and the compositor — and arrive on
+/// screen as a stroke that fades into what is behind it. A mistake anywhere on
+/// that road shows up as a hard edge, a black fringe, or a stroke drawn at
+/// full strength.
+#[test]
+fn a_soft_stroke_fades_into_the_background_on_the_gpu() {
+    with_exporter(|exporter| {
+        let brush = buzz_scene::SoftBrush {
+            radius: 40.0,
+            hardness: 0.0,
+            flow: 1.0,
+            color: Color::BLACK,
+        };
+        let canvas = buzz_scene::Canvas::for_stroke(
+            &[
+                buzz_geom::Point::new(200.0, 200.0),
+                buzz_geom::Point::new(500.0, 200.0),
+            ],
+            &brush,
+        )
+        .expect("a stroke");
+        let area = canvas.area();
+        let asset = Arc::new(canvas.to_asset(ImageId(7), "Stroke", &brush));
+
+        let mut scene = Scene::default();
+        scene.stage_mut().background = Color::WHITE;
+        let layer = scene.add_layer("Paint", LayerKind::Normal);
+        let mut fill = ImageFill::new(asset, area);
+        fill.smooth = false;
+        scene.add_shape(
+            layer,
+            ShapeData {
+                path: area.to_path(1e-9),
+                fill: Some(FillSpec::image(fill)),
+                stroke: None,
+                blend: buzz_scene::PaintBlend::Normal,
+            },
+        );
+
+        let frame = exporter
+            .render(&scene, 0, &ExportSettings::for_stage(&scene))
+            .expect("render");
+
+        // Down the middle of the stroke, then out across its edge.
+        let grey = |y: u32| frame.pixel(350, y)[0];
+        let middle = grey(200);
+        let edge = grey(225);
+        let outside = grey(250);
+
+        assert!(middle < 40, "the middle should be near black, is {middle}");
+        assert!(
+            edge > 60 && edge < 220,
+            "the edge should be a grey between the stroke and the page, is {edge}"
+        );
+        assert!(
+            outside > 240,
+            "past the brush should be the white page, is {outside}"
+        );
+
+        // And the fade is monotonic across the edge: no ring, no banding.
+        let mut last = 0u16;
+        for y in 200..=250 {
+            let here = u16::from(grey(y));
+            assert!(
+                here + 2 >= last,
+                "the fade goes back on itself at y={y}: {last} then {here}"
+            );
+            last = here;
+        }
     });
 }

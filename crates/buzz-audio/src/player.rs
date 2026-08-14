@@ -238,8 +238,7 @@ impl Mixer {
             if cue.sync == CueSync::Stream {
                 continue;
             }
-            let start =
-                (cue.start_frame as f64 / self.fps * self.sample_rate as f64) as u64;
+            let start = (cue.start_frame as f64 / self.fps * self.sample_rate as f64) as u64;
             if start < from || start >= to {
                 continue;
             }
@@ -253,10 +252,7 @@ impl Mixer {
             // clips are shared out of the document's sound cache, so one
             // asset is one `Arc` and pointer equality is the identity test.
             if cue.sync == CueSync::Start
-                && self
-                    .voices
-                    .iter()
-                    .any(|v| Arc::ptr_eq(&v.clip, &cue.clip))
+                && self.voices.iter().any(|v| Arc::ptr_eq(&v.clip, &cue.clip))
             {
                 continue;
             }
@@ -720,7 +716,10 @@ mod tests {
 
         let mut out = vec![0.0f32; 512];
         mixer.render(&mut out);
-        assert!(out.iter().all(|s| (*s - 0.5).abs() < 1e-6), "expected the clip");
+        assert!(
+            out.iter().all(|s| (*s - 0.5).abs() < 1e-6),
+            "expected the clip"
+        );
         assert_eq!(mixer.position, 256, "512 samples over two channels");
     }
 
@@ -793,7 +792,11 @@ mod tests {
 
         let mut out = vec![0.0f32; 64];
         mixer.render(&mut out);
-        assert!((out[0] - 0.2).abs() < 1e-6, "0.8 x 0.5 x 0.5 = 0.2, got {}", out[0]);
+        assert!(
+            (out[0] - 0.2).abs() < 1e-6,
+            "0.8 x 0.5 x 0.5 = 0.2, got {}",
+            out[0]
+        );
     }
 
     /// Sample rates rarely match: a 44.1 kHz file on a 48 kHz device is the

@@ -159,8 +159,9 @@ pub fn deform_path(path: &BezPath, binding: &SkinBinding, armature: &Armature) -
     // One transform per bone, not one per point: a 2 000-point path over a
     // 20-bone rig would otherwise rebuild the same twenty matrices two
     // thousand times.
-    let transforms: Vec<buzz_geom::Affine> =
-        (0..armature.len()).map(|i| armature.pose_transform(i)).collect();
+    let transforms: Vec<buzz_geom::Affine> = (0..armature.len())
+        .map(|i| armature.pose_transform(i))
+        .collect();
 
     let moved: Vec<Point> = source
         .iter()
@@ -278,8 +279,8 @@ mod tests {
     fn a_point_beside_a_bone_belongs_mostly_to_that_bone() {
         let arm = arm();
         let path = BezPath::from_vec(vec![
-            kurbo::PathEl::MoveTo(Point::new(10.0, 2.0)),  // beside the upper arm
-            kurbo::PathEl::LineTo(Point::new(90.0, 2.0)),  // beside the forearm
+            kurbo::PathEl::MoveTo(Point::new(10.0, 2.0)), // beside the upper arm
+            kurbo::PathEl::LineTo(Point::new(90.0, 2.0)), // beside the forearm
         ]);
         let binding = bind_path(&path, &arm);
 
@@ -331,8 +332,14 @@ mod tests {
         let bounds = deformed.bounding_box();
 
         // The far end has swung below the axis rather than staying to the right.
-        assert!(bounds.y1 > 40.0, "the forearm did not swing down: {bounds:?}");
-        assert!(bounds.x1 < 95.0, "the artwork still reaches right: {bounds:?}");
+        assert!(
+            bounds.y1 > 40.0,
+            "the forearm did not swing down: {bounds:?}"
+        );
+        assert!(
+            bounds.x1 < 95.0,
+            "the artwork still reaches right: {bounds:?}"
+        );
     }
 
     #[test]
@@ -423,7 +430,10 @@ mod tests {
         let from_posed = bind_path(&path, &posed);
         let from_rest = bind_path(&path, &arm());
 
-        assert_eq!(from_posed, from_rest, "the current pose leaked into the weights");
+        assert_eq!(
+            from_posed, from_rest,
+            "the current pose leaked into the weights"
+        );
     }
 
     /// A point on the far side of a joint is shared between the two bones, so
@@ -435,7 +445,10 @@ mod tests {
         let binding = bind_path(&path, &arm);
 
         let weights = &binding.points[0];
-        assert!(weights.len() >= 2, "the elbow should be shared: {weights:?}");
+        assert!(
+            weights.len() >= 2,
+            "the elbow should be shared: {weights:?}"
+        );
         let smallest = weights.iter().map(|(_, w)| *w).fold(f64::MAX, f64::min);
         assert!(smallest > 0.2, "one bone dominates the joint: {weights:?}");
     }

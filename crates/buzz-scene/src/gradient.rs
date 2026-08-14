@@ -587,7 +587,10 @@ mod tests {
         // And an even two-stop ramp averages to its midpoint.
         let even = two(rgb(0, 0, 0), rgb(255, 255, 255));
         let mid = even.average_color().components;
-        assert!((mid[0] - 0.5).abs() < 1e-3, "expected mid grey, got {mid:?}");
+        assert!(
+            (mid[0] - 0.5).abs() < 1e-3,
+            "expected mid grey, got {mid:?}"
+        );
     }
 
     #[test]

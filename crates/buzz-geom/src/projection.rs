@@ -500,7 +500,14 @@ impl Projection {
             return None;
         }
 
-        Self::plane_in_view([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], to_origin, focal, pitch, yaw)
+        Self::plane_in_view(
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            to_origin,
+            focal,
+            pitch,
+            yaw,
+        )
     }
 
     /// The basis of a plane rotated about its own axes.
@@ -594,7 +601,10 @@ mod tests {
     fn an_affine_round_trips() {
         let affine = Affine::translate((10.0, -4.0)) * Affine::rotate(0.7) * Affine::scale(2.0);
         let projection = Projection::from_affine(affine);
-        assert_eq!(projection.as_affine().unwrap().as_coeffs(), affine.as_coeffs());
+        assert_eq!(
+            projection.as_affine().unwrap().as_coeffs(),
+            affine.as_coeffs()
+        );
 
         let p = Point::new(3.0, 5.0);
         let by_affine = affine * p;
@@ -606,11 +616,12 @@ mod tests {
     /// a trapezoid, with the far edge shorter than the near one.
     #[test]
     fn pitching_the_camera_makes_a_trapezoid() {
-        let projection =
-            Projection::look_at_plane(1000.0, 1000.0, 0.5, 0.0).expect("in front");
+        let projection = Projection::look_at_plane(1000.0, 1000.0, 0.5, 0.0).expect("in front");
         assert!(!projection.is_affine(), "a tilt must not stay affine");
 
-        let corners = projection.map_rect(Rect::new(-100.0, -100.0, 100.0, 100.0)).unwrap();
+        let corners = projection
+            .map_rect(Rect::new(-100.0, -100.0, 100.0, 100.0))
+            .unwrap();
         let top = (corners[1] - corners[0]).hypot();
         let bottom = (corners[2] - corners[3]).hypot();
         assert!(
@@ -922,9 +933,15 @@ mod tests {
         assert!(sa.is_finite() && sb.is_finite());
         assert_ne!(wa, wb, "a pitched camera should not see both at one depth");
         if wa < wb {
-            assert!(sa > sb, "the nearer point should magnify more: {sa} vs {sb}");
+            assert!(
+                sa > sb,
+                "the nearer point should magnify more: {sa} vs {sb}"
+            );
         } else {
-            assert!(sb > sa, "the nearer point should magnify more: {sb} vs {sa}");
+            assert!(
+                sb > sa,
+                "the nearer point should magnify more: {sb} vs {sa}"
+            );
         }
     }
 

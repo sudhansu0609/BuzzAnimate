@@ -105,10 +105,7 @@ impl Autosave {
     /// while the prompt offering it was still on screen. Found exactly that
     /// way, by crashing the program and relaunching it.
     pub fn untitled(directory: impl Into<PathBuf>) -> Self {
-        Self::new(
-            directory.into(),
-            format!("untitled-{}", std::process::id()),
-        )
+        Self::new(directory.into(), format!("untitled-{}", std::process::id()))
     }
 
     /// A fresh slot in the same directory, for a document that has just become
@@ -147,7 +144,8 @@ impl Autosave {
 
     /// Where this document's recovery file lives.
     pub fn recovery_path(&self) -> PathBuf {
-        self.directory.join(format!("{}{RECOVERY_SUFFIX}", self.stem))
+        self.directory
+            .join(format!("{}{RECOVERY_SUFFIX}", self.stem))
     }
 
     /// Is a save due for `revision`?

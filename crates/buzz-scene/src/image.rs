@@ -54,6 +54,23 @@ pub struct ImageAsset {
     /// or a half-transparent red and an opaque dark red become the same
     /// number and the wand selects across an edge that is plainly there.
     pub pixels: Arc<Vec<u8>>,
+    /// Bumped whenever the pixels change.
+    ///
+    /// # Why this exists, and what breaks without it
+    ///
+    /// The GPU keeps its own copy of every bitmap, and it decides whether the
+    /// copy it has is still good by comparing an *identifier* — not the pixels,
+    /// which is the whole point of having a cache. Vello's identifier comes
+    /// from `peniko::Blob`, and `Blob::new` takes a fresh number from a global
+    /// counter every single time it is called. Building the brush per frame
+    /// therefore produced a new identity per frame, and a four-megapixel
+    /// photograph was re-uploaded sixty times a second for as long as it was on
+    /// screen.
+    ///
+    /// So the identifier is built from [`ImageAsset::id`] and this counter
+    /// instead: stable while the picture is, different the instant it is
+    /// painted on. See [`ImageAsset::blob_id`].
+    pub generation: u64,
 }
 
 /// Why a bitmap could not be read.
@@ -64,11 +81,7 @@ pub enum ImageError {
     #[error(
         "that image is {width} x {height}, which is larger than BuzzAnimate will          import ({limit} x {limit}). Scale it down first."
     )]
-    TooLarge {
-        width: u32,
-        height: u32,
-        limit: u32,
-    },
+    TooLarge { width: u32, height: u32, limit: u32 },
 }
 
 /// The largest bitmap that may be imported, per side.
@@ -88,8 +101,7 @@ impl ImageAsset {
     /// strength of its name would be wrong when the bytes say plainly what it
     /// is.
     pub fn decode(id: ImageId, name: impl Into<String>, bytes: &[u8]) -> Result<Self, ImageError> {
-        let format = ::image::guess_format(bytes)
-            .map_err(|e| ImageError::Decode(e.to_string()))?;
+        let format = ::image::guess_format(bytes).map_err(|e| ImageError::Decode(e.to_string()))?;
         let decoded = ::image::load_from_memory_with_format(bytes, format)
             .map_err(|e| ImageError::Decode(e.to_string()))?;
 
@@ -122,6 +134,7 @@ impl ImageAsset {
             width,
             height,
             pixels: Arc::new(rgba.into_raw()),
+            generation: 0,
         })
     }
 
@@ -137,6 +150,7 @@ impl ImageAsset {
             width,
             height,
             pixels: Arc::new(vec![0; (width as usize) * (height as usize) * 4]),
+            generation: 0,
         }
     }
 
@@ -145,12 +159,9 @@ impl ImageAsset {
     /// A painted canvas has no source file to write back — its pixels *are*
     /// the document — so saving one means encoding what is there now.
     pub fn encode_png(&self) -> Result<Vec<u8>, ImageError> {
-        let buffer = ::image::RgbaImage::from_raw(
-            self.width,
-            self.height,
-            self.pixels.as_ref().clone(),
-        )
-        .ok_or_else(|| ImageError::Decode("the pixel buffer is the wrong size".into()))?;
+        let buffer =
+            ::image::RgbaImage::from_raw(self.width, self.height, self.pixels.as_ref().clone())
+                .ok_or_else(|| ImageError::Decode("the pixel buffer is the wrong size".into()))?;
         let mut out = std::io::Cursor::new(Vec::new());
         buffer
             .write_to(&mut out, ::image::ImageFormat::Png)
@@ -178,6 +189,51 @@ impl ImageAsset {
 
     pub fn size(&self) -> buzz_geom::Size {
         buzz_geom::Size::new(f64::from(self.width), f64::from(self.height))
+    }
+
+    /// A number that identifies **these pixels**, for the renderer's cache.
+    ///
+    /// Stable across frames while the picture is unchanged, and different as
+    /// soon as it is painted on. Spread across the whole 64-bit range rather
+    /// than counted, so it cannot collide with the small sequential numbers
+    /// that fonts and other blobs take from `Blob::new`.
+    pub fn blob_id(&self) -> u64 {
+        // Two rounds of a cheap mixer. The id and the generation both start at
+        // small numbers, and a plain XOR of two small numbers is a small number
+        // — two different assets would land close enough together to be worth
+        // worrying about.
+        let mut h = self.id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 29;
+        h = h.wrapping_add(self.generation.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        h ^= h >> 32;
+        h
+    }
+
+    /// Mark this bitmap as one that is rebuilt every frame.
+    ///
+    /// # Why a picture would ever want *not* to be cached
+    ///
+    /// A brush preview is new pixels on every pointer move, built from scratch
+    /// and thrown away. It is not in the library and has no id of its own, so
+    /// caching by id and generation would give every one of them the same
+    /// identity — and the renderer, correctly believing it already had that
+    /// picture, would go on showing the first frame of the stroke while the
+    /// user carried on drawing. So a transient bitmap takes a fresh number, and
+    /// this is the one place where paying for an upload every frame is right.
+    pub fn made_transient(mut self) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.id = ImageId(u64::MAX);
+        self
+    }
+
+    /// Edit the pixels, marking them changed so the GPU reloads them.
+    ///
+    /// The only supported way to alter a decoded picture: writing to `pixels`
+    /// directly leaves the renderer showing what was there before.
+    pub fn edit_pixels(&mut self, f: impl FnOnce(&mut Vec<u8>)) {
+        f(Arc::make_mut(&mut self.pixels));
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// The pixel at `(x, y)` as straight-alpha RGBA.
@@ -260,12 +316,7 @@ impl ImageFill {
         if n == 0 {
             return peniko::Color::TRANSPARENT;
         }
-        peniko::Color::from_rgba8(
-            (r / n) as u8,
-            (g / n) as u8,
-            (b / n) as u8,
-            (a / n) as u8,
-        )
+        peniko::Color::from_rgba8((r / n) as u8, (g / n) as u8, (b / n) as u8, (a / n) as u8)
     }
 
     /// Carry the image through a transform, so it stays on its artwork.
@@ -369,6 +420,7 @@ mod tests {
                     .flatten()
                     .collect(),
             ),
+            generation: 0,
         })
     }
 
@@ -395,7 +447,10 @@ mod tests {
 
         // The middle of the artwork is the middle pixel.
         let p = fill.to_pixel(Point::new(150.0, 70.0)).expect("a pixel");
-        assert!((p.x - 100.0).abs() < 1e-9 && (p.y - 50.0).abs() < 1e-9, "got {p:?}");
+        assert!(
+            (p.x - 100.0).abs() < 1e-9 && (p.y - 50.0).abs() < 1e-9,
+            "got {p:?}"
+        );
 
         // And back again.
         let back = fill.from_pixel(p);
@@ -434,6 +489,7 @@ mod tests {
             width: 20,
             height: 20,
             pixels: Arc::new(pixels),
+            generation: 0,
         });
         let fill = ImageFill::new(a, Rect::new(0.0, 0.0, 20.0, 20.0));
         let average = fill.average_color().to_rgba8().to_u8_array();
@@ -461,6 +517,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: Arc::new(vec![0, 0, 0, 255]),
+            generation: 0,
         });
         assert_eq!(library.unique_name("Tree"), "Tree 2");
         assert_eq!(library.unique_name("Hut"), "Hut");

@@ -175,7 +175,11 @@ fn yaw_converges_the_other_way() {
         let left = height_at(150);
         let right = height_at(400);
         assert!(left > 0 && right > 0, "the artwork vanished");
-        let (tall, short) = if left > right { (left, right) } else { (right, left) };
+        let (tall, short) = if left > right {
+            (left, right)
+        } else {
+            (right, left)
+        };
         assert!(
             tall > short + 15,
             "no convergence across the frame: {tall} against {short}"

@@ -337,11 +337,9 @@ fn settings_view(
                 "No ffmpeg found on this machine.",
             );
             ui.label(
-                RichText::new(
-                    "Video export needs one. On Windows: winget install Gyan.FFmpeg",
-                )
-                .small()
-                .weak(),
+                RichText::new("Video export needs one. On Windows: winget install Gyan.FFmpeg")
+                    .small()
+                    .weak(),
             );
             ui.add_space(4.0);
         }

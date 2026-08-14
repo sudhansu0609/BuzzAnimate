@@ -284,9 +284,33 @@ mod tests {
         let owner = object(1);
         cache.begin();
 
-        cache.blur(Some(&owner), 0, &square(), Color::BLACK, (6.0, 6.0), Quality::Low, 0.01);
-        cache.blur(Some(&owner), 0, &square(), Color::BLACK, (12.0, 6.0), Quality::Low, 0.01);
-        cache.blur(Some(&owner), 0, &square(), Color::BLACK, (6.0, 6.0), Quality::High, 0.01);
+        cache.blur(
+            Some(&owner),
+            0,
+            &square(),
+            Color::BLACK,
+            (6.0, 6.0),
+            Quality::Low,
+            0.01,
+        );
+        cache.blur(
+            Some(&owner),
+            0,
+            &square(),
+            Color::BLACK,
+            (12.0, 6.0),
+            Quality::Low,
+            0.01,
+        );
+        cache.blur(
+            Some(&owner),
+            0,
+            &square(),
+            Color::BLACK,
+            (6.0, 6.0),
+            Quality::High,
+            0.01,
+        );
         assert_eq!(cache.len(), 3);
     }
 
@@ -296,7 +320,15 @@ mod tests {
     fn unowned_artwork_is_not_cached() {
         let mut cache = FilterCache::new();
         cache.begin();
-        cache.blur(None, 0, &square(), Color::BLACK, (6.0, 6.0), Quality::Low, 0.01);
+        cache.blur(
+            None,
+            0,
+            &square(),
+            Color::BLACK,
+            (6.0, 6.0),
+            Quality::Low,
+            0.01,
+        );
         assert!(cache.is_empty());
     }
 
@@ -305,7 +337,15 @@ mod tests {
         let mut cache = FilterCache::new();
         let owner = object(1);
         cache.begin();
-        cache.blur(Some(&owner), 0, &square(), Color::BLACK, (6.0, 6.0), Quality::Low, 0.01);
+        cache.blur(
+            Some(&owner),
+            0,
+            &square(),
+            Color::BLACK,
+            (6.0, 6.0),
+            Quality::Low,
+            0.01,
+        );
         cache.end();
         assert_eq!(cache.len(), 1, "still fresh");
 

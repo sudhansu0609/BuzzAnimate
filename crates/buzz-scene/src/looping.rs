@@ -217,7 +217,11 @@ mod tests {
             end: 6,
             repeats: 2,
         };
-        assert_eq!(region.wrap(7), Some(3), "past the end goes back to the start");
+        assert_eq!(
+            region.wrap(7),
+            Some(3),
+            "past the end goes back to the start"
+        );
         assert_eq!(region.wrap(5), None, "inside the section, carry on");
         assert_eq!(region.wrap(1), None, "before it, carry on");
     }

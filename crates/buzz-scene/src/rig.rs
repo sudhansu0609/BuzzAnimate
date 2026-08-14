@@ -402,7 +402,10 @@ mod tests {
             panic!("expected a shape");
         };
         // The geometry is untouched; only the transform moved.
-        assert_eq!(shape.path.bounding_box(), Rect::new(0.0, -10.0, 100.0, 10.0));
+        assert_eq!(
+            shape.path.bounding_box(),
+            Rect::new(0.0, -10.0, 100.0, 10.0)
+        );
         assert_ne!(posed[0].transform, Affine::IDENTITY);
     }
 
@@ -433,7 +436,10 @@ mod tests {
     /// of a straight edge would go back to being unbendable.
     #[test]
     fn a_warp_at_rest_is_the_artwork_as_drawn() {
-        let shape = ShapeData::filled(Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9), Color::WHITE);
+        let shape = ShapeData::filled(
+            Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9),
+            Color::WHITE,
+        );
         let warp = WarpData::new(shape.clone()).with_grid(3, 3);
 
         assert_eq!(warp.handles.len(), 9);
@@ -454,19 +460,28 @@ mod tests {
 
     #[test]
     fn dragging_a_warp_handle_moves_the_artwork() {
-        let shape = ShapeData::filled(Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9), Color::WHITE);
+        let shape = ShapeData::filled(
+            Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9),
+            Color::WHITE,
+        );
         let mut warp = WarpData::new(shape).with_grid(3, 3);
         warp.handles[0].current = Point::new(-50.0, -50.0);
 
         assert!(warp.warped().path.bounding_box().x0 < -10.0);
 
         warp.reset();
-        assert!(warp.warped().path.bounding_box().x0.abs() < 1e-9, "reset failed");
+        assert!(
+            warp.warped().path.bounding_box().x0.abs() < 1e-9,
+            "reset failed"
+        );
     }
 
     #[test]
     fn tweening_a_warp_moves_its_handles_between_the_two() {
-        let shape = ShapeData::filled(Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9), Color::WHITE);
+        let shape = ShapeData::filled(
+            Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9),
+            Color::WHITE,
+        );
         let from = WarpData::new(shape).with_grid(2, 2);
         let mut to = from.clone();
         to.handles[0].current = Point::new(-100.0, 0.0);

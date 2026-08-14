@@ -55,7 +55,12 @@ fn main() {
                             let c = object.transform.as_coeffs();
                             println!(
                                 "      {:<26} scale {:.3},{:.3} at {:.0},{:.0}  first {} {:?}",
-                                name, c[0], c[3], c[4], c[5], instance.first_frame,
+                                name,
+                                c[0],
+                                c[3],
+                                c[4],
+                                c[5],
+                                instance.first_frame,
                                 instance.loop_mode
                             );
                         }
@@ -67,10 +72,8 @@ fn main() {
                         layer.kind.display_name(),
                         objects.len(),
                         match bounds {
-                            Some(b) => format!(
-                                "{:.0},{:.0} .. {:.0},{:.0}",
-                                b.x0, b.y0, b.x1, b.y1
-                            ),
+                            Some(b) =>
+                                format!("{:.0},{:.0} .. {:.0},{:.0}", b.x0, b.y0, b.x1, b.y1),
                             None => "empty".to_string(),
                         }
                     );
@@ -81,10 +84,7 @@ fn main() {
             // are linked, and what each holds at frame 0. A rigged character
             // that arrives in pieces is a question about this, not about the
             // stage.
-            if let Some(wanted) = std::env::args()
-                .skip_while(|a| a != "--symbol")
-                .nth(1)
-            {
+            if let Some(wanted) = std::env::args().skip_while(|a| a != "--symbol").nth(1) {
                 let at: u32 = std::env::args()
                     .skip_while(|a| a != "--symbol")
                     .nth(2)
@@ -98,10 +98,8 @@ fn main() {
                         symbol.kind,
                         symbol.length(),
                         match symbol.bounds() {
-                            Some(b) => format!(
-                                "{:.0},{:.0} .. {:.0},{:.0}",
-                                b.x0, b.y0, b.x1, b.y1
-                            ),
+                            Some(b) =>
+                                format!("{:.0},{:.0} .. {:.0},{:.0}", b.x0, b.y0, b.x1, b.y1),
                             None => "empty".into(),
                         }
                     );

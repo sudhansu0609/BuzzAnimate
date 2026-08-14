@@ -96,11 +96,17 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
     host_fn!(ctx, host, state, "backgroundColor", |state| {
         Ok(to_hex(state.borrow().scene.stage().background))
     });
-    host_fn!(ctx, host, state, "setBackgroundColor", |state, hex: String| {
-        let color = parse_color(&hex)?;
-        state.borrow_mut().scene.stage_mut().background = color;
-        Ok(())
-    });
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setBackgroundColor",
+        |state, hex: String| {
+            let color = parse_color(&hex)?;
+            state.borrow_mut().scene.stage_mut().background = color;
+            Ok(())
+        }
+    );
 
     // -- layers -------------------------------------------------------------
     host_fn!(ctx, host, state, "layerCount", |state| {
@@ -110,41 +116,71 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         let s = state.borrow();
         Ok(layer_at(&s, index)?.name.clone())
     });
-    host_fn!(ctx, host, state, "setLayerName", |state, index: i32, name: String| {
-        let id = layer_id(&state.borrow(), index)?;
-        state.borrow_mut().scene.update_layer(id, |l| l.name = name);
-        Ok(())
-    });
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setLayerName",
+        |state, index: i32, name: String| {
+            let id = layer_id(&state.borrow(), index)?;
+            state.borrow_mut().scene.update_layer(id, |l| l.name = name);
+            Ok(())
+        }
+    );
     host_fn!(ctx, host, state, "layerVisible", |state, index: i32| {
         let s = state.borrow();
         Ok(layer_at(&s, index)?.visible)
     });
-    host_fn!(ctx, host, state, "setLayerVisible", |state, index: i32, on: bool| {
-        let id = layer_id(&state.borrow(), index)?;
-        state.borrow_mut().scene.update_layer(id, |l| l.visible = on);
-        Ok(())
-    });
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setLayerVisible",
+        |state, index: i32, on: bool| {
+            let id = layer_id(&state.borrow(), index)?;
+            state
+                .borrow_mut()
+                .scene
+                .update_layer(id, |l| l.visible = on);
+            Ok(())
+        }
+    );
     host_fn!(ctx, host, state, "layerLocked", |state, index: i32| {
         let s = state.borrow();
         Ok(layer_at(&s, index)?.locked)
     });
-    host_fn!(ctx, host, state, "setLayerLocked", |state, index: i32, on: bool| {
-        let id = layer_id(&state.borrow(), index)?;
-        state.borrow_mut().scene.update_layer(id, |l| l.locked = on);
-        Ok(())
-    });
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setLayerLocked",
+        |state, index: i32, on: bool| {
+            let id = layer_id(&state.borrow(), index)?;
+            state.borrow_mut().scene.update_layer(id, |l| l.locked = on);
+            Ok(())
+        }
+    );
     host_fn!(ctx, host, state, "layerDepth", |state, index: i32| {
         let s = state.borrow();
         Ok(layer_at(&s, index)?.depth)
     });
-    host_fn!(ctx, host, state, "setLayerDepth", |state, index: i32, depth: f64| {
-        if !depth.is_finite() {
-            return Err(throw("layer depth must be a finite number"));
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setLayerDepth",
+        |state, index: i32, depth: f64| {
+            if !depth.is_finite() {
+                return Err(throw("layer depth must be a finite number"));
+            }
+            let id = layer_id(&state.borrow(), index)?;
+            state
+                .borrow_mut()
+                .scene
+                .update_layer(id, |l| l.depth = depth);
+            Ok(())
         }
-        let id = layer_id(&state.borrow(), index)?;
-        state.borrow_mut().scene.update_layer(id, |l| l.depth = depth);
-        Ok(())
-    });
+    );
     host_fn!(ctx, host, state, "addNewLayer", |state, name: String| {
         let mut s = state.borrow_mut();
         let name = if name.is_empty() {
@@ -210,12 +246,24 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
     // Two functions rather than one with a `kind` argument: rquickjs binds
     // native functions up to seven parameters, and a shape needs four for its
     // rectangle plus three for its paint. That is exactly seven.
-    host_fn!(ctx, host, state, "addRectangle", |state, l: f64, t: f64, r: f64, b: f64, fill: String, stroke: String, width: f64| {
-        add_shape(state, false, l, t, r, b, &fill, &stroke, width)
-    });
-    host_fn!(ctx, host, state, "addOval", |state, l: f64, t: f64, r: f64, b: f64, fill: String, stroke: String, width: f64| {
-        add_shape(state, true, l, t, r, b, &fill, &stroke, width)
-    });
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "addRectangle",
+        |state, l: f64, t: f64, r: f64, b: f64, fill: String, stroke: String, width: f64| {
+            add_shape(state, false, l, t, r, b, &fill, &stroke, width)
+        }
+    );
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "addOval",
+        |state, l: f64, t: f64, r: f64, b: f64, fill: String, stroke: String, width: f64| {
+            add_shape(state, true, l, t, r, b, &fill, &stroke, width)
+        }
+    );
 
     // -- selection ----------------------------------------------------------
     host_fn!(ctx, host, state, "selectionCount", |state| {
@@ -239,19 +287,25 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         state.borrow_mut().context.selection.clear();
         Ok(())
     });
-    host_fn!(ctx, host, state, "moveSelectionBy", |state, dx: f64, dy: f64| {
-        if !dx.is_finite() || !dy.is_finite() {
-            return Err(throw("a move needs finite distances"));
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "moveSelectionBy",
+        |state, dx: f64, dy: f64| {
+            if !dx.is_finite() || !dy.is_finite() {
+                return Err(throw("a move needs finite distances"));
+            }
+            let ids = state.borrow().context.selection.clone();
+            let mut s = state.borrow_mut();
+            for id in ids {
+                s.scene.update_object(id, |o| {
+                    o.transform = Affine::translate((dx, dy)) * o.transform;
+                });
+            }
+            Ok(())
         }
-        let ids = state.borrow().context.selection.clone();
-        let mut s = state.borrow_mut();
-        for id in ids {
-            s.scene.update_object(id, |o| {
-                o.transform = Affine::translate((dx, dy)) * o.transform;
-            });
-        }
-        Ok(())
-    });
+    );
     host_fn!(ctx, host, state, "deleteSelection", |state| {
         let ids = state.borrow().context.selection.clone();
         let mut s = state.borrow_mut();
@@ -274,7 +328,12 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             .cloned()
             .ok_or_else(|| throw(&format!("there is no library item {index}")))
     });
-    host_fn!(ctx, host, state, "convertToSymbol", |state, kind: String, name: String| {
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "convertToSymbol",
+        |state, kind: String, name: String| {
             let kind = match kind.to_ascii_lowercase().as_str() {
                 "graphic" => SymbolKind::Graphic,
                 "button" => SymbolKind::Button,
@@ -295,7 +354,11 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             let (layer, frame) = target(&state.borrow())?;
             let mut s = state.borrow_mut();
 
-            let name = if name.is_empty() { "Symbol".to_string() } else { name };
+            let name = if name.is_empty() {
+                "Symbol".to_string()
+            } else {
+                name
+            };
             let symbol = s.scene.add_symbol(name, kind, None);
             let Some(inner) = s
                 .scene
@@ -319,15 +382,17 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 });
             });
 
-            let placed = s.scene.add_instance_at(layer, frame, symbol, Affine::IDENTITY);
+            let placed = s
+                .scene
+                .add_instance_at(layer, frame, symbol, Affine::IDENTITY);
             s.context.selection = placed.into_iter().collect();
             Ok(())
-        });
+        }
+    );
 
     ctx.globals().set("__host", host)?;
     Ok(())
 }
-
 
 /// Add a rectangle or an oval to the layer the editor is working on.
 #[allow(clippy::too_many_arguments, reason = "mirrors the script-facing call")]
@@ -368,7 +433,10 @@ fn add_shape(
         shape.fill = Some(buzz_scene::FillSpec::solid(parse_color(fill)?));
     }
     if !stroke.is_empty() {
-        shape.stroke = Some(buzz_scene::StrokeSpec::new(parse_color(stroke)?, width.max(0.0)));
+        shape.stroke = Some(buzz_scene::StrokeSpec::new(
+            parse_color(stroke)?,
+            width.max(0.0),
+        ));
     }
     if shape.fill.is_none() && shape.stroke.is_none() {
         return Err(throw(
@@ -437,7 +505,10 @@ fn parse_color(text: &str) -> JsResult<Color> {
     let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
 
     let parsed = match hex.len() {
-        6 => byte(0).zip(byte(2)).zip(byte(4)).map(|((r, g), b)| Color::from_rgba8(r, g, b, 255)),
+        6 => byte(0)
+            .zip(byte(2))
+            .zip(byte(4))
+            .map(|((r, g), b)| Color::from_rgba8(r, g, b, 255)),
         8 => byte(0)
             .zip(byte(2))
             .zip(byte(4))

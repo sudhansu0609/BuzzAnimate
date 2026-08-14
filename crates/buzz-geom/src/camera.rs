@@ -521,7 +521,10 @@ mod tests {
         cam.rotation = std::f64::consts::FRAC_PI_6;
         let p = Point::new(75.5, 12.25);
         let back = cam.screen_to_doc(cam.doc_to_screen(p));
-        assert!((back - p).hypot() < 1e-9, "rotated round trip failed: {back:?}");
+        assert!(
+            (back - p).hypot() < 1e-9,
+            "rotated round trip failed: {back:?}"
+        );
     }
 
     #[test]

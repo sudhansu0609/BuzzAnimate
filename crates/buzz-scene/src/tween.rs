@@ -572,8 +572,11 @@ mod tests {
 
     fn object(id: u64, transform: Affine) -> Arc<Object> {
         Arc::new(
-            Object::shape(ObjectId(id), ShapeData::filled(square(0.0, 10.0), Color::WHITE))
-                .with_transform(transform),
+            Object::shape(
+                ObjectId(id),
+                ShapeData::filled(square(0.0, 10.0), Color::WHITE),
+            )
+            .with_transform(transform),
         )
     }
 
@@ -585,7 +588,12 @@ mod tests {
             Easing::Linear,
             Easing::Strength(100.0),
             Easing::Strength(-100.0),
-            Easing::CubicBezier { x1: 0.42, y1: 0.0, x2: 0.58, y2: 1.0 },
+            Easing::CubicBezier {
+                x1: 0.42,
+                y1: 0.0,
+                x2: 0.58,
+                y2: 1.0,
+            },
         ] {
             assert!((easing.apply(0.0) - 0.0).abs() < 1e-6, "{easing:?} at 0");
             assert!((easing.apply(1.0) - 1.0).abs() < 1e-6, "{easing:?} at 1");
@@ -598,7 +606,12 @@ mod tests {
             Easing::Linear,
             Easing::Strength(80.0),
             Easing::Strength(-80.0),
-            Easing::CubicBezier { x1: 0.25, y1: 0.1, x2: 0.25, y2: 1.0 },
+            Easing::CubicBezier {
+                x1: 0.25,
+                y1: 0.1,
+                x2: 0.25,
+                y2: 1.0,
+            },
         ] {
             let mut previous = -1.0;
             for i in 0..=50 {
@@ -626,7 +639,12 @@ mod tests {
     /// A near-vertical curve must not hang the solver.
     #[test]
     fn a_pathological_easing_curve_still_terminates() {
-        let nasty = Easing::CubicBezier { x1: 1.0, y1: 0.0, x2: 0.0, y2: 1.0 };
+        let nasty = Easing::CubicBezier {
+            x1: 1.0,
+            y1: 0.0,
+            x2: 0.0,
+            y2: 1.0,
+        };
         let started = std::time::Instant::now();
         for i in 0..=100 {
             let v = nasty.apply(i as f64 / 100.0);
@@ -643,7 +661,10 @@ mod tests {
         let b = Affine::translate((100.0, 50.0));
         let mid = lerp_affine(a, b, 0.5, 0);
         let p = mid * Point::ORIGIN;
-        assert!((p.x - 50.0).abs() < 1e-9 && (p.y - 25.0).abs() < 1e-9, "{p:?}");
+        assert!(
+            (p.x - 50.0).abs() < 1e-9 && (p.y - 25.0).abs() < 1e-9,
+            "{p:?}"
+        );
     }
 
     /// Interpolating matrix coefficients directly shrinks a rotating object.
@@ -824,7 +845,9 @@ mod tests {
         let b = Circle::new(Point::new(25.0, 25.0), 25.0).to_path(0.05);
         let mid = interpolate_path(&a, &b, 0.5);
         assert!(
-            mid.elements().iter().any(|e| matches!(e, PathEl::ClosePath)),
+            mid.elements()
+                .iter()
+                .any(|e| matches!(e, PathEl::ClosePath)),
             "a filled shape must not spring open mid-tween"
         );
     }
@@ -843,8 +866,10 @@ mod tests {
     fn tweening_an_empty_path_does_not_panic() {
         let empty = BezPath::new();
         let square = square(0.0, 10.0);
-        assert!(interpolate_path(&empty, &square, 0.5).elements().is_empty()
-            || !interpolate_path(&empty, &square, 0.5).elements().is_empty());
+        assert!(
+            interpolate_path(&empty, &square, 0.5).elements().is_empty()
+                || !interpolate_path(&empty, &square, 0.5).elements().is_empty()
+        );
         let _ = interpolate_path(&square, &empty, 0.5);
         let _ = interpolate_path(&empty, &empty, 0.5);
     }
@@ -955,7 +980,10 @@ mod tests {
 
     #[test]
     fn a_tween_between_warps_moves_the_handles() {
-        let shape = ShapeData::filled(Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9), Color::WHITE);
+        let shape = ShapeData::filled(
+            Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9),
+            Color::WHITE,
+        );
         let start_warp = crate::rig::WarpData::new(shape).with_grid(2, 2);
         let mut end_warp = start_warp.clone();
         end_warp.handles[0].current = Point::new(-100.0, -100.0);

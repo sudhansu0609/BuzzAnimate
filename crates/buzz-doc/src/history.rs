@@ -235,7 +235,12 @@ mod tests {
     }
 
     fn add_one(scene: &mut Scene) {
-        let layer = scene.layers().iter().next().map(|l| l.id).unwrap_or(LayerId(1));
+        let layer = scene
+            .layers()
+            .iter()
+            .next()
+            .map(|l| l.id)
+            .unwrap_or(LayerId(1));
         scene.add_shape(
             layer,
             ShapeData::filled(Rect::new(0.0, 50.0, 5.0, 55.0).to_path(1e-9), Color::WHITE),
@@ -389,7 +394,11 @@ mod tests {
         while history.can_redo() {
             current = history.redo(current).unwrap();
         }
-        assert_eq!(current.shape_count(), final_count, "redo should restore all");
+        assert_eq!(
+            current.shape_count(),
+            final_count,
+            "redo should restore all"
+        );
     }
 
     #[test]

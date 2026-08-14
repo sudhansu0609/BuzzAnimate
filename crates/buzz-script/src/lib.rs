@@ -107,7 +107,10 @@ impl ScriptOutcome {
     pub fn summary(&self) -> String {
         match &self.error {
             Some(_) => "Script failed".to_string(),
-            None if self.changed => format!("Script finished in {:.0} ms", self.elapsed.as_secs_f64() * 1000.0),
+            None if self.changed => format!(
+                "Script finished in {:.0} ms",
+                self.elapsed.as_secs_f64() * 1000.0
+            ),
             None => "Script finished; the document is unchanged".to_string(),
         }
     }
@@ -577,7 +580,10 @@ mod tests {
     #[test]
     fn a_script_that_changes_nothing_reports_no_change() {
         let mut scene = document();
-        let out = run_source(&mut scene, "var d = fl.getDocumentDOM(); fl.trace(d.width);");
+        let out = run_source(
+            &mut scene,
+            "var d = fl.getDocumentDOM(); fl.trace(d.width);",
+        );
 
         assert!(out.succeeded());
         assert!(!out.changed, "reading must not mark the document dirty");
@@ -630,6 +636,10 @@ mod tests {
 
         assert!(out.succeeded(), "{:?}", out.error);
         assert_eq!(out.trace, vec!["1", "true"]);
-        assert_eq!(scene.layers().len(), 1, "a document keeps at least one layer");
+        assert_eq!(
+            scene.layers().len(),
+            1,
+            "a document keeps at least one layer"
+        );
     }
 }

@@ -473,7 +473,8 @@ mod tests {
         let mut pixels = Vec::with_capacity((size * size * 4) as usize);
         for y in 0..size {
             for x in 0..size {
-                let d = ((f64::from(x) + 0.5 - c).powi(2) + (f64::from(y) + 0.5 - c).powi(2)).sqrt();
+                let d =
+                    ((f64::from(x) + 0.5 - c).powi(2) + (f64::from(y) + 0.5 - c).powi(2)).sqrt();
                 if d <= radius {
                     pixels.extend_from_slice(&[255, 0, 0, 255]);
                 } else {
@@ -489,6 +490,7 @@ mod tests {
             width: size,
             height: size,
             pixels: Arc::new(pixels),
+            generation: 0,
         })
     }
 
@@ -525,6 +527,7 @@ mod tests {
             width: 64,
             height: 8,
             pixels: Arc::new(pixels),
+            generation: 0,
         });
 
         let exact = flood(
@@ -571,6 +574,7 @@ mod tests {
             width: w,
             height: h,
             pixels: Arc::new(pixels),
+            generation: 0,
         });
 
         let near = flood(&asset, (2, 4), WandOptions::default()).unwrap();
@@ -627,7 +631,8 @@ mod tests {
         let mut pixels = Vec::new();
         for y in 0..size {
             for x in 0..size {
-                let d = ((f64::from(x) + 0.5 - c).powi(2) + (f64::from(y) + 0.5 - c).powi(2)).sqrt();
+                let d =
+                    ((f64::from(x) + 0.5 - c).powi(2) + (f64::from(y) + 0.5 - c).powi(2)).sqrt();
                 // A ring: taken between 10 and 24.
                 let inside = (10.0..24.0).contains(&d);
                 if inside {
@@ -645,6 +650,7 @@ mod tests {
             width: size,
             height: size,
             pixels: Arc::new(pixels),
+            generation: 0,
         });
 
         let mask = flood(&asset, (32, 32 - 17), WandOptions::default()).unwrap();

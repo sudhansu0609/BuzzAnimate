@@ -317,7 +317,10 @@ mod tests {
         assert_eq!(reopened.scene().shape_count(), doc.scene().shape_count());
         assert_eq!(reopened.scene().layers().len(), doc.scene().layers().len());
         assert!(!reopened.is_dirty());
-        assert!(!reopened.can_undo(), "a freshly opened document has no history");
+        assert!(
+            !reopened.can_undo(),
+            "a freshly opened document has no history"
+        );
     }
 
     #[test]
@@ -341,7 +344,10 @@ mod tests {
     #[test]
     fn saving_without_a_path_asks_for_save_as() {
         let mut doc = Document::default();
-        assert!(doc.save().is_err(), "an unsaved document has nowhere to save");
+        assert!(
+            doc.save().is_err(),
+            "an unsaved document has nowhere to save"
+        );
     }
 
     #[test]

@@ -2895,6 +2895,66 @@ deleted itself: a rebuilt preview is a new picture by definition.
 
 ---
 
+### ✅ The panels, measured this time
+
+The first attempt at this fixed a real bug - list panels claiming ten thousand
+points of their column - and the complaints came back unchanged. The binary was
+current; the diagnosis was not finished. So this time the layout was
+**measured** rather than reasoned about, with a headless egui harness, and the
+numbers said something different.
+
+| | before | after |
+|---|---|---|
+| Layers, four layers | 280 pt | 160 pt |
+| Properties | 845 pt | 369 pt |
+| Colour panel starts at | 1127 pt | 531 pt |
+| Bottom of the column | **1321 pt** | **725 pt** |
+
+The column is 854 points tall on a 1080p screen. Everything past that is not
+merely hard to reach - it looks *missing*, which is exactly how it was
+reported: "no asset panel seen".
+
+**Seventy points a layer.** Every layer drew two rows: its switches, and then a
+"follows" combo and a layer-kind combo. Those are settings changed once and left
+alone, so they now belong to the layer being worked on, and every other layer is
+one row. A fifteen-layer character - an ordinary rig - went from taller than the
+window to a third of it.
+
+**Six hundred points of tool settings** sat in Properties whatever tool was
+selected: the whole Brush section, the Magic Wand's two dials, and a View
+section of ten checkboxes every one of which is also on the View menu with its
+shortcut beside it. All three are rolled up now, and remembered once opened.
+
+**The scrollbar that "overlapped" the Layers panel** was in the right place all
+along - a probe of the real dock geometry put the drawing area at `0..1236` and
+the panel at `1236..1680`, touching but not overlapping. It *looked* wrong
+because it was drawn flush to that seam in almost the panel's own grey, so what
+the eye saw was the panel wearing a scrollbar. It is inset four points now,
+rounded, translucent over the artwork: the stage's furniture, looking like the
+stage's.
+
+**And panels in a column were separated by a hairline and nothing else**, which
+is why the Library "looked obscure" and the panel below it read as absent rather
+than as further down. Each header is a filled strip the width of the panel.
+
+`crates/buzz-ui/tests/dock_columns.rs` keeps all of it honest: three tests that
+draw real panels into a real column and fail if the total exceeds the window,
+including one with a fifteen-layer character in it.
+
+### ✅ A launcher that cannot run last build's program
+
+The round trip that produced the paragraph above had a second cause, and it is
+worth its own note. Windows will not replace a running `.exe`, and cargo's
+message for it - `failed to remove file ... Access is denied (os error 5)` -
+does not mention that. The old binary stays where it is, so anything that skips
+past the error runs **last build's program**, and every fix looks as though it
+did nothing.
+
+The launcher now checks for a running copy before it builds and says so plainly,
+and its build-failed message says which binary is still sitting in `target/`.
+
+---
+
 ## 5. Current metrics
 
 | Measure | Value |
@@ -3209,6 +3269,8 @@ down here has not been finished.
 | 168 | **Layer transparency fades the working view only.** Animate's does the same, and for the same reason: it is a thing you do to see what you are drawing, not a property of the film. A layer meant to be genuinely see-through in the finished picture wants an alpha on its artwork instead. | By design |
 | 169 | **A dock column has one scrollbar, so a long panel scrolls the whole column.** The Library is the exception, at a fixed three hundred points, because a big library would otherwise carry everything below it out of reach. The general answer - each panel with its own bounded height, dragged by a splitter - is what Animate has and is a layout engine in its own right. | Follow-up |
 | 170 | **Rolled-up panels are remembered in the workspace, not per document.** A preference belonging to the person, like the theme and the dock widths, and it must not travel inside a `.buzz` file. | By design |
+| 171 | **Layer parenting and layer kind are shown for the selected layer only.** Animate has them as columns on every row; here they are two combo boxes, and drawn on every layer they cost seventy points each and pushed every panel below the Layers panel off the window. They are set once and then left, so they follow the selection. | By design |
+| 172 | **Brush, Magic Wand and View settings in Properties start rolled up.** They are tool settings and view settings in a panel about the document and the selection, and open they were six hundred points of it. Everything in the View section is also on the View menu. | By design |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |

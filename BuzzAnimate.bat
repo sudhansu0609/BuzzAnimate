@@ -46,6 +46,28 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem --- refuse to build over a copy that is already running -------------------
+rem
+rem  Windows will not let cargo replace a running .exe, and cargo's message for
+rem  it is "failed to remove file ... Access is denied (os error 5)", which
+rem  says nothing about the cause. Worse, the old binary is still sitting there
+rem  afterwards, so anything that skips the error runs last build's program and
+rem  every fix looks as though it did nothing. Ask first, and say why.
+tasklist /FI "IMAGENAME eq buzzanimate.exe" 2>nul | find /I "buzzanimate.exe" >nul
+if not errorlevel 1 (
+    echo.
+    echo   BuzzAnimate is already running.
+    echo.
+    echo   Windows will not let a running program be replaced, so the build
+    echo   would fail and this would start the OLD copy again - which looks
+    echo   exactly like a fix that did not work.
+    echo.
+    echo   Close BuzzAnimate and run this again.
+    echo.
+    pause
+    exit /b 1
+)
+
 echo Building BuzzAnimate ^(%PROFILE%^)...
 if "%PROFILE%"=="release" (
     cargo build --release -p buzz-app
@@ -54,7 +76,9 @@ if "%PROFILE%"=="release" (
 )
 if errorlevel 1 (
     echo.
-    echo   The build failed. Nothing was started.
+    echo   The build failed. Nothing was started - the binary in
+    echo   target\%PROFILE_DIR%\ is whatever was there before, and is NOT what
+    echo   the sources say. Fix the build before running it.
     echo.
     pause
     exit /b 1

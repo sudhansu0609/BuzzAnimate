@@ -1673,7 +1673,9 @@ impl App {
     /// moved into place. The extent therefore grows with the drawing rather
     /// than being a fixed canvas the way Animate's is.
     fn stage_scrollbars(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
-        const THICKNESS: f32 = 10.0;
+        const THICKNESS: f32 = 9.0;
+        /// How far the bars sit in from the edge of the drawing area.
+        const INSET: f32 = 4.0;
         if area.width() < 120.0 || area.height() < 120.0 {
             return;
         }
@@ -1689,9 +1691,19 @@ impl App {
             return;
         }
 
-        let track_colour = buzz_ui::Palette::chrome();
-        let thumb_colour = buzz_ui::Palette::raised();
+        // **Inset, translucent and rounded**, so it reads as something floating
+        // over the drawing area rather than as part of the panel beside it.
+        //
+        // Drawn flush to the edge in the panel colour, it butted straight up
+        // against the Layers panel with no gap and in almost the same grey, and
+        // what a user sees then is the panel wearing a scrollbar. The stage's
+        // furniture has to look like the stage's.
+        let track_colour = egui::Color32::from_black_alpha(70);
+        let thumb_colour = buzz_ui::Palette::text_dim().gamma_multiply(0.85);
         let thumb_hot = buzz_ui::Palette::active();
+        // Clear of the panel edge, and clear of the corner where the two bars
+        // would otherwise meet.
+        let area = area.shrink(INSET);
 
         let mut moved: Option<(f64, f64)> = None;
 
@@ -1710,10 +1722,11 @@ impl App {
             );
             let (thumb, fraction) =
                 thumb_of(track, extent.x0, extent.x1, visible.x0, visible.x1, true);
-            ui.painter().rect_filled(track, 0.0, track_colour);
+            ui.painter()
+                .rect_filled(track, THICKNESS / 2.0, track_colour);
             ui.painter().rect_filled(
                 thumb,
-                2.0,
+                THICKNESS / 2.0,
                 if response.hovered() || response.dragged() {
                     thumb_hot
                 } else {
@@ -1748,10 +1761,11 @@ impl App {
                 egui::Sense::click_and_drag(),
             );
             let (thumb, _) = thumb_of(track, extent.y0, extent.y1, visible.y0, visible.y1, false);
-            ui.painter().rect_filled(track, 0.0, track_colour);
+            ui.painter()
+                .rect_filled(track, THICKNESS / 2.0, track_colour);
             ui.painter().rect_filled(
                 thumb,
-                2.0,
+                THICKNESS / 2.0,
                 if response.hovered() || response.dragged() {
                     thumb_hot
                 } else {
@@ -3133,68 +3147,83 @@ fn panel_header(
 ) -> Option<buzz_ui::Dock> {
     let mut moved = None;
 
-    ui.horizontal(|ui| {
-        // The roll-up triangle, where every collapsible thing keeps one. Only
-        // docked panels get it: a floating window already has a close button,
-        // and rolling one up would leave a title bar adrift over the stage.
-        if let Some(collapsed) = collapsed {
-            let glyph = if *collapsed { "\u{25b8}" } else { "\u{25be}" };
-            if ui
-                .add(egui::Button::new(egui::RichText::new(glyph).small()).frame(false))
-                .on_hover_text(if *collapsed { "Open" } else { "Roll up" })
-                .clicked()
-            {
-                *collapsed = !*collapsed;
+    // **A header that looks like a header.**
+    //
+    // Panels in a column were separated by a hairline and nothing else, so a
+    // column of them read as one long undifferentiated list — which is why the
+    // Library "looked obscure" and the Assets panel below it was reported
+    // missing rather than merely out of sight. A filled strip the width of the
+    // panel says plainly where one panel stops and the next begins.
+    let frame = egui::Frame::new()
+        .fill(Palette::raised())
+        .inner_margin(egui::Margin::symmetric(4, 2))
+        .corner_radius(3);
+
+    frame.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.set_width(ui.available_width());
+            // The roll-up triangle, where every collapsible thing keeps one. Only
+            // docked panels get it: a floating window already has a close button,
+            // and rolling one up would leave a title bar adrift over the stage.
+            if let Some(collapsed) = collapsed {
+                let glyph = if *collapsed { "\u{25b8}" } else { "\u{25be}" };
+                if ui
+                    .add(egui::Button::new(egui::RichText::new(glyph).small()).frame(false))
+                    .on_hover_text(if *collapsed { "Open" } else { "Roll up" })
+                    .clicked()
+                {
+                    *collapsed = !*collapsed;
+                }
             }
-        }
 
-        // Only the panels with no heading of their own are named here. The
-        // rest would read their name twice \u2014 which is exactly how the first
-        // version looked.
-        //
-        // Rolled up, every panel is named: the title bar is all that is left of
-        // it, and an unlabelled strip is not a panel, it is a smudge.
-        if named {
-            ui.label(
-                egui::RichText::new(id.title())
-                    .small()
-                    .color(Palette::text_dim()),
-            );
-        }
+            // Only the panels with no heading of their own are named here. The
+            // rest would read their name twice \u2014 which is exactly how the first
+            // version looked.
+            //
+            // Rolled up, every panel is named: the title bar is all that is left of
+            // it, and an unlabelled strip is not a panel, it is a smudge.
+            if named {
+                ui.label(
+                    egui::RichText::new(id.title())
+                        .small()
+                        .color(Palette::text_dim()),
+                );
+            }
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Three bars, drawn as text: this one *is* in egui's bundled font,
-            // unlike most symbols — and it is checked by a test rather than
-            // assumed, because that assumption has been wrong twice.
-            ui.menu_button(egui::RichText::new(PANEL_MENU).small(), |ui| {
-                if locked {
-                    ui.label(egui::RichText::new("The layout is locked").small().weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Three bars, drawn as text: this one *is* in egui's bundled font,
+                // unlike most symbols — and it is checked by a test rather than
+                // assumed, because that assumption has been wrong twice.
+                ui.menu_button(egui::RichText::new(PANEL_MENU).small(), |ui| {
+                    if locked {
+                        ui.label(egui::RichText::new("The layout is locked").small().weak());
+                        ui.separator();
+                    }
+
+                    for dock in buzz_ui::Dock::CHOICES {
+                        if ui
+                            .add_enabled(
+                                !locked || dock == buzz_ui::Dock::Hidden,
+                                egui::Button::new(dock.label()),
+                            )
+                            .clicked()
+                        {
+                            moved = Some(dock);
+                            ui.close();
+                        }
+                    }
+
                     ui.separator();
-                }
-
-                for dock in buzz_ui::Dock::CHOICES {
-                    if ui
-                        .add_enabled(
-                            !locked || dock == buzz_ui::Dock::Hidden,
-                            egui::Button::new(dock.label()),
-                        )
-                        .clicked()
-                    {
-                        moved = Some(dock);
-                        ui.close();
+                    for (label, delta) in [("Move Up", -1), ("Move Down", 1)] {
+                        if ui.add_enabled(!locked, egui::Button::new(label)).clicked() {
+                            reorders.push((id, delta));
+                            ui.close();
+                        }
                     }
-                }
-
-                ui.separator();
-                for (label, delta) in [("Move Up", -1), ("Move Down", 1)] {
-                    if ui.add_enabled(!locked, egui::Button::new(label)).clicked() {
-                        reorders.push((id, delta));
-                        ui.close();
-                    }
-                }
-            })
-            .response
-            .on_hover_text("Move, float or close this panel");
+                })
+                .response
+                .on_hover_text("Move, float or close this panel");
+            });
         });
     });
 

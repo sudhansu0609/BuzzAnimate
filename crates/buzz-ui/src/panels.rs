@@ -819,9 +819,6 @@ fn instance_properties(
 /// too much look the same until you look at what is left. So they sit beside
 /// the brush settings, in the same place, rather than behind a menu.
 fn wand_properties(ui: &mut Ui, style: &mut DrawStyle) {
-    ui.add_space(8.0);
-    ui.label(RichText::new("Magic Wand").strong());
-
     egui::Grid::new("wand-props").num_columns(2).show(ui, |ui| {
         ui.label("Tolerance");
         // Shown 0–255, which is the scale every other editor uses and the one
@@ -853,9 +850,6 @@ fn wand_properties(ui: &mut Ui, style: &mut DrawStyle) {
 /// than the deviation.
 fn brush_properties(ui: &mut Ui, style: &mut DrawStyle) {
     use crate::brush::{BrushKind, PatternShape};
-
-    ui.add_space(8.0);
-    ui.label(RichText::new("Brush").strong());
 
     egui::Grid::new("brush-props").num_columns(2).show(ui, |ui| {
         ui.label("Type");
@@ -1161,8 +1155,21 @@ pub fn properties_panel(
         changed |= spatial_properties(ui, scene, id, at);
     }
 
-    brush_properties(ui, style);
-    wand_properties(ui, style);
+    // **Rolled up, not gone.**
+    //
+    // These two are settings for one tool each, and open they took six hundred
+    // points of a panel that also has to show the document and the selection —
+    // enough to push the Colour panel below it clean off the window. Closed by
+    // default and remembered once opened, which is what every other long
+    // section of settings does.
+    egui::CollapsingHeader::new(RichText::new("Brush").strong())
+        .id_salt("brush-section")
+        .default_open(false)
+        .show(ui, |ui| brush_properties(ui, style));
+    egui::CollapsingHeader::new(RichText::new("Magic Wand").strong())
+        .id_salt("wand-section")
+        .default_open(false)
+        .show(ui, |ui| wand_properties(ui, style));
 
     ui.add_space(8.0);
     ui.label(RichText::new("Stroke and Fill").strong());
@@ -1218,24 +1225,31 @@ pub fn properties_panel(
     }
 
     ui.add_space(8.0);
-    ui.label(RichText::new("View").strong());
-    ui.checkbox(&mut view.show_rulers, "Rulers");
-    ui.checkbox(&mut view.show_grid, "Grid");
-    ui.checkbox(&mut view.show_guides, "Guides");
-    ui.checkbox(&mut view.lock_guides, "Lock guides");
-    ui.horizontal(|ui| {
-        ui.label("Grid size");
-        ui.add(
-            egui::DragValue::new(&mut view.grid_spacing)
-                .range(0.1..=1000.0)
-                .speed(0.5),
-        );
-    });
-    ui.label(RichText::new("Snap to").small().weak());
-    ui.checkbox(&mut view.snap.to_guides, "Guides");
-    ui.checkbox(&mut view.snap.to_grid, "Grid");
-    ui.checkbox(&mut view.snap.to_objects, "Objects");
-    ui.checkbox(&mut view.snap.to_pixels, "Pixels");
+    // **Rolled up.** Ten checkboxes and a number, every one of which is also on
+    // the View menu with its keyboard shortcut beside it. Open, they were a
+    // quarter of the panel's height for settings chosen once a project.
+    egui::CollapsingHeader::new(RichText::new("View").strong())
+        .id_salt("view-section")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.checkbox(&mut view.show_rulers, "Rulers");
+            ui.checkbox(&mut view.show_grid, "Grid");
+            ui.checkbox(&mut view.show_guides, "Guides");
+            ui.checkbox(&mut view.lock_guides, "Lock guides");
+            ui.horizontal(|ui| {
+                ui.label("Grid size");
+                ui.add(
+                    egui::DragValue::new(&mut view.grid_spacing)
+                        .range(0.1..=1000.0)
+                        .speed(0.5),
+                );
+            });
+            ui.label(RichText::new("Snap to").small().weak());
+            ui.checkbox(&mut view.snap.to_guides, "Guides");
+            ui.checkbox(&mut view.snap.to_grid, "Grid");
+            ui.checkbox(&mut view.snap.to_objects, "Objects");
+            ui.checkbox(&mut view.snap.to_pixels, "Pixels");
+        });
 
     changed
 }
@@ -1856,6 +1870,32 @@ pub fn layers_panel(
             }
         });
 
+        if set_visible != visible
+            || set_locked != locked
+            || set_outline != outline
+            || set_alpha != alpha
+        {
+            scene.update_layer(id, |l| {
+                l.visible = set_visible;
+                l.locked = set_locked;
+                l.outline = set_outline;
+                l.alpha = set_alpha;
+            });
+        }
+
+        // **The second row belongs to the layer being worked on, and only to
+        // it.**
+        //
+        // Parenting and layer kind were drawn for every layer, which put two
+        // rows and seventy points on each. Twenty layers — an ordinary
+        // character — filled the whole column with them, and everything below
+        // the Layers panel went off the bottom of the window. They are settings
+        // changed once and then left alone, so they belong to the selection,
+        // which is exactly what Animate's Layer Properties does with them.
+        if active != Some(id) {
+            continue;
+        }
+
         // Animate's Parent column: which layer this one follows, so
         // moving that layer's artwork moves this layer's with it.
         let follows = names
@@ -1936,19 +1976,6 @@ pub fn layers_panel(
                     .on_hover_text(layer_kind_hint(kind));
             }
         });
-
-        if set_visible != visible
-            || set_locked != locked
-            || set_outline != outline
-            || set_alpha != alpha
-        {
-            scene.update_layer(id, |l| {
-                l.visible = set_visible;
-                l.locked = set_locked;
-                l.outline = set_outline;
-                l.alpha = set_alpha;
-            });
-        }
     }
 
     if let Some((layer, follows)) = set_follows {

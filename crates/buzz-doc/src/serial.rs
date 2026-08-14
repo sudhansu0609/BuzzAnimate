@@ -69,7 +69,7 @@ use serde::{Deserialize, Serialize};
 /// keyframe at frame 0, which is exactly what it meant; version 2 simply has
 /// no library and no tweens, and both default to empty. Keeping those paths is
 /// cheap and it exercises the version check for real rather than in theory.
-pub const FORMAT_VERSION: u32 = 17;
+pub const FORMAT_VERSION: u32 = 18;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -589,6 +589,10 @@ pub struct LayerDto {
     pub locked: bool,
     #[serde(default)]
     pub outline: bool,
+    /// Working transparency. Version 18; absent means fully solid, which is
+    /// every layer of every older document.
+    #[serde(default = "full", skip_serializing_if = "is_one")]
+    pub alpha: f64,
     pub color: String,
     #[serde(default)]
     pub height: LayerHeight,
@@ -617,6 +621,15 @@ fn one() -> u32 {
 
 fn is_zero(value: &f64) -> bool {
     *value == 0.0
+}
+
+/// The default for a fraction whose absence means "all of it".
+fn full() -> f64 {
+    1.0
+}
+
+fn is_one(value: &f64) -> bool {
+    *value == 1.0
 }
 
 /// An angle from a file, made safe. A corrupt one must not turn an object into
@@ -1148,6 +1161,7 @@ impl LayerDto {
             visible: layer.visible,
             locked: layer.locked,
             outline: layer.outline,
+            alpha: layer.alpha,
             color: color_to_hex(layer.color),
             height: layer.height,
             depth: layer.depth,
@@ -1186,6 +1200,14 @@ impl LayerDto {
         layer.visible = self.visible;
         layer.locked = self.locked;
         layer.outline = self.outline;
+        // Clamped on the way in: a document written by hand, or by a build
+        // that meant something else by this number, must not make a layer
+        // invisible or brighter than it can be.
+        layer.alpha = if self.alpha.is_finite() {
+            self.alpha.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         layer.color = color_from_hex(&self.color)?;
         layer.height = self.height;
         // A corrupt value must not put a layer behind the camera for good.
@@ -1877,6 +1899,7 @@ mod tests {
         scene.update_layer(art, |l| {
             l.locked = true;
             l.outline = true;
+            l.alpha = 0.4;
             l.height = LayerHeight::Double;
         });
         scene
@@ -1963,6 +1986,7 @@ mod tests {
             assert_eq!(a.kind, b.kind);
             assert_eq!(a.locked, b.locked);
             assert_eq!(a.outline, b.outline);
+            assert_eq!(a.alpha, b.alpha);
             assert_eq!(a.height, b.height);
             assert_eq!(a.objects_at(0).len(), b.objects_at(0).len());
         }
@@ -2951,5 +2975,84 @@ mod tests {
         );
         // And it resolves rather than hanging.
         assert_eq!(rig.armature.joints().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod layer_alpha_tests {
+    use super::*;
+    use buzz_scene::{LayerKind, Scene};
+
+    /// A dimmed layer stays dimmed across a save.
+    #[test]
+    fn layer_transparency_survives_the_round_trip() {
+        let mut scene = Scene::default();
+        let layer = scene.add_layer("Reference", LayerKind::Normal);
+        scene.update_layer(layer, |l| l.alpha = 0.35);
+
+        let back = DocumentDto::from_scene(&scene)
+            .to_scene()
+            .expect("round trip");
+        let after = back.layers().get(layer).expect("the layer came back");
+        assert!(
+            (after.alpha - 0.35).abs() < 1e-9,
+            "transparency was lost: {}",
+            after.alpha
+        );
+    }
+
+    /// **A document written before this existed opens fully solid.**
+    ///
+    /// The failure it prevents is silent and total: a missing field defaulting
+    /// to zero would open every layer of every older film completely invisible.
+    #[test]
+    fn a_layer_from_an_older_document_is_fully_solid() {
+        let mut scene = Scene::default();
+        scene.add_layer("Old", LayerKind::Normal);
+        let dto = DocumentDto::from_scene(&scene);
+
+        let mut json = serde_json::to_value(&dto).expect("serialise");
+        // Strip the field, exactly as a file from before version 18 has it.
+        for layer in json["layers"].as_array_mut().expect("layers") {
+            layer.as_object_mut().expect("a layer").remove("alpha");
+        }
+
+        let older: DocumentDto = serde_json::from_value(json).expect("read it back");
+        let back = older.to_scene().expect("to scene");
+        for layer in back.layers().iter() {
+            assert_eq!(
+                layer.alpha, 1.0,
+                "a layer with no transparency recorded must open solid"
+            );
+        }
+    }
+
+    /// A nonsense value in a file cannot make a layer invisible.
+    #[test]
+    fn a_corrupt_transparency_is_clamped_rather_than_believed() {
+        let mut scene = Scene::default();
+        scene.add_layer("Odd", LayerKind::Normal);
+        let dto = DocumentDto::from_scene(&scene);
+
+        for (written, want) in [(-4.0, 0.0), (17.0, 1.0), (f64::NAN, 1.0)] {
+            let mut json = serde_json::to_value(&dto).expect("serialise");
+            for layer in json["layers"].as_array_mut().expect("layers") {
+                let value = serde_json::Number::from_f64(written)
+                    .map(serde_json::Value::Number)
+                    // NaN has no JSON spelling; a null exercises the default.
+                    .unwrap_or(serde_json::Value::Null);
+                layer
+                    .as_object_mut()
+                    .expect("a layer")
+                    .insert("alpha".into(), value);
+            }
+            let Ok(read): Result<DocumentDto, _> = serde_json::from_value(json) else {
+                continue;
+            };
+            let back = read.to_scene().expect("to scene");
+            for layer in back.layers().iter() {
+                assert_eq!(layer.alpha, want, "{written} should have been clamped");
+            }
+        }
     }
 }

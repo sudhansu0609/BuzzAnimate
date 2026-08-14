@@ -79,14 +79,11 @@ pub fn rig_panel(ui: &mut Ui, armature: Option<&Armature>) -> RigResponse {
 
     ui.separator();
 
-    egui::ScrollArea::vertical()
-        .id_salt("armature-bones")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for (index, bone) in armature.bones.iter().enumerate() {
-                bone_row(ui, index, bone, &mut response);
-            }
-        });
+    // The dock column already scrolls; see the note on `tool_bar`.
+
+    for (index, bone) in armature.bones.iter().enumerate() {
+        bone_row(ui, index, bone, &mut response);
+    }
 
     response
 }

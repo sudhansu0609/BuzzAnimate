@@ -262,18 +262,15 @@ impl Canvas {
             let alpha = (f64::from(*c) * flow).round().clamp(0.0, 255.0) as u8;
             pixels.extend_from_slice(&[rgba[0], rgba[1], rgba[2], alpha]);
         }
-        ImageAsset {
+        // Painted, not read from a file: the pixels *are* the original, so
+        // there is nothing to keep beside them. Saving encodes a PNG.
+        ImageAsset::from_pixels(
             id,
-            name: name.into(),
-            // Painted, not read from a file: the pixels *are* the original, so
-            // there is nothing to keep beside them. Saving encodes a PNG.
-            source: std::sync::Arc::new(Vec::new()),
-            format: "png".into(),
-            width: self.width,
-            height: self.height,
-            pixels: std::sync::Arc::new(pixels),
-            generation: 0,
-        }
+            name,
+            self.width,
+            self.height,
+            std::sync::Arc::new(pixels),
+        )
     }
 }
 

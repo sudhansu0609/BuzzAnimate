@@ -482,16 +482,13 @@ mod tests {
                 }
             }
         }
-        Arc::new(ImageAsset {
-            id: crate::ImageId(1),
-            name: "Disc".into(),
-            source: Arc::new(Vec::new()),
-            format: "png".into(),
-            width: size,
-            height: size,
-            pixels: Arc::new(pixels),
-            generation: 0,
-        })
+        Arc::new(ImageAsset::from_pixels(
+            crate::ImageId(1),
+            "Disc",
+            size,
+            size,
+            Arc::new(pixels),
+        ))
     }
 
     #[test]
@@ -519,16 +516,13 @@ mod tests {
                 pixels.extend_from_slice(&[v, v, v, 255]);
             }
         }
-        let asset = Arc::new(ImageAsset {
-            id: crate::ImageId(2),
-            name: "Ramp".into(),
-            source: Arc::new(Vec::new()),
-            format: "png".into(),
-            width: 64,
-            height: 8,
-            pixels: Arc::new(pixels),
-            generation: 0,
-        });
+        let asset = Arc::new(ImageAsset::from_pixels(
+            crate::ImageId(2),
+            "Ramp",
+            64,
+            8,
+            Arc::new(pixels),
+        ));
 
         let exact = flood(
             &asset,
@@ -566,16 +560,13 @@ mod tests {
                 pixels.extend_from_slice(&[v, v, v, 255]);
             }
         }
-        let asset = Arc::new(ImageAsset {
-            id: crate::ImageId(3),
-            name: "Wall".into(),
-            source: Arc::new(Vec::new()),
-            format: "png".into(),
-            width: w,
-            height: h,
-            pixels: Arc::new(pixels),
-            generation: 0,
-        });
+        let asset = Arc::new(ImageAsset::from_pixels(
+            crate::ImageId(3),
+            "Wall",
+            w,
+            h,
+            Arc::new(pixels),
+        ));
 
         let near = flood(&asset, (2, 4), WandOptions::default()).unwrap();
         assert_eq!(near.count(), 14 * 8, "stopped at the wall");
@@ -642,16 +633,13 @@ mod tests {
                 }
             }
         }
-        let asset = Arc::new(ImageAsset {
-            id: crate::ImageId(4),
-            name: "Ring".into(),
-            source: Arc::new(Vec::new()),
-            format: "png".into(),
-            width: size,
-            height: size,
-            pixels: Arc::new(pixels),
-            generation: 0,
-        });
+        let asset = Arc::new(ImageAsset::from_pixels(
+            crate::ImageId(4),
+            "Ring",
+            size,
+            size,
+            Arc::new(pixels),
+        ));
 
         let mask = flood(&asset, (32, 32 - 17), WandOptions::default()).unwrap();
         let path = trace(&mask, 0.5);

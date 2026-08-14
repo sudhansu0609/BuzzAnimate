@@ -160,6 +160,14 @@ pub struct Slot {
     /// Where a floating panel sits, and how big it is.
     pub float_pos: (f32, f32),
     pub float_size: (f32, f32),
+    /// Rolled up to its title bar.
+    ///
+    /// A dock column holds nine panels in the default layout, and a column is
+    /// as tall as the window. Without this, reaching the ninth means scrolling
+    /// past the other eight every time — so the ones an animator opens
+    /// occasionally start rolled up, and the ones they live in start open.
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 /// The whole arrangement.
@@ -242,10 +250,15 @@ impl Workspace {
             dock,
             home,
             order,
+            collapsed: false,
             // Floating panels start over the stage rather than at the origin,
             // where they would sit under the menu bar.
             float_pos: (320.0 + order as f32 * 24.0, 140.0 + order as f32 * 24.0),
             float_size: (300.0, 380.0),
+        };
+        let rolled = |id: PanelId, dock: Dock, order: u32, home: Dock| Slot {
+            collapsed: true,
+            ..slot(id, dock, order, home)
         };
 
         Self {
@@ -259,11 +272,14 @@ impl Workspace {
                 // reached for. Animate docks Swatches with Color for the same
                 // reason.
                 slot(PanelId::Swatches, Dock::Right, 3, Dock::Right),
-                slot(PanelId::Depth, Dock::Right, 4, Dock::Right),
-                slot(PanelId::Rig, Dock::Right, 5, Dock::Right),
-                slot(PanelId::Filters, Dock::Right, 6, Dock::Right),
-                slot(PanelId::Lighting, Dock::Right, 7, Dock::Right),
-                slot(PanelId::Sound, Dock::Right, 8, Dock::Right),
+                // Rolled up to begin with. Each of these is reached for now
+                // and then rather than all day, and open they buried the
+                // Library and the Assets panel below the fold.
+                rolled(PanelId::Depth, Dock::Right, 4, Dock::Right),
+                rolled(PanelId::Rig, Dock::Right, 5, Dock::Right),
+                rolled(PanelId::Filters, Dock::Right, 6, Dock::Right),
+                rolled(PanelId::Lighting, Dock::Right, 7, Dock::Right),
+                rolled(PanelId::Sound, Dock::Right, 8, Dock::Right),
                 slot(PanelId::Library, Dock::RightOuter, 0, Dock::RightOuter),
                 // Beside the Library, which is the panel it is most often
                 // compared with: one holds this film's symbols, the other
@@ -357,6 +373,18 @@ impl Workspace {
     ///
     /// Allowed while locked: a locked *layout* is about where things are, and
     /// an animator still needs to open the Actions panel and close it again.
+    /// Roll a panel up, or open it again.
+    pub fn toggle_collapsed(&mut self, id: PanelId) {
+        if let Some(slot) = self.slot_mut(id) {
+            slot.collapsed = !slot.collapsed;
+        }
+    }
+
+    /// Is this panel rolled up to its title bar?
+    pub fn is_collapsed(&self, id: PanelId) -> bool {
+        self.slot(id).is_some_and(|s| s.collapsed)
+    }
+
     pub fn toggle(&mut self, id: PanelId) {
         let hidden = self.dock_of(id) == Dock::Hidden;
         let locked = self.locked;

@@ -106,10 +106,23 @@ pub fn library_panel(ui: &mut Ui, scene: &mut Scene, state: &mut LibraryState) -
 
     let usage = scene.symbol_usage();
 
+    // **A fixed height, not the room available.**
+    //
+    // This panel keeps a scroll area of its own, because a library of three
+    // hundred symbols has to be scrollable without carrying the whole dock
+    // column with it. But it sits *inside* the column's scroll area, and there
+    // `available_height` is not the height of the window — it is however much
+    // room the column is willing to promise, which is effectively all of it.
+    // Asking for that meant the library grew to fill the column and pushed the
+    // Assets panel below it clean off the bottom of the screen, where nobody
+    // was ever going to find it.
+    //
+    // So: a definite number of rows. Enough to browse in, and never enough to
+    // hide what comes after it.
     egui::ScrollArea::vertical()
         .id_salt("library-items")
-        .auto_shrink([false, false])
-        .max_height(ui.available_height() - 60.0)
+        .auto_shrink([false, true])
+        .max_height(300.0)
         .show(ui, |ui| {
             if scene.library().is_empty() {
                 ui.add_space(8.0);

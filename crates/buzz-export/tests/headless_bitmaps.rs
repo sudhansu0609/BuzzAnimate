@@ -51,16 +51,13 @@ fn quadrants() -> Arc<ImageAsset> {
             pixels.extend_from_slice(&c);
         }
     }
-    Arc::new(ImageAsset {
-        id: ImageId(1),
-        name: "Quadrants".into(),
-        source: Arc::new(Vec::new()),
-        format: "png".into(),
-        width: 4,
-        height: 4,
-        pixels: Arc::new(pixels),
-        generation: 0,
-    })
+    Arc::new(ImageAsset::from_pixels(
+        ImageId(1),
+        "Quadrants",
+        4,
+        4,
+        Arc::new(pixels),
+    ))
 }
 
 /// A stage with the image filling a rectangle.
@@ -223,16 +220,13 @@ fn a_transparent_bitmap_shows_what_is_behind_it() {
                 }
             }
         }
-        let asset = Arc::new(ImageAsset {
-            id: ImageId(2),
-            name: "Half".into(),
-            source: Arc::new(Vec::new()),
-            format: "png".into(),
-            width: 2,
-            height: 2,
-            pixels: Arc::new(pixels),
-            generation: 0,
-        });
+        let asset = Arc::new(ImageAsset::from_pixels(
+            ImageId(2),
+            "Half",
+            2,
+            2,
+            Arc::new(pixels),
+        ));
 
         let area = Rect::new(100.0, 50.0, 400.0, 350.0);
         let scene = staged(asset, area);
@@ -323,5 +317,66 @@ fn a_soft_stroke_fades_into_the_background_on_the_gpu() {
             );
             last = here;
         }
+    });
+}
+
+/// **A dimmed layer is dimmed while you work, and never in the film.**
+///
+/// Layer transparency is an authoring aid — fade a reference layer to draw over
+/// it, fade the foreground to see behind it — and a film that shipped faded
+/// because somebody left a layer at 40% would be a trap rather than a feature.
+/// So the flag that applies it is off in the export's options and on in the
+/// stage's, and this checks both halves of that on the real GPU.
+#[test]
+fn layer_transparency_fades_the_working_view_and_not_the_export() {
+    with_exporter(|exporter| {
+        let mut scene = Scene::default();
+        scene.stage_mut().background = Color::WHITE;
+        let layer = scene.add_layer("Reference", LayerKind::Normal);
+        scene.add_shape(
+            layer,
+            ShapeData {
+                path: Rect::new(100.0, 100.0, 400.0, 300.0).to_path(1e-9),
+                fill: Some(FillSpec::solid(Color::BLACK)),
+                stroke: None,
+                blend: buzz_scene::PaintBlend::Normal,
+            },
+        );
+
+        let settings = ExportSettings::for_stage(&scene);
+        let solid = exporter.render(&scene, 0, &settings).expect("render");
+        assert!(
+            solid.pixel(250, 200)[0] < 20,
+            "the shape should be black to begin with"
+        );
+
+        scene.update_layer(layer, |l| l.alpha = 0.25);
+
+        // The export: unchanged. This is the half that matters most.
+        let exported = exporter.render(&scene, 0, &settings).expect("render");
+        assert!(
+            exported.pixel(250, 200)[0] < 20,
+            "a dimmed layer must export at full strength, and came out {}",
+            exported.pixel(250, 200)[0]
+        );
+
+        // The working view: faded, and by about the amount asked for. Black at
+        // a quarter over white lands near three quarters of the way to white.
+        let working = exporter
+            .render_with(
+                &scene,
+                0,
+                &settings,
+                &buzz_render::document::FrameOptions {
+                    layer_alpha: true,
+                    ..buzz_render::document::FrameOptions::default()
+                },
+            )
+            .expect("render");
+        let grey = working.pixel(250, 200)[0];
+        assert!(
+            (150..=210).contains(&grey),
+            "a quarter-strength black over white should be a light grey, and is {grey}"
+        );
     });
 }

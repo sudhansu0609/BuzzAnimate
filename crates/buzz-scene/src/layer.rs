@@ -159,6 +159,18 @@ pub struct Layer {
     pub locked: bool,
     /// The outline column: draw artwork as outlines in the layer colour.
     pub outline: bool,
+    /// How solid this layer is drawn **while working**, `0.0`–`1.0`.
+    ///
+    /// Animate's layer transparency, and like Animate's it is an authoring aid
+    /// rather than a property of the film: the export draws every layer at full
+    /// strength. That is the whole use of it — dimming a reference layer to
+    /// draw over, or fading the foreground to see what is behind it, without
+    /// changing a frame of what is delivered. A layer meant to be genuinely
+    /// see-through in the film wants an alpha on its artwork instead.
+    ///
+    /// Hiding a layer is a different thing and stays a different thing:
+    /// [`Self::visible`] takes it out of the export too.
+    pub alpha: f64,
     /// Tint used for outline view and selection highlights.
     pub color: Color,
     pub height: LayerHeight,
@@ -226,6 +238,7 @@ impl Layer {
             visible: true,
             locked: false,
             outline: false,
+            alpha: 1.0,
             height: LayerHeight::Normal,
             // On the focal plane, so a new layer is unaffected by perspective.
             depth: 0.0,

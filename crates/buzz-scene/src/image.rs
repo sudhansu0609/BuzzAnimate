@@ -54,23 +54,33 @@ pub struct ImageAsset {
     /// or a half-transparent red and an opaque dark red become the same
     /// number and the wand selects across an edge that is plainly there.
     pub pixels: Arc<Vec<u8>>,
-    /// Bumped whenever the pixels change.
+    /// What the renderer's cache calls **these exact pixels**.
     ///
-    /// # Why this exists, and what breaks without it
+    /// # Why this exists
     ///
-    /// The GPU keeps its own copy of every bitmap, and it decides whether the
-    /// copy it has is still good by comparing an *identifier* — not the pixels,
-    /// which is the whole point of having a cache. Vello's identifier comes
-    /// from `peniko::Blob`, and `Blob::new` takes a fresh number from a global
-    /// counter every single time it is called. Building the brush per frame
-    /// therefore produced a new identity per frame, and a four-megapixel
-    /// photograph was re-uploaded sixty times a second for as long as it was on
-    /// screen.
+    /// The GPU keeps its own copy of every bitmap, and decides whether that
+    /// copy is still good by comparing an identifier — not the pixels, which is
+    /// the whole point of having a cache. Vello's identifier comes from
+    /// `peniko::Blob`, and `Blob::new` takes a fresh number from a global
+    /// counter on every call, so building the image brush once per frame made
+    /// every frame a cache miss: a four-megapixel photograph re-uploaded sixty
+    /// times a second for as long as it was on screen.
     ///
-    /// So the identifier is built from [`ImageAsset::id`] and this counter
-    /// instead: stable while the picture is, different the instant it is
-    /// painted on. See [`ImageAsset::blob_id`].
-    pub generation: u64,
+    /// # Why it is *issued* rather than worked out
+    ///
+    /// The obvious identity is `id` and a change counter. It is wrong, and the
+    /// way it is wrong is nasty: two `ImageAsset`s can carry the same
+    /// [`ImageId`] and hold **different pixels** — a document opened twice, an
+    /// import run again, a symbol duplicated, or simply two tests building the
+    /// same fixture. Vello's atlas keeps whichever arrived first under that
+    /// identity and quietly serves it to everyone after, so the second picture
+    /// draws as the first, or as nothing at all.
+    ///
+    /// So identity is taken from a counter, never derived from anything a
+    /// caller can duplicate, and it is not reused. Copying an asset copies its
+    /// identity — that is right, because the pixels are the same pixels — and
+    /// [`ImageAsset::edit_pixels`] takes a new one, because they are not.
+    identity: u64,
 }
 
 /// Why a bitmap could not be read.
@@ -92,6 +102,15 @@ pub enum ImageError {
 /// process would die with no explanation. Sixteen thousand covers any
 /// reasonable scan or photograph at four times 4K.
 pub const MAX_IMAGE_SIDE: u32 = 16_384;
+
+/// The next never-yet-used bitmap identity.
+///
+/// Monotonic and never reused. At one identity per painted stroke it would take
+/// longer than the universe has existed to wrap.
+fn next_identity() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 impl ImageAsset {
     /// Decode a file into an asset, keeping the original bytes.
@@ -134,7 +153,7 @@ impl ImageAsset {
             width,
             height,
             pixels: Arc::new(rgba.into_raw()),
-            generation: 0,
+            identity: next_identity(),
         })
     }
 
@@ -150,7 +169,7 @@ impl ImageAsset {
             width,
             height,
             pixels: Arc::new(vec![0; (width as usize) * (height as usize) * 4]),
-            generation: 0,
+            identity: next_identity(),
         }
     }
 
@@ -191,49 +210,50 @@ impl ImageAsset {
         buzz_geom::Size::new(f64::from(self.width), f64::from(self.height))
     }
 
-    /// A number that identifies **these pixels**, for the renderer's cache.
+    /// Build an asset from pixels already in hand.
     ///
-    /// Stable across frames while the picture is unchanged, and different as
-    /// soon as it is painted on. Spread across the whole 64-bit range rather
-    /// than counted, so it cannot collide with the small sequential numbers
-    /// that fonts and other blobs take from `Blob::new`.
-    pub fn blob_id(&self) -> u64 {
-        // Two rounds of a cheap mixer. The id and the generation both start at
-        // small numbers, and a plain XOR of two small numbers is a small number
-        // — two different assets would land close enough together to be worth
-        // worrying about.
-        let mut h = self.id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h ^= h >> 29;
-        h = h.wrapping_add(self.generation.wrapping_mul(0xBF58_476D_1CE4_E5B9));
-        h ^= h >> 32;
-        h
+    /// **The only way to make one**, because it is the only way to be sure the
+    /// identity is fresh — see the note on `identity`. A struct literal could
+    /// give two different pictures the same one, and the renderer would then
+    /// draw whichever it saw first for both.
+    pub fn from_pixels(
+        id: ImageId,
+        name: impl Into<String>,
+        width: u32,
+        height: u32,
+        pixels: Arc<Vec<u8>>,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            source: Arc::new(Vec::new()),
+            format: "png".to_string(),
+            width,
+            height,
+            pixels,
+            identity: next_identity(),
+        }
     }
 
-    /// Mark this bitmap as one that is rebuilt every frame.
-    ///
-    /// # Why a picture would ever want *not* to be cached
-    ///
-    /// A brush preview is new pixels on every pointer move, built from scratch
-    /// and thrown away. It is not in the library and has no id of its own, so
-    /// caching by id and generation would give every one of them the same
-    /// identity — and the renderer, correctly believing it already had that
-    /// picture, would go on showing the first frame of the stroke while the
-    /// user carried on drawing. So a transient bitmap takes a fresh number, and
-    /// this is the one place where paying for an upload every frame is right.
-    pub fn made_transient(mut self) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        self.generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.id = ImageId(u64::MAX);
+    /// The file this was decoded from, kept for saving it back unchanged.
+    pub fn with_source(mut self, source: Arc<Vec<u8>>, format: &str) -> Self {
+        self.source = source;
+        self.format = format.to_ascii_lowercase();
         self
     }
 
-    /// Edit the pixels, marking them changed so the GPU reloads them.
+    /// What the renderer's cache calls these pixels.
+    pub fn blob_id(&self) -> u64 {
+        self.identity
+    }
+
+    /// Edit the pixels, taking a new identity so the GPU reloads them.
     ///
     /// The only supported way to alter a decoded picture: writing to `pixels`
     /// directly leaves the renderer showing what was there before.
     pub fn edit_pixels(&mut self, f: impl FnOnce(&mut Vec<u8>)) {
         f(Arc::make_mut(&mut self.pixels));
-        self.generation = self.generation.wrapping_add(1);
+        self.identity = next_identity();
     }
 
     /// The pixel at `(x, y)` as straight-alpha RGBA.
@@ -408,20 +428,17 @@ mod tests {
     use super::*;
 
     fn asset(width: u32, height: u32, fill: [u8; 4]) -> Arc<ImageAsset> {
-        Arc::new(ImageAsset {
-            id: ImageId(1),
-            name: "Test".into(),
-            source: Arc::new(Vec::new()),
-            format: "png".into(),
+        Arc::new(ImageAsset::from_pixels(
+            ImageId(1),
+            "Test",
             width,
             height,
-            pixels: Arc::new(
+            Arc::new(
                 std::iter::repeat_n(fill, (width * height) as usize)
                     .flatten()
                     .collect(),
             ),
-            generation: 0,
-        })
+        ))
     }
 
     #[test]
@@ -481,16 +498,13 @@ mod tests {
                 pixels.extend_from_slice(&[0, 0, 0, 0]);
             }
         }
-        let a = Arc::new(ImageAsset {
-            id: ImageId(2),
-            name: "Cutout".into(),
-            source: Arc::new(Vec::new()),
-            format: "png".into(),
-            width: 20,
-            height: 20,
-            pixels: Arc::new(pixels),
-            generation: 0,
-        });
+        let a = Arc::new(ImageAsset::from_pixels(
+            ImageId(2),
+            "Cutout",
+            20,
+            20,
+            Arc::new(pixels),
+        ));
         let fill = ImageFill::new(a, Rect::new(0.0, 0.0, 20.0, 20.0));
         let average = fill.average_color().to_rgba8().to_u8_array();
         assert!(
@@ -509,16 +523,13 @@ mod tests {
     #[test]
     fn library_names_do_not_collide() {
         let mut library = ImageLibrary::default();
-        library.insert(ImageAsset {
-            id: ImageId(1),
-            name: "Tree".into(),
-            source: Arc::new(Vec::new()),
-            format: "png".into(),
-            width: 1,
-            height: 1,
-            pixels: Arc::new(vec![0, 0, 0, 255]),
-            generation: 0,
-        });
+        library.insert(ImageAsset::from_pixels(
+            ImageId(1),
+            "Tree",
+            1,
+            1,
+            Arc::new(vec![0, 0, 0, 255]),
+        ));
         assert_eq!(library.unique_name("Tree"), "Tree 2");
         assert_eq!(library.unique_name("Hut"), "Hut");
     }

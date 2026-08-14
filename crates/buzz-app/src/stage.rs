@@ -113,6 +113,9 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
             // Ghosts are reference, not picture: shading and cast shadows on a
             // faded copy of another frame read as dirt on the stage.
             lit: false,
+            // A dimmed layer is dimmed in its ghosts too, or a layer faded
+            // right down still shows solidly in every ghost around it.
+            layer_alpha: true,
         };
         draw_frame_within(&mut builder, scene, ghost_frame, camera, &options, cache);
     }
@@ -123,6 +126,8 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
     let live = FrameOptions {
         masks: MaskDisplay::WhenLocked,
         lit: true,
+        // The working view, and the only place a dimmed layer is dimmed.
+        layer_alpha: true,
         place,
         ..FrameOptions::default()
     };

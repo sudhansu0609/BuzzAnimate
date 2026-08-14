@@ -35,16 +35,13 @@ fn disc_picture(size: u32, radius: f64) -> Arc<ImageAsset> {
             }
         }
     }
-    Arc::new(ImageAsset {
-        id: ImageId(1),
-        name: "Photo".into(),
-        source: Arc::new(Vec::new()),
-        format: "png".into(),
-        width: size,
-        height: size,
-        pixels: Arc::new(pixels),
-        generation: 0,
-    })
+    Arc::new(ImageAsset::from_pixels(
+        ImageId(1),
+        "Photo",
+        size,
+        size,
+        Arc::new(pixels),
+    ))
 }
 
 /// An editor holding one bitmap laid across `area`, already broken apart.
@@ -338,16 +335,13 @@ fn a_tolerance_of_zero_takes_only_the_exact_colour() {
             }
         }
     }
-    let asset = Arc::new(ImageAsset {
-        id: ImageId(9),
-        name: "Shades".into(),
-        source: Arc::new(Vec::new()),
-        format: "png".into(),
-        width: 64,
-        height: 64,
-        pixels: Arc::new(pixels),
-        generation: 0,
-    });
+    let asset = Arc::new(ImageAsset::from_pixels(
+        ImageId(9),
+        "Shades",
+        64,
+        64,
+        Arc::new(pixels),
+    ));
 
     let area = Rect::new(0.0, 0.0, 64.0, 64.0);
 
@@ -706,26 +700,35 @@ fn a_painted_stroke_undoes_in_one_step() {
     );
 }
 
-/// **The GPU is not asked to re-upload a picture that has not changed.**
+/// **The GPU is not asked to re-upload a picture that has not changed — and
+/// is never handed two different pictures under one name.**
 ///
 /// The renderer caches bitmaps by an identifier, and the obvious way of
-/// building one hands out a fresh number every frame — which re-uploads a
+/// building one hands out a fresh number every frame, which re-uploads a
 /// four-megapixel photograph sixty times a second for as long as it is on
-/// screen. The identifier must be stable while the pixels are, and must change
-/// the moment they are painted on.
+/// screen. The second obvious way — the bitmap's library id and a change
+/// counter — is worse, and worse in a way that does not show up until it does:
+/// two assets can carry the same library id and hold *different pixels*, and
+/// the renderer's atlas keeps whichever it saw first and serves it to both.
+/// That was caught by these tests failing intermittently, and only under load.
 #[test]
-fn a_bitmaps_identity_is_stable_until_its_pixels_change() {
+fn a_bitmaps_identity_follows_its_pixels_and_nothing_else() {
     let asset = disc_picture(64, 20.0);
     let first = asset.blob_id();
     assert_eq!(first, asset.blob_id(), "asking twice gave two answers");
 
-    let other = disc_picture(64, 20.0);
-    let mut renamed = (*other).clone();
-    renamed.id = ImageId(2);
+    // A copy is the same pixels, so it keeps the identity: this is what stops
+    // the re-upload every frame, since the scene is copied on every edit.
+    let copied = (*asset).clone();
+    assert_eq!(copied.blob_id(), first, "a copy is the same picture");
+
+    // **Two separately built pictures never share an identity**, however alike
+    // they are and whatever library id they carry.
+    let twin = disc_picture(64, 20.0);
     assert_ne!(
-        renamed.blob_id(),
+        twin.blob_id(),
         first,
-        "two different bitmaps share an identity"
+        "two bitmaps built separately share an identity — the renderer would          draw the first of them for both"
     );
 
     let mut painted = (*asset).clone();
@@ -739,23 +742,25 @@ fn a_bitmaps_identity_is_stable_until_its_pixels_change() {
 
 /// **A brush preview is never mistaken for the one before it.**
 ///
-/// The other half of caching by identity: a picture rebuilt every pointer move
-/// must take a new identity each time, or the renderer keeps showing the first
-/// frame of the stroke while the user goes on drawing.
+/// The other half of caching by identity: a picture rebuilt on every pointer
+/// move must take a new identity each time, or the renderer keeps showing the
+/// first frame of the stroke while the user goes on drawing. Nothing special is
+/// done for it — identity is issued at construction, so a rebuilt preview is a
+/// new picture by definition.
 #[test]
-fn a_preview_bitmap_takes_a_fresh_identity_every_time() {
-    let a = (*disc_picture(16, 4.0)).clone().made_transient();
-    let b = (*disc_picture(16, 4.0)).clone().made_transient();
+fn a_rebuilt_preview_takes_a_fresh_identity_every_time() {
+    let brush = buzz_scene::SoftBrush::default();
+    let stroke = |to: f64| {
+        buzz_scene::Canvas::for_stroke(&[Point::new(0.0, 0.0), Point::new(to, 0.0)], &brush)
+            .expect("a stroke")
+            .to_asset(ImageId(0), "preview", &brush)
+            .blob_id()
+    };
     assert_ne!(
-        a.blob_id(),
-        b.blob_id(),
+        stroke(40.0),
+        stroke(60.0),
         "two previews share an identity, so the second would not be drawn"
     );
-
-    // And a transient never collides with a bitmap that is really in the
-    // document, however many have been imported.
-    let real = disc_picture(16, 4.0);
-    assert_ne!(a.blob_id(), real.blob_id());
 }
 
 /// **Paint survives saving and reopening.**

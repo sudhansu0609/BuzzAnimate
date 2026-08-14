@@ -421,43 +421,46 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
 pub fn tool_bar(ui: &mut Ui, active: ToolId, style: &mut DrawStyle) -> Option<ToolId> {
     let mut chosen = None;
 
-    egui::ScrollArea::vertical()
-        .id_salt("tool-strip")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            // **As many columns as it has been given room for.** One column
-            // is Animate's strip and what the default width holds; widen the
-            // dock and the tools flow into two or three rather than leaving a
-            // column of empty space beside them.
-            let spacing = ui.spacing().item_spacing.x;
-            let per_row = ((ui.available_width() + spacing) / (Metrics::TOOL_BUTTON + spacing))
-                .floor()
-                .clamp(1.0, 8.0) as usize;
+    // **No scroll area of its own.** The dock column it sits in already
+    // scrolls, and a vertical scroll area inside another one is told it has
+    // the whole column to fill — so it claims the lot, its scrollbar lands on
+    // top of the column's, and every panel below it is pushed off the bottom
+    // of the window. That single mistake, repeated in five panels, is what hid
+    // the Library and the Assets panel entirely.
+    {
+        // **As many columns as it has been given room for.** One column
+        // is Animate's strip and what the default width holds; widen the
+        // dock and the tools flow into two or three rather than leaving a
+        // column of empty space beside them.
+        let spacing = ui.spacing().item_spacing.x;
+        let per_row = ((ui.available_width() + spacing) / (Metrics::TOOL_BUTTON + spacing))
+            .floor()
+            .clamp(1.0, 8.0) as usize;
 
-            ui.vertical_centered(|ui| {
-                for (index, group) in TOOL_GROUPS.iter().enumerate() {
-                    if index > 0 {
-                        ui.add_space(2.0);
-                        ui.separator();
-                        ui.add_space(2.0);
-                    }
-                    for row in group.chunks(per_row) {
-                        ui.horizontal(|ui| {
-                            for tool in row.iter().copied() {
-                                if tool_button(ui, tool, tool == active) {
-                                    chosen = Some(tool);
-                                }
-                            }
-                        });
-                    }
+        ui.vertical_centered(|ui| {
+            for (index, group) in TOOL_GROUPS.iter().enumerate() {
+                if index > 0 {
+                    ui.add_space(2.0);
+                    ui.separator();
+                    ui.add_space(2.0);
                 }
+                for row in group.chunks(per_row) {
+                    ui.horizontal(|ui| {
+                        for tool in row.iter().copied() {
+                            if tool_button(ui, tool, tool == active) {
+                                chosen = Some(tool);
+                            }
+                        }
+                    });
+                }
+            }
 
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
-                color_wells(ui, style);
-            });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+            color_wells(ui, style);
         });
+    }
 
     chosen
 }
@@ -1121,9 +1124,9 @@ pub fn properties_panel(
             ui.end_row();
 
             ui.label("Background");
-            let mut bg = to_egui(scene.stage().background);
-            if ui.color_edit_button_srgba(&mut bg).changed() {
-                scene.stage_mut().background = from_egui(bg);
+            let mut bg = scene.stage().background;
+            if color_row(ui, "stage-bg", &mut bg) {
+                scene.stage_mut().background = bg;
                 changed = true;
             }
             ui.end_row();
@@ -1250,12 +1253,11 @@ pub fn color_panel(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
 
     ui.horizontal(|ui| {
         ui.label("Stroke");
-        let mut c = to_egui(style.stroke_color);
-        if ui.color_edit_button_srgba(&mut c).changed() {
-            style.stroke_color = from_egui(c);
+        let mut c = style.stroke_color;
+        if color_row(ui, "stroke", &mut c) {
+            style.stroke_color = c;
             style.stroke_enabled = true;
-            let remembered = style.stroke_color;
-            style.remember(remembered);
+            style.remember(c);
         }
         if let Some(swatch) = scene.swatches().find_color(style.stroke_color) {
             ui.label(RichText::new(&swatch.name).small().weak());
@@ -1276,12 +1278,11 @@ pub fn color_panel(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
     if style.fill_kind == FillKind::Solid {
         ui.horizontal(|ui| {
             ui.add_space(38.0);
-            let mut c = to_egui(style.fill_color);
-            if ui.color_edit_button_srgba(&mut c).changed() {
-                style.fill_color = from_egui(c);
+            let mut c = style.fill_color;
+            if color_row(ui, "fill", &mut c) {
+                style.fill_color = c;
                 style.fill_enabled = true;
-                let remembered = style.fill_color;
-                style.remember(remembered);
+                style.remember(c);
             }
             if let Some(swatch) = scene.swatches().find_color(style.fill_color) {
                 ui.label(RichText::new(&swatch.name).small().weak());
@@ -1500,6 +1501,203 @@ fn swatch_chip(ui: &mut Ui, color: Color, name: &str) -> bool {
 /// `frame` is the playhead's, because clicking a layer selects what is on it
 /// *now* — a layer's artwork is different on different frames, and selecting
 /// frame zero's while looking at frame forty would select things not on screen.
+/// A colour with **two ways in**: the picker, and a hex field.
+///
+/// # Why both
+///
+/// The picker is a button that opens a popup, and a popup is the one kind of
+/// control that can be present, correct and still unreachable — behind a panel,
+/// off the edge of a window, or closed by whatever else the frame is doing. A
+/// hex field cannot fail that way: it is six characters, in the notation every
+/// palette, every style guide and every other program already uses.
+///
+/// Returns whether the colour changed.
+pub fn color_row(ui: &mut Ui, id: &str, color: &mut Color) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let mut egui_color = to_egui(*color);
+        if ui
+            .color_edit_button_srgba(&mut egui_color)
+            .on_hover_text("Pick a colour")
+            .changed()
+        {
+            *color = from_egui(egui_color);
+            changed = true;
+        }
+
+        // The field is authoritative only while it is being typed in: while
+        // the pointer is elsewhere it shows whatever the colour actually is,
+        // so picking a colour updates the text and typing updates the picker.
+        let key = egui::Id::new(("hex", id));
+        let live = ui.memory(|m| m.data.get_temp::<String>(key));
+        let mut text = live.unwrap_or_else(|| hex_of(*color));
+
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .desired_width(74.0)
+                .font(egui::TextStyle::Monospace)
+                .hint_text("#RRGGBB"),
+        );
+        if response.has_focus() || response.changed() {
+            ui.memory_mut(|m| m.data.insert_temp(key, text.clone()));
+            if let Some(parsed) = parse_hex(&text)
+                && parsed != *color
+            {
+                *color = parsed;
+                changed = true;
+            }
+        } else {
+            // Focus lost: forget the half-typed text so the field goes back to
+            // showing the truth rather than whatever was abandoned in it.
+            ui.memory_mut(|m| m.data.remove::<String>(key));
+        }
+    });
+    changed
+}
+
+/// A colour as `#RRGGBB`, or `#RRGGBBAA` when it is not opaque.
+fn hex_of(color: Color) -> String {
+    let [r, g, b, a] = color.to_rgba8().to_u8_array();
+    if a == 255 {
+        format!("#{r:02X}{g:02X}{b:02X}")
+    } else {
+        format!("#{r:02X}{g:02X}{b:02X}{a:02X}")
+    }
+}
+
+/// Read `#RGB`, `#RRGGBB` or `#RRGGBBAA`, with or without the hash.
+///
+/// Lenient on the way in and strict on the way out: somebody pasting a colour
+/// from a style guide should not have to think about which of the three
+/// notations it is written in.
+fn parse_hex(text: &str) -> Option<Color> {
+    let text = text.trim().trim_start_matches('#');
+    let byte = |i: usize| u8::from_str_radix(&text[i..i + 2], 16).ok();
+    match text.len() {
+        // Short form: each digit stands for a pair, so `#f0c` is `#ff00cc`.
+        3 => {
+            let digit = |i: usize| u8::from_str_radix(&text[i..i + 1], 16).ok();
+            let (r, g, b) = (digit(0)?, digit(1)?, digit(2)?);
+            Some(Color::from_rgba8(r * 17, g * 17, b * 17, 255))
+        }
+        6 => Some(Color::from_rgba8(byte(0)?, byte(2)?, byte(4)?, 255)),
+        8 => Some(Color::from_rgba8(byte(0)?, byte(2)?, byte(4)?, byte(6)?)),
+        _ => None,
+    }
+}
+
+/// Which switch a layer row is drawing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerIcon {
+    /// The eye column: shown, or struck through when hidden.
+    Eye,
+    /// The padlock column: closed when locked, open when not.
+    Lock,
+    /// The outline column: a hollow square in the layer's own colour.
+    Outline,
+}
+
+/// One of Animate's three layer columns, drawn rather than lettered.
+///
+/// # Why these are painted and not characters
+///
+/// The same reason the tool icons are (see `icons.rs`): egui's bundled fonts
+/// cover a scattering of the symbols an interface wants, and the ones missing
+/// render as an empty box. This row previously used `O` for *visible* and `O`
+/// again for *outlines* — two different switches with one glyph between them,
+/// which is worse than a box, because it looks deliberate.
+///
+/// Painted shapes always render, at any size, in any theme.
+fn layer_toggle(ui: &mut Ui, icon: LayerIcon, on: bool, layer_color: Color) -> egui::Response {
+    let side = 15.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    let painter = ui.painter();
+
+    // Off is dim, on is plain — except the outline switch, which shows the
+    // layer's own colour when it is on, because that is the colour the artwork
+    // is about to be drawn in.
+    let ink = match (icon, on) {
+        (LayerIcon::Outline, true) => to_egui(layer_color),
+        (_, true) => Palette::text(),
+        (_, false) => Palette::text_dim(),
+    };
+    if response.hovered() {
+        painter.rect_filled(rect, 2.0, Palette::raised());
+    }
+
+    let c = rect.center();
+    let s = side * 0.5;
+    let at = |x: f32, y: f32| egui::pos2(c.x + x * s, c.y + y * s);
+    let stroke = egui::Stroke::new(1.3, ink);
+
+    match icon {
+        LayerIcon::Eye => {
+            // A lens: two arcs meeting at the corners, with a pupil. Drawn as
+            // a polyline because egui has no arc primitive.
+            let lens = |up: f32| -> Vec<egui::Pos2> {
+                (0..=12)
+                    .map(|i| {
+                        let t = i as f32 / 12.0;
+                        let x = -0.85 + t * 1.7;
+                        // A parabola through (-0.85, 0), (0, up), (0.85, 0).
+                        let y = up * (1.0 - (x / 0.85).powi(2));
+                        at(x, y)
+                    })
+                    .collect()
+            };
+            painter.add(egui::Shape::line(lens(-0.62), stroke));
+            painter.add(egui::Shape::line(lens(0.62), stroke));
+            if on {
+                painter.circle_filled(c, side * 0.13, ink);
+            } else {
+                // Struck through: the universal "not this".
+                painter.line_segment([at(-0.95, 0.95), at(0.95, -0.95)], stroke);
+            }
+        }
+        LayerIcon::Lock => {
+            let body = egui::Rect::from_min_max(at(-0.6, 0.0), at(0.6, 0.8));
+            if on {
+                painter.rect_filled(body, 1.5, ink);
+                // A closed shackle, sitting on the body.
+                painter.add(egui::Shape::line(
+                    (0..=10)
+                        .map(|i| {
+                            let a = std::f32::consts::PI * (1.0 + i as f32 / 10.0);
+                            at(0.38 * a.cos(), -0.05 + 0.42 * a.sin())
+                        })
+                        .collect(),
+                    stroke,
+                ));
+            } else {
+                painter.rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
+                // Open: the shackle swung up and to one side.
+                painter.add(egui::Shape::line(
+                    (0..=10)
+                        .map(|i| {
+                            let a = std::f32::consts::PI * (1.0 + i as f32 / 10.0);
+                            at(-0.42 + 0.38 * a.cos(), -0.25 + 0.42 * a.sin())
+                        })
+                        .collect(),
+                    stroke,
+                ));
+            }
+        }
+        LayerIcon::Outline => {
+            // Animate's hollow square, and filled when the layer is drawn
+            // normally — so the switch shows what the artwork looks like
+            // rather than what clicking it would do.
+            let box_rect = egui::Rect::from_min_max(at(-0.7, -0.7), at(0.7, 0.7));
+            if on {
+                painter.rect_stroke(box_rect, 1.0, stroke, egui::StrokeKind::Inside);
+            } else {
+                painter.rect_filled(box_rect, 1.0, ink);
+            }
+        }
+    }
+
+    response
+}
+
 pub fn layers_panel(
     ui: &mut Ui,
     scene: &mut Scene,
@@ -1551,173 +1749,207 @@ pub fn layers_panel(
     let mut set_follows: Option<(LayerId, Option<LayerId>)> = None;
     let mut set_kind: Option<(LayerId, LayerKind)> = None;
 
-    egui::ScrollArea::vertical()
-        .id_salt("layer-list")
-        .show(ui, |ui| {
-            for id in ids {
-                let Some(layer) = scene.layers().get(id) else {
-                    continue;
-                };
-                let (name, kind, visible, locked, outline, color, depth) = (
-                    layer.name.clone(),
-                    layer.kind,
-                    layer.visible,
-                    layer.locked,
-                    layer.outline,
-                    layer.color,
-                    layer.parent.is_some() as usize,
-                );
+    // The dock column already scrolls; see the note on `tool_bar`.
+    for id in ids {
+        let Some(layer) = scene.layers().get(id) else {
+            continue;
+        };
+        let (name, kind, visible, locked, outline, alpha, color, depth) = (
+            layer.name.clone(),
+            layer.kind,
+            layer.visible,
+            layer.locked,
+            layer.outline,
+            layer.alpha,
+            layer.color,
+            layer.parent.is_some() as usize,
+        );
 
-                let mut set_visible = visible;
-                let mut set_locked = locked;
-                let mut set_outline = outline;
+        let mut set_visible = visible;
+        let mut set_locked = locked;
+        let mut set_outline = outline;
+        let mut set_alpha = alpha;
 
-                ui.horizontal(|ui| {
-                    ui.add_space(depth as f32 * 12.0);
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 12.0);
 
-                    if ui
-                        .selectable_label(set_visible, if set_visible { "O" } else { "-" })
-                        .on_hover_text("Show or hide")
-                        .clicked()
-                    {
-                        set_visible = !set_visible;
-                    }
-                    if ui
-                        .selectable_label(set_locked, if set_locked { "🔒" } else { "🔓" })
-                        .on_hover_text("Lock")
-                        .clicked()
-                    {
-                        set_locked = !set_locked;
-                    }
-                    if ui
-                        .selectable_label(set_outline, "O")
-                        .on_hover_text("Show as outlines")
-                        .clicked()
-                    {
-                        set_outline = !set_outline;
-                    }
+            // **Drawn, not lettered.** These three columns were an
+            // `O`, a padlock and a second `O` — the same glyph for
+            // "visible" and for "outlines", which is no way to tell
+            // two switches apart. Animate draws an eye, a padlock and
+            // a hollow square, and so does this: see `layer_toggle`.
+            if layer_toggle(ui, LayerIcon::Eye, set_visible, color)
+                .on_hover_text(if set_visible {
+                    "Visible \u{2014} click to hide. A hidden layer is left out of the export too."
+                } else {
+                    "Hidden \u{2014} click to show"
+                })
+                .clicked()
+            {
+                set_visible = !set_visible;
+            }
+            if layer_toggle(ui, LayerIcon::Lock, set_locked, color)
+                .on_hover_text(if set_locked {
+                    "Locked \u{2014} click to unlock"
+                } else {
+                    "Unlocked \u{2014} click to lock. A locked layer cannot be selected or edited."
+                })
+                .clicked()
+            {
+                set_locked = !set_locked;
+            }
+            if layer_toggle(ui, LayerIcon::Outline, set_outline, color)
+                .on_hover_text(
+                    "Show this layer as outlines, in its own colour. \
+                             A working view: the export draws it filled.",
+                )
+                .clicked()
+            {
+                set_outline = !set_outline;
+            }
 
-                    // The layer's colour chip, used for outline view.
-                    let (chip, _) =
-                        ui.allocate_exact_size(egui::vec2(8.0, 12.0), egui::Sense::hover());
-                    ui.painter().rect_filled(chip, 1.0, to_egui(color));
+            // **Transparency**, as a number rather than a switch,
+            // because it is one. Drag it, or click and type.
+            let mut percent = (set_alpha * 100.0).round();
+            if ui
+                .add(
+                    egui::DragValue::new(&mut percent)
+                        .range(0.0..=100.0)
+                        .speed(1.0)
+                        .suffix("%")
+                        .fixed_decimals(0),
+                )
+                .on_hover_text(
+                    "How solid this layer is drawn while you work \u{2014} dim one \
+                             to draw over it, or to see what is behind it. A working \
+                             view only: the export draws every layer at full strength.",
+                )
+                .changed()
+            {
+                set_alpha = (percent / 100.0).clamp(0.0, 1.0);
+            }
 
-                    let mark = match kind {
-                        LayerKind::Folder => "F ",
-                        LayerKind::Mask => "M ",
-                        // The mask that hides rather than reveals. Marked with
-                        // a letter rather than a struck-through M: a combining
-                        // stroke is one of the glyphs the interface font does
-                        // not have, and would draw as a box.
-                        LayerKind::InverseMask => "iM ",
-                        LayerKind::Masked => ". ",
-                        LayerKind::Guide => "G ",
-                        LayerKind::Guided => ". ",
-                        LayerKind::Normal => "",
-                    };
-                    if ui
-                        .selectable_label(active == Some(id), format!("{mark}{name}"))
-                        .clicked()
-                    {
-                        // Animate selects the layer's artwork with it, so the
-                        // obvious next move needs no second gesture.
-                        selection.select_layer(scene, id, frame);
-                    }
-                });
+            // The layer's colour chip, used for outline view.
+            let (chip, _) = ui.allocate_exact_size(egui::vec2(8.0, 12.0), egui::Sense::hover());
+            ui.painter().rect_filled(chip, 1.0, to_egui(color));
 
-                // Animate's Parent column: which layer this one follows, so
-                // moving that layer's artwork moves this layer's with it.
-                let follows = names
-                    .iter()
-                    .find(|(other, _, _)| *other == id)
-                    .and_then(|(_, _, f)| *f);
-                let choices = allowed
-                    .iter()
-                    .find(|(other, _)| *other == id)
-                    .map(|(_, list)| list.clone())
-                    .unwrap_or_default();
-
-                ui.horizontal(|ui| {
-                    ui.add_space(depth as f32 * 12.0 + 18.0);
-                    ui.label(RichText::new("follows").small().weak());
-
-                    let label = match follows
-                        .and_then(|f| names.iter().find(|(other, _, _)| *other == f))
-                    {
-                        Some((_, name, _)) => name.clone(),
-                        // An em dash reads as "nothing" without needing a word
-                        // for it, and this line is repeated on every layer.
-                        None => "\u{2014}".to_string(),
-                    };
-
-                    egui::ComboBox::from_id_salt(("follows", id.0))
-                        .selected_text(RichText::new(label).small())
-                        .width(96.0)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(follows.is_none(), "\u{2014}  none")
-                                .clicked()
-                            {
-                                set_follows = Some((id, None));
-                            }
-                            for other in &choices {
-                                let Some((_, name, _)) = names.iter().find(|(o, _, _)| o == other)
-                                else {
-                                    continue;
-                                };
-                                if ui.selectable_label(follows == Some(*other), name).clicked() {
-                                    set_follows = Some((id, Some(*other)));
-                                }
-                            }
-                        })
-                        .response
-                        .on_hover_text(
-                            "Layer Parenting: this layer's artwork moves with the \
-                             layer it follows",
-                        );
-
-                    // **What kind of layer this is.** Masking is positional —
-                    // a mask claims the run of masked layers directly below it
-                    // — so this is the only control it needs: set one layer to
-                    // Mask, the ones under it to Masked, and the stack does the
-                    // rest. Folders are not offered: a folder holds layers, and
-                    // turning one into a drawing layer would orphan them.
-                    if kind != LayerKind::Folder {
-                        egui::ComboBox::from_id_salt(("layer-kind", id.0))
-                            .selected_text(RichText::new(kind.display_name()).small())
-                            .width(92.0)
-                            .show_ui(ui, |ui| {
-                                for choice in [
-                                    LayerKind::Normal,
-                                    LayerKind::Mask,
-                                    LayerKind::InverseMask,
-                                    LayerKind::Masked,
-                                    LayerKind::Guide,
-                                    LayerKind::Guided,
-                                ] {
-                                    if ui
-                                        .selectable_label(kind == choice, choice.display_name())
-                                        .on_hover_text(layer_kind_hint(choice))
-                                        .clicked()
-                                    {
-                                        set_kind = Some((id, choice));
-                                    }
-                                }
-                            })
-                            .response
-                            .on_hover_text(layer_kind_hint(kind));
-                    }
-                });
-
-                if set_visible != visible || set_locked != locked || set_outline != outline {
-                    scene.update_layer(id, |l| {
-                        l.visible = set_visible;
-                        l.locked = set_locked;
-                        l.outline = set_outline;
-                    });
-                }
+            let mark = match kind {
+                LayerKind::Folder => "F ",
+                LayerKind::Mask => "M ",
+                // The mask that hides rather than reveals. Marked with
+                // a letter rather than a struck-through M: a combining
+                // stroke is one of the glyphs the interface font does
+                // not have, and would draw as a box.
+                LayerKind::InverseMask => "iM ",
+                LayerKind::Masked => ". ",
+                LayerKind::Guide => "G ",
+                LayerKind::Guided => ". ",
+                LayerKind::Normal => "",
+            };
+            if ui
+                .selectable_label(active == Some(id), format!("{mark}{name}"))
+                .clicked()
+            {
+                // Animate selects the layer's artwork with it, so the
+                // obvious next move needs no second gesture.
+                selection.select_layer(scene, id, frame);
             }
         });
+
+        // Animate's Parent column: which layer this one follows, so
+        // moving that layer's artwork moves this layer's with it.
+        let follows = names
+            .iter()
+            .find(|(other, _, _)| *other == id)
+            .and_then(|(_, _, f)| *f);
+        let choices = allowed
+            .iter()
+            .find(|(other, _)| *other == id)
+            .map(|(_, list)| list.clone())
+            .unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 12.0 + 18.0);
+            ui.label(RichText::new("follows").small().weak());
+
+            let label = match follows.and_then(|f| names.iter().find(|(other, _, _)| *other == f)) {
+                Some((_, name, _)) => name.clone(),
+                // An em dash reads as "nothing" without needing a word
+                // for it, and this line is repeated on every layer.
+                None => "\u{2014}".to_string(),
+            };
+
+            egui::ComboBox::from_id_salt(("follows", id.0))
+                .selected_text(RichText::new(label).small())
+                .width(96.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(follows.is_none(), "\u{2014}  none")
+                        .clicked()
+                    {
+                        set_follows = Some((id, None));
+                    }
+                    for other in &choices {
+                        let Some((_, name, _)) = names.iter().find(|(o, _, _)| o == other) else {
+                            continue;
+                        };
+                        if ui.selectable_label(follows == Some(*other), name).clicked() {
+                            set_follows = Some((id, Some(*other)));
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Layer Parenting: this layer's artwork moves with the \
+                             layer it follows",
+                );
+
+            // **What kind of layer this is.** Masking is positional —
+            // a mask claims the run of masked layers directly below it
+            // — so this is the only control it needs: set one layer to
+            // Mask, the ones under it to Masked, and the stack does the
+            // rest. Folders are not offered: a folder holds layers, and
+            // turning one into a drawing layer would orphan them.
+            if kind != LayerKind::Folder {
+                egui::ComboBox::from_id_salt(("layer-kind", id.0))
+                    .selected_text(RichText::new(kind.display_name()).small())
+                    .width(92.0)
+                    .show_ui(ui, |ui| {
+                        for choice in [
+                            LayerKind::Normal,
+                            LayerKind::Mask,
+                            LayerKind::InverseMask,
+                            LayerKind::Masked,
+                            LayerKind::Guide,
+                            LayerKind::Guided,
+                        ] {
+                            if ui
+                                .selectable_label(kind == choice, choice.display_name())
+                                .on_hover_text(layer_kind_hint(choice))
+                                .clicked()
+                            {
+                                set_kind = Some((id, choice));
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(layer_kind_hint(kind));
+            }
+        });
+
+        if set_visible != visible
+            || set_locked != locked
+            || set_outline != outline
+            || set_alpha != alpha
+        {
+            scene.update_layer(id, |l| {
+                l.visible = set_visible;
+                l.locked = set_locked;
+                l.outline = set_outline;
+                l.alpha = set_alpha;
+            });
+        }
+    }
 
     if let Some((layer, follows)) = set_follows {
         scene.update_layer(layer, |l| l.follows = follows);
@@ -2096,5 +2328,125 @@ mod tests {
             );
             let _ = layers_panel(ui, &mut scene, &mut selection, 0);
         });
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// **A panel in a dock column must take only the room it needs.**
+    ///
+    /// This is the regression that hid half the interface. Every list panel
+    /// opened a vertical `ScrollArea` of its own, inside the one the dock
+    /// column already had, with `auto_shrink([false, false])` — which says
+    /// "fill the space available". Inside another scroll area the space
+    /// available is the whole column, so the Layers panel took all of it, its
+    /// scrollbar landed on top of the column's, and Properties, Library and the
+    /// Assets panel were pushed off the bottom of the window where nobody could
+    /// find them.
+    ///
+    /// Measured, not eyeballed: a panel showing one layer must not consume the
+    /// height of the window.
+    #[test]
+    fn a_layers_panel_takes_only_the_room_its_rows_need() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+
+        let mut scene = Scene::default();
+        scene.add_layer("Only", buzz_scene::LayerKind::Normal);
+        let mut selection = Selection::new();
+        let mut used = 0.0;
+
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("test-column")
+                .show(ui, |ui| {
+                    let top = ui.cursor().top();
+                    let _ = layers_panel(ui, &mut scene, &mut selection, 0);
+                    used = ui.cursor().top() - top;
+                });
+        });
+
+        assert!(
+            used > 0.0,
+            "the panel drew nothing at all, so this proves nothing"
+        );
+        assert!(
+            used < 400.0,
+            "one layer took {used:.0} points of column. A panel that fills the \
+             column pushes every panel below it off the screen \u{2014} which is \
+             exactly what hid the Library and the Assets panel."
+        );
+    }
+
+    #[test]
+    fn a_tool_strip_takes_only_the_room_its_buttons_need() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut style = DrawStyle::default();
+        let mut used = 0.0;
+
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("test-column")
+                .show(ui, |ui| {
+                    let top = ui.cursor().top();
+                    let _ = tool_bar(ui, ToolId::Selection, &mut style);
+                    used = ui.cursor().top() - top;
+                });
+        });
+
+        assert!(used > 0.0, "the tool strip drew nothing");
+        // Twenty-three tools in eight groups, one column wide, plus the colour
+        // wells. Tall, but a definite height rather than "all of it".
+        assert!(
+            used < 1200.0,
+            "the tool strip took {used:.0} points of column"
+        );
+    }
+
+    /// Hex in, hex out, in every notation somebody might paste.
+    #[test]
+    fn a_colour_can_be_typed_as_well_as_picked() {
+        assert_eq!(
+            parse_hex("#FF0066").map(|c| c.to_rgba8().to_u8_array()),
+            Some([0xFF, 0x00, 0x66, 0xFF])
+        );
+        // Without the hash, and in lower case.
+        assert_eq!(
+            parse_hex("ff0066").map(|c| c.to_rgba8().to_u8_array()),
+            Some([0xFF, 0x00, 0x66, 0xFF])
+        );
+        // The short form: each digit stands for a pair.
+        assert_eq!(
+            parse_hex("#f06").map(|c| c.to_rgba8().to_u8_array()),
+            Some([0xFF, 0x00, 0x66, 0xFF])
+        );
+        // With alpha.
+        assert_eq!(
+            parse_hex("#10203040").map(|c| c.to_rgba8().to_u8_array()),
+            Some([0x10, 0x20, 0x30, 0x40])
+        );
+        // And nonsense is refused rather than guessed at, so a half-typed
+        // field does not repaint the stage on every keystroke.
+        for bad in ["", "#", "12345", "#GGGGGG", "not a colour"] {
+            assert!(parse_hex(bad).is_none(), "{bad:?} was accepted");
+        }
+
+        // Round trip: what is shown can be typed back.
+        for c in [
+            Color::BLACK,
+            Color::WHITE,
+            Color::from_rgb8(0x12, 0x34, 0x56),
+            Color::from_rgba8(0x12, 0x34, 0x56, 0x78),
+        ] {
+            assert_eq!(
+                parse_hex(&hex_of(c)).map(|c| c.to_rgba8().to_u8_array()),
+                Some(c.to_rgba8().to_u8_array()),
+                "{} did not survive being written out and read back",
+                hex_of(c)
+            );
+        }
     }
 }

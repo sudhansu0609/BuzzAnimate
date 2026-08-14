@@ -672,7 +672,7 @@ impl App {
                     .exact_size(height)
                     .show(ui, |ui| {
                         if let Some(dock) =
-                            panel_header(ui, id, locked, !id.draws_own_title(), &mut reorders)
+                            panel_header(ui, id, locked, !id.draws_own_title(), &mut reorders, None)
                         {
                             moves.push((id, dock));
                         }
@@ -746,7 +746,8 @@ impl App {
                     .show(ui.ctx(), |ui| {
                         // Never named here: the window frame already carries
                         // the title, and the panel below may carry it again.
-                        if let Some(dock) = panel_header(ui, id, locked, false, &mut reorders) {
+                        if let Some(dock) = panel_header(ui, id, locked, false, &mut reorders, None)
+                        {
                             moves.push((id, dock));
                         }
                         egui::ScrollArea::vertical()
@@ -924,12 +925,24 @@ impl App {
                     if index > 0 {
                         ui.separator();
                     }
+                    let mut collapsed = self.editor.workspace.is_collapsed(id);
+                    let was = collapsed;
+                    // Rolled up, the header carries the name whatever the panel
+                    // would normally do, or the column becomes a stack of
+                    // anonymous strips.
+                    let named = collapsed || !id.draws_own_title();
                     if let Some(dock) =
-                        panel_header(ui, id, locked, !id.draws_own_title(), reorders)
+                        panel_header(ui, id, locked, named, reorders, Some(&mut collapsed))
                     {
                         moves.push((id, dock));
                     }
-                    self.draw_panel(ui, id, commands);
+                    if collapsed != was {
+                        self.editor.workspace.toggle_collapsed(id);
+                        self.editor.workspace.save();
+                    }
+                    if !collapsed {
+                        self.draw_panel(ui, id, commands);
+                    }
                 }
             });
     }
@@ -3116,13 +3129,31 @@ fn panel_header(
     locked: bool,
     named: bool,
     reorders: &mut Vec<(buzz_ui::PanelId, i32)>,
+    collapsed: Option<&mut bool>,
 ) -> Option<buzz_ui::Dock> {
     let mut moved = None;
 
     ui.horizontal(|ui| {
+        // The roll-up triangle, where every collapsible thing keeps one. Only
+        // docked panels get it: a floating window already has a close button,
+        // and rolling one up would leave a title bar adrift over the stage.
+        if let Some(collapsed) = collapsed {
+            let glyph = if *collapsed { "\u{25b8}" } else { "\u{25be}" };
+            if ui
+                .add(egui::Button::new(egui::RichText::new(glyph).small()).frame(false))
+                .on_hover_text(if *collapsed { "Open" } else { "Roll up" })
+                .clicked()
+            {
+                *collapsed = !*collapsed;
+            }
+        }
+
         // Only the panels with no heading of their own are named here. The
-        // rest would read their name twice — which is exactly how the first
+        // rest would read their name twice \u2014 which is exactly how the first
         // version looked.
+        //
+        // Rolled up, every panel is named: the title bar is all that is left of
+        // it, and an unlabelled strip is not a panel, it is a smudge.
         if named {
             ui.label(
                 egui::RichText::new(id.title())

@@ -2824,6 +2824,77 @@ stroke that fades into the page, monotonically, with no ring and no fringe.
 
 ---
 
+### ✅ The panels: one scrollbar a column, and four switches on a layer
+
+Five complaints, four causes, and one of them explained three of the five.
+
+**A panel in a dock column was taking ten thousand points of it.** Every list
+panel - Layers, Tools, Depth, Rig, Library - opened a vertical `ScrollArea` of
+its own, inside the one the dock column already had, with
+`auto_shrink([false, false])`: *fill the space available*. Inside another scroll
+area the space available is not the height of the window; egui offers about ten
+thousand points. So the Layers panel took all of it, its scrollbar landed on top
+of the column's - the overlap that was reported - and **Properties, Colour, the
+Library and the Assets panel were pushed ten thousand points down the page**,
+where nobody was ever going to find them. The Assets panel had been in the saved
+layout all along.
+
+Measured rather than eyeballed: `a_layers_panel_takes_only_the_room_its_rows_need`
+put the number at **10 004 points for a single layer row**, and fails at once if
+the pattern comes back. The column scrolls; a panel in it does not. The Library
+keeps a scroll area of its own, because three hundred symbols should not carry
+the whole column with them - but at a **fixed** three hundred points, not at
+whatever the column was willing to promise.
+
+**And nine panels in one column is too many even when they fit.** Each is now
+collapsible, and the five reached for occasionally - Depth, Rig, Filters,
+Lighting, Sound - start rolled up.
+
+**The layer row had one glyph for two switches.** `O` meant *visible*, and `O`
+also meant *show as outlines*. They are now drawn rather than lettered, for the
+same reason the tool icons are: an eye that strikes through when hidden, a
+padlock that opens, and Animate's hollow square that fills in when the layer
+draws normally - so the switch shows what the artwork *is*, not what clicking
+would do to it.
+
+**Layer transparency**, the fourth switch, is new: a percentage per layer, drag
+or type. It rides the same road the onion-skin ghosts use - one alpha
+multiplying every colour on the way out - so a dimmed layer needed no second
+mechanism, and a dimmed layer seen as a ghost is dimmed by both rather than by
+whichever was checked last. **It fades the working view and never the film**:
+the flag is on in the stage's options and off in the export's, which
+`layer_transparency_fades_the_working_view_and_not_the_export` checks on the
+real GPU, both halves. Format version 18, and a document from before it opens
+solid rather than invisible.
+
+**The background colour** now has two ways in: the picker, and a hex field. A
+picker is a button that opens a popup, and a popup is the one control that can
+be present, correct and still unreachable. Six characters in the notation every
+palette already uses cannot fail that way. Stroke and fill got the same field.
+
+### ✅ And a defect in the bitmap identity, found by its own tests
+
+The soft-brush work gave every bitmap a stable identity so the GPU would stop
+re-uploading unchanged photographs. It was built from the library id and a
+change counter - and that is **wrong in a way that does not show until it
+does**. Two `ImageAsset`s can carry the same `ImageId` and hold different
+pixels: a document opened twice, an import run again, a symbol duplicated, two
+tests building the same fixture. Vello's atlas keeps whichever picture it saw
+first under an identity and serves it to everyone after.
+
+It surfaced as two bitmap tests failing **intermittently, and only with all six
+in the file running together** - enough images resident in one atlas at once.
+Eight runs to confirm the fix, five to confirm the cause by reverting it.
+
+The rule it cost: **identity is issued, never derived from something a caller
+can duplicate.** `ImageAsset::from_pixels` takes a number from a counter that is
+never reused, the field is private so a struct literal cannot forge one, and
+copying an asset copies its identity because the pixels really are the same
+pixels. The brush preview's special case - an explicit opt-out of caching -
+deleted itself: a rebuilt preview is a new picture by definition.
+
+---
+
 ## 5. Current metrics
 
 | Measure | Value |
@@ -3135,6 +3206,9 @@ down here has not been finished.
 | 165 | **A soft brush paints at the document's own pixel scale**, one painted pixel to one document unit, because that is the resolution the film exports at. Zoomed to 800% the paint is visibly pixelated, where a vector stroke would still be smooth. Painting finer would need a resolution setting and would make every stroke four or sixteen times the memory. | By design |
 | 166 | **A long soft stroke is rebuilt from scratch on every pointer move** to preview it: 7.8 ms for a sweep the full width of a 1080p stage, against under 1 ms for an ordinary stroke. Within a frame, and the worst case that exists, but an incremental buffer that only stamps the new segment would make it constant. | Follow-up |
 | 167 | **A painted bitmap re-uploads to the GPU on every change.** The whole picture, not the part that changed — which is right for a stroke that arrives complete, and wasteful if painting ever becomes incremental (item 164). Vello has no partial image update, so a dirty-rect upload would mean holding the picture in tiles. | Follow-up |
+| 168 | **Layer transparency fades the working view only.** Animate's does the same, and for the same reason: it is a thing you do to see what you are drawing, not a property of the film. A layer meant to be genuinely see-through in the finished picture wants an alpha on its artwork instead. | By design |
+| 169 | **A dock column has one scrollbar, so a long panel scrolls the whole column.** The Library is the exception, at a fixed three hundred points, because a big library would otherwise carry everything below it out of reach. The general answer - each panel with its own bounded height, dragged by a splitter - is what Animate has and is a layout engine in its own right. | Follow-up |
+| 170 | **Rolled-up panels are remembered in the workspace, not per document.** A preference belonging to the person, like the theme and the dock widths, and it must not travel inside a `.buzz` file. | By design |
 | 2 | **egui pinned to 0.35.** 0.36 requires wgpu 30; vello 0.9 requires wgpu 29. Two wgpu majors cannot share a device. | Blocked on vello |
 | 3 | **egui is immediate-mode**, not ideal long-term for a pro creative tool. Chosen to reach a working app fast. | Revisit after Phase 4 |
 | 4 | **`f64` precision floor** — sub-pixel to ~1e12%, linear decay after. | Documented, by design |

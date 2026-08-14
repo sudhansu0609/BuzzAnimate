@@ -197,6 +197,32 @@ impl Exporter {
         frame: u32,
         settings: &ExportSettings,
     ) -> Result<Frame> {
+        // An export always shows the finished picture: masks clip and lights
+        // light, whatever the stage happens to be showing while the document is
+        // being worked on — and no authoring aid reaches the film.
+        self.render_with(
+            scene,
+            frame,
+            settings,
+            &document::FrameOptions {
+                lit: true,
+                ..document::FrameOptions::default()
+            },
+        )
+    }
+
+    /// Render one frame with options of the caller's choosing.
+    ///
+    /// For the passes that are *not* the film: the working view, which honours
+    /// each layer's transparency, and the tests that have to prove the two
+    /// differ.
+    pub fn render_with(
+        &mut self,
+        scene: &Scene,
+        frame: u32,
+        settings: &ExportSettings,
+        options: &document::FrameOptions,
+    ) -> Result<Frame> {
         let limit = self.max_dimension();
         if settings.width == 0 || settings.height == 0 {
             bail!("an exported image needs a width and a height");
@@ -230,18 +256,12 @@ impl Exporter {
             if !settings.transparent {
                 builder.fill_shape(&stage, scene.stage().background);
             }
-            // An export always shows the finished picture: masks clip and
-            // lights light, whatever the stage happens to be showing while the
-            // document is being worked on.
             document::draw_frame_cached(
                 &mut builder,
                 scene,
                 frame,
                 scene.camera_transform(frame),
-                &document::FrameOptions {
-                    lit: true,
-                    ..document::FrameOptions::default()
-                },
+                options,
                 &mut self.lights,
             );
         }

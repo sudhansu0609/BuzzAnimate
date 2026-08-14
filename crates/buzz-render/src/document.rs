@@ -44,6 +44,14 @@ pub struct FrameOptions {
     /// check. Off is for the authoring passes that want the artwork as drawn —
     /// onion-skin ghosts, which are reference rather than picture.
     pub lit: bool,
+    /// Honour each layer's working transparency.
+    ///
+    /// **Off by default, which is the export.** Layer transparency is a thing
+    /// an animator does to see what they are doing — dimming a reference layer
+    /// to draw over it — and a film that came out faded because somebody left
+    /// a layer at 40% would be a trap rather than a feature. The stage turns it
+    /// on; nothing else does.
+    pub layer_alpha: bool,
     /// Where this stack sits in the document's space.
     ///
     /// Identity for the document's own timeline. Editing a symbol **in place**
@@ -60,6 +68,7 @@ impl Default for FrameOptions {
             ghost_outlines: false,
             masks: MaskDisplay::default(),
             lit: false,
+            layer_alpha: false,
             place: Affine::IDENTITY,
         }
     }
@@ -491,6 +500,26 @@ fn draw_layer(
             }
         };
 
+        // **Layer transparency rides the onion-skin road.** Both are the same
+        // thing to the renderer — one alpha multiplying every colour on the
+        // way out — so a dimmed layer needs no second mechanism, and a dimmed
+        // layer *seen as a ghost* is dimmed once by each rather than by
+        // whichever happened to be checked last.
+        //
+        // `layer_alpha` is off in the export's options, so this fades the
+        // working view and never the film.
+        let alpha = if options.layer_alpha {
+            layer.alpha.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let layer_alpha = match (options.ghost, alpha < 1.0) {
+            (Some(ghost), true) => Some(ghost * alpha),
+            (Some(ghost), false) => Some(ghost),
+            (None, true) => Some(alpha),
+            (None, false) => None,
+        };
+
         // Guides are authoring aids: visible on stage, never exported.
         let outline = layer.outline || (options.ghost.is_some() && options.ghost_outlines);
         let tint = outline.then_some(layer.color);
@@ -527,7 +556,7 @@ fn draw_layer(
                     .min(frame),
             tint,
             faded,
-            ghost: options.ghost,
+            ghost: layer_alpha,
             effect: ColorTransform::default(),
             adjust: None,
             blur: None,

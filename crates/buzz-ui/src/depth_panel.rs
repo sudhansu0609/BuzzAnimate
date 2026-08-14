@@ -105,50 +105,46 @@ pub fn depth_panel(ui: &mut Ui, scene: &Scene, active: Option<LayerId>) -> Depth
     ui.separator();
 
     // -- per-layer depth ----------------------------------------------------
-    egui::ScrollArea::vertical()
-        .id_salt("depth-layers")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let rows: Vec<(LayerId, String, f64, Color32)> = scene
-                .layers()
-                .iter()
-                .map(|l| {
-                    let [r, g, b, a] = l.color.to_rgba8().to_u8_array();
-                    (
-                        l.id,
-                        l.name.clone(),
-                        l.depth,
-                        Color32::from_rgba_unmultiplied(r, g, b, a),
-                    )
-                })
-                .collect();
+    // The dock column already scrolls; see the note on `tool_bar`.
 
-            for (id, name, depth, colour) in rows {
-                ui.horizontal(|ui| {
-                    let (chip, _) =
-                        ui.allocate_exact_size(egui::vec2(7.0, 12.0), egui::Sense::hover());
-                    ui.painter().rect_filled(chip, 1.0, colour);
+    let rows: Vec<(LayerId, String, f64, Color32)> = scene
+        .layers()
+        .iter()
+        .map(|l| {
+            let [r, g, b, a] = l.color.to_rgba8().to_u8_array();
+            (
+                l.id,
+                l.name.clone(),
+                l.depth,
+                Color32::from_rgba_unmultiplied(r, g, b, a),
+            )
+        })
+        .collect();
 
-                    if ui.selectable_label(active == Some(id), &name).clicked() {
-                        response.select_layer = Some(id);
-                    }
+    for (id, name, depth, colour) in rows {
+        ui.horizontal(|ui| {
+            let (chip, _) = ui.allocate_exact_size(egui::vec2(7.0, 12.0), egui::Sense::hover());
+            ui.painter().rect_filled(chip, 1.0, colour);
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut value = depth;
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut value)
-                                    .speed(5.0)
-                                    .range(focal * NEAR_LIMIT..=focal * FAR_LIMIT),
-                            )
-                            .changed()
-                        {
-                            response.set_depth = Some((id, value));
-                        }
-                    });
-                });
+            if ui.selectable_label(active == Some(id), &name).clicked() {
+                response.select_layer = Some(id);
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut value = depth;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut value)
+                            .speed(5.0)
+                            .range(focal * NEAR_LIMIT..=focal * FAR_LIMIT),
+                    )
+                    .changed()
+                {
+                    response.set_depth = Some((id, value));
+                }
+            });
         });
+    }
 
     response
 }

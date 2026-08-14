@@ -436,14 +436,15 @@ impl ToolMachine {
                     match paint_soft_stroke(samples, ctx.style) {
                         Some((canvas, brush)) => {
                             let area = canvas.area();
-                            // Transient: rebuilt on every pointer move, so it
-                            // must not share an identity with the move before
-                            // it or the renderer shows the stroke as it was.
-                            let asset = std::sync::Arc::new(
-                                canvas
-                                    .to_asset(buzz_scene::ImageId(0), "preview", &brush)
-                                    .made_transient(),
-                            );
+                            // A fresh identity every move, because every move
+                            // really is new pixels — which `to_asset` gives
+                            // without being asked, since a bitmap's identity is
+                            // issued at construction rather than worked out.
+                            let asset = std::sync::Arc::new(canvas.to_asset(
+                                buzz_scene::ImageId(0),
+                                "preview",
+                                &brush,
+                            ));
                             let mut fill = buzz_scene::ImageFill::new(asset, area);
                             fill.smooth = false;
                             Preview::Painted {

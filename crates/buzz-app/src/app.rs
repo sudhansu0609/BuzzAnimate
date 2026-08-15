@@ -289,6 +289,16 @@ pub struct App {
     /// picture from the last film cannot be shown for a symbol in this one
     /// that happens to have been given the same id.
     thumbnails: crate::thumbnails::Thumbnails,
+    /// Shading geometry being built off the UI thread, if any.
+    ///
+    /// The first lit frame of a heavy scene used to cost a third of a second,
+    /// because every crescent and cast shadow was built — one boolean each, one
+    /// at a time — before anything appeared. Now a cold cache draws the frame
+    /// unlit and the geometry is built on every core at once, off this thread;
+    /// when it lands, the cache is warm and the next frame is lit. Per-light
+    /// keying keeps the cache warm through ordinary edits, so this path fires
+    /// only when it is genuinely cold. Closes §7-154 and §7-155.
+    shade_build: Option<crossbeam_channel::Receiver<Vec<buzz_render::lighting::Built>>>,
     /// A script running on a thread, if one is, and where its result lands.
     ///
     /// A script is a transaction over the document: while it runs the window
@@ -348,6 +358,7 @@ impl App {
             last_crash_revision: None,
             animate_import: None,
             thumbnails: crate::thumbnails::Thumbnails::default(),
+            shade_build: None,
             scripting: None,
             loading: std::collections::HashMap::new(),
             picker: crate::dialogs::Pending::default(),
@@ -3792,7 +3803,56 @@ impl App {
         );
         // The camera works in physical pixels, matching the render target.
         self.editor.camera.viewport = Size::new(area_px.width(), area_px.height());
+
+        // Any shading geometry that finished building off-thread lands here,
+        // before the frame that will read it, so this frame draws lit.
+        if let Some(rx) = &self.shade_build
+            && let Ok(built) = rx.try_recv()
+        {
+            self.lights.lights.install(built);
+            self.shade_build = None;
+            active.window.request_redraw();
+        }
+
+        // **Defer only when the cache is cold.** A warm cache — the ordinary
+        // case, kept warm by per-light keying through every edit — builds any
+        // stray miss inline and stays flicker-free. A cold one (a document just
+        // opened, lighting just switched on) draws unlit this frame and builds
+        // its geometry off-thread instead of freezing on it.
+        let cold = self.lights.lights.is_empty() && self.editor.scene().lights().is_active();
+        self.lights.lights.set_defer(cold);
+
         stage::build_scene(&mut active.vello, &self.editor, area_px, &mut self.lights);
+
+        // Whatever this frame could not light, build in parallel off-thread and
+        // ask for another frame to show it in.
+        let misses = self.lights.lights.take_misses();
+        // Deferring was for the stage frame only; anything else that draws
+        // through this cache — the Library thumbnails below — builds inline.
+        self.lights.lights.set_defer(false);
+        if !misses.is_empty() && self.shade_build.is_none() {
+            let jobs = std::sync::Arc::clone(&self.jobs);
+            let (send, receive) = crossbeam_channel::bounded(1);
+            // A plain thread that parks on the interactive pool: the build fans
+            // out across every core there, and the UI thread is not one of
+            // them, so drawing is never what waits.
+            std::thread::Builder::new()
+                .name("buzz-shade".into())
+                .spawn(move || {
+                    let built = jobs.run(Pool::Interactive, || {
+                        use rayon::prelude::*;
+                        misses
+                            .into_par_iter()
+                            .map(buzz_render::lighting::Miss::build)
+                            .collect::<Vec<_>>()
+                    });
+                    let _ = send.send(built);
+                })
+                .ok();
+            self.shade_build = Some(receive);
+            active.window.request_redraw();
+        }
+
         // Restore logical units so pointer maths stays in egui's space.
         self.editor.camera.viewport =
             Size::new(stage_area.width() as f64, stage_area.height() as f64);

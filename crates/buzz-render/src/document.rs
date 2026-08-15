@@ -1461,3 +1461,98 @@ fn cast_shadows_within(
 fn fade(color: Color) -> Color {
     color.multiply_alpha(0.35)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use buzz_geom::{Camera, Point, Rect, Shape, Size};
+    use buzz_scene::{LightKind, ShapeData};
+
+    fn lit_scene() -> Scene {
+        let mut scene = Scene::default();
+        let layer = scene.add_layer("Art", buzz_scene::LayerKind::Normal);
+        scene.add_shape(
+            layer,
+            ShapeData::filled(
+                Rect::new(10.0, 10.0, 100.0, 100.0).to_path(1e-9),
+                Color::WHITE,
+            ),
+        );
+        // A sun low in the sky, so it actually casts a terminator and a shadow.
+        scene.add_light(LightKind::Sun {
+            azimuth: 0.4,
+            elevation: 0.3,
+        });
+        assert!(scene.lights().is_active(), "the rig should be on");
+        scene
+    }
+
+    /// The plan's acceptance test for Wave 4.5: a **cold** cache draws the
+    /// frame without building any geometry on the calling thread. The shapes
+    /// come out unlit and the geometry is queued for an off-thread build.
+    #[test]
+    fn a_cold_cache_defers_rather_than_building() {
+        let scene = lit_scene();
+        let mut vello = crate::vello::Scene::new();
+        let camera = Camera::new(Point::new(55.0, 55.0), 1.0, Size::new(400.0, 400.0));
+        let mut builder = SceneBuilder::new(&mut vello, &camera);
+
+        let mut cache = DrawCache::new();
+        cache.begin(scene.lights().fingerprint());
+        cache.lights.set_defer(true);
+
+        let options = FrameOptions {
+            lit: true,
+            ..FrameOptions::default()
+        };
+        draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut cache);
+
+        assert!(
+            cache.lights.is_empty(),
+            "a deferred draw must not build geometry into the cache on this thread"
+        );
+        let misses = cache.lights.take_misses();
+        assert!(
+            !misses.is_empty(),
+            "the geometry it could not draw should have been queued for later"
+        );
+
+        // And building those misses and installing them warms the cache, so the
+        // next draw of the same frame is lit rather than deferred again.
+        let built: Vec<_> = misses
+            .into_iter()
+            .map(crate::lighting::Miss::build)
+            .collect();
+        cache.lights.install(built);
+        assert!(!cache.lights.is_empty(), "the built geometry is now cached");
+    }
+
+    /// The warm path: with defer off, the same draw builds inline, as it always
+    /// did — so an ordinary edit lights on the spot with no unlit frame.
+    #[test]
+    fn a_warm_draw_builds_inline() {
+        let scene = lit_scene();
+        let mut vello = crate::vello::Scene::new();
+        let camera = Camera::new(Point::new(55.0, 55.0), 1.0, Size::new(400.0, 400.0));
+        let mut builder = SceneBuilder::new(&mut vello, &camera);
+
+        let mut cache = DrawCache::new();
+        cache.begin(scene.lights().fingerprint());
+        // defer left off
+
+        let options = FrameOptions {
+            lit: true,
+            ..FrameOptions::default()
+        };
+        draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut cache);
+
+        assert!(
+            cache.lights.take_misses().is_empty(),
+            "an inline draw queues nothing"
+        );
+        assert!(
+            !cache.lights.is_empty(),
+            "it should have built the geometry into the cache"
+        );
+    }
+}

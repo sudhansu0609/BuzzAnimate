@@ -155,6 +155,69 @@ impl Light {
         matches!(self.kind, LightKind::Sky { .. })
     }
 
+    /// A number that changes whenever anything about this light that affects the
+    /// geometry it generates changes.
+    ///
+    /// This is the geometry cache key. It is **per light** on purpose: the whole
+    /// point is that nudging one lamp rebuilds that lamp's crescents and shadows
+    /// and leaves every other light's alone — so the sun does not rebuild when
+    /// you drag a lamp, and a keyframed light in Wave 9a does not evict its
+    /// static neighbours every frame. The name and colour tint are folded in too
+    /// because the highlight geometry takes its softness and the shadow its
+    /// direction from exactly these fields.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::Hasher;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash_into(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The part of a fingerprint this one light contributes. Shared by
+    /// [`Light::fingerprint`] and [`LightRig::fingerprint`] so the two can never
+    /// drift apart on what counts as a change.
+    fn hash_into(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        fn f(hasher: &mut impl std::hash::Hasher, v: f64) {
+            v.to_bits().hash(hasher);
+        }
+        fn colour(hasher: &mut impl std::hash::Hasher, c: Color) {
+            for channel in c.components {
+                channel.to_bits().hash(hasher);
+            }
+        }
+
+        self.id.0.hash(hasher);
+        colour(hasher, self.color);
+        self.intensity.to_bits().hash(hasher);
+        self.enabled.hash(hasher);
+        self.shadows.hash(hasher);
+        self.shadow_strength.to_bits().hash(hasher);
+        f(hasher, self.standing_height);
+        f(hasher, self.softness);
+        match &self.kind {
+            LightKind::Sun { azimuth, elevation } => {
+                0u8.hash(hasher);
+                f(hasher, *azimuth);
+                f(hasher, *elevation);
+            }
+            LightKind::Sky { horizon } => {
+                1u8.hash(hasher);
+                colour(hasher, *horizon);
+            }
+            LightKind::Lamp {
+                position,
+                height,
+                radius,
+            } => {
+                2u8.hash(hasher);
+                f(hasher, position.x);
+                f(hasher, position.y);
+                f(hasher, *height);
+                f(hasher, *radius);
+            }
+        }
+    }
+
     /// Where the light is, as seen from `point` on a surface at `depth`.
     ///
     /// Returns the unit vector **towards the light** and how strongly it
@@ -287,11 +350,8 @@ impl LightRig {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
-        // Floats are hashed by their bits: two rigs that differ only in a
-        // colour or an angle must not collide, and `f64` is not `Hash`.
-        fn f(hasher: &mut impl Hasher, v: f64) {
-            v.to_bits().hash(hasher);
-        }
+        // The base colour is hashed by its bits: two rigs that differ only in a
+        // fill colour must not collide, and `f32` is not `Hash`.
         fn colour(hasher: &mut impl Hasher, c: Color) {
             for channel in c.components {
                 channel.to_bits().hash(hasher);
@@ -303,37 +363,11 @@ impl LightRig {
         self.modelling.to_bits().hash(&mut hasher);
         self.lights.len().hash(&mut hasher);
 
+        // Each light hashes itself, through the same routine `Light::fingerprint`
+        // uses, so the rig-wide number and any single light's number always
+        // agree on what a change is.
         for light in &self.lights {
-            light.id.0.hash(&mut hasher);
-            colour(&mut hasher, light.color);
-            light.intensity.to_bits().hash(&mut hasher);
-            light.enabled.hash(&mut hasher);
-            light.shadows.hash(&mut hasher);
-            light.shadow_strength.to_bits().hash(&mut hasher);
-            f(&mut hasher, light.standing_height);
-            f(&mut hasher, light.softness);
-            match &light.kind {
-                LightKind::Sun { azimuth, elevation } => {
-                    0u8.hash(&mut hasher);
-                    f(&mut hasher, *azimuth);
-                    f(&mut hasher, *elevation);
-                }
-                LightKind::Sky { horizon } => {
-                    1u8.hash(&mut hasher);
-                    colour(&mut hasher, *horizon);
-                }
-                LightKind::Lamp {
-                    position,
-                    height,
-                    radius,
-                } => {
-                    2u8.hash(&mut hasher);
-                    f(&mut hasher, position.x);
-                    f(&mut hasher, position.y);
-                    f(&mut hasher, *height);
-                    f(&mut hasher, *radius);
-                }
-            }
+            light.hash_into(&mut hasher);
         }
         hasher.finish()
     }

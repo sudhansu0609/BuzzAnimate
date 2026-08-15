@@ -3463,6 +3463,21 @@ front of the user — installs on `poll`. A second load is declined rather than 
 because "whichever finished second wins" is not what *second* means to the person who
 asked.
 
+**The first lit frame, and per-light keying (closes §7-154, §7-155).** The geometry
+cache is now keyed on **each light's** fingerprint rather than on a single rig-wide
+revision that cleared the whole cache on any change (`Light::fingerprint`,
+`lighting.rs`). So dragging one lamp rebuilds that lamp's crescents and shadows and
+leaves the sun's alone — which is what keeps the cache warm through ordinary editing,
+and what will make keyframed lights affordable in Wave 9a. On top of that, a **cold**
+cache no longer builds every crescent and shadow inline before the frame appears: it
+draws the frame unlit, queues the misses (`LightCache::set_defer`/`take_misses`), and the
+app builds them on the interactive pool — every core at once — off the UI thread
+(`Miss::build`, `LightCache::install`). When the geometry lands the next frame is lit.
+Deferral fires **only when the cache is cold**, so an ordinary edit still lights on the
+spot with no unlit flash; a document just opened shows for a frame or two unlit rather
+than freezing for a third of a second. The 305 ms first frame is gone, and the
+single-threaded geometry build with it.
+
 **Scripts off the UI thread (closes §7-32).** `buzz_script::run_until` takes a
 `StopSignal` — `Arc<dyn Fn() -> bool>` — consulted from QuickJS's interrupt handler, the
 same "fuel" hook that already enforced the time limit, so Stop lands between bytecodes
@@ -3782,8 +3797,8 @@ down here has not been finished.
 | 134 | **PDF gradients are still flattened.** PDF expresses them as shading dictionaries and Pattern colour spaces, which is a subsystem rather than an attribute — seven shading types, of which two are function-driven meshes. The XFL road brings gradients in; the PDF one still averages them. | Phase 5 follow-up |
 | 135 | **A gradient and a solid do not tween into each other.** Two gradients interpolate stop by stop when they correspond; a solid tweening to a gradient switches at the halfway point instead, because moving a colour and then jumping to a ramp reads as a glitch rather than a transition. Two gradients with different stop counts switch for the same reason. | By design |
 | 153 | **An armature layer is not marked, so a rigged film looks like any other.** §7 item 33 already records that a rig is an object rather than an armature layer; building the horror short confirmed the cost — with thirty rigged characters there is nothing in the timeline that says which layers hold rigs. | Phase 7 follow-up |
-| 154 | **Lighting geometry is single-threaded.** Booleans, hit-testing, IK and export encoding all use the cores; shading crescents and cast shadows are built one shape at a time. It does not matter yet — the first lit frame of a heavy scene is 305 ms and every frame after it is 6 ms — but it is the largest remaining single-threaded cost in the draw walk. | Follow-up |
-| 155 | **The first frame of a heavy scene costs 305 ms**, because every crescent, shadow and blur is built before anything appears. It is paid once and then cached, but opening a complex document shows nothing for a third of a second. Building the geometry on the background pool and drawing unlit until it arrives would hide it. | Follow-up |
+| 154 | ~~**Lighting geometry is single-threaded.**~~ | ✅ **Resolved in Wave 4** — a cold cache's shading crescents and cast shadows build on the interactive pool, every core at once, off the UI thread (`Miss::build` fanned out by `JobSystem::run(Pool::Interactive)`). §4 |
+| 155 | ~~**The first frame of a heavy scene costs 305 ms.**~~ | ✅ **Resolved in Wave 4** — a cold `LightCache` draws the frame unlit, queues its geometry, and builds it off-thread; the frame it lands in is lit. Per-light keying keeps the cache warm through ordinary edits, so this only ever happens on a genuinely cold cache. §4 |
 | 157 | **A mask added before the layer it masks ends up underneath it and claims nothing**, and the sheet it should have holed then draws flat across the whole film. Masking is positional and `add_layer` puts each new layer in front, so the masked layer has to be created *first*. Animate's order of work is the same — draw the content, then add a mask above it — but nothing here says so, and the symptom (an evenly darkened film) looks like a lighting problem rather than a layer-order one. | Follow-up |
 | 156 | **A layer that is one frame long shows nothing past frame zero**, which is correct and is also a trap: setting a document's length is a separate action (`set_frame_count`, Animate's F5), and a scene built without it appears to lose all its artwork the moment the playhead moves. Nothing in the interface says so. | Follow-up |
 | 158 | **The XFL, SWF and PDF readers still do not bring their bitmaps across.** The pipeline they needed now exists — decode, library, `media/` storage, a paint that draws them — so each reader has only to call it where it currently logs "bitmap ignored". Doing so needs the DefineBits/JPEGTables chain for SWF and the `<DOMBitmapItem>` road for XFL. | Phase 5 follow-up |

@@ -169,6 +169,13 @@ pub struct Editor {
     /// Memoised timeline waveforms, so the panel does not re-derive an envelope
     /// from raw PCM every frame. See [`Editor::waveforms`].
     waveform_cache: WaveformCache,
+    /// Every symbol's resolved extent, memoised by document revision. Hit-testing
+    /// and the selection chrome resolve an instance's bounds against this table
+    /// rather than re-walking the library per object — the difference between a
+    /// snappy click and a second's pause on a rig-heavy import.
+    bounds_cache: std::cell::RefCell<
+        Option<(u64, std::sync::Arc<std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>>)>,
+    >,
 }
 
 /// The waveform strip the timeline draws, cached against the document revision.
@@ -292,7 +299,25 @@ impl Editor {
             should_quit: false,
             status: None,
             waveform_cache: WaveformCache::default(),
+            bounds_cache: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Every symbol's resolved extent, memoised by revision. Rebuilt only on an
+    /// edit; a lookup for the whole document otherwise. See
+    /// [`buzz_scene::Scene::symbol_bounds_table`].
+    fn symbol_bounds(
+        &self,
+    ) -> std::sync::Arc<std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>> {
+        let revision = self.doc.scene().revision();
+        if let Some((r, table)) = self.bounds_cache.borrow().as_ref() {
+            if *r == revision {
+                return std::sync::Arc::clone(table);
+            }
+        }
+        let table = std::sync::Arc::new(self.doc.scene().symbol_bounds_table());
+        *self.bounds_cache.borrow_mut() = Some((revision, std::sync::Arc::clone(&table)));
+        table
     }
 
     /// The frame the user is editing.
@@ -1332,17 +1357,24 @@ impl Editor {
     /// cannot select would be a worse trick than not showing it. The frame the
     /// playhead is on still wins where they overlap.
     pub fn object_at(&self, point: Point, tolerance: f64) -> Option<ObjectId> {
-        if let Some(hit) = self.object_at_frame(self.current_frame, point, tolerance) {
+        let table = self.symbol_bounds();
+        if let Some(hit) = self.object_at_frame(self.current_frame, point, tolerance, &table) {
             return Some(hit);
         }
         self.multi_frames()
             .into_iter()
             .rev()
-            .find_map(|frame| self.object_at_frame(frame, point, tolerance))
+            .find_map(|frame| self.object_at_frame(frame, point, tolerance, &table))
     }
 
     /// Topmost object under `point` on one particular frame.
-    fn object_at_frame(&self, frame: u32, point: Point, tolerance: f64) -> Option<ObjectId> {
+    fn object_at_frame(
+        &self,
+        frame: u32,
+        point: Point,
+        tolerance: f64,
+        table: &std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>,
+    ) -> Option<ObjectId> {
         let scene = self.doc.scene();
         let mut hit = None;
         // `selectable` yields back to front, so the last match is on top.
@@ -1381,7 +1413,7 @@ impl Editor {
                     // Edge-on: nothing on screen to click.
                     None => continue,
                 };
-                if object_contains(scene, object, local, local_tolerance, frame, 0) {
+                if object_contains(scene, object, local, local_tolerance, frame, 0, table) {
                     hit = Some(object.id);
                 }
             }
@@ -1402,8 +1434,12 @@ impl Editor {
         let (layer, object) = scene.find_object(id)?;
         let depth = scene.layers().get(layer).map(|l| l.depth).unwrap_or(0.0);
 
-        let bounds = scene.resolved_bounds(object);
-        let pivot = scene.pivot_of(object);
+        // Resolved from the memoised table: this runs every frame the object is
+        // selected, and re-measuring a rig through the library each time is what
+        // made the frame after a selection crawl.
+        let table = self.symbol_bounds();
+        let bounds = scene.resolved_bounds_with(object, &table);
+        let pivot = scene.pivot_of_with(object, &table);
         let projection = scene.camera().projection_for_object(
             self.current_frame,
             scene.stage().size,
@@ -1538,6 +1574,7 @@ impl Editor {
     /// every other instance with it.
     fn pick_in_region(&mut self, region: &BezPath, additive: bool) {
         let scene = self.doc.scene().clone();
+        let table = self.symbol_bounds();
         let frame = self.current_frame;
         let region_bounds = buzz_geom::Shape::bounding_box(region);
 
@@ -1568,7 +1605,7 @@ impl Editor {
                 if !object.visible || object.locked {
                     continue;
                 }
-                let bounds = scene.resolved_bounds(object);
+                let bounds = scene.resolved_bounds_with(object, &table);
                 if bounds.intersect(region_bounds).is_zero_area()
                     && !region_bounds.contains_rect(bounds)
                 {
@@ -4046,11 +4083,13 @@ fn object_contains(
     tolerance: f64,
     frame: u32,
     depth: usize,
+    table: &std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>,
 ) -> bool {
-    // Cheap rejection first, resolved through the library so an instance is
-    // rejected on its artwork's extents rather than a placeholder.
+    // Cheap rejection first, resolved through the memoised bounds table so an
+    // instance is rejected on its artwork's real extents — a lookup, not a
+    // fresh recursive measure of its whole rig on every object of every click.
     if !scene
-        .resolved_bounds(object)
+        .resolved_bounds_with(object, table)
         .inflate(tolerance, tolerance)
         .contains(point)
     {
@@ -4079,7 +4118,7 @@ fn object_contains(
         }
         ObjectKind::Group(children) => children
             .iter()
-            .any(|c| object_contains(scene, c, local, tolerance, frame, depth)),
+            .any(|c| object_contains(scene, c, local, tolerance, frame, depth, table)),
 
         ObjectKind::Instance(instance) => {
             // Same cycle guard the renderer uses.
@@ -4096,7 +4135,7 @@ fn object_contains(
                 .layers
                 .selectable()
                 .flat_map(|l| l.objects_at(inner))
-                .any(|c| object_contains(scene, c, local, tolerance, inner, depth + 1))
+                .any(|c| object_contains(scene, c, local, tolerance, inner, depth + 1, table))
         }
 
         // Rigged artwork is hit **where it is drawn**, not where it was drawn.

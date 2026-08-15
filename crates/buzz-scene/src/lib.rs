@@ -1008,6 +1008,19 @@ impl Scene {
         }
     }
 
+    /// The object's transformation point, resolving an instance's centre from a
+    /// bounds table rather than by re-walking the library. See [`Self::pivot_of`].
+    pub fn pivot_of_with(
+        &self,
+        object: &Object,
+        table: &std::collections::HashMap<SymbolId, Rect>,
+    ) -> Point {
+        match object.pivot {
+            Some(local) => object.transform * local,
+            None => self.resolved_bounds_with(object, table).center(),
+        }
+    }
+
     /// How many times each symbol is used, for the Library panel.
     ///
     /// Counts instances on the stage *and* inside other symbols, because a

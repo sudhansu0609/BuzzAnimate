@@ -200,10 +200,13 @@ impl BoundsCache {
 /// symbol's encoding?" is a hash-map lookup rather than a walk of its subtree.
 #[derive(Debug, Clone)]
 pub struct SymbolInfo {
-    /// Pins the symbol's address for the life of the entry, so the fingerprint —
-    /// which folds in `Arc` pointers — cannot be invalidated by a free-and-reuse
-    /// at the same address within one revision.
-    /// Also handed to the scene cache, which stores the same Arc per entry.
+    /// Held, not read: keeping a reference to each symbol means the next edit
+    /// finds its `Arc` shared and `Arc::make_mut` forks it, giving it a new
+    /// address — which is what moves the fingerprint below. This is the same
+    /// pointer-identity convention the other caches rely on (see [`BoundsCache`],
+    /// which holds an `Arc<Object>` for the same reason). Without it, an in-place
+    /// edit of an unshared library would leave the fingerprint stale.
+    #[allow(dead_code)]
     arc: Arc<buzz_scene::Symbol>,
     /// Changes whenever the symbol's own contents change **or** any symbol it
     /// nests changes. Editing a nested symbol forks that symbol's `Arc` but not
@@ -283,14 +286,20 @@ impl SymFlags {
 /// on any edit, which is a single depth-first pass over the library.
 #[derive(Debug, Default)]
 pub struct SymbolTable {
-    revision: Option<u64>,
+    /// Validity key: the library's identity **and** the scene revision. The
+    /// revision alone is a per-document counter, so a different document with a
+    /// coincidentally-equal revision — a new file opened into the same cache, or
+    /// one test scene after another — would otherwise be served the previous
+    /// document's symbols. The library address distinguishes documents.
+    key: Option<(usize, u64)>,
     infos: std::collections::HashMap<buzz_scene::SymbolId, SymbolInfo>,
 }
 
 impl SymbolTable {
     /// Bring the table up to date with the scene, cheaply if nothing changed.
     pub fn refresh(&mut self, scene: &Scene) {
-        if self.revision == Some(scene.revision()) {
+        let key = (scene.library().content_id(), scene.revision());
+        if self.key == Some(key) {
             return;
         }
         self.infos.clear();
@@ -298,7 +307,7 @@ impl SymbolTable {
         for symbol in scene.library().iter() {
             build_symbol(symbol.id, scene, &mut self.infos, &mut visiting);
         }
-        self.revision = Some(scene.revision());
+        self.key = Some(key);
     }
 
     fn get(&self, id: buzz_scene::SymbolId) -> Option<&SymbolInfo> {
@@ -1688,7 +1697,7 @@ fn try_stamp_symbol(
     ctx: &DrawCtx<'_>,
     inner_ctx: &DrawCtx<'_>,
     symbol_id: buzz_scene::SymbolId,
-    symbol: &buzz_scene::Symbol,
+    symbol: &Arc<buzz_scene::Symbol>,
     inner: u32,
     doc: Affine,
     cache: &mut DrawCache,
@@ -1700,15 +1709,18 @@ fn try_stamp_symbol(
     // The symbol's whole subtree must render position-independently, and the memo
     // must know it. Copy the few facts out so the memo's borrow ends here, before
     // the cache is borrowed mutably below.
-    let (fingerprint, resolved_bounds, symbol_arc) = {
+    let (fingerprint, resolved_bounds) = {
         let Some(info) = cache.symbols.get(symbol_id) else {
             return false;
         };
         if !info.cacheable_content() {
             return false;
         }
-        (info.fingerprint, info.resolved_bounds, Arc::clone(&info.arc))
+        (info.fingerprint, info.resolved_bounds)
     };
+    // The identity check on a hit compares against the *live* symbol, not the
+    // memo's copy, so an entry left over from another document is rejected.
+    let symbol_arc = Arc::clone(symbol);
 
     // Colour, overlay and lighting must all be neutral; otherwise the cached
     // artwork — encoded once, shared by every instance — would be wrong here.

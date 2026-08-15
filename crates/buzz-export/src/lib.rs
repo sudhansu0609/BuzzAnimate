@@ -215,6 +215,30 @@ impl Exporter {
         self.gpu.device.limits().max_texture_dimension_2d
     }
 
+    /// Turn the symbol-encoding cache on or off for this exporter. Exposed so a
+    /// parity test can render the same document both ways; the picture must be
+    /// the same either way.
+    pub fn set_symbol_reuse(&mut self, on: bool) {
+        self.lights.set_symbol_reuse(on);
+    }
+
+    /// (builds, stamps) of the symbol cache so far — for a parity test to
+    /// confirm the cache actually engaged rather than passing vacuously.
+    pub fn symbol_cache_stats(&self) -> (u64, u64) {
+        (
+            self.lights.symbol_scenes.builds,
+            self.lights.symbol_scenes.stamps,
+        )
+    }
+
+    /// Drop all retained render geometry. The symbol table already refuses to
+    /// serve one document's symbols for another, so this is not needed for
+    /// correctness; a test uses it to render each unrelated document from a
+    /// clean slate.
+    pub fn reset_caches(&mut self) {
+        self.lights = buzz_render::document::DrawCache::new();
+    }
+
     /// Render one frame.
     pub fn render(
         &mut self,

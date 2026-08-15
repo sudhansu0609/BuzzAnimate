@@ -431,6 +431,17 @@ impl Library {
         self.symbols.get(&id)
     }
 
+    /// A cheap identity for the shared symbol map: its address, which is stable
+    /// across the pointer-copy clones the document makes each frame and changes
+    /// exactly when the library is edited (via `Arc::make_mut`). Two different
+    /// documents hold different maps, so a render cache keyed partly on this
+    /// will not serve one document's symbols for another — the per-scene
+    /// `revision` counter alone cannot tell two documents apart. See
+    /// [`crate::Scene::revision`].
+    pub fn content_id(&self) -> usize {
+        Arc::as_ptr(&self.symbols) as *const () as usize
+    }
+
     /// Symbols in insertion-independent order, so listings are stable.
     pub fn iter(&self) -> impl Iterator<Item = &Arc<Symbol>> {
         self.symbols.values()

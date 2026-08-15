@@ -143,6 +143,47 @@ pub fn draw_frame(
 pub struct DrawCache {
     pub lights: LightCache,
     pub filters: FilterCache,
+    pub bounds: BoundsCache,
+}
+
+/// Resolved document-space bounds of instances, kept between frames so culling
+/// an off-screen symbol does not re-walk its whole library subtree every frame.
+///
+/// Keyed by the object's copy-on-write pointer, exactly as the lighting cache is:
+/// an instance's extent is a pure function of its transform and the symbol it
+/// points at, both of which are captured by its `Arc` identity, so an unedited
+/// instance keeps hitting. The bounds are in the object's own (parent) space, so
+/// they do not depend on where the instance is nested and can be transformed to
+/// document space at the point of use.
+#[derive(Debug, Default)]
+pub struct BoundsCache {
+    entries: std::collections::HashMap<usize, (Arc<Object>, buzz_geom::Rect, u64)>,
+    frame: u64,
+}
+
+impl BoundsCache {
+    fn begin(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    fn end(&mut self) {
+        let frame = self.frame;
+        self.entries
+            .retain(|_, (_, _, used)| frame.saturating_sub(*used) < 3);
+    }
+
+    /// The resolved parent-space bounds of `owner`, computed once and reused.
+    fn resolved(&mut self, owner: &Arc<Object>, scene: &Scene) -> buzz_geom::Rect {
+        let key = Arc::as_ptr(owner) as usize;
+        let frame = self.frame;
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.2 = frame;
+            return entry.1;
+        }
+        let bounds = scene.resolved_bounds(owner);
+        self.entries.insert(key, (Arc::clone(owner), bounds, frame));
+        bounds
+    }
 }
 
 impl DrawCache {
@@ -170,11 +211,13 @@ impl DrawCache {
     pub fn begin(&mut self, lights: u64) {
         self.lights.begin(lights);
         self.filters.begin();
+        self.bounds.begin();
     }
 
     pub fn end(&mut self) {
         self.lights.end();
         self.filters.end();
+        self.bounds.end();
     }
 }
 
@@ -197,6 +240,7 @@ pub fn draw_frame_lit(
     let mut cache = DrawCache {
         lights: std::mem::take(lights),
         filters: FilterCache::new(),
+        bounds: BoundsCache::default(),
     };
     draw_frame_cached(builder, scene, frame, camera, options, &mut cache);
     *lights = cache.lights;
@@ -996,11 +1040,25 @@ fn draw_object(
     // culled by their own bounds, but each shape they contain is culled here.
     if let Some(cull) = ctx.cull
         && object.filters.is_empty()
-        && matches!(object.kind, ObjectKind::Shape(_))
     {
-        let world = buzz_scene::object::transform_rect(doc, object.bounds());
-        if !rects_overlap(world, cull) {
-            return;
+        // A bare shape has exact bounds; an instance (or a group) has a
+        // placeholder, so its real extent is resolved through the library and
+        // cached — culling an off-screen *character* skips its whole subtree,
+        // which on an instance-heavy import is where the time goes. Only owned
+        // objects (a layer's own, not tweened) are cached and culled; tweened
+        // artwork changes every frame and is cheap to draw anyway.
+        let bounds = match &object.kind {
+            ObjectKind::Shape(_) => Some(object.bounds()),
+            ObjectKind::Instance(_) | ObjectKind::Group(_) => {
+                owner.map(|o| cache.bounds.resolved(o, ctx.scene))
+            }
+            _ => None,
+        };
+        if let Some(bounds) = bounds {
+            let world = buzz_scene::object::transform_rect(doc, bounds);
+            if !rects_overlap(world, cull) {
+                return;
+            }
         }
     }
 

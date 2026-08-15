@@ -1064,10 +1064,48 @@ pass, a Library pass, and **committing a merged monster scene and drawing it** �
 the reported bug, directly — all stay far under budget. The rule going forward is
 that every new per-frame cost lands with a budget assertion.
 
+### 7. The symbol encoding cache
+
+Culling made the **working** view fast, but the view a user first sees after an
+import is the whole document zoomed to fit, where nothing is off-screen and
+culling cannot help. The residual cost there was the draw walk's own shape: a
+symbol placed three hundred times is walked and re-encoded three hundred times a
+frame. The fix encodes each eligible symbol **once** per frame into its own Vello
+scene and stamps it at each instance with `Scene::append` — an O(N) copy of the
+encoding with a transform folded into every child transform. Measured on a
+60k-shape document, the zoomed-to-fit encode drops from ~35 ms to ~4 ms.
+
+- **The memo** (`SymbolTable`). A depth-first pass over the library records, per
+  symbol, a fingerprint, its resolved extent, and content flags — rebuilt only
+  when the library changes, so panning, zooming and playback never pay for it.
+  The fingerprint folds in each nested symbol's, so editing a part invalidates
+  every character that instances it. It also memoises `has_additive_paint`,
+  killing that per-frame library walk. Keyed on the library's identity
+  (`Library::content_id`) as well as the revision, so a second document opened
+  into the same cache is never served the first one's symbols.
+- **Eligibility.** An instance is stamped only when reuse is safe: the symbol's
+  whole subtree is simple (no filters, group blends, out-of-plane objects or
+  inverse masks), nothing tints/fades/ghosts/adjusts/blurs/lights it, and its
+  placement is an **orthogonal affine** — so baked stroke and seam widths, which
+  scale by the view zoom alone, stay screen-correct once the placement folds in.
+  Anything else falls through to the live walk, which is always correct; the
+  cache only ever adds a fast path. (Uniformly-scaled instances are a planned
+  Tier 2 and fall back for now.)
+- **The stamp** is an exact conjugation of the render split, in `f64` up to the
+  final compose: a child encoded as `S·(p − anchor)` about the symbol centre is
+  carried to the stage's `S·(A·p − cam)` by `gpu_view ∘ [A_lin, S·(A·anchor − cam)]`.
+  Parity is therefore pixel-exact up to `f32` rounding — `headless_symbol_cache.rs`
+  gates it at ≤ 2 LSB and ≥ 99.9% identical across translation, rotation,
+  reflection, nesting, masks, gradients, strokes, additive paint, guide/outline
+  layers and looping graphics; ineligible fall-through stays byte-identical.
+- On by default; `BUZZ_NO_SYMBOL_CACHE=1` draws every instance live.
+  `encode_cost.rs` gates that a warm zoomed-to-fit frame re-encodes nothing.
+
 **Files:** `buzz-scene` (`symbol.rs`, `sound.rs`, `image.rs`, `timeline.rs`),
 `buzz-audio` (`lib.rs`), `buzz-app` (`app.rs`, `sound.rs`, `editor.rs`,
 `thumbnails.rs`, `stage.rs`, `profile.rs`, `main.rs`), `buzz-ui`
-(`timeline_panel.rs`, `library_panel.rs`), `buzz-render` (`document.rs`).
+(`timeline_panel.rs`, `library_panel.rs`), `buzz-render` (`document.rs`),
+`buzz-export` (`lib.rs`).
 
 ---
 

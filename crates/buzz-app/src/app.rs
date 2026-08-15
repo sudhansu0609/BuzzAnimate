@@ -579,7 +579,16 @@ impl App {
             exports: crate::export_service::ExportQueue::default(),
             quit_prompt: false,
             presets: crate::presets::PresetLibrary::load(),
-            lights: buzz_render::document::DrawCache::new(),
+            lights: {
+                // The symbol-encoding cache is on by default; `BUZZ_NO_SYMBOL_CACHE=1`
+                // turns it off so an instance-heavy document draws every instance
+                // live, for bisecting a suspected reuse bug.
+                let mut cache = buzz_render::document::DrawCache::new();
+                if std::env::var("BUZZ_NO_SYMBOL_CACHE").is_ok() {
+                    cache.set_symbol_reuse(false);
+                }
+                cache
+            },
             recovery: buzz_ui::RecoveryState::default(),
             last_crash_revision: None,
             animate_import: None,

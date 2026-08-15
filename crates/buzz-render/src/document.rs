@@ -426,11 +426,11 @@ fn scan_object(
 /// Entries age out like the other caches (a few generations) and are capped, so
 /// a zoom gesture — which changes the key's `scale_bits` every frame — cannot
 /// pile up generations of full-document encodings.
-#[derive(Default)]
 pub struct SymbolSceneCache {
     entries: std::collections::HashMap<SymKey, SymEntry>,
-    /// Off by default; the window turns it on unless `BUZZ_NO_SYMBOL_CACHE` is
-    /// set. Off, every instance draws live exactly as before.
+    /// On by default; the window turns it off when `BUZZ_NO_SYMBOL_CACHE` is
+    /// set, and tests toggle it to compare. Off, every instance draws live
+    /// exactly as before.
     enabled: bool,
     /// Generation, bumped per window frame like the lighting cache.
     frame: u64,
@@ -438,6 +438,18 @@ pub struct SymbolSceneCache {
     pub builds: u64,
     /// How many times a cached scene was stamped, likewise.
     pub stamps: u64,
+}
+
+impl Default for SymbolSceneCache {
+    fn default() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            enabled: true,
+            frame: 0,
+            builds: 0,
+            stamps: 0,
+        }
+    }
 }
 
 /// vello::Scene is not `Debug`, so spell the cache's out by hand.

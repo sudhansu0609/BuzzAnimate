@@ -156,4 +156,50 @@ fn measure_encode_zoomed_to_fit() {
         near_per * 3 < per,
         "zoomed-in encode ({near_per:?}) is not much cheaper than zoomed-to-fit ({per:?})"
     );
+
+    // Zoomed to fit, with the symbol cache on: every character is visible, so
+    // culling cannot help — but the symbol is encoded once and stamped, so the
+    // walk is over one character's worth of artwork, not three hundred.
+    let mut reuse = DrawCache::new();
+    reuse.set_symbol_reuse(true);
+
+    // The first, cold frame encodes exactly two symbols — the character and its
+    // part — whatever the number of instances.
+    {
+        let mut vs = vello::Scene::new();
+        let mut builder = SceneBuilder::new(&mut vs, &camera);
+        reuse.begin(0);
+        document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut reuse);
+        reuse.end();
+    }
+    assert_eq!(
+        reuse.symbol_scenes.builds, 2,
+        "a cold frame should encode only the character and the part, not per instance"
+    );
+
+    // Warm frames re-encode nothing: they are all stamps.
+    let warm_before = reuse.symbol_scenes.builds;
+    let start = Instant::now();
+    for _ in 0..frames {
+        let mut vs = vello::Scene::new();
+        let mut builder = SceneBuilder::new(&mut vs, &camera);
+        reuse.begin(0);
+        document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut reuse);
+        reuse.end();
+    }
+    let reuse_per = start.elapsed() / frames;
+    eprintln!(
+        "zoomed-to-fit encode (symbol cache on): {reuse_per:?}/frame, {} builds over {frames} warm frames",
+        reuse.symbol_scenes.builds - warm_before
+    );
+
+    assert_eq!(
+        reuse.symbol_scenes.builds - warm_before,
+        0,
+        "warm frames should stamp, not re-encode"
+    );
+    assert!(
+        reuse_per * 3 < per,
+        "symbol reuse ({reuse_per:?}) is not much cheaper than encoding every instance ({per:?})"
+    );
 }

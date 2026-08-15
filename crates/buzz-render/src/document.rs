@@ -1478,8 +1478,17 @@ fn draw_object(
             _ => None,
         };
         if let Some(bounds) = bounds {
+            // `world` is in **document** space (the geometry accumulation), but
+            // the cull rectangle is the viewport in the camera's **shot** space.
+            // Project the bounds the same way the artwork is projected before
+            // comparing — with an animated camera the two spaces differ, and at
+            // high zoom that difference exceeds the margin, which culled
+            // on-screen artwork. When the bounds cannot be projected (edge-on or
+            // behind the camera) nothing is culled.
             let world = buzz_scene::object::transform_rect(doc, bounds);
-            if !rects_overlap(world, cull) {
+            if let Some(world) = ctx.projection.map_rect_bounds(world)
+                && !rects_overlap(world, cull)
+            {
                 return;
             }
         }

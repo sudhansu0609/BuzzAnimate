@@ -45,7 +45,11 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
     // off the edge is culled rather than encoded. Display-only: the exporter and
     // thumbnails leave it `None` and render everything. See
     // `buzz_render::document::FrameOptions::cull`.
-    let cull = Some(builder.clip_bounds());
+    let cull = if std::env::var("BUZZ_NO_CULL").is_ok() {
+        None
+    } else {
+        Some(builder.clip_bounds())
+    };
 
     // **One cache generation for the whole screen frame.** What follows can be
     // a dozen draws — the context behind an opened symbol, every keyframe under

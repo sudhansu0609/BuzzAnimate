@@ -662,16 +662,19 @@ fn ruler(
     } else {
         20
     } as u32;
-    // Only the labels in view, aligned down to the step so the numbering stays
-    // on its regular grid however far the ruler is scrolled.
+    // Label frame 1 and every fifth frame after — 1, 5, 10, 15 — the way
+    // Animate numbers its ruler, on the one-based frame the animator sees.
     let visible = visible_columns(ui.clip_rect(), grid_left, cell_width, columns);
-    let start = (visible.start / step) * step;
-    for frame in (start..visible.end).step_by(step as usize) {
+    for frame in visible.clone() {
+        let number = frame + 1;
+        if number != 1 && number % step != 0 {
+            continue;
+        }
         let x = grid_left + frame as f32 * cell_width;
         painter.text(
             egui::pos2(x + 1.0, rect.min.y + 2.0),
             Align2::LEFT_TOP,
-            format!("{}", frame + 1),
+            format!("{number}"),
             font.clone(),
             Palette::ruler_text(),
         );
@@ -874,7 +877,19 @@ fn layer_row(
 
     let active = state.active_layer == Some(layer.id);
     if active {
-        painter.rect_filled(rect, 0.0, Palette::raised());
+        // Animate marks the selected layer with a blue name panel and its own
+        // outline colour as a line along the bottom of the row.
+        let panel = egui::Rect::from_min_size(rect.min, egui::vec2(LAYER_COLUMN, height));
+        painter.rect_filled(panel, 0.0, Color32::from_rgb(0x35, 0x61, 0x91));
+        let [r, g, b, _] = layer.color.to_rgba8().to_u8_array();
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.min.x, rect.max.y - 2.0),
+                egui::pos2(rect.min.x + LAYER_COLUMN, rect.max.y),
+            ),
+            0.0,
+            Color32::from_rgb(r, g, b),
+        );
     }
 
     // -- name column ------------------------------------------------------

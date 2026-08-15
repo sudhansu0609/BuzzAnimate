@@ -133,6 +133,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                     Command::ExportImage,
                     Command::ExportSequence,
                     Command::ExportVideo,
+                    Command::ExportGif,
+                    Command::ExportWebp,
                 ] {
                     item(ui, c, true, &mut raised);
                 }

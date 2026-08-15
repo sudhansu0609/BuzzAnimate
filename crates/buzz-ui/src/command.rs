@@ -29,6 +29,10 @@ pub enum Command {
     ExportSequence,
     /// Render the film as an MP4 or MOV. CP-6.2.
     ExportVideo,
+    /// Render the film as an animated GIF. CP-6.3.
+    ExportGif,
+    /// Render the film as an animated WebP. CP-6.3.
+    ExportWebp,
     /// Bring a sound file into the library.
     ImportSound,
     /// Bring a bitmap onto the stage, already broken apart into artwork.
@@ -230,6 +234,8 @@ impl Command {
             ExportImage => "Export Image…",
             ExportSequence => "Export PNG Sequence…",
             ExportVideo => "Export Video…",
+            ExportGif => "Export GIF…",
+            ExportWebp => "Export WebP…",
             ImportSound => "Import Sound…",
             ImportImage => "Import Image…",
             AttachSound => "Attach Sound to Frame",
@@ -368,6 +374,8 @@ impl Command {
             ExportImage => None,
             ExportSequence => None,
             ExportVideo => None,
+            ExportGif => None,
+            ExportWebp => None,
             // Animate has no default binding for any of these.
             ImportSound | ImportImage | AttachSound | RemoveSound | LipSync | NewMouthSymbol => {
                 None
@@ -636,6 +644,8 @@ pub fn all_with_shortcuts() -> Vec<Command> {
         ExportImage,
         ExportSequence,
         ExportVideo,
+        ExportGif,
+        ExportWebp,
         ImportSound,
         ImportImage,
         AttachSound,
@@ -759,6 +769,8 @@ mod tests {
             ExportImage,
             ExportSequence,
             ExportVideo,
+            ExportGif,
+            ExportWebp,
             ImportSound,
             ImportImage,
             ImportImage,

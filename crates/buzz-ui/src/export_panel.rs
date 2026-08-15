@@ -17,6 +17,10 @@ pub enum ExportKind {
     Sequence,
     /// An MP4 or MOV. CP-6.2.
     Video,
+    /// An animated GIF. CP-6.3.
+    Gif,
+    /// An animated WebP. CP-6.3.
+    Webp,
 }
 
 impl ExportKind {
@@ -25,12 +29,19 @@ impl ExportKind {
             ExportKind::Image => "Export Image",
             ExportKind::Sequence => "Export PNG Sequence",
             ExportKind::Video => "Export Video",
+            ExportKind::Gif => "Export GIF",
+            ExportKind::Webp => "Export WebP",
         }
     }
 
     /// Does this export cover a range of frames rather than one?
     pub fn is_range(self) -> bool {
-        matches!(self, Self::Sequence | Self::Video)
+        matches!(self, Self::Sequence | Self::Video | Self::Gif | Self::Webp)
+    }
+
+    /// Does this format need an ffmpeg to encode?
+    pub fn needs_ffmpeg(self) -> bool {
+        matches!(self, Self::Video | Self::Gif | Self::Webp)
     }
 }
 
@@ -59,6 +70,10 @@ pub struct ExportState {
     /// choice is a preference about the machine, not about the document, so
     /// resetting it every time would be an annoyance rather than a safeguard.
     pub video: VideoOptions,
+    /// GIF settings, remembered for the same reason.
+    pub gif: GifOptions,
+    /// Animated-WebP settings.
+    pub webp: WebpOptions,
     /// Whether this machine has an ffmpeg to encode with, checked when the
     /// dialog opens rather than when Export is pressed.
     pub ffmpeg: bool,
@@ -138,6 +153,55 @@ impl ContainerChoice {
     }
 }
 
+/// The GIF choices the dialog offers. A plain mirror of
+/// `buzz_export::GifSettings`, kept here so `buzz-ui` need not depend on the
+/// exporter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GifOptions {
+    pub dither: DitherChoice,
+}
+
+impl Default for GifOptions {
+    fn default() -> Self {
+        Self {
+            dither: DitherChoice::Bayer,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DitherChoice {
+    None,
+    Bayer,
+    FloydSteinberg,
+}
+
+impl DitherChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Bayer => "Ordered (steady)",
+            Self::FloydSteinberg => "Diffusion (smoother, shimmers)",
+        }
+    }
+}
+
+/// The animated-WebP choices. Mirror of `buzz_export::WebpSettings`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebpOptions {
+    pub quality: u32,
+    pub lossless: bool,
+}
+
+impl Default for WebpOptions {
+    fn default() -> Self {
+        Self {
+            quality: 90,
+            lossless: false,
+        }
+    }
+}
+
 impl Default for ExportState {
     fn default() -> Self {
         Self {
@@ -151,6 +215,8 @@ impl Default for ExportState {
             stage: (550, 400),
             progress: None,
             video: VideoOptions::default(),
+            gif: GifOptions::default(),
+            webp: WebpOptions::default(),
             ffmpeg: true,
         }
     }
@@ -327,22 +393,62 @@ fn settings_view(
     ui.checkbox(&mut state.transparent, "Transparent background")
         .on_hover_text("Leave the stage colour out, so the artwork can be composited elsewhere");
 
+    if kind.needs_ffmpeg() && !state.ffmpeg {
+        ui.add_space(4.0);
+        ui.separator();
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 120, 90),
+            "No ffmpeg found on this machine.",
+        );
+        ui.label(
+            RichText::new("This format needs one. On Windows: winget install Gyan.FFmpeg")
+                .small()
+                .weak(),
+        );
+    }
+
+    if kind == ExportKind::Gif {
+        ui.add_space(4.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Dithering");
+            egui::ComboBox::from_id_salt("gif-dither")
+                .selected_text(state.gif.dither.label())
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for d in [
+                        DitherChoice::Bayer,
+                        DitherChoice::FloydSteinberg,
+                        DitherChoice::None,
+                    ] {
+                        ui.selectable_value(&mut state.gif.dither, d, d.label());
+                    }
+                });
+        });
+        ui.label(
+            RichText::new("A GIF has 256 colours; dithering trades pattern for banding.")
+                .small()
+                .weak(),
+        );
+    }
+
+    if kind == ExportKind::Webp {
+        ui.add_space(4.0);
+        ui.separator();
+        ui.checkbox(&mut state.webp.lossless, "Lossless")
+            .on_hover_text("Exact pixels, larger file. Suits flat vector artwork.");
+        if !state.webp.lossless {
+            ui.horizontal(|ui| {
+                ui.label("Quality");
+                ui.add(egui::Slider::new(&mut state.webp.quality, 10..=100).show_value(false))
+                    .on_hover_text("Higher is better and larger");
+            });
+        }
+    }
+
     if kind == ExportKind::Video {
         ui.add_space(4.0);
         ui.separator();
-
-        if !state.ffmpeg {
-            ui.colored_label(
-                egui::Color32::from_rgb(220, 120, 90),
-                "No ffmpeg found on this machine.",
-            );
-            ui.label(
-                RichText::new("Video export needs one. On Windows: winget install Gyan.FFmpeg")
-                    .small()
-                    .weak(),
-            );
-            ui.add_space(4.0);
-        }
 
         egui::Grid::new("export-video")
             .num_columns(2)
@@ -402,10 +508,10 @@ fn settings_view(
             ui.label("to");
             ui.add(egui::DragValue::new(&mut state.to_frame).range(0..=u32::MAX));
             let count = state.range().len();
-            let what = if kind == ExportKind::Video {
-                format!("({count} frames)")
-            } else {
+            let what = if kind == ExportKind::Sequence {
                 format!("({count} files)")
+            } else {
+                format!("({count} frames)")
             };
             ui.label(RichText::new(what).small().weak());
         });

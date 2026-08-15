@@ -43,8 +43,8 @@ pub use camera_panel::{CameraResponse, camera_panel};
 pub use command::Command;
 pub use depth_panel::{DepthResponse, depth_panel};
 pub use export_panel::{
-    ContainerChoice, ExportKind, ExportResponse, ExportState, VideoChoice, VideoOptions,
-    export_dialog,
+    ContainerChoice, DitherChoice, ExportKind, ExportResponse, ExportState, GifOptions,
+    VideoChoice, VideoOptions, WebpOptions, export_dialog,
 };
 pub use filter_panel::{FilterPanelState, FilterResponse, FilterTarget, filter_panel};
 pub use library_panel::{LibraryState, library_panel};

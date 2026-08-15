@@ -1914,7 +1914,7 @@ impl Editor {
             CreateShapeTween => self.set_tween(Tween::shape()),
             RemoveTween => self.set_tween(Tween::default()),
 
-            ExportImage | ExportSequence | ExportVideo => {
+            ExportImage | ExportSequence | ExportVideo | ExportGif | ExportWebp => {
                 // The shell owns the file dialog and the exporting thread, as
                 // with Open and Save. Reaching here means a code path raised
                 // the command without going through `App::dispatch`.

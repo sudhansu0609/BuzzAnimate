@@ -2601,6 +2601,8 @@ impl App {
             Command::ExportImage => self.open_export(buzz_ui::ExportKind::Image),
             Command::ExportSequence => self.open_export(buzz_ui::ExportKind::Sequence),
             Command::ExportVideo => self.open_export(buzz_ui::ExportKind::Video),
+            Command::ExportGif => self.open_export(buzz_ui::ExportKind::Gif),
+            Command::ExportWebp => self.open_export(buzz_ui::ExportKind::Webp),
             Command::Open => self.open_dialog(),
             Command::Save => self.save(false),
             Command::SaveAs => self.save(true),
@@ -3152,7 +3154,7 @@ impl App {
         // Checked as the dialog opens rather than when Export is pressed, so
         // the missing dependency is visible while the settings are still being
         // chosen instead of after a file name has been picked.
-        let has_ffmpeg = kind != buzz_ui::ExportKind::Video || buzz_export::ffmpeg_available();
+        let has_ffmpeg = !kind.needs_ffmpeg() || buzz_export::ffmpeg_available();
         let (size, length) = {
             let scene = self.editor.scene();
             // The length of the **film**, not of the timeline: a looping
@@ -3214,6 +3216,12 @@ impl App {
                     .filter(options.container.label(), &[extension])
                     .file_name(format!("{stem}.{extension}"))
             }
+            buzz_ui::ExportKind::Gif => crate::dialogs::Request::save_file()
+                .filter("Animated GIF", &["gif"])
+                .file_name(format!("{stem}.gif")),
+            buzz_ui::ExportKind::Webp => crate::dialogs::Request::save_file()
+                .filter("Animated WebP", &["webp"])
+                .file_name(format!("{stem}.webp")),
         };
         self.ask_for_path(request, Pick::Export(kind));
     }
@@ -3278,6 +3286,40 @@ impl App {
                             quality: options.quality,
                             hardware: options.hardware,
                             audio: options.audio,
+                        },
+                    },
+                    label,
+                )
+            }
+            buzz_ui::ExportKind::Gif => {
+                let label = file_name(&path);
+                (
+                    ExportTarget::Gif {
+                        path,
+                        gif: buzz_export::GifSettings {
+                            dither: match self.editor.export.gif.dither {
+                                buzz_ui::DitherChoice::None => buzz_export::Dither::None,
+                                buzz_ui::DitherChoice::Bayer => buzz_export::Dither::Bayer,
+                                buzz_ui::DitherChoice::FloydSteinberg => {
+                                    buzz_export::Dither::FloydSteinberg
+                                }
+                            },
+                            loops: 0,
+                        },
+                    },
+                    label,
+                )
+            }
+            buzz_ui::ExportKind::Webp => {
+                let options = self.editor.export.webp;
+                let label = file_name(&path);
+                (
+                    ExportTarget::Webp {
+                        path,
+                        webp: buzz_export::WebpSettings {
+                            quality: options.quality,
+                            lossless: options.lossless,
+                            loops: 0,
                         },
                     },
                     label,

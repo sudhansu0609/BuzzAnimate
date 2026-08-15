@@ -178,6 +178,10 @@ pub struct Waveform {
 /// them took the room from the window rather than from the layer names.
 const LAYER_COLUMN: f32 = 210.0;
 
+/// The layer-names column background — dark, like Animate's. It is opaque so the
+/// horizontally scrolling frame grid never shows through the pinned names.
+const NAMES_BG: Color32 = Color32::from_rgb(0x2B, 0x2B, 0x2B);
+
 /// Gap between the three switch columns, and from the frame grid.
 ///
 /// Five rather than three because the *headings* are what set this: `show` and
@@ -629,28 +633,18 @@ fn ruler(
         egui::vec2(LAYER_COLUMN + width, 16.0),
         Sense::click_and_drag(),
     );
-    let painter = ui.painter_at(rect);
-
-    painter.rect_filled(rect, 0.0, Palette::ruler_bg());
-
     let grid_left = rect.min.x + LAYER_COLUMN;
+    let pinned_left = ui.clip_rect().min.x;
     let font = FontId::proportional(9.0);
 
-    // Headings over the three switch columns, in the same place the switches
-    // are: a painted eye is only obvious once you know what it is, and this is
-    // the row Animate rules them under.
-    for (column, icon) in switch_columns(rect)
-        .iter()
-        .zip(crate::panels::LayerIcon::ALL)
-    {
-        painter.text(
-            column.center(),
-            Align2::CENTER_CENTER,
-            icon.heading(),
-            FontId::proportional(8.0),
-            Palette::ruler_text(),
-        );
-    }
+    // The numbers, loop band and playhead scroll with the grid, clipped to the
+    // area right of the pinned layer-names column so none of it draws over the
+    // headings.
+    let painter = ui.painter_at(
+        egui::Rect::from_min_max(egui::pos2(pinned_left + LAYER_COLUMN, rect.min.y), rect.max)
+            .intersect(ui.clip_rect()),
+    );
+    painter.rect_filled(rect, 0.0, Palette::ruler_bg());
 
     // Label every fifth frame, as Animate does — or every tenth, or every
     // twentieth, once the cells are too narrow for the numbers to fit beside
@@ -682,6 +676,27 @@ fn ruler(
 
     draw_loop_band(&painter, rect, grid_left, columns, region, cell_width);
     draw_playhead(&painter, rect, grid_left, state.current_frame, cell_width);
+
+    // The pinned header over the layer-names column: the eye/lock/outline
+    // headings, sitting in the same columns their switches do on each row below.
+    let name_row = egui::Rect::from_min_size(
+        egui::pos2(pinned_left, rect.min.y),
+        egui::vec2(LAYER_COLUMN, rect.height()),
+    );
+    let head = ui.painter_at(name_row.intersect(ui.clip_rect()));
+    head.rect_filled(name_row, 0.0, Palette::ruler_bg());
+    for (column, icon) in switch_columns(name_row)
+        .iter()
+        .zip(crate::panels::LayerIcon::ALL)
+    {
+        head.text(
+            column.center(),
+            Align2::CENTER_CENTER,
+            icon.heading(),
+            FontId::proportional(8.0),
+            Palette::ruler_text(),
+        );
+    }
 
     // Dragging along the ruler scrubs.
     if (response.clicked() || response.dragged())
@@ -778,23 +793,21 @@ fn camera_row(
     let width = columns as f32 * cell_width;
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(LAYER_COLUMN + width, height), Sense::click());
-    let painter = ui.painter_at(rect);
-
-    if state.camera_selected {
-        painter.rect_filled(rect, 0.0, Palette::raised());
-    }
-
-    painter.text(
-        egui::pos2(rect.min.x + 4.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        "Camera",
-        FontId::proportional(11.0),
-        Palette::text(),
+    let pinned_left = ui.clip_rect().min.x;
+    let name_row = egui::Rect::from_min_size(
+        egui::pos2(pinned_left, rect.min.y),
+        egui::vec2(LAYER_COLUMN, height),
     );
+    let grid_left = rect.min.x + LAYER_COLUMN;
 
+    // The camera's keyframe cells scroll with the grid, clipped right of the
+    // pinned name column.
+    let painter = ui.painter_at(
+        egui::Rect::from_min_max(egui::pos2(pinned_left + LAYER_COLUMN, rect.min.y), rect.max)
+            .intersect(ui.clip_rect()),
+    );
     let camera = scene.camera();
     let last = camera.last_frame();
-    let grid_left = rect.min.x + LAYER_COLUMN;
     let tint = Color32::from_rgb(0x3A, 0x4A, 0x60);
 
     for frame in visible_columns(ui.clip_rect(), grid_left, cell_width, columns) {
@@ -821,6 +834,25 @@ fn camera_row(
 
         draw_frame_cell(&painter, cell, kind, tween, frame == state.current_frame);
     }
+
+    // The pinned "Camera" name cell, over the grid.
+    let names = ui.painter_at(name_row.intersect(ui.clip_rect()));
+    names.rect_filled(
+        name_row,
+        0.0,
+        if state.camera_selected {
+            Color32::from_rgb(0x35, 0x61, 0x91)
+        } else {
+            NAMES_BG
+        },
+    );
+    names.text(
+        egui::pos2(name_row.min.x + 4.0, name_row.center().y),
+        Align2::LEFT_CENTER,
+        "Camera",
+        FontId::proportional(11.0),
+        Palette::text(),
+    );
 
     if response.clicked() {
         out.select_camera = true;
@@ -873,26 +905,65 @@ fn layer_row(
     if !rect.intersects(ui.clip_rect()) {
         return;
     }
-    let painter = ui.painter_at(rect);
+    // The layer names column is **sticky**: it stays pinned to the left edge of
+    // the viewport while the frames grid scrolls horizontally beside it, exactly
+    // as Animate keeps its layer list in place. Everything on the left is drawn
+    // at `name_row` (pinned to the viewport) rather than at the row's own
+    // scrolled origin, and the grid is clipped to the area right of it so the two
+    // never overlap.
+    let pinned_left = ui.clip_rect().min.x;
+    let name_row = egui::Rect::from_min_size(
+        egui::pos2(pinned_left, rect.min.y),
+        egui::vec2(LAYER_COLUMN, height),
+    );
+    let grid_left = rect.min.x + LAYER_COLUMN;
+    let length = layer.length();
 
+    // -- frame grid, clipped to the area right of the pinned column -------
+    let grid = ui.painter_at(
+        egui::Rect::from_min_max(egui::pos2(pinned_left + LAYER_COLUMN, rect.min.y), rect.max)
+            .intersect(ui.clip_rect()),
+    );
+    let visible = visible_columns(ui.clip_rect(), grid_left, cell_width, columns);
+    for frame in visible.clone() {
+        let x = grid_left + frame as f32 * cell_width;
+        let cell =
+            egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(cell_width, height));
+        draw_frame_cell(
+            &grid,
+            cell,
+            layer.frame_kind(frame),
+            tween_cell(layer, frame, length),
+            frame == state.current_frame,
+        );
+    }
+    // A sound layer draws its waveform across the frames the sound covers, over
+    // the cells and translucently, so an animator finds the accents by looking.
+    if let Some(waveform) = state.waveforms.get(&layer.id) {
+        draw_waveform(&grid, waveform, grid_left, rect, height, &visible, cell_width);
+    }
+
+    // -- name column, pinned and drawn over the grid ----------------------
+    let painter = ui.painter_at(name_row.intersect(ui.clip_rect()));
     let active = state.active_layer == Some(layer.id);
     if active {
         // Animate marks the selected layer with a blue name panel and its own
         // outline colour as a line along the bottom of the row.
-        let panel = egui::Rect::from_min_size(rect.min, egui::vec2(LAYER_COLUMN, height));
-        painter.rect_filled(panel, 0.0, Color32::from_rgb(0x35, 0x61, 0x91));
+        painter.rect_filled(name_row, 0.0, Color32::from_rgb(0x35, 0x61, 0x91));
         let [r, g, b, _] = layer.color.to_rgba8().to_u8_array();
         painter.rect_filled(
             egui::Rect::from_min_max(
-                egui::pos2(rect.min.x, rect.max.y - 2.0),
-                egui::pos2(rect.min.x + LAYER_COLUMN, rect.max.y),
+                egui::pos2(name_row.min.x, name_row.max.y - 2.0),
+                name_row.max,
             ),
             0.0,
             Color32::from_rgb(r, g, b),
         );
+    } else {
+        // Opaque, so the scrolling grid never shows through the pinned names.
+        painter.rect_filled(name_row, 0.0, NAMES_BG);
     }
 
-    // -- name column ------------------------------------------------------
     let indent = if layer.parent.is_some() { 12.0 } else { 0.0 };
     let mark = match layer.kind {
         LayerKind::Folder => "F ",
@@ -906,9 +977,9 @@ fn layer_row(
     // itself, and a long layer name would otherwise be drawn straight through
     // the three switches to its right.
     painter
-        .with_clip_rect(name_area(rect).intersect(rect))
+        .with_clip_rect(name_area(name_row).intersect(name_row))
         .text(
-            egui::pos2(rect.min.x + 4.0 + indent, rect.center().y),
+            egui::pos2(name_row.min.x + 4.0 + indent, name_row.center().y),
             Align2::LEFT_CENTER,
             format!("{mark}{}", layer.name),
             FontId::proportional(11.0),
@@ -919,15 +990,10 @@ fn layer_row(
             },
         );
 
-    // **Animate's three columns, beside the name.**
-    //
-    // The Layers panel has had these for a while and the timeline had none of
-    // them, which meant hiding a layer while working in the timeline — the
-    // panel an animator is actually in — needed a trip to the other side of
-    // the window. They are painted rather than laid out as widgets because the
-    // whole grid is: see `paint_layer_icon`.
+    // **Animate's three columns, beside the name** — eye, lock and outline,
+    // painted rather than laid out as widgets because the whole grid is.
     let hover = ui.ctx().input(|i| i.pointer.hover_pos());
-    let switches = switch_columns(rect);
+    let switches = switch_columns(name_row);
     for (column, icon) in switches.iter().zip(crate::panels::LayerIcon::ALL) {
         let on = match icon {
             crate::panels::LayerIcon::Eye => layer.visible,
@@ -938,53 +1004,23 @@ fn layer_row(
         crate::panels::paint_layer_icon(&painter, *column, icon, on, layer.color, hovered);
     }
 
-    // The layer's colour chip, which is also its outline-view colour. Left of
-    // the switches, beside the outline one it explains.
+    // The layer's colour chip, which is also its outline-view colour.
     let chip = egui::Rect::from_min_size(
         egui::pos2(
             switches[0].left() - crate::panels::CHIP_WIDTH - SWITCH_GAP,
-            rect.center().y - 4.0,
+            name_row.center().y - 4.0,
         ),
         egui::vec2(7.0, 8.0),
     );
     let [r, g, b, a] = layer.color.to_rgba8().to_u8_array();
     painter.rect_filled(chip, 1.0, Color32::from_rgba_unmultiplied(r, g, b, a));
 
-    // -- frame grid --------------------------------------------------------
-    let grid_left = rect.min.x + LAYER_COLUMN;
-    let length = layer.length();
-
-    // Only the cells in view: see `visible_columns`.
-    let visible = visible_columns(ui.clip_rect(), grid_left, cell_width, columns);
-    for frame in visible.clone() {
-        let x = grid_left + frame as f32 * cell_width;
-        let cell =
-            egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(cell_width, height));
-        draw_frame_cell(
-            &painter,
-            cell,
-            layer.frame_kind(frame),
-            tween_cell(layer, frame, length),
-            frame == state.current_frame,
-        );
-    }
-
-    // A sound layer draws its waveform across the frames the sound covers.
-    // This is what makes a soundtrack usable: an animator finds the accents by
-    // *looking* at where the loud parts are, then keys on them.
-    //
-    // Drawn **over** the frame cells, translucently. Underneath it was
-    // invisible: every cell paints its own background, so the envelope was
-    // covered by the very frames it describes.
-    if let Some(waveform) = state.waveforms.get(&layer.id) {
-        draw_waveform(
-            &painter, waveform, grid_left, rect, height, &visible, cell_width,
-        );
-    }
-
+    // The grid begins to the right of the pinned column, not at its scrolled
+    // origin, so a click on the pinned names is never read as a frame click.
+    let grid_edge = pinned_left + LAYER_COLUMN;
     let clicked_frame = |ui: &Ui| -> Option<u32> {
         let pos = ui.ctx().input(|i| i.pointer.interact_pos())?;
-        (pos.x >= grid_left).then(|| {
+        (pos.x >= grid_edge).then(|| {
             let frame = ((pos.x - grid_left) / cell_width).floor().max(0.0) as u32;
             frame.min(columns.saturating_sub(1))
         })
@@ -996,7 +1032,7 @@ fn layer_row(
         let hit = ui
             .ctx()
             .input(|i| i.pointer.interact_pos())
-            .and_then(|pos| switch_at(rect, pos));
+            .and_then(|pos| switch_at(name_row, pos));
         if let Some(icon) = hit {
             out.toggle_layer = Some((layer.id, icon));
         } else {
@@ -1016,7 +1052,7 @@ fn layer_row(
     let in_name_column = ui
         .ctx()
         .input(|i| i.pointer.interact_pos())
-        .is_some_and(|pos| pos.x < grid_left);
+        .is_some_and(|pos| pos.x < grid_edge);
     response.context_menu(|ui| {
         out.select_layer = Some(layer.id);
         if in_name_column {

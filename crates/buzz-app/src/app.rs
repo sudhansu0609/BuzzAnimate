@@ -2435,20 +2435,27 @@ impl App {
         let ink = buzz_ui::Palette::text();
         let halo = egui::Stroke::new(2.5, egui::Color32::from_black_alpha(120));
 
-        // The brush-like tools show a ring the size of the mark they make, in
-        // document units scaled to the screen — Animate's brush cursor.
+        // The brush-like tools are Animate's brush cursor: a ring the exact size
+        // of the mark, centred on the point it will make — and **nothing else**,
+        // so the mark lands under the ring's centre rather than beside a floating
+        // icon. This is what "the brush looks like Animate" means, and it is why
+        // strokes now start where the ring is.
         let ring = match tool {
             Brush => Some(self.editor.style.brush.size),
             Pencil | Eraser => Some(self.editor.style.stroke_width.max(1.0)),
             _ => None,
         };
         if let Some(size) = ring {
-            let r = (size * self.editor.camera.zoom * 0.5).clamp(2.0, 600.0) as f32;
+            let r = (size * self.editor.camera.zoom * 0.5).clamp(2.5, 600.0) as f32;
             painter.circle_stroke(pos, r, halo);
             painter.circle_stroke(pos, r, egui::Stroke::new(1.0, ink));
+            // A centre dot marks the exact point for a very small brush.
+            painter.circle_filled(pos, 1.0, ink);
+            return;
         }
 
-        // A small crosshair marks the exact hotspot.
+        // Every other tool: a crosshair on the exact hotspot, with the tool's
+        // icon just off it so it never covers the point.
         let h = 5.0;
         for (a, b) in [
             (egui::pos2(pos.x - h, pos.y), egui::pos2(pos.x + h, pos.y)),
@@ -2457,9 +2464,6 @@ impl App {
             painter.line_segment([a, b], halo);
             painter.line_segment([a, b], egui::Stroke::new(1.0, ink));
         }
-
-        // The tool's own icon, down-right of the hotspot, on a faint backing so
-        // it reads over any artwork.
         let icon = egui::Rect::from_min_size(egui::pos2(pos.x + 9.0, pos.y + 9.0), egui::vec2(18.0, 18.0));
         painter.rect_filled(icon.expand(2.0), 3.0, egui::Color32::from_black_alpha(140));
         buzz_ui::icons::tool_icon(&painter, icon, tool, ink);

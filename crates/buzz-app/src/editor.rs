@@ -1116,25 +1116,19 @@ impl Editor {
             }
 
             ToolAction::SampleColor { point } => {
-                let tolerance = self.pick_tolerance();
-                if let Some(id) = self.object_at(point, tolerance)
-                    && let Some((_, object)) = self.doc.scene().find_object(id)
-                    && let ObjectKind::Shape(shape) = &object.kind
-                {
-                    // The eyedropper picks up a colour, so a gradient is
-                    // sampled to the one colour it stands for rather than
-                    // loading the whole ramp into the colour well. Animate's
-                    // eyedropper does copy a gradient; ours does not yet, and
-                    // it is recorded in PROGRESS.md §7.
-                    if let Some(fill) = &shape.fill {
-                        self.style.fill_color = fill.color();
+                // The topmost shape under the point, found through instances and
+                // groups — an imported file is all instances, so the old
+                // top-level-shape-only check sampled nothing. A gradient is taken
+                // as the one colour it stands for rather than loading the ramp.
+                if let Some((color, is_fill)) = self.sampled_paint_at(point) {
+                    if is_fill {
+                        self.style.fill_color = color;
                         self.style.fill_enabled = true;
-                        self.style.remember(fill.color());
-                    } else if let Some(stroke) = &shape.stroke {
-                        self.style.stroke_color = stroke.color();
+                    } else {
+                        self.style.stroke_color = color;
                         self.style.stroke_enabled = true;
-                        self.style.remember(stroke.color());
                     }
+                    self.style.remember(color);
                 }
             }
 
@@ -1414,6 +1408,39 @@ impl Editor {
                 };
                 if object_contains(scene, object, local, local_tolerance, frame, 0, table) {
                     hit = Some(object.id);
+                }
+            }
+        }
+        hit
+    }
+
+    /// The colour under `point` for the eyedropper — the topmost shape's fill or
+    /// stroke, found through instances and groups. Mirrors [`Self::object_at`]'s
+    /// layer walk, so it samples exactly what a click would select into.
+    pub fn sampled_paint_at(&self, point: Point) -> Option<(Color, bool)> {
+        let table = self.symbol_bounds();
+        let scene = self.doc.scene();
+        let tolerance = self.pick_tolerance();
+        let frame = self.current_frame;
+        let mut hit = None;
+        for layer in scene.layers().selectable() {
+            let Some(local) = scene.view_to_layer(frame, layer.depth, point) else {
+                continue;
+            };
+            let local = match invert(scene.layers().inherited_transform(layer.id, frame)) {
+                Some(back) => back * local,
+                None => local,
+            };
+            for object in layer.objects_at(frame) {
+                if !object.visible || object.locked {
+                    continue;
+                }
+                let Some(local) = unturn(scene, object, frame, layer.depth, local) else {
+                    continue;
+                };
+                if let Some(paint) = sampled_paint(scene, object, local, tolerance, frame, 0, &table)
+                {
+                    hit = Some(paint);
                 }
             }
         }
@@ -4150,6 +4177,79 @@ fn object_contains(
                     || buzz_geom::hit::stroke_contains(path, local, 0.0, tolerance)
             })
         }
+    }
+}
+
+/// The colour of the topmost shape under `point`, and whether it is the fill
+/// (`true`) or the stroke — descending through instances and groups, so the
+/// eyedropper picks up a rig's artwork, not the placeholder of the instance the
+/// click first lands on. `None` when the point is over nothing paintable.
+fn sampled_paint(
+    scene: &Scene,
+    object: &Object,
+    point: Point,
+    tolerance: f64,
+    frame: u32,
+    depth: usize,
+    table: &std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>,
+) -> Option<(Color, bool)> {
+    if !scene
+        .resolved_bounds_with(object, table)
+        .inflate(tolerance, tolerance)
+        .contains(point)
+    {
+        return None;
+    }
+    let inverse = invert(object.transform)?;
+    let local = inverse * point;
+
+    match &object.kind {
+        ObjectKind::Shape(shape) => {
+            if let Some(fill) = &shape.fill
+                && buzz_geom::hit::fill_contains(&shape.path, local, buzz_geom::FillMode::NonZero)
+            {
+                return Some((fill.color(), true));
+            }
+            if let Some(stroke) = &shape.stroke {
+                let width = if stroke.hairline { 0.0 } else { stroke.width };
+                if buzz_geom::hit::stroke_contains(&shape.path, local, width, tolerance) {
+                    return Some((stroke.color(), false));
+                }
+            }
+            None
+        }
+        // The last hit in draw order is the one on top.
+        ObjectKind::Group(children) => {
+            let mut hit = None;
+            for child in children {
+                if let Some(paint) = sampled_paint(scene, child, local, tolerance, frame, depth, table)
+                {
+                    hit = Some(paint);
+                }
+            }
+            hit
+        }
+        ObjectKind::Instance(instance) => {
+            if depth >= MAX_SYMBOL_DEPTH {
+                return None;
+            }
+            let symbol = scene.library().get(instance.symbol)?;
+            let inner = instance.resolve_frame(symbol.kind, frame, symbol.length());
+            let mut hit = None;
+            for layer in symbol.layers.selectable() {
+                for child in layer.objects_at(inner) {
+                    if let Some(paint) =
+                        sampled_paint(scene, child, local, tolerance, inner, depth + 1, table)
+                    {
+                        hit = Some(paint);
+                    }
+                }
+            }
+            hit
+        }
+        // Posed rig artwork is skipped for now — sampling its deformed fill is
+        // recorded as a follow-up.
+        ObjectKind::Armature(_) | ObjectKind::Warp(_) => None,
     }
 }
 

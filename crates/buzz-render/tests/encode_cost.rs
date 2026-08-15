@@ -88,7 +88,11 @@ fn measure_encode_zoomed_to_fit() {
     // culled, exactly like the view right after an import.
     let camera = Camera::new(Point::new(1200.0, 750.0), 0.4, Size::new(1600.0, 1000.0));
 
+    // The baseline is the encode *without* the symbol cache — every instance
+    // walked and encoded live. The cache is on by default now, so turn it off
+    // here to measure what it saves against.
     let mut cache = DrawCache::new();
+    cache.set_symbol_reuse(false);
     let options = FrameOptions::default();
 
     // Warm, then measure a few frames.

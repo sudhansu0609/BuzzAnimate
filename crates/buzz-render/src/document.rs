@@ -345,39 +345,53 @@ fn build_symbol(
     (Arc::as_ptr(symbol) as usize).hash(&mut hasher);
 
     let mut flags = SymFlags::default();
+    // Bounds are unioned here in the *same* memoised pass — a nested symbol's
+    // extent is read from its already-computed entry, never re-measured. Doing
+    // it any other way (a `Scene::symbol_bounds` call per symbol) re-walks each
+    // subtree from scratch and is exponential in the nesting depth, which froze
+    // the first frame after importing a rig-heavy document.
+    let mut bounds: Option<buzz_geom::Rect> = None;
     for layer in symbol.layers.iter() {
         if layer.kind == LayerKind::InverseMask {
             flags.inverse_mask = true;
         }
         for object in layer.all_objects() {
-            flags = flags.or(scan_object(object, scene, infos, visiting, &mut hasher));
+            let (f, b) = scan_object(object, scene, infos, visiting, &mut hasher);
+            flags = flags.or(f);
+            if b != buzz_geom::Rect::ZERO {
+                bounds = Some(bounds.map_or(b, |acc| acc.union(b)));
+            }
         }
     }
 
     visiting.remove(&id);
     let fingerprint = hasher.finish();
-    let resolved_bounds = scene.symbol_bounds(id).unwrap_or(buzz_geom::Rect::ZERO);
     infos.insert(
         id,
         SymbolInfo {
             arc: Arc::clone(symbol),
             fingerprint,
-            resolved_bounds,
+            resolved_bounds: bounds.unwrap_or(buzz_geom::Rect::ZERO),
             flags,
         },
     );
     fingerprint
 }
 
-/// OR the content flags of one object's subtree, folding nested symbols' whole
-/// (already-computed) flags in and hashing their fingerprints into `hasher`.
+/// OR the content flags of one object's subtree and return its resolved bounds
+/// in the parent's space, folding nested symbols' whole (already-computed) flags
+/// and extents in and hashing their fingerprints into `hasher`.
+///
+/// The bounds mirror `Scene::resolved_bounds_within` exactly, but read a nested
+/// instance's extent from the memo rather than re-measuring the library.
 fn scan_object(
     object: &Object,
     scene: &Scene,
     infos: &mut std::collections::HashMap<buzz_scene::SymbolId, SymbolInfo>,
     visiting: &mut std::collections::HashSet<buzz_scene::SymbolId>,
     hasher: &mut std::collections::hash_map::DefaultHasher,
-) -> SymFlags {
+) -> (SymFlags, buzz_geom::Rect) {
+    use buzz_scene::object::transform_rect;
     use std::hash::Hash;
 
     // Filters, blend and facing live on every object, not just shapes.
@@ -388,30 +402,59 @@ fn scan_object(
         ..SymFlags::default()
     };
 
-    match &object.kind {
-        ObjectKind::Shape(shape) => flags.additive |= shape.blend.is_additive(),
-        ObjectKind::Warp(warp) => flags.additive |= warp.shape.blend.is_additive(),
-        ObjectKind::Group(children) => {
-            for child in children {
-                flags = flags.or(scan_object(child, scene, infos, visiting, hasher));
-            }
+    let bounds = match &object.kind {
+        ObjectKind::Shape(shape) => {
+            flags.additive |= shape.blend.is_additive();
+            object.bounds()
+        }
+        // A posed rig, like a warp, measures itself — its bounds do not come
+        // from unioning its parts (which are the undeformed source).
+        ObjectKind::Warp(warp) => {
+            flags.additive |= warp.shape.blend.is_additive();
+            object.bounds()
         }
         ObjectKind::Armature(rig) => {
             for part in &rig.parts {
-                flags = flags.or(scan_object(&part.artwork, scene, infos, visiting, hasher));
+                let (f, _) = scan_object(&part.artwork, scene, infos, visiting, hasher);
+                flags = flags.or(f);
             }
+            object.bounds()
+        }
+        ObjectKind::Group(children) => {
+            let mut group: Option<buzz_geom::Rect> = None;
+            for child in children {
+                let (f, cb) = scan_object(child, scene, infos, visiting, hasher);
+                flags = flags.or(f);
+                let tb = transform_rect(object.transform, cb);
+                group = Some(group.map_or(tb, |acc| acc.union(tb)));
+            }
+            group.unwrap_or_else(|| object.bounds())
         }
         ObjectKind::Instance(instance) => {
             let child_fp = build_symbol(instance.symbol, scene, infos, visiting);
             child_fp.hash(hasher);
             match infos.get(&instance.symbol) {
-                Some(child) => flags = flags.or(child.flags),
-                // Dangling reference or cycle back-edge: assume the worst.
-                None => flags = flags.or(SymFlags::ALL),
+                Some(child) => {
+                    flags = flags.or(child.flags);
+                    if child.resolved_bounds == buzz_geom::Rect::ZERO {
+                        // An empty (or cyclic) symbol has no measurable extent;
+                        // fall back to the placeholder, as `instance_bounds`
+                        // does when the library measure comes back empty.
+                        object.bounds()
+                    } else {
+                        transform_rect(object.transform, child.resolved_bounds)
+                    }
+                }
+                // Dangling reference or cycle back-edge: assume the worst, and
+                // measure with the placeholder.
+                None => {
+                    flags = flags.or(SymFlags::ALL);
+                    object.bounds()
+                }
             }
         }
-    }
-    flags
+    };
+    (flags, bounds)
 }
 
 /// A cache of whole symbols encoded once and stamped per instance.

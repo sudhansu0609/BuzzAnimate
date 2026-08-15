@@ -173,10 +173,11 @@ pub struct Editor {
     /// and the selection chrome resolve an instance's bounds against this table
     /// rather than re-walking the library per object — the difference between a
     /// snappy click and a second's pause on a rig-heavy import.
-    bounds_cache: std::cell::RefCell<
-        Option<(u64, std::sync::Arc<std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>>)>,
-    >,
+    bounds_cache: std::cell::RefCell<Option<(u64, SymbolBounds)>>,
 }
+
+/// Every symbol's resolved extent, keyed by id. See [`Editor::symbol_bounds`].
+type SymbolBounds = std::sync::Arc<std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>>;
 
 /// The waveform strip the timeline draws, cached against the document revision.
 ///
@@ -306,14 +307,12 @@ impl Editor {
     /// Every symbol's resolved extent, memoised by revision. Rebuilt only on an
     /// edit; a lookup for the whole document otherwise. See
     /// [`buzz_scene::Scene::symbol_bounds_table`].
-    fn symbol_bounds(
-        &self,
-    ) -> std::sync::Arc<std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>> {
+    fn symbol_bounds(&self) -> SymbolBounds {
         let revision = self.doc.scene().revision();
-        if let Some((r, table)) = self.bounds_cache.borrow().as_ref() {
-            if *r == revision {
-                return std::sync::Arc::clone(table);
-            }
+        if let Some((r, table)) = self.bounds_cache.borrow().as_ref()
+            && *r == revision
+        {
+            return std::sync::Arc::clone(table);
         }
         let table = std::sync::Arc::new(self.doc.scene().symbol_bounds_table());
         *self.bounds_cache.borrow_mut() = Some((revision, std::sync::Arc::clone(&table)));

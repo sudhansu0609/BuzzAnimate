@@ -81,7 +81,7 @@ each is repaid on every character placed.
 | Item | Size | What it is | What is already there |
 |---|---|---|---|
 | ~~**The clipboard**~~ ✅ | M | ~~Cut/Copy/Paste for artwork, within a document and across two of them.~~ **Shipped** — see `PROGRESS.md` §4 *Wave 1.1 — The clipboard*. Closed §7-13. | |
-| **Thumbnails** | L | Rasterise each symbol off-thread into a cache keyed by symbol **and revision**. Turns choosing-by-name into choosing-by-sight. | A Vello renderer and a job system. New: the cache, and knowing when to invalidate it. Closes §7-17 and §7-81. |
+| ~~**Thumbnails**~~ ✅ | L | ~~Rasterise each symbol off-thread into a cache.~~ **Shipped for the Library** — on the window's own device with no readback, four a frame, keyed on the symbol's `Arc` address. Closed §7-17; §7-81 (Assets) waits on Wave 4, because an asset is a file and reading it is I/O. See `PROGRESS.md` §4 *Wave 1.2*. | |
 | **Drag from panel, drop on stage** | S | It lands where you let go. Removes two steps — press Place, then hunt for it and drag it — from every placement. | Closes §7-82. |
 
 > **Wave 1 alone changes what the tool *is* for assembly work.**

@@ -220,6 +220,13 @@ pub struct App {
     last_crash_revision: Option<u64>,
     /// An Animate asset import running on its own thread.
     animate_import: Option<crossbeam_channel::Receiver<crate::animate_assets::Progress>>,
+    /// Pictures of the library's symbols, drawn on the window's own device.
+    ///
+    /// On `App` rather than `Editor` because it owns GPU resources, and the
+    /// device outlives any one document. `adopt_document` clears it, so a
+    /// picture from the last film cannot be shown for a symbol in this one
+    /// that happens to have been given the same id.
+    thumbnails: crate::thumbnails::Thumbnails,
     /// Where each dock column ended up on this frame.
     ///
     /// The splitters are drawn after the panels, over whatever is underneath,
@@ -257,6 +264,7 @@ impl App {
             recovery: buzz_ui::RecoveryState::default(),
             last_crash_revision: None,
             animate_import: None,
+            thumbnails: crate::thumbnails::Thumbnails::default(),
             dock_rects: Vec::new(),
         };
         app.recovery = app.find_recoveries();
@@ -664,6 +672,9 @@ impl App {
         // played without first being asked to.
         let scene = self.editor.doc.scene().clone();
         self.editor.sound.refresh(&scene);
+        // Before the panels ask for pictures, throw away the ones whose
+        // symbols have been edited since they were drawn.
+        self.thumbnails.invalidate_stale(&scene);
         // Taken before the panels are built, so the code editor never sees the
         // keystroke that ran it.
         commands.extend(script_shortcuts(&ctx));
@@ -1108,9 +1119,12 @@ impl App {
             Library => {
                 let editor = &mut self.editor;
                 let library = &mut editor.library;
+                let thumbnails = &mut self.thumbnails;
                 let mut raised = None;
                 editor.doc.edit("Library", |scene| {
-                    raised = buzz_ui::library_panel(ui, scene, library);
+                    raised = buzz_ui::library_panel(ui, scene, library, &mut |id| {
+                        thumbnails.get(id)
+                    });
                 });
                 if let Some(command) = raised {
                     commands.push(command);
@@ -2812,6 +2826,9 @@ impl App {
         self.editor = Editor::new(doc);
         self.editor.workspace = workspace;
         self.editor.clipboard = clipboard;
+        // Symbol ids start again in a new document, so a kept picture would be
+        // shown against whatever symbol inherited its number.
+        self.thumbnails.clear();
     }
 
     /// Open one of our own documents.
@@ -3120,6 +3137,26 @@ impl App {
         let surface_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // **The thumbnails the panels asked for, drawn now.**
+        //
+        // Here because this is the only place the device, the Vello renderer
+        // and egui's renderer are all reachable at once — and after the stage's
+        // own scene has been consumed, because it borrows the same Vello scene
+        // to build into. At most a handful per frame; see `thumbnails`.
+        if self.thumbnails.pending() {
+            let mut scratch = buzz_render::vello::Scene::new();
+            self.thumbnails.fulfil(
+                &mut active.gpu,
+                &mut active.egui_renderer,
+                &mut scratch,
+                self.editor.doc.scene(),
+                &mut self.lights,
+            );
+            // Ask for another frame so the rest arrive without the pointer
+            // having to move.
+            active.window.request_redraw();
+        }
 
         let (w, h) = (active.surface_config.width, active.surface_config.height);
         active.ensure_target();

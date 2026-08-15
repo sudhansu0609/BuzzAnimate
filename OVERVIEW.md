@@ -1,6 +1,6 @@
 # BuzzAnimate — Overview: what it has, what it cannot do, what is next
 
-**Written:** 2026-08-15 · **Format version:** 18 · **Tests:** 1 482 passing, clippy clean
+**Written:** 2026-08-15 · **Format version:** 18 · **Tests:** 1 486 passing, clippy clean
 
 One page that consolidates the three questions people actually ask about this
 program. The detail behind each answer lives elsewhere and is linked:
@@ -97,7 +97,7 @@ The improvements go **underneath** — unbounded zoom, all cores, GPU rasterisat
   Auto Keyframe, a looping section, two zooms, and layer switches on the rows.
 - **Tweens** — classic, motion and shape, with easing in the model.
 - Symbols (Graphic, MovieClip, Button), nested timelines, a Library with folders,
-  search and usage counts.
+  search, usage counts and **a thumbnail of every symbol**.
 - Camera with keyframes, spatial 3D rotation, layer depth and a real projection.
 - Undo/redo by snapshot; autosave; crash recovery offered on launch.
 
@@ -169,7 +169,7 @@ waiting on other people, some are simply not built yet, and some are choices.
 | **Text tool** | No titles or credits without drawing them by hand or importing them. Needs font loading, shaping and an editing caret. | §7-9 |
 | **GIF/WebP and HTML5 export** | PNG, PNG sequence and MP4/MOV are the outputs; a GIF for a preview or a self-playing HTML5 build are not there. | CP-6.3–6.4 |
 | **Export blocks the document** | One export at a time, and its progress dialog belongs to the document — opening a new file mid-export orphans it. Quitting kills an export in flight. | Wave 5 |
-| **Thumbnails** | The Library and the Assets panel identify a character by its **name**. | §7-17, §7-81 |
+| **Thumbnails in the Assets panel** | The Library draws a picture of every symbol; an asset is a file on disk, so a picture of one needs a background read. | §7-81 |
 | **Motion Editor, motion paths, shape hints** | Easing exists in the model and interpolates; nothing edits the curve, and a tween cannot follow a drawn path. | §7-18 |
 | **Bitmap import in all three readers** | XFL, SWF and PDF count and report their bitmaps as skipped. The pipeline they need now exists. | §7-158, §7-116 |
 | **Multiple scenes** | One scene per document. | §7-12 |
@@ -197,7 +197,7 @@ exactly as Animate would.
 
 ### 3.4 The long tail
 
-`PROGRESS.md` §7 carries **155 numbered rows, 141 of them still open.** They are
+`PROGRESS.md` §7 carries **155 numbered rows, 140 of them still open.** They are
 the honest record of every place this program does something a reasonable person
 would not expect, from *"a soft brush cannot paint across strokes"* (§7-164) to
 *"a recovered document does not remember what it was"* (§7-102). Most are small,
@@ -283,12 +283,12 @@ blur and alpha video at export; a command palette.
 | Render quality across 13 decades | constant ~4.01% ink |
 | GPU frame time at 1e12% | 0.9 ms |
 | Threads in use | 20 interactive + 6 background |
-| Tests | 1 482 passing, clippy clean |
+| Tests | 1 486 passing, clippy clean |
 | Rust source | ~48 000 lines across 16 crates |
 | Format version | 18 |
 | IK budget | 50 six-bone rigs in parallel, inside one frame |
 | First frame of a heavy scene | 305 ms, then cached (§7-155) |
-| Open items in §7 | 141 of 155 |
+| Open items in §7 | 140 of 155 |
 
 ---
 

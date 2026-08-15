@@ -236,6 +236,38 @@ pub fn draw_frame_within(
     );
 }
 
+/// Draw one symbol's own contents, with nothing of the document around it.
+///
+/// For a **thumbnail**: the Library and the Assets panel identify a character
+/// by its name, which means opening symbols to find out what they are. A
+/// picture is the whole answer.
+///
+/// It is the symbol's layers rather than the document's, so nothing behind or
+/// in front of the instance leaks into the picture, and the caller supplies a
+/// camera that fits the artwork into whatever box it has.
+pub fn draw_symbol(
+    builder: &mut SceneBuilder<'_>,
+    scene: &Scene,
+    symbol: buzz_scene::SymbolId,
+    frame: u32,
+    camera: Affine,
+    options: &FrameOptions,
+    cache: &mut DrawCache,
+) {
+    let Some(symbol) = scene.library().get(symbol) else {
+        return;
+    };
+    draw_layers(
+        builder,
+        scene,
+        &symbol.layers,
+        frame,
+        camera,
+        options,
+        cache,
+    );
+}
+
 /// Draw the **document's own timeline**, whatever symbol is open.
 ///
 /// This is the context behind Animate's Edit in Place: the scene the symbol

@@ -3210,6 +3210,55 @@ Eight tests, including the one that matters: a symbol converted in one document,
 copied, and pasted into an editor whose library has never seen it arrives with its
 definition.
 
+### ✅ Wave 1.2 — Thumbnails in the Library
+
+Symbols were listed by name, kind and use count. Choosing one meant opening symbols
+to find out what they were, which is the slowest possible way to answer *which of
+these is the hero's left arm* — and it is a large part of why assembling a scene out
+of parts you already own took so long.
+
+**The design in §7-17 was "off-thread rasterisation into a cache", and that is not
+what was built.** Worth stating plainly, with the reason. An export creates a second
+`GpuContext` on a worker thread and reads pixels back; both halves are wrong here.
+Creating a context costs a few hundred milliseconds, so either every thumbnail pays
+it or a whole GPU device is kept alive for pictures the size of a postage stamp. And
+reading back means blocking on `device.poll`, which is the one thing that must not
+happen near a frame.
+
+**So there is no readback at all.** Vello draws the symbol into a small texture on the
+device the window already owns, and `egui_wgpu` is handed that texture to sample
+directly — which is what its `register_native_texture` is for. The cost is a GPU pass
+over a 96-pixel square and the CPU never waits for it. Panels have no device, so they
+*ask*; the requests are fulfilled once a frame from the render path, which is the only
+place the device, Vello and egui's renderer are all reachable at once.
+
+**At most four new pictures a frame.** That is the whole no-hang argument in one
+number: a library of three hundred symbols fills in over a few frames instead of
+stalling one, and the frame that has nothing new to draw costs nothing.
+
+**Keyed on a pointer, not a revision.** A thumbnail is stale when its symbol changes,
+and the document's revision moves whenever *anything* changes — every picture would be
+redrawn each time a line was drawn on the stage. The library holds `Arc<Symbol>` and
+every edit goes through `Arc::make_mut`, so an edited symbol is a different
+allocation, and its address changes exactly when it does. The cache holds the `Arc`
+alongside the picture so the address cannot be reused underneath it. This is the trick
+`LightCache` already plays on objects, and it is sound for the same reason.
+
+A new `buzz_render::document::draw_symbol` draws a symbol's own layers with nothing of
+the document around it, and `Camera::fit_to_rect` — what Zoom ▸ Show All already uses
+— frames it, so a thumbnail is composed by the same rule the stage is, including
+taking the smaller of the two scales so a tall character is not squashed into a square
+box.
+
+Checked by eye against `make_library_fixture`, which writes a library of deliberately
+different shapes: the wide ellipse is wide, the tall bar is tall, the tiny dot fills
+its box, and **Two Together** — a symbol containing two instances — draws both, which
+is the case that would have come out blank if the walk had only looked at shapes.
+
+The Assets panel still has none: an asset is a file on disk, so a picture of one means
+reading and parsing it first, which is I/O that belongs on Wave 4's background tasks
+rather than on the UI thread. §7-81 records that with its reason.
+
 ### ✅ Wave 3.2 — Align, Distribute and Match Size
 
 There was no equivalent to Animate's `Ctrl+K` anywhere in the command set — zero
@@ -3430,7 +3479,7 @@ down here has not been finished.
 | 11 | **Pen tool draws line segments, not Bézier curves.** Click-drag handle authoring is not there yet; anchors can be edited afterwards with Subselection. | Phase 2 follow-up |
 | 12 | **Multiple Scenes not implemented.** One scene per document. | Deferred |
 | 15 | ~~**Tweening not implemented.**~~ | ✅ **Resolved in CP-4.3** — classic, motion and shape tweens interpolate in the render path |
-| 17 | **Library has no previews.** Symbols are listed by name, kind and use count; there is no thumbnail. Needs off-thread rasterisation into a cache keyed by symbol and revision. | Phase 4 follow-up |
+| 17 | ~~**Library has no previews.**~~ | ✅ **Resolved in Wave 1** — every symbol draws a picture of itself, on the window's own device with no readback, keyed by the symbol's `Arc` address (§4) |
 | 18 | **No Motion Editor, motion paths or shape hints.** Easing exists in the model (strength and cubic Bézier) and interpolates correctly, but nothing in the UI edits a curve, and a motion tween cannot yet follow a drawn path. | Phase 4 follow-up |
 | 19 | ~~**Import commands are not wired.**~~ | ✅ **Resolved in CP-5.1b** — `Scene::merge` remaps every id; all three formats are on the File menu |
 | 20 | ~~**The XFL importer does not restore folder nesting.**~~ | ✅ **Resolved in CP-5.1c**, along with two fidelity bugs it exposed |
@@ -3497,7 +3546,7 @@ down here has not been finished.
 | 78 | **No `.clr`, `.act` or `.ase` palette import or export.** Animate reads Flash and Photoshop palettes; nothing here does, so a palette from another tool is retyped. | Follow-up |
 | 79 | **Swatches are not draggable between folders.** A dropdown per row moves one, exactly as the Library moves a symbol, for the same reason: the drag is a piece of work in its own right. | Follow-up |
 | 80 | **The Assets panel is a deviation from Animate's**, which ships a curated set of animated characters and props and syncs with Creative Cloud Libraries. This is the same idea with none of the service: a folder on this machine, holding `.buzz` documents. Nothing is bundled, and nothing is uploaded anywhere. | By design |
-| 81 | **Assets have no thumbnails**, for the same reason the Library has none (§7 item 17): rendering a preview needs off-thread rasterisation into a cache. An asset is identified by its name and its folder. | Follow-up |
+| 81 | **Assets have no thumbnails.** The Library now has them (§7 item 17), and the machinery is reusable — but an asset is a `.buzz` file on disk rather than a symbol in memory, so a picture of one means reading and parsing the file first. That is I/O per asset and belongs on a background task, which is Wave 4's `TaskRegistry`. Deliberately left until then rather than reading files on the UI thread. | Follow-up, after Wave 4 |
 | 82 | **A placed asset lands where it was drawn**, not under the pointer. Animate drops one at the centre of the stage or where you drag it; here the artwork keeps the coordinates it had when it was kept. Placing then dragging is one extra gesture. | Follow-up |
 | 83 | **The assets folder is not watched.** Adding a file outside the application shows up after the panel's refresh button, not immediately — a file watcher is a thread, a platform API and a class of bug for something a button does. | By design |
 | 84 | **An asset carries its sounds and lights, but not the stage.** `Scene::extract` takes the objects and the symbols they need; frame rate, stage size, camera and lighting stay with the document being placed into, which is what "place a prop" should mean. | By design |

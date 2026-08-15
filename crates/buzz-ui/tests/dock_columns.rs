@@ -110,7 +110,7 @@ fn the_library_and_the_assets_panel_fit_side_by_side_in_one_column() {
     let mut asset_state = AssetPanelState::default();
 
     let used = column_height(240.0, |ui| {
-        let _ = library_panel(ui, &mut scene, &mut lib_state);
+        let _ = library_panel(ui, &mut scene, &mut lib_state, &mut |_| None);
         ui.separator();
         let _ = assets_panel(ui, &assets, &mut asset_state, false);
     });
@@ -265,7 +265,7 @@ fn the_library_fits_the_narrowest_column() {
     let mut state = LibraryState::default();
 
     let over = column_overflow(narrowest, |ui| {
-        let _ = library_panel(ui, &mut scene, &mut state);
+        let _ = library_panel(ui, &mut scene, &mut state, &mut |_| None);
     });
 
     assert!(

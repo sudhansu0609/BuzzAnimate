@@ -21,6 +21,16 @@ use buzz_scene::{Scene, SymbolId, SymbolKind};
 use egui::{RichText, Ui};
 
 use crate::command::Command;
+use crate::theme::Palette;
+
+/// Edge of a symbol's picture in the list, in points.
+///
+/// Matches the row height a symbol already had, so adding pictures did not
+/// make the library taller per entry.
+const THUMBNAIL: f32 = 20.0;
+
+/// Room kept on the right of a symbol row for its use count.
+const USE_COUNT: f32 = 26.0;
 
 /// Panel state that is not part of the document.
 ///
@@ -74,12 +84,23 @@ impl LibraryState {
     }
 }
 
+/// Looks up the picture for a symbol, and remembers that it was asked for.
+///
+/// A closure rather than a type, because the pictures live on the GPU and this
+/// crate has no device — the shell owns them and hands in a way to ask.
+pub type ThumbnailSource<'a> = &'a mut dyn FnMut(SymbolId) -> Option<egui::TextureId>;
+
 /// Draw the Library panel.
 ///
 /// Takes the scene mutably because renaming a symbol and moving it between
 /// folders are edits in their own right; the caller wraps the call in an undo
 /// step, and a frame where nothing changed records nothing.
-pub fn library_panel(ui: &mut Ui, scene: &mut Scene, state: &mut LibraryState) -> Option<Command> {
+pub fn library_panel(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    state: &mut LibraryState,
+    thumbnail: ThumbnailSource<'_>,
+) -> Option<Command> {
     let mut command = None;
 
     ui.horizontal(|ui| {
@@ -139,7 +160,7 @@ pub fn library_panel(ui: &mut Ui, scene: &mut Scene, state: &mut LibraryState) -
             }
 
             // Root level first, then its folders, recursively.
-            draw_folder_contents(ui, scene, state, None, 0, &usage, &mut command);
+            draw_folder_contents(ui, scene, state, None, 0, &usage, thumbnail, &mut command);
         });
 
     ui.separator();
@@ -153,6 +174,7 @@ pub fn library_panel(ui: &mut Ui, scene: &mut Scene, state: &mut LibraryState) -
 ///
 /// Folders come first because that is where Animate puts them, and because a
 /// long symbol list would otherwise push the folders off the top.
+#[allow(clippy::too_many_arguments, reason = "internal tree walker, not an API")]
 fn draw_folder_contents(
     ui: &mut Ui,
     scene: &mut Scene,
@@ -160,6 +182,7 @@ fn draw_folder_contents(
     parent: Option<&str>,
     depth: usize,
     usage: &std::collections::BTreeMap<SymbolId, usize>,
+    thumbnail: ThumbnailSource<'_>,
     command: &mut Option<Command>,
 ) {
     let indent = depth as f32 * 14.0;
@@ -193,7 +216,16 @@ fn draw_folder_contents(
         });
 
         if open {
-            draw_folder_contents(ui, scene, state, Some(&folder), depth + 1, usage, command);
+            draw_folder_contents(
+                ui,
+                scene,
+                state,
+                Some(&folder),
+                depth + 1,
+                usage,
+                thumbnail,
+                command,
+            );
         }
     }
 
@@ -208,7 +240,9 @@ fn draw_folder_contents(
         if !state.matches(&name) {
             continue;
         }
-        draw_symbol_row(ui, scene, state, id, &name, kind, indent, usage, command);
+        draw_symbol_row(
+            ui, scene, state, id, &name, kind, indent, usage, thumbnail, command,
+        );
     }
 }
 
@@ -225,12 +259,36 @@ fn draw_symbol_row(
     kind: SymbolKind,
     indent: f32,
     usage: &std::collections::BTreeMap<SymbolId, usize>,
+    thumbnail: ThumbnailSource<'_>,
     command: &mut Option<Command>,
 ) {
     let uses = usage.get(&id).copied().unwrap_or(0);
 
     ui.horizontal(|ui| {
         ui.add_space(indent + 18.0);
+
+        // **The picture, where the eye goes first.**
+        //
+        // A symbol identified only by its name means opening symbols to find
+        // out what they are. The space is always claimed, whether or not the
+        // picture has been drawn yet, so a library does not jiggle as its
+        // thumbnails arrive over the next few frames.
+        let (slot, _) = ui.allocate_exact_size(
+            egui::vec2(THUMBNAIL, THUMBNAIL),
+            egui::Sense::hover(),
+        );
+        match thumbnail(id) {
+            Some(texture) => {
+                egui::Image::new((texture, egui::vec2(THUMBNAIL, THUMBNAIL)))
+                    .paint_at(ui, slot);
+            }
+            // Not drawn yet: a quiet frame, so the row reads as a row rather
+            // than as a gap.
+            None => {
+                ui.painter()
+                    .rect_stroke(slot, 2.0, egui::Stroke::new(1.0, Palette::border()), egui::StrokeKind::Inside);
+            }
+        }
 
         // A one-letter kind marker, as Animate's icon column does.
         let mark = match kind {
@@ -267,14 +325,14 @@ fn draw_symbol_row(
         // Truncated rather than allowed to run on: a symbol name has no length
         // limit, and the use count on the right of this row is the one thing
         // that must not be pushed off the panel by one.
-        let label = ui.add(
-            egui::Button::selectable(state.selected == Some(id), name)
-                .truncate()
-                .min_size(egui::vec2(
-                    // Room for the use count and its spacing on the right.
-                    (ui.available_width() - 26.0).max(1.0),
-                    0.0,
-                )),
+        // `add_sized`, not `min_size`: a minimum is only a floor, and
+        // `truncate` still wraps against the *whole* remaining width, so the
+        // button could grow into the room the use count needs. Sizing the
+        // allocation is what actually bounds it.
+        let room = (ui.available_width() - USE_COUNT).max(1.0);
+        let label = ui.add_sized(
+            egui::vec2(room, ui.spacing().interact_size.y),
+            egui::Button::selectable(state.selected == Some(id), name).truncate(),
         );
         if label.clicked() {
             state.selected = Some(id);

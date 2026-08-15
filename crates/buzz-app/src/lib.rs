@@ -16,4 +16,5 @@ pub mod lipsync;
 pub mod rigging;
 pub mod sound;
 pub mod stage;
+pub mod thumbnails;
 pub mod tools;

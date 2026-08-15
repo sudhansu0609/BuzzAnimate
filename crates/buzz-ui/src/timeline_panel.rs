@@ -401,6 +401,115 @@ fn transport(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Timeli
     });
 }
 
+/// The transport strip's symbols, drawn like Animate's — icon buttons, not text.
+#[derive(Clone, Copy)]
+enum Glyph {
+    First,
+    Prev,
+    Play,
+    Pause,
+    Next,
+    Last,
+    Onion,
+    AutoKey,
+    EditMultiple,
+    Loop,
+    InsertFrame,
+    InsertKey,
+    InsertBlank,
+}
+
+/// A small square icon button, highlighted blue when its mode is on.
+fn icon_button(ui: &mut Ui, active: bool, tip: &str, glyph: Glyph) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), Sense::click());
+    let bg = if active {
+        Palette::active()
+    } else if resp.hovered() {
+        Palette::hover()
+    } else {
+        Palette::raised()
+    };
+    ui.painter().rect_filled(rect, 3.0, bg);
+    let ink = if active { Color32::WHITE } else { Palette::text() };
+    draw_glyph(ui.painter(), rect.shrink(6.0), glyph, ink);
+    resp.on_hover_text(tip).clicked()
+}
+
+fn draw_glyph(p: &egui::Painter, r: egui::Rect, g: Glyph, c: Color32) {
+    let s = Stroke::new(1.5, c);
+    let at = |x: f32, y: f32| egui::pos2(r.min.x + r.width() * x, r.min.y + r.height() * y);
+    let tri = |a: egui::Pos2, b: egui::Pos2, d: egui::Pos2| {
+        p.add(egui::Shape::convex_polygon(vec![a, b, d], c, Stroke::NONE));
+    };
+    let bar = |x0: f32, x1: f32| {
+        p.rect_filled(egui::Rect::from_min_max(at(x0, 0.08), at(x1, 0.92)), 0.0, c);
+    };
+    match g {
+        Glyph::Play => tri(at(0.15, 0.08), at(0.15, 0.92), at(0.9, 0.5)),
+        Glyph::Pause => {
+            bar(0.22, 0.4);
+            bar(0.6, 0.78);
+        }
+        Glyph::First => {
+            bar(0.12, 0.24);
+            tri(at(0.92, 0.1), at(0.92, 0.9), at(0.34, 0.5));
+        }
+        Glyph::Last => {
+            bar(0.76, 0.88);
+            tri(at(0.08, 0.1), at(0.08, 0.9), at(0.66, 0.5));
+        }
+        Glyph::Prev => tri(at(0.82, 0.1), at(0.82, 0.9), at(0.22, 0.5)),
+        Glyph::Next => tri(at(0.18, 0.1), at(0.18, 0.9), at(0.78, 0.5)),
+        // Two overlapping frames — the onion.
+        Glyph::Onion => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(at(0.1, 0.2), at(0.6, 0.8)),
+                1.0,
+                s,
+                StrokeKind::Inside,
+            );
+            p.rect_stroke(
+                egui::Rect::from_min_max(at(0.4, 0.2), at(0.9, 0.8)),
+                1.0,
+                s,
+                StrokeKind::Inside,
+            );
+        }
+        // A key, as a filled diamond.
+        Glyph::AutoKey => {
+            tri(at(0.5, 0.1), at(0.12, 0.5), at(0.5, 0.9));
+            tri(at(0.5, 0.1), at(0.88, 0.5), at(0.5, 0.9));
+        }
+        // Several frames at once — three columns.
+        Glyph::EditMultiple => {
+            for x in [0.16, 0.44, 0.72] {
+                p.rect_filled(egui::Rect::from_min_max(at(x, 0.15), at(x + 0.12, 0.85)), 0.0, c);
+            }
+        }
+        // A loop — a ring with an arrowhead.
+        Glyph::Loop => {
+            p.circle_stroke(r.center(), r.width() * 0.3, s);
+            tri(at(0.62, 0.02), at(0.98, 0.14), at(0.66, 0.32));
+        }
+        // Insert Frame / Keyframe / Blank Keyframe — a frame box, a filled dot,
+        // a hollow dot: Animate's own marks for the three.
+        Glyph::InsertFrame => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(at(0.2, 0.18), at(0.8, 0.82)),
+                0.0,
+                s,
+                StrokeKind::Inside,
+            );
+        }
+        Glyph::InsertKey => {
+            p.circle_filled(r.center(), r.width() * 0.24, c);
+        }
+        Glyph::InsertBlank => {
+            p.circle_stroke(r.center(), r.width() * 0.24, s);
+        }
+    }
+}
+
 fn transport_controls(
     ui: &mut Ui,
     scene: &Scene,
@@ -408,57 +517,45 @@ fn transport_controls(
     out: &mut TimelineResponse,
 ) {
     {
-        if ui.button("|<").on_hover_text("Go to first frame").clicked() {
+        if icon_button(ui, false, "Go to first frame", Glyph::First) {
             out.go_to_start = true;
         }
-        if ui.button("◀").on_hover_text("Previous frame (,)").clicked() {
+        if icon_button(ui, false, "Previous frame (,)", Glyph::Prev) {
             out.step -= 1;
         }
-        let play_label = if state.playing { "||" } else { ">" };
-        if ui
-            .button(play_label)
-            .on_hover_text("Play or pause (Enter)")
-            .clicked()
-        {
+        let play = if state.playing { Glyph::Pause } else { Glyph::Play };
+        if icon_button(ui, state.playing, "Play or pause (Enter)", play) {
             out.toggle_play = true;
         }
-        if ui.button("▶|").on_hover_text("Next frame (.)").clicked() {
+        if icon_button(ui, false, "Next frame (.)", Glyph::Next) {
             out.step += 1;
         }
-        if ui.button(">|").on_hover_text("Go to last frame").clicked() {
+        if icon_button(ui, false, "Go to last frame", Glyph::Last) {
             out.go_to_end = true;
         }
 
         ui.separator();
 
-        if ui
-            .selectable_label(state.onion_enabled, "Onion")
-            .on_hover_text("Onion skinning")
-            .clicked()
-        {
+        if icon_button(ui, state.onion_enabled, "Onion skinning", Glyph::Onion) {
             out.toggle_onion = true;
         }
-
-        if ui
-            .selectable_label(state.auto_keyframe, "Auto Key")
-            .on_hover_text(
-                "Auto Keyframe \u{2014} changing anything at a frame that is not a \
-                 keyframe makes one first, so the change starts here rather than \
-                 reaching back to the start of the span",
-            )
-            .clicked()
-        {
+        if icon_button(
+            ui,
+            state.auto_keyframe,
+            "Auto Keyframe \u{2014} changing anything at a frame that is not a \
+             keyframe makes one first, so the change starts here rather than \
+             reaching back to the start of the span",
+            Glyph::AutoKey,
+        ) {
             out.toggle_auto_keyframe = true;
         }
-
-        if ui
-            .selectable_label(state.edit_multiple, "Edit Multiple")
-            .on_hover_text(
-                "Edit Multiple Frames \u{2014} every keyframe inside the onion markers \
-                 is drawn solid, can be clicked, and moves together",
-            )
-            .clicked()
-        {
+        if icon_button(
+            ui,
+            state.edit_multiple,
+            "Edit Multiple Frames \u{2014} every keyframe inside the onion markers \
+             is drawn solid, can be clicked, and moves together",
+            Glyph::EditMultiple,
+        ) {
             out.toggle_edit_multiple = true;
         }
 
@@ -537,16 +634,13 @@ fn transport_controls(
         // group takes all the width that is left, which would leave nothing to
         // centre the row within.
         ui.separator();
-        for action in [
-            FrameAction::InsertFrame,
-            FrameAction::InsertKeyframe,
-            FrameAction::InsertBlankKeyframe,
+        for (action, glyph) in [
+            (FrameAction::InsertFrame, Glyph::InsertFrame),
+            (FrameAction::InsertKeyframe, Glyph::InsertKey),
+            (FrameAction::InsertBlankKeyframe, Glyph::InsertBlank),
         ] {
-            if ui
-                .small_button(action.shortcut_text())
-                .on_hover_text(action.label())
-                .clicked()
-            {
+            let tip = format!("{} ({})", action.label(), action.shortcut_text());
+            if icon_button(ui, false, &tip, glyph) {
                 out.action = Some(action);
             }
         }
@@ -565,11 +659,12 @@ fn loop_controls(ui: &mut Ui, scene: &Scene, out: &mut TimelineResponse) {
     let region = *scene.looping();
     let mut edited = region;
 
-    if ui
-        .selectable_label(region.enabled, "Loop")
-        .on_hover_text("Repeat a section — in playback and in the export")
-        .clicked()
-    {
+    if icon_button(
+        ui,
+        region.enabled,
+        "Loop — repeat a section in playback and in the export",
+        Glyph::Loop,
+    ) {
         edited.enabled = !region.enabled;
         // Switching it on with nothing set would loop a single frame, which
         // reads as a bug. Default to the whole timeline, which is at least

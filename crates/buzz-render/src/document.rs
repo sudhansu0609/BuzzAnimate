@@ -13,7 +13,7 @@
 //! the brush preview are authoring aids drawn in screen space by the
 //! application, and they must never reach an exported frame.
 
-use buzz_geom::{Affine, Projection, Shape as _};
+use buzz_geom::{Affine, Projection, RenderClip, RenderSplit, Shape as _};
 use buzz_scene::{ColorTransform, LayerKind, Object, ObjectKind, Scene};
 use peniko::Color;
 
@@ -147,6 +147,8 @@ pub struct DrawCache {
     /// Per-symbol facts (fingerprint, extent, cache-eligibility), rebuilt only
     /// when the document changes rather than every frame.
     pub symbols: SymbolTable,
+    /// Whole eligible symbols encoded once and stamped per instance.
+    pub symbol_scenes: SymbolSceneCache,
 }
 
 /// Resolved document-space bounds of instances, kept between frames so culling
@@ -201,8 +203,7 @@ pub struct SymbolInfo {
     /// Pins the symbol's address for the life of the entry, so the fingerprint —
     /// which folds in `Arc` pointers — cannot be invalidated by a free-and-reuse
     /// at the same address within one revision.
-    // Read by the scene cache (step 4), which stores the same Arc per entry.
-    #[allow(dead_code)]
+    /// Also handed to the scene cache, which stores the same Arc per entry.
     arc: Arc<buzz_scene::Symbol>,
     /// Changes whenever the symbol's own contents change **or** any symbol it
     /// nests changes. Editing a nested symbol forks that symbol's `Arc` but not
@@ -213,8 +214,7 @@ pub struct SymbolInfo {
     /// (`Scene::symbol_bounds`). Placeholder instance bounds would be far too
     /// small — this is why the cache clips and anchors from here, not from
     /// `Symbol::bounds`.
-    // Read by the scene cache (step 4) to anchor and clip the child encode.
-    #[allow(dead_code)]
+    /// Read by the scene cache to anchor and clip the child encode.
     resolved_bounds: buzz_geom::Rect,
     flags: SymFlags,
 }
@@ -223,8 +223,6 @@ impl SymbolInfo {
     /// Simple enough to cache: nothing inside it renders in a way that depends on
     /// where the instance sits (no filters, group blends, out-of-plane objects
     /// or inverse masks, transitively).
-    // Gates the scene cache (step 4); also exercised by the flag tests.
-    #[allow(dead_code)]
     fn cacheable_content(&self) -> bool {
         !(self.flags.filters
             || self.flags.group_blend
@@ -407,6 +405,133 @@ fn scan_object(
     flags
 }
 
+/// A cache of whole symbols encoded once and stamped per instance.
+///
+/// The lag on an imported Animate document is that a symbol placed hundreds of
+/// times is walked and encoded hundreds of times a frame. This encodes each
+/// eligible `(symbol, inner-frame, depth, zoom)` once into its own Vello scene
+/// and then [appends](crate::vello::Scene::append) it — an O(N) memcpy of the
+/// encoding with a transform folded into every child transform — at each
+/// instance, turning N encodes into one build and N stamps.
+///
+/// Entries age out like the other caches (a few generations) and are capped, so
+/// a zoom gesture — which changes the key's `scale_bits` every frame — cannot
+/// pile up generations of full-document encodings.
+#[derive(Default)]
+pub struct SymbolSceneCache {
+    entries: std::collections::HashMap<SymKey, SymEntry>,
+    /// Off by default; the window turns it on unless `BUZZ_NO_SYMBOL_CACHE` is
+    /// set. Off, every instance draws live exactly as before.
+    enabled: bool,
+    /// Generation, bumped per window frame like the lighting cache.
+    frame: u64,
+    /// How many child scenes were encoded this session, for tests and the HUD.
+    pub builds: u64,
+    /// How many times a cached scene was stamped, likewise.
+    pub stamps: u64,
+}
+
+/// vello::Scene is not `Debug`, so spell the cache's out by hand.
+impl std::fmt::Debug for SymbolSceneCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SymbolSceneCache")
+            .field("entries", &self.entries.len())
+            .field("enabled", &self.enabled)
+            .field("builds", &self.builds)
+            .field("stamps", &self.stamps)
+            .finish()
+    }
+}
+
+/// What makes two instances share one cached encoding.
+///
+/// `depth` is in the key because symbol nesting is truncated at
+/// [`MAX_SYMBOL_DEPTH`], so the same symbol drawn deeper can render less;
+/// `scale_bits` is in it because the encoding is built at one zoom (the
+/// flattening tolerance and baked stroke widths are zoom-specific). The camera
+/// anchor is deliberately *not* in the key — the encoding is anchor-independent,
+/// which is what makes panning free.
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+struct SymKey {
+    fingerprint: u64,
+    inner: u32,
+    depth: u8,
+    scale_bits: u64,
+}
+
+struct SymEntry {
+    scene: Arc<crate::vello::Scene>,
+    /// Guards against a fingerprint hash collision: a hit must point at the same
+    /// symbol it was built from.
+    symbol: Arc<buzz_scene::Symbol>,
+    /// The symbol centre the child was encoded about; the stamp is derived from
+    /// this exact value, never a recomputed one.
+    anchor: buzz_geom::Point,
+    used: u64,
+}
+
+/// How many generations an unused entry survives, matching the other caches.
+const SYM_KEEP_FRAMES: u64 = 3;
+/// Ceiling on live entries. A zoom gesture rekeys everything each frame, so
+/// without a cap three generations of full encodings would accumulate.
+const SYM_CACHE_CAP: usize = 256;
+
+impl SymbolSceneCache {
+    fn begin(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    fn end(&mut self) {
+        let frame = self.frame;
+        self.entries
+            .retain(|_, e| frame.saturating_sub(e.used) < SYM_KEEP_FRAMES);
+        // If still over budget, drop the least-recently-used until at the cap.
+        while self.entries.len() > SYM_CACHE_CAP {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.used)
+                .map(|(k, _)| *k)
+            {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Whether a 2×2 linear part (kurbo coeffs `[a,b,c,d]`) is orthogonal — a pure
+/// rotation, reflection or the identity, with no scale or shear. Only then do
+/// baked stroke and seam-seal widths, which scale by the view zoom alone, stay
+/// screen-correct after the instance's transform is folded in.
+fn is_orthogonal(coeffs: [f64; 6], eps: f64) -> bool {
+    let [a, b, c, d, _, _] = coeffs;
+    (a * a + b * b - 1.0).abs() < eps
+        && (c * c + d * d - 1.0).abs() < eps
+        && (a * c + b * d).abs() < eps
+}
+
+/// The transform that carries a child scene, encoded as `S·(p − anchor)` about
+/// the symbol centre, into the stage's render space.
+///
+/// Derivation: the stage needs `gpu_view ∘ S·(A·p − cam)` where `A` is the
+/// instance's placement (projection ∘ document transform). Since the uniform
+/// scale `S` commutes with `A`'s linear part, that is
+/// `gpu_view ∘ [A_lin, S·(A·anchor − cam)] ∘ (S·(p − anchor))` — the bracket is
+/// this stamp. Everything but the final compose is `f64`.
+fn symbol_stamp(
+    gpu_view: Affine,
+    a: Affine,
+    anchor: buzz_geom::Point,
+    scale: f64,
+    cam: buzz_geom::Point,
+) -> Affine {
+    let t = ((a * anchor) - cam) * scale;
+    let c = a.as_coeffs();
+    gpu_view * Affine::new([c[0], c[1], c[2], c[3], t.x, t.y])
+}
+
 impl DrawCache {
     pub fn new() -> Self {
         Self::default()
@@ -433,12 +558,20 @@ impl DrawCache {
         self.lights.begin(lights);
         self.filters.begin();
         self.bounds.begin();
+        self.symbol_scenes.begin();
     }
 
     pub fn end(&mut self) {
         self.lights.end();
         self.filters.end();
         self.bounds.end();
+        self.symbol_scenes.end();
+    }
+
+    /// Turn the symbol-encoding cache on or off. Off, every instance is drawn
+    /// live; the result is identical, only slower on instance-heavy documents.
+    pub fn set_symbol_reuse(&mut self, on: bool) {
+        self.symbol_scenes.enabled = on;
     }
 }
 
@@ -463,6 +596,7 @@ pub fn draw_frame_lit(
         filters: FilterCache::new(),
         bounds: BoundsCache::default(),
         symbols: SymbolTable::default(),
+        symbol_scenes: SymbolSceneCache::default(),
     };
     draw_frame_cached(builder, scene, frame, camera, options, &mut cache);
     *lights = cache.lights;
@@ -1442,6 +1576,22 @@ fn draw_object_inner(
             // must show both effects.
             inner_ctx.effect = instance.color.compose(&ctx.effect);
 
+            // Reuse a cached encoding of the whole symbol when it is safe to; the
+            // symbol is not cloned here, so `symbol` is still borrowed from the
+            // scene, which is why the id and the reference both go in.
+            if try_stamp_symbol(
+                builder,
+                ctx,
+                &inner_ctx,
+                instance.symbol,
+                symbol,
+                inner,
+                doc,
+                cache,
+            ) {
+                return;
+            }
+
             draw_symbol_contents(builder, symbol, inner, doc, &inner_ctx, cache);
         }
 
@@ -1524,6 +1674,172 @@ fn draw_symbol_contents(
     }
 
     close_mask(builder, open);
+}
+
+/// Draw an instance from the symbol-scene cache when it is safe to, returning
+/// whether it did.
+///
+/// When it returns `false` the caller draws the symbol live, which is always
+/// correct — the cache only ever *adds* a fast path, and every gate below that
+/// falls through leaves the live walk to produce the picture.
+#[allow(clippy::too_many_arguments)]
+fn try_stamp_symbol(
+    builder: &mut SceneBuilder<'_>,
+    ctx: &DrawCtx<'_>,
+    inner_ctx: &DrawCtx<'_>,
+    symbol_id: buzz_scene::SymbolId,
+    symbol: &buzz_scene::Symbol,
+    inner: u32,
+    doc: Affine,
+    cache: &mut DrawCache,
+) -> bool {
+    if !cache.symbol_scenes.enabled {
+        return false;
+    }
+
+    // The symbol's whole subtree must render position-independently, and the memo
+    // must know it. Copy the few facts out so the memo's borrow ends here, before
+    // the cache is borrowed mutably below.
+    let (fingerprint, resolved_bounds, symbol_arc) = {
+        let Some(info) = cache.symbols.get(symbol_id) else {
+            return false;
+        };
+        if !info.cacheable_content() {
+            return false;
+        }
+        (info.fingerprint, info.resolved_bounds, Arc::clone(&info.arc))
+    };
+
+    // Colour, overlay and lighting must all be neutral; otherwise the cached
+    // artwork — encoded once, shared by every instance — would be wrong here.
+    if ctx.tint.is_some()
+        || ctx.faded
+        || ctx.ghost.is_some()
+        || ctx.adjust.is_some()
+        || ctx.blur.is_some()
+        || ctx.lighting.is_some()
+        || !inner_ctx.effect.is_identity()
+    {
+        return false;
+    }
+
+    // The placement must be an orthogonal affine, so baked stroke widths stay
+    // screen-correct and the stamp is an exact conjugation of the render split.
+    let Some(proj_affine) = ctx.projection.as_affine() else {
+        return false;
+    };
+    let a = proj_affine * doc;
+    if !is_orthogonal(a.as_coeffs(), 1e-6) {
+        return false;
+    }
+
+    let scale = builder.split.scale;
+    if !scale.is_finite() || scale <= 0.0 {
+        return false;
+    }
+    // Keep the child's render-space coordinates, and the stamp's translation,
+    // inside the well-conditioned range of f32.
+    let diag = resolved_bounds.width().hypot(resolved_bounds.height());
+    if scale * diag > 1e5 {
+        return false;
+    }
+    let anchor = resolved_bounds.center();
+    let cam = builder.split.anchor;
+    if (((a * anchor) - cam) * scale).hypot() > 1e7 {
+        return false;
+    }
+
+    let key = SymKey {
+        fingerprint,
+        inner,
+        depth: inner_ctx.depth.min(u8::MAX as usize) as u8,
+        scale_bits: scale.to_bits(),
+    };
+    let generation = cache.symbol_scenes.frame;
+
+    // A hit: stamp the cached encoding. The pointer check rejects the rare case
+    // of two different symbols colliding on the key.
+    let hit = match cache.symbol_scenes.entries.get_mut(&key) {
+        Some(entry) if Arc::ptr_eq(&entry.symbol, &symbol_arc) => {
+            entry.used = generation;
+            Some((Arc::clone(&entry.scene), entry.anchor))
+        }
+        _ => None,
+    };
+    if let Some((scene, anchor)) = hit {
+        cache.symbol_scenes.stamps += 1;
+        stamp_scene(builder, &scene, a, anchor);
+        return true;
+    }
+
+    // A miss: encode the whole symbol once, about its own centre, at this zoom,
+    // through the *same* `draw_symbol_contents` the live path uses.
+    let mut child_scene = crate::vello::Scene::new();
+    {
+        let split = RenderSplit {
+            anchor,
+            scale,
+            gpu_view: Affine::IDENTITY,
+        };
+        let clip = RenderClip::new(resolved_bounds);
+        let mut child = SceneBuilder {
+            scene: &mut child_scene,
+            split,
+            clip,
+        };
+        let neutral = DrawCtx {
+            cull: None,
+            lighting: None,
+            effect: ColorTransform::default(),
+            tint: None,
+            faded: false,
+            ghost: None,
+            adjust: None,
+            blur: None,
+            projection: Projection::from_affine(Affine::IDENTITY),
+            ..inner_ctx.clone()
+        };
+        draw_symbol_contents(&mut child, symbol, inner, Affine::IDENTITY, &neutral, cache);
+    }
+    let scene = Arc::new(child_scene);
+    {
+        let sc = &mut cache.symbol_scenes;
+        sc.builds += 1;
+        sc.stamps += 1;
+        sc.entries.insert(
+            key,
+            SymEntry {
+                scene: Arc::clone(&scene),
+                symbol: symbol_arc,
+                anchor,
+                used: generation,
+            },
+        );
+    }
+    stamp_scene(builder, &scene, a, anchor);
+    true
+}
+
+/// Append a cached child scene into the stage at the instance's placement.
+fn stamp_scene(
+    builder: &mut SceneBuilder<'_>,
+    child: &crate::vello::Scene,
+    a: Affine,
+    anchor: buzz_geom::Point,
+) {
+    let stamp = symbol_stamp(
+        builder.split.gpu_view,
+        a,
+        anchor,
+        builder.split.scale,
+        builder.split.anchor,
+    );
+    // Only glyph runs set encoding flags, and nothing here draws text; a child
+    // with an unbalanced clip stack would corrupt the parent's. Both hold today
+    // and these pin them for whoever adds text rendering.
+    debug_assert_eq!(builder.scene.encoding().flags, 0, "no glyph-run flags to carry");
+    debug_assert_eq!(child.encoding().n_open_clips, 0, "child must be layer-balanced");
+    builder.scene.append(child, Some(stamp));
 }
 
 /// Collect an object's filled outlines into one path, through `transform`.
@@ -2316,5 +2632,298 @@ mod symbol_table {
         table.refresh(&scene); // must not recurse forever
         // A cycle is treated conservatively: out of the cache.
         assert!(!table.get(recur).unwrap().cacheable_content());
+    }
+}
+
+#[cfg(test)]
+mod symbol_scene {
+    use super::*;
+    use buzz_geom::{Camera, Point, Rect, Shape, Size};
+    use buzz_scene::{Object, ObjectId, ShapeData, SymbolId, SymbolKind};
+
+    fn first_layer(scene: &Scene, symbol: SymbolId) -> buzz_scene::LayerId {
+        scene
+            .library()
+            .get(symbol)
+            .unwrap()
+            .layers
+            .iter()
+            .next()
+            .unwrap()
+            .id
+    }
+
+    fn shape_object(id: u64, rect: Rect) -> Object {
+        Object::shape(ObjectId(id), ShapeData::filled(rect.to_path(1e-9), Color::WHITE))
+    }
+
+    /// A `part` symbol (one shape), a `character` that places the part `parts`
+    /// times, and `chars` characters on a stage layer. Returns (scene, part,
+    /// character).
+    fn crowd(parts: usize, chars: usize) -> (Scene, SymbolId, SymbolId) {
+        let mut scene = Scene::default();
+
+        let part = scene.add_symbol("part", SymbolKind::Graphic, None);
+        let pl = first_layer(&scene, part);
+        scene.library_mut().update(part, |s| {
+            s.layers.update(pl, |l| {
+                l.frames
+                    .push_object(0, Arc::new(shape_object(1, Rect::new(0.0, 0.0, 10.0, 10.0))));
+            });
+        });
+
+        let character = scene.add_symbol("character", SymbolKind::Graphic, None);
+        let cl = first_layer(&scene, character);
+        scene.library_mut().update(character, |s| {
+            for i in 0..parts {
+                s.layers.update(cl, |l| {
+                    l.frames.push_object(
+                        0,
+                        Arc::new(
+                            Object::instance_of(ObjectId(100 + i as u64), part)
+                                .with_transform(Affine::translate((0.0, i as f64 * 12.0))),
+                        ),
+                    );
+                });
+            }
+        });
+
+        let layer = scene.add_layer("Cast", LayerKind::Normal);
+        for i in 0..chars {
+            let x = (i % 10) as f64 * 30.0;
+            let y = (i / 10) as f64 * 40.0;
+            scene.add_instance_at(layer, 0, character, Affine::translate((x, y)));
+        }
+        (scene, part, character)
+    }
+
+    fn wide_camera() -> Camera {
+        Camera::new(Point::new(150.0, 100.0), 0.5, Size::new(2000.0, 2000.0))
+    }
+
+    /// Draw once and report (builds, stamps, n_paths).
+    fn render(
+        scene: &Scene,
+        camera: &Camera,
+        options: &FrameOptions,
+        reuse: bool,
+    ) -> (u64, u64, u32) {
+        let mut vello = crate::vello::Scene::new();
+        let mut builder = SceneBuilder::new(&mut vello, camera);
+        let mut cache = DrawCache::new();
+        cache.set_symbol_reuse(reuse);
+        cache.begin(0);
+        draw_frame_within(&mut builder, scene, 0, Affine::IDENTITY, options, &mut cache);
+        cache.end();
+        (
+            cache.symbol_scenes.builds,
+            cache.symbol_scenes.stamps,
+            vello.encoding().n_paths,
+        )
+    }
+
+    #[test]
+    fn stamp_matches_the_live_split_formula() {
+        // For a handful of orthogonal placements, the stamped child must land a
+        // point exactly where the live render split would.
+        let cases = [
+            (Affine::translate((37.0, -12.0)), Point::new(5.0, 9.0), 0.4),
+            (Affine::rotate(0.7), Point::new(-20.0, 3.0), 2.5),
+            (
+                Affine::translate((100.0, 200.0)) * Affine::rotate(-1.2),
+                Point::new(50.0, -50.0),
+                1.0,
+            ),
+            (Affine::FLIP_Y * Affine::rotate(0.3), Point::new(8.0, 8.0), 7.0),
+        ];
+        let gpu_view = Affine::translate((400.0, 300.0)) * Affine::rotate(0.2);
+        let cam = Point::new(123.0, -45.0);
+
+        for (a, anchor, scale) in cases {
+            assert!(is_orthogonal(a.as_coeffs(), 1e-9), "test A must be orthogonal");
+            let stamp = symbol_stamp(gpu_view, a, anchor, scale, cam);
+            // The child encodes C(p) = S·(p − anchor).
+            let child = Affine::scale(scale) * Affine::translate(-anchor.to_vec2());
+            // The live render space of the document point A·p is S·(A·p − cam),
+            // then the GPU view.
+            let live_split = gpu_view * Affine::scale(scale) * Affine::translate(-cam.to_vec2());
+            for p in [Point::new(0.0, 0.0), Point::new(3.0, -7.0), Point::new(-11.0, 4.0)] {
+                let stamped = stamp * (child * p);
+                let live = live_split * (a * p);
+                assert!(
+                    (stamped - live).hypot() < 1e-9,
+                    "stamp diverged from the live split: {stamped:?} vs {live:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn n_instances_build_once() {
+        let (scene, _part, _character) = crowd(10, 50);
+        let (builds, stamps, _paths) =
+            render(&scene, &wide_camera(), &FrameOptions::default(), true);
+        assert_eq!(builds, 2, "one encode for the character, one for the part — not 60k");
+        // 50 character stamps, plus the 10 part stamps of the single character
+        // build (the other 49 characters are whole-scene stamps that never walk
+        // the parts again).
+        assert_eq!(stamps, 60);
+    }
+
+    #[test]
+    fn a_repeated_redraw_reuses_and_an_edit_rebuilds() {
+        let (mut scene, part, _character) = crowd(3, 5);
+        let camera = wide_camera();
+        let options = FrameOptions::default();
+        let mut cache = DrawCache::new();
+        cache.set_symbol_reuse(true);
+
+        let go = |scene: &Scene, cache: &mut DrawCache| {
+            let mut vello = crate::vello::Scene::new();
+            let mut builder = SceneBuilder::new(&mut vello, &camera);
+            cache.begin(0);
+            draw_frame_within(&mut builder, scene, 0, Affine::IDENTITY, &options, cache);
+            cache.end();
+        };
+
+        go(&scene, &mut cache);
+        let after_first = cache.symbol_scenes.builds;
+        assert_eq!(after_first, 2);
+
+        go(&scene, &mut cache);
+        assert_eq!(
+            cache.symbol_scenes.builds, after_first,
+            "an unchanged redraw stamps from the cache and encodes nothing new"
+        );
+
+        // Edit the nested part: its fingerprint, and the character's, both move.
+        let pl = first_layer(&scene, part);
+        scene.library_mut().update(part, |s| {
+            s.layers.update(pl, |l| {
+                l.frames
+                    .push_object(0, Arc::new(shape_object(77, Rect::new(0.0, 0.0, 5.0, 5.0))));
+            });
+        });
+        go(&scene, &mut cache);
+        assert!(
+            cache.symbol_scenes.builds > after_first,
+            "a nested edit forces a fresh encode"
+        );
+    }
+
+    #[test]
+    fn aging_evicts_unused_entries() {
+        let (scene, _p, _c) = crowd(3, 3);
+        let camera = wide_camera();
+        let options = FrameOptions::default();
+        let mut cache = DrawCache::new();
+        cache.set_symbol_reuse(true);
+
+        let mut vello = crate::vello::Scene::new();
+        let mut builder = SceneBuilder::new(&mut vello, &camera);
+        cache.begin(0);
+        draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut cache);
+        cache.end();
+        assert!(!cache.symbol_scenes.entries.is_empty(), "the draw cached something");
+
+        // Generations pass with nothing drawn; entries age out.
+        for _ in 0..SYM_KEEP_FRAMES {
+            cache.begin(0);
+            cache.end();
+        }
+        assert!(
+            cache.symbol_scenes.entries.is_empty(),
+            "entries not drawn for a few generations are dropped"
+        );
+    }
+
+    #[test]
+    fn the_entry_count_is_capped() {
+        let mut scene = Scene::default();
+        let sym_id = scene.add_symbol("s", SymbolKind::Graphic, None);
+        let sym = Arc::clone(scene.library().get(sym_id).unwrap());
+        let dummy = Arc::new(crate::vello::Scene::new());
+
+        let mut sc = SymbolSceneCache::default();
+        sc.begin();
+        for i in 0..(SYM_CACHE_CAP + 50) {
+            sc.entries.insert(
+                SymKey {
+                    fingerprint: i as u64,
+                    inner: 0,
+                    depth: 0,
+                    scale_bits: 0,
+                },
+                SymEntry {
+                    scene: Arc::clone(&dummy),
+                    symbol: Arc::clone(&sym),
+                    anchor: Point::ORIGIN,
+                    used: sc.frame,
+                },
+            );
+        }
+        sc.end();
+        assert!(
+            sc.entries.len() <= SYM_CACHE_CAP,
+            "the cap bounds live entries at {SYM_CACHE_CAP}, got {}",
+            sc.entries.len()
+        );
+    }
+
+    /// For any scene the cache cannot take, it must build nothing, stamp nothing,
+    /// and leave the encoding identical to drawing with the cache off — because
+    /// the fallback *is* the live path.
+    fn assert_ineligible(scene: &Scene, camera: &Camera, options: &FrameOptions) {
+        let (builds, stamps, paths_on) = render(scene, camera, options, true);
+        assert_eq!(builds, 0, "an ineligible scene must encode no child");
+        assert_eq!(stamps, 0, "and stamp nothing");
+        let (_, _, paths_off) = render(scene, camera, options, false);
+        assert_eq!(paths_on, paths_off, "and encode exactly what the live path does");
+    }
+
+    #[test]
+    fn a_scaled_instance_falls_back() {
+        // A non-orthogonal placement (uniform 2x) is out of scope for v1.
+        let (mut scene, _p, character) = crowd(3, 0);
+        let layer = scene.add_layer("Scaled", LayerKind::Normal);
+        scene.add_instance_at(layer, 0, character, Affine::scale(2.0));
+        assert_ineligible(&scene, &wide_camera(), &FrameOptions::default());
+    }
+
+    #[test]
+    fn an_onion_ghost_falls_back() {
+        let (scene, _p, _c) = crowd(3, 4);
+        let ghosted = FrameOptions {
+            ghost: Some(0.5),
+            ..FrameOptions::default()
+        };
+        assert_ineligible(&scene, &wide_camera(), &ghosted);
+    }
+
+    #[test]
+    fn a_symbol_with_a_filter_falls_back() {
+        let mut scene = Scene::default();
+        let part = scene.add_symbol("part", SymbolKind::Graphic, None);
+        let pl = first_layer(&scene, part);
+        scene.library_mut().update(part, |s| {
+            s.layers.update(pl, |l| {
+                let mut o = shape_object(1, Rect::new(0.0, 0.0, 10.0, 10.0));
+                o.filters = vec![buzz_fx::Filter::new(buzz_fx::FilterKind::blur())];
+                l.frames.push_object(0, Arc::new(o));
+            });
+        });
+        let character = scene.add_symbol("character", SymbolKind::Graphic, None);
+        let cl = first_layer(&scene, character);
+        scene.library_mut().update(character, |s| {
+            s.layers.update(cl, |l| {
+                l.frames
+                    .push_object(0, Arc::new(Object::instance_of(ObjectId(9), part)));
+            });
+        });
+        let layer = scene.add_layer("Cast", LayerKind::Normal);
+        for i in 0..4 {
+            scene.add_instance_at(layer, 0, character, Affine::translate((i as f64 * 30.0, 0.0)));
+        }
+        assert_ineligible(&scene, &wide_camera(), &FrameOptions::default());
     }
 }

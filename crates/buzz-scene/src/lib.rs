@@ -909,6 +909,105 @@ impl Scene {
         }
     }
 
+    /// Every symbol's resolved extent, computed in **one memoised pass** — linear
+    /// in the library, not exponential in its nesting.
+    ///
+    /// [`Self::resolved_bounds`] re-walks a symbol's whole subtree per call, so
+    /// resolving many objects (a whole frame's worth, every frame while
+    /// scrubbing) re-measures the same rigs over and over. Build this table once
+    /// per document revision and resolve objects against it with
+    /// [`Self::resolved_bounds_with`], and the per-object cost becomes a lookup.
+    pub fn symbol_bounds_table(&self) -> std::collections::HashMap<SymbolId, Rect> {
+        let mut table = std::collections::HashMap::new();
+        let mut visiting = std::collections::HashSet::new();
+        for symbol in self.library.iter() {
+            self.symbol_bounds_memo(symbol.id, &mut table, &mut visiting);
+        }
+        table
+    }
+
+    /// One symbol's resolved extent, memoised into `table`. Cycle-safe: a
+    /// back-edge to a symbol still being measured contributes nothing, exactly
+    /// as the depth limit does for the recursive measure.
+    fn symbol_bounds_memo(
+        &self,
+        id: SymbolId,
+        table: &mut std::collections::HashMap<SymbolId, Rect>,
+        visiting: &mut std::collections::HashSet<SymbolId>,
+    ) -> Rect {
+        if let Some(&bounds) = table.get(&id) {
+            return bounds;
+        }
+        let Some(symbol) = self.library.get(id) else {
+            return Rect::ZERO;
+        };
+        if !visiting.insert(id) {
+            return Rect::ZERO;
+        }
+        let mut bounds: Option<Rect> = None;
+        for layer in symbol.layers.iter() {
+            for object in layer.all_objects() {
+                let b = self.object_bounds_memo(object, table, visiting);
+                if b != Rect::ZERO {
+                    bounds = Some(bounds.map_or(b, |acc| acc.union(b)));
+                }
+            }
+        }
+        visiting.remove(&id);
+        let resolved = bounds.unwrap_or(Rect::ZERO);
+        table.insert(id, resolved);
+        resolved
+    }
+
+    /// An object's resolved bounds in its parent's space, reading nested symbols
+    /// from the memo rather than the library.
+    fn object_bounds_memo(
+        &self,
+        object: &Object,
+        table: &mut std::collections::HashMap<SymbolId, Rect>,
+        visiting: &mut std::collections::HashSet<SymbolId>,
+    ) -> Rect {
+        match &object.kind {
+            ObjectKind::Instance(instance) => {
+                let child = self.symbol_bounds_memo(instance.symbol, table, visiting);
+                if child == Rect::ZERO {
+                    object.bounds()
+                } else {
+                    object::transform_rect(object.transform, child)
+                }
+            }
+            ObjectKind::Group(children) => children
+                .iter()
+                .map(|c| object::transform_rect(object.transform, self.object_bounds_memo(c, table, visiting)))
+                .reduce(|a, b| a.union(b))
+                .unwrap_or_else(|| object.bounds()),
+            ObjectKind::Shape(_) | ObjectKind::Armature(_) | ObjectKind::Warp(_) => object.bounds(),
+        }
+    }
+
+    /// An object's resolved bounds, reading nested symbols from a table built by
+    /// [`Self::symbol_bounds_table`] instead of re-walking the library.
+    pub fn resolved_bounds_with(
+        &self,
+        object: &Object,
+        table: &std::collections::HashMap<SymbolId, Rect>,
+    ) -> Rect {
+        match &object.kind {
+            ObjectKind::Instance(instance) => match table.get(&instance.symbol) {
+                Some(&local) if local != Rect::ZERO => {
+                    object::transform_rect(object.transform, local)
+                }
+                _ => object.bounds(),
+            },
+            ObjectKind::Group(children) => children
+                .iter()
+                .map(|c| object::transform_rect(object.transform, self.resolved_bounds_with(c, table)))
+                .reduce(|a, b| a.union(b))
+                .unwrap_or_else(|| object.bounds()),
+            ObjectKind::Shape(_) | ObjectKind::Armature(_) | ObjectKind::Warp(_) => object.bounds(),
+        }
+    }
+
     /// How many times each symbol is used, for the Library panel.
     ///
     /// Counts instances on the stage *and* inside other symbols, because a

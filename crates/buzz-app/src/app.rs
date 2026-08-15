@@ -457,6 +457,11 @@ pub struct App {
     /// run on a frame that only panned or zoomed. Both are camera-only and touch
     /// neither the revision nor the frame, so the cache holds across them.
     scroll_extent: Option<(u64, u32, buzz_geom::Rect)>,
+    /// Every symbol's resolved extent, memoised by document revision. Resolving
+    /// an instance's bounds by re-walking the library is exponential in the
+    /// nesting; against this table it is a lookup. Rebuilt only on an edit, so it
+    /// stays warm across every frame the user scrubs through.
+    bounds_table: Option<(u64, std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>)>,
     /// Bumped whenever installed lighting geometry changes what the stage would
     /// encode, so a retained stage is invalidated when a light's shading lands.
     lights_generation: u64,
@@ -580,6 +585,7 @@ impl App {
             force_poll: std::env::var("BUZZ_POLL").is_ok(),
             stage_stamp: None,
             scroll_extent: None,
+            bounds_table: None,
             lights_generation: 0,
             retain_stage: std::env::var("BUZZ_NO_RETAIN").is_err(),
             profiler: crate::profile::FrameProfiler::default(),
@@ -2530,6 +2536,12 @@ impl App {
         let content = match self.scroll_extent {
             Some((r, f, ext)) if r == revision && f == frame => ext,
             _ => {
+                // Keep the symbol-bounds table warm for this revision, so the
+                // recompute below is a lookup per object even while scrubbing.
+                if self.bounds_table.as_ref().map(|(r, _)| *r) != Some(revision) {
+                    let table = self.editor.scene().symbol_bounds_table();
+                    self.bounds_table = Some((revision, table));
+                }
                 let ext = self.compute_content_extent(frame);
                 self.scroll_extent = Some((revision, frame, ext));
                 ext
@@ -2548,9 +2560,11 @@ impl App {
         let scene = self.editor.scene();
         let mut extent = scene.stage().stage_rect();
 
+        let empty = std::collections::HashMap::new();
+        let table = self.bounds_table.as_ref().map(|(_, t)| t).unwrap_or(&empty);
         for layer in scene.layers().iter() {
             for object in layer.objects_at(frame) {
-                let bounds = scene.resolved_bounds(object);
+                let bounds = scene.resolved_bounds_with(object, table);
                 if bounds.width().is_finite() && bounds.height().is_finite() {
                     extent = extent.union(bounds);
                 }

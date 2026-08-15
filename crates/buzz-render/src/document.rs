@@ -144,6 +144,9 @@ pub struct DrawCache {
     pub lights: LightCache,
     pub filters: FilterCache,
     pub bounds: BoundsCache,
+    /// Per-symbol facts (fingerprint, extent, cache-eligibility), rebuilt only
+    /// when the document changes rather than every frame.
+    pub symbols: SymbolTable,
 }
 
 /// Resolved document-space bounds of instances, kept between frames so culling
@@ -184,6 +187,226 @@ impl BoundsCache {
         self.entries.insert(key, (Arc::clone(owner), bounds, frame));
         bounds
     }
+}
+
+/// What the draw walk needs to know about a symbol that does not change between
+/// frames: how to key a cached encoding of it, how big it is, and whether it is
+/// simple enough to cache at all.
+///
+/// Computed once per document edit (see [`SymbolTable`]) and read on every
+/// instance of the symbol, so the per-frame cost of deciding "can I reuse this
+/// symbol's encoding?" is a hash-map lookup rather than a walk of its subtree.
+#[derive(Debug, Clone)]
+pub struct SymbolInfo {
+    /// Pins the symbol's address for the life of the entry, so the fingerprint —
+    /// which folds in `Arc` pointers — cannot be invalidated by a free-and-reuse
+    /// at the same address within one revision.
+    // Read by the scene cache (step 4), which stores the same Arc per entry.
+    #[allow(dead_code)]
+    arc: Arc<buzz_scene::Symbol>,
+    /// Changes whenever the symbol's own contents change **or** any symbol it
+    /// nests changes. Editing a nested symbol forks that symbol's `Arc` but not
+    /// its parent's, so a fingerprint that folds in the children's is what makes
+    /// a nested edit invalidate the parent's cached encoding.
+    fingerprint: u64,
+    /// The symbol's real extent, resolved through the library across every frame
+    /// (`Scene::symbol_bounds`). Placeholder instance bounds would be far too
+    /// small — this is why the cache clips and anchors from here, not from
+    /// `Symbol::bounds`.
+    // Read by the scene cache (step 4) to anchor and clip the child encode.
+    #[allow(dead_code)]
+    resolved_bounds: buzz_geom::Rect,
+    flags: SymFlags,
+}
+
+impl SymbolInfo {
+    /// Simple enough to cache: nothing inside it renders in a way that depends on
+    /// where the instance sits (no filters, group blends, out-of-plane objects
+    /// or inverse masks, transitively).
+    // Gates the scene cache (step 4); also exercised by the flag tests.
+    #[allow(dead_code)]
+    fn cacheable_content(&self) -> bool {
+        !(self.flags.filters
+            || self.flags.group_blend
+            || self.flags.non_flat
+            || self.flags.inverse_mask)
+    }
+}
+
+/// Content facts about a symbol's whole subtree, OR-combined across every object
+/// in every frame and through every nested symbol.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SymFlags {
+    /// Any object carries filters — drawn from a document-space silhouette whose
+    /// blur radius does not survive being stamped at another position.
+    filters: bool,
+    /// Any object uses a blend that needs an isolation group, which the group's
+    /// bounds — position-dependent — are pushed for.
+    group_blend: bool,
+    /// Any object faces out of its plane, so it is drawn through the stage
+    /// camera's projection and moves with its placement.
+    non_flat: bool,
+    /// Any layer is an inverse mask, whose isolation the live path bounds in
+    /// symbol-local space — a placement-dependent quirk the cache must not "fix".
+    inverse_mask: bool,
+    /// Any shape paints additively, so a layer holding this symbol must be
+    /// isolated. Not a cache-eligibility fact — this one memoises
+    /// [`has_additive_paint`].
+    additive: bool,
+}
+
+impl SymFlags {
+    /// Everything true — the conservative answer for a dangling reference or a
+    /// symbol caught in a cycle, which keeps it out of the cache and isolated.
+    const ALL: SymFlags = SymFlags {
+        filters: true,
+        group_blend: true,
+        non_flat: true,
+        inverse_mask: true,
+        additive: true,
+    };
+
+    fn or(self, other: SymFlags) -> SymFlags {
+        SymFlags {
+            filters: self.filters || other.filters,
+            group_blend: self.group_blend || other.group_blend,
+            non_flat: self.non_flat || other.non_flat,
+            inverse_mask: self.inverse_mask || other.inverse_mask,
+            additive: self.additive || other.additive,
+        }
+    }
+}
+
+/// A per-symbol memo of [`SymbolInfo`], rebuilt only when the document changes.
+///
+/// The interactive view camera is not part of the scene, so panning, zooming and
+/// playback never bump [`Scene::revision`] — the table is built once on import
+/// and reused for every frame the user then works through. It is rebuilt in full
+/// on any edit, which is a single depth-first pass over the library.
+#[derive(Debug, Default)]
+pub struct SymbolTable {
+    revision: Option<u64>,
+    infos: std::collections::HashMap<buzz_scene::SymbolId, SymbolInfo>,
+}
+
+impl SymbolTable {
+    /// Bring the table up to date with the scene, cheaply if nothing changed.
+    pub fn refresh(&mut self, scene: &Scene) {
+        if self.revision == Some(scene.revision()) {
+            return;
+        }
+        self.infos.clear();
+        let mut visiting = std::collections::HashSet::new();
+        for symbol in scene.library().iter() {
+            build_symbol(symbol.id, scene, &mut self.infos, &mut visiting);
+        }
+        self.revision = Some(scene.revision());
+    }
+
+    // Consulted by the additive memo (step 3) and the scene cache (step 4).
+    #[allow(dead_code)]
+    fn get(&self, id: buzz_scene::SymbolId) -> Option<&SymbolInfo> {
+        self.infos.get(&id)
+    }
+}
+
+/// Compute (and memoise) one symbol's [`SymbolInfo`], returning its fingerprint.
+///
+/// Depth-first through nested symbols. `visiting` breaks cycles: a back-edge to a
+/// symbol still being built contributes only its pointer to the fingerprint and
+/// the conservative [`SymFlags::ALL`] to its flags, so a self-referencing symbol
+/// terminates and stays out of the cache.
+fn build_symbol(
+    id: buzz_scene::SymbolId,
+    scene: &Scene,
+    infos: &mut std::collections::HashMap<buzz_scene::SymbolId, SymbolInfo>,
+    visiting: &mut std::collections::HashSet<buzz_scene::SymbolId>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    if let Some(info) = infos.get(&id) {
+        return info.fingerprint;
+    }
+    let Some(symbol) = scene.library().get(id) else {
+        return 0;
+    };
+    if !visiting.insert(id) {
+        // Cycle: contribute the pointer and unwind. The still-building ancestor
+        // will fold in SymFlags::ALL for us below.
+        return Arc::as_ptr(symbol) as u64;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (Arc::as_ptr(symbol) as usize).hash(&mut hasher);
+
+    let mut flags = SymFlags::default();
+    for layer in symbol.layers.iter() {
+        if layer.kind == LayerKind::InverseMask {
+            flags.inverse_mask = true;
+        }
+        for object in layer.all_objects() {
+            flags = flags.or(scan_object(object, scene, infos, visiting, &mut hasher));
+        }
+    }
+
+    visiting.remove(&id);
+    let fingerprint = hasher.finish();
+    let resolved_bounds = scene.symbol_bounds(id).unwrap_or(buzz_geom::Rect::ZERO);
+    infos.insert(
+        id,
+        SymbolInfo {
+            arc: Arc::clone(symbol),
+            fingerprint,
+            resolved_bounds,
+            flags,
+        },
+    );
+    fingerprint
+}
+
+/// OR the content flags of one object's subtree, folding nested symbols' whole
+/// (already-computed) flags in and hashing their fingerprints into `hasher`.
+fn scan_object(
+    object: &Object,
+    scene: &Scene,
+    infos: &mut std::collections::HashMap<buzz_scene::SymbolId, SymbolInfo>,
+    visiting: &mut std::collections::HashSet<buzz_scene::SymbolId>,
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+) -> SymFlags {
+    use std::hash::Hash;
+
+    // Filters, blend and facing live on every object, not just shapes.
+    let mut flags = SymFlags {
+        filters: !object.filters.is_empty(),
+        group_blend: object.blend.needs_group(),
+        non_flat: !object.spatial.is_flat(),
+        ..SymFlags::default()
+    };
+
+    match &object.kind {
+        ObjectKind::Shape(shape) => flags.additive |= shape.blend.is_additive(),
+        ObjectKind::Warp(warp) => flags.additive |= warp.shape.blend.is_additive(),
+        ObjectKind::Group(children) => {
+            for child in children {
+                flags = flags.or(scan_object(child, scene, infos, visiting, hasher));
+            }
+        }
+        ObjectKind::Armature(rig) => {
+            for part in &rig.parts {
+                flags = flags.or(scan_object(&part.artwork, scene, infos, visiting, hasher));
+            }
+        }
+        ObjectKind::Instance(instance) => {
+            let child_fp = build_symbol(instance.symbol, scene, infos, visiting);
+            child_fp.hash(hasher);
+            match infos.get(&instance.symbol) {
+                Some(child) => flags = flags.or(child.flags),
+                // Dangling reference or cycle back-edge: assume the worst.
+                None => flags = flags.or(SymFlags::ALL),
+            }
+        }
+    }
+    flags
 }
 
 impl DrawCache {
@@ -241,6 +464,7 @@ pub fn draw_frame_lit(
         lights: std::mem::take(lights),
         filters: FilterCache::new(),
         bounds: BoundsCache::default(),
+        symbols: SymbolTable::default(),
     };
     draw_frame_cached(builder, scene, frame, camera, options, &mut cache);
     *lights = cache.lights;
@@ -1806,5 +2030,215 @@ mod tests {
             !cache.lights.is_empty(),
             "it should have built the geometry into the cache"
         );
+    }
+}
+
+#[cfg(test)]
+mod symbol_table {
+    use super::*;
+    use buzz_geom::{Rect, Shape};
+    use buzz_scene::{
+        Layer, LayerId, Object, ObjectId, PaintBlend, ShapeData, Spatial, SymbolId, SymbolKind,
+    };
+
+    fn first_layer(scene: &Scene, symbol: SymbolId) -> LayerId {
+        scene
+            .library()
+            .get(symbol)
+            .unwrap()
+            .layers
+            .iter()
+            .next()
+            .unwrap()
+            .id
+    }
+
+    /// A symbol whose one layer holds `object`.
+    fn symbol_with(scene: &mut Scene, name: &str, object: Object) -> SymbolId {
+        let id = scene.add_symbol(name, SymbolKind::Graphic, None);
+        let layer = first_layer(scene, id);
+        scene.library_mut().update(id, |s| {
+            s.layers.update(layer, |l| {
+                l.frames.push_object(0, Arc::new(object));
+            });
+        });
+        id
+    }
+
+    fn shape(id: u64, rect: Rect) -> Object {
+        Object::shape(ObjectId(id), ShapeData::filled(rect.to_path(1e-9), Color::WHITE))
+    }
+
+    fn unit(id: u64) -> Object {
+        shape(id, Rect::new(0.0, 0.0, 10.0, 10.0))
+    }
+
+    #[test]
+    fn editing_a_nested_symbol_changes_the_parents_fingerprint_only() {
+        let mut scene = Scene::default();
+        let part = symbol_with(&mut scene, "part", unit(1));
+        let character = symbol_with(
+            &mut scene,
+            "character",
+            Object::instance_of(ObjectId(2), part),
+        );
+        let unrelated = symbol_with(&mut scene, "unrelated", unit(3));
+
+        let mut table = SymbolTable::default();
+        table.refresh(&scene);
+        let fp_part = table.get(part).unwrap().fingerprint;
+        let fp_char = table.get(character).unwrap().fingerprint;
+        let fp_unrelated = table.get(unrelated).unwrap().fingerprint;
+
+        // Edit the nested part — a new shape on its layer.
+        let part_layer = first_layer(&scene, part);
+        scene.library_mut().update(part, |s| {
+            s.layers.update(part_layer, |l| {
+                l.frames.push_object(0, Arc::new(unit(9)));
+            });
+        });
+        table.refresh(&scene);
+
+        assert_ne!(fp_part, table.get(part).unwrap().fingerprint, "part changed");
+        assert_ne!(
+            fp_char,
+            table.get(character).unwrap().fingerprint,
+            "a nested edit must ripple up to the parent that instances it"
+        );
+        assert_eq!(
+            fp_unrelated,
+            table.get(unrelated).unwrap().fingerprint,
+            "an untouched symbol keeps its fingerprint"
+        );
+    }
+
+    #[test]
+    fn safety_flags_are_transitive() {
+        // A filter two levels deep.
+        {
+            let mut scene = Scene::default();
+            let mut filtered = unit(1);
+            filtered.filters = vec![buzz_fx::Filter::new(buzz_fx::FilterKind::blur())];
+            let inner = symbol_with(&mut scene, "inner", filtered);
+            let mid = symbol_with(&mut scene, "mid", Object::instance_of(ObjectId(2), inner));
+            let outer = symbol_with(&mut scene, "outer", Object::instance_of(ObjectId(3), mid));
+            let mut table = SymbolTable::default();
+            table.refresh(&scene);
+            assert!(table.get(outer).unwrap().flags.filters, "filter bubbles up two levels");
+            assert!(!table.get(outer).unwrap().cacheable_content());
+        }
+        // A group blend.
+        {
+            let mut scene = Scene::default();
+            let mut blended = unit(1);
+            blended.blend = buzz_fx::Blend::Add;
+            let inner = symbol_with(&mut scene, "inner", blended);
+            let outer = symbol_with(&mut scene, "outer", Object::instance_of(ObjectId(2), inner));
+            let mut table = SymbolTable::default();
+            table.refresh(&scene);
+            assert!(table.get(outer).unwrap().flags.group_blend);
+            assert!(!table.get(outer).unwrap().cacheable_content());
+        }
+        // An out-of-plane object.
+        {
+            let mut scene = Scene::default();
+            let mut tilted = unit(1);
+            tilted.spatial = Spatial {
+                rotation_y: 0.5,
+                ..Spatial::default()
+            };
+            let inner = symbol_with(&mut scene, "inner", tilted);
+            let outer = symbol_with(&mut scene, "outer", Object::instance_of(ObjectId(2), inner));
+            let mut table = SymbolTable::default();
+            table.refresh(&scene);
+            assert!(table.get(outer).unwrap().flags.non_flat);
+            assert!(!table.get(outer).unwrap().cacheable_content());
+        }
+        // An inverse-mask layer.
+        {
+            let mut scene = Scene::default();
+            let holed = scene.add_symbol("holed", SymbolKind::Graphic, None);
+            scene.library_mut().update(holed, |s| {
+                s.layers
+                    .push_front(Layer::new(LayerId(999), "Hole", LayerKind::InverseMask));
+            });
+            let outer = symbol_with(&mut scene, "outer", Object::instance_of(ObjectId(2), holed));
+            let mut table = SymbolTable::default();
+            table.refresh(&scene);
+            assert!(table.get(holed).unwrap().flags.inverse_mask);
+            assert!(table.get(outer).unwrap().flags.inverse_mask, "bubbles up");
+        }
+        // Additive paint.
+        {
+            let mut scene = Scene::default();
+            let glow = Object::shape(
+                ObjectId(1),
+                ShapeData::filled(Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9), Color::WHITE)
+                    .with_blend(PaintBlend::Additive),
+            );
+            let inner = symbol_with(&mut scene, "inner", glow);
+            let outer = symbol_with(&mut scene, "outer", Object::instance_of(ObjectId(2), inner));
+            let mut table = SymbolTable::default();
+            table.refresh(&scene);
+            assert!(table.get(outer).unwrap().flags.additive);
+            // Additive does not, by itself, make a symbol uncacheable.
+            assert!(table.get(outer).unwrap().cacheable_content());
+        }
+        // A plain symbol is fully cacheable.
+        {
+            let mut scene = Scene::default();
+            let plain = symbol_with(&mut scene, "plain", unit(1));
+            let mut table = SymbolTable::default();
+            table.refresh(&scene);
+            let info = table.get(plain).unwrap();
+            assert_eq!(info.flags, SymFlags::default());
+            assert!(info.cacheable_content());
+        }
+    }
+
+    #[test]
+    fn resolved_bounds_cover_nested_instances_beyond_naive_bounds() {
+        let mut scene = Scene::default();
+        let part = symbol_with(&mut scene, "part", unit(1));
+        // The character places the part a thousand units away — a naive measure
+        // through the placeholder instance box would miss it entirely.
+        let character = symbol_with(
+            &mut scene,
+            "character",
+            Object::instance_of(ObjectId(2), part)
+                .with_transform(Affine::translate((1000.0, 1000.0))),
+        );
+
+        let mut table = SymbolTable::default();
+        table.refresh(&scene);
+        let bounds = table.get(character).unwrap().resolved_bounds;
+        assert!(
+            bounds.x0 >= 500.0 && bounds.y0 >= 500.0,
+            "resolved bounds must follow the instance to where it was placed, got {bounds:?}"
+        );
+        // The real 10-unit shape, not the ~2-unit placeholder box at the origin.
+        assert!(
+            (bounds.width() - 10.0).abs() < 1.0 && (bounds.height() - 10.0).abs() < 1.0,
+            "and be the part's real size, got {bounds:?}"
+        );
+    }
+
+    #[test]
+    fn a_self_referencing_symbol_terminates() {
+        let mut scene = Scene::default();
+        let recur = scene.add_symbol("recur", SymbolKind::Graphic, None);
+        let layer = first_layer(&scene, recur);
+        // The symbol contains an instance of itself — a cycle.
+        scene.library_mut().update(recur, |s| {
+            s.layers.update(layer, |l| {
+                l.frames
+                    .push_object(0, Arc::new(Object::instance_of(ObjectId(1), recur)));
+            });
+        });
+
+        let mut table = SymbolTable::default();
+        table.refresh(&scene); // must not recurse forever
+        // A cycle is treated conservatively: out of the cache.
+        assert!(!table.get(recur).unwrap().cacheable_content());
     }
 }

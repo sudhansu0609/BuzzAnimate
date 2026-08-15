@@ -320,6 +320,193 @@ impl Armature {
         }
     }
 
+    /// **Remove a bone, and give its children to its parent.**
+    ///
+    /// Building a rig was additive only: one bone in the wrong place meant
+    /// starting the skeleton again, which is why nobody rigged the second
+    /// character. Deleting has to keep the rest of the tree standing, so a
+    /// bone's children are adopted by its parent rather than deleted with it —
+    /// removing a shoulder should not silently take the hand.
+    ///
+    /// **Every index after the removed one shifts down by one**, and parent
+    /// indices are rewritten to match. That is the whole difficulty: an
+    /// armature stores parents as positions, so a removal that did not renumber
+    /// would leave bones pointing at whichever bone slid into the gap.
+    ///
+    /// Returns `false` if there is no such bone.
+    pub fn remove_bone(&mut self, index: usize) -> bool {
+        if index >= self.bones.len() {
+            return false;
+        }
+        let orphan_parent = self.bones[index].parent;
+
+        // The removed bone's own turn is inherited by its children, so a limb
+        // does not snap to a new direction when a joint above it goes.
+        let inherited = self.bones[index].angle;
+        let inherited_rest = self.bones[index].rest_angle;
+        for bone in self.bones.iter_mut() {
+            if bone.parent == Some(index) {
+                bone.parent = orphan_parent;
+                bone.angle += inherited;
+                bone.rest_angle += inherited_rest;
+            }
+        }
+
+        self.bones.remove(index);
+
+        // Renumber: anything that pointed past the hole moves down with it.
+        for bone in self.bones.iter_mut() {
+            if let Some(parent) = bone.parent {
+                bone.parent = match parent.cmp(&index) {
+                    std::cmp::Ordering::Greater => Some(parent - 1),
+                    // A parent that *was* the removed bone has already been
+                    // rewritten above; anything still equal is a root now.
+                    std::cmp::Ordering::Equal => None,
+                    std::cmp::Ordering::Less => Some(parent),
+                };
+            }
+        }
+        self.mend_order();
+        true
+    }
+
+    /// **Point a bone at a different parent.**
+    ///
+    /// Refused when it would make a cycle — a bone cannot become its own
+    /// ancestor — and when the new parent does not exist. `None` makes the
+    /// bone a root.
+    ///
+    /// Returns `false` if the change was refused, so a caller can say why
+    /// rather than appearing to do nothing.
+    pub fn reparent_bone(&mut self, index: usize, parent: Option<usize>) -> bool {
+        if index >= self.bones.len() {
+            return false;
+        }
+        if let Some(p) = parent
+            && (p >= self.bones.len() || p == index || self.is_descendant(p, index))
+        {
+            return false;
+        }
+        self.bones[index].parent = parent;
+        self.mend_order();
+        true
+    }
+
+    /// Is `candidate` somewhere below `ancestor` in the tree?
+    fn is_descendant(&self, candidate: usize, ancestor: usize) -> bool {
+        let mut current = Some(candidate);
+        // Bounded by the bone count: a malformed tree must not spin here.
+        for _ in 0..=self.bones.len() {
+            match current {
+                Some(i) if i == ancestor => return true,
+                Some(i) => current = self.bones.get(i).and_then(|b| b.parent),
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Restore the parents-first invariant after an edit.
+    ///
+    /// Every walk here is a single forward pass, which is only sound while a
+    /// bone's parent sits before it. Reparenting can break that — attaching an
+    /// early bone to a late one — so the bones are reordered and every index
+    /// rewritten to match.
+    fn mend_order(&mut self) {
+        if self.is_ordered() {
+            return;
+        }
+        // Depth-first from the roots: a parent is always emitted before its
+        // children, which is exactly the invariant.
+        let mut order: Vec<usize> = Vec::with_capacity(self.bones.len());
+        let mut placed = vec![false; self.bones.len()];
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for i in 0..self.bones.len() {
+                if placed[i] {
+                    continue;
+                }
+                let ready = match self.bones[i].parent {
+                    None => true,
+                    Some(p) => placed.get(p).copied().unwrap_or(false),
+                };
+                if ready {
+                    placed[i] = true;
+                    order.push(i);
+                    progress = true;
+                }
+            }
+        }
+        // Anything left is part of a cycle that should not exist; making it a
+        // root is better than dropping it.
+        for (i, done) in placed.iter().enumerate() {
+            if !done {
+                order.push(i);
+            }
+        }
+
+        let mut position = vec![0usize; self.bones.len()];
+        for (new, &old) in order.iter().enumerate() {
+            position[old] = new;
+        }
+        let mut moved: Vec<Bone> = order.iter().map(|&i| self.bones[i].clone()).collect();
+        for bone in &mut moved {
+            bone.parent = bone.parent.and_then(|p| position.get(p).copied());
+            if bone.parent == Some(usize::MAX) {
+                bone.parent = None;
+            }
+        }
+        // A parent that still lands after its child is a cycle; cut it.
+        for (i, bone) in moved.iter_mut().enumerate() {
+            if bone.parent.is_some_and(|p| p >= i) {
+                bone.parent = None;
+            }
+        }
+        self.bones = moved;
+    }
+
+    fn is_ordered(&self) -> bool {
+        self.bones
+            .iter()
+            .enumerate()
+            .all(|(i, b)| b.parent.is_none_or(|p| p < i))
+    }
+
+    /// **The same pose, facing the other way.**
+    ///
+    /// Every joint angle is reflected about the vertical, which turns a pose
+    /// reaching right into the same pose reaching left. It halves the work of
+    /// building a pose set — and a set is what makes a pose library worth
+    /// having, so this is not a convenience so much as the other half of the
+    /// feature.
+    ///
+    /// # What it does not do
+    ///
+    /// It does not swap a left arm's bones with a right arm's. Doing that
+    /// needs to know which bones are a pair, and nothing here records that:
+    /// Animate infers it from names, which is a guess that is wrong quietly.
+    /// Reflecting the angles is the part that is always right, and for a rig
+    /// drawn symmetrically it is the whole answer.
+    pub fn mirrored_pose(&self) -> Vec<f64> {
+        // A bone's angle is relative to its parent, and reflecting a chain
+        // about a line negates every relative turn in it.
+        self.bones
+            .iter()
+            .map(|bone| {
+                // Reflect about the vertical: an angle measured from +x goes
+                // to pi - angle. For a child, that is simply the negation,
+                // because its parent has already been reflected.
+                let mirrored = if bone.parent.is_some() {
+                    -bone.angle
+                } else {
+                    std::f64::consts::PI - bone.angle
+                };
+                bone.constrain(wrap_pi(mirrored))
+            })
+            .collect()
+    }
+
     /// Interpolate between two poses of this armature, for a tween.
     ///
     /// Each joint turns the **shortest way round**, so a bone at 350° moving
@@ -625,5 +812,235 @@ mod tests {
         assert!((wrap_pi(std::f64::consts::TAU + 0.5) - 0.5).abs() < 1e-12);
         assert!((wrap_pi(-std::f64::consts::TAU - 0.5) + 0.5).abs() < 1e-12);
         assert!(wrap_pi(PI + 0.1) < 0.0, "just past the top wraps negative");
+    }
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use super::*;
+    use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+
+    fn arm() -> Armature {
+        let mut armature = Armature::new(Point::new(0.0, 0.0));
+        armature.push(Bone::new("upper", None, 50.0, 0.0));
+        armature.push(Bone::new("fore", Some(0), 40.0, 0.0));
+        armature
+    }
+
+    /// **The mirrored pose reaches the other way.** An arm out to the right
+    /// ends up out to the left, the same distance from the root.
+    #[test]
+    fn mirroring_reaches_the_other_side() {
+        let mut a = arm();
+        let tip_right = a.tip(1);
+        assert!(tip_right.x > 0.0, "the test arm should start pointing right");
+
+        let flipped = a.mirrored_pose();
+        a.set_pose(&flipped);
+        let tip_left = a.tip(1);
+
+        assert!(tip_left.x < 0.0, "it should now point left, not {tip_left:?}");
+        assert!(
+            (tip_left.x + tip_right.x).abs() < 1e-9,
+            "and the same distance out: {tip_right:?} vs {tip_left:?}"
+        );
+        assert!((tip_left.y - tip_right.y).abs() < 1e-9, "height is unchanged");
+    }
+
+    /// Mirroring twice is the pose you started with.
+    #[test]
+    fn mirroring_twice_is_where_it_started() {
+        let mut a = arm();
+        a.set_pose(&[FRAC_PI_4, -FRAC_PI_2]);
+        let start = a.tip(1);
+
+        let once = a.mirrored_pose();
+        a.set_pose(&once);
+        let twice = a.mirrored_pose();
+        a.set_pose(&twice);
+
+        let back = a.tip(1);
+        assert!(
+            (back - start).hypot() < 1e-9,
+            "{start:?} became {back:?} after two mirrors"
+        );
+    }
+
+    /// A bent elbow stays bent by the same amount — the shape of the pose
+    /// survives, only its handedness changes.
+    #[test]
+    fn mirroring_keeps_the_bend() {
+        let mut a = arm();
+        a.set_pose(&[0.3, 0.9]);
+        let bend = a.bones[1].angle.abs();
+
+        let flipped = a.mirrored_pose();
+        a.set_pose(&flipped);
+        assert!((a.bones[1].angle.abs() - bend).abs() < 1e-9);
+    }
+
+    /// Joint limits still hold: a mirrored angle outside them is clamped, not
+    /// smuggled past.
+    #[test]
+    fn mirroring_respects_joint_limits() {
+        let mut a = arm();
+        a.bones[1].limits = Some(JointLimits::new(0.0, PI / 2.0));
+        a.set_pose(&[0.0, 1.0]);
+
+        let flipped = a.mirrored_pose();
+        a.set_pose(&flipped);
+        let angle = a.bones[1].angle;
+        assert!(
+            (0.0..=PI / 2.0).contains(&angle),
+            "{angle} escaped its limits"
+        );
+    }
+
+    /// An empty rig has an empty pose, and mirroring it is not a panic.
+    #[test]
+    fn mirroring_an_empty_rig_is_empty() {
+        let a = Armature::new(Point::ZERO);
+        assert!(a.mirrored_pose().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod skeleton_edit_tests {
+    use super::*;
+
+    /// shoulder → elbow → wrist, a chain of three.
+    fn chain() -> Armature {
+        let mut a = Armature::new(Point::ZERO);
+        a.push(Bone::new("shoulder", None, 50.0, 0.0));
+        a.push(Bone::new("elbow", Some(0), 40.0, 0.2));
+        a.push(Bone::new("wrist", Some(1), 20.0, 0.1));
+        a
+    }
+
+    /// **Removing a joint must not take the limb below it.** The children are
+    /// adopted by the removed bone's parent.
+    #[test]
+    fn removing_a_bone_gives_its_children_to_its_parent() {
+        let mut a = chain();
+        assert!(a.remove_bone(1), "the elbow should have gone");
+
+        assert_eq!(a.len(), 2);
+        assert_eq!(a.bones[0].name, "shoulder");
+        assert_eq!(a.bones[1].name, "wrist", "the hand went with the elbow");
+        assert_eq!(
+            a.bones[1].parent,
+            Some(0),
+            "the wrist should now hang off the shoulder"
+        );
+    }
+
+    /// **The limb does not snap to a new direction.** The removed joint's turn
+    /// is inherited by what hung off it, so the hand still points where it
+    /// pointed.
+    ///
+    /// Its *position* does move, and must: the chain is genuinely shorter by
+    /// the length of the bone that went. Direction is the invariant here, not
+    /// place.
+    #[test]
+    fn removing_a_bone_keeps_the_limb_pointing_where_it_was() {
+        let mut a = chain();
+        let before = a.world_angle(2);
+        a.remove_bone(1);
+        let after = a.world_angle(1);
+        assert!(
+            (before - after).abs() < 1e-9,
+            "the hand turned from {before} to {after}"
+        );
+    }
+
+    /// Removing a root leaves what was below it standing.
+    #[test]
+    fn removing_the_root_leaves_a_root_behind() {
+        let mut a = chain();
+        a.remove_bone(0);
+        assert_eq!(a.len(), 2);
+        assert_eq!(a.bones[0].name, "elbow");
+        assert_eq!(a.bones[0].parent, None, "the elbow should be a root now");
+        assert_eq!(a.bones[1].parent, Some(0));
+    }
+
+    /// Every parent index still points at the right bone after the renumber —
+    /// the whole difficulty of removing from a list addressed by position.
+    #[test]
+    fn removing_a_bone_renumbers_every_parent() {
+        let mut a = Armature::new(Point::ZERO);
+        a.push(Bone::new("a", None, 10.0, 0.0));
+        a.push(Bone::new("b", Some(0), 10.0, 0.0));
+        a.push(Bone::new("c", Some(0), 10.0, 0.0));
+        a.push(Bone::new("d", Some(2), 10.0, 0.0));
+
+        a.remove_bone(1); // b, which has no children
+
+        let names: Vec<&str> = a.bones.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["a", "c", "d"]);
+        assert_eq!(a.bones[1].parent, Some(0), "c still hangs off a");
+        assert_eq!(a.bones[2].parent, Some(1), "d still hangs off c");
+    }
+
+    #[test]
+    fn removing_a_bone_that_is_not_there_does_nothing() {
+        let mut a = chain();
+        assert!(!a.remove_bone(9));
+        assert_eq!(a.len(), 3);
+    }
+
+    /// Reparenting moves a bone onto another, and the tree stays walkable.
+    #[test]
+    fn reparenting_moves_a_bone_onto_another() {
+        let mut a = chain();
+        assert!(a.reparent_bone(2, Some(0)), "wrist onto shoulder");
+
+        let wrist = a.bones.iter().position(|b| b.name == "wrist").unwrap();
+        assert_eq!(a.bones[wrist].parent, Some(0));
+        // Parents-first still holds, which is what every walk relies on.
+        for (i, bone) in a.bones.iter().enumerate() {
+            assert!(bone.parent.is_none_or(|p| p < i), "bone {i} points forward");
+        }
+    }
+
+    /// **A bone cannot become its own ancestor.** A cycle in a skeleton is an
+    /// infinite loop in the solver, so this is refused rather than clamped.
+    #[test]
+    fn reparenting_refuses_to_make_a_cycle() {
+        let mut a = chain();
+        assert!(!a.reparent_bone(0, Some(2)), "shoulder onto its own wrist");
+        assert!(!a.reparent_bone(1, Some(1)), "onto itself");
+        assert_eq!(a.bones[0].parent, None, "the tree should be untouched");
+        assert_eq!(a.bones[1].parent, Some(0));
+    }
+
+    #[test]
+    fn reparenting_to_nothing_makes_a_root() {
+        let mut a = chain();
+        assert!(a.reparent_bone(1, None));
+        let elbow = a.bones.iter().position(|b| b.name == "elbow").unwrap();
+        assert_eq!(a.bones[elbow].parent, None);
+    }
+
+    /// Reparenting an early bone onto a later one reorders the list so that
+    /// parents still come first — and every other index survives it.
+    #[test]
+    fn reparenting_backwards_reorders_and_keeps_the_tree() {
+        let mut a = Armature::new(Point::ZERO);
+        a.push(Bone::new("a", None, 10.0, 0.0));
+        a.push(Bone::new("b", None, 10.0, 0.0));
+        a.push(Bone::new("c", Some(1), 10.0, 0.0));
+
+        assert!(a.reparent_bone(0, Some(2)), "a onto c");
+
+        for (i, bone) in a.bones.iter().enumerate() {
+            assert!(bone.parent.is_none_or(|p| p < i), "bone {i} points forward");
+        }
+        let name_at = |i: usize| a.bones[i].name.as_str();
+        let a_at = a.bones.iter().position(|x| x.name == "a").unwrap();
+        let c_at = a.bones.iter().position(|x| x.name == "c").unwrap();
+        assert!(c_at < a_at, "c must come before a now");
+        assert_eq!(a.bones[a_at].parent, Some(c_at));
+        assert_eq!(name_at(0), "b");
     }
 }

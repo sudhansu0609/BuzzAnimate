@@ -1,6 +1,6 @@
 # BuzzAnimate — Overview: what it has, what it cannot do, what is next
 
-**Written:** 2026-08-15 · **Format version:** 18 · **Tests:** 1 486 passing, clippy clean
+**Written:** 2026-08-15 · **Format version:** 19 · **Tests:** 1 486 passing, clippy clean
 
 One page that consolidates the three questions people actually ask about this
 program. The detail behind each answer lives elsewhere and is linked:
@@ -121,6 +121,9 @@ The improvements go **underneath** — unbounded zoom, all cores, GPU rasterisat
 - Bone tool; armatures over shapes and symbol chains.
 - **FABRIK IK** with angle limits and pin constraints.
 - Puppet warp via Moving Least Squares; vertex weight binding; poses that tween.
+- **A pose library on each rig** — name a pose, apply it, mirror it, or *Key* it so
+  two poses tween; it travels with the character into any document. Bones can be
+  deleted and reparented.
 - Budget: 50 six-bone rigs solved in parallel, well inside one frame.
 
 ### In and out
@@ -174,7 +177,7 @@ waiting on other people, some are simply not built yet, and some are choices.
 | **Bitmap import in all three readers** | XFL, SWF and PDF count and report their bitmaps as skipped. The pipeline they need now exists. | §7-158, §7-116 |
 | **Multiple scenes** | One scene per document. | §7-12 |
 | **AS3 runtime and compiler** | JavaScript scripting works; ActionScript does not exist. | CP-8.3–8.4 |
-| **Bézier pen, Bind tool, bone delete/reparent** | The Pen draws segments; skin weights cannot be painted; rig building is additive-only. | §7-11, §7-34, §7-35 |
+| **Bézier pen and the Bind tool** | The Pen draws segments; skin weights cannot be painted by hand. Bones can now be deleted and reparented. | §7-11, §7-34 |
 | **Depth of field** | Layers off the focal plane stay perfectly sharp. | §7-29 |
 
 ### 3.3 Deliberate deviations from Animate
@@ -285,7 +288,7 @@ blur and alpha video at export; a command palette.
 | Threads in use | 20 interactive + 6 background |
 | Tests | 1 486 passing, clippy clean |
 | Rust source | ~48 000 lines across 16 crates |
-| Format version | 18 |
+| Format version | 19 |
 | IK budget | 50 six-bone rigs in parallel, inside one frame |
 | First frame of a heavy scene | 305 ms, then cached (§7-155) |
 | Open items in §7 | 140 of 155 |

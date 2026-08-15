@@ -69,7 +69,7 @@ use serde::{Deserialize, Serialize};
 /// keyframe at frame 0, which is exactly what it meant; version 2 simply has
 /// no library and no tweens, and both default to empty. Keeping those paths is
 /// cheap and it exercises the version check for real rather than in theory.
-pub const FORMAT_VERSION: u32 = 18;
+pub const FORMAT_VERSION: u32 = 19;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -800,6 +800,13 @@ pub enum ObjectKindDto {
         root: [f64; 2],
         bones: Vec<BoneDto>,
         parts: Vec<RigPartDto>,
+        /// Named poses this character owns. Version 19.
+        ///
+        /// Defaulted and skipped when empty, so a rig with no poses saves
+        /// exactly as it did before and a file from version 18 reads back
+        /// with none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        poses: Vec<NamedPoseDto>,
     },
     /// Artwork with warp handles on it. Version 6.
     Warp {
@@ -836,6 +843,12 @@ pub struct BoneDto {
 }
 
 /// Artwork attached to an armature, and how it follows the bones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamedPoseDto {
+    pub name: String,
+    pub angles: Vec<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RigPartDto {
     pub artwork: ObjectDto,
@@ -1677,6 +1690,14 @@ impl ObjectDto {
                         },
                     })
                     .collect(),
+                poses: rig
+                    .poses
+                    .iter()
+                    .map(|p| NamedPoseDto {
+                        name: p.name.clone(),
+                        angles: p.angles.clone(),
+                    })
+                    .collect(),
             },
             ObjectKind::Warp(warp) => ObjectKindDto::Warp {
                 path: warp.shape.path.to_svg(),
@@ -1765,7 +1786,12 @@ impl ObjectDto {
                     add: c.add,
                 }),
             }),
-            ObjectKindDto::Armature { root, bones, parts } => {
+            ObjectKindDto::Armature {
+                root,
+                bones,
+                parts,
+                poses,
+            } => {
                 let mut armature = buzz_rig::Armature::new(buzz_geom::Point::new(root[0], root[1]));
                 for dto in bones {
                     // Through `push`, which refuses a parent that comes later:
@@ -1795,6 +1821,13 @@ impl ObjectDto {
                     };
                     rig.parts.push(buzz_scene::RigPart { artwork, binding });
                 }
+                rig.poses = poses
+                    .iter()
+                    .map(|p| buzz_scene::NamedPose {
+                        name: p.name.clone(),
+                        angles: p.angles.clone(),
+                    })
+                    .collect();
                 ObjectKind::Armature(rig)
             }
             ObjectKindDto::Warp {
@@ -2760,6 +2793,15 @@ mod tests {
         armature.push(buzz_rig::Bone::new("hand", Some(1), 15.0, 0.1).pinned());
 
         let mut rig = buzz_scene::ArmatureData::new(armature);
+        // Two named poses — version 19.
+        rig.poses.push(buzz_scene::NamedPose {
+            name: "Reach".into(),
+            angles: vec![0.4, -0.9, 0.1],
+        });
+        rig.poses.push(buzz_scene::NamedPose {
+            name: "Rest".into(),
+            angles: vec![0.0, 0.0, 0.0],
+        });
         rig.bind_shape(Arc::new(Object::shape(
             ObjectId(50),
             ShapeData::filled(
@@ -2830,6 +2872,50 @@ mod tests {
         assert!((limits.max - 0.1).abs() < 1e-12);
         assert!(rig.armature.bones[2].pinned, "the pin was lost");
         assert_eq!(rig.armature.bones[1].name, "fore");
+
+        // The pose library, version 19. A character's poses are work in their
+        // own right; losing them on save would be losing the animation.
+        assert_eq!(rig.poses.len(), 2, "the saved poses are gone");
+        assert_eq!(rig.poses[0].name, "Reach");
+        assert!((rig.poses[0].angles[1] - -0.9).abs() < 1e-12);
+        assert_eq!(rig.poses[1].name, "Rest");
+    }
+
+    /// **A file from before version 19 loads, with no poses.**
+    ///
+    /// The field is `#[serde(default)]`, and this is what proves it: the same
+    /// strip-the-field trick the other back-compat tests use.
+    #[test]
+    fn a_rig_from_before_poses_still_loads() {
+        let scene = rigged_scene();
+        let dto = DocumentDto::from_scene(&scene);
+        let mut json = serde_json::to_value(&dto).expect("serialise");
+
+        // Remove the field entirely, exactly as a version-18 file has it.
+        fn strip(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("poses");
+                    for (_, v) in map.iter_mut() {
+                        strip(v);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        strip(&mut json);
+
+        let older: DocumentDto = serde_json::from_value(json).expect("read it back");
+        let scene = older.to_scene().expect("build the scene");
+        let object = scene.layers().iter().next().unwrap().objects_at(0)[0].clone();
+        let ObjectKind::Armature(rig) = &object.kind else {
+            panic!("the armature came back as something else");
+        };
+        assert!(rig.poses.is_empty(), "poses appeared from nowhere");
+        // And the rest of the rig is untouched.
+        assert_eq!(rig.armature.len(), 3);
+        assert_eq!(rig.parts.len(), 2);
     }
 
     /// Weights are what make the artwork bend; losing them would leave a rig

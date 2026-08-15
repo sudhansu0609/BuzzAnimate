@@ -32,6 +32,15 @@ const THUMBNAIL: f32 = 20.0;
 /// Room kept on the right of a symbol row for its use count.
 const USE_COUNT: f32 = 26.0;
 
+/// A symbol being dragged out of the Library, on its way to the stage.
+///
+/// A newtype rather than a bare `SymbolId` because egui keys a drag payload by
+/// its *type*: anything else that ever wants to be dragged must be
+/// distinguishable from this, or the stage would place a symbol when a swatch
+/// was dropped on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraggedSymbol(pub SymbolId);
+
 /// Panel state that is not part of the document.
 ///
 /// Which folders are open and what is typed in the search box are view state:
@@ -264,6 +273,15 @@ fn draw_symbol_row(
 ) {
     let uses = usage.get(&id).copied().unwrap_or(0);
 
+    // **The whole row is a drag source.**
+    //
+    // Placing a symbol was: select it, find the Place button, press it, then
+    // hunt for where the artwork landed and drag it there. Dragging the row
+    // onto the stage is the same intent with the three middle steps removed,
+    // and it is what every library in every drawing program does. The stage
+    // picks the payload up; see `App::handle_stage_input`.
+    let drag_id = ui.id().with(("library-drag", id.0));
+    ui.dnd_drag_source(drag_id, DraggedSymbol(id), |ui| {
     ui.horizontal(|ui| {
         ui.add_space(indent + 18.0);
 
@@ -373,6 +391,7 @@ fn draw_symbol_row(
                 format!("Used {uses} time(s), including inside other symbols")
             });
         });
+    });
     });
 }
 

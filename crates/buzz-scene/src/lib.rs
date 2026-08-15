@@ -63,7 +63,7 @@ pub use object::{
     FillSpec, Object, ObjectId, ObjectKind, Paint, PaintBlend, ShapeData, Spatial, StrokeSpec,
 };
 pub use raster::{Canvas, SoftBrush};
-pub use rig::{ArmatureData, RigBinding, RigPart, WarpData};
+pub use rig::{ArmatureData, NamedPose, RigBinding, RigPart, WarpData};
 pub use sound::{SoundAsset, SoundCue, SoundId, SoundLibrary, SoundRef, SoundSync};
 pub use swatch::{Swatch, SwatchId, Swatches, default_palette, default_swatches};
 pub use symbol::{

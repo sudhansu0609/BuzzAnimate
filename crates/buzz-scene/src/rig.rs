@@ -53,6 +53,36 @@ pub struct RigPart {
 pub struct ArmatureData {
     pub armature: Armature,
     pub parts: Vec<RigPart>,
+    /// Poses this character owns, by name.
+    ///
+    /// # Why they live on the rig and not on the symbol
+    ///
+    /// A pose is a list of joint angles, and it only means anything against
+    /// the skeleton it was taken from — so it belongs to that skeleton. Here
+    /// a rig is an object (§7 item 33), which may or may not be inside a
+    /// symbol, so hanging poses off the symbol would leave every rig that is
+    /// not in one unable to have any, and would break the moment a rigged
+    /// object was moved out of its symbol.
+    ///
+    /// Kept here they travel wherever the object does: through the clipboard,
+    /// into the Assets library, into another document — all of which copy
+    /// objects whole.
+    pub poses: Vec<NamedPose>,
+}
+
+/// A pose worth keeping, and what to call it.
+///
+/// Serialised by the DTO layer in `buzz-doc`, like everything else in this
+/// module — the model does not know about the file format.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedPose {
+    pub name: String,
+    /// One angle per bone, in bone order — the shape `Armature::pose` returns.
+    ///
+    /// A pose of the wrong length is applied as far as it goes rather than
+    /// refused, which is `Armature::set_pose`'s rule: a rig edited after a
+    /// pose was saved should lose that bone's angle, not the whole pose.
+    pub angles: Vec<f64>,
 }
 
 impl ArmatureData {
@@ -60,6 +90,7 @@ impl ArmatureData {
         Self {
             armature,
             parts: Vec::new(),
+            poses: Vec::new(),
         }
     }
 

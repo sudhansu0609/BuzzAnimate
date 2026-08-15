@@ -51,7 +51,7 @@ pub use light_panel::{LightPanelState, LightResponse, light_panel};
 pub use lipsync_panel::{Choice, LipSyncResponse, LipSyncState, lip_sync_dialog};
 pub use new_document::{DocumentSetup, NewDocumentResponse, NewDocumentState, new_document_dialog};
 pub use recovery_panel::{RecoveryChoice, RecoveryEntry, RecoveryState, recovery_dialog};
-pub use rig_panel::{RigResponse, rig_panel};
+pub use rig_panel::{RigPanelState, RigResponse, rig_panel};
 pub use selection::Selection;
 pub use sound_panel::{SoundChoice, SoundResponse, sound_panel};
 pub use style::{DrawStyle, DrawingMode, StrokeKind};

@@ -82,7 +82,7 @@ each is repaid on every character placed.
 |---|---|---|---|
 | ~~**The clipboard**~~ ✅ | M | ~~Cut/Copy/Paste for artwork, within a document and across two of them.~~ **Shipped** — see `PROGRESS.md` §4 *Wave 1.1 — The clipboard*. Closed §7-13. | |
 | ~~**Thumbnails**~~ ✅ | L | ~~Rasterise each symbol off-thread into a cache.~~ **Shipped for the Library** — on the window's own device with no readback, four a frame, keyed on the symbol's `Arc` address. Closed §7-17; §7-81 (Assets) waits on Wave 4, because an asset is a file and reading it is I/O. See `PROGRESS.md` §4 *Wave 1.2*. | |
-| **Drag from panel, drop on stage** | S | It lands where you let go. Removes two steps — press Place, then hunt for it and drag it — from every placement. | Closes §7-82. |
+| ~~**Drag from panel, drop on stage**~~ ✅ | S | ~~It lands where you let go.~~ **Shipped for Library symbols** — one gesture instead of four, under the cursor at any zoom. See `PROGRESS.md` §4 *Wave 1.3*. §7-82 narrows to assets, which merge as whole documents. | |
 
 > **Wave 1 alone changes what the tool *is* for assembly work.**
 
@@ -94,10 +94,10 @@ and travels with it.
 
 | Item | Size | What it is | What is already there |
 |---|---|---|---|
-| **The Pose Library** | M | Name the pose on screen; store it **on the `Symbol`**, so it travels into the Assets library and into every other document that character appears in. Apply with one click, with a thumbnail from Wave 1. | `pose()` and `set_pose()`. New: a named list on `Symbol` (which today holds only id, name, kind, folder, layers, registration) and a format-version bump. |
-| **Mirror a pose** | S | The same pose, other side: reflect the angles about the rig's axis and swap left/right bone pairs. Halves the work of building a pose set. | |
-| **Pose-to-pose keying** | S | Pose A on frame 1, pose B on frame 12, and the tween between them is the whole animation. **This is the actual speed-up** — it turns a pose library from a posing aid into a way of *animating*. | `tween_pose`, which already turns each joint the shortest way round. |
-| **Fix a rig without rebuilding it** | M | Delete and reparent bones. Rig building is additive-only today, so one wrong bone means starting the skeleton again — which is why nobody rigs the second character. | Closes §7-35. |
+| ~~**The Pose Library**~~ ✅ | M | ~~Name the pose on screen; store it on the `Symbol`.~~ **Shipped** — stored on the **rig**, not the symbol, because a pose means nothing except against its own skeleton and a rig is an object. Format 19. See `PROGRESS.md` §4 *Wave 2*. | |
+| ~~**Mirror a pose**~~ ✅ | S | ~~The same pose, other side.~~ **Shipped** — angles reflected, limits respected. Bone *pairs* are deliberately not swapped: nothing records which bones pair up, and guessing from names is wrong quietly. | |
+| ~~**Pose-to-pose keying**~~ ✅ | S | ~~Pose A on frame 1, pose B on frame 12.~~ **Shipped** as *Key* beside each pose — inserts a keyframe, then applies. | |
+| ~~**Fix a rig without rebuilding it**~~ ✅ | M | ~~Delete and reparent bones.~~ **Shipped** — children adopted, indices renumbered, cycles refused, artwork re-bound. Closed §7-35. | |
 
 ### Wave 3 — Set the stage once
 

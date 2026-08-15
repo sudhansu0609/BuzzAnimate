@@ -346,7 +346,7 @@ fn every_docked_panel_fits_the_narrowest_column() {
     check(
         "Armature",
         column_overflow(narrowest, |ui| {
-            let _ = rig_panel(ui, None);
+            let _ = rig_panel(ui, None, &[], &mut RigPanelState::default());
         }),
         &mut failures,
     );

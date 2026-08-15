@@ -77,6 +77,9 @@ pub struct Editor {
     /// Library panel state: what is selected, what is open, what is typed in
     /// the search box. View state, so it lives here and not in the document.
     pub library: LibraryState,
+    /// The Armature panel's own state — what is being typed into the pose
+    /// name box. View state, like the Library's.
+    pub rig_panel: buzz_ui::RigPanelState,
     /// Frames on the clipboard, from Cut Frames or Copy Frames.
     ///
     /// View state, not document state: a clipboard that was saved with the
@@ -243,6 +246,7 @@ impl Editor {
             swatch_panel: buzz_ui::SwatchState::default(),
             frame_clipboard: None,
             clipboard: None,
+            rig_panel: buzz_ui::RigPanelState::default(),
             new_document: buzz_ui::NewDocumentState::default(),
             about: buzz_ui::AboutState::default(),
             assets: buzz_doc::AssetLibrary::user(),
@@ -2811,6 +2815,23 @@ impl Editor {
             self.status = Some("Select a symbol in the Library first".into());
             return;
         };
+        // The middle of the view, which is the best guess available when the
+        // command carries no position of its own.
+        let at = self.camera.center;
+        self.place_symbol(symbol, at);
+    }
+
+    /// Place an instance where the pointer is, in **screen** coordinates.
+    ///
+    /// The drop end of dragging a symbol out of the Library. Screen rather than
+    /// document coordinates because that is what a pointer has; the camera
+    /// converts, so it lands under the cursor at any zoom or pan.
+    pub fn place_symbol_at(&mut self, symbol: buzz_scene::SymbolId, screen: Point) {
+        let at = self.camera.screen_to_doc(screen);
+        self.place_symbol(symbol, at);
+    }
+
+    fn place_symbol(&mut self, symbol: buzz_scene::SymbolId, at: Point) {
         let Some(layer) = self.active_layer() else {
             return;
         };
@@ -2819,14 +2840,17 @@ impl Editor {
             return;
         }
 
-        let at = self.camera.center;
         let frame = self.current_frame;
         let mut placed = None;
         self.doc.edit("Place Instance", |scene| {
             placed = scene.add_instance_at(layer, frame, symbol, Affine::translate((at.x, at.y)));
         });
         match placed {
-            Some(id) => self.selection.set([id]),
+            Some(id) => {
+                // What was just placed is what the user wants to move.
+                self.selection.set([id]);
+                self.library.selected = Some(symbol);
+            }
             None => self.status = Some("Could not place the instance here".into()),
         }
     }
@@ -4464,6 +4488,51 @@ mod tests {
 
         e.run(Command::Undo);
         assert_eq!(e.scene().shape_count(), 1);
+    }
+
+    /// Dropping a symbol on the stage places it **where it was dropped**, at
+    /// any zoom or pan — the point of dragging rather than pressing Place.
+    #[test]
+    fn dropping_a_symbol_places_it_under_the_pointer() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 20.0, Color::WHITE).unwrap();
+        e.selection.select_one(id);
+        e.run(Command::ConvertToSymbol);
+        let symbol = e.scene().library().iter().next().expect("a symbol").id;
+
+        // A pointer well away from the middle of the view.
+        let screen = Point::new(700.0, 120.0);
+        let expected = e.camera.screen_to_doc(screen);
+        e.place_symbol_at(symbol, screen);
+
+        let placed = e.selection.ids();
+        assert_eq!(placed.len(), 1, "the new instance should be selected");
+        // The instance's own origin lands on the drop point, so the artwork
+        // arrives centred there rather than hanging off it by its corner.
+        let centre = e.scene().find_object(placed[0]).unwrap().1.bounds().center();
+        assert!(
+            (centre.x - expected.x).abs() < 2.0 && (centre.y - expected.y).abs() < 2.0,
+            "landed centred at {centre:?}, wanted {expected:?}"
+        );
+    }
+
+    /// Placing from the menu, with no pointer, still lands in the middle of
+    /// the view rather than nowhere.
+    #[test]
+    fn placing_from_the_command_uses_the_middle_of_the_view() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 20.0, Color::WHITE).unwrap();
+        e.selection.select_one(id);
+        e.run(Command::ConvertToSymbol);
+        let symbol = e.scene().library().iter().next().expect("a symbol").id;
+        e.library.selected = Some(symbol);
+
+        let before = e.scene().shape_count();
+        e.run(Command::PlaceInstance);
+        assert!(e.scene().shape_count() >= before);
+        assert_eq!(e.selection.len(), 1);
     }
 
     // -- align and distribute ----------------------------------------------

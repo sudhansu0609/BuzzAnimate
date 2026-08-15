@@ -1429,7 +1429,20 @@ impl App {
                 _ => None,
             });
 
-        let response = buzz_ui::rig_panel(ui, armature.as_ref());
+        let poses = selected
+            .and_then(|id| self.editor.scene().find_object(id))
+            .and_then(|(_, object)| match &object.kind {
+                buzz_scene::ObjectKind::Armature(rig) => Some(rig.poses.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        let response = buzz_ui::rig_panel(
+            ui,
+            armature.as_ref(),
+            &poses,
+            &mut self.editor.rig_panel,
+        );
         let Some(object) = selected else { return };
 
         if let Some((bone, limits)) = response.set_limits {
@@ -1476,6 +1489,121 @@ impl App {
                 });
             });
         }
+
+        // -- the pose library ---------------------------------------------
+
+        if let Some(name) = response.save_pose {
+            self.editor.doc.edit("Save Pose", |scene| {
+                scene.update_object(object, |target| {
+                    if let buzz_scene::ObjectKind::Armature(rig) = &mut target.kind {
+                        let angles = rig.armature.pose();
+                        // Saving over a name replaces it, which is what
+                        // somebody typing the same name again means. A second
+                        // "reach" that does not replace the first is a list
+                        // that fills with near-duplicates.
+                        match rig.poses.iter_mut().find(|p| p.name == name) {
+                            Some(existing) => existing.angles = angles,
+                            None => rig.poses.push(buzz_scene::NamedPose { name, angles }),
+                        }
+                    }
+                });
+            });
+        }
+
+        if response.mirror_pose {
+            self.editor.doc.edit("Mirror Pose", |scene| {
+                scene.update_object(object, |target| {
+                    if let buzz_scene::ObjectKind::Armature(rig) = &mut target.kind {
+                        let flipped = rig.armature.mirrored_pose();
+                        rig.armature.set_pose(&flipped);
+                    }
+                });
+            });
+        }
+
+        if let Some(index) = response.apply_pose {
+            self.apply_named_pose(object, index, false);
+        }
+
+        // **Key, which is what turns a list of poses into an animation.**
+        // Applying at a keyframe means the next applied pose tweens from this
+        // one, so a shot is two clicks and a span rather than a pose held by
+        // hand at every frame.
+        if let Some(index) = response.key_pose {
+            self.apply_named_pose(object, index, true);
+        }
+
+        // -- editing the skeleton -----------------------------------------
+
+        if let Some(bone) = response.delete_bone {
+            // Weights were computed against a skeleton that no longer exists,
+            // so the artwork is re-bound — otherwise it would keep bending
+            // about a bone that has gone.
+            self.editor.doc.edit("Delete Bone", |scene| {
+                scene.update_object(object, |target| {
+                    if let buzz_scene::ObjectKind::Armature(rig) = &mut target.kind
+                        && rig.armature.remove_bone(bone)
+                    {
+                        rig.rebind();
+                    }
+                });
+            });
+        }
+
+        if let Some((bone, parent)) = response.reparent {
+            let mut refused = false;
+            self.editor.doc.edit("Reparent Bone", |scene| {
+                scene.update_object(object, |target| {
+                    if let buzz_scene::ObjectKind::Armature(rig) = &mut target.kind {
+                        if rig.armature.reparent_bone(bone, parent) {
+                            rig.rebind();
+                        } else {
+                            refused = true;
+                        }
+                    }
+                });
+            });
+            if refused {
+                // Said rather than silently ignored: the only reason to refuse
+                // is a cycle, and "nothing happened" is indistinguishable from
+                // a broken control.
+                self.editor.status =
+                    Some("A bone cannot hang off itself or off one of its own children".into());
+            }
+        }
+
+        if let Some(index) = response.delete_pose {
+            self.editor.doc.edit("Delete Pose", |scene| {
+                scene.update_object(object, |target| {
+                    if let buzz_scene::ObjectKind::Armature(rig) = &mut target.kind
+                        && index < rig.poses.len()
+                    {
+                        rig.poses.remove(index);
+                    }
+                });
+            });
+        }
+    }
+
+    /// Put a rig into one of its saved poses, optionally keying it first.
+    fn apply_named_pose(&mut self, object: buzz_scene::ObjectId, index: usize, key: bool) {
+        if key {
+            // A keyframe first, so the pose lands *on* one and the span before
+            // it can tween into it. Without this, applying two poses on one
+            // keyframe would simply overwrite the first.
+            self.editor.run(Command::InsertKeyframe);
+        }
+        let label = if key { "Key Pose" } else { "Apply Pose" };
+        self.editor.doc.edit(label, |scene| {
+            scene.update_object(object, |target| {
+                if let buzz_scene::ObjectKind::Armature(rig) = &mut target.kind
+                    && let Some(pose) = rig.poses.get(index)
+                {
+                    let angles = pose.angles.clone();
+                    rig.armature.set_pose(&angles);
+                }
+            });
+        });
     }
 
     /// The trail of symbols currently open, with the document at its root.
@@ -2163,6 +2291,38 @@ impl App {
 
         let local =
             |p: egui::Pos2| Point::new((p.x - area.min.x) as f64, (p.y - area.min.y) as f64);
+
+        // **A symbol dragged out of the Library, dropped where it was let go.**
+        //
+        // Taken before anything else, because the release that ends a drag is
+        // also a pointer release the tools would otherwise act on — a dropped
+        // symbol must not additionally deselect what was under it.
+        if egui::DragAndDrop::has_any_payload(&ctx) {
+            let over = ctx
+                .input(|i| i.pointer.hover_pos())
+                .is_some_and(|p| area.contains(p));
+            if over {
+                ctx.set_cursor_icon(egui::CursorIcon::Copy);
+                // A ghost of where it will land, so a drop is aimed rather
+                // than guessed at.
+                if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
+                    ui.painter().circle_stroke(
+                        p,
+                        7.0,
+                        egui::Stroke::new(1.5, buzz_ui::Palette::active()),
+                    );
+                }
+            }
+            if over && ctx.input(|i| i.pointer.any_released()) {
+                if let Some(dropped) =
+                    egui::DragAndDrop::take_payload::<buzz_ui::library_panel::DraggedSymbol>(&ctx)
+                    && let Some(p) = ctx.input(|i| i.pointer.interact_pos())
+                {
+                    self.editor.place_symbol_at(dropped.0, local(p));
+                }
+                return;
+            }
+        }
 
         // **Ctrl+wheel zooms; the wheel alone scrolls.** Animate's arrangement,
         // and every drawing program's — a wheel that zooms by itself makes a

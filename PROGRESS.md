@@ -3259,6 +3259,76 @@ The Assets panel still has none: an asset is a file on disk, so a picture of one
 reading and parsing it first, which is I/O that belongs on Wave 4's background tasks
 rather than on the UI thread. §7-81 records that with its reason.
 
+### ✅ Wave 1.3 — Drag a symbol onto the stage
+
+Placing a symbol was: select it in the Library, find the Place button, press it, then
+hunt for where the artwork landed and drag it where you actually wanted it. Four
+gestures, three of them overhead, on the single most repeated action in scene
+assembly.
+
+Now the row is a drag source and the stage is the drop zone, so it is one gesture and
+the artwork lands **where you let go** — converted through the camera, so it is under
+the cursor at any zoom or pan. While a drag is over the stage the cursor changes and a
+ring is drawn where it would land, because a drop you have to aim by guessing is not
+much better than pressing a button.
+
+The payload is a `DraggedSymbol` newtype rather than a bare `SymbolId`: egui keys a
+drag payload by its **type**, so anything else that ever becomes draggable has to be
+distinguishable, or dropping a swatch on the stage would place a symbol.
+
+The drop is taken *before* the tools see the pointer. The release that ends a drag is
+also an ordinary pointer release, and without that the drop would additionally
+deselect whatever was under it.
+
+Placing from the menu still works and still lands in the middle of the view — that is
+the best guess available to a command that carries no position of its own.
+
+### ✅ Wave 2 — Poses a character owns, and a skeleton you can fix
+
+**A pose was a fact about one keyframe.** To reuse one you posed the rig again by
+hand, every time — which is precisely the *"putting different poses takes time"* half
+of what was reported.
+
+**They live on the rig, not on the symbol.** The plan said symbol; the code says
+otherwise and the reason is worth keeping. A pose is a list of joint angles and means
+nothing except against the skeleton it came from, so it belongs to that skeleton. Here
+a rig is an *object* (§7-33), which may or may not sit inside a symbol — hanging poses
+off the symbol would leave every rig that is not in one unable to have any, and would
+lose them the moment a rigged object was dragged out of its symbol. On the rig they
+travel wherever the object does: through the clipboard, into the Assets library, into
+another film. A test pastes a character into a second document and finds its poses
+came with it.
+
+**Key is what makes it animation rather than posing.** Applying a pose puts the
+character into it; *Key* inserts a keyframe first, so the next pose applied tweens from
+this one. Two clicks and a span is a shot — `tween_pose` already turned each joint the
+shortest way round, so nothing new was needed underneath. A test keys two poses twelve
+frames apart and checks frame six is genuinely between them rather than a copy of
+either.
+
+**Mirror gives the other side.** Every joint angle reflected, so a pose reaching right
+becomes the same pose reaching left, and a pose set is half the work. What it
+deliberately does *not* do is swap a left arm's bones for a right arm's: that needs to
+know which bones are a pair, and nothing records that — Animate guesses from names,
+which is a guess that is wrong quietly. Reflecting the angles is the part that is
+always right. Joint limits still hold, which is its own test.
+
+**And the skeleton can be fixed rather than rebuilt** (§7-35). A bone can be deleted —
+its children adopted by its parent, inheriting its turn so the limb does not snap to a
+new direction — and pointed at a different parent, with cycles refused rather than
+clamped, because a cycle in a skeleton is an infinite loop in the solver. The hard part
+is that parents are stored as *positions*: removing renumbers every index, and
+reparenting an early bone onto a late one reorders the list so parents still come
+first, which is what every walk here relies on. Nine tests hold that, including the one
+that reparents backwards and checks no bone points forward afterwards.
+
+Both edits re-bind the artwork, because weights computed against a skeleton that has
+changed would attach a drawing to a bone that is no longer there.
+
+**Format version 19** adds the pose list, defaulted and skipped when empty — so a rig
+with no poses saves exactly as it did, and a version 18 file loads with none. Proved by
+stripping the field out of the JSON and reading it back.
+
 ### ✅ Wave 3.2 — Align, Distribute and Match Size
 
 There was no equivalent to Animate's `Ctrl+K` anywhere in the command set — zero
@@ -3317,7 +3387,7 @@ holding an arrow key down is one undo step rather than forty.
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
-| Format version | 18 — adds layer transparency |
+| Format version | 19 — adds named poses on a rig |
 | Formats heard | `.wav`, `.mp3`, `.ogg`, `.flac`, `.m4a`, `.aac` |
 | IK budget | 50 six-bone rigs solved in parallel, well inside one frame |
 | Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |
@@ -3506,7 +3576,7 @@ down here has not been finished.
 | 43 | **Scripting cannot reach sound.** `fl.getDocumentDOM()` exposes no sounds, no lip sync and no playback, so none of this can be driven from the Actions panel. | Phase 8 follow-up |
 | 33 | **An armature is an object, not an armature layer.** Animate moves rigged artwork onto its own layer whose keyframes are poses, and refuses to let you draw there. Here a rig is an object on an ordinary layer, which is why keyframes, tweens, undo, symbols and importing all work on it with no second code path — but the timeline does not mark the layer, and nothing stops you drawing on it. Recorded as a deviation, with the reason, in §4. | By design |
 | 34 | **No Bind tool.** Weights are computed at bind time and re-computed when the skeleton changes; there is no way to paint them by hand, which is Animate's Bind tool. A limb whose weights are wrong must be re-rigged rather than corrected. | Phase 7 follow-up |
-| 35 | **Bones cannot be deleted or reparented** once drawn, and there is no way to move a joint without posing it. Building a rig is currently additive. | Phase 7 follow-up |
+| 35 | ~~**Bones cannot be deleted or reparented**~~ | ✅ **Resolved in Wave 2** — a bone can be deleted (its children adopted by its parent) and pointed at a different parent, with cycles refused; moving a joint without posing it is still not possible (§4) |
 | 36 | **Joint speed is not implemented.** Animate gives each joint a speed that damps how much of a drag it absorbs; every joint here responds equally. | Phase 7 follow-up |
 | 37 | **F6 past the end of a span makes a *blank* keyframe.** Animate extends the span and duplicates the previous artwork; here there is no frame to duplicate, so the keyframe comes up empty and the artwork appears to vanish. Working around it means pressing F5 first. Found while writing Phase 7's exit test. | Phase 3 defect |
 | 44 | **Lighting is a deliberate departure from Animate**, which has no lights at all. It is off until a light is added, and a document with none renders pixel-identically to one from before the feature existed — so nothing an Animate user expects is changed by its existence. Added because it was asked for by name, and built the way Blender presents it. | By design |
@@ -3547,7 +3617,7 @@ down here has not been finished.
 | 79 | **Swatches are not draggable between folders.** A dropdown per row moves one, exactly as the Library moves a symbol, for the same reason: the drag is a piece of work in its own right. | Follow-up |
 | 80 | **The Assets panel is a deviation from Animate's**, which ships a curated set of animated characters and props and syncs with Creative Cloud Libraries. This is the same idea with none of the service: a folder on this machine, holding `.buzz` documents. Nothing is bundled, and nothing is uploaded anywhere. | By design |
 | 81 | **Assets have no thumbnails.** The Library now has them (§7 item 17), and the machinery is reusable — but an asset is a `.buzz` file on disk rather than a symbol in memory, so a picture of one means reading and parsing the file first. That is I/O per asset and belongs on a background task, which is Wave 4's `TaskRegistry`. Deliberately left until then rather than reading files on the UI thread. | Follow-up, after Wave 4 |
-| 82 | **A placed asset lands where it was drawn**, not under the pointer. Animate drops one at the centre of the stage or where you drag it; here the artwork keeps the coordinates it had when it was kept. Placing then dragging is one extra gesture. | Follow-up |
+| 82 | **A placed *asset* lands where it was drawn**, not under the pointer. A **symbol** can now be dragged out of the Library and dropped where you let go (§4, Wave 1.3); an asset is a whole document merged in, so where its layers land is a different question and it still keeps the coordinates it was kept with. | Follow-up |
 | 83 | **The assets folder is not watched.** Adding a file outside the application shows up after the panel's refresh button, not immediately — a file watcher is a thread, a platform API and a class of bug for something a button does. | By design |
 | 84 | **An asset carries its sounds and lights, but not the stage.** `Scene::extract` takes the objects and the symbols they need; frame rate, stage size, camera and lighting stay with the document being placed into, which is what "place a prop" should mean. | By design |
 | 85 | **A symbol's registration point is still inert.** `Symbol.registration` is stored, saved and carried through import and duplication, but nothing edits it and the renderer does not read it — convert-to-symbol rebases the artwork so the registration sits at the origin, and after that the field does nothing. The *object* transformation point is the one that now works. | Follow-up |

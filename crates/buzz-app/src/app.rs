@@ -457,6 +457,9 @@ pub struct App {
     /// Escape hatch: `BUZZ_NO_RETAIN=1` always re-encodes the stage, for
     /// bisecting any report of a stale stage.
     retain_stage: bool,
+    /// Per-frame section timing and the over-budget warning. See
+    /// [`crate::profile`].
+    profiler: crate::profile::FrameProfiler,
     /// Every export, run one at a time on the task registry. Replaces the old
     /// single slot that refused a second export outright.
     exports: crate::export_service::ExportQueue,
@@ -572,6 +575,7 @@ impl App {
             stage_stamp: None,
             lights_generation: 0,
             retain_stage: std::env::var("BUZZ_NO_RETAIN").is_err(),
+            profiler: crate::profile::FrameProfiler::default(),
             exports: crate::export_service::ExportQueue::default(),
             quit_prompt: false,
             presets: crate::presets::PresetLibrary::load(),
@@ -2707,7 +2711,10 @@ impl App {
                     egui::RichText::new(format!("{:.1} ms", self.frame_ms_display()))
                         .small()
                         .weak(),
-                );
+                )
+                // The per-section breakdown on hover — the frame watchdog's
+                // numbers, without taking a permanent seat in the status bar.
+                .on_hover_text(self.profiler.summary());
                 if let Some(status) = &self.editor.status {
                     ui.separator();
                     ui.label(egui::RichText::new(status).small());
@@ -4486,6 +4493,9 @@ impl App {
         active.frame_ms = elapsed.as_secs_f32() * 1000.0;
         active.last_frame = now;
 
+        self.profiler.begin_frame();
+        self.profiler.enter(crate::profile::Section::Ui);
+
         // Playback runs on wall-clock time, so the document plays at its
         // authored rate regardless of the display's refresh rate.
         self.editor.advance_playback(elapsed.as_secs_f64());
@@ -4557,6 +4567,8 @@ impl App {
         // The camera works in physical pixels, matching the render target.
         self.editor.camera.viewport = Size::new(area_px.width(), area_px.height());
 
+        self.profiler.enter(crate::profile::Section::Lights);
+
         // Any shading geometry that finished building off-thread lands here,
         // before the frame that will read it, so this frame draws lit.
         if let Some(rx) = &self.shade_build
@@ -4587,6 +4599,8 @@ impl App {
         // its geometry off-thread instead of freezing on it.
         let cold = self.lights.lights.is_empty() && self.editor.scene().lights().is_active();
         self.lights.lights.set_defer(cold);
+
+        self.profiler.enter(crate::profile::Section::Encode);
 
         // **Reuse the retained stage encoding when nothing that shaped it
         // changed.** `active.vello` still holds last frame's encoding, and it is
@@ -4665,6 +4679,8 @@ impl App {
         // Restore logical units so pointer maths stays in egui's space.
         self.editor.camera.viewport =
             Size::new(stage_area.width() as f64, stage_area.height() as f64);
+
+        self.profiler.enter(crate::profile::Section::Present);
 
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match active.surface.get_current_texture() {
@@ -4791,6 +4807,11 @@ impl App {
 
         self.keep_crash_snapshot();
         self.poll_autosave();
+
+        // Close the frame: store its section times and warn if one blew the
+        // budget. This is the watchdog that catches an O(document) cost creeping
+        // back onto the frame before it becomes a hang.
+        self.profiler.end_frame();
         Ok(())
     }
 }

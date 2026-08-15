@@ -983,6 +983,94 @@ Written before the work, so none of it is a surprise.
 
 ---
 
+## Wave 16 — Never-hang: the frame stays under budget at any document size
+
+> **✅ Shipped.** The window's one rule (§0) held for a script and an export but
+> not for a *large document*: importing an Animate file with thousands of symbols
+> and objects froze the window for seconds and stayed laggy. The parse and the
+> merge were already off-thread; the freeze was **per-frame O(document) work on
+> the UI thread**, amplified by a loop that redrew at monitor rate. This wave
+> takes that class of cost off the frame and keeps it off.
+
+### 1. The failure class
+
+A per-frame cost that grows with the document is a hang paid in installments: it
+is invisible on a small file and a freeze on a big one, and it creeps back one
+`.clone()` at a time. The import freeze was diagnosed cost by cost — a waveform
+re-derived from raw PCM every frame, a timeline grid of millions of cells, a
+`symbol_usage` walk of the whole file, a `Scene::clone` that allocated a node per
+symbol, sounds decoded inline on the commit frame, and a stage re-encoded from
+scratch every frame even when idle.
+
+### 2. The three mechanisms
+
+Each is a pattern the codebase already had, generalised:
+
+- **Revision gates and pointer-identity caches** (`SoundBank::cued_revision`,
+  `LightCache`'s `Arc::as_ptr` keying). Now applied to the timeline waveforms
+  (revision-gated, per-clip envelopes shared by `Arc`), the Library use counts,
+  and — for the stage — a `StageStamp` that reuses the retained Vello encoding
+  when nothing that shaped it changed.
+- **The defer / install fan-out** (the shade-build pattern: owned snapshot →
+  detached thread parking on `Pool::Interactive` → channel → install at the top
+  of the next frame + `request_redraw`). Now also decodes a large document's
+  sounds and computes `symbol_usage`, so neither lands on the commit frame.
+- **Virtualization** — build and paint only what the viewport shows. The timeline
+  grid and the Library panel paint a screenful of rows, never the whole document;
+  the stage draw walk **culls** shapes whose document-space bounds fall outside
+  the visible rectangle.
+
+### 3. Cheap snapshots
+
+`Library`, `SoundLibrary` and `ImageLibrary` join `LayerStack` behind
+`Arc` + `Arc::make_mut`, so `Scene::clone` — which every `Document::edit` and
+several panels do each frame — is pointer copies, not a tree node per symbol,
+sound and image. Pointer-identity caching survives because `make_mut` on the
+outer map clones its nodes but pointer-copies the inner `Arc<Symbol>`s, so editing
+one symbol changes only that symbol's address — exactly what the thumbnail and
+lighting caches key on. Undo, autosave and the crash snapshot get faster for free.
+
+### 4. The idle loop
+
+The loop defaults to `ControlFlow::Wait` and a pure `App::wants_frame` decides,
+each frame, whether to draw again now (playback, a pending thumbnail, a background
+install, a running task), at a set time (egui's own timed repaint), or to sleep.
+egui's repaint callback wakes the loop through an `EventLoopProxy` user event so
+its animations never stall, and **the invariant is that every install requests a
+redraw**. An idle static document now costs zero frames. `BUZZ_POLL=1` restores
+the old always-draw loop.
+
+### 5. Retained encoding and display-only culling
+
+`active.vello` already holds last frame's encoding and is re-rendered regardless,
+so "caching" the stage is simply not rebuilding it when the `StageStamp` matches
+(and no tool preview or lighting build is live). Culling is **display-only**:
+`FrameOptions::cull` is the viewport rect the window passes; the exporter and the
+thumbnail renderer pass `None` and render everything, so their output is
+byte-for-byte unchanged — **parity by construction**, since the field is the only
+thing that differs and they never set it. The cull is conservative: only a flat,
+depth-zero, unmasked, unshadowed layer, and only bare shapes whose bounds are
+exact. `BUZZ_NO_RETAIN=1` disables the retained encoding.
+
+### 6. The watchdog
+
+`FrameProfiler` (`crates/buzz-app/src/profile.rs`) times each frame's sections —
+`ui`, `encode`, `lights`, `present` — keeps a short history for the debug HUD, and
+emits a rate-limited warning when a section runs over the ~4 ms budget. The
+cross-cutting gate is `crates/buzz-app/tests/never_hang.rs`: it builds a monster
+document (thousands of symbols and objects, hundreds of layers, ten thousand
+frames) and asserts that a no-op edit, a million `frame_kind` calls, a timeline
+pass, a Library pass, and **committing a merged monster scene and drawing it** —
+the reported bug, directly — all stay far under budget. The rule going forward is
+that every new per-frame cost lands with a budget assertion.
+
+**Files:** `buzz-scene` (`symbol.rs`, `sound.rs`, `image.rs`, `timeline.rs`),
+`buzz-audio` (`lib.rs`), `buzz-app` (`app.rs`, `sound.rs`, `editor.rs`,
+`thumbnails.rs`, `stage.rs`, `profile.rs`, `main.rs`), `buzz-ui`
+(`timeline_panel.rs`, `library_panel.rs`), `buzz-render` (`document.rs`).
+
+---
+
 # Part III — the delight waves
 
 Part II makes the program fast, safe and capable. Part III is what makes it *good* —

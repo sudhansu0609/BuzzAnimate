@@ -67,7 +67,7 @@ The improvements go **underneath** — unbounded zoom, all cores, GPU rasterisat
 | 3 — Timeline & frame animation | ✅ complete |
 | 4 — Symbols, library & tweens | ✅ complete |
 | 5 — Importers | ✅ complete |
-| 6 — Export | 🟡 **PNG + MP4/MOV with sound** (CP-6.1, CP-6.2). GIF/WebP and HTML5 not built |
+| 6 — Export | 🟡 **PNG, MP4/MOV with sound, GIF and WebP** (CP-6.1–6.3), on a background queue with presets and a Tasks panel (Wave 5). HTML5 (CP-6.4) not built |
 | 7 — Rigging | ✅ complete |
 | 8 — Scripting & ActionScript | 🟡 **JS scripting only** (CP-8.1). No AS3 runtime or compiler |
 
@@ -170,8 +170,7 @@ waiting on other people, some are simply not built yet, and some are choices.
 | Missing | Consequence | Ref |
 |---|---|---|
 | **Text tool** | No titles or credits without drawing them by hand or importing them. Needs font loading, shaping and an editing caret. | §7-9 |
-| **GIF/WebP and HTML5 export** | PNG, PNG sequence and MP4/MOV are the outputs; a GIF for a preview or a self-playing HTML5 build are not there. | CP-6.3–6.4 |
-| **Export blocks the document** | One export at a time, and its progress dialog belongs to the document — opening a new file mid-export orphans it. Quitting kills an export in flight. | Wave 5 |
+| **HTML5 export** | PNG, PNG sequence, MP4/MOV, GIF and WebP are the outputs; a self-playing HTML5 build is not. | CP-6.4 |
 | **Thumbnails in the Assets panel** | The Library draws a picture of every symbol; an asset is a file on disk, so a picture of one needs a background read. | §7-81 |
 | **Motion Editor, motion paths, shape hints** | Easing exists in the model and interpolates; nothing edits the curve, and a tween cannot follow a drawn path. | §7-18 |
 | **Bitmap import in all three readers** | XFL, SWF and PDF count and report their bitmaps as skipped. The pipeline they need now exists. | §7-158, §7-116 |

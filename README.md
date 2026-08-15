@@ -48,12 +48,14 @@ pitch and yaw it and the stage tips away in real perspective, a rectangle drawn
 as a trapezoid — and **objects turn too**, so three flat cards at different
 angles make a tree the camera discovers rather than slides past.
 
-**Video comes out too**: MP4/MOV encoded on the GPU through NVENC, with the
-soundtrack muxed in.
+**Video comes out too**: MP4/MOV encoded on the GPU through NVENC with the
+soundtrack muxed in, plus animated GIF and WebP — all on a **background queue**
+with a Tasks panel, so a second export joins the line rather than being refused
+and the window never freezes while one runs.
 
 Not yet implemented, and honestly marked as such in the toolbar: Text, Bézier pen
-authoring, multiple Scenes, clipboard. GIF/WebP and HTML5 export, AS3 and the Bind
-tool are the largest gaps. See `PROGRESS.md` §7 for the full list.
+authoring, multiple Scenes, clipboard. HTML5 export, AS3 and the Bind tool are the
+largest gaps. See `PROGRESS.md` §7 for the full list.
 
 ---
 
@@ -232,10 +234,12 @@ rigging and IK · PNG export · the scripting API · lighting · filters and
 blend modes · layer parenting · a workspace you arrange · a camera that
 tilts · 3D rotation.
 
-Next: **the engine waves** — background export with a queue, raster layers beside
-the vectors, a compositor, 2.5D depth and keyframed lights. `ARCHITECTURE.md` is
-the design; `IMPROVEMENTS.md` Part II is the summary. After those, the rest of
-Phase 6 (GIF/WebP, HTML5 Canvas/SVG) and Phase 8's ActionScript runtime.
+**The engine waves** are underway: Wave 4 moved every long job — scripts, imports,
+opens, file dialogs, the first lit frame — off the UI thread so the window never
+freezes, and Wave 5 gave export a background queue, a Tasks panel, presets, and GIF
+and WebP output. Still to come: raster layers beside the vectors, a compositor, 2.5D
+depth and keyframed lights. `ARCHITECTURE.md` is the design; `IMPROVEMENTS.md` Part II
+is the summary. After those, HTML5 Canvas/SVG export and Phase 8's ActionScript runtime.
 
 `ARCHITECTURE.md` is the forward design: how the engine waves are built, the rules
 that keep the window responsive, and what each one costs.

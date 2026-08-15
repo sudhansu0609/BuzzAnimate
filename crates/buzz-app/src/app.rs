@@ -49,6 +49,32 @@ enum Redraw {
     Idle,
 }
 
+/// Everything the stage's Vello encoding depends on, captured so an unchanged
+/// frame can reuse the last encoding instead of rebuilding it.
+///
+/// It carries the document revision (all artwork, the stage, the document
+/// camera), plus the **view** state that is not in the revision — the current
+/// frame, the pan/zoom camera, the viewport, which symbol is open, and the onion
+/// and Edit-Multiple-Frames settings. A tool preview or a pending lighting build
+/// is handled separately, by refusing to reuse at all while either is live; see
+/// [`App::maybe_build_stage`]. Miss nothing here and a quiet repaint is free;
+/// the escape hatch `BUZZ_NO_RETAIN=1` disables the reuse entirely.
+#[derive(Clone, PartialEq, Debug)]
+struct StageStamp {
+    revision: u64,
+    frame: u32,
+    /// View camera: centre, zoom, rotation, as raw bits.
+    camera: [u64; 4],
+    /// The stage area in physical pixels, as raw bits.
+    area: [u64; 4],
+    /// Which symbols are open for editing, outermost first.
+    edit_path: Vec<u64>,
+    onion: (bool, bool, u32, u32),
+    edit_multiple: bool,
+    /// The generation of installed lighting geometry.
+    lights_generation: u64,
+}
+
 use crate::editor::Editor;
 use crate::stage;
 use crate::tools::{Mods, ToolAction};
@@ -419,6 +445,18 @@ pub struct App {
     /// Escape hatch: `BUZZ_POLL=1` forces the old always-redraw loop, for
     /// bisecting any report of stale UI.
     force_poll: bool,
+    /// What the stage's retained Vello encoding was last built from. When the
+    /// next frame's inputs match this, the encoding in `active.vello` is reused
+    /// as-is rather than rebuilt — so a repaint that only touched a panel (a
+    /// tooltip, a background install elsewhere) does not re-encode a huge stage.
+    /// See [`StageStamp`].
+    stage_stamp: Option<StageStamp>,
+    /// Bumped whenever installed lighting geometry changes what the stage would
+    /// encode, so a retained stage is invalidated when a light's shading lands.
+    lights_generation: u64,
+    /// Escape hatch: `BUZZ_NO_RETAIN=1` always re-encodes the stage, for
+    /// bisecting any report of a stale stage.
+    retain_stage: bool,
     /// Every export, run one at a time on the task registry. Replaces the old
     /// single slot that refused a second export outright.
     exports: crate::export_service::ExportQueue,
@@ -531,6 +569,9 @@ impl App {
             proxy: None,
             egui_repaint: None,
             force_poll: std::env::var("BUZZ_POLL").is_ok(),
+            stage_stamp: None,
+            lights_generation: 0,
+            retain_stage: std::env::var("BUZZ_NO_RETAIN").is_err(),
             exports: crate::export_service::ExportQueue::default(),
             quit_prompt: false,
             presets: crate::presets::PresetLibrary::load(),
@@ -4523,6 +4564,8 @@ impl App {
         {
             self.lights.lights.install(built);
             self.shade_build = None;
+            // The stage's shading changed, so a retained encoding is stale.
+            self.lights_generation = self.lights_generation.wrapping_add(1);
             active.window.request_redraw();
         }
 
@@ -4545,7 +4588,50 @@ impl App {
         let cold = self.lights.lights.is_empty() && self.editor.scene().lights().is_active();
         self.lights.lights.set_defer(cold);
 
-        stage::build_scene(&mut active.vello, &self.editor, area_px, &mut self.lights);
+        // **Reuse the retained stage encoding when nothing that shaped it
+        // changed.** `active.vello` still holds last frame's encoding, and it is
+        // re-rendered below either way, so "caching" is simply not rebuilding it.
+        // A frame that only touched a panel — a tooltip, a background install
+        // elsewhere — no longer re-encodes a stage of thousands of shapes. Reuse
+        // is refused whenever a tool preview is live or lighting is still being
+        // built, because those change the stage without moving the stamp.
+        let stamp = StageStamp {
+            revision: self.editor.scene().revision(),
+            frame: self.editor.current_frame,
+            camera: {
+                let c = &self.editor.camera;
+                [
+                    c.center.x.to_bits(),
+                    c.center.y.to_bits(),
+                    c.zoom.to_bits(),
+                    c.rotation.to_bits(),
+                ]
+            },
+            area: [
+                area_px.x0.to_bits(),
+                area_px.y0.to_bits(),
+                area_px.x1.to_bits(),
+                area_px.y1.to_bits(),
+            ],
+            edit_path: self.editor.scene().edit_path().iter().map(|s| s.0).collect(),
+            onion: (
+                self.editor.onion.enabled,
+                self.editor.onion.outlines,
+                self.editor.onion.before,
+                self.editor.onion.after,
+            ),
+            edit_multiple: self.editor.edit_multiple,
+            lights_generation: self.lights_generation,
+        };
+        let reuse = self.retain_stage
+            && !cold
+            && self.shade_build.is_none()
+            && matches!(self.editor.preview(), crate::tools::Preview::None)
+            && self.stage_stamp.as_ref() == Some(&stamp);
+        if !reuse {
+            stage::build_scene(&mut active.vello, &self.editor, area_px, &mut self.lights);
+            self.stage_stamp = Some(stamp);
+        }
 
         // Whatever this frame could not light, build in parallel off-thread and
         // ask for another frame to show it in.
@@ -5332,6 +5418,46 @@ mod idle_tests {
         let mut app = App::new(GpuPreference::Automatic);
         app.force_poll = true;
         assert_eq!(app.wants_frame(), Redraw::Now);
+    }
+
+    fn stamp() -> StageStamp {
+        StageStamp {
+            revision: 5,
+            frame: 3,
+            camera: [1, 2, 3, 4],
+            area: [0, 0, 100, 100],
+            edit_path: vec![],
+            onion: (false, false, 2, 2),
+            edit_multiple: false,
+            lights_generation: 0,
+        }
+    }
+
+    /// The stage encoding is reused only when the stamp is identical; every
+    /// input it captures must make it differ, or the stage would go stale.
+    #[test]
+    fn the_stage_stamp_notices_every_change() {
+        let base = stamp();
+        assert_eq!(base, stamp(), "an unchanged frame reuses");
+
+        let mut a = stamp();
+        a.revision = 6;
+        assert_ne!(base, a, "an edit re-encodes");
+        let mut a = stamp();
+        a.frame = 4;
+        assert_ne!(base, a, "scrubbing re-encodes");
+        let mut a = stamp();
+        a.camera[2] = 99;
+        assert_ne!(base, a, "a zoom re-encodes");
+        let mut a = stamp();
+        a.edit_path = vec![7];
+        assert_ne!(base, a, "entering a symbol re-encodes");
+        let mut a = stamp();
+        a.onion = (true, false, 2, 2);
+        assert_ne!(base, a, "turning on onion skin re-encodes");
+        let mut a = stamp();
+        a.lights_generation = 1;
+        assert_ne!(base, a, "installed shading re-encodes");
     }
 }
 

@@ -59,6 +59,17 @@ pub struct FrameOptions {
     /// opened, so a head stays on the shoulders it belongs to instead of
     /// jumping to the origin — see [`buzz_scene::Scene::edit_place`].
     pub place: Affine,
+    /// The visible rectangle in **document space**, for culling.
+    ///
+    /// **Display-only.** The window passes the viewport rect so artwork far off
+    /// the edge of a huge document is skipped rather than transformed, brushed
+    /// and encoded into a scene that clips it away anyway. The exporter and the
+    /// thumbnail renderer pass `None`: they render the whole stage (or a whole
+    /// symbol), so their output is byte-for-byte what it was before culling
+    /// existed — the parity guarantee is that this field is the *only* thing
+    /// that differs, and they never set it. The cull is applied conservatively;
+    /// see [`DrawCtx::cull`].
+    pub cull: Option<buzz_geom::Rect>,
 }
 
 impl Default for FrameOptions {
@@ -70,6 +81,7 @@ impl Default for FrameOptions {
             lit: false,
             layer_alpha: false,
             place: Affine::IDENTITY,
+            cull: None,
         }
     }
 }
@@ -319,6 +331,9 @@ fn draw_layers(
     let masks = active_masks(layers, options.masks);
     let mut open: Option<OpenMask> = None;
 
+    // Resolve the light rig once for the whole stack, not once per layer.
+    let lights = Arc::new(scene.lights().resolved_at(frame).into_owned());
+
     // Depth ordering is opt-in on the stage. The masked run stays contiguous
     // either way, so the mask machinery below is untouched; only the order the
     // layers arrive in changes. With every depth equal, the two orders are
@@ -378,7 +393,7 @@ fn draw_layers(
         // follows. Resolved here because only the stack knows the chain.
         let follows = layers.inherited_transform(layer.id, frame);
         draw_layer(
-            builder, scene, layer, frame, camera, follows, options, cache,
+            builder, scene, layer, frame, camera, follows, options, &lights, cache,
         );
     }
 
@@ -518,6 +533,10 @@ fn draw_layer(
     // document that uses none of this draws exactly as it did before.
     follows: Affine,
     options: &FrameOptions,
+    // The light rig resolved at this frame, shared across every layer of the
+    // pass. Resolved once by [`draw_layers`] rather than cloned per layer — on a
+    // document with hundreds of layers that clone was pure per-frame waste.
+    lights: &Arc<buzz_scene::LightRig>,
     cache: &mut DrawCache,
 ) {
     {
@@ -571,11 +590,10 @@ fn draw_layer(
         // How this layer is lit. Worked out once here rather than per shape:
         // every shape on a layer shares its depth, and therefore its distance
         // from the light and the length of what it casts.
-        // The rig, resolved at this frame: a keyframed light contributes its
-        // state *now*. Static rigs resolve to themselves, so the shading cache
-        // (keyed per light) keeps hitting.
-        let lights = Arc::new(scene.lights().resolved_at(frame).into_owned());
-        let rig: &buzz_scene::LightRig = &lights;
+        // The rig, resolved at this frame by the caller (keyframed lights
+        // contribute their state *now*). Static rigs resolve to themselves, so
+        // the shading cache (keyed per light) keeps hitting.
+        let rig: &buzz_scene::LightRig = lights;
         let lit = options.lit && rig.is_active() && tint.is_none();
         let stage_height = scene.stage().size.height;
         // Whether this layer is lit at all is decided here; *how much* light
@@ -589,8 +607,25 @@ fn draw_layer(
         // and then layer parenting, both in the plane, before the lens.
         let projection = projection.pre_affine(options.place).pre_affine(follows);
 
+        // Culling is safe only where document-space bounds compare directly to
+        // the viewport and nothing off-screen can reach into it: a flat camera,
+        // a depth-zero layer (so no perspective moves the artwork), no mask (a
+        // mask needs its whole geometry), and no key light (a cast shadow can
+        // fall in from an off-screen caster). When any of these does not hold,
+        // the layer draws everything, exactly as before.
+        let cull = options.cull.filter(|_| {
+            layer.depth == 0.0
+                && !scene.camera_has_tilt()
+                && !matches!(
+                    layer.kind,
+                    LayerKind::Mask | LayerKind::InverseMask | LayerKind::Masked
+                )
+                && !(lit && rig.key().is_some())
+        });
+
         let ctx = DrawCtx {
             scene,
+            cull,
             lights: lights.clone(),
             frame,
             elapsed: frame
@@ -750,6 +785,12 @@ fn has_additive_paint(object: &Object, scene: &Scene, depth: usize) -> bool {
     }
 }
 
+/// Do two rectangles overlap, edges included? Inclusive on purpose: a shape
+/// exactly touching the viewport edge is kept, never culled.
+fn rects_overlap(a: buzz_geom::Rect, b: buzz_geom::Rect) -> bool {
+    a.x0 <= b.x1 && a.x1 >= b.x0 && a.y0 <= b.y1 && a.y1 >= b.y0
+}
+
 /// Fold a depth-of-field blur into a layer's filter blur, taking the wider of
 /// the two so a background layer that is both filter-blurred and out of focus is
 /// blurred once rather than twice.
@@ -773,6 +814,14 @@ fn combine_blur(
 #[derive(Clone)]
 struct DrawCtx<'a> {
     scene: &'a Scene,
+    /// The visible rectangle in document space, **when it is safe to cull to
+    /// it**. `Some` only on a flat, depth-zero, unmasked, unshadowed layer whose
+    /// objects' document-space bounds compare directly to the viewport; `None`
+    /// everywhere culling could hide something that projects, bleeds or shadows
+    /// into view. Set per layer by [`draw_layer`]. When in doubt it is `None` and
+    /// everything draws — culling too little only costs time, culling too much is
+    /// a wrong picture.
+    cull: Option<buzz_geom::Rect>,
     /// The light rig **resolved at the stage frame** — every keyframed light
     /// evaluated to concrete values. Read instead of `scene.lights()` so a
     /// keyframed sun lights and shadows at the frame being drawn, while a static
@@ -937,6 +986,22 @@ fn draw_object(
 ) {
     if !object.visible {
         return;
+    }
+
+    // **Off-screen shapes are skipped.** Only a bare shape — whose bounds are
+    // exact, unlike an instance's placeholder — with no filter to bleed past its
+    // edge, and only when `ctx.cull` is set (a safe layer, see `draw_layer`).
+    // `doc` carries the full accumulation into document space at any nesting
+    // depth, so the test is valid inside a symbol too; instances are never
+    // culled by their own bounds, but each shape they contain is culled here.
+    if let Some(cull) = ctx.cull
+        && object.filters.is_empty()
+        && matches!(object.kind, ObjectKind::Shape(_))
+    {
+        let world = buzz_scene::object::transform_rect(doc, object.bounds());
+        if !rects_overlap(world, cull) {
+            return;
+        }
     }
 
     // Filters and blend modes are the object's own, so they are applied here,
@@ -1529,6 +1594,69 @@ mod tests {
         });
         assert!(scene.lights().is_active(), "the rig should be on");
         scene
+    }
+
+    /// A scene with one shape on-screen and one far off it, for culling.
+    fn near_and_far_scene() -> Scene {
+        let mut scene = Scene::default();
+        let layer = scene.add_layer("Art", buzz_scene::LayerKind::Normal);
+        // Near the origin, in view.
+        scene.add_shape(
+            layer,
+            ShapeData::filled(Rect::new(10.0, 10.0, 40.0, 40.0).to_path(1e-9), Color::WHITE),
+        );
+        // Far away, well outside any reasonable viewport.
+        scene.add_shape(
+            layer,
+            ShapeData::filled(
+                Rect::new(50_000.0, 50_000.0, 50_040.0, 50_040.0).to_path(1e-9),
+                Color::WHITE,
+            ),
+        );
+        scene
+    }
+
+    fn encoded_paths(scene: &Scene, cull: Option<Rect>) -> u32 {
+        let mut vello = crate::vello::Scene::new();
+        let camera = Camera::new(Point::new(25.0, 25.0), 1.0, Size::new(400.0, 400.0));
+        let mut builder = SceneBuilder::new(&mut vello, &camera);
+        let mut cache = DrawCache::new();
+        cache.begin(0);
+        let options = FrameOptions {
+            cull,
+            ..FrameOptions::default()
+        };
+        draw_frame_within(&mut builder, scene, 0, Affine::IDENTITY, &options, &mut cache);
+        vello.encoding().n_paths
+    }
+
+    /// **Culling changes nothing that is visible.** The stage culls to the same
+    /// rectangle the render clip already bounds to, so a shape it skips is one
+    /// the clip would have collapsed to nothing anyway — the parity guarantee
+    /// for plan 2.4. What culling saves is the *work* of transforming, clipping
+    /// and brushing that shape, which the perf gate (`never_hang.rs`) measures;
+    /// here we pin that the encoded result is identical with and without it.
+    #[test]
+    fn culling_to_the_viewport_matches_no_cull() {
+        let scene = near_and_far_scene();
+        let uncalled = encoded_paths(&scene, None);
+        // The clip in `encoded_paths` bounds a 400×400 view about (25,25); a cull
+        // covering it (the near shape in, the far shape out) is what the stage
+        // passes, and the far shape encodes nothing either way.
+        let culled = encoded_paths(&scene, Some(Rect::new(-500.0, -500.0, 500.0, 500.0)));
+        assert_eq!(
+            culled, uncalled,
+            "culling to the viewport must produce the identical encoding"
+        );
+        assert!(uncalled > 0, "the on-screen shape must be drawn");
+    }
+
+    #[test]
+    fn rects_overlap_is_inclusive_at_the_edge() {
+        let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+        assert!(rects_overlap(a, Rect::new(5.0, 5.0, 15.0, 15.0)), "overlapping");
+        assert!(rects_overlap(a, Rect::new(10.0, 0.0, 20.0, 10.0)), "edge-touching kept");
+        assert!(!rects_overlap(a, Rect::new(11.0, 0.0, 20.0, 10.0)), "clear of it");
     }
 
     /// The plan's acceptance test for Wave 4.5: a **cold** cache draws the

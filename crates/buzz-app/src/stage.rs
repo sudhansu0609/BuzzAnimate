@@ -41,6 +41,12 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
 
     let scene = editor.scene();
 
+    // The visible document rectangle, handed to every stage pass so artwork far
+    // off the edge is culled rather than encoded. Display-only: the exporter and
+    // thumbnails leave it `None` and render everything. See
+    // `buzz_render::document::FrameOptions::cull`.
+    let cull = Some(builder.clip_bounds());
+
     // **One cache generation for the whole screen frame.** What follows can be
     // a dozen draws — the context behind an opened symbol, every keyframe under
     // Edit Multiple Frames, the onion-skin ghosts either side, and the live
@@ -71,6 +77,7 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
             // Not lit: shading and cast shadows on artwork that is only there
             // for reference read as dirt on the stage.
             lit: false,
+            cull,
             ..FrameOptions::default()
         };
         draw_stage_context(&mut builder, scene, frame, camera, &context, cache);
@@ -96,6 +103,7 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
             masks: MaskDisplay::WhenLocked,
             lit: true,
             place,
+            cull,
             ..FrameOptions::default()
         };
         draw_frame_within(&mut builder, scene, other, camera, &options, cache);
@@ -116,6 +124,7 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
             // A dimmed layer is dimmed in its ghosts too, or a layer faded
             // right down still shows solidly in every ghost around it.
             layer_alpha: true,
+            cull,
         };
         draw_frame_within(&mut builder, scene, ghost_frame, camera, &options, cache);
     }
@@ -129,6 +138,7 @@ pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache:
         // The working view, and the only place a dimmed layer is dimmed.
         layer_alpha: true,
         place,
+        cull,
         ..FrameOptions::default()
     };
     draw_frame_within(&mut builder, scene, frame, camera, &live, cache);

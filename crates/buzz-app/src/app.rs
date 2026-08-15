@@ -451,6 +451,12 @@ pub struct App {
     /// tooltip, a background install elsewhere) does not re-encode a huge stage.
     /// See [`StageStamp`].
     stage_stamp: Option<StageStamp>,
+    /// The stage's scrollable content extent, cached by `(revision, frame)`.
+    /// Computing it walks and resolves every object's bounds through the library
+    /// — cheap on a small file, seconds on a rig-heavy import — so it must not
+    /// run on a frame that only panned or zoomed. Both are camera-only and touch
+    /// neither the revision nor the frame, so the cache holds across them.
+    scroll_extent: Option<(u64, u32, buzz_geom::Rect)>,
     /// Bumped whenever installed lighting geometry changes what the stage would
     /// encode, so a retained stage is invalidated when a light's shading lands.
     lights_generation: u64,
@@ -573,6 +579,7 @@ impl App {
             egui_repaint: None,
             force_poll: std::env::var("BUZZ_POLL").is_ok(),
             stage_stamp: None,
+            scroll_extent: None,
             lights_generation: 0,
             retain_stage: std::env::var("BUZZ_NO_RETAIN").is_err(),
             profiler: crate::profile::FrameProfiler::default(),
@@ -2400,8 +2407,8 @@ impl App {
             return;
         }
 
-        let camera = &self.editor.camera;
-        let visible = camera.visible_doc_rect();
+        let camera_center = self.editor.camera.center;
+        let visible = self.editor.camera.visible_doc_rect();
         let extent = self.scrollable_extent(visible);
 
         // Nothing to scroll: the whole extent is on screen.
@@ -2462,7 +2469,7 @@ impl App {
                 let t = ((pos.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0) as f64;
                 let span = extent.width() - visible.width();
                 let x = extent.x0 + span * t + visible.width() / 2.0;
-                moved = Some((x, camera.center.y));
+                moved = Some((x, camera_center.y));
             }
             let _ = fraction;
         }
@@ -2511,12 +2518,38 @@ impl App {
     }
 
     /// Everything worth scrolling over: the stage, the artwork, and a margin.
-    fn scrollable_extent(&self, visible: buzz_geom::Rect) -> buzz_geom::Rect {
+    fn scrollable_extent(&mut self, visible: buzz_geom::Rect) -> buzz_geom::Rect {
+        let revision = self.editor.scene().revision();
+        let frame = self.editor.current_frame;
+
+        // The content extent — the expensive part, resolving every object's
+        // bounds through the library — depends only on the document and the
+        // frame, never on the camera. Recompute it only when one of those moves;
+        // a pan or a zoom reuses it, which is what keeps the scrollbars off the
+        // per-frame budget on a large document.
+        let content = match self.scroll_extent {
+            Some((r, f, ext)) if r == revision && f == frame => ext,
+            _ => {
+                let ext = self.compute_content_extent(frame);
+                self.scroll_extent = Some((revision, frame, ext));
+                ext
+            }
+        };
+
+        // And never smaller than what is on screen, or the thumb would be
+        // longer than its track. This part is camera-dependent, so it stays
+        // outside the cache.
+        content.union(visible)
+    }
+
+    /// The document's content extent at `frame`, with a stage of air around it.
+    /// Cached by [`Self::scrollable_extent`]; see the cost note there.
+    fn compute_content_extent(&self, frame: u32) -> buzz_geom::Rect {
         let scene = self.editor.scene();
         let mut extent = scene.stage().stage_rect();
 
         for layer in scene.layers().iter() {
-            for object in layer.objects_at(self.editor.current_frame) {
+            for object in layer.objects_at(frame) {
                 let bounds = scene.resolved_bounds(object);
                 if bounds.width().is_finite() && bounds.height().is_finite() {
                     extent = extent.union(bounds);
@@ -2530,16 +2563,12 @@ impl App {
             scene.stage().size.width * 0.5,
             scene.stage().size.height * 0.5,
         );
-        extent = buzz_geom::Rect::new(
+        buzz_geom::Rect::new(
             extent.x0 - margin.x,
             extent.y0 - margin.y,
             extent.x1 + margin.x,
             extent.y1 + margin.y,
-        );
-
-        // And never smaller than what is on screen, or the thumb would be
-        // longer than its track.
-        extent.union(visible)
+        )
     }
 
     /// The zoom control that sits on the stage itself, top right.

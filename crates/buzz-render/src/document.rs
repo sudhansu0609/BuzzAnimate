@@ -1217,66 +1217,88 @@ fn draw_object_inner(
             // must show both effects.
             inner_ctx.effect = instance.color.compose(&ctx.effect);
 
-            // A symbol has its own layer stack, so it has its own masks. They
-            // are always in force inside a symbol: the "only when locked" rule
-            // is about editing the mask, and you are not editing this one —
-            // you are looking at an instance of it placed somewhere else.
-            let masks = active_masks(&symbol.layers, MaskDisplay::Always);
-            let mut open: Option<OpenMask> = None;
-
-            for layer in symbol.layers.drawable_at(inner) {
-                // Inside a symbol masks are always in force (see above), so a
-                // mask layer here is always a stencil and never artwork.
-                if layer.kind.is_mask() {
-                    continue;
-                }
-
-                let wanted = masks.get(&layer.id).copied();
-                if wanted != open.as_ref().map(|o| o.mask) {
-                    close_mask(builder, open.take());
-                    if let Some(mask_id) = wanted
-                        && let Some(path) = mask_geometry(
-                            &symbol.layers,
-                            mask_id,
-                            inner,
-                            doc,
-                            &ctx.projection,
-                            builder.tolerance(),
-                        )
-                    {
-                        open = open_mask(builder, &symbol.layers, mask_id, &masks, inner, path);
-                    }
-                }
-
-                // An outline already in force wins — the stage layer's outline
-                // toggle applies to everything it contains.
-                let layer_ctx = DrawCtx {
-                    tint: ctx.tint.or_else(|| layer.outline.then_some(layer.color)),
-                    faded: ctx.faded || layer.kind == LayerKind::Guide,
-                    // Each layer inside the symbol counts from its own
-                    // keyframe, exactly as the stage's layers do.
-                    elapsed: inner
-                        - layer
-                            .frames
-                            .keyframe_at(inner)
-                            .map(|k| k.start)
-                            .unwrap_or(0)
-                            .min(inner),
-                    ..inner_ctx.clone()
-                };
-                // A symbol's layers can follow each other too, which is
-                // how a character symbol is rigged inside itself.
-                let follows = symbol.layers.inherited_transform(layer.id, inner);
-                for (child, owner) in layer.frames.resolved_at(inner).iter_owned() {
-                    draw_object(builder, child, owner, doc * follows, &layer_ctx, cache);
-                }
-            }
-
-            close_mask(builder, open);
+            draw_symbol_contents(builder, symbol, inner, doc, &inner_ctx, cache);
         }
 
         ObjectKind::Shape(shape) => draw_shape(builder, owner, 0, shape, doc, ctx, cache),
     }
+}
+
+/// Draw a symbol's own layer stack — the body of an instance, factored out so
+/// that the live draw and the symbol-scene cache build walk it through the
+/// *same* code and cannot drift apart.
+///
+/// `inner` is the symbol's own playhead (already resolved from the instance);
+/// `doc` already includes the instance's placement; `inner_ctx` is the
+/// instance's context (frame = `inner`, depth already advanced, colour effect
+/// already composed). The old arm read `ctx.projection/tint/faded` here, which
+/// are identical to `inner_ctx`'s — `inner_ctx` is a clone of `ctx` that only
+/// changed frame, depth and effect — so reading them off `inner_ctx` is exactly
+/// what the arm did.
+fn draw_symbol_contents(
+    builder: &mut SceneBuilder<'_>,
+    symbol: &buzz_scene::Symbol,
+    inner: u32,
+    doc: Affine,
+    inner_ctx: &DrawCtx<'_>,
+    cache: &mut DrawCache,
+) {
+    // A symbol has its own layer stack, so it has its own masks. They
+    // are always in force inside a symbol: the "only when locked" rule
+    // is about editing the mask, and you are not editing this one —
+    // you are looking at an instance of it placed somewhere else.
+    let masks = active_masks(&symbol.layers, MaskDisplay::Always);
+    let mut open: Option<OpenMask> = None;
+
+    for layer in symbol.layers.drawable_at(inner) {
+        // Inside a symbol masks are always in force (see above), so a
+        // mask layer here is always a stencil and never artwork.
+        if layer.kind.is_mask() {
+            continue;
+        }
+
+        let wanted = masks.get(&layer.id).copied();
+        if wanted != open.as_ref().map(|o| o.mask) {
+            close_mask(builder, open.take());
+            if let Some(mask_id) = wanted
+                && let Some(path) = mask_geometry(
+                    &symbol.layers,
+                    mask_id,
+                    inner,
+                    doc,
+                    &inner_ctx.projection,
+                    builder.tolerance(),
+                )
+            {
+                open = open_mask(builder, &symbol.layers, mask_id, &masks, inner, path);
+            }
+        }
+
+        // An outline already in force wins — the stage layer's outline
+        // toggle applies to everything it contains.
+        let layer_ctx = DrawCtx {
+            tint: inner_ctx.tint.or_else(|| layer.outline.then_some(layer.color)),
+            faded: inner_ctx.faded || layer.kind == LayerKind::Guide,
+            // Each layer inside the symbol counts from its own
+            // keyframe, exactly as the stage's layers do.
+            elapsed: inner
+                - layer
+                    .frames
+                    .keyframe_at(inner)
+                    .map(|k| k.start)
+                    .unwrap_or(0)
+                    .min(inner),
+            ..inner_ctx.clone()
+        };
+        // A symbol's layers can follow each other too, which is
+        // how a character symbol is rigged inside itself.
+        let follows = symbol.layers.inherited_transform(layer.id, inner);
+        for (child, owner) in layer.frames.resolved_at(inner).iter_owned() {
+            draw_object(builder, child, owner, doc * follows, &layer_ctx, cache);
+        }
+    }
+
+    close_mask(builder, open);
 }
 
 /// Collect an object's filled outlines into one path, through `transform`.

@@ -4680,8 +4680,15 @@ impl App {
             stage_area.max.x as f64 * scale,
             stage_area.max.y as f64 * scale,
         );
-        // The camera works in physical pixels, matching the render target.
-        self.editor.camera.viewport = Size::new(area_px.width(), area_px.height());
+        // The camera stays in **logical** points — the space input and the
+        // selection chrome work in — so a click lands where the artwork is.
+        // `build_scene` scales the finished output up to the physical target by
+        // `scale`, which is what makes drawing land under the cursor at any
+        // display scaling. (Previously the viewport was set to physical here,
+        // which scaled the offset but not the artwork, so the two only agreed at
+        // the centre and drifted ~100px at the edges.)
+        self.editor.camera.viewport =
+            Size::new(stage_area.width() as f64, stage_area.height() as f64);
 
         self.profiler.enter(crate::profile::Section::Lights);
 
@@ -4759,7 +4766,7 @@ impl App {
             && matches!(self.editor.preview(), crate::tools::Preview::None)
             && self.stage_stamp.as_ref() == Some(&stamp);
         if !reuse {
-            stage::build_scene(&mut active.vello, &self.editor, area_px, &mut self.lights);
+            stage::build_scene(&mut active.vello, &self.editor, area_px, scale, &mut self.lights);
             self.stage_stamp = Some(stamp);
         }
 

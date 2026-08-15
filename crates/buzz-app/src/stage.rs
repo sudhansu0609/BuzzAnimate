@@ -33,11 +33,20 @@ pub struct ChromeResponse {
 
 /// Encode the document into a Vello scene.
 ///
-/// `area` is the region of the window the stage occupies; the camera's viewport
-/// carries its size and this supplies its origin.
-pub fn build_scene(vello: &mut vello::Scene, editor: &Editor, area: Rect, cache: &mut DrawCache) {
-    let mut builder =
-        SceneBuilder::new(vello, &editor.camera).with_viewport_offset(Vec2::new(area.x0, area.y0));
+/// `area` is the region of the window the stage occupies, in **physical**
+/// pixels; the camera works in logical points and `scale` (the display's
+/// `pixels_per_point`) carries the output up to physical, so a click maps to the
+/// same place the artwork and the chrome are drawn.
+pub fn build_scene(
+    vello: &mut vello::Scene,
+    editor: &Editor,
+    area: Rect,
+    scale: f64,
+    cache: &mut DrawCache,
+) {
+    let mut builder = SceneBuilder::new(vello, &editor.camera)
+        .with_output_scale(scale)
+        .with_viewport_offset(Vec2::new(area.x0, area.y0));
 
     let scene = editor.scene();
 
@@ -911,6 +920,7 @@ mod tests {
             &mut vello,
             &editor,
             Rect::new(0.0, 0.0, 1000.0, 800.0),
+            1.0,
             &mut DrawCache::new(),
         );
         assert!(
@@ -932,6 +942,7 @@ mod tests {
                 &mut vello,
                 &editor,
                 Rect::new(0.0, 0.0, 1000.0, 800.0),
+                1.0,
                 &mut DrawCache::new(),
             );
             assert!(
@@ -951,6 +962,7 @@ mod tests {
             &mut visible_scene,
             &editor,
             Rect::new(0.0, 0.0, 800.0, 600.0),
+            1.0,
             &mut DrawCache::new(),
         );
         let with_art = visible_scene.encoding().n_paths;
@@ -963,6 +975,7 @@ mod tests {
             &mut hidden_scene,
             &editor,
             Rect::new(0.0, 0.0, 800.0, 600.0),
+            1.0,
             &mut DrawCache::new(),
         );
 
@@ -985,6 +998,7 @@ mod tests {
             &mut vello,
             &editor,
             Rect::new(0.0, 0.0, 800.0, 600.0),
+            1.0,
             &mut DrawCache::new(),
         );
         assert!(vello.encoding().n_paths > 0);
@@ -1012,6 +1026,7 @@ mod tests {
             &mut vello,
             &editor,
             Rect::new(0.0, 0.0, 800.0, 600.0),
+            1.0,
             &mut DrawCache::new(),
         );
         assert!(

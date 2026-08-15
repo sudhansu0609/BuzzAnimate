@@ -1083,15 +1083,29 @@ fn draw_layer(
         // mask needs its whole geometry), and no key light (a cast shadow can
         // fall in from an off-screen caster). When any of these does not hold,
         // the layer draws everything, exactly as before.
-        let cull = options.cull.filter(|_| {
-            layer.depth == 0.0
-                && !scene.camera_has_tilt()
-                && !matches!(
-                    layer.kind,
-                    LayerKind::Mask | LayerKind::InverseMask | LayerKind::Masked
-                )
-                && !(lit && rig.key().is_some())
-        });
+        let cull = options
+            .cull
+            .filter(|_| {
+                layer.depth == 0.0
+                    && !scene.camera_has_tilt()
+                    && !matches!(
+                        layer.kind,
+                        LayerKind::Mask | LayerKind::InverseMask | LayerKind::Masked
+                    )
+            })
+            .map(|rect| {
+                // A key light casts shadows from artwork just off the edge into
+                // view. Rather than turn culling off — which draws the whole
+                // document every frame and froze a lit rig-heavy import — the
+                // lit layer keeps culling but widens the rectangle to reach in
+                // for those casters, so the work stays bounded by the view.
+                if lit && rig.key().is_some() {
+                    let margin = rect.width().max(rect.height());
+                    rect.inflate(margin, margin)
+                } else {
+                    rect
+                }
+            });
 
         let ctx = DrawCtx {
             scene,

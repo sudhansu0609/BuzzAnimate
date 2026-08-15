@@ -263,6 +263,20 @@ impl<'a> SceneBuilder<'a> {
         self
     }
 
+    /// Scale the rendered output by the display's device-pixel ratio.
+    ///
+    /// The camera works in **logical** points, the same space egui lays the
+    /// panels and draws the selection chrome in, so a click maps to the same
+    /// place the chrome is drawn. Vello's target is **physical** pixels, so the
+    /// finished output is scaled up by `pixels_per_point` here — on the GPU
+    /// transform only, after the precision-critical CPU split. On a 1:1 display
+    /// this is the identity. Apply **before** [`Self::with_viewport_offset`] so
+    /// the offset, already in physical pixels, is not scaled again.
+    pub fn with_output_scale(mut self, scale: f64) -> Self {
+        self.split.gpu_view = Affine::scale(scale) * self.split.gpu_view;
+        self
+    }
+
     /// Curve-flattening tolerance, in **document units**, for the current zoom.
     ///
     /// A fixed document-space tolerance is wrong in both directions, and both

@@ -7,6 +7,7 @@
 
 pub mod about;
 pub mod actions_panel;
+pub mod align;
 pub mod assets_panel;
 pub mod brush;
 pub mod camera_panel;
@@ -33,6 +34,7 @@ pub mod view;
 pub mod workspace;
 
 pub use about::{AboutState, about_dialog};
+pub use align::{Align, Distribute, MatchSize};
 pub use actions_panel::{ActionsResponse, ActionsState, SampleEntry, actions_panel};
 pub use assets_panel::{AssetAction, AssetPanelState, assets_panel};
 pub use brush::{BrushKind, BrushSettings, PatternShape};

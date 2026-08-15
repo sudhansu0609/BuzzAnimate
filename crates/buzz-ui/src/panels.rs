@@ -366,6 +366,73 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::GroupSelection, has_selection, &mut raised);
             item(ui, Command::UngroupSelection, has_selection, &mut raised);
             ui.separator();
+
+            // Animate keeps Align in a submenu of Modify, and a panel besides.
+            // The submenu is where the hand goes; the thirteen operations do
+            // not each want a keystroke.
+            ui.menu_button("Align", |ui| {
+                // **Two halves, because "align to stage" is a different
+                // operation and not a modifier on this one.** Spelling both
+                // out beats a checkbox whose state you cannot see from here.
+                for op in crate::align::Align::ALL {
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new(op.label()))
+                        .clicked()
+                    {
+                        raised.push(Command::Align {
+                            op,
+                            to_stage: false,
+                        });
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                ui.menu_button("To Stage", |ui| {
+                    for op in crate::align::Align::ALL {
+                        if ui
+                            .add_enabled(has_selection, egui::Button::new(op.label()))
+                            .clicked()
+                        {
+                            raised.push(Command::Align { op, to_stage: true });
+                            ui.close();
+                        }
+                    }
+                });
+
+                ui.separator();
+                ui.label(RichText::new("Distribute").small().weak());
+                for op in crate::align::Distribute::ALL {
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new(op.label()))
+                        .on_hover_text(match op {
+                            crate::align::Distribute::HorizontalSpacing
+                            | crate::align::Distribute::VerticalSpacing => {
+                                "Equal gaps \u{2014} what the eye reads as evenly \
+                                 spaced when the objects are different sizes"
+                            }
+                            _ => "Equal distance between centres",
+                        })
+                        .clicked()
+                    {
+                        raised.push(Command::Distribute(op));
+                        ui.close();
+                    }
+                }
+
+                ui.separator();
+                ui.label(RichText::new("Match Size").small().weak());
+                for op in crate::align::MatchSize::ALL {
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new(op.label()))
+                        .on_hover_text("Scale everything up to the largest, about its own centre")
+                        .clicked()
+                    {
+                        raised.push(Command::MatchSize(op));
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
             for c in [
                 Command::BringToFront,
                 Command::BringForward,

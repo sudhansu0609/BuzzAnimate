@@ -1675,6 +1675,9 @@ impl Editor {
             }
             Deselect => self.selection.clear(),
             DuplicateSelection => self.duplicate_selection(),
+            Align { op, to_stage } => self.align_selection(op, to_stage),
+            Distribute(op) => self.distribute_selection(op),
+            MatchSize(op) => self.match_selection_size(op),
             Nudge { x, y } => {
                 if !self.selection.is_empty() {
                     // Through the same path a drag takes, so a nudge is an
@@ -3167,6 +3170,120 @@ impl Editor {
         self.selection.clear();
     }
 
+    /// Each selected object's id and its bounds on the current frame, in a
+    /// stable order.
+    ///
+    /// Shared by align, distribute and match size, all of which are "measure
+    /// everything, then move everything" and must measure against the state
+    /// *before* any of them moved — a running fold would make the answer
+    /// depend on the order.
+    fn selection_bounds(&self) -> Vec<(buzz_scene::ObjectId, kurbo::Rect)> {
+        let scene = self.doc.scene();
+        let frame = self.current_frame;
+        self.selection
+            .ids()
+            .into_iter()
+            .filter_map(|id| {
+                scene
+                    .layers()
+                    .iter()
+                    .find_map(|l| l.objects_at(frame).iter().find(|o| o.id == id).cloned())
+                    .or_else(|| scene.find_object(id).map(|(_, o)| o.clone()))
+                    .map(|o| (id, o.bounds()))
+            })
+            .collect()
+    }
+
+    /// Move each selected object by its own offset, as one undo step.
+    fn offset_selection(
+        &mut self,
+        offsets: &[(buzz_scene::ObjectId, buzz_geom::Vec2)],
+        label: &'static str,
+    ) {
+        if offsets.iter().all(|(_, d)| d.x == 0.0 && d.y == 0.0) {
+            return;
+        }
+        let offsets = offsets.to_vec();
+        let at = self.edit_at();
+        self.doc.edit(label, |scene| {
+            for (id, delta) in offsets {
+                update_object(scene, at, id, |o| {
+                    o.transform = Affine::translate(delta) * o.transform;
+                });
+            }
+        });
+    }
+
+    fn align_selection(&mut self, op: buzz_ui::Align, to_stage: bool) {
+        let measured = self.selection_bounds();
+        if measured.is_empty() {
+            self.status = Some("Select artwork to align".into());
+            return;
+        }
+        let stage = to_stage.then(|| self.doc.scene().stage().stage_rect());
+        let bounds: Vec<kurbo::Rect> = measured.iter().map(|(_, r)| *r).collect();
+        let offsets = buzz_ui::align::align_offsets(&bounds, op, stage);
+
+        let moves: Vec<_> = measured
+            .iter()
+            .map(|(id, _)| *id)
+            .zip(offsets)
+            .collect();
+        self.offset_selection(&moves, "Align");
+    }
+
+    fn distribute_selection(&mut self, op: buzz_ui::Distribute) {
+        let measured = self.selection_bounds();
+        if measured.len() < 3 {
+            // Said rather than silently ignored: two objects look like they
+            // ought to distribute, and nothing happening is indistinguishable
+            // from a broken menu item.
+            self.status = Some("Select three or more objects to distribute".into());
+            return;
+        }
+        let bounds: Vec<kurbo::Rect> = measured.iter().map(|(_, r)| *r).collect();
+        let offsets = buzz_ui::align::distribute_offsets(&bounds, op);
+
+        let moves: Vec<_> = measured
+            .iter()
+            .map(|(id, _)| *id)
+            .zip(offsets)
+            .collect();
+        self.offset_selection(&moves, "Distribute");
+    }
+
+    fn match_selection_size(&mut self, op: buzz_ui::MatchSize) {
+        let measured = self.selection_bounds();
+        if measured.len() < 2 {
+            self.status = Some("Select two or more objects to match their size".into());
+            return;
+        }
+        let bounds: Vec<kurbo::Rect> = measured.iter().map(|(_, r)| *r).collect();
+        let scales = buzz_ui::align::match_size_scales(&bounds, op);
+
+        let work: Vec<_> = measured
+            .iter()
+            .zip(scales)
+            .filter(|(_, (sx, sy))| (sx - 1.0).abs() > 1e-9 || (sy - 1.0).abs() > 1e-9)
+            .map(|((id, rect), scale)| (*id, rect.center(), scale))
+            .collect();
+        if work.is_empty() {
+            return;
+        }
+
+        let at = self.edit_at();
+        self.doc.edit("Match Size", |scene| {
+            for (id, centre, (sx, sy)) in work {
+                // About the object's own centre, so nothing wanders across the
+                // stage while being resized.
+                let about = Affine::translate(centre.to_vec2())
+                    * Affine::scale_non_uniform(sx, sy)
+                    * Affine::translate(-centre.to_vec2());
+                update_object(scene, at, id, |o| o.transform = about * o.transform);
+            }
+        });
+    }
+
     /// Put the selection on the clipboard. `false` when there was nothing to
     /// put there, which is what stops Cut deleting on an empty selection.
     ///
@@ -4347,6 +4464,124 @@ mod tests {
 
         e.run(Command::Undo);
         assert_eq!(e.scene().shape_count(), 1);
+    }
+
+    // -- align and distribute ----------------------------------------------
+
+    /// Aligning moves the artwork on the stage, not just the numbers.
+    #[test]
+    fn aligning_left_lines_the_selection_up() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let a = draw_square(&mut e, 10.0, 0.0, 20.0, Color::WHITE).unwrap();
+        let b = draw_square(&mut e, 90.0, 0.0, 20.0, Color::WHITE).unwrap();
+        e.selection.set(vec![a, b]);
+
+        e.run(Command::Align {
+            op: buzz_ui::Align::LeftEdges,
+            to_stage: false,
+        });
+
+        let left_a = e.scene().find_object(a).unwrap().1.bounds().min_x();
+        let left_b = e.scene().find_object(b).unwrap().1.bounds().min_x();
+        assert!((left_a - left_b).abs() < 1e-9, "{left_a} vs {left_b}");
+        assert!((left_a - 10.0).abs() < 1e-9, "the leftmost should not move");
+    }
+
+    /// Align to stage centres on the *stage*, which is the whole point of the
+    /// distinction.
+    #[test]
+    fn aligning_to_the_stage_centres_on_the_stage() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 20.0, Color::WHITE).unwrap();
+        e.selection.select_one(id);
+        let stage = e.scene().stage().stage_rect();
+
+        e.run(Command::Align {
+            op: buzz_ui::Align::HorizontalCentres,
+            to_stage: true,
+        });
+
+        let centre = e.scene().find_object(id).unwrap().1.bounds().center().x;
+        assert!((centre - stage.center().x).abs() < 1e-6, "at {centre}");
+    }
+
+    /// Distributing needs three; with two it says so rather than doing
+    /// nothing silently.
+    #[test]
+    fn distributing_two_objects_explains_itself() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let a = draw_square(&mut e, 0.0, 0.0, 10.0, Color::WHITE).unwrap();
+        let b = draw_square(&mut e, 100.0, 0.0, 10.0, Color::WHITE).unwrap();
+        e.selection.set(vec![a, b]);
+
+        e.run(Command::Distribute(
+            buzz_ui::Distribute::HorizontalCentres,
+        ));
+        assert!(
+            e.status.as_deref().unwrap_or_default().contains("three"),
+            "it should say what is needed"
+        );
+    }
+
+    #[test]
+    fn distributing_three_objects_evens_them_out() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let a = draw_square(&mut e, 0.0, 0.0, 10.0, Color::WHITE).unwrap();
+        let b = draw_square(&mut e, 30.0, 0.0, 10.0, Color::WHITE).unwrap();
+        let c = draw_square(&mut e, 100.0, 0.0, 10.0, Color::WHITE).unwrap();
+        e.selection.set(vec![a, b, c]);
+
+        e.run(Command::Distribute(
+            buzz_ui::Distribute::HorizontalCentres,
+        ));
+
+        let centre = |id| e.scene().find_object(id).unwrap().1.bounds().center().x;
+        let (x0, x1, x2) = (centre(a), centre(b), centre(c));
+        assert!(((x1 - x0) - (x2 - x1)).abs() < 1e-6, "{x0} {x1} {x2}");
+    }
+
+    /// Match Size scales about each object's own centre, so nothing wanders.
+    #[test]
+    fn matching_size_grows_the_smaller_one_in_place() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let small = draw_square(&mut e, 0.0, 0.0, 10.0, Color::WHITE).unwrap();
+        let large = draw_square(&mut e, 100.0, 0.0, 40.0, Color::WHITE).unwrap();
+        e.selection.set(vec![small, large]);
+        let before = e.scene().find_object(small).unwrap().1.bounds().center();
+
+        e.run(Command::MatchSize(buzz_ui::MatchSize::Width));
+
+        let after = e.scene().find_object(small).unwrap().1.bounds();
+        assert!((after.width() - 40.0).abs() < 1e-6, "width {}", after.width());
+        assert!(
+            (after.center().x - before.x).abs() < 1e-6,
+            "it should grow about its own centre"
+        );
+    }
+
+    /// Aligning is one undo step however many objects moved.
+    #[test]
+    fn aligning_is_one_undo_step() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let a = draw_square(&mut e, 10.0, 0.0, 20.0, Color::WHITE).unwrap();
+        let b = draw_square(&mut e, 90.0, 0.0, 20.0, Color::WHITE).unwrap();
+        e.selection.set(vec![a, b]);
+        let before = e.scene().find_object(b).unwrap().1.bounds().min_x();
+
+        e.run(Command::Align {
+            op: buzz_ui::Align::LeftEdges,
+            to_stage: false,
+        });
+        e.run(Command::Undo);
+
+        let after = e.scene().find_object(b).unwrap().1.bounds().min_x();
+        assert!((after - before).abs() < 1e-9);
     }
 
     // -- the arrow keys ----------------------------------------------------

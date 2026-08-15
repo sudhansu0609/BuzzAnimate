@@ -3210,6 +3210,34 @@ Eight tests, including the one that matters: a symbol converted in one document,
 copied, and pasted into an editor whose library has never seen it arrives with its
 definition.
 
+### ✅ Wave 3.2 — Align, Distribute and Match Size
+
+There was no equivalent to Animate's `Ctrl+K` anywhere in the command set — zero
+matches for "align". It is the standard way anybody lays out a stage, which is the
+half of the reported complaint that is not about placing characters.
+
+**In `Modify ▸ Align`, not a panel.** Animate has both; the submenu is where the hand
+goes, thirteen operations do not each want a keystroke, and a panel would have meant a
+new `PanelId` and a workspace migration for something that is a list of buttons.
+
+**Align to stage is a separate submenu, not a checkbox.** It changes what the
+operation *means* — towards each other, or towards the frame — and a command that did
+one or the other depending on hidden state is a command you cannot predict from the
+menu you are looking at. So the flag is on the command and both halves are spelled
+out.
+
+**Distribute comes in two kinds, because "evenly" does.** Equal distance between
+*centres* and equal *gaps* are the same thing only when the objects are the same size;
+with a wide one in the middle, gaps are what the eye reads as even. Both are offered,
+and the hover text says which is which. The outermost two never move: distributing is
+about what is between them, and sliding the ends would make the row a different width.
+
+The arithmetic is a module of pure functions in `buzz-ui/src/align.rs` taking
+rectangles and returning offsets — eleven tests against worked examples, including
+that the answer does not depend on the order things were selected in, and that a flat
+shape does not produce an infinity when matched for size. The editor measures
+everything *before* moving anything, so no operation depends on its own results.
+
 ### ✅ Wave 3.3 — The arrow keys
 
 One document unit per press, eight with Shift — Animate's numbers, and the reason for

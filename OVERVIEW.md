@@ -1,6 +1,6 @@
 # BuzzAnimate — Overview: what it has, what it cannot do, what is next
 
-**Written:** 2026-08-15 · **Format version:** 18 · **Tests:** 1 456 passing, clippy clean
+**Written:** 2026-08-15 · **Format version:** 18 · **Tests:** 1 482 passing, clippy clean
 
 One page that consolidates the three questions people actually ask about this
 program. The detail behind each answer lives elsewhere and is linked:
@@ -90,6 +90,9 @@ The improvements go **underneath** — unbounded zoom, all cores, GPU rasterisat
 
 - **7 layer kinds** — Normal, Folder, Mask, **Inverse Mask**, Masked, Guide, Guided.
 - Layer parenting, per-layer depth, colour, transparency, outline view, lock, hide.
+- **Cut, Copy and Paste** — artwork carries the symbols it needs and moves between
+  documents. **Align, Distribute and Match Size** in `Modify ▸ Align`, with or without
+  the stage as the frame. **Arrow-key nudge**, one unit and eight with Shift.
 - Timeline with Animate's frame conventions, onion skin, Edit Multiple Frames,
   Auto Keyframe, a looping section, two zooms, and layer switches on the rows.
 - **Tweens** — classic, motion and shape, with easing in the model.
@@ -164,7 +167,6 @@ waiting on other people, some are simply not built yet, and some are choices.
 | Missing | Consequence | Ref |
 |---|---|---|
 | **Text tool** | No titles or credits without drawing them by hand or importing them. Needs font loading, shaping and an editing caret. | §7-9 |
-| **Clipboard (cut/copy/paste)** | Copy and Paste are stubs that set a status line. Artwork cannot move between documents except through the Assets library. Duplicate works. | §7-13 |
 | **GIF/WebP and HTML5 export** | PNG, PNG sequence and MP4/MOV are the outputs; a GIF for a preview or a self-playing HTML5 build are not there. | CP-6.3–6.4 |
 | **Export blocks the document** | One export at a time, and its progress dialog belongs to the document — opening a new file mid-export orphans it. Quitting kills an export in flight. | Wave 5 |
 | **Thumbnails** | The Library and the Assets panel identify a character by its **name**. | §7-17, §7-81 |
@@ -174,8 +176,6 @@ waiting on other people, some are simply not built yet, and some are choices.
 | **AS3 runtime and compiler** | JavaScript scripting works; ActionScript does not exist. | CP-8.3–8.4 |
 | **Bézier pen, Bind tool, bone delete/reparent** | The Pen draws segments; skin weights cannot be painted; rig building is additive-only. | §7-11, §7-34, §7-35 |
 | **Depth of field** | Layers off the focal plane stay perfectly sharp. | §7-29 |
-| **Align and Distribute** | No equivalent to Animate's `Ctrl+K` anywhere in the command set. | — |
-| **Arrow-key nudge** | Artwork moves by dragging or Free Transform only. | §7-72 |
 
 ### 3.3 Deliberate deviations from Animate
 
@@ -197,7 +197,7 @@ exactly as Animate would.
 
 ### 3.4 The long tail
 
-`PROGRESS.md` §7 carries **155 numbered rows, 143 of them still open.** They are
+`PROGRESS.md` §7 carries **155 numbered rows, 141 of them still open.** They are
 the honest record of every place this program does something a reasonable person
 would not expect, from *"a soft brush cannot paint across strokes"* (§7-164) to
 *"a recovered document does not remember what it was"* (§7-102). Most are small,
@@ -283,12 +283,12 @@ blur and alpha video at export; a command palette.
 | Render quality across 13 decades | constant ~4.01% ink |
 | GPU frame time at 1e12% | 0.9 ms |
 | Threads in use | 20 interactive + 6 background |
-| Tests | 1 456 passing, clippy clean |
+| Tests | 1 482 passing, clippy clean |
 | Rust source | ~48 000 lines across 16 crates |
 | Format version | 18 |
 | IK budget | 50 six-bone rigs in parallel, inside one frame |
 | First frame of a heavy scene | 305 ms, then cached (§7-155) |
-| Open items in §7 | 143 of 155 |
+| Open items in §7 | 141 of 155 |
 
 ---
 

@@ -182,6 +182,16 @@ pub enum Command {
     // Tools
     SelectTool(super::tools::ToolId),
 
+    /// Line the selection up. Animate's Modify ▸ Align.
+    ///
+    /// `to_stage` is carried on the command rather than read from a panel
+    /// toggle, because it changes what the operation *means* — towards each
+    /// other, or towards the frame — and a command that did one or the other
+    /// depending on hidden state is a command you cannot predict.
+    Align { op: super::align::Align, to_stage: bool },
+    Distribute(super::align::Distribute),
+    MatchSize(super::align::MatchSize),
+
     /// Move the selection by whole document units, from the arrow keys.
     ///
     /// Carried as one command with a vector rather than four commands, because
@@ -320,6 +330,9 @@ impl Command {
 
             SelectTool(_) => "Tool",
             Nudge { .. } => "Nudge",
+            Align { op, .. } => op.label(),
+            Distribute(op) => op.label(),
+            MatchSize(op) => op.label(),
         }
     }
 
@@ -468,6 +481,9 @@ impl Command {
             // sizes is eight bindings for one action, and none of them belongs
             // in a menu.
             Nudge { .. } => None,
+            // Thirteen operations behind one menu. Animate gives the panel a
+            // key, not the operations.
+            Align { .. } | Distribute(_) | MatchSize(_) => None,
         }
     }
 
@@ -496,6 +512,9 @@ impl Command {
                 | ConvertToSymbol
                 | BrushFromSelection
                 | Nudge { .. }
+                | Align { .. }
+                | Distribute(_)
+                | MatchSize(_)
         )
     }
 }

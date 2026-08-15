@@ -327,6 +327,18 @@ count. Preset serde round-trip and `quit_blockers` are plain unit tests.
 
 ## Wave 6 — The compositor: bloom, grain, vignette, grade (M)
 
+> **✅ Shipped.** `buzz-render/src/compositor.{rs,wgsl}` — a raw-wgpu post chain
+> (bright-pass → half-res Kawase bloom → fused grade/vignette/grain), run from
+> the app's blit seam (`buzz-app/src/app.rs`) and the exporter
+> (`buzz-export/src/lib.rs`, `apply_post`) through the **same** `Compositor::run`,
+> so stage and film match. `PostSettings` on `StageProperties`; format **v20**.
+> Effects UI in the document properties. Tested on real GPU: disabled is
+> bit-identical, vignette/bloom/grain verified, export parity.
+> **Deviation from the design below:** a single half-resolution Kawase ping-pong
+> replaces the dual-Kawase pyramid — same `new`/`resize`/`run` API, simpler
+> internals. **Depth of field ships in Wave 9c**, not here, to avoid touching the
+> render walk twice.
+
 ### Decision
 
 A raw-wgpu post-pass chain in `buzz-render`, inserted between Vello's output and the
@@ -645,6 +657,15 @@ empty.
 
 ### 9a · Keyframed lights (M)
 
+> **✅ Shipped.** `buzz-light/src/track.rs` — `LightTrack`/`LightKey`, `Light.track`,
+> `LightRig::resolved_at(frame) -> Cow`. The renderer resolves the rig per frame
+> into `DrawCtx.lights` (an `Arc`), so the existing **per-light** shading-cache
+> keying gives cache-warmth for free: a static light in an animated rig keeps its
+> fingerprint and stays cached. Format **v21**. Tested: interpolation units, serde
+> round-trip, real-GPU render (a climbing sun brightens the frame; a static rig
+> does not). **Not yet built:** the in-app timeline light channel and on-stage
+> keyframe gizmos — the model, render and format are done and reachable via file.
+
 Today `LightRig` is a plain field on `Scene` (`buzz-scene/src/lib.rs:180`) with no
 notion of frames, so a sun cannot swing through a shot the way the camera can (§7-47).
 
@@ -701,6 +722,14 @@ dragging a gizmo writes a key at the playhead the way the camera does. Closes §
 
 ### 9b · Depth sorting (S)
 
+> **✅ Shipped.** Opt-in `StageProperties::sort_by_depth`;
+> `LayerStack::depth_paint_order` sorts mask-group **units** (mask + its masked
+> run move together) by depth, stably, so equal depths are byte-identical to the
+> timeline order. Wired at `document.rs` `draw_layers`; UI toggle in document
+> properties; format **v21**. Tested: equal-depth identity, furthest-first order,
+> mask-run stays contiguous. Per-object `Spatial.z` sort within a layer is the
+> one remaining sub-item.
+
 `Layer.depth` (`buzz-scene/src/layer.rs:188`) drives parallax and projection but
 explicitly does **not** reorder drawing, so two layers that cross in space still draw
 one wholly in front of the other (§7-60, §7-65).
@@ -723,6 +752,15 @@ free for anyone who leaves every depth at zero, and gives the opt-out an exact
 definition: identical output.
 
 ### 9c · Depth of field, the honest half (M)
+
+> **🟡 Geometric half shipped; sliced half not.** `CameraTrack.aperture` +
+> `focus_depth` + `dof_blur(depth)`; the renderer folds the DOF blur into the
+> per-shape filter blur (`document.rs` `combine_blur`), so a layer off the focus
+> plane softens with no new pipeline. DOF UI in document properties; format
+> **v21**. Real-GPU test: an aperture widens an out-of-focus edge. **Not built:**
+> the per-pixel *sliced* compositor DOF described below (K depth slices → CoC
+> blur → back-to-front composite), the honest upgrade over this approximation.
+> Aperture is a document-level field here, not yet a keyable per-key one.
 
 Wave 6 ships geometric DOF by reusing the per-shape blur hook. This replaces it when
 enabled: bucket layers into K depth slices (4–6), render each through the existing
@@ -753,6 +791,15 @@ today. A golden render of two overlapping rectangles with swapped depths flips.
 ---
 
 ## Wave 10 — The film: `.buzzproj` (M)
+
+> **✅ Core shipped.** `buzz-doc/src/project.rs` — `Project`/`Shot` with their own
+> JSON versioning (`PROJECT_VERSION`), relative-path resolution, and same-frame-rate
+> validation returning a list of `FilmError`. `buzz-export/src/film.rs`
+> `concat_segments` joins per-shot segments with ffmpeg's concat demuxer
+> (`-c copy -fflags +genpts`). Tested: project serde/validation units, and a
+> real-GPU+ffmpeg headless film (two four-frame shots → an eight-frame film,
+> ffprobe-verified). **Not yet built:** the in-app Project panel and the wiring
+> that enqueues each shot on the Wave-5 export queue then fires the concat task.
 
 ### Decision
 
@@ -811,6 +858,11 @@ mismatched frame rates.
 ---
 
 ## Wave 10b — Camera angles: stage once, shoot from anywhere (S–M)
+
+> **🟡 Model shipped; panel not.** `CameraTrack.angles: Vec<NamedAngle>` with
+> `save_angle`/`angle`/`remove_angle`, and `Shot.angle` on the project file;
+> format **v21**, round-trip tested. **Not built:** the Angles panel and the
+> `Camera ▸ Save Angle` / `Cut to Angle at Playhead` commands.
 
 The direct answer to *"I have to set the scene up again for a different angle, and that
 takes time as well."*

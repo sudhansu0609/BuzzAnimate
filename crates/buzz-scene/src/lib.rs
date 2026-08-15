@@ -33,6 +33,7 @@ pub mod layer;
 pub mod looping;
 pub mod merge;
 pub mod object;
+pub mod post;
 pub mod raster;
 pub mod rig;
 pub mod sound;
@@ -49,8 +50,8 @@ use peniko::Color;
 use serde::{Deserialize, Serialize};
 
 pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, Quality};
-pub use buzz_light::{Light, LightId, LightKind, LightRig};
-pub use camera_track::{CameraKey, CameraTrack, MAX_TILT};
+pub use buzz_light::{Light, LightId, LightKey, LightKind, LightRig, LightTrack};
+pub use camera_track::{CameraKey, CameraTrack, MAX_TILT, NamedAngle};
 pub use gradient::{
     Gradient, GradientHandles, GradientKind, GradientSpread, GradientStop, MAX_STOPS, lerp_color,
 };
@@ -62,6 +63,7 @@ pub use merge::{ImportTarget, MergeReport};
 pub use object::{
     FillSpec, Object, ObjectId, ObjectKind, Paint, PaintBlend, ShapeData, Spatial, StrokeSpec,
 };
+pub use post::{BloomSettings, GradeSettings, GrainSettings, PostSettings, VignetteSettings};
 pub use raster::{Canvas, SoftBrush};
 pub use rig::{ArmatureData, NamedPose, RigBinding, RigPart, WarpData};
 pub use sound::{SoundAsset, SoundCue, SoundId, SoundLibrary, SoundRef, SoundSync};
@@ -80,6 +82,19 @@ pub struct StageProperties {
     pub size: Size,
     pub background: Color,
     pub frame_rate: f64,
+    /// The full-frame look: bloom, grade, vignette and grain. Off by default,
+    /// so a stage that never opens the Effects panel behaves exactly as one did
+    /// before the compositor existed. See [`crate::PostSettings`].
+    pub post: PostSettings,
+    /// Draw layers ordered by their depth rather than by the timeline.
+    ///
+    /// **Off by default, and byte-identical to the timeline order when every
+    /// depth is equal.** Existing films rely on paint order being the timeline's,
+    /// so reordering them silently would change work already finished. When on,
+    /// layers that cross in space resolve by which is nearer the camera instead
+    /// of one always drawing wholly in front. A mask and the layers it clips move
+    /// together, or the mask would stop meaning anything.
+    pub sort_by_depth: bool,
 }
 
 impl Default for StageProperties {
@@ -88,6 +103,8 @@ impl Default for StageProperties {
             size: Size::new(550.0, 400.0),
             background: Color::WHITE,
             frame_rate: 24.0,
+            post: PostSettings::default(),
+            sort_by_depth: false,
         }
     }
 }

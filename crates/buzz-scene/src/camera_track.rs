@@ -91,6 +91,19 @@ pub const DEFAULT_FOCAL_DISTANCE: f64 = 1000.0;
 /// better than a frame filled by one runaway layer.
 const NEAR_PLANE: f64 = 1.0;
 
+/// A named camera position — a "shot" of the staged scene.
+///
+/// An angle is a *camera state*, not a new scene: the stage is furniture,
+/// characters and lights, and the camera already carries everything a viewpoint
+/// needs — centre, zoom, roll, pitch, yaw. Naming one lets an animator stage a
+/// set once and shoot it from several angles, jumping between them or cutting
+/// between them on the timeline. See [`CameraTrack::angles`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedAngle {
+    pub name: String,
+    pub state: CameraKey,
+}
+
 /// The camera's keyframes over the whole timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CameraTrack {
@@ -101,6 +114,19 @@ pub struct CameraTrack {
     /// This is what turns a layer's depth into a size: the smaller it is, the
     /// more violent the perspective, exactly as a shorter lens exaggerates it.
     pub focal_distance: f64,
+    /// Depth-of-field strength, in blur document-units per unit of depth away
+    /// from focus. Zero — the default — is a pinhole camera: everything sharp.
+    ///
+    /// This is the *geometric* half of depth of field: layers off the focal
+    /// plane get a blur proportional to how far out of focus they are, reusing
+    /// the per-shape blur the filter path already draws. The per-pixel sliced
+    /// version is a later upgrade; this one ships by reusing what exists.
+    pub aperture: f64,
+    /// The layer depth that is in focus. Zero is the focal plane.
+    pub focus_depth: f64,
+    /// Named viewpoints of the staged scene — Wave 10b. Empty for every
+    /// document that never saves one.
+    pub angles: Vec<NamedAngle>,
     /// Sorted by frame.
     keys: Vec<CameraKey>,
 }
@@ -110,6 +136,9 @@ impl Default for CameraTrack {
         Self {
             enabled: false,
             focal_distance: DEFAULT_FOCAL_DISTANCE,
+            aperture: 0.0,
+            focus_depth: 0.0,
+            angles: Vec::new(),
             keys: Vec::new(),
         }
     }
@@ -426,8 +455,49 @@ impl CameraTrack {
             } else {
                 DEFAULT_FOCAL_DISTANCE
             },
+            aperture: 0.0,
+            focus_depth: 0.0,
+            angles: Vec::new(),
             keys,
         }
+    }
+
+    /// The depth-of-field blur, in document units, for a layer at `depth`.
+    ///
+    /// `None` when the camera is a pinhole (`aperture == 0`) or the layer is in
+    /// focus, so the sharp common case sets no blur at all. The blur grows with
+    /// distance from the focus depth, which is the geometric approximation to a
+    /// lens's circle of confusion.
+    pub fn dof_blur(&self, depth: f64) -> Option<f64> {
+        if self.aperture <= 0.0 {
+            return None;
+        }
+        let coc = self.aperture * (depth - self.focus_depth).abs();
+        (coc > 0.05).then_some(coc)
+    }
+
+    /// Save the camera's state at `frame` under `name`, replacing any angle of
+    /// the same name.
+    pub fn save_angle(&mut self, name: impl Into<String>, frame: u32) {
+        let name = name.into();
+        let state = self
+            .state_at(frame)
+            .unwrap_or_else(|| CameraKey::new(frame, Point::ORIGIN));
+        match self.angles.iter_mut().find(|a| a.name == name) {
+            Some(angle) => angle.state = state,
+            None => self.angles.push(NamedAngle { name, state }),
+        }
+    }
+
+    /// The saved angle of this name, if any.
+    pub fn angle(&self, name: &str) -> Option<&NamedAngle> {
+        self.angles.iter().find(|a| a.name == name)
+    }
+
+    pub fn remove_angle(&mut self, name: &str) -> bool {
+        let before = self.angles.len();
+        self.angles.retain(|a| a.name != name);
+        self.angles.len() != before
     }
 }
 
@@ -463,6 +533,47 @@ mod tests {
         let mut t = CameraTrack::new();
         t.enabled = true;
         t
+    }
+
+    #[test]
+    fn a_pinhole_camera_has_no_depth_of_field() {
+        let track = CameraTrack::new();
+        assert_eq!(track.aperture, 0.0);
+        assert_eq!(track.dof_blur(500.0), None, "no aperture, no blur");
+    }
+
+    #[test]
+    fn depth_of_field_grows_with_distance_from_focus() {
+        let mut track = CameraTrack::new();
+        track.aperture = 0.02;
+        track.focus_depth = 0.0;
+        assert_eq!(track.dof_blur(0.0), None, "the focus plane is sharp");
+        let near = track.dof_blur(200.0).expect("out of focus");
+        let far = track.dof_blur(800.0).expect("further out of focus");
+        assert!(far > near, "further from focus should blur more: {near} vs {far}");
+    }
+
+    #[test]
+    fn a_saved_angle_captures_the_camera_and_comes_back() {
+        let mut track = track();
+        track.set_key(CameraKey {
+            frame: 0,
+            center: Point::new(120.0, 80.0),
+            zoom: 2.5,
+            rotation: 0.3,
+            pitch: 0.0,
+            yaw: 0.0,
+        });
+        track.save_angle("Wide", 0);
+        let angle = track.angle("Wide").expect("saved");
+        assert_eq!(angle.state.center, Point::new(120.0, 80.0));
+        assert_eq!(angle.state.zoom, 2.5);
+
+        // Saving the same name again replaces it rather than duplicating.
+        track.save_angle("Wide", 0);
+        assert_eq!(track.angles.len(), 1);
+        assert!(track.remove_angle("Wide"));
+        assert!(track.angle("Wide").is_none());
     }
 
     #[test]

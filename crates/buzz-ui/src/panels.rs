@@ -1163,6 +1163,174 @@ fn brush_pattern_preview(ui: &mut Ui, style: &DrawStyle) {
 }
 
 /// Contextual properties for the current selection.
+/// The Effects section of the document properties: the full-frame compositor.
+///
+/// Edits a `Copy` of the settings and writes the whole bundle back only when
+/// something actually moved, so an untouched panel never bumps the document's
+/// revision or marks it dirty — the same discipline the width and FPS rows use.
+fn effects_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
+    let mut post = scene.stage().post;
+    let mut changed = false;
+
+    egui::CollapsingHeader::new(RichText::new("Effects").strong())
+        .id_salt("effects-section")
+        .default_open(false)
+        .show(ui, |ui| {
+            changed |= ui
+                .checkbox(&mut post.enabled, "Enable effects")
+                .changed();
+            ui.add_enabled_ui(post.enabled, |ui| {
+                changed |= bloom_controls(ui, &mut post.bloom);
+                changed |= grade_controls(ui, &mut post.grade);
+                changed |= vignette_controls(ui, &mut post.vignette);
+                changed |= grain_controls(ui, &mut post.grain);
+            });
+        });
+
+    if changed {
+        scene.stage_mut().post = post;
+    }
+    changed
+}
+
+/// Depth-of-field controls: a camera aperture and the depth in focus. Writes
+/// back only on change, so an untouched panel never dirties the document.
+fn depth_of_field_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
+    let mut aperture = scene.camera().aperture;
+    let mut focus = scene.camera().focus_depth;
+    let mut changed = false;
+
+    egui::CollapsingHeader::new(RichText::new("Depth of Field").strong())
+        .id_salt("dof-section")
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::Grid::new("dof-grid").num_columns(2).show(ui, |ui| {
+                ui.label("Aperture")
+                    .on_hover_text("0 is a pinhole — everything sharp");
+                if ui
+                    .add(egui::Slider::new(&mut aperture, 0.0..=0.2).step_by(0.001))
+                    .changed()
+                {
+                    scene.camera_mut().aperture = aperture;
+                    changed = true;
+                }
+                ui.end_row();
+
+                ui.label("Focus depth")
+                    .on_hover_text("The layer depth that stays sharp");
+                if ui
+                    .add(egui::DragValue::new(&mut focus).speed(1.0))
+                    .changed()
+                {
+                    scene.camera_mut().focus_depth = focus;
+                    changed = true;
+                }
+                ui.end_row();
+            });
+        });
+    changed
+}
+
+fn bloom_controls(ui: &mut Ui, b: &mut buzz_scene::BloomSettings) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new("Bloom")
+        .id_salt("fx-bloom")
+        .show(ui, |ui| {
+            changed |= ui.checkbox(&mut b.enabled, "On").changed();
+            egui::Grid::new("fx-bloom-grid").num_columns(2).show(ui, |ui| {
+                ui.label("Threshold");
+                changed |= ui
+                    .add(egui::Slider::new(&mut b.threshold, 0.0..=1.0))
+                    .changed();
+                ui.end_row();
+                ui.label("Intensity");
+                changed |= ui
+                    .add(egui::Slider::new(&mut b.intensity, 0.0..=3.0))
+                    .changed();
+                ui.end_row();
+                ui.label("Radius");
+                changed |= ui.add(egui::Slider::new(&mut b.radius, 0.0..=1.0)).changed();
+                ui.end_row();
+            });
+        });
+    changed
+}
+
+fn grade_controls(ui: &mut Ui, g: &mut buzz_scene::GradeSettings) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new("Colour Grade")
+        .id_salt("fx-grade")
+        .show(ui, |ui| {
+            changed |= ui.checkbox(&mut g.enabled, "On").changed();
+            egui::Grid::new("fx-grade-grid").num_columns(2).show(ui, |ui| {
+                ui.label("Exposure");
+                changed |= ui.add(egui::Slider::new(&mut g.exposure, -3.0..=3.0)).changed();
+                ui.end_row();
+                ui.label("Contrast");
+                changed |= ui.add(egui::Slider::new(&mut g.contrast, 0.0..=2.0)).changed();
+                ui.end_row();
+                ui.label("Saturation");
+                changed |= ui.add(egui::Slider::new(&mut g.saturation, 0.0..=2.0)).changed();
+                ui.end_row();
+                ui.label("Temperature");
+                changed |= ui.add(egui::Slider::new(&mut g.temperature, -1.0..=1.0)).changed();
+                ui.end_row();
+                ui.label("Tint");
+                changed |= ui.add(egui::Slider::new(&mut g.tint, -1.0..=1.0)).changed();
+                ui.end_row();
+                ui.label("Lift");
+                changed |= ui.add(egui::Slider::new(&mut g.lift, -0.5..=0.5)).changed();
+                ui.end_row();
+                ui.label("Gamma");
+                changed |= ui.add(egui::Slider::new(&mut g.gamma, 0.1..=3.0)).changed();
+                ui.end_row();
+                ui.label("Gain");
+                changed |= ui.add(egui::Slider::new(&mut g.gain, 0.0..=2.0)).changed();
+                ui.end_row();
+            });
+        });
+    changed
+}
+
+fn vignette_controls(ui: &mut Ui, v: &mut buzz_scene::VignetteSettings) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new("Vignette")
+        .id_salt("fx-vignette")
+        .show(ui, |ui| {
+            changed |= ui.checkbox(&mut v.enabled, "On").changed();
+            egui::Grid::new("fx-vignette-grid").num_columns(2).show(ui, |ui| {
+                ui.label("Amount");
+                changed |= ui.add(egui::Slider::new(&mut v.amount, 0.0..=1.0)).changed();
+                ui.end_row();
+                ui.label("Softness");
+                changed |= ui.add(egui::Slider::new(&mut v.softness, 0.0..=1.0)).changed();
+                ui.end_row();
+                ui.label("Colour");
+                changed |= color_row(ui, "fx-vignette-colour", &mut v.color);
+                ui.end_row();
+            });
+        });
+    changed
+}
+
+fn grain_controls(ui: &mut Ui, g: &mut buzz_scene::GrainSettings) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new("Grain")
+        .id_salt("fx-grain")
+        .show(ui, |ui| {
+            changed |= ui.checkbox(&mut g.enabled, "On").changed();
+            egui::Grid::new("fx-grain-grid").num_columns(2).show(ui, |ui| {
+                ui.label("Amount");
+                changed |= ui.add(egui::Slider::new(&mut g.amount, 0.0..=1.0)).changed();
+                ui.end_row();
+                ui.label("Size");
+                changed |= ui.add(egui::Slider::new(&mut g.size, 1.0..=8.0)).changed();
+                ui.end_row();
+            });
+        });
+    changed
+}
+
 pub fn properties_panel(
     ui: &mut Ui,
     scene: &mut Scene,
@@ -1223,7 +1391,25 @@ pub fn properties_panel(
                 changed = true;
             }
             ui.end_row();
+
+            ui.label("Sort by depth")
+                .on_hover_text("Draw layers ordered by depth rather than the timeline");
+            let mut sort = scene.stage().sort_by_depth;
+            if ui.checkbox(&mut sort, "").changed() {
+                scene.stage_mut().sort_by_depth = sort;
+                changed = true;
+            }
+            ui.end_row();
         });
+
+        // Depth of field: a document-level camera setting, so it sits with the
+        // document rather than in the timeline.
+        changed |= depth_of_field_properties(ui, scene);
+
+        // The full-frame look. Its own section because it is a different kind of
+        // thing from the stage's size — the colour and mood of the finished
+        // film, not its dimensions.
+        changed |= effects_properties(ui, scene);
     } else if let Some(bounds) = selection.bounds(scene) {
         egui::Grid::new("sel-props").num_columns(2).show(ui, |ui| {
             ui.label("X");

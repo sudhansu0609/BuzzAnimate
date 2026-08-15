@@ -224,6 +224,7 @@ struct Active {
     surface_config: wgpu::SurfaceConfiguration,
     gpu: GpuContext,
     blitter: wgpu::util::TextureBlitter,
+    compositor: buzz_render::Compositor,
     target: Option<TargetTexture>,
 
     egui_ctx: egui::Context,
@@ -500,6 +501,10 @@ impl App {
         surface.configure(&gpu.device, &surface_config);
 
         let blitter = wgpu::util::TextureBlitter::new(&gpu.device, format);
+        // The full-frame compositor writes to the surface directly, so it is
+        // built for the surface format. When the document has no effects the
+        // blitter above is used instead, so a plain document pays nothing.
+        let compositor = buzz_render::Compositor::new(&gpu.device, format);
 
         let egui_ctx = egui::Context::default();
         // The saved layout carries the interface theme, so the window opens in
@@ -523,6 +528,7 @@ impl App {
             surface_config,
             gpu,
             blitter,
+            compositor,
             target: None,
             egui_ctx,
             egui_state,
@@ -4296,9 +4302,29 @@ impl App {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("buzz-frame"),
                 });
-        active
-            .blitter
-            .copy(&active.gpu.device, &mut encoder, target, &surface_view);
+        // The artwork reaches the screen one of two ways. With no effects the
+        // blitter is a straight copy, exactly as before the compositor existed.
+        // With a look set, the compositor runs its chain from the same texture
+        // into the same surface — the seam the design is built on. The exporter
+        // calls the identical `Compositor::run`, so screen and film cannot drift.
+        let post = self.editor.scene().stage().post;
+        if post.is_identity() {
+            active
+                .blitter
+                .copy(&active.gpu.device, &mut encoder, target, &surface_view);
+        } else {
+            active.compositor.run(
+                &active.gpu.device,
+                &active.gpu.queue,
+                &mut encoder,
+                target,
+                &surface_view,
+                w,
+                h,
+                &post,
+                self.editor.frame(),
+            );
+        }
 
         for (id, delta) in &output.textures_delta.set {
             active

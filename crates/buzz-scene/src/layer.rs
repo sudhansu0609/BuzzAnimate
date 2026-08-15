@@ -181,10 +181,12 @@ pub struct Layer {
     /// pans. Negative is nearer: larger, and faster. This is Animate's Layer
     /// Depth, and it is what produces parallax.
     ///
-    /// Depth does **not** reorder drawing. Paint order is still the layer
+    /// Depth does **not** reorder drawing by default. Paint order is the layer
     /// order in the timeline, exactly as in Animate — a layer pushed into the
     /// distance keeps its place in the stack, so pushing a foreground layer
-    /// back shrinks it without sending it behind anything.
+    /// back shrinks it without sending it behind anything. The stage's opt-in
+    /// `sort_by_depth` changes that, ordering layers by this value instead; see
+    /// [`LayerStack::depth_paint_order`].
     pub depth: f64,
     /// Folders only: whether children are hidden in the timeline. Purely a UI
     /// state — it never affects rendering.
@@ -640,6 +642,58 @@ impl LayerStack {
             .filter(move |l| l.is_drawable_at(frame) && self.is_effectively_visible(l.id))
     }
 
+    /// Back to front, ordered by layer depth rather than by the timeline.
+    ///
+    /// Furthest from the camera (largest depth) is painted first. A mask and its
+    /// run of masked layers move as **one unit** and keep their relative order,
+    /// so the mask still owns an unbroken run — the invariant the render walk
+    /// relies on. The sort is **stable**, so layers at equal depth keep the
+    /// timeline's order; with every depth equal the result is exactly
+    /// [`Self::paint_order`], which is what makes the feature free for any
+    /// document that leaves depth alone.
+    pub fn depth_paint_order(&self) -> Vec<&Arc<Layer>> {
+        // Units in timeline (front-to-back) order, each tagged with the depth it
+        // sorts by — the mask's, for a mask group.
+        let mut units: Vec<(f64, Vec<&Arc<Layer>>)> = Vec::new();
+        let mut i = 0;
+        while i < self.layers.len() {
+            let layer = &self.layers[i];
+            if layer.kind.is_mask() {
+                let mut unit = vec![layer];
+                let mut j = i + 1;
+                while j < self.layers.len() && self.layers[j].kind == LayerKind::Masked {
+                    unit.push(&self.layers[j]);
+                    j += 1;
+                }
+                units.push((layer.depth, unit));
+                i = j;
+            } else {
+                units.push((layer.depth, vec![layer]));
+                i += 1;
+            }
+        }
+
+        // Reverse to paint order (back to front), inside units and out, so the
+        // pre-sort sequence is exactly `paint_order()`. Then a stable sort by
+        // depth descending puts the furthest unit first and leaves equal depths
+        // in that paint order — byte-identical output when nothing uses depth.
+        units.reverse();
+        for (_, unit) in &mut units {
+            unit.reverse();
+        }
+        units.sort_by(|a, b| b.0.total_cmp(&a.0));
+        units.into_iter().flat_map(|(_, unit)| unit).collect()
+    }
+
+    /// Drawable layers at `frame`, depth-ordered. The depth-sorted sibling of
+    /// [`Self::drawable_at`], used when the stage's `sort_by_depth` is on.
+    pub fn drawable_at_by_depth(&self, frame: u32) -> Vec<&Arc<Layer>> {
+        self.depth_paint_order()
+            .into_iter()
+            .filter(|l| l.is_drawable_at(frame) && self.is_effectively_visible(l.id))
+            .collect()
+    }
+
     /// Longest layer, which is the document's frame count.
     pub fn frame_count(&self) -> u32 {
         self.layers.iter().map(|l| l.length()).max().unwrap_or(1)
@@ -690,6 +744,63 @@ mod tests {
             painted,
             vec![3, 2, 1],
             "the bottom layer must paint first so the top layer lands on top"
+        );
+    }
+
+    /// With every depth equal, the depth order is exactly the timeline order —
+    /// the guarantee that makes the feature free for documents that ignore it.
+    #[test]
+    fn depth_order_with_equal_depths_matches_paint_order() {
+        let s = stack(&[
+            (1, "top", LayerKind::Normal),
+            (2, "middle", LayerKind::Normal),
+            (3, "bottom", LayerKind::Normal),
+        ]);
+        let plain: Vec<u64> = s.paint_order().map(|l| l.id.0).collect();
+        let by_depth: Vec<u64> = s.depth_paint_order().iter().map(|l| l.id.0).collect();
+        assert_eq!(by_depth, plain);
+    }
+
+    /// A layer pushed into the distance paints behind a nearer one, whatever the
+    /// timeline says.
+    #[test]
+    fn depth_order_puts_the_furthest_layer_first() {
+        let mut s = stack(&[
+            (1, "near-on-top", LayerKind::Normal),
+            (2, "far-below", LayerKind::Normal),
+        ]);
+        // Make the top layer nearer (small depth) and the bottom one far.
+        s.update(LayerId(1), |l| l.depth = -100.0);
+        s.update(LayerId(2), |l| l.depth = 500.0);
+
+        let by_depth: Vec<u64> = s.depth_paint_order().iter().map(|l| l.id.0).collect();
+        // Furthest (id 2, depth 500) paints first; nearest (id 1) last, on top.
+        assert_eq!(by_depth, vec![2, 1]);
+    }
+
+    /// A mask and its masked run move together, keeping the run unbroken.
+    #[test]
+    fn depth_order_keeps_a_mask_with_its_run() {
+        let mut s = stack(&[
+            (1, "faraway", LayerKind::Normal),
+            (2, "mask", LayerKind::Mask),
+            (3, "masked", LayerKind::Masked),
+        ]);
+        // Push the plain layer far away so it must sort behind the mask group,
+        // and give the mask group a nearer depth.
+        s.update(LayerId(1), |l| l.depth = 900.0);
+        s.update(LayerId(2), |l| l.depth = 0.0);
+
+        let ids: Vec<u64> = s.depth_paint_order().iter().map(|l| l.id.0).collect();
+        // The far plain layer paints first; then the mask group, mask and its
+        // masked layer still adjacent.
+        assert_eq!(ids, vec![1, 3, 2]);
+        let mask_pos = ids.iter().position(|&i| i == 2).unwrap();
+        let masked_pos = ids.iter().position(|&i| i == 3).unwrap();
+        assert_eq!(
+            mask_pos.abs_diff(masked_pos),
+            1,
+            "the mask and its masked layer must stay adjacent"
         );
     }
 

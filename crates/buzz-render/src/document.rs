@@ -319,7 +319,16 @@ fn draw_layers(
     let masks = active_masks(layers, options.masks);
     let mut open: Option<OpenMask> = None;
 
-    for layer in layers.drawable_at(frame) {
+    // Depth ordering is opt-in on the stage. The masked run stays contiguous
+    // either way, so the mask machinery below is untouched; only the order the
+    // layers arrive in changes. With every depth equal, the two orders are
+    // identical — see `LayerStack::depth_paint_order`.
+    let ordered: Vec<&Arc<buzz_scene::Layer>> = if scene.stage().sort_by_depth {
+        layers.drawable_at_by_depth(frame)
+    } else {
+        layers.drawable_at(frame).collect()
+    };
+    for layer in ordered {
         // A mask layer's own artwork is never drawn in the finished picture:
         // it is a stencil, and Animate hides it for the same reason. It still
         // has to be *found*, which is what `active_masks` did.
@@ -562,7 +571,11 @@ fn draw_layer(
         // How this layer is lit. Worked out once here rather than per shape:
         // every shape on a layer shares its depth, and therefore its distance
         // from the light and the length of what it casts.
-        let rig = scene.lights();
+        // The rig, resolved at this frame: a keyframed light contributes its
+        // state *now*. Static rigs resolve to themselves, so the shading cache
+        // (keyed per light) keeps hitting.
+        let lights = Arc::new(scene.lights().resolved_at(frame).into_owned());
+        let rig: &buzz_scene::LightRig = &lights;
         let lit = options.lit && rig.is_active() && tint.is_none();
         let stage_height = scene.stage().size.height;
         // Whether this layer is lit at all is decided here; *how much* light
@@ -578,6 +591,7 @@ fn draw_layer(
 
         let ctx = DrawCtx {
             scene,
+            lights: lights.clone(),
             frame,
             elapsed: frame
                 - layer
@@ -678,11 +692,20 @@ fn draw_layer(
             None => ctx.clone(),
         };
 
+        // Depth of field: a layer off the focus plane is blurred in proportion
+        // to how far out of focus it is. The **geometric** approximation — it
+        // reuses the per-shape blur the filter path already draws, so it costs
+        // no new pipeline. `None` for a pinhole camera or a layer in focus, so
+        // a document that sets no aperture is untouched.
+        let dof_blur = scene.camera().dof_blur(layer.depth);
+
         if !layer_fx.as_ref().is_some_and(|fx| fx.hide_subject) {
             for (object, owner) in resolved.iter_owned() {
                 let mut object_ctx = layer_ctx.clone();
-                // A layer blur applies to every shape on the layer.
-                object_ctx.blur = layer_fx.as_ref().and_then(|fx| fx.blur);
+                // A layer blur applies to every shape on the layer, and depth of
+                // field adds to it — the wider of the two wins, so a blurred
+                // background layer thrown out of focus is not blurred twice.
+                object_ctx.blur = combine_blur(layer_fx.as_ref().and_then(|fx| fx.blur), dof_blur);
                 draw_object(builder, object, owner, Affine::IDENTITY, &object_ctx, cache);
             }
         }
@@ -727,6 +750,21 @@ fn has_additive_paint(object: &Object, scene: &Scene, depth: usize) -> bool {
     }
 }
 
+/// Fold a depth-of-field blur into a layer's filter blur, taking the wider of
+/// the two so a background layer that is both filter-blurred and out of focus is
+/// blurred once rather than twice.
+fn combine_blur(
+    filter: Option<(f64, f64, buzz_fx::Quality)>,
+    dof: Option<f64>,
+) -> Option<(f64, f64, buzz_fx::Quality)> {
+    match (filter, dof) {
+        (Some((rx, ry, q)), Some(d)) => Some((rx.max(d), ry.max(d), q)),
+        (Some(blur), None) => Some(blur),
+        (None, Some(d)) => Some((d, d, buzz_fx::Quality::Medium)),
+        (None, None) => None,
+    }
+}
+
 /// State the draw walk carries down through groups and nested symbols.
 ///
 /// Descending into an instance changes nearly all of it — the frame, the
@@ -735,6 +773,12 @@ fn has_additive_paint(object: &Object, scene: &Scene, depth: usize) -> bool {
 #[derive(Clone)]
 struct DrawCtx<'a> {
     scene: &'a Scene,
+    /// The light rig **resolved at the stage frame** — every keyframed light
+    /// evaluated to concrete values. Read instead of `scene.lights()` so a
+    /// keyframed sun lights and shadows at the frame being drawn, while a static
+    /// rig resolves to the same values and keeps the shading cache warm. An
+    /// `Arc` so the nested contexts of symbol drawing share it by a pointer bump.
+    lights: Arc<buzz_scene::LightRig>,
     /// Which frame of *this* timeline is being drawn. A nested graphic symbol
     /// runs on its own frame number, not the stage's.
     frame: u32,
@@ -1165,7 +1209,7 @@ fn draw_shape(
     let here = placed.bounding_box().center();
     let light = ctx
         .lighting
-        .map(|(stage_height, depth)| ctx.scene.lights().illuminate(here, depth, stage_height));
+        .map(|(stage_height, depth)| ctx.lights.illuminate(here, depth, stage_height));
 
     // Where a gradient's unit space lands. The gradient is stored in the
     // shape's own coordinates, so `doc` puts it in the document, and the
@@ -1236,7 +1280,7 @@ fn draw_shape(
         // glint towards it. Both are the artwork's own outline, offset, which
         // is what makes them read as form rather than as a filter over it.
         if let Some(light) = &light
-            && let Some(key) = ctx.scene.lights().key()
+            && let Some(key) = ctx.lights.key()
         {
             // **The same arguments the shadow pass used.** The cache keys on
             // the object, not on what the caller happens to want, so asking
@@ -1247,7 +1291,7 @@ fn draw_shape(
             //
             // One entry holds all three pieces; each pass draws the ones it
             // is responsible for, and the booleans are paid for once.
-            let modelling = ctx.scene.lights().modelling;
+            let modelling = ctx.lights.modelling;
             let height = ctx.scene.shadow_height(ctx.layer_depth, key);
             let geometry = cache.lights.shade(
                 owner,
@@ -1338,7 +1382,7 @@ fn cast_shadows_within(
 ) {
     // Asked for with modelling on so the entry this builds is the same one
     // `draw_shape` will look up: one set of booleans, used by both passes.
-    let modelling = ctx.scene.lights().modelling;
+    let modelling = ctx.lights.modelling;
     if !object.visible {
         return;
     }

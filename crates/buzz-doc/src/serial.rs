@@ -69,7 +69,17 @@ use serde::{Deserialize, Serialize};
 /// keyframe at frame 0, which is exactly what it meant; version 2 simply has
 /// no library and no tweens, and both default to empty. Keeping those paths is
 /// cheap and it exercises the version check for real rather than in theory.
-pub const FORMAT_VERSION: u32 = 19;
+///
+/// * **20** — the compositor: the stage carries a `PostSettings` (bloom, grade,
+///   vignette, grain). Absent in every older file and in any document with the
+///   look left at its default, so a document with no effects is written exactly
+///   as version 19 wrote it.
+/// * **21** — 2.5D: lights carry a `LightTrack` so a sun can swing through a
+///   shot; the stage carries `sort_by_depth`; the camera carries a keyable
+///   aperture; and the camera carries named angles. Every one is absent in older
+///   files and in any document that does not use it, so a document that keyframes
+///   nothing is written exactly as version 20 wrote it.
+pub const FORMAT_VERSION: u32 = 21;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -216,6 +226,176 @@ pub struct LightDto {
     pub height: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radius: Option<f64>,
+    /// The light's animation. Version 21. Absent in older files and in any
+    /// static light, which is nearly all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<LightTrackDto>,
+}
+
+/// A light's keyframes. Version 21.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightTrackDto {
+    pub enabled: bool,
+    pub keys: Vec<LightKeyDto>,
+}
+
+/// One light keyframe. Carries the same flat kind fields as [`LightDto`], for
+/// the same reason: the format must not be welded to a Rust enum.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightKeyDto {
+    pub frame: u32,
+    pub color: String,
+    pub intensity: f32,
+    pub softness: f64,
+    pub standing_height: f64,
+    pub shadow_strength: f32,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azimuth: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elevation: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f64>,
+}
+
+/// The flat serialised form of a [`buzz_scene::LightKind`]: a kind string plus
+/// whichever numbers that kind needs. Shared by [`LightDto`] and [`LightKeyDto`]
+/// so the two can never disagree on how a kind is written.
+struct FlatKind {
+    kind: String,
+    azimuth: Option<f64>,
+    elevation: Option<f64>,
+    horizon: Option<String>,
+    position: Option<[f64; 2]>,
+    height: Option<f64>,
+    radius: Option<f64>,
+}
+
+fn kind_to_flat(kind: buzz_scene::LightKind) -> FlatKind {
+    let mut flat = FlatKind {
+        kind: kind.label().to_ascii_lowercase(),
+        azimuth: None,
+        elevation: None,
+        horizon: None,
+        position: None,
+        height: None,
+        radius: None,
+    };
+    match kind {
+        buzz_scene::LightKind::Sun { azimuth, elevation } => {
+            flat.azimuth = Some(azimuth);
+            flat.elevation = Some(elevation);
+        }
+        buzz_scene::LightKind::Sky { horizon } => {
+            flat.horizon = Some(color_to_hex(horizon));
+        }
+        buzz_scene::LightKind::Lamp {
+            position,
+            height,
+            radius,
+        } => {
+            flat.position = Some([position.x, position.y]);
+            flat.height = Some(height);
+            flat.radius = Some(radius);
+        }
+    }
+    flat
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flat_to_kind(
+    kind: &str,
+    azimuth: Option<f64>,
+    elevation: Option<f64>,
+    horizon: Option<&str>,
+    position: Option<[f64; 2]>,
+    height: Option<f64>,
+    radius: Option<f64>,
+) -> Result<buzz_scene::LightKind, SerialError> {
+    Ok(match kind {
+        "sun" => buzz_scene::LightKind::Sun {
+            azimuth: azimuth.unwrap_or(-0.6),
+            elevation: elevation.unwrap_or(0.9),
+        },
+        "lamp" => buzz_scene::LightKind::Lamp {
+            position: position
+                .map(|p| buzz_geom::Point::new(p[0], p[1]))
+                .unwrap_or(buzz_geom::Point::new(275.0, 200.0)),
+            height: height.unwrap_or(160.0),
+            radius: radius.unwrap_or(320.0),
+        },
+        _ => buzz_scene::LightKind::Sky {
+            horizon: horizon
+                .map(color_from_hex)
+                .transpose()?
+                .unwrap_or(Color::from_rgb8(0x9A, 0x8C, 0x78)),
+        },
+    })
+}
+
+impl LightKeyDto {
+    fn from_key(key: &buzz_scene::LightKey) -> Self {
+        let flat = kind_to_flat(key.kind);
+        Self {
+            frame: key.frame,
+            color: color_to_hex(key.color),
+            intensity: key.intensity,
+            softness: key.softness,
+            standing_height: key.standing_height,
+            shadow_strength: key.shadow_strength,
+            kind: flat.kind,
+            azimuth: flat.azimuth,
+            elevation: flat.elevation,
+            horizon: flat.horizon,
+            position: flat.position,
+            height: flat.height,
+            radius: flat.radius,
+        }
+    }
+
+    fn to_key(&self) -> Result<buzz_scene::LightKey, SerialError> {
+        Ok(buzz_scene::LightKey {
+            frame: self.frame,
+            color: color_from_hex(&self.color)?,
+            intensity: self.intensity,
+            softness: self.softness,
+            standing_height: self.standing_height,
+            shadow_strength: self.shadow_strength,
+            kind: flat_to_kind(
+                &self.kind,
+                self.azimuth,
+                self.elevation,
+                self.horizon.as_deref(),
+                self.position,
+                self.height,
+                self.radius,
+            )?,
+        })
+    }
+}
+
+impl LightTrackDto {
+    fn from_track(track: &buzz_scene::LightTrack) -> Self {
+        Self {
+            enabled: track.enabled,
+            keys: track.keys().iter().map(LightKeyDto::from_key).collect(),
+        }
+    }
+
+    fn to_track(&self) -> Result<buzz_scene::LightTrack, SerialError> {
+        let mut track = buzz_scene::LightTrack::new();
+        track.enabled = self.enabled;
+        for key in &self.keys {
+            track.set_key(key.to_key()?);
+        }
+        Ok(track)
+    }
 }
 
 /// One filter on an object or a layer. Version 9.
@@ -572,6 +752,137 @@ pub struct StageDto {
     pub height: f64,
     pub background: String,
     pub frame_rate: f64,
+    /// The full-frame look. Version 20. Absent in older files and in any
+    /// document whose effects are at their default, which is most of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post: Option<PostDto>,
+    /// Draw layers by depth rather than the timeline. Version 21. Absent when
+    /// off, which is every older file and most documents.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sort_by_depth: bool,
+}
+
+/// The compositor settings. Written flat, like [`LightDto`], so the runtime
+/// [`buzz_scene::PostSettings`] can gain fields without moving the format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostDto {
+    pub enabled: bool,
+    pub bloom: BloomDto,
+    pub grade: GradeDto,
+    pub vignette: VignetteDto,
+    pub grain: GrainDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BloomDto {
+    pub enabled: bool,
+    pub threshold: f32,
+    pub intensity: f32,
+    pub radius: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GradeDto {
+    pub enabled: bool,
+    pub exposure: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub temperature: f32,
+    pub tint: f32,
+    pub lift: f32,
+    pub gamma: f32,
+    pub gain: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VignetteDto {
+    pub enabled: bool,
+    pub amount: f32,
+    pub softness: f32,
+    /// `#RRGGBB` or `#RRGGBBAA`, as every other colour in this format.
+    pub color: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrainDto {
+    pub enabled: bool,
+    pub amount: f32,
+    pub size: f32,
+}
+
+impl PostDto {
+    /// Written only when the look is not the default, so an unmodified document
+    /// is byte-identical to what version 19 wrote.
+    fn from_settings(p: &buzz_scene::PostSettings) -> Option<Self> {
+        if *p == buzz_scene::PostSettings::default() {
+            return None;
+        }
+        Some(Self {
+            enabled: p.enabled,
+            bloom: BloomDto {
+                enabled: p.bloom.enabled,
+                threshold: p.bloom.threshold,
+                intensity: p.bloom.intensity,
+                radius: p.bloom.radius,
+            },
+            grade: GradeDto {
+                enabled: p.grade.enabled,
+                exposure: p.grade.exposure,
+                contrast: p.grade.contrast,
+                saturation: p.grade.saturation,
+                temperature: p.grade.temperature,
+                tint: p.grade.tint,
+                lift: p.grade.lift,
+                gamma: p.grade.gamma,
+                gain: p.grade.gain,
+            },
+            vignette: VignetteDto {
+                enabled: p.vignette.enabled,
+                amount: p.vignette.amount,
+                softness: p.vignette.softness,
+                color: color_to_hex(p.vignette.color),
+            },
+            grain: GrainDto {
+                enabled: p.grain.enabled,
+                amount: p.grain.amount,
+                size: p.grain.size,
+            },
+        })
+    }
+
+    fn to_settings(&self) -> Result<buzz_scene::PostSettings, SerialError> {
+        Ok(buzz_scene::PostSettings {
+            enabled: self.enabled,
+            bloom: buzz_scene::BloomSettings {
+                enabled: self.bloom.enabled,
+                threshold: self.bloom.threshold,
+                intensity: self.bloom.intensity,
+                radius: self.bloom.radius,
+            },
+            grade: buzz_scene::GradeSettings {
+                enabled: self.grade.enabled,
+                exposure: self.grade.exposure,
+                contrast: self.grade.contrast,
+                saturation: self.grade.saturation,
+                temperature: self.grade.temperature,
+                tint: self.grade.tint,
+                lift: self.grade.lift,
+                gamma: self.grade.gamma,
+                gain: self.grade.gain,
+            },
+            vignette: buzz_scene::VignetteSettings {
+                enabled: self.vignette.enabled,
+                amount: self.vignette.amount,
+                softness: self.vignette.softness,
+                color: color_from_hex(&self.vignette.color)?,
+            },
+            grain: buzz_scene::GrainSettings {
+                enabled: self.grain.enabled,
+                amount: self.grain.amount,
+                size: self.grain.size,
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -698,8 +1009,47 @@ pub struct CameraDto {
     /// default, which leaves a document with no depth looking identical.
     #[serde(default = "default_focal_distance")]
     pub focal_distance: f64,
+    /// Depth-of-field strength. Version 21; absent (0) is a pinhole camera.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub aperture: f64,
+    /// The layer depth in focus. Version 21.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub focus_depth: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<CameraKeyDto>,
+    /// Named camera angles — Wave 10b. Version 21. Absent for any document that
+    /// saves none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub angles: Vec<NamedAngleDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamedAngleDto {
+    pub name: String,
+    pub state: CameraKeyDto,
+}
+
+fn camera_key_to_dto(k: &buzz_scene::CameraKey) -> CameraKeyDto {
+    CameraKeyDto {
+        frame: k.frame,
+        x: k.center.x,
+        y: k.center.y,
+        zoom: k.zoom,
+        rotation: k.rotation,
+        pitch: k.pitch,
+        yaw: k.yaw,
+    }
+}
+
+fn camera_key_from_dto(dto: &CameraKeyDto) -> buzz_scene::CameraKey {
+    buzz_scene::CameraKey {
+        frame: dto.frame,
+        center: buzz_geom::Point::new(dto.x, dto.y),
+        zoom: dto.zoom,
+        rotation: dto.rotation,
+        pitch: dto.pitch,
+        yaw: dto.yaw,
+    }
 }
 
 fn default_focal_distance() -> f64 {
@@ -1330,27 +1680,33 @@ impl DocumentDto {
                 height: scene.stage().size.height,
                 background: color_to_hex(scene.stage().background),
                 frame_rate: scene.stage().frame_rate,
+                post: PostDto::from_settings(&scene.stage().post),
+                sort_by_depth: scene.stage().sort_by_depth,
             },
             layers,
             max_id,
-            camera: (!scene.camera().is_empty() || scene.camera().enabled).then(|| CameraDto {
-                enabled: scene.camera().enabled,
-                focal_distance: scene.camera().focal_distance,
-                keys: scene
-                    .camera()
-                    .keys()
-                    .iter()
-                    .map(|k| CameraKeyDto {
-                        frame: k.frame,
-                        x: k.center.x,
-                        y: k.center.y,
-                        zoom: k.zoom,
-                        rotation: k.rotation,
-                        pitch: k.pitch,
-                        yaw: k.yaw,
-                    })
-                    .collect(),
-            }),
+            camera: {
+                let cam = scene.camera();
+                let has_content = !cam.is_empty()
+                    || cam.enabled
+                    || cam.aperture != 0.0
+                    || !cam.angles.is_empty();
+                has_content.then(|| CameraDto {
+                    enabled: cam.enabled,
+                    focal_distance: cam.focal_distance,
+                    aperture: cam.aperture,
+                    focus_depth: cam.focus_depth,
+                    keys: cam.keys().iter().map(camera_key_to_dto).collect(),
+                    angles: cam
+                        .angles
+                        .iter()
+                        .map(|a| NamedAngleDto {
+                            name: a.name.clone(),
+                            state: camera_key_to_dto(&a.state),
+                        })
+                        .collect(),
+                })
+            },
             library,
             sounds: scene
                 .sounds()
@@ -1424,6 +1780,11 @@ impl DocumentDto {
                             position: None,
                             height: None,
                             radius: None,
+                            track: light
+                                .track
+                                .as_ref()
+                                .filter(|t| !t.is_empty())
+                                .map(LightTrackDto::from_track),
                         };
                         match light.kind {
                             buzz_scene::LightKind::Sun { azimuth, elevation } => {
@@ -1485,6 +1846,11 @@ impl DocumentDto {
             size: Size::new(self.stage.width, self.stage.height),
             background: color_from_hex(&self.stage.background)?,
             frame_rate: self.stage.frame_rate,
+            post: match &self.stage.post {
+                Some(dto) => dto.to_settings()?,
+                None => buzz_scene::PostSettings::default(),
+            },
+            sort_by_depth: self.stage.sort_by_depth,
         };
 
         for (index, dto) in self.layers.iter().enumerate() {
@@ -1504,28 +1870,28 @@ impl DocumentDto {
         }
 
         if let Some(camera) = &self.camera {
-            *scene.camera_mut() = buzz_scene::CameraTrack::from_parts(
+            let mut track = buzz_scene::CameraTrack::from_parts(
                 camera
                     .keys
                     .iter()
-                    .map(|k| {
-                        // Clamped on the way in: a corrupt or hand-edited tilt
-                        // must not produce a camera looking through the back of
-                        // the scene.
-                        buzz_scene::CameraKey {
-                            frame: k.frame,
-                            center: buzz_geom::Point::new(k.x, k.y),
-                            zoom: k.zoom,
-                            rotation: k.rotation,
-                            pitch: k.pitch,
-                            yaw: k.yaw,
-                        }
-                        .clamped()
-                    })
+                    // Clamped on the way in: a corrupt or hand-edited tilt must
+                    // not produce a camera looking through the back of the scene.
+                    .map(|k| camera_key_from_dto(k).clamped())
                     .collect(),
                 camera.enabled,
                 camera.focal_distance,
             );
+            track.aperture = camera.aperture.max(0.0);
+            track.focus_depth = camera.focus_depth;
+            track.angles = camera
+                .angles
+                .iter()
+                .map(|a| buzz_scene::NamedAngle {
+                    name: a.name.clone(),
+                    state: camera_key_from_dto(&a.state).clamped(),
+                })
+                .collect();
+            *scene.camera_mut() = track;
         }
 
         // Sounds come back without their audio: the bytes live in the
@@ -1621,6 +1987,7 @@ impl DocumentDto {
                     shadow_strength: dto.shadow_strength,
                     standing_height: dto.standing_height,
                     softness: dto.softness,
+                    track: dto.track.as_ref().map(LightTrackDto::to_track).transpose()?,
                 });
             }
         }
@@ -3111,6 +3478,199 @@ mod layer_alpha_tests {
                 "a layer with no transparency recorded must open solid"
             );
         }
+    }
+
+    #[test]
+    fn the_compositor_look_survives_the_round_trip() {
+        let mut scene = Scene::default();
+        scene.stage_mut().post = buzz_scene::PostSettings {
+            enabled: true,
+            bloom: buzz_scene::BloomSettings {
+                enabled: true,
+                threshold: 0.6,
+                intensity: 0.7,
+                radius: 0.4,
+            },
+            grade: buzz_scene::GradeSettings {
+                enabled: true,
+                exposure: 0.5,
+                contrast: 1.2,
+                saturation: 0.8,
+                temperature: 0.1,
+                tint: -0.2,
+                lift: 0.05,
+                gamma: 0.9,
+                gain: 1.1,
+            },
+            ..Default::default()
+        };
+
+        let back = DocumentDto::from_scene(&scene)
+            .to_scene()
+            .expect("round trip");
+        assert_eq!(back.stage().post, scene.stage().post, "the look changed");
+    }
+
+    /// **A document written before the compositor opens with effects off.**
+    ///
+    /// The failure it guards against is a document from version 19 or earlier
+    /// suddenly rendering through a bloomed, graded pipeline it never asked for.
+    #[test]
+    fn a_document_from_before_the_compositor_has_no_effects() {
+        let mut scene = Scene::default();
+        scene.stage_mut().post.enabled = true;
+        scene.stage_mut().post.vignette.enabled = true;
+        let dto = DocumentDto::from_scene(&scene);
+
+        let mut json = serde_json::to_value(&dto).expect("serialise");
+        // Strip the field, exactly as a file from before version 20 has it.
+        json["stage"]
+            .as_object_mut()
+            .expect("a stage")
+            .remove("post");
+
+        let older: DocumentDto = serde_json::from_value(json).expect("read it back");
+        let back = older.to_scene().expect("to scene");
+        assert_eq!(
+            back.stage().post,
+            buzz_scene::PostSettings::default(),
+            "a document with no post settings recorded must open with effects off"
+        );
+        assert!(back.stage().post.is_identity());
+    }
+
+    /// A document whose look is untouched writes no `post` block at all, so it
+    /// stays byte-identical to what version 19 produced.
+    #[test]
+    fn an_unmodified_look_writes_no_post_block() {
+        let scene = Scene::default();
+        let json = serde_json::to_value(DocumentDto::from_scene(&scene)).expect("serialise");
+        assert!(
+            json["stage"].as_object().expect("stage").get("post").is_none(),
+            "a default look must not write a post block"
+        );
+    }
+
+    #[test]
+    fn a_light_track_survives_the_round_trip() {
+        let mut scene = Scene::default();
+        let mut sun = buzz_scene::Light::new(
+            buzz_scene::LightId(1),
+            "Key",
+            buzz_scene::LightKind::Sun {
+                azimuth: 0.2,
+                elevation: 0.3,
+            },
+        );
+        let mut track = buzz_scene::LightTrack::new();
+        track.enabled = true;
+        track.set_key(buzz_scene::LightKey {
+            frame: 0,
+            color: peniko::Color::WHITE,
+            intensity: 1.0,
+            softness: 0.35,
+            standing_height: 40.0,
+            shadow_strength: 0.45,
+            kind: buzz_scene::LightKind::Sun {
+                azimuth: 0.2,
+                elevation: 0.3,
+            },
+        });
+        track.set_key(buzz_scene::LightKey {
+            frame: 24,
+            color: peniko::Color::from_rgb8(0xFF, 0x80, 0x00),
+            intensity: 2.0,
+            softness: 0.5,
+            standing_height: 60.0,
+            shadow_strength: 0.6,
+            kind: buzz_scene::LightKind::Sun {
+                azimuth: 1.0,
+                elevation: 1.2,
+            },
+        });
+        sun.track = Some(track);
+        scene.lights_mut().enabled = true;
+        scene.lights_mut().lights.push(sun);
+
+        let back = DocumentDto::from_scene(&scene)
+            .to_scene()
+            .expect("round trip");
+        let restored = &back.lights().lights[0];
+        assert_eq!(
+            restored.track,
+            scene.lights().lights[0].track,
+            "the light track changed across a save"
+        );
+    }
+
+    /// A document from before keyframed lights loads with static lights, so an
+    /// older film is not suddenly animated.
+    #[test]
+    fn a_light_from_before_tracks_is_static() {
+        let mut scene = Scene::default();
+        let sun = buzz_scene::Light::new(
+            buzz_scene::LightId(1),
+            "Key",
+            buzz_scene::LightKind::sun(),
+        );
+        scene.lights_mut().enabled = true;
+        scene.lights_mut().lights.push(sun);
+
+        let mut json = serde_json::to_value(DocumentDto::from_scene(&scene)).expect("serialise");
+        // A version-20 file simply has no `track` on any light.
+        if let Some(lights) = json["lights"]["lights"].as_array_mut() {
+            for light in lights {
+                light.as_object_mut().expect("a light").remove("track");
+            }
+        }
+        let older: DocumentDto = serde_json::from_value(json).expect("read back");
+        let back = older.to_scene().expect("to scene");
+        assert!(
+            back.lights().lights[0].track.is_none(),
+            "a light with no track recorded must open static"
+        );
+    }
+
+    #[test]
+    fn depth_sorting_survives_the_round_trip_and_defaults_off() {
+        let scene = Scene::default();
+        // Off by default and not written, so an untouched document is unchanged.
+        let json = serde_json::to_value(DocumentDto::from_scene(&scene)).expect("serialise");
+        assert!(
+            json["stage"]
+                .as_object()
+                .expect("stage")
+                .get("sort_by_depth")
+                .is_none(),
+            "a default document must not write sort_by_depth"
+        );
+
+        let mut on = Scene::default();
+        on.stage_mut().sort_by_depth = true;
+        let back = DocumentDto::from_scene(&on).to_scene().expect("round trip");
+        assert!(back.stage().sort_by_depth);
+    }
+
+    #[test]
+    fn camera_aperture_and_angles_survive_the_round_trip() {
+        let mut scene = Scene::default();
+        {
+            let cam = scene.camera_mut();
+            cam.enabled = true;
+            cam.aperture = 0.03;
+            cam.focus_depth = 250.0;
+            cam.set_key(buzz_scene::CameraKey::new(0, buzz_geom::Point::new(10.0, 20.0)));
+            cam.save_angle("Wide", 0);
+            cam.save_angle("Close", 0);
+        }
+
+        let back = DocumentDto::from_scene(&scene)
+            .to_scene()
+            .expect("round trip");
+        assert!((back.camera().aperture - 0.03).abs() < 1e-9);
+        assert!((back.camera().focus_depth - 250.0).abs() < 1e-9);
+        assert_eq!(back.camera().angles.len(), 2);
+        assert_eq!(back.camera().angle("Close").map(|a| a.name.as_str()), Some("Close"));
     }
 
     /// A nonsense value in a file cannot make a layer invisible.

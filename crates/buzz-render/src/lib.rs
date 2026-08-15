@@ -13,6 +13,7 @@
 //!   an animation tool can have.
 
 pub mod adapter;
+pub mod compositor;
 pub mod document;
 pub mod filters;
 pub mod lighting;
@@ -26,6 +27,7 @@ use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 use wgpu::{Device, Instance, Queue, TextureFormat, TextureView};
 
 pub use adapter::{GpuPreference, Selection, SelectionError};
+pub use compositor::Compositor;
 // Re-export the wgpu that vello uses, so downstream crates cannot accidentally
 // link a second, incompatible copy. Vello itself goes with it, for the same
 // reason: the exporter builds scenes and must build *these* scenes.

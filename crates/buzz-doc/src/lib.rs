@@ -10,6 +10,7 @@ pub mod assets;
 pub mod autosave;
 pub mod format;
 pub mod history;
+pub mod project;
 pub mod serial;
 pub mod templates;
 
@@ -21,6 +22,7 @@ pub use assets::{Asset, AssetLibrary};
 pub use autosave::{Autosave, AutosavePlan, Recovery, find_recoveries};
 pub use format::{DocError, EXTENSION, MIMETYPE, Meta};
 pub use history::{History, UndoLabel};
+pub use project::{FilmError, PROJECT_EXTENSION, PROJECT_VERSION, Project, Shot};
 pub use serial::{FORMAT_VERSION, SerialError};
 pub use templates::{Template, TemplateLibrary};
 

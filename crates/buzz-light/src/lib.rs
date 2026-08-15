@@ -37,12 +37,15 @@
 //! that never touches lighting renders exactly as it did before this existed.
 
 pub mod geometry;
+pub mod track;
 
 use buzz_geom::{Point, Vec2};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 pub use geometry::{ShadeGeometry, cast_shadow, highlight_crescent, shade_crescent};
+pub use track::{LightKey, LightTrack};
 
 /// Stable identity for a light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -132,6 +135,15 @@ pub struct Light {
     /// This is the closest thing to a light's *size*: a small, hard light
     /// gives a narrow terminator, a broad soft one gives a wide gradient.
     pub softness: f64,
+    /// The light's animation, if it has one. `None` is a static light — every
+    /// document until Wave 9a, and most since. See [`LightTrack`], and
+    /// [`LightRig::resolved_at`] for how the renderer reads it.
+    ///
+    /// Deliberately left out of [`Light::fingerprint`]: the fingerprint keys the
+    /// shading cache on the *resolved* light's values, and the track is how you
+    /// get those values, not one of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<LightTrack>,
 }
 
 impl Light {
@@ -147,6 +159,7 @@ impl Light {
             shadow_strength: 0.45,
             standing_height: 40.0,
             softness: 0.35,
+            track: None,
         }
     }
 
@@ -390,6 +403,48 @@ impl LightRig {
     /// Is there anything that would change how the document looks?
     pub fn is_active(&self) -> bool {
         self.enabled && self.lights.iter().any(|l| l.enabled)
+    }
+
+    /// Does any light in the rig animate?
+    pub fn animates(&self) -> bool {
+        self.lights
+            .iter()
+            .any(|l| l.track.as_ref().is_some_and(|t| t.animates()))
+    }
+
+    /// The rig with every animated light resolved to its state at `frame`.
+    ///
+    /// Borrowed when nothing animates — which is every document that never
+    /// keyframes a light — so the common case allocates nothing. When something
+    /// does animate, one small clone of the rig resolves it, and the renderer
+    /// then lights and caches from concrete values exactly as it always has. A
+    /// static light in an animated rig keeps its identical fingerprint frame to
+    /// frame, so it stays cached; see [`crate::track`].
+    pub fn resolved_at(&self, frame: u32) -> Cow<'_, LightRig> {
+        if !self.animates() {
+            return Cow::Borrowed(self);
+        }
+        let mut rig = self.clone();
+        for light in &mut rig.lights {
+            if let Some(track) = light.track.clone()
+                && track.animates()
+            {
+                *light = track.state_at(frame, light);
+            }
+        }
+        Cow::Owned(rig)
+    }
+
+    /// The highest frame any light in the rig is keyed at, for working out the
+    /// document's animated length.
+    pub fn last_animated_frame(&self) -> u32 {
+        self.lights
+            .iter()
+            .filter_map(|l| l.track.as_ref())
+            .filter(|t| t.animates())
+            .map(|t| t.last_frame())
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn get(&self, id: LightId) -> Option<&Light> {

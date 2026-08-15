@@ -37,10 +37,12 @@ use rayon::prelude::*;
 /// test suites like to use avoid it.
 const COPY_ALIGNMENT: u32 = 256;
 
+pub mod film;
 pub mod gif;
 pub mod preset;
 pub mod video;
 
+pub use film::concat_segments;
 pub use preset::{ExportPreset, PresetFormat};
 
 pub use gif::{
@@ -164,6 +166,20 @@ pub struct Exporter {
     /// frames share most of their artwork, so most of the shadows are the
     /// same shadows.
     lights: buzz_render::document::DrawCache,
+    /// The full-frame compositor and its own render target, built the first
+    /// time a film with effects is exported and then reused. Kept off the plain
+    /// path so a document with no look allocates nothing extra.
+    compositor: Option<buzz_render::Compositor>,
+    post_target: Option<PostTarget>,
+}
+
+/// A second render target the compositor writes into, sized to the frame.
+struct PostTarget {
+    width: u32,
+    height: u32,
+    #[allow(dead_code, reason = "kept alive so the view stays valid")]
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
 }
 
 struct Target {
@@ -184,6 +200,8 @@ impl Exporter {
             gpu,
             target: None,
             lights: buzz_render::document::DrawCache::new(),
+            compositor: None,
+            post_target: None,
         })
     }
 
@@ -293,6 +311,16 @@ impl Exporter {
             )
             .context("rendering the frame")?;
 
+        // The finished picture carries the document's look. Gated on `lit`,
+        // which is the film's own flag — the working-view and comparison passes
+        // render `lit: false` and must stay the raw artwork. The compositor is
+        // the *same* `Compositor::run` the window calls, so the film matches the
+        // stage frame for frame.
+        let post = scene.stage().post;
+        if options.lit && !post.is_identity() {
+            self.apply_post(frame, &post, settings.width, settings.height);
+        }
+
         self.read_back(settings.transparent)
     }
 
@@ -322,7 +350,10 @@ impl Exporter {
             format: RENDER_FORMAT,
             usage: wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                // The compositor's result is copied back into this texture so
+                // read-back stays unchanged, which needs it as a copy target.
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -342,6 +373,88 @@ impl Exporter {
             padded_row,
         });
         Ok(())
+    }
+
+    /// Run the compositor over the just-rendered frame and copy its result back
+    /// into the main target, so read-back is unchanged.
+    fn apply_post(
+        &mut self,
+        frame: u32,
+        post: &buzz_scene::PostSettings,
+        width: u32,
+        height: u32,
+    ) {
+        // A matching second target for the compositor's output.
+        if !matches!(&self.post_target, Some(p) if p.width == width && p.height == height) {
+            let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("export-post-target"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: RENDER_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.post_target = Some(PostTarget {
+                width,
+                height,
+                texture,
+                view,
+            });
+        }
+        if self.compositor.is_none() {
+            self.compositor = Some(buzz_render::Compositor::new(&self.gpu.device, RENDER_FORMAT));
+        }
+
+        let target = self.target.as_ref().expect("a target has been made");
+        let post_target = self.post_target.as_ref().expect("just ensured");
+        let compositor = self.compositor.as_mut().expect("just ensured");
+
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("export-compositor"),
+            });
+        compositor.run(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &mut encoder,
+            &target.view,
+            &post_target.view,
+            width,
+            height,
+            post,
+            frame,
+        );
+        // Copy the composited image back into the main target so read-back and
+        // everything downstream sees the finished frame.
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &post_target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.gpu.queue.submit([encoder.finish()]);
     }
 
     /// Copy the rendered texture back to the CPU and strip the row padding.

@@ -746,8 +746,11 @@ fn draw_playhead(
         egui::pos2(x, rect.min.y),
         egui::vec2(cell_width, rect.height()),
     );
-    painter.rect_filled(head, 0.0, Palette::selection());
+    painter.rect_filled(head, 0.0, PLAYHEAD);
 }
+
+/// Animate's playhead blue, sampled from the reference.
+const PLAYHEAD: Color32 = Color32::from_rgb(0x36, 0x79, 0xC1);
 
 /// The camera's row, above every layer.
 ///
@@ -1178,14 +1181,16 @@ fn draw_frame_cell(
     tween: Option<TweenCell>,
     playhead: bool,
 ) {
-    // Occupied frames get a lighter background than empty ones — unless a
-    // tween covers them, in which case Animate tints the whole span in the
-    // tween's colour, which is how you tell the three kinds apart at a glance.
+    // Animate's frame grid: an occupied frame is a light grey, an empty one the
+    // dark panel; a tween tints its whole span so the three kinds read apart at
+    // a glance. Sampled from Animate: occupied #909090, empty #252525.
+    let occupied = Color32::from_rgb(0x90, 0x90, 0x90);
+    let empty = Color32::from_rgb(0x25, 0x25, 0x25);
     let background = match (kind, tween) {
-        (FrameKind::Empty, _) => Palette::panel(),
+        (FrameKind::Empty, _) => empty,
         (_, Some(t)) => t.tint,
-        (FrameKind::BlankKeyframe, None) => Palette::panel(),
-        _ => Color32::from_rgb(0x44, 0x4A, 0x52),
+        // A blank keyframe still holds its span open, so its cell is occupied.
+        _ => occupied,
     };
     painter.rect_filled(cell, 0.0, background);
 
@@ -1195,7 +1200,14 @@ fn draw_frame_cell(
     // timeline showed: rows looked separated by a gap they did not have, and
     // the frames themselves were hard to count. One hairline down the right
     // and one along the bottom is Animate's grid, and it is half the ink.
-    let rule = Palette::border();
+    // A subtle grid: a darker hairline on the light occupied cells, a lighter
+    // one on the dark empty cells, so the columns read without boxing each frame.
+    let on_empty = matches!(kind, FrameKind::Empty) && tween.is_none();
+    let rule = if on_empty {
+        Color32::from_rgb(0x33, 0x33, 0x33)
+    } else {
+        Color32::from_rgb(0x7C, 0x7C, 0x7C)
+    };
     painter.rect_filled(
         egui::Rect::from_min_max(egui::pos2(cell.max.x - 1.0, cell.min.y), cell.max),
         0.0,
@@ -1213,19 +1225,21 @@ fn draw_frame_cell(
 
     let centre = cell.center();
     let dot = 3.0;
+    // On Animate's light grid the marks are near-black.
+    let mark = Color32::from_rgb(0x1E, 0x1E, 0x1E);
 
     match kind {
         FrameKind::Empty => {}
         FrameKind::Keyframe => {
             // Filled circle: a keyframe with artwork.
-            painter.circle_filled(egui::pos2(centre.x, cell.max.y - 5.0), dot, Palette::text());
+            painter.circle_filled(egui::pos2(centre.x, cell.max.y - 5.0), dot, mark);
         }
         FrameKind::BlankKeyframe => {
             // Hollow circle: a keyframe that deliberately shows nothing.
             painter.circle_stroke(
                 egui::pos2(centre.x, cell.max.y - 5.0),
                 dot,
-                Stroke::new(1.0, Palette::text_dim()),
+                Stroke::new(1.0, mark),
             );
         }
         FrameKind::Span => {}
@@ -1235,21 +1249,17 @@ fn draw_frame_cell(
                 egui::pos2(centre.x, cell.max.y - 5.0),
                 egui::vec2(5.0, 5.0),
             );
-            painter.rect_stroke(
-                end,
-                0.0,
-                Stroke::new(1.0, Palette::text_dim()),
-                StrokeKind::Inside,
-            );
+            painter.rect_stroke(end, 0.0, Stroke::new(1.0, mark), StrokeKind::Inside);
         }
     }
 
     if playhead {
-        painter.rect_stroke(
+        // Animate marks the current frame's whole column with a translucent
+        // wash of the playhead blue, not just an outline.
+        painter.rect_filled(
             cell,
             0.0,
-            Stroke::new(1.0, Palette::selection()),
-            StrokeKind::Inside,
+            Color32::from_rgba_unmultiplied(0x36, 0x79, 0xC1, 0x40),
         );
     }
 }

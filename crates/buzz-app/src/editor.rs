@@ -80,6 +80,9 @@ pub struct Editor {
     /// The Armature panel's own state — what is being typed into the pose
     /// name box. View state, like the Library's.
     pub rig_panel: buzz_ui::RigPanelState,
+    /// Stages saved as starting points. Rescanned when one is saved, so the
+    /// File menu lists what is actually on disk.
+    pub templates: buzz_doc::TemplateLibrary,
     /// Frames on the clipboard, from Cut Frames or Copy Frames.
     ///
     /// View state, not document state: a clipboard that was saved with the
@@ -247,6 +250,7 @@ impl Editor {
             frame_clipboard: None,
             clipboard: None,
             rig_panel: buzz_ui::RigPanelState::default(),
+            templates: buzz_doc::TemplateLibrary::user(),
             new_document: buzz_ui::NewDocumentState::default(),
             about: buzz_ui::AboutState::default(),
             assets: buzz_doc::AssetLibrary::user(),
@@ -388,6 +392,21 @@ impl Editor {
         let at = self.edit_at();
         self.doc
             .edit(label, |scene| update_object(scene, at, id, f));
+    }
+
+    /// Put a document on screen and reset everything that belonged to the
+    /// last one.
+    ///
+    /// Shared by "new from template" and anything else that swaps the document
+    /// without replacing the whole `Editor`: the selection, the playhead and
+    /// the view all belonged to the film that has gone.
+    pub fn adopt(&mut self, doc: Document) {
+        self.doc = doc;
+        self.doc.mark_clean();
+        self.selection = Selection::new();
+        self.selection.ensure_active_layer(self.doc.scene());
+        self.current_frame = 0;
+        self.zoom_fit();
     }
 
     /// Make a new document with these settings, and remember them.
@@ -1635,6 +1654,45 @@ impl Editor {
             Save | SaveAs | Open | Close => {
                 // File dialogs are host concerns; the shell handles them.
                 self.status = Some(format!("{} is handled by the shell", command.label()));
+            }
+
+            SaveAsTemplate => {
+                // Named after the document, so a template is called what the
+                // film it came from was called. `unique_name` keeps a second
+                // save from quietly replacing the first.
+                let wanted = self
+                    .doc
+                    .path()
+                    .and_then(|p| p.file_stem())
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Template".to_string());
+                let scene = self.doc.scene().clone();
+                match self.templates.save(&wanted, &scene) {
+                    Ok(template) => {
+                        self.status = Some(format!(
+                            "Saved the stage as a template called \"{}\"",
+                            template.name
+                        ));
+                    }
+                    Err(e) => self.status = Some(format!("Could not save the template: {e}")),
+                }
+            }
+
+            NewFromTemplate(index) => {
+                let Some(template) = self.templates.iter().nth(index).cloned() else {
+                    self.status = Some("That template is no longer there".into());
+                    return;
+                };
+                match self.templates.start(&template) {
+                    Ok(doc) => {
+                        let name = template.name.clone();
+                        self.adopt(doc);
+                        self.status = Some(format!("Started from \"{name}\""));
+                    }
+                    Err(e) => {
+                        self.status = Some(format!("Could not open \"{}\": {e}", template.name))
+                    }
+                }
             }
             Quit => self.should_quit = true,
 

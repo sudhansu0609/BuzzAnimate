@@ -182,6 +182,12 @@ pub enum Command {
     // Tools
     SelectTool(super::tools::ToolId),
 
+    /// Keep this document as a starting point for the next film.
+    SaveAsTemplate,
+    /// Start a document from a saved template. The index is into the list the
+    /// menu was drawn from, which is the same list the editor holds.
+    NewFromTemplate(usize),
+
     /// Line the selection up. Animate's Modify ▸ Align.
     ///
     /// `to_stage` is carried on the command rather than read from a panel
@@ -330,6 +336,8 @@ impl Command {
 
             SelectTool(_) => "Tool",
             Nudge { .. } => "Nudge",
+            SaveAsTemplate => "Save as Template",
+            NewFromTemplate(_) => "New from Template",
             Align { op, .. } => op.label(),
             Distribute(op) => op.label(),
             MatchSize(op) => op.label(),
@@ -484,6 +492,9 @@ impl Command {
             // Thirteen operations behind one menu. Animate gives the panel a
             // key, not the operations.
             Align { .. } | Distribute(_) | MatchSize(_) => None,
+            // Reached from the File menu; the templates one needs a name, and
+            // a keystroke cannot carry one.
+            SaveAsTemplate | NewFromTemplate(_) => None,
         }
     }
 

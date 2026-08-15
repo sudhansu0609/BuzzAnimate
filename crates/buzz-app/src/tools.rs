@@ -146,6 +146,17 @@ pub enum Preview {
         area: Rect,
         paint: buzz_scene::Paint,
     },
+    /// **The selection as the transform in progress would leave it.**
+    ///
+    /// A rotate, scale or skew used to be applied on release, so the artwork
+    /// sat still while the handles moved and you found out what you had done
+    /// only afterwards. The maths was never the missing part: this carries the
+    /// *same* affine the release will commit, built by the same functions, and
+    /// the stage draws the selected outlines through it.
+    ///
+    /// Nothing is edited until the pointer comes up, so a drag is still one
+    /// undo step rather than one per pixel.
+    Transform(Affine),
     /// The transformation point being dragged, where the pointer has it.
     ///
     /// The point only *moves* when the drag ends — it is one edit, not one per
@@ -493,27 +504,53 @@ impl ToolMachine {
                     .unwrap_or(Preview::None),
                 ToolId::Zoom => Preview::Marquee(Rect::from_points(*origin, *current)),
 
-                // The transformation point, wherever it can be grabbed. Only
-                // when the drag *began* on the circle: anywhere else is a
-                // marquee, a move, or — on Free Transform — a scale, rotate or
-                // skew, and those preview by moving nothing until committed.
+                // What the drag *began* on decides what it previews, exactly
+                // as it decides what the release commits — the pointer's shape
+                // there is the promise, and the preview has to keep it.
                 ToolId::FreeTransform | ToolId::Selection | ToolId::Subselection => {
-                    let on_pivot = match (ctx.pivot, ctx.selection_bounds) {
+                    let zone = match (ctx.pivot, ctx.selection_bounds) {
                         (Some(pivot), Some(bounds)) => {
                             let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
-                            matches!(
-                                transform_zone(bounds, pivot, *origin, grab),
-                                TransformZone::Pivot
-                            )
+                            Some((pivot, bounds, transform_zone(bounds, pivot, *origin, grab)))
                         }
-                        _ => false,
+                        _ => None,
                     };
-                    if on_pivot {
-                        Preview::Pivot(*current)
-                    } else if self.tool == ToolId::FreeTransform {
-                        Preview::None
-                    } else {
-                        Preview::Marquee(Rect::from_points(*origin, *current))
+                    // A marquee everywhere the tools do not transform.
+                    let marquee = || {
+                        if self.tool == ToolId::FreeTransform {
+                            Preview::None
+                        } else {
+                            Preview::Marquee(Rect::from_points(*origin, *current))
+                        }
+                    };
+                    match zone {
+                        Some((_, _, TransformZone::Pivot)) => Preview::Pivot(*current),
+
+                        // **The live preview.** The affine is built by the same
+                        // functions the release calls, so what is drawn is what
+                        // will happen rather than a second approximation of it.
+                        // Nothing is edited until the pointer comes up, so the
+                        // whole drag is still one undo step.
+                        Some((pivot, _, TransformZone::Rotate)) => Preview::Transform(
+                            rotate_about(pivot, *origin, *current, mods.shift),
+                        ),
+                        Some((pivot, bounds, TransformZone::Corner))
+                            if self.tool == ToolId::FreeTransform =>
+                        {
+                            Preview::Transform(if mods.alt {
+                                scale_about(pivot, bounds, *origin, *current, mods.shift)
+                            } else {
+                                scale_about_corner(bounds, *origin, *current, mods.shift)
+                            })
+                        }
+                        Some((pivot, bounds, TransformZone::Edge(horizontal)))
+                            if self.tool == ToolId::FreeTransform =>
+                        {
+                            Preview::Transform(skew_about(
+                                pivot, bounds, *origin, *current, horizontal,
+                            ))
+                        }
+                        _ => marquee(),
                     }
                 }
                 _ => Preview::None,
@@ -2288,6 +2325,146 @@ mod tests {
                 grip: GradientGrip::Center,
                 to: Point::new(160.0, 100.0),
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod transform_preview_tests {
+    use crate::tools::{Mods, Preview, ToolAction, ToolContext, ToolId, ToolMachine};
+    use buzz_geom::{Point, Rect};
+    use buzz_ui::DrawStyle;
+
+    const BOX: Rect = Rect {
+        x0: 0.0,
+        y0: 0.0,
+        x1: 100.0,
+        y1: 80.0,
+    };
+
+    fn context(style: &DrawStyle) -> ToolContext<'_> {
+        ToolContext {
+            style,
+            zoom: 1.0,
+            selection_bounds: Some(BOX),
+            anchors: &[],
+            pivot: Some(BOX.center()),
+            gradient: None,
+        }
+    }
+
+    /// Drag from `from` to `to` and report what was previewed mid-drag and
+    /// what was committed on release.
+    fn drag(tool: ToolId, from: Point, to: Point, mods: Mods) -> (Preview, ToolAction) {
+        let style = DrawStyle::default();
+        let ctx = context(&style);
+        let mut m = ToolMachine::new(tool);
+        m.pointer_down(from, from, mods, &ctx);
+        m.pointer_move(to, to, mods);
+        let previewed = m.preview(&ctx);
+        let committed = m.pointer_up(to, to, &ctx);
+        (previewed, committed)
+    }
+
+    /// **What is drawn while dragging is what happens when you let go.**
+    ///
+    /// The preview and the commit are built by the same functions on purpose;
+    /// this is what stops them drifting into two answers that disagree, which
+    /// would be worse than having no preview at all.
+    #[test]
+    fn the_preview_matches_what_the_release_commits() {
+        // A rotate handle sits outside a corner.
+        let cases = [
+            (ToolId::FreeTransform, Point::new(-8.0, -8.0), Point::new(60.0, -30.0)),
+            (ToolId::FreeTransform, Point::new(100.0, 80.0), Point::new(160.0, 130.0)),
+            (ToolId::FreeTransform, Point::new(50.0, 0.0), Point::new(90.0, 0.0)),
+        ];
+
+        for (tool, from, to) in cases {
+            let (previewed, committed) = drag(tool, from, to, Mods::default());
+            match (previewed, committed) {
+                (Preview::Transform(shown), ToolAction::TransformSelection { transform }) => {
+                    let a = shown.as_coeffs();
+                    let b = transform.as_coeffs();
+                    for (x, y) in a.iter().zip(b.iter()) {
+                        assert!(
+                            (x - y).abs() < 1e-9,
+                            "dragging {from:?} to {to:?} previewed {a:?} but committed {b:?}"
+                        );
+                    }
+                }
+                // Not every grab point is a transform; those that are not must
+                // preview no transform either, which is the other half of the
+                // same promise.
+                (other, ToolAction::TransformSelection { .. }) => {
+                    panic!("committed a transform but previewed {other:?}")
+                }
+                (Preview::Transform(_), other) => {
+                    panic!("previewed a transform but committed {other:?}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Shift is honoured in the preview too — a constrained rotate that
+    /// previewed unconstrained would be lying about where it will land.
+    #[test]
+    fn the_preview_honours_the_modifiers() {
+        let from = Point::new(-8.0, -8.0);
+        let to = Point::new(60.0, -30.0);
+        let plain = drag(ToolId::FreeTransform, from, to, Mods::default());
+        let shifted = drag(
+            ToolId::FreeTransform,
+            from,
+            to,
+            Mods {
+                shift: true,
+                ..Mods::default()
+            },
+        );
+
+        match (&plain.0, &shifted.0) {
+            (Preview::Transform(a), Preview::Transform(b)) => {
+                assert!(
+                    a.as_coeffs() != b.as_coeffs(),
+                    "Shift changed nothing about the preview"
+                );
+            }
+            other => panic!("expected two transform previews, got {other:?}"),
+        }
+        // And each still agrees with its own commit.
+        for (previewed, committed) in [plain, shifted] {
+            if let (Preview::Transform(shown), ToolAction::TransformSelection { transform }) =
+                (previewed, committed)
+            {
+                for (x, y) in shown.as_coeffs().iter().zip(transform.as_coeffs().iter()) {
+                    assert!((x - y).abs() < 1e-9);
+                }
+            }
+        }
+    }
+
+    /// Dragging inside the selection moves it, and moving already previewed
+    /// nothing — a move is shown by the artwork itself, not by an outline.
+    ///
+    /// Away from the centre on purpose: the transformation point sits there,
+    /// and grabbing *it* is a third thing again.
+    #[test]
+    fn dragging_inside_still_moves_rather_than_transforming() {
+        let (previewed, committed) = drag(
+            ToolId::FreeTransform,
+            Point::new(25.0, 20.0),
+            Point::new(45.0, 30.0),
+            Mods::default(),
+        );
+        assert!(
+            !matches!(previewed, Preview::Transform(_)),
+            "a move should not preview a transform"
+        );
+        assert!(
+            matches!(committed, ToolAction::MoveSelection { .. }),
+            "committed {committed:?}"
         );
     }
 }

@@ -11,6 +11,7 @@ pub mod autosave;
 pub mod format;
 pub mod history;
 pub mod serial;
+pub mod templates;
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,7 @@ pub use autosave::{Autosave, AutosavePlan, Recovery, find_recoveries};
 pub use format::{DocError, EXTENSION, MIMETYPE, Meta};
 pub use history::{History, UndoLabel};
 pub use serial::{FORMAT_VERSION, SerialError};
+pub use templates::{Template, TemplateLibrary};
 
 /// An open document.
 pub struct Document {

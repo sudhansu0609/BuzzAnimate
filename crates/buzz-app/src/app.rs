@@ -672,6 +672,14 @@ impl App {
         // played without first being asked to.
         let scene = self.editor.doc.scene().clone();
         self.editor.sound.refresh(&scene);
+        // The File menu lists templates by name; gathered before the menu is
+        // built, because the menu cannot borrow the editor while it draws.
+        let template_names: Vec<String> = self
+            .editor
+            .templates
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
         // Before the panels ask for pictures, throw away the ones whose
         // symbols have been edited since they were drawn.
         self.thumbnails.invalidate_stale(&scene);
@@ -694,6 +702,7 @@ impl App {
                             can_redo,
                             workspace: &self.editor.workspace,
                             light_gizmos: self.editor.light_panel.gizmos,
+                            templates: &template_names,
                         },
                     ));
                 });

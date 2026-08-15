@@ -3329,6 +3329,31 @@ changed would attach a drawing to a bone that is no longer there.
 with no poses saves exactly as it did, and a version 18 file loads with none. Proved by
 stripping the field out of the JSON and reading it back.
 
+### ✅ Wave 3.1 — Scene templates
+
+Every film began empty: background, camera, lights and the cast laid out again by
+hand. A template is a stage you set up once and start from again.
+
+**A template is just a `.buzz` file**, kept in a folder of its own. Everything one has
+to carry — stage size, background, frame rate, the camera, the lights, the layers, the
+symbols they use, the sounds — is already exactly what a document carries. So a
+template *is* a document, and starting from one is opening it and forgetting where it
+came from. The alternative, a bespoke "stage settings" record, would have to grow a
+field every time a document gained one and would silently drop whatever nobody
+remembered to add. The Assets library made the same argument for the same reason.
+
+**Starting from one forgets it.** The new document is untitled, so Save asks where to
+put it and a film cannot be written back over the starting point by accident. Saving
+twice under one name keeps both rather than one quietly replacing the other.
+
+`File ▸ New from Template ▸ …` lists what is on disk, sorted so the menu does not
+shuffle between launches; `File ▸ Save as Template` keeps the current stage, named
+after the document it came from.
+
+This is what §7-84 was about for assets — an asset deliberately leaves the stage
+behind, because it merges *into* a document that already has one. A template replaces
+the document, so it can carry everything.
+
 ### ✅ Wave 3.2 — Align, Distribute and Match Size
 
 There was no equivalent to Animate's `Ctrl+K` anywhere in the command set — zero
@@ -3357,6 +3382,26 @@ that the answer does not depend on the order things were selected in, and that a
 shape does not produce an infinity when matched for size. The editor measures
 everything *before* moving anything, so no operation depends on its own results.
 
+### ✅ Wave 3.4 — Watching a transform happen
+
+A rotate, scale or skew was applied on release: the handles moved, the artwork sat
+still, and you found out what you had done afterwards. The maths was never the missing
+part.
+
+**The preview carries the same affine the release will commit**, built by calling the
+same functions — `rotate_about`, `scale_about`, `scale_about_corner`, `skew_about` —
+rather than a second approximation of them. That is the whole design, and it is what a
+test holds: for three different grabs, what was previewed mid-drag and what was
+committed on release agree to within 1e-9, and Shift changes both or neither.
+
+Nothing is edited until the pointer comes up, so a drag is still **one undo step**
+rather than one per pixel.
+
+**Outlines, not re-rendered artwork.** Each selected object's quad is put through the
+pending transform and drawn as chrome over the stage. Re-rendering the artwork on every
+pointer move is exactly the cost this is meant to avoid, and while dragging a corner
+what the eye needs is the shape and the angle.
+
 ### ✅ Wave 3.3 — The arrow keys
 
 One document unit per press, eight with Shift — Animate's numbers, and the reason for
@@ -3383,7 +3428,7 @@ holding an arrow key down is one undo step rather than forty.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 456 passing, clippy clean |
+| Tests | 1 516 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
@@ -3619,9 +3664,9 @@ down here has not been finished.
 | 81 | **Assets have no thumbnails.** The Library now has them (§7 item 17), and the machinery is reusable — but an asset is a `.buzz` file on disk rather than a symbol in memory, so a picture of one means reading and parsing the file first. That is I/O per asset and belongs on a background task, which is Wave 4's `TaskRegistry`. Deliberately left until then rather than reading files on the UI thread. | Follow-up, after Wave 4 |
 | 82 | **A placed *asset* lands where it was drawn**, not under the pointer. A **symbol** can now be dragged out of the Library and dropped where you let go (§4, Wave 1.3); an asset is a whole document merged in, so where its layers land is a different question and it still keeps the coordinates it was kept with. | Follow-up |
 | 83 | **The assets folder is not watched.** Adding a file outside the application shows up after the panel's refresh button, not immediately — a file watcher is a thread, a platform API and a class of bug for something a button does. | By design |
-| 84 | **An asset carries its sounds and lights, but not the stage.** `Scene::extract` takes the objects and the symbols they need; frame rate, stage size, camera and lighting stay with the document being placed into, which is what "place a prop" should mean. | By design |
+| 84 | **An *asset* carries its sounds and lights, but not the stage.** A **scene template** does carry all of it (§4, Wave 3.1) — this row is now only about assets, which merge *into* a document and must not overwrite its stage. `Scene::extract` takes the objects and the symbols they need; frame rate, stage size, camera and lighting stay with the document being placed into, which is what "place a prop" should mean. | By design |
 | 85 | **A symbol's registration point is still inert.** `Symbol.registration` is stored, saved and carried through import and duplication, but nothing edits it and the renderer does not read it — convert-to-symbol rebases the artwork so the registration sits at the origin, and after that the field does nothing. The *object* transformation point is the one that now works. | Follow-up |
-| 86 | **There is no live preview while transforming.** A rotate or skew is applied on release, as scaling always was; Animate redraws the artwork as you drag. The maths is the same either way — what is missing is drawing the in-progress transform. | Follow-up |
+| 86 | ~~**There is no live preview while transforming.**~~ | ✅ **Resolved in Wave 3** — the selection's outlines are drawn through the pending affine while the drag runs, built by the same functions the release commits (§4). Outlines rather than re-rendered artwork, which is the point: a full redraw per pointer move is the cost the preview exists to avoid. |
 | 87 | **The transform handles still hang off the bounding box.** §7 item 61 already recorded this for a tilted camera; it applies to a rotated object too, so the eight handles sit on the axis-aligned extent of a turned rectangle rather than on its corners. The transformation point itself is drawn where it really is. | Follow-up |
 | 88 | **Skew is not constrained.** Animate holds the opposite edge fixed while shearing; here the shear is about the transformation point, which is the same thing when the point is on that edge and a different thing when it is not. Shear is clamped at 20:1 so a stray drag cannot flatten artwork into a line. | By design |
 | 89 | **Two themes, not a theme editor.** Animate's Preferences offer four interface brightnesses and a separate stage colour; here there is Dark and Light, and the stage colour is the document's own. | By design |

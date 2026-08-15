@@ -696,6 +696,26 @@ fn draw_preview(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poi
             painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0, 168, 255, 30));
             painter.rect_stroke(r, 0.0, stroke, StrokeKind::Outside);
         }
+        // **Where the artwork will be when the drag ends.**
+        //
+        // Each selected object's outline, put through the pending affine —
+        // the same one the release will commit. Outlines rather than filled
+        // artwork because this is chrome drawn over the stage, and because a
+        // full re-render per pointer move is exactly the cost this preview is
+        // supposed to avoid; the shape and the angle are what the eye needs
+        // while dragging a corner.
+        Preview::Transform(transform) => {
+            let stroke = Stroke::new(1.0, Palette::active());
+            for id in editor.selection.iter() {
+                let Some(quad) = editor.object_quad(id) else {
+                    continue;
+                };
+                let moved = quad.map(|p| to_screen(transform * p));
+                let mut outline: Vec<egui::Pos2> = moved.to_vec();
+                outline.push(moved[0]);
+                painter.add(egui::Shape::line(outline, stroke));
+            }
+        }
         Preview::Shape(path) | Preview::Stroke { path, .. } => {
             // Flattened for display only; the committed geometry keeps its
             // curves.

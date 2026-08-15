@@ -60,6 +60,10 @@ pub struct MenuState<'a> {
     /// Whether the on-stage light handles are shown. Not read off
     /// `ViewSettings` because it belongs to the Lighting panel's own state.
     pub light_gizmos: bool,
+    /// The saved templates, by name, for the File menu to list. Names rather
+    /// than paths: a menu shows names, and the editor holds the list this
+    /// indexes into.
+    pub templates: &'a [String],
 }
 
 /// Draw the menu bar. Returns whatever the user chose.
@@ -72,6 +76,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         can_redo,
         workspace,
         light_gizmos,
+        templates,
     } = *state;
     let mut raised = Vec::new();
 
@@ -91,6 +96,31 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             for c in [Command::New, Command::Open] {
                 item(ui, c, true, &mut raised);
             }
+
+            // **Start from a stage you set up once.**
+            //
+            // Every film began empty: background, camera, lights and the cast
+            // laid out again by hand. A template is a whole document kept
+            // aside, so starting from one carries all of it.
+            ui.menu_button("New from Template", |ui| {
+                if templates.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "No templates yet.\nSet a stage up, then File \u{25b8} Save as Template.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    return;
+                }
+                for (index, name) in templates.iter().enumerate() {
+                    if ui.button(name.as_str()).clicked() {
+                        raised.push(Command::NewFromTemplate(index));
+                        ui.close();
+                    }
+                }
+            });
+            item(ui, Command::SaveAsTemplate, true, &mut raised);
             ui.separator();
             for c in [Command::ImportToStage, Command::ImportToLibrary] {
                 item(ui, c, true, &mut raised);
@@ -2491,6 +2521,7 @@ mod tests {
                     can_redo: false,
                     workspace: &workspace,
                     light_gizmos: true,
+                    templates: &[],
                 },
             );
             let _ = tool_bar(ui, ToolId::Selection, &mut style);
@@ -2628,6 +2659,7 @@ mod tests {
                     can_redo: true,
                     workspace: &workspace,
                     light_gizmos: false,
+                    templates: &[],
                 },
             );
             let _ = properties_panel(

@@ -106,10 +106,10 @@ individually trivial and collectively constant.
 
 | Item | Size | What it is | What is already there |
 |---|---|---|---|
-| **Scene templates** | M | Save a whole stage — background, characters, camera, lights, size, frame rate — as a named starting point, and begin a film from it. An asset today carries its objects and sounds but deliberately leaves the stage behind. | Extract and merge again. Extends §7-84. |
+| ~~**Scene templates**~~ ✅ | M | ~~Save a whole stage as a named starting point.~~ **Shipped** — a template is a `.buzz` in a folder of its own, so it carries everything a document can; starting from one forgets it. See `PROGRESS.md` §4 *Wave 3.1*. | |
 | ~~**Align and Distribute**~~ ✅ | S | ~~Animate's `Ctrl+K`.~~ **Shipped** as `Modify ▸ Align` — six alignments, the same six to the stage, two kinds of distribute and Match Size. See `PROGRESS.md` §4 *Wave 3.2*. | |
 | ~~**Arrow-key nudge**~~ ✅ | S | ~~One unit per press, eight with Shift.~~ **Shipped** — see `PROGRESS.md` §4 *Wave 3.3 — The arrow keys*. Closed §7-72. | |
-| **Live transform preview** | S–M | Artwork that redraws *while* you rotate it rather than on release. The maths is identical either way; only the feedback changes. | Closes §7-86. |
+| ~~**Live transform preview**~~ ✅ | S–M | ~~Artwork that redraws while you rotate it.~~ **Shipped** — outlines through the *same* affine the release commits, held equal by a test. Closed §7-86. | |
 
 ---
 

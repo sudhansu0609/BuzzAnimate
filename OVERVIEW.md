@@ -1,6 +1,6 @@
 # BuzzAnimate — Overview: what it has, what it cannot do, what is next
 
-**Written:** 2026-08-15 · **Format version:** 19 · **Tests:** 1 486 passing, clippy clean
+**Written:** 2026-08-15 · **Format version:** 19 · **Tests:** 1 516 passing, clippy clean
 
 One page that consolidates the three questions people actually ask about this
 program. The detail behind each answer lives elsewhere and is linked:
@@ -200,7 +200,7 @@ exactly as Animate would.
 
 ### 3.4 The long tail
 
-`PROGRESS.md` §7 carries **155 numbered rows, 140 of them still open.** They are
+`PROGRESS.md` §7 carries **155 numbered rows, 138 of them still open.** They are
 the honest record of every place this program does something a reasonable person
 would not expect, from *"a soft brush cannot paint across strokes"* (§7-164) to
 *"a recovered document does not remember what it was"* (§7-102). Most are small,
@@ -286,12 +286,12 @@ blur and alpha video at export; a command palette.
 | Render quality across 13 decades | constant ~4.01% ink |
 | GPU frame time at 1e12% | 0.9 ms |
 | Threads in use | 20 interactive + 6 background |
-| Tests | 1 486 passing, clippy clean |
+| Tests | 1 516 passing, clippy clean |
 | Rust source | ~48 000 lines across 16 crates |
 | Format version | 19 |
 | IK budget | 50 six-bone rigs in parallel, inside one frame |
 | First frame of a heavy scene | 305 ms, then cached (§7-155) |
-| Open items in §7 | 140 of 155 |
+| Open items in §7 | 138 of 155 |
 
 ---
 

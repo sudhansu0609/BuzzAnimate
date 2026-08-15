@@ -7,6 +7,7 @@
 pub mod animate_assets;
 pub mod app;
 pub mod demo;
+pub mod dialogs;
 pub mod editor;
 pub mod export_job;
 pub mod hud;
@@ -16,5 +17,6 @@ pub mod lipsync;
 pub mod rigging;
 pub mod sound;
 pub mod stage;
+pub mod tasks;
 pub mod thumbnails;
 pub mod tools;

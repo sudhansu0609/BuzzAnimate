@@ -3418,6 +3418,69 @@ holding an arrow key down is one undo step rather than forty.
 
 ---
 
+### ✅ Wave 4 — Foundations: nothing may hang the window
+
+The engine waves rest on one rule, stated in `ARCHITECTURE.md` and now enforced: **the
+window must never stop responding** — not for a script, an export, a heavy first frame,
+or a file dialog. Wave 4 builds the machinery that keeps it and rewrites the code that
+broke it.
+
+**`CancelToken` (`buzz-jobs`).** One primitive both sides of a long job agree on: a
+shared atomic flag, `cancel()` on one side, `is_cancelled()` glanced at in a loop on the
+other. `Relaxed` because it becomes true and never false and guards nothing ordered
+against it. Long *work* deliberately does **not** live in `buzz-jobs`: its pools are
+rayon pools sized for data-parallel bursts, and a minutes-long job squatting on one of
+six background workers would starve autosave. So tasks live on `App`, and the crate
+contributes only the flag.
+
+**`TaskRegistry` (`buzz-app/src/tasks.rs`).** Every long-running piece of work in the
+program: `spawn_thread` (for work that owns something expensive for its whole life, like
+an export's second GPU device) and `spawn_pool` (for short fan-out), a `poll` that
+delivers each outcome **once** on the UI thread, and `quit_blockers` for the exit
+prompt. A task that panics is reported `Failed` rather than left spinning for ever in the
+panel; a cancelled export is joined before the process exits so its `.part` file is
+cleaned up. **It lives on `App`, not `Editor`** — the structural fix for a real bug:
+the export job was a field of `App` while its progress dialog was a field of `Editor`,
+so opening a document destroyed the dialog while the job ran on, orphaning progress and
+Cancel. Work that outlives a document must be owned by something that outlives a
+document.
+
+**File dialogs off the thread (`buzz-app/src/dialogs.rs`).** All nine `rfd` call sites
+blocked the UI thread until the user chose — long enough for Windows to paint "Not
+Responding" and for a running export to stop reporting. Now the picker runs on its own
+thread and the answer returns down a channel as `(Pick, Option<PathBuf>)`, where `Pick`
+is *why the path was asked for* so the reply comes back already labelled. Still modal and
+still parented to the main window (so it cannot hide behind it), but the window keeps
+painting and background work keeps running. One picker at a time — two modal dialogs on
+one owner window is not a state worth having. *Rejected `rfd`'s async API:* it wants an
+executor this codebase does not have; a thread and a channel is what everything else here
+already uses.
+
+**Import and open in the background.** A 40 MB `.fla` is seconds of XML parsing; on the
+UI thread that is seconds of frozen window. Parsing now happens on a `TaskKind::Open`/
+`Import` thread and the built `Document` — or the failure, carried back to be shown in
+front of the user — installs on `poll`. A second load is declined rather than raced,
+because "whichever finished second wins" is not what *second* means to the person who
+asked.
+
+**Scripts off the UI thread (closes §7-32).** `buzz_script::run_until` takes a
+`StopSignal` — `Arc<dyn Fn() -> bool>` — consulted from QuickJS's interrupt handler, the
+same "fuel" hook that already enforced the time limit, so Stop lands between bytecodes
+and a `while (true) {}` stops on the spot rather than at the end of a loop that never
+ends. *(Deviation from `ARCHITECTURE.md`, which named `RunOptions { interrupt:
+CancelToken }`: a closure is the same semantic — a `CancelToken` becomes `Arc::new(move
+|| token.is_cancelled())` — and keeps the low-level script crate from depending on
+`buzz-jobs`.)* The interactive run goes to a `TaskKind::Script` thread against an owned
+COW snapshot; while it runs an `egui::Modal` gates every pointer path into the document
+and keyboard commands are gated in `update`, because a script *is* briefly in sole
+charge of the document — a transaction, not a hang. Its working copy is committed in one
+edit on completion, so four hundred generated shapes are one Ctrl+Z, and a stopped or
+timed-out script keeps whatever it managed, exactly as before. The CLI `--script` path
+stays synchronous by construction: it runs before the event loop and reports on the next
+line.
+
+---
+
 ## 5. Current metrics
 
 | Measure | Value |
@@ -3638,7 +3701,7 @@ down here has not been finished.
 | 49 | **Scripting cannot reach the lights**, as it cannot reach sound (§7 item 43). `fl.getDocumentDOM()` exposes no rig, so lighting cannot be driven from the Actions panel. | Phase 8 follow-up |
 | 30 | **A script lives in the panel, not in the document.** There are no frame scripts and no saved commands: what is typed in the Actions panel is view state, so it is not saved with the `.buzz` file and does not survive closing it. Both need somewhere in the format to keep a script, and frame scripts additionally need the player to run them at the right frame. | Phase 8 |
 | 31 | **The scripting API is a useful subset, not JSFL.** Rectangles, ovals, layers, frames, selection, the library and document properties are there; text, gradients, tweens, groups, transforms beyond translation, and `fl.fileSystem` are not. Several of those are gaps in the editor itself (§7 items 8 and 9) rather than in the binding. | Phase 8 follow-up |
-| 32 | **A script runs on the UI thread**, so a five-second script freezes the window for five seconds — bounded, but visible. Moving it off needs the run to own its scene outright, since the engine holds it behind `Rc`. | Phase 8 follow-up |
+| 32 | ~~**A script runs on the UI thread.**~~ | ✅ **Resolved in Wave 4** — an interactive script runs on a `TaskRegistry` thread against an owned copy-on-write snapshot; the window keeps painting while an input-gating overlay holds the document read-only, with a live Stop that reaches the interpreter through QuickJS's interrupt handler (`buzz_script::run_until`, `StopSignal`). The CLI `--script` path stays synchronous, because it reports before the event loop starts. §4 |
 | 16 | **Camera rotation and zoom have no direct gesture.** Both are keyable and interpolate correctly, and `zoom_camera` exists, but only panning is bound to a drag. | Phase 3 follow-up |
 | 13 | ~~**Clipboard (cut/copy/paste) not implemented.**~~ | ✅ **Resolved in Wave 1** — artwork copies as a whole `Scene`, so an instance carries its symbol; pastes onto the active layer at the playhead; survives opening another document (§4) |
 | 14 | ~~**Workspace layout is not persisted** across runs.~~ | ✅ **Resolved** — panels dock, float and lock, and the arrangement is saved between runs |

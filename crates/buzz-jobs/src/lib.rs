@@ -35,6 +35,42 @@ use rayon::ThreadPool;
 
 use crate::clock::WorkerClocks;
 
+/// A way to ask work to stop.
+///
+/// # Why this is the only thing the job system knows about cancellation
+///
+/// Long work does not live here. The pools are rayon pools, sized for
+/// data-parallel bursts, and a job that runs for minutes would squat on one of
+/// the six background workers and starve everything behind it — autosave
+/// included. So tasks are owned elsewhere (`buzz_app::tasks`), and what this
+/// crate contributes is the one primitive both sides need to agree on.
+///
+/// A flag rather than a channel because the reader is in a loop and wants to
+/// glance, not wait. Cloning shares the flag: cancel one, cancel all.
+#[derive(Clone, Default, Debug)]
+pub struct CancelToken(Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the work to stop. It stops when it next looks.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Has anybody asked?
+    ///
+    /// `Relaxed` on purpose: this is a hint that becomes true and never false,
+    /// and the work it guards is not ordered against anything. Paying for
+    /// acquire/release on every iteration of a tight loop would be a real cost
+    /// for no guarantee anybody uses.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// Which pool a unit of work belongs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pool {
@@ -446,5 +482,65 @@ mod tests {
             "idle pool reported {} mean utilisation",
             u.mean
         );
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_token_is_not_cancelled() {
+        assert!(!CancelToken::new().is_cancelled());
+    }
+
+    /// Cancelling one clone cancels them all — that is what makes it usable
+    /// as a handle held on one side and read on the other.
+    #[test]
+    fn a_clone_shares_the_flag() {
+        let held = CancelToken::new();
+        let given_away = held.clone();
+        assert!(!given_away.is_cancelled());
+
+        held.cancel();
+        assert!(given_away.is_cancelled());
+    }
+
+    /// It only ever goes one way, which is what lets the reader glance at it
+    /// without synchronising.
+    #[test]
+    fn cancelling_twice_is_still_cancelled() {
+        let token = CancelToken::new();
+        token.cancel();
+        token.cancel();
+        assert!(token.is_cancelled());
+    }
+
+    /// The shape the work actually uses: a loop that checks and stops.
+    #[test]
+    fn a_worker_thread_stops_when_asked() {
+        let token = CancelToken::new();
+        let worker = token.clone();
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&done);
+
+        let handle = std::thread::spawn(move || {
+            for i in 0..1_000_000 {
+                if worker.is_cancelled() {
+                    return i;
+                }
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+            -1
+        });
+
+        // Let it get going, then stop it.
+        while done.load(Ordering::Relaxed) < 10 {
+            std::hint::spin_loop();
+        }
+        token.cancel();
+
+        let stopped_at = handle.join().expect("the worker panicked");
+        assert!(stopped_at >= 0, "it ran to the end instead of stopping");
     }
 }

@@ -103,6 +103,13 @@ fn name_this_application() {
 ///
 /// By extension, and case-insensitively: `SCENE.FLA` off somebody's server is
 /// the same file as `scene.fla`.
+/// What to call a file in front of a person: its name, not its whole path.
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 fn opens_as_document(path: &std::path::Path) -> bool {
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case(buzz_doc::EXTENSION))
@@ -201,6 +208,61 @@ struct Active {
     last_autosave_check: Instant,
 }
 
+/// Why a path was asked for.
+///
+/// The picker runs on its own thread and answers a frame or several later, by
+/// which time nothing remembers what the question was — so the question comes
+/// back attached to the answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pick {
+    /// File ▸ Open.
+    Open,
+    /// File ▸ Save As, or a first save of an untitled document.
+    SaveAs,
+    ImportImage,
+    ImportSound,
+    /// File ▸ Import, into the stage or into the library.
+    ImportInto(buzz_scene::ImportTarget),
+    /// The root of an Animate asset library.
+    AnimateAssets,
+    /// Where an export should be written.
+    Export(buzz_ui::ExportKind),
+}
+
+/// What a background load produced.
+///
+/// Reading a 40 MB `.fla` is seconds of XML parsing, and a `.swf` with a
+/// thousand shapes is seconds of tag decoding. Doing either on the UI thread
+/// stops the window for exactly as long as the file is big — so it happens on
+/// a thread, and what it made arrives here.
+///
+/// The failure is carried too, rather than reported from the worker: a file
+/// that will not open is the whole of what the user was trying to do, and
+/// saying so belongs in front of them, on the thread that owns the window.
+enum Loaded {
+    /// One of our own documents.
+    Document {
+        path: std::path::PathBuf,
+        result: Result<Box<Document>, String>,
+    },
+    /// Somebody else's — `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai`.
+    ///
+    /// `target` says what to do with it: `None` opens it as a new document,
+    /// `Some(target)` merges it into the one already open.
+    Foreign {
+        path: std::path::PathBuf,
+        target: Option<buzz_scene::ImportTarget>,
+        result: Result<Box<crate::import::Imported>, String>,
+    },
+}
+
+/// A script in flight: the task running it, and where its result will arrive.
+struct ScriptRun {
+    id: crate::tasks::TaskId,
+    /// The working scene and what the run made of it, sent back together.
+    result: crossbeam_channel::Receiver<(buzz_scene::Scene, buzz_script::ScriptOutcome)>,
+}
+
 pub struct App {
     active: Option<Active>,
     editor: Editor,
@@ -227,6 +289,27 @@ pub struct App {
     /// picture from the last film cannot be shown for a symbol in this one
     /// that happens to have been given the same id.
     thumbnails: crate::thumbnails::Thumbnails,
+    /// A script running on a thread, if one is, and where its result lands.
+    ///
+    /// A script is a transaction over the document: while it runs the window
+    /// keeps painting but the document is read-only, held behind an
+    /// input-gating overlay with a live Cancel. That is a truer picture than a
+    /// frozen window — a script *is* briefly in sole charge of the document —
+    /// and it is the difference between "working" and "hung".
+    scripting: Option<ScriptRun>,
+    /// Files being read on a thread, by the task that is reading them.
+    ///
+    /// A map rather than a single slot because the registry is free to run
+    /// several — though [`App::loading_already`] declines a second, since two
+    /// documents racing to replace the open one has no sensible answer.
+    loading: std::collections::HashMap<crate::tasks::TaskId, crossbeam_channel::Receiver<Loaded>>,
+    /// The file picker, if one is open, and what it was opened for.
+    picker: crate::dialogs::Pending<Pick>,
+    /// Every long-running piece of work in the program.
+    ///
+    /// On `App`, not on `Editor`, because work outlives documents — see the
+    /// module docs in `tasks.rs` for the bug that taught us this.
+    tasks: crate::tasks::TaskRegistry,
     /// Where each dock column ended up on this frame.
     ///
     /// The splitters are drawn after the panels, over whatever is underneath,
@@ -265,6 +348,10 @@ impl App {
             last_crash_revision: None,
             animate_import: None,
             thumbnails: crate::thumbnails::Thumbnails::default(),
+            scripting: None,
+            loading: std::collections::HashMap::new(),
+            picker: crate::dialogs::Pending::default(),
+            tasks: crate::tasks::TaskRegistry::default(),
             dock_rects: Vec::new(),
         };
         app.recovery = app.find_recoveries();
@@ -284,6 +371,12 @@ impl App {
     /// screen and can be corrected and run again — a script that executed
     /// invisibly and left no trace of itself would be very hard to debug.
     /// Returns whatever it traced, for printing to the terminal as well.
+    ///
+    /// **Synchronous on purpose.** This runs before the event loop starts, and
+    /// [`script_report`](Self::script_report) reads the result on the very next
+    /// line — there is no frame in which a background run could report back.
+    /// So it goes through `Editor::run` directly rather than `App::dispatch`,
+    /// which is the path that hands interactive scripts to a thread.
     pub fn with_script(mut self, source: String) -> Self {
         self.editor.actions.source = source;
         self.editor.run(Command::RunScript);
@@ -904,7 +997,13 @@ impl App {
                     self.editor.camera.viewport =
                         Size::new(area.width() as f64, area.height() as f64);
 
-                    self.handle_stage_input(ui, area);
+                    // Not while a script is running: the document is its for
+                    // the duration, and a brush stroke landing in the middle of
+                    // a script rewriting the same artwork is exactly the race
+                    // the overlay exists to prevent.
+                    if self.scripting.is_none() {
+                        self.handle_stage_input(ui, area);
+                    }
                     let response = stage::draw_chrome(ui, &self.editor, area);
                     if let Some(guide) = response.new_guide {
                         self.editor.view.add_guide(guide);
@@ -923,9 +1022,15 @@ impl App {
         // bar moving on a document that is otherwise still.
         self.poll_export();
         self.poll_animate_import();
-        if self.export.is_some() {
+        self.poll_picker();
+        self.poll_tasks();
+        if self.export.is_some() || !self.tasks.is_empty() || self.picker.busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        // The overlay keeps the elapsed count moving and gives the Stop button
+        // somewhere to live; it is drawn after the panels so it sits over
+        // everything, and gates pointer input to the document beneath it.
+        self.script_overlay(&ctx);
         self.export_dialog(&ctx);
         self.lip_sync_dialog(&ctx);
         self.recovery_dialog(&ctx);
@@ -938,8 +1043,16 @@ impl App {
         }
 
         commands.extend(keyboard_commands(&ctx, &self.editor));
-        for command in commands {
-            self.dispatch(command);
+        // While a script owns the document, nothing else may touch it —
+        // keyboard shortcuts included, which the modal backdrop does not catch.
+        // The one thing still live is the overlay's own Stop button.
+        if self.scripting.is_none() {
+            for command in commands {
+                self.dispatch(command);
+            }
+        }
+        if self.scripting.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         // The dock splitters, after everything else has had its say.
@@ -2440,6 +2553,11 @@ impl App {
             Command::Close => self.editor.should_quit = true,
             Command::ImportToStage => self.import_dialog(buzz_scene::ImportTarget::Stage),
             Command::ImportToLibrary => self.import_dialog(buzz_scene::ImportTarget::Library),
+            // A script drives the whole document and can run for seconds, so it
+            // goes to a thread rather than blocking the frame — see
+            // `run_script_async`. The `Editor::run` path is kept for the
+            // headless CLI, which needs the answer before it can print it.
+            Command::RunScript => self.run_script_async(),
             other => self.editor.run(other),
         }
     }
@@ -2550,14 +2668,16 @@ impl App {
             return;
         }
 
-        let mut picker = rfd::FileDialog::new();
+        let mut request =
+            crate::dialogs::Request::folder().title("Choose an Animate assets folder");
         if let Some(root) = crate::animate_assets::likely_roots().first() {
-            picker = picker.set_directory(root);
+            request = request.directory(root);
         }
-        let Some(root) = picker.pick_folder() else {
-            return;
-        };
+        self.ask_for_path(request, Pick::AnimateAssets);
+    }
 
+    /// The folder was chosen; read what is in it.
+    fn import_animate_assets_from(&mut self, root: std::path::PathBuf) {
         let found = crate::animate_assets::scan(&root);
         if found.is_empty() {
             self.editor.status = Some(format!(
@@ -2574,6 +2694,333 @@ impl App {
             found,
             self.editor.assets.clone(),
         ));
+    }
+
+    /// Open a file picker, off the UI thread.
+    ///
+    /// The window it belongs to is read here, on the thread that owns it,
+    /// because a `Window` cannot cross to the picker's thread and an
+    /// unparented dialog is free to hide behind the window that asked for it.
+    fn ask_for_path(&mut self, request: crate::dialogs::Request, purpose: Pick) {
+        let parent = self
+            .active
+            .as_ref()
+            .map(|active| crate::dialogs::Parent::of(&active.window))
+            .unwrap_or_default();
+
+        if !self.picker.ask(request, parent, purpose) {
+            self.editor.status = Some("A file dialog is already open".into());
+        }
+    }
+
+    /// Act on whatever the picker came back with.
+    ///
+    /// Cancelling says nothing: the user closed a dialog they opened, and a
+    /// status line announcing that would be noise.
+    fn poll_picker(&mut self) {
+        let Some((purpose, path)) = self.picker.poll() else {
+            return;
+        };
+        let Some(path) = path else { return };
+
+        match purpose {
+            Pick::Open => {
+                if opens_as_document(&path) {
+                    self.open_buzz(&path);
+                } else {
+                    self.open_imported(&path);
+                }
+            }
+            Pick::SaveAs => self.save_to(path),
+            Pick::ImportImage => self.import_image_from(path),
+            Pick::ImportSound => self.import_sound_from(path),
+            Pick::ImportInto(target) => self.import_file(target, path),
+            Pick::AnimateAssets => self.import_animate_assets_from(path),
+            Pick::Export(kind) => self.start_export(kind, path),
+        }
+    }
+
+    /// Run the Actions-panel script on a thread of its own.
+    ///
+    /// The scene is snapshotted here and handed over — a copy-on-write clone,
+    /// so it is pointer copies, not the artwork — and the script mutates *that*
+    /// while the user goes on looking at the document as it was. When it
+    /// finishes, its working copy is committed in one edit, so a script that
+    /// draws four hundred shapes is still a single Ctrl+Z.
+    fn run_script_async(&mut self) {
+        if self.scripting.is_some() {
+            self.editor.status = Some("A script is already running".into());
+            return;
+        }
+        if !self.editor.actions.has_source() {
+            self.editor.status = Some("Write a script in the Actions panel first".into());
+            return;
+        }
+        // Running from the menu or the keyboard while the panel is closed would
+        // put the output somewhere the user cannot see it.
+        if !self.editor.workspace.is_open(buzz_ui::PanelId::Actions) {
+            self.editor.workspace.toggle(buzz_ui::PanelId::Actions);
+        }
+
+        let source = self.editor.actions.source.clone();
+        let context = buzz_script::ScriptContext {
+            current_frame: self.editor.current_frame,
+            selection: self.editor.selection.ids(),
+            active_layer: self.editor.selection.active_layer(),
+        };
+        let mut working = self.editor.doc.scene().clone();
+
+        let (send, result) = crossbeam_channel::bounded(1);
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Script, "Script", move |ctx| {
+            // Cancel reaches the interpreter through its interrupt handler,
+            // which QuickJS calls between bytecodes — so Stop lands mid-loop,
+            // not at the end of one. A `while (true) {}` stops on the spot.
+            let cancel = ctx.cancel.clone();
+            let stop: buzz_script::StopSignal = std::sync::Arc::new(move || cancel.is_cancelled());
+            let outcome = buzz_script::run_until(
+                &mut working,
+                context,
+                &source,
+                &buzz_script::Limits::default(),
+                Some(stop),
+            );
+            let summary = outcome.summary();
+            let _ = send.send((working, outcome));
+            crate::tasks::TaskOutcome::Finished(summary)
+        });
+
+        self.scripting = Some(ScriptRun { id, result });
+    }
+
+    /// A script finished — committed, applied, and reported.
+    fn collect_script(&mut self, id: crate::tasks::TaskId) {
+        let Some(run) = self.scripting.take_if(|r| r.id == id) else {
+            return;
+        };
+        let Ok((working, outcome)) = run.result.try_recv() else {
+            self.editor.status = Some("The script finished but returned nothing".into());
+            return;
+        };
+
+        // Committed whether it finished, timed out, or was stopped: a partial
+        // result is still the user's work, and a single Ctrl+Z removes it if
+        // they did not want it. `changed` is the revision actually moving, so a
+        // read-only script leaves no empty undo step behind.
+        if outcome.changed {
+            self.editor.doc.edit("Run Script", |scene| *scene = working);
+            self.editor.doc.end_gesture();
+        }
+
+        // Computed before the outcome is taken apart below.
+        let summary = outcome.summary();
+
+        // The script's view of the editor becomes the editor's, so
+        // `t.currentFrame = 5` moves the playhead and `d.selectAll()` leaves
+        // the artwork actually selected.
+        self.editor.set_frame(outcome.context.current_frame);
+        self.editor.selection.set(outcome.context.selection);
+        self.editor.selection.prune(self.editor.doc.scene());
+        if let Some(layer) = outcome.context.active_layer {
+            self.editor.selection.set_active_layer(Some(layer));
+        }
+        self.editor.selection.ensure_active_layer(self.editor.doc.scene());
+
+        self.editor.status = Some(summary.clone());
+        self.editor.actions.report(outcome.trace, outcome.error, summary);
+    }
+
+    /// The overlay shown while a script runs.
+    ///
+    /// A [`egui::Modal`], so it gates every pointer path into the document for
+    /// free — a click on the stage cannot reach the artwork the script is in
+    /// the middle of rewriting. Keyboard commands are gated separately, in
+    /// `update`, because shortcuts do not go through the backdrop.
+    fn script_overlay(&mut self, ctx: &egui::Context) {
+        let Some(run) = &self.scripting else { return };
+        let elapsed = self
+            .tasks
+            .running()
+            .find(|t| t.id == run.id)
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        let cancel_id = run.id;
+
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("script-running")).show(ctx, |ui| {
+            ui.set_width(260.0);
+            ui.vertical_centered(|ui| {
+                ui.add_space(6.0);
+                ui.add(egui::Spinner::new().size(28.0));
+                ui.add_space(8.0);
+                ui.strong("Running script\u{2026}");
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(format!("{:.1} s", elapsed.as_secs_f64()))
+                        .weak()
+                        .monospace(),
+                );
+                ui.add_space(10.0);
+                if ui.button("Stop").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+        if cancel {
+            // Sets the token the script's interrupt handler reads; it stops at
+            // the next bytecode and comes back through `collect_script` with
+            // whatever it had done marked as its own.
+            self.tasks.cancel(cancel_id);
+            self.editor.status = Some("Stopping the script\u{2026}".into());
+        }
+    }
+
+    /// Is a file already being read?
+    ///
+    /// Two documents racing to replace the open one has no sensible answer —
+    /// whichever finished second would win, which is not what "second" means to
+    /// the person who asked. So the second request is declined and said so.
+    fn loading_already(&mut self) -> bool {
+        if self.loading.is_empty() {
+            return false;
+        }
+        self.editor.status = Some("A file is already being read".into());
+        true
+    }
+
+    /// Read a file on a thread, and remember where the answer will arrive.
+    ///
+    /// Cancel discards the result rather than stopping the parse: the
+    /// importers have no interruption point inside them, and pretending
+    /// otherwise would be worse than saying so. The parse is bounded by the
+    /// file, and nothing waits on it.
+    fn start_load<F>(&mut self, kind: crate::tasks::TaskKind, label: String, read: F)
+    where
+        F: FnOnce(&crate::tasks::TaskCtx) -> Loaded + Send + 'static,
+    {
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let id = self.tasks.spawn_thread(kind, label, move |ctx| {
+            let loaded = read(&ctx);
+            // Sent *before* the outcome. The outcome is what the frame loop
+            // waits on, and a channel hand-off orders everything that happened
+            // before it — so by the time the outcome lands, this has too.
+            let _ = send.send(loaded);
+            crate::tasks::TaskOutcome::Finished(String::new())
+        });
+        self.loading.insert(id, receive);
+    }
+
+    /// A file finished reading. Put it where it was going.
+    fn collect_loaded_document(&mut self, id: crate::tasks::TaskId) {
+        let Some(receiver) = self.loading.remove(&id) else {
+            return;
+        };
+        let Ok(loaded) = receiver.try_recv() else {
+            // Cannot happen — the payload is sent before the outcome that
+            // brought us here — but a silent nothing beats an unwrap.
+            self.editor.status = Some("The file was read but arrived empty".into());
+            return;
+        };
+
+        match loaded {
+            Loaded::Document { path, result } => match result {
+                Ok(doc) => {
+                    self.adopt_document(*doc);
+                    self.remember_document_directory(&path);
+                    self.editor.status = Some(format!("Opened {}", path.display()));
+                }
+                Err(why) => self.editor.status = Some(why),
+            },
+            Loaded::Foreign {
+                path,
+                target,
+                result,
+            } => match (result, target) {
+                (Ok(imported), None) => self.finish_open_imported(&path, *imported),
+                (Ok(imported), Some(target)) => self.finish_import(target, path, *imported),
+                (Err(message), None) => {
+                    // **In front of the user, not in the status bar.** A file
+                    // that will not open is the whole of what they were trying
+                    // to do, and the reason is usually specific enough to act
+                    // on — but only if it is read.
+                    let name = file_name(&path);
+                    self.editor.status = Some(format!("Could not open {name}: {message}"));
+                    self.editor.import_summary = Some(crate::import::ImportSummary {
+                        title: format!("Could not open {name}"),
+                        what_arrived: message,
+                        unsupported: Vec::new(),
+                        failed: true,
+                    });
+                }
+                (Err(message), Some(_)) => {
+                    // A failed import leaves the open document untouched, which
+                    // it does: nothing was merged.
+                    self.editor.status = Some(format!("Could not import: {message}"));
+                }
+            },
+        }
+    }
+
+    /// Collect whatever the background tasks have finished.
+    ///
+    /// Everything a task has to say arrives here, once, on the UI thread — so
+    /// applying a result is an ordinary edit at an ordinary moment rather than
+    /// another thread reaching into the document.
+    fn poll_tasks(&mut self) {
+        for (id, kind, outcome) in self.tasks.poll() {
+            match outcome {
+                crate::tasks::TaskOutcome::Finished(message) => {
+                    self.finish_task(id, kind, message);
+                }
+                crate::tasks::TaskOutcome::Cancelled => {
+                    self.abandon_task(id, kind);
+                }
+                crate::tasks::TaskOutcome::Failed(why) => {
+                    self.abandon_task(id, kind);
+                    self.editor.status = Some(why);
+                }
+            }
+        }
+    }
+
+    /// A task got where it was going.
+    ///
+    /// The message is what the task wants said; anything it *produced* it left
+    /// in a slot of its own, which is what the per-kind arms collect.
+    fn finish_task(&mut self, id: crate::tasks::TaskId, kind: crate::tasks::TaskKind, message: String) {
+        match kind {
+            crate::tasks::TaskKind::Open | crate::tasks::TaskKind::Import => {
+                self.collect_loaded_document(id);
+            }
+            crate::tasks::TaskKind::Script => {
+                self.collect_script(id);
+                // `collect_script` sets the status from the outcome itself, so
+                // the task's own message is not repeated over the top of it.
+                return;
+            }
+            _ => {}
+        }
+        if !message.is_empty() {
+            self.editor.status = Some(message);
+        }
+    }
+
+    /// A task stopped early, or fell over. Whatever it was going to hand back
+    /// is dropped rather than half-applied.
+    fn abandon_task(&mut self, id: crate::tasks::TaskId, kind: crate::tasks::TaskKind) {
+        match kind {
+            crate::tasks::TaskKind::Open | crate::tasks::TaskKind::Import => {
+                self.loading.remove(&id);
+            }
+            crate::tasks::TaskKind::Script => {
+                // Only reached if the script *thread* fell over — a real Stop
+                // is caught inside the interpreter and comes back as a normal
+                // Finished with `stopped` set, through `collect_script`.
+                self.scripting = None;
+            }
+            _ => {}
+        }
+        self.editor.status = Some(format!("{} stopped", kind.label()));
     }
 
     /// Move an Animate import along, if one is running.
@@ -2673,13 +3120,53 @@ impl App {
         let Some(kind) = self.editor.export.open else {
             return;
         };
+        let stem = self
+            .editor
+            .doc
+            .path()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "untitled".to_string());
+
+        let request = match kind {
+            buzz_ui::ExportKind::Image => {
+                let frame = self.editor.current_frame;
+                crate::dialogs::Request::save_file()
+                    .filter("PNG image", &["png"])
+                    .file_name(format!("{stem}-{frame:04}.png"))
+            }
+            buzz_ui::ExportKind::Sequence => {
+                // A folder, not a file: a sequence is many files, and asking
+                // for one file name would leave the user guessing what the
+                // rest were called.
+                crate::dialogs::Request::folder().title("Choose a folder for the sequence")
+            }
+            buzz_ui::ExportKind::Video => {
+                let options = self.editor.export.video;
+                let extension = options.container.extension();
+                crate::dialogs::Request::save_file()
+                    .filter(options.container.label(), &[extension])
+                    .file_name(format!("{stem}.{extension}"))
+            }
+        };
+        self.ask_for_path(request, Pick::Export(kind));
+    }
+
+    /// The user has said where the export goes. Start it.
+    ///
+    /// The snapshot is taken **here**, not when the dialog was confirmed: the
+    /// picker is modal, so nothing can have changed in between, and taking it
+    /// at the last possible moment is one fewer clone held across a dialog.
+    fn start_export(&mut self, kind: buzz_ui::ExportKind, path: std::path::PathBuf) {
+        if self.export.is_some() {
+            self.editor.status = Some("An export is already running".into());
+            return;
+        }
         let settings = buzz_export::ExportSettings {
             width: self.editor.export.width,
             height: self.editor.export.height,
             transparent: self.editor.export.transparent,
         };
-        // A snapshot, so the export renders the document as it was when the
-        // user asked — and they can keep editing while it writes.
         let scene = self.editor.scene().clone();
         let stem = self
             .editor
@@ -2692,12 +3179,6 @@ impl App {
         let job = match kind {
             buzz_ui::ExportKind::Image => {
                 let frame = self.editor.current_frame;
-                let picked = rfd::FileDialog::new()
-                    .add_filter("PNG image", &["png"])
-                    .set_file_name(format!("{stem}-{frame:04}.png"))
-                    .save_file();
-                let Some(path) = picked else { return };
-
                 crate::export_job::ExportJob::image(
                     scene,
                     frame,
@@ -2707,18 +3188,10 @@ impl App {
                 )
             }
             buzz_ui::ExportKind::Sequence => {
-                // A folder, not a file: a sequence is many files, and asking
-                // for one file name would leave the user guessing what the
-                // rest were called.
-                let picked = rfd::FileDialog::new()
-                    .set_title("Choose a folder for the sequence")
-                    .pick_folder();
-                let Some(directory) = picked else { return };
-
                 crate::export_job::ExportJob::sequence(
                     scene,
                     self.editor.export.range(),
-                    directory,
+                    path,
                     stem,
                     settings,
                     self.preference.clone(),
@@ -2726,13 +3199,6 @@ impl App {
             }
             buzz_ui::ExportKind::Video => {
                 let options = self.editor.export.video;
-                let extension = options.container.extension();
-                let picked = rfd::FileDialog::new()
-                    .add_filter(options.container.label(), &[extension])
-                    .set_file_name(format!("{stem}.{extension}"))
-                    .save_file();
-                let Some(path) = picked else { return };
-
                 crate::export_job::ExportJob::video(
                     scene,
                     self.editor.export.range(),
@@ -2763,11 +3229,14 @@ impl App {
 
     /// Animate's File ▸ Import Image.
     fn import_image_dialog(&mut self) {
-        let picked = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "jpg", "jpeg", "gif", "bmp", "webp"])
-            .pick_file();
-        let Some(path) = picked else { return };
+        self.ask_for_path(
+            crate::dialogs::Request::open_file()
+                .filter("Image", &["png", "jpg", "jpeg", "gif", "bmp", "webp"]),
+            Pick::ImportImage,
+        );
+    }
 
+    fn import_image_from(&mut self, path: std::path::PathBuf) {
         match self.editor.import_image(&path) {
             Ok(name) => {
                 self.editor.status = Some(format!(
@@ -2780,11 +3249,14 @@ impl App {
 
     /// Animate's File ▸ Import Sound.
     fn import_sound_dialog(&mut self) {
-        let picked = rfd::FileDialog::new()
-            .add_filter("Sound", &["wav", "mp3", "ogg", "flac", "m4a", "aac"])
-            .pick_file();
-        let Some(path) = picked else { return };
+        self.ask_for_path(
+            crate::dialogs::Request::open_file()
+                .filter("Sound", &["wav", "mp3", "ogg", "flac", "m4a", "aac"]),
+            Pick::ImportSound,
+        );
+    }
 
+    fn import_sound_from(&mut self, path: std::path::PathBuf) {
         match self.editor.import_sound(&path) {
             Ok(name) => {
                 self.editor.status = Some(format!(
@@ -2846,27 +3318,47 @@ impl App {
     /// The whole import is one [`Document::edit`], so a file that brings in
     /// four hundred symbols is still a single Ctrl+Z.
     fn import_dialog(&mut self, target: buzz_scene::ImportTarget) {
-        let picked = rfd::FileDialog::new()
-            .add_filter(
-                "Everything BuzzAnimate can import",
-                crate::import::IMPORTABLE,
-            )
-            .add_filter("Animate document", &["fla", "xfl"])
-            .add_filter("Flash movie", &["swf"])
-            .add_filter("PDF or Illustrator artwork", &["pdf", "ai"])
-            .pick_file();
-        let Some(path) = picked else { return };
+        self.ask_for_path(
+            crate::dialogs::Request::open_file()
+                .filter(
+                    "Everything BuzzAnimate can import",
+                    crate::import::IMPORTABLE,
+                )
+                .filter("Animate document", &["fla", "xfl"])
+                .filter("Flash movie", &["swf"])
+                .filter("PDF or Illustrator artwork", &["pdf", "ai"]),
+            Pick::ImportInto(target),
+        );
+    }
 
-        let imported = match crate::import::read(&path) {
-            Ok(imported) => imported,
-            Err(message) => {
-                // A failed import must leave the open document untouched, which
-                // it does: nothing has been merged at this point.
-                self.editor.status = Some(format!("Could not import: {message}"));
-                return;
+    /// Merge a chosen file into the open document.
+    fn import_file(&mut self, target: buzz_scene::ImportTarget, path: std::path::PathBuf) {
+        if self.loading_already() {
+            return;
+        }
+        let name = file_name(&path);
+        let reading = path.clone();
+
+        self.start_load(crate::tasks::TaskKind::Import, name, move |ctx| {
+            ctx.progress.detail(format!("Reading {}", file_name(&reading)));
+            Loaded::Foreign {
+                result: crate::import::read(&reading).map(Box::new),
+                path: reading,
+                target: Some(target),
             }
-        };
+        });
+    }
 
+    /// A foreign file finished reading and is to be merged in.
+    ///
+    /// The whole merge is one [`Document::edit`], so a file that brings in four
+    /// hundred symbols is still a single Ctrl+Z.
+    fn finish_import(
+        &mut self,
+        target: buzz_scene::ImportTarget,
+        path: std::path::PathBuf,
+        imported: crate::import::Imported,
+    ) {
         let label = match target {
             buzz_scene::ImportTarget::Stage => "Import to Stage",
             buzz_scene::ImportTarget::Library => "Import to Library",
@@ -2966,20 +3458,16 @@ impl App {
         let mut everything = vec![buzz_doc::EXTENSION];
         everything.extend_from_slice(crate::import::IMPORTABLE);
 
-        let picked = rfd::FileDialog::new()
-            .add_filter("Everything BuzzAnimate can open", &everything)
-            .add_filter("BuzzAnimate document", &[buzz_doc::EXTENSION])
-            .add_filter("Animate document", &["fla", "xfl"])
-            .add_filter("Flash movie", &["swf"])
-            .add_filter("PDF or Illustrator artwork", &["pdf", "ai"])
-            .pick_file();
-        let Some(path) = picked else { return };
-
-        if opens_as_document(&path) {
-            self.open_buzz(&path);
-        } else {
-            self.open_imported(&path);
-        }
+        let everything: Vec<&str> = everything;
+        self.ask_for_path(
+            crate::dialogs::Request::open_file()
+                .filter("Everything BuzzAnimate can open", &everything)
+                .filter("BuzzAnimate document", &[buzz_doc::EXTENSION])
+                .filter("Animate document", &["fla", "xfl"])
+                .filter("Flash movie", &["swf"])
+                .filter("PDF or Illustrator artwork", &["pdf", "ai"]),
+            Pick::Open,
+        );
     }
 
     /// Put a different document on screen, carrying across the things that
@@ -3002,16 +3490,22 @@ impl App {
 
     /// Open one of our own documents.
     fn open_buzz(&mut self, path: &std::path::Path) {
-        match Document::open(path) {
-            Ok(doc) => {
-                self.adopt_document(doc);
-                self.remember_document_directory(path);
-                self.editor.status = Some(format!("Opened {}", path.display()));
-            }
-            Err(e) => {
-                self.editor.status = Some(format!("Could not open: {e}"));
-            }
+        if self.loading_already() {
+            return;
         }
+        let path = path.to_path_buf();
+        let name = file_name(&path);
+        let reading = path.clone();
+
+        self.start_load(crate::tasks::TaskKind::Open, name, move |ctx| {
+            ctx.progress.detail(format!("Reading {}", file_name(&reading)));
+            Loaded::Document {
+                result: Document::open(&reading)
+                    .map(Box::new)
+                    .map_err(|e| format!("Could not open: {e}")),
+                path: reading,
+            }
+        });
     }
 
     /// Open a foreign file — `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` — as a new
@@ -3022,32 +3516,26 @@ impl App {
     /// back over somebody's Animate source, which this program cannot produce
     /// and would therefore destroy.
     fn open_imported(&mut self, path: &std::path::Path) {
-        let imported = match crate::import::read(path) {
-            Ok(imported) => imported,
-            Err(message) => {
-                // **In front of the user, not in the status bar.** A file that
-                // will not open is the whole of what they were trying to do,
-                // and the reason is usually specific enough to act on — but
-                // only if it is read.
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path.display().to_string());
-                self.editor.status = Some(format!("Could not open {name}: {message}"));
-                self.editor.import_summary = Some(crate::import::ImportSummary {
-                    title: format!("Could not open {name}"),
-                    what_arrived: message.clone(),
-                    unsupported: Vec::new(),
-                    failed: true,
-                });
-                return;
-            }
-        };
+        if self.loading_already() {
+            return;
+        }
+        let path = path.to_path_buf();
+        let name = file_name(&path);
+        let reading = path.clone();
 
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.display().to_string());
+        self.start_load(crate::tasks::TaskKind::Open, name, move |ctx| {
+            ctx.progress.detail(format!("Reading {}", file_name(&reading)));
+            Loaded::Foreign {
+                result: crate::import::read(&reading).map(Box::new),
+                path: reading,
+                target: None,
+            }
+        });
+    }
+
+    /// A foreign file finished reading and is to become the open document.
+    fn finish_open_imported(&mut self, path: &std::path::Path, imported: crate::import::Imported) {
+        let name = file_name(path);
 
         self.adopt_document(Document::new(imported.scene.clone()));
         self.editor.doc.mark_clean();
@@ -3071,16 +3559,33 @@ impl App {
     }
 
     fn save(&mut self, force_dialog: bool) {
-        let path = if force_dialog || self.editor.doc.path().is_none() {
-            rfd::FileDialog::new()
-                .add_filter("BuzzAnimate document", &[buzz_doc::EXTENSION])
-                .set_file_name(format!("untitled.{}", buzz_doc::EXTENSION))
-                .save_file()
-        } else {
-            self.editor.doc.path().map(|p| p.to_path_buf())
+        if force_dialog || self.editor.doc.path().is_none() {
+            // Save As opens on the document's own name, not on "untitled":
+            // saving a variant of a file is what Save As is mostly for, and
+            // retyping the name every time is the thing that makes it tedious.
+            let name = self
+                .editor
+                .doc
+                .path()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("untitled.{}", buzz_doc::EXTENSION));
+            self.ask_for_path(
+                crate::dialogs::Request::save_file()
+                    .filter("BuzzAnimate document", &[buzz_doc::EXTENSION])
+                    .file_name(name),
+                Pick::SaveAs,
+            );
+            return;
+        }
+        let Some(path) = self.editor.doc.path().map(|p| p.to_path_buf()) else {
+            return;
         };
-        let Some(path) = path else { return };
+        self.save_to(path);
+    }
 
+    /// Write the document where the user said.
+    fn save_to(&mut self, path: std::path::PathBuf) {
         match self.editor.doc.save_as(&path) {
             Ok(()) => {
                 // Saved: there is nothing left to recover, and the crash

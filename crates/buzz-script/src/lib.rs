@@ -84,6 +84,13 @@ pub struct ScriptContext {
     pub active_layer: Option<LayerId>,
 }
 
+/// A way for the host to stop a script that is already running.
+///
+/// Shared and `'static` because it ends up inside QuickJS's interrupt handler,
+/// which the engine owns; `Send + Sync` because the script may be running on a
+/// thread while the Stop button is pressed on another.
+pub type StopSignal = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// What a run produced.
 #[derive(Debug, Clone, Default)]
 pub struct ScriptOutcome {
@@ -95,6 +102,9 @@ pub struct ScriptOutcome {
     pub context: ScriptContext,
     /// Did the document actually change?
     pub changed: bool,
+    /// True when the host asked it to stop, rather than it finishing or
+    /// failing on its own.
+    pub stopped: bool,
     pub elapsed: Duration,
 }
 
@@ -105,6 +115,9 @@ impl ScriptOutcome {
 
     /// A line for the status bar.
     pub fn summary(&self) -> String {
+        if self.stopped {
+            return "Script stopped".to_string();
+        }
         match &self.error {
             Some(_) => "Script failed".to_string(),
             None if self.changed => format!(
@@ -135,6 +148,22 @@ pub fn run(
     source: &str,
     limits: &Limits,
 ) -> ScriptOutcome {
+    run_until(scene, context, source, limits, None)
+}
+
+/// Run `source`, with a way to stop it.
+///
+/// `stop` is consulted from inside QuickJS's interrupt handler, so it is asked
+/// the same way the time limit is — often, and between bytecodes rather than
+/// between statements. That is what makes Stop take effect on the spot instead
+/// of at the end of whatever loop the script is in.
+pub fn run_until(
+    scene: &mut Scene,
+    context: ScriptContext,
+    source: &str,
+    limits: &Limits,
+    stop: Option<StopSignal>,
+) -> ScriptOutcome {
     let started = Instant::now();
     let revision_before = scene.revision();
 
@@ -146,7 +175,7 @@ pub fn run(
         trace: Vec::new(),
     }));
 
-    let error = evaluate(&state, source, limits);
+    let (error, stopped) = evaluate(&state, source, limits, stop);
 
     // Take the work back out, whether or not the script finished. A partial
     // result is still the user's work.
@@ -162,6 +191,7 @@ pub fn run(
         error,
         context: finished.context,
         changed,
+        stopped,
         elapsed: started.elapsed(),
     }
 }
@@ -178,10 +208,22 @@ impl State {
 }
 
 /// Build the engine, install the API, and evaluate.
-fn evaluate(state: &Rc<RefCell<State>>, source: &str, limits: &Limits) -> Option<String> {
+///
+/// Returns the failure, if any, and whether the host is what stopped it.
+fn evaluate(
+    state: &Rc<RefCell<State>>,
+    source: &str,
+    limits: &Limits,
+    stop: Option<StopSignal>,
+) -> (Option<String>, bool) {
     let runtime = match rquickjs::Runtime::new() {
         Ok(r) => r,
-        Err(e) => return Some(format!("could not start the script engine: {e}")),
+        Err(e) => {
+            return (
+                Some(format!("could not start the script engine: {e}")),
+                false,
+            );
+        }
     };
 
     runtime.set_memory_limit(limits.memory);
@@ -195,23 +237,37 @@ fn evaluate(state: &Rc<RefCell<State>>, source: &str, limits: &Limits) -> Option
     // from a script that threw that word itself — so the cause is recorded at
     // the point it is known rather than guessed at from the message later.
     let timed_out = Arc::new(AtomicBool::new(false));
+    let asked_to_stop = Arc::new(AtomicBool::new(false));
     let fired = Arc::clone(&timed_out);
+    let asked = Arc::clone(&asked_to_stop);
     let deadline = Instant::now() + limits.time;
     runtime.set_interrupt_handler(Some(Box::new(move || {
+        // The host first: a person who pressed Stop is owed an answer sooner
+        // than a clock is.
+        if let Some(stop) = &stop
+            && stop()
+        {
+            asked.store(true, Ordering::Relaxed);
+            return true;
+        }
         if Instant::now() >= deadline {
             fired.store(true, Ordering::Relaxed);
-            true
-        } else {
-            false
+            return true;
         }
+        false
     })));
 
     let context = match rquickjs::Context::full(&runtime) {
         Ok(c) => c,
-        Err(e) => return Some(format!("could not start the script context: {e}")),
+        Err(e) => {
+            return (
+                Some(format!("could not start the script context: {e}")),
+                false,
+            );
+        }
     };
 
-    context.with(|ctx| {
+    let error = context.with(|ctx| {
         if let Err(e) = host::install(&ctx, state) {
             return Some(format!("could not install the script API: {e}"));
         }
@@ -219,6 +275,12 @@ fn evaluate(state: &Rc<RefCell<State>>, source: &str, limits: &Limits) -> Option
         // The prelude shapes the host primitives into Animate's API. A failure
         // here is our bug, not the user's, so it says so.
         if let Err(e) = ctx.eval::<(), _>(PRELUDE) {
+            // Stop can land while the prelude is still running — the user
+            // pressed it the moment they pressed Run. Blaming our own prelude
+            // for that would be both wrong and alarming.
+            if asked_to_stop.load(Ordering::Relaxed) {
+                return None;
+            }
             return Some(format!(
                 "the built-in script prelude failed, which is a defect in \
                  BuzzAnimate rather than in your script: {}",
@@ -233,6 +295,11 @@ fn evaluate(state: &Rc<RefCell<State>>, source: &str, limits: &Limits) -> Option
                 // either way and its answer is only preferred when the engine
                 // stopped for a reason other than our deadline.
                 let described = describe(&ctx, e);
+                if asked_to_stop.load(Ordering::Relaxed) {
+                    // Not a failure. The user asked, and what the script
+                    // managed before then is kept, as it is for a timeout.
+                    return None;
+                }
                 Some(if timed_out.load(Ordering::Relaxed) {
                     TIMED_OUT.to_string()
                 } else {
@@ -240,7 +307,9 @@ fn evaluate(state: &Rc<RefCell<State>>, source: &str, limits: &Limits) -> Option
                 })
             }
         }
-    })
+    });
+
+    (error, asked_to_stop.load(Ordering::Relaxed))
 }
 
 /// Said whenever the deadline is what stopped the script. QuickJS's own word
@@ -302,6 +371,117 @@ mod tests {
 
     fn run_source(scene: &mut Scene, source: &str) -> ScriptOutcome {
         run(scene, ScriptContext::default(), source, &Limits::default())
+    }
+
+    // -- stopping -----------------------------------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// A script that would run for a minute stops when the host says so, and
+    /// does it in far less than the time limit — this is what makes the Stop
+    /// button a button rather than a suggestion.
+    #[test]
+    fn the_host_can_stop_a_running_script() {
+        let mut scene = document();
+        let asked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&asked);
+
+        // Say stop the moment the engine first asks.
+        let stop: StopSignal = Arc::new(move || {
+            flag.store(true, Ordering::Relaxed);
+            true
+        });
+
+        let started = Instant::now();
+        let out = run_until(
+            &mut scene,
+            ScriptContext::default(),
+            "while (true) {}",
+            &Limits {
+                time: Duration::from_secs(60),
+                ..Limits::default()
+            },
+            Some(stop),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(out.stopped, "it should say the host stopped it");
+        assert!(asked.load(Ordering::Relaxed), "nobody was asked");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "stopping took {elapsed:?}, which is not stopping"
+        );
+    }
+
+    /// Stopping is not failing. A script that built four hundred shapes and
+    /// was then stopped has still built them, and saying "Script failed" over
+    /// the top of that would be a lie.
+    #[test]
+    fn a_stopped_script_is_not_a_failed_one() {
+        let mut scene = document();
+        // Let it get going first, so this tests a script that was stopped
+        // part-way rather than one that never started.
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&asked);
+        let stop: StopSignal = Arc::new(move || count.fetch_add(1, Ordering::Relaxed) > 200);
+
+        let out = run_until(
+            &mut scene,
+            ScriptContext::default(),
+            "fl.trace('starting'); while (true) {}",
+            &Limits::default(),
+            Some(stop),
+        );
+
+        assert!(out.stopped);
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(out.summary(), "Script stopped");
+        // What it managed before being stopped is kept.
+        assert_eq!(out.trace, vec!["starting".to_string()]);
+    }
+
+    /// Nobody asking is the ordinary case, and it must not change what the
+    /// engine does.
+    #[test]
+    fn a_signal_that_never_fires_changes_nothing() {
+        let mut scene = document();
+        let stop: StopSignal = Arc::new(|| false);
+
+        let out = run_until(
+            &mut scene,
+            ScriptContext::default(),
+            "fl.trace('hello');",
+            &Limits::default(),
+            Some(stop),
+        );
+
+        assert!(!out.stopped);
+        assert!(out.succeeded(), "{:?}", out.error);
+        assert_eq!(out.trace, vec!["hello".to_string()]);
+    }
+
+    /// The time limit still applies when a signal is present — the two are not
+    /// alternatives, and a runaway script with a signal nobody is watching must
+    /// still end.
+    #[test]
+    fn the_time_limit_still_applies_alongside_a_signal() {
+        let mut scene = document();
+        let stop: StopSignal = Arc::new(|| false);
+
+        let out = run_until(
+            &mut scene,
+            ScriptContext::default(),
+            "while (true) {}",
+            &Limits {
+                time: Duration::from_millis(250),
+                ..Limits::default()
+            },
+            Some(stop),
+        );
+
+        assert!(!out.stopped, "the clock stopped it, not the host");
+        let message = out.error.expect("it should have been interrupted");
+        assert!(message.contains("time limit"), "{message}");
     }
 
     // -- the engine ---------------------------------------------------------

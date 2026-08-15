@@ -27,6 +27,7 @@ pub mod selection;
 pub mod sound_panel;
 pub mod style;
 pub mod swatch_panel;
+pub mod tasks_panel;
 pub mod theme;
 pub mod timeline_panel;
 pub mod tools;
@@ -56,6 +57,7 @@ pub use selection::Selection;
 pub use sound_panel::{SoundChoice, SoundResponse, sound_panel};
 pub use style::{DrawStyle, DrawingMode, StrokeKind};
 pub use swatch_panel::{SwatchState, swatch_panel};
+pub use tasks_panel::{FinishedRow, TaskAction, TaskRow, TasksView, tasks_panel};
 pub use theme::{Metrics, Palette};
 pub use timeline_panel::{
     FrameAction, TimelineResponse, TimelineState, TweenRequest, Waveform, timeline_panel,

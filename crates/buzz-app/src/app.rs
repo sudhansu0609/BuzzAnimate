@@ -103,6 +103,39 @@ fn name_this_application() {
 ///
 /// By extension, and case-insensitively: `SCENE.FLA` off somebody's server is
 /// the same file as `scene.fla`.
+/// Show a finished export in the file manager, selected where it can be.
+///
+/// Best-effort: a failure to open a folder is not worth interrupting the user
+/// over — they know where they saved it — so the result is ignored.
+fn reveal_in_folder(path: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        // `/select,` highlights the file within its folder. A directory (a PNG
+        // sequence's destination) is opened directly instead.
+        if path.is_dir() {
+            let _ = std::process::Command::new("explorer").arg(path).spawn();
+        } else {
+            let _ = std::process::Command::new("explorer")
+                .arg(format!("/select,{}", path.display()))
+                .spawn();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No portable "select the file", so open the folder it is in.
+        let dir = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
 /// What to call a file in front of a person: its name, not its whole path.
 fn file_name(path: &std::path::Path) -> String {
     path.file_name()
@@ -268,8 +301,14 @@ pub struct App {
     editor: Editor,
     jobs: Arc<JobSystem>,
     preference: GpuPreference,
-    /// An export writing frames on its own thread, if one is running.
-    export: Option<crate::export_job::ExportJob>,
+    /// Every export, run one at a time on the task registry. Replaces the old
+    /// single slot that refused a second export outright.
+    exports: crate::export_service::ExportQueue,
+    /// True while the "an export is still running" quit prompt is up.
+    ///
+    /// A close request with work that would be lost raises this instead of
+    /// exiting, so a half-written film is a decision rather than an accident.
+    quit_prompt: bool,
     /// Lighting geometry kept between frames.
     ///
     /// The renderer is stateless — a `SceneBuilder` lives for one frame — so
@@ -352,7 +391,8 @@ impl App {
             editor,
             jobs: Arc::new(JobSystem::new()),
             preference,
-            export: None,
+            exports: crate::export_service::ExportQueue::default(),
+            quit_prompt: false,
             lights: buzz_render::document::DrawCache::new(),
             recovery: buzz_ui::RecoveryState::default(),
             last_crash_revision: None,
@@ -1031,17 +1071,18 @@ impl App {
         // An export runs on its own thread; this is where what it has done
         // reaches the screen. The repaint request is what keeps the progress
         // bar moving on a document that is otherwise still.
-        self.poll_export();
+        self.pump_export_queue();
         self.poll_animate_import();
         self.poll_picker();
         self.poll_tasks();
-        if self.export.is_some() || !self.tasks.is_empty() || self.picker.busy() {
+        if !self.exports.is_idle() || !self.tasks.is_empty() || self.picker.busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         // The overlay keeps the elapsed count moving and gives the Stop button
         // somewhere to live; it is drawn after the panels so it sits over
         // everything, and gates pointer input to the document beneath it.
         self.script_overlay(&ctx);
+        self.quit_prompt_dialog(&ctx);
         self.export_dialog(&ctx);
         self.lip_sync_dialog(&ctx);
         self.recovery_dialog(&ctx);
@@ -1292,6 +1333,8 @@ impl App {
                     commands.push(Command::RunScript);
                 }
             }
+
+            Tasks => self.tasks_panel(ui),
         }
     }
 
@@ -2561,7 +2604,7 @@ impl App {
             Command::Open => self.open_dialog(),
             Command::Save => self.save(false),
             Command::SaveAs => self.save(true),
-            Command::Close => self.editor.should_quit = true,
+            Command::Close => self.request_quit(),
             Command::ImportToStage => self.import_dialog(buzz_scene::ImportTarget::Stage),
             Command::ImportToLibrary => self.import_dialog(buzz_scene::ImportTarget::Library),
             // A script drives the whole document and can run for seconds, so it
@@ -2979,6 +3022,22 @@ impl App {
     /// another thread reaching into the document.
     fn poll_tasks(&mut self) {
         for (id, kind, outcome) in self.tasks.poll() {
+            // Exports are handled in one place because all three outcomes have
+            // to be recorded against the queue — success, cancel and failure
+            // alike free it for the next export and get a row in the panel.
+            if kind == crate::tasks::TaskKind::Export {
+                let (ok, message) = match outcome {
+                    crate::tasks::TaskOutcome::Finished(m) => (true, m),
+                    crate::tasks::TaskOutcome::Cancelled => {
+                        (false, "Export cancelled".to_string())
+                    }
+                    crate::tasks::TaskOutcome::Failed(why) => (false, why),
+                };
+                self.exports.complete(id, ok, message.clone());
+                self.editor.status = Some(message);
+                continue;
+            }
+
             match outcome {
                 crate::tasks::TaskOutcome::Finished(message) => {
                     self.finish_task(id, kind, message);
@@ -3087,10 +3146,9 @@ impl App {
 
     /// Open the Export dialog, sized to the document as it is now.
     fn open_export(&mut self, kind: buzz_ui::ExportKind) {
-        if self.export.is_some() {
-            self.editor.status = Some("An export is already running".into());
-            return;
-        }
+        // No one-slot gate any more: a second export while one runs joins the
+        // queue rather than being refused.
+        //
         // Checked as the dialog opens rather than when Export is pressed, so
         // the missing dependency is visible while the settings are still being
         // chosen instead of after a file name has been picked.
@@ -3118,12 +3176,9 @@ impl App {
     fn export_dialog(&mut self, ctx: &egui::Context) {
         let response = buzz_ui::export_dialog(ctx, &mut self.editor.export);
 
-        if response.cancelled
-            && let Some(job) = &self.export
-        {
-            job.cancel();
-            self.editor.status = Some("Stopping the export…".into());
-        }
+        // Cancel just closes the dialog now — there is no inline job to stop,
+        // because the dialog configures and enqueues rather than running the
+        // export itself. A running export is stopped from the Tasks panel.
         if !response.confirmed {
             return;
         }
@@ -3169,15 +3224,15 @@ impl App {
     /// picker is modal, so nothing can have changed in between, and taking it
     /// at the last possible moment is one fewer clone held across a dialog.
     fn start_export(&mut self, kind: buzz_ui::ExportKind, path: std::path::PathBuf) {
-        if self.export.is_some() {
-            self.editor.status = Some("An export is already running".into());
-            return;
-        }
+        use crate::export_service::{ExportRequest, ExportTarget};
+
         let settings = buzz_export::ExportSettings {
             width: self.editor.export.width,
             height: self.editor.export.height,
             transparent: self.editor.export.transparent,
         };
+        // A snapshot, so the export renders the document as it was when the user
+        // asked — and they can keep editing, or queue another, while it writes.
         let scene = self.editor.scene().clone();
         let stem = self
             .editor
@@ -3186,56 +3241,89 @@ impl App {
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "untitled".to_string());
+        let range = self.editor.export.range();
 
-        let job = match kind {
+        let (target, label) = match kind {
             buzz_ui::ExportKind::Image => {
                 let frame = self.editor.current_frame;
-                crate::export_job::ExportJob::image(
-                    scene,
-                    frame,
-                    path,
-                    settings,
-                    self.preference.clone(),
-                )
+                let label = file_name(&path);
+                (ExportTarget::Image { frame, path }, label)
             }
             buzz_ui::ExportKind::Sequence => {
-                crate::export_job::ExportJob::sequence(
-                    scene,
-                    self.editor.export.range(),
-                    path,
-                    stem,
-                    settings,
-                    self.preference.clone(),
+                let label = format!("{}\u{2044}", file_name(&path));
+                (
+                    ExportTarget::Sequence {
+                        directory: path,
+                        base_name: stem,
+                    },
+                    label,
                 )
             }
             buzz_ui::ExportKind::Video => {
                 let options = self.editor.export.video;
-                crate::export_job::ExportJob::video(
-                    scene,
-                    self.editor.export.range(),
-                    path,
-                    settings,
-                    buzz_export::VideoSettings {
-                        codec: match options.codec {
-                            buzz_ui::VideoChoice::H264 => buzz_export::VideoCodec::H264,
-                            buzz_ui::VideoChoice::Hevc => buzz_export::VideoCodec::Hevc,
-                            buzz_ui::VideoChoice::Av1 => buzz_export::VideoCodec::Av1,
+                let label = file_name(&path);
+                (
+                    ExportTarget::Video {
+                        path,
+                        video: buzz_export::VideoSettings {
+                            codec: match options.codec {
+                                buzz_ui::VideoChoice::H264 => buzz_export::VideoCodec::H264,
+                                buzz_ui::VideoChoice::Hevc => buzz_export::VideoCodec::Hevc,
+                                buzz_ui::VideoChoice::Av1 => buzz_export::VideoCodec::Av1,
+                            },
+                            container: match options.container {
+                                buzz_ui::ContainerChoice::Mp4 => buzz_export::VideoContainer::Mp4,
+                                buzz_ui::ContainerChoice::Mov => buzz_export::VideoContainer::Mov,
+                            },
+                            quality: options.quality,
+                            hardware: options.hardware,
+                            audio: options.audio,
                         },
-                        container: match options.container {
-                            buzz_ui::ContainerChoice::Mp4 => buzz_export::VideoContainer::Mp4,
-                            buzz_ui::ContainerChoice::Mov => buzz_export::VideoContainer::Mov,
-                        },
-                        quality: options.quality,
-                        hardware: options.hardware,
-                        audio: options.audio,
                     },
-                    self.preference.clone(),
+                    label,
                 )
             }
         };
 
-        self.editor.export.progress = Some(job.progress);
-        self.export = Some(job);
+        let busy = !self.exports.is_idle();
+        self.exports.enqueue(ExportRequest {
+            scene,
+            settings,
+            range,
+            target,
+            gpu: self.preference.clone(),
+            label: label.clone(),
+        });
+
+        // Open the Tasks panel so there is somewhere to watch it — this is the
+        // progress bar and the Cancel button now that the dialog has neither.
+        if !self.editor.workspace.is_open(buzz_ui::PanelId::Tasks) {
+            self.editor.workspace.toggle(buzz_ui::PanelId::Tasks);
+            self.editor.workspace.save();
+        }
+        self.editor.status = Some(if busy {
+            format!("Queued {label}")
+        } else {
+            format!("Exporting {label}\u{2026}")
+        });
+    }
+
+    /// Start the next queued export, if the queue is free.
+    ///
+    /// Serial by construction: [`ExportQueue::next_to_start`] hands back nothing
+    /// while one is running, so this does nothing until it finishes.
+    fn pump_export_queue(&mut self) {
+        let Some(request) = self.exports.next_to_start() else {
+            return;
+        };
+        let reveal = request.reveal_path();
+        let label = request.label.clone();
+        let id = self.tasks.spawn_thread(
+            crate::tasks::TaskKind::Export,
+            label.clone(),
+            move |ctx| crate::export_service::run_export(request, &ctx),
+        );
+        self.exports.started(id, reveal, label);
     }
 
     /// Animate's File ▸ Import Image.
@@ -3310,17 +3398,147 @@ impl App {
         }
     }
 
-    /// Take whatever the exporting thread has said since the last frame.
-    fn poll_export(&mut self) {
-        let Some(job) = &mut self.export else { return };
+    /// Somebody asked to close the window.
+    ///
+    /// If nothing that matters is running, that is that. If an export is in
+    /// flight — minutes of GPU time and a file half-written to disk — the quit
+    /// waits behind a prompt rather than throwing it away.
+    fn request_quit(&mut self) {
+        if self.tasks.quit_blockers().is_empty() {
+            self.editor.should_quit = true;
+        } else {
+            self.quit_prompt = true;
+            if let Some(active) = &self.active {
+                active.window.request_redraw();
+            }
+        }
+    }
 
-        let finished = job.poll();
-        self.editor.export.progress = Some(job.progress);
+    /// The "an export is still running" prompt.
+    fn quit_prompt_dialog(&mut self, ctx: &egui::Context) {
+        if !self.quit_prompt {
+            return;
+        }
 
-        if let Some(message) = finished {
-            self.editor.status = Some(message);
-            self.editor.export.close();
-            self.export = None;
+        // The blocker with the most to lose, described for the prompt. Collected
+        // as an owned string so the borrow on the registry is dropped before the
+        // buttons below want `&mut self`.
+        let blockers = self.tasks.quit_blockers();
+        let (headline, more) = match blockers.first() {
+            Some(task) => {
+                let progress = task.progress();
+                let percent = progress
+                    .fraction()
+                    .map(|f| format!(" is {:.0}% done", f * 100.0))
+                    .unwrap_or_default();
+                let headline = format!("{} \u{201C}{}\u{201D}{percent}.", task.kind.label(), task.label);
+                let more = blockers.len().saturating_sub(1);
+                (headline, more)
+            }
+            None => {
+                // Nothing left to block: whatever was running finished while the
+                // prompt was being raised.
+                self.quit_prompt = false;
+                self.editor.should_quit = true;
+                return;
+            }
+        };
+
+        let mut keep_waiting = false;
+        let mut quit_anyway = false;
+        egui::Modal::new(egui::Id::new("quit-prompt")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Still exporting");
+            ui.add_space(6.0);
+            ui.label(headline);
+            if more > 0 {
+                ui.label(
+                    egui::RichText::new(format!("And {more} more waiting behind it."))
+                        .weak(),
+                );
+            }
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Quitting now stops it and deletes the partly-written file.",
+                )
+                .weak(),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Keep waiting").clicked() {
+                    keep_waiting = true;
+                }
+                if ui
+                    .button(egui::RichText::new("Stop export and quit").color(egui::Color32::from_rgb(0xE5, 0x53, 0x53)))
+                    .clicked()
+                {
+                    quit_anyway = true;
+                }
+            });
+        });
+
+        if keep_waiting {
+            self.quit_prompt = false;
+        }
+        if quit_anyway {
+            self.quit_prompt = false;
+            // The exports stop and tidy their `.part` files as the process
+            // shuts down — see the exit path in `window_event`.
+            self.editor.should_quit = true;
+        }
+    }
+
+    /// Draw the Tasks panel: everything the program is doing in the background.
+    fn tasks_panel(&mut self, ui: &mut egui::Ui) {
+        let running: Vec<buzz_ui::TaskRow> = self
+            .tasks
+            .running()
+            .map(|task| {
+                let progress = task.progress();
+                buzz_ui::TaskRow {
+                    id: task.id.0,
+                    kind: task.kind.label().to_string(),
+                    label: task.label.clone(),
+                    progress: progress.fraction(),
+                    detail: progress.detail,
+                    elapsed_secs: task.elapsed().as_secs_f64(),
+                    can_cancel: task.kind.can_cancel(),
+                }
+            })
+            .collect();
+
+        let finished: Vec<buzz_ui::FinishedRow> = self
+            .exports
+            .finished()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| buzz_ui::FinishedRow {
+                id: i as u64,
+                label: f.label.clone(),
+                ok: f.ok,
+                message: f.message.clone(),
+            })
+            .collect();
+
+        let view = buzz_ui::TasksView {
+            running: &running,
+            finished: &finished,
+            queued: self.exports.waiting(),
+        };
+
+        if let Some(action) = buzz_ui::tasks_panel(ui, &view) {
+            match action {
+                buzz_ui::TaskAction::Cancel(id) => {
+                    self.tasks.cancel(crate::tasks::TaskId(id));
+                    self.editor.status = Some("Stopping\u{2026}".into());
+                }
+                buzz_ui::TaskAction::Reveal(i) => {
+                    if let Some(f) = self.exports.finished().get(i as usize) {
+                        reveal_in_folder(&f.reveal);
+                    }
+                }
+            }
         }
     }
 
@@ -3991,7 +4209,15 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Not an immediate exit: a running export gets a prompt first.
+                // The actual close happens on the next redraw, once
+                // `should_quit` is set — here or by the prompt.
+                self.request_quit();
+                if let Some(active) = &self.active {
+                    active.window.request_redraw();
+                }
+            }
             WindowEvent::Resized(size) => {
                 active.resize(size.width, size.height);
                 active.window.request_redraw();
@@ -4001,6 +4227,10 @@ impl ApplicationHandler for App {
                     eprintln!("frame failed: {e:?}");
                 }
                 if self.editor.should_quit {
+                    // Stop anything still running and wait for it, so a
+                    // cancelled export removes its `.part` before the process
+                    // is gone.
+                    self.tasks.cancel_and_join();
                     event_loop.exit();
                 }
             }

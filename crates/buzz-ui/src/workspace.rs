@@ -43,6 +43,9 @@ pub enum PanelId {
     Assets,
     Timeline,
     Actions,
+    /// Everything the program is doing in the background: exports, imports,
+    /// asset scans. Global rather than per-document; hidden until asked for.
+    Tasks,
 }
 
 impl PanelId {
@@ -63,6 +66,7 @@ impl PanelId {
             Self::Assets => "Assets",
             Self::Timeline => "Timeline",
             Self::Actions => "Actions",
+            Self::Tasks => "Tasks",
         }
     }
 
@@ -92,7 +96,7 @@ impl PanelId {
         !matches!(self, Self::Tools | Self::Timeline)
     }
 
-    pub const ALL: [PanelId; 14] = [
+    pub const ALL: [PanelId; 15] = [
         PanelId::Tools,
         PanelId::Layers,
         PanelId::Properties,
@@ -107,6 +111,7 @@ impl PanelId {
         PanelId::Assets,
         PanelId::Timeline,
         PanelId::Actions,
+        PanelId::Tasks,
     ];
 }
 
@@ -449,6 +454,9 @@ impl Workspace {
                 // Closed until F9 asks for it — and it belongs at the bottom,
                 // under the stage, where Animate keeps it.
                 slot(PanelId::Actions, Dock::Hidden, 1, Dock::Bottom),
+                // Hidden until there is something to watch; opened from the
+                // Window menu, or by the shell when an export is enqueued.
+                slot(PanelId::Tasks, Dock::Hidden, 2, Dock::Bottom),
             ],
             locked: false,
             theme: crate::theme::Theme::default(),

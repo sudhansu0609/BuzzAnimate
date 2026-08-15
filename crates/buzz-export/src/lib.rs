@@ -37,8 +37,12 @@ use rayon::prelude::*;
 /// test suites like to use avoid it.
 const COPY_ALIGNMENT: u32 = 256;
 
+pub mod gif;
 pub mod video;
 
+pub use gif::{
+    AnimatedFormat, AnimatedReport, Dither, GifSettings, WebpSettings, export_gif, export_webp,
+};
 pub use video::{
     AudioTrack, VideoCodec, VideoContainer, VideoReport, VideoSettings, export_video,
     ffmpeg_available,

@@ -3496,6 +3496,50 @@ line.
 
 ---
 
+### ✅ Wave 5 — Background export: a queue, a panel, and two more formats
+
+Export was a single slot: starting one while another ran was refused outright, its
+progress dialog died with the document (the bug that first motivated the task
+registry), and quitting threw away a half-written file. Wave 5 replaces the slot with a
+service.
+
+**The export queue (`buzz-app/src/export_service.rs`).** A **serial** `ExportQueue` on
+`App`, each job a task-registry thread running `run_export`. "Export while exporting" now
+means "joins the queue" rather than being refused. Serial on purpose, not a shortcut:
+every export builds its own second wgpu device and Vello renderer, so running four at
+once would quadruple VRAM and fight NVENC's session limit to finish the same work no
+sooner. The old one-slot gate is gone, and the retired `export_job.rs` with it — its
+soundtrack extraction moved into the service unchanged.
+
+**The Tasks panel (`buzz-ui/src/tasks_panel.rs`, `PanelId::Tasks`).** A global,
+dockable panel — global because work outlives documents, so `File ▸ New` mid-export
+changes nothing about it. It lists every running task from `TaskRegistry::running()`
+(exports, imports, background opens, scripts) with a progress bar, elapsed time and,
+where the work is worth stopping, a Stop button; and finished exports with **Reveal in
+folder**. It is the one place to answer "what is this program doing", and it is where an
+export's progress and Cancel live now that the dialog is configure-and-enqueue only. It
+is hidden by default and opens itself when an export is enqueued. Added to `PanelId`,
+which `mend` folds into any saved layout with no version bump.
+
+**Quit protection.** A close request with an export still running raises a prompt —
+*"Export "shot3.mp4" is 37% done. Keep waiting · Stop export and quit"* — driven by
+`TaskRegistry::quit_blockers()`, which counts exports and films and *not* thumbnails or
+asset scans (asking about work that is redone for free is how a prompt stops being read).
+On the way out `cancel_and_join` stops everything and waits, so a cancelled export
+removes its `.part` before the process is gone — the same atomic write-then-rename
+discipline autosave uses.
+
+**GIF and animated WebP (closes CP-6.3).** A new `buzz-export/src/gif.rs`, built like
+`video.rs`: frames piped once to the machine's ffmpeg. A GIF gets a whole-clip palette in
+a **single pass** via a split filter (`palettegen=stats_mode=diff` → `paletteuse`), so a
+character over a flat background spends its 256 colours on the character rather than on
+the background every frame shares — no two-pass palette file. Ordered (Bayer) dithering
+by default because it does not crawl between frames the way error-diffusion does. Animated
+WebP via `libwebp`, keeping the exporter's straight alpha so a WebP over a transparent
+stage stays transparent. Cancelling either removes the `.part`, as the video path does.
+
+---
+
 ## 5. Current metrics
 
 | Measure | Value |
@@ -3616,7 +3660,10 @@ line.
       the reasoning at the head of `crates/buzz-export/src/video.rs`). Frames
       are piped down stdin as they are rendered, and **the soundtrack is muxed
       in**. Verified by `crates/buzz-export/tests/headless_video.rs`.
-- [ ] **CP-6.3** GIF / WebP — palette quantisation, animated WebP
+- [x] **CP-6.3** GIF / WebP — animated GIF with a whole-clip palette
+      (`stats_mode=diff`) built in one pass by a split filter, and animated
+      WebP, both piped to ffmpeg exactly as the video path is
+      (`crates/buzz-export/src/gif.rs`). Wired into the Export dialog in Wave 5.
 - [ ] **CP-6.4** HTML5 Canvas / SVG — scene graph → JS + small runtime player
 - [ ] **Exit test:** one document exported to all four, all four play correctly
 

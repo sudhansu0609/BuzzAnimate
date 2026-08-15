@@ -83,6 +83,20 @@ impl TaskKind {
         }
     }
 
+    /// Can the user stop this from the Tasks panel?
+    ///
+    /// Everything holds a cancel token, but stopping some work makes no sense to
+    /// offer: a thumbnail batch or an asset scan is redone for free, and the
+    /// button would be a way to make the program do *less* than it already
+    /// finished. Work with a real cost to lose — or a real wait to escape —
+    /// gets the button.
+    pub fn can_cancel(self) -> bool {
+        matches!(
+            self,
+            Self::Export | Self::ConcatFilm | Self::Import | Self::Open | Self::Script
+        )
+    }
+
     /// **Would losing this to a quit destroy work?**
     ///
     /// An export half-written to disk is a broken file and minutes of GPU time

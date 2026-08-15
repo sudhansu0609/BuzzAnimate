@@ -28,13 +28,32 @@ use crate::timeline::{Keyframe, LayerTimeline};
 use crate::{IdAllocator, Scene};
 
 /// Where an imported document should land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `PartialEq` but not `Eq`: a paste carries a distance, and a distance is
+/// floating point.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ImportTarget {
     /// Animate's *Import to Library*: bring the symbols, leave the stage alone.
     Library,
     /// Animate's *Import to Stage*: bring the symbols **and** place the
     /// document's own timeline as new layers on top of the current one.
     Stage,
+    /// **Paste.** Bring the symbols, and put the incoming artwork on a layer
+    /// that already exists, at one frame.
+    ///
+    /// Distinct from [`Self::Stage`] because pasting must not invent layers.
+    /// An import arrives as a document and keeps its own structure; a paste is
+    /// artwork arriving in the middle of the drawing you are already making,
+    /// and Animate puts it on the current layer at the current frame. Three
+    /// copies of a character would otherwise be three new layers each.
+    Onto {
+        layer: LayerId,
+        frame: u32,
+        /// Moved by this much on the way in, so a paste over its own original
+        /// is visibly a second copy rather than an invisible one exactly on
+        /// top. Animate offsets a plain paste and not a Paste in Place.
+        offset: buzz_geom::Vec2,
+    },
 }
 
 /// What a merge brought across.
@@ -235,11 +254,29 @@ impl Scene {
             });
         }
 
-        // 3. The document's own timeline, if this is an Import to Stage.
-        let stage_layers = match target {
-            ImportTarget::Stage => Some(remap.layer_stack(other.stage_layers())),
-            ImportTarget::Library => None,
-        };
+        // 3. The document's own timeline, if this is an Import to Stage — or
+        //    just its artwork, if this is a paste.
+        let mut stage_layers = None;
+        let mut pasted: Vec<Object> = Vec::new();
+        match target {
+            ImportTarget::Stage => stage_layers = Some(remap.layer_stack(other.stage_layers())),
+            ImportTarget::Library => {}
+            ImportTarget::Onto { frame, offset, .. } => {
+                // Everything the source shows on its own first frame. A
+                // clipboard scene built by `extract` is one layer at frame 0,
+                // but taking `objects_at` of every layer means a whole
+                // imported document can be pasted too, flattened onto one
+                // layer, which is what "paste this artwork here" means.
+                let _ = frame;
+                for layer in other.stage_layers().iter() {
+                    for object in layer.objects_at(0).iter() {
+                        let mut copy = remap.object(object);
+                        copy.transform = buzz_geom::Affine::translate(offset) * copy.transform;
+                        pasted.push(copy);
+                    }
+                }
+            }
+        }
         report.objects = remap.objects;
 
         // 4. Names are resolved against the destination one at a time, so two
@@ -269,6 +306,13 @@ impl Scene {
             report.layers = arriving.len();
             for (index, layer) in arriving.into_iter().enumerate() {
                 self.layers.insert(index, (*layer).clone());
+            }
+        }
+
+        // 6. Or, for a paste, onto the layer that is already there.
+        if let ImportTarget::Onto { layer, frame, .. } = target {
+            for object in pasted {
+                self.add_object_at(layer, frame, object);
             }
         }
 

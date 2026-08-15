@@ -220,6 +220,16 @@ pub struct App {
     last_crash_revision: Option<u64>,
     /// An Animate asset import running on its own thread.
     animate_import: Option<crossbeam_channel::Receiver<crate::animate_assets::Progress>>,
+    /// Where each dock column ended up on this frame.
+    ///
+    /// The splitters are drawn after the panels, over whatever is underneath,
+    /// and they have to sit on the *actual* boundary between two columns. That
+    /// boundary was being guessed from the stage rectangle, which works for
+    /// exactly one column a side — the far-right column had no handle at all,
+    /// so the Library and the Assets panel were stuck at whatever width they
+    /// were born with. Recording the rects as they are laid out is the only
+    /// way to be right about this that does not repeat the layout arithmetic.
+    dock_rects: Vec<(buzz_ui::Dock, egui::Rect)>,
 }
 
 impl App {
@@ -247,6 +257,7 @@ impl App {
             recovery: buzz_ui::RecoveryState::default(),
             last_crash_revision: None,
             animate_import: None,
+            dock_rects: Vec::new(),
         };
         app.recovery = app.find_recoveries();
         app
@@ -578,6 +589,42 @@ fn keyboard_commands(ctx: &egui::Context, editor: &Editor) -> Vec<Command> {
         out.push(Command::Redo);
     }
 
+    // **The arrow keys nudge the selection**, one document unit at a time and
+    // eight with Shift — Animate's numbers.
+    //
+    // Read here rather than through the shortcut map because four directions
+    // times two step sizes is eight bindings for one action, and none of them
+    // belongs in a menu. Only when something is selected: with an empty
+    // selection the arrows are free for whatever wants them next, and nudging
+    // nothing would be a silent no-op that looks like a dropped keystroke.
+    if !editor.selection.is_empty() {
+        let shift = ctx.input(|i| i.modifiers.shift_only());
+        let step = if shift {
+            buzz_ui::command::NUDGE_STEP_LARGE
+        } else {
+            buzz_ui::command::NUDGE_STEP
+        };
+        let modifiers = if shift {
+            egui::Modifiers::SHIFT
+        } else {
+            egui::Modifiers::NONE
+        };
+        for (key, x, y) in [
+            (egui::Key::ArrowLeft, -1, 0),
+            (egui::Key::ArrowRight, 1, 0),
+            // Screen down is +y in document space, as everywhere else here.
+            (egui::Key::ArrowUp, 0, -1),
+            (egui::Key::ArrowDown, 0, 1),
+        ] {
+            if ctx.input_mut(|i| i.consume_key(modifiers, key)) {
+                out.push(Command::Nudge {
+                    x: x * step,
+                    y: y * step,
+                });
+            }
+        }
+    }
+
     // Bare letters select tools, but only without modifiers.
     let plain = ctx.input(|i| !i.modifiers.any());
     if plain {
@@ -648,20 +695,21 @@ impl App {
             // side here, which is what makes the layout the user's to arrange.
             // Requested moves are collected and applied after the frame: a
             // panel cannot be moved while it is being drawn.
-            let mut moves: Vec<(buzz_ui::PanelId, buzz_ui::Dock)> = Vec::new();
-            let mut reorders: Vec<(buzz_ui::PanelId, i32)> = Vec::new();
+            let mut requests = DockRequests::default();
             let workspace = self.editor.workspace.clone();
             let locked = workspace.locked;
+            self.dock_rects.clear();
 
             // Bottom first: `egui` gives each side to whichever panel asks
             // first, so the order here is the order down the window.
-            for id in workspace.on(buzz_ui::Dock::Bottom) {
-                let height = if id == buzz_ui::PanelId::Timeline {
+            for section in workspace.sections(buzz_ui::Dock::Bottom) {
+                let neighbours = workspace.on(buzz_ui::Dock::Bottom);
+                let height = if section.front == buzz_ui::PanelId::Timeline {
                     workspace.bottom_height
                 } else {
                     240.0
                 };
-                let response = egui::Panel::bottom(egui::Id::new(("dock-bottom", id)))
+                let response = egui::Panel::bottom(egui::Id::new(("dock-bottom", section.group)))
                     // **Exact, not default.** egui keeps a size of its own per
                     // panel, and a `default_size` is only consulted when it has
                     // none — so the workspace's number and egui's could
@@ -671,36 +719,44 @@ impl App {
                     .resizable(false)
                     .exact_size(height)
                     .show(ui, |ui| {
-                        if let Some(dock) =
-                            panel_header(ui, id, locked, !id.draws_own_title(), &mut reorders, None)
-                        {
-                            moves.push((id, dock));
-                        }
-                        self.draw_panel(ui, id, &mut commands);
+                        section_header(
+                            ui,
+                            &section,
+                            &neighbours,
+                            locked,
+                            !section.front.draws_own_title(),
+                            false,
+                            &mut requests,
+                        );
+                        self.draw_panel(ui, section.front, &mut commands);
                     });
-                let _ = &response;
+                if section.panels.contains(&buzz_ui::PanelId::Timeline) {
+                    self.dock_rects
+                        .push((buzz_ui::Dock::Bottom, response.response.rect));
+                }
             }
 
             for (dock, id_name, width) in [(buzz_ui::Dock::Left, "dock-left", workspace.left_width)]
             {
-                let panels = workspace.on(dock);
-                if panels.is_empty() {
+                let sections = workspace.sections(dock);
+                if sections.is_empty() {
                     continue;
                 }
+                let neighbours = workspace.on(dock);
                 let response = egui::Panel::left(id_name)
                     .resizable(false)
                     .exact_size(width)
                     .show(ui, |ui| {
                         self.draw_column(
                             ui,
-                            &panels,
+                            &sections,
+                            &neighbours,
                             locked,
-                            &mut moves,
-                            &mut reorders,
+                            &mut requests,
                             &mut commands,
                         );
                     });
-                let _ = &response;
+                self.dock_rects.push((dock, response.response.rect));
             }
 
             for (dock, id_name, width) in [
@@ -711,69 +767,94 @@ impl App {
                 ),
                 (buzz_ui::Dock::Right, "dock-right", workspace.right_width),
             ] {
-                let panels = workspace.on(dock);
-                if panels.is_empty() {
+                let sections = workspace.sections(dock);
+                if sections.is_empty() {
                     continue;
                 }
+                let neighbours = workspace.on(dock);
                 let response = egui::Panel::right(id_name)
                     .resizable(false)
                     .exact_size(width)
                     .show(ui, |ui| {
                         self.draw_column(
                             ui,
-                            &panels,
+                            &sections,
+                            &neighbours,
                             locked,
-                            &mut moves,
-                            &mut reorders,
+                            &mut requests,
                             &mut commands,
                         );
                     });
-                let _ = &response;
+                self.dock_rects.push((dock, response.response.rect));
             }
 
-            // Floating panels are windows over the stage, movable and resizable
-            // unless the layout is locked.
-            for id in workspace.on(buzz_ui::Dock::Float) {
-                let slot = workspace.slot(id).copied();
+            // Floating sections are windows over the stage, movable and
+            // resizable unless the layout is locked. A grouped section floats
+            // as **one** window with its tabs, which is what "undock these two
+            // together" has to mean if grouping is to survive being undocked.
+            let floating = workspace.sections(buzz_ui::Dock::Float);
+            let float_neighbours = workspace.on(buzz_ui::Dock::Float);
+            for section in floating {
+                let slot = workspace.slot(section.front).copied();
                 let mut open = true;
-                let response = egui::Window::new(id.title())
-                    .id(egui::Id::new(("float", id)))
+                let title = if section.is_tabbed() {
+                    // Named for what is in it, so two floating groups are not
+                    // two identical title bars.
+                    section
+                        .panels
+                        .iter()
+                        .map(|id| id.tab_title())
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                } else {
+                    section.front.title().to_string()
+                };
+                let response = egui::Window::new(title)
+                    .id(egui::Id::new(("float", section.group)))
                     .open(&mut open)
                     .movable(!locked)
                     .resizable(!locked)
                     .default_pos(slot.map(|s| s.float_pos).unwrap_or((320.0, 140.0)))
                     .default_size(slot.map(|s| s.float_size).unwrap_or((300.0, 380.0)))
                     .show(ui.ctx(), |ui| {
-                        // Never named here: the window frame already carries
-                        // the title, and the panel below may carry it again.
-                        if let Some(dock) = panel_header(ui, id, locked, false, &mut reorders, None)
-                        {
-                            moves.push((id, dock));
-                        }
+                        // A lone floating panel is not named here: the window
+                        // frame already carries the title, and the panel below
+                        // may carry it again. A tabbed one still needs its tabs.
+                        section_header(
+                            ui,
+                            &section,
+                            &float_neighbours,
+                            locked,
+                            false,
+                            false,
+                            &mut requests,
+                        );
                         egui::ScrollArea::vertical()
-                            .id_salt(("float-scroll", id))
-                            .show(ui, |ui| self.draw_panel(ui, id, &mut commands));
+                            .id_salt(("float-scroll", section.group))
+                            .show(ui, |ui| self.draw_panel(ui, section.front, &mut commands));
                     });
-                if let Some(response) = response
-                    && let Some(slot) = self.editor.workspace.slot_mut(id)
-                {
+                if let Some(response) = response {
                     let rect = response.response.rect;
-                    slot.float_pos = (rect.min.x, rect.min.y);
-                    slot.float_size = (rect.width(), rect.height());
+                    // Written to every tab in the section, so the window keeps
+                    // its place whichever of them is at the front next time.
+                    for id in &section.panels {
+                        if let Some(slot) = self.editor.workspace.slot_mut(*id) {
+                            slot.float_pos = (rect.min.x, rect.min.y);
+                            slot.float_size = (rect.width(), rect.height());
+                        }
+                    }
                 }
                 if !open {
-                    moves.push((id, buzz_ui::Dock::Hidden));
+                    // Closing a floating group closes the whole group: the
+                    // window is the section, and leaving its other tabs behind
+                    // with no window would lose them.
+                    for id in &section.panels {
+                        requests.moves.push((*id, buzz_ui::Dock::Hidden));
+                    }
                 }
             }
 
-            for (id, dock) in moves {
-                self.editor.workspace.move_to(id, dock);
-                self.editor.workspace.save();
-            }
-            for (id, delta) in reorders {
-                self.editor.workspace.reorder(id, delta);
-                self.editor.workspace.save();
-            }
+            requests.apply(&mut self.editor.workspace);
 
             // The edit-path breadcrumb. Animate keeps this strip directly above
             // the stage, and it is the only way back out of a symbol.
@@ -908,40 +989,35 @@ impl App {
         }
     }
 
-    /// Draw a column of docked panels, each with its own header.
+    /// Draw a column of docked sections, each with its own tab strip.
+    ///
+    /// A section holding several panels draws one header and one body: the
+    /// tabs across the top, the front tab's contents below. That is the whole
+    /// point of grouping — five occasional panels cost the height of one.
     fn draw_column(
         &mut self,
         ui: &mut egui::Ui,
-        panels: &[buzz_ui::PanelId],
+        sections: &[buzz_ui::Section],
+        neighbours: &[buzz_ui::PanelId],
         locked: bool,
-        moves: &mut Vec<(buzz_ui::PanelId, buzz_ui::Dock)>,
-        reorders: &mut Vec<(buzz_ui::PanelId, i32)>,
+        requests: &mut DockRequests,
         commands: &mut Vec<Command>,
     ) {
         egui::ScrollArea::vertical()
-            .id_salt(("column", panels.first().copied()))
+            .id_salt(("column", sections.first().map(|s| s.front)))
             .show(ui, |ui| {
-                for (index, id) in panels.iter().copied().enumerate() {
+                for (index, section) in sections.iter().enumerate() {
                     if index > 0 {
                         ui.separator();
                     }
-                    let mut collapsed = self.editor.workspace.is_collapsed(id);
-                    let was = collapsed;
                     // Rolled up, the header carries the name whatever the panel
                     // would normally do, or the column becomes a stack of
-                    // anonymous strips.
-                    let named = collapsed || !id.draws_own_title();
-                    if let Some(dock) =
-                        panel_header(ui, id, locked, named, reorders, Some(&mut collapsed))
-                    {
-                        moves.push((id, dock));
-                    }
-                    if collapsed != was {
-                        self.editor.workspace.toggle_collapsed(id);
-                        self.editor.workspace.save();
-                    }
-                    if !collapsed {
-                        self.draw_panel(ui, id, commands);
+                    // anonymous strips. A tabbed section always shows its tabs,
+                    // so it never needs this.
+                    let named = section.collapsed || !section.front.draws_own_title();
+                    section_header(ui, section, neighbours, locked, named, true, requests);
+                    if !section.collapsed {
+                        self.draw_panel(ui, section.front, commands);
                     }
                 }
             });
@@ -1463,6 +1539,24 @@ impl App {
             // clicking any row takes it from the one before.
             self.editor.camera_selected = false;
         }
+        if let Some((layer, icon)) = response.toggle_layer {
+            // The same edit the Layers panel makes, through the same document
+            // call — one undo step, named for the switch, so undoing "hide" is
+            // a thing the history says rather than a thing you have to guess.
+            use buzz_ui::panels::LayerIcon;
+            let label = match icon {
+                LayerIcon::Eye => "Show/Hide Layer",
+                LayerIcon::Lock => "Lock Layer",
+                LayerIcon::Outline => "Outline Layer",
+            };
+            self.editor.doc.edit(label, |scene| {
+                scene.update_layer(layer, |l| match icon {
+                    LayerIcon::Eye => l.visible = !l.visible,
+                    LayerIcon::Lock => l.locked = !l.locked,
+                    LayerIcon::Outline => l.outline = !l.outline,
+                });
+            });
+        }
         if response.select_camera {
             self.editor.camera_selected = true;
             // Selecting the camera row selects the Camera tool, which is what
@@ -1566,43 +1660,64 @@ impl App {
         const GRAB: f32 = 6.0;
 
         let mut changed = false;
-        let workspace = self.editor.workspace.clone();
 
         // (id, the strip to grab, vertical?, which way widening runs)
         let mut handles: Vec<(&'static str, egui::Rect, bool, f32)> = Vec::new();
 
-        if !workspace.on(buzz_ui::Dock::Left).is_empty() {
-            handles.push((
-                "split-left",
-                egui::Rect::from_min_max(
-                    egui::pos2(stage.left() - GRAB * 0.5, stage.top()),
-                    egui::pos2(stage.left() + GRAB * 0.5, stage.bottom()),
-                ),
-                true,
-                1.0,
-            ));
-        }
-        if !workspace.on(buzz_ui::Dock::Right).is_empty() {
-            handles.push((
-                "split-right",
-                egui::Rect::from_min_max(
-                    egui::pos2(stage.right() - GRAB * 0.5, stage.top()),
-                    egui::pos2(stage.right() + GRAB * 0.5, stage.bottom()),
-                ),
-                true,
-                -1.0,
-            ));
-        }
-        if !workspace.on(buzz_ui::Dock::Bottom).is_empty() {
-            handles.push((
-                "split-bottom",
-                egui::Rect::from_min_max(
-                    egui::pos2(stage.left(), stage.bottom() - GRAB * 0.5),
-                    egui::pos2(stage.right(), stage.bottom() + GRAB * 0.5),
-                ),
-                false,
-                -1.0,
-            ));
+        // **Every handle sits on the column's own edge, as it was laid out.**
+        //
+        // A column's inner edge is not always the stage: the far-right column's
+        // neighbour is the right column, not the artwork. Reading the rects
+        // back is what lets the outer column have a handle at all — and it is
+        // what stops the others drifting off the boundary when a column is
+        // hidden and the layout shifts under them.
+        let vertical = |rect: egui::Rect, x: f32| {
+            egui::Rect::from_min_max(
+                egui::pos2(x - GRAB * 0.5, rect.top()),
+                egui::pos2(x + GRAB * 0.5, rect.bottom()),
+            )
+        };
+
+        for (dock, rect) in self.dock_rects.clone() {
+            // A column squeezed to nothing on a tiny window has no meaningful
+            // edge to grab.
+            if rect.width() < 1.0 || rect.height() < 1.0 {
+                continue;
+            }
+            match dock {
+                // Widening a left column means dragging its right edge right.
+                buzz_ui::Dock::Left => {
+                    handles.push(("split-left", vertical(rect, rect.right()), true, 1.0));
+                }
+                // And a right column means dragging its left edge left.
+                buzz_ui::Dock::Right => {
+                    handles.push(("split-right", vertical(rect, rect.left()), true, -1.0));
+                }
+                buzz_ui::Dock::RightOuter => {
+                    handles.push((
+                        "split-right-outer",
+                        vertical(rect, rect.left()),
+                        true,
+                        -1.0,
+                    ));
+                }
+                // The timeline runs the full width of the window, and its top
+                // edge therefore also runs under the dock columns. The handle
+                // is kept to the stage's width so it cannot steal the bottom
+                // few points of a column the user is clicking in.
+                buzz_ui::Dock::Bottom => {
+                    handles.push((
+                        "split-bottom",
+                        egui::Rect::from_min_max(
+                            egui::pos2(stage.left(), rect.top() - GRAB * 0.5),
+                            egui::pos2(stage.right(), rect.top() + GRAB * 0.5),
+                        ),
+                        false,
+                        -1.0,
+                    ));
+                }
+                buzz_ui::Dock::Float | buzz_ui::Dock::Hidden => {}
+            }
         }
 
         for (name, rect, vertical, direction) in handles {
@@ -1628,17 +1743,29 @@ impl App {
             if response.dragged() {
                 let delta = response.drag_delta();
                 let moved = if vertical { delta.x } else { delta.y } * direction;
+                use buzz_ui::workspace::{
+                    BOTTOM_HEIGHT_RANGE, COLUMN_WIDTH_RANGE, LEFT_WIDTH_RANGE, clamp_to,
+                };
                 let workspace = &mut self.editor.workspace;
+                // The same ranges the workspace clamps a loaded layout to, so a
+                // column cannot be dragged to a width that the next launch
+                // would silently undo.
                 match name {
                     "split-left" => {
-                        workspace.left_width = (workspace.left_width + moved).clamp(40.0, 400.0)
+                        workspace.left_width =
+                            clamp_to(workspace.left_width + moved, LEFT_WIDTH_RANGE);
                     }
                     "split-right" => {
-                        workspace.right_width = (workspace.right_width + moved).clamp(120.0, 900.0)
+                        workspace.right_width =
+                            clamp_to(workspace.right_width + moved, COLUMN_WIDTH_RANGE);
+                    }
+                    "split-right-outer" => {
+                        workspace.right_outer_width =
+                            clamp_to(workspace.right_outer_width + moved, COLUMN_WIDTH_RANGE);
                     }
                     _ => {
                         workspace.bottom_height =
-                            (workspace.bottom_height + moved).clamp(80.0, 900.0)
+                            clamp_to(workspace.bottom_height + moved, BOTTOM_HEIGHT_RANGE);
                     }
                 }
                 changed = true;
@@ -2560,6 +2687,9 @@ impl App {
         let label = match target {
             buzz_scene::ImportTarget::Stage => "Import to Stage",
             buzz_scene::ImportTarget::Library => "Import to Library",
+            // Not reachable from an import — pasting is `Editor::paste_clipboard`
+            // — but a match that guesses would be worse than one that says so.
+            buzz_scene::ImportTarget::Onto { .. } => "Paste",
         };
 
         let mut merge = None;
@@ -2669,13 +2799,26 @@ impl App {
         }
     }
 
+    /// Put a different document on screen, carrying across the things that
+    /// belong to the **person** rather than to the film.
+    ///
+    /// The panel layout was already carried this way; the clipboard has to be
+    /// too, or copy-here-open-that-paste-there — the one thing a clipboard can
+    /// do that Duplicate cannot — quietly loses what you copied. Everything
+    /// else about an `Editor` is about the document and should not survive it.
+    fn adopt_document(&mut self, doc: Document) {
+        let workspace = std::mem::take(&mut self.editor.workspace);
+        let clipboard = self.editor.clipboard.take();
+        self.editor = Editor::new(doc);
+        self.editor.workspace = workspace;
+        self.editor.clipboard = clipboard;
+    }
+
     /// Open one of our own documents.
     fn open_buzz(&mut self, path: &std::path::Path) {
         match Document::open(path) {
             Ok(doc) => {
-                let workspace = std::mem::take(&mut self.editor.workspace);
-                self.editor = Editor::new(doc);
-                self.editor.workspace = workspace;
+                self.adopt_document(doc);
                 self.remember_document_directory(path);
                 self.editor.status = Some(format!("Opened {}", path.display()));
             }
@@ -2720,9 +2863,7 @@ impl App {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string());
 
-        let workspace = std::mem::take(&mut self.editor.workspace);
-        self.editor = Editor::new(Document::new(imported.scene.clone()));
-        self.editor.workspace = workspace;
+        self.adopt_document(Document::new(imported.scene.clone()));
         self.editor.doc.mark_clean();
         self.editor
             .selection
@@ -2816,9 +2957,7 @@ impl App {
                         // recovery, and this session's own autosave must not
                         // land on the file it was recovered from.
                         doc.forget_path();
-                        let workspace = std::mem::take(&mut self.editor.workspace);
-                        self.editor = Editor::new(doc);
-                        self.editor.workspace = workspace;
+                        self.adopt_document(doc);
 
                         // Moved aside rather than deleted: the prompt should
                         // not offer it again every launch, and a copy on disk
@@ -3129,24 +3268,97 @@ fn _tool_ids() -> Vec<ToolId> {
 #[allow(dead_code)]
 fn _mouse_types(_: MouseButton, _: ElementState, _: MouseScrollDelta) {}
 
-/// The strip at the top of every panel: its name, and the menu that moves it.
+/// Everything the user asked the dock chrome to do this frame.
+///
+/// Collected rather than applied on the spot, because every one of these
+/// rearranges the layout the panels are *currently being drawn from*. Applying
+/// a move mid-frame would leave the rest of the column laid out against a
+/// workspace that no longer describes it.
+#[derive(Default)]
+struct DockRequests {
+    moves: Vec<(buzz_ui::PanelId, buzz_ui::Dock)>,
+    reorders: Vec<(buzz_ui::PanelId, i32)>,
+    /// Bring a tab to the front of its section.
+    selects: Vec<buzz_ui::PanelId>,
+    /// Put the first panel into the second's section, as a tab.
+    groups: Vec<(buzz_ui::PanelId, buzz_ui::PanelId)>,
+    /// Take a panel out of its section, into one of its own.
+    ungroups: Vec<buzz_ui::PanelId>,
+    /// Roll a section up to its tabs, or open it.
+    collapses: Vec<(buzz_ui::PanelId, bool)>,
+}
+
+impl DockRequests {
+    /// Apply what was asked, and save the layout if anything changed.
+    ///
+    /// Selection and roll-up are applied before the rest: they are the two that
+    /// cannot fail, and doing them first means clicking a tab in a section you
+    /// then also move still leaves the right tab at the front.
+    fn apply(self, workspace: &mut buzz_ui::Workspace) -> bool {
+        let touched = !self.moves.is_empty()
+            || !self.reorders.is_empty()
+            || !self.selects.is_empty()
+            || !self.groups.is_empty()
+            || !self.ungroups.is_empty()
+            || !self.collapses.is_empty();
+
+        for id in self.selects {
+            workspace.select_tab(id);
+        }
+        for (id, collapsed) in self.collapses {
+            workspace.set_collapsed(id, collapsed);
+        }
+        for (id, target) in self.groups {
+            workspace.group_with(id, target);
+        }
+        for id in self.ungroups {
+            workspace.ungroup(id);
+        }
+        for (id, dock) in self.moves {
+            workspace.move_to(id, dock);
+        }
+        for (id, delta) in self.reorders {
+            workspace.reorder(id, delta);
+        }
+
+        if touched {
+            workspace.save();
+        }
+        touched
+    }
+}
+
+/// The strip at the top of every panel section: its tabs, and the menu that
+/// moves it.
+///
+/// # Sections, not panels
+///
+/// Several panels can share one section — Animate's panel group — and then this
+/// strip is a row of tabs and only the front one's contents are drawn below it.
+/// A section holding one panel is the same strip showing that panel's name,
+/// which is what every section was before grouping existed.
 ///
 /// Animate puts the same menu behind the ≡ button in each panel's corner. It is
 /// drawn here rather than inside each panel because a panel should not have to
 /// know it is dockable — every one of them was written before this existed, and
 /// none of them needed changing.
 ///
-/// Returns the side the user asked for, if they asked for one.
-fn panel_header(
+/// # Nothing in this row may overflow
+///
+/// A widget wider than its `Ui` expands that `Ui`'s **max** rect, the column
+/// then reports itself wider than it was drawn, and egui lays the stage out
+/// underneath it. See `dock_geometry_tests`. That is why the menu is placed
+/// against the right edge first, why the tabs wrap, and why every label
+/// truncates.
+fn section_header(
     ui: &mut egui::Ui,
-    id: buzz_ui::PanelId,
+    section: &buzz_ui::Section,
+    neighbours: &[buzz_ui::PanelId],
     locked: bool,
     named: bool,
-    reorders: &mut Vec<(buzz_ui::PanelId, i32)>,
-    collapsed: Option<&mut bool>,
-) -> Option<buzz_ui::Dock> {
-    let mut moved = None;
-
+    collapsible: bool,
+    out: &mut DockRequests,
+) {
     // **A header that looks like a header.**
     //
     // Panels in a column were separated by a hairline and nothing else, so a
@@ -3162,33 +3374,10 @@ fn panel_header(
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.set_width(ui.available_width());
-            // The roll-up triangle, where every collapsible thing keeps one. Only
-            // docked panels get it: a floating window already has a close button,
-            // and rolling one up would leave a title bar adrift over the stage.
-            if let Some(collapsed) = collapsed {
-                let glyph = if *collapsed { "\u{25b8}" } else { "\u{25be}" };
-                if ui
-                    .add(egui::Button::new(egui::RichText::new(glyph).small()).frame(false))
-                    .on_hover_text(if *collapsed { "Open" } else { "Roll up" })
-                    .clicked()
-                {
-                    *collapsed = !*collapsed;
-                }
-            }
-
-            // Only the panels with no heading of their own are named here. The
-            // rest would read their name twice \u2014 which is exactly how the first
-            // version looked.
-            //
-            // Rolled up, every panel is named: the title bar is all that is left of
-            // it, and an unlabelled strip is not a panel, it is a smudge.
-            if named {
-                ui.label(
-                    egui::RichText::new(id.title())
-                        .small()
-                        .color(Palette::text_dim()),
-                );
-            }
+            // The default button padding alone is twelve points of the twenty
+            // this row has in the tools strip.
+            ui.spacing_mut().button_padding = egui::vec2(3.0, 1.0);
+            ui.spacing_mut().item_spacing.x = 3.0;
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Three bars, drawn as text: this one *is* in egui's bundled font,
@@ -3208,7 +3397,7 @@ fn panel_header(
                             )
                             .clicked()
                         {
-                            moved = Some(dock);
+                            out.moves.push((section.front, dock));
                             ui.close();
                         }
                     }
@@ -3216,18 +3405,132 @@ fn panel_header(
                     ui.separator();
                     for (label, delta) in [("Move Up", -1), ("Move Down", 1)] {
                         if ui.add_enabled(!locked, egui::Button::new(label)).clicked() {
-                            reorders.push((id, delta));
+                            out.reorders.push((section.front, delta));
                             ui.close();
                         }
                     }
+
+                    // **Grouping**, which is the whole point of a section.
+                    //
+                    // A menu rather than a drag: dragging a tab onto another
+                    // panel is what Animate does and it is the nicer gesture,
+                    // but it needs a drop-target model this dock does not have,
+                    // and a menu can be read, found and tested. The offer is
+                    // only ever the panels on the same side — a section is a
+                    // stack within one dock, so grouping across two of them
+                    // would have to move one first, silently.
+                    ui.separator();
+                    let elsewhere: Vec<buzz_ui::PanelId> = neighbours
+                        .iter()
+                        .copied()
+                        .filter(|id| !section.panels.contains(id))
+                        .collect();
+                    ui.add_enabled_ui(!locked && !elsewhere.is_empty(), |ui| {
+                        ui.menu_button("Group With", |ui| {
+                            for target in &elsewhere {
+                                if ui.button(target.title()).clicked() {
+                                    out.groups.push((section.front, *target));
+                                    ui.close();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Share a section with another panel, as tabs \u{2014} \
+                             both take the room of one",
+                        )
+                        .on_disabled_hover_text(if locked {
+                            "The layout is locked"
+                        } else {
+                            "Nothing else is docked on this side"
+                        });
+                    });
+                    if ui
+                        .add_enabled(
+                            !locked && section.is_tabbed(),
+                            egui::Button::new("Ungroup This Panel"),
+                        )
+                        .on_hover_text("Give this tab a section of its own")
+                        .clicked()
+                    {
+                        out.ungroups.push(section.front);
+                        ui.close();
+                    }
                 })
                 .response
-                .on_hover_text("Move, float or close this panel");
+                .on_hover_text("Move, group, float or close this panel");
+
+                // Whatever the menu left over holds the roll-up triangle and
+                // the tabs.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    // The roll-up triangle, where every collapsible thing keeps
+                    // one. Only docked sections get it: a floating window
+                    // already has a close button, and rolling one up would
+                    // leave a title bar adrift over the stage.
+                    if collapsible
+                        && ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(if section.collapsed {
+                                        ROLLED_UP
+                                    } else {
+                                        OPEN
+                                    })
+                                    .small(),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text(if section.collapsed {
+                                "Rolled up \u{2014} click to open"
+                            } else {
+                                "Roll up, and keep the tabs"
+                            })
+                            .clicked()
+                    {
+                        out.collapses.push((section.front, !section.collapsed));
+                    }
+
+                    if section.is_tabbed() {
+                        // **Tabs.** Wrapped, because five of them do not fit a
+                        // 216-point column on one line and a tab that does not
+                        // fit is one nobody can click.
+                        ui.horizontal_wrapped(|ui| {
+                            for id in &section.panels {
+                                let front = *id == section.front;
+                                let label = egui::RichText::new(id.tab_title()).small();
+                                let label = if front { label } else { label.weak() };
+                                if ui
+                                    .add(egui::Button::selectable(front, label).truncate())
+                                    .on_hover_text(id.title())
+                                    .clicked()
+                                {
+                                    out.selects.push(*id);
+                                }
+                            }
+                        });
+                    } else if named {
+                        // Only the panels with no heading of their own are named
+                        // here. The rest would read their name twice - which is
+                        // exactly how the first version looked.
+                        //
+                        // Rolled up, every panel is named: the title bar is all
+                        // that is left of it, and an unlabelled strip is not a
+                        // panel, it is a smudge.
+                        let room = ui.available_width().max(1.0);
+                        ui.add_sized(
+                            egui::vec2(room, ui.spacing().interact_size.y),
+                            egui::Label::new(
+                                egui::RichText::new(section.front.title())
+                                    .small()
+                                    .color(Palette::text_dim()),
+                            )
+                            .truncate(),
+                        );
+                    }
+                });
             });
         });
     });
-
-    moved
 }
 
 /// The panel menu's label.
@@ -3237,6 +3540,135 @@ fn panel_header(
 /// empty box. `theme::font_has` said so before it reached a screenshot,
 /// which is the whole reason that check exists.
 const PANEL_MENU: &str = "...";
+
+/// The roll-up triangle on a docked panel's header.
+///
+/// `\u{25b8}` and `\u{25be}` — the small triangles a dropdown normally uses —
+/// have **no glyph** in the bundled font, so every panel in every dock column
+/// was headed by an empty box where its expander should be. `theme::font_has`
+/// already knew: both are in the list of characters this project has been
+/// caught out by. These two are the pair the Library panel settled on, and they
+/// are covered by the glyph test.
+const ROLLED_UP: &str = "\u{25b6}";
+const OPEN: &str = "\u{23f7}";
+
+#[cfg(test)]
+mod dock_geometry_tests {
+    use super::*;
+
+    /// **A dock column must report the rectangle it was given.**
+    ///
+    /// This is the invariant that failed, and everything the user saw followed
+    /// from it. egui lays a right-hand panel out at the edge it was allotted,
+    /// then takes the panel's *frame* rect back to decide where the central
+    /// panel — the stage — begins. A widget wider than its `Ui` expands that
+    /// `Ui`'s **max** rect as well as its min rect, so one overflowing combo
+    /// box in the Layers panel grew the frame, the column reported itself 56
+    /// points to the right of where it had been drawn, and the stage was then
+    /// laid out *underneath* it. The visible result was the stage's ruler and
+    /// its own scrollbar painted across the Properties panel — reported, quite
+    /// reasonably, as "the scrollbar overlaps the panels".
+    ///
+    /// No panel drawing is involved here on purpose: this measures the dock
+    /// chrome itself, which lives in this crate and which the panel tests in
+    /// `buzz-ui` therefore cannot see. `buzz-ui`'s `dock_columns` measures the
+    /// panels; this measures what wraps them.
+    #[test]
+    fn a_dock_column_reports_the_rectangle_it_was_placed_in() {
+        for width in [
+            *buzz_ui::workspace::COLUMN_WIDTH_RANGE.start(),
+            300.0,
+            *buzz_ui::workspace::LEFT_WIDTH_RANGE.start(),
+        ] {
+            let ctx = egui::Context::default();
+            buzz_ui::theme::apply(&ctx);
+
+            let mut placed = egui::Rect::NOTHING;
+            let mut reported = egui::Rect::NOTHING;
+
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(1920.0, 1040.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let outer = ui.available_rect_before_wrap();
+                    placed = egui::Rect::from_min_max(
+                        egui::pos2(outer.right() - width, outer.top()),
+                        outer.max,
+                    );
+
+                    let response = egui::Panel::right("probe")
+                        .resizable(false)
+                        .exact_size(width)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().id_salt("probe").show(ui, |ui| {
+                                let mut requests = DockRequests::default();
+                                let neighbours: Vec<buzz_ui::PanelId> =
+                                    buzz_ui::PanelId::ALL.to_vec();
+
+                                // The header every docked panel wears, for every
+                                // panel there is — including the two narrow ones.
+                                for id in buzz_ui::PanelId::ALL {
+                                    let section = buzz_ui::Section {
+                                        group: 0,
+                                        panels: vec![id],
+                                        front: id,
+                                        collapsed: false,
+                                    };
+                                    section_header(
+                                        ui,
+                                        &section,
+                                        &neighbours,
+                                        false,
+                                        true,
+                                        true,
+                                        &mut requests,
+                                    );
+                                }
+
+                                // **And a tab strip carrying every panel there
+                                // is.** Tabs are the widest thing this chrome
+                                // can be asked to draw, and the whole reason
+                                // they wrap and truncate is that a strip which
+                                // does not fit takes the column's rect with it.
+                                let all = buzz_ui::Section {
+                                    group: 1,
+                                    panels: buzz_ui::PanelId::ALL.to_vec(),
+                                    front: buzz_ui::PanelId::Layers,
+                                    collapsed: false,
+                                };
+                                section_header(
+                                    ui,
+                                    &all,
+                                    &neighbours,
+                                    false,
+                                    true,
+                                    true,
+                                    &mut requests,
+                                );
+                            });
+                        });
+                    reported = response.response.rect;
+                },
+            );
+
+            // A point of slack for the frame's own rounding; 56 points of drift
+            // is what this exists to catch.
+            assert!(
+                (reported.right() - placed.right()).abs() < 1.0,
+                "a {width}-point column was drawn at {placed:?} and reported \
+                 {reported:?}. The stage is laid out from what the column \
+                 reports, so it will be drawn underneath the panel by \
+                 {:.0} points.",
+                reported.right() - placed.right()
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

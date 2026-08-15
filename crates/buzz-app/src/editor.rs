@@ -84,6 +84,22 @@ pub struct Editor {
     /// travelled inside a `.buzz` file handed to somebody else would be a
     /// stranger one.
     pub frame_clipboard: Option<Vec<std::sync::Arc<Object>>>,
+    /// Artwork on the clipboard, from Cut or Copy.
+    ///
+    /// # Why a whole `Scene`
+    ///
+    /// The same reason an asset is one: an instance whose symbol was left
+    /// behind draws nothing, so what is copied has to carry the definitions it
+    /// depends on. `Scene::extract` already gathers those recursively and
+    /// `Scene::merge` already renumbers every id on the way in, so the
+    /// clipboard is those two functions with somewhere to put the result.
+    ///
+    /// **Kept on the `Editor`, which is replaced when a document is opened.**
+    /// That is deliberate and it is the one thing to be careful about: see
+    /// `App::take_clipboard`, which carries it across so that copy-here,
+    /// open-that, paste-there works — the whole point of having a clipboard
+    /// rather than Duplicate.
+    pub clipboard: Option<buzz_scene::Scene>,
     /// The New Document dialog: how big, how fast, what colour.
     pub new_document: buzz_ui::NewDocumentState,
     /// Help ▸ About, and the banner it shows once it has been opened.
@@ -226,6 +242,7 @@ impl Editor {
             library: LibraryState::default(),
             swatch_panel: buzz_ui::SwatchState::default(),
             frame_clipboard: None,
+            clipboard: None,
             new_document: buzz_ui::NewDocumentState::default(),
             about: buzz_ui::AboutState::default(),
             assets: buzz_doc::AssetLibrary::user(),
@@ -1658,12 +1675,27 @@ impl Editor {
             }
             Deselect => self.selection.clear(),
             DuplicateSelection => self.duplicate_selection(),
+            Nudge { x, y } => {
+                if !self.selection.is_empty() {
+                    // Through the same path a drag takes, so a nudge is an
+                    // ordinary Move in the history and coalesces with the
+                    // nudges either side of it — holding an arrow key down is
+                    // one undo step, not forty.
+                    self.transform_selection(
+                        Affine::translate((f64::from(x), f64::from(y))),
+                        "Move",
+                    );
+                }
+            }
             Cut => {
-                self.delete_selection();
+                if self.copy_selection() {
+                    self.delete_selection();
+                }
             }
-            Copy | Paste => {
-                self.status = Some("Clipboard arrives with the Phase 2 follow-up".into());
+            Copy => {
+                self.copy_selection();
             }
+            Paste => self.paste_clipboard(),
 
             ZoomIn => self.zoom_by(2.0),
             ZoomOut => self.zoom_by(0.5),
@@ -3135,6 +3167,99 @@ impl Editor {
         self.selection.clear();
     }
 
+    /// Put the selection on the clipboard. `false` when there was nothing to
+    /// put there, which is what stops Cut deleting on an empty selection.
+    ///
+    /// The artwork is taken **as it is on the current frame**, for the reason
+    /// `Scene::extract` gives: the same object appears on several keyframes
+    /// with different transforms, and what you copied is what you were looking
+    /// at.
+    fn copy_selection(&mut self) -> bool {
+        if self.selection.is_empty() {
+            self.status = Some("Select artwork to copy".into());
+            return false;
+        }
+        let ids = self.selection.ids();
+        let lifted = self.doc.scene().extract(self.current_frame, &ids);
+        let count = ids.len();
+        self.clipboard = Some(lifted);
+        self.status = Some(format!(
+            "Copied {count} {}",
+            if count == 1 { "object" } else { "objects" }
+        ));
+        true
+    }
+
+    /// Paste the clipboard onto the active layer at the playhead.
+    ///
+    /// The clipboard is **not** consumed: pasting the same character into four
+    /// scenes is the thing this exists for.
+    fn paste_clipboard(&mut self) {
+        let Some(lifted) = self.clipboard.clone() else {
+            self.status = Some("There is nothing on the clipboard".into());
+            return;
+        };
+        let scene = self.doc.scene().clone();
+        self.selection.ensure_active_layer(&scene);
+        let Some(layer) = self.selection.active_layer() else {
+            self.status = Some("There is no layer to paste onto".into());
+            return;
+        };
+
+        // Offset like Duplicate does, and for the same reason: a copy landing
+        // exactly on its original is indistinguishable from nothing happening.
+        const OFFSET: (f64, f64) = (10.0, 10.0);
+        let frame = self.current_frame;
+        let before: Vec<buzz_scene::ObjectId> = scene
+            .layers()
+            .get(layer)
+            .map(|l| l.objects_at(frame).iter().map(|o| o.id).collect())
+            .unwrap_or_default();
+
+        let mut report = None;
+        self.doc.edit("Paste", |scene| {
+            report = Some(scene.merge(
+                &lifted,
+                buzz_scene::ImportTarget::Onto {
+                    layer,
+                    frame,
+                    offset: buzz_geom::Vec2::new(OFFSET.0, OFFSET.1),
+                },
+            ));
+        });
+
+        // What arrived is what the user now wants to move — the same rule
+        // Duplicate and Place Asset follow.
+        let arrived: Vec<buzz_scene::ObjectId> = self
+            .doc
+            .scene()
+            .layers()
+            .get(layer)
+            .map(|l| {
+                l.objects_at(frame)
+                    .iter()
+                    .map(|o| o.id)
+                    .filter(|id| !before.contains(id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let count = arrived.len();
+        self.selection.set(arrived);
+
+        self.status = Some(match report {
+            Some(report) if report.symbols > 0 => format!(
+                "Pasted {count} {} and {} symbol{}",
+                if count == 1 { "object" } else { "objects" },
+                report.symbols,
+                if report.symbols == 1 { "" } else { "s" }
+            ),
+            _ => format!(
+                "Pasted {count} {}",
+                if count == 1 { "object" } else { "objects" }
+            ),
+        });
+    }
+
     fn duplicate_selection(&mut self) {
         if self.selection.is_empty() {
             return;
@@ -4086,6 +4211,179 @@ mod tests {
         assert_eq!(e.scene().shape_count(), 2);
         assert_eq!(e.selection.len(), 1);
         assert!(!e.selection.contains(id), "the copy should be selected");
+    }
+
+    // -- the clipboard -----------------------------------------------------
+
+    /// **Copy then paste puts a second copy on the stage, and selects it.**
+    ///
+    /// The selection matters as much as the copy: what you just pasted is what
+    /// you want to drag, which is the rule Duplicate and Place Asset follow.
+    #[test]
+    fn pasting_adds_a_copy_and_selects_it() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 20.0, Color::WHITE).unwrap();
+        e.selection.select_one(id);
+
+        e.run(Command::Copy);
+        assert!(e.clipboard.is_some(), "nothing reached the clipboard");
+        assert_eq!(e.scene().shape_count(), 1, "copying must not add artwork");
+
+        e.run(Command::Paste);
+        assert_eq!(e.scene().shape_count(), 2);
+        assert_eq!(e.selection.len(), 1);
+        assert!(
+            !e.selection.contains(id),
+            "the pasted copy should be selected, not the original"
+        );
+    }
+
+    /// The clipboard is not consumed — pasting the same character into four
+    /// scenes is the thing it exists for.
+    #[test]
+    fn pasting_twice_gives_two_copies() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 20.0, Color::WHITE).unwrap();
+        e.selection.select_one(id);
+        e.run(Command::Copy);
+
+        e.run(Command::Paste);
+        e.run(Command::Paste);
+        assert_eq!(e.scene().shape_count(), 3);
+    }
+
+    /// **Cut copies before it deletes.** A Cut that deleted without copying
+    /// would be Delete with a misleading name.
+    #[test]
+    fn cutting_removes_the_artwork_and_keeps_it_for_pasting() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 20.0, Color::WHITE).unwrap();
+        e.selection.select_one(id);
+
+        e.run(Command::Cut);
+        assert_eq!(e.scene().shape_count(), 0, "cut should remove it");
+        assert!(e.clipboard.is_some());
+
+        e.run(Command::Paste);
+        assert_eq!(e.scene().shape_count(), 1, "and it should come back");
+    }
+
+    /// Cut with nothing selected must not delete anything, and must not leave
+    /// an empty clipboard behind that a later Paste would act on.
+    #[test]
+    fn cutting_nothing_does_nothing() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        draw_square(&mut e, 0.0, 0.0, 20.0, Color::WHITE);
+        e.selection.clear();
+
+        e.run(Command::Cut);
+        assert_eq!(e.scene().shape_count(), 1);
+        assert!(e.clipboard.is_none());
+    }
+
+    /// Pasting with an empty clipboard says so rather than doing something.
+    #[test]
+    fn pasting_an_empty_clipboard_explains_itself() {
+        let mut e = editor();
+        e.run(Command::Paste);
+        assert_eq!(e.scene().shape_count(), 0);
+        assert!(
+            e.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("clipboard"),
+            "it should say why nothing happened"
+        );
+    }
+
+    /// **A pasted instance brings its symbol with it.**
+    ///
+    /// This is the reason the clipboard holds a whole `Scene` rather than a
+    /// list of objects: an instance whose symbol was left behind draws
+    /// nothing. Simulated here the way the cross-document case works — the
+    /// clipboard is carried into an editor whose document has never seen the
+    /// symbol.
+    #[test]
+    fn a_pasted_instance_carries_its_symbol_into_another_document() {
+        let mut source = editor();
+        source.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut source, 0.0, 0.0, 20.0, Color::WHITE).unwrap();
+        source.selection.select_one(id);
+        source.run(Command::ConvertToSymbol);
+
+        let instance = source.selection.ids();
+        assert_eq!(instance.len(), 1, "convert should leave the instance selected");
+        assert_eq!(source.scene().library().len(), 1);
+        source.run(Command::Copy);
+
+        // A different document, as `App::adopt_document` hands the clipboard on.
+        let mut target = editor();
+        target.clipboard = source.clipboard.clone();
+        assert_eq!(target.scene().library().len(), 0);
+
+        target.run(Command::Paste);
+        assert_eq!(
+            target.scene().library().len(),
+            1,
+            "the symbol should have come across with its instance"
+        );
+        assert_eq!(target.selection.len(), 1);
+    }
+
+    /// A paste is one undo step, and undoing it leaves the document as it was.
+    #[test]
+    fn pasting_is_one_undo_step() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 20.0, Color::WHITE).unwrap();
+        e.selection.select_one(id);
+        e.run(Command::Copy);
+        e.run(Command::Paste);
+        assert_eq!(e.scene().shape_count(), 2);
+
+        e.run(Command::Undo);
+        assert_eq!(e.scene().shape_count(), 1);
+    }
+
+    // -- the arrow keys ----------------------------------------------------
+
+    /// A nudge moves the selection by exactly the distance asked for, in the
+    /// direction asked for. Screen down is +y, as everywhere else here.
+    #[test]
+    fn nudging_moves_the_selection_by_whole_units() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 10.0, 10.0, 20.0, Color::WHITE).unwrap();
+        e.selection.select_one(id);
+        let before = e.scene().find_object(id).unwrap().1.bounds();
+
+        e.run(Command::Nudge { x: 1, y: 0 });
+        let after = e.scene().find_object(id).unwrap().1.bounds();
+        assert!((after.min_x() - before.min_x() - 1.0).abs() < 1e-9);
+        assert!((after.min_y() - before.min_y()).abs() < 1e-9);
+
+        e.run(Command::Nudge { x: 0, y: 8 });
+        let down = e.scene().find_object(id).unwrap().1.bounds();
+        assert!((down.min_y() - after.min_y() - 8.0).abs() < 1e-9);
+    }
+
+    /// Nudging nothing changes nothing — and in particular does not record an
+    /// undo step for a move that did not happen.
+    #[test]
+    fn nudging_with_nothing_selected_does_nothing() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 10.0, 10.0, 20.0, Color::WHITE).unwrap();
+        e.selection.clear();
+        let before = e.scene().find_object(id).unwrap().1.bounds();
+
+        e.run(Command::Nudge { x: 1, y: 0 });
+        let after = e.scene().find_object(id).unwrap().1.bounds();
+        assert!((after.min_x() - before.min_x()).abs() < 1e-9);
     }
 
     #[test]

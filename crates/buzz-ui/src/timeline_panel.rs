@@ -27,6 +27,13 @@ pub struct TimelineResponse {
     pub select_camera: bool,
     /// A layer row was clicked.
     pub select_layer: Option<LayerId>,
+    /// One of the three switches beside a layer's name was clicked.
+    ///
+    /// The timeline carries Animate's eye, padlock and outline columns beside
+    /// its layer names, and they are the same three switches the Layers panel
+    /// draws — the same painted icons, the same words, and the same edit. Two
+    /// places to reach them, one meaning.
+    pub toggle_layer: Option<(LayerId, crate::panels::LayerIcon)>,
     /// A frame operation was requested.
     pub action: Option<FrameAction>,
     /// A tween was created or removed from the frame menu.
@@ -161,7 +168,60 @@ pub struct Waveform {
 }
 
 /// Width reserved for the layer-name column.
-const LAYER_COLUMN: f32 = 190.0;
+///
+/// Wider than it was by the width of the three switch columns, so that adding
+/// them took the room from the window rather than from the layer names.
+const LAYER_COLUMN: f32 = 210.0;
+
+/// Gap between the three switch columns, and from the frame grid.
+///
+/// Five rather than three because the *headings* are what set this: `show` and
+/// `lock` at eight points are each about as wide as the fifteen-point column
+/// they name, and at a three-point gap they ran together into `showlock`.
+const SWITCH_GAP: f32 = 5.0;
+
+/// **Where Animate's three layer columns sit in the timeline's name column.**
+///
+/// Returned in [`LayerIcon::ALL`] order — eye, padlock, outline — running left
+/// to right and ending just short of the frame grid, which is where Animate
+/// rules them and where the hand goes looking.
+///
+/// One function rather than arithmetic repeated in the row, the heading and the
+/// hit test: three copies of a layout that has to agree to the pixel is three
+/// chances for a switch to be drawn somewhere other than where clicking it
+/// works.
+fn switch_columns(row: egui::Rect) -> [egui::Rect; 3] {
+    let side = crate::panels::LAYER_SWITCH;
+    // The rightmost column ends a gap short of the grid.
+    let right = row.min.x + LAYER_COLUMN - SWITCH_GAP;
+    let top = row.center().y - side * 0.5;
+    std::array::from_fn(|i| {
+        // `i` counts from the left, and there are three of them.
+        let x = right - (3 - i) as f32 * (side + SWITCH_GAP) + SWITCH_GAP;
+        egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(side, side))
+    })
+}
+
+/// Which switch is under this point, if any.
+fn switch_at(row: egui::Rect, pos: egui::Pos2) -> Option<crate::panels::LayerIcon> {
+    switch_columns(row)
+        .iter()
+        .zip(crate::panels::LayerIcon::ALL)
+        .find(|(rect, _)| rect.contains(pos))
+        .map(|(_, icon)| icon)
+}
+
+/// Where the layer's name may be drawn: everything left of the switches.
+fn name_area(row: egui::Rect) -> egui::Rect {
+    let switches = switch_columns(row);
+    egui::Rect::from_min_max(
+        row.min,
+        egui::pos2(
+            switches[0].left() - crate::panels::CHIP_WIDTH - SWITCH_GAP * 2.0,
+            row.max.y,
+        ),
+    )
+}
 
 /// Draw the timeline.
 pub fn timeline_panel(ui: &mut Ui, scene: &Scene, state: &TimelineState) -> TimelineResponse {
@@ -571,6 +631,22 @@ fn ruler(
     let grid_left = rect.min.x + LAYER_COLUMN;
     let font = FontId::proportional(9.0);
 
+    // Headings over the three switch columns, in the same place the switches
+    // are: a painted eye is only obvious once you know what it is, and this is
+    // the row Animate rules them under.
+    for (column, icon) in switch_columns(rect)
+        .iter()
+        .zip(crate::panels::LayerIcon::ALL)
+    {
+        painter.text(
+            column.center(),
+            Align2::CENTER_CENTER,
+            icon.heading(),
+            FontId::proportional(8.0),
+            Palette::ruler_text(),
+        );
+    }
+
     // Label every fifth frame, as Animate does — or every tenth, or every
     // twentieth, once the cells are too narrow for the numbers to fit beside
     // each other. A ruler whose labels overlap is worse than one with fewer.
@@ -774,21 +850,49 @@ fn layer_row(
         LayerKind::Masked | LayerKind::Guided => ". ",
         LayerKind::Normal => "",
     };
-    painter.text(
-        egui::pos2(rect.min.x + 4.0 + indent, rect.center().y),
-        Align2::LEFT_CENTER,
-        format!("{mark}{}", layer.name),
-        FontId::proportional(11.0),
-        if layer.visible {
-            Palette::text()
-        } else {
-            Palette::text_dim()
-        },
-    );
+    // **Clipped to the name area.** A painted string does not wrap or truncate
+    // itself, and a long layer name would otherwise be drawn straight through
+    // the three switches to its right.
+    painter
+        .with_clip_rect(name_area(rect).intersect(rect))
+        .text(
+            egui::pos2(rect.min.x + 4.0 + indent, rect.center().y),
+            Align2::LEFT_CENTER,
+            format!("{mark}{}", layer.name),
+            FontId::proportional(11.0),
+            if layer.visible {
+                Palette::text()
+            } else {
+                Palette::text_dim()
+            },
+        );
 
-    // The layer's colour chip, which is also its outline-view colour.
+    // **Animate's three columns, beside the name.**
+    //
+    // The Layers panel has had these for a while and the timeline had none of
+    // them, which meant hiding a layer while working in the timeline — the
+    // panel an animator is actually in — needed a trip to the other side of
+    // the window. They are painted rather than laid out as widgets because the
+    // whole grid is: see `paint_layer_icon`.
+    let hover = ui.ctx().input(|i| i.pointer.hover_pos());
+    let switches = switch_columns(rect);
+    for (column, icon) in switches.iter().zip(crate::panels::LayerIcon::ALL) {
+        let on = match icon {
+            crate::panels::LayerIcon::Eye => layer.visible,
+            crate::panels::LayerIcon::Lock => layer.locked,
+            crate::panels::LayerIcon::Outline => layer.outline,
+        };
+        let hovered = hover.is_some_and(|p| column.contains(p) && response.hovered());
+        crate::panels::paint_layer_icon(&painter, *column, icon, on, layer.color, hovered);
+    }
+
+    // The layer's colour chip, which is also its outline-view colour. Left of
+    // the switches, beside the outline one it explains.
     let chip = egui::Rect::from_min_size(
-        egui::pos2(rect.max.x - width - 12.0, rect.center().y - 4.0),
+        egui::pos2(
+            switches[0].left() - crate::panels::CHIP_WIDTH - SWITCH_GAP,
+            rect.center().y - 4.0,
+        ),
         egui::vec2(7.0, 8.0),
     );
     let [r, g, b, a] = layer.color.to_rgba8().to_u8_array();
@@ -833,17 +937,41 @@ fn layer_row(
     };
 
     if response.clicked() {
-        out.select_layer = Some(layer.id);
-        if let Some(frame) = clicked_frame(ui) {
-            out.scrub_to = Some(frame);
+        // A switch first: clicking the eye hides the layer, it does not also
+        // select it and move the playhead to frame one.
+        let hit = ui
+            .ctx()
+            .input(|i| i.pointer.interact_pos())
+            .and_then(|pos| switch_at(rect, pos));
+        if let Some(icon) = hit {
+            out.toggle_layer = Some((layer.id, icon));
+        } else {
+            out.select_layer = Some(layer.id);
+            if let Some(frame) = clicked_frame(ui) {
+                out.scrub_to = Some(frame);
+            }
         }
     }
 
-    // Animate's right-click frame menu. Opening it moves the playhead first,
-    // so the command that follows lands on the frame the user pointed at
-    // rather than wherever the playhead happened to be.
+    // **Two right-click menus, decided by where the pointer is.**
+    //
+    // Animate has a frame menu on the frames and a layer menu on the name, and
+    // they are different sets of commands about different things. The frame
+    // menu opening over a layer's name was the only menu here, so hiding or
+    // deleting a layer from the timeline had no route at all.
+    let in_name_column = ui
+        .ctx()
+        .input(|i| i.pointer.interact_pos())
+        .is_some_and(|pos| pos.x < grid_left);
     response.context_menu(|ui| {
         out.select_layer = Some(layer.id);
+        if in_name_column {
+            layer_context_menu(ui, layer, out);
+            return;
+        }
+        // Opening the frame menu moves the playhead first, so the command that
+        // follows lands on the frame the user pointed at rather than wherever
+        // the playhead happened to be.
         if let Some(frame) = clicked_frame(ui)
             && out.scrub_to.is_none()
         {
@@ -851,6 +979,61 @@ fn layer_row(
         }
         frame_context_menu(ui, out);
     });
+}
+
+/// Animate's right-click menu on a layer's name.
+///
+/// The same three switches the columns carry, spelled out — nothing on a
+/// fifteen-point painted square says which one hides a layer — plus the layer
+/// commands, which is where Delete belongs: a destructive action does not want
+/// to be a fourth small square beside three toggles.
+fn layer_context_menu(ui: &mut Ui, layer: &buzz_scene::Layer, out: &mut TimelineResponse) {
+    ui.label(egui::RichText::new(&layer.name).small().weak());
+    ui.separator();
+
+    for (icon, label) in [
+        (
+            crate::panels::LayerIcon::Eye,
+            if layer.visible {
+                "Hide Layer"
+            } else {
+                "Show Layer"
+            },
+        ),
+        (
+            crate::panels::LayerIcon::Lock,
+            if layer.locked {
+                "Unlock Layer"
+            } else {
+                "Lock Layer"
+            },
+        ),
+        (
+            crate::panels::LayerIcon::Outline,
+            if layer.outline {
+                "Show Layer Filled"
+            } else {
+                "Show Layer as Outlines"
+            },
+        ),
+    ] {
+        if ui.button(label).clicked() {
+            out.toggle_layer = Some((layer.id, icon));
+            ui.close();
+        }
+    }
+
+    ui.separator();
+    for command in [
+        crate::Command::NewLayer,
+        crate::Command::NewLayerFolder,
+        crate::Command::DeleteLayer,
+    ] {
+        if ui.button(command.label()).clicked() {
+            out.command = Some(command);
+            ui.close();
+        }
+    }
 }
 
 /// The tween drawn in one cell, if any.
@@ -1324,5 +1507,115 @@ mod tests {
             (scene.duration_seconds() - 1.0).abs() < 0.001,
             "24 frames at 24 fps"
         );
+    }
+}
+
+#[cfg(test)]
+mod layer_switch_tests {
+    use super::*;
+    use crate::panels::LayerIcon;
+
+    fn row() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(LAYER_COLUMN + 400.0, 20.0))
+    }
+
+    /// **A switch is clickable exactly where it is drawn.**
+    ///
+    /// The row is painted and hit-tested separately — there is no widget to
+    /// keep the two in step — so the one thing that must hold is that the
+    /// rectangle the eye is drawn in is the rectangle that toggles it. Off by
+    /// a few points and the icon is decoration.
+    #[test]
+    fn every_switch_is_hit_where_it_is_drawn() {
+        let row = row();
+        for (column, icon) in switch_columns(row).iter().zip(LayerIcon::ALL) {
+            assert_eq!(
+                switch_at(row, column.center()),
+                Some(icon),
+                "{icon:?} is not clickable at its own centre"
+            );
+            // And the corners, because a hit test that only works in the middle
+            // of a fifteen-point square is a fight.
+            for corner in [column.min + egui::vec2(1.0, 1.0), column.max - egui::vec2(1.0, 1.0)] {
+                assert_eq!(switch_at(row, corner), Some(icon), "{icon:?} misses a corner");
+            }
+        }
+    }
+
+    /// The three columns sit inside the name column, in order, and do not
+    /// overlap each other or run into the frame grid.
+    #[test]
+    fn the_switch_columns_fit_the_layer_name_column() {
+        let row = row();
+        let columns = switch_columns(row);
+        let grid_left = row.min.x + LAYER_COLUMN;
+
+        for column in &columns {
+            assert!(
+                column.left() >= row.min.x && column.right() <= grid_left,
+                "a switch at {column:?} is outside the {LAYER_COLUMN}-point name column"
+            );
+        }
+        for pair in columns.windows(2) {
+            assert!(
+                pair[0].right() <= pair[1].left(),
+                "the switch columns overlap: {:?} and {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Eye, padlock, outline — left to right, as Animate rules them.
+        assert!(columns[0].left() < columns[1].left());
+        assert!(columns[1].left() < columns[2].left());
+    }
+
+    /// The name never runs under the switches: there is real room left for it,
+    /// and the two areas do not overlap.
+    #[test]
+    fn the_name_has_room_of_its_own() {
+        let row = row();
+        let name = name_area(row);
+        let first = switch_columns(row)[0];
+
+        assert!(
+            name.right() <= first.left(),
+            "the name area runs into the switches"
+        );
+        // Enough for an ordinary layer name — "Right hand" and the like — at
+        // the eleven points the row draws them in.
+        assert!(
+            name.width() >= 120.0,
+            "only {:.0} points left for a layer name",
+            name.width()
+        );
+    }
+
+    /// A click anywhere else in the row is not a switch — otherwise selecting
+    /// a layer by its name would silently hide it.
+    #[test]
+    fn the_rest_of_the_row_is_not_a_switch() {
+        let row = row();
+        for x in [2.0, 40.0, name_area(row).right() - 2.0, LAYER_COLUMN + 50.0] {
+            assert_eq!(
+                switch_at(row, egui::pos2(x, row.center().y)),
+                None,
+                "x = {x} was taken for a switch"
+            );
+        }
+    }
+
+    /// The timeline and the Layers panel draw the same three switches, in the
+    /// same order, meaning the same things.
+    #[test]
+    fn the_two_places_agree_about_what_the_switches_are() {
+        assert_eq!(
+            LayerIcon::ALL,
+            [LayerIcon::Eye, LayerIcon::Lock, LayerIcon::Outline]
+        );
+        for icon in LayerIcon::ALL {
+            assert!(!icon.heading().is_empty());
+            assert!(!icon.hint(true).is_empty());
+            assert!(!icon.hint(false).is_empty());
+        }
     }
 }

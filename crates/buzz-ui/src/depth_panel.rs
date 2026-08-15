@@ -69,6 +69,11 @@ pub fn depth_panel(ui: &mut Ui, scene: &Scene, active: Option<LayerId>) -> Depth
     ui.horizontal(|ui| {
         ui.label("Camera depth");
         let mut value = focal;
+        // **The slider takes what is left of the row, not egui's fixed 100
+        // points.** A label, a 100-point slider and its number box come to
+        // more than a dock column at its narrowest, and the number box — the
+        // half you can type into — was the part that ended up off the panel.
+        ui.spacing_mut().slider_width = (ui.available_width() - 66.0).max(40.0);
         if ui
             .add(
                 egui::Slider::new(&mut value, 200.0..=6000.0)
@@ -126,7 +131,16 @@ pub fn depth_panel(ui: &mut Ui, scene: &Scene, active: Option<LayerId>) -> Depth
             let (chip, _) = ui.allocate_exact_size(egui::vec2(7.0, 12.0), egui::Sense::hover());
             ui.painter().rect_filled(chip, 1.0, colour);
 
-            if ui.selectable_label(active == Some(id), &name).clicked() {
+            // Truncated: a layer name has no length limit, and the depth field
+            // on the right of this row is what a long one pushes off the panel.
+            if ui
+                .add(
+                    egui::Button::selectable(active == Some(id), &name)
+                        .truncate()
+                        .min_size(egui::vec2((ui.available_width() - 64.0).max(1.0), 0.0)),
+                )
+                .clicked()
+            {
                 response.select_layer = Some(id);
             }
 

@@ -264,7 +264,18 @@ fn draw_symbol_row(
             return;
         }
 
-        let label = ui.selectable_label(state.selected == Some(id), name);
+        // Truncated rather than allowed to run on: a symbol name has no length
+        // limit, and the use count on the right of this row is the one thing
+        // that must not be pushed off the panel by one.
+        let label = ui.add(
+            egui::Button::selectable(state.selected == Some(id), name)
+                .truncate()
+                .min_size(egui::vec2(
+                    // Room for the use count and its spacing on the right.
+                    (ui.available_width() - 26.0).max(1.0),
+                    0.0,
+                )),
+        );
         if label.clicked() {
             state.selected = Some(id);
             state.selected_folder = None;
@@ -317,7 +328,15 @@ fn draw_footer(
 ) {
     let selected = state.selected;
 
-    ui.horizontal(|ui| {
+    // **Wrapped, not one long row.**
+    //
+    // Seven controls end to end need something over 250 points, and a dock
+    // column can legitimately be narrower than that. Unwrapped, the ones at the
+    // end — Place, Duplicate, Delete — were simply drawn off the edge of the
+    // panel, which is the "the Library is hidden" report: not the panel, the
+    // half of it that had nowhere to go. Wrapping puts them on a second line
+    // instead, and costs nothing in a column wide enough for one.
+    ui.horizontal_wrapped(|ui| {
         // The kind the next new symbol gets, in place of Animate's dialog.
         egui::ComboBox::from_id_salt("library_new_kind")
             .selected_text(RichText::new(state.new_symbol_kind.label()).small())
@@ -376,7 +395,7 @@ fn draw_footer(
     let (current, kind) = (symbol.folder.clone(), symbol.kind);
     let uses = usage.get(&id).copied().unwrap_or(0);
 
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Folder").small().weak());
 
         // The destination list is every folder plus the root, which is what

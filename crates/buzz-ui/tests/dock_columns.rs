@@ -9,6 +9,13 @@
 //!
 //! So this measures. A panel column that overflows the window is a defect, and
 //! the numbers below are what makes it one that can be caught.
+//!
+//! The same complaint came back a second time, sideways: panels "obscured by
+//! the scroll bar", the Library hidden, the Layers panel's switches nowhere to
+//! be found. Also one fact — a column is only as wide as it is, and a scroll
+//! bar that floats over the content takes the right-hand end of every row in
+//! it. The tests at the foot of this file measure *width* for the same reason
+//! the ones above measure height.
 
 use buzz_doc::AssetLibrary;
 use buzz_scene::{EditAt, LayerKind, Scene};
@@ -26,6 +33,39 @@ fn screen() -> egui::RawInput {
         )),
         ..Default::default()
     }
+}
+
+/// Draw a column of panels and report how far past its right edge they ran.
+///
+/// Zero or less means everything fitted. A positive number is the width of
+/// whatever is hanging off the end of the panel, where it is drawn under the
+/// scroll bar, under the next column, or not at all.
+fn column_overflow(width: f32, draw: impl FnOnce(&mut egui::Ui)) -> f32 {
+    let ctx = egui::Context::default();
+    buzz_ui::theme::apply(&ctx);
+    let mut over = 0.0;
+    let mut draw = Some(draw);
+    let _ = ctx.run_ui(screen(), |ui| {
+        egui::Panel::right("dock")
+            .resizable(false)
+            .exact_size(width)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("column")
+                    .show(ui, |ui| {
+                        // What the scroll area is willing to give the contents,
+                        // which is the column less the bar's own width.
+                        let usable = ui.max_rect().right();
+                        if let Some(draw) = draw.take() {
+                            draw(ui);
+                        }
+                        // `min_rect` is what the contents actually took, and it
+                        // grows past `max_rect` when a row does not fit.
+                        over = ui.min_rect().right() - usable;
+                    });
+            });
+    });
+    over
 }
 
 /// Draw a column of panels and report how tall it came out.
@@ -135,6 +175,229 @@ fn a_fifteen_layer_character_leaves_room_for_the_panels_below_it() {
         "Layers, Properties and Colour need {used:.0} points of a {COLUMN}-point \
          column for a fifteen-layer character. The panels past the bottom are \
          the ones the user reports as missing."
+    );
+}
+
+/// **A scroll bar reserves its width; it does not sit on the panel.**
+///
+/// This is the "obscured by the scroll bar" report, as one number. egui's
+/// default bar floats over the content, and every dock column is a scroll
+/// area — so the bar was drawn across the right-hand end of whatever panel
+/// was in it, which is where the panels keep their menus and their buttons.
+#[test]
+fn a_dock_column_leaves_room_for_its_scroll_bar() {
+    let ctx = egui::Context::default();
+    buzz_ui::theme::apply(&ctx);
+
+    // Both slots, because the theme installs the same style in each and a
+    // dark-only application still has to survive a light system setting.
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        let scroll = ctx.style_of(theme).spacing.scroll;
+        assert!(
+            !scroll.floating,
+            "the dock's scroll bars float over the panels again \u{2014} the right-hand \
+             end of every row in a column is drawn underneath one"
+        );
+
+        // And the width it takes is the width the layouts are budgeted against.
+        assert!(
+            scroll.bar_width + scroll.bar_inner_margin + scroll.bar_outer_margin
+                <= Metrics::SCROLL_BAR,
+            "the bar now takes more than the {} points the panels leave for it",
+            Metrics::SCROLL_BAR
+        );
+    }
+}
+
+/// **A layer's row fits in the narrowest column the workspace allows.**
+///
+/// The eye, the padlock and the outline box are the controls that were
+/// reported missing. They were never missing: they were at the *left* of a row
+/// that ended in a variable-length name, in a column the user had dragged down
+/// to 144 points, with a floating scroll bar over the last few. Every one of
+/// those three things is fixed by this measurement staying at zero.
+///
+/// **With a layer selected.** The first version of this test did not select
+/// one, so the two rows that only the selected layer draws — its parent and
+/// its kind — were never measured, and they were the pair that overflowed by
+/// more than fifty points. A Layers panel with nothing selected is not the one
+/// anybody uses.
+#[test]
+fn a_layer_row_fits_the_narrowest_column() {
+    let narrowest = *buzz_ui::workspace::COLUMN_WIDTH_RANGE.start();
+
+    let mut scene = Scene::default();
+    // A long name, because a short one would fit anything and prove nothing.
+    let long = scene.add_layer("Right forearm, overlap pass", LayerKind::Normal);
+    scene.add_layer("Head", LayerKind::Normal);
+
+    for (what, active) in [("no layer selected", None), ("a layer selected", Some(long))] {
+        let mut selection = Selection::new();
+        selection.set_active_layer(active);
+
+        let over = column_overflow(narrowest, |ui| {
+            let _ = buzz_ui::panels::layers_panel(ui, &mut scene, &mut selection, 0);
+        });
+
+        assert!(
+            over <= 0.0,
+            "with {what}, a layer row runs {over:.0} points past the end of a \
+             {narrowest:.0}-point column. That is not only a clipped control: a \
+             widget wider than its column expands the column's own rect, and the \
+             stage is then laid out underneath the panel."
+        );
+    }
+}
+
+/// And so does the Library, which is the other panel reported as hidden.
+#[test]
+fn the_library_fits_the_narrowest_column() {
+    let narrowest = *buzz_ui::workspace::COLUMN_WIDTH_RANGE.start();
+
+    let mut scene = Scene::default();
+    for i in 0..12 {
+        scene.add_symbol(
+            format!("Background element {i}"),
+            buzz_scene::SymbolKind::Graphic,
+            None,
+        );
+    }
+    let mut state = LibraryState::default();
+
+    let over = column_overflow(narrowest, |ui| {
+        let _ = library_panel(ui, &mut scene, &mut state);
+    });
+
+    assert!(
+        over <= 0.0,
+        "the Library runs {over:.0} points past the end of a {narrowest:.0}-point column"
+    );
+}
+
+/// **And every other panel that goes in a column, too.**
+///
+/// The report was not about one panel. It was "the right side and the other
+/// tabs" — so this walks the lot at the narrowest width the workspace will
+/// give them, and names the one that does not fit.
+#[test]
+fn every_docked_panel_fits_the_narrowest_column() {
+    let narrowest = *buzz_ui::workspace::COLUMN_WIDTH_RANGE.start();
+
+    let mut scene = Scene::default();
+    scene.add_layer("Head", LayerKind::Normal);
+    scene.add_symbol("Hero Body", buzz_scene::SymbolKind::Graphic, None);
+
+    let selection = Selection::new();
+    let mut style = DrawStyle::default();
+    let mut view = ViewSettings::default();
+    let mut swatches = SwatchState::default();
+    let mut filters = FilterPanelState::default();
+    let mut lights = LightPanelState::default();
+    let mut actions = ActionsState::default();
+    let mut assets_state = AssetPanelState::default();
+    let assets = AssetLibrary::default();
+    let rig = buzz_scene::LightRig::default();
+
+    // Each is drawn on its own, because a panel that overflows has to be
+    // named — a single figure for the whole column says only that something
+    // somewhere is too wide.
+    let mut failures: Vec<String> = Vec::new();
+    let check = |name: &str, over: f32, failures: &mut Vec<String>| {
+        if over > 0.0 {
+            failures.push(format!("{name} by {over:.0} points"));
+        }
+    };
+
+    check(
+        "Properties",
+        column_overflow(narrowest, |ui| {
+            let _ = buzz_ui::panels::properties_panel(
+                ui,
+                &mut scene,
+                &selection,
+                &mut style,
+                &mut view,
+                EditAt::exact(0),
+            );
+        }),
+        &mut failures,
+    );
+    check(
+        "Color",
+        column_overflow(narrowest, |ui| {
+            buzz_ui::panels::color_panel(ui, &scene, &mut style);
+        }),
+        &mut failures,
+    );
+    check(
+        "Swatches",
+        column_overflow(narrowest, |ui| {
+            swatch_panel(ui, &mut scene, &mut swatches, &mut style);
+        }),
+        &mut failures,
+    );
+    check(
+        "Layer Depth",
+        column_overflow(narrowest, |ui| {
+            let _ = depth_panel(ui, &scene, selection.active_layer());
+        }),
+        &mut failures,
+    );
+    check(
+        "Armature",
+        column_overflow(narrowest, |ui| {
+            let _ = rig_panel(ui, None);
+        }),
+        &mut failures,
+    );
+    check(
+        "Filters",
+        column_overflow(narrowest, |ui| {
+            let _ = filter_panel(ui, &[], None, &mut filters, false);
+        }),
+        &mut failures,
+    );
+    check(
+        "Lighting",
+        column_overflow(narrowest, |ui| {
+            let _ = light_panel(ui, &rig, &mut lights);
+        }),
+        &mut failures,
+    );
+    check(
+        "Sound",
+        column_overflow(narrowest, |ui| {
+            let _ = sound_panel(ui, &[], None, true, 0);
+        }),
+        &mut failures,
+    );
+    check(
+        "Assets",
+        column_overflow(narrowest, |ui| {
+            let _ = assets_panel(ui, &assets, &mut assets_state, false);
+        }),
+        &mut failures,
+    );
+    check(
+        "Actions",
+        column_overflow(narrowest, |ui| {
+            let _ = actions_panel(ui, &mut actions, &[]);
+        }),
+        &mut failures,
+    );
+    check(
+        "Camera",
+        column_overflow(narrowest, |ui| {
+            let _ = camera_panel(ui, scene.camera(), 0);
+        }),
+        &mut failures,
+    );
+
+    assert!(
+        failures.is_empty(),
+        "these panels run past the end of a {narrowest:.0}-point column, which is \
+         where their controls go missing: {}",
+        failures.join(", ")
     );
 }
 

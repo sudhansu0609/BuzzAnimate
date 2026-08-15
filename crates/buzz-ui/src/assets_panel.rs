@@ -127,7 +127,10 @@ pub fn assets_panel(
     }
 
     ui.separator();
-    ui.horizontal(|ui| {
+    // Wrapped: four controls and a hint are wider than a dock column at its
+    // narrowest, and unwrapped the last of them — "From Animate…" — was drawn
+    // off the end of the panel where it could not be clicked.
+    ui.horizontal_wrapped(|ui| {
         let add = ui.add_enabled(can_add, egui::Button::new("+").small());
         if add
             .on_hover_text("Keep the selected artwork as an asset")

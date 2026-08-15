@@ -66,6 +66,23 @@ impl PanelId {
         }
     }
 
+    /// The name on a tab, which has a column to share rather than fill.
+    ///
+    /// Five tabs in a 216-point section is the arrangement this was added for,
+    /// and "Layer Depth" and "Armature" spelled out do not fit in it. Animate
+    /// abbreviates its own tabs for the same reason. Only the four long ones
+    /// differ; the rest are already short, and a second name for a panel that
+    /// does not need one is just something else to keep in step.
+    pub fn tab_title(self) -> &'static str {
+        match self {
+            Self::Depth => "Depth",
+            Self::Rig => "Rig",
+            Self::Lighting => "Light",
+            Self::Properties => "Props",
+            other => other.title(),
+        }
+    }
+
     /// Does this panel draw its own name?
     ///
     /// Most do — the heading is part of the panel. The two that do not would
@@ -94,7 +111,9 @@ impl PanelId {
 }
 
 /// Where a panel lives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub enum Dock {
     Left,
     #[default]
@@ -168,6 +187,50 @@ pub struct Slot {
     /// occasionally start rolled up, and the ones they live in start open.
     #[serde(default)]
     pub collapsed: bool,
+    /// Which tab stack this panel is part of, within its dock.
+    ///
+    /// Panels sharing a dock **and** a group are one *section*: one strip of
+    /// tabs, one set of chrome, and only the front tab's contents drawn. This
+    /// is Animate's panel group, and it is the answer to a column that is
+    /// taller than the window — five occasional panels in one section cost the
+    /// height of one.
+    ///
+    /// A number rather than a list of members, because the membership has to
+    /// survive a panel being moved, hidden and brought back, and a list would
+    /// need mending at every one of those. Nothing outside this module should
+    /// mint one: [`Workspace::group_with`] and [`Workspace::ungroup`] are the
+    /// only ways in and out.
+    #[serde(default)]
+    pub group: GroupId,
+    /// Is this the front tab of its section?
+    ///
+    /// Exactly one panel in each section carries this; [`Workspace::sections`]
+    /// falls back to the first member if a hand-edited file carries none or
+    /// several, so a damaged layout shows a panel rather than an empty box.
+    #[serde(default)]
+    pub selected: bool,
+}
+
+/// Identifies a tab stack within one dock. See [`Slot::group`].
+pub type GroupId = u32;
+
+/// One tab stack: the panels in it, and which one is at the front.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section {
+    pub group: GroupId,
+    /// Every panel in the stack, in tab order. Never empty.
+    pub panels: Vec<PanelId>,
+    /// The one whose contents are drawn.
+    pub front: PanelId,
+    /// Rolled up to its tab strip.
+    pub collapsed: bool,
+}
+
+impl Section {
+    /// Is this a real stack, or a lone panel wearing the same chrome?
+    pub fn is_tabbed(&self) -> bool {
+        self.panels.len() > 1
+    }
 }
 
 /// The whole arrangement.
@@ -237,6 +300,46 @@ pub struct Workspace {
 pub const FRAME_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 4.0..=40.0;
 pub const ROW_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.6..=2.5;
 
+/// How wide a dock column may be dragged.
+///
+/// # Why the minimum is not smaller
+///
+/// It was 120, which is narrower than the *contents* of every panel that goes
+/// in one of these columns. A Layers row is three switches, a colour chip and a
+/// name; a Properties row is a label and two number fields. Dragged down to
+/// 120 the column still drew — it just drew everything with its right-hand end
+/// cut off, which is indistinguishable from a panel whose controls are
+/// missing, and is exactly how it was reported. This number is the width at
+/// which those rows are whole, and the scroll bar's width is on top of it.
+pub const COLUMN_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 216.0..=900.0;
+/// The tool strip, which holds icons rather than rows.
+///
+/// One 30-point tool button, the panel frame's margins either side of it, and
+/// the scroll bar's own width. It was 46, which was one button and its margins
+/// and nothing else — correct until the dock's scroll bars stopped floating
+/// over the content and started reserving space, at which point the buttons no
+/// longer fitted the strip they were measured for.
+pub const LEFT_WIDTH_RANGE: std::ops::RangeInclusive<f32> =
+    (46.0 + crate::theme::Metrics::SCROLL_BAR)..=400.0;
+/// The timeline, which needs a couple of layer rows to be worth having.
+pub const BOTTOM_HEIGHT_RANGE: std::ops::RangeInclusive<f32> = 80.0..=900.0;
+
+/// The two sections the default arrangement ships grouped.
+///
+/// Numbered above any `order` so they cannot collide with the one-panel
+/// sections, which take their group from their position.
+const GROUP_UTILITY: GroupId = 100;
+const GROUP_ASSETS: GroupId = 101;
+
+/// Bring a size back inside its range — including a NaN out of a damaged file,
+/// which `f32::clamp` panics on rather than fixing.
+pub fn clamp_to(value: f32, range: std::ops::RangeInclusive<f32>) -> f32 {
+    if value.is_nan() {
+        return *range.start();
+    }
+    value.clamp(*range.start(), *range.end())
+}
+
 fn default_frame_width() -> f32 {
     crate::theme::Metrics::FRAME_WIDTH
 }
@@ -256,20 +359,26 @@ impl Workspace {
     /// the left, properties and the library on the right, timeline along the
     /// bottom.
     pub fn animate() -> Self {
-        let slot = |id: PanelId, dock: Dock, order: u32, home: Dock| Slot {
-            id,
-            dock,
-            home,
-            order,
-            collapsed: false,
-            // Floating panels start over the stage rather than at the origin,
-            // where they would sit under the menu bar.
-            float_pos: (320.0 + order as f32 * 24.0, 140.0 + order as f32 * 24.0),
-            float_size: (300.0, 380.0),
+        // `group` is the section this panel shares; `front` marks the tab that
+        // starts at the front of it.
+        let tab = |id: PanelId, dock: Dock, order: u32, home: Dock, group: GroupId, front: bool| {
+            Slot {
+                id,
+                dock,
+                home,
+                order,
+                collapsed: false,
+                group,
+                selected: front,
+                // Floating panels start over the stage rather than at the
+                // origin, where they would sit under the menu bar.
+                float_pos: (320.0 + order as f32 * 24.0, 140.0 + order as f32 * 24.0),
+                float_size: (300.0, 380.0),
+            }
         };
-        let rolled = |id: PanelId, dock: Dock, order: u32, home: Dock| Slot {
-            collapsed: true,
-            ..slot(id, dock, order, home)
+        // A panel in a section of its own, which is what most of them are.
+        let slot = |id: PanelId, dock: Dock, order: u32, home: Dock| {
+            tab(id, dock, order, home, order, true)
         };
 
         Self {
@@ -284,19 +393,58 @@ impl Workspace {
                 // reached for. Animate docks Swatches with Color for the same
                 // reason.
                 slot(PanelId::Swatches, Dock::Right, 3, Dock::Right),
-                // Rolled up to begin with. Each of these is reached for now
-                // and then rather than all day, and open they buried the
-                // Library and the Assets panel below the fold.
-                rolled(PanelId::Depth, Dock::Right, 4, Dock::Right),
-                rolled(PanelId::Rig, Dock::Right, 5, Dock::Right),
-                rolled(PanelId::Filters, Dock::Right, 6, Dock::Right),
-                rolled(PanelId::Lighting, Dock::Right, 7, Dock::Right),
-                rolled(PanelId::Sound, Dock::Right, 8, Dock::Right),
-                slot(PanelId::Library, Dock::RightOuter, 0, Dock::RightOuter),
-                // Beside the Library, which is the panel it is most often
-                // compared with: one holds this film's symbols, the other
-                // what outlives the film.
-                slot(PanelId::Assets, Dock::RightOuter, 1, Dock::RightOuter),
+                // **One section, five tabs.** Each of these is reached for now
+                // and then rather than all day. Rolled up they were five title
+                // bars taking five rows and showing nothing; as tabs they take
+                // one row and always show one of them. That is what the
+                // grouping is *for*, and the default arrangement should
+                // demonstrate it rather than leave it as something to discover.
+                tab(PanelId::Depth, Dock::Right, 4, Dock::Right, GROUP_UTILITY, true),
+                tab(PanelId::Rig, Dock::Right, 5, Dock::Right, GROUP_UTILITY, false),
+                tab(
+                    PanelId::Filters,
+                    Dock::Right,
+                    6,
+                    Dock::Right,
+                    GROUP_UTILITY,
+                    false,
+                ),
+                tab(
+                    PanelId::Lighting,
+                    Dock::Right,
+                    7,
+                    Dock::Right,
+                    GROUP_UTILITY,
+                    false,
+                ),
+                tab(
+                    PanelId::Sound,
+                    Dock::Right,
+                    8,
+                    Dock::Right,
+                    GROUP_UTILITY,
+                    false,
+                ),
+                // The Library and the Assets panel share a section too: one
+                // holds this film's symbols and the other what outlives the
+                // film, which is the comparison an animator is making when
+                // they reach for either.
+                tab(
+                    PanelId::Library,
+                    Dock::RightOuter,
+                    0,
+                    Dock::RightOuter,
+                    GROUP_ASSETS,
+                    true,
+                ),
+                tab(
+                    PanelId::Assets,
+                    Dock::RightOuter,
+                    1,
+                    Dock::RightOuter,
+                    GROUP_ASSETS,
+                    false,
+                ),
                 slot(PanelId::Timeline, Dock::Bottom, 0, Dock::Bottom),
                 // Closed until F9 asks for it — and it belongs at the bottom,
                 // under the stage, where Animate keeps it.
@@ -306,10 +454,10 @@ impl Workspace {
             theme: crate::theme::Theme::default(),
             new_document: crate::new_document::DocumentSetup::default(),
             recovery_dirs: Vec::new(),
-            // One tool column and its padding — the strip is Animate's
-            // narrow one, and the extra half-column of empty space beside it
-            // was the first thing anybody noticed.
-            left_width: 46.0,
+            // One tool column, its padding and the scroll bar — the strip is
+            // Animate's narrow one, and the extra half-column of empty space
+            // beside it was the first thing anybody noticed.
+            left_width: *LEFT_WIDTH_RANGE.start(),
             right_width: 300.0,
             right_outer_width: 240.0,
             bottom_height: 170.0,
@@ -323,6 +471,205 @@ impl Workspace {
         let mut found: Vec<&Slot> = self.slots.iter().filter(|s| s.dock == dock).collect();
         found.sort_by_key(|s| s.order);
         found.iter().map(|s| s.id).collect()
+    }
+
+    /// The sections on one side, in the order they are drawn down it.
+    ///
+    /// A section is a tab stack: every panel sharing this dock and a group.
+    /// Sections are ordered by their earliest member, so grouping two panels
+    /// puts the section where the first of them already was rather than
+    /// shuffling the column.
+    pub fn sections(&self, dock: Dock) -> Vec<Section> {
+        let mut here: Vec<&Slot> = self.slots.iter().filter(|s| s.dock == dock).collect();
+        here.sort_by_key(|s| s.order);
+
+        let mut sections: Vec<Section> = Vec::new();
+        for slot in here {
+            match sections.iter_mut().find(|s| s.group == slot.group) {
+                Some(section) => {
+                    section.panels.push(slot.id);
+                    if slot.selected {
+                        section.front = slot.id;
+                    }
+                    // A section is rolled up if the layout says its front tab
+                    // is; the two are kept in step by `set_collapsed`.
+                    section.collapsed |= slot.collapsed && slot.selected;
+                }
+                None => sections.push(Section {
+                    group: slot.group,
+                    panels: vec![slot.id],
+                    front: slot.id,
+                    collapsed: slot.collapsed,
+                }),
+            }
+        }
+
+        // A file that names no front tab, or several, still has to draw one.
+        for section in &mut sections {
+            if !section.panels.contains(&section.front) {
+                section.front = section.panels[0];
+            }
+            section.collapsed = self
+                .slot(section.front)
+                .is_some_and(|slot| slot.collapsed);
+        }
+        sections
+    }
+
+    /// The section a panel belongs to, if it is on screen.
+    pub fn section_of(&self, id: PanelId) -> Option<Section> {
+        let dock = self.slot(id)?.dock;
+        self.sections(dock).into_iter().find(|s| s.panels.contains(&id))
+    }
+
+    /// Bring a panel to the front of its section.
+    ///
+    /// Allowed while the layout is locked, for the same reason opening and
+    /// closing a panel is: locking is about where things are, and clicking a
+    /// tab does not move anything.
+    pub fn select_tab(&mut self, id: PanelId) {
+        let Some(slot) = self.slot(id).copied() else {
+            return;
+        };
+        // Whatever the outgoing front tab's roll-up state was, the section
+        // keeps it — clicking a tab should not silently unroll the section, and
+        // should not roll it up either.
+        let collapsed = self
+            .sections(slot.dock)
+            .into_iter()
+            .find(|s| s.group == slot.group)
+            .is_some_and(|s| s.collapsed);
+
+        for other in &mut self.slots {
+            if other.dock == slot.dock && other.group == slot.group {
+                other.selected = other.id == id;
+                other.collapsed = collapsed;
+            }
+        }
+    }
+
+    /// Put `id` into `target`'s section, as the tab after it.
+    ///
+    /// The moved panel comes to the front, because a tab you have just asked
+    /// for and cannot see is indistinguishable from one that did not move.
+    pub fn group_with(&mut self, id: PanelId, target: PanelId) {
+        if self.locked || id == target {
+            return;
+        }
+        let Some(target_slot) = self.slot(target).copied() else {
+            return;
+        };
+        if target_slot.dock == Dock::Hidden {
+            return;
+        }
+
+        // Everything after the target on that side shuffles down one, so the
+        // newcomer has a place in the tab order rather than sharing one.
+        for slot in &mut self.slots {
+            if slot.dock == target_slot.dock && slot.order > target_slot.order {
+                slot.order += 1;
+            }
+        }
+        if let Some(slot) = self.slot_mut(id) {
+            slot.dock = target_slot.dock;
+            slot.home = target_slot.dock;
+            slot.group = target_slot.group;
+            slot.order = target_slot.order + 1;
+        }
+        self.select_tab(id);
+    }
+
+    /// Take a panel out of its section into one of its own, directly below.
+    pub fn ungroup(&mut self, id: PanelId) {
+        if self.locked {
+            return;
+        }
+        let Some(slot) = self.slot(id).copied() else {
+            return;
+        };
+        // A panel already alone in its section has nothing to leave.
+        if !self
+            .slots
+            .iter()
+            .any(|s| s.dock == slot.dock && s.group == slot.group && s.id != id)
+        {
+            return;
+        }
+
+        let group = self.next_group(slot.dock);
+        if let Some(slot) = self.slot_mut(id) {
+            slot.group = group;
+            slot.selected = true;
+            slot.collapsed = false;
+        }
+        // The section it left needs a front tab again.
+        self.mend_fronts();
+    }
+
+    /// Make every panel in a section agree about whether it is rolled up.
+    ///
+    /// The flag is per panel because that is what a saved layout can express,
+    /// but what it *means* is a property of the section — so a file where two
+    /// tabs of one stack disagree is mended to whatever the front tab says.
+    fn mend_collapse(&mut self) {
+        let states: Vec<(Dock, GroupId, bool)> = self
+            .slots
+            .iter()
+            .filter(|s| s.selected)
+            .map(|s| (s.dock, s.group, s.collapsed))
+            .collect();
+        for (dock, group, collapsed) in states {
+            for slot in &mut self.slots {
+                if slot.dock == dock && slot.group == group {
+                    slot.collapsed = collapsed;
+                }
+            }
+        }
+    }
+
+    /// A group number nothing on this side is using.
+    fn next_group(&self, dock: Dock) -> GroupId {
+        self.slots
+            .iter()
+            .filter(|s| s.dock == dock)
+            .map(|s| s.group + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Make sure every section has exactly one front tab.
+    ///
+    /// Called after anything that can leave a section without one — a panel
+    /// ungrouped, hidden, or moved to another side.
+    fn mend_fronts(&mut self) {
+        let keys: Vec<(Dock, GroupId)> = {
+            let mut keys: Vec<(Dock, GroupId)> =
+                self.slots.iter().map(|s| (s.dock, s.group)).collect();
+            keys.sort();
+            keys.dedup();
+            keys
+        };
+        for (dock, group) in keys {
+            if dock == Dock::Hidden {
+                continue;
+            }
+            let mut members: Vec<(u32, PanelId, bool)> = self
+                .slots
+                .iter()
+                .filter(|s| s.dock == dock && s.group == group)
+                .map(|s| (s.order, s.id, s.selected))
+                .collect();
+            members.sort();
+            if members.is_empty() || members.iter().filter(|(_, _, front)| *front).count() == 1 {
+                continue;
+            }
+            let front = members[0].1;
+            for slot in &mut self.slots {
+                if slot.dock == dock && slot.group == group {
+                    slot.selected = slot.id == front;
+                }
+            }
+        }
     }
 
     /// Note that documents live here, for crash recovery to look at later.
@@ -371,28 +718,51 @@ impl Workspace {
             .map(|s| s.order + 1)
             .max()
             .unwrap_or(0);
+        // **A panel sent to another side arrives in a section of its own.**
+        // Joining whatever section happened to carry the same group number
+        // over there would group two panels that nobody asked to group, and
+        // the second one would vanish behind the first's tab.
+        let group = self.next_group(dock);
         if let Some(slot) = self.slot_mut(id) {
             slot.dock = dock;
             slot.order = next;
+            slot.group = group;
+            slot.selected = true;
             // Somewhere it can be seen is somewhere it can come back to.
             if dock != Dock::Hidden {
                 slot.home = dock;
             }
         }
+        // The section it left may have lost its front tab.
+        self.mend_fronts();
     }
 
     /// Show a hidden panel, or hide a shown one.
     ///
     /// Allowed while locked: a locked *layout* is about where things are, and
     /// an animator still needs to open the Actions panel and close it again.
-    /// Roll a panel up, or open it again.
+    /// Roll a section up to its tab strip, or open it again.
+    ///
+    /// Whole sections, not single tabs: what is rolled up is the *body* below
+    /// the tabs, and there is only one of those however many tabs sit above it.
     pub fn toggle_collapsed(&mut self, id: PanelId) {
-        if let Some(slot) = self.slot_mut(id) {
-            slot.collapsed = !slot.collapsed;
+        let collapsed = self.is_collapsed(id);
+        self.set_collapsed(id, !collapsed);
+    }
+
+    /// Roll a section up or open it, whichever is asked for.
+    pub fn set_collapsed(&mut self, id: PanelId, collapsed: bool) {
+        let Some(slot) = self.slot(id).copied() else {
+            return;
+        };
+        for other in &mut self.slots {
+            if other.dock == slot.dock && other.group == slot.group {
+                other.collapsed = collapsed;
+            }
         }
     }
 
-    /// Is this panel rolled up to its title bar?
+    /// Is the section this panel is in rolled up to its tabs?
     pub fn is_collapsed(&self, id: PanelId) -> bool {
         self.slot(id).is_some_and(|s| s.collapsed)
     }
@@ -459,14 +829,52 @@ impl Workspace {
         // A layout from before panels could be rolled up: adopt which ones
         // start rolled, once. Everything else the user arranged is left alone
         // — their docks, their widths, their order.
-        if self.version < LAYOUT_VERSION {
+        if self.version < VERSION_ROLL_UPS {
             for slot in &mut self.slots {
                 if let Some(default) = defaults.slot(slot.id) {
                     slot.collapsed = default.collapsed;
                 }
             }
-            self.version = LAYOUT_VERSION;
         }
+
+        // **A layout from before panels could be grouped.**
+        //
+        // `group` defaults to zero, and zero for every panel means *one
+        // section holding all of them* — a column that draws a single tab
+        // strip and one panel, with everything else apparently gone. So the
+        // migration is not optional and cannot be left to serde's default:
+        // every saved slot takes the grouping the default arrangement gives
+        // it, which puts the five occasional panels in one section and the
+        // Library with the Assets panel, and leaves every other panel alone in
+        // its own.
+        if self.version < VERSION_TAB_GROUPS {
+            for slot in &mut self.slots {
+                match defaults.slot(slot.id) {
+                    // Still where the default workspace put it: take the
+                    // default grouping, tabs and all — including whether the
+                    // section starts rolled up.
+                    //
+                    // The roll-up has to come across with the grouping or the
+                    // migration produces the one state a tabbed section must
+                    // never be in: five panels behind a strip of tabs, rolled
+                    // up, showing nothing. The five that start grouped are
+                    // exactly the five that used to start rolled up, so a file
+                    // from the last build has them all `collapsed: true`.
+                    Some(default) if default.dock == slot.dock => {
+                        slot.group = default.group;
+                        slot.selected = default.selected;
+                        slot.collapsed = default.collapsed;
+                    }
+                    // Moved somewhere of their own: a section to itself, which
+                    // is exactly what it was before groups existed.
+                    _ => {
+                        slot.group = slot.order;
+                        slot.selected = true;
+                    }
+                }
+            }
+        }
+        self.version = LAYOUT_VERSION;
 
         for id in PanelId::ALL {
             if self.slot(id).is_none()
@@ -479,11 +887,19 @@ impl Workspace {
         // layout looks like from here.
         self.slots.retain(|s| PanelId::ALL.contains(&s.id));
 
-        // Sizes from a corrupt file must not collapse the window.
-        self.left_width = self.left_width.clamp(40.0, 400.0);
-        self.right_width = self.right_width.clamp(120.0, 900.0);
-        self.right_outer_width = self.right_outer_width.clamp(120.0, 900.0);
-        self.bottom_height = self.bottom_height.clamp(80.0, 900.0);
+        // A hand-edited or half-migrated file must still show a panel in every
+        // section rather than an empty body under a tab strip.
+        self.mend_fronts();
+        self.mend_collapse();
+
+        // Sizes from a corrupt file must not collapse the window — and a
+        // column dragged narrower than its contents by an earlier build is
+        // brought back to a width its panels fit in, which is the whole point
+        // of having a minimum at all.
+        self.left_width = clamp_to(self.left_width, LEFT_WIDTH_RANGE);
+        self.right_width = clamp_to(self.right_width, COLUMN_WIDTH_RANGE);
+        self.right_outer_width = clamp_to(self.right_outer_width, COLUMN_WIDTH_RANGE);
+        self.bottom_height = clamp_to(self.bottom_height, BOTTOM_HEIGHT_RANGE);
     }
 }
 
@@ -493,11 +909,45 @@ impl Workspace {
 
 /// Bumped when the *default arrangement* changes in a way a saved layout
 /// should adopt. See [`Workspace::version`].
-pub const LAYOUT_VERSION: u32 = 1;
+pub const LAYOUT_VERSION: u32 = VERSION_TAB_GROUPS;
+
+/// Panels gained the roll-up, and five of them started rolled.
+const VERSION_ROLL_UPS: u32 = 1;
+/// Panels gained tab groups, and two sections started tabbed.
+const VERSION_TAB_GROUPS: u32 = 2;
 
 /// The home a slot takes when a saved layout predates the field.
 fn default_home() -> Dock {
     Dock::Right
+}
+
+/// Set once by the application's `main`, so only the program the user launched
+/// reads and writes the user's layout.
+///
+/// See [`claim_user_workspace`].
+static IS_THE_APPLICATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// **Claim the user's real layout file. Called by `main`, and by nothing else.**
+///
+/// # Why an opt-in rather than a test opt-out
+///
+/// An `Editor` loads the workspace when it is built and saves it whenever a
+/// preference changes, and a *test* that builds one therefore reads and writes
+/// the layout of whoever is running the suite. There was a guard for this, in
+/// the unit tests' own helper — and it covered the unit tests only. Four
+/// integration test binaries build an `Editor` without going near that helper,
+/// so `cargo test` quietly rearranged the running user's panels; it was caught
+/// when a test run left the Library and the Assets panel floating over the
+/// stage.
+///
+/// Opting *out* in each test is the arrangement that failed: it has to be
+/// remembered in every new test file, and forgetting is silent and destructive.
+/// Opting *in*, from the one function that means "a person launched this", is a
+/// thing you cannot forget, because everything that has not called it gets a
+/// scratch file and nothing breaks.
+pub fn claim_user_workspace() {
+    IS_THE_APPLICATION.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Where the layout is kept.
@@ -506,11 +956,21 @@ fn default_home() -> Dock {
 /// workspace belongs to the person, not to the film, and a `.buzz` file handed
 /// to somebody else must not rearrange their window.
 pub fn workspace_path() -> std::path::PathBuf {
-    // An explicit override, which is what a test uses so that running the
-    // suite cannot rewrite the layout of whoever is running it — and what
-    // anybody wanting a second, separate arrangement can use too.
+    // An explicit override: what a test uses when it wants a layout file of its
+    // own to look at, and what anybody wanting a second, separate arrangement
+    // can use too.
     if let Some(path) = std::env::var_os("BUZZANIMATE_WORKSPACE") {
         return std::path::PathBuf::from(path);
+    }
+
+    // Nobody has claimed the user's layout, so this is not the application:
+    // a scratch file per process, which behaves exactly like the real one and
+    // is nobody's to lose.
+    if !IS_THE_APPLICATION.load(std::sync::atomic::Ordering::Relaxed) {
+        return std::env::temp_dir().join(format!(
+            "buzzanimate-scratch-workspace-{}.json",
+            std::process::id()
+        ));
     }
 
     let base = std::env::var_os("APPDATA")
@@ -705,11 +1165,46 @@ mod tests {
     fn silly_sizes_are_brought_back_into_range() {
         let mut workspace = Workspace::animate();
         workspace.right_width = -4000.0;
+        workspace.right_outer_width = f32::NAN;
         workspace.bottom_height = f32::INFINITY;
         workspace.fill_gaps();
 
-        assert!(workspace.right_width >= 120.0);
-        assert!(workspace.bottom_height <= 900.0);
+        assert!(workspace.right_width >= *COLUMN_WIDTH_RANGE.start());
+        assert!(workspace.right_outer_width >= *COLUMN_WIDTH_RANGE.start());
+        assert!(workspace.bottom_height <= *BOTTOM_HEIGHT_RANGE.end());
+    }
+
+    /// **A column dragged narrower than its contents is widened on load.**
+    ///
+    /// The minimum used to be 120 points, which is narrower than a Layers row
+    /// — so a user who had dragged their right column in was left with panels
+    /// whose right-hand end, switches and menus included, was simply not on
+    /// screen. Raising the minimum only helps if the layouts already saved
+    /// adopt it, which is what this checks.
+    #[test]
+    fn a_column_saved_narrower_than_its_contents_is_widened() {
+        let mut workspace = Workspace::animate();
+        // What was actually in a workspace file when this was reported.
+        workspace.right_width = 144.0;
+        workspace.fill_gaps();
+
+        assert_eq!(workspace.right_width, *COLUMN_WIDTH_RANGE.start());
+    }
+
+    /// The default arrangement must not itself be narrower than the minimum,
+    /// or a fresh install starts in the state that was reported as broken.
+    #[test]
+    fn the_default_columns_are_wide_enough_for_what_is_in_them() {
+        let workspace = Workspace::animate();
+        for (what, width) in [
+            ("right", workspace.right_width),
+            ("far right", workspace.right_outer_width),
+        ] {
+            assert!(
+                COLUMN_WIDTH_RANGE.contains(&width),
+                "the default {what} column is {width} points"
+            );
+        }
     }
 
     #[test]
@@ -741,6 +1236,32 @@ mod tests {
         assert_eq!(back.name, "Mine");
         assert!(back.locked);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Nothing but the application writes the user's layout.**
+    ///
+    /// An `Editor` loads the workspace when it is built and saves it whenever a
+    /// preference changes, so any test that builds one used to read and write
+    /// the layout of whoever was running the suite. It was caught by a test run
+    /// leaving the Library and the Assets panel floating over the stage — the
+    /// sort of damage that is invisible until somebody opens the program and
+    /// finds their window rearranged.
+    ///
+    /// This test runs in a process that has never called `claim_user_workspace`,
+    /// which is true of every test binary and false of `main`.
+    #[test]
+    fn a_test_process_never_touches_the_real_layout_file() {
+        // The override still wins, because a test that wants to look at a file
+        // has to be able to name one.
+        assert!(
+            std::env::var_os("BUZZANIMATE_WORKSPACE").is_some() || {
+                let path = workspace_path();
+                !path.ends_with("BuzzAnimate/workspace.json")
+                    && !path.ends_with("BuzzAnimate\\workspace.json")
+            },
+            "a test process resolved to the user's own layout file: {}",
+            workspace_path().display()
+        );
     }
 
     /// A layout file that is missing, empty or nonsense must not stop the
@@ -787,9 +1308,11 @@ mod migration_tests {
     fn an_older_layout_adopts_the_new_default_roll_ups() {
         let mut saved = Workspace::animate();
         saved.version = 0;
-        // As an older file has it: nothing rolled up.
+        // As an older file has it: nothing rolled up, and no groups at all.
         for slot in &mut saved.slots {
             slot.collapsed = false;
+            slot.group = 0;
+            slot.selected = false;
         }
         // And an arrangement of their own, which must survive.
         saved.right_width = 444.0;
@@ -798,14 +1321,6 @@ mod migration_tests {
         saved.fill_gaps();
 
         assert_eq!(saved.version, LAYOUT_VERSION);
-        assert!(
-            saved.is_collapsed(PanelId::Depth),
-            "the occasional panels should now start rolled up"
-        );
-        assert!(
-            !saved.is_collapsed(PanelId::Layers),
-            "the panels lived in must stay open"
-        );
         assert_eq!(saved.right_width, 444.0, "their column width was disturbed");
         assert_eq!(
             saved.dock_of(PanelId::Sound),
@@ -814,18 +1329,137 @@ mod migration_tests {
         );
     }
 
-    /// And it happens once: a panel the user rolls open stays open.
+    /// **A layout saved before panels could be grouped does not collapse into
+    /// one section.**
+    ///
+    /// `group` defaults to zero, so an untouched older file says *every panel
+    /// on this side is one tab stack* — a column that would draw a single strip
+    /// of tabs and one panel, with the rest apparently gone. This is the one
+    /// migration that cannot be skipped, and it is checked on the exact shape
+    /// an older file has: no groups, no front tabs.
+    #[test]
+    fn an_older_layout_does_not_become_one_giant_tab_stack() {
+        let mut saved = Workspace::animate();
+        saved.version = VERSION_ROLL_UPS;
+        for slot in &mut saved.slots {
+            slot.group = 0;
+            slot.selected = false;
+        }
+
+        saved.fill_gaps();
+
+        let right = saved.sections(Dock::Right);
+        assert!(
+            right.len() > 1,
+            "every panel on the right ended up in one section of {} tabs",
+            right.first().map(|s| s.panels.len()).unwrap_or(0)
+        );
+        // And it adopted the arrangement this build ships: the occasional
+        // panels as one tabbed section, everything else on its own.
+        let utility = right
+            .iter()
+            .find(|s| s.panels.contains(&PanelId::Depth))
+            .expect("the Depth panel is on the right");
+        assert!(utility.panels.contains(&PanelId::Sound));
+        assert!(utility.is_tabbed());
+        assert_eq!(utility.front, PanelId::Depth);
+
+        for id in [PanelId::Layers, PanelId::Properties] {
+            let section = right
+                .iter()
+                .find(|s| s.panels.contains(&id))
+                .expect("still on the right");
+            assert!(!section.is_tabbed(), "{id:?} was grouped with something");
+        }
+    }
+
+    /// **The migrated tab section is not rolled up.**
+    ///
+    /// The five panels that now share a section are exactly the five that used
+    /// to start rolled up, so every saved layout from the last build has them
+    /// `collapsed: true`. Carried across unchanged that gives a strip of tabs
+    /// with nothing under it — the one state a tabbed section must never be in,
+    /// and one that looks precisely like five panels that have gone missing.
+    #[test]
+    fn the_migrated_tab_section_is_not_left_rolled_up() {
+        let mut saved = Workspace::animate();
+        saved.version = VERSION_ROLL_UPS;
+        // As a file from the previous build has it.
+        for slot in &mut saved.slots {
+            slot.group = 0;
+            slot.selected = false;
+            slot.collapsed = matches!(
+                slot.id,
+                PanelId::Depth
+                    | PanelId::Rig
+                    | PanelId::Filters
+                    | PanelId::Lighting
+                    | PanelId::Sound
+            );
+        }
+
+        saved.fill_gaps();
+
+        let section = saved
+            .section_of(PanelId::Depth)
+            .expect("Layer Depth is on screen");
+        assert!(section.is_tabbed());
+        assert!(
+            !section.collapsed,
+            "the new tabbed section arrived rolled up, so all five panels in it \
+             show nothing at all"
+        );
+    }
+
+    /// A panel the user had moved somewhere of its own is not swept into a
+    /// group by the migration — it kept its place before, so it keeps it now.
+    #[test]
+    fn a_panel_the_user_moved_keeps_a_section_to_itself() {
+        let mut saved = Workspace::animate();
+        saved.version = VERSION_ROLL_UPS;
+        for slot in &mut saved.slots {
+            slot.group = 0;
+            slot.selected = false;
+        }
+        // Their arrangement: the Filters panel dragged to the left column.
+        if let Some(slot) = saved.slot_mut(PanelId::Filters) {
+            slot.dock = Dock::Left;
+            slot.order = 7;
+        }
+
+        saved.fill_gaps();
+
+        let left = saved.sections(Dock::Left);
+        let filters = left
+            .iter()
+            .find(|s| s.panels.contains(&PanelId::Filters))
+            .expect("still on the left");
+        assert!(
+            !filters.is_tabbed(),
+            "a panel the user had moved was grouped with the tools"
+        );
+    }
+
+    /// And it happens once: a section the user rolls up stays rolled up.
     #[test]
     fn a_layout_already_migrated_is_left_alone() {
         let mut saved = Workspace::animate();
-        saved.toggle_collapsed(PanelId::Depth); // the user opens it
-        assert!(!saved.is_collapsed(PanelId::Depth));
+        saved.toggle_collapsed(PanelId::Depth); // the user rolls it up
+        assert!(saved.is_collapsed(PanelId::Depth));
+        // Their own grouping, too.
+        saved.ungroup(PanelId::Sound);
 
         saved.fill_gaps();
 
         assert!(
-            !saved.is_collapsed(PanelId::Depth),
-            "a panel the user opened was rolled up again on the next launch"
+            saved.is_collapsed(PanelId::Depth),
+            "a section the user rolled up was opened again on the next launch"
+        );
+        assert!(
+            saved
+                .section_of(PanelId::Sound)
+                .is_some_and(|s| !s.is_tabbed()),
+            "a panel the user ungrouped was grouped again on the next launch"
         );
     }
 
@@ -843,6 +1477,225 @@ mod migration_tests {
                 "{id:?} starts rolled up, so it still looks missing"
             );
             assert_ne!(workspace.dock_of(id), Dock::Hidden);
+        }
+        // And they share it as tabs, which is what makes them one section.
+        let section = workspace
+            .section_of(PanelId::Library)
+            .expect("the Library is on screen");
+        assert!(section.panels.contains(&PanelId::Assets));
+        assert_eq!(section.front, PanelId::Library);
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    /// The default arrangement puts the five occasional panels in one section,
+    /// which is what turns a column of nine into a column of five.
+    #[test]
+    fn the_occasional_panels_share_one_section() {
+        let workspace = Workspace::animate();
+        let section = workspace
+            .section_of(PanelId::Depth)
+            .expect("Layer Depth is on screen");
+
+        for id in [
+            PanelId::Depth,
+            PanelId::Rig,
+            PanelId::Filters,
+            PanelId::Lighting,
+            PanelId::Sound,
+        ] {
+            assert!(section.panels.contains(&id), "{id:?} is not in the section");
+        }
+        assert!(section.is_tabbed());
+        assert_eq!(section.front, PanelId::Depth, "no tab is at the front");
+        assert!(
+            !section.collapsed,
+            "a tabbed section that starts rolled up shows nothing at all"
+        );
+
+        // Five panels, one section: the right column is five sections, not nine.
+        assert_eq!(workspace.sections(Dock::Right).len(), 5);
+    }
+
+    /// **Every section has exactly one front tab, always.**
+    ///
+    /// A section with none draws an empty body under a strip of tabs, which is
+    /// indistinguishable from a panel that has stopped working.
+    #[test]
+    fn every_section_shows_exactly_one_of_its_panels() {
+        let mut workspace = Workspace::animate();
+        // Put it through everything that can disturb a section.
+        workspace.group_with(PanelId::Color, PanelId::Layers);
+        workspace.select_tab(PanelId::Color);
+        workspace.ungroup(PanelId::Rig);
+        workspace.move_to(PanelId::Filters, Dock::Left);
+        workspace.toggle(PanelId::Sound);
+        workspace.toggle(PanelId::Sound);
+
+        for dock in [Dock::Left, Dock::Right, Dock::RightOuter, Dock::Bottom] {
+            for section in workspace.sections(dock) {
+                assert!(!section.panels.is_empty(), "an empty section in {dock:?}");
+                assert!(
+                    section.panels.contains(&section.front),
+                    "{dock:?} has a section whose front tab is not in it"
+                );
+                let fronts = section
+                    .panels
+                    .iter()
+                    .filter(|id| workspace.slot(**id).is_some_and(|s| s.selected))
+                    .count();
+                assert_eq!(fronts, 1, "{:?} has {fronts} front tabs", section.panels);
+            }
+        }
+    }
+
+    /// Grouping puts one panel into another's section and brings it forward —
+    /// a tab you asked for and cannot see is one that did not move.
+    #[test]
+    fn grouping_joins_a_section_and_comes_to_the_front() {
+        let mut workspace = Workspace::animate();
+        workspace.group_with(PanelId::Assets, PanelId::Layers);
+
+        let section = workspace
+            .section_of(PanelId::Layers)
+            .expect("the Layers panel is on screen");
+        assert!(section.panels.contains(&PanelId::Assets));
+        assert_eq!(section.front, PanelId::Assets);
+        assert_eq!(workspace.dock_of(PanelId::Assets), Dock::Right);
+
+        // And the section it left still shows something.
+        let outer = workspace.sections(Dock::RightOuter);
+        assert_eq!(outer.len(), 1);
+        assert_eq!(outer[0].front, PanelId::Library);
+    }
+
+    /// Ungrouping gives a tab a section of its own, and leaves the old one
+    /// with a front tab.
+    #[test]
+    fn ungrouping_gives_a_panel_a_section_of_its_own() {
+        let mut workspace = Workspace::animate();
+        workspace.select_tab(PanelId::Sound);
+        workspace.ungroup(PanelId::Sound);
+
+        let sound = workspace.section_of(PanelId::Sound).expect("still on screen");
+        assert!(!sound.is_tabbed());
+        assert_eq!(sound.front, PanelId::Sound);
+
+        let utility = workspace.section_of(PanelId::Depth).expect("still on screen");
+        assert!(!utility.panels.contains(&PanelId::Sound));
+        assert!(utility.panels.contains(&utility.front));
+    }
+
+    /// A panel alone in its section has nothing to leave, and asking must not
+    /// disturb the layout.
+    #[test]
+    fn ungrouping_a_lone_panel_does_nothing() {
+        let mut workspace = Workspace::animate();
+        let before = workspace.clone();
+        workspace.ungroup(PanelId::Layers);
+        assert_eq!(workspace, before);
+    }
+
+    /// Clicking a tab is not moving a panel, so it works while locked — the
+    /// same rule that lets a locked layout still open and close a panel.
+    #[test]
+    fn a_locked_layout_still_lets_tabs_be_clicked_but_not_regrouped() {
+        let mut workspace = Workspace::animate();
+        workspace.locked = true;
+
+        workspace.select_tab(PanelId::Sound);
+        assert_eq!(
+            workspace.section_of(PanelId::Sound).map(|s| s.front),
+            Some(PanelId::Sound),
+            "a tab could not be brought forward in a locked layout"
+        );
+
+        let before = workspace.clone();
+        workspace.group_with(PanelId::Layers, PanelId::Properties);
+        workspace.ungroup(PanelId::Sound);
+        assert_eq!(workspace, before, "a locked layout was regrouped");
+    }
+
+    /// Rolling up a section rolls up all of it: what is hidden is the one body
+    /// under the tabs, and a section half rolled up is not a state that exists.
+    #[test]
+    fn rolling_up_a_section_takes_every_tab_with_it() {
+        let mut workspace = Workspace::animate();
+        workspace.toggle_collapsed(PanelId::Depth);
+
+        for id in [PanelId::Depth, PanelId::Rig, PanelId::Sound] {
+            assert!(workspace.is_collapsed(id), "{id:?} disagreed");
+        }
+        assert!(
+            workspace
+                .section_of(PanelId::Rig)
+                .is_some_and(|s| s.collapsed)
+        );
+
+        // And clicking a tab in a rolled-up section leaves it rolled up.
+        workspace.select_tab(PanelId::Sound);
+        assert!(
+            workspace
+                .section_of(PanelId::Sound)
+                .is_some_and(|s| s.collapsed),
+            "clicking a tab silently opened the section"
+        );
+    }
+
+    /// Moving a panel to another side gives it a section of its own there —
+    /// it must not silently join whatever group number it happens to match.
+    #[test]
+    fn a_panel_moved_to_another_side_lands_in_its_own_section() {
+        let mut workspace = Workspace::animate();
+        workspace.move_to(PanelId::Sound, Dock::RightOuter);
+
+        let section = workspace.section_of(PanelId::Sound).expect("on screen");
+        assert!(
+            !section.is_tabbed(),
+            "it joined {:?} without being asked",
+            section.panels
+        );
+        // The Library and Assets are still together, and still showing one.
+        let library = workspace.section_of(PanelId::Library).expect("on screen");
+        assert!(library.panels.contains(&PanelId::Assets));
+    }
+
+    /// A group survives being undocked: the section floats as one window.
+    #[test]
+    fn a_grouped_section_can_be_floated_together() {
+        let mut workspace = Workspace::animate();
+        workspace.group_with(PanelId::Assets, PanelId::Layers);
+        for id in [PanelId::Layers, PanelId::Assets] {
+            workspace.move_to(id, Dock::Float);
+        }
+        // Moved one at a time they each get their own section, which is right:
+        // `move_to` is "send this panel there", not "send its section there".
+        // Re-grouping them floats them as one window.
+        workspace.group_with(PanelId::Assets, PanelId::Layers);
+
+        let floating = workspace.sections(Dock::Float);
+        assert_eq!(floating.len(), 1, "two windows, not one");
+        assert_eq!(floating[0].panels.len(), 2);
+    }
+
+    /// Every panel is reachable: no panel may be left in a section that never
+    /// shows it, and every open panel is in exactly one section.
+    #[test]
+    fn every_open_panel_belongs_to_exactly_one_section() {
+        let workspace = Workspace::animate();
+        for id in PanelId::ALL {
+            if !workspace.is_open(id) {
+                continue;
+            }
+            let found: Vec<_> = [Dock::Left, Dock::Right, Dock::RightOuter, Dock::Bottom]
+                .into_iter()
+                .flat_map(|d| workspace.sections(d))
+                .filter(|s| s.panels.contains(&id))
+                .collect();
+            assert_eq!(found.len(), 1, "{id:?} is in {} sections", found.len());
         }
     }
 }

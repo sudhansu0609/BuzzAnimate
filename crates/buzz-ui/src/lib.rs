@@ -60,4 +60,4 @@ pub use timeline_panel::{
 };
 pub use tools::{ToolId, ToolStatus, all_tools, tool_for_key};
 pub use view::{Guide, Orientation, SnapSettings, SnapTarget, Snapped, ViewSettings};
-pub use workspace::{Dock, PanelId, Slot, Workspace};
+pub use workspace::{Dock, GroupId, PanelId, Section, Slot, Workspace};

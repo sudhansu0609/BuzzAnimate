@@ -95,10 +95,26 @@ if not exist "%EXE%" (
 
 echo Starting BuzzAnimate...
 echo.
-rem Run it here rather than through `start`: the binary keeps a console for its
-rem adapter table and its crash message, and `start` hands the child whatever
-rem window state it was itself given — which, launched from a script with no
-rem console of its own, opened BuzzAnimate minimised off-screen. Found by
-rem running this file and looking for the window.
-"%EXE%" %ARGS%
+rem --- how the program is started, and why it differs by profile -------------
+rem
+rem  Release is a Windows GUI binary (see the note at the top of main.rs), so it
+rem  has no console of its own. `start` hands it over and this script exits, and
+rem  the terminal window this batch file runs in closes with it: one window on
+rem  screen, which is the editor. The empty "" is the title argument `start`
+rem  requires before a quoted path - without it the path IS taken as the title
+rem  and nothing launches.
+rem
+rem  A previous attempt at `start` opened BuzzAnimate minimised off-screen. The
+rem  cause was the desktop shortcut, which is created minimised (WindowStyle 7)
+rem  so its console does not flash: `start` passed that state to a *console*
+rem  binary. A GUI binary creates its own window and is unaffected.
+rem
+rem  Debug stays in the console on purpose. `--dev` is how you ask for the
+rem  adapter table, the tracing output and a panic's backtrace, and all of that
+rem  goes to this window - so this window has to stay.
+if "%PROFILE%"=="release" (
+    start "" "%EXE%" %ARGS%
+) else (
+    "%EXE%" %ARGS%
+)
 endlocal

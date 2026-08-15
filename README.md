@@ -48,11 +48,12 @@ pitch and yaw it and the stage tips away in real perspective, a rectangle drawn
 as a trapezoid — and **objects turn too**, so three flat cards at different
 angles make a tree the camera discovers rather than slides past.
 
-Not yet implemented, and honestly marked as such in the toolbar: gradients,
-Text, Lasso, Bézier pen authoring, multiple Scenes, clipboard. Video export
-(and with it, sound in the output), AS3 and the Bind tool are the largest
-gaps. See `PROGRESS.md` §7 for the full
-list.
+**Video comes out too**: MP4/MOV encoded on the GPU through NVENC, with the
+soundtrack muxed in.
+
+Not yet implemented, and honestly marked as such in the toolbar: Text, Bézier pen
+authoring, multiple Scenes, clipboard. GIF/WebP and HTML5 export, AS3 and the Bind
+tool are the largest gaps. See `PROGRESS.md` §7 for the full list.
 
 ---
 
@@ -231,9 +232,22 @@ rigging and IK · PNG export · the scripting API · lighting · filters and
 blend modes · layer parenting · a workspace you arrange · a camera that
 tilts · 3D rotation.
 
-Next: **the rest of Phase 6 — video export** (MP4/MOV via NVENC, GIF/WebP,
-HTML5 Canvas/SVG), then Phase 8's ActionScript runtime and compiler.
+Next: **the engine waves** — background export with a queue, raster layers beside
+the vectors, a compositor, 2.5D depth and keyframed lights. `ARCHITECTURE.md` is
+the design; `IMPROVEMENTS.md` Part II is the summary. After those, the rest of
+Phase 6 (GIF/WebP, HTML5 Canvas/SVG) and Phase 8's ActionScript runtime.
+
+`ARCHITECTURE.md` is the forward design: how the engine waves are built, the rules
+that keep the window responsive, and what each one costs.
+
+`OVERVIEW.md` is the one-page consolidation: what is implemented, what the
+restrictions are — hard limits, absences and deliberate deviations, kept apart
+because the difference matters — and what is suggested next.
 
 `PROGRESS.md` is the detailed record: what was built, what was measured, what
 was found broken along the way, and every deviation from Animate with its
 reason.
+
+`IMPROVEMENTS.md` is the forward half of the same record: where the time
+actually goes when an animator sets up a stage, read out of the source, and the
+three waves of work that would close it.

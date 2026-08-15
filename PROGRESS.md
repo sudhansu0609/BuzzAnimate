@@ -2953,6 +2953,277 @@ did nothing.
 The launcher now checks for a running copy before it builds and says so plainly,
 and its build-failed message says which binary is still sitting in `target/`.
 
+### ✅ The panels, measured the other way — width
+
+The last round measured how *tall* a dock column's contents were and fixed what
+overflowed the bottom. The complaints came back a third time, and every one of
+them was the other axis: panels "obscured by the scroll bar", the Library
+hidden, and the Layers panel's hide, lock and outline switches reported as
+missing options. Four causes.
+
+**The scroll bar was drawn on top of the panel.** egui's default
+`ScrollStyle` floats the bar over the content, and every dock column *is* a
+scroll area — so the bar sat across the right-hand end of whatever was in it,
+which is precisely where the panels keep their controls: the dock menu on every
+header, the Layers panel's new and delete buttons, the Library's own strip. The
+theme now installs `ScrollStyle::solid()`: the bar reserves nine points and
+covers nothing.
+
+**A column could be dragged narrower than its own contents.** The minimum was
+120 points. The workspace file that came with the report said `right_width:
+144.0` — narrower than a Layers row, so the row was drawn with its right-hand
+end simply off the panel. That is what "the lock and outline options are
+missing" was: they were there, at coordinates nobody could see. The minimum is
+now 216, the width at which those rows are whole, and `fill_gaps` widens a
+column already saved narrower than that.
+
+**The far-right column had no drag handle at all.** The splitters were placed
+by guessing from the stage rectangle, which works for exactly one column a
+side — so the Library and the Assets panel were stuck at whatever width they
+were born with. Each column's rect is now recorded as it is laid out and the
+handle put on its real edge, which gives the outer column a handle and stops
+the others drifting when a column is hidden.
+
+**Every panel header's roll-up triangle was an empty box.** `▸` and `▾` have no
+glyph in the bundled font — and `theme::font_has` already *knew*: both are in
+the list of characters this project has been caught out by, and neither had ever
+been added to the list of characters it draws. A window's worth of tofu, in
+every dock column, for as long as the dock has existed. They are `▶` and `⏷`
+now, the pair the Library settled on, and both are covered by the glyph test.
+
+So `dock_columns.rs` measures width as well as height, and the measurement found
+four more overflows nobody had reported yet:
+
+| panel | over a 216-point column by |
+|---|---|
+| Library | 72 pt — seven footer controls in one unwrapped row |
+| Assets | 59 pt — same, ending in "From Animate…" |
+| Layer Depth | 52 pt — a label, a fixed 100-point slider and its number box |
+| Layers | fixed by the row rewrite below |
+
+The Layers row is Animate's way round now: the eye, the padlock and the outline
+box in a fixed column hard against the right edge, and the name — the one thing
+with no length limit — taking what is left and truncating. Transparency moved to
+the selected layer's own row, where the other per-layer settings already live;
+it was fifty points of every row, and the name was paying for it.
+
+**And the switches say what they are.** Nothing on a fifteen-point painted
+square tells you which one hides a layer, so a right-click on any layer names
+them: Hide, Lock, Show as Outlines, New Layer, New Folder, Delete Layer — the
+last of which is where a destructive action belongs, rather than as a fourth
+small square beside three toggles.
+
+### ✅ The scrollbar that really was on top of the panel — and why
+
+The round above fixed four real defects and the complaint came back unchanged,
+with a screenshot: a grey bar straight down the middle of the Properties panel,
+through *Document*, *Width*, *Height*, *FPS*. So this one was not reasoned
+about at all. The running window was captured, the pixels under the bar were
+**sampled**, and they gave the answer in two numbers: the thumb was
+`136,136,136`, which is `Palette::text_dim()` at 0.85; the track was `34,34,34`,
+which is `from_black_alpha(70)` over the panel's `47,47,47`. Both belong to
+`stage_scrollbars`. **It was the stage's own scrollbar, drawn inside the dock
+column** — which meant the stage's rectangle overlapped the panel, which is a
+layout fault, not a painting one.
+
+A probe printed the real geometry, and it was plain:
+
+| | placed at | reported as |
+|---|---|---|
+| far-right column | `1320 – 1560` | `1320 – 1560` ✓ |
+| right column | `1104 – 1320` | **`1160.3 – 1376.3`** |
+| stage | — | ends at **`1160.3`**, 56 points inside the panel |
+
+The chain, end to end, from one widget:
+
+1. The Layers panel's *follows* and *kind* combo boxes were 96 and 92 points
+   wide, side by side after a label and an indent — over 250 points on a row
+   that has 191.
+2. A widget wider than its `Ui` calls `expand_to_include_rect`, which unions
+   the **max** rect as well as the min rect.
+3. The panel's `Frame` therefore reported itself 56 points wider than it drew.
+4. egui anchors a right-hand panel to its frame's right edge and takes
+   `cursor.max.x` from it — so the column reported a left edge 56 points right
+   of where it was painted.
+5. The central panel — the stage — is laid out from that cursor, so **the stage
+   ran underneath the panel**, and its ruler, its pasteboard and its scrollbar
+   were painted over the Properties panel by everything drawn after.
+
+The tests missed it for a reason worth keeping: `a_layer_row_fits_the_narrowest_column`
+used a fresh `Selection`, and the two rows that overflowed are the ones only the
+**selected** layer draws. A Layers panel with nothing selected is not the one
+anybody uses. It now measures both.
+
+Fixed: one control to a row, each sized to the column it is in. And the same
+fault, smaller, in the dock chrome — the panel header laid its name out before
+the dock menu, so "Properties" pushed the menu off a 46-point tools strip. The
+menu is placed against the right edge first now and the name truncates into what
+is left. The tools strip itself went from 46 to 55, because the solid scroll bar
+takes nine points that a strip measured for exactly one 30-point tool button
+never had to give.
+
+`dock_geometry_tests::a_dock_column_reports_the_rectangle_it_was_placed_in` is
+the guard, and it is in `buzz-app` because the header is: it draws the real dock
+chrome for every panel at every allowed column width and fails if a column
+reports an edge it was not given. That is the invariant — not "does it look
+right", but **does a column tell the truth about where it is**, because the
+stage believes it.
+
+### ✅ One window, not two
+
+A release build is now a Windows GUI binary, so it opens the editor and nothing
+else; built as an ordinary console program it also opened a black terminal,
+which is a program appearing to start twice. The launcher hands a release build
+to `start` and exits, so its own terminal closes with it.
+
+A **debug** build keeps its console, and `--dev` is how you ask for it — the
+adapter table, the tracing output and a panic's backtrace all still go
+somewhere, they are just behind the flag. That is the right way round for a
+program whose users are animators rather than its author.
+
+### ✅ Panel groups — several panels, one section, tabs
+
+Animate's panel group, and the answer to the problem the last three rounds kept
+circling: a dock column is as tall as the window, and nine panels are not.
+Rolling them up helped and was still five title bars showing nothing. **Panels
+can now share a section**: one strip of tabs, one body, and only the front tab
+drawn. Five occasional panels cost the height of one.
+
+The model is a number on each slot. Panels sharing a dock *and* a `group` are
+one section; `selected` marks the front tab. A number rather than a list of
+members, because membership has to survive a panel being moved, hidden and
+brought back, and a list would need mending at every one of those.
+
+The default arrangement uses it, rather than leaving it to be discovered:
+**Depth · Rig · Filters · Light · Sound** are one tabbed section, and **Library ·
+Assets** another — the two panels an animator is comparing when they reach for
+either. The right column is five sections now instead of nine panels.
+
+Grouping is offered from each section's `…` menu — **Group With ▸** listing the
+panels docked on the same side, and **Ungroup This Panel**. A menu rather than
+a drag: dragging a tab onto another panel is the nicer gesture and needs a
+drop-target model this dock does not have, and a menu can be read, found and
+tested. Rolling up takes the whole section, because what is hidden is the one
+body under the tabs. A grouped section undocks as **one** floating window with
+its tabs, which is what "undock these two together" has to mean.
+
+Three invariants are held by tests rather than by care: every section has
+**exactly one** front tab (none draws an empty body under a strip of tabs); a
+panel moved to another side lands in a section of its **own** (it must not
+silently join whatever group number it happens to match); and the tab strip
+**fits**, which `dock_geometry_tests` checks by drawing all fourteen panels as
+one strip at every allowed column width — a strip that overflows would take the
+column's reported rect with it, which is the fault the round above was about.
+
+**The migration is the sharp edge.** `group` defaults to zero, and zero for
+every panel means *one section holding all of them* — a column drawing a single
+tab strip and one panel, with everything else apparently gone. So it is not
+left to serde: a layout from before groups takes the new grouping where the
+panel is still where the default put it, and a section of its own where the
+user had moved it. The roll-up state comes across with it, because the five
+that now start grouped are exactly the five that used to start rolled up, and
+carrying `collapsed: true` across would produce the one state a tabbed section
+must never be in.
+
+### ✅ And a test run that rearranged the user's panels
+
+Found while checking the above: the Library and the Assets panel were floating
+over the stage, and nobody had moved them. `cargo test` had.
+
+An `Editor` loads the workspace when it is built and saves it whenever a
+preference changes, so **any test that builds one reads and writes the layout of
+whoever is running the suite.** There was a guard for exactly this — in the unit
+tests' own helper, covering the unit tests only. Four integration test binaries
+build an `Editor` without going near that helper.
+
+Opting *out* per test is the arrangement that failed: it has to be remembered in
+every new test file, and forgetting is silent and destructive. It is an opt-*in*
+now — `claim_user_workspace()`, called by `main` and by nothing else. Everything
+that has not called it gets a scratch file per process and behaves identically,
+so there is nothing to remember and nothing to forget.
+
+### ✅ The layer switches, in the timeline as well
+
+Animate rules three columns beside its timeline layer names — eye, padlock,
+outline — and this timeline had none of them. Hiding a layer while working *in
+the timeline*, which is the panel an animator is actually in, meant a trip to
+the Layers panel on the other side of the window.
+
+They are there now, with `show · lock · out` headed over them in the ruler, and
+a right-click on a layer's name gives the same three spelled out plus New Layer,
+New Folder and **Delete Layer**. Two right-click menus in one row, decided by
+which side of the grid the pointer is on: the frame menu on the frames, the
+layer menu on the name, as Animate has it. The frame menu opening over a layer's
+name was the only menu here, which is why deleting a layer from the timeline had
+no route at all.
+
+**One definition of what an eye looks like.** `paint_layer_icon` takes a
+`Painter` and a rectangle rather than a `Ui`, so the Layers panel can lay these
+out as widgets while the timeline paints them into a grid it hit-tests by hand —
+a row of egui widgets per layer per frame is not a thing a timeline can afford.
+The icons, the headings and the hover text all come from `LayerIcon`, so the two
+places cannot drift apart, and the click makes the same document edit through
+the same call: one undo step, named for the switch.
+
+The risk in a painted row is that the icon and the hit test disagree, and then
+the switch is decoration. `switch_columns` is the single source of that
+geometry — the row, the heading and the hit test all ask it — and a test clicks
+the centre and both far corners of every column, checks they do not overlap or
+overrun the name column, and checks that everywhere else in the row is *not* a
+switch, because selecting a layer by its name must not silently hide it.
+
+The name column went from 190 points to 210, so the three columns took their
+room from the window rather than from the layer names, and the name is clipped
+to what is left of it: a painted string does not truncate itself, and a long
+name would otherwise be drawn straight through the switches.
+
+### ✅ Wave 1.1 — The clipboard
+
+Copy and Paste were stubs that set a status line reading *"Clipboard arrives with
+the Phase 2 follow-up"*, and Cut called `delete_selection` — which is Delete with a
+misleading name. So a posed character could not leave the file it was made in except
+by going through the Assets library.
+
+**What is copied is a whole `Scene`, not a list of objects.** That is the same
+decision an asset makes, for the same reason: an instance whose symbol was left
+behind draws nothing. `Scene::extract` already gathers the definitions a selection
+depends on — recursively, through nested symbols, without revisiting one — and
+`Scene::merge` already renumbers every id on the way in. The clipboard is those two
+functions with somewhere to put the result between them.
+
+**A paste must not invent layers.** `ImportTarget` gained `Onto { layer, frame,
+offset }` beside `Stage` and `Library`. An import arrives as a document and keeps its
+own structure; a paste is artwork arriving in the middle of the drawing you are
+already making, and Animate puts it on the current layer at the current frame. Three
+copies of a character would otherwise be three new layers each. The offset is
+Duplicate's, and for the same reason: a copy landing exactly on its original is
+indistinguishable from nothing having happened.
+
+**The clipboard outlives the document.** `Editor` is replaced wholesale when a file
+is opened, which is right for everything about the film and wrong for this — copy
+here, open that, paste there is the one thing a clipboard does that Duplicate cannot.
+The panel layout was already carried across by hand at three call sites; those are now
+one `App::adopt_document`, which carries the layout **and** the clipboard, so there is
+one place to state what belongs to the person rather than to the film.
+
+Eight tests, including the one that matters: a symbol converted in one document,
+copied, and pasted into an editor whose library has never seen it arrives with its
+definition.
+
+### ✅ Wave 3.3 — The arrow keys
+
+One document unit per press, eight with Shift — Animate's numbers, and the reason for
+having both is that one is *line it up* and eight is *get it roughly there*.
+
+Read directly from the input rather than through the shortcut map: four directions
+times two step sizes is eight bindings for one action, and none of them belongs in a
+menu. They are only taken when something is selected, so with an empty selection the
+arrows stay free and nudging nothing cannot look like a dropped keystroke.
+
+It goes through `transform_selection`, the same path a drag takes, so a nudge is an
+ordinary **Move** in the history and coalesces with the ones either side of it —
+holding an arrow key down is one undo step rather than forty.
+
 ---
 
 ## 5. Current metrics
@@ -2965,11 +3236,11 @@ and its build-failed message says which binary is still sitting in `target/`.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 365 passing, clippy clean |
+| Tests | 1 456 passing, clippy clean |
 | Rust source | ~48 000 lines |
 | Crates built | 16 of 17 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
-| Format version | 16 — adds gradients |
+| Format version | 18 — adds layer transparency |
 | Formats heard | `.wav`, `.mp3`, `.ogg`, `.flac`, `.m4a`, `.aac` |
 | IK budget | 50 six-bone rigs solved in parallel, well inside one frame |
 | Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |
@@ -3065,12 +3336,16 @@ and its build-failed message says which binary is still sitting in `target/`.
   - [ ] Frame-by-frame comparison against an Animate reference render — **not
         done**, and not possible here; see §7 item 21
 
-### 🟡 Phase 6 — Export — **CP-6.1 done**
+### 🟡 Phase 6 — Export — **CP-6.1 and CP-6.2 done**
 - [x] **CP-6.1** PNG image and PNG sequence — any resolution, transparent
       background optional, encoded across every core, on a background thread
       with progress and cancel (§4)
-- [ ] **CP-6.2** MP4 / MOV — NVENC (`h264_nvenc` / `hevc_nvenc` / `av1_nvenc`)
-      via `ffmpeg-sidecar`, N frames in flight
+- [x] **CP-6.2** MP4 / MOV — NVENC (`h264_nvenc` / `hevc_nvenc` / `av1_nvenc`)
+      with software fallbacks, driving the **ffmpeg already on the machine**
+      rather than `ffmpeg-sidecar` (which downloads one over the network — see
+      the reasoning at the head of `crates/buzz-export/src/video.rs`). Frames
+      are piped down stdin as they are rendered, and **the soundtrack is muxed
+      in**. Verified by `crates/buzz-export/tests/headless_video.rs`.
 - [ ] **CP-6.3** GIF / WebP — palette quantisation, animated WebP
 - [ ] **CP-6.4** HTML5 Canvas / SVG — scene graph → JS + small runtime player
 - [ ] **Exit test:** one document exported to all four, all four play correctly
@@ -3149,7 +3424,7 @@ down here has not been finished.
 | 38 | **Sound has no Properties panel.** Attaching a sound puts the newest import on the current keyframe with Animate's Stream sync; there is no picker, no per-sound volume or effect, and no way to choose Event/Start/Stop from the interface. The model carries all four sync modes and a volume — nothing edits them yet. | Sound follow-up |
 | 39 | **Only Stream sync actually differs.** Event, Start and Stop are stored, saved and reported, but the player treats every cue as timeline-positioned. An Event sound that should carry on past its keyframe stops with the playhead. | Sound follow-up |
 | 40 | **Resampling is nearest-neighbour.** A 44.1 kHz file on a 48 kHz device plays in the right place and at the right length, but the pitch is not exactly right and there is aliasing on bright material. Fine for animating to dialogue; not fine for a finished mix. | Sound follow-up |
-| 41 | **No sound in exports.** PNG sequences have no audio by definition; video export (CP-6.2) is where a soundtrack has to be muxed in, and that is not built yet. | Phase 6 |
+| 41 | ~~**No sound in exports.**~~ | ✅ **Resolved in CP-6.2** — a video export muxes the document's soundtrack in (`ExportSettings.audio`, `AudioTrack`, reported as `audio_tracks`). A PNG sequence still has no audio, by definition. |
 | 42 | **Lip sync is signal analysis, not phoneme recognition.** It distinguishes silence, open and rounded vowels, and fricatives; it cannot distinguish `p`/`b`/`m` or `l`/`n`, which land on the closed and tongue shapes. Animate uses a trained model here. Recorded as a limitation rather than sold as parity. | By design |
 | 43 | **Scripting cannot reach sound.** `fl.getDocumentDOM()` exposes no sounds, no lip sync and no playback, so none of this can be driven from the Actions panel. | Phase 8 follow-up |
 | 33 | **An armature is an object, not an armature layer.** Animate moves rigged artwork onto its own layer whose keyframes are poses, and refuses to let you draw there. Here a rig is an object on an ordinary layer, which is why keyframes, tweens, undo, symbols and importing all work on it with no second code path — but the timeline does not mark the layer, and nothing stops you drawing on it. Recorded as a deviation, with the reason, in §4. | By design |
@@ -3173,11 +3448,11 @@ down here has not been finished.
 | 31 | **The scripting API is a useful subset, not JSFL.** Rectangles, ovals, layers, frames, selection, the library and document properties are there; text, gradients, tweens, groups, transforms beyond translation, and `fl.fileSystem` are not. Several of those are gaps in the editor itself (§7 items 8 and 9) rather than in the binding. | Phase 8 follow-up |
 | 32 | **A script runs on the UI thread**, so a five-second script freezes the window for five seconds — bounded, but visible. Moving it off needs the run to own its scene outright, since the engine holds it behind `Rc`. | Phase 8 follow-up |
 | 16 | **Camera rotation and zoom have no direct gesture.** Both are keyable and interpolate correctly, and `zoom_camera` exists, but only panning is bound to a drag. | Phase 3 follow-up |
-| 13 | **Clipboard (cut/copy/paste) not implemented.** Duplicate works. | Phase 2 follow-up |
+| 13 | ~~**Clipboard (cut/copy/paste) not implemented.**~~ | ✅ **Resolved in Wave 1** — artwork copies as a whole `Scene`, so an instance carries its symbol; pastes onto the active layer at the playhead; survives opening another document (§4) |
 | 14 | ~~**Workspace layout is not persisted** across runs.~~ | ✅ **Resolved** — panels dock, float and lock, and the arrangement is saved between runs |
 | 59 | **The camera row is drawn by the timeline, not stored as a layer.** Animate presents its camera as a layer; here it is the `CameraTrack`, shown as a row. Everything that walks layers is therefore spared having to skip it, at the cost of the row not appearing in the Layers panel, which lists real layers only. | By design |
 | 56 | **Panels are moved by menu, not by dragging them.** Animate lets you drag a panel by its title bar and drop it into a dock, with a highlight showing where it will land. Here the same moves are on each panel's own menu. The model underneath is the same; what is missing is the drag, the hit-testing of drop zones, and the preview. | Follow-up |
-| 57 | **Panels cannot be grouped into tabs.** Animate stacks several panels in one frame with tabs along the top; here they stack vertically down a side. | Follow-up |
+| 57 | ~~**Panels cannot be grouped into tabs.**~~ | ✅ **Resolved** — panels sharing a dock and a group are one section with a tab strip; Depth/Rig/Filters/Light/Sound and Library/Assets ship grouped; layout version 2 migrates saved layouts |
 | 58 | **One workspace, not several.** Animate saves named workspaces and switches between them. There is one layout here, plus Reset. | Follow-up |
 | 66 | **The looping section is a deviation from Animate.** Animate's loop is a transport setting and never reaches the published file; this one is in the document and the exporter repeats it. It is off by default and a document without one exports byte-for-byte what it always did, so nothing an Animate user expects is changed by its existence. Added because "even in the final render that section keeps looping" was the request. | By design |
 | 67 | **One looping section per document, and it does not nest.** A section cannot contain another, and a layer cannot loop on its own while the rest of the timeline runs straight. Both are real requests; both need the playlist to become a tree rather than a range, and every frame lookup to go through it. | Follow-up |
@@ -3185,7 +3460,7 @@ down here has not been finished.
 | 69 | **A looping section is not marked on the frames themselves**, only on the ruler. Animate has no equivalent to mark, but a band across the frame grid would read better on a tall timeline where the ruler has scrolled out of sight. | Follow-up |
 | 70 | **Auto Keyframe is a deviation from Animate**, which has no such mode: you press F6 yourself, or your change reaches back to the start of the span. It is off by default and changes nothing when off. Added because it was asked for by name, and because the alternative is a surprise every time an animator edits inside a span. | By design |
 | 71 | **Auto Keyframe does not key a layer the edit does not touch.** Moving a parented limb keys the limb's layer, not the parent's; a camera move is keyed by the Camera menu as before. Animate has no equivalent to compare against. | By design |
-| 72 | **There is no arrow-key nudge.** Selected artwork is moved by dragging or by Free Transform; Animate moves it a pixel per arrow press and eight with Shift. Noticed while driving Auto Keyframe from a script. | Phase 2 follow-up |
+| 72 | ~~**There is no arrow-key nudge.**~~ | ✅ **Resolved in Wave 3** — one document unit per arrow press, eight with Shift, through the same path a drag takes (§4) |
 | 73 | **The onion markers are numbers, not brackets on the ruler.** Animate draws two draggable markers over the frame numbers and offers Onion 2/5/All from a menu; here the transport carries two counts and an All button. The model is the same range; what is missing is the drag and the drawn brackets. | Follow-up |
 | 74 | **Edit Multiple Frames does not move keyframes themselves.** It changes the artwork on every keyframe in range; Animate's mode also lets you cut and paste a whole span of frames elsewhere on the timeline. Moving frames as frames is its own feature and is not built. | Follow-up |
 | 75 | **Under Edit Multiple Frames the artwork of other keyframes draws in paint order, not in time order.** Two drawings that overlap on the stage are stacked by layer, so which one appears in front does not follow which frame it belongs to. Animate has the same behaviour. | By design |

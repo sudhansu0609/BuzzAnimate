@@ -1601,8 +1601,12 @@ fn parse_hex(text: &str) -> Option<Color> {
 }
 
 /// Which switch a layer row is drawing.
+///
+/// Public because the timeline draws the same three columns beside its own
+/// layer names, as Animate does. One definition of what an eye looks like, so
+/// the two places cannot drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LayerIcon {
+pub enum LayerIcon {
     /// The eye column: shown, or struck through when hidden.
     Eye,
     /// The padlock column: closed when locked, open when not.
@@ -1611,7 +1615,46 @@ enum LayerIcon {
     Outline,
 }
 
-/// One of Animate's three layer columns, drawn rather than lettered.
+impl LayerIcon {
+    /// The three columns, in the order Animate rules them.
+    pub const ALL: [LayerIcon; 3] = [Self::Eye, Self::Lock, Self::Outline];
+
+    /// The short word over the column, and what the switch does when clicked.
+    pub fn heading(self) -> &'static str {
+        match self {
+            Self::Eye => "show",
+            Self::Lock => "lock",
+            Self::Outline => "out",
+        }
+    }
+
+    /// What this switch means, spelled out — the same words wherever it is
+    /// drawn, because it is the same switch.
+    pub fn hint(self, on: bool) -> &'static str {
+        match (self, on) {
+            (Self::Eye, true) => {
+                "Visible \u{2014} click to hide. A hidden layer is left out of the export too."
+            }
+            (Self::Eye, false) => "Hidden \u{2014} click to show",
+            (Self::Lock, true) => "Locked \u{2014} click to unlock",
+            (Self::Lock, false) => {
+                "Unlocked \u{2014} click to lock. A locked layer cannot be selected or edited."
+            }
+            (Self::Outline, _) => {
+                "Show this layer as outlines, in its own colour. \
+                 A working view: the export draws it filled."
+            }
+        }
+    }
+}
+
+/// Edge of one of the three layer switches, and of the column heading over it.
+/// Shared so the labels line up with what they name.
+pub const LAYER_SWITCH: f32 = 15.0;
+/// The layer's colour chip, which sits beside the switches.
+pub const CHIP_WIDTH: f32 = 8.0;
+
+/// Paint one of Animate's three layer columns into an arbitrary rectangle.
 ///
 /// # Why these are painted and not characters
 ///
@@ -1622,11 +1665,21 @@ enum LayerIcon {
 /// which is worse than a box, because it looks deliberate.
 ///
 /// Painted shapes always render, at any size, in any theme.
-fn layer_toggle(ui: &mut Ui, icon: LayerIcon, on: bool, layer_color: Color) -> egui::Response {
-    let side = 15.0;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
-    let painter = ui.painter();
-
+///
+/// # Why it takes a `Painter` rather than a `Ui`
+///
+/// The Layers panel lays these out as widgets; the timeline paints its whole
+/// grid by hand and hit-tests it afterwards, because a row of egui widgets per
+/// layer per frame is not a thing a timeline can afford. Both need the same
+/// eye, so the drawing lives here and each caller brings its own rectangle.
+pub fn paint_layer_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: LayerIcon,
+    on: bool,
+    layer_color: Color,
+    hovered: bool,
+) {
     // Off is dim, on is plain — except the outline switch, which shows the
     // layer's own colour when it is on, because that is the colour the artwork
     // is about to be drawn in.
@@ -1635,10 +1688,11 @@ fn layer_toggle(ui: &mut Ui, icon: LayerIcon, on: bool, layer_color: Color) -> e
         (_, true) => Palette::text(),
         (_, false) => Palette::text_dim(),
     };
-    if response.hovered() {
+    if hovered {
         painter.rect_filled(rect, 2.0, Palette::raised());
     }
 
+    let side = rect.width().min(rect.height());
     let c = rect.center();
     let s = side * 0.5;
     let at = |x: f32, y: f32| egui::pos2(c.x + x * s, c.y + y * s);
@@ -1708,7 +1762,22 @@ fn layer_toggle(ui: &mut Ui, icon: LayerIcon, on: bool, layer_color: Color) -> e
             }
         }
     }
+}
 
+/// One layer switch, as a widget, for the Layers panel's own rows.
+fn layer_toggle(ui: &mut Ui, icon: LayerIcon, on: bool, layer_color: Color) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(LAYER_SWITCH, LAYER_SWITCH),
+        egui::Sense::click(),
+    );
+    paint_layer_icon(
+        ui.painter(),
+        rect,
+        icon,
+        on,
+        layer_color,
+        response.hovered(),
+    );
     response
 }
 
@@ -1719,19 +1788,61 @@ pub fn layers_panel(
     frame: u32,
 ) -> Option<Command> {
     let mut command = None;
+    let can_delete = scene.layers().len() > 1;
 
     ui.horizontal(|ui| {
         ui.heading("Layers");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("🗑").on_hover_text("Delete layer").clicked() {
+            if ui
+                .add_enabled(can_delete, egui::Button::new("\u{1F5D1}").small())
+                .on_hover_text("Delete the selected layer")
+                .on_disabled_hover_text("A document must keep at least one layer")
+                .clicked()
+            {
                 command = Some(Command::DeleteLayer);
             }
             if ui.small_button("Fld").on_hover_text("New folder").clicked() {
                 command = Some(Command::NewLayerFolder);
             }
-            if ui.small_button("➕").on_hover_text("New layer").clicked() {
+            if ui
+                .small_button("\u{2795}")
+                .on_hover_text("New layer")
+                .clicked()
+            {
                 command = Some(Command::NewLayer);
             }
+        });
+    });
+
+    // **A heading over the three switch columns.**
+    //
+    // The eye, the padlock and the outline box are painted line art fifteen
+    // points square, in a dim grey, at the end of a row — and they were
+    // reported as *missing options* by somebody looking straight at them. A
+    // switch nobody recognises as a switch is not on the screen. Animate rules
+    // these three columns and heads them; naming them here does the same job
+    // in the space available, and the row also says where to right-click for
+    // the same commands spelled out in words.
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Right to left, so this reads back to front — the outline column
+            // is the rightmost, as it is on the rows below and in the timeline.
+            for icon in LayerIcon::ALL.into_iter().rev() {
+                ui.add_sized(
+                    egui::vec2(LAYER_SWITCH, 12.0),
+                    egui::Label::new(RichText::new(icon.heading()).size(8.0).weak()),
+                )
+                .on_hover_text(icon.hint(true));
+            }
+            ui.add_space(CHIP_WIDTH);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new("right-click a layer for more")
+                        .size(8.0)
+                        .weak()
+                        .italics(),
+                );
+            });
         });
     });
     ui.separator();
@@ -1782,104 +1893,156 @@ pub fn layers_panel(
         let mut set_visible = visible;
         let mut set_locked = locked;
         let mut set_outline = outline;
-        let mut set_alpha = alpha;
+        let mut select_this = false;
 
+        // **The switches sit in a column of their own, hard against the right
+        // edge; the name takes what is left.**
+        //
+        // They used to lead the row, with the name last — so a dock column
+        // dragged narrow pushed the *name* off the end, and a column narrow
+        // enough pushed the switches under the scroll bar. Animate's layout is
+        // the other way round for this reason: the eye, the padlock and the
+        // outline box are always in the same place, and the one thing that can
+        // be any length is the one that gets truncated.
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 12.0);
 
-            // **Drawn, not lettered.** These three columns were an
-            // `O`, a padlock and a second `O` — the same glyph for
-            // "visible" and for "outlines", which is no way to tell
-            // two switches apart. Animate draws an eye, a padlock and
-            // a hollow square, and so does this: see `layer_toggle`.
-            if layer_toggle(ui, LayerIcon::Eye, set_visible, color)
-                .on_hover_text(if set_visible {
-                    "Visible \u{2014} click to hide. A hidden layer is left out of the export too."
-                } else {
-                    "Hidden \u{2014} click to show"
-                })
-                .clicked()
-            {
-                set_visible = !set_visible;
-            }
-            if layer_toggle(ui, LayerIcon::Lock, set_locked, color)
-                .on_hover_text(if set_locked {
-                    "Locked \u{2014} click to unlock"
-                } else {
-                    "Unlocked \u{2014} click to lock. A locked layer cannot be selected or edited."
-                })
-                .clicked()
-            {
-                set_locked = !set_locked;
-            }
-            if layer_toggle(ui, LayerIcon::Outline, set_outline, color)
-                .on_hover_text(
-                    "Show this layer as outlines, in its own colour. \
-                             A working view: the export draws it filled.",
-                )
-                .clicked()
-            {
-                set_outline = !set_outline;
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // **Drawn, not lettered.** These three columns were an
+                // `O`, a padlock and a second `O` — the same glyph for
+                // "visible" and for "outlines", which is no way to tell
+                // two switches apart. Animate draws an eye, a padlock and
+                // a hollow square, and so does this: see `layer_toggle`.
+                //
+                // Laid out right to left, so this reads back to front: the
+                // outline box is the rightmost of the three.
+                if layer_toggle(ui, LayerIcon::Outline, set_outline, color)
+                    .on_hover_text(LayerIcon::Outline.hint(set_outline))
+                    .clicked()
+                {
+                    set_outline = !set_outline;
+                }
+                if layer_toggle(ui, LayerIcon::Lock, set_locked, color)
+                    .on_hover_text(LayerIcon::Lock.hint(set_locked))
+                    .clicked()
+                {
+                    set_locked = !set_locked;
+                }
+                if layer_toggle(ui, LayerIcon::Eye, set_visible, color)
+                    .on_hover_text(LayerIcon::Eye.hint(set_visible))
+                    .clicked()
+                {
+                    set_visible = !set_visible;
+                }
 
-            // **Transparency**, as a number rather than a switch,
-            // because it is one. Drag it, or click and type.
-            let mut percent = (set_alpha * 100.0).round();
-            if ui
-                .add(
-                    egui::DragValue::new(&mut percent)
-                        .range(0.0..=100.0)
-                        .speed(1.0)
-                        .suffix("%")
-                        .fixed_decimals(0),
-                )
-                .on_hover_text(
-                    "How solid this layer is drawn while you work \u{2014} dim one \
-                             to draw over it, or to see what is behind it. A working \
-                             view only: the export draws every layer at full strength.",
-                )
-                .changed()
-            {
-                set_alpha = (percent / 100.0).clamp(0.0, 1.0);
-            }
+                // The layer's colour chip, used for outline view.
+                let (chip, _) =
+                    ui.allocate_exact_size(egui::vec2(CHIP_WIDTH, 12.0), egui::Sense::hover());
+                ui.painter().rect_filled(chip, 1.0, to_egui(color));
 
-            // The layer's colour chip, used for outline view.
-            let (chip, _) = ui.allocate_exact_size(egui::vec2(8.0, 12.0), egui::Sense::hover());
-            ui.painter().rect_filled(chip, 1.0, to_egui(color));
+                // Whatever the switches left over belongs to the name.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let mark = match kind {
+                        LayerKind::Folder => "F ",
+                        LayerKind::Mask => "M ",
+                        // The mask that hides rather than reveals. Marked with
+                        // a letter rather than a struck-through M: a combining
+                        // stroke is one of the glyphs the interface font does
+                        // not have, and would draw as a box.
+                        LayerKind::InverseMask => "iM ",
+                        LayerKind::Masked => ". ",
+                        LayerKind::Guide => "G ",
+                        LayerKind::Guided => ". ",
+                        LayerKind::Normal => "",
+                    };
+                    let width = ui.available_width().max(1.0);
+                    let response = ui.add_sized(
+                        egui::vec2(width, ui.spacing().interact_size.y),
+                        egui::Button::selectable(active == Some(id), format!("{mark}{name}"))
+                            .truncate(),
+                    );
+                    if response.clicked() {
+                        // Animate selects the layer's artwork with it, so the
+                        // obvious next move needs no second gesture.
+                        select_this = true;
+                    }
 
-            let mark = match kind {
-                LayerKind::Folder => "F ",
-                LayerKind::Mask => "M ",
-                // The mask that hides rather than reveals. Marked with
-                // a letter rather than a struck-through M: a combining
-                // stroke is one of the glyphs the interface font does
-                // not have, and would draw as a box.
-                LayerKind::InverseMask => "iM ",
-                LayerKind::Masked => ". ",
-                LayerKind::Guide => "G ",
-                LayerKind::Guided => ". ",
-                LayerKind::Normal => "",
-            };
-            if ui
-                .selectable_label(active == Some(id), format!("{mark}{name}"))
-                .clicked()
-            {
-                // Animate selects the layer's artwork with it, so the
-                // obvious next move needs no second gesture.
-                selection.select_layer(scene, id, frame);
-            }
+                    // **The same switches again, by name, on the right button.**
+                    //
+                    // The painted icons are the fast way once you know them, and
+                    // nothing on a 15-point square says which one hides a layer.
+                    // A menu that spells it out is how somebody finds these the
+                    // first time, and it is where Delete belongs anyway: a
+                    // destructive action does not want to be a 15-point square
+                    // beside three toggles.
+                    response.context_menu(|ui| {
+                        ui.label(RichText::new(&name).small().weak());
+                        ui.separator();
+                        if ui
+                            .button(if visible { "Hide Layer" } else { "Show Layer" })
+                            .clicked()
+                        {
+                            set_visible = !visible;
+                            ui.close();
+                        }
+                        if ui
+                            .button(if locked { "Unlock Layer" } else { "Lock Layer" })
+                            .clicked()
+                        {
+                            set_locked = !locked;
+                            ui.close();
+                        }
+                        if ui
+                            .button(if outline {
+                                "Show Layer Filled"
+                            } else {
+                                "Show Layer as Outlines"
+                            })
+                            .clicked()
+                        {
+                            set_outline = !outline;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button(Command::NewLayer.label()).clicked() {
+                            command = Some(Command::NewLayer);
+                            ui.close();
+                        }
+                        if ui.button(Command::NewLayerFolder.label()).clicked() {
+                            command = Some(Command::NewLayerFolder);
+                            ui.close();
+                        }
+                        ui.separator();
+                        // Delete acts on the *active* layer, so the row being
+                        // right-clicked has to become the active one first.
+                        // Selecting happens below, before the command is
+                        // dispatched, which is what makes that safe.
+                        if ui
+                            .add_enabled(can_delete, egui::Button::new(Command::DeleteLayer.label()))
+                            .on_disabled_hover_text("A document must keep at least one layer")
+                            .clicked()
+                        {
+                            select_this = true;
+                            command = Some(Command::DeleteLayer);
+                            ui.close();
+                        }
+                    });
+                });
+            });
         });
+
+        if select_this {
+            selection.select_layer(scene, id, frame);
+        }
 
         if set_visible != visible
             || set_locked != locked
             || set_outline != outline
-            || set_alpha != alpha
         {
             scene.update_layer(id, |l| {
                 l.visible = set_visible;
                 l.locked = set_locked;
                 l.outline = set_outline;
-                l.alpha = set_alpha;
             });
         }
 
@@ -1908,8 +2071,57 @@ pub fn layers_panel(
             .map(|(_, list)| list.clone())
             .unwrap_or_default();
 
+        // **Transparency**, as a number rather than a switch, because it is
+        // one. Drag it, or click and type.
+        //
+        // On the selected layer's row rather than on every row: it is a fifty-
+        // point number field, and three of the panel's width went on it for
+        // every layer in the document — width the layer's own *name* then did
+        // not have. Animate keeps it in Layer Properties for the same reason.
+        let mut set_alpha = alpha;
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 12.0 + 18.0);
+            ui.label(RichText::new("opacity").small().weak());
+            let mut percent = (set_alpha * 100.0).round();
+            if ui
+                .add(
+                    egui::DragValue::new(&mut percent)
+                        .range(0.0..=100.0)
+                        .speed(1.0)
+                        .suffix("%")
+                        .fixed_decimals(0),
+                )
+                .on_hover_text(
+                    "How solid this layer is drawn while you work \u{2014} dim one \
+                     to draw over it, or to see what is behind it. A working \
+                     view only: the export draws every layer at full strength.",
+                )
+                .changed()
+            {
+                set_alpha = (percent / 100.0).clamp(0.0, 1.0);
+            }
+        });
+        if set_alpha != alpha {
+            scene.update_layer(id, |l| l.alpha = set_alpha);
+        }
+
+        // **One control to a row, each sized to the column.**
+        //
+        // These two combo boxes were 96 and 92 points wide, side by side, after
+        // a label and an indent — a little over 250 points on a row a dock
+        // column gives 191. That overflow did far more than clip a control: a
+        // widget wider than its `Ui` expands that `Ui`'s *max* rect as well as
+        // its min rect, which grew the panel's frame, which moved the whole
+        // right-hand column 56 points right of where egui had placed it — and
+        // the stage, laid out from what was left, then ran underneath it. The
+        // ruler and the stage's own scrollbar were drawn on top of the
+        // Properties panel, which is what "the scroll bar overlaps the panels"
+        // was. A row that fits is not a tidiness question here.
+        let indent = depth as f32 * 12.0 + 18.0;
+        let field = |ui: &egui::Ui| (ui.available_width() - indent - 52.0).max(60.0);
+
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
             ui.label(RichText::new("follows").small().weak());
 
             let label = match follows.and_then(|f| names.iter().find(|(other, _, _)| *other == f)) {
@@ -1919,9 +2131,10 @@ pub fn layers_panel(
                 None => "\u{2014}".to_string(),
             };
 
+            let width = field(ui);
             egui::ComboBox::from_id_salt(("follows", id.0))
                 .selected_text(RichText::new(label).small())
-                .width(96.0)
+                .width(width)
                 .show_ui(ui, |ui| {
                     if ui
                         .selectable_label(follows.is_none(), "\u{2014}  none")
@@ -1943,17 +2156,22 @@ pub fn layers_panel(
                     "Layer Parenting: this layer's artwork moves with the \
                              layer it follows",
                 );
+        });
 
-            // **What kind of layer this is.** Masking is positional —
-            // a mask claims the run of masked layers directly below it
-            // — so this is the only control it needs: set one layer to
-            // Mask, the ones under it to Masked, and the stack does the
-            // rest. Folders are not offered: a folder holds layers, and
-            // turning one into a drawing layer would orphan them.
-            if kind != LayerKind::Folder {
+        // **What kind of layer this is.** Masking is positional —
+        // a mask claims the run of masked layers directly below it
+        // — so this is the only control it needs: set one layer to
+        // Mask, the ones under it to Masked, and the stack does the
+        // rest. Folders are not offered: a folder holds layers, and
+        // turning one into a drawing layer would orphan them.
+        if kind != LayerKind::Folder {
+            ui.horizontal(|ui| {
+                ui.add_space(indent);
+                ui.label(RichText::new("kind").small().weak());
+                let width = field(ui);
                 egui::ComboBox::from_id_salt(("layer-kind", id.0))
                     .selected_text(RichText::new(kind.display_name()).small())
-                    .width(92.0)
+                    .width(width)
                     .show_ui(ui, |ui| {
                         for choice in [
                             LayerKind::Normal,
@@ -1974,8 +2192,8 @@ pub fn layers_panel(
                     })
                     .response
                     .on_hover_text(layer_kind_hint(kind));
-            }
-        });
+            });
+        }
     }
 
     if let Some((layer, follows)) = set_follows {

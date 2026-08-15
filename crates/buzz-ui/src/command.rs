@@ -181,7 +181,22 @@ pub enum Command {
 
     // Tools
     SelectTool(super::tools::ToolId),
+
+    /// Move the selection by whole document units, from the arrow keys.
+    ///
+    /// Carried as one command with a vector rather than four commands, because
+    /// the four are the same action and a menu never shows any of them: this is
+    /// a key, and the key says which way.
+    Nudge { x: i32, y: i32 },
 }
+
+/// How far one arrow press moves the selection, and how far with Shift.
+///
+/// Animate's numbers. One unit is "line it up"; eight is "get it roughly
+/// there", and having both is what stops the arrow keys being useless at one
+/// end and imprecise at the other.
+pub const NUDGE_STEP: i32 = 1;
+pub const NUDGE_STEP_LARGE: i32 = 8;
 
 impl Command {
     /// Label as it appears in a menu.
@@ -304,6 +319,7 @@ impl Command {
             ResetCamera => "Reset Camera",
 
             SelectTool(_) => "Tool",
+            Nudge { .. } => "Nudge",
         }
     }
 
@@ -448,6 +464,10 @@ impl Command {
             ResetCamera => None,
 
             SelectTool(_) => None,
+            // The arrow keys, read directly: four directions times two step
+            // sizes is eight bindings for one action, and none of them belongs
+            // in a menu.
+            Nudge { .. } => None,
         }
     }
 
@@ -475,6 +495,7 @@ impl Command {
                 | StraightenSelection
                 | ConvertToSymbol
                 | BrushFromSelection
+                | Nudge { .. }
         )
     }
 }

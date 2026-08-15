@@ -6,6 +6,21 @@
 //! 1. **Unbounded zoom** — no 2000% ceiling, and no precision collapse.
 //! 2. **True multicore** — a work-stealing pool across every available thread.
 //! 3. **GPU rasterisation** — Vello compute shaders on the discrete adapter.
+//!
+//! # One window, not two
+//!
+//! A release build is a **Windows GUI application**, so double-clicking it
+//! opens the editor and nothing else. Built as an ordinary console program it
+//! also opened a black terminal alongside the window — which is what a user
+//! reports, reasonably, as the program opening twice.
+//!
+//! A **debug** build keeps its console, because that is where the adapter
+//! table, the tracing output and a panic's backtrace go, and `--dev` on the
+//! launcher is how you ask for it. The diagnostics are not lost, they are
+//! behind a flag; that is the trade, and it is the right way round for a
+//! program whose users are animators rather than its author.
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::Result;
 use buzz_app::app;
@@ -13,6 +28,12 @@ use buzz_render::GpuPreference;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() -> Result<()> {
+    // **A person launched this, so the layout on screen is theirs to keep.**
+    // Nothing else in the workspace claims it, which is what stops a test run
+    // rearranging the panels of whoever is running the suite. See
+    // `buzz_ui::workspace::claim_user_workspace`.
+    buzz_ui::workspace::claim_user_workspace();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

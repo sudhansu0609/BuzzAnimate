@@ -341,7 +341,20 @@ impl Metrics {
     pub const LAYER_ROW: f32 = 20.0;
     /// Frame cell width in the timeline.
     pub const FRAME_WIDTH: f32 = 12.0;
+    /// How much width a vertical scroll bar takes out of a panel.
+    ///
+    /// Public because the dock has to subtract it when it works out whether a
+    /// column is wide enough for what is in it.
+    pub const SCROLL_BAR: f32 = SCROLL_BAR;
 }
+
+/// Width of a scroll bar, including the margins either side of it.
+///
+/// Narrow on purpose: this is width taken away from every panel in a dock
+/// column, and the bar is a position indicator far more often than it is a
+/// thing anybody drags. Checked against the style in `dock_columns`, so the
+/// two cannot drift apart.
+const SCROLL_BAR: f32 = 9.0;
 
 /// Apply the theme to an egui context.
 ///
@@ -358,6 +371,19 @@ pub fn apply(ctx: &egui::Context) {
         style.spacing.button_padding = egui::vec2(6.0, 3.0);
         style.spacing.menu_margin = egui::Margin::same(4);
         style.spacing.interact_size.y = 20.0;
+
+        // **Scroll bars take space; they do not sit on top of the panel.**
+        //
+        // egui's default bar floats over the content, and every dock column is
+        // a scroll area — so the bar was drawn across the right-hand edge of
+        // whatever panel was in it. That edge is where the panels keep the
+        // controls that were reported missing: the dock menu on every panel
+        // header, the Layers panel's new/delete buttons, the Library's own
+        // controls. A bar that reserves its width covers nothing.
+        style.spacing.scroll = egui::style::ScrollStyle::solid();
+        style.spacing.scroll.bar_width = 6.0;
+        style.spacing.scroll.bar_inner_margin = 2.0;
+        style.spacing.scroll.bar_outer_margin = 1.0;
     });
 }
 
@@ -630,10 +656,10 @@ mod glyph_tests {
             ("\u{2014}", "an em dash"),
             ("\u{2022}", "a bullet"),
             ("\u{2026}", "an ellipsis"),
-            ("\u{23F7}", "the disclosure arrow"),
+            ("\u{23F7}", "the disclosure arrow, and an open panel"),
             ("\u{270B}", "the hand on the stage zoom control"),
             ("\u{2212}", "the minus on the stage zoom control"),
-            ("\u{25B6}", "play, and a closed folder"),
+            ("\u{25B6}", "play, a closed folder, and a rolled-up panel"),
             ("\u{25C0}", "step back"),
             ("\u{25D1}", "the gradient tool"),
             ("\u{2606}", "the star tool"),
@@ -673,6 +699,10 @@ mod glyph_tests {
             ("\u{2715}", "a multiplication sign, for delete"),
             ("\u{25A2}", "a rounded square, for outline view"),
             ("\u{21B3}", "a hierarchy arrow, for a child bone"),
+            // These two were the panel headers' roll-up triangle, in every
+            // dock column, for as long as the dock has existed: a whole
+            // window's worth of empty boxes that no test looked at because
+            // the characters were never added to the list above.
             ("\u{25B8}", "a small right triangle, for menu paths"),
             ("\u{25BC}", "a filled down triangle"),
             ("\u{25BE}", "a small down triangle, for a dropdown"),

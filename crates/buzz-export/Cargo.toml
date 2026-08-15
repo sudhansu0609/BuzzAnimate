@@ -19,12 +19,14 @@ rayon.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde.workspace = true
 
 png = "0.18"
 
 [dev-dependencies]
 tempfile = "3"
 png = "0.18"
+serde_json.workspace = true
 # For the `shot` example only: rendering a frame of a real Animate document
 # straight to a PNG is how import fidelity is checked by eye.
 buzz-doc.workspace = true

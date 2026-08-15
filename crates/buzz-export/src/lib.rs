@@ -38,7 +38,10 @@ use rayon::prelude::*;
 const COPY_ALIGNMENT: u32 = 256;
 
 pub mod gif;
+pub mod preset;
 pub mod video;
+
+pub use preset::{ExportPreset, PresetFormat};
 
 pub use gif::{
     AnimatedFormat, AnimatedReport, Dither, GifSettings, WebpSettings, export_gif, export_webp,

@@ -14,6 +14,7 @@ pub mod hud;
 pub mod import;
 pub mod lights;
 pub mod lipsync;
+pub mod presets;
 pub mod rigging;
 pub mod sound;
 pub mod stage;

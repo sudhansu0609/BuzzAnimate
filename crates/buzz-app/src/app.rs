@@ -309,6 +309,8 @@ pub struct App {
     /// A close request with work that would be lost raises this instead of
     /// exiting, so a half-written film is a decision rather than an accident.
     quit_prompt: bool,
+    /// The export presets, built-in and the user's own, for the Export dialog.
+    presets: crate::presets::PresetLibrary,
     /// Lighting geometry kept between frames.
     ///
     /// The renderer is stateless — a `SceneBuilder` lives for one frame — so
@@ -393,6 +395,7 @@ impl App {
             preference,
             exports: crate::export_service::ExportQueue::default(),
             quit_prompt: false,
+            presets: crate::presets::PresetLibrary::load(),
             lights: buzz_render::document::DrawCache::new(),
             recovery: buzz_ui::RecoveryState::default(),
             last_crash_revision: None,
@@ -3146,6 +3149,111 @@ impl App {
         }
     }
 
+    /// Fill the Export dialog from a preset.
+    ///
+    /// A preset can change the format too — choosing "GIF preview" while the
+    /// dialog was opened as a video switches the whole export to a GIF — so it
+    /// sets the kind, then the size (from the preset's target height and the
+    /// stage's aspect), then the format-specific options.
+    fn apply_preset(&mut self, preset: &buzz_export::ExportPreset) {
+        use buzz_export::PresetFormat;
+
+        let kind = match preset.format {
+            PresetFormat::Png => buzz_ui::ExportKind::Image,
+            PresetFormat::PngSequence => buzz_ui::ExportKind::Sequence,
+            PresetFormat::Mp4H264 | PresetFormat::Mp4Hevc | PresetFormat::Mp4Av1
+            | PresetFormat::MovHevc => buzz_ui::ExportKind::Video,
+            PresetFormat::Gif => buzz_ui::ExportKind::Gif,
+            PresetFormat::Webp => buzz_ui::ExportKind::Webp,
+        };
+
+        let stage = self.editor.scene().stage().size;
+        let stage = (
+            stage.width.round().max(1.0) as u32,
+            stage.height.round().max(1.0) as u32,
+        );
+        let (width, height) = preset.resolve_size(stage);
+
+        let export = &mut self.editor.export;
+        export.open = Some(kind);
+        export.width = width;
+        export.height = height;
+        export.transparent = preset.transparent;
+        export.ffmpeg = !kind.needs_ffmpeg() || buzz_export::ffmpeg_available();
+
+        match preset.format {
+            PresetFormat::Mp4H264 => {
+                export.video.container = buzz_ui::ContainerChoice::Mp4;
+                export.video.codec = buzz_ui::VideoChoice::H264;
+            }
+            PresetFormat::Mp4Hevc => {
+                export.video.container = buzz_ui::ContainerChoice::Mp4;
+                export.video.codec = buzz_ui::VideoChoice::Hevc;
+            }
+            PresetFormat::Mp4Av1 => {
+                export.video.container = buzz_ui::ContainerChoice::Mp4;
+                export.video.codec = buzz_ui::VideoChoice::Av1;
+            }
+            PresetFormat::MovHevc => {
+                export.video.container = buzz_ui::ContainerChoice::Mov;
+                export.video.codec = buzz_ui::VideoChoice::Hevc;
+            }
+            PresetFormat::Webp => {
+                export.webp.quality = preset.quality.min(100);
+                export.webp.lossless = preset.lossless;
+            }
+            PresetFormat::Png | PresetFormat::PngSequence | PresetFormat::Gif => {}
+        }
+        if kind == buzz_ui::ExportKind::Video {
+            export.video.quality = preset.quality;
+            export.video.audio = preset.audio;
+            export.video.hardware = preset.hardware;
+        }
+
+        self.editor.status = Some(format!("Applied preset \u{201C}{}\u{201D}", preset.name));
+    }
+
+    /// Build a preset from the dialog's current settings, to be saved.
+    fn preset_from_dialog(&self) -> Option<buzz_export::ExportPreset> {
+        use buzz_export::PresetFormat;
+
+        let export = &self.editor.export;
+        let kind = export.open?;
+        let format = match kind {
+            buzz_ui::ExportKind::Image => PresetFormat::Png,
+            buzz_ui::ExportKind::Sequence => PresetFormat::PngSequence,
+            buzz_ui::ExportKind::Gif => PresetFormat::Gif,
+            buzz_ui::ExportKind::Webp => PresetFormat::Webp,
+            buzz_ui::ExportKind::Video => match export.video.container {
+                buzz_ui::ContainerChoice::Mov => PresetFormat::MovHevc,
+                buzz_ui::ContainerChoice::Mp4 => match export.video.codec {
+                    buzz_ui::VideoChoice::H264 => PresetFormat::Mp4H264,
+                    buzz_ui::VideoChoice::Hevc => PresetFormat::Mp4Hevc,
+                    buzz_ui::VideoChoice::Av1 => PresetFormat::Mp4Av1,
+                },
+            },
+        };
+
+        let quality = match kind {
+            buzz_ui::ExportKind::Webp => export.webp.quality,
+            _ => export.video.quality,
+        };
+
+        Some(buzz_export::ExportPreset {
+            name: export.preset_name.clone(),
+            format,
+            // The current height, kept as the preset's target so re-applying it
+            // reproduces this size on a same-shaped stage.
+            height: Some(export.height),
+            quality,
+            transparent: export.transparent,
+            audio: export.video.audio,
+            hardware: export.video.hardware,
+            lossless: export.webp.lossless,
+            builtin: false,
+        })
+    }
+
     /// Open the Export dialog, sized to the document as it is now.
     fn open_export(&mut self, kind: buzz_ui::ExportKind) {
         // No one-slot gate any more: a second export while one runs joins the
@@ -3176,7 +3284,29 @@ impl App {
 
     /// Draw the Export dialog and act on what the user chose.
     fn export_dialog(&mut self, ctx: &egui::Context) {
-        let response = buzz_ui::export_dialog(ctx, &mut self.editor.export);
+        let names = self.presets.names();
+        let response = buzz_ui::export_dialog(ctx, &mut self.editor.export, &names);
+
+        if let Some(i) = response.apply_preset
+            && let Some(preset) = self.presets.all().into_iter().nth(i)
+        {
+            self.apply_preset(&preset);
+        }
+        if response.save_preset {
+            match self.preset_from_dialog() {
+                Some(preset) => match self.presets.add(preset) {
+                    Ok(()) => {
+                        self.editor.status =
+                            Some(format!("Saved preset \u{201C}{}\u{201D}", self.editor.export.preset_name));
+                        self.editor.export.preset_name.clear();
+                    }
+                    Err(e) => self.editor.status = Some(e),
+                },
+                None => {
+                    self.editor.status = Some("Nothing to save as a preset".into());
+                }
+            }
+        }
 
         // Cancel just closes the dialog now — there is no inline job to stop,
         // because the dialog configures and enqueues rather than running the

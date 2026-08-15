@@ -77,6 +77,8 @@ pub struct ExportState {
     /// Whether this machine has an ffmpeg to encode with, checked when the
     /// dialog opens rather than when Export is pressed.
     pub ffmpeg: bool,
+    /// The name being typed for "save these settings as a preset".
+    pub preset_name: String,
 }
 
 /// The video choices the dialog offers.
@@ -218,6 +220,7 @@ impl Default for ExportState {
             gif: GifOptions::default(),
             webp: WebpOptions::default(),
             ffmpeg: true,
+            preset_name: String::new(),
         }
     }
 }
@@ -292,16 +295,27 @@ impl ExportState {
 const MAX_SIDE: u32 = 16_384;
 
 /// What the user did in the dialog.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ExportResponse {
     /// Go ahead: pick a destination and export.
     pub confirmed: bool,
     /// Close without exporting.
     pub cancelled: bool,
+    /// Apply the preset at this index in the list passed in.
+    pub apply_preset: Option<usize>,
+    /// Save the current settings as a preset under `preset_name`.
+    pub save_preset: bool,
 }
 
 /// Draw the dialog. Returns what the user chose.
-pub fn export_dialog(ctx: &egui::Context, state: &mut ExportState) -> ExportResponse {
+///
+/// `presets` are the names to offer, built-ins first; the shell owns the list
+/// and acts on [`ExportResponse::apply_preset`] and friends.
+pub fn export_dialog(
+    ctx: &egui::Context,
+    state: &mut ExportState,
+    presets: &[String],
+) -> ExportResponse {
     let mut response = ExportResponse::default();
     let Some(kind) = state.open else {
         return response;
@@ -318,6 +332,7 @@ pub fn export_dialog(ctx: &egui::Context, state: &mut ExportState) -> ExportResp
                 progress_view(ui, done, total, &mut response);
                 return;
             }
+            preset_view(ui, state, presets, &mut response);
             settings_view(ui, kind, state, &mut response);
         });
 
@@ -329,6 +344,43 @@ pub fn export_dialog(ctx: &egui::Context, state: &mut ExportState) -> ExportResp
         state.close();
     }
     response
+}
+
+/// The preset row at the top of the dialog: pick one to fill the settings, or
+/// save the settings as a new one.
+fn preset_view(
+    ui: &mut Ui,
+    state: &mut ExportState,
+    presets: &[String],
+    response: &mut ExportResponse,
+) {
+    ui.horizontal(|ui| {
+        ui.label("Preset");
+        egui::ComboBox::from_id_salt("export-preset")
+            .selected_text("Choose\u{2026}")
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                for (i, name) in presets.iter().enumerate() {
+                    if ui.selectable_label(false, name).clicked() {
+                        response.apply_preset = Some(i);
+                    }
+                }
+            });
+    });
+
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut state.preset_name)
+                .hint_text("Name these settings")
+                .desired_width(160.0),
+        );
+        if ui.button("Save preset").clicked() {
+            response.save_preset = true;
+        }
+    });
+
+    ui.add_space(4.0);
+    ui.separator();
 }
 
 fn settings_view(

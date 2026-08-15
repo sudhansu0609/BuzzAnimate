@@ -3538,6 +3538,19 @@ by default because it does not crawl between frames the way error-diffusion does
 WebP via `libwebp`, keeping the exporter's straight alpha so a WebP over a transparent
 stage stays transparent. Cancelling either removes the `.part`, as the video path does.
 
+**Export presets (`buzz-export/src/preset.rs`, `buzz-app/src/presets.rs`).** A named
+delivery target set up once — format, size and quality together. Three ship built in:
+*YouTube 1080p* (H.264), *Master (HEVC, high quality)*, *GIF preview 480p*; the user's own
+are read from and written to `export_presets.json` beside the dock layout, because a
+preset encodes where a film is *going* — a fact about the person, not the film — so no
+document version moves when one is added. **Deviation from `ARCHITECTURE.md`, recorded
+deliberately:** a preset carries a target *height*, not a whole `ExportSettings` with
+absolute pixels, because a preset that hard-codes 1920×1080 distorts every stage that is
+not 16:9 — and Animate's own 550×400 default is not — so the width is taken from the
+document's aspect when the preset is applied. The dialog gains a preset dropdown that
+fills every setting (a preset may switch the format outright) and a name-and-save field;
+a name that collides with a built-in is refused rather than shadowing it.
+
 ---
 
 ## 5. Current metrics

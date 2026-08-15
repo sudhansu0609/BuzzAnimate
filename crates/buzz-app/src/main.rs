@@ -24,6 +24,7 @@
 
 use anyhow::Result;
 use buzz_app::app;
+use buzz_app::app::UserEvent;
 use buzz_render::GpuPreference;
 use winit::event_loop::{ControlFlow, EventLoop};
 
@@ -45,10 +46,14 @@ fn main() -> Result<()> {
     // script over the document once it is open.
     let args = Args::parse(std::env::args().skip(1));
 
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // A user-event loop so egui (and background installs) can wake it from an
+    // idle wait; `ControlFlow::Wait` is the default, and the app raises it to
+    // `Poll` only for the frames that actually need it. See `App::wants_frame`.
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
 
-    let mut app = app::App::new(args.gpu);
+    let mut app = app::App::new(args.gpu).with_proxy(proxy);
 
     // A trailing path argument opens that file, so the app can be associated
     // with `.buzz` and with every format it can import.

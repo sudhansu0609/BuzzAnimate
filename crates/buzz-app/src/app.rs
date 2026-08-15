@@ -27,8 +27,27 @@ use peniko::Color;
 use vello::Scene as VelloScene;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::{Window, WindowId};
+
+/// The one custom event the window loop takes: "something off the UI thread
+/// wants a frame". egui raises it through its repaint callback (a tooltip is due,
+/// an animation is running), and it is the safety net that lets the loop sit
+/// idle — `ControlFlow::Wait` — without ever missing a repaint egui asked for.
+#[derive(Debug, Clone, Copy)]
+pub enum UserEvent {
+    /// Wake and draw a frame.
+    Repaint,
+}
+
+/// What the loop should do after a frame: draw again now, draw at a set time, or
+/// sleep until something wakes it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Redraw {
+    Now,
+    At(Instant),
+    Idle,
+}
 
 use crate::editor::Editor;
 use crate::stage;
@@ -389,6 +408,17 @@ pub struct App {
     editor: Editor,
     jobs: Arc<JobSystem>,
     preference: GpuPreference,
+    /// Wakes the event loop from an idle wait. Handed in by `main` and given to
+    /// egui's repaint callback in `init`. `None` in tests, which never run a
+    /// real loop.
+    proxy: Option<EventLoopProxy<UserEvent>>,
+    /// When egui last asked to be repainted, as an absolute instant. `None`
+    /// means egui is idle and wants no timed repaint. Folded into
+    /// [`App::wants_frame`] so the loop wakes for tooltips and animations.
+    egui_repaint: Option<Instant>,
+    /// Escape hatch: `BUZZ_POLL=1` forces the old always-redraw loop, for
+    /// bisecting any report of stale UI.
+    force_poll: bool,
     /// Every export, run one at a time on the task registry. Replaces the old
     /// single slot that refused a second export outright.
     exports: crate::export_service::ExportQueue,
@@ -498,6 +528,9 @@ impl App {
             editor,
             jobs: Arc::new(JobSystem::new()),
             preference,
+            proxy: None,
+            egui_repaint: None,
+            force_poll: std::env::var("BUZZ_POLL").is_ok(),
             exports: crate::export_service::ExportQueue::default(),
             quit_prompt: false,
             presets: crate::presets::PresetLibrary::load(),
@@ -518,6 +551,51 @@ impl App {
         };
         app.recovery = app.find_recoveries();
         app
+    }
+
+    /// Give the app a handle to wake the event loop. Called by `main` before
+    /// the loop runs; egui's repaint callback uses it in [`Self::init`].
+    pub fn with_proxy(mut self, proxy: EventLoopProxy<UserEvent>) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+
+    /// Whether — and when — the window needs to draw another frame.
+    ///
+    /// A pure decision over everything that could still change what is on screen:
+    /// egui's own timed repaint (animations, tooltips), playback, and any
+    /// background work that installs its result on a later frame. When none of
+    /// these is live the loop sleeps ([`Redraw::Idle`]) until an input event or
+    /// egui's wake callback, so an idle document costs no frames at all — the
+    /// difference between the old monitor-rate burn and a truly quiet window.
+    fn wants_frame(&self) -> Redraw {
+        if self.force_poll {
+            return Redraw::Now;
+        }
+        // Anything mid-flight whose result lands on a future frame, or that is
+        // inherently animated, wants the next frame now.
+        let live = self.editor.playback.playing
+            || self.editor.restyle
+            || self.thumbnails.pending()
+            || self.shade_build.is_some()
+            || self.sound_decode.is_some()
+            || self.usage_cache.in_flight.is_some()
+            || self.scripting.is_some()
+            || self.merging
+            || !self.loading.is_empty()
+            || self.animate_import.is_some()
+            || !self.exports.is_idle()
+            || self.picker.busy()
+            || !self.tasks.is_empty();
+        if live {
+            return Redraw::Now;
+        }
+        // Otherwise defer to egui: a timed repaint if it asked for one, else
+        // sleep until woken.
+        match self.egui_repaint {
+            Some(at) => Redraw::At(at),
+            None => Redraw::Idle,
+        }
     }
 
     /// Open a document at startup.
@@ -614,6 +692,16 @@ impl App {
         let compositor = buzz_render::Compositor::new(&gpu.device, format);
 
         let egui_ctx = egui::Context::default();
+        // egui runs its own animations — a tooltip fading in, a spinner, the
+        // caret blinking — and asks to be repainted for them through this
+        // callback. With the loop idling on `ControlFlow::Wait`, this is what
+        // wakes it: without it, egui's animations would stall whenever the
+        // document itself was quiet. Cross-thread safe: the proxy is `Send`.
+        if let Some(proxy) = self.proxy.clone() {
+            egui_ctx.set_request_repaint_callback(move |_info| {
+                let _ = proxy.send_event(UserEvent::Repaint);
+            });
+        }
         // The saved layout carries the interface theme, so the window opens in
         // whichever the user was last using rather than flashing dark first.
         theme::set_theme(buzz_ui::Workspace::load().theme);
@@ -4400,6 +4488,21 @@ impl App {
         active
             .egui_state
             .handle_platform_output(&window, output.platform_output);
+
+        // When egui next wants to be repainted, folded into `wants_frame` so the
+        // idle loop honours its animations. A zero delay means "again now"; the
+        // sentinel far-future means "never, I am idle".
+        let egui_delay = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay)
+            .unwrap_or(Duration::MAX);
+        self.egui_repaint = if egui_delay == Duration::MAX {
+            None
+        } else {
+            Some(Instant::now() + egui_delay)
+        };
+
         let paint_jobs = egui_ctx.tessellate(output.shapes, output.pixels_per_point);
 
         // ---- artwork -------------------------------------------------------
@@ -4606,13 +4709,27 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
+    /// The loop was woken by something off the UI thread — egui's repaint
+    /// callback, or a background install. Draw a frame.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+        if let Some(active) = &self.active {
+            active.window.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.active.is_some() {
             return;
         }
         match self.init(event_loop) {
-            Ok(active) => self.active = Some(active),
+            Ok(active) => {
+                // Ask for the first frame explicitly: with the loop idling on
+                // `ControlFlow::Wait`, nothing else would, and the window would
+                // open blank until the pointer moved.
+                active.window.request_redraw();
+                self.active = Some(active);
+            }
             Err(e) => {
                 eprintln!("BuzzAnimate failed to start: {e:?}");
                 event_loop.exit();
@@ -4674,9 +4791,25 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(active) = &self.active {
-            active.window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The window only redraws when something on screen could have changed.
+        // An idle document sleeps here instead of re-rendering at monitor rate —
+        // the fix for a static file burning a whole core (and a GPU) doing
+        // nothing. Input events and the egui wake callback both request a
+        // redraw of their own, so nothing is missed.
+        match self.wants_frame() {
+            Redraw::Now => {
+                if let Some(active) = &self.active {
+                    active.window.request_redraw();
+                }
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
+            Redraw::At(instant) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(instant));
+            }
+            Redraw::Idle => {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
         }
     }
 }
@@ -5155,6 +5288,50 @@ mod tests {
         let big = icon_from_png(include_bytes!("../../../assets/logo-128.png"));
         assert!(small.is_some(), "the title bar icon did not decode");
         assert!(big.is_some(), "the taskbar icon did not decode");
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    #[test]
+    fn a_quiet_document_wants_no_frame() {
+        let app = App::new(GpuPreference::Automatic);
+        // Nothing playing, no background work, egui idle: the loop should sleep.
+        assert_eq!(app.wants_frame(), Redraw::Idle);
+    }
+
+    #[test]
+    fn playback_and_background_work_keep_frames_coming() {
+        let mut app = App::new(GpuPreference::Automatic);
+
+        app.editor.playback.playing = true;
+        assert_eq!(app.wants_frame(), Redraw::Now, "playback must animate");
+        app.editor.playback.playing = false;
+        assert_eq!(app.wants_frame(), Redraw::Idle);
+
+        app.thumbnails.get(buzz_scene::SymbolId(1)); // now pending
+        assert_eq!(
+            app.wants_frame(),
+            Redraw::Now,
+            "a pending thumbnail installs next frame"
+        );
+    }
+
+    #[test]
+    fn egui_timed_repaint_is_honoured_when_otherwise_idle() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let at = Instant::now() + Duration::from_millis(50);
+        app.egui_repaint = Some(at);
+        assert_eq!(app.wants_frame(), Redraw::At(at));
+    }
+
+    #[test]
+    fn the_poll_escape_hatch_forces_frames() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.force_poll = true;
+        assert_eq!(app.wants_frame(), Redraw::Now);
     }
 }
 

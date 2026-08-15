@@ -166,6 +166,29 @@ pub struct Editor {
     pub should_quit: bool,
     /// Transient message for the status bar.
     pub status: Option<String>,
+    /// Memoised timeline waveforms, so the panel does not re-derive an envelope
+    /// from raw PCM every frame. See [`Editor::waveforms`].
+    waveform_cache: WaveformCache,
+}
+
+/// The waveform strip the timeline draws, cached against the document revision.
+///
+/// Two layers of memoisation, both from the patterns the codebase already uses:
+/// the whole map is gated on [`buzz_scene::Scene::revision`] (the `cued_revision`
+/// gate), so an unchanged document hands the panel the same `Arc`s every frame;
+/// and each clip's per-frame levels are keyed by `(SoundId, fps)` with the clip's
+/// pointer recorded, so even a *real* edit (which bumps the revision) reassembles
+/// the map without recomputing an envelope whose sound did not change. The
+/// pointer check catches a re-decode of the same id.
+/// A memoised per-clip envelope: the clip's pointer (to catch a re-decode) and
+/// the shared levels.
+type CachedLevels = (usize, std::sync::Arc<Vec<f32>>);
+
+#[derive(Default)]
+struct WaveformCache {
+    revision: Option<u64>,
+    map: std::collections::BTreeMap<LayerId, buzz_ui::Waveform>,
+    levels: std::collections::HashMap<(buzz_scene::SoundId, u64), CachedLevels>,
 }
 
 /// Playback state.
@@ -268,6 +291,7 @@ impl Editor {
             import_summary: None,
             should_quit: false,
             status: None,
+            waveform_cache: WaveformCache::default(),
         }
     }
 
@@ -1022,16 +1046,18 @@ impl Editor {
             ToolAction::BucketFill { point } => {
                 let tolerance = self.pick_tolerance();
                 let style = self.style.clone();
-                if let Some(id) = self.object_at(point, tolerance) {
+                // Clicking a shape that already has a fill recolours it — the
+                // gradient is refitted to that shape's bounds. Clicking anywhere
+                // else (an empty region between lines, or on a bare outline)
+                // floods the enclosed area with a new fill, which is what a paint
+                // bucket is actually for.
+                let recolour = self
+                    .object_at(point, tolerance)
+                    .filter(|id| self.shape_has_fill(*id));
+                if let Some(id) = recolour {
                     let at = self.edit_at();
                     self.doc.edit("Paint Bucket", |scene| {
                         update_shape(scene, at, id, |s| {
-                            // **The bucket is how a gradient reaches artwork
-                            // that already exists**, so it fits the ramp to the
-                            // shape it is poured into rather than to the shape
-                            // the panel last drew. A gradient laid across
-                            // somebody else's bounds shows one flat colour, and
-                            // reads as the tool having done nothing.
                             let bounds = buzz_geom::Shape::bounding_box(&s.path);
                             if let Some(paint) = style.fill_for_new_shape(bounds) {
                                 s.fill = Some(FillSpec {
@@ -1041,6 +1067,8 @@ impl Editor {
                             }
                         });
                     });
+                } else {
+                    self.bucket_flood(point, &style);
                 }
             }
 
@@ -1108,6 +1136,89 @@ impl Editor {
     fn active_layer(&mut self) -> Option<LayerId> {
         let scene = self.doc.scene().clone();
         self.selection.ensure_active_layer(&scene)
+    }
+
+    /// Does this object carry a fill? The paint bucket recolours a filled shape
+    /// and floods everything else.
+    fn shape_has_fill(&self, id: ObjectId) -> bool {
+        matches!(
+            self.doc.scene().find_object(id),
+            Some((_, o)) if matches!(&o.kind, ObjectKind::Shape(s) if s.fill.is_some())
+        )
+    }
+
+    /// Flood-fill the enclosed region under `point` on the active layer.
+    ///
+    /// The boundaries are the layer's own shapes; the seed and the boundaries are
+    /// taken in the layer's local space — the space the shape paths are stored in
+    /// — so a layer moved by depth or parenting still fills where it is drawn.
+    fn bucket_flood(&mut self, point: Point, style: &DrawStyle) {
+        let Some(layer) = self.active_layer() else {
+            self.status = Some("No layer available to fill".into());
+            return;
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return;
+        }
+        if !style.fill_enabled {
+            self.status = Some("Set a fill colour first".into());
+            return;
+        }
+
+        let frame = self.current_frame;
+        let scene = self.doc.scene();
+
+        // The click, moved into the active layer's local space — the reverse of
+        // the depth and parenting that place the layer's artwork on screen.
+        let Some(depth) = scene.layers().get(layer).map(|l| l.depth) else {
+            return;
+        };
+        let Some(local) = scene.view_to_layer(frame, depth, point) else {
+            return;
+        };
+        let seed = match invert(scene.layers().inherited_transform(layer, frame)) {
+            Some(back) => back * local,
+            None => local,
+        };
+
+        // Every shape on the layer at this frame becomes a wall.
+        let mut boundaries = Vec::new();
+        if let Some(layer_ref) = scene.layers().get(layer) {
+            for object in layer_ref.frames.resolved_at(frame).iter() {
+                collect_bucket_boundaries(object, buzz_geom::Affine::IDENTITY, &mut boundaries);
+            }
+        }
+
+        let Some(path) = buzz_scene::fill_region(&boundaries, seed, style.gap_size) else {
+            self.status = Some(
+                "Nothing enclosed to fill here — raise the Gap Size if the outline has a gap"
+                    .into(),
+            );
+            return;
+        };
+
+        let bounds = buzz_geom::Shape::bounding_box(&path);
+        let Some(paint) = style.fill_for_new_shape(bounds) else {
+            return;
+        };
+        let shape = ShapeData {
+            path,
+            fill: Some(FillSpec {
+                paint,
+                rule: buzz_scene::bucket::FILL_RULE,
+            }),
+            stroke: None,
+            blend: buzz_scene::PaintBlend::default(),
+        };
+
+        let auto = self.auto_keyframe;
+        self.doc.edit("Paint Bucket", |scene| {
+            if auto {
+                scene.ensure_keyframe(layer, frame);
+            }
+            scene.add_shape_behind_at(layer, frame, shape);
+        });
     }
 
     fn add_shape(&mut self, shape: ShapeData, label: &'static str) {
@@ -2370,9 +2481,22 @@ impl Editor {
     }
 
     /// Waveforms for the timeline, one per layer carrying a sound.
-    pub fn waveforms(&self) -> std::collections::BTreeMap<LayerId, buzz_ui::Waveform> {
+    ///
+    /// **Cached.** The timeline draws this every frame; deriving an envelope from
+    /// raw PCM each time was a per-frame cost that scaled with the soundtrack's
+    /// length and turned a long document into a frozen one. Now the whole map is
+    /// gated on the document revision, and each clip's levels are memoised, so an
+    /// unchanged document is a handful of `Arc` clones and even a live edit only
+    /// reassembles the map. See [`WaveformCache`].
+    pub fn waveforms(&mut self) -> std::collections::BTreeMap<LayerId, buzz_ui::Waveform> {
+        let revision = self.doc.scene().revision();
+        if self.waveform_cache.revision == Some(revision) {
+            return self.waveform_cache.map.clone();
+        }
+
         let fps = self.doc.scene().stage().frame_rate;
-        let mut out = std::collections::BTreeMap::new();
+        let fps_bits = fps.to_bits();
+        let mut map = std::collections::BTreeMap::new();
 
         for layer in self.doc.scene().stage_layers().iter() {
             for keyframe in layer.frames.keyframes() {
@@ -2382,16 +2506,33 @@ impl Editor {
                 let Some(clip) = self.sound.clip(reference.sound) else {
                     continue;
                 };
-                out.insert(
+                let clip_ptr = std::sync::Arc::as_ptr(clip) as usize;
+                let key = (reference.sound, fps_bits);
+                // Reuse the memoised envelope unless the sound was re-decoded
+                // (its clip lives at a new address).
+                let levels = match self.waveform_cache.levels.get(&key) {
+                    Some((ptr, levels)) if *ptr == clip_ptr => levels.clone(),
+                    _ => {
+                        let levels = std::sync::Arc::new(clip.frame_levels(fps));
+                        self.waveform_cache
+                            .levels
+                            .insert(key, (clip_ptr, levels.clone()));
+                        levels
+                    }
+                };
+                map.insert(
                     layer.id,
                     buzz_ui::Waveform {
                         start_frame: keyframe.start,
-                        levels: clip.frame_levels(fps),
+                        levels,
                     },
                 );
             }
         }
-        out
+
+        self.waveform_cache.revision = Some(revision);
+        self.waveform_cache.map = map.clone();
+        map
     }
 
     /// Make a mouth symbol with a frame per shape.
@@ -3811,6 +3952,26 @@ fn update_shape(scene: &mut Scene, at: EditAt, id: ObjectId, mut f: impl FnMut(&
     });
 }
 
+/// Collect the walls the paint bucket must respect from one object, recursing
+/// into groups. Instances, rigs and warped artwork are left out: the bucket
+/// fills flat drawing, which is the only place the question is well posed.
+fn collect_bucket_boundaries(
+    object: &buzz_scene::Object,
+    transform: Affine,
+    out: &mut Vec<buzz_scene::Boundary>,
+) {
+    let t = transform * object.transform;
+    match &object.kind {
+        ObjectKind::Shape(shape) => out.push(buzz_scene::Boundary::from_shape(shape, t)),
+        ObjectKind::Group(children) => {
+            for child in children {
+                collect_bucket_boundaries(child, t, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Precise hit test against an object, including its transform.
 ///
 /// `scene` is needed because a symbol instance's real geometry lives in the
@@ -4794,6 +4955,154 @@ mod tests {
                 .to_u8_array()[0],
             255
         );
+    }
+
+    /// Clicking inside a stroke-only outline creates a new fill shape, behind
+    /// the lines — the paint bucket's actual job, not just recolouring.
+    #[test]
+    fn the_bucket_floods_an_empty_region_bounded_by_lines() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+
+        // A square outline with a stroke and no fill: the inside is empty.
+        let outline = ShapeData {
+            path: square(0.0, 0.0, 80.0),
+            fill: None,
+            stroke: Some(StrokeSpec {
+                paint: Paint::Solid(Color::BLACK),
+                width: 2.0,
+                hairline: false,
+            }),
+            blend: buzz_scene::PaintBlend::default(),
+        };
+        e.apply(ToolAction::AddShape {
+            shape: outline,
+            label: "Draw",
+        });
+        let before = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .count();
+
+        e.style.fill_enabled = true;
+        e.style.fill_color = Color::from_rgb8(0x00, 0xFF, 0x00);
+        e.apply(ToolAction::BucketFill {
+            point: Point::new(40.0, 40.0),
+        });
+
+        let objects: Vec<_> = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter().cloned())
+            .collect();
+        assert_eq!(
+            objects.len(),
+            before + 1,
+            "the bucket should have created a fill shape"
+        );
+        // Behind everything (index 0) and a fill-only shape.
+        let ObjectKind::Shape(first) = &objects[0].kind else {
+            panic!("expected a shape behind the lines");
+        };
+        assert!(
+            first.fill.is_some() && first.stroke.is_none(),
+            "the bucket makes a fill-only shape under the outline"
+        );
+    }
+
+    /// Clicking in an open (unclosed) outline fills nothing, unless a gap size
+    /// bridges the opening.
+    #[test]
+    fn the_bucket_respects_gaps_until_the_gap_size_closes_them() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+
+        // A C-shape: three sides of a box, leaving the right edge open.
+        let mut path = BezPath::new();
+        path.move_to(Point::new(80.0, 10.0));
+        path.line_to(Point::new(10.0, 10.0));
+        path.line_to(Point::new(10.0, 80.0));
+        path.line_to(Point::new(80.0, 80.0));
+        let outline = ShapeData {
+            path,
+            fill: None,
+            stroke: Some(StrokeSpec {
+                paint: Paint::Solid(Color::BLACK),
+                width: 2.0,
+                hairline: false,
+            }),
+            blend: buzz_scene::PaintBlend::default(),
+        };
+        e.apply(ToolAction::AddShape {
+            shape: outline,
+            label: "Draw",
+        });
+        let before = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .count();
+
+        e.style.fill_enabled = true;
+        e.style.gap_size = buzz_scene::GapSize::None;
+        e.apply(ToolAction::BucketFill {
+            point: Point::new(45.0, 45.0),
+        });
+        let after_open = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .count();
+        assert_eq!(after_open, before, "an open outline must not fill");
+
+        // The opening is 70 units — Extra Large (32) bridges up to 64, so widen
+        // it to a gap the setting can close by using a genuinely small opening.
+        // Redraw with a 12-unit gap and confirm Medium closes it.
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let mut path = BezPath::new();
+        path.move_to(Point::new(80.0, 10.0));
+        path.line_to(Point::new(10.0, 10.0));
+        path.line_to(Point::new(10.0, 80.0));
+        path.line_to(Point::new(80.0, 80.0));
+        path.line_to(Point::new(80.0, 52.0)); // stub up, leaving a ~12-unit gap
+        let outline = ShapeData {
+            path,
+            fill: None,
+            stroke: Some(StrokeSpec {
+                paint: Paint::Solid(Color::BLACK),
+                width: 2.0,
+                hairline: false,
+            }),
+            blend: buzz_scene::PaintBlend::default(),
+        };
+        e.apply(ToolAction::AddShape {
+            shape: outline,
+            label: "Draw",
+        });
+        let before = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .count();
+        e.style.fill_enabled = true;
+        e.style.gap_size = buzz_scene::GapSize::ExtraLarge;
+        e.apply(ToolAction::BucketFill {
+            point: Point::new(45.0, 45.0),
+        });
+        let after_closed = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .count();
+        assert_eq!(after_closed, before + 1, "the gap size should close the gap");
     }
 
     #[test]

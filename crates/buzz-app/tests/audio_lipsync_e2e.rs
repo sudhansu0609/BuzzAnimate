@@ -109,7 +109,7 @@ fn character_with_head(editor: &mut Editor) -> (buzz_scene::SymbolId, buzz_scene
 
 #[test]
 fn a_sound_imports_attaches_and_is_cued() {
-    let (editor, _dir) = editor_with_dialogue();
+    let (mut editor, _dir) = editor_with_dialogue();
 
     assert_eq!(
         editor.scene().sounds().len(),
@@ -132,6 +132,38 @@ fn a_sound_imports_attaches_and_is_cued() {
     assert!(
         waveform.levels.iter().any(|l| *l > 0.1),
         "the envelope should show the speech"
+    );
+}
+
+/// The timeline draws waveforms every frame; deriving them from raw PCM each
+/// time was a hang on a long soundtrack. The cache (plan 1.2) hands back the
+/// **same `Arc`** while the document is unchanged, and reuses the per-clip
+/// envelope even across an unrelated edit that bumps the revision.
+#[test]
+fn waveforms_are_cached_across_frames_and_edits() {
+    let (mut editor, _dir) = editor_with_dialogue();
+
+    let first = editor.waveforms();
+    let second = editor.waveforms();
+    let a = first.values().next().expect("a waveform");
+    let b = second.values().next().expect("a waveform");
+    assert!(
+        std::sync::Arc::ptr_eq(&a.levels, &b.levels),
+        "an unchanged document must return the identical envelope Arc"
+    );
+
+    // An unrelated edit bumps the revision, so the map is reassembled — but the
+    // envelope for the untouched sound is the same allocation as before.
+    editor.doc.edit("touch stage", |scene| {
+        // Any mutation bumps the revision; the frame rate is unchanged, so the
+        // sound and its envelope are untouched.
+        scene.stage_mut().background = scene.stage().background;
+    });
+    let third = editor.waveforms();
+    let c = third.values().next().expect("a waveform");
+    assert!(
+        std::sync::Arc::ptr_eq(&a.levels, &c.levels),
+        "a non-sound edit must reuse the memoised envelope, not recompute it"
     );
 }
 

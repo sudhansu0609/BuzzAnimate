@@ -159,12 +159,17 @@ pub struct TimelineState {
 }
 
 /// A sound's envelope, positioned on the timeline.
+///
+/// `levels` is an `Arc` so the editor's waveform cache can hand the same
+/// envelope to the panel every frame without re-deriving or copying it — the
+/// per-frame cost this timeline used to pay from raw PCM. See
+/// `Editor::waveforms`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Waveform {
     /// The frame the sound starts on.
     pub start_frame: u32,
     /// Loudness per frame, `0.0..=1.0`.
-    pub levels: Vec<f32>,
+    pub levels: std::sync::Arc<Vec<f32>>,
 }
 
 /// Width reserved for the layer-name column.
@@ -656,8 +661,12 @@ fn ruler(
         10
     } else {
         20
-    };
-    for frame in (0..columns).step_by(step) {
+    } as u32;
+    // Only the labels in view, aligned down to the step so the numbering stays
+    // on its regular grid however far the ruler is scrolled.
+    let visible = visible_columns(ui.clip_rect(), grid_left, cell_width, columns);
+    let start = (visible.start / step) * step;
+    for frame in (start..visible.end).step_by(step as usize) {
         let x = grid_left + frame as f32 * cell_width;
         painter.text(
             egui::pos2(x + 1.0, rect.min.y + 2.0),
@@ -782,7 +791,7 @@ fn camera_row(
     let grid_left = rect.min.x + LAYER_COLUMN;
     let tint = Color32::from_rgb(0x3A, 0x4A, 0x60);
 
-    for frame in 0..columns {
+    for frame in visible_columns(ui.clip_rect(), grid_left, cell_width, columns) {
         let x = grid_left + frame as f32 * cell_width;
         let cell =
             egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(cell_width, height));
@@ -819,6 +828,26 @@ fn camera_row(
 }
 
 /// One layer's row: name on the left, frames on the right.
+/// The range of frame columns that fall inside the visible viewport.
+///
+/// The timeline grid is virtualized: a row still *allocates* its full width — so
+/// clicking, context menus and the scroll extent are exactly as before — but it
+/// only *paints* the cells the user can actually see. On a document with
+/// thousands of frames and hundreds of layers that is the difference between a
+/// few thousand shapes a frame and several million. `clip` is the visible
+/// rectangle (`ui.clip_rect()`); it is padded by a column on each side so a cell
+/// half-scrolled off an edge is not missing.
+fn visible_columns(clip: egui::Rect, grid_left: f32, cell_width: f32, columns: u32) -> std::ops::Range<u32> {
+    if cell_width <= 0.0 {
+        return 0..columns;
+    }
+    let first = ((clip.min.x - grid_left) / cell_width).floor() - 1.0;
+    let last = ((clip.max.x - grid_left) / cell_width).ceil() + 1.0;
+    let first = first.max(0.0) as u32;
+    let last = last.max(0.0) as u32;
+    first.min(columns)..last.min(columns)
+}
+
 fn layer_row(
     ui: &mut Ui,
     layer: &buzz_scene::Layer,
@@ -833,6 +862,11 @@ fn layer_row(
         egui::vec2(LAYER_COLUMN + width, height),
         Sense::click_and_drag(),
     );
+    // A row scrolled out of view is allocated (above) but not painted — the
+    // virtualization that keeps a 500-layer timeline responsive.
+    if !rect.intersects(ui.clip_rect()) {
+        return;
+    }
     let painter = ui.painter_at(rect);
 
     let active = state.active_layer == Some(layer.id);
@@ -902,7 +936,9 @@ fn layer_row(
     let grid_left = rect.min.x + LAYER_COLUMN;
     let length = layer.length();
 
-    for frame in 0..columns {
+    // Only the cells in view: see `visible_columns`.
+    let visible = visible_columns(ui.clip_rect(), grid_left, cell_width, columns);
+    for frame in visible.clone() {
         let x = grid_left + frame as f32 * cell_width;
         let cell =
             egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(cell_width, height));
@@ -924,7 +960,7 @@ fn layer_row(
     // covered by the very frames it describes.
     if let Some(waveform) = state.waveforms.get(&layer.id) {
         draw_waveform(
-            &painter, waveform, grid_left, rect, height, columns, cell_width,
+            &painter, waveform, grid_left, rect, height, &visible, cell_width,
         );
     }
 
@@ -1105,7 +1141,7 @@ fn draw_waveform(
     grid_left: f32,
     row: egui::Rect,
     height: f32,
-    columns: u32,
+    visible: &std::ops::Range<u32>,
     cell_width: f32,
 ) {
     let middle = row.center().y;
@@ -1114,8 +1150,12 @@ fn draw_waveform(
 
     for (i, level) in waveform.levels.iter().enumerate() {
         let frame = waveform.start_frame + i as u32;
-        if frame >= columns {
+        // Only the bars in view — the strip is virtualized with the cells.
+        if frame >= visible.end {
             break;
+        }
+        if frame < visible.start {
+            continue;
         }
         let x = grid_left + frame as f32 * cell_width;
         let amplitude = (level.clamp(0.0, 1.0) * half).max(0.5);
@@ -1257,6 +1297,31 @@ mod tests {
     use buzz_scene::ShapeData;
     use kurbo::Rect;
     use peniko::Color;
+
+    /// The visible-column range is the heart of the timeline's virtualization:
+    /// only cells overlapping the clip rectangle are painted, padded a column
+    /// each side. Pins plan 1.6's arithmetic.
+    #[test]
+    fn visible_columns_covers_the_clip_and_pads_by_one() {
+        let grid_left = 100.0;
+        let cell_width = 10.0;
+        let columns = 9_999;
+
+        // A clip showing content x 300..500: cells 20..40, padded to 19..41.
+        let clip = egui::Rect::from_min_max(egui::pos2(300.0, 0.0), egui::pos2(500.0, 50.0));
+        let range = visible_columns(clip, grid_left, cell_width, columns);
+        assert_eq!(range, 19..41);
+        // Far fewer than the whole grid — that is the whole point.
+        assert!(range.len() < 30);
+
+        // Clamped to the grid at both ends.
+        let far_left = egui::Rect::from_min_max(egui::pos2(-1000.0, 0.0), egui::pos2(-500.0, 1.0));
+        assert_eq!(visible_columns(far_left, grid_left, cell_width, columns).start, 0);
+        let far_right =
+            egui::Rect::from_min_max(egui::pos2(1e9, 0.0), egui::pos2(1e9 + 100.0, 1.0));
+        let r = visible_columns(far_right, grid_left, cell_width, columns);
+        assert!(r.start <= columns && r.end <= columns);
+    }
 
     fn scene_with_frames() -> Scene {
         let mut scene = Scene::default();

@@ -42,7 +42,7 @@
 //! same trick `buzz_render::lighting::LightCache` plays on objects, and it is
 //! sound for the same reason.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use buzz_geom::{Camera, Rect, Size};
 use buzz_scene::{Scene, SymbolId};
@@ -59,6 +59,13 @@ pub const SIZE: u32 = 96;
 /// three hundred would be a stutter.
 const PER_FRAME: usize = 4;
 
+/// Most pictures kept at once. A library can hold tens of thousands of symbols,
+/// but only a screen's worth is ever on show; past this the least-recently-asked
+/// pictures are dropped and their textures freed, so a huge library does not sit
+/// on hundreds of megabytes of VRAM and descriptors for symbols nobody is
+/// looking at. Redrawing one that scrolls back into view is a single cheap pass.
+const MAX_ENTRIES: usize = 512;
+
 /// Margin around the artwork, as the multiplier `Camera::fit_to_rect` takes.
 /// A little air, so shapes that run to their own edge do not touch the frame.
 const MARGIN: f64 = 1.15;
@@ -74,6 +81,9 @@ struct Entry {
     #[allow(dead_code, reason = "kept alive for egui to sample")]
     view: buzz_render::wgpu::TextureView,
     id: egui::TextureId,
+    /// The tick this picture was last asked for, for least-recently-used
+    /// eviction once the cache is full.
+    used: u64,
 }
 
 /// Pictures of symbols, drawn once and kept until the symbol changes.
@@ -81,8 +91,19 @@ struct Entry {
 pub struct Thumbnails {
     entries: HashMap<SymbolId, Entry>,
     /// What the panels asked for while the frame was being built, in the order
-    /// they asked. Drained after the UI, when the GPU is reachable.
+    /// they asked. The front [`PER_FRAME`] are drawn each frame; the rest stay
+    /// queued rather than being thrown away and re-asked, which on a large
+    /// library was pure churn proportional to its size.
     wanted: Vec<SymbolId>,
+    /// The set of everything in `wanted`, so [`Self::get`] can dedupe a request
+    /// in O(1) rather than scanning the queue — the difference between O(n) and
+    /// O(n²) per frame across a library's worth of rows.
+    requested: HashSet<SymbolId>,
+    /// egui texture ids of dropped pictures, freed in [`Self::fulfil`] where the
+    /// renderer is reachable.
+    retired: Vec<egui::TextureId>,
+    /// A monotonic frame counter, for the LRU stamp.
+    tick: u64,
 }
 
 impl Thumbnails {
@@ -94,12 +115,18 @@ impl Thumbnails {
     /// already holding the scene mutably, and two borrows of it would not
     /// compile.
     pub fn invalidate_stale(&mut self, scene: &Scene) {
+        let retired = &mut self.retired;
         self.entries.retain(|id, entry| {
-            scene
+            let fresh = scene
                 .library()
                 .get(*id)
                 // Still the same allocation, so still the same artwork.
-                .is_some_and(|current| std::sync::Arc::ptr_eq(current, &entry.symbol))
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, &entry.symbol));
+            if !fresh {
+                // Free the texture egui was sampling for the stale picture.
+                retired.push(entry.id);
+            }
+            fresh
         });
     }
 
@@ -108,10 +135,14 @@ impl Thumbnails {
     ///
     /// Called from panel code, which has no GPU: asking is all it can do.
     pub fn get(&mut self, symbol: SymbolId) -> Option<egui::TextureId> {
-        if let Some(entry) = self.entries.get(&symbol) {
+        let tick = self.tick;
+        if let Some(entry) = self.entries.get_mut(&symbol) {
+            entry.used = tick;
             return Some(entry.id);
         }
-        if !self.wanted.contains(&symbol) {
+        // `insert` returns false when already queued, so a symbol asked for by a
+        // dozen rows this frame is enqueued once — O(1), not a queue scan.
+        if self.requested.insert(symbol) {
             self.wanted.push(symbol);
         }
         None
@@ -135,16 +166,54 @@ impl Thumbnails {
         scene: &Scene,
         cache: &mut buzz_render::document::DrawCache,
     ) {
-        let wanted: Vec<SymbolId> = self.wanted.drain(..).take(PER_FRAME).collect();
-        for symbol in wanted {
+        self.tick += 1;
+
+        // Free the textures of pictures dropped since last frame (stale ones,
+        // and any the LRU evicted), now that the renderer is reachable.
+        for id in self.retired.drain(..) {
+            egui_renderer.free_texture(&id);
+        }
+
+        // Take the front of the queue only; the rest stay queued for the next
+        // frame rather than being dropped and re-asked.
+        let count = PER_FRAME.min(self.wanted.len());
+        let batch: Vec<SymbolId> = self.wanted.drain(..count).collect();
+        for symbol in &batch {
+            self.requested.remove(symbol);
+        }
+        for symbol in batch {
             // Gone since it was asked for — a symbol deleted while the panel
             // was being drawn is not an error, it is just nothing to draw.
             let Some(arc) = scene.library().get(symbol).cloned() else {
-                self.entries.remove(&symbol);
+                if let Some(entry) = self.entries.remove(&symbol) {
+                    egui_renderer.free_texture(&entry.id);
+                }
                 continue;
             };
             if let Some(entry) = self.draw(gpu, egui_renderer, vello, scene, symbol, arc, cache) {
                 self.entries.insert(symbol, entry);
+            }
+        }
+
+        // Cap the cache: drop the least-recently-asked-for pictures past the
+        // limit and queue their textures to be freed next frame.
+        self.evict_over_cap();
+    }
+
+    /// Drop the least-recently-used pictures once the cache exceeds
+    /// [`MAX_ENTRIES`], retiring their textures.
+    fn evict_over_cap(&mut self) {
+        if self.entries.len() <= MAX_ENTRIES {
+            return;
+        }
+        let mut by_use: Vec<(SymbolId, u64)> =
+            self.entries.iter().map(|(id, e)| (*id, e.used)).collect();
+        // Oldest first.
+        by_use.sort_by_key(|(_, used)| *used);
+        let excess = self.entries.len() - MAX_ENTRIES;
+        for (id, _) in by_use.into_iter().take(excess) {
+            if let Some(entry) = self.entries.remove(&id) {
+                self.retired.push(entry.id);
             }
         }
     }
@@ -153,8 +222,14 @@ impl Thumbnails {
     /// the last film cannot be shown for symbols in this one that happen to
     /// have been given the same ids.
     pub fn clear(&mut self) {
+        // Queue every live texture to be freed next frame, so replacing the
+        // document does not leak the last one's pictures.
+        for entry in self.entries.values() {
+            self.retired.push(entry.id);
+        }
         self.entries.clear();
         self.wanted.clear();
+        self.requested.clear();
     }
 
     #[allow(clippy::too_many_arguments, reason = "one call site, in the render path")]
@@ -217,6 +292,7 @@ impl Thumbnails {
             texture,
             view,
             id,
+            used: self.tick,
         })
     }
 }
@@ -246,6 +322,37 @@ mod tests {
 
     fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Rect {
         Rect::new(x0, y0, x1, y1)
+    }
+
+    /// A symbol asked for many times a frame — as a dozen rows referencing the
+    /// same instance would — is queued exactly once, in O(1). This is the fix
+    /// for the O(n²)-per-frame `Vec::contains` (plan 1.7).
+    #[test]
+    fn a_repeated_request_is_queued_once() {
+        let mut thumbs = Thumbnails::default();
+        assert!(!thumbs.pending());
+
+        assert!(thumbs.get(SymbolId(1)).is_none());
+        assert!(thumbs.get(SymbolId(1)).is_none());
+        assert!(thumbs.get(SymbolId(1)).is_none());
+        assert_eq!(thumbs.wanted, vec![SymbolId(1)], "queued once, not thrice");
+
+        assert!(thumbs.get(SymbolId(2)).is_none());
+        assert_eq!(thumbs.wanted, vec![SymbolId(1), SymbolId(2)]);
+        assert!(thumbs.pending());
+    }
+
+    /// Clearing queues every live picture's texture to be freed, and empties the
+    /// request state — so replacing the document leaks nothing.
+    #[test]
+    fn clearing_retires_textures_and_empties_the_queue() {
+        let mut thumbs = Thumbnails::default();
+        thumbs.get(SymbolId(1));
+        thumbs.get(SymbolId(2));
+        thumbs.clear();
+        assert!(thumbs.wanted.is_empty());
+        assert!(thumbs.requested.is_empty());
+        assert!(!thumbs.pending());
     }
 
     /// Whatever the artwork's shape, the whole of it lands inside the box.

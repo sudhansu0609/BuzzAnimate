@@ -288,6 +288,93 @@ enum Loaded {
         target: Option<buzz_scene::ImportTarget>,
         result: Result<Box<crate::import::Imported>, String>,
     },
+    /// A finished merge, built off the UI thread.
+    ///
+    /// `Scene::merge` deep-copies every incoming symbol, layer and object, which
+    /// on a large `.fla` is a real cost. Doing it on the frame that collected the
+    /// read froze the window for as long as the merge took — the very thing the
+    /// background read was meant to prevent. So the merge runs on its own thread
+    /// against a snapshot, and only the finished scene is committed here, as one
+    /// undo step. The document is briefly read-only while it runs; see
+    /// [`App::doc_available`].
+    Merged {
+        path: std::path::PathBuf,
+        scene: Box<buzz_scene::Scene>,
+        report: buzz_scene::MergeReport,
+        unsupported: Vec<String>,
+        summary: String,
+    },
+}
+
+/// Symbol use counts for the Library panel, kept current off the UI thread.
+///
+/// Counting instances means walking every object in the document — every stage
+/// layer and every symbol's timeline — which on a large imported file is a
+/// per-frame cost the window cannot afford. So the walk runs on the background
+/// pool against a (cheap) scene snapshot, and the panel draws the last counts it
+/// has until fresher ones arrive. Counts one revision stale are invisible for a
+/// use column; the cache converges as the pool catches up.
+#[derive(Default)]
+struct UsageCache {
+    /// The document revision `counts` were computed for.
+    revision: Option<u64>,
+    counts: std::collections::BTreeMap<buzz_scene::SymbolId, usize>,
+    /// A recompute in flight: the revision it is for, and where it will land.
+    #[allow(clippy::type_complexity)]
+    in_flight: Option<(
+        u64,
+        crossbeam_channel::Receiver<std::collections::BTreeMap<buzz_scene::SymbolId, usize>>,
+    )>,
+}
+
+impl UsageCache {
+    /// The counts to show right now — the freshest that have finished.
+    fn counts(&self) -> &std::collections::BTreeMap<buzz_scene::SymbolId, usize> {
+        &self.counts
+    }
+
+    /// Should a recompute be started for `revision`? Only when the current
+    /// counts are for a different revision and nothing is already computing.
+    fn should_spawn(&self, revision: u64) -> bool {
+        self.revision != Some(revision) && self.in_flight.is_none()
+    }
+
+    /// Record that a recompute for `revision` was started.
+    fn spawned(
+        &mut self,
+        revision: u64,
+        rx: crossbeam_channel::Receiver<std::collections::BTreeMap<buzz_scene::SymbolId, usize>>,
+    ) {
+        self.in_flight = Some((revision, rx));
+    }
+
+    /// Install `counts` computed for `revision`, unless newer counts already
+    /// exist — a result that finished after the document moved past it is
+    /// dropped rather than allowed to overwrite fresher data.
+    fn install(
+        &mut self,
+        revision: u64,
+        counts: std::collections::BTreeMap<buzz_scene::SymbolId, usize>,
+    ) -> bool {
+        if self.revision.is_some_and(|current| current >= revision) {
+            return false;
+        }
+        self.counts = counts;
+        self.revision = Some(revision);
+        true
+    }
+
+    /// Drain a finished recompute, if any, installing its result.
+    fn poll(&mut self) {
+        let Some((revision, rx)) = &self.in_flight else {
+            return;
+        };
+        if let Ok(counts) = rx.try_recv() {
+            let revision = *revision;
+            self.in_flight = None;
+            self.install(revision, counts);
+        }
+    }
 }
 
 /// A script in flight: the task running it, and where its result will arrive.
@@ -324,6 +411,10 @@ pub struct App {
     last_crash_revision: Option<u64>,
     /// An Animate asset import running on its own thread.
     animate_import: Option<crossbeam_channel::Receiver<crate::animate_assets::Progress>>,
+    /// A background merge is in flight, so the document is briefly read-only.
+    /// Set while an imported file's artwork is being merged off the UI thread,
+    /// cleared when the finished scene is committed.
+    merging: bool,
     /// Pictures of the library's symbols, drawn on the window's own device.
     ///
     /// On `App` rather than `Editor` because it owns GPU resources, and the
@@ -341,6 +432,19 @@ pub struct App {
     /// keying keeps the cache warm through ordinary edits, so this path fires
     /// only when it is genuinely cold. Closes §7-154 and §7-155.
     shade_build: Option<crossbeam_channel::Receiver<Vec<buzz_render::lighting::Built>>>,
+    /// Sounds being decoded off the UI thread, and where the results land.
+    ///
+    /// `Scene::merge` can bring in a whole soundtrack at once; decoding it inline
+    /// on the frame the window first sees it froze for as long as the audio was
+    /// long. The decode is fanned out across the interactive pool instead — the
+    /// same pattern as `shade_build` — and installed when it returns. See
+    /// [`crate::sound::SoundBank::take_undecoded`].
+    #[allow(clippy::type_complexity)]
+    sound_decode: Option<
+        crossbeam_channel::Receiver<Vec<(buzz_scene::SoundId, Result<buzz_audio::Clip, String>)>>,
+    >,
+    /// Symbol use counts for the Library panel, computed off the UI thread.
+    usage_cache: UsageCache,
     /// A script running on a thread, if one is, and where its result lands.
     ///
     /// A script is a transaction over the document: while it runs the window
@@ -401,8 +505,11 @@ impl App {
             recovery: buzz_ui::RecoveryState::default(),
             last_crash_revision: None,
             animate_import: None,
+            merging: false,
             thumbnails: crate::thumbnails::Thumbnails::default(),
             shade_build: None,
+            sound_decode: None,
+            usage_cache: UsageCache::default(),
             scripting: None,
             loading: std::collections::HashMap::new(),
             picker: crate::dialogs::Pending::default(),
@@ -818,13 +925,15 @@ impl App {
         let can_redo = self.editor.doc.can_redo();
         let ctx = ui.ctx().clone();
 
-        // Decode any sound the document has gained — on open, on import, on
-        // undo. `refresh` compares the document's revision and does nothing
-        // when nothing has changed, so this costs a comparison per frame and
-        // means a document that *has* sound shows its waveform and can be
-        // played without first being asked to.
+        // Keep the sound cues current with the document, and decode any newly
+        // gained audio **off the UI thread**. `refresh_cues` only rebuilds cues
+        // from clips already decoded — a revision compare when nothing changed —
+        // so a large import's soundtrack never decodes on this frame; the
+        // background decode below picks it up and installs it a frame or two
+        // later. See `SoundBank::refresh_cues`.
         let scene = self.editor.doc.scene().clone();
-        self.editor.sound.refresh(&scene);
+        self.editor.sound.refresh_cues(&scene);
+        self.drive_sound_decode(&scene);
         // The File menu lists templates by name; gathered before the menu is
         // built, because the menu cannot borrow the editor while it draws.
         let template_names: Vec<String> = self
@@ -1057,11 +1166,11 @@ impl App {
                     self.editor.camera.viewport =
                         Size::new(area.width() as f64, area.height() as f64);
 
-                    // Not while a script is running: the document is its for
-                    // the duration, and a brush stroke landing in the middle of
-                    // a script rewriting the same artwork is exactly the race
-                    // the overlay exists to prevent.
-                    if self.scripting.is_none() {
+                    // Not while a script is running or an import is being
+                    // merged: the document is spoken for, and a brush stroke
+                    // landing in the middle would race the artwork being
+                    // rewritten under it.
+                    if self.doc_available() {
                         self.handle_stage_input(ui, area);
                     }
                     let response = stage::draw_chrome(ui, &self.editor, area);
@@ -1104,10 +1213,11 @@ impl App {
         }
 
         commands.extend(keyboard_commands(&ctx, &self.editor));
-        // While a script owns the document, nothing else may touch it —
-        // keyboard shortcuts included, which the modal backdrop does not catch.
-        // The one thing still live is the overlay's own Stop button.
-        if self.scripting.is_none() {
+        // While a script owns the document — or an import is being merged —
+        // nothing else may touch it, keyboard shortcuts included, which the
+        // modal backdrop does not catch. The one thing still live is the
+        // overlay's own Stop button.
+        if self.doc_available() {
             for command in commands {
                 self.dispatch(command);
             }
@@ -1300,12 +1410,26 @@ impl App {
             Sound => self.sound_panel(ui),
 
             Library => {
+                // Use counts come from the background cache, never a per-frame
+                // walk of the whole document.
+                let revision = self.editor.doc.scene().revision();
+                self.usage_cache.poll();
+                if self.usage_cache.should_spawn(revision) {
+                    let scene = self.editor.doc.scene().clone();
+                    let (send, receive) = crossbeam_channel::bounded(1);
+                    self.jobs.spawn(Pool::Background, move || {
+                        let _ = send.send(scene.symbol_usage());
+                    });
+                    self.usage_cache.spawned(revision, receive);
+                }
+
                 let editor = &mut self.editor;
                 let library = &mut editor.library;
                 let thumbnails = &mut self.thumbnails;
+                let usage = self.usage_cache.counts();
                 let mut raised = None;
                 editor.doc.edit("Library", |scene| {
-                    raised = buzz_ui::library_panel(ui, scene, library, &mut |id| {
+                    raised = buzz_ui::library_panel(ui, scene, library, usage, &mut |id| {
                         thumbnails.get(id)
                     });
                 });
@@ -2953,6 +3077,52 @@ impl App {
         true
     }
 
+    /// Start decoding the document's undecoded sounds off the UI thread, if any
+    /// and none is already in flight.
+    ///
+    /// The same fan-out as the shading build: a plain thread parks on the
+    /// interactive pool so the decode runs on every core there and never on the
+    /// UI thread, and the result is installed at the top of a later frame.
+    fn drive_sound_decode(&mut self, scene: &buzz_scene::Scene) {
+        if self.sound_decode.is_some() {
+            return;
+        }
+        let batch = self.editor.sound.take_undecoded(scene);
+        if batch.is_empty() {
+            return;
+        }
+        let jobs = std::sync::Arc::clone(&self.jobs);
+        let (send, receive) = crossbeam_channel::bounded(1);
+        std::thread::Builder::new()
+            .name("buzz-sound-decode".into())
+            .spawn(move || {
+                let results = jobs.run(Pool::Interactive, || {
+                    use rayon::prelude::*;
+                    batch
+                        .par_iter()
+                        .map(crate::sound::decode_undecoded)
+                        .collect::<Vec<_>>()
+                });
+                let _ = send.send(results);
+            })
+            .ok();
+        self.sound_decode = Some(receive);
+        if let Some(active) = &self.active {
+            active.window.request_redraw();
+        }
+    }
+
+    /// Is the document free to be edited right now?
+    ///
+    /// False while a script owns it, and false during the brief window a large
+    /// import is being merged off-thread — in both cases an edit landing in the
+    /// middle would race the wholesale scene the background work is about to
+    /// commit. Reading a file does *not* lock the document: the window stays
+    /// fully usable while a file is being read.
+    fn doc_available(&self) -> bool {
+        self.scripting.is_none() && !self.merging
+    }
+
     /// Read a file on a thread, and remember where the answer will arrive.
     ///
     /// Cancel discards the result rather than stopping the parse: the
@@ -3023,6 +3193,13 @@ impl App {
                     self.editor.status = Some(format!("Could not import: {message}"));
                 }
             },
+            Loaded::Merged {
+                path,
+                scene,
+                report,
+                unsupported,
+                summary,
+            } => self.finish_merge(path, *scene, report, unsupported, summary),
         }
     }
 
@@ -3092,6 +3269,9 @@ impl App {
         match kind {
             crate::tasks::TaskKind::Open | crate::tasks::TaskKind::Import => {
                 self.loading.remove(&id);
+                // If this was the merge step, the document is editable again.
+                // Harmless when it was only a read: `merging` was already false.
+                self.merging = false;
             }
             crate::tasks::TaskKind::Script => {
                 // Only reached if the script *thread* fell over — a real Stop
@@ -3756,56 +3936,89 @@ impl App {
         });
     }
 
-    /// A foreign file finished reading and is to be merged in.
+    /// A foreign file finished reading. Merge it **off the UI thread**.
     ///
-    /// The whole merge is one [`Document::edit`], so a file that brings in four
-    /// hundred symbols is still a single Ctrl+Z.
+    /// `Scene::merge` deep-copies every incoming symbol, layer and object, so on
+    /// a large `.fla` it is slow — and doing it here, on the frame that collected
+    /// the read, froze the window for its whole duration. Instead the merge runs
+    /// on a thread against a copy-on-write snapshot, and the finished scene is
+    /// committed in [`Self::finish_merge`] as one undo step. The document is
+    /// read-only for the short span the merge takes — see [`Self::doc_available`]
+    /// — because an edit landing mid-merge would be lost to the wholesale scene
+    /// about to replace it.
     fn finish_import(
         &mut self,
         target: buzz_scene::ImportTarget,
         path: std::path::PathBuf,
         imported: crate::import::Imported,
     ) {
-        let label = match target {
-            buzz_scene::ImportTarget::Stage => "Import to Stage",
-            buzz_scene::ImportTarget::Library => "Import to Library",
-            // Not reachable from an import — pasting is `Editor::paste_clipboard`
-            // — but a match that guesses would be worse than one that says so.
-            buzz_scene::ImportTarget::Onto { .. } => "Paste",
-        };
+        // A pointer copy of the tree, not a copy of the artwork.
+        let snapshot = self.editor.doc.scene().clone();
+        let name = file_name(&path);
+        self.merging = true;
+        self.editor.status = Some(format!("Merging {name}…"));
 
-        let mut merge = None;
-        self.editor.doc.edit(label, |scene| {
-            merge = Some(scene.merge(&imported.scene, target));
+        self.start_load(
+            crate::tasks::TaskKind::Import,
+            format!("Merging {name}"),
+            move |ctx| {
+                ctx.progress.detail(format!("Merging {name}"));
+                let mut scene = snapshot;
+                let report = scene.merge(&imported.scene, target);
+                Loaded::Merged {
+                    path,
+                    scene: Box::new(scene),
+                    report,
+                    unsupported: imported.unsupported.clone(),
+                    summary: imported.summary.clone(),
+                }
+            },
+        );
+    }
+
+    /// Commit a merge that finished on a background thread.
+    fn finish_merge(
+        &mut self,
+        path: std::path::PathBuf,
+        scene: buzz_scene::Scene,
+        report: buzz_scene::MergeReport,
+        imported_unsupported: Vec<String>,
+        imported_summary: String,
+    ) {
+        self.merging = false;
+
+        // One undo step: the whole import is a single Ctrl+Z, exactly as before,
+        // but the work that built the new scene happened off-thread. Taken
+        // through an `Option` so the closure can move the owned scene in even
+        // though `edit` takes an `FnMut`.
+        let mut scene = Some(scene);
+        self.editor.doc.edit("Import", |live| {
+            if let Some(merged) = scene.take() {
+                *live = merged;
+            }
         });
-        let merge = merge.unwrap_or_default();
 
-        // An import can change how many frames the document has and which
-        // layers exist, so the editor's idea of both has to be re-settled.
+        // An import can change how many frames the document has and which layers
+        // exist, so the editor's idea of both has to be re-settled.
         self.editor.selection.clear();
         self.editor
             .selection
             .ensure_active_layer(self.editor.doc.scene());
 
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.display().to_string());
-
-        self.editor.status = Some(format!("Imported {name}: {}", merge.summary()));
+        let name = file_name(&path);
+        self.editor.status = Some(format!("Imported {name}: {}", report.summary()));
 
         // Only interrupt the user when something was actually lost or moved.
-        // A clean import speaks for itself in the status bar.
-        if !imported.unsupported.is_empty() || !merge.renamed.is_empty() {
-            let mut unsupported = imported.unsupported.clone();
-            for (wanted, given) in &merge.renamed {
+        if !imported_unsupported.is_empty() || !report.renamed.is_empty() {
+            let mut unsupported = imported_unsupported;
+            for (wanted, given) in &report.renamed {
                 unsupported.push(format!(
                     "\"{wanted}\" was already in the library, so it came in as \"{given}\""
                 ));
             }
             self.editor.import_summary = Some(crate::import::ImportSummary {
                 title: format!("Imported {name}"),
-                what_arrived: format!("{} — {}", imported.summary, merge.summary()),
+                what_arrived: format!("{imported_summary} — {}", report.summary()),
                 unsupported,
                 failed: false,
             });
@@ -4207,6 +4420,17 @@ impl App {
         {
             self.lights.lights.install(built);
             self.shade_build = None;
+            active.window.request_redraw();
+        }
+
+        // Sounds that finished decoding off-thread install here, so the timeline
+        // gains their waveforms and the player their cues on the next frame.
+        if let Some(rx) = &self.sound_decode
+            && let Ok(results) = rx.try_recv()
+        {
+            let scene = self.editor.doc.scene().clone();
+            self.editor.sound.install_decoded(results, &scene);
+            self.sound_decode = None;
             active.window.request_redraw();
         }
 
@@ -4931,6 +5155,40 @@ mod tests {
         let big = icon_from_png(include_bytes!("../../../assets/logo-128.png"));
         assert!(small.is_some(), "the title bar icon did not decode");
         assert!(big.is_some(), "the taskbar icon did not decode");
+    }
+}
+
+#[cfg(test)]
+mod usage_cache_tests {
+    use super::UsageCache;
+    use buzz_scene::SymbolId;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_recompute_is_scheduled_only_when_stale() {
+        let mut cache = UsageCache::default();
+        assert!(cache.should_spawn(1), "a cold cache is stale");
+        cache.install(1, BTreeMap::new());
+        assert!(!cache.should_spawn(1), "already current for revision 1");
+        assert!(cache.should_spawn(2), "a new revision is stale");
+    }
+
+    #[test]
+    fn a_stale_result_does_not_overwrite_fresher_counts() {
+        let mut cache = UsageCache::default();
+        let mut counts5 = BTreeMap::new();
+        counts5.insert(SymbolId(1), 5);
+        assert!(cache.install(5, counts5), "the first counts install");
+
+        // A recompute that finished for an older revision must be dropped.
+        let mut counts3 = BTreeMap::new();
+        counts3.insert(SymbolId(1), 3);
+        assert!(!cache.install(3, counts3), "revision 3 is older than 5");
+        assert_eq!(
+            cache.counts().get(&SymbolId(1)),
+            Some(&5),
+            "the fresher counts must survive"
+        );
     }
 }
 

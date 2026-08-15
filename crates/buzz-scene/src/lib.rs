@@ -25,6 +25,7 @@
 //! [`SpatialIndex`] records the revision it was built from, so a consumer can
 //! tell whether what it holds is current instead of trusting it blindly.
 
+pub mod bucket;
 pub mod camera_track;
 pub mod gradient;
 pub mod image;
@@ -51,6 +52,7 @@ use serde::{Deserialize, Serialize};
 
 pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, Quality};
 pub use buzz_light::{Light, LightId, LightKey, LightKind, LightRig, LightTrack};
+pub use bucket::{Boundary, GapSize, fill_region};
 pub use camera_track::{CameraKey, CameraTrack, MAX_TILT, NamedAngle};
 pub use gradient::{
     Gradient, GradientHandles, GradientKind, GradientSpread, GradientStop, MAX_STOPS, lerp_color,
@@ -1048,6 +1050,25 @@ impl Scene {
         self.add_shape_at(layer, 0, shape)
     }
 
+    /// Place a shape **behind** everything else on the frame — for a paint-bucket
+    /// fill, which belongs under the lines it was poured between.
+    pub fn add_shape_behind_at(
+        &mut self,
+        layer: LayerId,
+        frame: u32,
+        shape: ShapeData,
+    ) -> Option<ObjectId> {
+        let id = ObjectId(self.ids.take());
+        let object = Arc::new(Object::shape(id, shape));
+        let mut placed = false;
+        self.active_layers_mut()
+            .update(layer, |l| placed = l.frames.insert_object_behind(frame, object));
+        placed.then(|| {
+            self.bump();
+            id
+        })
+    }
+
     /// Place an already-built object on a layer at `frame`.
     pub fn add_object_at(
         &mut self,
@@ -1607,6 +1628,54 @@ mod tests {
             );
         }
         (scene, layer)
+    }
+
+    /// Cloning a scene must be a pointer copy of the library, and editing one
+    /// symbol must change **only that symbol's** `Arc` address — the invariant
+    /// the thumbnail and lighting caches key on. This is the correctness pin for
+    /// the Arc-wrapped library maps (plan item 1.5).
+    #[test]
+    fn editing_one_symbol_leaves_the_others_pointer_identical() {
+        let mut scene = Scene::default();
+        let a = scene.add_symbol("a", SymbolKind::Graphic, None);
+        let b = scene.add_symbol("b", SymbolKind::Graphic, None);
+        let c = scene.add_symbol("c", SymbolKind::Graphic, None);
+
+        // A snapshot, exactly as Document::edit takes for undo.
+        let snapshot = scene.clone();
+        let ptr = |s: &Scene, id: SymbolId| Arc::as_ptr(s.library().get(id).unwrap());
+
+        // Edit only b.
+        scene.library_mut().update(b, |s| s.name = "renamed".into());
+
+        // b's address changed; a and c did not, in either the live scene or the
+        // snapshot — the snapshot is entirely untouched.
+        assert_ne!(ptr(&scene, b), ptr(&snapshot, b), "b should have forked");
+        assert_eq!(ptr(&scene, a), ptr(&snapshot, a), "a must not fork");
+        assert_eq!(ptr(&scene, c), ptr(&snapshot, c), "c must not fork");
+        assert_eq!(snapshot.library().get(b).unwrap().name, "b", "undo intact");
+    }
+
+    /// Cloning a big library is cheap — a handful of pointer copies, not one
+    /// allocation per symbol. Guards against a regression to inline maps.
+    #[test]
+    fn cloning_a_large_library_is_cheap() {
+        let mut scene = Scene::default();
+        for i in 0..5_000 {
+            scene.add_symbol(format!("sym{i}"), SymbolKind::Graphic, None);
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            let c = scene.clone();
+            std::hint::black_box(&c);
+        }
+        let per = start.elapsed() / 100;
+        // Generous even for a debug build: an inline BTreeMap clone of 5k
+        // symbols is milliseconds; a pointer copy is sub-microsecond.
+        assert!(
+            per < std::time::Duration::from_micros(200),
+            "cloning a 5k-symbol scene took {per:?} — the library is not pointer-shared"
+        );
     }
 
     #[test]

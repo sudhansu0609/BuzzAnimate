@@ -376,9 +376,12 @@ impl ImageFill {
 }
 
 /// Every bitmap a document holds.
+/// The map is behind an `Arc` so cloning the library is a pointer copy, not one
+/// tree node per bitmap; see [`crate::Library`] for the rationale. Mutation
+/// forks the map once via [`Arc::make_mut`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImageLibrary {
-    images: std::collections::BTreeMap<ImageId, Arc<ImageAsset>>,
+    images: Arc<std::collections::BTreeMap<ImageId, Arc<ImageAsset>>>,
 }
 
 impl ImageLibrary {
@@ -400,12 +403,12 @@ impl ImageLibrary {
 
     pub fn insert(&mut self, asset: ImageAsset) -> Arc<ImageAsset> {
         let asset = Arc::new(asset);
-        self.images.insert(asset.id, Arc::clone(&asset));
+        Arc::make_mut(&mut self.images).insert(asset.id, Arc::clone(&asset));
         asset
     }
 
     pub fn remove(&mut self, id: ImageId) -> Option<Arc<ImageAsset>> {
-        self.images.remove(&id)
+        Arc::make_mut(&mut self.images).remove(&id)
     }
 
     /// A name no existing bitmap has, so the Library stays readable.

@@ -23,6 +23,7 @@ pub mod analysis;
 pub mod player;
 
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 
@@ -30,7 +31,10 @@ pub use analysis::{LipSyncOptions, Viseme, VisemeTrack, analyse_visemes};
 pub use player::{Player, PlayerState};
 
 /// Decoded audio, ready to play, draw and analyse.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `PartialEq` is hand-written to ignore [`Self::mono_cache`], which is a
+/// memoised derivation of `samples` and so never changes what a clip *is*.
+#[derive(Debug, Clone)]
 pub struct Clip {
     /// Name for the library, taken from the file.
     pub name: String,
@@ -38,6 +42,23 @@ pub struct Clip {
     pub channels: u16,
     /// Interleaved samples, `-1.0..=1.0`.
     pub samples: Vec<f32>,
+    /// The mono mix-down, built once and shared.
+    ///
+    /// Every waveform level, every peak bucket and every lip-sync pass wants the
+    /// samples as one channel; without this each call cloned the whole buffer —
+    /// tens of megabytes for a few minutes of stereo, per call, per frame. Built
+    /// lazily by [`Self::mono`] and handed out as an `Arc`, so it is computed at
+    /// most once ever and every later reader gets a pointer copy.
+    mono_cache: OnceLock<Arc<Vec<f32>>>,
+}
+
+impl PartialEq for Clip {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.sample_rate == other.sample_rate
+            && self.channels == other.channels
+            && self.samples == other.samples
+    }
 }
 
 impl Clip {
@@ -184,6 +205,7 @@ impl Clip {
             sample_rate,
             channels,
             samples,
+            mono_cache: OnceLock::new(),
         })
     }
 
@@ -209,15 +231,24 @@ impl Clip {
     }
 
     /// One channel, averaged — what analysis and the waveform both want.
-    pub fn mono(&self) -> Vec<f32> {
-        let channels = self.channels.max(1) as usize;
-        if channels == 1 {
-            return self.samples.clone();
-        }
-        self.samples
-            .chunks(channels)
-            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-            .collect()
+    ///
+    /// Built once and shared: the first caller pays the mix-down, every later
+    /// one gets a pointer copy of the same `Arc`. See [`Self::mono_cache`].
+    pub fn mono(&self) -> Arc<Vec<f32>> {
+        self.mono_cache
+            .get_or_init(|| {
+                let channels = self.channels.max(1) as usize;
+                let mono = if channels == 1 {
+                    self.samples.clone()
+                } else {
+                    self.samples
+                        .chunks(channels)
+                        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                        .collect()
+                };
+                Arc::new(mono)
+            })
+            .clone()
     }
 
     /// Minimum and maximum per bucket, for drawing a waveform.
@@ -368,7 +399,9 @@ mod tests {
     #[test]
     fn stereo_mixes_down_to_mono_by_averaging() {
         let clip = Clip::new("x", 8_000, 2, vec![1.0, -1.0, 0.5, 0.5]).expect("clip");
-        assert_eq!(clip.mono(), vec![0.0, 0.5]);
+        assert_eq!(*clip.mono(), vec![0.0, 0.5]);
+        // The mix-down is memoised, so a second call is the same allocation.
+        assert!(Arc::ptr_eq(&clip.mono(), &clip.mono()));
         assert_eq!(clip.len(), 2, "two sample frames, not four samples");
     }
 

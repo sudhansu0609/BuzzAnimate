@@ -395,10 +395,23 @@ impl Symbol {
 /// Folders are stored as paths on the symbols themselves plus an explicit
 /// folder set, so an empty folder survives — Animate lets you make a folder
 /// before putting anything in it, and losing it on save would be surprising.
+/// # Why the maps are behind `Arc`
+///
+/// Cloning a [`crate::Scene`] happens constantly — every `Document::edit`
+/// snapshots for undo, and several panels wrap their draw in an `edit` each
+/// frame. If `symbols` were an inline `BTreeMap`, each of those clones would
+/// allocate one tree node per symbol; on an imported document with thousands of
+/// symbols that is a per-frame cost large enough to freeze the window. Behind an
+/// `Arc`, cloning the `Library` is a pointer copy, and the tree is forked once —
+/// via [`Arc::make_mut`] — only when it is actually mutated, exactly as
+/// [`crate::LayerStack`] does. **Editing one symbol still changes only that
+/// symbol's `Arc` address** (the inner `Arc<Symbol>` values are pointer-copied
+/// when the map forks), so the pointer-identity caches keyed on it — thumbnails,
+/// the lighting and filter caches — stay correct.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Library {
-    symbols: BTreeMap<SymbolId, Arc<Symbol>>,
-    folders: BTreeSet<String>,
+    symbols: Arc<BTreeMap<SymbolId, Arc<Symbol>>>,
+    folders: Arc<BTreeSet<String>>,
 }
 
 impl Library {
@@ -430,17 +443,17 @@ impl Library {
         {
             self.add_folder(folder);
         }
-        self.symbols.insert(id, Arc::new(symbol));
+        Arc::make_mut(&mut self.symbols).insert(id, Arc::new(symbol));
         id
     }
 
     pub fn remove(&mut self, id: SymbolId) -> Option<Arc<Symbol>> {
-        self.symbols.remove(&id)
+        Arc::make_mut(&mut self.symbols).remove(&id)
     }
 
     /// Edit a symbol in place, cloning only if another snapshot shares it.
     pub fn update(&mut self, id: SymbolId, f: impl FnOnce(&mut Symbol)) -> bool {
-        match self.symbols.get_mut(&id) {
+        match Arc::make_mut(&mut self.symbols).get_mut(&id) {
             Some(slot) => {
                 f(Arc::make_mut(slot));
                 true
@@ -456,7 +469,7 @@ impl Library {
     /// a symbol's layer stack in place of the document's, and every existing
     /// tool edits the symbol without needing to know.
     pub fn layers_mut(&mut self, id: SymbolId) -> Option<&mut LayerStack> {
-        self.symbols
+        Arc::make_mut(&mut self.symbols)
             .get_mut(&id)
             .map(|s| &mut Arc::make_mut(s).layers)
     }
@@ -495,7 +508,7 @@ impl Library {
                 accumulated.push('/');
             }
             accumulated.push_str(part);
-            self.folders.insert(accumulated.clone());
+            Arc::make_mut(&mut self.folders).insert(accumulated.clone());
         }
     }
 
@@ -505,8 +518,7 @@ impl Library {
     /// Animate keeps the contents.
     pub fn remove_folder(&mut self, path: &str) {
         let prefix = format!("{path}/");
-        self.folders
-            .retain(|f| f != path && !f.starts_with(&prefix));
+        Arc::make_mut(&mut self.folders).retain(|f| f != path && !f.starts_with(&prefix));
 
         let affected: Vec<SymbolId> = self
             .symbols

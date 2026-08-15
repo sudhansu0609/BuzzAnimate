@@ -941,6 +941,27 @@ fn wand_properties(ui: &mut Ui, style: &mut DrawStyle) {
     });
 }
 
+/// Paint Bucket settings: the gap size the fill will bridge.
+fn bucket_properties(ui: &mut Ui, style: &mut DrawStyle) {
+    egui::Grid::new("bucket-props").num_columns(2).show(ui, |ui| {
+        ui.label("Gap size");
+        egui::ComboBox::from_id_salt("bucket-gap")
+            .selected_text(style.gap_size.label())
+            .show_ui(ui, |ui| {
+                for gap in buzz_scene::GapSize::ALL {
+                    ui.selectable_value(&mut style.gap_size, gap, gap.label());
+                }
+            })
+            .response
+            .on_hover_text(
+                "How large a gap in the outline the bucket will close before it \
+                 fills. Larger settings fill sketchier line art but can spill \
+                 through wider openings.",
+            );
+        ui.end_row();
+    });
+}
+
 /// Brush settings, with a live preview of the pattern being stamped.
 ///
 /// Animate puts these in the tool options strip under the toolbar. They are
@@ -1455,6 +1476,10 @@ pub fn properties_panel(
         .id_salt("wand-section")
         .default_open(false)
         .show(ui, |ui| wand_properties(ui, style));
+    egui::CollapsingHeader::new(RichText::new("Paint Bucket").strong())
+        .id_salt("bucket-section")
+        .default_open(false)
+        .show(ui, |ui| bucket_properties(ui, style));
 
     ui.add_space(8.0);
     ui.label(RichText::new("Stroke and Fill").strong());

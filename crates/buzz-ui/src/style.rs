@@ -131,6 +131,9 @@ pub struct DrawStyle {
     /// user's way of working, not to a moment, so switching tools and coming
     /// back does not reset them.
     pub wand: buzz_scene::WandOptions,
+    /// Paint Bucket gap closing — how large a gap in the outline the bucket
+    /// bridges before filling. Animate's Gap Size.
+    pub gap_size: buzz_scene::GapSize,
     /// Recently used colours, most recent first.
     pub swatches: Vec<Color>,
 }
@@ -175,6 +178,7 @@ impl Default for DrawStyle {
             drawing_mode: DrawingMode::default(),
             brush: crate::brush::BrushSettings::default(),
             wand: buzz_scene::WandOptions::default(),
+            gap_size: buzz_scene::GapSize::default(),
             swatches: default_swatches(),
         }
     }

@@ -63,6 +63,12 @@ pub struct LibraryState {
     expanded: BTreeSet<String>,
     /// Rename buffer, live only while a rename is in progress.
     renaming: Option<(SymbolId, String)>,
+    /// The search string, lower-cased, recomputed only when `search` changes.
+    ///
+    /// `matches` is called once per symbol; lower-casing the needle inside it
+    /// allocated a `String` per symbol per frame, which on a large library is a
+    /// per-frame cost that scales with the whole library. Cached here instead.
+    search_lower: String,
 }
 
 impl LibraryState {
@@ -87,9 +93,14 @@ impl LibraryState {
         !self.search.trim().is_empty()
     }
 
+    /// Recompute the cached lower-cased needle. Called once at the top of a
+    /// frame — one allocation a frame, rather than one per symbol in `matches`.
+    fn sync_search(&mut self) {
+        self.search_lower = self.search.trim().to_lowercase();
+    }
+
     fn matches(&self, name: &str) -> bool {
-        let needle = self.search.trim().to_lowercase();
-        needle.is_empty() || name.to_lowercase().contains(&needle)
+        self.search_lower.is_empty() || name.to_lowercase().contains(&self.search_lower)
     }
 }
 
@@ -108,9 +119,15 @@ pub fn library_panel(
     ui: &mut Ui,
     scene: &mut Scene,
     state: &mut LibraryState,
+    // Use counts per symbol. Computed off the UI thread by the shell and passed
+    // in, because walking every object in a large document to count instances
+    // was a per-frame cost that scaled with the whole file — see the caller.
+    usage: &std::collections::BTreeMap<SymbolId, usize>,
     thumbnail: ThumbnailSource<'_>,
 ) -> Option<Command> {
     let mut command = None;
+    // Lower-case the search needle once, not once per symbol in `matches`.
+    state.sync_search();
 
     ui.horizontal(|ui| {
         ui.heading("Library");
@@ -134,8 +151,6 @@ pub fn library_panel(
     });
     ui.separator();
 
-    let usage = scene.symbol_usage();
-
     // **A fixed height, not the room available.**
     //
     // This panel keeps a scroll area of its own, because a library of three
@@ -149,12 +164,12 @@ pub fn library_panel(
     //
     // So: a definite number of rows. Enough to browse in, and never enough to
     // hide what comes after it.
-    egui::ScrollArea::vertical()
-        .id_salt("library-items")
-        .auto_shrink([false, true])
-        .max_height(300.0)
-        .show(ui, |ui| {
-            if scene.library().is_empty() {
+    if scene.library().is_empty() {
+        egui::ScrollArea::vertical()
+            .id_salt("library-items")
+            .auto_shrink([false, true])
+            .max_height(300.0)
+            .show(ui, |ui| {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(
@@ -165,15 +180,52 @@ pub fn library_panel(
                     .weak()
                     .italics(),
                 );
-                return;
-            }
-
-            // Root level first, then its folders, recursively.
-            draw_folder_contents(ui, scene, state, None, 0, &usage, thumbnail, &mut command);
-        });
+            });
+    } else {
+        // **Virtualized.** The tree is flattened to a list and only the rows the
+        // scroll area can show are turned into widgets, so a ten-thousand-symbol
+        // library costs a screenful of rows a frame, not ten thousand.
+        let rows = flatten_rows(scene, state);
+        let row_height = THUMBNAIL + 2.0;
+        egui::ScrollArea::vertical()
+            .id_salt("library-items")
+            .auto_shrink([false, true])
+            .max_height(300.0)
+            .show_rows(ui, row_height, rows.len(), |ui, range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for i in range {
+                    // Each row is built inside a fixed-height slot so the
+                    // virtualized layout stays aligned with its scrollbar.
+                    let (slot, _) =
+                        ui.allocate_exact_size(egui::vec2(ui.available_width(), row_height), egui::Sense::hover());
+                    let mut row_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(slot)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    match &rows[i] {
+                        Row::Folder { path, leaf, depth } => {
+                            draw_folder_row(&mut row_ui, state, path, leaf, *depth);
+                        }
+                        Row::Symbol {
+                            id,
+                            name,
+                            kind,
+                            depth,
+                        } => {
+                            let indent = *depth as f32 * 14.0;
+                            draw_symbol_row(
+                                &mut row_ui, scene, state, *id, name, *kind, indent, usage,
+                                thumbnail, &mut command,
+                            );
+                        }
+                    }
+                }
+            });
+    }
 
     ui.separator();
-    draw_footer(ui, scene, state, &usage, &mut command);
+    draw_footer(ui, scene, state, usage, &mut command);
 
     command
 }
@@ -183,76 +235,80 @@ pub fn library_panel(
 ///
 /// Folders come first because that is where Animate puts them, and because a
 /// long symbol list would otherwise push the folders off the top.
-#[allow(clippy::too_many_arguments, reason = "internal tree walker, not an API")]
-fn draw_folder_contents(
-    ui: &mut Ui,
-    scene: &mut Scene,
-    state: &mut LibraryState,
-    parent: Option<&str>,
-    depth: usize,
-    usage: &std::collections::BTreeMap<SymbolId, usize>,
-    thumbnail: ThumbnailSource<'_>,
-    command: &mut Option<Command>,
-) {
+/// One line of the flattened Library tree.
+///
+/// The tree — folders, expanded into their contents, and the symbols at each
+/// level — is flattened into this list once per frame, cheaply (no widgets),
+/// and then only the rows the scroll area can actually show are built into
+/// widgets. Without that, a flat library of ten thousand symbols built ten
+/// thousand rows a frame, which was tens of milliseconds of pure layout and a
+/// hang in its own right.
+enum Row {
+    Folder {
+        path: String,
+        leaf: String,
+        depth: usize,
+    },
+    Symbol {
+        id: SymbolId,
+        name: String,
+        kind: SymbolKind,
+        depth: usize,
+    },
+}
+
+/// Flatten the visible tree — expanded folders and matching symbols — into a
+/// list of rows, in display order. Reads only; the widgets are built later.
+fn flatten_rows(scene: &Scene, state: &LibraryState) -> Vec<Row> {
+    fn walk(scene: &Scene, state: &LibraryState, parent: Option<&str>, depth: usize, rows: &mut Vec<Row>) {
+        for folder in scene.library().child_folders(parent) {
+            let leaf = folder.rsplit('/').next().unwrap_or(&folder).to_string();
+            rows.push(Row::Folder {
+                path: folder.clone(),
+                leaf,
+                depth,
+            });
+            if state.is_expanded(&folder) {
+                walk(scene, state, Some(&folder), depth + 1, rows);
+            }
+        }
+        for symbol in scene.library().symbols_in(parent) {
+            if state.matches(&symbol.name) {
+                rows.push(Row::Symbol {
+                    id: symbol.id,
+                    name: symbol.name.clone(),
+                    kind: symbol.kind,
+                    depth,
+                });
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    walk(scene, state, None, 0, &mut rows);
+    rows
+}
+
+/// Draw one folder row of the flattened tree.
+fn draw_folder_row(ui: &mut Ui, state: &mut LibraryState, path: &str, leaf: &str, depth: usize) {
     let indent = depth as f32 * 14.0;
+    let open = state.is_expanded(path);
+    let selected = state.selected_folder.as_deref() == Some(path);
 
-    for folder in scene.library().child_folders(parent) {
-        let leaf = folder.rsplit('/').next().unwrap_or(&folder).to_string();
-        let open = state.is_expanded(&folder);
-        let selected = state.selected_folder.as_deref() == Some(folder.as_str());
-
-        ui.horizontal(|ui| {
-            ui.add_space(indent);
-            // `⏷` rather than `▼`: the bundled fonts have a glyph for U+23F7
-            // and none for U+25BC, so an expanded folder used to be marked
-            // with an empty box. `▶` for a closed one does render. Found by
-            // screenshot while checking the Actions panel, not by a test —
-            // a missing glyph is invisible to every assertion we can write.
-            if ui.small_button(if open { "⏷" } else { "▶" }).clicked() {
-                state.toggle(&folder);
-            }
-            // "F", not a folder emoji: egui's bundled fonts have no glyph for
-            // one, and it renders as an empty box. The Layers panel marks its
-            // folders the same way.
-            ui.label(RichText::new("F").small().weak())
-                .on_hover_text("Folder");
-            if ui.selectable_label(selected, &leaf).clicked() {
-                // Selecting a folder deselects the symbol, so "new symbol"
-                // has one unambiguous destination.
-                state.selected_folder = Some(folder.clone());
-                state.selected = None;
-            }
-        });
-
-        if open {
-            draw_folder_contents(
-                ui,
-                scene,
-                state,
-                Some(&folder),
-                depth + 1,
-                usage,
-                thumbnail,
-                command,
-            );
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        // `⏷` rather than `▼`: the bundled fonts have a glyph for U+23F7 and
+        // none for U+25BC, so an expanded folder used to be marked with an empty
+        // box. `▶` for a closed one does render.
+        if ui.small_button(if open { "⏷" } else { "▶" }).clicked() {
+            state.toggle(path);
         }
-    }
-
-    let symbols: Vec<(SymbolId, String, SymbolKind)> = scene
-        .library()
-        .symbols_in(parent)
-        .into_iter()
-        .map(|s| (s.id, s.name.clone(), s.kind))
-        .collect();
-
-    for (id, name, kind) in symbols {
-        if !state.matches(&name) {
-            continue;
+        ui.label(RichText::new("F").small().weak())
+            .on_hover_text("Folder");
+        if ui.selectable_label(selected, leaf).clicked() {
+            state.selected_folder = Some(path.to_string());
+            state.selected = None;
         }
-        draw_symbol_row(
-            ui, scene, state, id, &name, kind, indent, usage, thumbnail, command,
-        );
-    }
+    });
 }
 
 #[allow(
@@ -525,13 +581,21 @@ mod tests {
 
     #[test]
     fn search_matches_case_insensitively_anywhere_in_the_name() {
-        let state = LibraryState {
+        let mut state = LibraryState {
             search: "hero".to_string(),
             ..Default::default()
         };
+        // The needle is lower-cased once per frame; the panel calls this, so the
+        // test does too.
+        state.sync_search();
         assert!(state.matches("Hero Body"));
         assert!(state.matches("SUPERHERO"));
         assert!(!state.matches("Loop"));
+
+        // An uppercase search still matches — the caching lower-cases both ends.
+        state.search = "HERO".to_string();
+        state.sync_search();
+        assert!(state.matches("hero body"));
     }
 
     #[test]

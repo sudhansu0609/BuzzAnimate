@@ -151,9 +151,14 @@ pub struct SoundCue {
 }
 
 /// Every sound a document holds.
+///
+/// The map is behind an `Arc` so cloning the library — which every
+/// `Document::edit` does — is a pointer copy rather than one tree node per
+/// sound; see [`crate::Library`] for the full rationale. Mutation forks the map
+/// once through [`Arc::make_mut`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SoundLibrary {
-    sounds: BTreeMap<SoundId, Arc<SoundAsset>>,
+    sounds: Arc<BTreeMap<SoundId, Arc<SoundAsset>>>,
 }
 
 impl SoundLibrary {
@@ -174,11 +179,11 @@ impl SoundLibrary {
     }
 
     pub fn insert(&mut self, asset: SoundAsset) {
-        self.sounds.insert(asset.id, Arc::new(asset));
+        Arc::make_mut(&mut self.sounds).insert(asset.id, Arc::new(asset));
     }
 
     pub fn remove(&mut self, id: SoundId) -> Option<Arc<SoundAsset>> {
-        self.sounds.remove(&id)
+        Arc::make_mut(&mut self.sounds).remove(&id)
     }
 
     /// A name no existing sound has, so the Library stays readable.

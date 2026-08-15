@@ -26,6 +26,29 @@ use std::sync::Arc;
 use buzz_audio::{Clip, Player};
 use buzz_scene::{Scene, SoundId};
 
+/// One sound waiting to be decoded, owned so it can cross to a worker thread.
+pub struct Undecoded {
+    pub id: SoundId,
+    pub data: Arc<Vec<u8>>,
+    pub name: String,
+}
+
+/// Decode one queued sound. Pure and self-contained — a whole batch runs in
+/// parallel with no shared state, which is what lets [`SoundBank::take_undecoded`]
+/// hand its result to a rayon `par_iter` off the UI thread.
+pub fn decode_undecoded(u: &Undecoded) -> (SoundId, Result<Clip, String>) {
+    if u.data.is_empty() {
+        return (
+            u.id,
+            Err("the audio is missing from this document".to_string()),
+        );
+    }
+    match Clip::decode(&u.data, &u.name) {
+        Ok(clip) => (u.id, Ok(clip)),
+        Err(e) => (u.id, Err(format!("{e:#}"))),
+    }
+}
+
 /// Everything the editor needs to make a document audible.
 pub struct SoundBank {
     /// Decoded audio, keyed by the document's sound id.
@@ -147,11 +170,81 @@ impl SoundBank {
     }
 
     /// Rebuild the cues if the document has moved on since they were built.
+    ///
+    /// **The synchronous path.** Decodes any new sound inline, so a caller that
+    /// is about to play or analyse audio has it ready. Used for user-initiated,
+    /// one-or-few-sound actions — importing a sound, attaching one, pressing
+    /// play, running lip sync — and by the tests. The **per-frame** refresh the
+    /// window does is [`Self::refresh_cues`], which never decodes; see there.
     pub fn refresh(&mut self, scene: &Scene) {
         if self.cued_revision != Some(scene.revision()) {
             self.sync_with(scene);
             self.rebuild_cues(scene);
         }
+    }
+
+    /// Rebuild the cues from **already-decoded** clips — no decoding here.
+    ///
+    /// This is what the window calls every frame. Decoding a large document's
+    /// sounds inline on the frame that first sees them was a freeze that scaled
+    /// with the soundtrack; that work now happens off the UI thread (the App
+    /// drives [`Self::take_undecoded`] → [`Self::install_decoded`]). Until a clip
+    /// lands its layer simply has no waveform and its cue no sound, which is a
+    /// blank frame or two, not a hang.
+    pub fn refresh_cues(&mut self, scene: &Scene) {
+        if self.cued_revision != Some(scene.revision()) {
+            self.clips.retain(|id, _| scene.sounds().get(*id).is_some());
+            self.failed.retain(|id, _| scene.sounds().get(*id).is_some());
+            self.rebuild_cues(scene);
+        }
+    }
+
+    /// The document's sounds that are neither decoded nor known-bad, ready to be
+    /// decoded off the UI thread.
+    ///
+    /// The audio bytes are shared by `Arc`, so this is pointer copies, not a
+    /// copy of the audio.
+    pub fn take_undecoded(&self, scene: &Scene) -> Vec<Undecoded> {
+        scene
+            .sounds()
+            .iter()
+            .filter(|asset| {
+                !self.clips.contains_key(&asset.id) && !self.failed.contains_key(&asset.id)
+            })
+            .map(|asset| Undecoded {
+                id: asset.id,
+                data: Arc::clone(&asset.data),
+                name: asset.name.clone(),
+            })
+            .collect()
+    }
+
+    /// Put decoded clips (and decode failures) built off-thread back into the
+    /// bank, then rebuild the cues — the document revision has *not* moved since
+    /// they were queued, so [`Self::refresh_cues`] would not do it.
+    ///
+    /// A sound deleted while it was decoding is dropped rather than installed.
+    pub fn install_decoded(
+        &mut self,
+        results: Vec<(SoundId, Result<Clip, String>)>,
+        scene: &Scene,
+    ) {
+        for (id, result) in results {
+            if scene.sounds().get(id).is_none() {
+                continue;
+            }
+            match result {
+                Ok(clip) => {
+                    self.clips.insert(id, Arc::new(clip));
+                }
+                Err(why) => {
+                    self.failed.insert(id, why);
+                }
+            }
+        }
+        self.clips.retain(|id, _| scene.sounds().get(*id).is_some());
+        self.failed.retain(|id, _| scene.sounds().get(*id).is_some());
+        self.rebuild_cues(scene);
     }
 
     /// Start playing from `frame`.
@@ -310,6 +403,42 @@ mod tests {
             pointer,
             "the clip should not have been decoded twice"
         );
+    }
+
+    /// The per-frame path decodes **nothing** — that is what keeps a big
+    /// import's soundtrack off the UI thread. `refresh_cues` reports the audio
+    /// as still undecoded, and only `install_decoded` (fed by the background
+    /// worker) brings a clip to life. This is the pin for plan 1.3.
+    #[test]
+    fn the_per_frame_path_never_decodes_and_the_background_install_does() {
+        let (scene, sound, _, _) = document_with_dialogue();
+        let mut bank = SoundBank::new(24.0);
+
+        // The per-frame refresh must not decode.
+        bank.refresh_cues(&scene);
+        assert!(
+            bank.clip(sound).is_none(),
+            "refresh_cues must not decode on the UI thread"
+        );
+
+        // The document reports exactly the one undecoded sound, ready to hand to
+        // a worker thread.
+        let batch = bank.take_undecoded(&scene);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, sound);
+
+        // Decoding (as the worker would) and installing brings it to life.
+        let results = batch.iter().map(decode_undecoded).collect();
+        bank.install_decoded(results, &scene);
+        assert!(
+            bank.clip(sound).is_some(),
+            "the installed clip should be playable"
+        );
+        // And its cue is rebuilt even though the revision never moved.
+        assert!(bank.player().has_sound(), "the cue should be live");
+
+        // Now the sound is decoded, so nothing is left to hand out.
+        assert!(bank.take_undecoded(&scene).is_empty());
     }
 
     /// **The request, tested.** The root audio is cued the same wherever the

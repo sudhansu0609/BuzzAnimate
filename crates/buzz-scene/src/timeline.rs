@@ -298,12 +298,19 @@ impl LayerTimeline {
     }
 
     /// What the timeline draws at `frame`.
+    ///
+    /// Binary search, not a linear scan: the timeline calls this once **per
+    /// cell**, up to thousands of columns times every layer, so a linear walk of
+    /// the layer's keyframes here is the difference between a responsive grid and
+    /// a frozen one on a long document. Keyframes are sorted by `start`
+    /// ([`Self::from_parts`] guarantees it), so an exact-start lookup is a
+    /// `binary_search`.
     pub fn frame_kind(&self, frame: u32) -> FrameKind {
         if frame >= self.length {
             return FrameKind::Empty;
         }
-        if let Some(k) = self.keyframes.iter().find(|k| k.start == frame) {
-            return if k.is_blank() {
+        if let Ok(index) = self.keyframes.binary_search_by_key(&frame, |k| k.start) {
+            return if self.keyframes[index].is_blank() {
                 FrameKind::BlankKeyframe
             } else {
                 FrameKind::Keyframe
@@ -316,9 +323,12 @@ impl LayerTimeline {
         }
     }
 
-    /// Is `frame` the start of a keyframe?
+    /// Is `frame` the start of a keyframe? Binary search, for the same reason
+    /// [`Self::frame_kind`] is.
     pub fn is_keyframe(&self, frame: u32) -> bool {
-        self.keyframes.iter().any(|k| k.start == frame)
+        self.keyframes
+            .binary_search_by_key(&frame, |k| k.start)
+            .is_ok()
     }
 
     /// Frame the keyframe governing `frame` starts on.
@@ -480,6 +490,21 @@ impl LayerTimeline {
         }
     }
 
+    /// Add an object **behind** everything else on the frame — first in the
+    /// stored order, so it paints first and lands at the back.
+    ///
+    /// What a paint-bucket fill wants: the colour goes under the lines it was
+    /// poured between, exactly as Animate places a fill behind its strokes.
+    pub fn insert_object_behind(&mut self, frame: u32, object: Arc<Object>) -> bool {
+        match self.keyframe_at_mut(frame) {
+            Some(k) => {
+                Arc::make_mut(&mut k.objects).insert(0, object);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Remove an object from wherever it appears.
     pub fn remove_object(&mut self, id: ObjectId) -> Option<Arc<Object>> {
         for keyframe in &mut self.keyframes {
@@ -577,6 +602,60 @@ mod tests {
         assert_eq!(t.keyframe_count(), 1);
         assert_eq!(t.frame_kind(0), FrameKind::BlankKeyframe);
         assert_eq!(t.frame_kind(1), FrameKind::Empty);
+    }
+
+    /// The binary-search `frame_kind`/`is_keyframe` must agree with a plain
+    /// linear scan for every frame, on a track big enough that the linear form
+    /// was the timeline's freeze. This is the correctness pin for 1.1.
+    #[test]
+    fn frame_kind_binary_search_matches_a_linear_scan() {
+        // A long track with ~2 000 keyframes at scattered starts, alternating
+        // blank and filled so both keyframe kinds are exercised.
+        let length = 10_000u32;
+        let mut keyframes = Vec::new();
+        let mut frame = 0u32;
+        let mut i = 0u64;
+        while frame < length {
+            let mut k = Keyframe::new(frame);
+            if i % 2 == 0 {
+                k.objects = Arc::new(vec![object(i + 1)]);
+            }
+            keyframes.push(k);
+            // Irregular gaps so spans and span-ends land at varied frames.
+            frame += 1 + (i % 5) as u32;
+            i += 1;
+        }
+        let track = LayerTimeline::from_parts(keyframes.clone(), length);
+
+        // Linear reference, exactly the old implementation.
+        let starts: std::collections::HashSet<u32> = keyframes.iter().map(|k| k.start).collect();
+        let blanks: std::collections::HashSet<u32> = keyframes
+            .iter()
+            .filter(|k| k.is_blank())
+            .map(|k| k.start)
+            .collect();
+
+        for f in 0..length + 5 {
+            let expected = if f >= length {
+                FrameKind::Empty
+            } else if starts.contains(&f) {
+                if blanks.contains(&f) {
+                    FrameKind::BlankKeyframe
+                } else {
+                    FrameKind::Keyframe
+                }
+            } else if f + 1 == length {
+                FrameKind::SpanEnd
+            } else {
+                FrameKind::Span
+            };
+            assert_eq!(track.frame_kind(f), expected, "frame_kind mismatch at {f}");
+            assert_eq!(
+                track.is_keyframe(f),
+                starts.contains(&f),
+                "is_keyframe mismatch at {f}"
+            );
+        }
     }
 
     #[test]

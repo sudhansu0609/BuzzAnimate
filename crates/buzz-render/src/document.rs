@@ -303,8 +303,6 @@ impl SymbolTable {
         self.revision = Some(scene.revision());
     }
 
-    // Consulted by the additive memo (step 3) and the scene cache (step 4).
-    #[allow(dead_code)]
     fn get(&self, id: buzz_scene::SymbolId) -> Option<&SymbolInfo> {
         self.infos.get(&id)
     }
@@ -595,6 +593,12 @@ fn draw_layers(
     options: &FrameOptions,
     cache: &mut DrawCache,
 ) {
+    // Bring the per-symbol memo up to date once for the whole pass. Cheap when
+    // the document has not changed, which is every pan, zoom and playback frame.
+    // Every `has_additive_paint` and every scene-cache lookup below reaches the
+    // walk only through here, so this is the one place that has to run first.
+    cache.symbols.refresh(scene);
+
     // Which mask, if any, clips each layer, and whether that mask is in force.
     let masks = active_masks(layers, options.masks);
     let mut open: Option<OpenMask> = None;
@@ -950,7 +954,7 @@ fn draw_layer(
         // because every group is a render target and they are not free.
         let accumulates = resolved
             .iter()
-            .any(|object| has_additive_paint(object, scene, 0));
+            .any(|object| has_additive_paint(object, &cache.symbols, 0));
 
         if accumulates {
             // Bounded to the layer's own artwork: an unbounded group would
@@ -1025,9 +1029,12 @@ fn draw_layer(
 
 /// Does this object, or anything inside it, paint additively?
 ///
-/// Instances are followed into the library, because a symbol full of build-up
-/// paint placed on a layer still needs that layer isolated.
-fn has_additive_paint(object: &Object, scene: &Scene, depth: usize) -> bool {
+/// The shallow stage-object tree — shapes, groups, rigs — is walked live. An
+/// instance instead consults the [`SymbolTable`] memo, whose `additive` flag
+/// already folds the symbol's whole subtree across every frame: without that,
+/// this was a full recursive walk of the library for every stage object, every
+/// frame — the O(document) cost the memo exists to kill.
+fn has_additive_paint(object: &Object, symbols: &SymbolTable, depth: usize) -> bool {
     if depth >= MAX_SYMBOL_DEPTH {
         return false;
     }
@@ -1035,21 +1042,15 @@ fn has_additive_paint(object: &Object, scene: &Scene, depth: usize) -> bool {
         ObjectKind::Shape(shape) => shape.blend.is_additive(),
         ObjectKind::Group(children) => children
             .iter()
-            .any(|child| has_additive_paint(child, scene, depth + 1)),
+            .any(|child| has_additive_paint(child, symbols, depth + 1)),
         ObjectKind::Warp(warp) => warp.shape.blend.is_additive(),
         ObjectKind::Armature(rig) => rig
             .parts
             .iter()
-            .any(|part| has_additive_paint(&part.artwork, scene, depth + 1)),
-        ObjectKind::Instance(instance) => {
-            scene.library().get(instance.symbol).is_some_and(|symbol| {
-                symbol.layers.iter().any(|layer| {
-                    layer
-                        .all_objects()
-                        .any(|child| has_additive_paint(child, scene, depth + 1))
-                })
-            })
-        }
+            .any(|part| has_additive_paint(&part.artwork, symbols, depth + 1)),
+        ObjectKind::Instance(instance) => symbols
+            .get(instance.symbol)
+            .is_some_and(|info| info.flags.additive),
     }
 }
 
@@ -2071,6 +2072,81 @@ mod symbol_table {
 
     fn unit(id: u64) -> Object {
         shape(id, Rect::new(0.0, 0.0, 10.0, 10.0))
+    }
+
+    fn additive(id: u64) -> Object {
+        Object::shape(
+            ObjectId(id),
+            ShapeData::filled(Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9), Color::WHITE)
+                .with_blend(PaintBlend::Additive),
+        )
+    }
+
+    /// The old algorithm: walk the whole library live. The memo must agree.
+    fn brute(object: &Object, scene: &Scene, depth: usize) -> bool {
+        if depth >= MAX_SYMBOL_DEPTH {
+            return false;
+        }
+        match &object.kind {
+            ObjectKind::Shape(s) => s.blend.is_additive(),
+            ObjectKind::Group(children) => children.iter().any(|c| brute(c, scene, depth + 1)),
+            ObjectKind::Warp(w) => w.shape.blend.is_additive(),
+            ObjectKind::Armature(rig) => {
+                rig.parts.iter().any(|p| brute(&p.artwork, scene, depth + 1))
+            }
+            ObjectKind::Instance(i) => scene.library().get(i.symbol).is_some_and(|sym| {
+                sym.layers
+                    .iter()
+                    .any(|l| l.all_objects().any(|c| brute(c, scene, depth + 1)))
+            }),
+        }
+    }
+
+    #[test]
+    fn additive_memo_matches_brute_force() {
+        let mut scene = Scene::default();
+        let plain = symbol_with(&mut scene, "plain", unit(1));
+        let glow = symbol_with(&mut scene, "glow", additive(2));
+        let character = scene.add_symbol("character", SymbolKind::Graphic, None);
+        let clayer = first_layer(&scene, character);
+        scene.library_mut().update(character, |s| {
+            s.layers.update(clayer, |l| {
+                l.frames
+                    .push_object(0, Arc::new(Object::instance_of(ObjectId(10), plain)));
+                l.frames
+                    .push_object(0, Arc::new(Object::instance_of(ObjectId(11), glow)));
+            });
+        });
+
+        let mut table = SymbolTable::default();
+        table.refresh(&scene);
+
+        let check = |table: &SymbolTable, scene: &Scene, id: SymbolId, oid: u64| {
+            let memo = table.get(id).unwrap().flags.additive;
+            let brute_v = brute(&Object::instance_of(ObjectId(oid), id), scene, 0);
+            assert_eq!(memo, brute_v, "memo vs brute for {id:?}");
+        };
+        check(&table, &scene, plain, 900);
+        check(&table, &scene, glow, 901);
+        check(&table, &scene, character, 902);
+        assert!(!table.get(plain).unwrap().flags.additive);
+        assert!(table.get(glow).unwrap().flags.additive);
+        assert!(
+            table.get(character).unwrap().flags.additive,
+            "the character inherits the glow's build-up paint"
+        );
+
+        // Add build-up paint deep inside the previously-plain part.
+        let player = first_layer(&scene, plain);
+        scene.library_mut().update(plain, |s| {
+            s.layers.update(player, |l| {
+                l.frames.push_object(0, Arc::new(additive(20)));
+            });
+        });
+        table.refresh(&scene);
+        check(&table, &scene, plain, 903);
+        check(&table, &scene, character, 904);
+        assert!(table.get(plain).unwrap().flags.additive, "now additive");
     }
 
     #[test]

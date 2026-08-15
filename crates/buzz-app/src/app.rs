@@ -1336,6 +1336,9 @@ impl App {
                     // under a ruler or a selection outline.
                     self.stage_scrollbars(ui, area);
                     self.stage_zoom_overlay(ui, area);
+                    if self.doc_available() {
+                        self.draw_tool_cursor(ui, area);
+                    }
                     area
                 })
                 .inner
@@ -2405,6 +2408,63 @@ impl App {
     /// worth of margin so there is somewhere to put artwork that is still being
     /// moved into place. The extent therefore grows with the drawing rather
     /// than being a fixed canvas the way Animate's is.
+    /// Animate's tool cursor: over the stage, the active drawing tool shows its
+    /// own icon at the pointer — with a size ring for the brush-like tools — in
+    /// place of the system arrow, so what you are about to do is under your hand.
+    fn draw_tool_cursor(&self, ui: &egui::Ui, area: egui::Rect) {
+        use buzz_ui::ToolId::*;
+        let tool = self.editor.tool();
+        // The pointer, transform and navigation tools keep the system cursor
+        // Animate gives them (an arrow, a hand, a magnifier).
+        if matches!(
+            tool,
+            Selection | Subselection | FreeTransform | GradientTransform | Hand | Zoom
+        ) {
+            return;
+        }
+        let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) else {
+            return;
+        };
+        if !area.contains(pos) {
+            return;
+        }
+
+        // Ours, not the system arrow.
+        ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+        let painter = ui.painter_at(area);
+        let ink = buzz_ui::Palette::text();
+        let halo = egui::Stroke::new(2.5, egui::Color32::from_black_alpha(120));
+
+        // The brush-like tools show a ring the size of the mark they make, in
+        // document units scaled to the screen — Animate's brush cursor.
+        let ring = match tool {
+            Brush => Some(self.editor.style.brush.size),
+            Pencil | Eraser => Some(self.editor.style.stroke_width.max(1.0)),
+            _ => None,
+        };
+        if let Some(size) = ring {
+            let r = (size * self.editor.camera.zoom * 0.5).clamp(2.0, 600.0) as f32;
+            painter.circle_stroke(pos, r, halo);
+            painter.circle_stroke(pos, r, egui::Stroke::new(1.0, ink));
+        }
+
+        // A small crosshair marks the exact hotspot.
+        let h = 5.0;
+        for (a, b) in [
+            (egui::pos2(pos.x - h, pos.y), egui::pos2(pos.x + h, pos.y)),
+            (egui::pos2(pos.x, pos.y - h), egui::pos2(pos.x, pos.y + h)),
+        ] {
+            painter.line_segment([a, b], halo);
+            painter.line_segment([a, b], egui::Stroke::new(1.0, ink));
+        }
+
+        // The tool's own icon, down-right of the hotspot, on a faint backing so
+        // it reads over any artwork.
+        let icon = egui::Rect::from_min_size(egui::pos2(pos.x + 9.0, pos.y + 9.0), egui::vec2(18.0, 18.0));
+        painter.rect_filled(icon.expand(2.0), 3.0, egui::Color32::from_black_alpha(140));
+        buzz_ui::icons::tool_icon(&painter, icon, tool, ink);
+    }
+
     fn stage_scrollbars(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
         const THICKNESS: f32 = 9.0;
         /// How far the bars sit in from the edge of the drawing area.

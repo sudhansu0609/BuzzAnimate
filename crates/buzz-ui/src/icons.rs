@@ -294,11 +294,17 @@ fn pencil(d: &Draw) {
     d.solid(&[(0.46, 0.82), (0.30, 0.72), (0.26, 0.86)]);
 }
 
-/// A brush: a handle, a ferrule and a loaded tip that widens.
+/// A paintbrush on Animate's diagonal: a handle, a metal ferrule, and a loaded
+/// tip that widens to a soft, filled point.
 fn brush(d: &Draw) {
-    d.line((0.68, 0.18), (0.44, 0.52));
-    d.outline(&[(0.34, 0.50), (0.52, 0.62), (0.40, 0.80), (0.24, 0.70)]);
-    d.solid(&[(0.30, 0.68), (0.40, 0.74), (0.32, 0.86), (0.22, 0.80)]);
+    // The handle.
+    d.line((0.80, 0.14), (0.50, 0.48));
+    // The ferrule, banding the handle to the bristles.
+    d.hairline((0.44, 0.42), (0.58, 0.54));
+    // The bristles.
+    d.outline(&[(0.34, 0.46), (0.54, 0.56), (0.42, 0.80), (0.22, 0.70)]);
+    // The loaded tip, filled so it reads as paint on the brush.
+    d.solid(&[(0.22, 0.70), (0.33, 0.58), (0.47, 0.68), (0.42, 0.80)]);
 }
 
 /// Animate's bone: a joint, a taper, a tip.
@@ -326,13 +332,17 @@ fn warp(d: &Draw) {
     }
 }
 
-/// A tipped bucket with paint coming out of it.
+/// A tilted bucket pouring paint, with a drip — Animate's Paint Bucket.
 fn bucket(d: &Draw) {
-    d.outline(&[(0.22, 0.34), (0.62, 0.20), (0.72, 0.52), (0.36, 0.70)]);
-    d.hairline((0.30, 0.30), (0.66, 0.36));
-    // The handle, and the drip.
-    d.curve(&[(0.30, 0.30), (0.36, 0.16), (0.54, 0.16)]);
-    d.circle((0.76, 0.72), 0.075, true);
+    // The body, tilted so it pours from its lower lip.
+    d.outline(&[(0.24, 0.30), (0.58, 0.20), (0.70, 0.54), (0.36, 0.64)]);
+    // The rim across the open top.
+    d.hairline((0.24, 0.30), (0.58, 0.20));
+    // The handle arc over the top.
+    d.curve(&[(0.30, 0.26), (0.40, 0.12), (0.56, 0.16)]);
+    // The paint pouring from the lip, and a drop landing below.
+    d.line((0.66, 0.50), (0.80, 0.72));
+    d.circle((0.82, 0.80), 0.06, true);
 }
 
 /// A bottle with a nib, which is how Animate draws its stroke tool.

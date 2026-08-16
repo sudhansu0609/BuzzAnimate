@@ -269,8 +269,9 @@ pub fn timeline_panel(ui: &mut Ui, scene: &Scene, state: &TimelineState) -> Time
 
             ruler(ui, columns, *scene.looping(), state, &mut response);
 
-            // The camera sits above every layer, as it does in Animate.
-            if scene.camera().enabled {
+            // The camera sits above every layer, as it does in Animate — but
+            // only on the document's own timeline. See [`shows_camera_row`].
+            if shows_camera_row(scene) {
                 camera_row(ui, scene, columns, state, &mut response);
             }
 
@@ -883,6 +884,16 @@ fn draw_playhead(
 
 /// Animate's playhead blue, sampled from the reference.
 const PLAYHEAD: Color32 = Color32::from_rgb(0x36, 0x79, 0xC1);
+
+/// Whether the camera row belongs on the timeline right now.
+///
+/// It films the whole document, so it appears only on the document's own
+/// timeline and only once the camera is switched on. Inside a symbol the
+/// timeline shows that symbol's layers; a camera row there would suggest each
+/// symbol carries a camera of its own, which it does not — the film has one.
+fn shows_camera_row(scene: &Scene) -> bool {
+    scene.camera().enabled && scene.edit_path().is_empty()
+}
 
 /// The camera's row, above every layer.
 ///
@@ -1550,6 +1561,29 @@ mod tests {
         let _ = ctx.run_ui(Default::default(), |ui| {
             let _ = timeline_panel(ui, &scene, &state());
         });
+    }
+
+    /// **The camera belongs to the film, not to each symbol.** On the main
+    /// timeline the enabled camera shows its row; step into a symbol and the
+    /// row is gone, because a symbol has no camera of its own.
+    #[test]
+    fn the_camera_row_is_hidden_inside_a_symbol() {
+        let mut scene = Scene::default();
+        scene.camera_mut().enabled = true;
+        assert!(shows_camera_row(&scene), "the camera row shows at the root");
+
+        let symbol = scene.add_symbol("S", buzz_scene::SymbolKind::Graphic, None);
+        scene.enter_symbol(symbol);
+        assert!(
+            !shows_camera_row(&scene),
+            "the camera row must not appear inside a symbol"
+        );
+
+        scene.exit_symbol();
+        assert!(
+            shows_camera_row(&scene),
+            "and it returns on the main timeline"
+        );
     }
 
     /// With the camera row selected the panel still draws every layer: the

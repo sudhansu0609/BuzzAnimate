@@ -46,6 +46,10 @@ pub mod wand;
 
 use std::sync::Arc;
 
+/// A symbol's resolved extent, keyed by symbol id — every symbol's, built in
+/// one pass by [`Scene::symbol_bounds_table`].
+pub type BoundsTable = std::collections::HashMap<SymbolId, Rect>;
+
 use buzz_geom::{Affine, Point, Rect, Size};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
@@ -178,7 +182,7 @@ impl EditAt {
 }
 
 /// An immutable snapshot of the document.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Scene {
     /// Private so every change goes through [`Scene::stage_mut`] and bumps the
     /// revision. As a public field it was possible to resize the stage without
@@ -230,6 +234,36 @@ pub struct Scene {
     /// Symbol* — and the instance's own transform for one opened from the
     /// stage, which is *Edit in Place*. View state exactly as `editing` is.
     edit_places: Vec<Affine>,
+    /// Memoised resolved-bounds table, tagged with the revision it was built
+    /// for. Rebuilding it is linear in the library, but resolving bounds is a
+    /// per-object, per-frame operation on every selection, so even a linear
+    /// rebuild every call is enough to lag a big import. Cached here so a
+    /// steady document pays for it once. Interior-mutable and never part of the
+    /// document's identity — not serialised, not compared, not undone.
+    bounds_cache: std::sync::RwLock<Option<(u64, Arc<BoundsTable>)>>,
+}
+
+impl Clone for Scene {
+    fn clone(&self) -> Self {
+        Self {
+            stage: self.stage,
+            camera: self.camera.clone(),
+            library: self.library.clone(),
+            sounds: self.sounds.clone(),
+            images: self.images.clone(),
+            lights: self.lights.clone(),
+            looping: self.looping,
+            swatches: self.swatches.clone(),
+            layers: self.layers.clone(),
+            ids: self.ids,
+            revision: self.revision,
+            editing: self.editing.clone(),
+            edit_places: self.edit_places.clone(),
+            // A fresh, empty cache: a snapshot rebuilds its own on first use,
+            // so a clone shares no mutable state with the scene it came from.
+            bounds_cache: std::sync::RwLock::new(None),
+        }
+    }
 }
 
 /// Invert an affine, or `None` when it has collapsed and cannot be undone.
@@ -298,6 +332,7 @@ impl Default for Scene {
             revision: 0,
             editing: Vec::new(),
             edit_places: Vec::new(),
+            bounds_cache: std::sync::RwLock::new(None),
         };
         // Animate starts every document with one layer named "Layer_1".
         scene.add_layer("Layer_1", LayerKind::Normal);
@@ -326,6 +361,7 @@ impl Scene {
             revision: 0,
             editing: Vec::new(),
             edit_places: Vec::new(),
+            bounds_cache: std::sync::RwLock::new(None),
         }
     }
 
@@ -894,11 +930,30 @@ impl Scene {
         // because each level re-measures every level under it from scratch.
         // Selecting an imported character (rigs inside rigs) then re-measured
         // the whole tree every frame the selection chrome was drawn, and the
-        // stage froze. The table is linear in the library and memoised across
-        // its own build, so this is a walk of the object plus a lookup per
-        // instance. See [`Self::symbol_bounds_table`].
-        let table = self.symbol_bounds_table();
+        // stage froze. The table is linear in the library, and cached across
+        // calls at one revision, so a steady document resolves any object with
+        // a walk of the object plus a lookup per instance.
+        let table = self.cached_bounds_table();
         self.resolved_bounds_with(object, &table)
+    }
+
+    /// The resolved-bounds table for the current revision, built once and
+    /// reused until an edit moves the revision on. See [`Self::bounds_cache`].
+    pub fn cached_bounds_table(&self) -> Arc<BoundsTable> {
+        // A read lock for the common case: the table is present and current.
+        if let Ok(guard) = self.bounds_cache.read()
+            && let Some((revision, table)) = guard.as_ref()
+            && *revision == self.revision
+        {
+            return Arc::clone(table);
+        }
+        // Stale or missing: build it (linear in the library) with the read lock
+        // released, then store under a write lock.
+        let table = Arc::new(self.symbol_bounds_table());
+        if let Ok(mut guard) = self.bounds_cache.write() {
+            *guard = Some((self.revision, Arc::clone(&table)));
+        }
+        table
     }
 
     fn resolved_bounds_within(&self, object: &Object, depth: usize) -> Rect {

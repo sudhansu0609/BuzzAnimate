@@ -34,6 +34,9 @@ pub struct TimelineResponse {
     /// draws — the same painted icons, the same words, and the same edit. Two
     /// places to reach them, one meaning.
     pub toggle_layer: Option<(LayerId, crate::panels::LayerIcon)>,
+    /// A column heading above the layers was clicked: flip that switch on
+    /// **every** layer at once — Animate's show/hide-all, lock-all, outline-all.
+    pub toggle_all: Option<crate::panels::LayerIcon>,
     /// A frame operation was requested.
     pub action: Option<FrameAction>,
     /// A tween was created or removed from the frame menu.
@@ -774,23 +777,39 @@ fn ruler(
 
     // The pinned header over the layer-names column: the eye/lock/outline
     // headings, sitting in the same columns their switches do on each row below.
+    // Clicking a heading flips that switch on every layer — Animate's hide-all,
+    // lock-all, outline-all.
     let name_row = egui::Rect::from_min_size(
         egui::pos2(pinned_left, rect.min.y),
         egui::vec2(LAYER_COLUMN, rect.height()),
     );
     let head = ui.painter_at(name_row.intersect(ui.clip_rect()));
     head.rect_filled(name_row, 0.0, Palette::ruler_bg());
+    let hover = ui.ctx().input(|i| i.pointer.hover_pos());
     for (column, icon) in switch_columns(name_row)
         .iter()
         .zip(crate::panels::LayerIcon::ALL)
     {
+        let hovered = hover.is_some_and(|p| column.contains(p) && response.hovered());
         head.text(
             column.center(),
             Align2::CENTER_CENTER,
             icon.heading(),
             FontId::proportional(8.0),
-            Palette::ruler_text(),
+            if hovered {
+                Palette::text()
+            } else {
+                Palette::ruler_text()
+            },
         );
+        if response.clicked()
+            && ui
+                .ctx()
+                .input(|i| i.pointer.interact_pos())
+                .is_some_and(|p| column.contains(p))
+        {
+            out.toggle_all = Some(icon);
+        }
     }
 
     // Dragging along the ruler scrubs.

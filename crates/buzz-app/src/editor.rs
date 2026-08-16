@@ -1015,6 +1015,14 @@ impl Editor {
                         } else {
                             self.selection.select_one(id);
                         }
+                        // Selecting an object makes its layer the active layer, so
+                        // the timeline highlights the layer the selection lives on
+                        // — and, with the playhead already on the current frame,
+                        // its frame too. This is Animate's behaviour: click a thing
+                        // on the stage and its row lights up in the timeline.
+                        if let Some((layer, _)) = self.doc.scene().find_object(id) {
+                            self.selection.set_active_layer(Some(layer));
+                        }
                     }
                     None if !additive => self.selection.clear(),
                     None => {}

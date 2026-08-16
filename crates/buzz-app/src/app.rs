@@ -2166,6 +2166,35 @@ impl App {
                 });
             });
         }
+        if let Some(icon) = response.toggle_all {
+            // A column heading was clicked: flip that switch on every layer. One
+            // click hides (locks, outlines) them all; the next restores them.
+            use buzz_ui::panels::LayerIcon;
+            let label = match icon {
+                LayerIcon::Eye => "Show/Hide All Layers",
+                LayerIcon::Lock => "Lock All Layers",
+                LayerIcon::Outline => "Outline All Layers",
+            };
+            self.editor.doc.edit(label, |scene| {
+                let ids: Vec<_> = scene.layers().iter().map(|l| l.id).collect();
+                let on = |l: &buzz_scene::Layer| match icon {
+                    LayerIcon::Eye => l.visible,
+                    LayerIcon::Lock => l.locked,
+                    LayerIcon::Outline => l.outline,
+                };
+                let all_on = ids
+                    .iter()
+                    .all(|&id| scene.layers().get(id).is_some_and(|l| on(l)));
+                let target = !all_on;
+                for id in ids {
+                    scene.update_layer(id, |l| match icon {
+                        LayerIcon::Eye => l.visible = target,
+                        LayerIcon::Lock => l.locked = target,
+                        LayerIcon::Outline => l.outline = target,
+                    });
+                }
+            });
+        }
         if response.select_camera {
             self.editor.camera_selected = true;
             // Selecting the camera row selects the Camera tool, which is what

@@ -491,6 +491,8 @@ pub struct App {
     recovery: buzz_ui::RecoveryState,
     /// The revision the crash snapshot was last taken at.
     last_crash_revision: Option<u64>,
+    /// A scene being renamed from the edit bar: its index and the text so far.
+    scene_rename: Option<(usize, String)>,
     /// An Animate asset import running on its own thread.
     animate_import: Option<crossbeam_channel::Receiver<crate::animate_assets::Progress>>,
     /// A background merge is in flight, so the document is briefly read-only.
@@ -604,6 +606,7 @@ impl App {
             },
             recovery: buzz_ui::RecoveryState::default(),
             last_crash_revision: None,
+            scene_rename: None,
             animate_import: None,
             merging: false,
             thumbnails: crate::thumbnails::Thumbnails::default(),
@@ -2078,18 +2081,83 @@ impl App {
     /// Clicking a level jumps straight back to it. Returning a [`Command`]
     /// rather than mutating here keeps every navigation step going through the
     /// same dispatch path as the menu and the keyboard.
+    /// The scene name at the root of the edit-path breadcrumb, and the menu
+    /// behind it — switch scene, add, rename, delete. Animate's "Edit Scene"
+    /// control, folded into the crumb it sits on.
+    fn scene_crumb(&mut self, ui: &mut egui::Ui, command: &mut Option<Command>) {
+        let active = self.editor.doc.active_scene();
+        let names = self.editor.doc.scene_names();
+
+        // Mid-rename: the crumb becomes a text field, committed on Enter or
+        // when focus leaves, abandoned on Escape.
+        if let Some((index, mut buffer)) = self.scene_rename.take() {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut buffer)
+                    .desired_width(120.0)
+                    .font(egui::TextStyle::Small),
+            );
+            response.request_focus();
+            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if escape {
+                // Abandon, keeping the old name.
+            } else if response.lost_focus() {
+                // Enter or a click elsewhere: keep the edit.
+                self.editor.doc.rename_scene(index, buffer.trim().to_string());
+            } else {
+                self.scene_rename = Some((index, buffer));
+            }
+            return;
+        }
+
+        let current = names
+            .get(active)
+            .cloned()
+            .unwrap_or_else(|| "Scene 1".to_string());
+
+        ui.menu_button(egui::RichText::new(current).small(), |ui| {
+            for (i, name) in names.iter().enumerate() {
+                if ui
+                    .selectable_label(i == active, egui::RichText::new(name).small())
+                    .clicked()
+                {
+                    if i == active {
+                        // Already here: the click means "leave the symbol and
+                        // show this scene's main timeline".
+                        *command = Some(Command::EditDocument);
+                    } else {
+                        self.editor.switch_scene(i);
+                    }
+                    ui.close();
+                }
+            }
+
+            ui.separator();
+
+            if ui.button("Add Scene").clicked() {
+                self.editor.add_scene();
+                ui.close();
+            }
+            if ui.button("Rename Scene\u{2026}").clicked() {
+                self.scene_rename = Some((active, names[active].clone()));
+                ui.close();
+            }
+            ui.add_enabled_ui(names.len() > 1, |ui| {
+                if ui.button("Delete Scene").clicked() {
+                    self.editor.delete_scene(active);
+                    ui.close();
+                }
+            });
+        })
+        .response
+        .on_hover_text("Switch, add, rename or delete a scene");
+    }
+
     fn breadcrumb(&mut self, ui: &mut egui::Ui) -> Option<Command> {
         let mut command = None;
         let path: Vec<buzz_scene::SymbolId> = self.editor.scene().edit_path().to_vec();
 
         ui.horizontal(|ui| {
-            if ui
-                .link(egui::RichText::new("Scene 1").small())
-                .on_hover_text("Back to the main timeline")
-                .clicked()
-            {
-                command = Some(Command::EditDocument);
-            }
+            self.scene_crumb(ui, &mut command);
 
             for (depth, id) in path.iter().enumerate() {
                 // ">" rather than a typographic chevron: egui's bundled fonts
@@ -4594,16 +4662,13 @@ impl App {
     /// `Arc`s, so cloning one copies pointers rather than artwork. It is what
     /// turns "up to two minutes lost" into "nothing lost".
     fn keep_crash_snapshot(&mut self) {
-        let revision = self.editor.doc.scene().revision();
+        let revision = self.editor.doc.combined_revision();
         if self.last_crash_revision == Some(revision) {
             return;
         }
         self.last_crash_revision = Some(revision);
         if self.editor.doc.is_dirty() {
-            buzz_doc::autosave::remember_for_crash(
-                self.editor.doc.scene(),
-                self.editor.doc.recovery_path(),
-            );
+            self.editor.doc.remember_for_crash();
         }
     }
 

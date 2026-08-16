@@ -186,7 +186,21 @@ impl Autosave {
     /// Returns `None` when nothing needs doing. The returned plan is `Send`, so
     /// it can be moved onto the background pool along with the snapshot.
     pub fn plan(&mut self, scene: &Scene) -> Option<AutosavePlan> {
-        let revision = scene.revision();
+        self.plan_scenes(&[("Scene 1", scene)], 0, scene.revision())
+    }
+
+    /// Build the work item for a due save of a whole multi-scene document.
+    ///
+    /// `revision` is a combined fingerprint of every scene, so any edit in any
+    /// scene makes a save due again; a document nobody is touching costs
+    /// nothing. Recovery keeps *all* the scenes — writing only the active one
+    /// would silently lose the rest.
+    pub fn plan_scenes(
+        &mut self,
+        scenes: &[(&str, &Scene)],
+        active: usize,
+        revision: u64,
+    ) -> Option<AutosavePlan> {
         self.observe(revision);
         if !self.is_due(revision) {
             return None;
@@ -197,7 +211,11 @@ impl Autosave {
         self.last_revision = Some(revision);
 
         Some(AutosavePlan {
-            scene: scene.clone(),
+            scenes: scenes
+                .iter()
+                .map(|(name, scene)| ((*name).to_string(), (*scene).clone()))
+                .collect(),
+            active,
             path: self.recovery_path(),
             revision,
         })
@@ -223,10 +241,12 @@ impl Autosave {
     }
 }
 
-/// A snapshot and where to write it. Safe to move to another thread.
+/// A snapshot of every scene and where to write it. Safe to move to another
+/// thread — scenes are trees of `Arc`s, so cloning copies pointers not artwork.
 #[derive(Debug, Clone)]
 pub struct AutosavePlan {
-    scene: Scene,
+    scenes: Vec<(String, Scene)>,
+    active: usize,
     path: PathBuf,
     revision: u64,
 }
@@ -242,7 +262,12 @@ impl AutosavePlan {
 
     /// Serialise and write. Intended to run on the background pool.
     pub fn write(&self) -> Result<(), DocError> {
-        let bytes = format::to_bytes(&self.scene)?;
+        let refs: Vec<(&str, &Scene)> = self
+            .scenes
+            .iter()
+            .map(|(name, scene)| (name.as_str(), scene))
+            .collect();
+        let bytes = format::to_bytes_scenes(&refs, self.active)?;
         format::write_atomic(&self.path, &bytes)?;
         tracing::debug!(path = %self.path.display(), revision = self.revision, "autosaved");
         Ok(())
@@ -310,10 +335,25 @@ static LAST_CHANCE: std::sync::Mutex<Option<AutosavePlan>> = std::sync::Mutex::n
 /// `Arc`s and cloning one copies pointers, not artwork — and turns those two
 /// minutes into nothing.
 pub fn remember_for_crash(scene: &Scene, path: PathBuf) {
+    remember_scenes_for_crash(&[("Scene 1", scene)], 0, scene.revision(), path);
+}
+
+/// Remember every scene of a multi-scene document for crash recovery, so a
+/// crash restores the whole document rather than only the scene on screen.
+pub fn remember_scenes_for_crash(
+    scenes: &[(&str, &Scene)],
+    active: usize,
+    revision: u64,
+    path: PathBuf,
+) {
     let plan = AutosavePlan {
-        scene: scene.clone(),
+        scenes: scenes
+            .iter()
+            .map(|(name, scene)| ((*name).to_string(), (*scene).clone()))
+            .collect(),
+        active,
         path,
-        revision: scene.revision(),
+        revision,
     };
     if let Ok(mut slot) = LAST_CHANCE.lock() {
         *slot = Some(plan);

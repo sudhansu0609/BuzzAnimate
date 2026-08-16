@@ -40,6 +40,7 @@ pub const MIMETYPE: &str = "application/vnd.buzzcaf.buzzanimate";
 const ENTRY_MIMETYPE: &str = "mimetype";
 const ENTRY_META: &str = "meta.json";
 const ENTRY_DOCUMENT: &str = "document.json";
+const ENTRY_SCENES: &str = "scenes.json";
 
 /// The customary extension.
 pub const EXTENSION: &str = "buzz";
@@ -98,12 +99,50 @@ fn now_unix() -> u64 {
 /// Separated from the file writing so autosave can build the bytes on a
 /// background thread and only touch the disk at the end.
 pub fn to_bytes(scene: &Scene) -> Result<Vec<u8>, DocError> {
+    to_bytes_scenes(&[("Scene 1", scene)], 0)
+}
+
+/// The scene index for a multi-scene document: the scene names and which one
+/// was active. Absent from a single-scene file — which is every file older
+/// versions wrote — so its absence means "one scene".
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ScenesDto {
+    active: usize,
+    names: Vec<String>,
+}
+
+/// The archive entry holding one scene's document JSON, and the media directory
+/// its sounds and images live under. Scene 0 keeps the original names
+/// (`document.json`, `media/`) so a single-scene file is byte-for-byte what it
+/// always was and older readers still open it; later scenes are numbered.
+fn scene_entry(index: usize) -> String {
+    if index == 0 {
+        ENTRY_DOCUMENT.to_string()
+    } else {
+        format!("scene-{index}.json")
+    }
+}
+
+fn media_prefix(index: usize) -> String {
+    if index == 0 {
+        "media/".to_string()
+    } else {
+        format!("media/s{index}/")
+    }
+}
+
+/// Serialise several named scenes into one `.buzz` archive.
+pub fn to_bytes_scenes(scenes: &[(&str, &Scene)], active: usize) -> Result<Vec<u8>, DocError> {
     let mut buffer = Cursor::new(Vec::new());
-    write_archive(&mut buffer, scene)?;
+    write_archive(&mut buffer, scenes, active)?;
     Ok(buffer.into_inner())
 }
 
-fn write_archive<W: Write + Seek>(writer: &mut W, scene: &Scene) -> Result<(), DocError> {
+fn write_archive<W: Write + Seek>(
+    writer: &mut W,
+    scenes: &[(&str, &Scene)],
+    active: usize,
+) -> Result<(), DocError> {
     let mut zip = ZipWriter::new(writer);
 
     // Stored, not deflated, and written first: that is what makes the archive
@@ -119,47 +158,72 @@ fn write_archive<W: Write + Seek>(writer: &mut W, scene: &Scene) -> Result<(), D
     zip.start_file(ENTRY_META, deflated)?;
     zip.write_all(&serde_json::to_vec_pretty(&Meta::default())?)?;
 
-    zip.start_file(ENTRY_DOCUMENT, deflated)?;
-    let dto = DocumentDto::from_scene(scene);
-    zip.write_all(&serde_json::to_vec_pretty(&dto)?)?;
-
-    // Sounds go in `media/`, byte for byte as they were imported — the
-    // directory the container reserved for exactly this in Phase 1.
-    //
-    // **Stored, not deflated.** MP3 and compressed WAV do not compress again;
-    // deflating them costs time on every save and autosave and gives back a
-    // fraction of a percent. An uncompressed entry also means an unzip
-    // recovers a playable file directly.
-    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-    for sound in scene.sounds().iter() {
-        zip.start_file(format!("media/{}", sound.file_name()), stored)?;
-        zip.write_all(&sound.data)?;
+    // The scene index — only when there is more than one, so a single-scene
+    // document stays exactly the file it was and opens in older versions.
+    if scenes.len() > 1 {
+        let index = ScenesDto {
+            active,
+            names: scenes.iter().map(|(name, _)| name.to_string()).collect(),
+        };
+        zip.start_file(ENTRY_SCENES, deflated)?;
+        zip.write_all(&serde_json::to_vec_pretty(&index)?)?;
     }
 
-    // Bitmaps, the same way and for the same reasons. PNG and JPEG are already
-    // compressed, so these are stored rather than deflated too.
-    //
-    // A bitmap that was *painted* here has no source file, so its current
-    // pixels are encoded as a PNG — see `ImageAsset::bytes_for_storage`. An
-    // image that cannot be written is reported and skipped rather than losing
-    // the whole save: the artwork that references it keeps its shape and its
-    // place, and reopening shows a grey fill where the picture was.
-    for image in scene.images().iter() {
-        match image.bytes_for_storage() {
-            Ok(bytes) => {
-                zip.start_file(format!("media/{}", image.file_name()), stored)?;
-                zip.write_all(&bytes)?;
-            }
-            Err(e) => tracing::warn!("could not store {}: {e}", image.name),
-        }
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    for (i, (_, scene)) in scenes.iter().enumerate() {
+        zip.start_file(scene_entry(i), deflated)?;
+        let dto = DocumentDto::from_scene(scene);
+        zip.write_all(&serde_json::to_vec_pretty(&dto)?)?;
+        write_media(&mut zip, scene, &media_prefix(i), stored)?;
     }
 
     zip.finish()?;
     Ok(())
 }
 
-/// Read a scene from `.buzz` bytes.
+/// Write a scene's sounds and images into the archive under `prefix`.
+///
+/// **Stored, not deflated.** MP3 and compressed WAV do not compress again;
+/// deflating them costs time on every save and gives back a fraction of a
+/// percent, and an uncompressed entry unzips to a playable file directly. A
+/// painted bitmap that cannot be written is reported and skipped rather than
+/// losing the whole save — the artwork keeps its place and shows a grey fill.
+fn write_media<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    scene: &Scene,
+    prefix: &str,
+    stored: SimpleFileOptions,
+) -> Result<(), DocError> {
+    for sound in scene.sounds().iter() {
+        zip.start_file(format!("{prefix}{}", sound.file_name()), stored)?;
+        zip.write_all(&sound.data)?;
+    }
+    for image in scene.images().iter() {
+        match image.bytes_for_storage() {
+            Ok(bytes) => {
+                zip.start_file(format!("{prefix}{}", image.file_name()), stored)?;
+                zip.write_all(&bytes)?;
+            }
+            Err(e) => tracing::warn!("could not store {}: {e}", image.name),
+        }
+    }
+    Ok(())
+}
+
+/// Read the first (or only) scene from `.buzz` bytes.
 pub fn from_bytes(bytes: &[u8]) -> Result<Scene, DocError> {
+    Ok(from_bytes_scenes(bytes)?
+        .0
+        .into_iter()
+        .next()
+        .map(|(_, scene)| scene)
+        .unwrap_or_else(Scene::empty))
+}
+
+/// Read every named scene from `.buzz` bytes, and which one was active. A file
+/// with no scene index is a single-scene document — every file older versions
+/// wrote — and comes back as one scene named "Scene 1".
+pub fn from_bytes_scenes(bytes: &[u8]) -> Result<(Vec<(String, Scene)>, usize), DocError> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
 
     // Check the type before trusting anything else in the file.
@@ -172,11 +236,33 @@ pub fn from_bytes(bytes: &[u8]) -> Result<Scene, DocError> {
         return Err(DocError::WrongType(mimetype.trim().to_string()));
     }
 
-    let mut document = String::new();
-    archive
-        .by_name(ENTRY_DOCUMENT)?
-        .read_to_string(&mut document)?;
+    let (names, active): (Vec<String>, usize) = match archive.by_name(ENTRY_SCENES) {
+        Ok(mut file) => {
+            let mut json = String::new();
+            file.read_to_string(&mut json)?;
+            let index: ScenesDto = serde_json::from_str(&json)?;
+            (index.names, index.active)
+        }
+        Err(_) => (vec!["Scene 1".to_string()], 0),
+    };
 
+    let mut scenes = Vec::with_capacity(names.len());
+    for (i, name) in names.into_iter().enumerate() {
+        let scene = read_scene(&mut archive, &scene_entry(i), &media_prefix(i))?;
+        scenes.push((name, scene));
+    }
+    let active = active.min(scenes.len().saturating_sub(1));
+    Ok((scenes, active))
+}
+
+/// Read one scene's document JSON and the media under `prefix`.
+fn read_scene<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    doc_entry: &str,
+    prefix: &str,
+) -> Result<Scene, DocError> {
+    let mut document = String::new();
+    archive.by_name(doc_entry)?.read_to_string(&mut document)?;
     let dto: DocumentDto = serde_json::from_str(&document)?;
 
     // **Bitmaps are decoded before the scene is built**, because a fill refers
@@ -186,7 +272,7 @@ pub fn from_bytes(bytes: &[u8]) -> Result<Scene, DocError> {
     // first.
     let mut images = buzz_scene::ImageLibrary::default();
     for entry in &dto.images {
-        let name = format!("media/image-{}.{}", entry.id, entry.format);
+        let name = format!("{prefix}image-{}.{}", entry.id, entry.format);
         let mut bytes = Vec::new();
         match archive.by_name(&name) {
             Ok(mut file) => file.read_to_end(&mut bytes)?,
@@ -212,12 +298,11 @@ pub fn from_bytes(bytes: &[u8]) -> Result<Scene, DocError> {
     // Reunite each sound with its bytes. A sound whose file is missing keeps
     // its entry — name, duration and every keyframe that references it — and
     // simply plays nothing. Dropping it instead would silently delete the
-    // user's edits along with it, and they would have no way to tell what the
-    // document used to sound like.
+    // user's edits along with it.
     let names: Vec<(buzz_scene::SoundId, String)> = scene
         .sounds()
         .iter()
-        .map(|s| (s.id, format!("media/{}", s.file_name())))
+        .map(|s| (s.id, format!("{prefix}{}", s.file_name())))
         .collect();
     for (id, name) in names {
         let mut bytes = Vec::new();
@@ -256,9 +341,17 @@ pub fn read_meta(path: impl AsRef<Path>) -> Result<Meta, DocError> {
 /// Writes a sibling temporary file and renames it over the target, so an
 /// interrupted save cannot destroy the previous version.
 pub fn save(scene: &Scene, path: impl AsRef<Path>) -> Result<(), DocError> {
-    let path = path.as_ref();
-    let bytes = to_bytes(scene)?;
-    write_atomic(path, &bytes)
+    save_scenes(&[("Scene 1", scene)], 0, path)
+}
+
+/// Save several named scenes to `path`, atomically.
+pub fn save_scenes(
+    scenes: &[(&str, &Scene)],
+    active: usize,
+    path: impl AsRef<Path>,
+) -> Result<(), DocError> {
+    let bytes = to_bytes_scenes(scenes, active)?;
+    write_atomic(path.as_ref(), &bytes)
 }
 
 /// Write bytes to `path` via a temporary file and a rename.
@@ -294,11 +387,18 @@ fn temp_sibling(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tmp"))
 }
 
-/// Load a scene from `path`.
+/// Load the first (or only) scene from `path`.
 pub fn load(path: impl AsRef<Path>) -> Result<Scene, DocError> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
     from_bytes(&bytes)
+}
+
+/// Load every named scene from `path`, and which one was active.
+pub fn load_scenes(path: impl AsRef<Path>) -> Result<(Vec<(String, Scene)>, usize), DocError> {
+    let mut bytes = Vec::new();
+    File::open(path)?.read_to_end(&mut bytes)?;
+    from_bytes_scenes(&bytes)
 }
 
 #[cfg(test)]
@@ -463,6 +563,52 @@ mod tests {
         assert_eq!(back.shape_count(), scene.shape_count());
         assert_eq!(back.layers().len(), scene.layers().len());
         assert_eq!(back.stage().size, scene.stage().size);
+    }
+
+    /// **Every scene survives a save and reopen**, in order, with its name and
+    /// its own artwork — and the file remembers which one was active.
+    #[test]
+    fn several_scenes_round_trip_with_their_names() {
+        let mut second = Scene::empty();
+        let layer = second.add_layer("Only here", LayerKind::Normal);
+        second.add_shape(
+            layer,
+            ShapeData::filled(Rect::new(0.0, 0.0, 4.0, 4.0).to_path(1e-9), Color::WHITE),
+        );
+
+        let first = sample();
+        let scenes = [("Opening", &first), ("Chase", &second)];
+        let bytes = to_bytes_scenes(&scenes, 1).unwrap();
+        let (back, active) = from_bytes_scenes(&bytes).unwrap();
+        assert_eq!(active, 1, "the active scene was not remembered");
+
+        assert_eq!(back.len(), 2, "a scene was lost");
+        assert_eq!(back[0].0, "Opening");
+        assert_eq!(back[1].0, "Chase");
+        assert_eq!(back[0].1.shape_count(), first.shape_count());
+        assert_eq!(back[1].1.shape_count(), 1);
+        assert!(
+            back[1]
+                .1
+                .layers()
+                .iter()
+                .any(|l| l.name == "Only here"),
+            "the second scene's layers were mixed up with the first's"
+        );
+    }
+
+    /// A single-scene file — every file written before scenes existed — opens
+    /// as one scene named "Scene 1". Backward compatibility.
+    #[test]
+    fn an_old_single_scene_file_opens_as_one_scene() {
+        let scene = sample();
+        let bytes = to_bytes(&scene).unwrap();
+        let (back, active) = from_bytes_scenes(&bytes).unwrap();
+
+        assert_eq!(back.len(), 1);
+        assert_eq!(active, 0);
+        assert_eq!(back[0].0, "Scene 1");
+        assert_eq!(back[0].1.shape_count(), scene.shape_count());
     }
 
     #[test]

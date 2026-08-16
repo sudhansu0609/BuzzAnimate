@@ -2841,6 +2841,46 @@ impl Editor {
             .select_layer(self.doc.scene(), layer, self.current_frame);
     }
 
+    /// Switch which scene is being edited, and put the editor into a clean
+    /// state for it: nothing selected, the active layer resolved, the playhead
+    /// clamped, and the symbol-bounds cache dropped (a different scene reuses
+    /// revision numbers, so a stale entry would give wrong bounds).
+    pub fn switch_scene(&mut self, index: usize) {
+        if index == self.doc.active_scene() {
+            return;
+        }
+        self.doc.switch_scene(index);
+        self.bounds_cache.borrow_mut().take();
+        self.selection.clear();
+        self.camera_selected = false;
+        self.selection.ensure_active_layer(self.doc.scene());
+        // A fresh scene may be shorter than where the playhead sat; prune what
+        // is no longer on screen.
+        self.set_frame(self.current_frame);
+        self.playback.playing = false;
+    }
+
+    /// Add a new empty scene after the active one and edit it.
+    pub fn add_scene(&mut self) {
+        self.doc.add_scene();
+        self.bounds_cache.borrow_mut().take();
+        self.selection.clear();
+        self.camera_selected = false;
+        self.selection.ensure_active_layer(self.doc.scene());
+        self.set_frame(0);
+        self.playback.playing = false;
+    }
+
+    /// Delete a scene. The last remaining scene cannot be removed.
+    pub fn delete_scene(&mut self, index: usize) {
+        self.doc.delete_scene(index);
+        self.bounds_cache.borrow_mut().take();
+        self.selection.clear();
+        self.camera_selected = false;
+        self.selection.ensure_active_layer(self.doc.scene());
+        self.set_frame(self.current_frame);
+    }
+
     /// Give a transform tool something to work on.
     ///
     /// Free Transform with nothing selected has nothing to draw handles round,

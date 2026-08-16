@@ -889,7 +889,16 @@ impl Scene {
     }
 
     pub fn resolved_bounds(&self, object: &Object) -> Rect {
-        self.resolved_bounds_within(object, 0)
+        // Through the memoised table, not the naive recursion below: an
+        // instance nested N deep costs the recursion time exponential in N,
+        // because each level re-measures every level under it from scratch.
+        // Selecting an imported character (rigs inside rigs) then re-measured
+        // the whole tree every frame the selection chrome was drawn, and the
+        // stage froze. The table is linear in the library and memoised across
+        // its own build, so this is a walk of the object plus a lookup per
+        // instance. See [`Self::symbol_bounds_table`].
+        let table = self.symbol_bounds_table();
+        self.resolved_bounds_with(object, &table)
     }
 
     fn resolved_bounds_within(&self, object: &Object, depth: usize) -> Rect {
@@ -2546,6 +2555,68 @@ mod tests {
             asset.library().get(head).is_some(),
             "and the symbol nested inside that one"
         );
+    }
+
+    /// **The selection freeze.** `resolved_bounds` used to re-measure a
+    /// symbol's whole subtree on every call, so a chain of instances nested N
+    /// deep cost time exponential in N — and it was called for every selected
+    /// object, every frame the selection chrome was drawn. Selecting an
+    /// imported character (rigs inside rigs) locked the stage up. Through the
+    /// memoised table it is linear, so even a deep chain resolves instantly.
+    #[test]
+    fn resolving_a_deeply_nested_instance_is_not_exponential() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+
+        // A chain: sym0 contains sym1 contains sym2 … the deepest holds a
+        // shape. A naive recursive measure branches at every level.
+        const DEPTH: usize = 24;
+        let mut symbols = Vec::new();
+        for i in 0..DEPTH {
+            symbols.push(scene.add_symbol(format!("s{i}"), SymbolKind::Graphic, None));
+        }
+        for i in 0..DEPTH {
+            let this = symbols[i];
+            let child = symbols.get(i + 1).copied();
+            scene.library_mut().update(this, |symbol| {
+                let mut inner = Layer::new(LayerId(7_000 + i as u64), "L", LayerKind::Normal);
+                let objects = Arc::make_mut(&mut inner.frames.keyframes_mut()[0].objects);
+                match child {
+                    Some(child) => objects.push(Arc::new(Object::instance_of(
+                        ObjectId(9_000 + i as u64),
+                        child,
+                    ))),
+                    // The leaf carries real geometry, so the bounds are non-zero.
+                    None => objects.push(Arc::new(Object::shape(
+                        ObjectId(9_000 + i as u64),
+                        ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+                    ))),
+                }
+                symbol.layers.push_front(inner);
+            });
+        }
+
+        let instance = scene
+            .add_instance_at(layer, 0, symbols[0], Affine::IDENTITY)
+            .expect("an instance");
+        let (_, object) = scene.find_object(instance).expect("the placed instance");
+
+        let start = std::time::Instant::now();
+        let bounds = scene.resolved_bounds(object);
+        let elapsed = start.elapsed();
+
+        assert!(bounds.area() > 0.0, "the nested shape gives it real extents");
+        // Exponential in 24 would never finish; linear is microseconds. The
+        // bound is generous for a debug build under test-runner load.
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "resolving a {DEPTH}-deep instance took {elapsed:?} — the exponential \
+             measure is back"
+        );
+
+        // And it still agrees with the table it now reads from.
+        let table = scene.symbol_bounds_table();
+        assert_eq!(bounds, scene.resolved_bounds_with(object, &table));
     }
 
     /// A symbol that contains an instance of itself — which an import can

@@ -218,6 +218,17 @@ enum Gesture {
         /// drag began on decides what it does, which is the rule the rest of
         /// this file already follows.
         moving: bool,
+        /// This drag is **turning the selection**, and about which point.
+        ///
+        /// Recorded for the same reason `moving` is, and needed for the same
+        /// reason: the rotation is applied as the pointer travels, so by the
+        /// second step the selection is no longer where it was when the
+        /// question could have been asked.
+        ///
+        /// `applied` is how much of the turn has already been made, so each
+        /// move can commit the *difference* — which is what keeps Shift's snap
+        /// to 45 degrees exact instead of accumulating rounding.
+        turning: Option<Turning>,
     },
     /// Accumulating freehand samples.
     ///
@@ -238,6 +249,14 @@ enum Gesture {
         origin: Point,
         current: Point,
     },
+}
+
+/// A rotation in progress: the point it turns about, and how far it has gone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Turning {
+    pivot: Point,
+    /// Radians already committed to the document.
+    applied: f64,
 }
 
 /// Where stroke timing comes from.
@@ -355,6 +374,7 @@ impl ToolMachine {
                         current: doc,
                         mods,
                         moving: self.begins_a_move(doc, ctx),
+                        turning: self.begins_a_turn(doc, ctx),
                     },
                 };
             }
@@ -364,6 +384,7 @@ impl ToolMachine {
                     current: doc,
                     mods,
                     moving: self.begins_a_move(doc, ctx),
+                    turning: self.begins_a_turn(doc, ctx),
                 };
             }
         }
@@ -408,6 +429,32 @@ impl ToolMachine {
         self.tool == ToolId::FreeTransform || contains(bounds, at)
     }
 
+    /// Does a press at `at` begin a rotation, and about what?
+    ///
+    /// The ring just outside a corner, which is where both the selection tools
+    /// and Free Transform turn the selection — the same zone `finish_drag`
+    /// reads, asked once at the start where the answer is still true.
+    fn begins_a_turn(&self, at: Point, ctx: &ToolContext<'_>) -> Option<Turning> {
+        if !matches!(
+            self.tool,
+            ToolId::Selection | ToolId::Subselection | ToolId::FreeTransform
+        ) {
+            return None;
+        }
+        let bounds = ctx.selection_bounds?;
+        let pivot = match (self.tool, ctx.pivot) {
+            (ToolId::FreeTransform, p) => p.unwrap_or_else(|| bounds.center()),
+            (_, Some(p)) => p,
+            (_, None) => return None,
+        };
+        let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+        matches!(
+            transform_zone(bounds, pivot, at, grab),
+            TransformZone::Rotate
+        )
+        .then_some(Turning { pivot, applied: 0.0 })
+    }
+
     pub fn pointer_move(&mut self, doc: Point, screen: Point, mods: Mods) -> ToolAction {
         let delta_screen = screen - self.last_screen;
         self.last_screen = screen;
@@ -432,15 +479,42 @@ impl ToolMachine {
                 ToolAction::None
             }
             Gesture::Dragging {
+                origin,
                 current,
                 mods: m,
                 moving,
-                ..
+                turning,
             } => {
                 let previous = *current;
                 let moving = *moving;
+                let origin = *origin;
                 *current = doc;
                 *m = mods;
+
+                // **The artwork turns under the pointer.**
+                //
+                // A rotation used to be drawn as an outline and committed on
+                // release, so the drawing sat still while a wireframe swung
+                // around it and you found out what you had done afterwards.
+                //
+                // Committed as the *difference* from what has already been
+                // applied rather than as the whole angle each time: that is
+                // what keeps Shift's snap to 45 degrees landing exactly on 45
+                // rather than on the sum of a hundred roundings.
+                if let Some(turn) = turning {
+                    let target = angle_of(turn.pivot, origin, doc, mods.shift);
+                    let step = target - turn.applied;
+                    turn.applied = target;
+                    return if step.abs() > f64::EPSILON {
+                        ToolAction::TransformSelection {
+                            transform: Affine::translate(turn.pivot.to_vec2())
+                                * Affine::rotate(step)
+                                * Affine::translate(-turn.pivot.to_vec2()),
+                        }
+                    } else {
+                        ToolAction::None
+                    };
+                }
                 // **The artwork travels with the pointer.**
                 //
                 // A move used to be committed only on release, so the drag
@@ -491,8 +565,12 @@ impl ToolMachine {
                 self.finish_freehand(samples, mods, ctx)
             }
             Gesture::Dragging {
-                origin, mods, moving, ..
-            } => self.finish_drag(origin, doc, mods, moving, ctx),
+                origin,
+                mods,
+                moving,
+                turning,
+                ..
+            } => self.finish_drag(origin, doc, mods, moving || turning.is_some(), ctx),
         }
     }
 
@@ -576,6 +654,10 @@ impl ToolMachine {
             // top of it would be a second, redundant answer to "where is this
             // going?" — drawn in the place the artwork already is.
             Gesture::Dragging { moving: true, .. } => Preview::None,
+            // A live rotation shows itself, for the same reason a move does.
+            Gesture::Dragging {
+                turning: Some(_), ..
+            } => Preview::None,
             Gesture::Dragging {
                 origin,
                 current,
@@ -1277,6 +1359,25 @@ fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> Transform
     }
 
     TransformZone::Inside
+}
+
+/// The angle a drag has swept about `pivot`, snapped to 45 degrees with Shift.
+///
+/// Pulled out of `rotate_about` so a live rotation can ask for the angle alone
+/// and commit the part of it that is left.
+fn angle_of(pivot: Point, origin: Point, end: Point, snap: bool) -> f64 {
+    let from = origin - pivot;
+    let to = end - pivot;
+    if from.hypot() < 1e-9 || to.hypot() < 1e-9 {
+        return 0.0;
+    }
+    let angle = to.atan2() - from.atan2();
+    if snap {
+        let step = std::f64::consts::FRAC_PI_4;
+        (angle / step).round() * step
+    } else {
+        angle
+    }
 }
 
 /// Rotation about a point, by the angle the drag swept.
@@ -2577,41 +2678,49 @@ mod transform_preview_tests {
     }
 
     /// Shift is honoured in the preview too — a constrained rotate that
-    /// previewed unconstrained would be lying about where it will land.
+    /// **Shift snaps the turn to 45 degrees, as it happens.**
+    ///
+    /// The rotation is applied while the pointer travels rather than drawn as
+    /// an outline and committed on release, so this asks the drag itself what
+    /// it did rather than asking a preview what it promised.
     #[test]
-    fn the_preview_honours_the_modifiers() {
-        let from = Point::new(-8.0, -8.0);
-        let to = Point::new(60.0, -30.0);
-        let plain = drag(ToolId::FreeTransform, from, to, Mods::default());
-        let shifted = drag(
-            ToolId::FreeTransform,
-            from,
-            to,
-            Mods {
-                shift: true,
-                ..Mods::default()
-            },
-        );
+    fn a_live_rotation_honours_shift() {
+        let style = DrawStyle::default();
+        let ctx = context(&style);
+        let (from, to) = (Point::new(-8.0, -8.0), Point::new(60.0, -30.0));
 
-        match (&plain.0, &shifted.0) {
-            (Preview::Transform(a), Preview::Transform(b)) => {
-                assert!(
-                    a.as_coeffs() != b.as_coeffs(),
-                    "Shift changed nothing about the preview"
-                );
-            }
-            other => panic!("expected two transform previews, got {other:?}"),
-        }
-        // And each still agrees with its own commit.
-        for (previewed, committed) in [plain, shifted] {
-            if let (Preview::Transform(shown), ToolAction::TransformSelection { transform }) =
-                (previewed, committed)
-            {
-                for (x, y) in shown.as_coeffs().iter().zip(transform.as_coeffs().iter()) {
-                    assert!((x - y).abs() < 1e-9);
+        let swept = |mods: Mods| -> f64 {
+            let mut m = ToolMachine::new(ToolId::FreeTransform);
+            m.pointer_down(from, from, mods, &ctx);
+            let action = m.pointer_move(to, to, mods);
+            let _ = m.pointer_up(to, to, &ctx);
+            match action {
+                ToolAction::TransformSelection { transform } => {
+                    let c = transform.as_coeffs();
+                    c[1].atan2(c[0])
                 }
+                other => panic!("a drag on the ring should turn it, got {other:?}"),
             }
-        }
+        };
+
+        let plain = swept(Mods::default());
+        let shifted = swept(Mods {
+            shift: true,
+            ..Mods::default()
+        });
+
+        assert!(
+            (plain - shifted).abs() > 1e-9,
+            "Shift changed nothing about the turn"
+        );
+        // And the snapped one lands on a multiple of 45 degrees.
+        let step = std::f64::consts::FRAC_PI_4;
+        let off = (shifted / step) - (shifted / step).round();
+        assert!(
+            off.abs() < 1e-9,
+            "with Shift the turn should land on 45 degrees, it swept {}",
+            shifted.to_degrees()
+        );
     }
 
     /// **Free Transform can still choose what to work on.**

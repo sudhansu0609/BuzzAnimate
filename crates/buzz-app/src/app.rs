@@ -2347,8 +2347,12 @@ impl App {
             } else {
                 "Unparent Layer"
             };
+            // Through `set_follows`, which records the pose the link is made
+            // at — without it a character with a single keyframe has no motion
+            // to propagate and moving a wrist leaves its palm behind.
+            let frame = self.editor.current_frame;
             self.editor.doc.edit(label, |scene| {
-                scene.update_layer(layer, |l| l.follows = follows);
+                scene.set_follows(layer, follows, frame);
             });
         }
         if let Some(frame) = response.scrub_to {

@@ -5844,6 +5844,120 @@ mod tests {
         );
     }
 
+    /// **Move the wrist and the palm goes with it.**
+    ///
+    /// The whole point of layer parenting, and the case it is actually used in:
+    /// a character posed on one keyframe, nothing animated yet, and a chain of
+    /// limbs that has to move as a limb.
+    #[test]
+    fn moving_a_parent_layer_carries_its_children() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+
+        let wrist_layer = e.active_layer().expect("a layer");
+        let wrist = draw_square(&mut e, 100.0, 100.0, 30.0, Color::WHITE).expect("wrist");
+
+        let mut palm_layer = None;
+        let mut palm = None;
+        e.doc.edit("Palm", |scene| {
+            let layer = scene.add_layer("palm", buzz_scene::LayerKind::Normal);
+            palm_layer = Some(layer);
+            let id = scene.next_object_id();
+            palm = Some(id);
+            let art =
+                Object::shape(id, ShapeData::filled(square(140.0, 100.0, 20.0), Color::WHITE));
+            scene.edit_layers().update(layer, |l| {
+                l.frames.set_objects(0, vec![Arc::new(art)]);
+            });
+            // Through the same call the timeline and the Layers panel make,
+            // which records the pose the link was made at.
+            scene.set_follows(layer, Some(wrist_layer), 0);
+        });
+        let palm = palm.expect("the palm");
+        let palm_layer = palm_layer.expect("the palm layer");
+
+        let where_is = |e: &Editor, id: ObjectId, layer: buzz_scene::LayerId| -> Point {
+            let scene = e.scene();
+            let object = scene
+                .layers()
+                .get(layer)
+                .and_then(|l| l.objects_at(0).iter().find(|o| o.id == id).cloned())
+                .expect("the artwork");
+            let follows = scene.layers().inherited_transform(layer, 0);
+            buzz_scene::object::transform_rect(follows, object.bounds()).origin()
+        };
+
+        let palm_before = where_is(&e, palm, palm_layer);
+
+        // Drag the wrist 60 to the right, as the pointer would.
+        e.selection.select_one(wrist);
+        e.apply(ToolAction::MoveSelection {
+            delta: Vec2::new(60.0, 0.0),
+        });
+
+        let wrist_after = where_is(&e, wrist, wrist_layer);
+        assert!(
+            (wrist_after.x - 160.0).abs() < 1e-6,
+            "the wrist should have moved, it is at {wrist_after:?}"
+        );
+
+        let palm_after = where_is(&e, palm, palm_layer);
+        assert!(
+            (palm_after.x - palm_before.x - 60.0).abs() < 1e-6,
+            "the palm should have gone with it: {palm_before:?} -> {palm_after:?}"
+        );
+    }
+
+    /// **Both tools turn the artwork, and turn it as the pointer moves.**
+    ///
+    /// The rotation used to be drawn as an outline and committed on release,
+    /// so the drawing sat still while a wireframe swung around it. Asked here
+    /// through the whole editor, for the Selection tool and Free Transform
+    /// alike — Free Transform is the one an animator reaches for to rotate, and
+    /// it has to be the one that does.
+    #[test]
+    fn both_transform_tools_rotate_while_the_pointer_moves() {
+        for tool in [buzz_ui::ToolId::Selection, buzz_ui::ToolId::FreeTransform] {
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::ObjectDrawing;
+            let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+            e.selection.select_one(id);
+            e.set_tool(tool);
+
+            let before = e.scene().find_object(id).expect("there").1.transform;
+            let camera = e.camera.clone();
+            let screen = |p: Point| camera.doc_to_screen(p);
+
+            // Press on the ring just outside a corner, then walk the pointer
+            // round it a step at a time.
+            e.pointer_down(screen(Point::new(214.0, 186.0)), Mods::default());
+            let mut seen_turning = false;
+            for step in 1..=8 {
+                let angle = (step as f64) * 0.08;
+                let at = Point::new(
+                    150.0 + 90.0 * angle.cos(),
+                    150.0 + 90.0 * angle.sin() - 60.0,
+                );
+                e.pointer_move(screen(at), Mods::default());
+                let now = e.scene().find_object(id).expect("there").1.transform;
+                if now.as_coeffs() != before.as_coeffs() {
+                    seen_turning = true;
+                }
+            }
+            assert!(
+                seen_turning,
+                "[{tool:?}] the artwork should turn while the pointer moves,                  not only when it is released"
+            );
+
+            e.pointer_up(screen(Point::new(120.0, 220.0)));
+            let after = e.scene().find_object(id).expect("there").1.transform;
+            assert!(
+                before.as_coeffs() != after.as_coeffs(),
+                "[{tool:?}] and the turn should still be there afterwards"
+            );
+        }
+    }
+
     #[test]
     fn moving_the_selection_shifts_it_and_is_undoable() {
         let mut e = editor();

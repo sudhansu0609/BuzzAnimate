@@ -896,6 +896,10 @@ pub struct LayerDto {
     /// absent means it follows nothing, which is every older document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follows: Option<u64>,
+    /// The pose a rig parent was linked at. Version 10; absent on older
+    /// documents, which fall back to their first keyframe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest_pose: Option<[f64; 6]>,
     pub visible: bool,
     pub locked: bool,
     #[serde(default)]
@@ -1521,6 +1525,7 @@ impl LayerDto {
             kind: layer.kind,
             parent: layer.parent.map(|p| p.0),
             follows: layer.follows.map(|p| p.0),
+            rest_pose: layer.rest_pose.map(|m| m.as_coeffs()),
             visible: layer.visible,
             locked: layer.locked,
             outline: layer.outline,
@@ -1560,6 +1565,7 @@ impl LayerDto {
         let mut layer = Layer::new(LayerId(self.id), self.name.clone(), self.kind);
         layer.parent = self.parent.map(LayerId);
         layer.follows = self.follows.map(LayerId);
+        layer.rest_pose = self.rest_pose.map(buzz_geom::Affine::new);
         layer.visible = self.visible;
         layer.locked = self.locked;
         layer.outline = self.outline;

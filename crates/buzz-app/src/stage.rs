@@ -443,6 +443,13 @@ fn draw_selection(
         draw_pivot(painter, editor, &to_screen);
         return;
     }
+    // **Free Transform turns as well as scales**, and the ring that turns it
+    // sits just outside the corners it scales from — a few pixels apart, doing
+    // different things, with only the square handles drawn. The arcs mark the
+    // other half of the gizmo so it can be found without discovering it by
+    // accident.
+    draw_rotate_hints(painter, rect);
+
     const HANDLE: f32 = 6.0;
     for corner in [
         rect.left_top(),

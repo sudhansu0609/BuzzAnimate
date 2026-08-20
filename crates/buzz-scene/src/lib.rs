@@ -1211,6 +1211,38 @@ impl Scene {
     }
 
     /// Edit a layer in place. Returns false if it does not exist.
+    /// **Make `child` follow `parent`** — Animate's Layer Parenting — recording
+    /// the pose the link was made at.
+    ///
+    /// The recording is the part that matters. Parenting propagates a parent's
+    /// motion away from its rest pose, so without a rest to measure from, a
+    /// character with a single keyframe has no motion to propagate and moving
+    /// a wrist leaves its palm behind. See [`Layer::rest_pose`].
+    ///
+    /// `parent` of `None` detaches. Refuses a link that would make a cycle,
+    /// because a layer that follows itself has nothing sensible to draw.
+    pub fn set_follows(&mut self, child: LayerId, parent: Option<LayerId>, frame: u32) -> bool {
+        if let Some(parent) = parent {
+            if !self.layers().can_follow(child, parent) {
+                return false;
+            }
+            // Where the parent stands right now, taken before the link exists
+            // so it is the pose the user sees when they make it.
+            let rest = self
+                .layers()
+                .get(parent)
+                .and_then(|l| l.frames.resolved_at(frame).iter().next().map(|o| o.transform));
+            self.update_layer(parent, |l| {
+                // Only if it has none: a second child must not move the rest
+                // the first one was rigged against.
+                if l.rest_pose.is_none() {
+                    l.rest_pose = rest;
+                }
+            });
+        }
+        self.update_layer(child, |l| l.follows = parent)
+    }
+
     pub fn update_layer(&mut self, id: LayerId, f: impl FnOnce(&mut Layer)) -> bool {
         let ok = self.active_layers_mut().update(id, f);
         if ok {

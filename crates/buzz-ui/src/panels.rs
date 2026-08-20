@@ -2510,7 +2510,9 @@ pub fn layers_panel(
     }
 
     if let Some((layer, follows)) = set_follows {
-        scene.update_layer(layer, |l| l.follows = follows);
+        // The same call the timeline's parenting view makes, so both record
+        // the pose the link was made at. See `Scene::set_follows`.
+        scene.set_follows(layer, follows, frame);
     }
     if let Some((layer, kind)) = set_kind {
         scene.update_layer(layer, |l| l.kind = kind);

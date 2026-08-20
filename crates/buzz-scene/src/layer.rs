@@ -153,6 +153,23 @@ pub struct Layer {
     /// apart for exactly that reason.
     pub follows: Option<LayerId>,
 
+    /// This layer's own transform **at the moment it became a rig parent**.
+    ///
+    /// Layer parenting propagates a parent's motion *away from its rest pose*,
+    /// so the whole feature turns on what "rest" means. It used to mean "this
+    /// layer's first keyframe" — which is fine for a character that is already
+    /// animated and useless for one that is not: with a single keyframe, now
+    /// *is* rest, the motion is always the identity, and moving a wrist left
+    /// its palm behind. Parenting did nothing until you had animated, which is
+    /// the wrong way round, because parenting is what you set up *before* you
+    /// animate.
+    ///
+    /// Recorded when a link is made, so it stays put while the artwork moves.
+    /// `None` on a layer nothing follows, and on documents written before this
+    /// existed — those fall back to the first keyframe, which is what they were
+    /// saved expecting.
+    pub rest_pose: Option<Affine>,
+
     /// The eye column.
     pub visible: bool,
     /// The padlock column. Locked layers cannot be selected or edited.
@@ -237,6 +254,7 @@ impl Layer {
             kind,
             parent: None,
             follows: None,
+            rest_pose: None,
             visible: true,
             locked: false,
             outline: false,
@@ -504,10 +522,6 @@ impl LayerStack {
         let Some(layer) = self.get(id) else {
             return Affine::IDENTITY;
         };
-        let Some(rest_frame) = layer.frames.keyframes().first().map(|k| k.start) else {
-            return Affine::IDENTITY;
-        };
-
         let anchor = |at: u32| {
             layer
                 .frames
@@ -516,8 +530,24 @@ impl LayerStack {
                 .next()
                 .map(|object| object.transform)
         };
-        let (Some(now), Some(rest)) = (anchor(frame), anchor(rest_frame)) else {
+        let Some(now) = anchor(frame) else {
             return Affine::IDENTITY;
+        };
+        // The pose the link was made at, when there is one. Falling back to the
+        // first keyframe keeps documents written before rest poses existed
+        // behaving as they did — and those are exactly the documents whose
+        // parenting only ever showed up once they were animated.
+        let rest = match layer.rest_pose {
+            Some(recorded) => recorded,
+            None => {
+                let Some(rest_frame) = layer.frames.keyframes().first().map(|k| k.start) else {
+                    return Affine::IDENTITY;
+                };
+                let Some(rest) = anchor(rest_frame) else {
+                    return Affine::IDENTITY;
+                };
+                rest
+            }
         };
 
         // A rest pose scaled to nothing has no inverse; a layer like that

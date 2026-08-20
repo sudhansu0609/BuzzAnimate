@@ -993,6 +993,13 @@ fn bake_rig_offsets(layers: &mut [PendingLayer]) {
 
         let length = layers[index].layer.frames.length();
         layers[index].layer.frames = buzz_scene::LayerTimeline::from_parts(moved, length);
+        // **And the pose the rig hangs off.** Layer parenting propagates a
+        // parent's motion away from its rest pose, and this is that pose — the
+        // one just baked into the child. Without it the model falls back to
+        // "the parent's first keyframe", which for a character that has been
+        // imported but not yet animated is the same as now: no motion to
+        // propagate, so moving a wrist would leave its palm behind.
+        layers[parent_index].layer.rest_pose = Some(parent_rest);
         // **The link stays.** The artwork now sits where the parent's rest pose
         // puts it, and the parent's motion from that rest pose is exactly what
         // layer parenting adds — so the character is both posed and rigged.

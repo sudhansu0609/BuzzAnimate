@@ -707,6 +707,32 @@ impl LayerStack {
                 && !self.is_effectively_locked(l.id)
         })
     }
+
+    /// Layers the user can select on, **in the order they are painted**.
+    ///
+    /// `by_depth` mirrors the stage's `sort_by_depth`. A hit test walks these
+    /// back to front and keeps the last match, so it only finds what is
+    /// actually on top if it walks them in the order they were drawn. With
+    /// depth sorting on, [`Self::selectable`] walks the timeline's order
+    /// instead — so a layer pushed to the back of the shot but sitting high in
+    /// the timeline won the click, and the artwork visibly in front of it could
+    /// not be selected at all.
+    ///
+    /// With depth sorting off, or with every depth equal, this is exactly
+    /// [`Self::selectable`].
+    pub fn selectable_in_paint_order(&self, by_depth: bool) -> Vec<&Arc<Layer>> {
+        if !by_depth {
+            return self.selectable().collect();
+        }
+        self.depth_paint_order()
+            .into_iter()
+            .filter(|l| {
+                l.is_editable()
+                    && self.is_effectively_visible(l.id)
+                    && !self.is_effectively_locked(l.id)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

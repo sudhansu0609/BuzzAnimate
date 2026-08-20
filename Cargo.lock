@@ -571,6 +571,7 @@ dependencies = [
  "kurbo",
  "peniko",
  "rquickjs",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
 ]

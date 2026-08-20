@@ -883,19 +883,37 @@ fn resolve_layer_parents(layers: &mut [PendingLayer]) {
 /// *motion* away from its rest pose, which is what Animate's editor does when
 /// you parent two layers that already sit where you want them.
 ///
-/// Reconciling the two by baking the parent's **rest** pose into the child is
-/// exact for one level and wrong for two, because matrices do not commute: by
-/// the shin the two products disagree, and a leg comes out stretched. So the
-/// chain is composed here **per keyframe** instead:
+/// # Keeping the rig, not just the picture
+///
+/// This used to compose the whole chain per keyframe —
+/// `child_world(f) = parent_world(f) * child_relative(f)` — and then **drop the
+/// rig link**, on the grounds that propagating the parent's motion again would
+/// move the child twice. That produced the right picture and threw the rig
+/// away: an imported character arrived as a stack of unrelated layers, so
+/// moving the torso left the head behind, and the parenting an animator had
+/// built in Animate was simply not there.
+///
+/// What is baked in is the parent's **rest** pose instead, and the link is
+/// kept. That is exact at every depth, which is worth showing because the note
+/// this replaces claimed otherwise. Writing `motion_of(P, f) = P(f)·P(rest)⁻¹`
+/// for what our model propagates, and baking `C_stored(f) = P_rest·C_rel(f)`:
 ///
 /// ```text
-/// child_world(f) = parent_world(f) * child_relative(f)
+/// drawn C(f) = motion_of(P,f) · C_stored(f)
+///            = P(f)·P(rest)⁻¹ · P_rest·C_rel(f)
+///            = P(f)·C_rel(f)                     — which is what Animate draws
 /// ```
 ///
-/// Parents are baked before their children, so `parent_world` is read straight
-/// off the parent's own already-absolute keyframes. The rig link is then
-/// dropped: the artwork carries the pose, and propagating the parent's motion
-/// a second time would double every move.
+/// And one level further down, where the old note expected it to come apart —
+/// `motion_of(C,f) = C_stored(f)·C_stored(rest)⁻¹ = P_rest·C_rel(f)·C_rel(rest)⁻¹·P_rest⁻¹`,
+/// so with `G_stored(f) = C_rest_world·G_rel(f)` the `P_rest` terms cancel and
+/// `drawn G(f) = P(f)·C_rel(f)·G_rel(f)`. The rest pose that gets baked in is
+/// the parent's *stored* transform at its own first keyframe — already the
+/// composed rest chain, because parents are baked before their children — so
+/// each level cancels the one above it.
+///
+/// The upshot: the character arrives posed exactly as Animate drew it **and**
+/// still rigged, so dragging a parent layer carries its children.
 fn bake_rig_offsets(layers: &mut [PendingLayer]) {
     use std::collections::HashMap;
 
@@ -936,13 +954,15 @@ fn bake_rig_offsets(layers: &mut [PendingLayer]) {
             continue;
         };
 
-        // What the parent is doing at each of this layer's keyframes, read
-        // from the parent as it now stands — already absolute.
-        let at_parent = |frame: u32| -> Affine {
-            layers[parent_index]
-                .layer
-                .frames
-                .resolved_at(frame)
+        // **The parent's rest pose**, which is what our model measures its
+        // motion away from — the transform on the parent's *first* keyframe,
+        // exactly as `LayerStack::motion_of` reads it. Already absolute,
+        // because parents are baked before their children.
+        let parent_rest = {
+            let frames = &layers[parent_index].layer.frames;
+            let rest = frames.keyframes().first().map(|k| k.start).unwrap_or(0);
+            frames
+                .resolved_at(rest)
                 .iter()
                 .next()
                 .map(|object| object.transform)
@@ -955,13 +975,12 @@ fn bake_rig_offsets(layers: &mut [PendingLayer]) {
             .keyframes()
             .iter()
             .map(|keyframe| {
-                let parent_now = at_parent(keyframe.start);
                 let objects: Vec<std::sync::Arc<Object>> = keyframe
                     .objects
                     .iter()
                     .map(|object| {
                         let mut copy = (**object).clone();
-                        copy.transform = parent_now * copy.transform;
+                        copy.transform = parent_rest * copy.transform;
                         std::sync::Arc::new(copy)
                     })
                     .collect();
@@ -974,8 +993,9 @@ fn bake_rig_offsets(layers: &mut [PendingLayer]) {
 
         let length = layers[index].layer.frames.length();
         layers[index].layer.frames = buzz_scene::LayerTimeline::from_parts(moved, length);
-        // The pose is in the artwork now; keeping the link would move it twice.
-        layers[index].layer.follows = None;
+        // **The link stays.** The artwork now sits where the parent's rest pose
+        // puts it, and the parent's motion from that rest pose is exactly what
+        // layer parenting adds — so the character is both posed and rigged.
     }
 }
 
@@ -2190,11 +2210,13 @@ mod tests {
         let head = figure.layers.iter().find(|l| l.name == "head").unwrap();
         let body = figure.layers.iter().find(|l| l.name == "body").unwrap();
 
-        // The link is read and then *spent*: the child's pose is composed
-        // with the parent's, frame by frame, and the artwork carries it from
-        // there. Keeping the link as well would move the head twice.
-        assert_eq!(head.follows, None, "the rig is baked, not left live");
-        assert_eq!(body.follows, None);
+        // **The link is kept.** What is baked into the artwork is the parent's
+        // *rest* pose, which is exactly the part layer parenting does not
+        // propagate — so the head arrives where Animate drew it and still
+        // follows the body. Spending the link instead produced the right
+        // picture and no rig: moving the body left the head behind.
+        assert_eq!(head.follows, Some(body.id), "the rig is kept, not spent");
+        assert_eq!(body.follows, None, "the body hangs off nothing");
 
         // Relative (10, -20) on a body at (300, 400) is (310, 380) absolute.
         let placed = head.objects_at(0)[0].transform.as_coeffs();
@@ -2203,6 +2225,126 @@ mod tests {
             "the parent's rest pose should be baked in, got {:?}",
             (placed[4], placed[5])
         );
+    }
+
+    /// **An imported rig draws where Animate draws it, on every frame.**
+    ///
+    /// The one that matters: a parent that *moves*. Baking the parent's rest
+    /// pose into the child and keeping the link has to reproduce Animate's
+    /// `parent_world(f) · child_relative(f)` once our own layer parenting has
+    /// added the parent's motion back on top — at two levels down, which is
+    /// where the arithmetic was previously assumed to come apart.
+    #[test]
+    fn an_imported_rig_draws_where_animate_draws_it_on_every_frame() {
+        const RIG: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="figure" symbolType="graphic">
+  <timeline>
+    <DOMTimeline name="figure">
+      <layers>
+        <DOMLayer name="hand" layerRiggingIndex="7">
+          <frames>
+            <DOMFrame index="0" duration="11" parentLayerIndex="9">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="5" ty="7"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+        <DOMLayer name="arm" layerRiggingIndex="9">
+          <frames>
+            <DOMFrame index="0" duration="11" parentLayerIndex="5">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="10" ty="-20"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+        <DOMLayer name="body" layerRiggingIndex="5">
+          <frames>
+            <DOMFrame index="0" duration="10">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="300" ty="400"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+            <DOMFrame index="10" duration="1">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="380" ty="455"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timeline>
+</DOMSymbolItem>"##;
+
+        const PART: &str = r##"<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="part"
+             symbolType="graphic"><timeline><DOMTimeline name="part"><layers>
+             <DOMLayer name="Layer_1"><frames><DOMFrame index="0" duration="1"/>
+             </frames></DOMLayer></layers></DOMTimeline></timeline></DOMSymbolItem>"##;
+
+        let (scene, _) = build(
+            MINIMAL_DOCUMENT,
+            &[
+                ("LIBRARY/figure.xml".to_string(), RIG.to_string()),
+                ("LIBRARY/part.xml".to_string(), PART.to_string()),
+            ],
+        )
+        .unwrap();
+
+        let figure = scene.library().find_by_name("figure").unwrap();
+        let layer = |name: &str| figure.layers.iter().find(|l| l.name == name).unwrap();
+        let (body, arm, hand) = (layer("body"), layer("arm"), layer("hand"));
+
+        assert_eq!(arm.follows, Some(body.id), "the arm follows the body");
+        assert_eq!(hand.follows, Some(arm.id), "the hand follows the arm");
+
+        // Where each part is actually drawn: its own transform, carried by
+        // whatever its chain of parents is doing on that frame.
+        let drawn = |l: &buzz_scene::Layer, frame: u32| -> (f64, f64) {
+            let follows = figure.layers.inherited_transform(l.id, frame);
+            let own = l.objects_at(frame)[0].transform;
+            let c = (follows * own).as_coeffs();
+            (c[4], c[5])
+        };
+
+        // Animate's answer, composed straight down the chain.
+        // Frame 0:  body (300,400) · arm (10,-20) · hand (5,7)
+        for (name, l, want) in [
+            ("body", body, (300.0, 400.0)),
+            ("arm", arm, (310.0, 380.0)),
+            ("hand", hand, (315.0, 387.0)),
+        ] {
+            let (x, y) = drawn(l, 0);
+            assert!(
+                (x - want.0).abs() < 1e-6 && (y - want.1).abs() < 1e-6,
+                "at rest the {name} should be drawn at {want:?}, got {:?}",
+                (x, y)
+            );
+        }
+
+        // Frame 10: the body has moved to (380, 455). Everything hanging off
+        // it moves by the same (80, 55) and no more.
+        for (name, l, want) in [
+            ("body", body, (380.0, 455.0)),
+            ("arm", arm, (390.0, 435.0)),
+            ("hand", hand, (395.0, 442.0)),
+        ] {
+            let (x, y) = drawn(l, 10);
+            assert!(
+                (x - want.0).abs() < 1e-6 && (y - want.1).abs() < 1e-6,
+                "once the body moves the {name} should be drawn at {want:?}, got {:?}",
+                (x, y)
+            );
+        }
     }
 
     /// Animate's camera layer becomes our camera, not an error.

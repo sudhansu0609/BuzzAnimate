@@ -231,10 +231,72 @@
       host.trace(parts.join(" "));
     },
     getDocumentDOM: function () { return theDocument; },
+
+    // Where the scripts live, as Animate spells it. Scripts concatenate onto
+    // this: fl.configURI + "Commands/commonVariables.jsfl".
+    configURI: host.configUri(),
+
+    // **Pull in another script.**
+    //
+    // The line almost every command on a shelf opens with, because the shelf
+    // shares its settings through one file. Evaluated in *global* scope —
+    // through indirect eval — because that file declares its settings with
+    // `var`, and a `var` inside a function would be invisible to the caller,
+    // which is the one thing this call exists to avoid.
+    //
+    // Animate's optional trailing arguments are honoured too: pass a function
+    // name and its arguments and it is called once the file has loaded.
+    runScript: function (uri, funcName) {
+      var source = host.readScript(String(uri));
+      var indirectEval = eval;
+      indirectEval(source);
+      if (funcName === undefined) {
+        return undefined;
+      }
+      var fn = globalThis[String(funcName)];
+      if (typeof fn !== "function") {
+        throw new Error(
+          String(uri) + " has no function called " + String(funcName)
+        );
+      }
+      return fn.apply(null, Array.prototype.slice.call(arguments, 2));
+    },
   };
   // Animate routes trace through the Output panel; scripts written against it
   // sometimes call it that way.
   fl.outputPanel = { trace: fl.trace, clear: function () {} };
+
+  // ---- the dialogs a JSFL script expects ----------------------------------
+  //
+  // `alert` is how a JSFL command reports that it could not find a layer, and
+  // it is *everywhere* on a real shelf: on 20 of 62 commands measured, an
+  // undefined `alert` was the first thing that stopped the script — usually
+  // inside the error handling, so the script died reporting the problem rather
+  // than doing the work.
+  //
+  // A script runs with nobody watching, so these cannot open a window. They
+  // record the question, answer it the way an unattended run has to, and let
+  // the script carry on; the host shows what was asked when the run ends.
+  globalThis.alert = function (message) {
+    host.alert(message === undefined ? "" : String(message));
+  };
+  // Animate's own spelling of the same thing.
+  fl.alert = globalThis.alert;
+
+  globalThis.prompt = function (message, initial) {
+    var answer = initial === undefined || initial === null ? "" : String(initial);
+    host.askedWith(message === undefined ? "" : String(message), answer);
+    return answer;
+  };
+
+  // **Yes, because No means the script does nothing.** These are the user's
+  // own commands, run deliberately; a confirmation answered No every time
+  // would make half a shelf silently no-op, which is a worse answer than
+  // doing the work and saying it was asked.
+  globalThis.confirm = function (message) {
+    host.askedWith(message === undefined ? "" : String(message), "yes");
+    return true;
+  };
 
   globalThis.fl = fl;
   // `document` is what nearly every JSFL script assigns first.

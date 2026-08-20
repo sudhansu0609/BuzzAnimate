@@ -262,6 +262,44 @@ impl AssetLibrary {
         Ok(())
     }
 
+    /// Delete a folder and everything under it.
+    ///
+    /// # Why this takes the whole tree
+    ///
+    /// A folder in this library *is* a directory, and an animator who asks to
+    /// delete "Trees" means the trees. Refusing while it has contents would
+    /// leave the only way to remove a folder being to empty it by hand, one
+    /// asset at a time — and the panel already has to warn before it calls
+    /// this, because assets outlive documents and there is no undo out here.
+    ///
+    /// Refuses the root itself: an empty folder name would take the whole
+    /// library with it, which is not a thing any button should be able to do
+    /// by accident.
+    pub fn delete_folder(&mut self, folder: &str) -> Result<(), DocError> {
+        let Some(root) = self.root.clone() else {
+            return Ok(());
+        };
+        let folder = folder.trim_matches('/');
+        if folder.is_empty() {
+            return Ok(());
+        }
+        // Built the same way `create_folder` builds it, and checked to be
+        // inside the root before anything is removed — a `..` that arrived
+        // from a hand-edited config must not reach outside the library.
+        let path = root.join(folder.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let inside = path
+            .canonicalize()
+            .ok()
+            .zip(root.canonicalize().ok())
+            .is_some_and(|(p, r)| p.starts_with(&r) && p != r);
+        if !inside {
+            return Ok(());
+        }
+        std::fs::remove_dir_all(path).map_err(DocError::Io)?;
+        self.rescan();
+        Ok(())
+    }
+
     /// A name not already used in `folder`.
     pub fn unique_name(&self, wanted: &str, folder: &str) -> String {
         let taken = |name: &str| {
@@ -307,6 +345,38 @@ fn sanitise(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deleting a folder takes what is in it, and **cannot** take the library.
+    ///
+    /// The second half matters more than the first: an empty folder name would
+    /// resolve to the root, and a button that can delete every asset a person
+    /// owns by accident is not one worth having.
+    #[test]
+    fn a_folder_is_deleted_with_its_contents_but_the_root_is_safe() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut library = AssetLibrary::at(dir.path());
+        library.save("Oak", "Trees", &a_tree()).expect("save");
+        library.save("Pine", "Trees/Conifers", &a_tree()).expect("save");
+        library.save("Lamp", "", &a_tree()).expect("save");
+        assert_eq!(library.len(), 3);
+
+        // The root is refused, whatever it is spelled as.
+        for name in ["", "/", "   "] {
+            library.delete_folder(name).expect("refused, not failed");
+            assert_eq!(library.len(), 3, "{name:?} must not empty the library");
+        }
+
+        // A real folder goes, and so does everything nested under it.
+        library.delete_folder("Trees").expect("delete");
+        assert_eq!(library.len(), 1, "only the lamp is left");
+        assert_eq!(library.assets()[0].name, "Lamp");
+        assert!(
+            library.folders().iter().all(|f| !f.starts_with("Trees")),
+            "the folder itself is gone too, got {:?}",
+            library.folders()
+        );
+    }
+
     use buzz_geom::{Rect, Shape as _};
     use buzz_scene::{LayerKind, ShapeData};
     use peniko::Color;

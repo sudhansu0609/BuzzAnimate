@@ -151,17 +151,51 @@ impl Selection {
         self.active_layer
     }
 
-    /// Combined bounds of the selection, for transform handles.
+    /// Combined bounds of the selection **where the artwork is drawn**, for
+    /// transform handles.
     ///
     /// Goes through the scene rather than [`Object::bounds`] so that a
     /// selected symbol instance reports the extents of the artwork inside it.
-    pub fn bounds(&self, scene: &Scene) -> Option<Rect> {
+    ///
+    /// # Why the frame is needed
+    ///
+    /// Layer parenting draws a layer's artwork somewhere other than where its
+    /// geometry sits, and how far depends on where the parent is *on this
+    /// frame*. Without it these bounds described a rig's limb where it was
+    /// drawn at rest rather than where it is now, and everything built on them
+    /// was wrong in the same way: the transform box and its handles drew off
+    /// the artwork, the transformation point sat beside it, and — worst,
+    /// because it is silent — the "did this drag start inside the selection?"
+    /// test said no when the user pressed on their own character, so dragging
+    /// it rubber-banded a marquee instead of moving it.
+    ///
+    /// This is the same space [`crate::Selection`]'s callers hit-test in: the
+    /// artwork as drawn, before the document camera.
+    /// Combined bounds of the selection in the objects' **own** space, before
+    /// layer parenting moves the artwork.
+    ///
+    /// For edits that rebase geometry rather than measure it on screen —
+    /// Convert to Symbol lifts the objects out with their own transforms, so
+    /// the registration point it computes has to be in the space those
+    /// transforms are written in. Anything the user points at or that is drawn
+    /// as chrome wants [`Self::bounds_at`] instead.
+    pub fn local_bounds(&self, scene: &Scene) -> Option<Rect> {
+        self.objects
+            .iter()
+            .filter_map(|id| scene.find_object(*id).map(|(_, o)| scene.resolved_bounds(o)))
+            .reduce(|a, b| a.union(b))
+    }
+
+    pub fn bounds_at(&self, scene: &Scene, frame: u32) -> Option<Rect> {
         self.objects
             .iter()
             .filter_map(|id| {
-                scene
-                    .find_object(*id)
-                    .map(|(_, o)| scene.resolved_bounds(o))
+                let (layer, object) = scene.find_object(*id)?;
+                let follows = scene.layers().inherited_transform(layer, frame);
+                Some(buzz_scene::object::transform_rect(
+                    follows,
+                    scene.resolved_bounds(object),
+                ))
             })
             .reduce(|a, b| a.union(b))
     }
@@ -476,7 +510,7 @@ mod tests {
         let mut s = Selection::new();
         s.set([ids[0], ids[2]]);
 
-        let bounds = s.bounds(&scene).unwrap();
+        let bounds = s.bounds_at(&scene, 0).unwrap();
         assert!((bounds.x0 - 0.0).abs() < 1e-9);
         assert!((bounds.x1 - 50.0).abs() < 1e-9, "got {bounds:?}");
     }
@@ -484,7 +518,7 @@ mod tests {
     #[test]
     fn an_empty_selection_has_no_bounds() {
         let (scene, _, _) = scene_with(2);
-        assert!(Selection::new().bounds(&scene).is_none());
+        assert!(Selection::new().bounds_at(&scene, 0).is_none());
     }
 
     #[test]

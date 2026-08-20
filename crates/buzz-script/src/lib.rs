@@ -82,6 +82,72 @@ pub struct ScriptContext {
     pub current_frame: u32,
     pub selection: Vec<ObjectId>,
     pub active_layer: Option<LayerId>,
+    /// The Configuration folder `fl.configURI` points at, and the only place
+    /// `fl.runScript` will read from.
+    ///
+    /// A shelf of JSFL commands is not 71 separate programs: they open by
+    /// pulling in a shared file of settings —
+    /// `fl.runScript(fl.configURI + "Commands/commonVariables.jsfl")` — and
+    /// everything after that line depends on the variables it defines. Without
+    /// somewhere to read that from, a script either fails on its first line or,
+    /// worse, swallows the error and runs on with every setting undefined.
+    ///
+    /// **This is also the sandbox boundary.** Reading files is a capability a
+    /// script otherwise does not have, so it is confined to this one directory:
+    /// a script may read the scripts that live beside it and nothing else.
+    /// `None` disables reading altogether.
+    pub config_dir: Option<std::path::PathBuf>,
+}
+
+/// Where a shelf of JSFL commands lives on this machine.
+///
+/// BuzzAnimate's own folder first, then Animate's — because somebody with a
+/// shelf of commands built up over years has it in Animate's Configuration
+/// directory, and asking them to move it to use it here would be the whole
+/// cost of switching for no benefit. Newest Animate first, since a script
+/// shelf follows the version it was written against.
+///
+/// `None` when neither exists, which turns `fl.runScript` off rather than
+/// pointing it somewhere arbitrary.
+pub fn default_config_dir() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // Ours: `%APPDATA%/BuzzAnimate/Configuration`, beside the assets library.
+    if let Some(dir) = dirs_next_config() {
+        candidates.push(dir);
+    }
+
+    // Animate's, newest first.
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let adobe = std::path::Path::new(&local).join("Adobe");
+        let mut versions: Vec<std::path::PathBuf> = std::fs::read_dir(&adobe)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("Animate"))
+            })
+            .collect();
+        versions.sort();
+        for version in versions.into_iter().rev() {
+            candidates.push(version.join("en_US").join("Configuration"));
+        }
+    }
+
+    candidates.into_iter().find(|path| path.is_dir())
+}
+
+/// `%APPDATA%/BuzzAnimate/Configuration`, if the platform has such a place.
+fn dirs_next_config() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(
+        std::path::PathBuf::from(base)
+            .join("BuzzAnimate")
+            .join("Configuration"),
+    )
 }
 
 /// A way for the host to stop a script that is already running.
@@ -96,6 +162,14 @@ pub type StopSignal = Arc<dyn Fn() -> bool + Send + Sync>;
 pub struct ScriptOutcome {
     /// Everything the script passed to `fl.trace`, in order.
     pub trace: Vec<String>,
+    /// Everything the script raised through `alert`, `prompt` or `confirm`.
+    ///
+    /// A script runs without a person watching it, so a modal question has
+    /// nobody to answer it. Rather than fail — which is what an undefined
+    /// `alert` did, and it stopped twenty of the commands on a real shelf at
+    /// their first line of error handling — the question is recorded and
+    /// answered with its own default, and the host shows the list afterwards.
+    pub alerts: Vec<String>,
     /// The failure, already formatted for a person, or `None` on success.
     pub error: Option<String>,
     /// Editor state as the script left it.
@@ -134,6 +208,7 @@ pub(crate) struct State {
     pub scene: Scene,
     pub context: ScriptContext,
     pub trace: Vec<String>,
+    pub alerts: Vec<String>,
 }
 
 /// Run `source` against `scene`.
@@ -173,6 +248,7 @@ pub fn run_until(
         scene: scene.clone(),
         context,
         trace: Vec::new(),
+        alerts: Vec::new(),
     }));
 
     let (error, stopped) = evaluate(&state, source, limits, stop);
@@ -188,6 +264,7 @@ pub fn run_until(
 
     ScriptOutcome {
         trace: finished.trace,
+        alerts: finished.alerts,
         error,
         context: finished.context,
         changed,
@@ -203,6 +280,7 @@ impl State {
             scene: self.scene.clone(),
             context: self.context.clone(),
             trace: self.trace.clone(),
+            alerts: self.alerts.clone(),
         }
     }
 }
@@ -371,6 +449,170 @@ mod tests {
 
     fn run_source(scene: &mut Scene, source: &str) -> ScriptOutcome {
         run(scene, ScriptContext::default(), source, &Limits::default())
+    }
+
+    // -- the script shelf ---------------------------------------------------
+
+    /// **The line every command on a shelf opens with.**
+    ///
+    /// A JSFL shelf shares its settings through one file, pulled in with
+    /// `fl.runScript(fl.configURI + "Commands/...")`, and everything after
+    /// that line depends on the variables it declares. Those are `var`
+    /// declarations, so the file has to be evaluated in *global* scope or the
+    /// caller sees none of them.
+    #[test]
+    fn a_script_can_pull_in_the_settings_file_beside_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let commands = dir.path().join("Commands");
+        std::fs::create_dir_all(&commands).expect("commands dir");
+        std::fs::write(
+            commands.join("commonVariables.jsfl"),
+            "var moveFrames = 6;
+var CONFIG = { moveAmount: 5, browFrames: 10 };
+",
+        )
+        .expect("write");
+
+        let context = ScriptContext {
+            config_dir: Some(dir.path().to_path_buf()),
+            ..ScriptContext::default()
+        };
+        let mut scene = document();
+        let outcome = run(
+            &mut scene,
+            context,
+            r#"
+              var file = fl.configURI + "Commands/commonVariables.jsfl";
+              fl.runScript(file);
+              fl.trace("frames=" + moveFrames);
+              fl.trace("amount=" + CONFIG.moveAmount);
+              fl.trace("brow=" + CONFIG.browFrames);
+            "#,
+            &Limits::default(),
+        );
+
+        assert_eq!(outcome.error, None, "the include should have run");
+        assert_eq!(
+            outcome.trace,
+            vec!["frames=6", "amount=5", "brow=10"],
+            "the settings must land in global scope where the caller can see them"
+        );
+    }
+
+    /// A shelf may read the scripts beside it and **nothing else**. Reading
+    /// files is a capability a script otherwise has none of.
+    #[test]
+    fn a_script_cannot_read_past_its_own_folder() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let commands = dir.path().join("Commands");
+        std::fs::create_dir_all(&commands).expect("commands dir");
+        let secret = dir.path().parent().expect("a parent").join("buzz-secret.txt");
+        std::fs::write(&secret, "not for scripts").expect("write");
+
+        let context = ScriptContext {
+            config_dir: Some(dir.path().to_path_buf()),
+            ..ScriptContext::default()
+        };
+        let mut scene = document();
+        let outcome = run(
+            &mut scene,
+            context,
+            &format!(
+                "fl.runScript({:?});",
+                secret.display().to_string().replace(char::from(92), "/")
+            ),
+            &Limits::default(),
+        );
+        assert!(
+            outcome.error.is_some(),
+            "reading outside the script folder must fail, not succeed quietly"
+        );
+        let _ = std::fs::remove_file(&secret);
+    }
+
+    /// **What a real shelf of JSFL commands does in this engine.**
+    ///
+    /// Not a pass/fail test — a *report*. Point it at a Configuration folder
+    /// and it runs every command in it against an empty document, then prints
+    /// how far each got and what stopped it. That turns "do my scripts work"
+    /// from an opinion into a list of missing calls in the order they matter.
+    ///
+    /// Ignored by default because it reads a folder that only exists on a
+    /// machine with a shelf on it. Run it deliberately:
+    ///
+    /// ```text
+    /// cargo test -p buzz-script --lib jsfl_shelf -- --ignored --nocapture
+    /// ```
+    ///
+    /// Set `BUZZ_JSFL_DIR` to point it at a Configuration folder; it falls back
+    /// to whatever [`default_config_dir`] finds.
+    #[test]
+    #[ignore = "reads a JSFL shelf that only exists on a machine that has one"]
+    fn jsfl_shelf_compatibility_report() {
+        let root = std::env::var_os("BUZZ_JSFL_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(default_config_dir);
+        let Some(root) = root else {
+            println!("no Configuration folder found; nothing to report on");
+            return;
+        };
+        let commands = root.join("Commands");
+        let Ok(entries) = std::fs::read_dir(&commands) else {
+            println!("no Commands folder under {}", root.display());
+            return;
+        };
+
+        let mut scripts: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("jsfl"))
+            })
+            .collect();
+        scripts.sort();
+
+        // What stopped each script, tallied, so the most valuable thing to
+        // implement next is the one at the top.
+        let mut blockers: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut ran = 0usize;
+
+        println!("\n=== {} scripts in {} ===", scripts.len(), commands.display());
+        for path in &scripts {
+            let Ok(source) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let context = ScriptContext {
+                config_dir: Some(root.clone()),
+                ..ScriptContext::default()
+            };
+            let mut scene = document();
+            let outcome = run(&mut scene, context, &source, &Limits::default());
+            match &outcome.error {
+                None => {
+                    ran += 1;
+                    println!("  ok    {name}");
+                }
+                Some(error) => {
+                    let first = error.lines().next().unwrap_or(error).trim().to_string();
+                    // "X is not a function" / "cannot read property Y" carry the
+                    // missing call; that is the part worth counting.
+                    *blockers.entry(first.clone()).or_default() += 1;
+                    println!("  stop  {name}: {first}");
+                }
+            }
+        }
+
+        println!("\n{ran} of {} ran to the end", scripts.len());
+        let mut ranked: Vec<(&String, &usize)> = blockers.iter().collect();
+        ranked.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
+        println!("\nwhat stopped the rest, most common first:");
+        for (reason, count) in ranked.iter().take(25) {
+            println!("  {count:>3}  {reason}");
+        }
     }
 
     // -- stopping -----------------------------------------------------------

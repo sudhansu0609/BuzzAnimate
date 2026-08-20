@@ -319,6 +319,22 @@ impl Editor {
         table
     }
 
+    /// **Is a gesture in progress?**
+    ///
+    /// True from the press to the release of any drag that edits the document
+    /// — a tool gesture, a bone being posed, a light being moved.
+    ///
+    /// This is the gate on work that is *derived* from the document but is not
+    /// what the user is looking at while they drag. Moving artwork bumps the
+    /// revision on every pointer move, and everything keyed on the revision
+    /// treats that as "the document changed, redo your sums": the symbol use
+    /// counts, the sound envelopes, the scrollable extent. None of them can
+    /// have changed in a way that matters mid-drag, and recomputing them
+    /// between frames is time taken directly out of the drag.
+    pub fn is_gesturing(&self) -> bool {
+        self.machine.is_active() || self.rig_gesture.is_some() || self.light_gesture.is_some()
+    }
+
     /// The frame the user is editing.
     pub fn frame(&self) -> u32 {
         self.current_frame
@@ -344,7 +360,7 @@ impl Editor {
                 {
                     return Some(*at);
                 }
-                self.selection.bounds(self.doc.scene()).map(|b| b.center())
+                self.selection_bounds_drawn().map(|b| b.center())
             }
         }
     }
@@ -733,7 +749,7 @@ impl Editor {
         ToolContext {
             style: &self.style,
             zoom: self.camera.zoom,
-            selection_bounds: self.selection.bounds(self.doc.scene()),
+            selection_bounds: self.selection_bounds_drawn(),
             anchors: &[],
             pivot: self.pivot(),
             gradient: self.selected_gradient_handles(),
@@ -850,7 +866,7 @@ impl Editor {
     }
 
     /// Document-space tolerance equivalent to a few screen pixels.
-    fn pick_tolerance(&self) -> f64 {
+    pub(crate) fn pick_tolerance(&self) -> f64 {
         PICK_TOLERANCE_PX / self.camera.zoom.max(f64::MIN_POSITIVE)
     }
 
@@ -864,8 +880,38 @@ impl Editor {
     /// would work at an offset — drawing a line beside the pointer, picking
     /// artwork that is not under it.
     pub fn screen_to_edit(&self, screen: Point) -> Point {
+        let scene = self.doc.scene();
+        // The workspace view first — where the user has scrolled and zoomed.
         let doc = self.camera.screen_to_doc(screen);
-        match buzz_scene::invert_affine(self.doc.scene().edit_place()) {
+
+        // **Then back through the document camera.**
+        //
+        // The stage is drawn `camera * place * follows * object`
+        // (`buzz_render::document`), and a click has to be carried back through
+        // every one of those before it can be tested against geometry. This
+        // step was missing: with a shot framed anywhere but dead centre, the
+        // artwork was drawn where the camera put it while the click was tested
+        // where the artwork would have been with no camera at all — so clicking
+        // a character selected the one beside it, or nothing, by exactly how
+        // far the camera had been moved.
+        //
+        // At depth zero, which is the plane the editor works on. Layers pushed
+        // into the distance are carried the rest of the way by
+        // `Scene::view_to_layer`, which is written to take a point in *this*
+        // space — the comment there about "the space the rest of the editor
+        // already works in" is only true once this has happened.
+        //
+        // Identity for a document with the camera off, which is every document
+        // that has not asked for one.
+        let doc = scene
+            .camera_projection_at_depth(self.current_frame, 0.0)
+            .and_then(|shot| shot.inverse())
+            .and_then(|back| back.map_point(doc))
+            // A shot with no inverse cannot be undone; the point as it stands
+            // is the honest fallback.
+            .unwrap_or(doc);
+
+        match buzz_scene::invert_affine(scene.edit_place()) {
             Some(back) => back * doc,
             // A collapsed place cannot be undone; the document's own space is
             // the honest fallback.
@@ -898,7 +944,7 @@ impl Editor {
         }
 
         let anchors = self.selected_anchors();
-        let selection_bounds = self.selection.bounds(self.doc.scene());
+        let selection_bounds = self.selection_bounds_drawn();
         let pivot = self.pivot();
         let zoom = self.camera.zoom;
         let gradient = self.selected_gradient_handles();
@@ -952,7 +998,7 @@ impl Editor {
         // Built from disjoint fields rather than via `tool_context`, which
         // would borrow all of `self` and conflict with `&mut self.machine`.
         let anchors = self.selected_anchors();
-        let selection_bounds = self.selection.bounds(self.doc.scene());
+        let selection_bounds = self.selection_bounds_drawn();
         let pivot = self.pivot();
         let zoom = self.camera.zoom;
         let gradient = self.selected_gradient_handles();
@@ -1142,7 +1188,18 @@ impl Editor {
 
             ToolAction::PanView { delta_screen } => self.camera.pan_screen(delta_screen),
 
-            ToolAction::MoveCamera { delta_doc } => self.nudge_camera(delta_doc),
+            ToolAction::MoveCamera { delta_screen } => {
+                // Screen pixels into document units, the same conversion
+                // `Camera::pan_screen` makes for the view: undo the view's
+                // rotation, then divide by its magnification, so a drag of an
+                // inch moves the shot the same distance whatever the zoom.
+                let unrotated =
+                    Affine::rotate(-self.camera.rotation) * delta_screen.to_point();
+                let zoom = self.camera.zoom;
+                if zoom.is_finite() && zoom > 0.0 {
+                    self.nudge_camera(unrotated.to_vec2() / zoom);
+                }
+            }
 
             ToolAction::ZoomView { factor, at_screen } => {
                 self.camera.zoom_by_at(factor, at_screen);
@@ -1293,11 +1350,44 @@ impl Editor {
         if self.selection.is_empty() {
             return;
         }
-        let ids = self.selection.ids();
+
+        // **The gesture is in view space; an object's transform is not.**
+        //
+        // Layer parenting draws a child through its parent's motion, so a drag
+        // of 100 to the right on a child whose parent is turned a quarter turn
+        // must not add 100 to the child's own x — that lands the artwork 100
+        // *down*, along the parent's rotated axis, and dragging a rigged limb
+        // felt like fighting the rig. Carried back through the same transform
+        // it will be drawn with, so what the pointer did is what the artwork
+        // does.
+        //
+        // Worked out per object, because a selection can span layers with
+        // different parents, and before the edit so the scene is not borrowed
+        // while it is being changed. With no parenting `follows` is the
+        // identity and this is exactly `transform * o.transform`.
+        let frame = self.current_frame;
+        let scene = self.doc.scene();
+        let moves: Vec<(ObjectId, Affine)> = self
+            .selection
+            .ids()
+            .into_iter()
+            .filter_map(|id| {
+                let (layer, _) = scene.find_object(id)?;
+                let follows = scene.layers().inherited_transform(layer, frame);
+                let local = match invert(follows) {
+                    Some(back) => back * transform * follows,
+                    // A parent collapsed to nothing cannot be undone; the
+                    // object's own space is the honest fallback.
+                    None => transform,
+                };
+                Some((id, local))
+            })
+            .collect();
+
         let at = self.edit_at();
         self.doc.edit(label, |scene| {
-            for id in ids {
-                update_object(scene, at, id, |o| o.transform = transform * o.transform);
+            for (id, local) in moves {
+                update_object(scene, at, id, |o| o.transform = local * o.transform);
             }
         });
     }
@@ -1379,7 +1469,10 @@ impl Editor {
         let scene = self.doc.scene();
         let mut hit = None;
         // `selectable` yields back to front, so the last match is on top.
-        for layer in scene.layers().selectable() {
+        // Walked in the order the renderer paints, so the last match really is
+        // what is on top. See `LayerStack::selectable_in_paint_order`.
+        let by_depth = scene.stage().sort_by_depth;
+        for layer in scene.layers().selectable_in_paint_order(by_depth) {
             // Depth draws a layer's artwork somewhere other than where its
             // geometry says it is, so the click has to be moved the same way
             // in reverse. Without this, a layer pushed into the distance is
@@ -1431,7 +1524,10 @@ impl Editor {
         let tolerance = self.pick_tolerance();
         let frame = self.current_frame;
         let mut hit = None;
-        for layer in scene.layers().selectable() {
+        // Walked in the order the renderer paints, so the last match really is
+        // what is on top. See `LayerStack::selectable_in_paint_order`.
+        let by_depth = scene.stage().sort_by_depth;
+        for layer in scene.layers().selectable_in_paint_order(by_depth) {
             let Some(local) = scene.view_to_layer(frame, layer.depth, point) else {
                 continue;
             };
@@ -1465,7 +1561,25 @@ impl Editor {
     /// nothing on screen to put a handle on.
     pub fn object_quad(&self, id: ObjectId) -> Option<[Point; 4]> {
         let scene = self.doc.scene();
-        let (layer, object) = scene.find_object(id)?;
+        // **On the frame it is drawn on, not on the playhead's.**
+        //
+        // Under Edit Multiple Frames the artwork of other keyframes is on
+        // screen, and the renderer draws each of them through its *own* layer
+        // parenting (`buzz_render::document`). Measuring here at the playhead's
+        // frame instead applied a parent's motion that had not happened to
+        // artwork that was not there yet, so the handles sat off the drawing by
+        // exactly how far the parent had travelled between the two frames.
+        //
+        // `None` when the object is on no frame currently drawn — a selection
+        // that has outlived its span. There is nothing on screen to put a
+        // handle on, and drawing one anyway put a box over empty stage.
+        let (frame, layer) = self.drawn_at(id)?;
+        let object = scene
+            .layers()
+            .get(layer)?
+            .objects_at(frame)
+            .iter()
+            .find(|o| o.id == id)?;
         let depth = scene.layers().get(layer).map(|l| l.depth).unwrap_or(0.0);
 
         // Resolved from the memoised table: this runs every frame the object is
@@ -1475,19 +1589,92 @@ impl Editor {
         let bounds = scene.resolved_bounds_with(object, &table);
         let pivot = scene.pivot_of_with(object, &table);
         let projection = scene.camera().projection_for_object(
-            self.current_frame,
+            frame,
             scene.stage().size,
             depth,
             pivot,
             &object.spatial,
         )?;
 
-        // Layer parenting moves the artwork as well, and it happens in the
-        // plane, before the lens.
-        let follows = scene
-            .layers()
-            .inherited_transform(layer, self.current_frame);
-        projection.pre_affine(follows).map_rect(bounds)
+        // Layer parenting moves the artwork, and so does the place a symbol was
+        // opened at — both in the plane, before the lens, and in that order.
+        // This is the same chain `buzz_render::document` draws through
+        // (`projection.pre_affine(place).pre_affine(follows)`); without the
+        // place, chrome inside a symbol opened *in place* was drawn at the
+        // origin the artwork is no longer at.
+        let follows = scene.layers().inherited_transform(layer, frame);
+        projection
+            .pre_affine(scene.edit_place())
+            .pre_affine(follows)
+            .map_rect(bounds)
+    }
+
+    /// The selection's bounds **where the artwork is drawn**, on the focal
+    /// plane the pointer works on.
+    ///
+    /// Worked out object by object rather than asking the selection for one
+    /// answer, because under Edit Multiple Frames two selected objects can be
+    /// on different frames, and on layers whose parents and depths differ. This
+    /// is the space the pointer works in, so it is what the transform box, the
+    /// transformation point, and the "did this drag start inside the
+    /// selection?" test must all be built on.
+    ///
+    /// `None` when nothing in the selection is on a frame currently drawn.
+    pub fn selection_bounds_drawn(&self) -> Option<Rect> {
+        let scene = self.doc.scene();
+        self.selection
+            .iter()
+            .filter_map(|id| {
+                // **Measured once.** `object_quad` is where the artwork is
+                // drawn — through the object's own turn in space, its layer's
+                // depth and parenting, the place a symbol was opened at, and
+                // the shot. Deriving the bounds from it rather than
+                // re-measuring means the handle box and the outline cannot
+                // drift apart, which is how they drifted before.
+                let quad = self.object_quad(id)?;
+                let (frame, _) = self.drawn_at(id)?;
+
+                // Back to the focal plane, which is where the pointer is by the
+                // time `screen_to_edit` has finished with it — and where the
+                // "did this drag start inside the selection?" test has to ask
+                // its question. The place comes off with it, for the same
+                // reason it does there.
+                let shot = buzz_geom::Projection::from_affine(scene.camera_transform(frame));
+                let back = shot.inverse()?;
+                let unplace = buzz_scene::invert_affine(scene.edit_place());
+
+                let mut out: Option<Rect> = None;
+                for corner in quad {
+                    let at = back.map_point(corner)?;
+                    let at = match unplace {
+                        Some(u) => u * at,
+                        None => at,
+                    };
+                    out = Some(match out {
+                        Some(r) => r.union_pt(at),
+                        None => Rect::from_points(at, at),
+                    });
+                }
+                out
+            })
+            .reduce(|a, b| a.union(b))
+    }
+
+    /// The frame an object is currently drawn on, and the layer it is on.
+    ///
+    /// The playhead's frame when the object is there, which is the ordinary
+    /// case and the cheap one. Otherwise whichever keyframe Edit Multiple
+    /// Frames is showing it on. `None` when it is on neither.
+    fn drawn_at(&self, id: ObjectId) -> Option<(u32, LayerId)> {
+        let scene = self.doc.scene();
+        let on = |frame: u32| {
+            scene
+                .layers()
+                .iter()
+                .find(|l| l.objects_at(frame).iter().any(|o| o.id == id))
+                .map(|l| (frame, l.id))
+        };
+        on(self.current_frame).or_else(|| self.multi_frames().into_iter().find_map(on))
     }
 
     /// Objects fully inside `rect`, matching Animate's marquee.
@@ -1510,22 +1697,73 @@ impl Editor {
     /// Objects fully inside `rect` on one particular frame.
     fn objects_in_frame(&self, rect: Rect, frame: u32) -> Vec<ObjectId> {
         let scene = self.doc.scene();
+        // Resolved through the library, for the reason `Scene::symbol_bounds`
+        // records: an instance cannot measure itself, so `Object::bounds` gives
+        // it a two-unit placeholder about its own origin. Marqueeing against
+        // that picked a character up only when the drag happened to cross the
+        // dot its registration point sits on — which reads as a selection
+        // offset by however far the artwork is drawn from that point, typically
+        // most of a limb away from where the user dragged.
+        let table = self.symbol_bounds();
         let mut out = Vec::new();
-        for layer in scene.layers().selectable() {
-            // Marquee against where the artwork is drawn, which for a followed
-            // layer is not where its geometry sits.
-            let follows = scene.layers().inherited_transform(layer.id, frame);
+        // Walked in the order the renderer paints, so the last match really is
+        // what is on top. See `LayerStack::selectable_in_paint_order`.
+        let by_depth = scene.stage().sort_by_depth;
+        for layer in scene.layers().selectable_in_paint_order(by_depth) {
+            // The marquee carried back the way a click is: through the camera's
+            // projection at this layer's depth, then through whatever the layer
+            // is parented to. Both draw a layer's artwork somewhere other than
+            // where its geometry says it is, so the rectangle has to be moved
+            // the same way in reverse before it can be tested against that
+            // geometry — the trip `object_at` and the Lasso already make.
+            //
+            // With no depth and no tilt this is the identity, so an ordinary
+            // document tests exactly the rectangle that was dragged.
+            let Some(in_layer) = self.marquee_in_layer(rect, frame, layer.depth, layer.id) else {
+                // At or behind the camera: not drawn, so not selectable.
+                continue;
+            };
             for object in layer.objects_at(frame) {
                 if !object.visible || object.locked {
                     continue;
                 }
-                let bounds = buzz_scene::object::transform_rect(follows, object.bounds());
-                if rect.contains_rect(bounds) {
+                let bounds = scene.resolved_bounds_with(object, &table);
+                if in_layer.contains_rect(bounds) {
                     out.push(object.id);
                 }
             }
         }
         out
+    }
+
+    /// A marquee rectangle moved from what the user sees into one layer's own
+    /// coordinates.
+    ///
+    /// `None` when the layer is at or behind the camera. A tilted camera turns
+    /// the rectangle into a trapezoid, and the extent of that trapezoid is what
+    /// is returned: a marquee gesture has no way to express a quad, and the
+    /// honest approximation is the box round the one the user dragged.
+    fn marquee_in_layer(&self, rect: Rect, frame: u32, depth: f64, layer: LayerId) -> Option<Rect> {
+        let scene = self.doc.scene();
+        let back = invert(scene.layers().inherited_transform(layer, frame));
+        let mut mapped: Option<Rect> = None;
+        for corner in [
+            Point::new(rect.x0, rect.y0),
+            Point::new(rect.x1, rect.y0),
+            Point::new(rect.x1, rect.y1),
+            Point::new(rect.x0, rect.y1),
+        ] {
+            let point = scene.view_to_layer(frame, depth, corner)?;
+            let point = match back {
+                Some(back) => back * point,
+                None => point,
+            };
+            mapped = Some(match mapped {
+                Some(r) => r.union_pt(point),
+                None => Rect::from_points(point, point),
+            });
+        }
+        mapped
     }
 
     /// Place a soft-brush stroke as artwork.
@@ -1618,7 +1856,10 @@ impl Editor {
         let mut cuts: Vec<(LayerId, ObjectId, BezPath)> = Vec::new();
         let mut picks: Vec<ObjectId> = Vec::new();
 
-        for layer in scene.layers().selectable() {
+        // Walked in the order the renderer paints, so the last match really is
+        // what is on top. See `LayerStack::selectable_in_paint_order`.
+        let by_depth = scene.stage().sort_by_depth;
+        for layer in scene.layers().selectable_in_paint_order(by_depth) {
             // The region carried back the way a click is: through the camera's
             // projection at this layer's depth, then through whatever the layer
             // is parented to. A projective map takes straight lines to straight
@@ -2564,6 +2805,12 @@ impl Editor {
         if self.waveform_cache.revision == Some(revision) {
             return self.waveform_cache.map.clone();
         }
+        // Mid-drag the revision moves every pointer move, and no drag of
+        // artwork can change a sound. Hold the last answer; the release will
+        // bring the revision to rest and this will rebuild once.
+        if self.is_gesturing() && self.waveform_cache.revision.is_some() {
+            return self.waveform_cache.map.clone();
+        }
 
         let fps = self.doc.scene().stage().frame_rate;
         let fps_bits = fps.to_bits();
@@ -2769,6 +3016,7 @@ impl Editor {
             current_frame: self.current_frame,
             selection: self.selection.ids(),
             active_layer: self.selection.active_layer(),
+                    config_dir: buzz_script::default_config_dir(),
         };
 
         let mut working = self.doc.scene().clone();
@@ -2963,7 +3211,7 @@ impl Editor {
         // does not jump when it is replaced.
         let origin = self
             .selection
-            .bounds(self.doc.scene())
+            .local_bounds(self.doc.scene())
             .map(|b| b.origin())
             .unwrap_or(Point::ZERO);
 
@@ -4205,11 +4453,23 @@ fn object_contains(
             let inner = instance.resolve_frame(symbol.kind, frame, symbol.length());
             // Hit the artwork, not the bounding box: clicking the hole in a
             // ring selects what is behind it, as it does in Animate.
-            symbol
-                .layers
-                .selectable()
-                .flat_map(|l| l.objects_at(inner))
-                .any(|c| object_contains(scene, c, local, tolerance, inner, depth + 1, table))
+            //
+            // **Through the symbol's own layer parenting**, in reverse. A
+            // character symbol is rigged inside itself, and the renderer draws
+            // each part through the chain it follows; testing the parts where
+            // they were drawn at rest meant a click on a raised arm missed it
+            // and fell through to whatever was behind — which is the object
+            // behind getting selected.
+            symbol.layers.selectable().any(|l| {
+                let follows = symbol.layers.inherited_transform(l.id, inner);
+                let local = match invert(follows) {
+                    Some(back) => back * local,
+                    None => local,
+                };
+                l.objects_at(inner)
+                    .iter()
+                    .any(|c| object_contains(scene, c, local, tolerance, inner, depth + 1, table))
+            })
         }
 
         // Rigged artwork is hit **where it is drawn**, not where it was drawn.
@@ -4285,6 +4545,14 @@ fn sampled_paint(
             let inner = instance.resolve_frame(symbol.kind, frame, symbol.length());
             let mut hit = None;
             for layer in symbol.layers.selectable() {
+                // The same reverse trip through the symbol's rigging that
+                // `object_contains` makes; sampling a colour has to look where
+                // the paint is drawn.
+                let follows = symbol.layers.inherited_transform(layer.id, inner);
+                let local = match invert(follows) {
+                    Some(back) => back * local,
+                    None => local,
+                };
                 for child in layer.objects_at(inner) {
                     if let Some(paint) =
                         sampled_paint(scene, child, local, tolerance, inner, depth + 1, table)
@@ -4683,6 +4951,897 @@ mod tests {
             additive: false,
         });
         assert_eq!(e.selection.len(), 1);
+    }
+
+    /// **A symbol instance is marqueed where its artwork is, not where its
+    /// registration point is.**
+    ///
+    /// An instance cannot measure itself — `Object::bounds` gives it a
+    /// two-unit placeholder about its own origin — so a marquee tested against
+    /// that picked a character up only when the drag crossed the dot its
+    /// registration point sits on, and refused it everywhere the character
+    /// actually was. On an imported character, whose parts hang a long way off
+    /// that point, the effect is a selection offset by most of a limb from
+    /// wherever the user dragged.
+    #[test]
+    fn a_marquee_finds_an_instance_where_its_artwork_is_drawn() {
+        let mut e = editor();
+        let layer = e.active_layer().expect("a layer");
+        e.doc.edit("Build", |scene| {
+            let symbol = scene.add_symbol("Character", buzz_scene::SymbolKind::Graphic, None);
+            let inner = scene
+                .library()
+                .get(symbol)
+                .and_then(|s| s.layers.iter().next())
+                .map(|l| l.id)
+                .expect("a layer inside the symbol");
+            // Artwork a long way from the symbol's registration point, as a
+            // part of an imported character is.
+            let id = scene.next_object_id();
+            let art = Object::shape(
+                id,
+                ShapeData::filled(square(200.0, 200.0, 40.0), Color::WHITE),
+            );
+            scene.library_mut().update(symbol, |s| {
+                s.layers.update(inner, |l| {
+                    l.frames.set_objects(0, vec![Arc::new(art)]);
+                });
+            });
+            scene.add_instance_at(layer, 0, symbol, Affine::IDENTITY);
+        });
+
+        // Round the artwork: selected.
+        e.apply(ToolAction::PickInRect {
+            rect: Rect::new(150.0, 150.0, 300.0, 300.0),
+            additive: false,
+        });
+        assert_eq!(
+            e.selection.len(),
+            1,
+            "a marquee round the drawing must take it"
+        );
+
+        // Round the registration point, with no artwork in it: not selected.
+        e.apply(ToolAction::PickInRect {
+            rect: Rect::new(-50.0, -50.0, 50.0, 50.0),
+            additive: false,
+        });
+        assert!(
+            e.selection.is_empty(),
+            "a marquee round empty stage must take nothing"
+        );
+
+        // And still "fully enclosed": a marquee that clips the artwork misses.
+        e.apply(ToolAction::PickInRect {
+            rect: Rect::new(150.0, 150.0, 220.0, 220.0),
+            additive: false,
+        });
+        assert!(
+            e.selection.is_empty(),
+            "a marquee that only half covers the drawing must not take it"
+        );
+    }
+
+    /// **A parented layer's selection is measured where its artwork is drawn.**
+    ///
+    /// Layer parenting moves a child layer's artwork by however far its parent
+    /// has travelled since its rest pose. The bounds everything interactive is
+    /// built on ignored that, so on a rig they described the limb where it was
+    /// drawn at rest: the transform box and handles drew off the artwork, the
+    /// transformation point sat beside it, and pressing on the character to
+    /// drag it read as "outside the selection" and rubber-banded a marquee
+    /// instead of moving it.
+    #[test]
+    fn a_parented_layer_measures_its_selection_where_it_is_drawn() {
+        let mut e = editor();
+        let child_layer = e.active_layer().expect("a layer");
+
+        let mut parent_layer = None;
+        let mut child_object = None;
+        e.doc.edit("Rig", |scene| {
+            let parent = scene.add_layer("Parent", buzz_scene::LayerKind::Normal);
+            parent_layer = Some(parent);
+
+            // The parent's artwork: at rest on frame 0, moved 120 right by
+            // frame 10. `motion_of` reads the difference between the two.
+            let rest = scene.next_object_id();
+            let rest = Object::shape(rest, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+            let moved = scene.next_object_id();
+            let moved = Object::shape(moved, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE))
+                .with_transform(Affine::translate((120.0, 0.0)));
+
+            // The child's artwork, and the link that makes it follow.
+            let art = scene.next_object_id();
+            child_object = Some(art);
+            let art = Object::shape(art, ShapeData::filled(square(300.0, 40.0, 20.0), Color::WHITE));
+
+            let layers = scene.edit_layers();
+            layers.update(parent, |l| {
+                l.frames.set_objects(0, vec![Arc::new(rest)]);
+                l.frames.insert_keyframe(10);
+                l.frames.set_objects(10, vec![Arc::new(moved)]);
+            });
+            layers.update(child_layer, |l| {
+                l.follows = Some(parent);
+                l.frames.set_objects(0, vec![Arc::new(art)]);
+            });
+        });
+
+        let parent_layer = parent_layer.expect("the parent was added");
+        let child_object = child_object.expect("the child artwork was added");
+        e.selection.select_one(child_object);
+
+        // On frame 0 the parent is at rest, so nothing has moved.
+        e.current_frame = 0;
+        let at_rest = e
+            .selection
+            .bounds_at(e.scene(), 0)
+            .expect("the selection has bounds");
+        assert!(
+            (at_rest.x0 - 300.0).abs() < 1e-9,
+            "at rest it sits where it was drawn, got {at_rest:?}"
+        );
+
+        // On frame 10 the parent has carried it 120 to the right, and the
+        // selection has to say so.
+        e.current_frame = 10;
+        let carried = e
+            .selection
+            .bounds_at(e.scene(), 10)
+            .expect("the selection has bounds");
+        assert!(
+            (carried.x0 - 420.0).abs() < 1e-9,
+            "the parent carried it 120 right, got {carried:?}"
+        );
+        assert!(
+            (carried.y0 - at_rest.y0).abs() < 1e-9,
+            "nothing moved it vertically"
+        );
+
+        // And that is the same place the artwork is drawn, which is what makes
+        // a press on it read as a press *inside* the selection.
+        let follows = e
+            .scene()
+            .layers()
+            .inherited_transform(child_layer, 10);
+        assert!(
+            (follows.as_coeffs()[4] - 120.0).abs() < 1e-9,
+            "the layer really is carried, {follows:?}"
+        );
+        let _ = parent_layer;
+    }
+
+    /// **A live move is still one undo step.** The artwork now travels with the
+    /// pointer, which means an edit per pointer move — and if each of those
+    /// were its own step, undoing a drag would take fifty presses of Ctrl+Z.
+    #[test]
+    fn dragging_a_selection_across_the_stage_is_one_undo_step() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).unwrap();
+        e.selection.select_one(id);
+        let before = e.scene().find_object(id).unwrap().1.bounds();
+
+        // Pressed inside the artwork, walked across the stage a step at a time,
+        // released — the gesture the tools actually receive.
+        //
+        // Pressed at (30, 30) rather than the middle: the transformation point
+        // sits at the centre of the selection, and grabbing *that* is a
+        // different gesture (see `finish_drag`).
+        let camera = e.camera.clone();
+        let screen = |p: Point| camera.doc_to_screen(p);
+        e.pointer_down(screen(Point::new(30.0, 30.0)), Mods::default());
+        for i in 1..=20 {
+            let at = Point::new(30.0 + i as f64 * 5.0, 30.0);
+            e.pointer_move(screen(at), Mods::default());
+        }
+        e.pointer_up(screen(Point::new(130.0, 30.0)));
+
+        let after = e.scene().find_object(id).unwrap().1.bounds();
+        assert!(
+            (after.x0 - before.x0 - 100.0).abs() < 1e-6,
+            "it should have travelled the whole drag, {before:?} -> {after:?}"
+        );
+
+        // One press of Ctrl+Z puts it all the way back.
+        e.run(Command::Undo);
+        let undone = e.scene().find_object(id).unwrap().1.bounds();
+        assert!(
+            (undone.x0 - before.x0).abs() < 1e-6,
+            "one undo should reverse the whole drag, got {undone:?}"
+        );
+    }
+
+    /// **What is drawn at a point is what a click there selects.**
+    ///
+    /// The one invariant the whole stage rests on, asserted against the two
+    /// answers that must agree: `object_quad`, which is where the chrome draws
+    /// an object, and `object_at`, which is what a click finds. Any transform
+    /// applied by one and not the other shows up here as a selection that
+    /// misses the artwork by exactly that transform — which is what "the
+    /// selection has an offset" means.
+    ///
+    /// Built to look like an imported Animate character, because that is where
+    /// every transform in the chain is in play at once: a symbol whose artwork
+    /// sits far from its registration point, instanced with a transform of its
+    /// own, on a layer parented to another layer that has moved.
+    #[test]
+    fn what_is_drawn_at_a_point_is_what_a_click_there_selects() {
+        let mut e = editor();
+        let child_layer = e.active_layer().expect("a layer");
+        let mut instance = None;
+
+        e.doc.edit("Character", |scene| {
+            // A part symbol: artwork a long way from its registration point.
+            let symbol = scene.add_symbol("Arm", buzz_scene::SymbolKind::Graphic, None);
+            let inner = scene
+                .library()
+                .get(symbol)
+                .and_then(|s| s.layers.iter().next())
+                .map(|l| l.id)
+                .expect("a layer inside the symbol");
+            let art = scene.next_object_id();
+            let art = Object::shape(
+                art,
+                ShapeData::filled(square(180.0, 140.0, 60.0), Color::WHITE),
+            );
+            scene.library_mut().update(symbol, |s| {
+                s.layers.update(inner, |l| {
+                    l.frames.set_objects(0, vec![Arc::new(art)]);
+                });
+            });
+
+            // A parent layer that moves between its rest frame and frame 10.
+            let parent = scene.add_layer("Body", buzz_scene::LayerKind::Normal);
+            let rest = scene.next_object_id();
+            let rest = Object::shape(rest, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+            let moved = scene.next_object_id();
+            let moved = Object::shape(
+                moved,
+                ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+            )
+            .with_transform(Affine::translate((90.0, 35.0)));
+            scene.edit_layers().update(parent, |l| {
+                l.frames.set_objects(0, vec![Arc::new(rest)]);
+                l.frames.insert_keyframe(10);
+                l.frames.set_objects(10, vec![Arc::new(moved)]);
+            });
+
+            // The instance, with a transform of its own, on the parented layer,
+            // whose span has to reach the frame being tested — a layer that
+            // does not is not drawn there and has nothing to select.
+            instance = scene.add_instance_at(
+                child_layer,
+                0,
+                symbol,
+                Affine::translate((40.0, 25.0)),
+            );
+            scene.edit_layers().update(child_layer, |l| {
+                l.follows = Some(parent);
+                // F5: the span has to reach the frame being tested.
+                l.frames.insert_frame(10);
+            });
+        });
+
+        let instance = instance.expect("the instance was placed");
+        e.current_frame = 10;
+
+        // Where the chrome says the artwork is.
+        let quad = e.object_quad(instance).expect("it is on screen");
+        let drawn = quad
+            .iter()
+            .fold(Rect::from_points(quad[0], quad[0]), |r, p| r.union_pt(*p));
+
+        // A click in the middle of it, taken the whole way round the loop the
+        // pointer really travels: stage space -> screen -> back to edit space.
+        let middle = drawn.center();
+        let screen = e.camera.doc_to_screen(middle);
+        let back = e.screen_to_edit(screen);
+        assert!(
+            (back - middle).hypot() < 1e-6,
+            "the screen round trip moved the point by {:?}",
+            back - middle
+        );
+
+        let hit = e.object_at(back, e.pick_tolerance());
+        assert_eq!(
+            hit,
+            Some(instance),
+            "clicking the middle of where it is drawn ({drawn:?}) must select it"
+        );
+
+        // And the selection it produces is measured in the same place, or the
+        // handles draw off the artwork.
+        e.selection.select_one(instance);
+        let bounds = e
+            .selection
+            .bounds_at(e.scene(), e.current_frame)
+            .expect("bounds");
+        assert!(
+            (bounds.center() - drawn.center()).hypot() < 1e-6,
+            "the selection is measured at {:?} but drawn at {:?}",
+            bounds.center(),
+            drawn.center()
+        );
+    }
+
+    /// **Chrome for another keyframe's artwork is drawn on that keyframe's
+    /// terms.**
+    ///
+    /// Edit Multiple Frames puts other keyframes on the stage, and the renderer
+    /// draws each through its own layer parenting. The selection chrome
+    /// measured every object at the *playhead's* frame instead, so a parent
+    /// that had moved between the two dragged the handles off the artwork by
+    /// exactly that much — a selection with an offset, and one that only
+    /// appears once a rig is animated.
+    #[test]
+    fn chrome_for_another_keyframe_uses_that_keyframes_parenting() {
+        let mut e = editor();
+        let child_layer = e.active_layer().expect("a layer");
+        let mut art = None;
+
+        e.doc.edit("Rig", |scene| {
+            // A parent that is still at frame 0 and has moved on by frame 10.
+            let parent = scene.add_layer("Body", buzz_scene::LayerKind::Normal);
+            let rest = scene.next_object_id();
+            let rest = Object::shape(rest, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+            let moved = scene.next_object_id();
+            let moved =
+                Object::shape(moved, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE))
+                    .with_transform(Affine::translate((150.0, 0.0)));
+            scene.edit_layers().update(parent, |l| {
+                l.frames.set_objects(0, vec![Arc::new(rest)]);
+                l.frames.insert_keyframe(10);
+                l.frames.set_objects(10, vec![Arc::new(moved)]);
+            });
+
+            // The child's artwork exists on frame 0 only.
+            let id = scene.next_object_id();
+            art = Some(id);
+            let shape =
+                Object::shape(id, ShapeData::filled(square(200.0, 100.0, 30.0), Color::WHITE));
+            scene.edit_layers().update(child_layer, |l| {
+                l.follows = Some(parent);
+                l.frames.set_objects(0, vec![Arc::new(shape)]);
+            });
+        });
+
+        let art = art.expect("artwork");
+        e.selection.select_one(art);
+
+        // On frame 0 it is drawn where it was made: the parent is at rest.
+        e.current_frame = 0;
+        let quad = e.object_quad(art).expect("on screen at its own frame");
+        let at_rest = quad
+            .iter()
+            .fold(Rect::from_points(quad[0], quad[0]), |r, p| r.union_pt(*p));
+        assert!(
+            (at_rest.x0 - 200.0).abs() < 1e-6,
+            "at rest, got {at_rest:?}"
+        );
+
+        // Playhead at 10 with Edit Multiple Frames off: the artwork is not on
+        // this frame at all, so there is no box to draw.
+        e.current_frame = 10;
+        e.edit_multiple = false;
+        assert!(
+            e.object_quad(art).is_none(),
+            "a selection off the current frame must not draw a floating box"
+        );
+        assert!(e.selection_bounds_drawn().is_none());
+
+        // Edit Multiple Frames on: the artwork *is* drawn — through frame 0's
+        // parenting, because that is the frame it lives on. The chrome must
+        // agree, and must not add the 150 the parent travelled afterwards.
+        e.edit_multiple = true;
+        e.onion.before = 20;
+        e.onion.after = 20;
+        assert!(
+            e.multi_frames().contains(&0),
+            "frame 0 should be one of the frames being shown"
+        );
+        let quad = e.object_quad(art).expect("drawn by Edit Multiple Frames");
+        let shown = quad
+            .iter()
+            .fold(Rect::from_points(quad[0], quad[0]), |r, p| r.union_pt(*p));
+        assert!(
+            (shown.x0 - at_rest.x0).abs() < 1e-6,
+            "it is drawn on frame 0's terms; chrome put it at {shown:?}, artwork is at {at_rest:?}"
+        );
+
+        let bounds = e.selection_bounds_drawn().expect("bounds");
+        assert!(
+            (bounds.center() - shown.center()).hypot() < 1e-6,
+            "the handles are measured at {:?} but the artwork is at {:?}",
+            bounds.center(),
+            shown.center()
+        );
+    }
+
+    /// **The round trip, in every mode that moves artwork.**
+    ///
+    /// Each of these draws the artwork somewhere other than where its geometry
+    /// says it is, and each has to be undone before a click can be tested
+    /// against that geometry. Any one that is applied on the way out and not on
+    /// the way back shows up as a click that selects the shape *beside* the one
+    /// under the pointer.
+    #[test]
+    fn a_click_finds_the_artwork_under_it_in_every_mode() {
+        // Each case sets up one displacement and names itself, so a failure
+        // says which mode is broken rather than which line.
+        let cases: Vec<(&str, fn(&mut Editor, ObjectId))> = vec![
+            ("plain", |_e, _id| {}),
+            ("scene camera moved", |e, _id| {
+                e.run(Command::ToggleCamera);
+                e.doc.edit("Frame", |scene| {
+                    let stage = scene.stage().size;
+                    let mut key = scene
+                        .camera()
+                        .state_at(0)
+                        .expect("enabling the camera seeds a key");
+                    key.frame = 0;
+                    key.center = Point::new(stage.width / 2.0 + 120.0, stage.height / 2.0);
+                    scene.camera_mut().set_key(key);
+                });
+            }),
+            ("layer pushed in depth", |e, _id| {
+                let layer = e.active_layer().expect("a layer");
+                e.run(Command::ToggleCamera);
+                e.doc.edit("Depth", |scene| {
+                    scene.update_layer(layer, |l| l.depth = 220.0);
+                });
+            }),
+            ("object turned in space", |e, id| {
+                e.doc.edit("Turn", |scene| {
+                    let at = buzz_scene::EditAt::exact(0);
+                    update_object(scene, at, id, |o| {
+                        o.spatial.rotation_y = 0.6;
+                    });
+                });
+            }),
+            ("camera moved and layer in depth", |e, _id| {
+                let layer = e.active_layer().expect("a layer");
+                e.run(Command::ToggleCamera);
+                e.doc.edit("Frame", |scene| {
+                    let stage = scene.stage().size;
+                    let mut key = scene
+                        .camera()
+                        .state_at(0)
+                        .expect("enabling the camera seeds a key");
+                    key.frame = 0;
+                    key.center = Point::new(stage.width / 2.0 - 90.0, stage.height / 2.0 + 40.0);
+                    key.zoom = 1.4;
+                    scene.camera_mut().set_key(key);
+                    scene.update_layer(layer, |l| l.depth = 160.0);
+                });
+            }),
+        ];
+
+        for (name, setup) in cases {
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::ObjectDrawing;
+            let id = draw_square(&mut e, 260.0, 180.0, 80.0, Color::WHITE)
+                .expect("the square was drawn");
+            setup(&mut e, id);
+
+            let quad = e
+                .object_quad(id)
+                .unwrap_or_else(|| panic!("[{name}] nothing on screen to click"));
+            let drawn = quad
+                .iter()
+                .fold(Rect::from_points(quad[0], quad[0]), |r, p| r.union_pt(*p));
+
+            // The exact loop the pointer travels: stage space out to the
+            // screen, and back in through the editor's own conversion.
+            let screen = e.camera.doc_to_screen(drawn.center());
+            let back = e.screen_to_edit(screen);
+            let hit = e.object_at(back, e.pick_tolerance());
+            assert_eq!(
+                hit,
+                Some(id),
+                "[{name}] the artwork is drawn at {drawn:?}; clicking its middle found {hit:?}"
+            );
+
+            // The handle box and the object quad live in different spaces on
+            // purpose — the quad is already through the camera, the bounds are
+            // not — so they are compared where the chrome actually puts them,
+            // which is the same trip `stage::draw_selection` makes.
+            e.selection.select_one(id);
+            let bounds = e
+                .selection_bounds_drawn()
+                .unwrap_or_else(|| panic!("[{name}] no bounds"));
+            let shot = e
+                .scene()
+                .camera_projection_at_depth(e.current_frame, 0.0)
+                .unwrap_or(buzz_geom::Projection::IDENTITY);
+            let handles = shot
+                .map_point(e.scene().edit_place() * bounds.center())
+                .expect("the handle box is on screen");
+            let slip = (handles - drawn.center()).hypot();
+            assert!(
+                slip < 1e-6,
+                "[{name}] handles drawn at {handles:?}, artwork at {:?} - {slip:.1} out",
+                drawn.center()
+            );
+        }
+    }
+
+    /// **A character rigged inside its own symbol is clicked where its parts
+    /// are drawn.**
+    ///
+    /// A symbol's layers can follow each other — that is how an Animate
+    /// character is built — and the renderer draws each part through the chain
+    /// it follows. Hit testing tested the parts where they sat at rest, so a
+    /// click on a raised arm missed it and fell through to whatever was behind:
+    /// the object behind gets selected.
+    #[test]
+    fn a_part_rigged_inside_a_symbol_is_clicked_where_it_is_drawn() {
+        let mut e = editor();
+        let layer = e.active_layer().expect("a layer");
+        let mut instance = None;
+        let mut backdrop = None;
+
+        e.doc.edit("Character", |scene| {
+            let symbol = scene.add_symbol("Hero", buzz_scene::SymbolKind::Graphic, None);
+
+            // Inside the symbol: a body layer that has moved between its rest
+            // frame and frame 6, and an arm layer that follows it.
+            let mut body = None;
+            scene.library_mut().update(symbol, |s| {
+                body = s.layers.iter().next().map(|l| l.id);
+            });
+            let body = body.expect("a symbol starts with a layer");
+            // Ids inside a symbol come from the scene in the running program;
+            // a test can name one, so long as it is not one already in use.
+            let arm = buzz_scene::LayerId(9001);
+            scene.library_mut().update(symbol, |s| {
+                s.layers.push_front(buzz_scene::Layer::new(
+                    arm,
+                    "Arm",
+                    buzz_scene::LayerKind::Normal,
+                ));
+            });
+
+            let rest = scene.next_object_id();
+            let rest = Object::shape(rest, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+            let moved = scene.next_object_id();
+            let moved = Object::shape(moved, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE))
+                .with_transform(Affine::translate((0.0, -130.0)));
+            let limb = scene.next_object_id();
+            let limb = Object::shape(
+                limb,
+                ShapeData::filled(square(20.0, 20.0, 40.0), Color::WHITE),
+            );
+
+            scene.library_mut().update(symbol, |s| {
+                s.layers.update(body, |l| {
+                    l.frames.set_objects(0, vec![Arc::new(rest)]);
+                    l.frames.insert_keyframe(6);
+                    l.frames.set_objects(6, vec![Arc::new(moved)]);
+                });
+                s.layers.update(arm, |l| {
+                    l.follows = Some(body);
+                    l.frames.set_objects(0, vec![Arc::new(limb)]);
+                    l.frames.insert_frame(6);
+                });
+            });
+
+            // A backdrop sitting exactly where the arm was drawn at rest, on a
+            // layer below. If the click is tested at the rest position this is
+            // what wins.
+            let back = scene.next_object_id();
+            let back = Object::shape(
+                back,
+                ShapeData::filled(square(0.0, 0.0, 200.0), Color::WHITE),
+            );
+            let under = scene.add_layer("Backdrop", buzz_scene::LayerKind::Normal);
+            backdrop = Some(back.id);
+            scene.edit_layers().update(under, |l| {
+                l.frames.set_objects(0, vec![Arc::new(back)]);
+                l.frames.insert_frame(6);
+            });
+
+            instance = scene.add_instance_at(layer, 0, symbol, Affine::IDENTITY);
+            scene.edit_layers().update(layer, |l| {
+                l.frames.insert_frame(6);
+            });
+        });
+
+        let instance = instance.expect("the character was placed");
+        let backdrop = backdrop.expect("the backdrop was placed");
+        e.current_frame = 6;
+
+        // The arm is drawn 130 above its rest position, carried there by the
+        // body layer it follows. Its rest position is (20,20)-(60,60), so it is
+        // drawn at (20,-110)-(60,-70).
+        let on_the_arm = Point::new(40.0, -90.0);
+        let screen = e.camera.doc_to_screen(on_the_arm);
+        let hit = e.object_at(e.screen_to_edit(screen), e.pick_tolerance());
+        assert_eq!(
+            hit,
+            Some(instance),
+            "clicking the arm where it is drawn must take the character, not {hit:?}"
+        );
+
+        // And where the arm used to be, there is only the backdrop.
+        let at_rest = Point::new(40.0, 40.0);
+        let screen = e.camera.doc_to_screen(at_rest);
+        let hit = e.object_at(e.screen_to_edit(screen), e.pick_tolerance());
+        assert_eq!(
+            hit,
+            Some(backdrop),
+            "the arm is no longer at its rest position, so the backdrop is what is there"
+        );
+    }
+
+    /// **Dragging a selection on a real document has to stay interactive.**
+    ///
+    /// The artwork travels with the pointer, which means an edit per pointer
+    /// move — and everything keyed on the document's revision is thrown away by
+    /// each one. On a character built the way an imported one is (symbols
+    /// inside symbols, a library of parts) that adds up to a re-measure of the
+    /// whole library on every mouse move, which is what a drag that judders
+    /// feels like.
+    ///
+    /// A budget rather than a stopwatch: this is measuring that the work per
+    /// move is *bounded*, not how fast any particular machine is.
+    #[test]
+    fn dragging_a_selection_on_a_heavy_document_stays_interactive() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+
+        // A library of parts, each a symbol with artwork of its own, and
+        // instances of them on the stage — the shape of an imported character.
+        const PARTS: usize = 400;
+        let mut placed = Vec::new();
+        e.doc.edit("Character", |scene| {
+            let layer = scene
+                .layers()
+                .iter()
+                .next()
+                .map(|l| l.id)
+                .expect("a layer");
+            for part in 0..PARTS as i32 {
+                let symbol = scene.add_symbol(
+                    format!("Part {part}"),
+                    buzz_scene::SymbolKind::Graphic,
+                    None,
+                );
+                let inner = scene
+                    .library()
+                    .get(symbol)
+                    .and_then(|s| s.layers.iter().next())
+                    .map(|l| l.id)
+                    .expect("a layer inside");
+                let art: Vec<std::sync::Arc<Object>> = (0..12)
+                    .map(|i| {
+                        let id = scene.next_object_id();
+                        std::sync::Arc::new(Object::shape(
+                            id,
+                            ShapeData::filled(
+                                square(i as f64 * 9.0, part as f64 * 3.0, 14.0),
+                                Color::WHITE,
+                            ),
+                        ))
+                    })
+                    .collect();
+                scene.library_mut().update(symbol, |s| {
+                    s.layers.update(inner, |l| {
+                        l.frames.set_objects(0, art);
+                    });
+                });
+                if let Some(id) = scene.add_instance_at(
+                    layer,
+                    0,
+                    symbol,
+                    Affine::translate((part as f64 * 11.0, 40.0)),
+                ) {
+                    placed.push(id);
+                }
+            }
+        });
+        assert_eq!(placed.len(), PARTS, "the character was built");
+
+        // One part picked up and dragged across the stage, exactly as the
+        // window drives it: press, a run of moves, release.
+        let id = placed[20];
+        e.selection.select_one(id);
+        let camera = e.camera.clone();
+        let screen = |p: Point| camera.doc_to_screen(p);
+        let start = Point::new(220.0 + 5.0, 45.0);
+
+        const MOVES: usize = 120;
+        let began = std::time::Instant::now();
+        e.pointer_down(screen(start), Mods::default());
+        for step in 1..=MOVES {
+            let at = Point::new(start.x + step as f64 * 2.0, start.y);
+            e.pointer_move(screen(at), Mods::default());
+            // The window asks for these every frame of the drag: the preview
+            // for the stage, and the bounds for the transform box.
+            let _ = e.preview();
+            let _ = e.selection_bounds_drawn();
+        }
+        e.pointer_up(screen(Point::new(start.x + MOVES as f64 * 2.0, start.y)));
+        let elapsed = began.elapsed();
+
+        let per_move = elapsed.as_secs_f64() * 1000.0 / MOVES as f64;
+        // A drag has to fit inside a frame with the rest of the window's work
+        // still to do. Generous enough not to fail on a loaded CI machine, and
+        // far below where a re-measure of the whole library per move lands.
+        // The window re-encodes the stage after every one of those moves, and
+        // that is what a drag actually waits on. Measured here with a move
+        // between each encode, so anything keyed on the document revision is
+        // as cold as it is during a real drag.
+        let mut vello = buzz_render::vello::Scene::new();
+        let mut cache = buzz_render::document::DrawCache::default();
+        let area = buzz_geom::Rect::new(0.0, 0.0, 1600.0, 1000.0);
+        const ENCODES: usize = 20;
+        let encode_began = std::time::Instant::now();
+        for step in 0..ENCODES {
+            e.doc.edit("Move", |scene| {
+                let at = buzz_scene::EditAt::exact(0);
+                update_object(scene, at, id, |o| {
+                    o.transform = Affine::translate((step as f64 * 0.5, 0.0)) * o.transform;
+                });
+            });
+            crate::stage::build_scene(&mut vello, &e, area, 1.0, &mut cache);
+        }
+        let per_encode = encode_began.elapsed().as_secs_f64() * 1000.0 / ENCODES as f64;
+
+        assert!(
+            per_move < 2.0,
+            "a pointer move cost {per_move:.2} ms; a drag cannot afford that"
+        );
+        // Generous enough not to fail on a loaded machine, and well under where
+        // re-walking the whole library per move lands.
+        assert!(
+            per_encode < 5.0,
+            "re-encoding the stage mid-drag cost {per_encode:.2} ms a frame"
+        );
+    }
+
+    /// **A rotation turns about the transformation point the user moved.**
+    ///
+    /// Animate's white circle is not decoration: you put it on the shoulder and
+    /// the arm swings from the shoulder. Setting it and then rotating are two
+    /// gestures, and the second has to remember what the first did.
+    #[test]
+    fn a_rotation_turns_about_the_moved_transformation_point() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+
+        // By default it sits at the centre of the artwork.
+        assert!(
+            (e.pivot().expect("a pivot") - Point::new(150.0, 150.0)).hypot() < 1e-6,
+            "it should start at the centre, got {:?}",
+            e.pivot()
+        );
+
+        // Put it on the top-left corner, the way a shoulder joint is placed.
+        let corner = Point::new(100.0, 100.0);
+        e.apply(ToolAction::SetTransformPoint { at: corner });
+        assert!(
+            (e.pivot().expect("a pivot") - corner).hypot() < 1e-6,
+            "the transformation point should have moved, got {:?}",
+            e.pivot()
+        );
+
+        // Now rotate: the ring sits just *outside* a corner, which is where the
+        // pointer turns into the rotation cursor.
+        let camera = e.camera.clone();
+        let screen = |p: Point| camera.doc_to_screen(p);
+        let from = Point::new(214.0, 186.0);
+        let to = Point::new(186.0, 214.0);
+        e.pointer_down(screen(from), Mods::default());
+        e.pointer_move(screen(to), Mods::default());
+        e.pointer_up(screen(to));
+
+        let after = e.scene().find_object(id).expect("still there").1.bounds();
+        assert!(
+            (after.x0 - 100.0).abs() > 1.0 || (after.y0 - 100.0).abs() > 1.0,
+            "the drag should have rotated it at all, bounds are {after:?}"
+        );
+
+        // **Turning about a point leaves that point where it is.** Asked of the
+        // transformation point itself rather than of the artwork's bounding
+        // box, which a rotation changes the shape of whatever it turned about.
+        let now = e.pivot().expect("still has one");
+        assert!(
+            (now - corner).hypot() < 1e-6,
+            "the point it was turned about moved to {now:?}, so the rotation \
+             turned about something else"
+        );
+    }
+
+    /// **A transformation point parked on a joint must not swallow the
+    /// rotate ring beside it.**
+    ///
+    /// This is how the control is actually used: the point goes on the
+    /// shoulder — which is at the edge of the arm, not in the middle of it —
+    /// and then you reach just outside the nearest corner for the ring. The
+    /// circle is a forgiving target on purpose, so it claimed that reach too,
+    /// and the arm could never be swung about the joint it had just been given.
+    #[test]
+    fn a_transformation_point_on_a_corner_still_leaves_room_to_rotate() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+
+        // The joint, right on the corner of the artwork.
+        let joint = Point::new(200.0, 200.0);
+        e.apply(ToolAction::SetTransformPoint { at: joint });
+        assert!((e.pivot().expect("a pivot") - joint).hypot() < 1e-6);
+
+        let before = e.scene().find_object(id).expect("there").1.transform;
+
+        // The ring, just outside that same corner.
+        let camera = e.camera.clone();
+        let screen = |p: Point| camera.doc_to_screen(p);
+        let from = Point::new(210.0, 210.0);
+        let to = Point::new(190.0, 226.0);
+        e.pointer_down(screen(from), Mods::default());
+        e.pointer_move(screen(to), Mods::default());
+        e.pointer_up(screen(to));
+
+        let after = e.scene().find_object(id).expect("there").1.transform;
+        assert!(
+            before.as_coeffs() != after.as_coeffs(),
+            "the drag should have turned the artwork, not moved the point"
+        );
+        let now = e.pivot().expect("still has one");
+        assert!(
+            (now - joint).hypot() < 1e-6,
+            "and it should have turned about the joint, which is now {now:?}"
+        );
+    }
+
+    /// **A transformation point set on a *group* survives to the rotation.**
+    ///
+    /// A character on the stage is several objects, so this is the case that
+    /// matters: place the point, then swing the lot about it.
+    #[test]
+    fn a_group_rotates_about_its_moved_transformation_point() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let a = draw_square(&mut e, 100.0, 100.0, 60.0, Color::WHITE).expect("a");
+        let b = draw_square(&mut e, 200.0, 100.0, 60.0, Color::WHITE).expect("b");
+        e.selection.set(vec![a, b]);
+
+        let joint = Point::new(110.0, 110.0);
+        e.apply(ToolAction::SetTransformPoint { at: joint });
+        assert!(
+            (e.pivot().expect("a pivot") - joint).hypot() < 1e-6,
+            "the group point should have moved, got {:?}",
+            e.pivot()
+        );
+
+        // Where the group's box is, and the ring just outside its far corner.
+        let bounds = e.selection_bounds_drawn().expect("bounds");
+        let camera = e.camera.clone();
+        let screen = |p: Point| camera.doc_to_screen(p);
+        let from = Point::new(bounds.x1 + 10.0, bounds.y1 + 10.0);
+        let to = Point::new(bounds.x1 - 10.0, bounds.y1 + 26.0);
+
+        let before = e.scene().find_object(a).expect("a").1.transform;
+        e.pointer_down(screen(from), Mods::default());
+        e.pointer_move(screen(to), Mods::default());
+        e.pointer_up(screen(to));
+
+        let after = e.scene().find_object(a).expect("a").1.transform;
+        assert!(
+            before.as_coeffs() != after.as_coeffs(),
+            "the group should have turned"
+        );
+
+        // The point it turned about has not moved.
+        let now = e.pivot().expect("still has one");
+        assert!(
+            (now - joint).hypot() < 1e-6,
+            "the group turned about {now:?} instead of the point set at {joint:?}"
+        );
     }
 
     #[test]
@@ -6688,7 +7847,7 @@ mod tests {
         let before = e.scene().camera().state_at(0).unwrap().center;
 
         e.apply(ToolAction::MoveCamera {
-            delta_doc: Vec2::new(50.0, 0.0),
+            delta_screen: Vec2::new(50.0, 0.0),
         });
 
         let after = e.scene().camera().state_at(0).unwrap().center;
@@ -6696,6 +7855,53 @@ mod tests {
             after.x < before.x,
             "dragging right should move the camera left: {before:?} -> {after:?}"
         );
+    }
+
+    /// **Aiming the camera is steady.**
+    ///
+    /// Two things used to make it shake. The drag was measured from the
+    /// pointer's *snapped* document position, so the shot jumped from artwork
+    /// edge to artwork edge; and that position is measured *through the
+    /// camera*, so each step was measured against a ruler the step before had
+    /// already moved. Neither can reach a screen-pixel delta, and this holds
+    /// the tool to that: an even sweep of the pointer must move the shot evenly.
+    #[test]
+    fn aiming_the_camera_is_steady_over_artwork() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        // Artwork all over the stage, so snapping has plenty to grab at.
+        for i in 0..6 {
+            draw_square(&mut e, i as f64 * 60.0, 40.0, 30.0, Color::WHITE);
+        }
+        // Turned on explicitly: the test editor starts from a saved workspace,
+        // and this is the setting the jitter came from.
+        e.view.snap.to_objects = true;
+
+        e.run(Command::ToggleCamera);
+        e.set_tool(buzz_ui::ToolId::Camera);
+
+        // An even sweep across the stage, one pixel-sized step at a time.
+        let start = Point::new(20.0, 60.0);
+        e.pointer_down(start, Mods::default());
+        let mut centres = Vec::new();
+        for step in 1..=24 {
+            let at = Point::new(start.x + step as f64 * 12.0, start.y);
+            e.pointer_move(at, Mods::default());
+            centres.push(e.scene().camera().state_at(0).unwrap().center.x);
+        }
+        e.pointer_up(Point::new(start.x + 24.0 * 12.0, start.y));
+
+        // Every step moved the shot by the same amount. Jitter shows up here
+        // as one step disagreeing with its neighbours.
+        let steps: Vec<f64> = centres.windows(2).map(|w| w[1] - w[0]).collect();
+        let first = steps[0];
+        assert!(first.abs() > 0.0, "the shot should move at all");
+        for (i, step) in steps.iter().enumerate() {
+            assert!(
+                (step - first).abs() < 1e-9,
+                "step {i} moved the shot by {step} where every other step moved it {first}"
+            );
+        }
     }
 
     #[test]
@@ -6886,7 +8092,7 @@ mod tests {
             "Q should have taken the layer's artwork"
         );
         assert!(
-            e.selection.bounds(e.scene()).is_some(),
+            e.selection.bounds_at(e.scene(), e.current_frame).is_some(),
             "there should now be handles to draw"
         );
     }

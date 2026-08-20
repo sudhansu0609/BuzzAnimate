@@ -296,6 +296,21 @@ pub struct Workspace {
     /// Row height, as a multiple of the standard row.
     #[serde(default = "default_row_scale")]
     pub row_scale: f32,
+    /// How big the Assets panel draws its pictures, and so how it lays them
+    /// out. A way of looking at the library rather than part of any film.
+    #[serde(default)]
+    pub asset_thumbnail_size: crate::assets_panel::ThumbnailSize,
+    /// The timeline's layer column shows the **parenting view** — Animate's
+    /// node graph — instead of layer names.
+    ///
+    /// A way of looking at the film rather than part of it, so it lives here
+    /// with the other view preferences and survives a restart.
+    #[serde(default)]
+    pub parenting_view: bool,
+    /// The timeline's layer column shows **layer depth** instead of names.
+    /// Mutually exclusive with the parenting view: one column, one question.
+    #[serde(default)]
+    pub depth_view: bool,
 }
 
 /// Bounds for the timeline's two zooms.
@@ -471,6 +486,9 @@ impl Workspace {
             bottom_height: 170.0,
             frame_width: default_frame_width(),
             row_scale: default_row_scale(),
+            parenting_view: false,
+            depth_view: false,
+            asset_thumbnail_size: crate::assets_panel::ThumbnailSize::default(),
         }
     }
 

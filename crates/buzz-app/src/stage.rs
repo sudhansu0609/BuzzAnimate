@@ -349,7 +349,7 @@ fn draw_selection(
     to_screen: impl Fn(Point) -> egui::Pos2,
     to_screen_view: impl Fn(Point) -> egui::Pos2,
 ) {
-    let Some(bounds) = editor.selection.bounds(editor.scene()) else {
+    let Some(bounds) = editor.selection_bounds_drawn() else {
         return;
     };
 
@@ -429,6 +429,17 @@ fn draw_selection(
         return;
     }
     if editor.tool() != buzz_ui::ToolId::FreeTransform {
+        // **Where the rotation is.**
+        //
+        // The selection tools rotate too — the ring just outside a corner, the
+        // same one Free Transform uses — but nothing on screen said so, so the
+        // gesture may as well not have existed: dragging anywhere else marquees
+        // and takes the selection away instead. A quarter-turn arc at each
+        // corner is the smallest thing that says "swing it from here".
+        //
+        // An arc rather than a square handle on purpose: a square would promise
+        // scaling, which these tools do not do (see `tools::transform_zone`).
+        draw_rotate_hints(painter, rect);
         draw_pivot(painter, editor, &to_screen);
         return;
     }
@@ -691,6 +702,44 @@ fn draw_lights(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poin
                 painter.circle_stroke(middle, size + 4.0, Stroke::new(1.0, ring));
             }
         }
+    }
+}
+
+/// A quarter-turn arc just outside each corner of the selection: where a drag
+/// rotates rather than marquees.
+///
+/// Drawn at the radius `tools::transform_zone` actually tests, so the mark and
+/// the behaviour cannot drift apart — a hint pointing somewhere the gesture is
+/// not would be worse than none.
+fn draw_rotate_hints(painter: &egui::Painter, rect: egui::Rect) {
+    // Too small a selection has no room outside its corners for a ring, and
+    // crowding four arcs onto it would hide the artwork rather than help.
+    if rect.width() < 34.0 || rect.height() < 34.0 {
+        return;
+    }
+    let stroke = Stroke::new(1.2, Palette::selection().gamma_multiply(0.75));
+    const RADIUS: f32 = 13.0;
+    const STEPS: usize = 7;
+
+    // One arc per corner, each sweeping the quadrant that points away from the
+    // selection — the side the pointer comes in from.
+    for (corner, from) in [
+        (rect.left_top(), std::f32::consts::PI),
+        (rect.right_top(), -std::f32::consts::FRAC_PI_2),
+        (rect.right_bottom(), 0.0),
+        (rect.left_bottom(), std::f32::consts::FRAC_PI_2),
+    ] {
+        let points: Vec<egui::Pos2> = (0..=STEPS)
+            .map(|i| {
+                let t = i as f32 / STEPS as f32;
+                let angle = from + t * std::f32::consts::FRAC_PI_2;
+                egui::pos2(
+                    corner.x + RADIUS * angle.cos(),
+                    corner.y + RADIUS * angle.sin(),
+                )
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, stroke));
     }
 }
 

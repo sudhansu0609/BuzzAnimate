@@ -73,6 +73,10 @@ struct StageStamp {
     edit_multiple: bool,
     /// The generation of installed lighting geometry.
     lights_generation: u64,
+    /// Whether the encoding this stamp describes has a tool preview painted
+    /// **into** it. See the reuse test in `run`: it is what makes the frame
+    /// after a brush stroke rebuild rather than keep the stale ink.
+    painted_preview: bool,
 }
 
 use crate::editor::Editor;
@@ -505,7 +509,14 @@ pub struct App {
     /// device outlives any one document. `adopt_document` clears it, so a
     /// picture from the last film cannot be shown for a symbol in this one
     /// that happens to have been given the same id.
+    /// Top-left of the stage this frame, so the right-click menu can turn a
+    /// pointer position into a document point the way the tools do.
+    stage_area_min: egui::Pos2,
     thumbnails: crate::thumbnails::Thumbnails,
+    /// Pictures for the Assets panel. Separate from [`Self::thumbnails`]
+    /// because an asset is a file on disk rather than a symbol in the open
+    /// document, so it is keyed and invalidated differently.
+    asset_thumbnails: crate::thumbnails::AssetThumbnails,
     /// Shading geometry being built off the UI thread, if any.
     ///
     /// The first lit frame of a heavy scene used to cost a third of a second,
@@ -609,7 +620,9 @@ impl App {
             scene_rename: None,
             animate_import: None,
             merging: false,
+            stage_area_min: egui::Pos2::ZERO,
             thumbnails: crate::thumbnails::Thumbnails::default(),
+            asset_thumbnails: crate::thumbnails::AssetThumbnails::default(),
             shade_build: None,
             sound_decode: None,
             usage_cache: UsageCache::default(),
@@ -647,6 +660,7 @@ impl App {
         let live = self.editor.playback.playing
             || self.editor.restyle
             || self.thumbnails.pending()
+            || self.asset_thumbnails.pending()
             || self.shade_build.is_some()
             || self.sound_decode.is_some()
             || self.usage_cache.in_flight.is_some()
@@ -1339,6 +1353,7 @@ impl App {
                     // under a ruler or a selection outline.
                     self.stage_scrollbars(ui, area);
                     self.stage_zoom_overlay(ui, area);
+                    self.stage_camera_controls(ui, area);
                     if self.doc_available() {
                         self.draw_tool_cursor(ui, area);
                     }
@@ -1542,12 +1557,24 @@ impl App {
 
             Assets => {
                 let can_add = !self.editor.selection.is_empty();
+                // The size lives in the workspace so it survives a restart,
+                // and in the panel state so the panel can change it. Carried
+                // across either way round each frame, which is what keeps one
+                // the copy and the other the record.
+                self.editor.assets_panel.thumbnail_size = self.editor.workspace.asset_thumbnail_size;
+                let thumbs = &mut self.asset_thumbnails;
                 let action = buzz_ui::assets_panel(
                     ui,
                     &self.editor.assets,
                     &mut self.editor.assets_panel,
                     can_add,
+                    &mut |path| thumbs.get(path),
                 );
+                if self.editor.assets_panel.thumbnail_size != self.editor.workspace.asset_thumbnail_size {
+                    self.editor.workspace.asset_thumbnail_size =
+                        self.editor.assets_panel.thumbnail_size;
+                    self.editor.workspace.save();
+                }
                 if let Some(action) = action {
                     self.apply_asset_action(action);
                 }
@@ -1575,7 +1602,13 @@ impl App {
                 // walk of the whole document.
                 let revision = self.editor.doc.scene().revision();
                 self.usage_cache.poll();
-                if self.usage_cache.should_spawn(revision) {
+                // **Not while a drag is running.** Moving artwork cannot change
+                // how many times a symbol is used, but it moves the revision on
+                // every pointer move — so this spawned a job per mouse move,
+                // each one cloning the whole document and walking it, and each
+                // one keeping the window at full poll while it ran. The release
+                // brings the revision to rest and this spawns once.
+                if !self.editor.is_gesturing() && self.usage_cache.should_spawn(revision) {
                     let scene = self.editor.doc.scene().clone();
                     let (send, receive) = crossbeam_channel::bounded(1);
                     self.jobs.spawn(Pool::Background, move || {
@@ -1612,6 +1645,9 @@ impl App {
                     onion_after: self.editor.onion.after,
                     frame_width: self.editor.workspace.frame_width,
                     row_scale: self.editor.workspace.row_scale,
+                    parenting_view: self.editor.workspace.parenting_view,
+                    depth_view: self.editor.workspace.depth_view,
+                    focal_distance: self.editor.scene().camera().focal_distance,
                     waveforms: self.editor.waveforms(),
                 };
                 let response = buzz_ui::timeline_panel(ui, self.editor.scene(), &state);
@@ -1640,7 +1676,49 @@ impl App {
     fn camera_panel(&mut self, ui: &mut egui::Ui) {
         let frame = self.editor.current_frame;
         let response = buzz_ui::camera_panel(ui, self.editor.scene().camera(), frame);
+        self.apply_camera(response);
+    }
 
+    /// **Animate's on-stage camera controls.**
+    ///
+    /// Shown while the camera is what is being worked on — its row selected in
+    /// the timeline, or the Camera tool in hand — because framing a shot is
+    /// done by looking at the stage, and the Properties panel is at the far
+    /// side of the window. Along the bottom, where it cannot cover the rulers
+    /// or the zoom readout.
+    fn stage_camera_controls(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
+        let wanted =
+            self.editor.camera_selected || self.editor.tool() == buzz_ui::ToolId::Camera;
+        if !wanted || area.width() < 420.0 || area.height() < 120.0 {
+            return;
+        }
+
+        let frame = self.editor.current_frame;
+        // Clear of the horizontal scrollbar, which floats at the bottom edge.
+        let anchor = egui::pos2(area.center().x, area.max.y - 20.0);
+        let mut response = buzz_ui::CameraResponse::default();
+
+        egui::Area::new(egui::Id::new("stage-camera"))
+            .fixed_pos(anchor)
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .order(egui::Order::Middle)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(Palette::panel())
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        let driving = self.editor.tool() == buzz_ui::ToolId::Camera;
+                        response =
+                            buzz_ui::camera_hud(ui, self.editor.scene().camera(), frame, driving);
+                    });
+            });
+
+        self.apply_camera(response);
+    }
+
+    /// One application for both, so the panel and the strip on the stage
+    /// cannot drift into two behaviours.
+    fn apply_camera(&mut self, response: buzz_ui::CameraResponse) {
         if response.toggle {
             self.editor.run(Command::ToggleCamera);
         }
@@ -1666,6 +1744,17 @@ impl App {
         }
         if response.reset {
             self.editor.run(Command::ResetCamera);
+        }
+        if response.grab_camera {
+            // A toggle: pressing it again puts the tool down and gives the
+            // Selection tool back, so the strip is not a one-way door into a
+            // mode you then have to find your way out of.
+            let tool = if self.editor.tool() == buzz_ui::ToolId::Camera {
+                buzz_ui::ToolId::Selection
+            } else {
+                buzz_ui::ToolId::Camera
+            };
+            self.editor.set_tool(tool);
         }
     }
 
@@ -2203,6 +2292,63 @@ impl App {
 
     /// Turn timeline interactions into editor actions.
     fn apply_timeline(&mut self, response: buzz_ui::TimelineResponse, commands: &mut Vec<Command>) {
+        if response.toggle_depth {
+            let on = !self.editor.workspace.depth_view;
+            self.editor.workspace.depth_view = on;
+
+            // **And show the picture.** The numbers in the column say what each
+            // depth *is*; the Layer Depth panel draws the scene from the side —
+            // camera at the left, each layer a plane at the height perspective
+            // gives it — which is the only thing that answers "how close is
+            // that layer to me". It was a background tab in the right dock, so
+            // turning depth on showed a column of numbers and nothing else.
+            //
+            // Opened rather than merely selected when it is hidden, because a
+            // closed panel cannot be brought to the front of anything.
+            if on {
+                let workspace = &mut self.editor.workspace;
+                if !workspace.is_open(buzz_ui::PanelId::Depth) {
+                    workspace.move_to(buzz_ui::PanelId::Depth, buzz_ui::Dock::Right);
+                }
+                workspace.select_tab(buzz_ui::PanelId::Depth);
+            }
+            // One column, one question: turning either view on puts the other
+            // away rather than leaving two answers fighting for the same room.
+            if on {
+                self.editor.workspace.parenting_view = false;
+            }
+            self.editor.workspace.save();
+        }
+        if let Some((layer, depth)) = response.set_depth {
+            // The same edit the Layer Depth panel makes, so the two are doors
+            // onto one room.
+            self.editor.doc.edit("Layer Depth", |scene| {
+                scene.update_layer(layer, |l| l.depth = depth);
+            });
+        }
+        if response.toggle_parenting {
+            // A view preference, so it is saved with the layout rather than
+            // with the film — the same rule the frame width follows.
+            let on = !self.editor.workspace.parenting_view;
+            self.editor.workspace.parenting_view = on;
+            if on {
+                self.editor.workspace.depth_view = false;
+            }
+            self.editor.workspace.save();
+        }
+        if let Some((layer, follows)) = response.set_follows {
+            // The same edit the Layers panel's Parent dropdown makes, so the
+            // graph and the menu are two doors onto one room. Named for what it
+            // does, because undoing it is a thing the history should say.
+            let label = if follows.is_some() {
+                "Parent Layer"
+            } else {
+                "Unparent Layer"
+            };
+            self.editor.doc.edit(label, |scene| {
+                scene.update_layer(layer, |l| l.follows = follows);
+            });
+        }
         if let Some(frame) = response.scrub_to {
             // Scrubbing stops playback, as it does in Animate: the user has
             // taken manual control of the playhead.
@@ -2517,6 +2663,20 @@ impl App {
             tool,
             Selection | Subselection | FreeTransform | GradientTransform | Hand | Zoom
         ) {
+            // **Except that the transform tools say where they rotate.**
+            //
+            // The ring just outside a corner turns the selection, and with no
+            // cursor change nothing distinguished it from the empty stage
+            // beside it — where the same drag marquees and throws the selection
+            // away. Grab is the nearest thing egui offers to Animate's curved
+            // arrow, and it reads as "take hold of this and swing it".
+            if matches!(tool, Selection | Subselection | FreeTransform)
+                && let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos())
+                && area.contains(pos)
+                && self.pointer_is_on_the_rotate_ring(area, pos)
+            {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
             return;
         }
         let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) else {
@@ -2528,7 +2688,18 @@ impl App {
 
         // Ours, not the system arrow.
         ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-        let painter = ui.painter_at(area);
+        // **Above everything the stage floats.** Painted into the panel's own
+        // layer, the cursor was drawn *under* the zoom readout and the camera
+        // controls — so moving the pointer onto them lost the very thing that
+        // says where the tool will act. A cursor that can be covered is not a
+        // cursor. Clipped to the stage so it still cannot stray onto a panel.
+        let painter = ui
+            .ctx()
+            .layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("stage-tool-cursor"),
+            ))
+            .with_clip_rect(area);
         let ink = buzz_ui::Palette::text();
         let halo = egui::Stroke::new(2.5, egui::Color32::from_black_alpha(120));
 
@@ -2564,6 +2735,42 @@ impl App {
         let icon = egui::Rect::from_min_size(egui::pos2(pos.x + 9.0, pos.y + 9.0), egui::vec2(18.0, 18.0));
         painter.rect_filled(icon.expand(2.0), 3.0, egui::Color32::from_black_alpha(140));
         buzz_ui::icons::tool_icon(&painter, icon, tool, ink);
+    }
+
+    /// Is the pointer in the ring that rotates, just outside a corner of the
+    /// selection?
+    ///
+    /// Asked in *screen* space against the same box the chrome draws, and with
+    /// the same radii  tests, so the cursor cannot
+    /// promise a gesture the release will not make.
+    fn pointer_is_on_the_rotate_ring(&self, area: egui::Rect, pos: egui::Pos2) -> bool {
+        let Some(bounds) = self.editor.selection_bounds_drawn() else {
+            return false;
+        };
+        let to_screen = |p: buzz_geom::Point| {
+            let s = self.editor.camera.doc_to_screen(p);
+            egui::pos2(area.min.x + s.x as f32, area.min.y + s.y as f32)
+        };
+        let corners = [
+            to_screen(buzz_geom::Point::new(bounds.x0, bounds.y0)),
+            to_screen(buzz_geom::Point::new(bounds.x1, bounds.y0)),
+            to_screen(buzz_geom::Point::new(bounds.x1, bounds.y1)),
+            to_screen(buzz_geom::Point::new(bounds.x0, bounds.y1)),
+        ];
+        let box_rect = corners
+            .iter()
+            .fold(egui::Rect::from_two_pos(corners[0], corners[2]), |r, c| {
+                r.union(egui::Rect::from_two_pos(*c, *c))
+            });
+        // Outside the box: inside it the pointer is over artwork, and a drag
+        // there moves rather than turns.
+        if box_rect.contains(pos) {
+            return false;
+        }
+        let grab = crate::tools::TRANSFORM_GRAB_PX as f32;
+        corners
+            .iter()
+            .any(|c| c.distance(pos) > grab && c.distance(pos) <= grab * 3.0)
     }
 
     fn stage_scrollbars(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
@@ -2696,6 +2903,12 @@ impl App {
         // per-frame budget on a large document.
         let content = match self.scroll_extent {
             Some((r, f, ext)) if r == revision && f == frame => ext,
+            // Mid-drag, hold the last one. It is the scrollbars' extent: it
+            // changes as the artwork moves, and it is nobody's reason for
+            // dragging. Re-resolving every object through the library between
+            // frames of a drag is exactly the cost this cache exists to avoid,
+            // and the release recomputes it.
+            Some((_, f, ext)) if f == frame && self.editor.is_gesturing() => ext,
             _ => {
                 // Keep the symbol-bounds table warm for this revision, so the
                 // recompute below is a lookup per object even while scrubbing.
@@ -2940,10 +3153,112 @@ impl App {
         self.active.as_ref().map(|a| a.frame_ms).unwrap_or(0.0)
     }
 
+    /// **Animate's right-click menu on the stage.**
+    ///
+    /// Everything the Modify menu offers for the thing under the pointer,
+    /// where the thing is. Without it the stage was the one surface in the
+    /// program that answered a right-click with nothing, so transforming a
+    /// selection meant a trip to the menu bar for an operation that is about a
+    /// specific object in a specific place.
+    ///
+    /// Raised as commands rather than performed here, so every entry runs
+    /// through the same path as the menu bar and the shortcut — undo included.
+    fn stage_context_menu(&mut self, response: &egui::Response) {
+        let has_selection = !self.editor.selection.is_empty();
+        let mut raised: Option<Command> = None;
+        let mut save_asset = false;
+
+        // A probe for the test that drives the real window: the popup egui
+        // opens has an id of its own, and this is the honest way to ask the
+        // stage whether its menu is up.
+        if response.context_menu_opened() {
+            let ctx = response.ctx.clone();
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("stage-context-probe"), true));
+        }
+        response.context_menu(|ui| {
+            // A right-click on artwork that is not selected selects it first,
+            // which is what every editor does: the menu is about the thing you
+            // pointed at, not about whatever was chosen before.
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                let local = buzz_geom::Point::new(
+                    (pos.x - self.stage_area_min.x) as f64,
+                    (pos.y - self.stage_area_min.y) as f64,
+                );
+                let point = self.editor.screen_to_edit(local);
+                if let Some(id) = self.editor.object_at(point, self.editor.pick_tolerance())
+                    && !self.editor.selection.contains(id)
+                {
+                    self.editor.selection.select_one(id);
+                }
+            }
+            let has_selection = has_selection || !self.editor.selection.is_empty();
+
+            let mut item = |ui: &mut egui::Ui, command: Command, enabled: bool| {
+                if ui
+                    .add_enabled(enabled, egui::Button::new(command.label()))
+                    .clicked()
+                {
+                    raised = Some(command);
+                    ui.close();
+                }
+            };
+
+            item(ui, Command::Cut, has_selection);
+            item(ui, Command::Copy, has_selection);
+            item(ui, Command::Paste, true);
+            item(ui, Command::Delete, has_selection);
+            ui.separator();
+
+            item(ui, Command::RotateClockwise, has_selection);
+            item(ui, Command::RotateAnticlockwise, has_selection);
+            item(ui, Command::FlipHorizontal, has_selection);
+            item(ui, Command::FlipVertical, has_selection);
+            ui.separator();
+
+            ui.menu_button("Arrange", |ui| {
+                item(ui, Command::BringToFront, has_selection);
+                item(ui, Command::BringForward, has_selection);
+                item(ui, Command::SendBackward, has_selection);
+                item(ui, Command::SendToBack, has_selection);
+            });
+            item(ui, Command::GroupSelection, has_selection);
+            item(ui, Command::UngroupSelection, has_selection);
+            ui.separator();
+
+            item(ui, Command::ConvertToSymbol, has_selection);
+            // **Keeping artwork as an asset, where the artwork is.** The panel
+            // has a button for this, but it is the panel's button — you have to
+            // find the panel, and by then you have stopped looking at the thing
+            // you wanted to keep.
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Save as Asset"))
+                .on_hover_text("Keep the selection in the Assets library, for any film")
+                .clicked()
+            {
+                save_asset = true;
+                ui.close();
+            }
+            ui.separator();
+            item(ui, Command::SelectAll, true);
+        });
+
+        if let Some(command) = raised {
+            self.dispatch(command);
+        }
+        if save_asset {
+            let folder = self.editor.assets_panel.selected_folder.clone();
+            self.apply_asset_action(buzz_ui::AssetAction::Add { folder });
+        }
+    }
+
     /// Route pointer input over the stage to the active tool.
     fn handle_stage_input(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
         let id = ui.id().with("stage");
         let response = ui.interact(area, id, egui::Sense::click_and_drag());
+        // Remembered so the menu can turn a pointer position into a document
+        // point; it is opened from the same response, after this returns.
+        self.stage_area_min = area.min;
+        self.stage_context_menu(&response);
         let ctx = ui.ctx().clone();
         let mods = mods_from(&ctx);
 
@@ -3184,10 +3499,48 @@ impl App {
                 if let Err(e) = self.editor.assets.delete(&asset) {
                     self.editor.status = Some(format!("Could not delete: {e}"));
                 }
+                self.asset_thumbnails.forget();
+            }
+
+            DeleteFolder { folder } => {
+                // **No undo out here.** An asset library is files on disk, and
+                // deleting a folder takes everything under it — so the count is
+                // said out loud and the second click is the confirmation.
+                let count = self
+                    .editor
+                    .assets
+                    .assets()
+                    .iter()
+                    .filter(|a| a.folder == folder || a.folder.starts_with(&format!("{folder}/")))
+                    .count();
+                if self.editor.assets_panel.confirm_delete.as_deref() != Some(folder.as_str()) {
+                    self.editor.assets_panel.confirm_delete = Some(folder.clone());
+                    self.editor.status = Some(format!(
+                        "Delete the folder {folder} and {count} asset(s)? Click Delete again to confirm"
+                    ));
+                } else {
+                    self.editor.assets_panel.confirm_delete = None;
+                    match self.editor.assets.delete_folder(&folder) {
+                        Ok(()) => {
+                            self.asset_thumbnails.forget();
+                            if self.editor.assets_panel.selected_folder == folder {
+                                self.editor.assets_panel.selected_folder.clear();
+                            }
+                            self.editor.status = Some(format!("Deleted {folder}"));
+                        }
+                        Err(e) => {
+                            self.editor.status = Some(format!("Could not delete the folder: {e}"))
+                        }
+                    }
+                }
             }
 
             Rescan => {
                 self.editor.assets.rescan();
+                // The pictures were drawn from files that may have been
+                // rewritten, moved or deleted since; a rescan is exactly when
+                // to stop trusting them.
+                self.asset_thumbnails.forget();
                 self.editor.status = Some(format!("{} assets", self.editor.assets.len()));
             }
 
@@ -3305,6 +3658,7 @@ impl App {
             current_frame: self.editor.current_frame,
             selection: self.editor.selection.ids(),
             active_layer: self.editor.selection.active_layer(),
+                    config_dir: buzz_script::default_config_dir(),
         };
         let mut working = self.editor.doc.scene().clone();
 
@@ -3364,7 +3718,20 @@ impl App {
         self.editor.selection.ensure_active_layer(self.editor.doc.scene());
 
         self.editor.status = Some(summary.clone());
-        self.editor.actions.report(outcome.trace, outcome.error, summary);
+
+        // **What the script tried to ask.** A run has nobody watching it, so
+        // an `alert` cannot open a window — it is recorded instead, and shown
+        // here with the rest of the output. A command that says "no eye layer
+        // found" has told you the useful thing, and losing that would leave
+        // only a script that appeared to do nothing.
+        let mut output = outcome.trace;
+        if !outcome.alerts.is_empty() {
+            output.push(String::new());
+            for asked in &outcome.alerts {
+                output.push(format!("alert: {asked}"));
+            }
+        }
+        self.editor.actions.report(output, outcome.error, summary);
     }
 
     /// The overlay shown while a script runs.
@@ -4826,6 +5193,10 @@ impl App {
         // elsewhere — no longer re-encodes a stage of thousands of shapes. Reuse
         // is refused whenever a tool preview is live or lighting is still being
         // built, because those change the stage without moving the stamp.
+        let paints_into_scene = matches!(
+            self.editor.preview(),
+            crate::tools::Preview::Ink { .. } | crate::tools::Preview::Painted { .. }
+        );
         let stamp = StageStamp {
             revision: self.editor.scene().revision(),
             frame: self.editor.current_frame,
@@ -4853,11 +5224,25 @@ impl App {
             ),
             edit_multiple: self.editor.edit_multiple,
             lights_generation: self.lights_generation,
+            painted_preview: paints_into_scene,
         };
+        // **Only a preview that is painted into the scene invalidates it.**
+        //
+        // `stage::build_scene` encodes exactly two previews as artwork — the
+        // brush's ink and the soft brush's pixels — because for those the
+        // preview *is* the result and has to carry its real weight and colour.
+        // Every other preview is egui chrome drawn over the finished frame:
+        // the marquee, the transform outlines, the transformation point.
+        //
+        // Refusing reuse for all of them re-encoded the whole stage on every
+        // pointer move of a gesture that could not change it. On a document
+        // with an imported character that is thousands of shapes per frame, and
+        // it is what made dragging a selection judder while a brush stroke —
+        // the genuinely expensive case — cost the same.
         let reuse = self.retain_stage
             && !cold
             && self.shade_build.is_none()
-            && matches!(self.editor.preview(), crate::tools::Preview::None)
+            && !paints_into_scene
             && self.stage_stamp.as_ref() == Some(&stamp);
         if !reuse {
             stage::build_scene(&mut active.vello, &self.editor, area_px, scale, &mut self.lights);
@@ -4931,6 +5316,21 @@ impl App {
             );
             // Ask for another frame so the rest arrive without the pointer
             // having to move.
+            active.window.request_redraw();
+        }
+
+        // The Assets panel's pictures, on the same budget and for the same
+        // reason. Kept separate so a document with a big library and a disk
+        // with a big asset folder do not each spend the other's budget.
+        if self.asset_thumbnails.pending() {
+            let mut scratch = buzz_render::vello::Scene::new();
+            self.asset_thumbnails.fulfil(
+                &mut active.gpu,
+                &mut active.egui_renderer,
+                &mut scratch,
+                &self.editor.assets,
+                &mut self.lights,
+            );
             active.window.request_redraw();
         }
 
@@ -5658,6 +6058,122 @@ mod idle_tests {
         assert_eq!(app.wants_frame(), Redraw::Now);
     }
 
+    /// **A right-click on the stage opens the stage's menu.**
+    ///
+    /// Driven through the real `build_ui`, because the pattern works in
+    /// isolation and the question was always whether something else in the
+    /// window was taking the click first.
+    #[test]
+    fn right_clicking_the_stage_opens_its_menu() {
+        let mut app = App::new(GpuPreference::Automatic);
+        // Whatever this machine has lying about from earlier runs must not
+        // decide the test: a recovery window over the stage would take the
+        // click, which is a real thing that can happen but not this question.
+        app.recovery.found.clear();
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0));
+        // Middle of the window, which is stage whatever the docks are doing.
+        let at = egui::pos2(700.0, 430.0);
+        let mods = egui::Modifiers::default();
+
+        let mut opened = false;
+        let mut drive = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            });
+            // The popup egui opens for a context menu is an Area of its own,
+            // and its id is derived from the widget it belongs to. Asking the
+            // stage's own response is what "did the menu come up" means.
+            let id = egui::Id::new("stage-context-probe");
+            if ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false) {
+                opened = true;
+            }
+        };
+
+        // A frame to lay the window out, so the stage is a registered widget
+        // before the pointer is asked about.
+        drive(&mut app, vec![]);
+        drive(&mut app, vec![egui::Event::PointerMoved(at)]);
+        drive(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: mods,
+            }],
+        );
+        drive(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: mods,
+            }],
+        );
+        drive(&mut app, vec![]);
+
+        assert!(opened, "right-clicking the stage should raise its menu");
+    }
+
+    /// **Turning on the depth view shows the picture.**
+    ///
+    /// The column of numbers says what each depth is; only the Layer Depth
+    /// panel draws the scene from the side, which is the thing that answers
+    /// "how close is that layer to me". It is a background tab in the right
+    /// dock, so without this the depth view was numbers and nothing else.
+    #[test]
+    fn turning_on_the_depth_view_reveals_the_depth_panel() {
+        let mut app = App::new(GpuPreference::Automatic);
+        // Put it away first, both ways it can be away: closed, and buried
+        // behind another tab in its own section.
+        app.editor.workspace.move_to(buzz_ui::PanelId::Depth, buzz_ui::Dock::Hidden);
+        assert!(!app.editor.workspace.is_open(buzz_ui::PanelId::Depth));
+
+        let mut commands = Vec::new();
+        app.apply_timeline(
+            buzz_ui::TimelineResponse {
+                toggle_depth: true,
+                ..Default::default()
+            },
+            &mut commands,
+        );
+
+        assert!(app.editor.workspace.depth_view, "the column switched over");
+        assert!(
+            app.editor.workspace.is_open(buzz_ui::PanelId::Depth),
+            "a closed panel cannot be brought to the front of anything"
+        );
+        assert_eq!(
+            app.editor
+                .workspace
+                .section_of(buzz_ui::PanelId::Depth)
+                .map(|s| s.front),
+            Some(buzz_ui::PanelId::Depth),
+            "and it must be the tab actually on show"
+        );
+
+        // Turning it off again leaves the panel alone: the user may well want
+        // to keep looking at it.
+        app.apply_timeline(
+            buzz_ui::TimelineResponse {
+                toggle_depth: true,
+                ..Default::default()
+            },
+            &mut commands,
+        );
+        assert!(!app.editor.workspace.depth_view);
+        assert!(app.editor.workspace.is_open(buzz_ui::PanelId::Depth));
+    }
+
     fn stamp() -> StageStamp {
         StageStamp {
             revision: 5,
@@ -5668,6 +6184,7 @@ mod idle_tests {
             onion: (false, false, 2, 2),
             edit_multiple: false,
             lights_generation: 0,
+            painted_preview: false,
         }
     }
 
@@ -5696,6 +6213,11 @@ mod idle_tests {
         let mut a = stamp();
         a.lights_generation = 1;
         assert_ne!(base, a, "installed shading re-encodes");
+        // The frame after a brush stroke must rebuild rather than keep the ink
+        // the preview left in the scene.
+        let mut a = stamp();
+        a.painted_preview = true;
+        assert_ne!(base, a, "a preview painted into the scene re-encodes");
     }
 }
 

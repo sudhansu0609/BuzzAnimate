@@ -297,6 +297,239 @@ impl Thumbnails {
     }
 }
 
+/// One asset's picture. Keyed by the file it was drawn from.
+struct AssetEntry {
+    #[allow(dead_code, reason = "kept alive for egui to sample")]
+    texture: buzz_render::wgpu::Texture,
+    #[allow(dead_code, reason = "kept alive for egui to sample")]
+    view: buzz_render::wgpu::TextureView,
+    id: egui::TextureId,
+    used: u64,
+}
+
+/// Pictures of **assets** — the reusable artwork kept on disk, which the
+/// Assets panel listed by name alone.
+///
+/// The same budget, cache and no-readback argument as [`Thumbnails`]; see this
+/// module's header. What differs is where the artwork comes from: an asset is a
+/// whole `Scene` in a file, so drawing one means reading and parsing it first.
+/// That is why the per-frame budget matters even more here than it does for
+/// symbols, and why a file that fails to load is remembered as failed rather
+/// than retried on every frame for as long as the panel is open.
+///
+/// Keyed by path rather than by pointer, because an asset has no `Arc` to
+/// watch: it changes when somebody writes the file, which is what
+/// [`Self::forget`] is for — the panel's Rescan already knows when that has
+/// happened.
+#[derive(Default)]
+pub struct AssetThumbnails {
+    entries: HashMap<std::path::PathBuf, AssetEntry>,
+    wanted: Vec<std::path::PathBuf>,
+    requested: HashSet<std::path::PathBuf>,
+    /// Files that could not be read or drawn. Held so a broken asset costs one
+    /// attempt rather than one per frame forever.
+    failed: HashSet<std::path::PathBuf>,
+    retired: Vec<egui::TextureId>,
+    tick: u64,
+}
+
+impl AssetThumbnails {
+    /// The picture for an asset, if there is one, and a note that it was asked
+    /// for if there is not.
+    pub fn get(&mut self, path: &std::path::Path) -> Option<egui::TextureId> {
+        let tick = self.tick;
+        if let Some(entry) = self.entries.get_mut(path) {
+            entry.used = tick;
+            return Some(entry.id);
+        }
+        if self.failed.contains(path) {
+            return None;
+        }
+        if self.requested.insert(path.to_path_buf()) {
+            self.wanted.push(path.to_path_buf());
+        }
+        None
+    }
+
+    /// Is anything waiting to be drawn? The caller repaints while there is, so
+    /// the panel fills in without the pointer having to move.
+    pub fn pending(&self) -> bool {
+        !self.wanted.is_empty()
+    }
+
+    /// Throw everything away — after a rescan, when the files on disk may no
+    /// longer be the ones these pictures were drawn from.
+    pub fn forget(&mut self) {
+        for entry in self.entries.values() {
+            self.retired.push(entry.id);
+        }
+        self.entries.clear();
+        self.wanted.clear();
+        self.requested.clear();
+        // Failures are forgotten too: a rescan is exactly when a file that was
+        // unreadable may have been fixed or replaced.
+        self.failed.clear();
+    }
+
+    /// Draw up to [`PER_FRAME`] of the pictures that were asked for.
+    ///
+    /// Called once a frame from the render path, which is the only place the
+    /// device, the Vello renderer and egui's renderer are all reachable.
+    pub fn fulfil(
+        &mut self,
+        gpu: &mut buzz_render::GpuContext,
+        egui_renderer: &mut egui_wgpu::Renderer,
+        vello: &mut vello::Scene,
+        library: &buzz_doc::AssetLibrary,
+        cache: &mut buzz_render::document::DrawCache,
+    ) {
+        self.tick += 1;
+
+        for id in self.retired.drain(..) {
+            egui_renderer.free_texture(&id);
+        }
+
+        let count = PER_FRAME.min(self.wanted.len());
+        let batch: Vec<std::path::PathBuf> = self.wanted.drain(..count).collect();
+        for path in &batch {
+            self.requested.remove(path);
+        }
+
+        for path in batch {
+            let Some(asset) = library.assets().iter().find(|a| a.path == path).cloned() else {
+                // Gone since it was asked for: deleted while the panel was
+                // being drawn is not an error, it is just nothing to draw.
+                continue;
+            };
+            match library.load(&asset) {
+                Ok(scene) => match self.draw(gpu, egui_renderer, vello, &scene, cache) {
+                    Some(entry) => {
+                        self.entries.insert(path, entry);
+                    }
+                    // Nothing in it to draw. An empty asset keeps its name, as
+                    // it did before there were pictures at all.
+                    None => {
+                        self.failed.insert(path);
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(?path, %error, "asset thumbnail could not be read");
+                    self.failed.insert(path);
+                }
+            }
+        }
+
+        self.evict_over_cap();
+    }
+
+    fn evict_over_cap(&mut self) {
+        if self.entries.len() <= MAX_ENTRIES {
+            return;
+        }
+        let mut by_use: Vec<(std::path::PathBuf, u64)> = self
+            .entries
+            .iter()
+            .map(|(path, e)| (path.clone(), e.used))
+            .collect();
+        by_use.sort_by_key(|(_, used)| *used);
+        let excess = self.entries.len() - MAX_ENTRIES;
+        for (path, _) in by_use.into_iter().take(excess) {
+            if let Some(entry) = self.entries.remove(&path) {
+                self.retired.push(entry.id);
+            }
+        }
+    }
+
+    fn draw(
+        &mut self,
+        gpu: &mut buzz_render::GpuContext,
+        egui_renderer: &mut egui_wgpu::Renderer,
+        vello: &mut vello::Scene,
+        scene: &Scene,
+        cache: &mut buzz_render::document::DrawCache,
+    ) -> Option<AssetEntry> {
+        let bounds = scene_bounds(scene)?;
+        if !(bounds.width().is_finite() && bounds.height().is_finite()) {
+            return None;
+        }
+
+        let camera = fit(bounds, SIZE);
+        vello.reset();
+        let mut builder = buzz_render::SceneBuilder::new(vello, &camera);
+        // **Not through the asset's own camera.** An asset is a fragment — a
+        // tree, a lamp-post, a mouth chart — and any shot saved beside it
+        // framed the film it was cut from rather than the thing itself. The
+        // picture wanted here is of the artwork.
+        buzz_render::document::draw_frame_within(
+            &mut builder,
+            scene,
+            0,
+            buzz_geom::Affine::IDENTITY,
+            &buzz_render::document::FrameOptions::default(),
+            cache,
+        );
+
+        let texture = gpu
+            .device
+            .create_texture(&buzz_render::wgpu::TextureDescriptor {
+                label: Some("asset thumbnail"),
+                size: buzz_render::wgpu::Extent3d {
+                    width: SIZE,
+                    height: SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: buzz_render::wgpu::TextureDimension::D2,
+                format: buzz_render::RENDER_FORMAT,
+                usage: buzz_render::wgpu::TextureUsages::STORAGE_BINDING
+                    | buzz_render::wgpu::TextureUsages::TEXTURE_BINDING
+                    | buzz_render::wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+        let view = texture.create_view(&buzz_render::wgpu::TextureViewDescriptor::default());
+
+        gpu.render(vello, &view, SIZE, SIZE, peniko::Color::TRANSPARENT)
+            .ok()?;
+
+        let id = egui_renderer.register_native_texture(
+            &gpu.device,
+            &view,
+            buzz_render::wgpu::FilterMode::Linear,
+        );
+        Some(AssetEntry {
+            texture,
+            view,
+            id,
+            used: self.tick,
+        })
+    }
+}
+
+/// Everything an asset's first frame covers, resolved through its own library.
+///
+/// `None` when there is nothing on it — no picture to draw, rather than an
+/// error.
+fn scene_bounds(scene: &Scene) -> Option<Rect> {
+    let table = scene.symbol_bounds_table();
+    let layers: Vec<_> = scene.layers().drawable_at(0).collect();
+    layers
+        .into_iter()
+        .flat_map(|layer| {
+            let follows = scene.layers().inherited_transform(layer.id, 0);
+            layer
+                .objects_at(0)
+                .iter()
+                .filter(|o| o.visible)
+                .map(move |o| (follows, o))
+        })
+        .map(|(follows, object)| {
+            buzz_scene::object::transform_rect(follows, scene.resolved_bounds_with(object, &table))
+        })
+        .filter(|r| r.width() > 0.0 || r.height() > 0.0)
+        .reduce(|a, b| a.union(b))
+}
+
 /// A camera that fits `bounds` into a square of `size` pixels, centred.
 ///
 /// `Camera::fit_to_rect` is what Zoom ▸ Show All already uses, so a thumbnail

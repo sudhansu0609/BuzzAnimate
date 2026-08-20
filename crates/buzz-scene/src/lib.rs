@@ -874,11 +874,31 @@ impl Scene {
         }
         // Across every frame, as `Symbol::bounds` does: a symbol's extent is
         // what it covers over its whole timeline, not what one frame shows.
+        //
+        // **Through the symbol's own layer parenting**, which is how a
+        // character symbol is rigged inside itself — the renderer draws a part
+        // through the chain it follows (`buzz_render::document`), so measuring
+        // the parts where they were drawn at rest gives a symbol smaller than
+        // the character on screen. Everything downstream inherits that error:
+        // the cheap rejection in hit testing throws away clicks that land on a
+        // limb the rig has carried outside the measured box, so the click falls
+        // through to whatever is behind it.
+        //
+        // Per keyframe, because where a parent has taken a part depends on the
+        // frame. Memoised by `symbol_bounds_table`, so this runs once per
+        // symbol per revision rather than once per measurement.
         symbol
             .layers
             .iter()
-            .flat_map(|l| l.all_objects())
-            .map(|o| self.resolved_bounds_within(o, depth))
+            .flat_map(|layer| {
+                layer.frames.keyframes().iter().flat_map(move |key| {
+                    let follows = symbol.layers.inherited_transform(layer.id, key.start);
+                    key.objects.iter().map(move |o| (follows, o))
+                })
+            })
+            .map(|(follows, o)| {
+                crate::object::transform_rect(follows, self.resolved_bounds_within(o, depth))
+            })
             .reduce(|a, b| a.union(b))
     }
 
@@ -1347,10 +1367,39 @@ impl Scene {
         // carried back through the same perspective it was drawn with — or
         // tilted artwork is visible and unclickable.
         let with_depth = self.camera_projection_at_depth(frame, depth)?;
-        // Relative to the depth-zero transform, because that is the space the
-        // rest of the editor already works in.
+        // **Out through the depth-zero shot, then back in through this
+        // layer's.**
+        //
+        // `point` arrives in the space the editor works in: the focal plane,
+        // with the document camera already taken off it by
+        // `Editor::screen_to_edit`. So it goes forward through the depth-zero
+        // shot to reach the view, and back through this layer's own shot to
+        // reach its geometry.
+        //
+        // The order matters and was the other way round, which composed to the
+        // identity whenever the camera was — every document without one — and
+        // to a displacement the moment a shot was framed off centre.
         let base = buzz_geom::Projection::from_affine(self.camera_transform(frame));
-        let combined = with_depth.inverse()?.then(&base);
+        let combined = base.then(&with_depth.inverse()?);
+        combined.map_point(point)
+    }
+
+    /// Move a point from a layer's own coordinates back out to the space the
+    /// editor works in — the exact inverse of [`Self::view_to_layer`].
+    ///
+    /// Needed wherever the editor has geometry and wants to know where the user
+    /// will see it: the selection's handle box, and the test for whether a drag
+    /// began inside the selection.
+    ///
+    /// Returns the point unchanged for a layer on the focal plane, which is
+    /// every layer in a document that does not use depth.
+    pub fn layer_to_view(&self, frame: u32, depth: f64, point: Point) -> Option<Point> {
+        if depth == 0.0 && !self.camera_has_tilt() {
+            return Some(point);
+        }
+        let with_depth = self.camera_projection_at_depth(frame, depth)?;
+        let base = buzz_geom::Projection::from_affine(self.camera_transform(frame));
+        let combined = with_depth.then(&base.inverse()?);
         combined.map_point(point)
     }
 

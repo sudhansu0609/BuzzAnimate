@@ -76,7 +76,18 @@ pub enum ToolAction {
     /// Pan the view.
     PanView { delta_screen: Vec2 },
     /// Move the document camera. Unlike `PanView` this changes the animation.
-    MoveCamera { delta_doc: Vec2 },
+    ///
+    /// In **screen pixels**, like [`Self::PanView`], and for two reasons that
+    /// both showed up as a shot that shook while it was being aimed.
+    ///
+    /// The pointer's document position is *snapped* — pulled to nearby artwork
+    /// edges — which is right for drawing and nonsense for a camera: the shot
+    /// jumped from edge to edge as the pointer crossed the stage. And the
+    /// document position is measured *through the camera*, so moving the camera
+    /// moves the frame the measurement is made in; each step was measured
+    /// against a ruler the previous step had already shifted. Screen pixels are
+    /// what the hand actually did, and neither problem can reach them.
+    MoveCamera { delta_screen: Vec2 },
     /// Zoom about a screen point.
     ZoomView { factor: f64, at_screen: Point },
     /// Clear the selection.
@@ -197,6 +208,16 @@ enum Gesture {
         origin: Point,
         current: Point,
         mods: Mods,
+        /// This drag is **moving the selection**, decided when it began.
+        ///
+        /// Recorded rather than re-derived on every move because the artwork
+        /// travels *as the pointer does*, so the selection's bounds are no
+        /// longer where they were when the press landed — asking "did this
+        /// start inside the selection?" at release would be asking about a
+        /// selection that has since moved out from under the question. What the
+        /// drag began on decides what it does, which is the rule the rest of
+        /// this file already follows.
+        moving: bool,
     },
     /// Accumulating freehand samples.
     ///
@@ -333,6 +354,7 @@ impl ToolMachine {
                         origin: doc,
                         current: doc,
                         mods,
+                        moving: self.begins_a_move(doc, ctx),
                     },
                 };
             }
@@ -341,10 +363,49 @@ impl ToolMachine {
                     origin: doc,
                     current: doc,
                     mods,
+                    moving: self.begins_a_move(doc, ctx),
                 };
             }
         }
         ToolAction::None
+    }
+
+    /// Does a press at `at` begin a move of the selection?
+    ///
+    /// The same question `finish_drag` used to ask on release, asked once at
+    /// the start where the answer is still true. Only the tools that can move
+    /// artwork by dragging it answer yes.
+    fn begins_a_move(&self, at: Point, ctx: &ToolContext<'_>) -> bool {
+        if !matches!(
+            self.tool,
+            ToolId::Selection | ToolId::Subselection | ToolId::FreeTransform
+        ) {
+            return false;
+        }
+        let Some(bounds) = ctx.selection_bounds else {
+            return false;
+        };
+        // Which point counts as "the transformation point" is per tool, and
+        // matches what `finish_drag` does with it. Free Transform always draws
+        // one, falling back to the centre. The selection tools can only grab a
+        // point that actually exists — without one the centre of a selection is
+        // ordinary artwork, and a press there moves it like anywhere else.
+        let pivot = match (self.tool, ctx.pivot) {
+            (ToolId::FreeTransform, p) => p.unwrap_or_else(|| bounds.center()),
+            (_, Some(p)) => p,
+            (_, None) => return contains(bounds, at),
+        };
+        let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+        if !matches!(
+            transform_zone(bounds, pivot, at, grab),
+            TransformZone::Inside
+        ) {
+            return false;
+        }
+        // `Inside` means "on none of the handles", which is also true of empty
+        // stage far from the selection — and a drag out there is a marquee.
+        // Free Transform has no marquee, so anywhere off its handles moves.
+        self.tool == ToolId::FreeTransform || contains(bounds, at)
     }
 
     pub fn pointer_move(&mut self, doc: Point, screen: Point, mods: Mods) -> ToolAction {
@@ -371,18 +432,36 @@ impl ToolMachine {
                 ToolAction::None
             }
             Gesture::Dragging {
-                current, mods: m, ..
+                current,
+                mods: m,
+                moving,
+                ..
             } => {
                 let previous = *current;
+                let moving = *moving;
                 *current = doc;
                 *m = mods;
+                // **The artwork travels with the pointer.**
+                //
+                // A move used to be committed only on release, so the drag
+                // showed a marquee stretched across the artwork and then the
+                // artwork teleported — the gesture gave no feedback at all
+                // about the thing it was doing. Applied by the step since the
+                // last move, exactly as the camera already is, and collapsed
+                // into a single undo step by `end_gesture` on release.
+                if moving {
+                    let delta = doc - previous;
+                    return if delta.hypot() > 0.0 {
+                        ToolAction::MoveSelection { delta }
+                    } else {
+                        ToolAction::None
+                    };
+                }
                 match self.tool {
                     ToolId::Hand => ToolAction::PanView { delta_screen },
                     // The camera moves live so the user can see the framing
                     // they are choosing, rather than only on release.
-                    ToolId::Camera => ToolAction::MoveCamera {
-                        delta_doc: doc - previous,
-                    },
+                    ToolId::Camera => ToolAction::MoveCamera { delta_screen },
                     _ => ToolAction::None,
                 }
             }
@@ -411,7 +490,9 @@ impl ToolMachine {
                 }
                 self.finish_freehand(samples, mods, ctx)
             }
-            Gesture::Dragging { origin, mods, .. } => self.finish_drag(origin, doc, mods, ctx),
+            Gesture::Dragging {
+                origin, mods, moving, ..
+            } => self.finish_drag(origin, doc, mods, moving, ctx),
         }
     }
 
@@ -490,10 +571,16 @@ impl ToolMachine {
                     width: brush_width(self.tool, ctx.style),
                 },
             },
+            // **A move previews nothing.** The artwork is already travelling
+            // with the pointer (see `pointer_move`), and an outline over the
+            // top of it would be a second, redundant answer to "where is this
+            // going?" — drawn in the place the artwork already is.
+            Gesture::Dragging { moving: true, .. } => Preview::None,
             Gesture::Dragging {
                 origin,
                 current,
                 mods,
+                ..
             } => match self.tool {
                 ToolId::Rectangle
                 | ToolId::Oval
@@ -550,6 +637,7 @@ impl ToolMachine {
                                 pivot, bounds, *origin, *current, horizontal,
                             ))
                         }
+
                         _ => marquee(),
                     }
                 }
@@ -644,10 +732,24 @@ impl ToolMachine {
         origin: Point,
         end: Point,
         mods: Mods,
+        moving: bool,
         ctx: &ToolContext<'_>,
     ) -> ToolAction {
         let slop = CLICK_SLOP_PX / ctx.zoom.max(f64::MIN_POSITIVE);
         let was_click = (end - origin).hypot() <= slop;
+
+        // **A move is already done.** `pointer_move` applied it step by step,
+        // so the release has nothing left to commit — re-applying the whole
+        // delta here would move the artwork twice as far as the pointer went.
+        // `end_gesture` still collapses the run into one undo step.
+        //
+        // Taken before the transformation-point branch below, which asks how
+        // close the press was to the pivot: the pivot has travelled with the
+        // selection, so on a long move it can end up under the point the drag
+        // started from and claim a gesture that was never about it.
+        if moving && !was_click {
+            return ToolAction::None;
+        }
 
         // **The transformation point can be dragged with the selection tools
         // too**, not only with Free Transform.
@@ -687,20 +789,42 @@ impl ToolMachine {
             }
             ToolId::Selection | ToolId::Subselection => {
                 if was_click {
-                    ToolAction::PickAt {
+                    return ToolAction::PickAt {
                         point: end,
                         additive: mods.shift,
+                    };
+                }
+
+                // **Rotating without changing tools.**
+                //
+                // `preview` has drawn this rotation for the whole drag — the
+                // ring just outside a corner is the same one Free Transform
+                // uses, and the pointer turns there — but the release used to
+                // fall straight through to a marquee, so the artwork snapped
+                // back and the selection was replaced by whatever the rubber
+                // band had swept. A preview that promises something the release
+                // does not do is worse than no preview, and this is the file
+                // that says so.
+                //
+                // Committed by the same `rotate_about` the preview called, so
+                // the two cannot drift apart.
+                if let Some((pivot, bounds)) = ctx.pivot.zip(ctx.selection_bounds) {
+                    let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+                    if matches!(
+                        transform_zone(bounds, pivot, origin, grab),
+                        TransformZone::Rotate
+                    ) {
+                        return ToolAction::TransformSelection {
+                            transform: rotate_about(pivot, origin, end, mods.shift),
+                        };
                     }
-                } else if ctx.selection_bounds.is_some_and(|b| contains(b, origin)) {
-                    // Started inside the selection: move it.
-                    ToolAction::MoveSelection {
-                        delta: end - origin,
-                    }
-                } else {
-                    ToolAction::PickInRect {
-                        rect: Rect::from_points(origin, end),
-                        additive: mods.shift,
-                    }
+                }
+
+                // A drag that began inside the selection has already returned
+                // above; anything left is a marquee.
+                ToolAction::PickInRect {
+                    rect: Rect::from_points(origin, end),
+                    additive: mods.shift,
                 }
             }
 
@@ -728,7 +852,29 @@ impl ToolMachine {
                             ToolAction::SetTransformPoint { at: end }
                         }
                     }
-                    _ if was_click => ToolAction::None,
+                    // **A click on a handle is a mis-grab of the gizmo**, not a
+                    // selection. The handles are furniture drawn over the
+                    // artwork, and picking whatever happens to lie under a
+                    // corner would take the selection away from the very thing
+                    // the user was lining up to transform.
+                    TransformZone::Corner | TransformZone::Rotate | TransformZone::Edge(_)
+                        if was_click =>
+                    {
+                        ToolAction::None
+                    }
+
+                    // **A click anywhere else selects.**
+                    //
+                    // Every click used to answer `None` once anything was
+                    // selected, so Free Transform locked onto the first object
+                    // you picked: you could transform it forever and never
+                    // reach another one without changing tools and back. A
+                    // click is how you choose what to work on, and that has to
+                    // keep working while a gizmo is on screen.
+                    TransformZone::Inside if was_click => ToolAction::PickAt {
+                        point: end,
+                        additive: mods.shift,
+                    },
                     TransformZone::Corner => ToolAction::TransformSelection {
                         transform: if mods.alt {
                             // Animate's Alt: scale about the transformation
@@ -744,9 +890,8 @@ impl ToolMachine {
                     TransformZone::Edge(horizontal) => ToolAction::TransformSelection {
                         transform: skew_about(pivot, bounds, origin, end, horizontal),
                     },
-                    TransformZone::Inside => ToolAction::MoveSelection {
-                        delta: end - origin,
-                    },
+                    // Already applied move by move; see the early return above.
+                    TransformZone::Inside => ToolAction::None,
                 }
             }
 
@@ -1034,7 +1179,7 @@ fn star_path(center: Point, radius: f64, points: usize) -> BezPath {
 
 /// Scale the selection by dragging, anchored at the opposite corner.
 /// How far from a handle a grab still counts, in screen pixels.
-const TRANSFORM_GRAB_PX: f64 = 8.0;
+pub(crate) const TRANSFORM_GRAB_PX: f64 = 8.0;
 
 /// Which part of the Free Transform gizmo a drag started on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1586,6 +1731,10 @@ mod tests {
 
     /// Dragging from *inside* the selection moves it instead of starting a new
     /// marquee — the behaviour that makes the Selection tool feel right.
+    ///
+    /// The move arrives **while the pointer travels**, a step at a time, so the
+    /// artwork is under the pointer the whole way rather than jumping to it on
+    /// release. The release itself therefore has nothing left to commit.
     #[test]
     fn dragging_from_inside_the_selection_moves_it() {
         let style = DrawStyle::default();
@@ -1598,12 +1747,32 @@ mod tests {
             gradient: None,
         };
         let mut m = ToolMachine::new(ToolId::Selection);
-        match drag(&mut m, Point::new(50.0, 50.0), Point::new(80.0, 90.0), &c) {
-            ToolAction::MoveSelection { delta } => {
-                assert!((delta.x - 30.0).abs() < 1e-9 && (delta.y - 40.0).abs() < 1e-9);
+        m.pointer_down(
+            Point::new(50.0, 50.0),
+            Point::new(50.0, 50.0),
+            Mods::default(),
+            &c,
+        );
+
+        // Walked in two steps, so the deltas have to add up to the whole move
+        // rather than each being measured from the origin.
+        let mut total = buzz_geom::Vec2::new(0.0, 0.0);
+        for at in [Point::new(60.0, 70.0), Point::new(80.0, 90.0)] {
+            match m.pointer_move(at, at, Mods::default()) {
+                ToolAction::MoveSelection { delta } => total += delta,
+                other => panic!("mid-drag: got {other:?}"),
             }
-            other => panic!("got {other:?}"),
         }
+        assert!(
+            (total.x - 30.0).abs() < 1e-9 && (total.y - 40.0).abs() < 1e-9,
+            "the steps should sum to the drag, got {total:?}"
+        );
+
+        let end = Point::new(80.0, 90.0);
+        assert!(
+            matches!(m.pointer_up(end, end, &c), ToolAction::None),
+            "the release must not move it a second time"
+        );
     }
 
     #[test]
@@ -2445,26 +2614,63 @@ mod transform_preview_tests {
         }
     }
 
-    /// Dragging inside the selection moves it, and moving already previewed
-    /// nothing — a move is shown by the artwork itself, not by an outline.
+    /// **Free Transform can still choose what to work on.**
+    ///
+    /// Every click answered `None` once anything was selected, so the tool
+    /// locked onto the first object picked: you could transform it forever and
+    /// never reach another without changing tools and back.
+    #[test]
+    fn free_transform_can_still_select_another_object() {
+        let style = DrawStyle::default();
+        let ctx = context(&style);
+        let mut m = ToolMachine::new(ToolId::FreeTransform);
+
+        // A click well inside the gizmo but off every handle: pick what is
+        // under it, which is how another object is reached.
+        let at = Point::new(30.0, 40.0);
+        m.pointer_down(at, at, Mods::default(), &ctx);
+        let committed = m.pointer_up(at, at, &ctx);
+        assert!(
+            matches!(committed, ToolAction::PickAt { .. }),
+            "a click should select, got {committed:?}"
+        );
+
+        // A click on a corner handle is a mis-grab of the gizmo, not a change
+        // of selection — it must not throw away what is being transformed.
+        let corner = Point::new(0.0, 0.0);
+        m.pointer_down(corner, corner, Mods::default(), &ctx);
+        let committed = m.pointer_up(corner, corner, &ctx);
+        assert!(
+            matches!(committed, ToolAction::None),
+            "a handle click must leave the selection alone, got {committed:?}"
+        );
+    }
+
+    /// Dragging inside the selection moves it, and moving previews nothing —
+    /// a move is shown by the artwork itself, not by an outline.
     ///
     /// Away from the centre on purpose: the transformation point sits there,
     /// and grabbing *it* is a third thing again.
     #[test]
     fn dragging_inside_still_moves_rather_than_transforming() {
-        let (previewed, committed) = drag(
-            ToolId::FreeTransform,
-            Point::new(25.0, 20.0),
-            Point::new(45.0, 30.0),
-            Mods::default(),
+        let style = DrawStyle::default();
+        let ctx = context(&style);
+        let mut m = ToolMachine::new(ToolId::FreeTransform);
+        let (from, to) = (Point::new(25.0, 20.0), Point::new(45.0, 30.0));
+        m.pointer_down(from, from, Mods::default(), &ctx);
+
+        let moved = m.pointer_move(to, to, Mods::default());
+        assert!(
+            matches!(moved, ToolAction::MoveSelection { .. }),
+            "the artwork should move as the pointer does, got {moved:?}"
         );
         assert!(
-            !matches!(previewed, Preview::Transform(_)),
+            matches!(m.preview(&ctx), Preview::None),
             "a move should not preview a transform"
         );
         assert!(
-            matches!(committed, ToolAction::MoveSelection { .. }),
-            "committed {committed:?}"
+            matches!(m.pointer_up(to, to, &ctx), ToolAction::None),
+            "the release must not move it a second time"
         );
     }
 }

@@ -66,6 +66,68 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         Ok(())
     });
 
+    // -- the questions a script asks of a person -----------------------------
+    //
+    // Nobody is watching a script run, so a modal question has nobody to
+    // answer it. Recording it and answering with the default is what lets the
+    // rest of the script run; the host shows the list when it is over.
+    host_fn!(ctx, host, state, "alert", |state, text: String| {
+        state.borrow_mut().alerts.push(text);
+        Ok(())
+    });
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "askedWith",
+        |state, question: String, answer: String| {
+            state
+                .borrow_mut()
+                .alerts
+                .push(format!("{question} - answered {answer:?}"));
+            Ok(())
+        }
+    );
+
+    // -- the script shelf ---------------------------------------------------
+    //
+    // Animate hands scripts the Configuration folder as a `file:///` URI and
+    // lets them pull each other in from it. A shelf of commands is written
+    // against that: a shared settings file first, then the command itself.
+    host_fn!(ctx, host, state, "configUri", |state| {
+        Ok(state
+            .borrow()
+            .context
+            .config_dir
+            .as_deref()
+            .map(path_to_uri)
+            .unwrap_or_default())
+    });
+    host_fn!(ctx, host, state, "readScript", |state, uri: String| {
+        let borrowed = state.borrow();
+        let Some(root) = borrowed.context.config_dir.clone() else {
+            return Err(throw(
+                "this script asked to read another script, and no script folder is configured",
+            ));
+        };
+        drop(borrowed);
+        let path = uri_to_path(&uri)?;
+        // **Confined to the folder.** A `..` in the URI, or an absolute path
+        // somewhere else entirely, must not turn scripting into a way to read
+        // the disk. Canonicalised first so the check cannot be walked around.
+        let (real, root) = match (path.canonicalize(), root.canonicalize()) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return Err(throw(&format!("no script at {uri}"))),
+        };
+        if !real.starts_with(&root) {
+            return Err(throw(&format!(
+                "{uri} is outside the script folder, which scripts may not read past"
+            )));
+        }
+        std::fs::read_to_string(&real)
+            .map_err(|e| throw(&format!("could not read {uri}: {e}")))
+    });
+
     // -- document properties ------------------------------------------------
     host_fn!(ctx, host, state, "docWidth", |state| {
         Ok(state.borrow().scene.stage().size.width)
@@ -453,6 +515,41 @@ fn add_shape(
 }
 
 /// A JavaScript exception carrying `message`.
+/// A path as JSFL writes it: `file:///C|/Users/...`.
+///
+/// Animate's own spelling, drive letter and all — the pipe rather than a colon
+/// is a genuine quirk of the format and scripts concatenate onto it, so it has
+/// to come back out the same way it went in.
+fn path_to_uri(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let text = match text.as_bytes() {
+        [drive, b':', ..] => format!("{}|{}", *drive as char, &text[2..]),
+        _ => text.to_string(),
+    };
+    let text = text.trim_end_matches('/').to_string();
+    format!("file:///{text}/")
+}
+
+/// The reverse, accepting the plain path a script might also pass.
+fn uri_to_path(uri: &str) -> JsResult<std::path::PathBuf> {
+    let text = uri.trim();
+    let text = text
+        .strip_prefix("file:///")
+        .or_else(|| text.strip_prefix("file://"))
+        .unwrap_or(text);
+    // `C|/...` back to `C:/...`, and percent-escaped spaces back to spaces —
+    // both of which turn up in a real Configuration path.
+    let text = text.replace("%20", " ");
+    let text = match text.as_bytes() {
+        [drive, b'|', ..] => format!("{}:{}", *drive as char, &text[2..]),
+        _ => text.to_string(),
+    };
+    if text.is_empty() {
+        return Err(throw("expected the path of a script"));
+    }
+    Ok(std::path::PathBuf::from(text))
+}
+
 fn throw(message: &str) -> rquickjs::Error {
     // The engine turns this into a thrown `Error` at the call site, which is
     // what lets a script `try`/`catch` a bad index.

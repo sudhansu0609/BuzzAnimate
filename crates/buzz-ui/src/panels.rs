@@ -1431,7 +1431,7 @@ pub fn properties_panel(
         // thing from the stage's size — the colour and mood of the finished
         // film, not its dimensions.
         changed |= effects_properties(ui, scene);
-    } else if let Some(bounds) = selection.bounds(scene) {
+    } else if let Some(bounds) = selection.bounds_at(scene, at.frame) {
         egui::Grid::new("sel-props").num_columns(2).show(ui, |ui| {
             ui.label("X");
             ui.label(format!("{:.2}", bounds.x0));

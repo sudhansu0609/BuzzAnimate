@@ -27,6 +27,15 @@ pub struct TimelineResponse {
     pub select_camera: bool,
     /// A layer row was clicked.
     pub select_layer: Option<LayerId>,
+    /// The parenting view was switched on or off.
+    pub toggle_parenting: bool,
+    /// The depth view was switched on or off.
+    pub toggle_depth: bool,
+    /// A layer's depth was dragged in the depth view.
+    pub set_depth: Option<(LayerId, f64)>,
+    /// A parent link was made or broken in the parenting view: the child, and
+    /// the layer it should now follow (`None` to detach it).
+    pub set_follows: Option<(LayerId, Option<LayerId>)>,
     /// One of the three switches beside a layer's name was clicked.
     ///
     /// The timeline carries Animate's eye, padlock and outline columns beside
@@ -152,6 +161,15 @@ pub struct TimelineState {
     /// standard one. Both come from the workspace, so they survive a restart.
     pub frame_width: f32,
     pub row_scale: f32,
+    /// Show Animate's **parenting view** in the layer column: a node per layer,
+    /// wired to the layer it follows.
+    pub parenting_view: bool,
+    /// Show the **layer depth** in the layer column: how far each layer sits
+    /// from the camera, on a scale against the focal distance.
+    pub depth_view: bool,
+    /// The camera's focal distance, which is what a layer's depth is measured
+    /// against. Supplied so the column can draw the scale.
+    pub focal_distance: f64,
     /// Loudness per frame for each layer carrying a sound, so the timeline can
     /// draw the waveform where the sound actually sits.
     ///
@@ -235,6 +253,154 @@ fn name_area(row: egui::Rect) -> egui::Rect {
     )
 }
 
+/// **Animate's parenting view.**
+///
+/// The layer column stops being a list of names and becomes a node graph: one
+/// node per layer, indented by how deep it sits in its parent chain, with a
+/// connector running from each child to the layer it follows. Dragging one node
+/// onto another parents it; dropping on empty column detaches it.
+///
+/// # Why a graph rather than the dropdown
+///
+/// A rig is a *shape* — a spine with limbs hanging off it — and the question an
+/// animator asks of it is "what moves when I move this?". A per-layer dropdown
+/// can answer that only one layer at a time, so reading a twelve-layer
+/// character means opening twelve menus and holding the answer in your head.
+/// The whole point of Animate's view is that the shape is on screen.
+mod parenting {
+    use super::*;
+
+    /// How far in from the left the first node sits.
+    pub const INSET: f32 = 14.0;
+    /// How much further right each generation is drawn.
+    pub const STEP: f32 = 18.0;
+    pub const RADIUS: f32 = 5.0;
+
+    /// How many layers this one follows, up to the root.
+    ///
+    /// Bounded by the layer count: a file edited by hand can hold a cycle, and
+    /// this must terminate rather than hang the timeline.
+    pub fn generation(scene: &Scene, id: LayerId) -> usize {
+        let layers = scene.layers();
+        let mut seen = Vec::new();
+        let mut current = layers.get(id).and_then(|l| l.follows);
+        for _ in 0..layers.len() {
+            let Some(next) = current else { break };
+            if seen.contains(&next) {
+                break;
+            }
+            seen.push(next);
+            current = layers.get(next).and_then(|l| l.follows);
+        }
+        seen.len()
+    }
+
+    /// Where a layer's node is drawn within its row.
+    pub fn node_centre(name_row: egui::Rect, generation: usize) -> egui::Pos2 {
+        egui::pos2(
+            name_row.min.x + INSET + generation as f32 * STEP,
+            name_row.center().y,
+        )
+    }
+
+    /// The link being dragged, remembered across rows and frames.
+    ///
+    /// In egui's own store rather than in [`TimelineState`] because it is
+    /// transient interaction state that belongs to the widget: the app has no
+    /// use for a half-finished drag, and threading it through the response
+    /// would make every caller carry it.
+    pub fn dragging(ctx: &egui::Context) -> Option<LayerId> {
+        ctx.data(|d| d.get_temp::<LayerId>(egui::Id::new("timeline-parent-drag")))
+    }
+
+    pub fn set_dragging(ctx: &egui::Context, layer: Option<LayerId>) {
+        let id = egui::Id::new("timeline-parent-drag");
+        match layer {
+            Some(l) => ctx.data_mut(|d| {
+                d.insert_temp(id, l);
+            }),
+            None => ctx.data_mut(|d| d.remove::<LayerId>(id)),
+        }
+    }
+
+    /// Every node drawn this frame, so the connectors can be drawn over them
+    /// once the rows are done. A row scrolled out of view is not in here, and
+    /// a connector to it is simply not drawn — it is off screen anyway.
+    pub fn nodes(ctx: &egui::Context) -> Vec<(LayerId, egui::Pos2)> {
+        ctx.data(|d| {
+            d.get_temp::<Vec<(LayerId, egui::Pos2)>>(egui::Id::new("timeline-parent-nodes"))
+                .unwrap_or_default()
+        })
+    }
+
+    pub fn record_node(ctx: &egui::Context, layer: LayerId, at: egui::Pos2) {
+        let id = egui::Id::new("timeline-parent-nodes");
+        ctx.data_mut(|d| {
+            let mut all = d
+                .get_temp::<Vec<(LayerId, egui::Pos2)>>(id)
+                .unwrap_or_default();
+            all.retain(|(other, _)| *other != layer);
+            all.push((layer, at));
+            d.insert_temp(id, all);
+        });
+    }
+
+    pub fn clear_nodes(ctx: &egui::Context) {
+        ctx.data_mut(|d| {
+            d.insert_temp::<Vec<(LayerId, egui::Pos2)>>(
+                egui::Id::new("timeline-parent-nodes"),
+                Vec::new(),
+            )
+        });
+    }
+
+    /// What a drop means.
+    ///
+    /// `None` for *nothing happened*; `Some(None)` to detach; `Some(Some(id))`
+    /// to follow that layer. A pure decision so the destructive half of it can
+    /// be tested without driving a pointer.
+    pub fn drop_decision(
+        layers: &buzz_scene::LayerStack,
+        dragged: LayerId,
+        dropped_on: Option<LayerId>,
+    ) -> Option<Option<LayerId>> {
+        match dropped_on {
+            // **Back where it started.** A press that barely moves still ends
+            // as a drag, and reading that as "detach" meant a click on a node
+            // cut the very link it was drawn to show.
+            Some(other) if other == dragged => None,
+            Some(other) if layers.can_follow(dragged, other) => Some(Some(other)),
+            // An illegal target, or open column: detach. Dropping a node into
+            // space is how a limb comes off a rig.
+            _ => Some(None),
+        }
+    }
+
+    /// The elbow from a child's node up to its parent's.
+    ///
+    /// Drawn as a curve rather than a straight line so that two links crossing
+    /// the same rows stay tellable apart, which is the whole reason to draw
+    /// them at all.
+    pub fn connector(painter: &egui::Painter, from: egui::Pos2, to: egui::Pos2, colour: Color32) {
+        let stroke = egui::Stroke::new(1.5, colour);
+        let bend = ((to.y - from.y).abs() * 0.4).clamp(6.0, 26.0);
+        let points = [
+            from,
+            egui::pos2(from.x, from.y - bend.copysign(from.y - to.y)),
+            egui::pos2(to.x, to.y + bend.copysign(from.y - to.y)),
+            to,
+        ];
+        painter.add(egui::Shape::CubicBezier(
+            egui::epaint::CubicBezierShape::from_points_stroke(
+                points,
+                false,
+                Color32::TRANSPARENT,
+                stroke,
+            ),
+        ));
+    }
+}
+
 /// Draw the timeline.
 pub fn timeline_panel(ui: &mut Ui, scene: &Scene, state: &TimelineState) -> TimelineResponse {
     let mut response = TimelineResponse::default();
@@ -275,12 +441,44 @@ pub fn timeline_panel(ui: &mut Ui, scene: &Scene, state: &TimelineState) -> Time
                 camera_row(ui, scene, columns, state, &mut response);
             }
 
+            // The node table is rebuilt every frame the view is on: rows come
+            // and go with the scroll, and a stale position would draw a
+            // connector to where a layer used to be.
+            if state.parenting_view {
+                parenting::clear_nodes(ui.ctx());
+            }
+
             let layer_ids: Vec<LayerId> = scene.layers().iter().map(|l| l.id).collect();
             for id in layer_ids {
                 let Some(layer) = scene.layers().get(id) else {
                     continue;
                 };
-                layer_row(ui, layer, columns, state, &mut response);
+                layer_row(ui, scene, layer, columns, state, &mut response);
+            }
+
+            // **Connectors last**, over every row, because a link crosses the
+            // rows between its two ends and would otherwise be painted over by
+            // whichever row was drawn next.
+            if state.parenting_view {
+                let nodes = parenting::nodes(ui.ctx());
+                let at = |id: LayerId| nodes.iter().find(|(l, _)| *l == id).map(|(_, p)| *p);
+                let painter = ui.painter_at(ui.clip_rect());
+                for (id, from) in &nodes {
+                    let Some(parent) = scene.layers().get(*id).and_then(|l| l.follows) else {
+                        continue;
+                    };
+                    // A parent scrolled out of view has no end to draw to.
+                    let Some(to) = at(parent) else { continue };
+                    let colour = scene
+                        .layers()
+                        .get(parent)
+                        .map(|l| {
+                            let [r, g, b, _] = l.color.to_rgba8().to_u8_array();
+                            Color32::from_rgb(r, g, b)
+                        })
+                        .unwrap_or_else(Palette::text_dim);
+                    parenting::connector(&painter, *from, to, colour);
+                }
             }
         });
 
@@ -323,6 +521,51 @@ fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Time
             .clicked()
         {
             out.command = Some(crate::Command::DeleteLayer);
+        }
+
+        // **Animate's parenting view**, on the same strip as the layer tools
+        // because it is one: it changes what the layer column is for. A toggle
+        // rather than a mode you have to leave — the frame grid and every
+        // switch keep working while it is on.
+        if ui
+            .add(
+                // **Named, not a pictogram.** This was three box-drawing
+                // characters meant to look like two nodes on a wire. The
+                // bundled fonts do not have them, so the one control that turns
+                // on the whole parenting view drew as an empty box — which is
+                // why it could not be found.
+                egui::Button::new("Parent")
+                    .small()
+                    .selected(state.parenting_view),
+            )
+            .on_hover_text(
+                "Parenting view: the layer column becomes a node graph. Drag a \
+                 layer's node onto another to make it follow that layer, or onto \
+                 empty space to detach it.",
+            )
+            .clicked()
+        {
+            out.toggle_parenting = true;
+        }
+
+        // **Layer depth, in the timeline.** Animate keeps this beside the layer
+        // names because depth is a property of a *layer*, read down the stack:
+        // the question is always "which of these is in front", and a panel on
+        // the far side of the window cannot answer it next to the layer it is
+        // about.
+        if ui
+            .add(
+                egui::Button::new("Depth")
+                    .small()
+                    .selected(state.depth_view),
+            )
+            .on_hover_text(
+                "Depth view: the layer column shows how far each layer sits \
+                 from the camera. Drag a number to move that layer in space.",
+            )
+            .clicked()
+        {
+            out.toggle_depth = true;
         }
 
         // How many, on the same line: the count is the one thing about the
@@ -1013,6 +1256,7 @@ fn visible_columns(clip: egui::Rect, grid_left: f32, cell_width: f32, columns: u
 
 fn layer_row(
     ui: &mut Ui,
+    scene: &Scene,
     layer: &buzz_scene::Layer,
     columns: u32,
     state: &TimelineState,
@@ -1089,31 +1333,41 @@ fn layer_row(
         painter.rect_filled(name_row, 0.0, NAMES_BG);
     }
 
-    let indent = if layer.parent.is_some() { 12.0 } else { 0.0 };
-    let mark = match layer.kind {
-        LayerKind::Folder => "F ",
-        LayerKind::Mask => "M ",
-        LayerKind::InverseMask => "iM ",
-        LayerKind::Guide => "G ",
-        LayerKind::Masked | LayerKind::Guided => ". ",
-        LayerKind::Normal => "",
-    };
-    // **Clipped to the name area.** A painted string does not wrap or truncate
-    // itself, and a long layer name would otherwise be drawn straight through
-    // the three switches to its right.
-    painter
-        .with_clip_rect(name_area(name_row).intersect(name_row))
-        .text(
-            egui::pos2(name_row.min.x + 4.0 + indent, name_row.center().y),
-            Align2::LEFT_CENTER,
-            format!("{mark}{}", layer.name),
-            FontId::proportional(11.0),
-            if layer.visible {
-                Palette::text()
-            } else {
-                Palette::text_dim()
-            },
-        );
+    // **The parenting view puts the graph where the names go.** Everything
+    // right of it — the switches, the colour chip, the frame grid, and every
+    // click they answer — is untouched, because parenting is a thing layers do
+    // rather than a different set of layers.
+    if state.depth_view {
+        depth_cell(ui, layer, name_row, &painter, state, out);
+    } else if state.parenting_view {
+        parenting_node(ui, scene, layer, name_row, &painter, out);
+    } else {
+        let indent = if layer.parent.is_some() { 12.0 } else { 0.0 };
+        let mark = match layer.kind {
+            LayerKind::Folder => "F ",
+            LayerKind::Mask => "M ",
+            LayerKind::InverseMask => "iM ",
+            LayerKind::Guide => "G ",
+            LayerKind::Masked | LayerKind::Guided => ". ",
+            LayerKind::Normal => "",
+        };
+        // **Clipped to the name area.** A painted string does not wrap or
+        // truncate itself, and a long layer name would otherwise be drawn
+        // straight through the three switches to its right.
+        painter
+            .with_clip_rect(name_area(name_row).intersect(name_row))
+            .text(
+                egui::pos2(name_row.min.x + 4.0 + indent, name_row.center().y),
+                Align2::LEFT_CENTER,
+                format!("{mark}{}", layer.name),
+                FontId::proportional(11.0),
+                if layer.visible {
+                    Palette::text()
+                } else {
+                    Palette::text_dim()
+                },
+            );
+    }
 
     // **Animate's three columns, beside the name** — eye, lock and outline,
     // painted rather than laid out as widgets because the whole grid is.
@@ -1181,7 +1435,7 @@ fn layer_row(
     response.context_menu(|ui| {
         out.select_layer = Some(layer.id);
         if in_name_column {
-            layer_context_menu(ui, layer, out);
+            layer_context_menu(ui, scene, layer, out);
             return;
         }
         // Opening the frame menu moves the playhead first, so the command that
@@ -1202,7 +1456,299 @@ fn layer_row(
 /// fifteen-point painted square says which one hides a layer — plus the layer
 /// commands, which is where Delete belongs: a destructive action does not want
 /// to be a fourth small square beside three toggles.
-fn layer_context_menu(ui: &mut Ui, layer: &buzz_scene::Layer, out: &mut TimelineResponse) {
+/// One layer's depth, in the layer column.
+///
+/// The name, the number, and a bar showing where the layer sits between the
+/// camera and the focal plane — so the stack can be read at a glance rather
+/// than one layer at a time.
+///
+/// # Why the bar is worth the room
+///
+/// A column of numbers says what the depths *are* and not how they relate,
+/// which is the only thing anybody asks of depth: whether this layer is in
+/// front of that one, and by how much. The bar answers it by being longer.
+fn depth_cell(
+    ui: &mut Ui,
+    layer: &buzz_scene::Layer,
+    name_row: egui::Rect,
+    painter: &egui::Painter,
+    state: &TimelineState,
+    out: &mut TimelineResponse,
+) {
+    let area = name_area(name_row).intersect(name_row);
+
+    // The name first, narrowed to leave room for the number and the bar.
+    let name_width = (area.width() * 0.42).clamp(40.0, 110.0);
+    painter
+        .with_clip_rect(egui::Rect::from_min_size(
+            area.min,
+            egui::vec2(name_width, area.height()),
+        ))
+        .text(
+            egui::pos2(area.min.x + 4.0, area.center().y),
+            Align2::LEFT_CENTER,
+            layer.name.clone(),
+            FontId::proportional(11.0),
+            if layer.visible {
+                Palette::text()
+            } else {
+                Palette::text_dim()
+            },
+        );
+
+    // The number, draggable. Bounded just short of the focal distance: a layer
+    // *at* the camera's focal point has no size on screen, and one past it is
+    // behind the lens and not drawn at all.
+    let focal = if state.focal_distance.is_finite() && state.focal_distance > 1.0 {
+        state.focal_distance
+    } else {
+        1000.0
+    };
+    let limit = focal * 0.95;
+
+    let number = egui::Rect::from_min_size(
+        egui::pos2(area.min.x + name_width, area.center().y - 9.0),
+        egui::vec2(54.0, 18.0),
+    );
+
+    // **Painted and interacted, not `put`.**
+    //
+    // `Ui::put` builds a child `Ui` and then advances the parent's cursor past
+    // it — and this rect is pinned to the viewport's left edge rather than
+    // sitting where the row was laid out, so every layer row grew by the height
+    // of its own depth box and the rows drifted apart down the timeline. The
+    // switches beside a layer's name are painted for exactly this reason; so is
+    // this. `interact` claims the pointer without claiming any space.
+    let response = ui.interact(
+        number,
+        egui::Id::new(("layer-depth", layer.id.0)),
+        Sense::click_and_drag(),
+    );
+
+    // Dragging sideways changes the depth, at a speed set by the focal
+    // distance so the control feels the same whatever the lens.
+    if response.dragged() {
+        let step = response.drag_delta().x as f64 * (focal / 400.0);
+        if step != 0.0 {
+            out.set_depth = Some((layer.id, (layer.depth + step).clamp(-limit, limit)));
+        }
+    }
+    if response.double_clicked() {
+        // Back to the stage, which is the value everything is measured from.
+        out.set_depth = Some((layer.id, 0.0));
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+
+    let hot = response.hovered() || response.dragged();
+    painter.rect_filled(
+        number,
+        2.0,
+        if hot {
+            Palette::chrome()
+        } else {
+            Color32::TRANSPARENT
+        },
+    );
+    painter.text(
+        egui::pos2(number.max.x - 4.0, number.center().y),
+        Align2::RIGHT_CENTER,
+        format!("{:.0}", layer.depth),
+        FontId::proportional(11.0),
+        if layer.depth == 0.0 {
+            Palette::text_dim()
+        } else {
+            Palette::text()
+        },
+    );
+    response.on_hover_text(
+        "How far this layer sits from the focal plane. Drag sideways to move \
+         it; double-click to put it back on the stage. Positive is further \
+         away, and draws smaller; negative is nearer the camera.",
+    );
+
+    // The bar: the focal plane is the middle, and the layer's mark slides
+    // either side of it.
+    let track = egui::Rect::from_min_max(
+        egui::pos2(number.max.x + 6.0, area.center().y - 3.0),
+        egui::pos2(area.max.x - 2.0, area.center().y + 3.0),
+    );
+    if track.width() > 12.0 {
+        painter.rect_filled(track, 2.0, Palette::chrome());
+        // The focal plane, where depth is zero.
+        let middle = track.center().x;
+        painter.line_segment(
+            [
+                egui::pos2(middle, track.min.y - 2.0),
+                egui::pos2(middle, track.max.y + 2.0),
+            ],
+            egui::Stroke::new(1.0, Palette::text_dim()),
+        );
+        let t = (layer.depth / limit).clamp(-1.0, 1.0) as f32;
+        let x = middle + t * (track.width() * 0.5 - 2.0);
+        let [r, g, b, _] = layer.color.to_rgba8().to_u8_array();
+        painter.circle_filled(
+            egui::pos2(x, track.center().y),
+            3.5,
+            Color32::from_rgb(r, g, b),
+        );
+    }
+}
+
+/// One layer's node in the parenting view, and the drag that rewires it.
+///
+/// Animate's gesture exactly: press the node of the layer you want to *move*,
+/// drag to the layer you want it to follow, let go. Dropping anywhere that is
+/// not another node detaches it, which is how a limb is taken off a rig without
+/// hunting for a "none" entry in a menu.
+fn parenting_node(
+    ui: &mut Ui,
+    scene: &Scene,
+    layer: &buzz_scene::Layer,
+    name_row: egui::Rect,
+    painter: &egui::Painter,
+    out: &mut TimelineResponse,
+) {
+    let ctx = ui.ctx().clone();
+    let generation = parenting::generation(scene, layer.id);
+    let centre = parenting::node_centre(name_row, generation);
+    // Recorded before anything is drawn, so the connector pass below can find
+    // both ends of a link however far apart their rows are.
+    parenting::record_node(&ctx, layer.id, centre);
+
+    // The name still has to be readable — a graph of anonymous dots says which
+    // layers are linked but not which layers they are — so it runs from just
+    // right of the node to where the switches begin.
+    let text_left = centre.x + parenting::RADIUS + 5.0;
+    painter
+        .with_clip_rect(name_area(name_row).intersect(name_row))
+        .text(
+            egui::pos2(text_left, name_row.center().y),
+            Align2::LEFT_CENTER,
+            layer.name.clone(),
+            FontId::proportional(11.0),
+            if layer.visible {
+                Palette::text()
+            } else {
+                Palette::text_dim()
+            },
+        );
+
+    let hit = egui::Rect::from_center_size(centre, egui::vec2(18.0, 18.0));
+    let response = ui.interact(
+        hit,
+        egui::Id::new(("parent-node", layer.id.0)),
+        Sense::click_and_drag(),
+    );
+
+    if response.drag_started() {
+        parenting::set_dragging(&ctx, Some(layer.id));
+    }
+
+    let dragging = parenting::dragging(&ctx);
+    let source = dragging == Some(layer.id);
+    // A node this drag could legally land on. Refusing the link here rather
+    // than on release is what makes the illegal target *look* illegal.
+    let target = dragging.is_some_and(|from| {
+        from != layer.id && scene.layers().can_follow(from, layer.id)
+    });
+    let hovered = ui
+        .ctx()
+        .input(|i| i.pointer.hover_pos())
+        .is_some_and(|p| hit.contains(p));
+
+    let [r, g, b, _] = layer.color.to_rgba8().to_u8_array();
+    let colour = Color32::from_rgb(r, g, b);
+    // The node the drag came from and the node it would land on are both lit,
+    // because a link has two ends and the gesture is about both of them.
+    let ring = if source || (target && hovered) {
+        Palette::active()
+    } else if layer.follows.is_some() {
+        Palette::text()
+    } else {
+        Palette::text_dim()
+    };
+    painter.circle_filled(centre, parenting::RADIUS, colour);
+    painter.circle_stroke(
+        centre,
+        parenting::RADIUS,
+        egui::Stroke::new(if source || (target && hovered) { 2.0 } else { 1.0 }, ring),
+    );
+
+    // The line the pointer is dragging, drawn from the node it started on.
+    if source && let Some(pointer) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+        painter.line_segment(
+            [centre, pointer],
+            egui::Stroke::new(1.5, Palette::active()),
+        );
+    }
+
+    // **The drop.** Read on the *source* node's response, because that is the
+    // widget egui gives the drag to for its whole life — the node under the
+    // pointer at the end never sees a release of its own.
+    if response.drag_stopped() {
+        let dropped_on = ui
+            .ctx()
+            .input(|i| i.pointer.interact_pos())
+            .and_then(|p| {
+                parenting::nodes(&ctx)
+                    .into_iter()
+                    .find(|(_, at)| at.distance(p) <= 11.0)
+                    .map(|(id, _)| id)
+            });
+        out.set_follows = parenting::drop_decision(scene.layers(), layer.id, dropped_on)
+            .map(|parent| (layer.id, parent));
+        parenting::set_dragging(&ctx, None);
+    }
+
+    // **Detaching, spelled out.** Dropping a node in open space unlinks it,
+    // but a gesture is not an option — there is nothing on screen that says it
+    // is possible. A right-click on the node says so, and names the parent it
+    // would break from so the answer is never guessed at.
+    let parent_name = layer.follows.and_then(|id| {
+        scene
+            .layers()
+            .get(id)
+            .map(|l| l.name.clone())
+    });
+    response.context_menu(|ui| {
+        match &parent_name {
+            Some(name) => {
+                if ui.button(format!("Detach from {name}")).clicked() {
+                    out.set_follows = Some((layer.id, None));
+                    ui.close();
+                }
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new("Not parented\nDrag this node onto another to parent it")
+                        .small()
+                        .weak(),
+                );
+            }
+        }
+    });
+
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        let tip = match &parent_name {
+            Some(name) => format!(
+                "Follows {name}\nDrag onto another layer's node to re-parent \u{b7} \
+                 drag into empty space to detach \u{b7} right-click to detach"
+            ),
+            None => "Drag onto another layer's node to make this follow it".to_string(),
+        };
+        response.clone().on_hover_text(tip);
+    }
+}
+
+fn layer_context_menu(
+    ui: &mut Ui,
+    scene: &Scene,
+    layer: &buzz_scene::Layer,
+    out: &mut TimelineResponse,
+) {
     ui.label(egui::RichText::new(&layer.name).small().weak());
     ui.separator();
 
@@ -1237,6 +1783,62 @@ fn layer_context_menu(ui: &mut Ui, layer: &buzz_scene::Layer, out: &mut Timeline
             ui.close();
         }
     }
+
+    // **Parenting, without having to find the view.**
+    //
+    // The node graph is the way to *see* a rig, and the way to build one when
+    // the layers are on screen together. This is the other way in: a layer, and
+    // the list of layers it could follow, right where the layer is. Both make
+    // the same edit.
+    ui.separator();
+
+    // **Detaching is one click, at the top level.** It was inside the "Parent
+    // To" submenu, which is the right place to *choose* a parent and the wrong
+    // place to look for a way out of one — nobody opens a menu called "parent
+    // to" to stop parenting. Named for the parent, so it says what it breaks.
+    if let Some(parent) = layer.follows {
+        let name = scene
+            .layers()
+            .get(parent)
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| "parent".to_string());
+        if ui.button(format!("Detach from {name}")).clicked() {
+            out.set_follows = Some((layer.id, None));
+            ui.close();
+        }
+    }
+
+    ui.menu_button("Parent To", |ui| {
+        if ui
+            .add_enabled(layer.follows.is_some(), egui::Button::new("None (detach)"))
+            .clicked()
+        {
+            out.set_follows = Some((layer.id, None));
+            ui.close();
+        }
+        ui.separator();
+        let mut offered = false;
+        for other in scene.layers().iter() {
+            // A layer cannot follow itself, nor anything that already follows
+            // it — that would be a cycle with nothing sensible to draw.
+            if other.id == layer.id || !scene.layers().can_follow(layer.id, other.id) {
+                continue;
+            }
+            offered = true;
+            let already = layer.follows == Some(other.id);
+            if ui.selectable_label(already, &other.name).clicked() {
+                out.set_follows = Some((layer.id, Some(other.id)));
+                ui.close();
+            }
+        }
+        if !offered {
+            ui.label(
+                egui::RichText::new("No other layer can be its parent")
+                    .small()
+                    .weak(),
+            );
+        }
+    });
 
     ui.separator();
     for command in [
@@ -1539,7 +2141,214 @@ mod tests {
             onion_after: 2,
             frame_width: Metrics::FRAME_WIDTH,
             row_scale: 1.0,
+            parenting_view: false,
+            depth_view: false,
+            focal_distance: 1000.0,
         }
+    }
+
+    /// **A node's indent is how deep it hangs in the rig.** This is the whole
+    /// readability of the parenting view: a spine at the left, a hand three
+    /// generations in from it.
+    #[test]
+    fn a_node_is_indented_by_its_generation() {
+        let mut scene = Scene::default();
+        let spine = scene.add_layer("Spine", LayerKind::Normal);
+        let arm = scene.add_layer("Arm", LayerKind::Normal);
+        let hand = scene.add_layer("Hand", LayerKind::Normal);
+        scene.update_layer(arm, |l| l.follows = Some(spine));
+        scene.update_layer(hand, |l| l.follows = Some(arm));
+
+        assert_eq!(parenting::generation(&scene, spine), 0, "the root");
+        assert_eq!(parenting::generation(&scene, arm), 1);
+        assert_eq!(parenting::generation(&scene, hand), 2);
+
+        // Indent follows from it, so the graph reads left to right.
+        let row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(210.0, 20.0));
+        let x = |id| parenting::node_centre(row, parenting::generation(&scene, id)).x;
+        assert!(x(spine) < x(arm) && x(arm) < x(hand));
+    }
+
+    /// **What a drop means**, including the case that used to destroy work: a
+    /// click on a node registers as a tiny drag that ends where it began, and
+    /// reading that as "detach" cut the link the node was drawn to show.
+    #[test]
+    fn dropping_a_node_back_on_itself_changes_nothing() {
+        let mut scene = Scene::default();
+        let spine = scene.add_layer("Spine", LayerKind::Normal);
+        let arm = scene.add_layer("Arm", LayerKind::Normal);
+        let hand = scene.add_layer("Hand", LayerKind::Normal);
+        scene.update_layer(arm, |l| l.follows = Some(spine));
+        scene.update_layer(hand, |l| l.follows = Some(arm));
+        let layers = scene.layers();
+
+        assert_eq!(
+            parenting::drop_decision(layers, arm, Some(arm)),
+            None,
+            "a click that went nowhere must not unlink anything"
+        );
+        assert_eq!(
+            parenting::drop_decision(layers, hand, Some(spine)),
+            Some(Some(spine)),
+            "a legal parent is taken"
+        );
+        assert_eq!(
+            parenting::drop_decision(layers, arm, None),
+            Some(None),
+            "open column detaches"
+        );
+        // Spine already follows nothing, but arm follows it: parenting the
+        // spine to the hand would close a loop, so the drop detaches instead
+        // of building something undrawable.
+        assert_eq!(
+            parenting::drop_decision(layers, spine, Some(hand)),
+            Some(None),
+            "a cycle is refused"
+        );
+    }
+
+    /// **A right-click on the stage must open its menu.**
+    ///
+    /// The stage's own widget senses click *and* drag, because the tools need
+    /// the drag; this pins down that the two can coexist, which is the thing
+    /// that was in doubt when the menu did not appear.
+    #[test]
+    fn a_secondary_click_opens_the_context_menu_on_a_draggable_widget() {
+        let ctx = egui::Context::default();
+
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let at = egui::pos2(200.0, 150.0);
+        let mods = egui::Modifiers::default();
+
+        let mut opened = false;
+        let mut drive = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(400.0, 300.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let response =
+                    ui.interact(area, ui.id().with("probe"), egui::Sense::click_and_drag());
+                response.context_menu(|ui| {
+                    let _ = ui.button("Cut");
+                });
+                if response.context_menu_opened() {
+                    opened = true;
+                }
+            });
+        };
+
+        drive(vec![egui::Event::PointerMoved(at)]);
+        drive(vec![egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: mods,
+        }]);
+        drive(vec![egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: mods,
+        }]);
+        drive(vec![]);
+
+        assert!(
+            opened,
+            "a secondary click on a click-and-drag widget should open its menu"
+        );
+    }
+
+    /// The layer column has three things it can be, and each has to draw for
+    /// a real document — including a layer pushed behind the camera, which is
+    /// the value the depth scale has to clamp rather than divide by.
+    #[test]
+    fn every_layer_column_view_draws() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+
+        let mut scene = Scene::default();
+        let spine = scene.add_layer("Spine", LayerKind::Normal);
+        let arm = scene.add_layer("Arm", LayerKind::Normal);
+        scene.update_layer(arm, |l| l.follows = Some(spine));
+        scene.update_layer(arm, |l| l.depth = 400.0);
+        scene.update_layer(spine, |l| l.depth = -9_000.0);
+
+        for (parenting, depth) in [(false, false), (true, false), (false, true)] {
+            let _ = ctx.run_ui(Default::default(), |ui| {
+                let mut st = state();
+                st.parenting_view = parenting;
+                st.depth_view = depth;
+                let _ = timeline_panel(ui, &scene, &st);
+            });
+        }
+    }
+
+    /// **The layer column claims no space of its own.**
+    ///
+    /// Every row is one `allocate_exact_size` and then paint; anything in the
+    /// name column that *allocates* adds its own height to the row. The depth
+    /// cell used `Ui::put`, which builds a child `Ui` and advances the parent
+    /// cursor past it — so every layer grew by the height of its depth box and
+    /// the rows drifted apart down the timeline.
+    #[test]
+    fn the_layer_column_claims_no_space_of_its_own() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+
+        let mut scene = Scene::default();
+        let spine = scene.add_layer("Spine", LayerKind::Normal);
+        let arm = scene.add_layer("Arm", LayerKind::Normal);
+        scene.update_layer(arm, |l| l.follows = Some(spine));
+        scene.update_layer(arm, |l| l.depth = 120.0);
+        let layer = scene.layers().get(arm).expect("the layer").clone();
+
+        for depth_view in [true, false] {
+            let mut moved = egui::Vec2::ZERO;
+            let _ = ctx.run_ui(Default::default(), |ui| {
+                let row =
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(LAYER_COLUMN, 20.0));
+                let painter = ui.painter().clone();
+                let mut out = TimelineResponse::default();
+                let mut st = state();
+                st.depth_view = depth_view;
+                st.parenting_view = !depth_view;
+
+                let before = ui.cursor().min;
+                if depth_view {
+                    depth_cell(ui, &layer, row, &painter, &st, &mut out);
+                } else {
+                    parenting_node(ui, &scene, &layer, row, &painter, &mut out);
+                }
+                moved = ui.cursor().min - before;
+            });
+            assert_eq!(
+                moved,
+                egui::Vec2::ZERO,
+                "depth_view={depth_view}: the column moved the cursor by {moved:?},                  which is a gap under every layer"
+            );
+        }
+    }
+
+    /// A file edited by hand can hold a follow cycle. The timeline must draw
+    /// something and move on rather than spin, which is why `generation` is
+    /// bounded by the layer count.
+    #[test]
+    fn a_follow_cycle_does_not_hang_the_parenting_view() {
+        let mut scene = Scene::default();
+        let a = scene.add_layer("A", LayerKind::Normal);
+        let b = scene.add_layer("B", LayerKind::Normal);
+        // `can_follow` refuses this, so it is written straight in — the point
+        // is what happens when a *document* already contains one.
+        scene.update_layer(a, |l| l.follows = Some(b));
+        scene.update_layer(b, |l| l.follows = Some(a));
+
+        assert!(parenting::generation(&scene, a) <= scene.layers().len());
+        assert!(parenting::generation(&scene, b) <= scene.layers().len());
     }
 
     /// The camera row appears only once the camera is switched on — which is

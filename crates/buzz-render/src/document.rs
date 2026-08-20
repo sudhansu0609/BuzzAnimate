@@ -286,20 +286,41 @@ impl SymFlags {
 /// on any edit, which is a single depth-first pass over the library.
 #[derive(Debug, Default)]
 pub struct SymbolTable {
-    /// Validity key: the library's identity **and** the scene revision. The
-    /// revision alone is a per-document counter, so a different document with a
-    /// coincidentally-equal revision — a new file opened into the same cache, or
-    /// one test scene after another — would otherwise be served the previous
-    /// document's symbols. The library address distinguishes documents.
-    key: Option<(usize, u64)>,
+    /// The library this table was built from, **held**.
+    ///
+    /// Everything in here is derived from the library and nothing else — see
+    /// [`build_symbol`], which reads `scene.library()` and no other part of
+    /// the scene. So the library's own identity is the whole validity key.
+    ///
+    /// It used to be keyed on that identity *and* the scene revision, which
+    /// made every edit to anything rebuild it: dragging one object across the
+    /// stage bumps the revision on every pointer move, and each one threw away
+    /// a table that was still perfectly good and re-walked the entire library —
+    /// depth-first, fingerprinting every symbol and every nested child. On an
+    /// imported character that is the most expensive thing in the frame, and it
+    /// was being paid per mouse move.
+    ///
+    /// The revision was there to guard against a *reused address*: a document
+    /// closed and another opened whose library lands on the same allocation.
+    /// Holding the `Library` closes that off properly — the allocation cannot
+    /// be freed, so its address cannot be handed to anything else, while this
+    /// table still refers to it. It is the same trick the thumbnail cache plays
+    /// on symbols, and it is sound for the same reason. Cheap to hold: a
+    /// `Library` is two `Arc`s, and an edit to it copies on write, which is
+    /// exactly the change this needs to notice.
+    library: Option<buzz_scene::Library>,
     infos: std::collections::HashMap<buzz_scene::SymbolId, SymbolInfo>,
 }
 
 impl SymbolTable {
     /// Bring the table up to date with the scene, cheaply if nothing changed.
     pub fn refresh(&mut self, scene: &Scene) {
-        let key = (scene.library().content_id(), scene.revision());
-        if self.key == Some(key) {
+        let current = scene.library();
+        if self
+            .library
+            .as_ref()
+            .is_some_and(|held| held.content_id() == current.content_id())
+        {
             return;
         }
         self.infos.clear();
@@ -307,7 +328,7 @@ impl SymbolTable {
         for symbol in scene.library().iter() {
             build_symbol(symbol.id, scene, &mut self.infos, &mut visiting);
         }
-        self.key = Some(key);
+        self.library = Some(current.clone());
     }
 
     fn get(&self, id: buzz_scene::SymbolId) -> Option<&SymbolInfo> {

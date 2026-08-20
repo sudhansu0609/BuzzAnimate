@@ -177,25 +177,25 @@ fn arrow(d: &Draw, solid: bool) {
     d.outline(&body);
 }
 
-/// A drawn loop that does not quite close, with its tail hanging.
-///
-/// The gap and the tail are the whole symbol: a closed circle would be the Oval
-/// tool, and a lasso is recognised by being a line that came back near where it
-/// started rather than a shape.
+/// A rope loop with its tail hanging, which is what Animate draws and what
+/// the gesture actually is: you throw a loop round something.
 fn lasso(d: &Draw) {
+    // The loop, an ellipse leaning slightly as a thrown rope does.
+    let steps = 26;
+    let pts: Vec<(f32, f32)> = (0..=steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32 * std::f32::consts::TAU;
+            (0.50 + 0.24 * t.cos(), 0.36 + 0.17 * t.sin())
+        })
+        .collect();
+    d.curve(&pts);
+    // The tail, falling from where the loop crosses itself.
     d.curve(&[
-        (0.32, 0.44),
-        (0.26, 0.30),
-        (0.38, 0.19),
-        (0.58, 0.17),
-        (0.74, 0.26),
-        (0.75, 0.40),
-        (0.62, 0.50),
-        (0.42, 0.51),
-        (0.33, 0.45),
+        (0.36, 0.49),
+        (0.32, 0.64),
+        (0.38, 0.76),
+        (0.34, 0.86),
     ]);
-    // The rope, falling away from the knot.
-    d.curve(&[(0.33, 0.45), (0.31, 0.62), (0.38, 0.74), (0.34, 0.86)]);
 }
 
 /// A wand at an angle with sparks off its tip.
@@ -237,23 +237,47 @@ fn free_transform(d: &Draw) {
     }
 }
 
-/// A disc shading from full to empty, with the handle that aims it.
+/// A gradient in a box, with the handle that stretches it.
+///
+/// The ramp is drawn as bands thinning left to right, because a fill here
+/// cannot itself be a gradient. Few and inside the box: a column of even bars
+/// reads as a barcode, which is what this looked like when there were more.
 fn gradient_transform(d: &Draw) {
-    d.circle((0.5, 0.5), 0.30, false);
-    // The lit half, as three chords rather than a fill: it reads as a ramp.
-    for (i, t) in [0.10f32, 0.20, 0.30].iter().enumerate() {
-        let half = (0.09 - 0.022 * i as f32).max(0.02);
-        d.hairline((0.5 - t, 0.5 - half * 2.0), (0.5 - t, 0.5 + half * 2.0));
-    }
-    d.line((0.5, 0.5), (0.86, 0.5));
-    d.circle((0.86, 0.5), 0.06, true);
+    // The box the gradient fills.
+    d.outline(&[(0.22, 0.22), (0.78, 0.22), (0.78, 0.60), (0.22, 0.60)]);
+    // Solid at the left, thinning to nothing at the right.
+    d.solid(&[(0.24, 0.24), (0.40, 0.24), (0.40, 0.58), (0.24, 0.58)]);
+    d.line((0.48, 0.24), (0.48, 0.58));
+    d.hairline((0.58, 0.24), (0.58, 0.58));
+    d.hairline((0.68, 0.30), (0.68, 0.52));
+
+    // The handle: drag it and the ramp follows.
+    d.line((0.24, 0.78), (0.76, 0.78));
+    d.circle((0.24, 0.78), 0.07, false);
+    d.circle((0.76, 0.78), 0.07, true);
 }
 
-/// A loop with a tail: freehand selection.
+/// A fountain-pen nib: a tapered blade with a vent hole and the slit running
+/// from it to the point.
+///
+/// **Outlined rather than filled.** A solid nib is a diamond — the slit and
+/// the vent are what make it a nib, and they are absences. Drawn on top of a
+/// fill they are the same colour as the fill and simply are not there, which
+/// is exactly how this icon came to read as another arrowhead.
 fn pen(d: &Draw) {
-    d.outline(&[(0.5, 0.12), (0.70, 0.56), (0.5, 0.72), (0.30, 0.56)]);
-    d.hairline((0.5, 0.30), (0.5, 0.72));
-    d.line((0.5, 0.74), (0.5, 0.88));
+    // The blade: narrow at the shoulder, narrowing again to the point.
+    d.outline(&[
+        (0.42, 0.18),
+        (0.58, 0.18),
+        (0.64, 0.50),
+        (0.50, 0.86),
+        (0.36, 0.50),
+    ]);
+    // The vent hole, and the slit from it down to the point.
+    d.circle((0.50, 0.48), 0.06, false);
+    d.hairline((0.50, 0.54), (0.50, 0.84));
+    // The shoulder, where the nib meets the holder.
+    d.hairline((0.42, 0.26), (0.58, 0.26));
 }
 
 /// A capital T, drawn rather than typed so it matches the weight of the rest.
@@ -294,78 +318,100 @@ fn pencil(d: &Draw) {
     d.solid(&[(0.46, 0.82), (0.30, 0.72), (0.26, 0.86)]);
 }
 
-/// A paintbrush on Animate's diagonal: a handle, a metal ferrule, and a loaded
-/// tip that widens to a soft, filled point.
+/// A paintbrush: handle, ferrule, and a bristle head that comes to a point.
+/// The old shape read as a shovel, which is the wrong tool entirely.
 fn brush(d: &Draw) {
-    // The handle.
-    d.line((0.80, 0.14), (0.50, 0.48));
-    // The ferrule, banding the handle to the bristles.
-    d.hairline((0.44, 0.42), (0.58, 0.54));
-    // The bristles.
-    d.outline(&[(0.34, 0.46), (0.54, 0.56), (0.42, 0.80), (0.22, 0.70)]);
-    // The loaded tip, filled so it reads as paint on the brush.
-    d.solid(&[(0.22, 0.70), (0.33, 0.58), (0.47, 0.68), (0.42, 0.80)]);
+    // The handle, running out to the top right.
+    d.line((0.60, 0.36), (0.84, 0.14));
+    // The ferrule: the metal band, solid.
+    d.solid(&[(0.46, 0.42), (0.62, 0.28), (0.70, 0.36), (0.54, 0.50)]);
+    // The bristles, a solid head tapering to the tip that paints.
+    d.solid(&[(0.54, 0.50), (0.46, 0.42), (0.24, 0.76), (0.20, 0.84)]);
+    d.solid(&[(0.24, 0.76), (0.20, 0.84), (0.30, 0.82)]);
 }
 
-/// Animate's bone: a joint, a taper, a tip.
+/// A bone: a shaft with a knuckle at each end. Animate's Bone tool, and the
+/// shape everybody draws for a skeleton — the old one was a lopsided blob.
 fn bone(d: &Draw) {
-    d.solid(&[(0.26, 0.62), (0.36, 0.46), (0.78, 0.30), (0.40, 0.72)]);
-    d.circle((0.28, 0.64), 0.10, false);
-    d.circle((0.76, 0.30), 0.055, true);
+    // The shaft.
+    d.solid(&[(0.34, 0.40), (0.66, 0.60), (0.62, 0.68), (0.30, 0.48)]);
+    // The knuckles, two lobes at each end.
+    d.circle((0.28, 0.36), 0.10, true);
+    d.circle((0.36, 0.28), 0.09, true);
+    d.circle((0.72, 0.64), 0.10, true);
+    d.circle((0.64, 0.72), 0.09, true);
 }
 
-/// A square pushed out of shape, with the handles that did it.
+/// A mesh with a pin in it: Animate's Asset Warp puts handles on artwork and
+/// bends it between them, and a grid is what says "this deforms".
 fn warp(d: &Draw) {
-    d.curve(&[
-        (0.24, 0.28),
-        (0.50, 0.20),
-        (0.76, 0.28),
-        (0.70, 0.52),
-        (0.78, 0.74),
-        (0.50, 0.80),
-        (0.26, 0.74),
-        (0.30, 0.50),
-        (0.24, 0.28),
-    ]);
-    for (x, y) in [(0.24, 0.28), (0.76, 0.28), (0.78, 0.74), (0.26, 0.74)] {
-        d.circle((x, y), 0.07, true);
-    }
+    // A bowed grid, so it reads as something already deformed.
+    d.curve(&[(0.22, 0.30), (0.50, 0.22), (0.78, 0.30)]);
+    d.curve(&[(0.22, 0.52), (0.50, 0.44), (0.78, 0.52)]);
+    d.curve(&[(0.22, 0.74), (0.50, 0.66), (0.78, 0.74)]);
+    d.curve(&[(0.22, 0.30), (0.18, 0.52), (0.22, 0.74)]);
+    d.curve(&[(0.50, 0.22), (0.50, 0.44), (0.50, 0.66)]);
+    d.curve(&[(0.78, 0.30), (0.82, 0.52), (0.78, 0.74)]);
+    // The pins.
+    d.circle((0.22, 0.30), 0.07, true);
+    d.circle((0.78, 0.74), 0.07, true);
 }
 
-/// A tilted bucket pouring paint, with a drip — Animate's Paint Bucket.
+/// A bucket tipped to pour, with a drop leaving the lip. Animate's Paint
+/// Bucket, and the shape reads as a bucket only when the sides taper — the
+/// old parallelogram did not.
 fn bucket(d: &Draw) {
-    // The body, tilted so it pours from its lower lip.
-    d.outline(&[(0.24, 0.30), (0.58, 0.20), (0.70, 0.54), (0.36, 0.64)]);
-    // The rim across the open top.
-    d.hairline((0.24, 0.30), (0.58, 0.20));
-    // The handle arc over the top.
-    d.curve(&[(0.30, 0.26), (0.40, 0.12), (0.56, 0.16)]);
-    // The paint pouring from the lip, and a drop landing below.
-    d.line((0.66, 0.50), (0.80, 0.72));
-    d.circle((0.82, 0.80), 0.06, true);
+    // The body, tapering downwards and tilted to pour.
+    d.solid(&[(0.24, 0.34), (0.58, 0.22), (0.66, 0.52), (0.40, 0.62)]);
+    // The rim, a touch proud of the body so the opening reads.
+    d.line((0.22, 0.33), (0.60, 0.20));
+    // The handle over the top.
+    d.curve(&[(0.28, 0.28), (0.40, 0.10), (0.58, 0.18)]);
+    // The pour, and the drop that has already left.
+    d.curve(&[(0.64, 0.46), (0.74, 0.60), (0.76, 0.70)]);
+    d.circle((0.78, 0.80), 0.07, true);
 }
 
-/// A bottle with a nib, which is how Animate draws its stroke tool.
+/// An ink bottle with ink in it and a drop leaving: the Ink Bottle changes a
+/// *stroke*, and the drop is what it leaves behind.
+///
+/// The body is outlined and the ink inside it filled. Stacking solid neck on
+/// solid body on solid stopper merged the three into one tower with no bottle
+/// anywhere in it.
 fn ink_bottle(d: &Draw) {
-    d.outline(&[(0.32, 0.44), (0.66, 0.44), (0.72, 0.82), (0.26, 0.82)]);
-    d.line((0.42, 0.44), (0.42, 0.26));
-    d.line((0.36, 0.26), (0.60, 0.16));
-    d.circle((0.72, 0.30), 0.07, true);
+    // The body, shouldered out from the neck.
+    d.outline(&[(0.30, 0.46), (0.70, 0.46), (0.74, 0.80), (0.26, 0.80)]);
+    // The ink standing in it.
+    d.solid(&[(0.32, 0.62), (0.72, 0.62), (0.735, 0.785), (0.265, 0.785)]);
+    // The neck.
+    d.outline(&[(0.44, 0.28), (0.56, 0.28), (0.56, 0.46), (0.44, 0.46)]);
+    // The stopper.
+    d.solid(&[(0.41, 0.18), (0.59, 0.18), (0.59, 0.28), (0.41, 0.28)]);
+    // And the drop it has let go.
+    d.circle((0.84, 0.58), 0.07, true);
 }
 
-/// A dropper: bulb, barrel, point.
+/// A dropper: a squeezed bulb, a barrel, and a fine tip. The old one was a
+/// bare diagonal with a dot, which reads as nothing in particular.
 fn eyedropper(d: &Draw) {
-    d.line((0.68, 0.24), (0.38, 0.56));
-    d.circle((0.72, 0.22), 0.10, false);
-    d.solid(&[(0.40, 0.54), (0.46, 0.62), (0.24, 0.80)]);
+    // The bulb.
+    d.circle((0.70, 0.28), 0.13, true);
+    // The barrel running down to the tip.
+    d.solid(&[(0.60, 0.36), (0.70, 0.46), (0.34, 0.78), (0.26, 0.70)]);
+    // The tip, a fine point where the colour is taken from.
+    d.solid(&[(0.26, 0.70), (0.34, 0.78), (0.18, 0.86)]);
 }
 
-/// A rubber block on its edge, with the band across it.
+/// A block eraser, tilted, with its working face showing. Animate draws the
+/// face because that is what tells an eraser from a plain quadrilateral.
 fn eraser(d: &Draw) {
-    d.outline(&[(0.20, 0.62), (0.52, 0.24), (0.80, 0.42), (0.48, 0.80)]);
-    // The working end, filled: an outline alone reads as a plain diamond, and
-    // it is the two-tone block that says "eraser".
-    d.solid(&[(0.20, 0.62), (0.34, 0.46), (0.64, 0.64), (0.48, 0.80)]);
+    // The body.
+    d.solid(&[(0.28, 0.62), (0.56, 0.26), (0.78, 0.40), (0.50, 0.76)]);
+    // The face it rubs with, outlined so it reads as a separate surface.
+    d.outline(&[(0.28, 0.62), (0.50, 0.76), (0.44, 0.86), (0.22, 0.72)]);
+    // And the crumbs it leaves.
+    d.hairline((0.60, 0.80), (0.70, 0.80));
+    d.hairline((0.66, 0.88), (0.78, 0.88));
 }
 
 fn camera(d: &Draw) {
@@ -400,6 +446,92 @@ fn zoom(d: &Draw) {
     d.line((0.62, 0.62), (0.82, 0.82));
     d.hairline((0.32, 0.44), (0.56, 0.44));
     d.hairline((0.44, 0.32), (0.44, 0.56));
+}
+
+/// **A contact sheet of every tool symbol, as JSON.**
+///
+/// Drawn icons cannot be judged by reading their coordinates, and no test can
+/// tell a convincing paintbrush from an unconvincing one. This dumps the
+/// geometry so it can be rasterised and *looked at*, which is the only way to
+/// answer "does this read as Animate's toolbar".
+///
+/// Ignored by default; it writes a file and answers a question no assertion
+/// can:
+///
+/// ```text
+/// cargo test -p buzz-ui --lib dump_tool_icons -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod contact_sheet {
+    use super::*;
+
+    #[test]
+    #[ignore = "writes a file for a person to look at"]
+    fn dump_tool_icons() {
+        let area = Rect::from_min_size(Pos2::ZERO, vec2(100.0, 100.0));
+        let mut out = String::from("{\n");
+        let tools = crate::tools::all_tools();
+        for (i, tool) in tools.iter().enumerate() {
+            let shapes = tool_shapes(area, *tool, Color32::BLACK);
+            out.push_str(&format!("  \"{:?}\": [\n", tool));
+            let mut parts: Vec<String> = Vec::new();
+            for shape in &shapes {
+                parts.push(describe(shape));
+            }
+            out.push_str(&parts.join(",\n"));
+            out.push_str("\n  ]");
+            if i + 1 < tools.len() {
+                out.push(',');
+            }
+            out.push('\n');
+        }
+        out.push_str("}\n");
+
+        let path = std::env::temp_dir().join("buzz-tool-icons.json");
+        std::fs::write(&path, out).expect("write the sheet");
+        println!("wrote {}", path.display());
+    }
+
+    fn describe(shape: &Shape) -> String {
+        match shape {
+            Shape::LineSegment { points, stroke } => format!(
+                "    {{\"kind\":\"line\",\"w\":{},\"pts\":[[{},{}],[{},{}]]}}",
+                stroke.width, points[0].x, points[0].y, points[1].x, points[1].y
+            ),
+            Shape::Path(path) => {
+                let pts: Vec<String> = path
+                    .points
+                    .iter()
+                    .map(|p| format!("[{},{}]", p.x, p.y))
+                    .collect();
+                format!(
+                    "    {{\"kind\":\"path\",\"fill\":{},\"w\":{},\"closed\":{},\"pts\":[{}]}}",
+                    path.fill != Color32::TRANSPARENT,
+                    path.stroke.width,
+                    path.closed,
+                    pts.join(",")
+                )
+            }
+            Shape::Circle(c) => format!(
+                "    {{\"kind\":\"circle\",\"fill\":{},\"w\":{},\"c\":[{},{}],\"r\":{}}}",
+                c.fill != Color32::TRANSPARENT,
+                c.stroke.width,
+                c.center.x,
+                c.center.y,
+                c.radius
+            ),
+            Shape::Rect(r) => format!(
+                "    {{\"kind\":\"rect\",\"fill\":{},\"w\":{},\"pts\":[[{},{}],[{},{}]]}}",
+                r.fill != Color32::TRANSPARENT,
+                r.stroke.width,
+                r.rect.min.x,
+                r.rect.min.y,
+                r.rect.max.x,
+                r.rect.max.y
+            ),
+            other => format!("    {{\"kind\":\"other\",\"debug\":{:?}}}", format!("{other:?}").len()),
+        }
+    }
 }
 
 #[cfg(test)]

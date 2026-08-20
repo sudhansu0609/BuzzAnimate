@@ -218,17 +218,14 @@ enum Gesture {
         /// drag began on decides what it does, which is the rule the rest of
         /// this file already follows.
         moving: bool,
-        /// This drag is **turning the selection**, and about which point.
+        /// This drag is **transforming the selection** — turning it, scaling
+        /// it from a corner, or skewing it from an edge — and from where.
         ///
         /// Recorded for the same reason `moving` is, and needed for the same
-        /// reason: the rotation is applied as the pointer travels, so by the
+        /// reason: the transform is applied as the pointer travels, so by the
         /// second step the selection is no longer where it was when the
         /// question could have been asked.
-        ///
-        /// `applied` is how much of the turn has already been made, so each
-        /// move can commit the *difference* — which is what keeps Shift's snap
-        /// to 45 degrees exact instead of accumulating rounding.
-        turning: Option<Turning>,
+        transforming: Option<Transforming>,
     },
     /// Accumulating freehand samples.
     ///
@@ -253,10 +250,22 @@ enum Gesture {
 
 /// A rotation in progress: the point it turns about, and how far it has gone.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Turning {
+struct Transforming {
+    /// Which part of the gizmo the drag began on, decided once.
+    zone: TransformZone,
+    /// The point a rotation or an Alt-scale turns about.
     pivot: Point,
-    /// Radians already committed to the document.
-    applied: f64,
+    /// The selection's box **as it was when the drag began**.
+    ///
+    /// Held rather than re-read, because the artwork is transformed as the
+    /// pointer travels: by the second step the box is no longer the one the
+    /// scale is a proportion of, and reading it again would compound the
+    /// gesture against itself.
+    bounds: Rect,
+    /// Everything committed to the document so far, so each move can commit
+    /// the *difference*. Applying the whole transform each time would apply it
+    /// on top of itself once per frame.
+    applied: Affine,
 }
 
 /// Where stroke timing comes from.
@@ -374,7 +383,7 @@ impl ToolMachine {
                         current: doc,
                         mods,
                         moving: self.begins_a_move(doc, ctx),
-                        turning: self.begins_a_turn(doc, ctx),
+                        transforming: self.begins_a_transform(doc, ctx),
                     },
                 };
             }
@@ -384,7 +393,7 @@ impl ToolMachine {
                     current: doc,
                     mods,
                     moving: self.begins_a_move(doc, ctx),
-                    turning: self.begins_a_turn(doc, ctx),
+                    transforming: self.begins_a_transform(doc, ctx),
                 };
             }
         }
@@ -429,12 +438,16 @@ impl ToolMachine {
         self.tool == ToolId::FreeTransform || contains(bounds, at)
     }
 
-    /// Does a press at `at` begin a rotation, and about what?
+    /// Which part of the gizmo a press at `at` grabbed, if any.
     ///
-    /// The ring just outside a corner, which is where both the selection tools
-    /// and Free Transform turn the selection — the same zone `finish_drag`
-    /// reads, asked once at the start where the answer is still true.
-    fn begins_a_turn(&self, at: Point, ctx: &ToolContext<'_>) -> Option<Turning> {
+    /// **The whole gizmo, from every tool that shows it.** Corners scale,
+    /// edges skew and the ring outside a corner turns — for the selection
+    /// tools as well as Free Transform, because the handles are drawn for all
+    /// of them and a handle you can see and cannot use is worse than none.
+    ///
+    /// Asked once at the press, where the answer is still true: the artwork
+    /// moves under the pointer from the next step onwards.
+    fn begins_a_transform(&self, at: Point, ctx: &ToolContext<'_>) -> Option<Transforming> {
         if !matches!(
             self.tool,
             ToolId::Selection | ToolId::Subselection | ToolId::FreeTransform
@@ -448,12 +461,20 @@ impl ToolMachine {
             (_, None) => return None,
         };
         let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+        let zone = transform_zone(bounds, pivot, at, grab);
         matches!(
-            transform_zone(bounds, pivot, at, grab),
-            TransformZone::Rotate
+            zone,
+            TransformZone::Rotate | TransformZone::Corner | TransformZone::Edge(_)
         )
-        .then_some(Turning { pivot, applied: 0.0 })
+        .then_some(Transforming {
+            zone,
+            pivot,
+            bounds,
+            applied: Affine::IDENTITY,
+        })
     }
+
+
 
     pub fn pointer_move(&mut self, doc: Point, screen: Point, mods: Mods) -> ToolAction {
         let delta_screen = screen - self.last_screen;
@@ -483,7 +504,7 @@ impl ToolMachine {
                 current,
                 mods: m,
                 moving,
-                turning,
+                transforming,
             } => {
                 let previous = *current;
                 let moving = *moving;
@@ -491,28 +512,36 @@ impl ToolMachine {
                 *current = doc;
                 *m = mods;
 
-                // **The artwork turns under the pointer.**
+                // **The artwork transforms under the pointer.**
                 //
-                // A rotation used to be drawn as an outline and committed on
-                // release, so the drawing sat still while a wireframe swung
-                // around it and you found out what you had done afterwards.
+                // A turn, a scale or a skew used to be drawn as an outline and
+                // committed on release, so the drawing sat still while a
+                // wireframe moved around it and you found out what you had
+                // done afterwards.
                 //
                 // Committed as the *difference* from what has already been
-                // applied rather than as the whole angle each time: that is
-                // what keeps Shift's snap to 45 degrees landing exactly on 45
-                // rather than on the sum of a hundred roundings.
-                if let Some(turn) = turning {
-                    let target = angle_of(turn.pivot, origin, doc, mods.shift);
-                    let step = target - turn.applied;
-                    turn.applied = target;
-                    return if step.abs() > f64::EPSILON {
-                        ToolAction::TransformSelection {
-                            transform: Affine::translate(turn.pivot.to_vec2())
-                                * Affine::rotate(step)
-                                * Affine::translate(-turn.pivot.to_vec2()),
-                        }
-                    } else {
+                // applied rather than as the whole transform each time — that
+                // one would land on top of itself once per frame. Taking the
+                // difference against the target also keeps Shift's snaps
+                // exact: the target is computed fresh from the pointer, so a
+                // 45-degree turn is 45 degrees and not the sum of a hundred
+                // roundings.
+                if let Some(t) = transforming {
+                    let target = transform_for(t, origin, doc, mods);
+                    // A transform collapsed to nothing cannot be undone —
+                    // a scale dragged through zero — and a step measured
+                    // against it would be infinite. Waiting for the pointer to
+                    // come back out is the only sane answer.
+                    let c = t.applied.as_coeffs();
+                    if (c[0] * c[3] - c[1] * c[2]).abs() < 1e-12 {
+                        return ToolAction::None;
+                    }
+                    let step = target * t.applied.inverse();
+                    t.applied = target;
+                    return if step.as_coeffs() == Affine::IDENTITY.as_coeffs() {
                         ToolAction::None
+                    } else {
+                        ToolAction::TransformSelection { transform: step }
                     };
                 }
                 // **The artwork travels with the pointer.**
@@ -568,9 +597,9 @@ impl ToolMachine {
                 origin,
                 mods,
                 moving,
-                turning,
+                transforming,
                 ..
-            } => self.finish_drag(origin, doc, mods, moving || turning.is_some(), ctx),
+            } => self.finish_drag(origin, doc, mods, moving || transforming.is_some(), ctx),
         }
     }
 
@@ -654,9 +683,10 @@ impl ToolMachine {
             // top of it would be a second, redundant answer to "where is this
             // going?" — drawn in the place the artwork already is.
             Gesture::Dragging { moving: true, .. } => Preview::None,
-            // A live rotation shows itself, for the same reason a move does.
+            // A live transform shows itself, for the same reason a move does.
             Gesture::Dragging {
-                turning: Some(_), ..
+                transforming: Some(_),
+                ..
             } => Preview::None,
             Gesture::Dragging {
                 origin,
@@ -1315,6 +1345,31 @@ pub fn grip_at(
     None
 }
 
+/// The whole transform a drag from `origin` to `end` asks for.
+///
+/// Built by the same functions the release used to call, from the bounds as
+/// they were when the drag began — so the answer depends only on where the
+/// pointer is now, never on how it got there. That is what lets each move
+/// commit the difference and still land exactly where a single commit would.
+///
+/// A free function rather than a method: it needs nothing from the machine,
+/// and asking `self` for it while the gesture is mutably borrowed is a borrow
+/// the compiler is right to refuse.
+fn transform_for(t: &Transforming, origin: Point, end: Point, mods: Mods) -> Affine {
+    match t.zone {
+        TransformZone::Rotate => rotate_about(t.pivot, origin, end, mods.shift),
+        TransformZone::Corner => {
+            if mods.alt {
+                scale_about(t.pivot, t.bounds, origin, end, mods.shift)
+            } else {
+                scale_about_corner(t.bounds, origin, end, mods.shift)
+            }
+        }
+        TransformZone::Edge(horizontal) => skew_about(t.pivot, t.bounds, origin, end, horizontal),
+        TransformZone::Pivot | TransformZone::Inside => Affine::IDENTITY,
+    }
+}
+
 fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> TransformZone {
     // A little more forgiving than a handle: the circle is small, it is often
     // parked over artwork you are looking at rather than over a corner, and
@@ -1368,10 +1423,11 @@ fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> Transform
 fn angle_of(pivot: Point, origin: Point, end: Point, snap: bool) -> f64 {
     let from = origin - pivot;
     let to = end - pivot;
+    // A drag that began on the pivot has no direction to measure from.
     if from.hypot() < 1e-9 || to.hypot() < 1e-9 {
         return 0.0;
     }
-    let angle = to.atan2() - from.atan2();
+    let angle = to.y.atan2(to.x) - from.y.atan2(from.x);
     if snap {
         let step = std::f64::consts::FRAC_PI_4;
         (angle / step).round() * step
@@ -1384,17 +1440,7 @@ fn angle_of(pivot: Point, origin: Point, end: Point, snap: bool) -> f64 {
 ///
 /// With Shift the angle snaps to 45°, as Animate does.
 fn rotate_about(pivot: Point, origin: Point, end: Point, snap: bool) -> Affine {
-    let from = origin - pivot;
-    let to = end - pivot;
-    // A drag that began on the pivot has no direction to measure from.
-    if from.hypot() < 1e-9 || to.hypot() < 1e-9 {
-        return Affine::IDENTITY;
-    }
-    let mut angle = to.y.atan2(to.x) - from.y.atan2(from.x);
-    if snap {
-        let step = std::f64::consts::FRAC_PI_4;
-        angle = (angle / step).round() * step;
-    }
+    let angle = angle_of(pivot, origin, end, snap);
     Affine::translate(pivot.to_vec2()) * Affine::rotate(angle) * Affine::translate(-pivot.to_vec2())
 }
 

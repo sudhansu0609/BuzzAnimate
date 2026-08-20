@@ -6052,6 +6052,110 @@ mod tests {
         );
     }
 
+    /// **A rotation turns and does nothing else.**
+    ///
+    /// A rotation, possibly with a uniform scale, always satisfies `a == d`
+    /// and `b == -c`. Shear breaks both, so this measures the matrix directly
+    /// rather than looking at the artwork: a drag is hundreds of small steps
+    /// multiplied together, and anything that is not quite a rotation
+    /// accumulates into a visible lean.
+    #[test]
+    fn turning_something_never_shears_it() {
+        for tool in [buzz_ui::ToolId::Selection, buzz_ui::ToolId::FreeTransform] {
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::ObjectDrawing;
+            let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+            e.selection.select_one(id);
+            e.set_tool(tool);
+
+            let camera = e.camera.clone();
+            let screen = |p: Point| camera.doc_to_screen(p);
+            let pivot = e.pivot().expect("a point");
+
+            // A long, finely-stepped drag right round the pivot — the worst
+            // case for anything that drifts, and what a real drag is.
+            e.pointer_down(screen(Point::new(214.0, 186.0)), Mods::default());
+            for step in 1..=400 {
+                let angle = (step as f64) * 0.015;
+                let at = Point::new(
+                    pivot.x + 92.0 * angle.cos(),
+                    pivot.y + 92.0 * angle.sin(),
+                );
+                e.pointer_move(screen(at), Mods::default());
+            }
+            let end = Point::new(pivot.x + 92.0, pivot.y);
+            e.pointer_up(screen(end));
+
+            let c = e.scene().find_object(id).expect("there").1.transform.as_coeffs();
+            let (a, b, cc, d) = (c[0], c[1], c[2], c[3]);
+            assert!(
+                (a - d).abs() < 1e-9 && (b + cc).abs() < 1e-9,
+                "[{tool:?}] a rotation must leave a == d and b == -c; got                  a={a}, b={b}, c={cc}, d={d}"
+            );
+            // And it stayed the size it was: a rotation is not a scale either.
+            let scale = (a * a + b * b).sqrt();
+            assert!(
+                (scale - 1.0).abs() < 1e-9,
+                "[{tool:?}] the turn changed its size by {scale}"
+            );
+        }
+    }
+
+    /// **Resize and skew are reachable, from either tool, and live.**
+    ///
+    /// The handles are drawn for the selection tools as well as Free
+    /// Transform, so they have to work from both — a handle you can see and
+    /// cannot use is worse than none.
+    #[test]
+    fn corners_resize_and_edges_skew_from_either_tool() {
+        for tool in [buzz_ui::ToolId::Selection, buzz_ui::ToolId::FreeTransform] {
+            // -- a corner scales ------------------------------------------
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::ObjectDrawing;
+            let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+            e.selection.select_one(id);
+            e.set_tool(tool);
+            let camera = e.camera.clone();
+            let screen = |p: Point| camera.doc_to_screen(p);
+
+            let before = e.scene().find_object(id).expect("there").1.bounds();
+            // Grab the bottom-right corner and pull it out.
+            e.pointer_down(screen(Point::new(200.0, 200.0)), Mods::default());
+            e.pointer_move(screen(Point::new(260.0, 240.0)), Mods::default());
+            let during = e.scene().find_object(id).expect("there").1.bounds();
+            assert!(
+                during.width() > before.width() + 1.0,
+                "[{tool:?}] dragging a corner should resize it as the pointer moves"
+            );
+            e.pointer_up(screen(Point::new(260.0, 240.0)));
+
+            // A scale leaves the matrix free of shear.
+            let c = e.scene().find_object(id).expect("there").1.transform.as_coeffs();
+            assert!(
+                c[1].abs() < 1e-9 && c[2].abs() < 1e-9,
+                "[{tool:?}] a resize must not shear: {c:?}"
+            );
+
+            // -- an edge skews --------------------------------------------
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::ObjectDrawing;
+            let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+            e.selection.select_one(id);
+            e.set_tool(tool);
+
+            // The middle of the top edge, well clear of both corners.
+            e.pointer_down(screen(Point::new(150.0, 100.0)), Mods::default());
+            e.pointer_move(screen(Point::new(190.0, 100.0)), Mods::default());
+            e.pointer_up(screen(Point::new(190.0, 100.0)));
+
+            let c = e.scene().find_object(id).expect("there").1.transform.as_coeffs();
+            assert!(
+                c[1].abs() > 1e-6 || c[2].abs() > 1e-6,
+                "[{tool:?}] dragging an edge should skew it: {c:?}"
+            );
+        }
+    }
+
     #[test]
     fn moving_the_selection_shifts_it_and_is_undoable() {
         let mut e = editor();

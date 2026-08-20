@@ -432,26 +432,18 @@ fn draw_selection(
         draw_gradient_handles(painter, editor, &to_screen);
         return;
     }
-    if editor.tool() != buzz_ui::ToolId::FreeTransform {
-        // **Where the rotation is.**
-        //
-        // The selection tools rotate too — the ring just outside a corner, the
-        // same one Free Transform uses — but nothing on screen said so, so the
-        // gesture may as well not have existed: dragging anywhere else marquees
-        // and takes the selection away instead. A quarter-turn arc at each
-        // corner is the smallest thing that says "swing it from here".
-        //
-        // An arc rather than a square handle on purpose: a square would promise
-        // scaling, which these tools do not do (see `tools::transform_zone`).
-        draw_rotate_hint(painter, rect, pointer);
-        draw_pivot(painter, editor, &to_screen);
-        return;
-    }
-    // **Free Transform turns as well as scales**, and the ring that turns it
-    // sits just outside the corners it scales from — a few pixels apart, doing
-    // different things, with only the square handles drawn. The arcs mark the
-    // other half of the gizmo so it can be found without discovering it by
-    // accident.
+    // **The whole gizmo, for every tool that can work it.**
+    //
+    // The handles used to be Free Transform's alone, so with the Selection
+    // tool an object had a box round it and nothing else: no sign that its
+    // corners resize, that its edges skew, or that the ring outside a corner
+    // turns. Three transforms, all reachable, none of them visible — and the
+    // zones sit a few pixels apart, so reaching for one and landing in another
+    // is how a rotation ends up scaling or skewing the artwork instead.
+    //
+    // They are drawn for the selection tools now because they *work* from the
+    // selection tools; see `tools::begins_a_transform`. A handle you can see
+    // and cannot use would be worse than none, and so is the reverse.
     draw_rotate_hint(painter, rect, pointer);
 
     const HANDLE: f32 = 6.0;

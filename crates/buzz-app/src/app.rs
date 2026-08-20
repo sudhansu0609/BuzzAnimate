@@ -2679,9 +2679,9 @@ impl App {
             if matches!(tool, Selection | Subselection | FreeTransform)
                 && let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos())
                 && area.contains(pos)
-                && self.pointer_is_on_the_rotate_ring(area, pos)
+                && let Some(cursor) = self.transform_cursor(area, pos)
             {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                ui.ctx().set_cursor_icon(cursor);
             }
             return;
         }
@@ -2749,10 +2749,19 @@ impl App {
     /// Asked in *screen* space against the same box the chrome draws, and with
     /// the same radii  tests, so the cursor cannot
     /// promise a gesture the release will not make.
-    fn pointer_is_on_the_rotate_ring(&self, area: egui::Rect, pos: egui::Pos2) -> bool {
-        let Some(bounds) = self.editor.selection_bounds_drawn() else {
-            return false;
-        };
+    /// The cursor for whatever part of the transform gizmo the pointer is on.
+    ///
+    /// **Three transforms live within a few pixels of each other** — a corner
+    /// resizes, the ring just outside it turns, an edge skews — and with one
+    /// arrow over all of them the only way to find out which you had grabbed
+    /// was to let go and look. Reaching for a rotation and landing on a corner
+    /// is how a turn ends up scaling the artwork, and the pointer never said.
+    ///
+    /// Read against the same box the chrome draws and the same radii
+    /// `tools::transform_zone` tests, so the cursor cannot promise a gesture
+    /// the release will not make.
+    fn transform_cursor(&self, area: egui::Rect, pos: egui::Pos2) -> Option<egui::CursorIcon> {
+        let bounds = self.editor.selection_bounds_drawn()?;
         let to_screen = |p: buzz_geom::Point| {
             let s = self.editor.camera.doc_to_screen(p);
             egui::pos2(area.min.x + s.x as f32, area.min.y + s.y as f32)
@@ -2768,15 +2777,47 @@ impl App {
             .fold(egui::Rect::from_two_pos(corners[0], corners[2]), |r, c| {
                 r.union(egui::Rect::from_two_pos(*c, *c))
             });
-        // Outside the box: inside it the pointer is over artwork, and a drag
-        // there moves rather than turns.
-        if box_rect.contains(pos) {
-            return false;
-        }
+
         let grab = crate::tools::TRANSFORM_GRAB_PX as f32;
-        corners
+        let nearest = corners
             .iter()
-            .any(|c| c.distance(pos) > grab && c.distance(pos) <= grab * 3.0)
+            .map(|c| c.distance(pos))
+            .fold(f32::INFINITY, f32::min);
+
+        // A corner resizes. The arrow leans the way that corner pulls, which
+        // is the difference between "this scales" and "this turns".
+        if nearest <= grab {
+            let on_left = (pos.x - box_rect.left()).abs() < (pos.x - box_rect.right()).abs();
+            let on_top = (pos.y - box_rect.top()).abs() < (pos.y - box_rect.bottom()).abs();
+            return Some(if on_left == on_top {
+                egui::CursorIcon::ResizeNwSe
+            } else {
+                egui::CursorIcon::ResizeNeSw
+            });
+        }
+
+        // Just outside a corner, and outside the box: the ring that turns.
+        // Grab is the nearest thing egui has to Animate's curved arrow.
+        if !box_rect.contains(pos) && nearest <= grab * 3.0 {
+            return Some(egui::CursorIcon::Grab);
+        }
+
+        // An edge, away from the corners: skew along it.
+        let near_vertical = ((pos.x - box_rect.left()).abs() <= grab
+            || (pos.x - box_rect.right()).abs() <= grab)
+            && pos.y > box_rect.top() + grab
+            && pos.y < box_rect.bottom() - grab;
+        let near_horizontal = ((pos.y - box_rect.top()).abs() <= grab
+            || (pos.y - box_rect.bottom()).abs() <= grab)
+            && pos.x > box_rect.left() + grab
+            && pos.x < box_rect.right() - grab;
+        if near_horizontal {
+            return Some(egui::CursorIcon::ResizeHorizontal);
+        }
+        if near_vertical {
+            return Some(egui::CursorIcon::ResizeVertical);
+        }
+        None
     }
 
     fn stage_scrollbars(&mut self, ui: &mut egui::Ui, area: egui::Rect) {

@@ -1351,6 +1351,26 @@ impl Editor {
             return;
         }
 
+        // **The transformation point travels with the artwork.**
+        //
+        // For several objects at once it is the middle of what is selected,
+        // worked out afresh each time it is asked for — and the middle of a
+        // *union* of boxes is not where it was once the artwork has turned,
+        // because a union of boxes is not symmetric about its own centre the
+        // way one box is. So the point wandered off during a rotation: the one
+        // control whose whole job is to be the fixed point of the turn was the
+        // thing that moved.
+        //
+        // Carried through the same transform the artwork is, which leaves it
+        // exactly where it was under a rotation about itself and moves it with
+        // the selection under everything else.
+        let ids = self.selection.ids();
+        if ids.len() > 1
+            && let Some(at) = self.pivot()
+        {
+            self.group_pivot = Some((ids.clone(), transform * at));
+        }
+
         // **The gesture is in view space; an object's transform is not.**
         //
         // Layer parenting draws a child through its parent's motion, so a drag
@@ -5956,6 +5976,80 @@ mod tests {
                 "[{tool:?}] and the turn should still be there afterwards"
             );
         }
+    }
+
+    /// **The transformation point stays where it is when you turn something.**
+    ///
+    /// With no point placed by hand it is derived from the artwork's bounding
+    /// box — and the bounding box of a turned shape is not the box it was, so
+    /// on anything that is not symmetric the point wandered off as the artwork
+    /// turned. The one control whose whole job is to be the fixed point of the
+    /// rotation was the thing that moved.
+    #[test]
+    fn the_transformation_point_does_not_drift_when_the_artwork_turns() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+
+        // Deliberately not symmetric: a triangle's bounding box moves under a
+        // rotation about its own centre, which a square's does not.
+        let mut path = BezPath::new();
+        path.move_to(Point::new(100.0, 100.0));
+        path.line_to(Point::new(220.0, 130.0));
+        path.line_to(Point::new(130.0, 200.0));
+        path.close_path();
+        let id = {
+            let before: Vec<ObjectId> = e
+                .scene()
+                .layers()
+                .iter()
+                .flat_map(|l| l.objects_at(0).iter())
+                .map(|o| o.id)
+                .collect();
+            e.apply(ToolAction::AddShape {
+                shape: ShapeData::filled(path, Color::WHITE),
+                label: "Draw",
+            });
+            e.scene()
+                .layers()
+                .iter()
+                .flat_map(|l| l.objects_at(0).iter())
+                .map(|o| o.id)
+                .find(|id| !before.contains(id))
+                .expect("the triangle")
+        };
+        e.selection.select_one(id);
+
+        let pivot = e.pivot().expect("a transformation point");
+
+        // Turn it about that point, the way the ring does.
+        e.apply(ToolAction::TransformSelection {
+            transform: Affine::translate(pivot.to_vec2())
+                * Affine::rotate(0.6)
+                * Affine::translate(-pivot.to_vec2()),
+        });
+
+        let after = e.pivot().expect("still has one");
+        assert!(
+            (after - pivot).hypot() < 1e-6,
+            "the point turned about should not have moved: {pivot:?} -> {after:?}"
+        );
+
+        // **And the same for several objects at once**, which is the case that
+        // actually drifts: one object's box turns about its own centre and
+        // stays centred there, but the union of several boxes does not.
+        let second = draw_square(&mut e, 320.0, 120.0, 40.0, Color::WHITE).expect("a square");
+        e.selection.set(vec![id, second]);
+        let group_pivot = e.pivot().expect("a group point");
+        e.apply(ToolAction::TransformSelection {
+            transform: Affine::translate(group_pivot.to_vec2())
+                * Affine::rotate(0.5)
+                * Affine::translate(-group_pivot.to_vec2()),
+        });
+        let after = e.pivot().expect("still has one");
+        assert!(
+            (after - group_pivot).hypot() < 1e-6,
+            "the group's point should not have moved: {group_pivot:?} -> {after:?}"
+        );
     }
 
     #[test]

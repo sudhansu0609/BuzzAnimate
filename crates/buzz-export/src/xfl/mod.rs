@@ -503,9 +503,14 @@ fn object_xml(scene: &Scene, object: &Object, report: &mut FlaReport, indent: us
                 ""
             };
             format!(
-                "{pad}<DOMSymbolInstance libraryItemName=\"{}\" symbolType=\"{kind}\"{playing}>\n{}{pad}</DOMSymbolInstance>\n",
+                "{pad}<DOMSymbolInstance libraryItemName=\"{}\" symbolType=\"{kind}\"{playing}>\n{}{}{pad}</DOMSymbolInstance>\n",
                 escape(&symbol.name),
                 matrix_xml(object.transform, indent + 2),
+                // **The joint goes back out too.** On a rigged character the
+                // transformation point is the shoulder an arm swings from, and
+                // leaving it out would hand Animate a character whose joints
+                // had all been reset to the middle of their artwork.
+                pivot_xml(object.pivot, indent + 2),
             )
         }
         // Rigged and warped artwork has no equivalent in a `.fla`: Animate's
@@ -607,6 +612,22 @@ fn alpha_attr(alpha: f32) -> String {
     } else {
         format!(" alpha=\"{}\"", number(f64::from(alpha)))
     }
+}
+
+/// The transformation point, in the object's own space, as Animate writes it.
+fn pivot_xml(pivot: Option<buzz_geom::Point>, indent: usize) -> String {
+    let Some(at) = pivot else {
+        return String::new();
+    };
+    let pad = " ".repeat(indent);
+    format!(
+        "{pad}<transformationPoint>
+{pad}  <Point x=\"{}\" y=\"{}\"/>
+{pad}</transformationPoint>
+",
+        number(at.x),
+        number(at.y),
+    )
 }
 
 fn matrix_xml(transform: Affine, indent: usize) -> String {

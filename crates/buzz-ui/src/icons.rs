@@ -318,16 +318,33 @@ fn pencil(d: &Draw) {
     d.solid(&[(0.46, 0.82), (0.30, 0.72), (0.26, 0.86)]);
 }
 
-/// A paintbrush: handle, ferrule, and a bristle head that comes to a point.
-/// The old shape read as a shovel, which is the wrong tool entirely.
+/// A paintbrush, held as you would hold one: a slim handle running up to the
+/// right, a metal ferrule across it, and a bristle head that swells out of the
+/// ferrule and comes back to a painting edge.
+///
+/// The swell is the part that makes it a brush. A head drawn as a straight
+/// taper is a pencil or a shovel depending on which end is fatter — bristles
+/// are wider than the ferrule that holds them, and the eye reads that before
+/// it reads anything else.
 fn brush(d: &Draw) {
-    // The handle, running out to the top right.
-    d.line((0.60, 0.36), (0.84, 0.14));
-    // The ferrule: the metal band, solid.
-    d.solid(&[(0.46, 0.42), (0.62, 0.28), (0.70, 0.36), (0.54, 0.50)]);
-    // The bristles, a solid head tapering to the tip that paints.
-    d.solid(&[(0.54, 0.50), (0.46, 0.42), (0.24, 0.76), (0.20, 0.84)]);
-    d.solid(&[(0.24, 0.76), (0.20, 0.84), (0.30, 0.82)]);
+    // The handle: a long thin taper, so it reads as a shaft rather than a bar.
+    d.solid(&[(0.63, 0.30), (0.86, 0.10), (0.90, 0.16), (0.68, 0.36)]);
+
+    // The ferrule, a short band set across the handle at an angle.
+    d.solid(&[(0.55, 0.36), (0.69, 0.24), (0.77, 0.34), (0.63, 0.46)]);
+
+    // The bristles: out wider than the ferrule, then in to the edge that
+    // paints. Two convex halves, because the shape is not convex.
+    //
+    // Set a hair clear of the ferrule rather than flush against it. Every part
+    // of an icon is the same colour, so two shapes that touch are one shape —
+    // the gap is the only thing that says the metal band and the bristles are
+    // different things, and that reading is most of what makes it a brush.
+    d.solid(&[(0.607, 0.479), (0.527, 0.379), (0.32, 0.575), (0.42, 0.695)]);
+    d.solid(&[(0.42, 0.695), (0.32, 0.575), (0.14, 0.855), (0.28, 0.815)]);
+
+    // The stroke it has just laid down, curving away from the tip.
+    d.curve(&[(0.14, 0.855), (0.30, 0.90), (0.46, 0.87)]);
 }
 
 /// A bone: a shaft with a knuckle at each end. Animate's Bone tool, and the

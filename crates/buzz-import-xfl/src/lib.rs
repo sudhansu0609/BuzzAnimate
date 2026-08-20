@@ -1034,6 +1034,10 @@ struct FrameContext {
     edges: Vec<edge::EdgeRecord>,
     /// An instance has just been pushed and is waiting for its `<Matrix>`.
     placing: bool,
+    /// A `<transformationPoint>` is open and the `<Point>` inside it belongs
+    /// to the object just pushed. `<Point>` appears elsewhere in XFL, so it
+    /// is only taken when something has asked for it.
+    reading_pivot: bool,
 }
 
 /// Flash's gradients are declared in a fixed square 32 768 twips across —
@@ -1503,6 +1507,32 @@ impl FrameContext {
             "DOMStaticText" | "DOMDynamicText" | "DOMInputText" => report.note_unsupported("text"),
             "DOMVideoInstance" => report.note_unsupported("video"),
             "DOMSoundItem" => report.note_unsupported("sound"),
+            // **The transformation point an animator placed.**
+            //
+            // Animate writes it beside the matrix on anything that can be
+            // transformed, and it is not decoration: on a rigged character it
+            // is the *joint* — the shoulder an arm swings from. Ignoring it
+            // put every joint back at the middle of its artwork, so an
+            // imported character had to be re-rigged by hand before it could
+            // be posed. It travels in the object's own space, which is where
+            // we store it too.
+            "transformationPoint" => {
+                self.reading_pivot = true;
+            }
+            "Point" if self.reading_pivot => {
+                self.reading_pivot = false;
+                let x = attrs
+                    .get("x")
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let y = attrs
+                    .get("y")
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                if let Some(last) = frame.objects.last_mut() {
+                    std::sync::Arc::make_mut(last).pivot = Some(buzz_geom::Point::new(x, y));
+                }
+            }
             "Matrix" => {
                 // **A gradient's matrix is its own.** It says where the ramp
                 // runs, and it is claimed here before anything else can mistake
@@ -2352,6 +2382,69 @@ mod tests {
                 (x, y)
             );
         }
+    }
+
+    /// **A joint placed in Animate is still a joint after importing.**
+    ///
+    /// The transformation point is not decoration on a rigged character: it is
+    /// the shoulder an arm swings from. Dropped on the way in, every joint went
+    /// back to the middle of its artwork and the character had to be re-rigged
+    /// by hand before it could be posed.
+    #[test]
+    fn a_transformation_point_survives_the_import() {
+        const WITH_POINT: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="arm" symbolType="graphic">
+  <timeline>
+    <DOMTimeline name="arm">
+      <layers>
+        <DOMLayer name="Layer_1">
+          <frames>
+            <DOMFrame index="0" duration="1">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="100" ty="50"/></matrix>
+                  <transformationPoint>
+                    <Point x="12.5" y="-40"/>
+                  </transformationPoint>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timeline>
+</DOMSymbolItem>"##;
+
+        const PART: &str = r##"<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="part"
+             symbolType="graphic"><timeline><DOMTimeline name="part"><layers>
+             <DOMLayer name="Layer_1"><frames><DOMFrame index="0" duration="1"/>
+             </frames></DOMLayer></layers></DOMTimeline></timeline></DOMSymbolItem>"##;
+
+        let (scene, _) = build(
+            MINIMAL_DOCUMENT,
+            &[
+                ("LIBRARY/arm.xml".to_string(), WITH_POINT.to_string()),
+                ("LIBRARY/part.xml".to_string(), PART.to_string()),
+            ],
+        )
+        .unwrap();
+
+        let arm = scene.library().find_by_name("arm").unwrap();
+        let placed = arm.layers.iter().next().unwrap().objects_at(0)[0].clone();
+        assert_eq!(
+            placed.pivot,
+            Some(buzz_geom::Point::new(12.5, -40.0)),
+            "the joint should have come across as it was placed"
+        );
+
+        // And it is where Animate draws it: the point is in the object's own
+        // space, so its place on the stage is through the instance's matrix.
+        let world = scene.pivot_of(&placed);
+        assert!(
+            (world.x - 112.5).abs() < 1e-9 && (world.y - 10.0).abs() < 1e-9,
+            "the joint landed at {world:?}"
+        );
     }
 
     /// Animate's camera layer becomes our camera, not an error.

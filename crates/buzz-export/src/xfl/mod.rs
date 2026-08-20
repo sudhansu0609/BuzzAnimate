@@ -145,6 +145,44 @@ fn io(what: &str) -> impl Fn(std::io::Error) -> FlaError + '_ {
     }
 }
 
+/// The XFL document type, which is the same in every `.fla` Adobe writes.
+/// Animate uses it to recognise the package; a file without it is not one.
+const FILETYPE_GUID: &str = "DD0DDBBF-5BEF-45B2-9F24-A3048D2A676F";
+
+/// The format version, as Animate 2023 writes it. Claiming a much older XFL
+/// would invite a reader to expect an older layout than this one.
+const XFL_VERSION: &str = "23.0";
+const MAJOR_VERSION: &str = "23";
+
+#[cfg(target_os = "windows")]
+const PLATFORM: &str = "Windows";
+#[cfg(not(target_os = "windows"))]
+const PLATFORM: &str = "Macintosh";
+
+/// A per-file identifier, **derived from the document** rather than random.
+///
+/// Animate's is arbitrary, so anything of the right shape will do — and taking
+/// it from the content means writing the same document twice gives the same
+/// bytes, which is what makes an export diffable and a test repeatable.
+fn file_guid(scene: &Scene) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    scene.stage().size.width.to_bits().hash(&mut hasher);
+    scene.stage().size.height.to_bits().hash(&mut hasher);
+    scene.layers().len().hash(&mut hasher);
+    for symbol in scene.library().iter() {
+        symbol.name.hash(&mut hasher);
+    }
+    let a = hasher.finish();
+    // The 32 hex digits Animate writes, with no hyphens.
+    format!("{a:016X}{:016X}", a.rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15)
+}
+
+/// A library item's id in the two-part hex form Animate uses.
+fn item_id(id: u64) -> String {
+    format!("{:08x}-{:08x}", (id >> 32) as u32 | 0x6000_0000, id as u32)
+}
+
 const METADATA: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8"?>"#,
     "\n",
@@ -159,26 +197,49 @@ fn document_xml(scene: &Scene, report: &mut FlaReport) -> String {
     let mut out = String::new();
     out.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
     out.push('\n');
+    // **Written to the shape Animate writes.**
+    //
+    // Compared attribute by attribute against a document Adobe saved (see
+    // `tests::compare_against_a_real_fla`, which is how this list was arrived
+    // at rather than guessed). The identifying attributes are not decoration:
+    // Animate uses `filetypeGUID` to recognise the package as an XFL document
+    // at all, and a reader that does not find what it expects in the header
+    // has no reason to look any further.
     out.push_str(&format!(
-        r#"<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="{}" height="{}" frameRate="{}" backgroundColor="{}" xflVersion="2.1">"#,
+        concat!(
+            r#"<DOMDocument xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" "#,
+            r#"xmlns="http://ns.adobe.com/xfl/2008/" backgroundColor="{}" width="{}" "#,
+            r#"height="{}" frameRate="{}" currentTimeline="1" xflVersion="{}" "#,
+            r#"creatorInfo="BuzzAnimate" platform="{}" versionInfo="Saved by BuzzAnimate" "#,
+            r#"majorVersion="{}" buildNumber="1" nextSceneIdentifier="2" "#,
+            r#"filetypeGUID="{}" fileGUID="{}">"#,
+        ),
+        hex(stage.background),
         number(stage.size.width),
         number(stage.size.height),
         number(stage.frame_rate),
-        hex(stage.background),
+        XFL_VERSION,
+        PLATFORM,
+        MAJOR_VERSION,
+        FILETYPE_GUID,
+        file_guid(scene),
     ));
     out.push('\n');
 
     // The library's index. Animate resolves `href` against `LIBRARY/`.
-    out.push_str("  <folders/>\n  <media/>\n");
+    //
+    // Empty `<folders/>` and `<media/>` are not written: Adobe leaves them out
+    // when there is nothing in them, and matching that keeps the file to the
+    // shape a reader has actually been given before.
     if scene.library().is_empty() {
         out.push_str("  <symbols/>\n");
     } else {
         out.push_str("  <symbols>\n");
         for symbol in scene.library().iter() {
             out.push_str(&format!(
-                "    <Include href=\"{}.xml\" itemID=\"{:08x}\"/>\n",
+                "    <Include href=\"{}.xml\" itemIcon=\"1\" loadImmediate=\"false\" itemID=\"{}\"/>\n",
                 escape(&file_name(&symbol.name)),
-                symbol.id.0
+                item_id(symbol.id.0),
             ));
         }
         out.push_str("  </symbols>\n");
@@ -193,6 +254,8 @@ fn document_xml(scene: &Scene, report: &mut FlaReport) -> String {
         4,
     ));
     out.push_str("  </timelines>\n");
+    // Animate writes this even with nothing in it.
+    out.push_str("  <scripts/>\n");
     out.push_str("</DOMDocument>\n");
     out
 }
@@ -229,8 +292,17 @@ fn timeline_xml(
 ) -> String {
     let pad = " ".repeat(indent);
     let mut out = String::new();
+    // **Depth has to be switched on for Animate to honour it.** A layer's
+    // depth is only read when the timeline says the document uses depth, so
+    // exporting depths without this would put every layer back on the focal
+    // plane — a picture quietly flattened rather than one visibly wrong.
+    let depth_attr = if layers.iter().any(|l| l.depth != 0.0) {
+        " layerDepthEnabled=\"true\""
+    } else {
+        ""
+    };
     out.push_str(&format!(
-        "{pad}<DOMTimeline name=\"{}\">\n{pad}  <layers>\n",
+        "{pad}<DOMTimeline name=\"{}\"{depth_attr}>\n{pad}  <layers>\n",
         escape(name)
     ));
 
@@ -245,9 +317,20 @@ fn timeline_xml(
         .map(|(i, l)| (l.id, i))
         .collect();
 
+    // Which layers something hangs off, so only those are marked as rig
+    // parents.
+    let parents: std::collections::BTreeSet<buzz_scene::LayerId> =
+        ordered.iter().filter_map(|l| l.follows).collect();
+
     for (index, layer) in ordered.iter().enumerate() {
         out.push_str(&layer_xml(
-            scene, layer, index, &index_of, report, indent + 4,
+            scene,
+            layer,
+            index,
+            &index_of,
+            parents.contains(&layer.id),
+            report,
+            indent + 4,
         ));
     }
 
@@ -260,6 +343,7 @@ fn layer_xml(
     layer: &Layer,
     index: usize,
     index_of: &BTreeMap<buzz_scene::LayerId, usize>,
+    is_rig_parent: bool,
     report: &mut FlaReport,
     indent: usize,
 ) -> String {
@@ -302,8 +386,13 @@ fn layer_xml(
     // **Layer parenting**, which Animate writes as a rigging index on the
     // parent and a reference to it on the child's frames. Written the same way
     // round, so a character rigged here arrives in Animate still rigged.
-    let rig_index = index;
-    attrs.push_str(&format!(" layerRiggingIndex=\"{rig_index}\""));
+    //
+    // Only on a layer something actually follows. Animate puts it on rig
+    // parents, not on every layer, and marking the whole timeline as rig nodes
+    // would describe a character that is not there.
+    if is_rig_parent {
+        attrs.push_str(&format!(" layerRiggingIndex=\"{index}\""));
+    }
     let follows_index = layer.follows.and_then(|id| index_of.get(&id)).copied();
 
     let mut out = format!("{pad}<DOMLayer {attrs}>\n{pad}  <frames>\n");
@@ -341,7 +430,14 @@ fn frame_xml(
         .min()
         .unwrap_or_else(|| layer.frames.length());
     let duration = next.saturating_sub(keyframe.start).max(1);
-    let mut attrs = format!("index=\"{}\" duration=\"{duration}\"", keyframe.start);
+    // `keyMode` is how Animate records what kind of keyframe this is; 9728 is
+    // the ordinary one, and it is on every frame in a document Adobe saved.
+    // A duration of one is left off, as Animate leaves it off.
+    let mut attrs = format!("index=\"{}\"", keyframe.start);
+    if duration > 1 {
+        attrs.push_str(&format!(" duration=\"{duration}\""));
+    }
+    attrs.push_str(" keyMode=\"9728\"");
     if let Some(label) = &keyframe.label {
         attrs.push_str(&format!(" name=\"{}\"", escape(label)));
     }
@@ -399,8 +495,15 @@ fn object_xml(scene: &Scene, object: &Object, report: &mut FlaReport, indent: us
                 SymbolKind::Button => "button",
                 SymbolKind::Graphic => "graphic",
             };
+            // A graphic instance carries how it plays; Animate writes it on
+            // every one, and a reader that expects it finds nothing otherwise.
+            let playing = if matches!(symbol.kind, SymbolKind::Graphic) {
+                " loop=\"loop\""
+            } else {
+                ""
+            };
             format!(
-                "{pad}<DOMSymbolInstance libraryItemName=\"{}\" symbolType=\"{kind}\">\n{}{pad}</DOMSymbolInstance>\n",
+                "{pad}<DOMSymbolInstance libraryItemName=\"{}\" symbolType=\"{kind}\"{playing}>\n{}{pad}</DOMSymbolInstance>\n",
                 escape(&symbol.name),
                 matrix_xml(object.transform, indent + 2),
             )

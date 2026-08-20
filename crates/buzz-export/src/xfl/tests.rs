@@ -271,3 +271,157 @@ fn an_awkward_symbol_name_is_still_written_safely() {
         );
     }
 }
+
+/// **Our package against one Adobe actually wrote.**
+///
+/// The round trips above prove our writer against our own reader, which is a
+/// permissive one. Animate's is not. This holds the two files side by side and
+/// reports what Adobe puts in a `DOMDocument.xml` that we do not — the
+/// difference that decides whether Animate opens the file or rejects it.
+///
+/// A report rather than an assertion, and ignored by default, because it reads
+/// a real `.fla` that only exists on a machine with Animate on it:
+///
+/// ```text
+/// cargo test -p buzz-export --lib compare_against_a_real_fla -- --ignored --nocapture
+/// ```
+///
+/// Point `BUZZ_REAL_FLA` at a file, or let it search the usual Animate folders.
+#[test]
+#[ignore = "reads a real .fla, which only exists on a machine with Animate"]
+fn compare_against_a_real_fla() {
+    let path = std::env::var_os("BUZZ_REAL_FLA")
+        .map(std::path::PathBuf::from)
+        .or_else(find_a_real_fla);
+    let Some(path) = path else {
+        println!("no .fla found to compare against");
+        return;
+    };
+    println!("comparing against {}", path.display());
+
+    let Ok(bytes) = std::fs::read(&path) else {
+        println!("could not read it");
+        return;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(&bytes)) else {
+        println!("not a package this zip reader can open");
+        return;
+    };
+    let theirs = {
+        use std::io::Read as _;
+        let Ok(mut entry) = archive.by_name("DOMDocument.xml") else {
+            println!("no DOMDocument.xml inside");
+            return;
+        };
+        let mut text = String::new();
+        let _ = entry.read_to_string(&mut text);
+        text
+    };
+
+    // Ours, written from the same document after importing theirs — so the two
+    // describe the same film and any difference is the writer's.
+    let (scene, _) = buzz_import_xfl::import_fla_bytes(&bytes).expect("we can read it");
+    let (ours_bytes, report) = fla_bytes(&scene).expect("and write it back");
+    let mut ours_zip =
+        zip::ZipArchive::new(std::io::Cursor::new(&ours_bytes)).expect("our own package");
+    let ours = {
+        use std::io::Read as _;
+        let mut entry = ours_zip.by_name("DOMDocument.xml").expect("ours has one");
+        let mut text = String::new();
+        let _ = entry.read_to_string(&mut text);
+        text
+    };
+
+    println!("\n{}", report.summary());
+    println!("\ntheirs is {} bytes, ours {}", theirs.len(), ours.len());
+
+    let elements = |xml: &str| -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut rest = xml;
+        while let Some(at) = rest.find('<') {
+            rest = &rest[at + 1..];
+            if rest.starts_with('/') || rest.starts_with('?') || rest.starts_with('!') {
+                continue;
+            }
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+                .unwrap_or(0);
+            if end > 0 {
+                out.insert(rest[..end].to_string());
+            }
+        }
+        out
+    };
+    let attributes = |xml: &str| -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for chunk in xml.split('<').skip(1) {
+            let Some(tag_end) = chunk.find('>') else { continue };
+            for piece in chunk[..tag_end].split_whitespace().skip(1) {
+                if let Some(name) = piece.split('=').next()
+                    && !name.is_empty()
+                    && name.chars().all(|c| c.is_alphanumeric() || c == ':')
+                {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+        out
+    };
+
+    let (te, oe) = (elements(&theirs), elements(&ours));
+    let (ta, oa) = (attributes(&theirs), attributes(&ours));
+
+    println!("\nelements Adobe writes that we do not:");
+    for name in te.difference(&oe) {
+        println!("  {name}");
+    }
+    println!("\nelements we write that Adobe does not:");
+    for name in oe.difference(&te) {
+        println!("  {name}");
+    }
+    println!("\nattributes Adobe writes that we do not:");
+    for name in ta.difference(&oa) {
+        println!("  {name}");
+    }
+    println!("\nattributes we write that Adobe does not:");
+    for name in oa.difference(&ta) {
+        println!("  {name}");
+    }
+
+    println!("\n--- the head of Adobe's, for reference ---");
+    for line in theirs.lines().take(24) {
+        println!("{line}");
+    }
+}
+
+/// Any `.fla` on this machine, smallest first so the comparison is readable.
+fn find_a_real_fla() -> Option<std::path::PathBuf> {
+    let documents = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)?;
+    let root = documents.join("Documents").join("Adobe");
+    let mut found: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    walk(&root, &mut found, 0);
+    found.sort_by_key(|(size, _)| *size);
+    found.into_iter().map(|(_, path)| path).next()
+}
+
+fn walk(dir: &std::path::Path, out: &mut Vec<(u64, std::path::PathBuf)>, depth: usize) {
+    if depth > 6 || out.len() > 400 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk(&path, out, depth + 1);
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("fla"))
+            && let Ok(meta) = entry.metadata()
+        {
+            out.push((meta.len(), path));
+        }
+    }
+}

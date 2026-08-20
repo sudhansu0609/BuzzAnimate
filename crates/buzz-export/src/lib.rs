@@ -41,9 +41,11 @@ pub mod film;
 pub mod gif;
 pub mod preset;
 pub mod video;
+pub mod xfl;
 
 pub use film::concat_segments;
 pub use preset::{ExportPreset, PresetFormat};
+pub use xfl::{FlaError, FlaReport, export_fla, fla_bytes};
 
 pub use gif::{
     AnimatedFormat, AnimatedReport, Dither, GifSettings, WebpSettings, export_gif, export_webp,

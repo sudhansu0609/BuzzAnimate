@@ -11,6 +11,7 @@ authors.workspace = true
 buzz-geom.workspace = true
 buzz-scene.workspace = true
 buzz-render.workspace = true
+zip.workspace = true
 
 kurbo.workspace = true
 peniko.workspace = true

@@ -310,6 +310,8 @@ pub enum Pick {
     AnimateAssets,
     /// Where an export should be written.
     Export(buzz_ui::ExportKind),
+    /// Where to write the document as an Animate `.fla`.
+    ExportFla,
 }
 
 /// What a background load produced.
@@ -3395,6 +3397,7 @@ impl App {
             Command::ImportSound => self.import_sound_dialog(),
             Command::ImportImage => self.import_image_dialog(),
             Command::LipSync => self.open_lip_sync(),
+            Command::ExportFla => self.export_fla_dialog(),
             Command::ExportImage => self.open_export(buzz_ui::ExportKind::Image),
             Command::ExportSequence => self.open_export(buzz_ui::ExportKind::Sequence),
             Command::ExportVideo => self.open_export(buzz_ui::ExportKind::Video),
@@ -3628,6 +3631,7 @@ impl App {
             Pick::ImportInto(target) => self.import_file(target, path),
             Pick::AnimateAssets => self.import_animate_assets_from(path),
             Pick::Export(kind) => self.start_export(kind, path),
+            Pick::ExportFla => self.export_fla_to(path),
         }
     }
 
@@ -4783,6 +4787,54 @@ impl App {
 
         if !open {
             self.editor.import_summary = None;
+        }
+    }
+
+    /// File ▸ Export ▸ Animate Document.
+    ///
+    /// Named after the document, so a film called `hero.buzz` is offered as
+    /// `hero.fla` rather than as `untitled`.
+    fn export_fla_dialog(&mut self) {
+        let suggested = self
+            .editor
+            .doc
+            .path()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "Untitled".to_string());
+        self.ask_for_path(
+            crate::dialogs::Request::save_file()
+                .file_name(format!("{suggested}.fla"))
+                .filter("Animate document", &["fla"]),
+            Pick::ExportFla,
+        );
+    }
+
+    /// Write it, and say what could not come along.
+    ///
+    /// On the UI thread rather than a worker: this is XML and a zip, not a
+    /// render, and even a large document is milliseconds. The exports that go
+    /// through `start_export` are frame renders, which is a different order of
+    /// cost entirely.
+    fn export_fla_to(&mut self, path: std::path::PathBuf) {
+        match buzz_export::export_fla(self.editor.doc.scene(), &path) {
+            Ok(report) => {
+                // **What did not travel is said out loud.** An export that
+                // quietly drops a document's gradients is a trap; the summary
+                // names them, and the Output panel keeps the list.
+                self.editor.status = Some(report.summary());
+                if !report.skipped.is_empty() {
+                    let mut lines = vec![format!("Exported {}", path.display())];
+                    lines.push(String::new());
+                    lines.push("Not carried into the .fla:".to_string());
+                    for what in &report.skipped {
+                        lines.push(format!("  {what}"));
+                    }
+                    self.editor.actions.report(lines, None, report.summary());
+                }
+            }
+            Err(error) => {
+                self.editor.status = Some(format!("Could not export: {error}"));
+            }
         }
     }
 

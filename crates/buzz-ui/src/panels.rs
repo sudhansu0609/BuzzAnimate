@@ -130,6 +130,9 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             // Animate keeps Export in a submenu of File, one entry per output.
             ui.menu_button("Export", |ui| {
                 for c in [
+                    // First, because it is the one that carries the *document*
+                    // rather than a picture of it.
+                    Command::ExportFla,
                     Command::ExportImage,
                     Command::ExportSequence,
                     Command::ExportVideo,

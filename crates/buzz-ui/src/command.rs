@@ -23,6 +23,12 @@ pub enum Command {
     ImportToLibrary,
     /// Import an Animate document onto the stage as well as the library.
     ImportToStage,
+    /// Write the document back out as an Adobe Animate `.fla`.
+    ///
+    /// Import was one-way, which makes this somewhere work goes to be finished
+    /// rather than a place in a pipeline. A studio, a client or a shelf of
+    /// Animate tooling all need the file to be able to go back.
+    ExportFla,
     /// Write the current frame out as a PNG.
     ExportImage,
     /// Write a numbered PNG for every frame in a range.
@@ -231,6 +237,7 @@ impl Command {
             Quit => "Exit",
             ImportToLibrary => "Import to Library…",
             ImportToStage => "Import to Stage…",
+            ExportFla => "Export Animate Document (.fla)…",
             ExportImage => "Export Image…",
             ExportSequence => "Export PNG Sequence…",
             ExportVideo => "Export Video…",
@@ -371,6 +378,7 @@ impl Command {
             ImportToLibrary => sc(ctrl_shift, Key::R),
             // Animate has no default binding for Export Image, and inventing
             // one risks colliding with a habit rather than serving it.
+            ExportFla => None,
             ExportImage => None,
             ExportSequence => None,
             ExportVideo => None,
@@ -641,6 +649,7 @@ pub fn all_with_shortcuts() -> Vec<Command> {
         ToggleActionsPanel,
         RunScript,
         ClearScriptOutput,
+        ExportFla,
         ExportImage,
         ExportSequence,
         ExportVideo,

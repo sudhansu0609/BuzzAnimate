@@ -205,6 +205,103 @@ fn difference(a: &BezPath, b: &BezPath) -> Option<BezPath> {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The light is seen, the shadow is cast, and both follow the light.**
+    ///
+    /// A sun from one side must shade the far side of a shape and throw its
+    /// shadow away from itself; move the sun to the opposite side and both
+    /// must swap. That is what "directional" means, and it is the whole
+    /// difference between lighting and a tint over everything.
+    #[test]
+    fn shading_and_shadow_follow_the_light() {
+        use buzz_geom::{Rect, Shape as _};
+
+        let path = Rect::new(100.0, 100.0, 180.0, 180.0).to_path(1e-9);
+        let at = buzz_geom::Point::new(140.0, 140.0);
+
+        let sun = |azimuth: f64| {
+            let mut light = Light::new(
+                LightId(1),
+                "Sun",
+                LightKind::Sun {
+                    azimuth,
+                    elevation: 0.5,
+                },
+            );
+            light.shadows = true;
+            light
+        };
+
+        // Azimuth zero: the light lies along +x, so the shading falls on the
+        // side away from it and the shadow is thrown the other way.
+        let east = shade_for(&path, &sun(0.0), at, 0.0, 60.0, 1.0);
+        assert!(east.shade.is_some(), "a lit shape should be shaded");
+        assert!(east.highlight.is_some(), "and catch a highlight");
+        let east_cast = east.cast.clone().expect("and throw a shadow");
+
+        let west = shade_for(&path, &sun(std::f64::consts::PI), at, 0.0, 60.0, 1.0);
+        let west_cast = west.cast.clone().expect("a shadow from the other side too");
+
+        // The two shadows must lie on opposite sides of the artwork. Compared
+        // by where their weight is, which is what the eye reads.
+        let middle = |p: &buzz_geom::BezPath| p.bounding_box().center().x;
+        let art = path.bounding_box().center().x;
+        assert!(
+            (middle(&east_cast) - art).signum() != (middle(&west_cast) - art).signum(),
+            "the shadow should swap sides with the light: {} then {}",
+            middle(&east_cast),
+            middle(&west_cast)
+        );
+
+        // The shading crescents swap with it.
+        let shade_side = |g: &ShadeGeometry| {
+            g.shade
+                .as_ref()
+                .map(|p| p.bounding_box().center().x - art)
+                .unwrap_or(0.0)
+        };
+        assert!(
+            shade_side(&east).signum() != shade_side(&west).signum(),
+            "the shaded side should swap with the light too"
+        );
+    }
+
+    /// A lamp is not a sun: its shadows **radiate**, so two shapes either side
+    /// of it are thrown in opposite directions. That is how a lamp reads as a
+    /// lamp in a finished shot.
+    #[test]
+    fn a_lamp_throws_its_shadows_outwards() {
+        use buzz_geom::{Point, Rect, Shape as _};
+
+        let mut lamp = Light::new(
+            LightId(1),
+            "Lamp",
+            LightKind::Lamp {
+                position: Point::new(400.0, 300.0),
+                height: 200.0,
+                radius: 1200.0,
+            },
+        );
+        lamp.shadows = true;
+
+        let thrown = |x: f64| {
+            let path = Rect::new(x, 280.0, x + 40.0, 320.0).to_path(1e-9);
+            let at = Point::new(x + 20.0, 300.0);
+            let cast = shade_for(&path, &lamp, at, 0.0, 60.0, 1.0)
+                .cast
+                .expect("a shadow");
+            cast.bounding_box().center().x - (x + 20.0)
+        };
+
+        // One shape to the left of the lamp, one to the right.
+        let left = thrown(200.0);
+        let right = thrown(600.0);
+        assert!(
+            left.signum() != right.signum(),
+            "a lamp's shadows should point away from it on both sides,              got {left} and {right}"
+        );
+    }
+
     use super::*;
     use crate::{LightId, LightKind};
     use peniko::Color;

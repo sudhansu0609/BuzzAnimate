@@ -5273,13 +5273,31 @@ impl App {
             active.window.request_redraw();
         }
 
-        // **Defer only when the cache is cold.** A warm cache — the ordinary
-        // case, kept warm by per-light keying through every edit — builds any
-        // stray miss inline and stays flicker-free. A cold one (a document just
-        // opened, lighting just switched on) draws unlit this frame and builds
-        // its geometry off-thread instead of freezing on it.
+        // **Defer when the cache is cold, and while a gesture is running.**
+        //
+        // A warm cache — the ordinary case, kept warm by per-light keying
+        // through every edit — builds any stray miss inline and stays
+        // flicker-free. A cold one (a document just opened, lighting just
+        // switched on) draws unlit this frame and builds off-thread instead of
+        // freezing on it.
+        //
+        // A gesture is the case that was missed, and it is the worst one. A
+        // lamp's geometry depends on where the lamp *is*, so dragging one
+        // misses every entry it owns on every pointer move — and with the
+        // cache warm those misses were built inline, on the frame thread, one
+        // boolean difference per shape. Measured at 322 ms a frame over four
+        // hundred curved shapes: three frames a second, which is not a slow
+        // drag but a frozen window. Deferring costs a frame of the previous
+        // shading during the drag and gives the gesture back.
+        // And while a build is already in flight, so the frame that ends a
+        // drag does not land the whole rebuild inline the moment the pointer
+        // comes up — the freeze would simply have moved to the end of the
+        // gesture rather than gone.
         let cold = self.lights.lights.is_empty() && self.editor.scene().lights().is_active();
-        self.lights.lights.set_defer(cold);
+        let settling = self.shade_build.is_some();
+        self.lights
+            .lights
+            .set_defer(cold || settling || self.editor.is_gesturing());
 
         self.profiler.enter(crate::profile::Section::Encode);
 

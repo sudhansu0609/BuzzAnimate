@@ -6156,6 +6156,102 @@ mod tests {
         }
     }
 
+    /// **Moving a lamp over a scene has to stay interactive.**
+    ///
+    /// Every shading crescent is a boolean difference — the most expensive
+    /// thing the renderer does — and a lamp's geometry depends on where the
+    /// lamp is, so dragging one invalidates all of it on every pointer move.
+    /// Whether that is affordable is the whole question, and it is the one
+    /// that decides whether the lighting tools can be used at all.
+    #[test]
+    fn dragging_a_lamp_over_a_scene_stays_interactive() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+
+        // A street's worth of artwork for the lamp to fall on.
+        // Curved outlines, not squares: a boolean's cost follows the segment
+        // count, and real artwork is curves.
+        const SHAPES: usize = 400;
+        e.doc.edit("Street", |scene| {
+            let layer = scene.layers().iter().next().map(|l| l.id).expect("a layer");
+            let art: Vec<std::sync::Arc<Object>> = (0..SHAPES)
+                .map(|i| {
+                    let x = (i % 20) as f64 * 60.0;
+                    let y = (i / 20) as f64 * 60.0;
+                    let id = scene.next_object_id();
+                    let path = kurbo::Circle::new(Point::new(x + 24.0, y + 24.0), 22.0)
+                        .to_path(0.05);
+                    std::sync::Arc::new(Object::shape(
+                        id,
+                        ShapeData::filled(path, Color::WHITE),
+                    ))
+                })
+                .collect();
+            scene.edit_layers().update(layer, |l| {
+                l.frames.set_objects(0, art);
+            });
+        });
+
+        // The lamp, casting shadows, as one placed from the Lights panel is.
+        e.doc.edit("Light", |scene| {
+            let rig = scene.lights_mut();
+            rig.enabled = true;
+            let mut lamp = buzz_scene::Light::new(
+                buzz_scene::LightId(1),
+                "Lamp",
+                buzz_scene::LightKind::Lamp {
+                    position: Point::new(400.0, 300.0),
+                    height: 220.0,
+                    radius: 900.0,
+                },
+            );
+            lamp.shadows = true;
+            rig.lights.push(lamp);
+        });
+        assert!(e.scene().lights().is_active(), "the rig should be on");
+
+        let mut vello = buzz_render::vello::Scene::new();
+        let mut cache = buzz_render::document::DrawCache::default();
+        let area = buzz_geom::Rect::new(0.0, 0.0, 1600.0, 1000.0);
+
+        // Warm it once, as the window does on the frame the light appears.
+        crate::stage::build_scene(&mut vello, &e, area, 1.0, &mut cache);
+
+        // **As the window does while a gesture is running.** A lamp's geometry
+        // depends on where the lamp is, so every entry it owns misses on every
+        // pointer move; built inline those misses are one boolean difference
+        // per shape, on the frame thread. Deferred, they are handed off and the
+        // frame draws with the shading it had.
+        cache.lights.set_defer(true);
+
+        // Now walk the lamp across the stage, re-encoding after each move
+        // exactly as the window does.
+        const MOVES: usize = 12;
+        let began = std::time::Instant::now();
+        for step in 1..=MOVES {
+            let at = Point::new(400.0 + step as f64 * 20.0, 300.0);
+            e.doc.edit("Move Light", |scene| {
+                if let Some(light) = scene.lights_mut().get_mut(buzz_scene::LightId(1))
+                    && let buzz_scene::LightKind::Lamp { position, .. } = &mut light.kind
+                {
+                    *position = at;
+                }
+            });
+            crate::stage::build_scene(&mut vello, &e, area, 1.0, &mut cache);
+            // The window hands these to a worker; here they are simply not
+            // built on this thread, which is the point being measured.
+            let _ = cache.lights.take_misses();
+        }
+        let per_move = began.elapsed().as_secs_f64() * 1000.0 / MOVES as f64;
+
+        eprintln!("LAMP DRAG: {per_move:.2} ms a frame over {SHAPES} shapes");
+        assert!(
+            per_move < 16.0,
+            "moving a lamp cost {per_move:.1} ms a frame; the window cannot \
+             draw at that and the tool is unusable"
+        );
+    }
+
     #[test]
     fn moving_the_selection_shifts_it_and_is_undoable() {
         let mut e = editor();

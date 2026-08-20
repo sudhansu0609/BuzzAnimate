@@ -242,7 +242,10 @@ pub fn draw_chrome(ui: &mut Ui, editor: &Editor, area: egui::Rect) -> ChromeResp
         draw_guides(&painter, area, view, to_screen);
     }
 
-    draw_selection(&painter, editor, to_screen_art, to_screen);
+    // Where the pointer is, so the rotate mark can appear on the corner it is
+    // actually near rather than on all four at once.
+    let pointer = ui.input(|i| i.pointer.hover_pos());
+    draw_selection(&painter, editor, pointer, to_screen_art, to_screen);
     draw_rigs(&painter, editor, to_screen_art);
     draw_lights(&painter, editor, to_screen_art);
     draw_preview(&painter, editor, to_screen_art);
@@ -346,6 +349,7 @@ fn draw_guides(
 fn draw_selection(
     painter: &egui::Painter,
     editor: &Editor,
+    pointer: Option<egui::Pos2>,
     to_screen: impl Fn(Point) -> egui::Pos2,
     to_screen_view: impl Fn(Point) -> egui::Pos2,
 ) {
@@ -439,7 +443,7 @@ fn draw_selection(
         //
         // An arc rather than a square handle on purpose: a square would promise
         // scaling, which these tools do not do (see `tools::transform_zone`).
-        draw_rotate_hints(painter, rect);
+        draw_rotate_hint(painter, rect, pointer);
         draw_pivot(painter, editor, &to_screen);
         return;
     }
@@ -448,7 +452,7 @@ fn draw_selection(
     // different things, with only the square handles drawn. The arcs mark the
     // other half of the gizmo so it can be found without discovering it by
     // accident.
-    draw_rotate_hints(painter, rect);
+    draw_rotate_hint(painter, rect, pointer);
 
     const HANDLE: f32 = 6.0;
     for corner in [
@@ -718,36 +722,82 @@ fn draw_lights(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poin
 /// Drawn at the radius `tools::transform_zone` actually tests, so the mark and
 /// the behaviour cannot drift apart — a hint pointing somewhere the gesture is
 /// not would be worse than none.
-fn draw_rotate_hints(painter: &egui::Painter, rect: egui::Rect) {
-    // Too small a selection has no room outside its corners for a ring, and
-    // crowding four arcs onto it would hide the artwork rather than help.
-    if rect.width() < 34.0 || rect.height() < 34.0 {
-        return;
+/// Which corner the rotate mark belongs on, and the angle its arc starts at.
+///
+/// **The corner the pointer is actually on.** Four arcs drawn at once said
+/// "you may rotate from any of these", which is true and not what the hand
+/// needs to know — it needs to know that *this* grab will turn rather than
+/// marquee. Animate shows its rotate cursor at one corner for the same reason,
+/// and only while the pointer is in the ring.
+///
+/// `None` inside the box, where a drag moves the artwork; on a corner handle,
+/// which scales; and anywhere outside the band. The band is the one
+/// `tools::transform_zone` turns in, so the mark cannot promise a gesture the
+/// release will not make.
+fn rotate_hint_at(rect: egui::Rect, pointer: egui::Pos2) -> Option<(egui::Pos2, f32)> {
+    if rect.contains(pointer) {
+        return None;
     }
-    let stroke = Stroke::new(1.2, Palette::selection().gamma_multiply(0.75));
-    const RADIUS: f32 = 13.0;
-    const STEPS: usize = 7;
-
-    // One arc per corner, each sweeping the quadrant that points away from the
-    // selection — the side the pointer comes in from.
-    for (corner, from) in [
+    let corners = [
         (rect.left_top(), std::f32::consts::PI),
         (rect.right_top(), -std::f32::consts::FRAC_PI_2),
         (rect.right_bottom(), 0.0),
         (rect.left_bottom(), std::f32::consts::FRAC_PI_2),
-    ] {
-        let points: Vec<egui::Pos2> = (0..=STEPS)
-            .map(|i| {
-                let t = i as f32 / STEPS as f32;
-                let angle = from + t * std::f32::consts::FRAC_PI_2;
-                egui::pos2(
-                    corner.x + RADIUS * angle.cos(),
-                    corner.y + RADIUS * angle.sin(),
-                )
-            })
-            .collect();
-        painter.add(egui::Shape::line(points, stroke));
+    ];
+    let (corner, from) = corners
+        .into_iter()
+        .min_by(|a, b| a.0.distance(pointer).total_cmp(&b.0.distance(pointer)))?;
+
+    let grab = crate::tools::TRANSFORM_GRAB_PX as f32;
+    let reach = corner.distance(pointer);
+    (reach > grab && reach <= grab * 3.0).then_some((corner, from))
+}
+
+fn draw_rotate_hint(painter: &egui::Painter, rect: egui::Rect, pointer: Option<egui::Pos2>) {
+    // Too small a selection has no room outside its corners for a ring.
+    if rect.width() < 34.0 || rect.height() < 34.0 {
+        return;
     }
+    let Some(pointer) = pointer else {
+        return;
+    };
+    let Some((corner, from)) = rotate_hint_at(rect, pointer) else {
+        return;
+    };
+
+    let stroke = Stroke::new(1.6, Palette::selection());
+    const RADIUS: f32 = 14.0;
+    const STEPS: usize = 10;
+    let at = |angle: f32| {
+        egui::pos2(
+            corner.x + RADIUS * angle.cos(),
+            corner.y + RADIUS * angle.sin(),
+        )
+    };
+
+    let sweep = std::f32::consts::FRAC_PI_2;
+    let points: Vec<egui::Pos2> = (0..=STEPS)
+        .map(|i| at(from + (i as f32 / STEPS as f32) * sweep))
+        .collect();
+    painter.add(egui::Shape::line(points, stroke));
+
+    // **An arrowhead, so it reads as a turn rather than as a corner mark.**
+    // At the far end of the sweep and along the tangent there, which is the
+    // direction the artwork will actually go.
+    let end = from + sweep;
+    let tip = at(end);
+    // Travelling anticlockwise in screen terms as the angle grows.
+    let along = egui::vec2(-end.sin(), end.cos());
+    let outward = egui::vec2(end.cos(), end.sin());
+    const HEAD: f32 = 5.0;
+    painter.add(egui::Shape::line(
+        vec![
+            tip - along * HEAD + outward * HEAD * 0.55,
+            tip,
+            tip - along * HEAD - outward * HEAD * 0.55,
+        ],
+        stroke,
+    ));
 }
 
 /// How wide to draw a bone: a fraction of its length, bounded in *screen*
@@ -939,6 +989,47 @@ mod tests {
     use buzz_scene::ShapeData;
     use kurbo::Rect as KRect;
     use peniko::Color;
+
+    /// **The rotate mark belongs on one corner, and only in the ring.**
+    ///
+    /// Four arcs at once told the hand nothing it needed: the question is
+    /// whether *this* grab will turn the artwork or throw the selection away,
+    /// and that is a question about the corner the pointer is on.
+    #[test]
+    fn the_rotate_mark_appears_on_the_corner_the_pointer_is_on() {
+        let rect = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(300.0, 240.0));
+        let grab = crate::tools::TRANSFORM_GRAB_PX as f32;
+
+        // In the ring outside the top-left: the mark goes there.
+        let at = egui::pos2(100.0 - grab * 1.4, 100.0 - grab * 1.4);
+        let (corner, _) = rotate_hint_at(rect, at).expect("the ring turns");
+        assert_eq!(corner, rect.left_top(), "on the corner nearest the pointer");
+
+        // And the far corner gets it when the pointer is there instead.
+        let at = egui::pos2(300.0 + grab * 1.4, 240.0 + grab * 1.4);
+        let (corner, _) = rotate_hint_at(rect, at).expect("the ring turns");
+        assert_eq!(corner, rect.right_bottom(), "not always the same corner");
+
+        // Inside the box a drag moves the artwork.
+        assert!(
+            rotate_hint_at(rect, rect.center()).is_none(),
+            "no rotate mark over the artwork"
+        );
+
+        // On the handle itself, which scales rather than turns.
+        let on_handle = egui::pos2(100.0 - grab * 0.4, 100.0 - grab * 0.4);
+        assert!(
+            rotate_hint_at(rect, on_handle).is_none(),
+            "the handle scales; the mark must not claim it turns"
+        );
+
+        // And well outside, where a drag is a marquee.
+        let far = egui::pos2(100.0 - grab * 6.0, 100.0 - grab * 6.0);
+        assert!(
+            rotate_hint_at(rect, far).is_none(),
+            "out here a drag marquees, and the mark must not say otherwise"
+        );
+    }
 
     fn editor_with_art() -> Editor {
         let mut e = Editor::default();

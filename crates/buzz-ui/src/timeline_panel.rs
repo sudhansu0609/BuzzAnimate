@@ -170,6 +170,10 @@ pub struct TimelineState {
     /// The camera's focal distance, which is what a layer's depth is measured
     /// against. Supplied so the column can draw the scale.
     pub focal_distance: f64,
+    /// As near the camera as a layer may be dragged —
+    /// [`buzz_scene::CameraTrack::nearest_depth`]. Supplied rather than derived
+    /// so the column and the Layer Depth panel cannot disagree about it.
+    pub nearest_depth: f64,
     /// Loudness per frame for each layer carrying a sound, so the timeline can
     /// draw the waveform where the sound actually sits.
     ///
@@ -1504,7 +1508,10 @@ fn depth_cell(
     } else {
         1000.0
     };
-    let limit = focal * 0.95;
+    // The near side is the camera's own bound, so a drag here and a drag in the
+    // Layer Depth panel stop in the same place; the far side matches it only so
+    // that the bar below reads symmetrically about the focal plane.
+    let limit = -state.nearest_depth;
 
     let number = egui::Rect::from_min_size(
         egui::pos2(area.min.x + name_width, area.center().y - 9.0),
@@ -2144,6 +2151,7 @@ mod tests {
             parenting_view: false,
             depth_view: false,
             focal_distance: 1000.0,
+            nearest_depth: -900.0,
         }
     }
 

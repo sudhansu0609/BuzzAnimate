@@ -91,6 +91,22 @@ pub const DEFAULT_FOCAL_DISTANCE: f64 = 1000.0;
 /// better than a frame filled by one runaway layer.
 const NEAR_PLANE: f64 = 1.0;
 
+/// **How near the lens a layer may be put**, as a fraction of the focal
+/// distance.
+///
+/// Not [`NEAR_PLANE`], which is where the projection actually gives up. A layer
+/// a hair in front of that is magnified by hundreds and swamps the frame, so
+/// every control that moves a layer stops well short — and so does
+/// [`Scene::set_focal_distance`](crate::Scene::set_focal_distance), which has
+/// to keep the same promise when it is the *lens* that moves rather than the
+/// layer.
+///
+/// One number, in one place, because the two controls used to disagree: the
+/// timeline's depth column bounded a drag at 0.95 of the focal distance and the
+/// Layer Depth panel at 0.9, so the same layer had two different "as near as it
+/// goes" depending on which one you reached for.
+const NEAR_LIMIT: f64 = 0.9;
+
 /// A named camera position — a "shot" of the staged scene.
 ///
 /// An angle is a *camera state*, not a new scene: the stage is furniture,
@@ -167,6 +183,30 @@ impl CameraTrack {
         let focal = self.focal_distance.max(NEAR_PLANE);
         let distance = focal + depth;
         (distance >= NEAR_PLANE).then(|| focal / distance)
+    }
+
+    /// **As near the camera as a layer may be put**, in depth.
+    ///
+    /// Negative, because depth counts away from the lens. This is the one bound
+    /// that has to hold: past it [`depth_scale`](Self::depth_scale) answers
+    /// `None` and the layer is not drawn at all. There is deliberately no
+    /// matching far bound — a layer behind the stage only ever gets smaller,
+    /// and no distance takes it out of the picture — so this is a floor and not
+    /// a range. Anything a *control* wants to bound the far side at is that
+    /// control's business.
+    ///
+    /// **Two bounds, whichever is the nearer to the stage.** [`NEAR_LIMIT`] is
+    /// the comfortable one and holds at every ordinary focal distance. It is
+    /// not sufficient on its own: it leaves a *fraction* of the focal distance
+    /// in front of the layer, and below ten units that fraction is smaller than
+    /// [`NEAR_PLANE`] — so a short lens would hand back a bound that
+    /// `depth_scale` refuses to draw, which is the one thing this must never
+    /// do. `NEAR_PLANE - focal` is that case stated exactly.
+    pub fn nearest_depth(&self) -> f64 {
+        // The same clamp `depth_scale` applies, so the two agree about where
+        // the lens is even for a focal distance smaller than the near plane.
+        let focal = self.focal_distance.max(NEAR_PLANE);
+        (-(focal * NEAR_LIMIT)).max(NEAR_PLANE - focal)
     }
 
     /// The transform for artwork on a layer at `depth`.
@@ -912,6 +952,35 @@ mod tests {
             (moved.x - (200.0 + 150.0)).abs() < 1e-9,
             "expected 100 x 1.5 = 150 from the centre, got {moved:?}"
         );
+    }
+
+    #[test]
+    /// **The bound the controls stop at must be a depth that still draws.**
+    ///
+    /// `nearest_depth` and `depth_scale` are two expressions of the same fact —
+    /// where the lens is — written apart, and a layer dragged exactly to the
+    /// bound and then not drawn would be the worst of both. Ties them together
+    /// so neither constant can be moved without the other.
+    #[test]
+    fn a_layer_at_the_nearest_depth_is_still_drawn() {
+        for focal in [1.0, 5.0, 50.0, 200.0, DEFAULT_FOCAL_DISTANCE, 6000.0] {
+            let mut track = CameraTrack::default();
+            track.focal_distance = focal;
+            let nearest = track.nearest_depth();
+            // Never *behind* the stage. It reaches zero only for a lens sitting
+            // on the near plane, where there is honestly no room in front of it
+            // — no control offers that, but a file or a script can.
+            assert!(nearest <= 0.0, "the bound is never behind the stage: {focal}");
+            assert!(
+                track.depth_scale(nearest).is_some(),
+                "a layer at the bound must still draw, at focal {focal}"
+            );
+            // And it is a real bound, not a formality: past it, nothing.
+            assert!(
+                track.depth_scale(-focal * 2.0).is_none(),
+                "well past the lens must not draw, at focal {focal}"
+            );
+        }
     }
 
     #[test]

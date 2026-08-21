@@ -36,14 +36,12 @@ pub struct DepthResponse {
     pub distribute: bool,
 }
 
-/// The depth range the panel offers.
+/// How far behind the stage the panel will drag a layer.
 ///
-/// Bounded well short of the camera: a layer may be brought forward, but the
-/// slider will not take it to the plane where the projection blows up. Typing
-/// a value past this is still possible through the document, and the renderer
-/// handles it by not drawing the layer — but a slider should not lead you
-/// somewhere the picture disappears.
-const NEAR_LIMIT: f64 = -0.9;
+/// There is no near constant to match it: how near the camera a layer may come
+/// is the camera's own business, and asking it
+/// ([`buzz_scene::CameraTrack::nearest_depth`]) is what stops this control and
+/// the timeline's depth column stopping in two different places.
 const FAR_LIMIT: f64 = 4.0;
 
 /// Draw the Layer Depth panel.
@@ -150,7 +148,7 @@ pub fn depth_panel(ui: &mut Ui, scene: &Scene, active: Option<LayerId>) -> Depth
                     .add(
                         egui::DragValue::new(&mut value)
                             .speed(5.0)
-                            .range(focal * NEAR_LIMIT..=focal * FAR_LIMIT),
+                            .range(scene.camera().nearest_depth()..=focal * FAR_LIMIT),
                     )
                     .changed()
                 {

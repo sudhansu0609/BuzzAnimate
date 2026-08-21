@@ -47,6 +47,10 @@ fn state() -> TimelineState {
         onion_after: 2,
         frame_width: 8.0,
         row_scale: 1.0,
+        parenting_view: false,
+        depth_view: false,
+        focal_distance: buzz_scene::DEFAULT_FOCAL_DISTANCE,
+        nearest_depth: -buzz_scene::DEFAULT_FOCAL_DISTANCE * 0.9,
         waveforms: std::collections::BTreeMap::new(),
     }
 }

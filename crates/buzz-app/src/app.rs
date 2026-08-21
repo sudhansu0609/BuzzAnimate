@@ -1523,7 +1523,10 @@ impl App {
 
         if let Some(distance) = response.set_focal_distance {
             self.editor.doc.edit("Camera Depth", |scene| {
-                scene.camera_mut().focal_distance = distance;
+                // Through the scene, not the field: moving the lens moves what
+                // counts as in front of it, and a layer left behind it is not
+                // drawn. See `Scene::set_focal_distance`.
+                scene.set_focal_distance(distance);
             });
         }
 
@@ -1738,6 +1741,7 @@ impl App {
                     parenting_view: self.editor.workspace.parenting_view,
                     depth_view: self.editor.workspace.depth_view,
                     focal_distance: self.editor.scene().camera().focal_distance,
+                    nearest_depth: self.editor.scene().camera().nearest_depth(),
                     waveforms: self.editor.waveforms(),
                 };
                 let response = buzz_ui::timeline_panel(ui, self.editor.scene(), &state);
@@ -1822,7 +1826,10 @@ impl App {
 
         if let Some(distance) = response.set_focal_distance {
             self.editor.doc.edit("Camera Depth", |scene| {
-                scene.camera_mut().focal_distance = distance;
+                // Through the scene, not the field: moving the lens moves what
+                // counts as in front of it, and a layer left behind it is not
+                // drawn. See `Scene::set_focal_distance`.
+                scene.set_focal_distance(distance);
             });
         }
 

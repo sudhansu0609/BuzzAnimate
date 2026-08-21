@@ -127,6 +127,10 @@ fn the_timeline_panel_is_bounded_on_the_monster() {
         onion_after: 2,
         frame_width: 8.0,
         row_scale: 1.0,
+        parenting_view: false,
+        depth_view: false,
+        focal_distance: buzz_scene::DEFAULT_FOCAL_DISTANCE,
+        nearest_depth: -buzz_scene::DEFAULT_FOCAL_DISTANCE * 0.9,
         waveforms: std::collections::BTreeMap::new(),
     };
 
@@ -216,6 +220,10 @@ fn committing_a_merged_monster_and_drawing_is_bounded() {
         onion_after: 2,
         frame_width: 8.0,
         row_scale: 1.0,
+        parenting_view: false,
+        depth_view: false,
+        focal_distance: buzz_scene::DEFAULT_FOCAL_DISTANCE,
+        nearest_depth: -buzz_scene::DEFAULT_FOCAL_DISTANCE * 0.9,
         waveforms: std::collections::BTreeMap::new(),
     };
     let ctx = egui::Context::default();

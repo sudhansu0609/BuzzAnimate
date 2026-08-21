@@ -57,7 +57,9 @@ use serde::{Deserialize, Serialize};
 pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, Quality};
 pub use buzz_light::{Light, LightId, LightKey, LightKind, LightRig, LightTrack};
 pub use bucket::{Boundary, GapSize, fill_region};
-pub use camera_track::{CameraKey, CameraTrack, MAX_TILT, NamedAngle};
+pub use camera_track::{
+    CameraKey, CameraTrack, DEFAULT_FOCAL_DISTANCE, MAX_TILT, NamedAngle,
+};
 pub use gradient::{
     Gradient, GradientHandles, GradientKind, GradientSpread, GradientStop, MAX_STOPS, lerp_color,
 };
@@ -483,6 +485,44 @@ impl Scene {
     pub fn camera_mut(&mut self) -> &mut CameraTrack {
         self.revision += 1;
         &mut self.camera
+    }
+
+    /// **Move the camera nearer or further, carrying the layers with it.**
+    ///
+    /// A layer's depth is measured from the focal plane, so what counts as in
+    /// front of the lens moves when the lens does. Setting the focal distance
+    /// through the field alone left every layer where it was: pull a 6000-unit
+    /// camera in to 200 and a layer parked at −5700 is suddenly four thousand
+    /// units *behind* it, `CameraTrack::depth_scale` answers `None`, and the
+    /// layer stops being drawn — artwork vanishing off the stage with nothing
+    /// on screen having touched it.
+    ///
+    /// So this is the way to set it. Any layer nearer than
+    /// [`CameraTrack::nearest_depth`] is carried forward to that bound — the
+    /// same one every control that moves a layer already respects. Only the
+    /// near side: a layer behind the stage merely gets smaller, and clamping it
+    /// would throw away staging that was never in danger. A layer already in
+    /// front of the new bound does not move at all, which is almost all of them
+    /// almost always, and every layer on the stage.
+    pub fn set_focal_distance(&mut self, distance: f64) {
+        // A distance that is not a distance would put `nearest_depth` on top of
+        // the stage and flatten every layer against it — a destructive edit
+        // from a value no control can produce but a script can. `from_parts`
+        // refuses the same values when reading a file, for the same reason.
+        if !distance.is_finite() || distance <= 0.0 {
+            return;
+        }
+        self.camera_mut().focal_distance = distance;
+        let nearest = self.camera.nearest_depth();
+        let squeezed: Vec<LayerId> = self
+            .layers()
+            .iter()
+            .filter(|l| l.depth < nearest)
+            .map(|l| l.id)
+            .collect();
+        for id in squeezed {
+            self.update_layer(id, |l| l.depth = nearest);
+        }
     }
 
     pub fn library(&self) -> &Library {
@@ -1885,6 +1925,66 @@ mod tests {
             );
         }
         (scene, layer)
+    }
+
+    /// **Pulling the camera in must not push a layer out of the picture.**
+    ///
+    /// A layer's depth is measured from the focal plane, so what counts as "in
+    /// front of the lens" moves when the lens does. Both depth controls bound a
+    /// *drag* against the focal distance of the moment — and then the camera
+    /// depth is its own slider, from 6000 down to 200, with nothing to say that
+    /// the layer parked at −5700 is now four thousand units behind the camera.
+    /// `depth_scale` answers `None` there, correctly, and the layer stops being
+    /// drawn: artwork vanishing off the stage with nothing on screen having
+    /// touched it.
+    #[test]
+    fn pulling_the_camera_in_keeps_every_layer_in_front_of_it() {
+        let mut scene = Scene::default();
+        let near = scene.add_layer("Near", LayerKind::Normal);
+        let far = scene.add_layer("Far", LayerKind::Normal);
+
+        scene.set_focal_distance(6000.0);
+        scene.update_layer(near, |l| l.depth = -5700.0);
+        scene.update_layer(far, |l| l.depth = 3000.0);
+        assert!(
+            scene.camera().depth_scale(-5700.0).is_some(),
+            "the fixture must start visible"
+        );
+
+        scene.set_focal_distance(200.0);
+
+        for layer in scene.layers().iter() {
+            assert!(
+                scene.camera().depth_scale(layer.depth).is_some(),
+                "{:?} at depth {} fell behind a 200-unit lens",
+                layer.name,
+                layer.depth
+            );
+        }
+        // The near layer is carried in rather than flattened onto the stage:
+        // it was in front, and it stays in front.
+        let depth = scene.layers().iter().find(|l| l.id == near).unwrap().depth;
+        assert!(depth < 0.0, "it must stay in front of the stage, not on it");
+        // The far layer never threatened anything and must not have moved.
+        let depth = scene.layers().iter().find(|l| l.id == far).unwrap().depth;
+        assert_eq!(depth, 3000.0, "a layer behind the stage is never in danger");
+    }
+
+    /// A focal distance that is not a distance must be refused rather than
+    /// flattening every layer onto the stage.
+    #[test]
+    fn a_nonsense_focal_distance_moves_nothing() {
+        let mut scene = Scene::default();
+        let layer = scene.add_layer("Near", LayerKind::Normal);
+        scene.set_focal_distance(4000.0);
+        scene.update_layer(layer, |l| l.depth = -3000.0);
+
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -100.0] {
+            scene.set_focal_distance(bad);
+            assert_eq!(scene.camera().focal_distance, 4000.0, "for {bad}");
+            let depth = scene.layers().iter().find(|l| l.id == layer).unwrap().depth;
+            assert_eq!(depth, -3000.0, "for {bad}");
+        }
     }
 
     /// Cloning a scene must be a pointer copy of the library, and editing one

@@ -99,7 +99,7 @@ fn measure_encode_zoomed_to_fit() {
     for _ in 0..2 {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &camera);
-        cache.begin(0);
+        cache.begin();
         document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut cache);
         cache.end();
     }
@@ -110,7 +110,7 @@ fn measure_encode_zoomed_to_fit() {
     for _ in 0..frames {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &camera);
-        cache.begin(0);
+        cache.begin();
         document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut cache);
         cache.end();
         n_paths = vs.encoding().n_paths;
@@ -131,7 +131,7 @@ fn measure_encode_zoomed_to_fit() {
     for _ in 0..2 {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &near);
-        cache.begin(0);
+        cache.begin();
         document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &near_options, &mut cache);
         cache.end();
     }
@@ -140,7 +140,7 @@ fn measure_encode_zoomed_to_fit() {
     for _ in 0..frames {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &near);
-        cache.begin(0);
+        cache.begin();
         document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &near_options, &mut cache);
         cache.end();
         near_paths = vs.encoding().n_paths;
@@ -172,7 +172,7 @@ fn measure_encode_zoomed_to_fit() {
     {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &camera);
-        reuse.begin(0);
+        reuse.begin();
         document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut reuse);
         reuse.end();
     }
@@ -187,7 +187,7 @@ fn measure_encode_zoomed_to_fit() {
     for _ in 0..frames {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &camera);
-        reuse.begin(0);
+        reuse.begin();
         document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut reuse);
         reuse.end();
     }
@@ -207,3 +207,150 @@ fn measure_encode_zoomed_to_fit() {
         "symbol reuse ({reuse_per:?}) is not much cheaper than encoding every instance ({per:?})"
     );
 }
+
+/// **Switching a light on must not draw the artwork again, once per pass.**
+///
+/// The guard that was missing. A GPU will only bind a buffer up to a limit —
+/// 128 MB on the hardware this was written against — and Vello's path data is
+/// one buffer. Nothing here had ever asked how large the encoding *was*, so a
+/// lighting pass that drew each shape a few more times looked right in every
+/// picture, stayed inside every timing budget, and then had a real document's
+/// frame refused by the driver, taking the process with it.
+///
+/// # There is no instancing
+///
+/// That is the fact the arithmetic turns on. `Scene::fill` re-encodes the path
+/// it is handed, every time: a shape drawn under six transforms costs six copies
+/// of its outline, not one copy and six matrices. So a lighting model that lays
+/// passes *over* the artwork pays for that artwork again per pass, and one that
+/// steps a ramp across a band pays for it once per step. Measured on a 28-layer
+/// Animate import: 615 thousand path segments unlit became **11.5 million**, and
+/// 9 MB of path data became 171 MB.
+///
+/// The fix is that a lamp goes into the **paint**. A lamp's light is radially
+/// symmetric about the point it stands over, so a solid colour under one is
+/// exactly a radial gradient of that colour lit at each radius — the shape is
+/// drawn once, as it always was, and a gradient costs stops, which are not
+/// geometry.
+///
+/// # Why this counts paths rather than bytes
+///
+/// Bytes are the thing that actually overflows, but they are a poor guard: a
+/// shading band is a boolean, and a boolean comes back flattened, so a band
+/// round a circle carries far more segments than the two cubics the circle was.
+/// That ratio is a property of the artwork and swamps the signal. **Path count**
+/// is exactly the quantity the failure moves — it is how many times something
+/// was encoded — and it is blind to how complex each one is.
+#[test]
+fn switching_a_light_on_does_not_draw_the_artwork_again_per_pass() {
+    use buzz_scene::{Light, LightId, LightKind};
+
+    // **Not `instance_heavy`.** Its parts are four units across, and a lamp
+    // barely varies over four units — so nothing would take the ramping path
+    // and this would measure the wrong thing entirely. These are shapes big
+    // enough for a lamp to fall off across, which is the case that has to stay
+    // affordable.
+    let mut scene = Scene::default();
+    scene.stage_mut().size = Size::new(1600.0, 1000.0);
+    let layer = scene.add_layer("Art", LayerKind::Normal);
+    for i in 0..1200 {
+        let x = 20.0 + ((i * 53) % 1540) as f64;
+        let y = 20.0 + ((i * 37) % 940) as f64;
+        scene.add_shape(
+            layer,
+            ShapeData::filled(
+                buzz_geom::Circle::new(Point::new(x, y), 26.0).to_path(0.05),
+                Color::from_rgb8(0xC0, 0xB8, 0xA8),
+            ),
+        );
+    }
+    let camera = Camera::new(Point::new(800.0, 500.0), 1.0, Size::new(1600.0, 1000.0));
+    // `lit` is off by default, so a test that leaves it there measures the unlit
+    // encode three times over and passes whatever happens.
+    let options = FrameOptions {
+        lit: true,
+        ..FrameOptions::default()
+    };
+
+    let encode = |scene: &Scene| {
+        let mut cache = DrawCache::new();
+        let mut vs = vello::Scene::new();
+        let mut builder = SceneBuilder::new(&mut vs, &camera);
+        cache.begin();
+        document::draw_frame_within(&mut builder, scene, 0, Affine::IDENTITY, &options, &mut cache);
+        cache.end();
+        let enc = vs.encoding();
+        (
+            enc.n_paths as usize,
+            enc.path_data.len() as f64 * 4.0 / 1048576.0,
+        )
+    };
+
+    assert!(!scene.lights().is_active(), "the baseline must be unlit");
+    let (unlit_paths, unlit_mb) = encode(&scene);
+
+    // A lamp, which is the expensive case: its light varies across the shapes it
+    // reaches, so those take the lit path rather than one flat tint.
+    scene.lights_mut().enabled = true;
+    scene.lights_mut().lights.push(Light::new(
+        LightId(1),
+        "Lamp",
+        LightKind::Lamp {
+            position: Point::new(400.0, 300.0),
+            height: 220.0,
+            radius: 400.0,
+        },
+    ));
+    assert!(scene.lights().is_active(), "the lamp must actually be on");
+    // And it has to be *ramping* somewhere, or this measures a flat tint and
+    // says nothing at all about what the ramping path costs.
+    assert!(
+        scene
+            .lights()
+            .field(
+                buzz_geom::Rect::new(360.0, 260.0, 440.0, 340.0),
+                0.0,
+                1000.0
+            )
+            .disc()
+            .is_some(),
+        "the lamp must vary across a shape beside it, or the path this guards is never taken"
+    );
+    let (lamp_paths, lamp_mb) = encode(&scene);
+
+    // A sun lights every shape in the document rather than only what is near it.
+    scene.lights_mut().lights.clear();
+    scene
+        .lights_mut()
+        .lights
+        .push(Light::new(LightId(2), "Sun", LightKind::sun()));
+    let (sun_paths, sun_mb) = encode(&scene);
+
+    eprintln!(
+        "encoded paths: unlit {unlit_paths} ({unlit_mb:.1} MB), lamp {lamp_paths} ({lamp_mb:.1} MB),          sun {sun_paths} ({sun_mb:.1} MB)"
+    );
+
+    // Lighting draws three things the unlit frame does not — the cast shadow and
+    // the two bands — and each is about one more outline. Four times the unlit
+    // count leaves room for that and nothing like enough for a pass that redraws
+    // the artwork, which lands at ten times and up.
+    for (what, paths) in [("a lamp", lamp_paths), ("a sun", sun_paths)] {
+        assert!(
+            paths <= unlit_paths * 4,
+            "{what} took the encoded path count from {unlit_paths} to {paths}. Something is \
+             drawing the artwork again per pass, and on a real document the GPU will refuse \
+             to bind the result."
+        );
+    }
+
+    // **A lamp must not cost materially more than a sun.** They light the same
+    // shapes with the same bands; the only difference is that a lamp's light is
+    // a ramp rather than one colour, and a ramp is stops rather than geometry.
+    // If a lamp ever starts compositing where a sun does not, it shows here.
+    assert!(
+        lamp_paths <= sun_paths + unlit_paths / 4,
+        "a lamp encoded {lamp_paths} paths against a sun's {sun_paths}; a lamp's falloff \
+         belongs in the paint, not in another pass over the artwork"
+    );
+}
+

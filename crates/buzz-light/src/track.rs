@@ -11,16 +11,19 @@
 //!
 //! # How this stays affordable
 //!
-//! The shading cache is keyed by [`Light::fingerprint`], per light. The renderer
-//! resolves the rig to concrete light values at the frame being drawn
-//! ([`LightRig::resolved_at`]) *before* the cache sees it, so:
+//! The shading cache is keyed by the **direction a crescent faces**, not by a
+//! light. The renderer resolves the rig to concrete light values at the frame
+//! being drawn ([`LightRig::resolved_at`]) *before* the cache sees it, so:
 //!
 //! * a **static** light resolves to the same values every frame — same
-//!   fingerprint, cache hit;
-//! * an **animating** light resolves to new values — new fingerprint, rebuild,
-//!   which is unavoidable and by construction;
-//! * animating light A leaves light B's entries alone, because the keys are per
-//!   light.
+//!   direction, cache hit;
+//! * a light animating in anything but its aim — brightening, warming, rising
+//!   and falling in the sky — also hits, because none of those turns a
+//!   terminator;
+//! * a light animating its *aim* rebuilds, which is unavoidable, and rounds to
+//!   the cache's step, so a slow sweep rebuilds far less often than it moves;
+//! * animating light A leaves light B's entries alone, and two lights lying the
+//!   same way share one.
 //!
 //! That is the whole design, and it falls out of the cache that already exists.
 
@@ -234,6 +237,27 @@ fn lerp_kind(a: LightKind, b: LightKind, t: f64) -> LightKind {
             position: Point::new(lerp(p_a.x, p_b.x, t), lerp(p_a.y, p_b.y, t)),
             height: lerp(h_a, h_b, t),
             radius: lerp(r_a, r_b, t),
+        },
+        (
+            LightKind::Gloom {
+                edge: e_a,
+                facing: f_a,
+                throw: t_a,
+                width: w_a,
+            },
+            LightKind::Gloom {
+                edge: e_b,
+                facing: f_b,
+                throw: t_b,
+                width: w_b,
+            },
+        ) => LightKind::Gloom {
+            edge: Point::new(lerp(e_a.x, e_b.x, t), lerp(e_a.y, e_b.y, t)),
+            // The shortest way round, like a sun's azimuth: a wall swung past
+            // due-west must not take the long route back.
+            facing: lerp_angle(f_a, f_b, t),
+            throw: lerp(t_a, t_b, t),
+            width: lerp(w_a, w_b, t),
         },
         // Mismatched variants: hold the first. Not reachable from the editor.
         _ => a,

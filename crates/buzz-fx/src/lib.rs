@@ -473,6 +473,30 @@ pub enum Blend {
 }
 
 impl Blend {
+    /// **The colour that changes nothing** under this blend.
+    ///
+    /// White for a multiply, black for anything that lightens: painting it
+    /// leaves the destination exactly as it was. That is what lets a pass be
+    /// *faded out* from the inside — draw the effect, then paint towards the
+    /// identity where it should not reach — without needing to erase, which
+    /// costs a compositing mode of its own and therefore a layer per step.
+    ///
+    /// `None` for a blend with no such colour: under Normal every colour is
+    /// drawn as itself, and the only way to change nothing is to draw nothing.
+    pub fn identity(self) -> Option<peniko::Color> {
+        match self {
+            // `dst × 1` and `min(dst, 1)`.
+            Self::Multiply | Self::Darken => Some(peniko::Color::WHITE),
+            // `1 − (1 − dst)(1 − 0)`, `max(dst, 0)`, and `dst + 0`.
+            Self::Screen | Self::Lighten | Self::Add => Some(peniko::Color::BLACK),
+            // `|dst − 0|`.
+            Self::Difference => Some(peniko::Color::BLACK),
+            // Overlay and hard light take mid grey to themselves only where the
+            // destination is mid grey; there is no one colour that is inert.
+            Self::Normal | Self::Layer | Self::Overlay | Self::HardLight => None,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal => "Normal",

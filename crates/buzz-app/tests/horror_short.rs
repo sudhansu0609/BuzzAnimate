@@ -1217,7 +1217,7 @@ fn the_waveform_and_onion_skins_are_cheap_enough_to_live_with() {
         let scene = editor.scene();
         let started = Instant::now();
         // One cache generation for the whole screen frame, as the stage does.
-        cache.begin(scene.lights().fingerprint());
+        cache.begin();
         for ghost in editor.onion_frames() {
             buzz_render::document::draw_frame_within(
                 &mut builder,
@@ -1412,7 +1412,7 @@ fn a_heavy_scene_still_draws_and_edits() {
         let mut builder = buzz_render::SceneBuilder::new(vello, &editor.camera);
         let scene = editor.scene();
         let started = Instant::now();
-        cache.begin(scene.lights().fingerprint());
+        cache.begin();
         buzz_render::document::draw_frame_within(
             &mut builder,
             scene,

@@ -44,6 +44,15 @@ pub struct FrameOptions {
     /// check. Off is for the authoring passes that want the artwork as drawn —
     /// onion-skin ghosts, which are reference rather than picture.
     pub lit: bool,
+    /// Draw the lamps' pools of light over the finished frame.
+    ///
+    /// On by default, and separate from `lit` because it belongs to the **frame**
+    /// rather than to a layer: a pool is light in the air, laid once over
+    /// everything, where shading and shadows are drawn per layer. A screen frame
+    /// that draws the document several times over — Edit Multiple Frames — wants
+    /// exactly one of them, so the extra passes turn this off and keep their
+    /// shading.
+    pub pools: bool,
     /// Honour each layer's working transparency.
     ///
     /// **Off by default, which is the export.** Layer transparency is a thing
@@ -79,6 +88,9 @@ impl Default for FrameOptions {
             ghost_outlines: false,
             masks: MaskDisplay::default(),
             lit: false,
+            // Gated by `lit` anyway, so a pass that wants no lighting gets no
+            // pools without having to say so twice.
+            pools: true,
             layer_alpha: false,
             place: Affine::IDENTITY,
             cull: None,
@@ -149,6 +161,224 @@ pub struct DrawCache {
     pub symbols: SymbolTable,
     /// Whole eligible symbols encoded once and stamped per instance.
     pub symbol_scenes: SymbolSceneCache,
+    /// The gradients a ramping lamp is drawn with, and the light field they were
+    /// built from. One entry: every shape a lamp reaches asks for the same
+    /// three, so the first shape of a frame builds them and the rest share.
+    lamp: Option<(u64, Arc<LampPaints>)>,
+    /// How much of the light this cache's frames can afford to draw. See
+    /// [`LightDetail`].
+    detail: LightDetail,
+    /// What the last frame judged by [`DrawCache::reconsider`] cost, for the
+    /// HUD and for tests that need to see the number the level was chosen from.
+    encode: u32,
+    /// A level held against the judgement, for a caller that has already
+    /// decided — a test measuring one level, or an animator who would rather
+    /// have the modelling off than have it come and go.
+    pinned: Option<LightDetail>,
+}
+
+/// **How much of the light a frame can afford to draw.**
+///
+/// # Why a frame can fail to afford it
+///
+/// Vello rasterises from fixed-size buffers, sized once in
+/// `vello_encoding::BufferSizes` from numbers its own comment calls "hand
+/// picked". The one that matters here holds `1 << 21` flattened lines. Past
+/// that the bump allocator fails, and `Renderer::render_to_texture` — the call
+/// the window and the exporter both make — **does not check**: the fine pass
+/// writes nothing and the target keeps whatever was in it before.
+///
+/// So an over-large frame is not slow, and it is not wrong. It is *absent*.
+/// The window presents the previous picture again, which is indistinguishable
+/// from nothing having changed — and since what most often pushes a frame over
+/// is switching the lights on, what it looks like is that the lights do
+/// nothing. Measured on the film this was reported from: 1.57 M lines unlit,
+/// 1.90 M with the light's colour and its cast shadows, and 3.46 M once the
+/// shading crescents were added — 165% of the buffer, so every lit frame was
+/// discarded and the stage sat on its last unlit one. Switching the lamp on,
+/// moving it, recolouring it, even setting the ambient to pure red, all
+/// produced a byte-identical picture.
+///
+/// # What is given up, and in what order
+///
+/// The artwork itself is never given up: a frame that cannot draw its own
+/// drawing has nothing to say. What lighting adds is given up instead, cheapest
+/// thing kept longest:
+///
+/// * **The tint is never given up.** A lit colour is folded into the paint the
+///   shape was going to be drawn with anyway ([`buzz_light::Illumination::apply`]),
+///   so it costs no geometry at all. Neither does a lamp's pool, which is one
+///   circle for the whole frame. At every level below, the light still colours
+///   the picture and still lays its pool — the light *works*.
+/// * **The modelling goes first.** A terminator and a highlight are a boolean
+///   difference each, and on dense artwork they come out at about 4.7× the
+///   geometry of the shape they model. That is the one part of lighting whose
+///   cost is a multiple of the drawing's own.
+/// * **Then the cast shadows**, which are the artwork under one affine — about
+///   1× — and only reached by a document whose artwork alone is close to the
+///   ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LightDetail {
+    /// Everything: tint, pool, cast shadows, terminator and highlight.
+    #[default]
+    Full,
+    /// No terminator and no highlight. Tint, pool and cast shadows stand.
+    NoModelling,
+    /// Tint and pool only.
+    Flat,
+}
+
+impl LightDetail {
+    /// May a shape draw its terminator and highlight?
+    fn models(self) -> bool {
+        self == Self::Full
+    }
+
+    /// May a shape cast a shadow?
+    fn casts(self) -> bool {
+        self != Self::Flat
+    }
+
+    fn down(self) -> Self {
+        match self {
+            Self::Full => Self::NoModelling,
+            Self::NoModelling | Self::Flat => Self::Flat,
+        }
+    }
+
+    fn up(self) -> Self {
+        match self {
+            Self::Flat => Self::NoModelling,
+            Self::NoModelling | Self::Full => Self::Full,
+        }
+    }
+
+    /// How small a frame has to be here before it is worth stepping up.
+    ///
+    /// **Stepping up has to be safe, or the two levels alternate for ever, one
+    /// frame each.** So the room asked for is the room the step itself needs.
+    /// Measured on the film this was reported from — 617 k encoded segments
+    /// flat, 931 k with cast shadows, 2.47 M with the modelling as well —
+    /// shadows cost about half as much again and modelling about two and a half
+    /// times on top. Both bounds below are well past those, so a frame small
+    /// enough to step up is small enough to stay stepped up.
+    ///
+    /// Conservative on purpose, and it errs the same way everything else here
+    /// does: a document between the two thresholds keeps a level it might have
+    /// climbed out of, which costs it some shading. The other mistake costs it
+    /// the frame.
+    fn room_to_step_up(self) -> u32 {
+        match self {
+            Self::Flat => SEGMENT_CEILING / 3,
+            Self::NoModelling => SEGMENT_CEILING / 6,
+            Self::Full => u32::MAX,
+        }
+    }
+}
+
+/// **The encoded path segments a frame may reach before lighting is trimmed.**
+///
+/// Vello's line buffer holds `1 << 21` — 2.1 M — flattened lines. What a
+/// segment costs in lines is a property of the artwork and of the zoom, because
+/// flattening is to a tolerance in *device* pixels: measured over the film this
+/// was reported from, 2.5 lines per segment for the drawing itself and 1.4 for
+/// a frame mostly made of generated shading, which is straighter. Eight hundred
+/// thousand segments is that buffer at the pessimistic end of the range, with
+/// the margin on the side that matters — trimming early costs a document some
+/// shading, trimming late costs it the frame.
+///
+/// The same document rendered larger is dearer: more device pixels means a
+/// finer tolerance and so more lines from the same segments. This does not know
+/// the output size, which is the other reason for the margin.
+///
+/// It is deliberately not a count of lines. The flattening happens on the GPU
+/// and cannot be asked about before the frame is submitted, so the only honest
+/// number available beforehand is the one Vello has already written down. See
+/// [`crate::SceneBuilder::encoded_segments`].
+pub const SEGMENT_CEILING: u32 = 800_000;
+
+impl DrawCache {
+    /// The lamp's gradients, built if this is the first shape to ask.
+    ///
+    /// Keyed on [`buzz_light::LightField::fingerprint`], which moves when — and
+    /// only when — the gradients would differ. A rig of one lamp over one layer
+    /// therefore builds them once a frame however many shapes it lights, while a
+    /// sky mixing by height still gives shapes at different heights their own.
+    fn lamp_paints(
+        &mut self,
+        field: &buzz_light::LightField,
+        centre: buzz_geom::Point,
+        reach: f64,
+    ) -> Arc<LampPaints> {
+        let key = field.fingerprint();
+        if let Some((cached, paints)) = &self.lamp
+            && *cached == key
+        {
+            return Arc::clone(paints);
+        }
+        let paints = Arc::new(LampPaints::build(field, centre, reach));
+        self.lamp = Some((key, Arc::clone(&paints)));
+        paints
+    }
+
+    /// How much of the light the frames drawn through this cache may show.
+    pub fn detail(&self) -> LightDetail {
+        self.detail
+    }
+
+    /// The encoded path segments of the last frame judged, in the units
+    /// [`SEGMENT_CEILING`] is expressed in.
+    pub fn last_encode(&self) -> u32 {
+        self.encode
+    }
+
+    /// Hold the level here, or (`None`) let each frame be judged again.
+    pub fn pin_detail(&mut self, pinned: Option<LightDetail>) {
+        self.pinned = pinned;
+        if let Some(detail) = pinned {
+            self.detail = detail;
+        }
+    }
+
+    /// **Judge the encode just finished, and say whether to build it again.**
+    ///
+    /// Called by whoever owns the `vello::Scene` — the window's stage pass, the
+    /// exporter — with [`crate::SceneBuilder::encoded_segments`] once the frame
+    /// is built and before it is submitted. A `true` answer means the level has
+    /// changed and this frame must be encoded a second time at the new one;
+    /// build in a loop until it answers `false`. It answers `false` on the
+    /// second pass at the latest for any given frame, because a level is only
+    /// ever stepped one at a time and there are three of them.
+    ///
+    /// Judging *after* the encode rather than guessing before it is the whole
+    /// point: the number is Vello's own count of what it will rasterise, so it
+    /// cannot disagree with what was drawn. The cost is one wasted encode on
+    /// the frame where the verdict changes, and the verdict is remembered, so
+    /// every frame after it builds once.
+    ///
+    /// A frame still over the ceiling at [`LightDetail::Flat`] is a frame whose
+    /// *artwork* will not fit, which no amount of trimming the lights can
+    /// mend; the level stops there rather than pretending otherwise.
+    pub fn reconsider(&mut self, segments: u32) -> bool {
+        self.encode = segments;
+        if self.pinned.is_some() {
+            return false;
+        }
+        let was = self.detail;
+        if segments > SEGMENT_CEILING {
+            self.detail = self.detail.down();
+        } else if segments < self.detail.room_to_step_up() {
+            self.detail = self.detail.up();
+        }
+        if self.detail == was {
+            return false;
+        }
+        // The pass just judged is being thrown away, so the shading it recorded
+        // as owed is owed for shapes the replacement will not shade. See
+        // `LightCache::discard_frame`.
+        self.lights.discard_frame();
+        true
+    }
 }
 
 /// Resolved document-space bounds of instances, kept between frames so culling
@@ -639,8 +869,8 @@ impl DrawCache {
     /// one shares it, which is what the eviction budget was written for — the
     /// comment on `KEEP_FRAMES` says "enough to cover onion skinning" and this
     /// is what finally makes that true.
-    pub fn begin(&mut self, lights: u64) {
-        self.lights.begin(lights);
+    pub fn begin(&mut self) {
+        self.lights.begin();
         self.filters.begin();
         self.bounds.begin();
         self.symbol_scenes.begin();
@@ -682,6 +912,10 @@ pub fn draw_frame_lit(
         bounds: BoundsCache::default(),
         symbols: SymbolTable::default(),
         symbol_scenes: SymbolSceneCache::default(),
+        lamp: None,
+        detail: LightDetail::default(),
+        encode: 0,
+        pinned: None,
     };
     draw_frame_cached(builder, scene, frame, camera, options, &mut cache);
     *lights = cache.lights;
@@ -700,11 +934,7 @@ pub fn draw_frame_cached(
     options: &FrameOptions,
     cache: &mut DrawCache,
 ) {
-    cache.begin(if options.lit {
-        scene.lights().fingerprint()
-    } else {
-        0
-    });
+    cache.begin();
     draw_frame_within(builder, scene, frame, camera, options, cache);
     cache.end();
 }
@@ -889,6 +1119,140 @@ fn draw_layers(
     }
 
     close_mask(builder, open);
+
+    // **Last, over everything: the light itself.**
+    //
+    // A lamp's pool is light in the air, so it belongs to the frame and not to
+    // any layer in it — drawn once, after all the artwork, over whatever the
+    // artwork turned out to be. That is also why it is here rather than inside
+    // `draw_layer`: one filled circle per lamp per frame, however many shapes it
+    // falls across.
+    // **The dark first, then the light.**
+    //
+    // Both belong to the frame rather than to any layer in it, and the order
+    // between them is the whole point of having both: a pool laid over the
+    // gloom cuts a hole through it, which is what a lamp in a dark room does.
+    // The other way round the gloom would fall on the pool and the lamp would
+    // be dimmed by the very darkness it is supposed to be beating.
+    draw_gloom_bands(builder, scene, frame, camera, options, &lights);
+    draw_light_pools(builder, scene, frame, camera, options, &lights);
+}
+
+/// Draw each gloom's wall of dark over the finished artwork.
+///
+/// See [`buzz_light::gloom_band`] for what one is and why the darkness is drawn
+/// rather than folded into the artwork's colours. Nothing here is cached, for
+/// the same reason a pool is not: it is a quad and a gradient, rebuilt each
+/// frame for the cost of neither, which is what lets it follow a wall being
+/// dragged.
+///
+/// Gated on `pools` along with the lamps' pools, and for the identical reason —
+/// this is one statement about the *frame*, and Edit Multiple Frames would
+/// otherwise stack six copies of the same darkness on one picture.
+fn draw_gloom_bands(
+    builder: &mut SceneBuilder<'_>,
+    scene: &Scene,
+    frame: u32,
+    camera: Affine,
+    options: &FrameOptions,
+    lights: &buzz_scene::LightRig,
+) {
+    if !options.lit || !options.pools || !lights.is_active() {
+        return;
+    }
+
+    // At the focal plane, like the stage itself and like a pool: a wall of dark
+    // is not artwork on a layer and has no depth of its own to be moved by.
+    let projection = scene
+        .camera_projection_at_depth(frame, 0.0)
+        .unwrap_or_else(|| Projection::from_affine(camera))
+        .pre_affine(options.place);
+
+    for light in lights.lights.iter().filter(|l| l.enabled) {
+        let Some(band) = buzz_light::gloom_band(light) else {
+            continue;
+        };
+
+        // The stops are already the colours to multiply by — opaque, ending at
+        // white — so the alpha channel carries nothing and the blend is a plain
+        // multiply. That is the same convention `Illumination::as_filter` uses
+        // for a light, which is what makes the two land on the same arithmetic.
+        let stops: Vec<buzz_scene::GradientStop> = band
+            .ramp
+            .iter()
+            .map(|(at, surviving)| buzz_scene::GradientStop::new(*at, *surviving))
+            .collect();
+        let mut gradient = buzz_scene::Gradient::new(buzz_scene::GradientKind::Linear, stops);
+        gradient.transform = band.ramp_transform();
+        let paint = buzz_scene::Paint::Gradient(Arc::new(gradient));
+
+        let quad = band.quad();
+        let drawn = projection.map_path(&quad, builder.tolerance());
+        // `SrcAtop`, so the dark lands on the picture and nowhere else. A gloom
+        // stood off the stage reaches across it, and source-over would paint
+        // its quad straight onto the transparency outside the frame.
+        builder.fill_shape_atop_paint(
+            &drawn,
+            &paint,
+            brush_projection(&projection, quad.bounding_box()),
+            buzz_fx::Blend::Multiply,
+        );
+    }
+}
+
+/// Draw each lamp's pool of light over the finished artwork.
+///
+/// See [`buzz_light::light_pool`] for what a pool is and why a lamp needs one.
+/// Nothing here is cached: a pool is a gradient and a circle, rebuilt each frame
+/// for the cost of neither, which is what lets it follow a lamp being dragged.
+fn draw_light_pools(
+    builder: &mut SceneBuilder<'_>,
+    scene: &Scene,
+    frame: u32,
+    camera: Affine,
+    options: &FrameOptions,
+    lights: &buzz_scene::LightRig,
+) {
+    if !options.lit || !options.pools || !lights.is_active() {
+        return;
+    }
+
+    // At the focal plane, like the stage itself: a pool is not artwork on a
+    // layer and has no depth of its own to be moved by.
+    let projection = scene
+        .camera_projection_at_depth(frame, 0.0)
+        .unwrap_or_else(|| Projection::from_affine(camera))
+        .pre_affine(options.place);
+
+    for light in lights.lights.iter().filter(|l| l.enabled) {
+        let Some(pool) = buzz_light::light_pool(light, 0.0) else {
+            continue;
+        };
+
+        // The ramp, as the lamp's own colour fading to nothing. Alpha carries
+        // how much light arrives, so the colour stays the light's at every
+        // radius and only its presence changes — which is what keeps a warm
+        // lamp warm all the way out instead of drifting towards grey.
+        let stops: Vec<buzz_scene::GradientStop> = pool
+            .ramp
+            .iter()
+            .map(|(at, arriving)| {
+                buzz_scene::GradientStop::new(*at, light.color.multiply_alpha(*arriving))
+            })
+            .collect();
+        let mut gradient = buzz_scene::Gradient::new(buzz_scene::GradientKind::Radial, stops);
+        let disc = buzz_geom::Circle::new(pool.centre, pool.reach);
+        gradient.fit_to(disc.bounding_box());
+        let paint = buzz_scene::Paint::Gradient(Arc::new(gradient));
+
+        let path = disc.to_path(builder.tolerance());
+        let drawn = projection.map_path(&path, builder.tolerance());
+        builder.fill_shape_paint_lit(
+            &drawn,
+            &paint,
+            brush_projection(&projection, disc.bounding_box()),
+        );
+    }
 }
 
 /// A mask group being drawn, and how it is closed.
@@ -1093,16 +1457,27 @@ fn draw_layer(
         // layer made two squares either side of a lamp exactly as bright as
         // each other, which is a sun pretending to be a lamp.
         let lighting = lit.then_some((stage_height, layer.depth));
-
         // Where this stack sits — identity unless a symbol is open in place —
         // and then layer parenting, both in the plane, before the lens.
         let projection = projection.pre_affine(options.place).pre_affine(follows);
 
+        // How this layer's shadows are thrown, if they are. Worked out once
+        // here: it depends on the light and on how far this layer's artwork
+        // stands above the surface catching it, and on nothing about any shape.
+        // The cull below needs it and so does the shadow pass, and they must
+        // agree — a caster culled away casts nothing.
+        // Trimmed away at `LightDetail::Flat`, where nothing generated fits;
+        // `None` here removes the shadow pass and the margin the cull below
+        // grows for it in one go, exactly as an unlit layer does.
+        let shadow = (lit && cache.detail().casts())
+            .then(|| rig.key())
+            .flatten()
+            .and_then(|key| buzz_light::shadow_transform(key, scene.shadow_height(layer.depth, key)));
+
         // Culling is safe only where document-space bounds compare directly to
         // the viewport and nothing off-screen can reach into it: a flat camera,
-        // a depth-zero layer (so no perspective moves the artwork), no mask (a
-        // mask needs its whole geometry), and no key light (a cast shadow can
-        // fall in from an off-screen caster). When any of these does not hold,
+        // a depth-zero layer (so no perspective moves the artwork), and no mask
+        // (a mask needs its whole geometry). When any of these does not hold,
         // the layer draws everything, exactly as before.
         let cull = options
             .cull
@@ -1115,16 +1490,26 @@ fn draw_layer(
                     )
             })
             .map(|rect| {
-                // A key light casts shadows from artwork just off the edge into
-                // view. Rather than turn culling off — which draws the whole
-                // document every frame and froze a lit rig-heavy import — the
-                // lit layer keeps culling but widens the rectangle to reach in
-                // for those casters, so the work stays bounded by the view.
-                if lit && rig.key().is_some() {
-                    let margin = rect.width().max(rect.height());
-                    rect.inflate(margin, margin)
-                } else {
-                    rect
+                // **A key light casts shadows into view from artwork off the
+                // edge, and the shadow itself says exactly how far off.**
+                //
+                // A caster whose shadow lands in `rect` is one for which
+                // `shadow · caster` is in `rect`, so the casters that matter are
+                // precisely those in `shadow⁻¹(rect)`. Taking that and the view
+                // together is the smallest rectangle that can miss nothing.
+                //
+                // It used to be `rect` grown by its own longest side — nine
+                // times the area, drawn every frame, whatever the light was
+                // doing. A high sun throws a shadow a few units long and now
+                // costs a few units of margin; a lamp *shrinks* the rectangle,
+                // because its shadows splay outwards, so a lit lamp scene culls
+                // to very nearly the view. That factor of nine, on every lit
+                // frame of a document larger than the window, is most of what
+                // made switching lighting on feel like switching responsiveness
+                // off.
+                match shadow {
+                    Some(shadow) => rect.union(shadow.inverse().transform_rect_bbox(rect)),
+                    None => rect,
                 }
             });
 
@@ -1160,20 +1545,16 @@ fn draw_layer(
         // each one just before its own shape would let a character's shadow
         // land on the character standing next to it on the same layer, which
         // is never what a flat drawing means.
-        if lit && let Some(key) = rig.key() {
-            let height = scene.shadow_height(layer.depth, key);
-            for (object, owner) in resolved.iter_owned() {
-                cast_shadows(
-                    builder,
-                    object,
-                    owner,
-                    Affine::IDENTITY,
-                    key,
-                    height,
-                    layer.depth,
-                    cache,
-                    &ctx,
-                );
+        //
+        // The projection was worked out **once for the layer**, above. A layer
+        // whose key light throws nothing — a sky, shadows switched off, a light
+        // down on the surface — skips the whole pass here rather than
+        // discovering it a shape at a time.
+        if let Some(shadow) = shadow
+            && let Some(key) = rig.key()
+        {
+            for object in resolved.iter() {
+                cast_shadows(builder, object, Affine::IDENTITY, key, shadow, &ctx);
             }
         }
 
@@ -1446,29 +1827,126 @@ impl DrawCtx<'_> {
     /// is not a visible difference; the alternative is dropping to a flat
     /// colour, which is. Recorded as a deviation in PROGRESS.md §7.
     fn brush_projection(&self, bounds: buzz_geom::Rect) -> Affine {
-        if let Some(a) = self.projection.as_affine() {
-            return a;
-        }
-        let (w, h) = (bounds.width(), bounds.height());
-        // A shape with no extent in one axis gives no second point to fit
-        // against, and dividing by it would put NaN into the matrix.
-        if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
-            return Affine::IDENTITY;
-        }
-        let o = bounds.origin();
-        let corner = |p: buzz_geom::Point| self.projection.map_point(p);
-        let (Some(p0), Some(px), Some(py)) = (
-            corner(o),
-            corner(buzz_geom::Point::new(o.x + w, o.y)),
-            corner(buzz_geom::Point::new(o.x, o.y + h)),
-        ) else {
-            // Behind the camera. Nothing will be drawn anyway.
-            return Affine::IDENTITY;
-        };
-        let cx = (px - p0) / w;
-        let cy = (py - p0) / h;
-        Affine::new([cx.x, cx.y, cy.x, cy.y, p0.x, p0.y])
+        brush_projection(&self.projection, bounds)
     }
+}
+
+/// **The dark edge one wall of dark leaves on one shape.**
+///
+/// The counterpart of the highlight: where the terminator says which side of a
+/// figure the key light is *not* on, this says which side the darkness is
+/// arriving from. A gloom without it is a wash — the figures standing in it go
+/// down evenly and lose their form, which is the same complaint a flat tint
+/// gets from a light.
+///
+/// # Why it goes through the crescent cache
+///
+/// It was drawn live first, as a clip and a punch: two fills and no geometry,
+/// exact on the frame the wall moved. That is a lovely property and it cost
+/// four encoded paths a shape — with the rim as well, five and a half times the
+/// unlit encode over twelve hundred shapes, which `encode_cost` exists to
+/// refuse and was right to. Lighting draws about one more outline per shape and
+/// this is one more outline per shape.
+///
+/// Keyed on the gloom's own bearing, so it shares nothing with the key light's
+/// entry and a wall being dragged does not throw away the terminators.
+#[allow(clippy::too_many_arguments)]
+fn draw_gloom_edge(
+    builder: &mut SceneBuilder<'_>,
+    ctx: &DrawCtx<'_>,
+    cache: &mut DrawCache,
+    owner: Option<&Arc<buzz_scene::Object>>,
+    index: u16,
+    placed: &buzz_geom::BezPath,
+    doc: Affine,
+    here: buzz_geom::Point,
+) {
+    use buzz_geom::Shape as _;
+
+    // A gloom's edge is a crescent by another name — the same cache, the same
+    // boolean — so it is given up with the rest of the modelling.
+    if !cache.detail().models() {
+        return;
+    }
+    let modelling = ctx.lights.modelling;
+    if modelling <= 0.01 {
+        return;
+    }
+
+    // **No edge on a backdrop.**
+    //
+    // A shape that runs past the sides of the frame has no edge *in shot*: its
+    // outline is the frame. A band along it is the edge of the paper going
+    // dark, not a figure. Measured against the stage rather than the visible
+    // rectangle, which is inflated for culling and moves with the zoom.
+    let bounds = placed.bounding_box();
+    let stage = ctx.scene.stage().stage_rect();
+    if bounds.width() >= stage.width() && bounds.height() >= stage.height() {
+        return;
+    }
+
+    // One gloom, the deepest here. Two walls overlapping on one edge would
+    // darken it twice and read as dirt, which is the same reason the terminator
+    // follows one key light rather than summing the rig.
+    let Some((light, (facing, deep))) = ctx
+        .lights
+        .lights
+        .iter()
+        .filter_map(|light| buzz_light::gloom_at(light, here).map(|got| (light, got)))
+        .max_by(|a, b| a.1.1.total_cmp(&b.1.1))
+    else {
+        return;
+    };
+
+    let alpha = (deep * modelling * 0.75).clamp(0.0, 1.0);
+    if alpha <= 0.02 {
+        return;
+    }
+
+    // The band belongs on the side the darkness arrives from, which is the side
+    // the wall is on — so the direction handed to the cache is *back along* the
+    // throw, and what is wanted from it is the near-side crescent.
+    let geometry = cache
+        .lights
+        .crescents(owner, index, placed, doc, -facing, light.softness);
+    let Some(edge) = &geometry.highlight else {
+        return;
+    };
+
+    let drawn = ctx.project(edge, builder.tolerance());
+    builder.fill_shape_atop(
+        &drawn,
+        light.color.multiply_alpha(alpha),
+        buzz_fx::Blend::Multiply,
+    );
+}
+
+/// [`DrawCtx::brush_projection`], for callers that have a projection and no
+/// context — the light pools, which belong to the frame rather than to any one
+/// layer's draw walk.
+fn brush_projection(projection: &Projection, bounds: buzz_geom::Rect) -> Affine {
+    if let Some(a) = projection.as_affine() {
+        return a;
+    }
+    let (w, h) = (bounds.width(), bounds.height());
+    // A shape with no extent in one axis gives no second point to fit
+    // against, and dividing by it would put NaN into the matrix.
+    if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
+        return Affine::IDENTITY;
+    }
+    let o = bounds.origin();
+    let corner = |p: buzz_geom::Point| projection.map_point(p);
+    let (Some(p0), Some(px), Some(py)) = (
+        corner(o),
+        corner(buzz_geom::Point::new(o.x + w, o.y)),
+        corner(buzz_geom::Point::new(o.x, o.y + h)),
+    ) else {
+        // Behind the camera. Nothing will be drawn anyway.
+        return Affine::IDENTITY;
+    };
+    let cx = (px - p0) / w;
+    let cy = (py - p0) / h;
+    Affine::new([cx.x, cx.y, cy.x, cy.y, p0.x, p0.y])
 }
 
 /// Draw one object.
@@ -2003,121 +2481,278 @@ fn draw_shape(
 
     // Where this shape sits in the document, which is what the lights are
     // measured against.
-    let here = placed.bounding_box().center();
-    let light = ctx
+    //
+    // **The whole region it covers, not only its middle.** A lamp's light falls
+    // off, and the falloff *is* the lamp: asked at one point, a lamp answers
+    // with one colour, and a shape filled with it shows no falloff at all —
+    // a wall came out flat, and the near side of a face was exactly as bright
+    // as the far side of the same face. `LightRig::field` answers for the
+    // region, carrying the ramp the renderer needs to lay the light per pixel.
+    let region = placed.bounding_box();
+    let here = region.center();
+    let field = ctx
         .lighting
-        .map(|(stage_height, depth)| ctx.lights.illuminate(here, depth, stage_height));
-
+        .map(|(stage_height, depth)| ctx.lights.field(region, depth, stage_height));
+    // The single-colour answer, for everything that cannot carry a ramp: a
+    // stroke, blurred artwork, and the cast shadow.
+    let light = field.as_ref().map(|f| f.uniform());
     // Where a gradient's unit space lands. The gradient is stored in the
     // shape's own coordinates, so `doc` puts it in the document, and the
     // projection puts it on the frame — the same two steps the path took above.
     let brush_to_doc = ctx.brush_projection(placed.bounding_box()) * doc;
 
     if let Some(fill) = &shape.fill {
-        // The light reaches the fill first: this is the tint that makes a warm
-        // key look warm and a blue sky fill look cold, before any geometry is
-        // drawn on top of it. A gradient takes it stop by stop, so a lit ramp
-        // stays a ramp.
-        let base = match &light {
-            Some(light) => fill.paint.map_colors(|c| light.apply(c)),
-            None => fill.paint.clone(),
-        };
-        let paint = ctx.paint(&base);
-        let color = paint.color();
+        // **A bitmap takes the light as a blend, not as a colour.**
+        //
+        // Everything in the branch below lights artwork by rewriting its paint,
+        // and a paint made of pixels has nothing to rewrite: `map_colors`
+        // returns an image untouched, by design — recolouring thirty million
+        // pixels would cost more than the frame they are drawn in. So an
+        // imported drawing, a photograph, and anything Break Apart produces
+        // went through the whole lit path and came out exactly as painted. No
+        // tint, no shaded side, no highlight. On a document made of pictures
+        // that is not "lighting is subtle here", it is the lights doing
+        // nothing at all.
+        //
+        // The light is composited over the picture instead; see
+        // [`draw_lit_composited`], which draws the same three things in the same
+        // order and lands on the same colours.
+        //
+        // **A lamp needs the same treatment, for the same reason one step
+        // removed.** Rewriting a fill's colours can only produce one colour per
+        // stop, so a lamp falling off across the shape has nowhere to put its
+        // falloff. Composited, the light is a *paint* — the lamp's own radial
+        // ramp — and lands per pixel. So the composited path is taken whenever
+        // the artwork has no colours to rewrite, or the light is not one colour
+        // here.
+        //
+        // **A solid colour does not need it, and must not pay for it.** Vello
+        // re-encodes a path for every fill, so laying the light over the artwork
+        // costs that shape's whole outline a second time and a third. A solid
+        // fill under a lamp is *exactly* a radial gradient of that colour lit at
+        // each radius, so the light goes into the paint and the shape is drawn
+        // once, as it always was. See [`lamp_lit`].
+        let composited = field
+            .as_ref()
+            // A blurred shape is not drawn as itself — the blur replaces the
+            // fill with a soft stack of copies — so there is nothing for the
+            // light to sit on. That branch flattens the image to one colour and
+            // lights *that*, below.
+            .filter(|f| {
+                let needs_compositing = fill.paint.is_image()
+                    || (f.disc().is_some()
+                        && !matches!(fill.paint, buzz_scene::Paint::Solid(_)));
+                needs_compositing && ctx.blur.is_none()
+            });
 
-        // A blur replaces the fill rather than joining it: the artwork *is*
-        // the soft stack of copies, and drawing the sharp shape as well would
-        // put a hard edge back in the middle of it.
-        if let Some((rx, ry, quality)) = ctx.blur {
-            let ops = cache.filters.blur(
-                owner,
-                index,
-                &shape.path,
-                color,
-                (rx, ry),
-                quality,
-                builder.tolerance(),
+        if let Some(field) = composited {
+            draw_lit_composited(
+                builder,
+                LitShape {
+                    owner,
+                    index,
+                    fill,
+                    blend: shape.blend,
+                    placed: &placed,
+                    path: &path,
+                    here,
+                    doc,
+                    brush_to_doc,
+                    field,
+                    // Artwork made of coloured regions shares its boundary with
+                    // the artwork beside it and must not leave a pale line along
+                    // the join; a bitmap's edges are exactly where it stops being
+                    // opaque and must never be grown. See `fill_shape_paint_sealed`.
+                    sealed: !fill.paint.is_image(),
+                },
+                ctx,
+                cache,
             );
-            crate::filters::draw_ops(builder, &ops, &ctx.projection.pre_affine(doc), 1.0);
-            if let Some(stroke) = &shape.stroke {
-                // A stroke under a blur is softened as its own outline, so a
-                // blurred drawing keeps its lines instead of losing them.
-                let outline = buzz_geom::outline_stroke(
+        } else {
+            // The light reaches the fill first: this is the tint that makes a warm
+            // key look warm and a blue sky fill look cold, before any geometry is
+            // drawn on top of it. A gradient takes it stop by stop, so a lit ramp
+            // stays a ramp.
+            //
+            // Under a lamp, a solid fill takes the light as a **ramp** rather
+            // than as one colour: that is what puts the falloff on the pixels
+            // instead of on the shape as a whole, and it costs one gradient and
+            // no extra geometry.
+            let lamp_fill = match (&field, &fill.paint) {
+                (Some(f), buzz_scene::Paint::Solid(c)) => lamp_lit(f, *c, |i, c| i.apply(c)),
+                _ => None,
+            };
+            let base = match (&lamp_fill, &light) {
+                (Some((paint, _)), _) => paint.clone(),
+                (None, Some(light)) => fill.paint.map_colors(|c| light.apply(c)),
+                (None, None) => fill.paint.clone(),
+            };
+            // A lamp's ramp lives where the lamp stands, in document space, so
+            // it takes the projection alone rather than the object's placement.
+            let brush_to_doc = match &lamp_fill {
+                Some((_, disc)) => ctx.brush_projection(*disc),
+                None => brush_to_doc,
+            };
+            let paint = ctx.paint(&base);
+            let color = match (&light, fill.paint.is_image()) {
+                // **A blurred bitmap is drawn as one colour, so the light has a
+                // colour to reach after all.** The blur below replaces the fill
+                // with a soft stack of copies of a single tone — the image's
+                // own mean — and `map_colors` left that tone unlit along with
+                // the pixels it came from. Here there is nothing to composite
+                // over, and nothing needs to be: it is a colour, so it takes
+                // the light the way every other colour does.
+                (Some(light), true) => light.apply(paint.color()),
+                _ => paint.color(),
+            };
+
+            // A blur replaces the fill rather than joining it: the artwork *is*
+            // the soft stack of copies, and drawing the sharp shape as well would
+            // put a hard edge back in the middle of it.
+            if let Some((rx, ry, quality)) = ctx.blur {
+                let ops = cache.filters.blur(
+                    owner,
+                    index,
                     &shape.path,
-                    buzz_geom::StrokeStyle::new(stroke.width.max(f64::MIN_POSITIVE)),
+                    color,
+                    (rx, ry),
+                    quality,
                     builder.tolerance(),
                 );
-                let colour = ctx.colour(match &light {
-                    Some(light) => light.apply(stroke.color()),
-                    None => stroke.color(),
-                });
-                let ops =
-                    buzz_fx::blur_ops(&outline, colour, (rx, ry), quality, builder.tolerance());
                 crate::filters::draw_ops(builder, &ops, &ctx.projection.pre_affine(doc), 1.0);
+                if let Some(stroke) = &shape.stroke {
+                    // A stroke under a blur is softened as its own outline, so a
+                    // blurred drawing keeps its lines instead of losing them.
+                    let outline = buzz_geom::outline_stroke(
+                        &shape.path,
+                        buzz_geom::StrokeStyle::new(stroke.width.max(f64::MIN_POSITIVE)),
+                        builder.tolerance(),
+                    );
+                    let colour = ctx.colour(match &light {
+                        Some(light) => light.apply(stroke.color()),
+                        None => stroke.color(),
+                    });
+                    let ops =
+                        buzz_fx::blur_ops(&outline, colour, (rx, ry), quality, builder.tolerance());
+                    crate::filters::draw_ops(builder, &ops, &ctx.projection.pre_affine(doc), 1.0);
+                }
+                return;
             }
-            return;
-        }
-        // Build-up paint sums its opacity with what is under it. The enclosing
-        // isolation group, opened by `draw_frame`, is what keeps that sum away
-        // from the stage behind it.
-        if shape.blend.is_additive() {
-            // Build-up paint is *summing* into an isolation group, so growing
-            // the edge would add to the accumulation there rather than merely
-            // covering a seam — a darker rim round every stroke, which is the
-            // one thing that mode exists to avoid.
-            builder.fill_shape_paint_additive(&path, &paint, brush_to_doc);
-        } else {
-            // Sealed: artwork that shares a boundary with the shape beside it
-            // must not leave a pale line along the join. See
-            // `SceneBuilder::fill_shape_paint_sealed`.
-            builder.fill_shape_paint_sealed(&path, &paint, brush_to_doc);
-        }
+            // Build-up paint sums its opacity with what is under it. The enclosing
+            // isolation group, opened by `draw_frame`, is what keeps that sum away
+            // from the stage behind it.
+            if shape.blend.is_additive() {
+                // Build-up paint is *summing* into an isolation group, so growing
+                // the edge would add to the accumulation there rather than merely
+                // covering a seam — a darker rim round every stroke, which is the
+                // one thing that mode exists to avoid.
+                builder.fill_shape_paint_additive(&path, &paint, brush_to_doc);
+            } else {
+                // Sealed: artwork that shares a boundary with the shape beside it
+                // must not leave a pale line along the join. See
+                // `SceneBuilder::fill_shape_paint_sealed`.
+                builder.fill_shape_paint_sealed(&path, &paint, brush_to_doc);
+            }
 
-        // Then the modelling: the terminator away from the key light, and the
-        // glint towards it. Both are the artwork's own outline, offset, which
-        // is what makes them read as form rather than as a filter over it.
-        if let Some(light) = &light
-            && let Some(key) = ctx.lights.key()
-        {
-            // **The same arguments the shadow pass used.** The cache keys on
-            // the object, not on what the caller happens to want, so asking
-            // for a different `height` or `modelling` here would either miss
-            // the entry or — worse, and this is how it was found — quietly
-            // return the shadow pass's geometry, which was built with
-            // modelling switched off and therefore had no crescents at all.
+            // Then the modelling: the terminator away from the key light, and the
+            // glint towards it. Both are the artwork's own outline, offset, which
+            // is what makes them read as form rather than as a filter over it.
+            // `detail` first, and it is the cheapest of the four: below
+            // `Full` the crescents are neither built nor drawn, so a frame that
+            // cannot afford them does not pay the booleans either. See
+            // [`LightDetail`].
+            if cache.detail().models()
+                && let Some(light) = &light
+                && let Some(key) = ctx.lights.key()
+                && let Some(towards) =
+                    buzz_light::crescent_direction(key, here, ctx.layer_depth, ctx.lights.modelling)
+            {
+                // `towards` above is which way the light lies from here — all a
+                // crescent takes from a light, and `None` when it draws none:
+                // modelling off, or a light straight on, which has no direction in
+                // the plane to shade along.
+                //
+                // `placed` is handed over rather than the shape, because the draw
+                // above already put the path in document space. Transforming it a
+                // second time inside the cache was a whole path copy per shape per
+                // frame, paid on every *hit*, which is most of what lighting used
+                // to cost once the geometry itself had settled.
+                let modelling = ctx.lights.modelling;
+                let geometry = cache
+                    .lights
+                    .crescents(owner, index, &placed, doc, towards, key.softness);
+
+                // The crescents take the fill's paint stop by stop as well, so the
+                // shaded side of a gradient-filled shape is that gradient darkened
+                // rather than one flat colour laid over it.
+                //
+                // **Feathered where the fill is one colour**, which is most
+                // artwork. A band filled with a single tone puts a hard edge
+                // across the drawing wherever the terminator falls — on a shape
+                // the size of a background that is a straight seam through the
+                // middle of the picture, and it reads as a join rather than as
+                // shading. Ramping from the shaded tone at the band's outer edge
+                // to the lit one at the terminator makes the width `softness`
+                // asks for the width the gradient actually takes, at no extra
+                // layer: it is the same one fill, with a ramp in it.
+                //
+                // A fill made of a ramp or of pixels has no single pair of
+                // colours to run between, so it keeps the flat band. A bitmap
+                // does not come here at all — it is composited, and feathered
+                // there.
+                // Each band is **one fill**, as the artwork itself is. Under a
+                // lamp it takes the same radial ramp the fill did, so the shaded
+                // side of a wall darkens along the wall rather than taking one
+                // value for the whole of it.
+                if let Some(shade) = &geometry.shade {
+                    let drawn = ctx.project(shade, builder.tolerance());
+                    match (&field, &fill.paint) {
+                        (Some(f), buzz_scene::Paint::Solid(c))
+                            if let Some((ramp, disc)) =
+                                lamp_lit(f, *c, |i, c| i.apply_shaded(c)) =>
+                        {
+                            builder.fill_shape_paint(&drawn, &ramp, ctx.brush_projection(disc));
+                        }
+                        _ => {
+                            let shaded =
+                                ctx.paint(&fill.paint.map_colors(|c| light.apply_shaded(c)));
+                            builder.fill_shape_paint(&drawn, &shaded, brush_to_doc);
+                        }
+                    }
+                }
+                if let Some(highlight) = &geometry.highlight {
+                    let drawn = ctx.project(highlight, builder.tolerance());
+                    match (&field, &fill.paint) {
+                        (Some(f), buzz_scene::Paint::Solid(c))
+                            if let Some((ramp, disc)) =
+                                lamp_lit(f, *c, |i, c| i.highlight(c, key.color, modelling)) =>
+                        {
+                            builder.fill_shape_paint(&drawn, &ramp, ctx.brush_projection(disc));
+                        }
+                        _ => {
+                            let glint = ctx.paint(
+                                &fill
+                                    .paint
+                                    .map_colors(|c| light.highlight(c, key.color, modelling)),
+                            );
+                            builder.fill_shape_paint(&drawn, &glint, brush_to_doc);
+                        }
+                    }
+                }
+            }
+
+            // **The dark edge a wall of dark leaves on a figure standing in
+            // it**, which is the other half of what makes light read as light.
             //
-            // One entry holds all three pieces; each pass draws the ones it
-            // is responsible for, and the booleans are paid for once.
-            let modelling = ctx.lights.modelling;
-            let height = ctx.scene.shadow_height(ctx.layer_depth, key);
-            let geometry = cache.lights.shade(
-                owner,
-                index,
-                shape,
-                doc,
-                key,
-                height,
-                ctx.layer_depth,
-                modelling,
-            );
-
-            // The crescents take the fill's paint stop by stop as well, so the
-            // shaded side of a gradient-filled shape is that gradient darkened
-            // rather than one flat colour laid over it.
-            if let Some(shade) = &geometry.shade {
-                let shaded = ctx.paint(&fill.paint.map_colors(|c| light.apply_shaded(c)));
-                let drawn = ctx.project(shade, builder.tolerance());
-                builder.fill_shape_paint(&drawn, &shaded, brush_to_doc);
-            }
-            if let Some(highlight) = &geometry.highlight {
-                let glint = ctx.paint(
-                    &fill
-                        .paint
-                        .map_colors(|c| light.highlight(c, key.color, modelling)),
-                );
-                let drawn = ctx.project(highlight, builder.tolerance());
-                builder.fill_shape_paint(&drawn, &glint, brush_to_doc);
-            }
+            // The tint and the band overhead say *how much* light there is; an
+            // edge says which way it is coming from, and without one a gloom is
+            // a wash over the picture that takes every figure's form with it.
+            //
+            // Built through the same cache the terminator uses, keyed on the
+            // gloom's own direction rather than the key light's — see
+            // `draw_gloom_edge`. One more outline per shape, which is what the
+            // rest of lighting costs and what `encode_cost` allows.
+            draw_gloom_edge(builder, ctx, cache, owner, index, &placed, doc, here);
         }
     }
 
@@ -2141,45 +2776,419 @@ fn draw_shape(
     }
 }
 
+/// One shape lit by **compositing** rather than by recolouring, and the light
+/// falling on it. See [`draw_lit_composited`].
+struct LitShape<'a> {
+    owner: Option<&'a Arc<Object>>,
+    index: u16,
+    fill: &'a buzz_scene::FillSpec,
+    blend: buzz_scene::PaintBlend,
+    /// The shape in **document** space — what the crescents are measured and
+    /// built from, and what the cache is keyed on.
+    placed: &'a buzz_geom::BezPath,
+    /// The same shape where the lens puts it — what is actually drawn.
+    path: &'a buzz_geom::BezPath,
+    /// The middle of the shape in document space, which is where the light is
+    /// evaluated.
+    here: buzz_geom::Point,
+    doc: Affine,
+    brush_to_doc: Affine,
+    /// The light over this shape — a ramp when a lamp falls off across it.
+    field: &'a buzz_light::LightField,
+    /// Whether the fill may be grown half a pixel to close the seam it shares
+    /// with its neighbour. True for artwork made of coloured regions, false for
+    /// a bitmap, whose edges are exactly where it stops being opaque.
+    sealed: bool,
+}
+
+/// Light a shape by **compositing the light over the picture** rather than
+/// folding it into the paint.
+///
+/// # Why this is not the ordinary path
+///
+/// [`draw_shape`] lights artwork with `Paint::map_colors`, which rewrites every
+/// colour a fill is made of. That is exactly right for a solid or a gradient
+/// under a light that arrives the same way everywhere — a lit ramp stays a ramp.
+/// Two things it cannot do, and both of them arrive here instead:
+///
+/// * **A bitmap has no list of colours to rewrite.** Its colours are its pixels,
+///   and `map_colors` returns it untouched by design, because rewriting a
+///   four-megapixel photograph per frame would cost more than drawing it. So the
+///   lit path ran over bitmaps and changed nothing about them.
+/// * **A rewritten colour is one colour**, and a lamp is not. A lamp's light
+///   falls off, and the falloff *is* the lamp; a shape whose fill was recoloured
+///   by the light at its middle showed none of it, so a wall under a lamp came
+///   out flat and the near side of a face was as bright as the far side. Laid
+///   over the picture the light is a *paint*, and a lamp's paint is its own
+///   radial falloff — see [`buzz_light::LightRig::field`]. The gradient lands the
+///   light per pixel, which is the whole difference between a lamp that lights
+///   the artwork and one that merely tints it.
+///
+/// Everything else is still recoloured, and encodes exactly what it always did:
+/// a rig of suns and skies delivers one colour over any one shape, and paying
+/// for a group and a gradient to say so would be waste.
+///
+/// # What is drawn, and why it lands on the same colours
+///
+/// The same three things, in the same order as the vector path:
+///
+/// 1. The picture, unlit, then the light laid over the whole of it — a multiply
+///    by the light up to full, and a screen for anything above it. Multiplying
+///    is what [`buzz_light::Illumination::apply`] does arithmetically, so this
+///    is the same tint arrived at per pixel.
+/// 2. The shaded crescent, carrying only the **ratio** from lit to ambient —
+///    the picture beneath it is already lit, and multiplication composes, so it
+///    lands on the ambient colour exactly.
+/// 3. The highlight crescent, the light's own colour laid on at the `t` the
+///    vector path mixes with.
+///
+/// # Isolated, and bounded
+///
+/// Every pass composes `SrcAtop` so it keeps the picture's alpha and cannot
+/// paint into the transparent parts of a cut-out. That makes the *backdrop*
+/// matter: outside a group the backdrop is everything already drawn, so the
+/// light would tint the stage showing through the cut-out's own corners. The
+/// group is bounded by what is drawn into it, because a group is a render
+/// target and an unbounded one costs a full-viewport buffer.
+///
+/// # Where the two paths part company, and by how much
+///
+/// The lit body and the shaded band land on the vector path's colours exactly —
+/// measured at 174 against 174 and 81 against 83 on a mid grey under the
+/// default sun. Two things do differ, both in the highlight, both by a few
+/// levels:
+///
+/// * **The glint mixes in the compositor's space, not in linear light.**
+///   [`buzz_light::mix`] blends towards the light in linear light, because an
+///   sRGB midpoint between two colours looks too dark. Laid over pixels the
+///   blend is the compositor's, which is not linear, so the glint comes out
+///   slightly the darker of the two.
+/// * **The two crescents overlap at a corner, and there the vector path lets
+///   the highlight win outright.** It is drawn second and opaque, so it
+///   replaces the shade. A blend cannot replace: it composes with what is under
+///   it, so at that corner the glint sits on the shaded pixel rather than the
+///   lit one and is dimmer for it. Making them agree means subtracting one
+///   crescent from the other, and that is a third boolean on every build of
+///   every shape — paid on all artwork, to move two corners of a bitmap by a
+///   few levels. Not taken; recorded here so the next reader knows it was
+///   weighed rather than missed.
+fn draw_lit_composited(
+    builder: &mut SceneBuilder<'_>,
+    it: LitShape<'_>,
+    ctx: &DrawCtx<'_>,
+    cache: &mut DrawCache,
+) {
+    let LitShape {
+        owner,
+        index,
+        fill,
+        blend,
+        placed,
+        path,
+        here,
+        doc,
+        brush_to_doc,
+        field,
+        sealed,
+    } = it;
+
+    let paint = ctx.paint(&fill.paint);
+    let light = field.uniform();
+
+    // A rig that is on but delivering full daylight must encode exactly what an
+    // unlit document encodes: no group, no passes, no crescents.
+    if field.is_neutral() {
+        if blend.is_additive() {
+            builder.fill_shape_paint_additive(path, &paint, brush_to_doc);
+        } else if sealed {
+            builder.fill_shape_paint_sealed(path, &paint, brush_to_doc);
+        } else {
+            builder.fill_shape_paint(path, &paint, brush_to_doc);
+        }
+        return;
+    }
+
+    // The crescents are worked out **before** anything is drawn, because the
+    // group opened below has to be big enough to hold them: a crescent is the
+    // artwork's own outline offset, so it can reach a little outside the shape.
+    let modelling = ctx.lights.modelling;
+    let key = ctx.lights.key();
+    let geometry = key
+        .and_then(|key| {
+            let towards =
+                buzz_light::crescent_direction(key, here, ctx.layer_depth, modelling)?;
+            Some((key, towards))
+        })
+        .map(|(key, towards)| {
+            (
+                key,
+                // Which way the light lies from here, kept so the crescents can
+                // be feathered along it below.
+                towards,
+                cache
+                    .lights
+                    .crescents(owner, index, placed, doc, towards, key.softness),
+            )
+        });
+
+    let shade = geometry
+        .as_ref()
+        .and_then(|(_, _, g)| g.shade.as_ref())
+        .map(|s| ctx.project(s, builder.tolerance()));
+    let highlight = geometry
+        .as_ref()
+        .and_then(|(_, _, g)| g.highlight.as_ref())
+        .map(|h| ctx.project(h, builder.tolerance()));
+
+    let mut bounds = path.bounding_box();
+    for extra in [shade.as_ref(), highlight.as_ref()].into_iter().flatten() {
+        bounds = bounds.union(extra.bounding_box());
+    }
+
+    // **The isolation group, when it is needed.**
+    //
+    // Every pass below composes `SrcAtop` so it keeps the picture's alpha and
+    // cannot paint into the transparent parts of a cut-out. That makes the
+    // *backdrop* matter: outside a group the backdrop is everything already
+    // drawn, so the light would tint the stage showing through a cut-out's own
+    // corners.
+    //
+    // An **opaque** fill has no such corners. Each pass is clipped to the shape
+    // or to a band inside it, under the same fill rule the artwork was drawn
+    // with, so the backdrop everywhere a pass can reach is that artwork and
+    // nothing else. Skipping the group there takes one render target off every
+    // solidly-filled lit shape, which is most of a drawing.
+    let isolate = !crate::is_opaque(&fill.paint) || blend.is_additive();
+    if isolate {
+        builder.push_isolation(bounds);
+    }
+
+    if blend.is_additive() {
+        builder.fill_shape_paint_additive(path, &paint, brush_to_doc);
+    } else if sealed {
+        // Artwork made of coloured regions shares a boundary with the artwork
+        // beside it, and must not leave a pale line along the join.
+        builder.fill_shape_paint_sealed(path, &paint, brush_to_doc);
+    } else {
+        // **Never sealed.** A bitmap's interesting edges are exactly where it
+        // stops being opaque, and growing it half a pixel smears those border
+        // pixels outwards — the fringe that makes a composite look pasted on.
+        // `fill_shape_paint_sealed` already refuses an image for this reason;
+        // saying so here keeps the two from drifting apart.
+        builder.fill_shape_paint(path, &paint, brush_to_doc);
+    }
+
+    // **The light over the whole shape**: one multiply by what arrives, and a
+    // screen for anything above full. A ramp when a lamp falls off across the
+    // shape — which is what puts the falloff on the pixels rather than on the
+    // shape as a whole — and one flat colour when nothing varies, in which case
+    // this encodes exactly what it always did.
+    let lamp = field
+        .disc()
+        .map(|(centre, reach)| cache.lamp_paints(field, centre, reach));
+    match &lamp {
+        None => {
+            let filter = light.as_filter(true);
+            builder.fill_shape_atop(path, filter.multiply, buzz_fx::Blend::Multiply);
+            if let Some(screen) = filter.screen {
+                builder.fill_shape_atop(path, screen, buzz_fx::Blend::Screen);
+            }
+        }
+        Some(lamp) => {
+            let to_doc = ctx.brush_projection(lamp.disc);
+            builder.fill_shape_atop_paint(path, &lamp.multiply, to_doc, buzz_fx::Blend::Multiply);
+            if let Some(screen) = &lamp.screen {
+                builder.fill_shape_atop_paint(path, screen, to_doc, buzz_fx::Blend::Screen);
+            }
+        }
+    }
+
+    // Then the modelling, **feathered**. A crescent filled with one flat colour
+    // puts a hard edge across the artwork wherever the terminator falls: on a
+    // shape the size of a background that is a straight seam through the middle
+    // of the picture, and it reads as a join rather than as shading. The ramp
+    // runs along the light's own direction, from the full tone at the far edge
+    // to nothing at the terminator, so the width `softness` asks for is the
+    // width the gradient actually takes.
+    // The two bands, each **one fill** laid over the picture. The shaded side
+    // carries only the *ratio* from lit to ambient — the picture beneath it is
+    // already lit, and multiplication composes, so it lands on the ambient
+    // colour exactly — and takes it as a ramp of the light field rather than as
+    // one colour, so a band lying across a lamp's falloff darkens with it.
+    if let Some(drawn) = &shade {
+        match &lamp {
+            None => builder.fill_shape_atop(drawn, light.shade_filter(), buzz_fx::Blend::Multiply),
+            Some(lamp) => builder.fill_shape_atop_paint(
+                drawn,
+                &lamp.shade,
+                ctx.brush_projection(lamp.disc),
+                buzz_fx::Blend::Multiply,
+            ),
+        }
+    }
+    if let (Some(drawn), Some((key, _, _))) = (&highlight, &geometry) {
+        let strength = buzz_light::Illumination::highlight_strength(modelling);
+        builder.fill_shape_atop(
+            drawn,
+            key.color.multiply_alpha(strength),
+            buzz_fx::Blend::Normal,
+        );
+    }
+
+    if isolate {
+        builder.pop_isolation();
+    }
+}
+
+/// The light across a lamp's reach, as a radial gradient in document space.
+///
+/// One stop per sample of the lamp's falloff, each turned into a colour to
+/// composite by `tone` — the multiply factor, the screen overflow, whichever
+/// pass is being laid. `disc` is the lamp's reach as a rectangle, which is what
+/// puts the unit gradient where the lamp stands.
+fn radial_light(
+    ramp: &[(f64, buzz_light::Illumination)],
+    disc: buzz_geom::Rect,
+    tone: impl Fn(&buzz_light::Illumination) -> Color,
+) -> buzz_scene::Paint {
+    let stops: Vec<buzz_scene::GradientStop> = ramp
+        .iter()
+        .map(|(at, light)| buzz_scene::GradientStop::new(*at, tone(light)))
+        .collect();
+    let mut gradient = buzz_scene::Gradient::new(buzz_scene::GradientKind::Radial, stops);
+    gradient.fit_to(disc);
+    buzz_scene::Paint::Gradient(Arc::new(gradient))
+}
+
+/// **A solid colour lit by a lamp, as one paint.**
+///
+/// A lamp's light is radially symmetric about the point it stands over — see
+/// [`buzz_light::Light::direct_at_radius`] — so a solid fill under one is
+/// *exactly* a radial gradient of that colour, lit at each radius. Folding the
+/// light into the paint this way is what puts the falloff on the pixels while
+/// the shape is still drawn **once**.
+///
+/// # Why that matters more than it sounds
+///
+/// The obvious alternative is to draw the artwork and lay the light over it,
+/// which is what a bitmap has to do. Vello re-encodes a path for every fill, and
+/// there is no instancing: laying the light over the artwork costs that shape's
+/// whole outline a second time, a third for a screen pass, and one more for
+/// every band. Measured on a 28-layer Animate import — 615 thousand path
+/// segments unlit — compositing every lit shape took the scene to **11.5
+/// million**, and its path data from 9 MB to 171 MB, past the 128 MB a buffer
+/// may bind. The GPU refused the frame and the process went with it.
+///
+/// `None` when no lamp varies across the region, which is every rig of suns and
+/// skies: there is nothing to ramp and the caller keeps its solid colour.
+fn lamp_lit(
+    field: &buzz_light::LightField,
+    base: Color,
+    tone: impl Fn(&buzz_light::Illumination, Color) -> Color,
+) -> Option<(buzz_scene::Paint, buzz_geom::Rect)> {
+    let (centre, reach) = field.disc()?;
+    let disc = buzz_geom::Circle::new(centre, reach).bounding_box();
+    Some((
+        radial_light(&field.ramp(), disc, |light| tone(light, base)),
+        disc,
+    ))
+}
+
+/// **A ramping lamp's three passes, built once and shared.**
+///
+/// The ramp spans the lamp rather than the shape (see
+/// [`buzz_light::LightRig::field`]), so every shape one lamp reaches asks for
+/// exactly these gradients. Building them per shape cost three allocations each
+/// — measured at half the cost of drawing four hundred lit shapes — and produced
+/// three identical answers over and over.
+#[derive(Debug)]
+struct LampPaints {
+    /// Where the gradients sit, for the brush projection.
+    disc: buzz_geom::Rect,
+    /// The light up to full.
+    multiply: buzz_scene::Paint,
+    /// Whatever it has above full. `None` where it never exceeds it, which is
+    /// most lamps over most of their reach.
+    screen: Option<buzz_scene::Paint>,
+    /// The step from lit to shaded, for the terminator.
+    shade: buzz_scene::Paint,
+}
+
+impl LampPaints {
+    fn build(field: &buzz_light::LightField, centre: buzz_geom::Point, reach: f64) -> Self {
+        let disc = buzz_geom::Circle::new(centre, reach).bounding_box();
+        let ramp = field.ramp();
+        Self {
+            disc,
+            multiply: radial_light(&ramp, disc, |i| i.as_filter(true).multiply),
+            // A second pass only where the lamp is actually brighter than full.
+            screen: ramp
+                .iter()
+                .any(|(_, i)| i.as_filter(true).screen.is_some())
+                .then(|| {
+                    radial_light(&ramp, disc, |i| {
+                        i.as_filter(true).screen.unwrap_or(Color::BLACK)
+                    })
+                }),
+            shade: radial_light(&ramp, disc, |i| i.shade_filter()),
+        }
+    }
+}
+
+
+
 /// Draw every shadow this object throws, before the layer's artwork.
-#[allow(clippy::too_many_arguments, reason = "one call site")]
+///
+/// `shadow` is the projection worked out once for the whole layer by
+/// [`buzz_light::shadow_transform`]: a shadow is the caster's own outline under
+/// one affine, so there is nothing here to build and nothing to cache. That is
+/// the change that lets a light be dragged — the shadows follow it exactly, on
+/// every frame, however heavy the artwork, while the crescents catch up behind.
 fn cast_shadows(
     builder: &mut SceneBuilder<'_>,
     object: &Object,
-    owner: Option<&Arc<Object>>,
     doc: Affine,
     key: &buzz_light::Light,
-    height: f64,
-    depth: f64,
-    cache: &mut DrawCache,
+    shadow: Affine,
     ctx: &DrawCtx<'_>,
 ) {
-    cast_shadows_within(
-        builder, object, owner, doc, key, height, depth, cache, ctx, 0,
-    );
+    cast_shadows_within(builder, object, doc, key, shadow, ctx, 0);
+}
+
+/// One shape's shadow: its outline, put where the light throws it.
+///
+/// The projection is folded into the placement rather than applied after it, so
+/// the path is copied once. `shadow * doc` is the same thing as shadowing the
+/// already-placed path — the shadow is taken in document space — for one path
+/// transform instead of two.
+fn draw_shadow(
+    builder: &mut SceneBuilder<'_>,
+    path: &buzz_geom::BezPath,
+    doc: Affine,
+    key: &buzz_light::Light,
+    shadow: Affine,
+    ctx: &DrawCtx<'_>,
+) {
+    let cast = (shadow * doc) * path.clone();
+    let colour = Color::from_rgba8(0, 0, 0, (key.shadow_strength.clamp(0.0, 1.0) * 255.0) as u8);
+    let drawn = ctx.project(&cast, builder.tolerance());
+    builder.fill_shape(&drawn, ctx.overlay(colour));
 }
 
 /// [`cast_shadows`], carrying how deep into nested symbols it has gone.
 ///
-/// `depth_limit` is the *nesting* count and is nothing to do with `depth`,
+/// `depth_limit` is the *nesting* count and is nothing to do with layer depth,
 /// which is the layer's distance from the camera. A symbol containing an
 /// instance of itself would otherwise recurse until the stack ran out.
-#[allow(clippy::too_many_arguments, reason = "one call path")]
 fn cast_shadows_within(
     builder: &mut SceneBuilder<'_>,
     object: &Object,
-    owner: Option<&Arc<Object>>,
     doc: Affine,
     key: &buzz_light::Light,
-    height: f64,
-    depth: f64,
-    cache: &mut DrawCache,
+    shadow: Affine,
     ctx: &DrawCtx<'_>,
     depth_limit: usize,
 ) {
-    // Asked for with modelling on so the entry this builds is the same one
-    // `draw_shape` will look up: one set of booleans, used by both passes.
-    let modelling = ctx.lights.modelling;
     if !object.visible {
         return;
     }
@@ -2191,62 +3200,24 @@ fn cast_shadows_within(
                 // An unfilled outline has nothing to block the light with.
                 return;
             }
-            let geometry = cache
-                .lights
-                .shade(owner, 0, shape, doc, key, height, depth, modelling);
-            if let Some(cast) = &geometry.cast {
-                let shadow =
-                    Color::from_rgba8(0, 0, 0, (key.shadow_strength.clamp(0.0, 1.0) * 255.0) as u8);
-                let drawn = ctx.project(cast, builder.tolerance());
-                builder.fill_shape(&drawn, ctx.overlay(shadow));
-            }
+            draw_shadow(builder, &shape.path, doc, key, shadow, ctx);
         }
         ObjectKind::Group(children) => {
             for child in children {
-                cast_shadows_within(
-                    builder,
-                    child,
-                    Some(child),
-                    doc,
-                    key,
-                    height,
-                    depth,
-                    cache,
-                    ctx,
-                    depth_limit,
-                );
+                cast_shadows_within(builder, child, doc, key, shadow, ctx, depth_limit);
             }
         }
         ObjectKind::Armature(rig) => {
             for part in rig.posed() {
-                cast_shadows_within(
-                    builder,
-                    &part,
-                    None,
-                    doc,
-                    key,
-                    height,
-                    depth,
-                    cache,
-                    ctx,
-                    depth_limit,
-                );
+                cast_shadows_within(builder, &part, doc, key, shadow, ctx, depth_limit);
             }
         }
         ObjectKind::Warp(warp) => {
-            let shape = warp.warped();
-            if shape.fill.is_none() {
+            let warped = warp.warped();
+            if warped.fill.is_none() {
                 return;
             }
-            let geometry = cache
-                .lights
-                .shade(owner, 1, &shape, doc, key, height, depth, modelling);
-            if let Some(cast) = &geometry.cast {
-                let shadow =
-                    Color::from_rgba8(0, 0, 0, (key.shadow_strength.clamp(0.0, 1.0) * 255.0) as u8);
-                let drawn = ctx.project(cast, builder.tolerance());
-                builder.fill_shape(&drawn, ctx.overlay(shadow));
-            }
+            draw_shadow(builder, &warped.path, doc, key, shadow, ctx);
         }
         // **A symbol's shadow is the shadow of what it contains.**
         //
@@ -2280,18 +3251,7 @@ fn cast_shadows_within(
                     continue;
                 }
                 for child in layer.objects_at(inner) {
-                    cast_shadows_within(
-                        builder,
-                        child,
-                        Some(child),
-                        doc,
-                        key,
-                        height,
-                        depth,
-                        cache,
-                        ctx,
-                        depth_limit + 1,
-                    );
+                    cast_shadows_within(builder, child, doc, key, shadow, ctx, depth_limit + 1);
                 }
             }
         }
@@ -2353,7 +3313,7 @@ mod tests {
         let camera = Camera::new(Point::new(25.0, 25.0), 1.0, Size::new(400.0, 400.0));
         let mut builder = SceneBuilder::new(&mut vello, &camera);
         let mut cache = DrawCache::new();
-        cache.begin(0);
+        cache.begin();
         let options = FrameOptions {
             cull,
             ..FrameOptions::default()
@@ -2402,7 +3362,7 @@ mod tests {
         let mut builder = SceneBuilder::new(&mut vello, &camera);
 
         let mut cache = DrawCache::new();
-        cache.begin(scene.lights().fingerprint());
+        cache.begin();
         cache.lights.set_defer(true);
 
         let options = FrameOptions {
@@ -2441,7 +3401,7 @@ mod tests {
         let mut builder = SceneBuilder::new(&mut vello, &camera);
 
         let mut cache = DrawCache::new();
-        cache.begin(scene.lights().fingerprint());
+        cache.begin();
         // defer left off
 
         let options = FrameOptions {
@@ -2823,7 +3783,7 @@ mod symbol_scene {
         let mut builder = SceneBuilder::new(&mut vello, camera);
         let mut cache = DrawCache::new();
         cache.set_symbol_reuse(reuse);
-        cache.begin(0);
+        cache.begin();
         draw_frame_within(&mut builder, scene, 0, Affine::IDENTITY, options, &mut cache);
         cache.end();
         (
@@ -2892,7 +3852,7 @@ mod symbol_scene {
         let go = |scene: &Scene, cache: &mut DrawCache| {
             let mut vello = crate::vello::Scene::new();
             let mut builder = SceneBuilder::new(&mut vello, &camera);
-            cache.begin(0);
+            cache.begin();
             draw_frame_within(&mut builder, scene, 0, Affine::IDENTITY, &options, cache);
             cache.end();
         };
@@ -2932,14 +3892,14 @@ mod symbol_scene {
 
         let mut vello = crate::vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vello, &camera);
-        cache.begin(0);
+        cache.begin();
         draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut cache);
         cache.end();
         assert!(!cache.symbol_scenes.entries.is_empty(), "the draw cached something");
 
         // Generations pass with nothing drawn; entries age out.
         for _ in 0..SYM_KEEP_FRAMES {
-            cache.begin(0);
+            cache.begin();
             cache.end();
         }
         assert!(

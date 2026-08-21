@@ -302,19 +302,30 @@ impl Exporter {
         );
 
         let mut vello_scene = buzz_render::vello::Scene::new();
-        {
-            let mut builder = SceneBuilder::new(&mut vello_scene, &camera);
-            if !settings.transparent {
-                builder.fill_shape(&stage, scene.stage().background);
+        // Build, then let the cache judge what was built. A frame too big for
+        // the rasteriser is not drawn at all — and an export has no next frame
+        // to correct itself on, so it is encoded again with less of the light
+        // rather than written out as whatever was in the target before. See
+        // `buzz_render::document::DrawCache::reconsider`.
+        for _ in 0..3 {
+            let segments = {
+                let mut builder = SceneBuilder::new(&mut vello_scene, &camera);
+                if !settings.transparent {
+                    builder.fill_shape(&stage, scene.stage().background);
+                }
+                document::draw_frame_cached(
+                    &mut builder,
+                    scene,
+                    frame,
+                    scene.camera_transform(frame),
+                    options,
+                    &mut self.lights,
+                );
+                builder.encoded_segments()
+            };
+            if !self.lights.reconsider(segments) {
+                break;
             }
-            document::draw_frame_cached(
-                &mut builder,
-                scene,
-                frame,
-                scene.camera_transform(frame),
-                options,
-                &mut self.lights,
-            );
         }
 
         let background = if settings.transparent {

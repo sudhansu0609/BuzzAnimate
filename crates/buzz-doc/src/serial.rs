@@ -79,7 +79,21 @@ use serde::{Deserialize, Serialize};
 ///   aperture; and the camera carries named angles. Every one is absent in older
 ///   files and in any document that does not use it, so a document that keyframes
 ///   nothing is written exactly as version 20 wrote it.
-pub const FORMAT_VERSION: u32 = 21;
+/// * **22** — a lamp carries a `glow`: how much of its light is drawn as a pool
+///   over the frame, which is what makes a lamp read as a lamp rather than as a
+///   flat tint. Absent in older files, where it reads as full strength — the
+///   honest reading of a lamp saved when there was no other kind.
+/// * **23** — the `gloom`: a wall of darkness with a bearing, a throw and a
+///   width, which is a new *kind* of light rather than a new field on the old
+///   ones. It reuses `position` for where the wall stands and `azimuth` for
+///   which way it faces, because those are the same two questions a lamp and a
+///   sun already answer, and adds `throw` and `width`. A version 22 build
+///   reading a file that uses one would load it as a sky — the fallback every
+///   unknown kind takes — so the bump is how the file says not to.
+/// * **24** — a light carries a `flicker`: how much it gutters, which is what
+///   turns a lamp into a fire. Absent in older files and in every steady light,
+///   so a document with no fire in it is written exactly as version 23 wrote it.
+pub const FORMAT_VERSION: u32 = 24;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -211,6 +225,15 @@ pub struct LightDto {
     pub shadow_strength: f32,
     pub standing_height: f64,
     pub softness: f64,
+    /// How much of a lamp's light is drawn as a pool. Version 22. Absent in
+    /// older files, which is read as a lamp at full strength — that is what a
+    /// lamp saved before the pool existed was meant to be.
+    #[serde(default = "full_glow")]
+    pub glow: f32,
+    /// How much this light gutters. Version 24. Absent in older files and in
+    /// every steady light, which is nearly all of them.
+    #[serde(default, skip_serializing_if = "is_steady")]
+    pub flicker: f32,
     /// Sun: the compass bearing and how high it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azimuth: Option<f64>,
@@ -226,6 +249,12 @@ pub struct LightDto {
     pub height: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radius: Option<f64>,
+    /// Gloom: how far the darkness is thrown and how wide the wall is.
+    /// Version 23. It stands at `position` and faces along `azimuth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throw: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
     /// The light's animation. Version 21. Absent in older files and in any
     /// static light, which is nearly all of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,6 +291,10 @@ pub struct LightKeyDto {
     pub height: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radius: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throw: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
 }
 
 /// The flat serialised form of a [`buzz_scene::LightKind`]: a kind string plus
@@ -275,6 +308,14 @@ struct FlatKind {
     position: Option<[f64; 2]>,
     height: Option<f64>,
     radius: Option<f64>,
+    throw: Option<f64>,
+    width: Option<f64>,
+}
+
+/// A light that does not gutter writes no `flicker`, so an ordinary document is
+/// byte-identical to what the version before this wrote.
+fn is_steady(flicker: &f32) -> bool {
+    *flicker == 0.0
 }
 
 fn kind_to_flat(kind: buzz_scene::LightKind) -> FlatKind {
@@ -286,6 +327,8 @@ fn kind_to_flat(kind: buzz_scene::LightKind) -> FlatKind {
         position: None,
         height: None,
         radius: None,
+        throw: None,
+        width: None,
     };
     match kind {
         buzz_scene::LightKind::Sun { azimuth, elevation } => {
@@ -304,6 +347,21 @@ fn kind_to_flat(kind: buzz_scene::LightKind) -> FlatKind {
             flat.height = Some(height);
             flat.radius = Some(radius);
         }
+        // A gloom's bearing is written as an azimuth and its wall as a
+        // position, because those are the same two questions a sun and a lamp
+        // already answer and a second name for either would be a second thing
+        // to keep in step.
+        buzz_scene::LightKind::Gloom {
+            edge,
+            facing,
+            throw,
+            width,
+        } => {
+            flat.position = Some([edge.x, edge.y]);
+            flat.azimuth = Some(facing);
+            flat.throw = Some(throw);
+            flat.width = Some(width);
+        }
     }
     flat
 }
@@ -317,8 +375,18 @@ fn flat_to_kind(
     position: Option<[f64; 2]>,
     height: Option<f64>,
     radius: Option<f64>,
+    throw: Option<f64>,
+    width: Option<f64>,
 ) -> Result<buzz_scene::LightKind, SerialError> {
     Ok(match kind {
+        "gloom" => buzz_scene::LightKind::Gloom {
+            edge: position
+                .map(|p| buzz_geom::Point::new(p[0], p[1]))
+                .unwrap_or_default(),
+            facing: azimuth.unwrap_or(0.0),
+            throw: throw.unwrap_or(900.0),
+            width: width.unwrap_or(2400.0),
+        },
         "sun" => buzz_scene::LightKind::Sun {
             azimuth: azimuth.unwrap_or(-0.6),
             elevation: elevation.unwrap_or(0.9),
@@ -356,6 +424,8 @@ impl LightKeyDto {
             position: flat.position,
             height: flat.height,
             radius: flat.radius,
+            throw: flat.throw,
+            width: flat.width,
         }
     }
 
@@ -375,6 +445,8 @@ impl LightKeyDto {
                 self.position,
                 self.height,
                 self.radius,
+                self.throw,
+                self.width,
             )?,
         })
     }
@@ -1114,6 +1186,11 @@ fn yes() -> bool {
     true
 }
 
+/// The default for a lamp's glow in a file written before there was one.
+fn full_glow() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ObjectKindDto {
@@ -1780,12 +1857,16 @@ impl DocumentDto {
                             shadow_strength: light.shadow_strength,
                             standing_height: light.standing_height,
                             softness: light.softness,
+                            glow: light.glow,
+                            flicker: light.flicker,
                             azimuth: None,
                             elevation: None,
                             horizon: None,
                             position: None,
                             height: None,
                             radius: None,
+                            throw: None,
+                            width: None,
                             track: light
                                 .track
                                 .as_ref()
@@ -1808,6 +1889,17 @@ impl DocumentDto {
                                 dto.position = Some([position.x, position.y]);
                                 dto.height = Some(height);
                                 dto.radius = Some(radius);
+                            }
+                            buzz_scene::LightKind::Gloom {
+                                edge,
+                                facing,
+                                throw,
+                                width,
+                            } => {
+                                dto.position = Some([edge.x, edge.y]);
+                                dto.azimuth = Some(facing);
+                                dto.throw = Some(throw);
+                                dto.width = Some(width);
                             }
                         }
                         dto
@@ -1960,6 +2052,15 @@ impl DocumentDto {
                 // light that vanishes takes the shot's look with it, and a
                 // fill light is the one kind that cannot look wrong.
                 let kind = match dto.kind.as_str() {
+                    "gloom" => buzz_scene::LightKind::Gloom {
+                        edge: dto
+                            .position
+                            .map(|[x, y]| buzz_geom::Point::new(x, y))
+                            .unwrap_or_default(),
+                        facing: dto.azimuth.unwrap_or(0.0),
+                        throw: dto.throw.unwrap_or(900.0),
+                        width: dto.width.unwrap_or(2400.0),
+                    },
                     "sun" => buzz_scene::LightKind::Sun {
                         azimuth: dto.azimuth.unwrap_or(0.0),
                         elevation: dto.elevation.unwrap_or(0.8),
@@ -1993,6 +2094,8 @@ impl DocumentDto {
                     shadow_strength: dto.shadow_strength,
                     standing_height: dto.standing_height,
                     softness: dto.softness,
+                    glow: dto.glow,
+                    flicker: dto.flicker,
                     track: dto.track.as_ref().map(LightTrackDto::to_track).transpose()?,
                 });
             }
@@ -3554,6 +3657,106 @@ mod layer_alpha_tests {
         assert!(
             json["stage"].as_object().expect("stage").get("post").is_none(),
             "a default look must not write a post block"
+        );
+    }
+
+    /// **A fire survives a save.**
+    ///
+    /// The gutter is one number and it is what makes the light a fire, so a
+    /// document that opens without it opens with an ordinary orange lamp — a
+    /// failure that looks exactly like the animator having imagined it.
+    #[test]
+    fn a_fire_survives_the_round_trip() {
+        let mut scene = Scene::default();
+        let mut lamp = buzz_scene::Light::new(
+            buzz_scene::LightId(7),
+            "Hearth",
+            buzz_scene::LightKind::lamp(buzz_geom::Point::new(100.0, 200.0)),
+        );
+        lamp.make_fire();
+        let expected = lamp.clone();
+        scene.lights_mut().enabled = true;
+        scene.lights_mut().lights.push(lamp);
+
+        let back = DocumentDto::from_scene(&scene)
+            .to_scene()
+            .expect("round trip");
+        assert_eq!(back.lights().lights[0], expected, "the fire went out on save");
+        assert!(back.lights().animates(), "and it must still animate");
+    }
+
+    /// A light that does not gutter must not start writing a `flicker`, so a
+    /// document with no fire in it is byte-identical to what the version before
+    /// this wrote.
+    #[test]
+    fn a_steady_light_writes_no_flicker() {
+        let mut scene = Scene::default();
+        scene.add_light(buzz_scene::LightKind::sun());
+        let json = serde_json::to_value(DocumentDto::from_scene(&scene)).expect("serialise");
+        let light = &json["lights"]["lights"][0];
+        assert!(
+            light.as_object().expect("a light").get("flicker").is_none(),
+            "a steady light wrote a flicker: {light}"
+        );
+    }
+
+    /// **A gloom survives a save**, wall, bearing, throw and width.
+    ///
+    /// It is written through the same flat fields a lamp and a sun use, which
+    /// is the arrangement that lets an older build read the file at all — and
+    /// the arrangement that would silently drop the two numbers that are only
+    /// a gloom's if either write path forgot them. There are two write paths,
+    /// one for the light and one for its keyframes, so both are checked here.
+    #[test]
+    fn a_gloom_survives_the_round_trip() {
+        let mut scene = Scene::default();
+        let kind = buzz_scene::LightKind::Gloom {
+            edge: buzz_geom::Point::new(-320.5, 77.25),
+            facing: 0.85,
+            throw: 1234.0,
+            width: 3210.0,
+        };
+        let mut dark = buzz_scene::Light::new(buzz_scene::LightId(4), "Dark", kind);
+
+        let mut track = buzz_scene::LightTrack::new();
+        track.enabled = true;
+        track.set_key(buzz_scene::LightKey {
+            frame: 0,
+            color: peniko::Color::from_rgb8(0x0B, 0x0E, 0x18),
+            intensity: 1.0,
+            softness: 0.35,
+            standing_height: 70.0,
+            shadow_strength: 0.45,
+            kind,
+        });
+        track.set_key(buzz_scene::LightKey {
+            frame: 48,
+            color: peniko::Color::from_rgb8(0x0B, 0x0E, 0x18),
+            intensity: 0.4,
+            softness: 0.35,
+            standing_height: 70.0,
+            shadow_strength: 0.45,
+            kind: buzz_scene::LightKind::Gloom {
+                edge: buzz_geom::Point::new(120.0, 77.25),
+                facing: 0.85,
+                throw: 600.0,
+                width: 3210.0,
+            },
+        });
+        dark.track = Some(track);
+
+        scene.lights_mut().enabled = true;
+        scene.lights_mut().lights.push(dark);
+
+        let back = DocumentDto::from_scene(&scene)
+            .to_scene()
+            .expect("round trip");
+        let restored = &back.lights().lights[0];
+        assert_eq!(restored.kind, kind, "the wall moved across a save");
+        assert_eq!(
+            restored.track,
+            scene.lights().lights[0].track,
+            "the gloom's keyframes changed across a save"
         );
     }
 

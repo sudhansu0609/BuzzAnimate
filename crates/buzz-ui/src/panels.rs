@@ -297,7 +297,13 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             // so Insert is where a user of either would look first.
             ui.separator();
             ui.menu_button("Light", |ui| {
-                for c in [Command::AddSun, Command::AddSky, Command::AddLamp] {
+                for c in [
+                    Command::AddSun,
+                    Command::AddSky,
+                    Command::AddLamp,
+                    Command::AddGloom,
+                    Command::AddFire,
+                ] {
                     item(ui, c, true, &mut raised);
                 }
             });

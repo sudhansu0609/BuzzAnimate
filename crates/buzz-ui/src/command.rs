@@ -141,6 +141,11 @@ pub enum Command {
     AddSky,
     /// Add a lamp: a point on the stage, with falloff.
     AddLamp,
+    /// Add a gloom: a wide wall of darkness thrown across the stage, aimed
+    /// against whatever light is already there.
+    AddGloom,
+    /// Add a fire: a lamp that gutters, in the colour of a hearth.
+    AddFire,
     /// Show or hide the light handles on the stage.
     ToggleLightGizmos,
 
@@ -312,6 +317,8 @@ impl Command {
             AddSun => "Sun",
             AddSky => "Sky",
             AddLamp => "Lamp",
+            AddGloom => "Gloom",
+            AddFire => "Fire",
             ToggleLightGizmos => "Light Handles",
 
             ToggleActionsPanel => "Actions",
@@ -458,7 +465,7 @@ impl Command {
             ToggleTheme => None,
             About => None,
 
-            AddSun | AddSky | AddLamp => None,
+            AddSun | AddSky | AddLamp | AddGloom | AddFire => None,
             ToggleLightGizmos => sc(ctrl_shift, Key::L),
 
             // F9 is Animate's own Actions panel key on Windows.
@@ -642,6 +649,8 @@ pub fn all_with_shortcuts() -> Vec<Command> {
         AddSun,
         AddSky,
         AddLamp,
+        AddGloom,
+        AddFire,
         ToggleLightGizmos,
         ToggleLayoutLock,
         ToggleTheme,
@@ -768,6 +777,8 @@ mod tests {
             AddSun,
             AddSky,
             AddLamp,
+            AddGloom,
+            AddFire,
             ToggleLightGizmos,
             ToggleLayoutLock,
             ToggleTheme,

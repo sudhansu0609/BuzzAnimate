@@ -183,11 +183,12 @@ fn blend_mode(blend: buzz_fx::Blend) -> peniko::BlendMode {
 /// going wider only disturbs more of the silhouette.
 const SEAM_SEAL_PX: f64 = 0.9;
 
+
 /// Is this paint fully opaque everywhere?
 ///
 /// A gradient has to be checked stop by stop: one transparent stop is enough to
 /// make sealing it draw a dark rim, and the average would hide that.
-fn is_opaque(paint: &Paint) -> bool {
+pub(crate) fn is_opaque(paint: &Paint) -> bool {
     match paint {
         Paint::Solid(c) => c.components[3] >= 1.0,
         Paint::Gradient(g) => g.stops().iter().all(|s| s.color.components[3] >= 1.0),
@@ -249,6 +250,17 @@ impl<'a> SceneBuilder<'a> {
         self.clip.bounds()
     }
 
+    /// **How much geometry this scene has taken so far**, as Vello's own count
+    /// of encoded path segments.
+    ///
+    /// Read rather than tallied: the encoding is the thing that will be
+    /// rasterised, so its own number cannot drift from what was drawn. It is
+    /// what [`crate::document::DrawCache::reconsider`] judges a frame by; see
+    /// there for why a frame has to be judged at all.
+    pub fn encoded_segments(&self) -> u32 {
+        self.scene.encoding().n_path_segments
+    }
+
     /// Shift the rendered output by a screen-space offset.
     ///
     /// The editor draws the stage into the central area between the docked
@@ -258,7 +270,21 @@ impl<'a> SceneBuilder<'a> {
     ///
     /// Applied to the GPU transform only, which keeps it away from the
     /// precision-critical CPU stages.
+    ///
+    /// **A non-finite offset is ignored rather than applied.** The window
+    /// derives this from the rectangle egui gave the stage, and that rectangle
+    /// is `Rect::NOTHING` — infinities — until the layout has been measured
+    /// once, which is the first frame after the app opens and can be a frame
+    /// again after the window is maximised. An infinity here goes into the GPU
+    /// transform, every coordinate through it comes out NaN, and the whole
+    /// frame rasterises to nothing: a black stage, with the lighting apparently
+    /// off because *everything* is off. Drawing the frame at the origin for one
+    /// frame is wrong by a few pixels; drawing it black is wrong by the whole
+    /// picture.
     pub fn with_viewport_offset(mut self, offset: buzz_geom::Vec2) -> Self {
+        if !offset.x.is_finite() || !offset.y.is_finite() {
+            return self;
+        }
         self.split.gpu_view = Affine::translate(offset) * self.split.gpu_view;
         self
     }
@@ -521,6 +547,106 @@ impl<'a> SceneBuilder<'a> {
         let blend = peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Plus);
         self.scene
             .push_layer(Fill::NonZero, blend, 1.0, self.split.gpu_view, &path);
+        self.scene.fill(
+            Fill::NonZero,
+            self.split.gpu_view,
+            &brush,
+            brush_transform,
+            &path,
+        );
+        self.scene.pop_layer();
+    }
+
+    /// Fill with a paint the way **light** falls on what is already there:
+    /// everything gets brighter, nothing gets darker, and nothing goes past
+    /// white.
+    ///
+    /// Screen rather than Plus, which is the other obvious choice. Plus is what
+    /// two beams of light do to each other in a vacuum and it blows past white
+    /// the moment a lamp is anywhere near a pale surface — a cream wall under a
+    /// warm lamp turns into a white disc with an edge. Screen is
+    /// `1 − (1 − a)(1 − b)`: it approaches white and never reaches it, which is
+    /// how a photograph of a lit wall behaves and what a painter reaches for.
+    /// Over black it does nothing, which is also right — a lamp cannot light
+    /// what absorbs everything.
+    pub fn fill_shape_paint_lit(&mut self, shape: &impl Shape, paint: &Paint, to_doc: Affine) {
+        let path = self.to_render_space(shape);
+        let (brush, brush_transform) = self.brush_for(paint, to_doc);
+        let blend = peniko::BlendMode::new(peniko::Mix::Screen, peniko::Compose::SrcOver);
+        self.scene
+            .push_layer(Fill::NonZero, blend, 1.0, self.split.gpu_view, &path);
+        self.scene.fill(
+            Fill::NonZero,
+            self.split.gpu_view,
+            &brush,
+            brush_transform,
+            &path,
+        );
+        self.scene.pop_layer();
+    }
+
+    /// Lay `color` over what is already drawn inside `shape`, **and only where
+    /// something is already drawn**.
+    ///
+    /// This is how light reaches artwork whose colours cannot be rewritten one
+    /// by one — a bitmap. The light becomes a blend over the picture instead of
+    /// a change to the paint; see [`buzz_light::Illumination::as_filter`].
+    ///
+    /// # Why `SrcAtop`
+    ///
+    /// A cut-out photograph is transparent over most of its own rectangle. Laid
+    /// on with ordinary source-over, a multiply against a transparent backdrop
+    /// paints the colour straight in — so the light would fill the hole in the
+    /// cut-out with itself, and a character on a white stage would gain a
+    /// coloured rectangle around it. `SrcAtop` keeps the backdrop's alpha, so
+    /// the light lands on the picture and nowhere else.
+    ///
+    /// The caller is responsible for what "already drawn" means: called outside
+    /// an isolation group the backdrop includes the stage, and the light would
+    /// tint that too. See [`Self::push_isolation`].
+    pub fn fill_shape_atop(&mut self, shape: &impl Shape, color: Color, blend: buzz_fx::Blend) {
+        let path = self.to_render_space(shape);
+        let mix = blend_mode(blend).mix;
+        self.scene.push_layer(
+            Fill::NonZero,
+            peniko::BlendMode::new(mix, peniko::Compose::SrcAtop),
+            1.0,
+            self.split.gpu_view,
+            &path,
+        );
+        self.scene
+            .fill(Fill::NonZero, self.split.gpu_view, color, None, &path);
+        self.scene.pop_layer();
+    }
+
+    /// [`Self::fill_shape_atop`], with a paint instead of one colour.
+    ///
+    /// **This is what makes a lamp fall off across a shape.** A light laid over
+    /// artwork as a solid can only tint it evenly; the same pass with a radial
+    /// gradient — the lamp's own falloff, centred where it stands — lands the
+    /// light per pixel, so the near side of a face is brighter than the far side
+    /// of the same face. See [`buzz_light::LightRig::field`].
+    ///
+    /// `to_doc` maps the paint's own space into document space, exactly as
+    /// [`Self::fill_shape_paint`] takes it. A light's ramp is already in document
+    /// space, so what it wants is the projection alone.
+    pub fn fill_shape_atop_paint(
+        &mut self,
+        shape: &impl Shape,
+        paint: &Paint,
+        to_doc: Affine,
+        blend: buzz_fx::Blend,
+    ) {
+        let path = self.to_render_space(shape);
+        let (brush, brush_transform) = self.brush_for(paint, to_doc);
+        let mix = blend_mode(blend).mix;
+        self.scene.push_layer(
+            Fill::NonZero,
+            peniko::BlendMode::new(mix, peniko::Compose::SrcAtop),
+            1.0,
+            self.split.gpu_view,
+            &path,
+        );
         self.scene.fill(
             Fill::NonZero,
             self.split.gpu_view,

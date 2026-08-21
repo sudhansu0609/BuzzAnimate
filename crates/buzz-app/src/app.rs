@@ -73,10 +73,59 @@ struct StageStamp {
     edit_multiple: bool,
     /// The generation of installed lighting geometry.
     lights_generation: u64,
+    /// **The lighting rig itself**, as [`buzz_scene::LightRig::fingerprint`],
+    /// resolved at the frame being drawn.
+    ///
+    /// Not covered by `revision`, and the difference matters. `revision` is a
+    /// clock on the document's *content*, and undo puts it back: adding a light
+    /// takes it from 5 to 6, undoing returns it to 5, and adding a different
+    /// light takes it to 6 again. So the same number describes two different
+    /// rigs, and the only thing standing between that and a retained encoding
+    /// of the wrong lighting is that a frame happened to be drawn in between.
+    /// Redraw requests coalesce, so that is not something to rely on.
+    ///
+    /// A fingerprint of the rig is what the reuse test actually wants to ask,
+    /// and it costs one hash of a handful of lights per frame. It also covers
+    /// what the revision never could: a keyframed light, whose values change
+    /// from frame to frame with no edit at all.
+    lights: u64,
     /// Whether the encoding this stamp describes has a tool preview painted
     /// **into** it. See the reuse test in `run`: it is what makes the frame
     /// after a brush stroke rebuild rather than keep the stale ink.
     painted_preview: bool,
+}
+
+/// A batch of shading geometry being built off the UI thread.
+///
+/// # Why it can be abandoned
+///
+/// Aiming a light is a drag, and a drag is fifty pointer positions. Each one
+/// asks for the crescents of everything on screen; each batch takes longer than
+/// the gap between two pointer moves. Without a way to give up, every batch ran
+/// to completion for a light that had already moved on — so the pool stayed
+/// saturated for the whole gesture, the window was starved of the cores it
+/// needed to draw, and the geometry never once caught up with the pointer. That
+/// is what "the app hangs and the controls are laggy" was.
+///
+/// So a batch carries a flag, and the frame that notices the light has moved
+/// again sets it. The workers drop what is left within one crescent, the pool
+/// empties, and a batch for where the light *is* starts instead. At most one
+/// batch is ever in flight, and it is always the current one.
+struct ShadeBuild {
+    results: crossbeam_channel::Receiver<Vec<buzz_render::lighting::Built>>,
+    /// Set to abandon the batch. Read between crescents by the workers.
+    abandon: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The light rig this batch is being built for. When the rig no longer
+    /// matches, the batch is for a light that has moved and is abandoned.
+    aim: u64,
+}
+
+impl ShadeBuild {
+    /// Give up on this batch, so its workers stop and free the pool.
+    fn abandon(&self) {
+        self.abandon
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 use crate::editor::Editor;
@@ -471,9 +520,16 @@ pub struct App {
     /// Bumped whenever installed lighting geometry changes what the stage would
     /// encode, so a retained stage is invalidated when a light's shading lands.
     lights_generation: u64,
+    /// The rig's fingerprint as of the last frame drawn, so a change to the
+    /// lighting can ask for the frame that shows it. See [`App::render`].
+    last_rig: u64,
     /// Escape hatch: `BUZZ_NO_RETAIN=1` always re-encodes the stage, for
     /// bisecting any report of a stale stage.
     retain_stage: bool,
+    /// The last stage rectangle egui actually measured. See [`App::render`]:
+    /// a frame whose layout has not settled hands out `Rect::NOTHING`, and
+    /// drawing through that is what a black stage is.
+    last_stage_area: Option<egui::Rect>,
     /// Per-frame section timing and the over-budget warning. See
     /// [`crate::profile`].
     profiler: crate::profile::FrameProfiler,
@@ -524,11 +580,18 @@ pub struct App {
     /// The first lit frame of a heavy scene used to cost a third of a second,
     /// because every crescent and cast shadow was built — one boolean each, one
     /// at a time — before anything appeared. Now a cold cache draws the frame
-    /// unlit and the geometry is built on every core at once, off this thread;
-    /// when it lands, the cache is warm and the next frame is lit. Per-light
-    /// keying keeps the cache warm through ordinary edits, so this path fires
-    /// only when it is genuinely cold. Closes §7-154 and §7-155.
-    shade_build: Option<crossbeam_channel::Receiver<Vec<buzz_render::lighting::Built>>>,
+    /// with the shading it last had and the geometry is built on every core at
+    /// once, off this thread; when it lands, the next frame is exact. Closes
+    /// §7-154 and §7-155.
+    shade_build: Option<ShadeBuild>,
+    /// The rig's [`aim`](buzz_scene::LightRig::aim) as of the previous frame, so
+    /// a frame can tell a light that is *moving* from one that has come to rest.
+    /// See where the batch is started for what that decides.
+    shade_aim: u64,
+    /// Whether the retained stage encoding was built with shading the cache
+    /// knew to be provisional. It must not be reused if so — see where reuse is
+    /// decided, which is where the trap is.
+    stage_stale: bool,
     /// Sounds being decoded off the UI thread, and where the results land.
     ///
     /// `Scene::merge` can bring in a whole soundtrack at once; decoding it inline
@@ -599,6 +662,8 @@ impl App {
             egui_repaint: None,
             force_poll: std::env::var("BUZZ_POLL").is_ok(),
             stage_stamp: None,
+            last_rig: 0,
+            last_stage_area: None,
             scroll_extent: None,
             bounds_table: None,
             lights_generation: 0,
@@ -626,6 +691,8 @@ impl App {
             thumbnails: crate::thumbnails::Thumbnails::default(),
             asset_thumbnails: crate::thumbnails::AssetThumbnails::default(),
             shade_build: None,
+            shade_aim: 0,
+            stage_stale: false,
             sound_decode: None,
             usage_cache: UsageCache::default(),
             scripting: None,
@@ -865,6 +932,27 @@ impl Active {
             .configure(&self.gpu.device, &self.surface_config);
     }
 }
+
+/// **Is this a rectangle the stage can be drawn through?**
+///
+/// Finite on all four sides and at least a pixel each way. Everything else —
+/// `egui::Rect::NOTHING`, a panel collapsed to a hairline, a window minimised
+/// to nothing — produces infinities or a degenerate transform, and a frame
+/// drawn through one of those is black. See [`App::render`].
+fn usable_stage_area(area: egui::Rect) -> bool {
+    area.min.x.is_finite()
+        && area.min.y.is_finite()
+        && area.max.x.is_finite()
+        && area.max.y.is_finite()
+        && area.width() >= 1.0
+        && area.height() >= 1.0
+}
+
+/// What the stage is drawn through when nothing has ever been measured: the
+/// same default [`Active`] starts with, so the very first frame of a session
+/// draws the document rather than a black rectangle.
+const FALLBACK_STAGE_AREA: egui::Rect =
+    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 600.0));
 
 /// Read the modifier state egui saw this frame.
 fn mods_from(ctx: &egui::Context) -> Mods {
@@ -1925,8 +2013,28 @@ impl App {
     }
 
     fn light_panel(&mut self, ui: &mut egui::Ui) {
+        // What the last stage encode had to leave out, so the panel can say so
+        // rather than leaving the animator to wonder why a lamp models nothing.
+        // See `buzz_render::document::LightDetail`.
+        let trimmed = if !self.editor.scene().lights().is_active() {
+            // An unlit document encodes nothing generated, so the level says
+            // nothing about it — and a note about lighting that is switched off
+            // is noise.
+            None
+        } else {
+            match self.lights.detail() {
+                buzz_render::document::LightDetail::Full => None,
+                buzz_render::document::LightDetail::NoModelling => {
+                    Some("too dense to model — colour and shadows only")
+                }
+                buzz_render::document::LightDetail::Flat => {
+                    Some("too dense to model or shadow — colour only")
+                }
+            }
+        };
         let editor = &mut self.editor;
         let state = &mut editor.light_panel;
+        state.trimmed = trimmed;
         let response = buzz_ui::light_panel(ui, editor.doc.scene().lights(), state);
 
         if let Some(id) = response.select {
@@ -1937,6 +2045,10 @@ impl App {
             // The same path the Insert menu takes, so a light added from the
             // panel and one added from the menu behave identically.
             editor.add_light(kind);
+        }
+
+        if response.add_fire {
+            editor.run(Command::AddFire);
         }
 
         if let Some(id) = response.remove {
@@ -5209,6 +5321,45 @@ impl App {
         let Some(active) = self.active.as_mut() else {
             return Ok(());
         };
+
+        // **A stage area that is not a rectangle is not a frame to draw.**
+        //
+        // `stage_area` starts as `egui::Rect::NOTHING`, whose width is negative
+        // infinity, and it is only replaced by whatever the layout gave the
+        // central panel. That is nothing at all on the first frame after the
+        // app opens, and nothing again on the frame a window is maximised,
+        // before egui has measured the new size.
+        //
+        // Carried into physical pixels it becomes a viewport offset of
+        // infinity, a camera viewport of minus infinity, and a cull rectangle
+        // of NaN. Every one of those turns the frame into nothing, and what is
+        // on screen is a black stage — which reads as the lights being broken,
+        // because a black picture is exactly what a light that does not work
+        // would leave. It is not the lights; it is that no artwork was drawn at
+        // all.
+        //
+        // The last area that *was* a rectangle is drawn instead. For one frame
+        // that is the previous framing, which nobody can see; a black frame is
+        // something everybody can see.
+        let stage_area = if usable_stage_area(stage_area) {
+            self.last_stage_area = Some(stage_area);
+            stage_area
+        } else {
+            // And ask for the frame that will have a stage in it, because
+            // nothing else here is going to.
+            //
+            // Said out loud, because a silent fallback is how a layout that
+            // never settles turns into "the app draws in the wrong place and
+            // the controls miss": the picture would be drawn through one
+            // rectangle while the pointer was mapped through another, every
+            // frame, with nothing anywhere saying so.
+            tracing::warn!(
+                ?stage_area,
+                "the stage had no measured area this frame; drawing through the last one"
+            );
+            active.window.request_redraw();
+            self.last_stage_area.unwrap_or(FALLBACK_STAGE_AREA)
+        };
         active.stage_area = stage_area;
         active
             .egui_state
@@ -5252,14 +5403,40 @@ impl App {
 
         // Any shading geometry that finished building off-thread lands here,
         // before the frame that will read it, so this frame draws lit.
-        if let Some(rx) = &self.shade_build
-            && let Ok(built) = rx.try_recv()
-        {
-            self.lights.lights.install(built);
-            self.shade_build = None;
-            // The stage's shading changed, so a retained encoding is stale.
-            self.lights_generation = self.lights_generation.wrapping_add(1);
-            active.window.request_redraw();
+        // Resolved at the frame being drawn, so a keyframed light is compared
+        // by the state it is actually in rather than by its track.
+        // Both numbers come off the same resolved rig: `aim` is what could move
+        // a crescent, and the fingerprint is everything that could change the
+        // picture at all — colour, strength, a light switched off, a wall of
+        // dark stood somewhere else.
+        let (aim, rig) = {
+            let resolved = self
+                .editor
+                .scene()
+                .lights()
+                .resolved_at(self.editor.current_frame);
+            (resolved.aim(), resolved.fingerprint())
+        };
+        if let Some(build) = &self.shade_build {
+            if let Ok(built) = build.results.try_recv() {
+                self.lights.lights.install(built);
+                self.shade_build = None;
+                // The stage's shading changed, so a retained encoding is stale.
+                self.lights_generation = self.lights_generation.wrapping_add(1);
+                active.window.request_redraw();
+            } else if build.aim != aim {
+                // The light moved while this was being built, so what it is
+                // building is already wrong. Tell the workers to stop — they
+                // free the pool within one crescent — and drop the batch, which
+                // lets this frame start one for where the light is now.
+                //
+                // Without this, aiming a light queued a fresh full rebuild
+                // behind every finished one and the machine stayed pinned for
+                // the whole gesture without the shading ever catching up.
+                build.abandon();
+                self.shade_build = None;
+                active.window.request_redraw();
+            }
         }
 
         // Sounds that finished decoding off-thread install here, so the timeline
@@ -5273,31 +5450,49 @@ impl App {
             active.window.request_redraw();
         }
 
-        // **Defer when the cache is cold, and while a gesture is running.**
+        // **What this frame may build on this thread, and what it may only
+        // record.**
         //
-        // A warm cache — the ordinary case, kept warm by per-light keying
-        // through every edit — builds any stray miss inline and stays
-        // flicker-free. A cold one (a document just opened, lighting just
-        // switched on) draws unlit this frame and builds off-thread instead of
-        // freezing on it.
+        // An ordinary frame gets a small budget — a handful of crescents, about
+        // two milliseconds — so drawing a shape lights it on the spot with no
+        // deferred frame and no flicker, while a *bulk* rebuild can never be
+        // paid for in front of the user however it was provoked. That single
+        // number replaced a rule that tried to name every expensive case in
+        // advance and, inevitably, missed one: the frame a light drag ended on
+        // found every crescent in the document stale, no build in flight to
+        // defer to, and built all of them inline. Measured at 170 ms over three
+        // hundred shapes. The freeze had not been removed by deferring during
+        // the gesture; it had been moved to the moment the pointer came up.
         //
-        // A gesture is the case that was missed, and it is the worst one. A
-        // lamp's geometry depends on where the lamp *is*, so dragging one
-        // misses every entry it owns on every pointer move — and with the
-        // cache warm those misses were built inline, on the frame thread, one
-        // boolean difference per shape. Measured at 322 ms a frame over four
-        // hundred curved shapes: three frames a second, which is not a slow
-        // drag but a frozen window. Deferring costs a frame of the previous
-        // shading during the drag and gives the gesture back.
-        // And while a build is already in flight, so the frame that ends a
-        // drag does not land the whole rebuild inline the moment the pointer
-        // comes up — the freeze would simply have moved to the end of the
-        // gesture rather than gone.
-        let cold = self.lights.lights.is_empty() && self.editor.scene().lights().is_active();
-        let settling = self.shade_build.is_some();
-        self.lights
-            .lights
-            .set_defer(cold || settling || self.editor.is_gesturing());
+        // Nothing is built here at all while the cache is cold or a gesture is
+        // running: both mean a rebuild of everything, and the whole of it
+        // belongs off-thread.
+        //
+        // Recording is separate, and is off while a batch is already being
+        // built, because what were recorded then would be dropped on the floor
+        // — and recording one copies a whole transformed path. On a heavy
+        // document that was a thousand path copies a frame, discarded, for
+        // every frame a build was running.
+        // **Cold means there is shading owed and none built**, so a document
+        // whose lighting has been trimmed back is never cold: no crescent will
+        // ever be built for it, and calling it cold forever would refuse the
+        // retained encoding on every frame and re-encode the whole stage at the
+        // display's rate. See `buzz_render::document::LightDetail`.
+        let cold = self.lights.lights.is_empty()
+            && self.editor.scene().lights().is_active()
+            && self.lights.detail() == buzz_render::document::LightDetail::Full;
+        let building = self.shade_build.is_some();
+        let bulk = cold || self.editor.is_gesturing();
+        // Has the light come to rest? Nothing is recorded or built while it is
+        // still moving — see where the batch is started, below.
+        let settled = aim == self.shade_aim;
+        self.shade_aim = aim;
+        self.lights.lights.set_inline_budget(if bulk || building {
+            Duration::ZERO
+        } else {
+            buzz_render::lighting::INLINE_BUDGET
+        });
+        self.lights.lights.set_queue(!building && settled);
 
         self.profiler.enter(crate::profile::Section::Encode);
 
@@ -5339,6 +5534,7 @@ impl App {
             ),
             edit_multiple: self.editor.edit_multiple,
             lights_generation: self.lights_generation,
+            lights: rig,
             painted_preview: paints_into_scene,
         };
         // **Only a preview that is painted into the scene invalidates it.**
@@ -5354,25 +5550,70 @@ impl App {
         // with an imported character that is thousands of shapes per frame, and
         // it is what made dragging a selection judder while a brush stroke —
         // the genuinely expensive case — cost the same.
+        //
+        // A build in flight no longer refuses reuse. It used to, and while one
+        // ran `wants_frame` returns `Now`, so the window spun at the display's
+        // full rate re-encoding a stage that could not have changed: nothing is
+        // recorded and nothing is installed until the batch lands, and when it
+        // does, `lights_generation` moves the stamp and this rebuilds anyway.
+        // On a heavy document that was tens of milliseconds a frame of pure
+        // waste, on exactly the frames the machine was busiest.
+        //
+        // **An encoding built with provisional shading is not reusable**, and
+        // that is not the same question as whether anything changed. Nothing
+        // *has* changed — that is exactly the trap. A frame that deferred its
+        // crescents leaves a retained encoding of the artwork half lit; the next
+        // frame finds an identical stamp, reuses it, and so never re-encodes,
+        // never records the misses it owes, and never builds them. The picture
+        // stays half lit for ever while the window spins asking for a frame that
+        // does nothing. That is "the lights do not work" on any document big
+        // enough that one frame's build budget did not cover it.
+        //
+        // Unless a batch is already running, in which case the encoding is going
+        // to be replaced the moment it lands — `lights_generation` moves the
+        // stamp — and re-encoding in the meantime is the pure waste this reuse
+        // exists to avoid.
+        let stale_encoding = self.stage_stale && self.shade_build.is_none();
         let reuse = self.retain_stage
             && !cold
-            && self.shade_build.is_none()
+            && !stale_encoding
             && !paints_into_scene
             && self.stage_stamp.as_ref() == Some(&stamp);
         if !reuse {
             stage::build_scene(&mut active.vello, &self.editor, area_px, scale, &mut self.lights);
             self.stage_stamp = Some(stamp);
+            // Read *after* the draw: it is the draw that discovers what it could
+            // not light.
+            self.stage_stale = self.lights.lights.is_stale();
         }
 
         // Whatever this frame could not light, build in parallel off-thread and
         // ask for another frame to show it in.
         let misses = self.lights.lights.take_misses();
-        // Deferring was for the stage frame only; anything else that draws
+        // The budget was for the stage frame only; anything else that draws
         // through this cache — the Library thumbnails below — builds inline.
         self.lights.lights.set_defer(false);
+
+        // **Nothing is built while the light is still moving.**
+        //
+        // A batch takes longer than the gap between two pointer moves, so one
+        // started mid-drag is for a light that will have moved before it lands
+        // — that is why it is abandoned above, and starting another in its
+        // place only pins the machine again for another result nobody will see.
+        // Meanwhile the shadows are exact on every frame and the crescents hold
+        // at their last angle, which is what a drag needs to look like.
+        //
+        // So the batch waits for the light to be where it was last frame: a
+        // pause, or the moment the pointer comes up. It lands a frame or two
+        // later and the picture is exact again, and the cores were free for
+        // drawing the whole time the hand was moving. `set_queue` above is the
+        // other half of it — while the light moves, the misses are not even
+        // collected, which is a copy of every visible path saved per frame.
         if !misses.is_empty() && self.shade_build.is_none() {
             let jobs = std::sync::Arc::clone(&self.jobs);
             let (send, receive) = crossbeam_channel::bounded(1);
+            let abandon = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop = std::sync::Arc::clone(&abandon);
             // A plain thread that parks on the interactive pool: the build fans
             // out across every core there, and the UI thread is not one of
             // them, so drawing is never what waits.
@@ -5383,13 +5624,58 @@ impl App {
                         use rayon::prelude::*;
                         misses
                             .into_par_iter()
+                            // Checked per crescent, so abandoning a batch frees
+                            // the pool within a fraction of a millisecond
+                            // rather than at the end of the whole rebuild.
+                            .filter(|_| !stop.load(std::sync::atomic::Ordering::Relaxed))
                             .map(buzz_render::lighting::Miss::build)
                             .collect::<Vec<_>>()
                     });
                     let _ = send.send(built);
                 })
                 .ok();
-            self.shade_build = Some(receive);
+            self.shade_build = Some(ShadeBuild {
+                results: receive,
+                abandon,
+                aim,
+            });
+            active.window.request_redraw();
+        }
+
+        // **Keep asking for frames until the shading is right.**
+        //
+        // Everything above is allowed to draw the frame with shading that is
+        // not quite the shading it asked for — a cold cache, a light still
+        // moving, a batch already running. Every one of those is fine *provided
+        // another frame follows*, and nothing else guarantees one: the window
+        // sleeps on `ControlFlow::Wait` and only wakes for input.
+        //
+        // Without this the rule that waits for a light to stop moving left the
+        // frame after the move carrying the shading from before it, and no
+        // reason to draw again. Switching a light on, or aiming one, then did
+        // nothing visible at all until the pointer happened to cross the window
+        // — which reads exactly like the lights being broken.
+        if self.stage_stale {
+            active.window.request_redraw();
+        }
+
+        // **A lighting change that builds nothing must still be shown.**
+        //
+        // Everything above that keeps the window awake is about *geometry* — a
+        // batch of crescents in flight, a frame that drew with shading it knew
+        // to be provisional. A great many lighting changes generate no geometry
+        // at all: recolouring a light, turning one down, switching one off,
+        // adding a sky, standing a wall of dark across the stage. None of those
+        // sets `shade_build` and none of them makes the cache stale, so nothing
+        // here asked for another frame and the window went back to sleep. It
+        // drew the right picture on the frame the edit was made — but only
+        // because the panel is built before the stage is encoded, which is an
+        // ordering the lighting has no business depending on.
+        //
+        // One comparison, and a lighting change is guaranteed a frame of its
+        // own whether or not anything else noticed it.
+        if rig != self.last_rig {
+            self.last_rig = rig;
             active.window.request_redraw();
         }
 
@@ -6299,6 +6585,7 @@ mod idle_tests {
             onion: (false, false, 2, 2),
             edit_multiple: false,
             lights_generation: 0,
+            lights: 0,
             painted_preview: false,
         }
     }
@@ -6328,6 +6615,9 @@ mod idle_tests {
         let mut a = stamp();
         a.lights_generation = 1;
         assert_ne!(base, a, "installed shading re-encodes");
+        let mut a = stamp();
+        a.lights = 1;
+        assert_ne!(base, a, "a change to the lighting rig re-encodes");
         // The frame after a brush stroke must rebuild rather than keep the ink
         // the preview left in the scene.
         let mut a = stamp();

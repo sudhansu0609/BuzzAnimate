@@ -2302,6 +2302,11 @@ impl Editor {
             AddSun => self.add_light(buzz_scene::LightKind::sun()),
             AddSky => self.add_light(buzz_scene::LightKind::sky()),
             AddLamp => self.add_light(buzz_scene::LightKind::lamp(self.camera.center)),
+            // The point it is given is thrown away by `add_light`, which aims a
+            // gloom against the rig it is joining. Passing one at all is what
+            // keeps every kind arriving by the same door.
+            AddGloom => self.add_light(buzz_scene::LightKind::gloom(self.camera.center)),
+            AddFire => self.add_fire(),
             TogglePanel(panel) => {
                 self.workspace.toggle(panel);
                 self.workspace.save();
@@ -2408,17 +2413,139 @@ impl Editor {
     /// Selecting it is the point: the Lighting panel then shows the new
     /// light's own settings rather than whichever one was there before.
     ///
-    /// A lamp arrives in the middle of the view whatever position the request
-    /// carried. A lamp is the one light with a place on the stage, and one
-    /// dropped off-screen — at the origin, say, which is the top-left corner of
-    /// the artwork — looks exactly like nothing having happened.
+    /// **The box a new light is sized against.**
+    ///
+    /// A lamp's reach and a gloom's throw are both derived from how big the
+    /// picture is, because a fixed number of units is right for one document
+    /// and wrong for every other. What they were derived from was
+    /// [`Camera::visible_doc_rect`] alone, and that is not always a picture:
+    ///
+    /// * **Before the stage has been laid out** the viewport is empty, so the
+    ///   visible rectangle is a *point*. A lamp built from it got the minimum
+    ///   reach of forty units and a gloom got a throw of one — a light that
+    ///   cannot be seen, on a stage hundreds of units across, which reads as
+    ///   the light never having been added. Any moment the stage has no area
+    ///   does this: the panel maximised over it, the window minimised, the very
+    ///   first frame after a document opens.
+    /// * **Zoomed in**, the visible rectangle is a detail rather than the shot.
+    ///   A light sized to it lights the detail and dies before the edge of the
+    ///   frame, so zooming back out shows a shot that is barely lit at all.
+    ///
+    /// So the view is used only when it is a real box, and it is unioned with
+    /// the stage: a light belongs to the *shot*, and the shot is at least the
+    /// stage. Where the light is put still follows the view, which is the half
+    /// of "put it where the user is looking" that was always right.
+    fn light_frame(&self) -> buzz_geom::Rect {
+        let stage = self.doc.scene().stage().stage_rect();
+        let seen = self.camera.visible_doc_rect();
+        let usable = seen.x0.is_finite()
+            && seen.y0.is_finite()
+            && seen.x1.is_finite()
+            && seen.y1.is_finite()
+            && seen.width() > 1.0
+            && seen.height() > 1.0;
+        if !usable {
+            return stage;
+        }
+        stage.union(seen)
+    }
+
+    /// Where to stand a new lamp so it is not on top of one already there.
+    ///
+    /// Up and to the left of `frame`, where a key light goes — and then stepped
+    /// along the diagonal until it is clear of every lamp in the rig.
+    ///
+    /// **Two lamps in the same place look like one lamp.** The position was a
+    /// fixed fraction of the view, so every lamp after the first landed on
+    /// exactly the same point: adding a second changed the picture by almost
+    /// nothing, which is indistinguishable from it not having been added. It is
+    /// the same report as "I deleted the light and the next one did nothing",
+    /// because the next one arrives where the last one was.
+    fn free_lamp_spot(&self, frame: buzz_geom::Rect) -> Point {
+        let start = Point::new(
+            frame.x0 + frame.width() * 0.22,
+            frame.y0 + frame.height() * 0.20,
+        );
+        // A step big enough that the two pools are visibly different lights,
+        // small enough that the tenth one is still on the picture.
+        let step = (frame.width().min(frame.height()) * 0.12).max(8.0);
+        let clear = |at: Point| {
+            !self
+                .doc
+                .scene()
+                .lights()
+                .lights
+                .iter()
+                .any(|light| match light.kind {
+                    buzz_scene::LightKind::Lamp { position, .. } => {
+                        (position - at).hypot() < step * 0.9
+                    }
+                    _ => false,
+                })
+        };
+        (0..12)
+            .map(|n| start + buzz_geom::Vec2::new(step * n as f64, step * n as f64 * 0.6))
+            .find(|at| clear(*at))
+            .unwrap_or(start)
+    }
+
+    /// A lamp arrives **in the view, and off to one side** — up and to the left,
+    /// where a key light goes — whatever position the request carried. A lamp is
+    /// the one light with a place on the stage, and one dropped off-screen (at
+    /// the origin, say, which is the top-left corner of the artwork) looks
+    /// exactly like nothing having happened.
+    ///
+    /// # Why not the middle of the view
+    ///
+    /// It used to arrive dead centre, which is the one position where a lamp
+    /// does nothing you can see. Everything a lamp does that reads as *light*
+    /// comes from the direction it lies in: the shaded crescent is the artwork
+    /// minus itself shifted towards the lamp, and the shadow is the artwork
+    /// projected away from it. A lamp directly over the middle of what it is
+    /// lighting has no direction in the plane at all — so there is no crescent,
+    /// the pool is symmetrical, and the shadow projects straight out from under
+    /// the drawing and hides beneath it.
+    ///
+    /// Measured on a character at the centre of the stage: the lit side and the
+    /// dark side came out within a couple of levels of each other, with no
+    /// shadow on the floor. Which is exactly the report — a lamp that lights
+    /// nothing, on a rig that works perfectly the moment the lamp is dragged an
+    /// inch off centre.
     pub fn add_light(&mut self, kind: buzz_scene::LightKind) {
+        let seen = self.light_frame();
         let kind = match kind {
-            buzz_scene::LightKind::Lamp { height, radius, .. } => buzz_scene::LightKind::Lamp {
-                position: self.camera.center,
-                height,
-                radius,
-            },
+            buzz_scene::LightKind::Lamp { height, radius, .. } => {
+                // **Reach is measured against what is on screen, not against a
+                // fixed number of pixels.**
+                //
+                // The default was 320 units whatever the document was. On the
+                // 550-wide stage this was built against that crosses most of
+                // the picture; on a 1920 film it is a sixth of the width, so a
+                // new lamp fell off to nothing before it reached the character
+                // standing in the middle of the shot — added, aimed, and
+                // apparently doing nothing, which is how a lamp gets reported
+                // as broken.
+                //
+                // Half the smaller side of the view puts the half-brightness
+                // ring around the middle distance of whatever is being looked
+                // at, so the falloff lands across the subject rather than
+                // inside the lamp or beyond the frame. The number stays in the
+                // Reach box for the animator to overrule.
+                let reach = (seen.width().min(seen.height()) * 0.5).clamp(40.0, 3000.0);
+                buzz_scene::LightKind::Lamp {
+                    position: self.free_lamp_spot(seen),
+                    height,
+                    radius: if radius > 0.0 { reach } else { radius },
+                }
+            }
+            // **A gloom is aimed, not placed.** Dropping one where the pointer
+            // happens to be is the one thing that cannot be right: it is a wall
+            // the width of the picture, and where it stands only means anything
+            // relative to the light it is standing against. So the panel's
+            // position is discarded and the rig is asked instead.
+            buzz_scene::LightKind::Gloom { .. } => {
+                self.doc.scene().lights().opposing_gloom(seen)
+            }
             other => other,
         };
 
@@ -2432,6 +2559,27 @@ impl Editor {
         // and cannot grab would look like nothing happened.
         self.light_panel.gizmos = true;
         self.status = Some(format!("Added a {}", label.to_lowercase()));
+    }
+
+    /// **Add a lamp and set it alight.**
+    ///
+    /// A fire is a lamp with a hearth colour and a gutter, so it arrives through
+    /// the same door every other light does — placed in the view, sized to the
+    /// shot, clear of the lamps already there — and is then made fire. Doing it
+    /// as one command rather than two clicks is the whole point: a preset buried
+    /// in a panel that has to be found, selected and scrolled to is a preset
+    /// nobody uses.
+    fn add_fire(&mut self) {
+        self.add_light(buzz_scene::LightKind::lamp(self.camera.center));
+        let Some(id) = self.light_panel.selected else {
+            return;
+        };
+        self.doc.edit("Fire", |scene| {
+            if let Some(light) = scene.lights_mut().get_mut(id) {
+                light.make_fire();
+            }
+        });
+        self.status = Some("Added a fire \u{2014} scrub the timeline to see it move".into());
     }
 
     /// Start a light drag, if a handle is under the pointer.
@@ -2450,7 +2598,12 @@ impl Editor {
         }
 
         let tolerance = crate::lights::GRAB_PX / self.camera.zoom.max(f64::MIN_POSITIVE);
-        let Some(gesture) = crate::lights::target_at(self.doc.scene(), doc, tolerance) else {
+        let Some(gesture) = crate::lights::target_at(
+            self.doc.scene(),
+            doc,
+            tolerance,
+            self.light_panel.selected,
+        ) else {
             return false;
         };
 
@@ -6250,6 +6403,46 @@ mod tests {
             "moving a lamp cost {per_move:.1} ms a frame; the window cannot \
              draw at that and the tool is unusable"
         );
+
+        // **And the frame the drag ends on.**
+        //
+        // This is where the freeze went when deferring during the gesture was
+        // added: the pointer comes up, nothing is deferring any more, every
+        // crescent in the document is stale, and the frame built all of them
+        // inline. Measured at 170 ms over three hundred shapes — a freeze that
+        // had been moved rather than removed, and worse than the one before it,
+        // because it landed at the moment the user expected to be finished.
+        //
+        // The window draws this frame with an inline budget, so what it may
+        // build is a fixed handful whatever it finds stale.
+        cache
+            .lights
+            .set_inline_budget(buzz_render::lighting::INLINE_BUDGET);
+        cache.lights.set_queue(true);
+        let began = std::time::Instant::now();
+        crate::stage::build_scene(&mut vello, &e, area, 1.0, &mut cache);
+        let ending = began.elapsed().as_secs_f64() * 1000.0;
+
+        eprintln!("LAMP DROP: {ending:.2} ms on the frame the drag ends");
+        // **Fourteen, not ten.** A lamp is drawn per pixel now — its falloff is a
+        // gradient laid over the artwork rather than one tint per shape — so a
+        // shape a lamp varies across goes through the composited path, which is
+        // a few passes rather than one fill. On this scene that is every one of
+        // the four hundred, because the lamp's reach is 900 over a 1600-wide
+        // stage: the worst case there is, which is what a guard should measure.
+        // It moved the frame from about 8 ms to about 9.5. What this exists to
+        // catch is a *freeze* — it was written against 170 ms — and the budget
+        // still sits inside a single 60 Hz frame, so it still catches one.
+        assert!(
+            ending < 14.0,
+            "the frame the drag ended on cost {ending:.1} ms; the freeze was \
+             moved to the end of the gesture rather than removed"
+        );
+        assert!(
+            !cache.lights.take_misses().is_empty(),
+            "what it could not build must still be queued, or the shading \
+             never becomes exact"
+        );
     }
 
     #[test]
@@ -9298,17 +9491,32 @@ mod tests {
         assert!(e.scene().lights().lights.is_empty());
     }
 
-    /// A lamp arrives where the user is looking, not at the origin — which is
-    /// off the top-left of the stage and would look like nothing happened.
+    /// **A lamp arrives in the view and off to one side.**
+    ///
+    /// In the view, because the origin is off the top-left of the stage and a
+    /// lamp dropped there looks exactly like nothing having happened. Off to one
+    /// side, because dead centre is the one place a lamp does nothing you can
+    /// see: everything that reads as *light* — the shaded crescent, the
+    /// highlight, the cast shadow — comes from the direction the lamp lies in,
+    /// and a lamp over the middle of what it lights has no direction at all.
     #[test]
-    fn a_lamp_arrives_in_the_middle_of_the_view() {
+    fn a_lamp_arrives_in_the_view_and_off_to_one_side() {
         let mut e = editor();
         e.camera.center = Point::new(640.0, 360.0);
+        let seen = e.camera.visible_doc_rect();
         e.run(Command::AddLamp);
 
         match e.scene().lights().lights[0].kind {
             buzz_scene::LightKind::Lamp { position, .. } => {
-                assert_eq!(position, Point::new(640.0, 360.0));
+                assert!(
+                    seen.contains(position),
+                    "the lamp landed outside the view: {position:?} in {seen:?}"
+                );
+                assert!(
+                    position.x < seen.center().x && position.y < seen.center().y,
+                    "a new lamp belongs up and to one side, where a key light \
+                     goes — not on top of what it is lighting: {position:?}"
+                );
             }
             other => panic!("not a lamp: {other:?}"),
         }

@@ -29,6 +29,10 @@ use crate::theme::Palette;
 pub struct LightResponse {
     /// Add a light of this kind.
     pub add: Option<LightKind>,
+    /// Add a lamp and set it alight. Its own field rather than a `LightKind`,
+    /// because a fire is a lamp plus a handful of settings rather than a kind
+    /// of its own; see [`buzz_scene::Light::make_fire`].
+    pub add_fire: bool,
     pub remove: Option<LightId>,
     pub select: Option<LightId>,
     /// A light was edited; this is the whole light, as it now is.
@@ -47,6 +51,14 @@ pub struct LightPanelState {
     pub selected: Option<LightId>,
     /// Draw the light handles on the stage, and let them be dragged.
     pub gizmos: bool,
+    /// **What the renderer had to leave out of the last frame**, if anything.
+    ///
+    /// A document dense enough that its lit frame will not fit the rasteriser
+    /// has some of its lighting trimmed away rather than losing the frame — see
+    /// `buzz_render::document::LightDetail`. That has to be *said*: an animator
+    /// looking at a lamp with the modelling missing, and no explanation, is
+    /// looking at the same silence this whole mechanism exists to end.
+    pub trimmed: Option<&'static str>,
 }
 
 impl Default for LightPanelState {
@@ -56,6 +68,7 @@ impl Default for LightPanelState {
             // On: a light you cannot see is a light you cannot aim, and the
             // handles cost nothing when there are no lights to draw.
             gizmos: true,
+            trimmed: None,
         }
     }
 }
@@ -64,6 +77,12 @@ impl Default for LightPanelState {
 /// view — it knows where the user is looking and the panel does not — so this
 /// is only the fallback for a caller that has no view at all.
 const NEW_LAMP: Point = Point::new(275.0, 120.0);
+
+/// Where a new wall of dark is asked for. As with a lamp, the editor throws
+/// this away and aims one against whatever is already lighting the shot — see
+/// [`buzz_scene::LightRig::opposing_gloom`] — so this is only what a caller
+/// with no view at all would get.
+const NEW_GLOOM: Point = Point::new(-200.0, 200.0);
 
 /// Draw the panel.
 pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> LightResponse {
@@ -87,6 +106,13 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
             );
         }
     });
+
+    if let Some(trimmed) = state.trimmed {
+        ui.label(RichText::new(trimmed).small().weak())
+            .on_hover_text(
+                "This document has more artwork in a frame than the renderer can                  rasterise with the lighting drawn in full, so the heaviest part                  of it is left out. Colour, falloff and the lamp's pool are                  unaffected. Zooming in, or simplifying the artwork, brings the                  rest back.",
+            );
+    }
 
     ui.horizontal(|ui| {
         if ui
@@ -112,6 +138,27 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
         {
             out.add = Some(LightKind::lamp(NEW_LAMP));
         }
+        if ui
+            .small_button("+ Gloom")
+            .on_hover_text(
+                "A wall of darkness with a long throw. Added facing back across the stage at \
+                 whatever is lighting it, so the dark end of the picture moves as well as the \
+                 bright one.",
+            )
+            .clicked()
+        {
+            out.add = Some(LightKind::gloom(NEW_GLOOM));
+        }
+        if ui
+            .small_button("\u{1F525} Fire")
+            .on_hover_text(
+                "A lamp that gutters, in the colour of a hearth. It moves every frame with \
+                 no keyframes at all \u{2014} scrub the timeline to see it.",
+            )
+            .clicked()
+        {
+            out.add_fire = true;
+        }
     });
 
     if rig.lights.is_empty() {
@@ -120,7 +167,8 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
             RichText::new(
                 "No lights — artwork draws exactly as you painted it.\n\nAdd a sun for one \
                  direction, a sky to fill the shadows, or a lamp for light that falls off \
-                 with distance.",
+                 with distance. A gloom does the opposite: it takes light away, in a wide \
+                 band thrown across the stage.",
             )
             .small()
             .weak(),
@@ -193,9 +241,21 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
         let mut changed = false;
 
         ui.horizontal(|ui| {
-            ui.label("Strength");
+            // **A gloom's strength stops at one.** It is the fraction of the
+            // light it takes away, and taking away more than all of it means
+            // nothing — a slider that ran to four would spend three quarters of
+            // its travel doing nothing at all, which is how a control teaches
+            // an animator that it is broken.
+            let gloom = edited.is_gloom();
+            let range = if gloom { 0.0..=1.0 } else { 0.0..=4.0 };
+            ui.label(if gloom { "Depth" } else { "Strength" });
             changed |= ui
-                .add(egui::Slider::new(&mut edited.intensity, 0.0..=4.0).fixed_decimals(2))
+                .add(egui::Slider::new(&mut edited.intensity, range).fixed_decimals(2))
+                .on_hover_text(if gloom {
+                    "How much of the light it stops where the dark is deepest"
+                } else {
+                    "How brightly it burns"
+                })
                 .changed();
         });
 
@@ -292,10 +352,119 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
                         .on_hover_text("The distance at which it is half as bright")
                         .changed();
                 });
+                // **Fire**, as a preset rather than a fourth kind of light.
+                // Everything a fire is, a lamp already has; the only things that
+                // make it fire are the colour and the fact that it will not hold
+                // still. See `buzz_scene::Light::make_fire`.
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("\u{1F525} Make it fire")
+                        .on_hover_text(
+                            "A hearth colour, a hard gutter and a tighter reach. Everything \
+                             else about the lamp is left alone.",
+                        )
+                        .clicked()
+                    {
+                        edited.make_fire();
+                        changed = true;
+                    }
+                    ui.label(RichText::new("scrub to see it move").small().weak());
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Flicker");
+                    changed |= ui
+                        .add(egui::Slider::new(&mut edited.flicker, 0.0..=1.0).fixed_decimals(2))
+                        .on_hover_text(
+                            "How much it gutters. The brightness and the colour move every \
+                             frame \u{2014} never the position, which would turn every \
+                             shaded edge in the film once a frame. Zero is a steady lamp.",
+                        )
+                        .changed();
+                });
+
+                // Only a lamp has this, because only a lamp falls off. A sun's
+                // light *is* the tint on the artwork; there is no pool to draw
+                // and nothing for a slider to do.
+                ui.horizontal(|ui| {
+                    ui.label("Glow");
+                    changed |= ui
+                        .add(egui::Slider::new(&mut edited.glow, 0.0..=1.0).fixed_decimals(2))
+                        .on_hover_text(
+                            "How much of this lamp's light you can see — the pool it lays on \
+                             the stage and the halo around it. At zero it still shades and \
+                             still casts, which is how you use a lamp only to model form.",
+                        )
+                        .changed();
+                });
+            }
+
+            LightKind::Gloom {
+                edge,
+                facing,
+                throw,
+                width,
+            } => {
+                let mut degrees = facing.to_degrees();
+                ui.horizontal(|ui| {
+                    ui.label("Throws");
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut degrees, -180.0..=180.0)
+                                .suffix("\u{b0}")
+                                .fixed_decimals(0),
+                        )
+                        .on_hover_text("Which way the darkness rolls in")
+                        .changed()
+                    {
+                        *facing = degrees.to_radians();
+                        changed = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Stands at");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut edge.x).speed(1.0).prefix("x "))
+                        .changed();
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut edge.y).speed(1.0).prefix("y "))
+                        .changed();
+                    ui.label(
+                        RichText::new("keep it off the stage")
+                            .small()
+                            .weak(),
+                    );
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Throw");
+                    changed |= ui
+                        .add(egui::Slider::new(throw, 100.0..=6000.0).suffix(" px"))
+                        .on_hover_text(
+                            "How far it reaches before it has faded to nothing. Long is the \
+                             point: a short throw reads as a grey shape rather than as dark.",
+                        )
+                        .changed();
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Width");
+                    changed |= ui
+                        .add(egui::Slider::new(width, 100.0..=8000.0).suffix(" px"))
+                        .on_hover_text(
+                            "How wide the wall is. Wider than the picture unless you want a \
+                             shaft of dark rather than a whole side of it.",
+                        )
+                        .changed();
+                });
             }
         }
 
-        if !edited.is_ambient() {
+        // Shading, cast shadows and standing height are all questions about a
+        // light with a direction. A sky has none and a gloom has none, and a
+        // checkbox that cannot change the picture is worse than no checkbox.
+        if edited.is_directional() {
             ui.horizontal(|ui| {
                 changed |= ui
                     .checkbox(&mut edited.shadows, "Shadows")
@@ -455,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_panel_offers_the_three_kinds_and_changes_nothing() {
+    fn an_empty_panel_offers_every_kind_and_changes_nothing() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
         let mut state = LightPanelState::default();
@@ -479,12 +648,20 @@ mod tests {
             Light::new(LightId(1), "Sun", LightKind::sun()),
             Light::new(LightId(2), "Sky", LightKind::sky()),
             Light::new(LightId(3), "Lamp", LightKind::lamp(Point::new(10.0, 10.0))),
+            Light::new(LightId(4), "Gloom", LightKind::gloom(Point::new(-20.0, 10.0))),
         ]);
 
-        for selected in [None, Some(LightId(1)), Some(LightId(2)), Some(LightId(3))] {
+        for selected in [
+            None,
+            Some(LightId(1)),
+            Some(LightId(2)),
+            Some(LightId(3)),
+            Some(LightId(4)),
+        ] {
             let mut state = LightPanelState {
                 selected,
                 gizmos: true,
+                ..LightPanelState::default()
             };
             let _ = ctx.run_ui(Default::default(), |ui| {
                 let _ = light_panel(ui, &rig, &mut state);
@@ -515,6 +692,7 @@ mod tests {
         let mut state = LightPanelState {
             selected: Some(LightId(99)),
             gizmos: false,
+            ..LightPanelState::default()
         };
         let rig = rig(vec![Light::new(LightId(1), "Sun", LightKind::sun())]);
 

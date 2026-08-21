@@ -39,12 +39,16 @@
 pub mod geometry;
 pub mod track;
 
-use buzz_geom::{Point, Vec2};
+use buzz_geom::{Point, Rect, Vec2};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-pub use geometry::{ShadeGeometry, cast_shadow, highlight_crescent, shade_crescent};
+pub use geometry::{
+    HIGHLIGHT_SHARE, crescent_offset, highlight_reach, shade_reach,
+    GloomBand, LightPool, ShadeGeometry, cast_shadow, crescent_direction, crescents, gloom_at,
+    gloom_band, highlight_crescent, light_pool, shade_crescent, shadow_transform,
+};
 pub use track::{LightKey, LightTrack};
 
 /// Stable identity for a light.
@@ -79,6 +83,37 @@ pub enum LightKind {
         height: f64,
         radius: f64,
     },
+    /// **Gloom.** A source of *darkness*, which is not a thing Blender has and
+    /// not a thing three-dimensional lighting needs: there, dark is what you
+    /// get where light does not reach, and the way to make more of it is to
+    /// put something in the way.
+    ///
+    /// Flat artwork has nothing to put in the way. A drawing is lit by the
+    /// tint on its own colours, so the only dark a rig can produce is the fill
+    /// light — one level, everywhere, however many lamps are switched on. That
+    /// is why a lit drawing so often reads as *tinted* rather than as lit: the
+    /// bright end moves and the dark end never does, and it is the distance
+    /// between them that the eye reads as light.
+    ///
+    /// A gloom is the other end, made movable. It is deliberately **not** a
+    /// point source — an inverse-square hole of dark centred on a spot looks
+    /// like a smudge on the lens. It is a **wall**: wide across, thrown a long
+    /// way forward, and fading as it goes. Stood off the far side of the stage
+    /// from a lamp and thrown back across it, the two meet somewhere in the
+    /// middle and the picture gains a range it cannot otherwise have.
+    ///
+    /// `edge` is where the near face of the wall stands and `facing` is the
+    /// bearing it throws along — the same convention a sun's azimuth uses,
+    /// clockwise from the right. The wall itself runs *across* that bearing,
+    /// `width` wide, and the dark has faded to nothing `throw` along it.
+    /// Outside that quad a gloom does nothing at all, which is what lets you
+    /// aim one: stand it off-stage and only its long tail reaches the picture.
+    Gloom {
+        edge: Point,
+        facing: f64,
+        throw: f64,
+        width: f64,
+    },
 }
 
 impl LightKind {
@@ -87,14 +122,26 @@ impl LightKind {
             LightKind::Sun { .. } => "Sun",
             LightKind::Sky { .. } => "Sky",
             LightKind::Lamp { .. } => "Lamp",
+            LightKind::Gloom { .. } => "Gloom",
         }
     }
 
-    /// A sun pointing down and to the right, as a default that reads well.
+    /// A sun up and to the right, as a default that reads well.
+    ///
+    /// **Not overhead.** A shadow's length is the caster's standing height over
+    /// the tangent of the elevation, so a sun at 52° threw one about eight tenths
+    /// of the standing height — which on flat artwork lands almost entirely
+    /// *underneath* the drawing that cast it and cannot be seen. The first thing
+    /// an animator does after adding a sun is look for its shadow, and the honest
+    /// report on finding none is that the sun does not work.
+    ///
+    /// 40° throws a shadow about a fifth longer than the caster stands tall, out
+    /// from under it and onto the floor, and still delivers most of the light a
+    /// higher sun would: `sin 40°` is 0.64 against 0.79.
     pub fn sun() -> Self {
         LightKind::Sun {
             azimuth: -0.6,
-            elevation: 0.9,
+            elevation: 0.7,
         }
     }
 
@@ -109,6 +156,26 @@ impl LightKind {
             position,
             height: 160.0,
             radius: 320.0,
+        }
+    }
+
+    /// A wall of dark stood at `edge`, thrown to the right.
+    ///
+    /// **Long and wide by default**, because the failure a short narrow one
+    /// produces is not "a subtle gloom" but "a grey rectangle on the picture":
+    /// the moment either end of the quad is inside the frame it stops reading
+    /// as darkness and starts reading as a shape. Nine hundred units of throw
+    /// on a stage a few hundred across puts the far end well outside it, and
+    /// the sides further out still.
+    ///
+    /// [`LightRig::opposing_gloom`] is the one an animator actually wants —
+    /// this is what it starts from when there is no light to oppose.
+    pub fn gloom(edge: Point) -> Self {
+        LightKind::Gloom {
+            edge,
+            facing: 0.0,
+            throw: 900.0,
+            width: 2400.0,
         }
     }
 }
@@ -135,32 +202,145 @@ pub struct Light {
     /// This is the closest thing to a light's *size*: a small, hard light
     /// gives a narrow terminator, a broad soft one gives a wide gradient.
     pub softness: f64,
+    /// **How much of this lamp's light you can see.** `0.0` draws none of it;
+    /// `1.0` is the full pool.
+    ///
+    /// A sun and a sky ignore it. They arrive the same way everywhere on the
+    /// stage, so what they do *is* the flat tint on the artwork and there is
+    /// nothing else to draw. A lamp is the opposite: its whole character is
+    /// that it falls off, and a lamp that only tinted each shape by the light
+    /// at that shape's middle showed no falloff at all — a wall under a lamp
+    /// came out one flat colour, which reads as a filter rather than as a lamp.
+    /// So a lamp lays a **pool** ([`crate::light_pool`]), and this is how
+    /// strongly it is laid.
+    ///
+    /// Separate from `intensity` because they are different questions: how
+    /// bright the lamp is, and how much of its light is in the air to be seen.
+    /// A lamp turned down to nothing here still shades and still casts, which
+    /// is how you use one purely to model form.
+    #[serde(default = "full")]
+    pub glow: f32,
+    /// **How much this light gutters**, `0.0..=1.0`. Zero is a steady light,
+    /// which is every light until this existed.
+    ///
+    /// A fire is not a lamp with an orange bulb. What makes a torch, a candle or
+    /// a hearth read as fire is that it is *never still*: the brightness moves
+    /// every frame, the colour goes redder as it drops, and the pool breathes
+    /// with it. Keyframing that by hand is forty keys for two seconds of film
+    /// and it still comes out looking mechanical, because a hand cannot help
+    /// making a pattern.
+    ///
+    /// So it is a number rather than a track. The value is smoothed noise on the
+    /// frame — two rates, a slow breath and a fast gutter, because a single rate
+    /// reads as a pulse — seeded from the light's own id, so two torches in one
+    /// shot flicker differently and neither ever repeats the other.
+    ///
+    /// **It moves the brightness and the colour, never the position.** A lamp
+    /// that jittered across the stage would turn every crescent in the document
+    /// on every frame, which is the one thing the shading cache cannot absorb;
+    /// see [`LightRig::aim`]. Brightness and colour turn nothing.
+    #[serde(default)]
+    pub flicker: f32,
     /// The light's animation, if it has one. `None` is a static light — every
     /// document until Wave 9a, and most since. See [`LightTrack`], and
     /// [`LightRig::resolved_at`] for how the renderer reads it.
     ///
-    /// Deliberately left out of [`Light::fingerprint`]: the fingerprint keys the
-    /// shading cache on the *resolved* light's values, and the track is how you
-    /// get those values, not one of them.
+    /// Deliberately left out of the fingerprints below: what is measured is the
+    /// *resolved* light's values, and the track is how you get those values,
+    /// not one of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track: Option<LightTrack>,
 }
 
+/// The serde default for [`Light::glow`]: a lamp in a file written before the
+/// pool existed lit nothing visibly, and the honest reading of what it meant is
+/// a lamp at full strength.
+fn full() -> f32 {
+    1.0
+}
+
 impl Light {
     pub fn new(id: LightId, name: impl Into<String>, kind: LightKind) -> Self {
-        Self {
+        let mut light = Self {
             id,
             name: name.into(),
             kind,
             color: Color::from_rgb8(0xFF, 0xF2, 0xD8),
-            intensity: 1.0,
+            // **A light at full strength must not merely dim the artwork.**
+            //
+            // At 1.0 it did. The lit side of a shape gets `ambient + direct`,
+            // and for the default sun that summed to about 0.80 of the artwork's
+            // own brightness — the fill light is a dim blue-grey and a sun at
+            // 40° delivers `sin 40°`, which is 0.64. Nearly equal across the
+            // three channels, so what reached the screen was the whole picture
+            // multiplied by 0.8: a tenth darker, no hue shift, nothing that
+            // reads as a light being on.
+            //
+            // Measured on a real film — a 28-layer Animate import — switching
+            // the sun on moved 77% of the stage and shifted it by ten levels,
+            // equally on red, green and blue. Every pixel changed and the
+            // picture looked identical. The honest report on that is that
+            // lighting does nothing, and that is the report it got.
+            //
+            // 1.3 puts the lit side back at the brightness the artwork was
+            // drawn at, so the sun's whole effect goes into the *difference*
+            // between the lit side and the shaded one rather than into a global
+            // dim. The shaded side is unchanged — it is the ambient alone — so
+            // the contrast that reads as form goes up rather than the picture
+            // going down. See `LightRig::base` for the other half of the pair.
+            intensity: 1.3,
             enabled: true,
             shadows: true,
             shadow_strength: 0.45,
-            standing_height: 40.0,
+            // **How a flat drawing gets a shadow at all**, so the default has to
+            // be one that produces a visible one. Forty put the whole shadow
+            // under the artwork at any reasonable sun; seventy puts it on the
+            // floor beside it. It costs nothing in brightness — standing height
+            // scales the shadow and touches nothing else.
+            standing_height: 70.0,
             softness: 0.35,
+            // **A pool you can see, not a wash over the stage.**
+            //
+            // At full the pool is the lamp's whole colour laid over the frame
+            // out to three times its reach — which is most of a stage, and it
+            // is screened, so the picture comes up evenly bright underneath it.
+            // The report it produced was that a lamp "does not highlight edges,
+            // it makes the whole area bright", and that is exactly what it was
+            // doing: the pool was drowning the very thing that reads as light,
+            // which is the difference between the near side of a figure and its
+            // far side.
+            //
+            // Blender has no pool at all — light in the air needs a volume, and
+            // there is no volume here. A third keeps what the pool is genuinely
+            // for, a lamp that is visible in an empty shot, without it being the
+            // loudest thing in a full one. The slider still goes to one.
+            glow: 0.35,
+            flicker: 0.0,
             track: None,
+        };
+
+        // **A gloom reads every one of these backwards**, so it cannot take the
+        // defaults a light takes.
+        //
+        // `color` is not what it emits — it emits nothing — but what it leaves
+        // behind: the colour the picture is multiplied towards where the dark
+        // is deepest. Near-black with a blue bias, because that is what an
+        // unlit surface under a sky actually is, and a neutral grey reads as a
+        // dirty lens instead.
+        //
+        // `intensity` is how much light it stops, and stopping more than all of
+        // it means nothing, so the range is `0..=1` and full is 1.0 — not the
+        // 1.3 a light wants for the reasons above.
+        //
+        // `shadows` is off and stays off: a gloom has no direction to cast
+        // along and nothing to cast, and leaving the flag set would put its ID
+        // in front of a checkbox that could never do anything.
+        if matches!(kind, LightKind::Gloom { .. }) {
+            light.color = Color::from_rgb8(0x0B, 0x0E, 0x18);
+            light.intensity = 1.0;
+            light.shadows = false;
         }
+        light
     }
 
     /// Is this the ambient fill rather than a directional source?
@@ -168,26 +348,97 @@ impl Light {
         matches!(self.kind, LightKind::Sky { .. })
     }
 
-    /// A number that changes whenever anything about this light that affects the
-    /// geometry it generates changes.
+    /// **This lamp as a fire**: a hearth colour, a strong gutter, and a shorter
+    /// reach than a bulb of the same brightness would have.
     ///
-    /// This is the geometry cache key. It is **per light** on purpose: the whole
-    /// point is that nudging one lamp rebuilds that lamp's crescents and shadows
-    /// and leaves every other light's alone — so the sun does not rebuild when
-    /// you drag a lamp, and a keyframed light in Wave 9a does not evict its
-    /// static neighbours every frame. The name and colour tint are folded in too
-    /// because the highlight geometry takes its softness and the shadow its
-    /// direction from exactly these fields.
-    pub fn fingerprint(&self) -> u64 {
-        use std::hash::Hasher;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.hash_into(&mut hasher);
-        hasher.finish()
+    /// A preset rather than a fourth kind of light. Everything a fire is, a lamp
+    /// already has — a place on the stage, a falloff, a pool in the air — and
+    /// the only things that make it fire are the colour and the fact that it
+    /// will not hold still. A `LightKind::Fire` would have been a lamp with the
+    /// same fields and a different name.
+    pub fn make_fire(&mut self) {
+        self.color = Color::from_rgb8(0xFF, 0x9A, 0x3C);
+        self.flicker = 0.6;
+        // **The brightness is left alone.** Turning it up as well was the
+        // obvious move and it is wrong: a lamp's pool is laid at the strength
+        // the lamp arrives with, and past full it clamps — so a fire that was
+        // both brighter *and* guttering upwards put an opaque disc of its own
+        // colour over the picture on its bright frames. The figure standing in
+        // front of the fire disappeared for a frame and came back on the next,
+        // which is the worst kind of flicker.
+        //
+        // A fire reads as fire from its colour, its tighter circle and the fact
+        // that it will not hold still. How bright it is stays the animator's.
+        // **A fire is one of the few lights that really does light the air.**
+        // An ordinary lamp lays a third of its pool, because a full one washes
+        // the stage; a fire is a visible thing in the shot rather than a bulb,
+        // and the glow around it is half of what says so.
+        self.glow = self.glow.max(0.6);
+        if let LightKind::Lamp { radius, .. } = &mut self.kind {
+            *radius *= 0.8;
+        }
     }
 
-    /// The part of a fingerprint this one light contributes. Shared by
-    /// [`Light::fingerprint`] and [`LightRig::fingerprint`] so the two can never
-    /// drift apart on what counts as a change.
+    /// This light as it stands at `frame`, once its gutter is applied.
+    ///
+    /// Borrowed-shaped rather than in place because the rig resolves a *copy*
+    /// per frame; see [`LightRig::resolved_at`]. A light with no flicker is
+    /// returned unchanged, so nothing pays for this that has not asked for it.
+    pub fn flickered(&self, frame: u32) -> Light {
+        let amount = self.flicker.clamp(0.0, 1.0);
+        if amount <= 0.0 {
+            return self.clone();
+        }
+        let n = flicker_noise(self.id.0, frame);
+        // **Never to nothing.** A flame gutters; it does not switch off, and a
+        // light that reached zero would take every crescent in the shot with it
+        // for one frame and put them back on the next, which reads as a fault
+        // rather than as fire.
+        // **A gutter, not a strobe.** Half again and back is a fault light; a
+        // real flame moves by something like a third and never stops moving.
+        // The floor is well under anything the noise reaches, and is there so
+        // no arithmetic can ever hand the renderer a light of zero.
+        let factor = (1.0 + amount as f64 * n * 0.35).max(0.2);
+        let mut out = self.clone();
+        out.intensity = self.intensity * factor as f32;
+        // The pool breathes with the light, but less: a flame's *reach* is
+        // steadier than its brightness, and a pool that pumped in and out at
+        // full depth reads as a lamp on a dimmer.
+        out.glow = (self.glow * (0.75 + 0.25 * factor as f32)).clamp(0.0, 1.0);
+        // Redder as it drops, which is what a flame actually does: the dim part
+        // of a fire is the ember colour, not a dimmer version of the flame.
+        let towards_ember = ((1.0 - factor).max(0.0) * amount as f64).min(1.0);
+        out.color = mix(self.color, EMBER, towards_ember as f32);
+        out
+    }
+
+    /// Is this a wall of dark rather than a light?
+    pub fn is_gloom(&self) -> bool {
+        matches!(self.kind, LightKind::Gloom { .. })
+    }
+
+    /// **Does this light have a direction that shading can follow?**
+    ///
+    /// The question every crescent, every cast shadow and the choice of key
+    /// light actually asks. It used to be spelled `!is_ambient()`, which was
+    /// the same set only for as long as a sky was the one kind with no
+    /// direction — a gloom has none either, and it must no more throw a
+    /// terminator than the dark under a table does.
+    pub fn is_directional(&self) -> bool {
+        matches!(self.kind, LightKind::Sun { .. } | LightKind::Lamp { .. })
+    }
+
+    /// The part of a fingerprint this one light contributes, so
+    /// [`LightRig::fingerprint`] and anything measuring one light agree on what
+    /// counts as a change.
+    ///
+    /// **This is no longer a cache key**, and a per-light version of it used to
+    /// be. Keying generated geometry here meant that brightening a lamp, or
+    /// warming it, or switching its shadows off, threw away every boolean the
+    /// lamp had ever lit — because all of those are "a change to this light",
+    /// and only a hash could not tell them from the one change that moves a
+    /// crescent. What the cache keys on now is the crescent's own direction;
+    /// see `buzz_render::lighting` and [`crate::crescent_direction`].
     fn hash_into(&self, hasher: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
         fn f(hasher: &mut impl std::hash::Hasher, v: f64) {
@@ -207,6 +458,8 @@ impl Light {
         self.shadow_strength.to_bits().hash(hasher);
         f(hasher, self.standing_height);
         f(hasher, self.softness);
+        self.glow.to_bits().hash(hasher);
+        self.flicker.to_bits().hash(hasher);
         match &self.kind {
             LightKind::Sun { azimuth, elevation } => {
                 0u8.hash(hasher);
@@ -228,6 +481,19 @@ impl Light {
                 f(hasher, *height);
                 f(hasher, *radius);
             }
+            LightKind::Gloom {
+                edge,
+                facing,
+                throw,
+                width,
+            } => {
+                3u8.hash(hasher);
+                f(hasher, edge.x);
+                f(hasher, edge.y);
+                f(hasher, *facing);
+                f(hasher, *throw);
+                f(hasher, *width);
+            }
         }
     }
 
@@ -237,7 +503,12 @@ impl Light {
     /// arrives. `None` for a sky, which has no direction.
     pub fn towards(&self, point: Point, depth: f64) -> Option<(Vec3, f32)> {
         match self.kind {
-            LightKind::Sky { .. } => None,
+            // Neither has a direction that light arrives from: a sky arrives
+            // from all of them, and a gloom does not arrive at all. Answering
+            // `None` here is what keeps a gloom out of every downstream sum
+            // without a special case in any of them — no direct light, no
+            // crescent to turn, no shadow to cast.
+            LightKind::Sky { .. } | LightKind::Gloom { .. } => None,
             LightKind::Sun { azimuth, elevation } => {
                 let (sin_e, cos_e) = elevation.sin_cos();
                 let (sin_a, cos_a) = azimuth.sin_cos();
@@ -270,11 +541,63 @@ impl Light {
         }
     }
 
+    /// **This one light's direct contribution at `point`**, in linear light.
+    ///
+    /// The per-light half of [`LightRig::illuminate`], split out so that the
+    /// point answer and the *field* answer ([`LightRig::field`]) are the same
+    /// arithmetic rather than two copies of it that can drift apart. A sky
+    /// contributes nothing here: its light is the ambient, and it arrives with
+    /// no direction.
+    pub fn direct_at(&self, point: Point, depth: f64) -> [f32; 3] {
+        let Some((towards, strength)) = self.towards(point, depth) else {
+            return [0.0; 3];
+        };
+        // Flat artwork faces the camera, so the surface normal is `+z` and
+        // `N·L` is simply how far the light is *in front of* the stage. A
+        // light at the horizon therefore adds almost no fill and casts a
+        // very long shadow, which is exactly right.
+        let facing = towards.z.max(0.0) as f32;
+        let c = to_linear(self.color);
+        [
+            c[0] * facing * strength,
+            c[1] * facing * strength,
+            c[2] * facing * strength,
+        ]
+    }
+
+    /// A lamp's direct contribution at planar distance `r` from where it
+    /// stands.
+    ///
+    /// **This is the whole reason a lamp can be drawn as a gradient.** Both
+    /// terms in [`direct_at`](Self::direct_at) — the inverse-square falloff and
+    /// how square-on the light strikes — depend on the surface point only
+    /// through `|p − position|`, so a lamp's light is *radially symmetric in
+    /// document space* about the point it stands over. A radial gradient centred
+    /// there is not an approximation of it; it is that function, exactly, up to
+    /// the resolution of the ramp.
+    ///
+    /// Answered by asking [`direct_at`](Self::direct_at) about a point at that
+    /// distance, so the two can never disagree. `None` for anything but a lamp.
+    pub fn direct_at_radius(&self, r: f64, depth: f64) -> Option<[f32; 3]> {
+        let LightKind::Lamp { position, .. } = self.kind else {
+            return None;
+        };
+        Some(self.direct_at(Point::new(position.x + r.max(0.0), position.y), depth))
+    }
+
     /// The ambient colour this light contributes at `point`.
     ///
     /// Only a sky contributes ambient, and it mixes its two colours by how
     /// high on the stage the point is — which is what makes a sky read as a
     /// sky rather than as a flat wash.
+    /// **The colour only.** Strength is applied by the caller, in linear light.
+    ///
+    /// It used to be folded in here with `multiply_alpha`, which multiplies a
+    /// colour's *alpha* — and the only reader, [`LightRig::illuminate`], takes
+    /// the three colour channels and drops the alpha on the floor. So a sky's
+    /// Strength slider moved a number that nothing ever read: the one control
+    /// that could have made a sky brighter did nothing at all, at any setting,
+    /// which is most of what "the sky does not work" meant.
     pub fn ambient_at(&self, point: Point, stage_height: f64) -> Option<Color> {
         let LightKind::Sky { horizon } = self.kind else {
             return None;
@@ -284,8 +607,65 @@ impl Light {
         } else {
             0.0
         };
-        Some(mix(self.color, horizon, t as f32).multiply_alpha(self.intensity.clamp(0.0, 4.0)))
+        Some(mix(self.color, horizon, t as f32))
     }
+}
+
+/// **How far a highlight is pushed towards the light's own colour.**
+///
+/// Raised with the same change that narrowed [`crate::HIGHLIGHT_SHARE`], and
+/// for the same reason: the two are one decision. A broad band at a little of
+/// the light's colour reads as the artwork having been painted in two tones; a
+/// narrow band at a lot of it reads as an edge catching the light, which is
+/// what a highlight is for. Narrowing without brightening would only have made
+/// the wash smaller.
+const RIM_MIX: f32 = 0.78;
+
+/// What a guttering flame drops towards: the colour of the ember rather than a
+/// dimmer copy of the flame.
+const EMBER: Color = Color::from_rgb8(0xC2, 0x3A, 0x10);
+
+/// A hash with no state and no crate behind it, for turning a light's id and a
+/// frame number into the same number every time.
+///
+/// Determinism is the whole requirement: the frame an exporter renders on one
+/// machine and the frame the window shows on another have to be the same
+/// picture, so the gutter cannot come from a random number generator or from
+/// the clock.
+fn hash01(a: u64) -> f64 {
+    let mut x = a.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Smoothed value noise at `t`, in `0..=1`: a random number per whole step,
+/// eased between them so the result is a wander rather than a staircase.
+fn wobble(seed: u64, t: f64) -> f64 {
+    let base = t.floor();
+    let f = t - base;
+    // Smoothstep, so the curve leaves each sample flat and there is no corner
+    // on the frame a step is crossed.
+    let s = f * f * (3.0 - 2.0 * f);
+    let step = base as i64 as u64;
+    let a = hash01(seed ^ step.wrapping_mul(0x2545_F491_4F6C_DD1D));
+    let b = hash01(seed ^ step.wrapping_add(1).wrapping_mul(0x2545_F491_4F6C_DD1D));
+    a + (b - a) * s
+}
+
+/// The gutter for one light at one frame, in `-1..=1`.
+///
+/// **Two rates.** One reads as a pulse however it is tuned, because the eye
+/// finds the period immediately. A slow breath under a fast gutter has no
+/// period to find, which is what a flame looks like.
+fn flicker_noise(seed: u64, frame: u32) -> f64 {
+    let t = f64::from(frame);
+    let slow = wobble(seed ^ 0xA1A1_A1A1, t / 7.0);
+    let fast = wobble(seed ^ 0xB2B2_B2B2, t / 2.3);
+    (slow * 0.6 + fast * 0.4) * 2.0 - 1.0
 }
 
 /// A three-dimensional direction. Small enough to keep here rather than pull a
@@ -400,16 +780,56 @@ impl Default for LightRig {
 }
 
 impl LightRig {
+    /// A number that changes when — and only when — a crescent could move.
+    ///
+    /// Not the same thing as [`fingerprint`](Self::fingerprint), which changes
+    /// on anything that alters the picture. This changes on the far smaller set
+    /// that alters generated *geometry*: how strongly the rig models at all, and
+    /// then, per light, where it lies and how soft it is. Colour, strength and
+    /// shadow settings are all absent, because none of them turns a terminator.
+    ///
+    /// The window uses it to tell an off-thread build that is still worth
+    /// finishing from one being built for a light that has since moved on.
+    pub fn aim(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.modelling.to_bits().hash(&mut hasher);
+        for light in self.lights.iter().filter(|l| l.enabled && l.is_directional()) {
+            light.id.0.hash(&mut hasher);
+            light.softness.to_bits().hash(&mut hasher);
+            match light.kind {
+                LightKind::Sky { .. } | LightKind::Gloom { .. } => {}
+                LightKind::Sun { azimuth, elevation } => {
+                    azimuth.to_bits().hash(&mut hasher);
+                    elevation.to_bits().hash(&mut hasher);
+                }
+                LightKind::Lamp {
+                    position, height, ..
+                } => {
+                    position.x.to_bits().hash(&mut hasher);
+                    position.y.to_bits().hash(&mut hasher);
+                    height.to_bits().hash(&mut hasher);
+                }
+            }
+        }
+        hasher.finish()
+    }
+
     /// Is there anything that would change how the document looks?
     pub fn is_active(&self) -> bool {
         self.enabled && self.lights.iter().any(|l| l.enabled)
     }
 
     /// Does any light in the rig animate?
+    ///
+    /// A gutter counts. It has no keys and no length — it is a function of the
+    /// frame — but it is the same question the renderer is asking: does this rig
+    /// have to be resolved again for the frame being drawn, or is what is on the
+    /// `LightRig` already the answer?
     pub fn animates(&self) -> bool {
         self.lights
             .iter()
-            .any(|l| l.track.as_ref().is_some_and(|t| t.animates()))
+            .any(|l| l.flicker > 0.0 || l.track.as_ref().is_some_and(|t| t.animates()))
     }
 
     /// The rig with every animated light resolved to its state at `frame`.
@@ -430,6 +850,12 @@ impl LightRig {
                 && track.animates()
             {
                 *light = track.state_at(frame, light);
+            }
+            // After the track, not before: the keys say how bright the fire is
+            // meant to be at this point in the shot, and the gutter is what
+            // happens around that.
+            if light.flicker > 0.0 {
+                *light = light.flickered(frame);
             }
         }
         Cow::Owned(rig)
@@ -462,7 +888,7 @@ impl LightRig {
 
     /// The lights that cast: everything directional and enabled.
     pub fn casters(&self) -> impl Iterator<Item = &Light> {
-        self.lights.iter().filter(|l| l.enabled && !l.is_ambient())
+        self.lights.iter().filter(|l| l.enabled && l.is_directional())
     }
 
     /// The **key light**: the strongest directional one, which is the light
@@ -485,6 +911,52 @@ impl LightRig {
         })
     }
 
+    /// **A wall of dark aimed against the key light.**
+    ///
+    /// The gloom an animator wants nine times out of ten, and the one gesture
+    /// that is tedious to build by hand: stand it off the side of `stage` the
+    /// key light is *not* on, turn it to face back across the stage, and throw
+    /// it far enough to die somewhere near the light. What the picture gains is
+    /// the thing a rig of lights alone cannot give it — the dark end moving as
+    /// well as the bright one, so the same lamp reads twice as strong without
+    /// being turned up at all.
+    ///
+    /// Sized from the stage rather than from the lamp: the failure to avoid is
+    /// an edge of the quad landing inside the frame, and the stage is what
+    /// says where the frame is. Both ends and both sides finish outside it.
+    ///
+    /// With no directional light to oppose — an empty rig, or one of nothing
+    /// but sky — the dark comes in from the left, which is a direction the
+    /// animator can then turn rather than a refusal to make one.
+    pub fn opposing_gloom(&self, stage: Rect) -> LightKind {
+        let centre = stage.center();
+        let span = stage.width().hypot(stage.height()).max(1.0);
+
+        // Which way the key light lies, seen from the middle of the stage. A
+        // light straight in front of the stage has no bearing in the plane at
+        // all, and normalising a zero vector is where a NaN would come from.
+        let towards = self
+            .key()
+            .and_then(|light| light.towards(centre, 0.0))
+            .map(|(direction, _)| direction.planar())
+            .filter(|planar| planar.hypot() > 1e-6)
+            .map(|planar| planar / planar.hypot())
+            .unwrap_or(Vec2::new(1.0, 0.0));
+
+        LightKind::Gloom {
+            // Half a stage-diagonal back from the middle, along the line to the
+            // light: far enough that the near face is off the frame whichever
+            // way round the stage the light happens to be.
+            edge: centre - towards * (span * 0.5),
+            facing: towards.y.atan2(towards.x),
+            // A full diagonal of throw puts the far end level with the light
+            // rather than short of it, so the fade runs the whole width of the
+            // picture instead of stopping in the middle of it.
+            throw: span,
+            width: span * 1.6,
+        }
+    }
+
     /// How a surface at `point`, on a layer at `depth`, is lit.
     ///
     /// `stage_height` is the stage's height in document units, used by the sky
@@ -497,25 +969,50 @@ impl LightRig {
         let mut ambient = to_linear(self.base);
         for light in self.lights.iter().filter(|l| l.enabled) {
             if let Some(colour) = light.ambient_at(point, stage_height) {
+                // In linear light, and on the colour rather than the alpha —
+                // see `ambient_at`. This is what makes a sky's Strength do
+                // anything at all.
+                let k = light.intensity.clamp(0.0, 4.0);
                 let c = to_linear(colour);
-                ambient = [ambient[0] + c[0], ambient[1] + c[1], ambient[2] + c[2]];
+                ambient = [
+                    ambient[0] + c[0] * k,
+                    ambient[1] + c[1] * k,
+                    ambient[2] + c[2] * k,
+                ];
             }
         }
 
         let mut direct = [0.0f32; 3];
-        for light in self.lights.iter().filter(|l| l.enabled && !l.is_ambient()) {
-            let Some((towards, strength)) = light.towards(point, depth) else {
-                continue;
-            };
-            // Flat artwork faces the camera, so the surface normal is `+z` and
-            // `N·L` is simply how far the light is *in front of* the stage. A
-            // light at the horizon therefore adds almost no fill and casts a
-            // very long shadow, which is exactly right.
-            let facing = towards.z.max(0.0) as f32;
-            let c = to_linear(light.color);
-            direct[0] += c[0] * facing * strength;
-            direct[1] += c[1] * facing * strength;
-            direct[2] += c[2] * facing * strength;
+        for light in self.lights.iter().filter(|l| l.enabled && l.is_directional()) {
+            // **A lamp lights the artwork, and it used to be left out of here.**
+            //
+            // The argument for leaving it out was that this term is one colour
+            // for the whole shape, taken at the shape's middle — right for a
+            // sun, whose parallel rays deliver the same light everywhere, and
+            // wrong for a lamp, whose whole character is that it falls off. A
+            // wall filled with the single colour found at its centre shows no
+            // hot spot and no falloff, so the lamp laid a pool instead
+            // (`light_pool`) and touched the artwork not at all.
+            //
+            // **But "not at all" is the worse error.** A lamp then had no
+            // colour you could put on a face, and carrying it across the stage
+            // changed nothing about the figure it was carried towards. Moving a
+            // lamp closer to a character has to make the near side of that
+            // character brighter — that is what a lamp *is* — and the version
+            // that only laid a pool could not do it, however bright the lamp.
+            //
+            // So it is summed here like any other light, with the inverse-square
+            // falloff `Light::towards` already works out, and the flat-wall case
+            // is met where it actually lives: a shape is lit by the light
+            // arriving at *it*, so a face near the lamp is lit more than a wall
+            // behind it, and the terminator across each shape comes from the
+            // crescents, which take their direction from this same lamp. The
+            // pool stays, because a pool is light in the air rather than light
+            // on a surface, and `glow` is what turns it down.
+            let d = light.direct_at(point, depth);
+            direct[0] += d[0];
+            direct[1] += d[1];
+            direct[2] += d[2];
         }
 
         Illumination {
@@ -524,6 +1021,173 @@ impl LightRig {
             key: self.key().map(|l| l.id),
         }
     }
+
+    /// How a **region** at `depth` is lit, rather than a point.
+    ///
+    /// # Why a region, and what was wrong with a point
+    ///
+    /// [`illuminate`](Self::illuminate) answers for one point, and the renderer
+    /// asked it once per shape, at that shape's middle. For a sun that is not an
+    /// approximation — parallel rays deliver the same light everywhere, so one
+    /// colour for the shape *is* the answer. For a lamp it is the whole defect:
+    /// a lamp is defined by falling off, and a shape filled with the single
+    /// colour found at its centre shows no falloff at all. A wall under a lamp
+    /// came out flat; the near side of a face was the same brightness as the far
+    /// side; carrying a lamp across the stage changed one number per shape and
+    /// nothing within any of them.
+    ///
+    /// A lamp's light is radially symmetric about the point it stands over — see
+    /// [`Light::direct_at_radius`] — so it is *exactly* a radial ramp in document
+    /// space. This returns that ramp, and the renderer lays it over the artwork
+    /// as a gradient. The falloff then lands per pixel: bright where the lamp is
+    /// near, dark where it is far, across a single shape as readily as across the
+    /// stage.
+    ///
+    /// # One lamp ramps; the rest stay flat
+    ///
+    /// Light adds, and two radial ramps do not sum to a third, so only one lamp
+    /// can be drawn as a gradient without a group and a pass per light. The one
+    /// chosen is the lamp whose brightness varies *most* across these bounds —
+    /// which is precisely the one for which a flat answer would be most wrong.
+    /// Every other lamp, and every sun, is taken at the middle exactly as before.
+    /// With a single lamp — the ordinary case — the result is exact.
+    ///
+    /// A lamp so far away, or so weak, that it does not vary measurably across
+    /// the region is left flat too: a gradient whose ends match is a solid that
+    /// costs more to draw.
+    pub fn field(&self, bounds: Rect, depth: f64, stage_height: f64) -> LightField {
+        if !self.is_active() {
+            return LightField::unlit();
+        }
+        let here = bounds.center();
+
+        let mut ambient = to_linear(self.base);
+        for light in self.lights.iter().filter(|l| l.enabled) {
+            if let Some(colour) = light.ambient_at(here, stage_height) {
+                let k = light.intensity.clamp(0.0, 4.0);
+                let c = to_linear(colour);
+                ambient = [
+                    ambient[0] + c[0] * k,
+                    ambient[1] + c[1] * k,
+                    ambient[2] + c[2] * k,
+                ];
+            }
+        }
+
+        // The lamp with the most to say across these bounds.
+        let mut ramping: Option<(f32, LightId, f64, f64)> = None;
+        for light in self.lights.iter().filter(|l| l.enabled && l.is_directional()) {
+            let LightKind::Lamp { position, .. } = light.kind else {
+                continue;
+            };
+            let (near, far) = radii(bounds, position);
+            let (Some(a), Some(b)) = (
+                light.direct_at_radius(near, depth),
+                light.direct_at_radius(far, depth),
+            ) else {
+                continue;
+            };
+            let varies = (luma(a) - luma(b)).abs();
+            if varies > VARIES && ramping.is_none_or(|(most, ..)| varies > most) {
+                ramping = Some((varies, light.id, near, far));
+            }
+        }
+
+        // Everything not being ramped, taken at the middle.
+        let mut uniform = [0.0f32; 3];
+        for light in self.lights.iter().filter(|l| l.enabled && l.is_directional()) {
+            if ramping.is_some_and(|(_, id, ..)| id == light.id) {
+                continue;
+            }
+            let d = light.direct_at(here, depth);
+            uniform = [uniform[0] + d[0], uniform[1] + d[1], uniform[2] + d[2]];
+        }
+
+        let lamp = ramping.and_then(|(_, id, ..)| {
+            let light = self.get(id)?;
+            let LightKind::Lamp {
+                position, radius, ..
+            } = light.kind
+            else {
+                return None;
+            };
+            // **The ramp spans the lamp, not the shape.**
+            //
+            // Fitting it to each shape's own bounds would put more stops where
+            // they are read, and would cost a fresh gradient — three, with the
+            // screen and the shading tone — for every shape on the stage, every
+            // frame. Measured on four hundred shapes that was half the cost of
+            // drawing them.
+            //
+            // Spanning the lamp instead makes the ramp a property of the *light*
+            // rather than of what it falls on, so every shape it reaches asks for
+            // the same one and it is built once a frame. Past the last stop a
+            // gradient pads, which is the honest answer out there anyway: at
+            // three radii a lamp is delivering about two per cent of what it
+            // delivers underneath itself, and a shape that far out has no falloff
+            // worth ramping — it takes the flat answer and never reaches here.
+            let reach = (radius.max(1.0) * RAMP_REACH).max(1e-6);
+            let mut stops: Vec<(f64, [f32; 3])> = Vec::with_capacity(RAMP_STOPS);
+            for i in 0..RAMP_STOPS {
+                let t = i as f64 / (RAMP_STOPS - 1) as f64;
+                stops.push((t, light.direct_at_radius(t * reach, depth)?));
+            }
+            Some(LampRamp {
+                centre: position,
+                reach,
+                stops,
+            })
+        });
+
+        LightField {
+            ambient,
+            uniform,
+            lamp,
+            key: self.key().map(|l| l.id),
+        }
+    }
+}
+
+/// How much a lamp's brightness has to move across a region before it is worth
+/// drawing as a ramp rather than as one flat tint.
+///
+/// In linear light, so it is a fraction of full: two per cent is below what a
+/// gradient can show in eight bits over the width of a shape, and above the
+/// noise of a lamp that is simply a long way off.
+const VARIES: f32 = 0.02;
+
+/// How many places the lamp's falloff is sampled.
+///
+/// Inverse-square is a curve and a gradient ramp is straight between its stops.
+/// Fifteen is what a gradient may carry, and the curve is flattest exactly where
+/// the stops are sparsest — out at the edge of the reach, where the lamp has
+/// almost nothing left to deliver.
+const RAMP_STOPS: usize = 15;
+
+/// How far past its half-strength radius a lamp's ramp is drawn.
+///
+/// The same three the pool uses, and for the same reason: the falloff goes as
+/// the cube of the distance out there, so at three radii a lamp delivers about
+/// two per cent of what it delivers underneath itself.
+const RAMP_REACH: f64 = 3.0;
+
+/// How near and how far `bounds` gets to `at`, in the plane.
+///
+/// Zero for the near distance when the point is inside, which is right: a lamp
+/// standing over a shape lights the ground directly under itself.
+fn radii(bounds: Rect, at: Point) -> (f64, f64) {
+    let dx = (bounds.x0 - at.x).max(0.0).max(at.x - bounds.x1);
+    let dy = (bounds.y0 - at.y).max(0.0).max(at.y - bounds.y1);
+    let near = dx.hypot(dy);
+    // The farthest corner.
+    let fx = (at.x - bounds.x0).abs().max((at.x - bounds.x1).abs());
+    let fy = (at.y - bounds.y0).abs().max((at.y - bounds.y1).abs());
+    (near, fx.hypot(fy))
+}
+
+/// Perceived brightness of a linear-light triple, for comparing two lights.
+fn luma(c: [f32; 3]) -> f32 {
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
 }
 
 /// What reaches one point: the fill light and the direct light, kept apart so
@@ -578,7 +1242,308 @@ impl Illumination {
     /// The colour a highlight is drawn in: the artwork, pushed towards the
     /// light's own colour.
     pub fn highlight(&self, base: Color, light: Color, strength: f32) -> Color {
-        mix(self.apply(base), light, strength.clamp(0.0, 1.0) * 0.55)
+        mix(self.apply(base), light, strength.clamp(0.0, 1.0) * RIM_MIX)
+    }
+
+    /// How far a highlight over **artwork that cannot be recoloured** is
+    /// pushed towards the light. The `t` of [`highlight`](Self::highlight), for
+    /// a caller that must lay the light's colour over the picture at an alpha
+    /// rather than mix it into one.
+    pub fn highlight_strength(strength: f32) -> f32 {
+        strength.clamp(0.0, 1.0) * RIM_MIX
+    }
+
+    /// The light itself, **as colours to composite with**.
+    ///
+    /// # Why this exists
+    ///
+    /// [`apply`](Self::apply) takes a colour and returns it lit, which is the
+    /// whole model for artwork made of coloured regions. A **bitmap** has no
+    /// such colour to take: it is thirty million pixels, and rewriting them for
+    /// a light would cost more than the frame it is drawn in. So a photograph
+    /// went through `Paint::map_colors`, which cannot touch an image, and came
+    /// out exactly as painted — no tint, no shading, no highlight, on every
+    /// imported drawing and everything Break Apart produces. That is the
+    /// difference between "the lights work" and "the lights do nothing" for a
+    /// document made of pictures.
+    ///
+    /// The light is laid *over* the picture instead of folded into it, which
+    /// the GPU does per pixel for the cost of one layer.
+    ///
+    /// # What the two colours are
+    ///
+    /// `multiply` is the light where it is no brighter than full. Multiplying
+    /// is exactly what [`tint`](Self::tint) does — `source × light` — so over a
+    /// bitmap the composited result is the same arithmetic the vector path
+    /// takes, per pixel.
+    ///
+    /// `screen` carries whatever is left above full, because a multiply can
+    /// only darken. It brightens towards white without reaching it, which is
+    /// the same choice a lamp's pool makes and for the same reason: `Plus`
+    /// blows past white the moment a bright light meets a pale surface.
+    /// **It is an approximation** — the exact shoulder in `tint` is a function
+    /// of the pixel, which is the one thing a blend mode does not know — and it
+    /// is only reached by lights brighter than full, which the defaults are not.
+    ///
+    /// # Encoded, not linear
+    ///
+    /// The compositor multiplies encoded values, so the factor is encoded too:
+    /// under the sRGB transfer curve `srgb(s·L) ≈ srgb(s)·srgb(L)`, which is
+    /// what lands the composited result where `tint` puts it.
+    pub fn as_filter(&self, direct: bool) -> LightFilter {
+        let mut multiply = [0.0f32; 3];
+        let mut screen = [0.0f32; 3];
+        let mut brightens = false;
+
+        for i in 0..3 {
+            let light = self.ambient[i] + if direct { self.direct[i] } else { 0.0 };
+            multiply[i] = light.clamp(0.0, 1.0);
+            // `1 − 1/L` is what a screen pass has to carry to take a surface
+            // already at `source` up towards `source · L`. Zero at or below
+            // full, so an ordinary light asks for no second pass at all.
+            let over = 1.0 - 1.0 / light.max(1.0);
+            screen[i] = over.clamp(0.0, 1.0);
+            brightens |= screen[i] > 0.0;
+        }
+
+        LightFilter {
+            multiply: from_linear(multiply, 255),
+            screen: brightens.then(|| from_linear(screen, 255)),
+        }
+    }
+
+    /// The step from **fully lit to shaded**, as a colour to multiply by.
+    ///
+    /// The shaded side of a bitmap cannot be painted with `apply_shaded`, for
+    /// the same reason the lit side cannot be painted with `apply`. But the
+    /// picture is already lit by then — [`as_filter`](Self::as_filter) has run
+    /// over the whole shape — so the crescent only has to carry the *ratio*
+    /// between the two, `ambient / (ambient + direct)`, which is never above
+    /// one and is therefore a plain multiply.
+    ///
+    /// Multiplying composes, so `source × lit × (ambient / lit)` is
+    /// `source × ambient` exactly: the shaded side of a photograph lands on the
+    /// same colour the shaded side of a drawing does.
+    pub fn shade_filter(&self) -> Color {
+        let mut ratio = [1.0f32; 3];
+        for i in 0..3 {
+            let lit = self.ambient[i] + self.direct[i];
+            // A channel with no light at all is already black; there is nothing
+            // for the crescent to take away, and dividing would be a NaN.
+            ratio[i] = if lit > 0.0 {
+                (self.ambient[i] / lit).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+        }
+        from_linear(ratio, 255)
+    }
+}
+
+/// **How a region is lit**, when that is not one answer.
+///
+/// The spatial form of [`Illumination`]: the part of the light that is the same
+/// everywhere over the region, plus at most one lamp's radial falloff across it.
+/// Built by [`LightRig::field`], which is where the reasoning lives.
+///
+/// A field with no lamp is a plain [`Illumination`] and says so through
+/// [`uniform`](Self::uniform) — the renderer takes its fast path and encodes
+/// exactly what it always did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LightField {
+    ambient: [f32; 3],
+    /// Direct light that does not vary usefully here.
+    uniform: [f32; 3],
+    lamp: Option<LampRamp>,
+    pub key: Option<LightId>,
+}
+
+/// One lamp's falloff across a region: where it stands, how far the ramp runs,
+/// and what it delivers along the way.
+#[derive(Debug, Clone, PartialEq)]
+struct LampRamp {
+    centre: Point,
+    reach: f64,
+    /// `(offset along the ramp, this lamp's direct light there)`, in linear
+    /// light, ordered outwards from `centre`.
+    stops: Vec<(f64, [f32; 3])>,
+}
+
+impl LampRamp {
+    /// The lamp's own light at `t` along the ramp, straight between stops —
+    /// which is how a gradient reads it, so this and the drawn pixel agree.
+    fn sample(&self, t: f64) -> [f32; 3] {
+        let Some(first) = self.stops.first() else {
+            return [0.0; 3];
+        };
+        if t <= first.0 {
+            return first.1;
+        }
+        for pair in self.stops.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if t <= b.0 {
+                let span = b.0 - a.0;
+                let k = if span > 0.0 {
+                    ((t - a.0) / span) as f32
+                } else {
+                    0.0
+                };
+                return [
+                    a.1[0] + (b.1[0] - a.1[0]) * k,
+                    a.1[1] + (b.1[1] - a.1[1]) * k,
+                    a.1[2] + (b.1[2] - a.1[2]) * k,
+                ];
+            }
+        }
+        self.stops.last().map_or([0.0; 3], |s| s.1)
+    }
+}
+
+impl LightField {
+    /// Full daylight: what an unlit document uses, so nothing changes colour.
+    pub fn unlit() -> Self {
+        Self {
+            ambient: [1.0, 1.0, 1.0],
+            uniform: [0.0, 0.0, 0.0],
+            lamp: None,
+            key: None,
+        }
+    }
+
+    /// Is this doing anything at all?
+    pub fn is_neutral(&self) -> bool {
+        self.lamp.is_none() && self.uniform().is_neutral()
+    }
+
+    /// **The one answer for the whole region**, taken at its middle.
+    ///
+    /// Exact when nothing varies — which is every rig made of suns and skies,
+    /// and every lamp far enough off to be flat here. When a lamp *is* ramping
+    /// this is still the honest average to fall back on, and is what artwork
+    /// that cannot carry a gradient is lit by.
+    pub fn uniform(&self) -> Illumination {
+        let along = self.lamp.as_ref().map_or(0.0, |lamp| {
+            // The middle of the ramp, so falling back never lands on the
+            // brightest or the dimmest end of it.
+            (lamp.stops.first().map_or(0.0, |s| s.0) + 1.0) * 0.5
+        });
+        self.along(along)
+    }
+
+    /// The light arriving **at one point** in the region.
+    ///
+    /// Interpolated from the same ramp the renderer lays as a gradient, so a
+    /// value worked out here and the pixel drawn there agree. Used where the
+    /// light has to be known at a particular place rather than laid across one —
+    /// feathering a terminator, which needs the tone at each step along it.
+    pub fn at(&self, point: Point) -> Illumination {
+        let along = self.lamp.as_ref().map_or(0.0, |lamp| {
+            ((point - lamp.centre).hypot() / lamp.reach).clamp(0.0, 1.0)
+        });
+        self.along(along)
+    }
+
+    /// The light at `t` along the lamp's ramp.
+    fn along(&self, t: f64) -> Illumination {
+        let mut direct = self.uniform;
+        if let Some(lamp) = &self.lamp {
+            let d = lamp.sample(t);
+            direct = [direct[0] + d[0], direct[1] + d[1], direct[2] + d[2]];
+        }
+        Illumination {
+            ambient: self.ambient,
+            direct,
+            key: self.key,
+        }
+    }
+
+    /// The lamp disc this field ramps over — where the lamp stands, in document
+    /// space, and how far out the ramp reaches. `None` when nothing varies.
+    pub fn disc(&self) -> Option<(Point, f64)> {
+        self.lamp.as_ref().map(|l| (l.centre, l.reach))
+    }
+
+    /// **A number that changes when — and only when — the ramp would.**
+    ///
+    /// Turning a ramp into gradients costs three allocations, and every shape one
+    /// lamp reaches asks for the same three. This is what lets the renderer build
+    /// them once and hand the rest a shared handle: two fields with the same
+    /// fingerprint produce identical paints. It covers the fill and the flat
+    /// lights as well as the lamp, because those are what the stops are added to
+    /// — a sky that mixes by height gives shapes at different heights different
+    /// numbers here, and they correctly get their own.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for channel in self.ambient.iter().chain(self.uniform.iter()) {
+            channel.to_bits().hash(&mut hasher);
+        }
+        match &self.lamp {
+            None => 0u8.hash(&mut hasher),
+            Some(lamp) => {
+                1u8.hash(&mut hasher);
+                lamp.centre.x.to_bits().hash(&mut hasher);
+                lamp.centre.y.to_bits().hash(&mut hasher);
+                lamp.reach.to_bits().hash(&mut hasher);
+                for (at, light) in &lamp.stops {
+                    at.to_bits().hash(&mut hasher);
+                    for channel in light {
+                        channel.to_bits().hash(&mut hasher);
+                    }
+                }
+            }
+        }
+        hasher.finish()
+    }
+
+    /// The ramp, as `(offset, the light arriving there)`.
+    ///
+    /// Each illumination is the whole of what reaches that radius — the fill,
+    /// every flat light, and the ramping lamp — so a caller can turn it into a
+    /// filter with [`Illumination::as_filter`] exactly as it would for a point.
+    /// Empty when the field is uniform.
+    pub fn ramp(&self) -> Vec<(f64, Illumination)> {
+        let Some(lamp) = &self.lamp else {
+            return Vec::new();
+        };
+        lamp.stops
+            .iter()
+            .map(|(at, d)| {
+                (
+                    *at,
+                    Illumination {
+                        ambient: self.ambient,
+                        direct: [
+                            self.uniform[0] + d[0],
+                            self.uniform[1] + d[1],
+                            self.uniform[2] + d[2],
+                        ],
+                        key: self.key,
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// The light as something to lay **over** a picture. See
+/// [`Illumination::as_filter`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LightFilter {
+    /// Multiplied into what is already drawn: the light up to full.
+    pub multiply: Color,
+    /// Screened over it afterwards: whatever the light has above full. `None`
+    /// for any light that does not exceed it, which is most of them.
+    pub screen: Option<Color>,
+}
+
+impl LightFilter {
+    /// Does this change the picture at all?
+    ///
+    /// A rig that is on but delivering full white light must draw no passes:
+    /// an unlit document has to encode exactly what it always did.
+    pub fn is_neutral(&self) -> bool {
+        self.screen.is_none() && self.multiply == Color::WHITE
     }
 }
 
@@ -648,6 +1613,239 @@ mod tests {
             enabled: true,
             ..LightRig::default()
         }
+    }
+
+
+    fn gloom(edge: Point, facing: f64) -> Light {
+        Light::new(
+            LightId(9),
+            "Gloom",
+            LightKind::Gloom {
+                edge,
+                facing,
+                throw: 400.0,
+                width: 2000.0,
+            },
+        )
+    }
+
+    /// **A gloom takes light away and does nothing else.**
+    ///
+    /// It has no direction light arrives from, so it must add nothing to the
+    /// direct sum, throw no shadow, turn no terminator, and never be picked as
+    /// the key. The whole of what it does is drawn — see
+    /// [`crate::gloom_band`] — and every one of these is a way the old
+    /// `!is_ambient()` reading of "directional" would have let it leak into
+    /// arithmetic that is not about it.
+    #[test]
+    fn a_gloom_neither_lights_nor_shades() {
+        let dark = gloom(Point::new(-300.0, 0.0), 0.0);
+        assert!(dark.towards(Point::new(50.0, 50.0), 0.0).is_none());
+        assert_eq!(dark.direct_at(Point::new(50.0, 50.0), 0.0), [0.0; 3]);
+        assert!(!dark.is_directional());
+        assert!(crate::shadow_transform(&dark, 70.0).is_none());
+        assert!(crate::crescent_direction(&dark, Point::ZERO, 0.0, 1.0).is_none());
+
+        let rig = rig_with(dark);
+        assert!(rig.key().is_none(), "darkness is never the key light");
+        assert_eq!(rig.casters().count(), 0);
+    }
+
+    /// A gloom beside a sun must leave the sun's own answer untouched: adding
+    /// darkness is a statement about the picture, not about how the sun lights
+    /// the shape it falls on.
+    #[test]
+    fn adding_a_gloom_does_not_change_what_the_lights_deliver() {
+        let mut rig = rig_with(sun(0.6, 0.7));
+        let at = Point::new(120.0, 90.0);
+        let before = rig.illuminate(at, 0.0, 400.0);
+
+        rig.lights.push(gloom(Point::new(-300.0, 0.0), 0.0));
+        assert_eq!(rig.illuminate(at, 0.0, 400.0), before);
+        assert_eq!(rig.key().map(|l| l.id), Some(LightId(1)));
+    }
+
+    /// **The gesture the feature is for**: one gloom, aimed at the light it is
+    /// fighting, without the animator working out a bearing.
+    ///
+    /// It has to face *towards* the light — the darkness rolls in from the far
+    /// side and dies as it nears the lamp — and its wall has to stand outside
+    /// the stage, because a wall with an edge inside the frame reads as a grey
+    /// rectangle rather than as dark.
+    #[test]
+    fn a_gloom_is_aimed_against_the_key_light() {
+        let stage = Rect::new(0.0, 0.0, 550.0, 400.0);
+        // A lamp off to the right of the stage.
+        let lamp = Light::new(
+            LightId(2),
+            "Lamp",
+            LightKind::Lamp {
+                position: Point::new(900.0, 200.0),
+                height: 160.0,
+                radius: 320.0,
+            },
+        );
+        let rig = rig_with(lamp);
+
+        let LightKind::Gloom {
+            edge,
+            facing,
+            throw,
+            width,
+        } = rig.opposing_gloom(stage)
+        else {
+            panic!("opposing_gloom must make a gloom");
+        };
+
+        assert!(
+            edge.x < stage.x0,
+            "the wall stands off the side away from the lamp, not on the stage: {edge:?}"
+        );
+        assert!(
+            facing.abs() < 0.35,
+            "it throws back towards the lamp, which is off to the right: {facing}"
+        );
+        assert!(
+            edge.x + throw * facing.cos() > stage.x1,
+            "the throw has to cross the whole picture, not stop inside it"
+        );
+        assert!(width > stage.height(), "the wall is wider than the stage");
+    }
+
+    /// With nothing to oppose there is still a gloom, facing a direction the
+    /// animator can then turn. Refusing to make one — or making one with a NaN
+    /// bearing out of a zero-length vector — is the failure to avoid.
+    #[test]
+    fn a_gloom_with_no_light_to_oppose_still_points_somewhere() {
+        let rig = LightRig {
+            lights: vec![Light::new(LightId(1), "Sky", LightKind::sky())],
+            enabled: true,
+            ..LightRig::default()
+        };
+        let LightKind::Gloom { facing, throw, .. } =
+            rig.opposing_gloom(Rect::new(0.0, 0.0, 550.0, 400.0))
+        else {
+            panic!("opposing_gloom must make a gloom");
+        };
+        assert!(facing.is_finite() && throw.is_finite() && throw > 0.0);
+    }
+
+    /// Moving the wall has to be a change the cache can see, or a gloom being
+    /// dragged would leave the picture exactly as it was.
+    #[test]
+    fn moving_a_gloom_changes_the_rigs_fingerprint() {
+        let rig = rig_with(gloom(Point::new(-300.0, 0.0), 0.0));
+        let mut moved = rig.clone();
+        moved.lights[0].kind = LightKind::Gloom {
+            edge: Point::new(-280.0, 0.0),
+            facing: 0.0,
+            throw: 400.0,
+            width: 2000.0,
+        };
+        assert_ne!(rig.fingerprint(), moved.fingerprint());
+    }
+
+    fn fire() -> Light {
+        let mut lamp = Light::new(
+            LightId(3),
+            "Fire",
+            LightKind::lamp(Point::new(100.0, 100.0)),
+        );
+        lamp.make_fire();
+        lamp
+    }
+
+    /// **A fire is never still, and never goes out.**
+    ///
+    /// Both halves matter. A gutter that repeated, or that only moved every
+    /// second frame, reads as a fault in the playback; one that reached zero
+    /// would take every shaded edge in the shot with it for a frame and put
+    /// them back on the next, which reads as a fault in the drawing.
+    #[test]
+    fn a_fire_gutters_every_frame_and_never_goes_out() {
+        let lamp = fire();
+        assert!(lamp.flicker > 0.0, "make_fire must set a gutter");
+
+        let brightness: Vec<f32> = (0..48).map(|f| lamp.flickered(f).intensity).collect();
+        for pair in brightness.windows(2) {
+            assert_ne!(pair[0], pair[1], "two frames running at the same brightness");
+        }
+        for (frame, level) in brightness.iter().enumerate() {
+            assert!(
+                *level > 0.1 && level.is_finite(),
+                "frame {frame} guttered out entirely: {level}"
+            );
+        }
+
+        // It has to *move*, not merely differ in the last decimal.
+        let low = brightness.iter().copied().fold(f32::MAX, f32::min);
+        let high = brightness.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            high > low * 1.3,
+            "the gutter is too small to see: {low} to {high}"
+        );
+    }
+
+    /// The same film has to render the same on two machines and in two
+    /// processes, so the gutter comes from a hash of the frame rather than from
+    /// a clock or a random number generator.
+    #[test]
+    fn a_fires_gutter_is_the_same_every_time_it_is_asked() {
+        let lamp = fire();
+        for frame in [0, 1, 7, 113, 4096] {
+            assert_eq!(
+                lamp.flickered(frame).intensity,
+                lamp.flickered(frame).intensity
+            );
+            assert_eq!(lamp.flickered(frame).color, lamp.flickered(frame).color);
+        }
+    }
+
+    /// Two fires in one shot must not flicker in step, or they read as one
+    /// light with two pools.
+    #[test]
+    fn two_fires_gutter_differently() {
+        let mut a = fire();
+        let mut b = fire();
+        b.id = LightId(4);
+        a.id = LightId(3);
+        let same = (0..40)
+            .filter(|f| a.flickered(*f).intensity == b.flickered(*f).intensity)
+            .count();
+        assert!(same < 3, "{same} of forty frames matched exactly");
+    }
+
+    /// **The gutter must not turn a single crescent.**
+    ///
+    /// The shading cache is keyed on the direction a light lies in, and a fire
+    /// that jittered across the stage would move that direction for every shape
+    /// in the film on every frame — a full rebuild per frame, which is the one
+    /// cost this whole design exists to avoid. So a gutter moves the brightness
+    /// and the colour and nothing else, and [`LightRig::aim`] must be able to
+    /// see that.
+    #[test]
+    fn a_fires_gutter_never_moves_a_shaded_edge() {
+        let rig = rig_with(fire());
+        let aim = rig.resolved_at(0).aim();
+        for frame in 1..30 {
+            assert_eq!(
+                rig.resolved_at(frame).aim(),
+                aim,
+                "frame {frame} moved the aim, so every crescent would rebuild"
+            );
+        }
+        // And the position really is untouched.
+        assert_eq!(rig.resolved_at(11).lights[0].kind, rig.lights[0].kind);
+    }
+
+    /// A rig with a fire in it animates, even with no keyframes anywhere: that
+    /// is the question the renderer asks before deciding whether the rig on the
+    /// document is already the answer for this frame.
+    #[test]
+    fn a_fire_makes_a_rig_animate_without_any_keys() {
+        let steady = rig_with(Light::new(LightId(1), "Lamp", LightKind::lamp(Point::ZERO)));
+        assert!(!steady.animates());
+        assert!(rig_with(fire()).animates());
     }
 
     #[test]

@@ -44,6 +44,38 @@ pub fn build_scene(
     scale: f64,
     cache: &mut DrawCache,
 ) {
+    // **One cache generation for the whole screen frame.** What follows can be
+    // a dozen draws — the context behind an opened symbol, every keyframe under
+    // Edit Multiple Frames, the onion-skin ghosts either side, and the live
+    // frame. Opening the cache once around the lot is what lets them share
+    // generated geometry; before this each pass opened its own, aged the
+    // others out, and rebuilt every blur from nothing. A re-encode at a
+    // trimmed lighting level shares it too, so the pass it replaces does not
+    // age anything out from under it.
+    cache.begin();
+    // Build, then let the cache judge what was built: a frame too big for the
+    // rasteriser is not drawn at all, and the answer is to encode it again with
+    // less of the light rather than to submit one that will vanish. See
+    // `buzz_render::document::DrawCache::reconsider`. Bounded because a level
+    // is only ever stepped one at a time, and there are three.
+    for _ in 0..3 {
+        let segments = encode(vello, editor, area, scale, cache);
+        if !cache.reconsider(segments) {
+            break;
+        }
+    }
+    // The screen frame is finished; anything not drawn in it can go.
+    cache.end();
+}
+
+/// One pass of the stage encode, answering how much geometry it took.
+fn encode(
+    vello: &mut vello::Scene,
+    editor: &Editor,
+    area: Rect,
+    scale: f64,
+    cache: &mut DrawCache,
+) -> u32 {
     let mut builder = SceneBuilder::new(vello, &editor.camera)
         .with_output_scale(scale)
         .with_viewport_offset(Vec2::new(area.x0, area.y0));
@@ -59,14 +91,6 @@ pub fn build_scene(
     } else {
         Some(builder.clip_bounds())
     };
-
-    // **One cache generation for the whole screen frame.** What follows can be
-    // a dozen draws — the context behind an opened symbol, every keyframe under
-    // Edit Multiple Frames, the onion-skin ghosts either side, and the live
-    // frame. Opening the cache once around the lot is what lets them share
-    // generated geometry; before this each pass opened its own, aged the
-    // others out, and rebuilt every blur from nothing.
-    cache.begin(scene.lights().fingerprint());
 
     // The stage rectangle. Everything outside it is pasteboard, which the
     // window's clear colour already provides.
@@ -115,6 +139,10 @@ pub fn build_scene(
         let options = FrameOptions {
             masks: MaskDisplay::WhenLocked,
             lit: true,
+            // The lamps' pools belong to the frame, and the live frame below
+            // lays them. Letting every keyframe under Edit Multiple Frames lay
+            // its own would stack six copies of the same light on one picture.
+            pools: false,
             place,
             cull,
             ..FrameOptions::default()
@@ -134,6 +162,7 @@ pub fn build_scene(
             // Ghosts are reference, not picture: shading and cast shadows on a
             // faded copy of another frame read as dirt on the stage.
             lit: false,
+            pools: false,
             // A dimmed layer is dimmed in its ghosts too, or a layer faded
             // right down still shows solidly in every ghost around it.
             layer_alpha: true,
@@ -173,8 +202,7 @@ pub fn build_scene(
         _ => {}
     }
 
-    // The screen frame is finished; anything not drawn in it can go.
-    cache.end();
+    builder.encoded_segments()
 }
 
 /// Draw the chrome over the rendered stage.
@@ -703,6 +731,54 @@ fn draw_lights(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poin
                 painter.circle_filled(middle, size, colour);
                 painter.circle_stroke(middle, size, Stroke::new(1.5, ink));
                 painter.circle_stroke(middle, size + 4.0, Stroke::new(1.0, ring));
+            }
+
+            crate::lights::GizmoKind::Gloom {
+                edge,
+                facing,
+                throw,
+                width,
+            } => {
+                // **The one place a gloom has an outline.** In the picture it
+                // is a fade with no edge anywhere, which is what it is for and
+                // also what makes it impossible to aim by eye: an animator
+                // dragging it has no idea which part of the stage it covers.
+                // So the quad is drawn as a quad — the wall solid, the two
+                // long sides ghosted, the throw running between them.
+                let across = Vec2::new(-facing.y, facing.x) * (width * 0.5);
+                let far = edge + facing * throw;
+
+                let (near_a, near_b) = (to_screen(edge - across), to_screen(edge + across));
+                let (far_a, far_b) = (to_screen(far - across), to_screen(far + across));
+
+                // The sides, and the far end where the dark has run out.
+                painter.line_segment([near_a, far_a], Stroke::new(1.0, ghost));
+                painter.line_segment([near_b, far_b], Stroke::new(1.0, ghost));
+                painter.line_segment([far_a, far_b], Stroke::new(1.0, ghost));
+
+                // The wall itself, heaviest: this is the edge the darkness
+                // comes off, and it is what the animator is placing.
+                painter.line_segment([near_a, near_b], Stroke::new(2.5, ink));
+
+                let start = to_screen(edge);
+                let end = to_screen(far);
+                painter.line_segment([start, end], Stroke::new(1.0, ghost));
+
+                let size = if selected { 6.0 } else { 5.0 };
+                painter.circle_filled(start, size, colour);
+                painter.circle_stroke(start, size, Stroke::new(1.5, ink));
+                painter.circle_stroke(start, size + 4.0, Stroke::new(1.0, ring));
+
+                // The far handle, square rather than round, because it does a
+                // different thing: it swings the wall and sets the throw.
+                let corner = egui::vec2(4.0, 4.0);
+                painter.rect_filled(egui::Rect::from_center_size(end, corner * 2.0), 0.0, colour);
+                painter.rect_stroke(
+                    egui::Rect::from_center_size(end, corner * 2.0),
+                    0.0,
+                    Stroke::new(1.5, ink),
+                    egui::StrokeKind::Middle,
+                );
             }
         }
     }

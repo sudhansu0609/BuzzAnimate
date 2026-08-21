@@ -91,8 +91,16 @@ impl Paint {
             Self::Gradient(g) => Self::Gradient(Arc::new(g.map_colors(f))),
             // A bitmap's colours are its pixels, and rewriting thirty million
             // of them for a tint would cost more than the frame it is drawn
-            // in. The renderer applies the effect as an alpha and a blend
-            // instead; recorded in PROGRESS.md §7.
+            // in. The renderer lays the effect **over** the picture instead, as
+            // a blend; recorded in PROGRESS.md §7.
+            //
+            // **Callers must know that.** Returning the image untouched is the
+            // right answer here and a silent no-op to anything that assumes
+            // this recolours what it is given — which is how the lights came to
+            // do nothing at all to imported artwork for a whole phase. See
+            // `buzz_render::document::draw_lit_composited` for what lighting does
+            // instead, and `buzz_light::Illumination::as_filter` for the
+            // arithmetic that makes the two agree.
             Self::Image(i) => Self::Image(i.clone()),
         }
     }

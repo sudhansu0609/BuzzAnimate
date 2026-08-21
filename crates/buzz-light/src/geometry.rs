@@ -25,6 +25,7 @@
 //!   give you and is why a lamp's shadows splay outwards and grow.
 
 use buzz_geom::{Affine, BezPath, Point, Rect, Shape as _, Vec2};
+use peniko::Color;
 
 use crate::{Light, LightKind};
 
@@ -49,7 +50,7 @@ impl ShadeGeometry {
 ///
 /// Proportional to the shape's *smaller* side, so a long thin limb gets a
 /// crescent along its length rather than one that swallows it whole.
-fn crescent_offset(bounds: Rect, direction: Vec2, softness: f64) -> Vec2 {
+pub fn crescent_offset(bounds: Rect, direction: Vec2, softness: f64) -> Vec2 {
     let extent = bounds.width().min(bounds.height()).max(1e-6);
     let reach = extent * softness.clamp(0.02, 0.9);
     let length = direction.hypot();
@@ -81,15 +82,52 @@ pub fn shade_crescent(path: &BezPath, towards: Vec2, softness: f64) -> Option<Be
     difference(path, &shifted)
 }
 
+/// How much narrower the highlight is than the shade.
+///
+/// A highlight is a glint, and one as wide as the terminator reads as a second
+/// light rather than as sheen. Named because the renderer has to feather the
+/// band across exactly the width it was built with, and guessing the number
+/// twice is how the two drift apart.
+///
+/// **A third narrower than it was, and much more saturated with it.** At 0.45
+/// the highlight was a broad band down one side of every shape: it lit the
+/// figure, but what it read as was the artwork having been painted in two
+/// tones, not as light catching an edge. The complaint it produced was that a
+/// lamp changes the overall colour of a drawing and nothing else — which is
+/// exactly right, because a wash and a broad band are both washes.
+///
+/// The pair matters. Narrowing alone only makes the wash smaller, so
+/// `Illumination::highlight`'s mix went up with it: a *narrow* band at a lot of
+/// the light's colour is what an edge catching the light looks like.
+///
+/// **Not narrower than this.** Below about a quarter the band stops carrying
+/// enough of the light's colour for the frame as a whole to read as lit at all;
+/// `stage_lighting::a_default_sun_lights_rather_than_dims` measures exactly
+/// that and fails at a fifth. The renderer pays for the band in the same fill
+/// either way, so a rim costs nothing the highlight did not already cost.
+pub const HIGHLIGHT_SHARE: f64 = 0.30;
+
+/// **How far a shade crescent reaches in from the far edge of the shape.**
+///
+/// The band's thickness along the light's own direction, which is the distance
+/// a feathered terminator has to ramp over. Measured from the same offset the
+/// geometry is built from, so the ramp and the shape it fills always agree.
+pub fn shade_reach(bounds: Rect, towards: Vec2, softness: f64) -> f64 {
+    crescent_offset(bounds, towards, softness).hypot()
+}
+
+/// [`shade_reach`], for the narrower highlight band.
+pub fn highlight_reach(bounds: Rect, towards: Vec2, softness: f64) -> f64 {
+    crescent_offset(bounds, -towards, softness * HIGHLIGHT_SHARE).hypot()
+}
+
 /// The lit crescent on the side towards the light.
 pub fn highlight_crescent(path: &BezPath, towards: Vec2, softness: f64) -> Option<BezPath> {
     let bounds = path.bounding_box();
     if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
         return None;
     }
-    // Narrower than the shade: a highlight is a glint, and one as wide as the
-    // terminator reads as a second light rather than as sheen.
-    let offset = crescent_offset(bounds, -towards, softness * 0.45);
+    let offset = crescent_offset(bounds, -towards, softness * HIGHLIGHT_SHARE);
     if offset.hypot() < 1e-6 {
         return None;
     }
@@ -105,12 +143,38 @@ pub fn highlight_crescent(path: &BezPath, towards: Vec2, softness: f64) -> Optio
 /// on the horizon casts a shadow of infinite length, and an infinite shadow is
 /// not a shape.
 pub fn cast_shadow(path: &BezPath, light: &Light, at: Point, height: f64) -> Option<BezPath> {
+    let _ = at;
+    Some(shadow_transform(light, height)? * path.clone())
+}
+
+/// **The whole of a cast shadow, as one affine.**
+///
+/// A shadow is the caster's own outline, moved: translated for a sun, because
+/// parallel rays move every point of it the same way, and scaled about the lamp
+/// for a lamp, because that is what similar triangles give. Neither needs a
+/// boolean, and neither depends on the shape — only on the light and on how far
+/// the artwork stands above the surface catching it.
+///
+/// Separating this from the crescents is the difference between a light you can
+/// drag and one you cannot. Shadows used to be built and cached beside the
+/// crescents, so aiming a sun threw away the cheap geometry and the expensive
+/// geometry together and *neither* could be redrawn until several hundred
+/// boolean differences had finished. Now every shadow in the document is one
+/// matrix multiply per shape per frame and follows the light exactly, live,
+/// however heavy the artwork.
+///
+/// `None` when this light throws nothing: a sky, a light with shadows switched
+/// off, artwork lying on the surface itself, or a light so low that the shadow
+/// would run away to infinity.
+pub fn shadow_transform(light: &Light, height: f64) -> Option<Affine> {
     if !light.shadows || height <= 0.0 {
         return None;
     }
 
     match light.kind {
-        LightKind::Sky { .. } => None,
+        // A sky has no direction to cast along; a gloom has no light to cast
+        // with. Neither throws anything.
+        LightKind::Sky { .. } | LightKind::Gloom { .. } => None,
 
         LightKind::Sun { azimuth, elevation } => {
             // Below the horizon: nothing is lit, so nothing casts.
@@ -126,7 +190,7 @@ pub fn cast_shadow(path: &BezPath, light: &Light, at: Point, height: f64) -> Opt
             let length = length.min(height * MAX_SHADOW_RATIO);
             let (sin_a, cos_a) = azimuth.sin_cos();
             let away = Vec2::new(-cos_a, -sin_a) * length;
-            Some(Affine::translate(away) * path.clone())
+            Some(Affine::translate(away))
         }
 
         LightKind::Lamp {
@@ -145,12 +209,12 @@ pub fn cast_shadow(path: &BezPath, light: &Light, at: Point, height: f64) -> Opt
                 // runs off to infinity, so there is nothing sensible to draw.
                 return None;
             }
-            let scale = (lamp_height / gap).min(MAX_SHADOW_RATIO);
-            let about = Affine::translate(position.to_vec2())
-                * Affine::scale(scale)
-                * Affine::translate(-position.to_vec2());
-            let _ = at;
-            Some(about * path.clone())
+            let scale = (lamp_height / gap).clamp(1.0, MAX_LAMP_SCALE);
+            Some(
+                Affine::translate(position.to_vec2())
+                    * Affine::scale(scale)
+                    * Affine::translate(-position.to_vec2()),
+            )
         }
     }
 }
@@ -161,6 +225,25 @@ pub fn cast_shadow(path: &BezPath, light: &Light, at: Point, height: f64) -> Opt
 /// longer than any stage and its far end is off-screen anyway, so the only
 /// thing the extra length costs is rasterisation.
 const MAX_SHADOW_RATIO: f64 = 12.0;
+
+/// **The largest a lamp may scale a shadow.**
+///
+/// A lamp's shadow is a scale *about the lamp's position*, so the factor does
+/// two things at once: it makes the shadow bigger, and it throws it further
+/// from the caster in proportion to how far the caster already is. At three
+/// times, a figure four hundred units from the lamp has its shadow eight
+/// hundred units away and three times its size — off the stage, enormous, and
+/// attached to nothing. That is the report, and it is not a rounding error: the
+/// factor is `lamp_height / (lamp_height − standing_height)`, which is 1.8 at
+/// the defaults and **diverges** as the lamp is lowered towards the height the
+/// artwork is assumed to stand at. The old bound let it reach twelve.
+///
+/// Similar triangles say twelve is *correct* for a lamp a whisker above the
+/// artwork. It is also useless: what an animator wants from moving a lamp
+/// around is what Blender gives them, a shadow that stays attached to the thing
+/// casting it and swings around it. Past about twice the caster, a shadow on
+/// flat artwork stops reading as that thing's shadow at all.
+const MAX_LAMP_SCALE: f64 = 2.0;
 
 /// Everything one light makes for one shape, in one call.
 ///
@@ -174,25 +257,365 @@ pub fn shade_for(
     height: f64,
     modelling: f32,
 ) -> ShadeGeometry {
-    let Some((towards, _)) = light.towards(at, depth) else {
-        return ShadeGeometry::default();
+    let mut geometry = match crescent_direction(light, at, depth, modelling) {
+        Some(towards) => crescents(path, towards, light.softness),
+        None => ShadeGeometry::default(),
     };
+    geometry.cast = cast_shadow(path, light, at, height);
+    geometry
+}
 
+/// Which way the crescents on a shape at `at` face, or `None` if this light
+/// draws none there.
+///
+/// **This is the whole of what a crescent knows about a light.** Not its
+/// colour, not its strength, not how high it stands, not whether it casts —
+/// every one of those changes the picture and not one of them turns the
+/// terminator round.
+///
+/// Saying so in one function is what lets the shading cache key on a
+/// *direction* rather than on a light. A sun climbing the sky, a lamp
+/// brightening, a key light warming: all of them keep every crescent in the
+/// document, because the cache can see that none of them moved one.
+pub fn crescent_direction(light: &Light, at: Point, depth: f64, modelling: f32) -> Option<Vec2> {
+    // Modelling switched off means no crescents at all, so there is nothing to
+    // aim and nothing to build.
+    if modelling <= 0.01 {
+        return None;
+    }
+    let (towards, _) = light.towards(at, depth)?;
     let planar = towards.planar();
     // A light directly in front has no direction *in the plane*, so it
     // produces no crescents — only fill. Trying to build them from a
     // zero-length vector is where a stray NaN would come from.
-    let modelled = modelling > 0.01 && planar.hypot() > 1e-6;
+    (planar.hypot() > 1e-6).then_some(planar)
+}
 
+/// The two crescents for one shape lit from `towards` — the expensive half of
+/// lighting, a boolean difference each, and the reason any of this is cached.
+///
+/// `towards` need not be a unit vector; only its direction is read.
+pub fn crescents(path: &BezPath, towards: Vec2, softness: f64) -> ShadeGeometry {
     ShadeGeometry {
-        shade: modelled
-            .then(|| shade_crescent(path, planar, light.softness))
-            .flatten(),
-        highlight: modelled
-            .then(|| highlight_crescent(path, planar, light.softness))
-            .flatten(),
-        cast: cast_shadow(path, light, at, height),
+        shade: shade_crescent(path, towards, softness),
+        highlight: highlight_crescent(path, towards, softness),
+        cast: None,
     }
+}
+
+/// **The pool of light a lamp lays on the stage**: the light you can actually
+/// see, as opposed to what it does to a silhouette.
+///
+/// # Why a lamp needs one and a sun does not
+///
+/// A sun's rays are parallel, so the same light arrives everywhere and tinting
+/// each shape by one colour is not an approximation — it is the answer. A lamp
+/// is defined by the opposite: it falls off, and the falloff *is* the lamp.
+///
+/// The illumination model evaluates a light once per shape, at the middle of
+/// that shape. For a sun that is exact. For a lamp it means a wall under a lamp
+/// is filled with one flat colour, the same at the bright end as at the dark
+/// end — no pool, no hot spot, nothing that reads as a light being on. Measured
+/// on a lamp a hundred units from the left edge of a 550-unit wall: identical
+/// pixels at x = 100 and x = 520.
+///
+/// So the lamp also lays a pool: a radial ramp of its own colour, centred where
+/// it stands, following the same inverse-square falloff the shading uses, and
+/// screened over the frame. It is a gradient rather than pixels, so it survives
+/// unbounded zoom like everything else here, and it costs one filled circle per
+/// lamp per frame however much artwork it falls on.
+///
+/// `None` when there is no pool to draw: any light that is not a lamp, one
+/// switched off, one with its glow turned down, or one so weak or so far behind
+/// the stage that nothing of it would land.
+pub fn light_pool(light: &Light, depth: f64) -> Option<LightPool> {
+    let LightKind::Lamp {
+        position,
+        height,
+        radius,
+    } = light.kind
+    else {
+        return None;
+    };
+    if !light.enabled {
+        return None;
+    }
+    let strength = light.intensity.max(0.0) * light.glow.clamp(0.0, 1.0);
+    if strength <= 0.001 {
+        return None;
+    }
+    // How far the lamp stands in front of the surface it is lighting.
+    let above = height + depth;
+    if above <= 0.0 {
+        return None;
+    }
+    let radius = radius.max(1.0);
+    let reach = radius * POOL_REACH;
+
+    // What arrives at a point `along` units from directly under the lamp. The
+    // same two terms `Light::towards` uses — the inverse-square falloff, and
+    // how square-on the light strikes — so the pool and the shading agree about
+    // what this lamp is doing.
+    let arriving = |along: f64| {
+        let distance = (along * along + above * above).sqrt();
+        let falloff = 1.0 / (1.0 + (distance / radius).powi(2));
+        let facing = above / distance;
+        (f64::from(strength) * facing * falloff) as f32
+    };
+
+    let mut ramp: Vec<(f64, f32)> = (0..POOL_STOPS)
+        .map(|i| {
+            let t = i as f64 / (POOL_STOPS - 1) as f64;
+            (t, arriving(t * reach).clamp(0.0, 1.0))
+        })
+        .collect();
+    // The outermost stop is forced to nothing so the pool has an edge rather
+    // than a step: past the last stop a gradient pads with it for ever, and a
+    // pool that never ended would be a flat wash over the whole document.
+    if let Some(last) = ramp.last_mut() {
+        last.1 = 0.0;
+    }
+    // Nothing worth drawing: a lamp behind everything, or turned right down.
+    if ramp[0].1 <= 0.004 {
+        return None;
+    }
+
+    Some(LightPool {
+        centre: position,
+        reach,
+        ramp,
+    })
+}
+
+/// A lamp's light, as something to draw. See [`light_pool`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LightPool {
+    /// Where the lamp stands, in document space.
+    pub centre: Point,
+    /// The radius at which the pool has faded to nothing.
+    pub reach: f64,
+    /// From the middle outwards: `(fraction of reach, how much of the lamp's
+    /// colour arrives there)`. Always ends at zero.
+    pub ramp: Vec<(f64, f32)>,
+}
+
+/// How far past its half-strength radius a lamp is still worth drawing.
+///
+/// Three: the falloff goes as the cube of the distance out here, so at three
+/// radii a lamp is delivering about two per cent of what it delivers under
+/// itself. Further out is a wider circle to rasterise for a difference nobody
+/// can see.
+const POOL_REACH: f64 = 3.0;
+
+/// How many steps the falloff is sampled at. Inverse-square is a curve and a
+/// gradient ramp is straight between its stops, so this is how faithfully the
+/// curve is followed — ten is smooth to the eye and well inside the fifteen a
+/// gradient may carry.
+const POOL_STOPS: usize = 10;
+
+/// **The darkness one gloom lays over the frame.** See [`LightKind::Gloom`].
+///
+/// The exact counterpart of [`light_pool`], built the same way and for the same
+/// reasons: one quad and one linear ramp, rebuilt every frame for the cost of
+/// neither, so it follows a wall of dark being dragged and survives unbounded
+/// zoom like everything else here.
+///
+/// # Why the dark is drawn and not tinted
+///
+/// A lamp does both — it tints the artwork it reaches *and* lays a pool, and
+/// [`Light::glow`] is what keeps the two from being the same statement twice,
+/// because light on a surface and light in the air are genuinely different
+/// things. Darkness has no such pair. Taking light away from a shape's colours
+/// and multiplying the finished picture down are the *same* removal, and doing
+/// both would take it away twice.
+///
+/// So a gloom is drawn, and only drawn. That is not the lesser half: a tint is
+/// one colour for a whole shape, and this lands per pixel, across a character's
+/// face as readily as across the stage. It reaches a photograph and a gradient
+/// and a hundred imported layers for the price of one quad, and it needs no
+/// entry in any cache, because there is nothing to build.
+///
+/// `None` when there is nothing to draw: any light that is not a gloom, one
+/// switched off, or one turned down until it stops nothing.
+pub fn gloom_band(light: &Light) -> Option<GloomBand> {
+    let LightKind::Gloom {
+        edge,
+        facing,
+        throw,
+        width,
+    } = light.kind
+    else {
+        return None;
+    };
+    if !light.enabled {
+        return None;
+    }
+    // Stopping more than all of the light means nothing, so this is the one
+    // strength in the rig that is a fraction rather than a multiplier.
+    let deepest = f64::from(light.intensity).clamp(0.0, 1.0);
+    if deepest <= 0.004 {
+        return None;
+    }
+
+    let throw = throw.max(1.0);
+    let width = width.max(1.0);
+    let (sin_f, cos_f) = facing.sin_cos();
+    let facing = Vec2::new(cos_f, sin_f);
+
+    // What survives, rather than what is taken away, because that is what the
+    // renderer multiplies by — and because the interpolation has to happen in
+    // linear light. A ramp between two encoded colours passes through a middle
+    // that is nothing like half as dark, which is exactly the muddy grey band
+    // an eye picks out of a picture immediately.
+    let stopped = crate::to_linear(light.color);
+    let ramp: Vec<(f64, Color)> = (0..GLOOM_STOPS)
+        .map(|i| {
+            let t = i as f64 / (GLOOM_STOPS - 1) as f64;
+            let deep = (deepest * stopping(t)) as f32;
+            let survives = [
+                1.0 + (stopped[0] - 1.0) * deep,
+                1.0 + (stopped[1] - 1.0) * deep,
+                1.0 + (stopped[2] - 1.0) * deep,
+            ];
+            (t, crate::from_linear(survives, 255))
+        })
+        .collect();
+
+    Some(GloomBand {
+        edge,
+        facing,
+        throw,
+        width,
+        ramp,
+    })
+}
+
+/// A wall of dark, as something to draw. See [`gloom_band`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct GloomBand {
+    /// Where the near face stands, in document space.
+    pub edge: Point,
+    /// The unit direction it throws along.
+    pub facing: Vec2,
+    /// How far along that direction the dark has faded to nothing.
+    pub throw: f64,
+    /// How wide the wall is, across the throw.
+    pub width: f64,
+    /// From the near face outwards: `(fraction of the throw, the colour the
+    /// picture is multiplied by there)`. Always ends at white, which is a
+    /// multiply that changes nothing — so the band has an edge rather than a
+    /// step, for the same reason a pool's last stop is forced to zero.
+    pub ramp: Vec<(f64, Color)>,
+}
+
+impl GloomBand {
+    /// The quad the band covers, in document space.
+    ///
+    /// Nothing outside it is touched. A gloom is a shape like everything else
+    /// here, which is what makes it aimable: stand it off the stage and only
+    /// its long faded tail reaches the picture.
+    pub fn quad(&self) -> BezPath {
+        let across = self.across();
+        let far = self.far();
+        let mut path = BezPath::new();
+        path.move_to(self.edge - across);
+        path.line_to(self.edge + across);
+        path.line_to(far + across);
+        path.line_to(far - across);
+        path.close_path();
+        path
+    }
+
+    /// Where the throw ends: the point at which the dark has faded to nothing.
+    pub fn far(&self) -> Point {
+        self.edge + self.facing * self.throw
+    }
+
+    /// Half the wall, across the throw.
+    fn across(&self) -> Vec2 {
+        Vec2::new(-self.facing.y, self.facing.x) * (self.width * 0.5)
+    }
+
+    /// **Where the ramp goes**, as the affine a linear gradient wants.
+    ///
+    /// A gradient's unit space runs `-1..1` along its x axis, so the matrix has
+    /// to put the first stop on the near face and the last one at the far end.
+    /// The second column is merely non-singular — a linear ramp never reads it,
+    /// but a zero column is a matrix that renders as nothing at all.
+    pub fn ramp_transform(&self) -> Affine {
+        let half = self.facing * (self.throw * 0.5);
+        let across = self.across();
+        let centre = self.edge + half;
+        Affine::new([half.x, half.y, across.x, across.y, centre.x, centre.y])
+    }
+}
+
+/// How much of the light a gloom stops, `t` of the way along its throw.
+///
+/// `1 - t²` rather than a straight `1 - t`. A straight fade spends its first
+/// half in tones an eye cannot separate and its second half arriving at nothing
+/// too fast, and the result reads as a grey wedge with a top edge on it — which
+/// is the one thing a wall of dark must not look like. Squared, it holds near
+/// full for the first third and then falls away, which is what a long throw
+/// actually looks like: darkness that is simply *there*, thinning out.
+fn stopping(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - t * t
+}
+
+/// How many places the fade is sampled at.
+///
+/// Fewer than a pool's ten, because this curve is a parabola rather than an
+/// inverse square and a gradient's straight segments follow it far more closely
+/// — and because it is stretched over a whole stage, where a stop buys less
+/// than it does inside a lamp's disc.
+const GLOOM_STOPS: usize = 8;
+
+/// **How a gloom falls on one point**: which way its darkness travels, and how
+/// much of the light it is taking away there.
+///
+/// The per-shape half of [`gloom_band`]. The band answers for the *frame* and
+/// lands per pixel, which is what makes a wall of dark a wall; this answers for
+/// one shape, so the shape can be given a dark edge on the side the darkness is
+/// coming from. Without it a gloom is a wash over the picture and the figures
+/// standing in it have no form — which is the same complaint a flat tint gets
+/// from a light.
+///
+/// `None` for anything that is not a gloom, one switched off, and any point
+/// outside the quad — a gloom does nothing outside its own band, and that is
+/// what makes one aimable.
+pub fn gloom_at(light: &Light, at: Point) -> Option<(Vec2, f32)> {
+    let LightKind::Gloom {
+        edge,
+        facing,
+        throw,
+        width,
+    } = light.kind
+    else {
+        return None;
+    };
+    if !light.enabled {
+        return None;
+    }
+    let deepest = f64::from(light.intensity).clamp(0.0, 1.0);
+    if deepest <= 0.004 {
+        return None;
+    }
+    let throw = throw.max(1.0);
+    let (sin_f, cos_f) = facing.sin_cos();
+    let facing = Vec2::new(cos_f, sin_f);
+
+    let out = at - edge;
+    let along = out.dot(facing);
+    if along < 0.0 || along > throw {
+        return None;
+    }
+    let across = out.dot(Vec2::new(-facing.y, facing.x)).abs();
+    if across > width.max(1.0) * 0.5 {
+        return None;
+    }
+    let deep = deepest * stopping(along / throw);
+    (deep > 0.004).then_some((facing, deep as f32))
 }
 
 /// Boolean difference, with the tolerance derived from the shapes themselves.
@@ -205,6 +628,183 @@ fn difference(a: &BezPath, b: &BezPath) -> Option<BezPath> {
 
 #[cfg(test)]
 mod tests {
+
+    fn gloom(throw: f64) -> crate::Light {
+        crate::Light::new(
+            crate::LightId(1),
+            "Gloom",
+            crate::LightKind::Gloom {
+                edge: buzz_geom::Point::new(-200.0, 0.0),
+                facing: 0.0,
+                throw,
+                width: 600.0,
+            },
+        )
+    }
+
+    /// **Darkest at the wall, gone by the end.**
+    ///
+    /// The last stop has to be white — a multiply that changes nothing — for
+    /// the same reason a pool's last stop is forced to zero: past its last stop
+    /// a gradient pads for ever, and a band that never ended would be a flat
+    /// wash over the whole document.
+    #[test]
+    fn a_gloom_is_deepest_at_its_wall_and_gone_at_the_far_end() {
+        let band = super::gloom_band(&gloom(400.0)).expect("a band");
+
+        let luma = |c: peniko::Color| {
+            let [r, g, b, _] = c.to_rgba8().to_u8_array();
+            u32::from(r) + u32::from(g) + u32::from(b)
+        };
+
+        let first = band.ramp.first().expect("a first stop").1;
+        let last = band.ramp.last().expect("a last stop").1;
+        assert!(luma(first) < 60, "the wall is nearly black: {first:?}");
+        assert_eq!(
+            last.to_rgba8().to_u8_array(),
+            [255, 255, 255, 255],
+            "the far end must multiply by white, or the band never ends"
+        );
+
+        // Monotone all the way out: a fade that brightened anywhere in the
+        // middle would read as a band of its own.
+        for pair in band.ramp.windows(2) {
+            assert!(
+                luma(pair[0].1) <= luma(pair[1].1),
+                "the dark must only ever thin out: {pair:?}"
+            );
+        }
+    }
+
+    /// The ramp has to start on the wall and finish where the dark runs out,
+    /// or the gradient and the quad describe two different bands.
+    #[test]
+    fn the_ramp_runs_from_the_wall_to_the_end_of_the_throw() {
+        let band = super::gloom_band(&gloom(400.0)).expect("a band");
+        let placed = band.ramp_transform();
+
+        let start = placed * buzz_geom::Point::new(-1.0, 0.0);
+        let end = placed * buzz_geom::Point::new(1.0, 0.0);
+        assert!((start - band.edge).hypot() < 1e-9, "{start:?}");
+        assert!((end - band.far()).hypot() < 1e-9, "{end:?}");
+
+        // And the quad it is painted through covers exactly that span.
+        let bounds = {
+            use buzz_geom::Shape as _;
+            band.quad().bounding_box()
+        };
+        assert!((bounds.x0 - band.edge.x).abs() < 1e-9);
+        assert!((bounds.x1 - band.far().x).abs() < 1e-9);
+        assert!((bounds.height() - band.width).abs() < 1e-9);
+    }
+
+    /// A gloom turned right down stops nothing, and a quad that darkens by
+    /// nothing is a full-frame layer bought for no picture at all.
+    #[test]
+    fn a_gloom_turned_down_draws_nothing() {
+        let mut dark = gloom(400.0);
+        dark.intensity = 0.0;
+        assert!(super::gloom_band(&dark).is_none());
+
+        let mut off = gloom(400.0);
+        off.enabled = false;
+        assert!(super::gloom_band(&off).is_none());
+
+        // And nothing else in the rig lays one.
+        let sun = crate::Light::new(crate::LightId(2), "Sun", crate::LightKind::sun());
+        assert!(super::gloom_band(&sun).is_none());
+    }
+
+    /// **A gloom falls on a shape only where the gloom is**, which is the whole
+    /// of what makes one aimable: outside its quad it does nothing, so a wall
+    /// stood off the stage darkens the near figures and leaves the far ones.
+    #[test]
+    fn a_gloom_reaches_a_shape_only_inside_its_own_band() {
+        use buzz_geom::Point;
+
+        let dark = gloom(400.0);
+        // Deepest at the wall, thinner further along, nothing past the end.
+        let near = super::gloom_at(&dark, Point::new(-190.0, 0.0)).expect("at the wall");
+        let far = super::gloom_at(&dark, Point::new(60.0, 0.0)).expect("down the throw");
+        assert!(near.1 > far.1, "{near:?} against {far:?}");
+        assert!(
+            super::gloom_at(&dark, Point::new(400.0, 0.0)).is_none(),
+            "past the end of the throw a gloom must reach nothing"
+        );
+        assert!(
+            super::gloom_at(&dark, Point::new(-300.0, 0.0)).is_none(),
+            "behind the wall is outside it too"
+        );
+        assert!(
+            super::gloom_at(&dark, Point::new(0.0, 900.0)).is_none(),
+            "and so is off the side"
+        );
+
+        // The direction is the way the darkness travels, so the dark edge lands
+        // on the side the wall is on.
+        assert!(near.0.x > 0.9, "it throws to the right: {:?}", near.0);
+
+        let mut off = gloom(400.0);
+        off.enabled = false;
+        assert!(super::gloom_at(&off, Point::new(-190.0, 0.0)).is_none());
+
+        let sun = crate::Light::new(crate::LightId(2), "Sun", crate::LightKind::sun());
+        assert!(super::gloom_at(&sun, Point::ZERO).is_none());
+    }
+
+    /// **A lamp's shadow stays attached to the thing casting it.**
+    ///
+    /// The report: the shadows become huge and go a long way from the artwork.
+    /// A lamp's shadow is a scale *about the lamp*, so the factor does two
+    /// things at once — it enlarges the shadow and it throws it away from the
+    /// caster in proportion to how far the caster already is. The factor is
+    /// `lamp_height / (lamp_height − standing_height)`, which **diverges** as
+    /// the lamp is lowered towards the height the artwork stands at, and the
+    /// old bound let it reach twelve: a figure four hundred units from the lamp
+    /// got a shadow twelve times its size, four thousand units away.
+    #[test]
+    fn a_lamps_shadow_never_runs_away_from_its_caster() {
+        use buzz_geom::{Point, Rect, Shape as _};
+
+        let caster = Rect::new(400.0, 200.0, 460.0, 320.0);
+        let path = caster.to_path(1e-9);
+
+        // The worst case an animator can reach with the sliders: a lamp barely
+        // above the height the artwork is assumed to stand at.
+        for (lamp_height, standing) in [(160.0, 70.0), (100.0, 90.0), (400.0, 390.0)] {
+            let mut light = crate::Light::new(
+                crate::LightId(1),
+                "Lamp",
+                crate::LightKind::Lamp {
+                    position: Point::new(60.0, 200.0),
+                    height: lamp_height,
+                    radius: 300.0,
+                },
+            );
+            light.standing_height = standing;
+
+            let Some(shadow) = super::cast_shadow(&path, &light, caster.center(), standing) else {
+                continue;
+            };
+            let thrown = shadow.bounding_box();
+
+            assert!(
+                thrown.width() <= caster.width() * 2.5,
+                "lamp at {lamp_height} over artwork standing at {standing}: the shadow \
+                 came out {:.0} wide against a caster {:.0} wide",
+                thrown.width(),
+                caster.width()
+            );
+            let travelled = (thrown.center() - caster.center()).hypot();
+            assert!(
+                travelled <= caster.width() * 8.0,
+                "lamp at {lamp_height} over artwork standing at {standing}: the shadow \
+                 landed {travelled:.0} units from its caster, which is {:.1} times the \
+                 caster's own width",
+                travelled / caster.width()
+            );
+        }
+    }
 
     /// **The light is seen, the shadow is cast, and both follow the light.**
     ///

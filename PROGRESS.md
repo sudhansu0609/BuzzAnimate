@@ -2204,11 +2204,39 @@ lights from one key and fills with the rest.
 - [x] **A document with no lights renders pixel-identically to one from before
       the feature existed** — asserted on the GPU, not assumed
 
-**Rendered, with a cache.** Booleans are not free, so shading geometry is kept
-between frames in a `LightCache` keyed on the copy-on-write `Arc`'s *pointer
-identity*: editing one shape rebuilds that shape and nothing else, because
-structural sharing means every untouched object is literally the same
-allocation. Entries unused for three frames are dropped.
+**What a lamp actually looks like.** A sun's light is the same everywhere, so a
+flat tint per shape *is* the answer for one. A lamp is the opposite: it falls off,
+and the falloff is the lamp. So a lamp also lays a **pool** — a radial ramp of its
+own colour, centred where it stands, following the inverse-square falloff the
+shading already uses, screened over the finished frame (`buzz_light::light_pool`).
+It lights the air as well as the artwork, so a lamp in an empty shot is visible;
+it costs one filled circle per lamp per frame however much artwork it crosses; and
+it is a gradient rather than pixels, so it zooms and exports like everything else
+here. `Light::glow` is how strongly it is laid, and a lamp with it at zero still
+shades and still casts.
+
+**What a lamp actually does to the artwork** — and the pool is not it. The
+paragraph above was written as though laying light *in the air* covered for a flat
+tint on the surface, and it does not: `Screen` cannot darken, so the far side of a
+lamp-lit wall never falls off, and screening over pale artwork — which is most of
+a drawing — does nothing at all. The falloff belongs on the pixels. Both terms of
+a lamp's light depend on the surface point only through its distance from where
+the lamp stands, so a lamp's light is *exactly* a radial ramp in document space:
+`LightRig::field` answers for a **region** rather than a point and hands the
+renderer that ramp, which is laid over the artwork as a gradient. The pool stays,
+and means what it always said it meant — light in the air rather than light on a
+surface — but it is no longer carrying the falloff on its own. See §7-179.
+
+**Rendered, with a cache.** Booleans are not free, so the shading and highlight
+crescents are kept between frames in a `LightCache` keyed on the copy-on-write
+`Arc`'s *pointer identity*, its placement, and **the direction the light lies
+in**: editing one shape rebuilds that shape and nothing else, because structural
+sharing means every untouched object is literally the same allocation, and
+changing anything about a light except its aim rebuilds nothing at all. The cast
+shadow is not cached — it is the artwork under one affine
+(`buzz_light::shadow_transform`), so it is rebuilt every frame and therefore
+follows a light being dragged exactly. Entries unused for three frames are
+dropped.
 
 **The panel and the on-stage gizmos**
 - [x] Insert ▸ Light ▸ Sun / Sky / Lamp, and the same three buttons in the
@@ -2256,6 +2284,315 @@ test could see:
    nearly white, and the handle was drawn in the light's own colour. Structure
    is now drawn in ink — dial, spoke, rays and outline — with the light's
    colour only as the handle's fill, which is what Blender does too.
+
+### ✅ The gloom — a source of darkness
+
+Blender has no such thing, and in three dimensions it does not need one: dark
+is what you get where light does not reach, and the way to make more of it is
+to put something in the way. Flat artwork has nothing to put in the way. A
+drawing is lit by the tint on its own colours, so the only dark a rig can
+produce is the fill light — one level, everywhere, however many lamps are on.
+
+That is why a lit drawing so often reads as *tinted* rather than as lit. The
+bright end of the picture moves and the dark end never does, and it is the
+distance between the two that an eye reads as light. A **gloom** is the dark
+end, made movable.
+
+**Not a point source.** An inverse-square hole of dark centred on a spot looks
+like a smudge on the lens; there is no such thing in the world and nothing in a
+shot it could be. A gloom is a **wall**: wide across, thrown a long way
+forward, fading as it goes.
+
+- [x] `LightKind::Gloom { edge, facing, throw, width }` — where the near face
+      stands, the bearing it throws along (a sun's convention, clockwise from
+      the right), how far it reaches, and how wide the wall is
+- [x] **Outside that quad it does nothing at all**, which is the whole of what
+      makes one aimable: stand it off the stage and only its long faded tail
+      reaches the picture. A wall of dark that faded to *almost* nothing over
+      the whole document would be a wash with a gradient in it, and there would
+      be no way to light a shot against it
+- [x] `1 - t²` rather than a straight fade. A straight one spends its first
+      half in tones an eye cannot separate and arrives at nothing too fast, and
+      reads as a grey wedge with a top edge on it — the one thing a wall of dark
+      must not look like. Squared, it holds near full for the first third and
+      then thins out, which is what a long throw actually looks like
+- [x] `intensity` is how much light it stops and stops at **one**, because
+      taking away more than all of it means nothing. The panel labels it Depth
+      and gives it its own range; a slider that ran to four would spend three
+      quarters of its travel doing nothing, which is how a control teaches an
+      animator that it is broken
+- [x] `color` is not what it emits — it emits nothing — but what it *leaves*:
+      the colour the picture is multiplied towards where the dark is deepest.
+      Near-black with a blue bias, because that is what an unlit surface under a
+      sky is, and a neutral grey reads as a dirty lens
+
+**Drawn, not tinted — and only drawn.** A lamp does both: it tints the artwork
+it reaches *and* lays a pool, and `Light::glow` is what keeps the two from being
+the same statement twice, because light on a surface and light in the air are
+genuinely different things. Darkness has no such pair. Taking light away from a
+shape's colours and multiplying the finished picture down are the *same*
+removal, and doing both would take it away twice. So `buzz_light::gloom_band`
+gives the renderer one quad and one linear ramp, multiplied over the finished
+frame with `SrcAtop` so it lands on the picture and nowhere else.
+
+That is not the lesser half. A tint is one colour for a whole shape; this lands
+per pixel, across a character's face as readily as across the stage. It reaches
+a photograph, a gradient and a hundred imported layers for the price of one
+quad, and it needs no entry in any cache, because there is nothing to build.
+
+**The dark is drawn before the light.** A pool laid over a gloom cuts a hole
+through it, which is what a lamp in a dark room does. The other way round the
+gloom would fall on the pool and the lamp would be dimmed by the very darkness
+it is meant to be beating.
+
+**`+ Gloom` aims it for you.** `LightRig::opposing_gloom` stands the wall off
+the side of the view the key light is *not* on, turns it to face back across,
+and throws it far enough to die near the light — sized to the view rather than
+the stage, for the same reason a new lamp's reach is. Dropping one where the
+pointer happens to be is the one thing that cannot be right: it is a wall the
+width of the picture, and where it stands only means anything relative to the
+light it stands against. With nothing to oppose it comes in from the left,
+which is a direction the animator can then turn rather than a refusal to make
+one.
+
+**It is never a light.** No direction light arrives from, so: nothing added to
+the direct sum, no crescent turned, no shadow cast, and never the key. What
+used to be spelled `!is_ambient()` is now `is_directional()`, because that set
+was only ever right for as long as a sky was the one kind with no direction.
+
+**Its gizmo is the one place it has an outline.** Everywhere else it is a fade
+with no edge, which is the point of it and also what makes it impossible to aim
+blind. So the quad is drawn as a quad — the wall solid, the long sides ghosted,
+the throw running between them to a square handle at the far end. Grab the bar
+to carry the wall; grab the far handle to swing it round and set how far it
+reaches, which is the two-numbers-in-one-gesture bargain the sun's dial makes.
+
+**Saved** at format version 23, through the same flat fields a sun and a lamp
+already use — `position` for the wall, `azimuth` for the bearing — plus `throw`
+and `width`. Keyframable like any other light: the wall interpolates, and the
+bearing takes the shortest way round the circle so one swung past due-west does
+not take the long route back.
+
+**Verified by pixels**, in the headless lighting tests: a gloom darkens the side
+it rolls in from, turning it round swaps which end of the picture is buried, and
+past the end of its throw the frame is what it was to within a level.
+
+### ✅ Three reports: a light that could not be seen
+
+> *"I still cannot see a different colour of light. If I use the light once and
+> cancel it, next time the light does not show up. I also could not see the
+> darkness again."*
+
+The renderer was not what was wrong, and chasing it there wasted the first hour.
+The exporter's lighting tests passed, the stage's passed, a lamp's colour moves
+the picture by a hundred levels when you measure it, and a light deleted and
+re-added lights exactly as the first one did — all of which is now pinned by
+tests rather than assumed. What was actually wrong is that a light could be
+**created unable to be seen**, and once created it stayed that way.
+
+**1. Every lamp after the first arrived on the same spot.** The position was a
+fixed fraction of the view — twenty-two per cent across, twenty down — so the
+second lamp landed inside the first one's pool and moved almost nothing. That is
+indistinguishable from it not having been added, and it is the same report
+worded the other way round: delete a light, add another, and the new one appears
+where the old one was. A new lamp now steps along a diagonal until it is clear of
+every lamp already in the rig.
+
+**2. A light born while the stage had no area was too small to see.** The reach
+and the throw were sized from `Camera::visible_doc_rect` alone, and that
+rectangle is a *point* until the stage has been laid out — also while a panel is
+maximised over it, and while the window is minimised. Measured: a lamp got the
+minimum reach of **forty units on a stage five hundred and fifty across**, and a
+gloom got a throw of **one unit and a width of one and a half**. Both exist, both
+are listed in the panel, and neither can be found on the stage. Zooming in did a
+milder version of the same thing — a light sized to a magnified detail dies
+before the edge of the frame.
+
+`Editor::light_frame` is the fix: the view is used only when it is a real box,
+and it is unioned with the stage, because a light belongs to the *shot* and the
+shot is at least the stage. Where the light is *put* still follows the view,
+which is the half of "put it where the user is looking" that was always right.
+
+This is also the honest answer to the colour report. A lamp with forty units of
+reach delivers two per cent of itself at the middle of the picture, so its colour
+touched almost nothing; the fill light was what the whole stage was made of. Give
+the same lamp the reach it should have had and swinging it from orange to blue
+swings the entire frame.
+
+**3. The retained stage encoding keyed the lighting on the document revision.**
+The window keeps last frame's Vello encoding and reuses it when a stamp of its
+inputs matches. The stamp carried `Scene::revision`, and **undo puts the revision
+back** — adding a light takes it 5→6, undoing returns it to 5, adding a different
+light takes it to 6 again. One number, two rigs. The only thing between that and
+a retained encoding of the wrong lighting was that a frame happened to be drawn
+in between, and redraw requests coalesce. The stamp now carries
+`LightRig::fingerprint`, resolved at the frame being drawn, which also covers
+what the revision never could: a keyframed light, whose values change frame to
+frame with no edit at all.
+
+**And a lighting change now always gets a frame of its own.** Everything that
+kept the window awake was about *geometry* — a batch of crescents in flight, a
+frame drawn with shading known to be provisional. Recolouring a light, turning
+one down, switching one off, adding a sky, standing a wall of dark across the
+stage: none of those generates a crescent, so nothing asked for another frame.
+It happened to work because the panel is built before the stage is encoded, and
+that is an ordering the lighting has no business depending on. One comparison of
+the rig's fingerprint against last frame's now guarantees it.
+
+**Proved both ways.** `crates/buzz-app/tests/lighting_reports.rs` fails against
+the old sizing with the exact numbers above (`reach: 40`, `throw: 135 against a
+stage span of 680`, `two lamps at (23, 20) and (23, 20)`) and passes against the
+new; `stage_lighting.rs` reads the pixels back off the window's own encoding for
+a light and a gloom born with no stage area, for a light deleted and re-added,
+and for a lamp recoloured on a warm cache.
+
+### ✅ Edges, and a fire
+
+> *"The lamp and the gloom give overall colour changes. I want highlights on the
+> edges of characters and objects when light falls on them, and darkness on
+> their sides and edges when the gloom falls on them, with no lag. And an
+> animated fire lamp that flickers."*
+
+**"Overall colour changes" was the right diagnosis of the wrong thing.** The
+highlight existed; it was 45% as wide as the terminator, which is a broad band
+down one side of every shape. A broad band and a wash are both washes — what the
+eye reads as *light* on a flat drawing is the narrow edge that catches it. So the
+highlight is now 30% of the terminator and carries 0.78 of the light's own
+colour rather than 0.55. The two are one decision: narrowing alone only makes the
+wash smaller.
+
+Not narrower than that. Below about a quarter the band stops carrying enough
+colour for the frame as a whole to read as lit, and
+`stage_lighting::a_default_sun_lights_rather_than_dims` fails at a fifth — it
+measures exactly that and it is what stopped this going too far.
+
+**A gloom now leaves a dark edge on what stands in it.** Where the terminator
+says which side the key light is not on, this says which side the darkness is
+arriving from; without it a wall of dark is a wash that takes every figure's
+form with it. It goes through the same crescent cache, keyed on the gloom's own
+bearing so a wall being dragged does not throw away the terminators.
+
+**What it cost to learn that a live rim is too expensive.** Both edges were
+first drawn live — a clip and a punch, two fills, no geometry built and exact on
+the frame the light moved, which is a lovely property and exactly what "no lag"
+asks for. Over twelve hundred shapes it took the encoded path count from 2,400 to
+**13,203**. `encode_cost::switching_a_light_on_does_not_draw_the_artwork_again_per_pass`
+refused it, and was right to: past about four times the unlit encode the GPU
+declines to bind the result. Lighting draws about one more outline per shape, and
+both edges now do too.
+
+**Fire is a `flicker` on a lamp, not a fourth kind of light.**
+- [x] `Light::flicker`, `0.0..=1.0`. The value is smoothed value noise on the
+      frame number, seeded from the light's own id — so two torches in one shot
+      never flicker together, and the same frame renders identically on every
+      machine and in every process. No keys, no track, nothing to draw
+- [x] **Two rates**, a slow breath under a fast gutter. One rate reads as a
+      pulse however it is tuned, because the eye finds the period immediately
+- [x] It moves the **brightness and the colour, never the position**. A lamp
+      that jittered across the stage would turn every crescent in the film on
+      every frame, which is the one thing the shading cache cannot absorb; the
+      test that pins it walks thirty frames and asserts `LightRig::aim` never
+      moves
+- [x] Redder as it drops, because the dim part of a fire is the ember colour
+      rather than a dimmer flame; and never to nothing, because a light that
+      reached zero would take every shaded edge with it for one frame
+- [x] **🔥 Make it fire** in the panel: the hearth colour, the gutter, and a
+      tighter circle. It deliberately leaves the brightness alone — turning that
+      up as well was the obvious move and it put an opaque disc of the lamp's
+      own colour over the picture on the bright frames, so the figure standing
+      in front of the fire vanished for a frame and came back on the next
+- [x] Saved at format version 24, and absent from every steady light, so a
+      document with no fire in it is byte-identical to what version 23 wrote
+
+**Verified by pixels**: the edge facing a lamp is brighter than the middle of
+the same figure and the far edge is not; carry the lamp across the stage and the
+lit edge swaps with it; the edge a wall of dark arrives at is darker than the
+middle; and eight frames of a fire, with no keyframe anywhere in the file, are
+eight different pictures.
+
+### ✅ The black stage
+
+> *"When the app starts, and when I maximise it, the screen becomes black and
+> then the lights don't work."*
+
+Not the lights. **No artwork was drawn at all**, and a black picture is exactly
+what a broken light would leave, so that is what it read as.
+
+The stage's viewport offset comes from the rectangle egui gave the central
+panel. That rectangle starts as `egui::Rect::NOTHING` — whose width is *negative
+infinity* — and is only replaced once the layout has been measured. That is the
+first frame of a session, and it is a frame again after the window is maximised,
+before egui has measured the new size. Carried into physical pixels it becomes a
+viewport offset of infinity; it goes into the GPU transform; every coordinate
+through it comes out NaN; nothing rasterises.
+
+Measured on the real GPU through the window's own encoder: **99.7% of the frame
+came out different from a measured one**. Two guards, because the failure is
+worth stopping twice:
+
+- [x] `SceneBuilder::with_viewport_offset` ignores an offset that is not finite.
+      Drawing the frame at the origin for one frame is wrong by a few pixels;
+      drawing it black is wrong by the whole picture
+- [x] `App::render` keeps the last stage rectangle that egui actually measured
+      and draws through that instead, and asks for the frame that will have a
+      real one. For one frame that is the previous framing, which nobody can
+      see
+
+Pinned by `stage_lighting::an_unmeasured_stage_area_still_draws_the_artwork`,
+which drives `Rect::NOTHING` and a NaN through `build_scene` and reads the
+pixels back. Without the guard it fails at 99.7%.
+
+**And the fire was where nobody would find it.** The preset was a button inside
+the *selected* light's section of the Lighting panel, reachable only by adding a
+lamp, opening the panel, selecting the lamp and scrolling to it. It is now
+**Insert ▸ Light ▸ Fire** and a `🔥 Fire` button beside the other four,
+as one command: a lamp placed and sized like any other light, then set alight.
+
+### ✅ Making a lamp behave like a lamp
+
+> *"The lighting does not highlight edges, it makes the whole area bright. I
+> cannot move the actual light source — the source stays in place and just the
+> outline moves. The shadows become huge and very far away. It should behave the
+> same as a lamp brought into the scene and moved around in Blender."*
+
+Three separate faults, each of which alone would produce that impression.
+
+**The pool was washing the stage.** `Light::glow` defaulted to full, and a full
+pool is the lamp's whole colour screened over the frame out to three times its
+reach — most of a stage. Everything underneath came up evenly bright, which
+drowns the one thing that reads as light: the difference between the near side
+of a figure and its far side. Blender has no pool at all, because light in the
+air needs a volume and there is no volume here. The default is now a third; the
+slider still goes to one, and `make_fire` puts it back up, because a fire is one
+of the few lights that genuinely does light the air.
+
+**The ring was the only thing you could grab.** A lamp's move handle was a dot
+nine screen pixels across. Its reach ring is a circle hundreds of units wide,
+drawn in the light's own colour, and it is plainly *the lamp* on the stage — so
+that is what a hand grabs, and grabbing the ring resizes it. The lamp does not
+move and the only thing that changes is the outline, which is the report word
+for word. The whole disc now moves the lamp, but **only for the lamp selected in
+the panel**: a ring covers a good part of the picture, and swallowing every
+brush stroke under it would be a worse bug than the one being fixed. Select it,
+then drag it — which is how Blender's viewport works too. The ring's own edge
+still sets the reach.
+
+**The shadows were running away.** A lamp's shadow is a scale *about the lamp's
+position*, so the factor does two things at once: it enlarges the shadow and it
+throws it away from the caster in proportion to how far the caster already was.
+The factor is `lamp_height / (lamp_height − standing_height)`, which **diverges**
+as the lamp is lowered towards the height the artwork is assumed to stand at,
+and the bound let it reach twelve. Measured: a caster sixty units wide threw a
+shadow **six hundred units wide**, a long way from the thing that cast it.
+Similar triangles say that is correct for a lamp a whisker above the artwork; it
+is also useless. Bounded at twice the caster, a shadow stays attached to its
+figure and swings around it, which is what moving a lamp about is supposed to
+look like.
+
+**Proved by pixels**, by moving one lamp across a scene of three objects: the
+lit edge swaps sides on every one of them, the shadows swing to the opposite
+side and stay beside their casters, and the stage behind is no longer washed
+out — `graphify-out/proof-lamp-moved-0..2.png`.
 
 ### ✅ The Animate importer, rewritten against real films
 
@@ -3464,19 +3801,24 @@ because "whichever finished second wins" is not what *second* means to the perso
 asked.
 
 **The first lit frame, and per-light keying (closes §7-154, §7-155).** The geometry
-cache is now keyed on **each light's** fingerprint rather than on a single rig-wide
-revision that cleared the whole cache on any change (`Light::fingerprint`,
-`lighting.rs`). So dragging one lamp rebuilds that lamp's crescents and shadows and
-leaves the sun's alone — which is what keeps the cache warm through ordinary editing,
-and what will make keyframed lights affordable in Wave 9a. On top of that, a **cold**
+cache was keyed on **each light's** fingerprint rather than on a single rig-wide
+revision that cleared the whole cache on any change (`lighting.rs`). So dragging one
+lamp rebuilt that lamp's crescents and shadows and left the sun's alone — which is what
+kept the cache warm through ordinary editing, and what made keyframed lights affordable
+in Wave 9a. *(Superseded: see §7-173. Keying on a light meant that brightening one, or
+warming it, or raising it in the sky, threw away every boolean it had lit; the key is
+now the direction a crescent faces, which is the only thing about a light that moves
+one.)* On top of that, a **cold**
 cache no longer builds every crescent and shadow inline before the frame appears: it
 draws the frame unlit, queues the misses (`LightCache::set_defer`/`take_misses`), and the
 app builds them on the interactive pool — every core at once — off the UI thread
 (`Miss::build`, `LightCache::install`). When the geometry lands the next frame is lit.
-Deferral fires **only when the cache is cold**, so an ordinary edit still lights on the
-spot with no unlit flash; a document just opened shows for a frame or two unlit rather
+Deferral fired **only when the cache is cold**, so an ordinary edit still lit on the
+spot with no unlit flash; a document just opened showed for a frame or two unlit rather
 than freezing for a third of a second. The 305 ms first frame is gone, and the
-single-threaded geometry build with it.
+single-threaded geometry build with it. *(Since §7-177 the rule is a time budget rather
+than a set of named cases, and a deferred shape draws its last crescents rather than
+none, so the unlit frame is gone as well.)*
 
 **Scripts off the UI thread (closes §7-32).** `buzz_script::run_until` takes a
 `StopSignal` — `Arc<dyn Fn() -> bool>` — consulted from QuickJS's interrupt handler, the
@@ -3858,7 +4200,17 @@ down here has not been finished.
 | 135 | **A gradient and a solid do not tween into each other.** Two gradients interpolate stop by stop when they correspond; a solid tweening to a gradient switches at the halfway point instead, because moving a colour and then jumping to a ramp reads as a glitch rather than a transition. Two gradients with different stop counts switch for the same reason. | By design |
 | 153 | **An armature layer is not marked, so a rigged film looks like any other.** §7 item 33 already records that a rig is an object rather than an armature layer; building the horror short confirmed the cost — with thirty rigged characters there is nothing in the timeline that says which layers hold rigs. | Phase 7 follow-up |
 | 154 | ~~**Lighting geometry is single-threaded.**~~ | ✅ **Resolved in Wave 4** — a cold cache's shading crescents and cast shadows build on the interactive pool, every core at once, off the UI thread (`Miss::build` fanned out by `JobSystem::run(Pool::Interactive)`). §4 |
-| 155 | ~~**The first frame of a heavy scene costs 305 ms.**~~ | ✅ **Resolved in Wave 4** — a cold `LightCache` draws the frame unlit, queues its geometry, and builds it off-thread; the frame it lands in is lit. Per-light keying keeps the cache warm through ordinary edits, so this only ever happens on a genuinely cold cache. §4 |
+| 155 | ~~**The first frame of a heavy scene costs 305 ms.**~~ | ✅ **Resolved in Wave 4** — a cold `LightCache` draws the frame with whatever shading it already had, queues its geometry, and builds it off-thread; the frame it lands in is exact. Keying on the crescent's direction keeps the cache warm through ordinary edits and through everything about a light except its aim, so this only ever happens on a genuinely cold cache. §4 |
+| 175 | ~~**A sky's Strength did nothing, at any setting.**~~ | ✅ **Resolved** — it was folded into the colour with `multiply_alpha`, which moves a colour's *alpha*, and the only reader takes the three colour channels and drops the alpha. The one control that could make a sky brighter moved a number nothing read. Strength is now applied in linear light, on the colour. |
+| 176 | ~~**A sun added from the panel threw no shadow, and a lamp lit a character evenly.**~~ | ✅ **Resolved** — both were defaults rather than the rig. A shadow is the standing height over the tangent of the elevation, so a sun 52° up with the artwork standing 40 off the background threw one 31 units long, entirely underneath the drawing that cast it; the sun now starts at 40° and artwork stands 70 off. And a new lamp arrived at the middle of the view, the one position with no direction in the plane — no crescent, a symmetrical pool, and the shadow hidden under the caster. It now arrives up and to one side, where a key light goes. |
+| 178 | ~~**The retained stage encoding kept a half-lit frame for ever.**~~ | ✅ **Resolved** — the window keeps last frame's Vello encoding and re-renders it when nothing that shaped it changed. A frame that deferred its crescents left a retained encoding of half-lit artwork; the next frame found an identical stamp, reused it, and so never re-encoded, never recorded the misses it owed, and never built them. Nothing had changed, which is exactly the trap. On any document where one frame's build budget did not cover the artwork the shading stopped there — no bright side, no terminator, whatever the light was set to — while the window spun asking for a frame that did nothing. Reuse is now refused while the encoding is known to be provisional and no batch is in flight to replace it. Pinned by `buzz-app/tests/lighting_settles.rs`, which models the retained encoding and fails without it. |
+| 177 | ~~**A frame drawn with provisional shading could be the last frame drawn.**~~ | ✅ **Resolved** — the window sleeps between input events, so a frame that deferred its crescents had to ask for another or the stale picture stayed on screen until something unrelated provoked a repaint. `LightCache::is_stale` reports it and the window keeps asking. Pinned by `buzz-app/tests/lighting_settles.rs`, which drives the real frame sequence and fails without it. |
+| 179 | ~~**A lamp lit every shape flatly, so it read as a filter rather than as a light.**~~ | ✅ **Resolved** — the light was evaluated **once per shape, at that shape's middle**, and the colour written into its fill. For a sun that is exact: parallel rays deliver the same light everywhere, so one colour per shape *is* the answer. For a lamp it threw away the only thing that makes a lamp a lamp. A wall under one came out a single flat tone from the bright end to the dark end; a face had no lit side and no shaded side; carrying the lamp nearer moved one number per shape and nothing within any of them. The pool of glow was meant to cover for it and could not: it is a `Screen` pass, and screening over pale artwork — which is most of a drawing — does nothing at all, and it can never darken the far side. Measured on a wall with a lamp at one edge: over a light fill the picture ran 222 down to 187 over the first two thirds, fell off a cliff of 64 levels where the shading band began, and then held **dead flat for the remaining 250 units**. A lamp's light is radially symmetric about the point it stands over — both terms of it depend on the surface point only through its distance — so it is *exactly* a radial ramp in document space, and `LightRig::field` now answers for a region rather than a point and hands the renderer that ramp. Laid over the artwork as a gradient the falloff lands per pixel: the same wall now runs 237 down to 116 smoothly, end to end, with no cliff and no flat stretch. Pinned by five tests in `stage_lighting.rs` that measure **across one shape** rather than between two, four of which fail without it. |
+| 180 | **The terminator is a hard edge, not a gradient.** | Open. The shading band is the silhouette minus a copy of itself shifted towards the light, filled with **one flat tone**: on a shape the size of a background that is a straight seam through the middle of the picture, and `softness` only widens the band, it never softens one. Two ways of fixing it were built and both were rejected, so the next reader does not build them again. **A gradient along the light** cannot follow the band: on a rectangle lit from a corner the band is an **L**, one arm down the side and one along the bottom, and the two arms lie at different distances along the light — laid along that direction the ramp is right for the corner where they meet and leaves both arms with no shading at all (caught by `the_side_of_a_character_facing_a_lamp_is_brighter`). **Stepping copies of the shape** through a multiply layer, each carrying a little more white, is exactly right for any silhouette — and cost the earth, because Vello re-encodes a path for every fill and there is no instancing, so thirty steps is the artwork thirty times. That is what §182 is about. What is affordable is a gradient *paint* on the band, which is one fill either way; what is not is any second pass over the artwork. |
+| 181 | ~~**The composited path was for bitmaps; a lamp needed it too.**~~ | ✅ **Resolved, then narrowed — see §182.** Artwork was lit by rewriting the colours its fill is made of, which a bitmap has none of. A lamp needs more than that too (§179: a rewritten colour is *one* colour, and a lamp is not), and the first fix sent every lamp-lit shape down the composited path. That was too much: a solid colour under a lamp is exactly a radial gradient of that colour, so the light goes in the **paint** and the shape is still drawn once. Only a bitmap, and a gradient fill under a lamp, composite now. |
+| 182 | ~~**Switching a light on made the GPU refuse the frame, and the app went with it.**~~ | ✅ **Resolved.** Reported as "it did not work and the app crashed", and reproduced from the recovery file the crash left behind: a 28-layer, 644-symbol import, on which wgpu refused `create_bind_group` — *buffer binding range 201326592 exceeds the `max_*_buffer_binding_size` limit 134217728*. Vello keeps path data in one buffer, and 192 MB is past what the device will bind. **There is no instancing**: `Scene::fill` re-encodes the path it is handed, every time, so a shape drawn under six transforms costs six copies of its outline rather than one copy and six matrices. Compositing the light over every lit shape, and stepping a ramp across each band, drew the artwork up to sixty times: **615 thousand path segments became 11.5 million, and 9 MB of path data became 171 MB.** The lighting model now puts a lamp in the paint rather than in another pass, and the same document encodes 31 MB and renders. Nothing had ever asked how large an encoding *was*, which is why this passed every picture test and every timing budget; `switching_a_light_on_does_not_draw_the_artwork_again_per_pass` now counts **encoded paths**, the quantity the failure actually moves, and fails against the version that crashed. |
+| 174 | ~~**A lamp lit a surface flat, and could not be seen at all.**~~ | ✅ **Resolved** — illumination is evaluated once per shape, at that shape's middle, which is exact for a sun and meaningless for a lamp: a wall under a lamp came out one colour end to end, and darker than it started. A lamp now lays a **pool** (`buzz_light::light_pool`) — a radial ramp of its own colour following the same inverse-square falloff the shading uses, screened over the finished frame — and is left out of the flat per-shape term so the two are not added twice. It is a gradient and a circle, rebuilt every frame for the cost of neither, so it follows a lamp being dragged; and it lands on the air as well as on artwork, so a lamp in an empty shot glows. `Light::glow` dials it, and at zero a lamp still shades and still casts. Format version 22. |
+| 173 | ~~**Aiming a light pinned the machine and the artwork went flat.**~~ | ✅ **Resolved** — the cast shadow is an affine and is no longer cached, so it tracks the light live; the crescents are keyed on their direction, hold at their last angle while the hand is moving, and rebuild once it stops. At most one off-thread batch is ever in flight and it is abandoned the moment the light moves past it. A frame may build at most `lighting::INLINE_BUDGET` of work on the UI thread, whatever it finds stale — which is what stopped the freeze reappearing at the end of the gesture. |
 | 157 | **A mask added before the layer it masks ends up underneath it and claims nothing**, and the sheet it should have holed then draws flat across the whole film. Masking is positional and `add_layer` puts each new layer in front, so the masked layer has to be created *first*. Animate's order of work is the same — draw the content, then add a mask above it — but nothing here says so, and the symptom (an evenly darkened film) looks like a lighting problem rather than a layer-order one. | Follow-up |
 | 156 | **A layer that is one frame long shows nothing past frame zero**, which is correct and is also a trap: setting a document's length is a separate action (`set_frame_count`, Animate's F5), and a scene built without it appears to lose all its artwork the moment the playhead moves. Nothing in the interface says so. | Follow-up |
 | 158 | **The XFL, SWF and PDF readers still do not bring their bitmaps across.** The pipeline they needed now exists — decode, library, `media/` storage, a paint that draws them — so each reader has only to call it where it currently logs "bitmap ignored". Doing so needs the DefineBits/JPEGTables chain for SWF and the `<DOMBitmapItem>` road for XFL. | Phase 5 follow-up |

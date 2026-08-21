@@ -1608,12 +1608,34 @@ fn draw_layer(
         // whose key light throws nothing — a sky, shadows switched off, a light
         // down on the surface — skips the whole pass here rather than
         // discovering it a shape at a time.
+        //
+        // **All of them into one group, and the tone put on the group.** A
+        // shadow is the silhouette of what casts it, at one tone. Drawn a shape
+        // at a time in black at the light's strength, the alphas compound
+        // wherever two of a caster's shapes overlap — `1-(1-a)^n` — and a
+        // character of a hundred shapes came out as a patchwork of a hundred
+        // darknesses with every internal seam showing. Opaque inside a group
+        // closed at the strength, the union is one tone however many shapes
+        // made it. See `SceneBuilder::push_alpha_group`.
         if let Some(shadow) = shadow
             && let Some(key) = rig.key()
+            && let Some(cast) = shadow_group_bounds(&resolved, shadow, &ctx)
         {
+            // The group carries everything that would have dimmed the fill:
+            // the light's own shadow strength, a guide layer's fade, and a
+            // ghost's alpha. Inside, every shadow is opaque.
+            let mut alpha = key.shadow_strength.clamp(0.0, 1.0);
+            if ctx.faded {
+                alpha *= FADE;
+            }
+            if let Some(ghost) = ctx.ghost {
+                alpha *= ghost as f32;
+            }
+            builder.push_alpha_group(cast, alpha);
             for object in resolved.iter() {
                 cast_shadows(builder, object, Affine::IDENTITY, key, shadow, &ctx);
             }
+            builder.pop_isolation();
         }
 
         // A layer holding build-up paint is drawn into its own transparent
@@ -3213,6 +3235,43 @@ fn cast_shadows(
     cast_shadows_within(builder, object, doc, key, shadow, ctx, 0);
 }
 
+/// **Where a layer's shadows land**, as the group they are drawn inside.
+///
+/// The union of what the layer actually draws, thrown by the shadow affine, and
+/// then through the lens. Every group is a render target, so it is trimmed to
+/// what can be seen: a caster whose shadow falls right off the side of the
+/// frame should not buy a buffer the size of the throw.
+///
+/// **Resolved bounds, not the object's own.** An instance's `bounds` is a
+/// placeholder a few units across — the symbol's real extent lives in the
+/// library — so measuring the layer that way gave a group a hair wide and
+/// clipped every shadow in the document to nothing. `Scene::resolved_bounds`
+/// is memoised across the library, so asking it per object is a lookup.
+///
+/// `None` when the layer draws nothing, or nothing whose shadow can be seen.
+fn shadow_group_bounds(
+    resolved: &buzz_scene::ResolvedFrame<'_>,
+    shadow: Affine,
+    ctx: &DrawCtx<'_>,
+) -> Option<buzz_geom::Rect> {
+    let mut area: Option<buzz_geom::Rect> = None;
+    for object in resolved.iter() {
+        let b = ctx.scene.resolved_bounds(object);
+        area = Some(match area {
+            Some(a) => a.union(b),
+            None => b,
+        });
+    }
+    let mut area = shadow.transform_rect_bbox(area?);
+    if let Some(cull) = ctx.cull {
+        area = area.intersect(cull);
+    }
+    if !(area.width() > 0.0 && area.height() > 0.0) {
+        return None;
+    }
+    ctx.projection.map_rect_bounds(area)
+}
+
 /// One shape's shadow: its outline, put where the light throws it.
 ///
 /// The projection is folded into the placement rather than applied after it, so
@@ -3223,14 +3282,16 @@ fn draw_shadow(
     builder: &mut SceneBuilder<'_>,
     path: &buzz_geom::BezPath,
     doc: Affine,
-    key: &buzz_light::Light,
+    _key: &buzz_light::Light,
     shadow: Affine,
     ctx: &DrawCtx<'_>,
 ) {
+    // **Opaque.** The tone is on the group this is drawn inside, so that shapes
+    // overlapping within one caster make a silhouette rather than a darker
+    // patch. See the shadow pass in `draw_layer`.
     let cast = (shadow * doc) * path.clone();
-    let colour = Color::from_rgba8(0, 0, 0, (key.shadow_strength.clamp(0.0, 1.0) * 255.0) as u8);
     let drawn = ctx.project(&cast, builder.tolerance());
-    builder.fill_shape(&drawn, ctx.overlay(colour));
+    builder.fill_shape(&drawn, Color::BLACK);
 }
 
 /// [`cast_shadows`], carrying how deep into nested symbols it has gone.
@@ -3318,8 +3379,12 @@ fn cast_shadows_within(
 
 /// Guide layers draw faintly, so they read as reference rather than artwork.
 fn fade(color: Color) -> Color {
-    color.multiply_alpha(0.35)
+    color.multiply_alpha(FADE)
 }
+
+/// How far a guide layer's artwork is faded back. Named because the shadow pass
+/// has to apply the same amount to a whole group rather than to one colour.
+const FADE: f32 = 0.35;
 
 #[cfg(test)]
 mod tests {

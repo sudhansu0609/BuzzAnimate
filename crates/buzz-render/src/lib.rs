@@ -770,7 +770,31 @@ impl<'a> SceneBuilder<'a> {
         );
     }
 
-    /// Close the group opened by [`Self::push_isolation`].
+    /// Begin a group that is composited at `alpha` when it closes.
+    ///
+    /// **What this buys over drawing at that alpha directly**: inside the
+    /// group, overlapping shapes do not compound. Two half-transparent shapes
+    /// laid one on another make three quarters; the same two drawn opaque
+    /// inside a group closed at a half make a half, everywhere, which is what
+    /// a *silhouette* means. That is exactly the difference between a shadow
+    /// and a stack of shadows — see the shadow pass in
+    /// [`crate::document`].
+    ///
+    /// `bounds` limits the group as [`Self::push_isolation`] does, and for the
+    /// same reason: a group is a render target.
+    pub fn push_alpha_group(&mut self, bounds: buzz_geom::Rect, alpha: f32) {
+        let path = self.to_render_space(&bounds);
+        self.scene.push_layer(
+            Fill::NonZero,
+            peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::SrcOver),
+            alpha.clamp(0.0, 1.0),
+            self.split.gpu_view,
+            &path,
+        );
+    }
+
+    /// Close the group opened by [`Self::push_isolation`] or
+    /// [`Self::push_alpha_group`].
     pub fn pop_isolation(&mut self) {
         self.scene.pop_layer();
     }

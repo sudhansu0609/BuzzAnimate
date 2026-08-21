@@ -2422,6 +2422,88 @@ fn a_trimmed_frame_still_takes_the_lights_colour() {
     }
 }
 
+/// **A caster made of several shapes throws one shadow, not one per shape.**
+///
+/// The report: the shadows look like overlapping parts, some darker than
+/// others. They were. Every shape cast its own, filled with black at the
+/// light's shadow strength, and drawn one over another — so where two of a
+/// character's shapes overlapped, and they overlap everywhere, the alphas
+/// compounded: `1-(1-a)^n`. A figure of a hundred shapes came out as a
+/// patchwork of a hundred different darknesses with every internal seam
+/// showing, which is not a shadow, it is a stack of them.
+///
+/// A shadow is the silhouette of what casts it, at one tone.
+#[test]
+fn overlapping_shapes_cast_one_shadow_at_one_tone() {
+    let Some(mut h) = Harness::new() else { return };
+
+    // Two squares that overlap down the middle, well clear of the shadow they
+    // will throw so the measurement is of the shadow alone.
+    let mut scene = Scene::default();
+    scene.stage_mut().background = Color::WHITE;
+    scene.stage_mut().size = Size::new(550.0, 400.0);
+    let layer = scene.add_layer("Art", LayerKind::Normal);
+    // Coloured, not grey: then a grey pixel can only be the white stage with
+    // shadow on it, and the artwork cannot be mistaken for its own shadow.
+    let blue = Color::from_rgb8(0x20, 0x40, 0xC0);
+    scene.add_shape(
+        layer,
+        ShapeData::filled(Rect::new(120.0, 60.0, 240.0, 180.0).to_path(1e-9), blue),
+    );
+    scene.add_shape(
+        layer,
+        ShapeData::filled(Rect::new(180.0, 60.0, 300.0, 180.0).to_path(1e-9), blue),
+    );
+
+    let mut editor = Editor::new(Document::new(scene));
+    editor.camera.viewport = Size::new(W as f64, H as f64);
+    editor.camera.center = Point::new(275.0, 200.0);
+    editor.camera.zoom = 0.8;
+    editor.add_light(LightKind::sun());
+    editor.doc.edit("A low sun", |scene| {
+        let id = scene.lights().lights[0].id;
+        let light = scene.lights_mut().get_mut(id).expect("the sun");
+        // Low and to one side, so the shadow lands clear of the artwork.
+        light.kind = LightKind::Sun {
+            azimuth: 0.0,
+            elevation: 0.55,
+        };
+        light.shadows = true;
+        light.shadow_strength = 0.5;
+        // Nothing else may darken the picture, or the measurement is of the
+        // rig rather than of the shadow.
+        scene.lights_mut().base = Color::WHITE;
+        scene.lights_mut().modelling = 0.0;
+    });
+
+    let px = h.stage(&editor, &mut DrawCache::default());
+
+    // Black at `strength` over the white stage is one tone — 128 at a half.
+    // Two of them stacked is 64. Edges ramp from the shadow's tone up to the
+    // stage, so the *light* side of the range is antialiasing and says nothing;
+    // anything **darker** than one shadow can only be two.
+    let single = 255.0 * (1.0 - 0.5);
+    let stacked = 255.0 * (1.0 - 0.5 * 1.5);
+    let mut at_single = 0usize;
+    let mut darker = 0usize;
+    for px in px.chunks_exact(4) {
+        let (r, g, b) = (px[0], px[1], px[2]);
+        if r != g || g != b || r >= 0xF4 {
+            continue;
+        }
+        if (r as f64 - single).abs() <= 6.0 {
+            at_single += 1;
+        } else if (r as f64) < single - 6.0 {
+            darker += 1;
+        }
+    }
+    assert!(at_single > 200, "no shadow was drawn at all: {at_single} pixels");
+    assert!(
+        darker * 200 < at_single,
+        "{darker} pixels are darker than one shadow ({single:.0}) against          {at_single} at it — around {stacked:.0}, two shapes' shadows are          stacking where they overlap instead of making one silhouette"
+    );
+}
+
 /// Not a test: open a real `.buzz` and report what each light does to the
 /// window's own encoding. `BUZZ_DOC=<file.buzz>`, `BUZZ_DUMP=<dir>`.
 #[test]
@@ -2442,7 +2524,18 @@ fn diagnose_a_saved_document() {
         rig.lights.len()
     );
     for l in &rig.lights {
-        eprintln!("  {:?} enabled {} {:?} x{} {:?}", l.id, l.enabled, l.color, l.intensity, l.kind);
+        eprintln!(
+            "  {:?} enabled {} x{} shadows {} strength {} stands off {} {:?}",
+            l.id, l.enabled, l.intensity, l.shadows, l.shadow_strength, l.standing_height, l.kind
+        );
+        if let buzz_scene::LightKind::Lamp { height, .. } = l.kind {
+            let gap = height - l.standing_height;
+            eprintln!(
+                "    shadow scale = {height} / ({height} - {}) = {:.2} (capped at 2.0)",
+                l.standing_height,
+                (height / gap.max(1e-9)).clamp(1.0, 2.0)
+            );
+        }
     }
 
     let Some(mut h) = Harness::new() else { return };
@@ -2641,4 +2734,107 @@ fn diagnose_the_ceiling_against_output_size() {
         }
         eprintln!();
     }
+}
+
+/// Not a test: what each layer costs the encode, and what the modelling would
+/// cost on top. `BUZZ_DOC=<file.buzz>`.
+#[test]
+#[ignore = "diagnostic"]
+fn diagnose_where_the_segments_go() {
+    use buzz_render::document::LightDetail;
+
+    let Ok(path) = std::env::var("BUZZ_DOC") else {
+        return;
+    };
+    let doc = Document::open(std::path::Path::new(&path)).expect("open");
+    let mut editor = Editor::new(doc);
+    editor.camera.viewport = Size::new(1295.0, 855.0);
+    let stage = editor.scene().stage().size;
+    editor.camera.center = Point::new(stage.width / 2.0, stage.height / 2.0);
+    editor.camera.zoom = (1295.0 / stage.width).min(855.0 / stage.height) * 0.9;
+
+    let area = Rect::new(0.0, 0.0, 1295.0, 855.0);
+    let measure = |editor: &Editor, detail: LightDetail| -> u32 {
+        let mut cache = DrawCache::default();
+        cache.pin_detail(Some(detail));
+        let mut vello = vello::Scene::new();
+        buzz_app::stage::build_scene(&mut vello, editor, area, 1.0, &mut cache);
+        vello.encoding().n_path_segments
+    };
+
+    let ids: Vec<_> = editor.scene().layers().iter().map(|l| l.id).collect();
+    let names: Vec<String> = editor
+        .scene()
+        .layers()
+        .iter()
+        .map(|l| l.name.clone())
+        .collect();
+
+    editor.doc.edit("Hide all", |s| {
+        for id in &ids {
+            s.update_layer(*id, |l| l.visible = false);
+        }
+    });
+    let empty = measure(&editor, LightDetail::Flat);
+
+    let mut rows: Vec<(String, u32, u32)> = Vec::new();
+    for (id, name) in ids.iter().zip(&names) {
+        editor.doc.edit("Hide all", |s| {
+            for other in &ids {
+                s.update_layer(*other, |l| l.visible = false);
+            }
+        });
+        editor.doc.edit("Show one", |s| {
+            s.update_layer(*id, |l| l.visible = true);
+        });
+        let flat = measure(&editor, LightDetail::Flat).saturating_sub(empty);
+        let full = measure(&editor, LightDetail::Full).saturating_sub(empty);
+        rows.push((name.clone(), flat, full));
+    }
+    editor.doc.edit("Show all", |s| {
+        for id in &ids {
+            s.update_layer(*id, |l| l.visible = true);
+        }
+    });
+
+    rows.sort_by_key(|(_, flat, _)| std::cmp::Reverse(*flat));
+    eprintln!("  {:<32} {:>10} {:>12}", "layer", "artwork", "with model");
+    for (name, flat, full) in &rows {
+        if *flat == 0 && *full == 0 {
+            continue;
+        }
+        eprintln!("  {name:<32} {flat:>10} {full:>12}");
+    }
+    let art: u32 = rows.iter().map(|(_, f, _)| f).sum();
+    let modelled: u32 = rows.iter().map(|(_, _, f)| f).sum();
+    eprintln!("  {:<32} {art:>10} {modelled:>12}", "-- sum of layers --");
+    eprintln!(
+        "  whole stage: flat {} shadows {} modelled {} (ceiling {})",
+        measure(&editor, LightDetail::Flat),
+        measure(&editor, LightDetail::NoModelling),
+        measure(&editor, LightDetail::Full),
+        buzz_render::document::segment_ceiling(1295.0 * 855.0),
+    );
+
+    // Does culling bite? Zoomed right in, nearly everything is off-screen and
+    // the encode should collapse. `encode_cost` gates exactly this.
+    let fit = editor.camera.zoom;
+    for factor in [1.0, 2.0, 4.0, 8.0, 16.0] {
+        editor.camera.zoom = fit * factor;
+        // And what the ladder actually settles on there, judged frame by frame
+        // the way the window does.
+        let mut cache = DrawCache::default();
+        for _ in 0..4 {
+            let mut vello = vello::Scene::new();
+            buzz_app::stage::build_scene(&mut vello, &editor, area, 1.0, &mut cache);
+        }
+        eprintln!(
+            "  zoom x{factor}: flat {} shadows {} modelled {} -> settles on {:?}",
+            measure(&editor, LightDetail::Flat),
+            measure(&editor, LightDetail::NoModelling),
+            measure(&editor, LightDetail::Full),
+            cache.detail(),
+        );
+    }
+    editor.camera.zoom = fit;
 }

@@ -1960,7 +1960,12 @@ impl WindowSim {
             }
         }
 
-        let cold = self.cache.lights.is_empty() && self.editor.scene().lights().is_active();
+        // Kept in step with `app.rs`: a document whose lighting has been
+        // trimmed back will never build a crescent, so calling it cold forever
+        // would refuse the retained encoding on every frame.
+        let cold = self.cache.lights.is_empty()
+            && self.editor.scene().lights().is_active()
+            && self.cache.detail() == buzz_render::document::LightDetail::Full;
         let building = self.build.is_some();
         let settled = aim == self.shade_aim;
         self.shade_aim = aim;
@@ -2287,15 +2292,27 @@ fn dense_document(shapes: usize, segments: usize) -> Editor {
     let across = (shapes as f64).sqrt().ceil() as usize;
     let step = 1000.0 / across as f64;
     for i in 0..shapes {
-        let x0 = (i % across) as f64 * step;
-        let y0 = (i / across) as f64 * step;
-        // A comb: as many segments as asked for, all inside the shape's cell.
+        let cx = (i % across) as f64 * step + step * 0.5;
+        let cy = (i / across) as f64 * step + step * 0.5;
+        // **Realistic density, not a scribble in a thimble.** Two earlier
+        // versions of this fixture were pathological and both produced frames
+        // the rasteriser silently dropped, so every test built on them was
+        // measuring a blank: first a comb of alternating up-down lines, which
+        // crosses every tile it touches dozens of times, then a polygon of the
+        // same segment count crammed into a cell a few pixels across. Real
+        // artwork is many overlapping shapes whose outlines carry a segment
+        // every pixel or two, so that is what this draws — the shapes are wide
+        // enough that their outlines are long enough to hold their segments.
+        let r = step * 1.6;
         let mut path = BezPath::new();
-        path.push(PathEl::MoveTo(Point::new(x0, y0)));
         for s in 0..segments {
-            let t = s as f64 / segments as f64;
-            let y = y0 + if s % 2 == 0 { step * 0.9 } else { step * 0.1 };
-            path.push(PathEl::LineTo(Point::new(x0 + t * step * 0.9, y)));
+            let t = s as f64 / segments as f64 * std::f64::consts::TAU;
+            let p = Point::new(cx + r * t.cos(), cy + r * t.sin());
+            if s == 0 {
+                path.push(PathEl::MoveTo(p));
+            } else {
+                path.push(PathEl::LineTo(p));
+            }
         }
         path.push(PathEl::ClosePath);
         scene.add_shape(layer, ShapeData::filled(path, ART));
@@ -2306,6 +2323,35 @@ fn dense_document(shapes: usize, segments: usize) -> Editor {
     editor.camera.center = Point::new(500.0, 500.0);
     editor.camera.zoom = W as f64 / 1000.0;
     editor
+}
+
+/// **The dense fixture has to actually render**, or every test built on it is
+/// measuring a blank frame and passing for the wrong reason.
+#[test]
+fn a_dense_document_still_renders() {
+    let Some(mut h) = Harness::new() else { return };
+    let mut editor = dense_document(500, 400);
+    let mut cache = DrawCache::default();
+    let blank = {
+        // A known picture to compare against: an empty stage.
+        let empty = Editor::new(Document::new(Scene::default()));
+        h.stage(&empty, &mut DrawCache::default())
+    };
+    let unlit = h.stage(&editor, &mut cache);
+    assert!(
+        difference(&blank, &unlit) > 0.2,
+        "the fixture drew nothing at all"
+    );
+
+    editor.add_light(LightKind::sun());
+    for _ in 0..3 {
+        h.stage(&editor, &mut cache);
+    }
+    let lit = h.stage(&editor, &mut cache);
+    assert!(
+        difference(&unlit, &lit) > 0.05,
+        "the fixture's lit frame never landed: it is showing the unlit one"
+    );
 }
 
 /// Encode the stage the way the window does, and answer what it cost.
@@ -2328,7 +2374,7 @@ fn encode_stage(editor: &Editor, cache: &mut DrawCache) -> u32 {
 fn a_frame_too_big_to_rasterise_trims_its_lighting_rather_than_vanishing() {
     use buzz_render::document::{LightDetail, segment_ceiling};
 
-    let mut editor = dense_document(500, 400);
+    let mut editor = dense_document(700, 600);
     let mut cache = DrawCache::default();
 
     // Unlit, this document is already most of what can be encoded, and nothing
@@ -2352,13 +2398,27 @@ fn a_frame_too_big_to_rasterise_trims_its_lighting_rather_than_vanishing() {
         lit <= ceiling,
         "what was handed to the rasteriser is still over the ceiling: {lit} of {ceiling}"
     );
+
+    // **Not asserted here: that the trimmed frame then renders.**
+    //
+    // It is the property the whole mechanism exists for, and it is measured —
+    // on the film the ceiling was fitted to, by `diagnose_a_saved_document`,
+    // and on honest artwork by `a_dense_document_still_renders`. It cannot be
+    // asserted *on this fixture*, and the reason is worth writing down: the
+    // ceiling counts segments, and what a segment costs the rasteriser depends
+    // on the artwork. A synthetic document dense enough to trip a ceiling
+    // fitted to real drawing is, by construction, dearer per segment than the
+    // thing it was fitted to — so it goes over while still under the count.
+    // Asserting otherwise here would be demanding a guarantee a proxy cannot
+    // give, and the honest place for that guarantee is the calibration test in
+    // `buzz_render::document`.
 }
 
 /// And it settles: the level does not come and go frame after frame, which
 /// would flicker the shading on and off for as long as the document was open.
 #[test]
 fn a_trimmed_frame_stays_trimmed() {
-    let mut editor = dense_document(500, 400);
+    let mut editor = dense_document(700, 600);
     editor.add_light(LightKind::sun());
     let mut cache = DrawCache::default();
 
@@ -2383,6 +2443,116 @@ fn an_ordinary_document_gives_up_nothing() {
         encode_stage(&editor, &mut cache);
     }
     assert_eq!(cache.detail(), LightDetail::Full);
+}
+
+/// **Switched off and on again, a trimmed document lights exactly as before.**
+///
+/// The report: with the light and its shadows on, switching them off and back
+/// on does not bring them back. The switch-and-back tests that already exist
+/// all run on a handful of shapes, where nothing is ever trimmed — so none of
+/// them exercises the one thing a heavy document does differently, which is
+/// change its own lighting level between the frame before and the frame after.
+#[test]
+fn a_trimmed_document_lights_the_same_after_a_switch_off_and_on() {
+    let Some(mut h) = Harness::new() else { return };
+    let mut editor = dense_document(500, 400);
+    editor.add_light(LightKind::sun());
+    let mut cache = DrawCache::default();
+
+    // Settle: the first lit frame is the one that discovers it must trim.
+    for _ in 0..3 {
+        h.stage(&editor, &mut cache);
+    }
+    let lit = h.stage(&editor, &mut cache);
+    let settled = cache.detail();
+    eprintln!("lit:  {:?} encode {} ceiling {}", cache.detail(), cache.last_encode(), cache.last_ceiling());
+
+    editor.doc.edit("Rig off", |s| s.lights_mut().enabled = false);
+    let off = h.stage(&editor, &mut cache);
+    eprintln!("off:  {:?} encode {} ceiling {}", cache.detail(), cache.last_encode(), cache.last_ceiling());
+    assert!(
+        difference(&lit, &off) > 0.02,
+        "switching the rig off must change the picture, or this proves nothing"
+    );
+
+    editor.doc.edit("Rig on", |s| s.lights_mut().enabled = true);
+    let back = h.stage(&editor, &mut cache);
+    eprintln!("back: {:?} encode {} ceiling {}", cache.detail(), cache.last_encode(), cache.last_ceiling());
+    let again = h.stage(&editor, &mut cache);
+    eprintln!(
+        "again: {:?} encode {} | back==off {} | again==off {} | again==lit {}",
+        cache.detail(),
+        cache.last_encode(),
+        back == off,
+        again == off,
+        again == lit,
+    );
+    {
+        let d = "B:/youtubeProjects/Buzzcaf_Media/BuzzAnimate/graphify-out/toggle";
+        std::fs::create_dir_all(d).ok();
+        for (n, px) in [("1-lit", &lit), ("2-off", &off), ("3-back", &back)] {
+            let f = std::fs::File::create(format!("{d}/{n}.png")).unwrap();
+            let mut e = png::Encoder::new(std::io::BufWriter::new(f), W, H);
+            e.set_color(png::ColorType::Rgba);
+            e.set_depth(png::BitDepth::Eight);
+            e.write_header().unwrap().write_image_data(px).unwrap();
+        }
+    }
+    assert_eq!(cache.detail(), settled, "the level must come back too");
+    assert!(
+        difference(&lit, &back) < 0.01,
+        "switched back on, {:.1}% of the frame is still unlit",
+        difference(&lit, &back) * 100.0
+    );
+}
+
+/// The same for one light's shadows, which is their own switch.
+///
+/// On a document held at a trimmed level, since that is the state the report
+/// was made from. Sparse artwork, because a shadow hidden behind the shape
+/// beside it would make this pass whatever happened.
+#[test]
+fn shadows_come_back_after_their_switch_on_a_trimmed_document() {
+    use buzz_render::document::LightDetail;
+
+    let Some(mut h) = Harness::new() else { return };
+    let mut editor = document();
+    editor.add_light(LightKind::sun());
+    editor.doc.edit("A low sun", |scene| {
+        let id = scene.lights().lights[0].id;
+        let light = scene.lights_mut().get_mut(id).expect("the sun");
+        light.kind = LightKind::Sun {
+            azimuth: 0.0,
+            elevation: 0.5,
+        };
+        light.shadows = true;
+    });
+    let mut cache = DrawCache::default();
+    cache.pin_detail(Some(LightDetail::NoModelling));
+    let with = h.stage(&editor, &mut cache);
+
+    let switch = |editor: &mut Editor, on: bool| {
+        editor.doc.edit("Shadows", |scene| {
+            let id = scene.lights().lights[0].id;
+            scene.lights_mut().get_mut(id).expect("the sun").shadows = on;
+        });
+    };
+
+    switch(&mut editor, false);
+    let without = h.stage(&editor, &mut cache);
+    assert!(
+        difference(&with, &without) > 0.005,
+        "switching the shadows off must change the picture, or this proves          nothing: {:.3}%",
+        difference(&with, &without) * 100.0
+    );
+
+    switch(&mut editor, true);
+    let back = h.stage(&editor, &mut cache);
+    assert!(
+        difference(&with, &back) < 0.002,
+        "switched back on, {:.2}% of the frame has no shadow",
+        difference(&with, &back) * 100.0
+    );
 }
 
 /// **What a trimmed frame must still do: light the picture.**
@@ -2597,6 +2767,48 @@ fn diagnose_a_saved_document() {
     let lit = shot(&mut h, &mut cache, &editor, "lit");
     eprintln!("the light moved {:.3}% of the stage", difference(&unlit, &lit) * 100.0);
     eprintln!("warmth unlit {:.2} lit {:.2}", warmth(&unlit), warmth(&lit));
+
+    // **The report: switch it off and on again.**
+    let off = shot(&mut h, &mut cache, &editor, "toggle-1-off-rig");
+    editor.doc.edit("Rig off", |s| s.lights_mut().enabled = false);
+    let off = shot(&mut h, &mut cache, &editor, "toggle-2-rig-off");
+    editor.doc.edit("Rig on", |s| s.lights_mut().enabled = true);
+    let back = shot(&mut h, &mut cache, &editor, "toggle-3-rig-back");
+    eprintln!(
+        "rig off changed {:.2}%, back on differs from the first lit frame by {:.2}%",
+        difference(&lit, &off) * 100.0,
+        difference(&lit, &back) * 100.0
+    );
+
+    // And the same for one light's own switch, and for its shadows.
+    let id = editor.scene().lights().lights[0].id;
+    editor.doc.edit("Light off", |s| {
+        s.lights_mut().get_mut(id).expect("l").enabled = false;
+    });
+    let l_off = shot(&mut h, &mut cache, &editor, "toggle-4-light-off");
+    editor.doc.edit("Light on", |s| {
+        s.lights_mut().get_mut(id).expect("l").enabled = true;
+    });
+    let l_back = shot(&mut h, &mut cache, &editor, "toggle-5-light-back");
+    eprintln!(
+        "light off changed {:.2}%, back on differs by {:.2}%",
+        difference(&lit, &l_off) * 100.0,
+        difference(&lit, &l_back) * 100.0
+    );
+
+    editor.doc.edit("Shadows off", |s| {
+        s.lights_mut().get_mut(id).expect("l").shadows = false;
+    });
+    let s_off = shot(&mut h, &mut cache, &editor, "toggle-6-shadows-off");
+    editor.doc.edit("Shadows on", |s| {
+        s.lights_mut().get_mut(id).expect("l").shadows = true;
+    });
+    let s_back = shot(&mut h, &mut cache, &editor, "toggle-7-shadows-back");
+    eprintln!(
+        "shadows off changed {:.2}%, back on differs by {:.2}%",
+        difference(&lit, &s_off) * 100.0,
+        difference(&lit, &s_back) * 100.0
+    );
 
     // And it must keep working, not merely land once.
     let z = editor.camera.zoom;
@@ -2837,4 +3049,74 @@ fn diagnose_where_the_segments_go() {
         );
     }
     editor.camera.zoom = fit;
+}
+
+/// Not a test: drive a real `.buzz` through the window's own frame loop and
+/// switch its lighting off and on again. `BUZZ_DOC=<file.buzz>`.
+#[test]
+#[ignore = "diagnostic"]
+fn diagnose_the_switch_through_the_window() {
+    let Ok(path) = std::env::var("BUZZ_DOC") else {
+        return;
+    };
+    let Some(mut h) = Harness::new() else { return };
+    let doc = Document::open(std::path::Path::new(&path)).expect("open");
+    let mut editor = Editor::new(doc);
+    editor.camera.viewport = Size::new(W as f64, H as f64);
+    let stage = editor.scene().stage().size;
+    editor.camera.center = Point::new(stage.width / 2.0, stage.height / 2.0);
+    editor.camera.zoom = (W as f64 / stage.width).min(H as f64 / stage.height) * 0.9;
+
+    let mut window = WindowSim::new(editor);
+    let lit = window.settle(&mut h);
+    eprintln!("  lit:  detail {:?}", window.cache.detail());
+
+    window
+        .editor
+        .doc
+        .edit("Rig off", |s| s.lights_mut().enabled = false);
+    let off = window.settle(&mut h);
+    eprintln!(
+        "  off:  detail {:?}  moved {:.2}%",
+        window.cache.detail(),
+        difference(&lit, &off) * 100.0
+    );
+
+    window
+        .editor
+        .doc
+        .edit("Rig on", |s| s.lights_mut().enabled = true);
+    let back = window.settle(&mut h);
+    eprintln!(
+        "  back: detail {:?}  differs from the first lit frame by {:.2}%",
+        window.cache.detail(),
+        difference(&lit, &back) * 100.0
+    );
+
+    // And the light's own switch.
+    let id = window.editor.scene().lights().lights[0].id;
+    window.editor.doc.edit("Light off", |s| {
+        s.lights_mut().get_mut(id).expect("l").enabled = false;
+    });
+    let l_off = window.settle(&mut h);
+    window.editor.doc.edit("Light on", |s| {
+        s.lights_mut().get_mut(id).expect("l").enabled = true;
+    });
+    let l_back = window.settle(&mut h);
+    eprintln!(
+        "  light off moved {:.2}%, back on differs by {:.2}%",
+        difference(&lit, &l_off) * 100.0,
+        difference(&lit, &l_back) * 100.0
+    );
+
+    // And undo, which puts the document's revision back to a number the
+    // retained encoding has already seen.
+    window.editor.doc.edit("Rig off", |s| s.lights_mut().enabled = false);
+    let _ = window.settle(&mut h);
+    window.editor.doc.undo();
+    let undone = window.settle(&mut h);
+    eprintln!(
+        "  undo of the switch differs from the first lit frame by {:.2}%",
+        difference(&lit, &undone) * 100.0
+    );
 }

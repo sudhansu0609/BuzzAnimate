@@ -171,6 +171,9 @@ pub struct DrawCache {
     /// What the last frame judged by [`DrawCache::reconsider`] cost, for the
     /// HUD and for tests that need to see the number the level was chosen from.
     encode: u32,
+    /// The ceiling the last frame was judged against, which depends on the
+    /// output it was drawn at. Kept for the HUD and for tests.
+    ceiling: u32,
     /// A level held against the judgement, for a caller that has already
     /// decided — a test measuring one level, or an animator who would rather
     /// have the modelling off than have it come and go.
@@ -258,7 +261,7 @@ impl LightDetail {
     /// **Stepping up has to be safe, or the two levels alternate for ever, one
     /// frame each.** So the room asked for is the room the step itself needs.
     /// Measured on the film this was reported from — 617 k encoded segments
-    /// flat, 931 k with cast shadows, 2.47 M with the modelling as well —
+    /// flat, 921 k with cast shadows, 2.46 M with the modelling as well —
     /// shadows cost about half as much again and modelling about two and a half
     /// times on top. Both bounds below are well past those, so a frame small
     /// enough to step up is small enough to stay stepped up.
@@ -267,35 +270,82 @@ impl LightDetail {
     /// does: a document between the two thresholds keeps a level it might have
     /// climbed out of, which costs it some shading. The other mistake costs it
     /// the frame.
-    fn room_to_step_up(self) -> u32 {
+    fn room_to_step_up(self, ceiling: u32) -> u32 {
         match self {
-            Self::Flat => SEGMENT_CEILING / 3,
-            Self::NoModelling => SEGMENT_CEILING / 6,
+            Self::Flat => ceiling / 3,
+            Self::NoModelling => ceiling / 6,
             Self::Full => u32::MAX,
         }
     }
 }
 
-/// **The encoded path segments a frame may reach before lighting is trimmed.**
+/// **The encoded path segments a frame may reach before lighting is trimmed**,
+/// at an output of `pixels` device pixels.
 ///
-/// Vello's line buffer holds `1 << 21` — 2.1 M — flattened lines. What a
-/// segment costs in lines is a property of the artwork and of the zoom, because
-/// flattening is to a tolerance in *device* pixels: measured over the film this
-/// was reported from, 2.5 lines per segment for the drawing itself and 1.4 for
-/// a frame mostly made of generated shading, which is straighter. Eight hundred
-/// thousand segments is that buffer at the pessimistic end of the range, with
-/// the margin on the side that matters — trimming early costs a document some
-/// shading, trimming late costs it the frame.
+/// Vello's line buffer holds `1 << 21` — 2.1 M — flattened lines, and what a
+/// segment costs in lines depends on two things. The artwork: a straight edge
+/// is one line however it is drawn, a curve is many. And the *output*, because
+/// flattening is to a tolerance in device pixels — the same document rendered
+/// larger is flattened finer and costs more lines for exactly the same
+/// geometry. Lines per curve go as the square root of the tolerance, so
+/// capacity in segments goes as the inverse square root of the output's linear
+/// size, which is what this is.
 ///
-/// The same document rendered larger is dearer: more device pixels means a
-/// finer tolerance and so more lines from the same segments. This does not know
-/// the output size, which is the other reason for the margin.
+/// # Where the constant comes from
 ///
-/// It is deliberately not a count of lines. The flattening happens on the GPU
-/// and cannot be asked about before the frame is submitted, so the only honest
-/// number available beforehand is the one Vello has already written down. See
-/// [`crate::SceneBuilder::encoded_segments`].
-pub const SEGMENT_CEILING: u32 = 800_000;
+/// Measured, not derived, by rendering one dense film at six output sizes with
+/// each level of [`LightDetail`] pinned and watching for the frame that never
+/// landed:
+///
+/// | output | 617 k segments | 921 k | 2.46 M |
+/// |---|---|---|---|
+/// | 512 × 512 | fits | fits | **lost** |
+/// | 1295 × 855 | fits | fits | lost |
+/// | 1920 × 1200 | fits | fits | lost |
+/// | 2080 × 1300 | fits | **lost** | lost |
+/// | 3840 × 2160 | fits | lost | lost |
+///
+/// A capacity of `C / sqrt(linear)` reproduces every one of those with
+/// `C ≈ 36 M`. The constant below is a tenth under that, which is the margin
+/// for artwork curvier than the film it was fitted to: erring low costs a
+/// document some shading, erring high costs it the frame.
+///
+/// # Why not just count the lines
+///
+/// Because the flattening happens on the GPU. Vello can report what it
+/// actually used — `BumpAllocators` — but only through the async render path
+/// with the `debug_layers` feature, which means a full GPU sync per frame. So
+/// this stays a proxy over the one number available before the frame is
+/// submitted: [`crate::SceneBuilder::encoded_segments`].
+pub fn segment_ceiling(pixels: f64) -> u32 {
+    // **An output size that is not a size answers for an ordinary window.**
+    //
+    // The window derives the stage's rectangle from the one egui gave the
+    // central panel, and that is `egui::Rect::NOTHING` — infinities — until the
+    // layout has been measured once: the first frame of a session, and a frame
+    // again after a resize. Multiplied out that is an infinite area, an
+    // infinite divisor and a ceiling of zero, which refuses *every* frame's
+    // lighting and drops the level to `Flat` on a document that had no trouble
+    // at all. `an_unmeasured_stage_area_still_draws_the_artwork` is what caught
+    // it, having been written for the same rectangle blacking the whole stage.
+    let pixels = if pixels.is_finite() && pixels > 0.0 {
+        pixels.clamp(REFERENCE_PIXELS / 64.0, REFERENCE_PIXELS * 64.0)
+    } else {
+        REFERENCE_PIXELS
+    };
+    // The output's linear size, as the side of the square with that area, so a
+    // wide frame and a tall one of the same area are charged the same.
+    let linear = pixels.sqrt();
+    (CEILING_CONSTANT / linear.sqrt()) as u32
+}
+
+/// What an unmeasured output is taken to be: an ordinary full-HD window. Also
+/// the middle of the range [`segment_ceiling`] will answer for at all, since a
+/// degenerate one-pixel viewport should not be granted an unbounded frame.
+const REFERENCE_PIXELS: f64 = 1920.0 * 1080.0;
+
+/// The fitted constant of [`segment_ceiling`]. See there for the measurements.
+const CEILING_CONSTANT: f64 = 33_000_000.0;
 
 impl DrawCache {
     /// The lamp's gradients, built if this is the first shape to ask.
@@ -327,9 +377,15 @@ impl DrawCache {
     }
 
     /// The encoded path segments of the last frame judged, in the units
-    /// [`SEGMENT_CEILING`] is expressed in.
+    /// [`segment_ceiling`] is expressed in.
     pub fn last_encode(&self) -> u32 {
         self.encode
+    }
+
+    /// What [`segment_ceiling`] came to for the last frame judged — which needs
+    /// that frame's output size, so it is remembered rather than recomputed.
+    pub fn last_ceiling(&self) -> u32 {
+        self.ceiling
     }
 
     /// Hold the level here, or (`None`) let each frame be judged again.
@@ -359,15 +415,16 @@ impl DrawCache {
     /// A frame still over the ceiling at [`LightDetail::Flat`] is a frame whose
     /// *artwork* will not fit, which no amount of trimming the lights can
     /// mend; the level stops there rather than pretending otherwise.
-    pub fn reconsider(&mut self, segments: u32) -> bool {
+    pub fn reconsider(&mut self, segments: u32, output_pixels: f64) -> bool {
         self.encode = segments;
+        self.ceiling = segment_ceiling(output_pixels);
         if self.pinned.is_some() {
             return false;
         }
         let was = self.detail;
-        if segments > SEGMENT_CEILING {
+        if segments > self.ceiling {
             self.detail = self.detail.down();
-        } else if segments < self.detail.room_to_step_up() {
+        } else if segments < self.detail.room_to_step_up(self.ceiling) {
             self.detail = self.detail.up();
         }
         if self.detail == was {
@@ -915,6 +972,7 @@ pub fn draw_frame_lit(
         lamp: None,
         detail: LightDetail::default(),
         encode: 0,
+        ceiling: 0,
         pinned: None,
     };
     draw_frame_cached(builder, scene, frame, camera, options, &mut cache);
@@ -3839,6 +3897,74 @@ mod symbol_scene {
         // build (the other 49 characters are whole-scene stamps that never walk
         // the parts again).
         assert_eq!(stamps, 60);
+    }
+
+    /// **The measurements [`segment_ceiling`] was fitted to.**
+    ///
+    /// One dense film, eight output sizes, each level of [`LightDetail`]
+    /// pinned, watching for the frame that never landed. What the GPU did is
+    /// the authority; the formula has to agree with it in the direction that
+    /// matters.
+    ///
+    /// **Every frame the rasteriser lost, the ceiling must refuse.** That is
+    /// the safety property and the only hard one. The converse is not asserted
+    /// everywhere: the ceiling refusing something that would in fact have
+    /// rendered costs a document some shading, which is the mistake this is
+    /// deliberately biased towards. It is asserted for the one size that
+    /// prompted the fitting — an ordinary window, where a film's cast shadows
+    /// have to survive.
+    #[test]
+    fn the_ceiling_refuses_every_frame_the_rasteriser_lost() {
+        // (width, height, encoded segments, did the frame actually render)
+        let measured = [
+            (512.0, 512.0, 617_341u32, true),
+            (512.0, 512.0, 930_972, true),
+            (512.0, 512.0, 2_471_361, false),
+            (1024.0, 1024.0, 930_972, true),
+            (1024.0, 1024.0, 2_471_361, false),
+            (1295.0, 855.0, 921_456, true),
+            (1295.0, 855.0, 2_461_927, false),
+            (1600.0, 1000.0, 921_536, true),
+            (1920.0, 1200.0, 921_529, true),
+            (2080.0, 1300.0, 921_539, false),
+            (2560.0, 1440.0, 921_630, false),
+            (3840.0, 2160.0, 921_633, false),
+        ];
+        for (w, h, segments, rendered) in measured {
+            let ceiling = segment_ceiling(w * h);
+            if !rendered {
+                assert!(
+                    ceiling < segments,
+                    "{w}x{h}: {segments} segments were lost by the rasteriser                      and a ceiling of {ceiling} would have let them through"
+                );
+            }
+        }
+
+        // The report this was fitted for: a film's cast shadows must survive an
+        // ordinary window. 921 k at a stage of roughly 1295 x 855.
+        assert!(
+            segment_ceiling(1295.0 * 855.0) >= 921_456,
+            "an ordinary window must keep its cast shadows"
+        );
+
+        // An output size that is not a size must answer for an ordinary window,
+        // not refuse everything. `egui::Rect::NOTHING` multiplies out to an
+        // infinite area, and a ceiling of zero would trim a document that had
+        // no trouble at all.
+        let ordinary = segment_ceiling(REFERENCE_PIXELS);
+        for bad in [f64::INFINITY, f64::NAN, 0.0, -1.0, f64::NEG_INFINITY] {
+            assert_eq!(segment_ceiling(bad), ordinary, "for {bad}");
+        }
+        assert!(ordinary > 617_000, "and it must be a workable ceiling");
+
+        // A bigger output must never be allowed *more*, or measuring it was
+        // pointless.
+        let mut last = u32::MAX;
+        for pixels in [0.25e6, 1.0e6, 2.0e6, 4.0e6, 8.0e6] {
+            let ceiling = segment_ceiling(pixels);
+            assert!(ceiling < last, "the ceiling must fall as the output grows");
+            last = ceiling;
+        }
     }
 
     #[test]

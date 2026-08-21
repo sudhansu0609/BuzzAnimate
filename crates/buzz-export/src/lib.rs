@@ -323,7 +323,10 @@ impl Exporter {
                 );
                 builder.encoded_segments()
             };
-            if !self.lights.reconsider(segments) {
+            if !self
+                .lights
+                .reconsider(segments, (settings.width as f64) * (settings.height as f64))
+            {
                 break;
             }
         }

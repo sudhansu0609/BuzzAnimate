@@ -58,9 +58,12 @@ pub fn build_scene(
     // less of the light rather than to submit one that will vanish. See
     // `buzz_render::document::DrawCache::reconsider`. Bounded because a level
     // is only ever stepped one at a time, and there are three.
+    // The output the frame will be rasterised at, which is what decides how
+    // dear a segment is: flattening is to a tolerance in device pixels.
+    let pixels = area.width() * area.height();
     for _ in 0..3 {
         let segments = encode(vello, editor, area, scale, cache);
-        if !cache.reconsider(segments) {
+        if !cache.reconsider(segments, pixels) {
             break;
         }
     }

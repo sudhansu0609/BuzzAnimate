@@ -2326,17 +2326,18 @@ fn encode_stage(editor: &Editor, cache: &mut DrawCache) -> u32 {
 /// what the rasteriser can take.
 #[test]
 fn a_frame_too_big_to_rasterise_trims_its_lighting_rather_than_vanishing() {
-    use buzz_render::document::{LightDetail, SEGMENT_CEILING};
+    use buzz_render::document::{LightDetail, segment_ceiling};
 
     let mut editor = dense_document(500, 400);
     let mut cache = DrawCache::default();
 
     // Unlit, this document is already most of what can be encoded, and nothing
     // is trimmed: there is no light to trim.
+    let ceiling = segment_ceiling((W as f64) * (H as f64));
     let unlit = encode_stage(&editor, &mut cache);
     assert!(
-        unlit < SEGMENT_CEILING,
-        "the fixture must fit unlit, or it is testing the wrong thing: {unlit}"
+        unlit < ceiling,
+        "the fixture must fit unlit, or it is testing the wrong thing: {unlit} of {ceiling}"
     );
     assert_eq!(cache.detail(), LightDetail::Full, "nothing to give up");
 
@@ -2348,8 +2349,8 @@ fn a_frame_too_big_to_rasterise_trims_its_lighting_rather_than_vanishing() {
         "a frame this size cannot carry its modelling and must say so"
     );
     assert!(
-        lit <= SEGMENT_CEILING,
-        "what was handed to the rasteriser is still over the ceiling: {lit}"
+        lit <= ceiling,
+        "what was handed to the rasteriser is still over the ceiling: {lit} of {ceiling}"
     );
 }
 
@@ -2455,13 +2456,13 @@ fn diagnose_a_saved_document() {
     if let Some(d) = &dump {
         std::fs::create_dir_all(d).ok();
     }
-    let mut shot = |h: &mut Harness, cache: &mut DrawCache, editor: &Editor, what: &str| {
+    let shot = |h: &mut Harness, cache: &mut DrawCache, editor: &Editor, what: &str| {
         let px = h.stage(editor, cache);
         eprintln!(
             "  {what}: detail {:?} encode {} of {}",
             cache.detail(),
             cache.last_encode(),
-            buzz_render::document::SEGMENT_CEILING
+            cache.last_ceiling()
         );
         if let Some(d) = &dump {
             let file = std::fs::File::create(
@@ -2512,4 +2513,132 @@ fn diagnose_a_saved_document() {
         "zooming out moved {:.3}% (a frame that never landed moves nothing)",
         difference(&lit, &out) * 100.0
     );
+}
+
+/// Not a test: at what output size does each lighting level stop fitting?
+/// `BUZZ_DOC=<file.buzz>`. A frame that never rendered leaves the previous
+/// pixels, so each measurement is taken against a known blank.
+#[test]
+#[ignore = "diagnostic"]
+fn diagnose_the_ceiling_against_output_size() {
+    use buzz_render::document::LightDetail;
+
+    let Ok(path) = std::env::var("BUZZ_DOC") else {
+        return;
+    };
+    let Ok(gpu) = GpuContext::new_blocking(&GpuPreference::Automatic) else {
+        return;
+    };
+    let mut gpu = gpu;
+
+    let doc = Document::open(std::path::Path::new(&path)).expect("open");
+    let mut editor = Editor::new(doc);
+
+    for (w, h) in [
+        (512u32, 512u32),
+        (1024, 1024),
+        (1295, 855),
+        (1600, 1000),
+        (1920, 1200),
+        (2080, 1300),
+        (2560, 1440),
+        (3840, 2160),
+    ] {
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: buzz_render::RENDER_FORMAT,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Row pitch must be a multiple of 256 bytes.
+        let row = (w * 4).div_ceil(256) * 256;
+        let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        editor.camera.viewport = Size::new(w as f64, h as f64);
+        let stage = editor.scene().stage().size;
+        editor.camera.center = Point::new(stage.width / 2.0, stage.height / 2.0);
+        editor.camera.zoom = (w as f64 / stage.width).min(h as f64 / stage.height) * 0.9;
+
+        let mut shot = |editor: &Editor, cache: &mut DrawCache| -> (u32, Vec<u8>) {
+            let mut vello = vello::Scene::new();
+            buzz_app::stage::build_scene(
+                &mut vello,
+                editor,
+                Rect::new(0.0, 0.0, w as f64, h as f64),
+                1.0,
+                cache,
+            );
+            gpu.render(&vello, &view, w, h, BACKGROUND).expect("render");
+            let mut enc = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row),
+                        rows_per_image: Some(h),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            gpu.queue.submit([enc.finish()]);
+            let slice = readback.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+            gpu.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_secs(60)),
+                })
+                .expect("poll");
+            let px = slice.get_mapped_range().to_vec();
+            readback.unmap();
+            (vello.encoding().n_path_segments, px)
+        };
+
+        eprint!("  {w}x{h}:");
+        for detail in [LightDetail::Flat, LightDetail::NoModelling, LightDetail::Full] {
+            let mut cache = DrawCache::default();
+            cache.pin_detail(Some(LightDetail::Flat));
+            editor.doc.edit("Off", |s| s.lights_mut().enabled = false);
+            let (_, blank) = shot(&editor, &mut cache);
+            editor.doc.edit("On", |s| s.lights_mut().enabled = true);
+            cache.pin_detail(Some(detail));
+            let (segments, px) = shot(&editor, &mut cache);
+            let ceiling = buzz_render::document::segment_ceiling((w as f64) * (h as f64));
+            eprint!(
+                "  {detail:?} {segments} {} (ceiling {ceiling} says {})",
+                if px == blank { "LOST" } else { "ok" },
+                if segments <= ceiling { "ok" } else { "trim" }
+            );
+        }
+        eprintln!();
+    }
 }

@@ -392,11 +392,18 @@ impl<'a> SceneBuilder<'a> {
             } else {
                 peniko::ImageQuality::Low
             };
+            // A tiling fill (a seamless texture) repeats across the shape; an
+            // ordinary photograph pads its last row of pixels out to the edge.
+            let extend = if fill.tile {
+                peniko::Extend::Repeat
+            } else {
+                peniko::Extend::Pad
+            };
             let brush = peniko::ImageBrush {
                 image: data,
                 sampler: peniko::ImageSampler {
-                    x_extend: peniko::Extend::Pad,
-                    y_extend: peniko::Extend::Pad,
+                    x_extend: extend,
+                    y_extend: extend,
                     quality,
                     alpha: 1.0,
                 },

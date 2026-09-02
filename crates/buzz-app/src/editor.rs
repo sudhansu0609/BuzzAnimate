@@ -4352,6 +4352,118 @@ impl Editor {
         }
     }
 
+    /// **Fill the selected shapes with a procedural texture.** The texture is
+    /// baked to one seamless tile from the current fill colour (foreground) and
+    /// stroke colour (background), added to the image library once, and set as a
+    /// tiling image fill on every selected shape. One undo step; a no-op with
+    /// nothing (or nothing shaped) selected.
+    pub fn apply_texture(&mut self, kind: buzz_scene::TextureKind) {
+        // Gather the shapes and a per-shape tile size (a few repeats across the
+        // smaller side) under an immutable borrow, before the edit takes a
+        // mutable one.
+        let targets: Vec<(ObjectId, f64)> = {
+            let scene = self.doc.scene();
+            self.selection
+                .iter()
+                .filter_map(|id| match scene.find_object(id) {
+                    Some((_, o)) => match &o.kind {
+                        ObjectKind::Shape(s) => {
+                            let bb = s.path.bounding_box();
+                            Some((id, (bb.width().min(bb.height()) / 5.0).max(16.0)))
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                })
+                .collect()
+        };
+        if targets.is_empty() {
+            self.status = Some("Select a shape to apply a texture to".into());
+            return;
+        }
+        let fg = self.style.fill_color;
+        let bg = self.style.stroke_color;
+        let pixels = std::sync::Arc::new(buzz_scene::texture::tile(kind, 256, fg, bg));
+        self.doc.edit("Apply Texture", |scene| {
+            let name = scene.images().unique_name(kind.label());
+            let id = scene.next_image_id();
+            let asset =
+                buzz_scene::ImageAsset::from_pixels(id, name, 256, 256, std::sync::Arc::clone(&pixels));
+            let asset = scene.images_mut().insert(asset);
+            for &(id, cell) in &targets {
+                let fill = buzz_scene::ImageFill::tiled(std::sync::Arc::clone(&asset), cell);
+                scene.update_object_across(0, u32::MAX, id, |o| {
+                    if let ObjectKind::Shape(s) = &mut o.kind {
+                        s.fill = Some(buzz_scene::FillSpec::image(fill.clone()));
+                    }
+                });
+            }
+        });
+        self.doc.end_gesture();
+        self.status = Some(format!("{} texture applied", kind.label()));
+    }
+
+    /// **Fill the selected shapes with an image file.** Decodes it, adds it to
+    /// the library, and sets it as each selected shape's fill: `tile` repeats a
+    /// seamless texture across the shape, otherwise one copy is laid across the
+    /// shape's bounds (what a photograph wants). One undo step.
+    pub fn fill_selection_with_image(
+        &mut self,
+        path: &std::path::Path,
+        tile: bool,
+    ) -> anyhow::Result<()> {
+        let bytes = std::fs::read(path)?;
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Bitmap".to_string());
+        let targets: Vec<(ObjectId, buzz_geom::Rect)> = {
+            let scene = self.doc.scene();
+            self.selection
+                .iter()
+                .filter_map(|id| match scene.find_object(id) {
+                    Some((_, o)) => match &o.kind {
+                        ObjectKind::Shape(s) => Some((id, s.path.bounding_box())),
+                        _ => None,
+                    },
+                    None => None,
+                })
+                .collect()
+        };
+        if targets.is_empty() {
+            anyhow::bail!("select a shape to fill with the image");
+        }
+        let mut failure: Option<String> = None;
+        self.doc.edit("Fill With Image", |scene| {
+            let asset = match scene.add_image(&name, &bytes) {
+                Ok(a) => a,
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    return;
+                }
+            };
+            for &(id, bounds) in &targets {
+                let fill = if tile {
+                    let cell = (bounds.width().min(bounds.height()) / 3.0).max(24.0);
+                    buzz_scene::ImageFill::tiled(std::sync::Arc::clone(&asset), cell)
+                } else {
+                    buzz_scene::ImageFill::new(std::sync::Arc::clone(&asset), bounds)
+                };
+                scene.update_object_across(0, u32::MAX, id, |o| {
+                    if let ObjectKind::Shape(s) = &mut o.kind {
+                        s.fill = Some(buzz_scene::FillSpec::image(fill.clone()));
+                    }
+                });
+            }
+        });
+        if let Some(e) = failure {
+            self.doc.undo();
+            anyhow::bail!(e);
+        }
+        self.doc.end_gesture();
+        Ok(())
+    }
+
     /// Frames between this keyframe and the next, for diagnostics.
     fn tween_span_length(&self, layer: LayerId, frame: u32) -> u32 {
         let Some(l) = self.doc.scene().layers().get(layer) else {

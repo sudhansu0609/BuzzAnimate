@@ -44,6 +44,7 @@ pub mod sound;
 pub mod stamp;
 pub mod swatch;
 pub mod symbol;
+pub mod texture;
 pub mod timeline;
 pub mod tween;
 pub mod wand;
@@ -82,6 +83,7 @@ pub use object::{
     TextData,
 };
 pub use post::{BloomSettings, GradeSettings, GrainSettings, PostSettings, VignetteSettings};
+pub use texture::TextureKind;
 pub use raster::{Canvas, SoftBrush};
 pub use rig::{ArmatureData, NamedPose, RigBinding, RigPart, WarpData};
 pub use sound::{SoundAsset, SoundCue, SoundId, SoundLibrary, SoundRef, SoundSync};

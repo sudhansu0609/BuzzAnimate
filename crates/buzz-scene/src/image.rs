@@ -289,10 +289,14 @@ pub struct ImageFill {
     pub transform: Affine,
     /// Draw the image smoothed. Off is what pixel art wants.
     pub smooth: bool,
+    /// Repeat the image across the shape instead of stretching one copy over it.
+    /// What a seamless texture (paper, checker, a procedural tile) wants; off for
+    /// an ordinary imported photo, which fills its shape once.
+    pub tile: bool,
 }
 
 impl ImageFill {
-    /// An image laid across `rect` at its natural proportions.
+    /// An image laid across `rect` at its natural proportions, filling it once.
     pub fn new(asset: Arc<ImageAsset>, rect: Rect) -> Self {
         Self {
             asset,
@@ -302,6 +306,19 @@ impl ImageFill {
                     rect.height().max(f64::MIN_POSITIVE),
                 ),
             smooth: true,
+            tile: false,
+        }
+    }
+
+    /// A seamless image tiled across the object, one copy spanning `cell` (a
+    /// square, in object units). What procedural and bundled textures use.
+    pub fn tiled(asset: Arc<ImageAsset>, cell: f64) -> Self {
+        let cell = cell.max(f64::MIN_POSITIVE);
+        Self {
+            asset,
+            transform: Affine::scale(cell),
+            smooth: true,
+            tile: true,
         }
     }
 
@@ -345,6 +362,7 @@ impl ImageFill {
             asset: Arc::clone(&self.asset),
             transform: t * self.transform,
             smooth: self.smooth,
+            tile: self.tile,
         }
     }
 

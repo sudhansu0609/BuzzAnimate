@@ -364,6 +364,8 @@ pub enum Pick {
     /// File ▸ Save As, or a first save of an untitled document.
     SaveAs,
     ImportImage,
+    /// An image to lay into the selected shapes as a fill.
+    FillWithImage,
     ImportSound,
     /// File ▸ Import, into the stage or into the library.
     ImportInto(buzz_scene::ImportTarget),
@@ -373,6 +375,29 @@ pub enum Pick {
     Export(buzz_ui::ExportKind),
     /// Where to write the document as an Animate `.fla`.
     ExportFla,
+}
+
+/// Image files in a project-local `assets/textures` folder, offered as one-click
+/// fills. Mirrors how bundled fonts are found under `assets/fonts`: dropping a
+/// `.png`/`.jpg` in there makes it a texture with no rebuild. Empty (not an
+/// error) when the folder is absent.
+fn bundled_textures() -> Vec<std::path::PathBuf> {
+    let dir = std::path::Path::new("assets/textures");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref(),
+                Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp")
+            )
+        })
+        .collect();
+    paths.sort();
+    paths
 }
 
 /// What a background load produced.
@@ -1811,6 +1836,51 @@ impl App {
             Color => {
                 let editor = &mut self.editor;
                 panels::color_panel(ui, editor.doc.scene(), &mut editor.style);
+
+                // Textures fill the selected shapes: procedural tiles baked from
+                // the fill (foreground) and stroke (background) colours, plus any
+                // image used as a fill. Applied to the selection, so it needs one.
+                ui.separator();
+                ui.label("Texture");
+                let has_shape = self.editor.selection.iter().next().is_some();
+                ui.add_enabled_ui(has_shape, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for kind in buzz_scene::TextureKind::ALL {
+                            if ui.button(kind.label()).clicked() {
+                                self.editor.apply_texture(kind);
+                            }
+                        }
+                    });
+                    if ui.button("Image as fill\u{2026}").clicked() {
+                        self.fill_with_image_dialog();
+                    }
+                    let bundled = bundled_textures();
+                    if !bundled.is_empty() {
+                        ui.label("Bundled");
+                        ui.horizontal_wrapped(|ui| {
+                            for path in &bundled {
+                                let name = path
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                if ui.button(name).clicked() {
+                                    if let Err(e) =
+                                        self.editor.fill_selection_with_image(path, true)
+                                    {
+                                        self.editor.status =
+                                            Some(format!("Could not use that texture: {e:#}"));
+                                    } else {
+                                        self.editor.status =
+                                            Some("Applied the bundled texture".into());
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+                if !has_shape {
+                    ui.label(egui::RichText::new("Select a shape to texture it").weak());
+                }
             }
 
             Assets => {
@@ -4320,6 +4390,7 @@ impl App {
             }
             Pick::SaveAs => self.save_to(path),
             Pick::ImportImage => self.import_image_from(path),
+            Pick::FillWithImage => self.fill_with_image_from(path),
             Pick::ImportSound => self.import_sound_from(path),
             Pick::ImportInto(target) => self.import_file(target, path),
             Pick::AnimateAssets => self.import_animate_assets_from(path),
@@ -5183,6 +5254,22 @@ impl App {
                 ))
             }
             Err(e) => self.editor.status = Some(format!("Could not import that image: {e:#}")),
+        }
+    }
+
+    /// Pick an image to fill the selected shapes with (as a fill, not new art).
+    fn fill_with_image_dialog(&mut self) {
+        self.ask_for_path(
+            crate::dialogs::Request::open_file()
+                .filter("Image", &["png", "jpg", "jpeg", "gif", "bmp", "webp"]),
+            Pick::FillWithImage,
+        );
+    }
+
+    fn fill_with_image_from(&mut self, path: std::path::PathBuf) {
+        match self.editor.fill_selection_with_image(&path, false) {
+            Ok(()) => self.editor.status = Some("Filled the selection with the image".into()),
+            Err(e) => self.editor.status = Some(format!("Could not fill with that image: {e:#}")),
         }
     }
 

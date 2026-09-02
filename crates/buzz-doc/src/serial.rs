@@ -120,7 +120,11 @@ use serde::{Deserialize, Serialize};
 ///   Hindi or calligraphy face survives a round-trip. Absent in older files and
 ///   in default-font text, so an unchanged document is written exactly as
 ///   version 29 wrote it.
-pub const FORMAT_VERSION: u32 = 30;
+/// * **31** — an image fill may `tile` (repeat seamlessly across its shape),
+///   which is how procedural and bundled textures are drawn. Absent (and off)
+///   for imported photos, so an unchanged document is written exactly as version
+///   30 wrote it.
+pub const FORMAT_VERSION: u32 = 31;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -1641,6 +1645,10 @@ pub struct ImageFillDto {
     /// overwhelming majority of images are.
     #[serde(default = "smoothing_on", skip_serializing_if = "is_smoothing_on")]
     pub smooth: bool,
+    /// Repeat the image across the shape (a seamless texture) rather than
+    /// stretching one copy. Version 31; absent (and off) for imported photos.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tile: bool,
 }
 
 fn smoothing_on() -> bool {
@@ -1674,6 +1682,7 @@ fn paint_to_dto(paint: &Paint) -> (Option<String>, Option<GradientDto>, Option<I
                 image: i.asset.id.0,
                 transform: i.transform.as_coeffs(),
                 smooth: i.smooth,
+                tile: i.tile,
             }),
         ),
     }
@@ -1703,6 +1712,7 @@ fn paint_from_dto(
                     asset: std::sync::Arc::clone(asset),
                     transform: Affine::new(fill.transform),
                     smooth: fill.smooth,
+                    tile: fill.tile,
                 })));
             }
             None => return Ok(Paint::Solid(Color::from_rgb8(0x80, 0x80, 0x80))),
@@ -2887,6 +2897,46 @@ mod tests {
         // An object without text writes no `text` key.
         let plain = serde_json::to_string(&DocumentDto::from_scene(&Scene::empty())).unwrap();
         assert!(!plain.contains("\"text\""), "no text object should write the key");
+    }
+
+    /// A tiling image fill keeps its `tile` flag through the paint conversion,
+    /// and a non-tiling one writes no `tile` key (so old files stay byte-identical
+    /// and load as `tile: false`).
+    #[test]
+    fn image_fill_tile_survives_and_stays_optional() {
+        use std::sync::Arc;
+        // A library holding one procedural-style asset the fill can resolve to.
+        let mut images = buzz_scene::ImageLibrary::default();
+        let asset = buzz_scene::ImageAsset::from_pixels(
+            buzz_scene::ImageId(7),
+            "tex",
+            2,
+            2,
+            Arc::new(vec![0xFFu8; 2 * 2 * 4]),
+        );
+        let asset = images.insert(asset);
+
+        let tiled = Paint::Image(Box::new(buzz_scene::ImageFill::tiled(asset, 32.0)));
+        assert!(matches!(&tiled, Paint::Image(i) if i.tile), "tiled() sets the flag");
+
+        // to_dto then from_dto (against the library) preserves tile.
+        let (_c, _g, dto) = paint_to_dto(&tiled);
+        let dto = dto.expect("an image dto");
+        assert!(dto.tile, "the dto carries tile");
+        let back = paint_from_dto(None, None, Some(&dto), &images).unwrap();
+        assert!(matches!(back, Paint::Image(i) if i.tile), "tile came back");
+
+        // A tiling fill writes the key; a non-tiling one omits it.
+        assert!(serde_json::to_string(&dto).unwrap().contains("\"tile\""));
+        let plain = ImageFillDto { image: 7, transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], smooth: true, tile: false };
+        assert!(
+            !serde_json::to_string(&plain).unwrap().contains("\"tile\""),
+            "a non-tiling fill must not write the key"
+        );
+        // And a JSON without the key loads as tile: false.
+        let loaded: ImageFillDto =
+            serde_json::from_str(r#"{"image":7,"transform":[1,0,0,1,0,0]}"#).unwrap();
+        assert!(!loaded.tile, "absent tile loads false");
     }
 
     /// A reverse (back) drawing — a whole nested object — round-trips, and an

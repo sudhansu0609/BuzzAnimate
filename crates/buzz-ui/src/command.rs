@@ -104,6 +104,9 @@ pub enum Command {
     // Insert
     NewLayer,
     NewLayerFolder,
+    /// A guide layer for reference art (rotoscoping): shown faded, never
+    /// exported. Import an image onto it to trace over.
+    NewReferenceLayer,
     DeleteLayer,
 
     // Symbols and library
@@ -344,6 +347,7 @@ impl Command {
 
             NewLayer => "New Layer",
             NewLayerFolder => "New Folder",
+            NewReferenceLayer => "New Reference Layer",
             DeleteLayer => "Delete Layer",
 
             ConvertToSymbol => "Convert to Symbol…",
@@ -532,6 +536,7 @@ impl Command {
             About => None,
             SaveSnapshot | Snapshots => None,
             DetectBeats => None,
+            NewReferenceLayer => None,
 
             AddSun | AddSky | AddLamp | AddGloom | AddFire => None,
             // No Animate binding to follow, and these open dialogs rather than
@@ -697,6 +702,7 @@ pub fn palette_commands() -> Vec<Command> {
         RotateAnticlockwise,
         NewLayer,
         NewLayerFolder,
+        NewReferenceLayer,
         DeleteLayer,
         InsertFrame,
         RemoveFrame,

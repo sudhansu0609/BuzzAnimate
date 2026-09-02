@@ -2745,6 +2745,14 @@ impl Editor {
             NewLayerFolder => {
                 self.doc_add_layer("Folder", LayerKind::Folder);
             }
+            NewReferenceLayer => {
+                // A guide layer: drawn faded, never exported. Made active so the
+                // next Import Image drops the reference art straight onto it.
+                let id = self.doc_add_layer("Reference", LayerKind::Guide);
+                self.selection.set_active_layer(Some(id));
+                self.status =
+                    Some("Reference layer added — Import Image onto it to trace over".into());
+            }
             DeleteLayer => self.delete_active_layer(),
 
             // -- timeline ----------------------------------------------------
@@ -6248,6 +6256,15 @@ mod tests {
 
     fn square(x: f64, y: f64, size: f64) -> BezPath {
         KRect::new(x, y, x + size, y + size).to_path(1e-9)
+    }
+
+    #[test]
+    fn a_reference_layer_is_a_guide_layer() {
+        let mut e = editor();
+        e.run(Command::NewReferenceLayer);
+        let active = e.selection.active_layer().expect("the reference layer is active");
+        let kind = e.doc.scene().layers().get(active).expect("the layer").kind;
+        assert_eq!(kind, buzz_scene::LayerKind::Guide, "a reference layer is a guide layer");
     }
 
     #[test]

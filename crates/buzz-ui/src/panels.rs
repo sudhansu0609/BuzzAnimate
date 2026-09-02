@@ -287,7 +287,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 item(ui, c, true, &mut raised);
             }
             ui.separator();
-            for c in [Command::NewLayer, Command::NewLayerFolder] {
+            for c in [Command::NewLayer, Command::NewLayerFolder, Command::NewReferenceLayer] {
                 item(ui, c, true, &mut raised);
             }
             item(

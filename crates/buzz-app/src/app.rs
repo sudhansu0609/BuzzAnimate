@@ -377,6 +377,31 @@ pub enum Pick {
     ExportFla,
 }
 
+/// A compact UTC timestamp, `YYYY-MM-DD HHhMM`, for naming a snapshot. Built
+/// from the Unix clock with civil-date arithmetic so it needs no date crate;
+/// UTC rather than local, which is honest about having no timezone database.
+fn chrono_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let sod = secs % 86_400;
+    let (hh, mm) = (sod / 3600, (sod % 3600) / 60);
+    // Howard Hinnant's days-from-civil, inverted.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hh:02}h{mm:02}")
+}
+
 /// Image files in a project-local `assets/textures` folder, offered as one-click
 /// fills. Mirrors how bundled fonts are found under `assets/fonts`: dropping a
 /// `.png`/`.jpg` in there makes it a texture with no rebuild. Empty (not an
@@ -596,6 +621,9 @@ pub struct App {
     recovery: buzz_ui::RecoveryState,
     /// The Ctrl+K command palette's open state and query.
     command_palette: buzz_ui::CommandPaletteState,
+    /// Named version snapshots of the document, and whether the list is open.
+    snapshots: buzz_doc::SnapshotLibrary,
+    show_snapshots: bool,
     /// The revision the crash snapshot was last taken at.
     last_crash_revision: Option<u64>,
     /// A scene being renamed from the edit bar: its index and the text so far.
@@ -733,6 +761,8 @@ impl App {
             },
             recovery: buzz_ui::RecoveryState::default(),
             command_palette: buzz_ui::CommandPaletteState::default(),
+            snapshots: buzz_doc::SnapshotLibrary::user(),
+            show_snapshots: false,
             last_crash_revision: None,
             scene_rename: None,
             animate_import: None,
@@ -1617,6 +1647,7 @@ impl App {
         self.lip_sync_dialog(&ctx);
         self.staging_dialog(&ctx);
         self.recovery_dialog(&ctx);
+        self.snapshots_dialog(&ctx);
         buzz_ui::about_dialog(&ctx, &mut self.editor.about);
 
         // File ▸ New asks before it acts, and the answer is remembered.
@@ -4233,7 +4264,80 @@ impl App {
             // `run_script_async`. The `Editor::run` path is kept for the
             // headless CLI, which needs the answer before it can print it.
             Command::RunScript => self.run_script_async(),
+            Command::SaveSnapshot => self.save_snapshot(),
+            Command::Snapshots => {
+                self.snapshots.rescan();
+                self.show_snapshots = true;
+            }
             other => self.editor.run(other),
+        }
+    }
+
+    /// Keep the document as it is now, under a name built from the document and
+    /// the time, so a later Snapshots ▸ Restore can bring it back.
+    fn save_snapshot(&mut self) {
+        let base = self
+            .editor
+            .doc
+            .path()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "Untitled".to_string());
+        let stamp = chrono_stamp();
+        let name = format!("{base} {stamp}");
+        match self.snapshots.save(&name, self.editor.doc.scene()) {
+            Ok(t) => self.editor.status = Some(format!("Snapshot saved: {}", t.name)),
+            Err(e) => self.editor.status = Some(format!("Could not save a snapshot: {e}")),
+        }
+    }
+
+    /// The Snapshots list: restore a past version into the current document as
+    /// one undo step, keeping the file being worked on.
+    fn snapshots_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_snapshots {
+            return;
+        }
+        let mut open = true;
+        let mut restore: Option<std::path::PathBuf> = None;
+        egui::Window::new("Snapshots")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if self.snapshots.is_empty() {
+                    ui.label("No snapshots yet.");
+                    ui.label(
+                        egui::RichText::new("Save one with Save Snapshot (⌘K ▸ Save Snapshot).")
+                            .weak(),
+                    );
+                    return;
+                }
+                ui.label("Restore a saved version into this document:");
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for snap in self.snapshots.iter() {
+                        ui.horizontal(|ui| {
+                            if ui.button("Restore").clicked() {
+                                restore = Some(snap.path.clone());
+                            }
+                            ui.label(&snap.name);
+                        });
+                    }
+                });
+            });
+        if let Some(path) = restore {
+            match buzz_doc::Document::open(&path) {
+                Ok(doc) => {
+                    let scene = doc.scene().clone();
+                    self.editor.doc.edit("Restore Snapshot", |s| *s = scene.clone());
+                    self.editor.doc.end_gesture();
+                    self.editor.status = Some("Snapshot restored".into());
+                    self.show_snapshots = false;
+                }
+                Err(e) => self.editor.status = Some(format!("Could not restore that snapshot: {e}")),
+            }
+        }
+        if !open {
+            self.show_snapshots = false;
         }
     }
 

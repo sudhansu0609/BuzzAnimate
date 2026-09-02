@@ -12,6 +12,7 @@ pub mod format;
 pub mod history;
 pub mod project;
 pub mod serial;
+pub mod snapshots;
 pub mod templates;
 
 use std::path::{Path, PathBuf};
@@ -24,6 +25,7 @@ pub use format::{DocError, EXTENSION, MIMETYPE, Meta};
 pub use history::{History, UndoLabel};
 pub use project::{FilmError, PROJECT_EXTENSION, PROJECT_VERSION, Project, Shot};
 pub use serial::{FORMAT_VERSION, SerialError};
+pub use snapshots::SnapshotLibrary;
 pub use templates::{Template, TemplateLibrary};
 
 /// An open document.

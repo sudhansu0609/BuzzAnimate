@@ -2524,8 +2524,9 @@ impl Editor {
                 self.new_document.setup = self.workspace.new_document;
                 self.new_document.open = true;
             }
-            Save | SaveAs | Open | Close => {
-                // File dialogs are host concerns; the shell handles them.
+            Save | SaveAs | Open | Close | SaveSnapshot | Snapshots => {
+                // File dialogs and the snapshots store are host concerns; the
+                // shell handles them.
                 self.status = Some(format!("{} is handled by the shell", command.label()));
             }
 

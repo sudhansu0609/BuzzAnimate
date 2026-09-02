@@ -133,6 +133,10 @@ pub enum Command {
     About,
     /// Put every panel back where it started.
     ResetWorkspace,
+    /// Keep the document as it is now under a name, to come back to.
+    SaveSnapshot,
+    /// Open the list of saved snapshots, to restore one.
+    Snapshots,
 
     // Lighting
     /// Add a sun: one direction for the whole stage.
@@ -355,6 +359,8 @@ impl Command {
             ToggleTheme => "Light Interface",
             About => "About BuzzAnimate",
             ResetWorkspace => "Reset Layout",
+            SaveSnapshot => "Save Snapshot",
+            Snapshots => "Snapshots\u{2026}",
 
             AddSun => "Sun",
             AddSky => "Sky",
@@ -521,6 +527,7 @@ impl Command {
             ToggleLayoutLock => sc(ctrl.plus(Modifiers::ALT), Key::L),
             ToggleTheme => None,
             About => None,
+            SaveSnapshot | Snapshots => None,
 
             AddSun | AddSky | AddLamp | AddGloom | AddFire => None,
             // No Animate binding to follow, and these open dialogs rather than
@@ -747,6 +754,8 @@ pub fn palette_commands() -> Vec<Command> {
         ToggleLayoutLock,
         ToggleTheme,
         About,
+        SaveSnapshot,
+        Snapshots,
         ToggleActionsPanel,
         RunScript,
         ClearScriptOutput,

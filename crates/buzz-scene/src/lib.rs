@@ -79,6 +79,7 @@ pub use merge::{ImportTarget, MergeReport};
 pub use modifier::Modifier;
 pub use object::{
     FillSpec, Object, ObjectId, ObjectKind, Paint, PaintBlend, ShapeData, Spatial, StrokeSpec,
+    TextData,
 };
 pub use post::{BloomSettings, GradeSettings, GrainSettings, PostSettings, VignetteSettings};
 pub use raster::{Canvas, SoftBrush};

@@ -1354,6 +1354,7 @@ impl Editor {
             ToolAction::ResetTransformPoint => self.reset_pivot(),
             ToolAction::DragGradient { grip, to } => self.drag_gradient(grip, to),
             ToolAction::DrawMotionPath { path } => self.begin_motion_path(path),
+            ToolAction::PlaceText { at } => self.place_text(at),
         }
     }
 
@@ -1488,6 +1489,68 @@ impl Editor {
         if !merge && let Some(id) = created {
             self.selection.select_one(id);
         }
+    }
+
+    /// **Place a text object** at `at`. The glyph outlines are shaped here (the
+    /// editor holds the font) and stored as an ordinary filled shape; the string
+    /// rides along on `Object::text` so it stays editable.
+    pub fn place_text(&mut self, at: Point) {
+        let Some(layer) = self.active_layer() else {
+            self.status = Some("No layer available to place text on".into());
+            return;
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return;
+        }
+        const DEFAULT: &str = "Text";
+        let size = 48.0;
+        let Some(path) = buzz_text::outline(DEFAULT, size) else {
+            self.status = Some("No font available to draw text with".into());
+            return;
+        };
+
+        let color = self.style.fill_color;
+        let frame = self.current_frame;
+        let auto = self.auto_keyframe;
+        let mut created: Option<ObjectId> = None;
+        self.doc.edit("Text", |scene| {
+            if auto {
+                scene.ensure_keyframe(layer, frame);
+            }
+            created = scene.add_shape_at(layer, frame, ShapeData::filled(path.clone(), color));
+            if let Some(id) = created {
+                scene.update_object_at(frame, id, |o| {
+                    o.transform = Affine::translate(at.to_vec2());
+                    o.text = Some(buzz_scene::TextData {
+                        content: DEFAULT.to_string(),
+                        size,
+                    });
+                });
+            }
+        });
+        if let Some(id) = created {
+            self.selection.select_one(id);
+            self.status = Some("Text placed \u{2014} edit it in Properties".into());
+        }
+    }
+
+    /// **Re-type a text object**: re-shape its glyphs from `content`/`size` and
+    /// keep the string on it. One undo step across a typing burst (no
+    /// `end_gesture`, so consecutive edits coalesce).
+    pub fn set_text(&mut self, id: ObjectId, content: String, size: f64) {
+        let path = buzz_text::outline(&content, size).unwrap_or_default();
+        self.doc.edit("Edit Text", |scene| {
+            scene.update_object_across(0, u32::MAX, id, |o| {
+                if let ObjectKind::Shape(shape) = &mut o.kind {
+                    shape.path = path.clone();
+                }
+                o.text = Some(buzz_scene::TextData {
+                    content: content.clone(),
+                    size,
+                });
+            });
+        });
     }
 
     fn transform_selection(&mut self, transform: Affine, label: &'static str) {
@@ -9169,13 +9232,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unavailable_tool_is_refused_with_a_message() {
+    fn the_text_tool_is_selectable() {
+        // Text used to be refused as unavailable; it now places vector type, so
+        // selecting it takes, like any other ready tool.
         let mut e = editor();
-        // Text is still to come; the Bone tool used to be here and arrived
-        // with Phase 7.
         e.set_tool(ToolId::Text);
-        assert_ne!(e.tool(), ToolId::Text);
-        assert!(e.status.is_some());
+        assert_eq!(e.tool(), ToolId::Text);
     }
 
     #[test]

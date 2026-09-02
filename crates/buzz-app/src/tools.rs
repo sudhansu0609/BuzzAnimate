@@ -130,6 +130,9 @@ pub enum ToolAction {
     /// editor takes with the selection and a dialog in front of it. The tool's
     /// part is only the curve.
     DrawMotionPath { path: BezPath },
+    /// Place a text object here. The editor shapes the glyphs (it holds the
+    /// font), so the tool only says where.
+    PlaceText { at: Point },
 }
 
 /// Which handle of a gradient is being dragged.
@@ -1182,6 +1185,8 @@ impl ToolMachine {
                 }
             }
 
+            // Text places where you click — the editor shapes the glyphs.
+            ToolId::Text => ToolAction::PlaceText { at: end },
             ToolId::Rectangle | ToolId::Oval | ToolId::PolyStar | ToolId::Line | ToolId::Pen => {
                 if was_click {
                     return ToolAction::None;
@@ -3043,7 +3048,8 @@ mod tests {
     #[test]
     fn unimplemented_tools_do_nothing_rather_than_misbehave() {
         let style = DrawStyle::default();
-        for tool in [ToolId::Bone, ToolId::Camera, ToolId::Text] {
+        // Text is no longer here — it places vector type now.
+        for tool in [ToolId::Bone, ToolId::Camera] {
             let mut m = ToolMachine::new(tool);
             let action = drag(
                 &mut m,

@@ -375,6 +375,7 @@ mod tests {
                         spatial: Default::default(),
                         pivot: None,
                         modifiers: Vec::new(),
+                        text: None,
                     })],
                 );
             });

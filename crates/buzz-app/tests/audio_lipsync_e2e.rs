@@ -91,6 +91,7 @@ fn character_with_head(editor: &mut Editor) -> (buzz_scene::SymbolId, buzz_scene
                         spatial: Default::default(),
                         pivot: None,
                         modifiers: Vec::new(),
+                        text: None,
                     })],
                 );
             });

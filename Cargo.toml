@@ -22,6 +22,8 @@ repository = "https://github.com/buzzcaf/buzzanimate"
 [workspace.dependencies]
 wgpu = "29.0.4"
 vello = "0.9.0"
+# Glyph-outline extraction for the Text tool. Already in the graph via vello.
+skrifa = "0.42.1"
 kurbo = { version = "0.13.1", features = ["serde"] }
 # `serde` here also turns it on for the `color` crate, so peniko::Color can be
 # persisted directly in the .buzz format rather than needing a wrapper type.
@@ -94,6 +96,7 @@ buzz-light = { path = "crates/buzz-light" }
 buzz-fx = { path = "crates/buzz-fx" }
 buzz-act = { path = "crates/buzz-act" }
 buzz-physics = { path = "crates/buzz-physics" }
+buzz-text = { path = "crates/buzz-text" }
 
 [profile.dev]
 opt-level = 1

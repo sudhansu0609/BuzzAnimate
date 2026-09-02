@@ -176,6 +176,7 @@ fn build_character(scene: &mut Scene) -> (buzz_scene::SymbolId, buzz_scene::Symb
                         spatial: Default::default(),
                         pivot: None,
                         modifiers: Vec::new(),
+                        text: None,
                     }),
                 ],
             );

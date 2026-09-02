@@ -191,6 +191,7 @@ pub fn rig_object(
             spatial: Default::default(),
             pivot: None,
             modifiers: Vec::new(),
+            text: None,
         };
 
         let mut rig = ArmatureData::new(armature);
@@ -477,6 +478,7 @@ pub fn rig_character(
             spatial: Default::default(),
             pivot: None,
             modifiers: Vec::new(),
+            text: None,
         },
     )
 }

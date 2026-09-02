@@ -1760,6 +1760,29 @@ impl App {
                 editor.doc.edit("Document Properties", |scene| {
                     panels::properties_panel(ui, scene, selection, style, view, at);
                 });
+
+                // A text object gets a content/size editor here — regenerating
+                // the glyph outlines needs the font, which lives in the editor.
+                // The current values are pulled out first so the scene borrow is
+                // done before `set_text` takes a mutable one.
+                let text_of = self.editor.selection.iter().next().and_then(|id| {
+                    self.editor
+                        .doc
+                        .scene()
+                        .find_object(id)
+                        .and_then(|(_, o)| o.text.as_ref().map(|t| (id, t.content.clone(), t.size)))
+                });
+                if let Some((id, mut content, mut size)) = text_of {
+                    ui.separator();
+                    ui.label("Text");
+                    let typed = ui.text_edit_multiline(&mut content).changed();
+                    let resized = ui
+                        .add(egui::DragValue::new(&mut size).range(4.0..=400.0).prefix("size "))
+                        .changed();
+                    if typed || resized {
+                        self.editor.set_text(id, content, size);
+                    }
+                }
             }
 
             Color => {

@@ -328,6 +328,7 @@ pub fn build(spec: &FigureSpec, id: ObjectId, mut next_id: impl FnMut() -> Objec
         spatial: Default::default(),
         pivot: None,
         modifiers: Vec::new(),
+        text: None,
     }
 }
 

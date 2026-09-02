@@ -967,6 +967,7 @@ mod tests {
             spatial: Default::default(),
             pivot: None,
             modifiers: Vec::new(),
+            text: None,
         }
     }
 
@@ -1040,6 +1041,7 @@ mod tests {
             spatial: Default::default(),
             pivot: None,
             modifiers: Vec::new(),
+            text: None,
         };
 
         let mid = interpolate_object(

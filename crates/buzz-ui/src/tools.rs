@@ -173,10 +173,8 @@ impl ToolId {
         match self {
             Selection | Subselection | Lasso | MagicWand | FreeTransform | Line | Rectangle
             | Oval | PolyStar | Pencil | Brush | Eraser | PaintBucket | InkBottle | Eyedropper
-            | Hand | Zoom | Pen | Camera | Bone | AssetWarp | MotionPath | GradientTransform => {
-                ToolStatus::Ready
-            }
-            Text => ToolStatus::Planned("Text arrives with Phase 2 follow-up"),
+            | Hand | Zoom | Pen | Camera | Bone | AssetWarp | MotionPath | GradientTransform
+            | Text => ToolStatus::Ready,
         }
     }
 
@@ -296,15 +294,13 @@ mod tests {
         );
     }
 
-    /// Every tool in the palette does something. `Text` is the only permitted
-    /// exception, until the font subsystem lands.
-    ///
-    /// The Lasso was once here as a greyed-out promise and was taken out for
-    /// it; it is back because it now cuts.
+    /// Every tool in the palette does something now that Text places vector
+    /// type. A greyed-out promise is worse than a missing tool, so there are no
+    /// inert tools left at all.
     #[test]
-    fn only_text_is_still_unimplemented() {
+    fn no_tool_is_still_inert() {
         let waiting: Vec<ToolId> = all_tools().into_iter().filter(|t| !t.is_ready()).collect();
-        assert_eq!(waiting, vec![ToolId::Text], "unexpected inert tools");
+        assert!(waiting.is_empty(), "unexpected inert tools: {waiting:?}");
     }
 
     /// Muscle memory: these letters must do what an Animate user expects.
@@ -374,15 +370,16 @@ mod tests {
         }
     }
 
-    /// A tool that is not implemented must say so rather than look available.
+    /// The tools that arrived across the phases are all ready, Text now among
+    /// them.
     #[test]
-    fn unimplemented_tools_declare_themselves() {
-        assert!(matches!(ToolId::Text.status(), ToolStatus::Planned(_)));
+    fn the_implemented_tools_are_ready() {
         assert!(ToolId::Selection.is_ready());
         assert!(ToolId::Rectangle.is_ready());
         assert!(ToolId::Camera.is_ready(), "the camera arrived in Phase 3");
         assert!(ToolId::Bone.is_ready(), "rigging arrived in Phase 7");
         assert!(ToolId::AssetWarp.is_ready(), "and so did the warp");
+        assert!(ToolId::Text.is_ready(), "text places vector type now");
     }
 
     /// The camera edits the document, so it must not be classed as navigation

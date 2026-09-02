@@ -369,6 +369,7 @@ dependencies = [
  "buzz-rig",
  "buzz-scene",
  "buzz-script",
+ "buzz-text",
  "buzz-ui",
  "crossbeam-channel",
  "egui",
@@ -596,6 +597,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
+]
+
+[[package]]
+name = "buzz-text"
+version = "0.1.0"
+dependencies = [
+ "buzz-geom",
+ "skrifa",
 ]
 
 [[package]]

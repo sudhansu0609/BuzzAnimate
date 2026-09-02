@@ -108,7 +108,11 @@ use serde::{Deserialize, Serialize};
 ///   than baked to keyframes. Absent in older files and in every object without
 ///   one, which is almost all of them, so an unchanged document is written
 ///   exactly as version 26 wrote it.
-pub const FORMAT_VERSION: u32 = 27;
+/// * **28** — a text object carries the `text` it was typed as (the string and
+///   its size), so the words stay editable; the glyph outlines themselves are an
+///   ordinary shape path. Absent in older files and in every non-text object, so
+///   an unchanged document is written exactly as version 27 wrote it.
+pub const FORMAT_VERSION: u32 = 28;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -1281,6 +1285,14 @@ impl ModifierDto {
     }
 }
 
+/// The source of a text object. Version 28. The rendered outlines are the
+/// Shape's path (serialized like any shape); this keeps the words editable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextDataDto {
+    pub content: String,
+    pub size: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectDto {
     pub id: u64,
@@ -1312,6 +1324,9 @@ pub struct ObjectDto {
     /// every object written before it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modifiers: Vec<ModifierDto>,
+    /// The text this object was typed as, when it is text. Version 28.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextDataDto>,
     pub kind: ObjectKindDto,
 }
 
@@ -2367,6 +2382,10 @@ impl ObjectDto {
                 .iter()
                 .map(ModifierDto::from_modifier)
                 .collect(),
+            text: object.text.as_ref().map(|t| TextDataDto {
+                content: t.content.clone(),
+                size: t.size,
+            }),
             kind,
         }
     }
@@ -2525,6 +2544,10 @@ impl ObjectDto {
                 .filter(|p| p[0].is_finite() && p[1].is_finite())
                 .map(|p| buzz_geom::Point::new(p[0], p[1])),
             modifiers: self.modifiers.iter().filter_map(ModifierDto::to_modifier).collect(),
+            text: self.text.as_ref().map(|t| buzz_scene::TextData {
+                content: t.content.clone(),
+                size: t.size,
+            }),
         })
     }
 }
@@ -2798,6 +2821,43 @@ mod tests {
                 buzz_scene::Modifier::AutoSquashStretch { amount: 0.015 },
             ]
         );
+    }
+
+    /// A text object's string and size survive a round trip (the outlines are an
+    /// ordinary shape path and serialise separately).
+    #[test]
+    fn text_metadata_survives_a_round_trip() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 40.0, 20.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        scene.update_object_across(0, u32::MAX, id, |o| {
+            o.text = Some(buzz_scene::TextData {
+                content: "Hello".to_string(),
+                size: 36.0,
+            });
+        });
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        let (_, object) = back.find_object(id).expect("the object");
+        assert_eq!(
+            object.text,
+            Some(buzz_scene::TextData {
+                content: "Hello".to_string(),
+                size: 36.0
+            })
+        );
+
+        // An object without text writes no `text` key.
+        let plain = serde_json::to_string(&DocumentDto::from_scene(&Scene::empty())).unwrap();
+        assert!(!plain.contains("\"text\""), "no text object should write the key");
     }
 
     /// An object with no modifiers writes no `modifiers` key, so a document that
@@ -3581,6 +3641,7 @@ mod tests {
                 spatial: Default::default(),
                 pivot: None,
                 modifiers: Vec::new(),
+                text: None,
             },
         );
         scene
@@ -3807,6 +3868,7 @@ mod tests {
                 spatial: Default::default(),
                 pivot: None,
                 modifiers: Vec::new(),
+                text: None,
             },
         );
 

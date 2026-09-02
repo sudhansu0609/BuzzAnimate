@@ -470,6 +470,22 @@ pub struct Object {
     /// Empty for almost every object, and an empty `Vec` allocates nothing, so
     /// this costs those objects nothing.
     pub modifiers: Vec<crate::Modifier>,
+
+    /// **The text this object was typed as**, when it is text. The glyph
+    /// outlines themselves live in the object's [`ShapeData`] — this is only
+    /// what they were made from, kept so the words stay editable. `None` for
+    /// everything that is not text, which is almost everything.
+    pub text: Option<TextData>,
+}
+
+/// The source of a text object: the string and its size. The rendered outlines
+/// are the object's `ShapeData`; regenerating them from this is how editing the
+/// words works. See [`crate::Object::text`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextData {
+    pub content: String,
+    /// Nominal glyph height, in document units.
+    pub size: f64,
 }
 
 impl Object {
@@ -486,6 +502,7 @@ impl Object {
             spatial: Default::default(),
             pivot: None,
             modifiers: Vec::new(),
+            text: None,
         }
     }
 
@@ -502,6 +519,7 @@ impl Object {
             spatial: Default::default(),
             pivot: None,
             modifiers: Vec::new(),
+            text: None,
         }
     }
 
@@ -632,6 +650,7 @@ impl Object {
             spatial: Default::default(),
             pivot: None,
             modifiers: Vec::new(),
+            text: None,
         }
     }
 }

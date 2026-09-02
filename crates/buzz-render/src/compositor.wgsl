@@ -98,6 +98,7 @@ const FLAG_VIGNETTE: u32 = 4u;
 const FLAG_GRAIN: u32 = 8u;
 const FLAG_POSTERISE: u32 = 16u;
 const FLAG_HALFTONE: u32 = 32u;
+const FLAG_HATCHING: u32 = 64u;
 
 struct CompositeU {
     resolution: vec2<f32>,
@@ -122,7 +123,7 @@ struct CompositeU {
     grain_size: f32,
     poster_levels: f32,
     halftone_scale: f32,
-    _pad2: f32,
+    hatch_scale: f32,
 
     vignette_color: vec3<f32>,
     _pad3: f32,
@@ -191,6 +192,26 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
         let l = clamp(luma(color), 0.0, 1.0);
         let radius = sqrt(1.0 - l);
         let ink = 1.0 - smoothstep(radius - 0.15, radius + 0.15, d);
+        color = mix(vec3<f32>(1.0), color, ink);
+    }
+
+    // Hatching: diagonal ink lines that fill in as the frame darkens, on white.
+    // A second set of lines the other way appears in the darkest tones, for a
+    // cross-hatch.
+    if ((comp.flags & FLAG_HATCHING) != 0u) {
+        let scale = max(comp.hatch_scale, 2.0);
+        let l = clamp(luma(color), 0.0, 1.0);
+        // Diagonal coordinate; fract gives a repeating 0..1 ramp across each line.
+        let a = (in.pos.x + in.pos.y) / scale;
+        let b = (in.pos.x - in.pos.y) / scale;
+        let line_a = abs(fract(a) - 0.5) * 2.0; // 0 on the line, 1 between
+        let line_b = abs(fract(b) - 0.5) * 2.0;
+        // Darker tones widen the inked band, and the cross set joins in below 0.5.
+        var ink = 1.0 - smoothstep(1.0 - l, 1.0 - l + 0.15, line_a);
+        if (l < 0.5) {
+            let cross = 1.0 - smoothstep(1.0 - l, 1.0 - l + 0.15, line_b);
+            ink = max(ink, cross);
+        }
         color = mix(vec3<f32>(1.0), color, ink);
     }
 

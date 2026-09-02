@@ -46,6 +46,8 @@ pub struct PostSettings {
     pub posterise: PosteriseSettings,
     #[serde(default)]
     pub halftone: HalftoneSettings,
+    #[serde(default)]
+    pub hatching: HatchingSettings,
 }
 
 impl PostSettings {
@@ -59,7 +61,8 @@ impl PostSettings {
                 && !self.vignette.enabled
                 && !self.grain.enabled
                 && !self.posterise.enabled
-                && !self.halftone.enabled)
+                && !self.halftone.enabled
+                && !self.hatching.enabled)
     }
 }
 
@@ -88,6 +91,21 @@ pub struct HalftoneSettings {
 }
 
 impl Default for HalftoneSettings {
+    fn default() -> Self {
+        Self { enabled: false, scale: 6.0 }
+    }
+}
+
+/// Hatching: parallel ink lines whose density follows the darkness, on white —
+/// a pen-and-ink cross-hatch look.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HatchingSettings {
+    pub enabled: bool,
+    /// Line spacing in output pixels. Larger is coarser.
+    pub scale: f32,
+}
+
+impl Default for HatchingSettings {
     fn default() -> Self {
         Self { enabled: false, scale: 6.0 }
     }

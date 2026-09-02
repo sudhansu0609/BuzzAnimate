@@ -63,6 +63,7 @@ mod flag {
     pub const GRAIN: u32 = 8;
     pub const POSTERISE: u32 = 16;
     pub const HALFTONE: u32 = 32;
+    pub const HATCHING: u32 = 64;
 }
 
 /// Half-resolution bloom targets and their current size.
@@ -531,6 +532,9 @@ fn pack_composite(
     if post.enabled && post.halftone.enabled {
         flags |= flag::HALFTONE;
     }
+    if post.enabled && post.hatching.enabled {
+        flags |= flag::HATCHING;
+    }
 
     let g = &post.grade;
     let v = &post.vignette;
@@ -564,12 +568,11 @@ fn pack_composite(
         // each; the shader names them poster_levels and halftone_scale.
         (68, post.posterise.levels.max(2) as f32),
         (72, post.halftone.scale.max(2.0)),
+        (76, post.hatching.scale.max(2.0)),
         // row 5: vignette colour (vec3) on its own 16-byte-aligned row
         (80, vr as f32 / 255.0),
         (84, vg as f32 / 255.0),
         (88, vb as f32 / 255.0),
-        // the remaining padding slot, kept explicit so the layout reads whole
-        (76, 0.0),
     ];
 
     let mut b = [0u8; 96];

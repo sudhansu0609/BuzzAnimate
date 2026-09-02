@@ -83,8 +83,8 @@ pub use object::{
     TextData,
 };
 pub use post::{
-    BloomSettings, GradeSettings, GrainSettings, HalftoneSettings, PosteriseSettings, PostSettings,
-    VignetteSettings,
+    BloomSettings, GradeSettings, GrainSettings, HalftoneSettings, HatchingSettings,
+    PosteriseSettings, PostSettings, VignetteSettings,
 };
 pub use texture::TextureKind;
 pub use raster::{Canvas, SoftBrush};

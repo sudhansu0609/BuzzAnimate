@@ -127,9 +127,9 @@ use serde::{Deserialize, Serialize};
 /// * **32** — a new `gradientmap` filter kind (a duotone recolour by
 ///   brightness), reusing the shadow/highlight colour keys. Files without one
 ///   are unchanged from version 31.
-/// * **33** — the compositor gains posterise and halftone passes, written flat
-///   on the post settings and defaulted off, so files without them are unchanged
-///   from version 32.
+/// * **33** — the compositor gains posterise, halftone and hatching passes,
+///   written flat on the post settings and defaulted off, so files without them
+///   are unchanged from version 32.
 pub const FORMAT_VERSION: u32 = 33;
 
 /// Anything that can go wrong converting to or from the document model.
@@ -910,6 +910,10 @@ pub struct PostDto {
     pub halftone: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub halftone_scale: Option<f32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hatching: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hatching_scale: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -990,6 +994,8 @@ impl PostDto {
             posterise_levels: Some(p.posterise.levels),
             halftone: p.halftone.enabled,
             halftone_scale: Some(p.halftone.scale),
+            hatching: p.hatching.enabled,
+            hatching_scale: Some(p.hatching.scale),
         })
     }
 
@@ -1031,6 +1037,10 @@ impl PostDto {
             halftone: buzz_scene::HalftoneSettings {
                 enabled: self.halftone,
                 scale: self.halftone_scale.unwrap_or(6.0),
+            },
+            hatching: buzz_scene::HatchingSettings {
+                enabled: self.hatching,
+                scale: self.hatching_scale.unwrap_or(6.0),
             },
         })
     }
@@ -4179,6 +4189,7 @@ mod layer_alpha_tests {
             },
             posterise: buzz_scene::PosteriseSettings { enabled: true, levels: 4 },
             halftone: buzz_scene::HalftoneSettings { enabled: true, scale: 10.0 },
+            hatching: buzz_scene::HatchingSettings { enabled: true, scale: 8.0 },
             ..Default::default()
         };
 

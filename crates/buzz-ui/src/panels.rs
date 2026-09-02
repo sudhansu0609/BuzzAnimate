@@ -1501,6 +1501,7 @@ fn effects_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
                 changed |= grain_controls(ui, &mut post.grain);
                 changed |= posterise_controls(ui, &mut post.posterise);
                 changed |= halftone_controls(ui, &mut post.halftone);
+                changed |= hatching_controls(ui, &mut post.hatching);
             });
         });
 
@@ -1670,6 +1671,20 @@ fn halftone_controls(ui: &mut Ui, h: &mut buzz_scene::HalftoneSettings) -> bool 
             changed |= ui.checkbox(&mut h.enabled, "On").changed();
             ui.horizontal(|ui| {
                 ui.label("Dot size");
+                changed |= ui.add(egui::Slider::new(&mut h.scale, 2.0..=24.0)).changed();
+            });
+        });
+    changed
+}
+
+fn hatching_controls(ui: &mut Ui, h: &mut buzz_scene::HatchingSettings) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new("Hatching")
+        .id_salt("fx-hatching")
+        .show(ui, |ui| {
+            changed |= ui.checkbox(&mut h.enabled, "On").changed();
+            ui.horizontal(|ui| {
+                ui.label("Line spacing");
                 changed |= ui.add(egui::Slider::new(&mut h.scale, 2.0..=24.0)).changed();
             });
         });

@@ -1881,6 +1881,27 @@ impl App {
                 if !has_shape {
                     ui.label(egui::RichText::new("Select a shape to texture it").weak());
                 }
+
+                // Symmetry drawing: everything drawn is mirrored across the
+                // stage centre. Lives on the draw style, so it applies to every
+                // drawing tool.
+                ui.separator();
+                ui.label("Symmetry");
+                let sym = &mut self.editor.style.symmetry;
+                egui::ComboBox::from_id_salt("symmetry-mode")
+                    .selected_text(sym.mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in buzz_ui::SymmetryMode::ALL {
+                            ui.selectable_value(&mut sym.mode, mode, mode.label());
+                        }
+                    });
+                if sym.mode == buzz_ui::SymmetryMode::Radial {
+                    ui.add(
+                        egui::DragValue::new(&mut sym.radial_count)
+                            .range(2..=24)
+                            .prefix("copies "),
+                    );
+                }
             }
 
             Assets => {

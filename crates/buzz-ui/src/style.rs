@@ -141,8 +141,67 @@ pub struct DrawStyle {
     /// Paint Bucket gap closing — how large a gap in the outline the bucket
     /// bridges before filling. Animate's Gap Size.
     pub gap_size: buzz_scene::GapSize,
+    /// Symmetry drawing — every stroke mirrored across the stage centre.
+    pub symmetry: SymmetrySettings,
     /// Recently used colours, most recent first.
     pub swatches: Vec<Color>,
+}
+
+/// How new strokes are mirrored as they are drawn — a mandala/character-symmetry
+/// aid. The axes pass through the centre of the stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymmetryMode {
+    /// Draw once, no mirroring.
+    Off,
+    /// Mirror left↔right across the vertical centre line.
+    MirrorX,
+    /// Mirror top↔bottom across the horizontal centre line.
+    MirrorY,
+    /// Mirror across both axes at once — four-fold.
+    Both,
+    /// Rotate the stroke into `n` copies around the centre.
+    Radial,
+}
+
+impl SymmetryMode {
+    pub const ALL: [SymmetryMode; 5] = [
+        SymmetryMode::Off,
+        SymmetryMode::MirrorX,
+        SymmetryMode::MirrorY,
+        SymmetryMode::Both,
+        SymmetryMode::Radial,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SymmetryMode::Off => "Off",
+            SymmetryMode::MirrorX => "Mirror ↔",
+            SymmetryMode::MirrorY => "Mirror ↕",
+            SymmetryMode::Both => "Mirror ✛",
+            SymmetryMode::Radial => "Radial",
+        }
+    }
+}
+
+/// Symmetry mode plus how many copies a radial symmetry makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymmetrySettings {
+    pub mode: SymmetryMode,
+    /// Number of copies for [`SymmetryMode::Radial`], 2..=24.
+    pub radial_count: u32,
+}
+
+impl Default for SymmetrySettings {
+    fn default() -> Self {
+        Self { mode: SymmetryMode::Off, radial_count: 6 }
+    }
+}
+
+impl SymmetrySettings {
+    /// Whether any mirroring is active.
+    pub fn is_on(self) -> bool {
+        self.mode != SymmetryMode::Off
+    }
 }
 
 /// Animate's default swatch row.
@@ -188,6 +247,7 @@ impl Default for DrawStyle {
             brush: crate::brush::BrushSettings::default(),
             wand: buzz_scene::WandOptions::default(),
             gap_size: buzz_scene::GapSize::default(),
+            symmetry: SymmetrySettings::default(),
             swatches: default_swatches(),
         }
     }

@@ -733,7 +733,7 @@ impl ToolMachine {
                     None => Preview::None,
                 },
                 ToolId::Eraser => Preview::Stroke {
-                    path: centreline_of(samples),
+                    path: centreline_of(samples, ctx.style.brush.conditioning()),
                     width: ctx.style.eraser_size.max(0.5),
                 },
                 // A soft brush previews its own pixels, because the pixels are
@@ -809,13 +809,13 @@ impl ToolMachine {
                     match vector_brush_shape(samples, ctx.style, &budget) {
                         Some(shape) => Preview::Artwork(vec![shape]),
                         None => Preview::Stroke {
-                            path: centreline_of(samples),
+                            path: centreline_of(samples, ctx.style.brush.conditioning()),
                             width: ctx.style.brush.size.max(1.0),
                         },
                     }
                 }
                 _ => Preview::Stroke {
-                    path: centreline_of(samples),
+                    path: centreline_of(samples, ctx.style.brush.conditioning()),
                     width: brush_width(self.tool, ctx.style),
                 },
             },
@@ -921,7 +921,7 @@ impl ToolMachine {
                 None => ToolAction::None,
             },
             ToolId::Eraser => ToolAction::Erase {
-                path: centreline_of(&samples),
+                path: centreline_of(&samples, ctx.style.brush.conditioning()),
                 width: ctx.style.eraser_size.max(0.5),
             },
             ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Raster => {
@@ -989,7 +989,7 @@ impl ToolMachine {
             // The motion-path tool hands over the drawn curve, smoothed the same
             // way the pencil's is. A tap with no length is not a path.
             ToolId::MotionPath => {
-                let path = centreline_of(&samples);
+                let path = centreline_of(&samples, ctx.style.brush.conditioning());
                 if path.segments().next().is_none() {
                     return ToolAction::None;
                 }
@@ -1002,7 +1002,7 @@ impl ToolMachine {
                         .unwrap_or((Color::BLACK, 1.0, false));
                 ToolAction::AddShape {
                     shape: ShapeData {
-                        path: centreline_of(&samples),
+                        path: centreline_of(&samples, ctx.style.brush.conditioning()),
                         fill: None,
                         stroke: Some(buzz_scene::StrokeSpec {
                             paint: buzz_scene::Paint::Solid(color),
@@ -1273,14 +1273,21 @@ fn brush_width(tool: ToolId, style: &DrawStyle) -> f64 {
     }
 }
 
-/// A smooth curve through the samples.
+/// A smooth curve through the samples, conditioned first.
 ///
 /// Used by the pencil, the eraser and every brush preview that is not painting
-/// its own artwork. Smoothing is applied first, so the pencil gets the same
-/// steadying the brush does — Animate's Pencil has a Smoothing setting for the
-/// same reason.
-fn centreline_of(samples: &[buzz_geom::StrokeSample]) -> BezPath {
-    buzz_geom::centreline(samples)
+/// its own artwork. The samples are steadied and smoothed *before* the curve is
+/// fitted, so the pencil gets the same stabiliser and smoothing the brush does —
+/// Animate's Pencil has a Smoothing setting for the same reason, and the
+/// pull-string stabiliser rides the same dial. Because the preview and the
+/// commit call this identically, what is drawn on screen is what lands.
+fn centreline_of(
+    samples: &[buzz_geom::StrokeSample],
+    how: buzz_geom::brush::Conditioning,
+) -> BezPath {
+    let budget = buzz_geom::BrushBudget::default();
+    let conditioned = buzz_geom::brush::condition(samples, how, &budget);
+    buzz_geom::centreline(&conditioned)
 }
 
 /// The soft brush the current style describes.

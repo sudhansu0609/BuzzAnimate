@@ -14,7 +14,8 @@ use buzz_scene::{
     StrokeSpec, Tween,
 };
 use buzz_ui::{
-    ActionsState, Command, DrawStyle, DrawingMode, LibraryState, Selection, ToolId, ViewSettings,
+    ActionsState, Command, DrawStyle, DrawingMode, LibraryState, Selection, SymmetryMode,
+    SymmetrySettings, ToolId, ViewSettings,
 };
 use peniko::Color;
 
@@ -1464,6 +1465,7 @@ impl Editor {
         }
 
         let merge = self.style.drawing_mode == DrawingMode::MergeShape;
+        let symmetry = self.style.symmetry;
         let frame = self.current_frame;
         let auto = self.auto_keyframe;
         let mut created: Option<ObjectId> = None;
@@ -1475,6 +1477,18 @@ impl Editor {
             // land and appear from.
             if auto {
                 scene.ensure_keyframe(layer, frame);
+            }
+            // Symmetry drawing lays down the mirror copies first (so the stroke
+            // the user is watching stays the selected one), each a reflection or
+            // rotation of the drawn shape about the stage centre.
+            let mirrors = symmetry_transforms(symmetry, scene.stage().size);
+            for t in &mirrors {
+                let copy = mirror_shape(&shape, *t);
+                if merge {
+                    merge_shape_into_layer(scene, layer, frame, copy);
+                } else {
+                    scene.add_shape_at(layer, frame, copy);
+                }
             }
             created = if merge {
                 merge_shape_into_layer(scene, layer, frame, shape)
@@ -5752,6 +5766,50 @@ fn sampled_paint(
 /// must not be clickable either.
 const MAX_SYMBOL_DEPTH: usize = 12;
 
+/// The extra placements a symmetry mode makes for one drawn shape — every copy
+/// but the original, reflected or rotated about the centre of the stage.
+fn symmetry_transforms(sym: SymmetrySettings, stage: buzz_geom::Size) -> Vec<Affine> {
+    if !sym.is_on() {
+        return Vec::new();
+    }
+    let c = buzz_geom::Vec2::new(stage.width / 2.0, stage.height / 2.0);
+    // Reflect about a line through the centre: move to the origin, flip, move back.
+    let reflect = |sx: f64, sy: f64| {
+        Affine::translate(c) * Affine::scale_non_uniform(sx, sy) * Affine::translate(-c)
+    };
+    match sym.mode {
+        SymmetryMode::Off => Vec::new(),
+        SymmetryMode::MirrorX => vec![reflect(-1.0, 1.0)],
+        SymmetryMode::MirrorY => vec![reflect(1.0, -1.0)],
+        SymmetryMode::Both => {
+            vec![reflect(-1.0, 1.0), reflect(1.0, -1.0), reflect(-1.0, -1.0)]
+        }
+        SymmetryMode::Radial => {
+            let n = sym.radial_count.clamp(2, 24);
+            (1..n)
+                .map(|k| {
+                    let angle = std::f64::consts::TAU * k as f64 / n as f64;
+                    Affine::translate(c) * Affine::rotate(angle) * Affine::translate(-c)
+                })
+                .collect()
+        }
+    }
+}
+
+/// One symmetry copy of a shape: its path and any gradient/image paint carried
+/// through the mirror transform, so the copy is a true reflection, fill and all.
+fn mirror_shape(shape: &ShapeData, t: Affine) -> ShapeData {
+    let mut copy = shape.clone();
+    copy.path.apply_affine(t);
+    if let Some(fill) = &mut copy.fill {
+        fill.paint = fill.paint.transformed(t);
+    }
+    if let Some(stroke) = &mut copy.stroke {
+        stroke.paint = stroke.paint.transformed(t);
+    }
+    copy
+}
+
 /// Invert an affine, or `None` if it is singular.
 fn invert(t: Affine) -> Option<Affine> {
     let c = t.as_coeffs();
@@ -6122,6 +6180,31 @@ mod tests {
 
     fn square(x: f64, y: f64, size: f64) -> BezPath {
         KRect::new(x, y, x + size, y + size).to_path(1e-9)
+    }
+
+    #[test]
+    fn symmetry_makes_the_right_number_of_copies() {
+        let size = buzz_geom::Size::new(400.0, 300.0);
+        let sym = |mode, radial| SymmetrySettings { mode, radial_count: radial };
+        assert_eq!(symmetry_transforms(sym(SymmetryMode::Off, 6), size).len(), 0);
+        assert_eq!(symmetry_transforms(sym(SymmetryMode::MirrorX, 6), size).len(), 1);
+        assert_eq!(symmetry_transforms(sym(SymmetryMode::Both, 6), size).len(), 3);
+        assert_eq!(symmetry_transforms(sym(SymmetryMode::Radial, 6), size).len(), 5);
+        // Radial count is clamped into a sane range.
+        assert_eq!(symmetry_transforms(sym(SymmetryMode::Radial, 100), size).len(), 23);
+    }
+
+    #[test]
+    fn mirror_x_reflects_across_the_stage_centre() {
+        let size = buzz_geom::Size::new(400.0, 300.0);
+        let t = symmetry_transforms(
+            SymmetrySettings { mode: SymmetryMode::MirrorX, radial_count: 6 },
+            size,
+        )[0];
+        // A point 30 left of centre lands 30 right of it; the row is unchanged.
+        let p = t * Point::new(170.0, 120.0); // centre x = 200
+        assert!((p.x - 230.0).abs() < 1e-9, "x should mirror to 230, got {}", p.x);
+        assert!((p.y - 120.0).abs() < 1e-9, "y should be unchanged, got {}", p.y);
     }
 
     fn editor() -> Editor {

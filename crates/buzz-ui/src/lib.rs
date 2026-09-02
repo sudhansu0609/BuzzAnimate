@@ -63,7 +63,7 @@ pub use splash::{SplashState, opening_scene};
 pub use staging_panel::{
     ActionChoice, SettingChoice, StagingDialog, StagingResponse, StagingState, staging_dialog,
 };
-pub use style::{DrawStyle, DrawingMode, StrokeKind};
+pub use style::{DrawStyle, DrawingMode, StrokeKind, SymmetryMode, SymmetrySettings};
 pub use swatch_panel::{SwatchState, swatch_panel};
 pub use tasks_panel::{FinishedRow, TaskAction, TaskRow, TasksView, tasks_panel};
 pub use theme::{Metrics, Palette};

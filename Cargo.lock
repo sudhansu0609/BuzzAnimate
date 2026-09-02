@@ -604,6 +604,7 @@ name = "buzz-text"
 version = "0.1.0"
 dependencies = [
  "buzz-geom",
+ "harfrust",
  "skrifa",
 ]
 

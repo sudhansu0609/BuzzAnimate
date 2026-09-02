@@ -1766,21 +1766,44 @@ impl App {
                 // The current values are pulled out first so the scene borrow is
                 // done before `set_text` takes a mutable one.
                 let text_of = self.editor.selection.iter().next().and_then(|id| {
-                    self.editor
-                        .doc
-                        .scene()
-                        .find_object(id)
-                        .and_then(|(_, o)| o.text.as_ref().map(|t| (id, t.content.clone(), t.size)))
+                    self.editor.doc.scene().find_object(id).and_then(|(_, o)| {
+                        o.text.as_ref().map(|t| (id, t.content.clone(), t.size, t.font.clone()))
+                    })
                 });
-                if let Some((id, mut content, mut size)) = text_of {
+                if let Some((id, mut content, mut size, mut font)) = text_of {
                     ui.separator();
                     ui.label("Text");
                     let typed = ui.text_edit_multiline(&mut content).changed();
                     let resized = ui
                         .add(egui::DragValue::new(&mut size).range(4.0..=400.0).prefix("size "))
                         .changed();
-                    if typed || resized {
-                        self.editor.set_text(id, content, size);
+                    // Font picker: "Default" plus every family installed on the
+                    // system (Hindi ones flagged), so calligraphy and Devanagari
+                    // faces are one click away.
+                    let mut refont = false;
+                    let current = font.clone().unwrap_or_else(|| "Default".to_string());
+                    egui::ComboBox::from_id_salt("text-font")
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(font.is_none(), "Default").clicked() {
+                                font = None;
+                                refont = true;
+                            }
+                            for face in buzz_text::available_fonts() {
+                                let label = if face.devanagari {
+                                    format!("{}  \u{0905}", face.family)
+                                } else {
+                                    face.family.clone()
+                                };
+                                let selected = font.as_deref() == Some(face.family.as_str());
+                                if ui.selectable_label(selected, label).clicked() {
+                                    font = Some(face.family.clone());
+                                    refont = true;
+                                }
+                            }
+                        });
+                    if typed || resized || refont {
+                        self.editor.set_text(id, content, size, font);
                     }
                 }
             }

@@ -116,7 +116,11 @@ use serde::{Deserialize, Serialize};
 ///   shown when it is turned to face away — a real turnaround rather than the
 ///   front mirrored. Absent in older files and in every object without a back,
 ///   so an unchanged document is written exactly as version 28 wrote it.
-pub const FORMAT_VERSION: u32 = 29;
+/// * **30** — a text object records the `font` family it was rendered with, so a
+///   Hindi or calligraphy face survives a round-trip. Absent in older files and
+///   in default-font text, so an unchanged document is written exactly as
+///   version 29 wrote it.
+pub const FORMAT_VERSION: u32 = 30;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -1295,6 +1299,10 @@ impl ModifierDto {
 pub struct TextDataDto {
     pub content: String,
     pub size: f64,
+    /// The font family the text was rendered with. Version 30; absent (and
+    /// meaning "system default") in older files and any default-font text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2393,6 +2401,7 @@ impl ObjectDto {
             text: object.text.as_ref().map(|t| TextDataDto {
                 content: t.content.clone(),
                 size: t.size,
+                font: t.font.clone(),
             }),
             reverse: object
                 .reverse
@@ -2559,6 +2568,7 @@ impl ObjectDto {
             text: self.text.as_ref().map(|t| buzz_scene::TextData {
                 content: t.content.clone(),
                 size: t.size,
+                font: t.font.clone(),
             }),
             reverse: self
                 .reverse
@@ -2859,6 +2869,7 @@ mod tests {
             o.text = Some(buzz_scene::TextData {
                 content: "Hello".to_string(),
                 size: 36.0,
+                font: Some("Nirmala UI".to_string()),
             });
         });
 
@@ -2868,7 +2879,8 @@ mod tests {
             object.text,
             Some(buzz_scene::TextData {
                 content: "Hello".to_string(),
-                size: 36.0
+                size: 36.0,
+                font: Some("Nirmala UI".to_string()),
             })
         );
 

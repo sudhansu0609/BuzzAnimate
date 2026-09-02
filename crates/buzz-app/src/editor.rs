@@ -1505,7 +1505,7 @@ impl Editor {
         }
         const DEFAULT: &str = "Text";
         let size = 48.0;
-        let Some(path) = buzz_text::outline(DEFAULT, size) else {
+        let Some(path) = buzz_text::outline(DEFAULT, size, None) else {
             self.status = Some("No font available to draw text with".into());
             return;
         };
@@ -1525,6 +1525,7 @@ impl Editor {
                     o.text = Some(buzz_scene::TextData {
                         content: DEFAULT.to_string(),
                         size,
+                        font: None,
                     });
                 });
             }
@@ -1535,11 +1536,11 @@ impl Editor {
         }
     }
 
-    /// **Re-type a text object**: re-shape its glyphs from `content`/`size` and
-    /// keep the string on it. One undo step across a typing burst (no
+    /// **Re-type a text object**: re-shape its glyphs from `content`/`size`/`font`
+    /// and keep the string on it. One undo step across a typing burst (no
     /// `end_gesture`, so consecutive edits coalesce).
-    pub fn set_text(&mut self, id: ObjectId, content: String, size: f64) {
-        let path = buzz_text::outline(&content, size).unwrap_or_default();
+    pub fn set_text(&mut self, id: ObjectId, content: String, size: f64, font: Option<String>) {
+        let path = buzz_text::outline(&content, size, font.as_deref()).unwrap_or_default();
         self.doc.edit("Edit Text", |scene| {
             scene.update_object_across(0, u32::MAX, id, |o| {
                 if let ObjectKind::Shape(shape) = &mut o.kind {
@@ -1548,6 +1549,7 @@ impl Editor {
                 o.text = Some(buzz_scene::TextData {
                     content: content.clone(),
                     size,
+                    font: font.clone(),
                 });
             });
         });

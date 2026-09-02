@@ -43,7 +43,7 @@ fn editing_text_reshapes_the_glyphs() {
     };
 
     let before = glyph_count(&editor, id);
-    editor.set_text(id, "wwwwwwwwww".to_string(), 96.0);
+    editor.set_text(id, "wwwwwwwwww".to_string(), 96.0, None);
     let after = glyph_count(&editor, id);
 
     assert_ne!(after, before, "a different, larger string should reshape the path");

@@ -10,3 +10,4 @@ authors.workspace = true
 [dependencies]
 buzz-geom.workspace = true
 skrifa.workspace = true
+harfrust.workspace = true

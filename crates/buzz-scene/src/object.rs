@@ -492,6 +492,9 @@ pub struct TextData {
     pub content: String,
     /// Nominal glyph height, in document units.
     pub size: f64,
+    /// Font family to render with, e.g. "Nirmala UI" for Hindi. `None` uses a
+    /// system default, so old documents and the default Text tool still work.
+    pub font: Option<String>,
 }
 
 impl Object {

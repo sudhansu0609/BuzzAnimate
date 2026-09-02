@@ -50,6 +50,9 @@ pub enum VideoCodec {
     Hevc,
     /// AV1. Smaller again, newer, and needs a recent player.
     Av1,
+    /// Apple ProRes 4444 — keeps a real alpha channel, so the work composites
+    /// over anything. Large files, and always a `.mov`.
+    ProRes4444,
 }
 
 impl VideoCodec {
@@ -58,15 +61,17 @@ impl VideoCodec {
             Self::H264 => "H.264",
             Self::Hevc => "HEVC (H.265)",
             Self::Av1 => "AV1",
+            Self::ProRes4444 => "ProRes 4444 (alpha)",
         }
     }
 
-    /// The NVENC encoder for this codec.
+    /// The NVENC encoder for this codec. ProRes has none, so it names its own.
     pub fn hardware_encoder(self) -> &'static str {
         match self {
             Self::H264 => "h264_nvenc",
             Self::Hevc => "hevc_nvenc",
             Self::Av1 => "av1_nvenc",
+            Self::ProRes4444 => "prores_ks",
         }
     }
 
@@ -78,7 +83,14 @@ impl VideoCodec {
             // libaom is very slow; SVT-AV1 is what a modern ffmpeg ships and
             // what anyone encoding AV1 on a CPU actually uses.
             Self::Av1 => "libsvtav1",
+            Self::ProRes4444 => "prores_ks",
         }
+    }
+
+    /// Whether this codec carries an alpha channel — so the export renders on a
+    /// transparent background and ffmpeg is told a pixel format that keeps it.
+    pub fn is_alpha(self) -> bool {
+        matches!(self, Self::ProRes4444)
     }
 }
 
@@ -202,6 +214,10 @@ fn compiled_encoders() -> Vec<String> {
 
 /// Choose the encoder, and say whether it is the one that was asked for.
 fn choose_encoder(settings: &VideoSettings) -> (String, bool) {
+    // ProRes has no hardware path; it is always the one software encoder.
+    if settings.codec.is_alpha() {
+        return (settings.codec.software_encoder().to_string(), false);
+    }
     let available = compiled_encoders();
     let wanted = settings.codec.hardware_encoder();
     if settings.hardware && available.iter().any(|e| e == wanted) {
@@ -245,6 +261,16 @@ pub fn export_video(
         bail!("there are no scenes to export");
     }
 
+    // An alpha codec must render on a transparent background, or there is no
+    // alpha to keep — force it whatever the checkbox says.
+    let effective;
+    let settings = if video.codec.is_alpha() && !settings.transparent {
+        effective = ExportSettings { transparent: true, ..*settings };
+        &effective
+    } else {
+        settings
+    };
+
     // The same resolution through the reel that a PNG sequence uses, so scenes
     // follow one another and a looping section repeats in the video exactly as
     // it does in the frames.
@@ -269,7 +295,7 @@ pub fn export_video(
     // refuses outright. Animate's own 550 x 400 default stage is even, but a
     // scaled export is not reliably so, and "550 works and 551 fails" is a
     // baffling thing to meet mid-deadline.
-    if width % 2 != 0 || height % 2 != 0 {
+    if !video.codec.is_alpha() && (width % 2 != 0 || height % 2 != 0) {
         bail!(
             "video is {width} x {height}, and H.264 and HEVC need both \
              dimensions to be even. Adjust the export size by a pixel."
@@ -413,24 +439,32 @@ fn spawn_ffmpeg(
             .args(["-map", "[aout]"]);
     }
 
-    command
-        .args(["-c:v", encoder])
+    command.args(["-c:v", encoder]);
+
+    if video.codec.is_alpha() {
+        // ProRes 4444 keeps alpha: a 10-bit 4:4:4:4 pixel format and the 4444
+        // profile. No CRF — ProRes is quality-by-profile, not by a rate factor.
+        command
+            .args(["-profile:v", "4444"])
+            .args(["-pix_fmt", "yuva444p10le"]);
+    } else {
         // yuv420p rather than a wider format: it is what every player and
         // every website accepts. A 4:4:4 export would be sharper on hard
         // vector edges and would not play in Safari or QuickTime.
-        .args(["-pix_fmt", "yuv420p"]);
+        command.args(["-pix_fmt", "yuv420p"]);
 
-    // Quality is spelled differently by each family of encoder, and asking for
-    // the wrong one is an error rather than an ignored argument.
-    if encoder.ends_with("_nvenc") {
-        command
-            .args(["-rc", "vbr"])
-            .args(["-cq", &video.quality.to_string()])
-            // NVENC's default preset is fast and soft; p5 is the middle of the
-            // modern scale and is what a render should use.
-            .args(["-preset", "p5"]);
-    } else {
-        command.args(["-crf", &video.quality.to_string()]);
+        // Quality is spelled differently by each family of encoder, and asking
+        // for the wrong one is an error rather than an ignored argument.
+        if encoder.ends_with("_nvenc") {
+            command
+                .args(["-rc", "vbr"])
+                .args(["-cq", &video.quality.to_string()])
+                // NVENC's default preset is fast and soft; p5 is the middle of
+                // the modern scale and is what a render should use.
+                .args(["-preset", "p5"]);
+        } else {
+            command.args(["-crf", &video.quality.to_string()]);
+        }
     }
 
     if !audio.is_empty() {
@@ -444,7 +478,7 @@ fn spawn_ffmpeg(
             .arg("-shortest");
     }
 
-    if video.container == VideoContainer::Mp4 {
+    if video.container == VideoContainer::Mp4 && !video.codec.is_alpha() {
         // Puts the index at the front, so the file starts playing before it has
         // finished downloading. Costs one extra pass over the finished file.
         command.args(["-movflags", "+faststart"]);
@@ -458,9 +492,14 @@ fn spawn_ffmpeg(
     // safety measure. Saying the format outright makes the two independent.
     command.args([
         "-f",
-        match video.container {
-            VideoContainer::Mp4 => "mp4",
-            VideoContainer::Mov => "mov",
+        // ProRes lives in a QuickTime .mov whatever the chosen container says.
+        if video.codec.is_alpha() {
+            "mov"
+        } else {
+            match video.container {
+                VideoContainer::Mp4 => "mp4",
+                VideoContainer::Mov => "mov",
+            }
         },
     ]);
 
@@ -477,6 +516,22 @@ fn spawn_ffmpeg(
 mod tests {
     use super::*;
     use buzz_scene::Scene;
+
+    #[test]
+    fn prores_is_the_alpha_codec_and_chooses_its_own_encoder() {
+        assert!(VideoCodec::ProRes4444.is_alpha());
+        assert!(!VideoCodec::H264.is_alpha());
+        // ProRes has no NVENC path, so it is always its one software encoder,
+        // even when hardware encoding was asked for.
+        let settings = VideoSettings {
+            codec: VideoCodec::ProRes4444,
+            hardware: true,
+            ..VideoSettings::default()
+        };
+        let (encoder, fell_back) = choose_encoder(&settings);
+        assert_eq!(encoder, "prores_ks");
+        assert!(!fell_back, "ProRes was the codec asked for, not a fallback");
+    }
 
     /// Every codec names both a hardware and a software encoder, and they are
     /// never the same string. A codec whose fallback *was* its hardware

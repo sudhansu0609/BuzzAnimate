@@ -5120,6 +5120,9 @@ impl App {
                     buzz_ui::VideoChoice::H264 => PresetFormat::Mp4H264,
                     buzz_ui::VideoChoice::Hevc => PresetFormat::Mp4Hevc,
                     buzz_ui::VideoChoice::Av1 => PresetFormat::Mp4Av1,
+                    // ProRes forces the container to MOV, so it never lands here;
+                    // map it for exhaustiveness.
+                    buzz_ui::VideoChoice::ProRes4444 => PresetFormat::MovHevc,
                 },
             },
         };
@@ -5348,6 +5351,9 @@ impl App {
                                 buzz_ui::VideoChoice::H264 => buzz_export::VideoCodec::H264,
                                 buzz_ui::VideoChoice::Hevc => buzz_export::VideoCodec::Hevc,
                                 buzz_ui::VideoChoice::Av1 => buzz_export::VideoCodec::Av1,
+                                buzz_ui::VideoChoice::ProRes4444 => {
+                                    buzz_export::VideoCodec::ProRes4444
+                                }
                             },
                             container: match options.container {
                                 buzz_ui::ContainerChoice::Mp4 => buzz_export::VideoContainer::Mp4,

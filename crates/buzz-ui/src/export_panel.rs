@@ -120,6 +120,7 @@ pub enum VideoChoice {
     H264,
     Hevc,
     Av1,
+    ProRes4444,
 }
 
 impl VideoChoice {
@@ -128,6 +129,7 @@ impl VideoChoice {
             Self::H264 => "H.264",
             Self::Hevc => "HEVC (H.265)",
             Self::Av1 => "AV1",
+            Self::ProRes4444 => "ProRes 4444 (alpha)",
         }
     }
 
@@ -138,7 +140,15 @@ impl VideoChoice {
             Self::H264 => "Plays everywhere. Choose this unless you have a reason not to.",
             Self::Hevc => "Smaller at the same quality; not every player opens it.",
             Self::Av1 => "Smaller again, and needs a recent player.",
+            Self::ProRes4444 => {
+                "Keeps a real alpha channel for compositing. Large .mov files."
+            }
         }
+    }
+
+    /// ProRes carries transparency; the export renders on no background.
+    pub fn is_alpha(self) -> bool {
+        matches!(self, Self::ProRes4444)
     }
 }
 
@@ -599,12 +609,22 @@ fn settings_view(
                     .selected_text(state.video.codec.label())
                     .width(140.0)
                     .show_ui(ui, |ui| {
-                        for c in [VideoChoice::H264, VideoChoice::Hevc, VideoChoice::Av1] {
+                        for c in [
+                            VideoChoice::H264,
+                            VideoChoice::Hevc,
+                            VideoChoice::Av1,
+                            VideoChoice::ProRes4444,
+                        ] {
                             ui.selectable_value(&mut state.video.codec, c, c.label())
                                 .on_hover_text(c.help());
                         }
                     });
                 ui.end_row();
+
+                // ProRes only lives in a .mov, so the container follows the codec.
+                if state.video.codec.is_alpha() {
+                    state.video.container = ContainerChoice::Mov;
+                }
 
                 ui.label("Quality");
                 // ffmpeg's scale runs backwards — lower is better — which is

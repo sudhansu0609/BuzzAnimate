@@ -594,6 +594,8 @@ pub struct App {
     lights: buzz_render::document::DrawCache,
     /// Autosaves found on launch, while the prompt is still up.
     recovery: buzz_ui::RecoveryState,
+    /// The Ctrl+K command palette's open state and query.
+    command_palette: buzz_ui::CommandPaletteState,
     /// The revision the crash snapshot was last taken at.
     last_crash_revision: Option<u64>,
     /// A scene being renamed from the edit bar: its index and the text so far.
@@ -730,6 +732,7 @@ impl App {
                 cache
             },
             recovery: buzz_ui::RecoveryState::default(),
+            command_palette: buzz_ui::CommandPaletteState::default(),
             last_crash_revision: None,
             scene_rename: None,
             animate_import: None,
@@ -1620,6 +1623,19 @@ impl App {
         let new_document = buzz_ui::new_document_dialog(&ctx, &mut self.editor.new_document);
         if let Some(setup) = new_document.create {
             self.editor.create_document(setup);
+        }
+
+        // Ctrl+K opens the command palette, a search box over every command;
+        // it runs whatever the list has highlighted. Handled here, ahead of the
+        // per-command keymap, so it opens even from a focused field.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+            self.command_palette.toggle();
+        }
+        let has_selection = !self.editor.selection.is_empty();
+        if let Some(command) = buzz_ui::command_palette(&ctx, &mut self.command_palette, |c| {
+            !c.needs_selection() || has_selection
+        }) {
+            commands.push(command);
         }
 
         commands.extend(keyboard_commands(&ctx, &self.editor));

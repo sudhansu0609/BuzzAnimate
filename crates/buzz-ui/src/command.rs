@@ -631,8 +631,18 @@ fn ctrl_semicolon() -> Modifiers {
 /// shortcut in this map is a *promise*, and the code that reads the keyboard
 /// is a separate list that has to keep it.
 pub fn all_with_shortcuts() -> Vec<Command> {
+    palette_commands()
+        .into_iter()
+        .filter(|c| c.shortcut().is_some())
+        .collect()
+}
+
+/// Every command worth offering by name — the whole menu catalogue, in menu
+/// order — for the command palette. The data-carrying commands (a specific
+/// tool, panel or template) are reached other ways and left out.
+pub fn palette_commands() -> Vec<Command> {
     use Command::*;
-    [
+    vec![
         New,
         Open,
         Save,
@@ -753,9 +763,6 @@ pub fn all_with_shortcuts() -> Vec<Command> {
         LipSync,
         NewMouthSymbol,
     ]
-    .into_iter()
-    .filter(|c| c.shortcut().is_some())
-    .collect()
 }
 
 /// Format a shortcut the way a menu shows it.
@@ -770,6 +777,24 @@ pub fn shortcut_text(ctx: &egui::Context, command: Command) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn the_palette_lists_real_commands_with_labels() {
+        let palette = palette_commands();
+        assert!(palette.len() > 50, "the palette should list the whole catalogue");
+        // Every listed command has a non-empty, non-generic label.
+        for c in &palette {
+            assert!(!c.label().is_empty(), "{c:?} has no label");
+        }
+        // A few landmarks a user would search for are present.
+        assert!(palette.contains(&Command::Save));
+        assert!(palette.contains(&Command::PlayPause));
+        assert!(palette.contains(&Command::ExportVideo));
+        // Every shortcut-bearing command is a subset of the palette.
+        for c in all_with_shortcuts() {
+            assert!(palette.contains(&c), "{c:?} has a shortcut but is not in the palette");
+        }
+    }
 
     /// Every command with a shortcut, for exhaustive checks.
     fn all_commands() -> Vec<Command> {

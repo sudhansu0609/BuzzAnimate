@@ -12,6 +12,7 @@ pub mod assets_panel;
 pub mod brush;
 pub mod camera_panel;
 pub mod command;
+pub mod command_palette;
 pub mod depth_panel;
 pub mod export_panel;
 pub mod filter_panel;
@@ -44,6 +45,7 @@ pub use assets_panel::{AssetAction, AssetPanelState, ThumbnailSize, assets_panel
 pub use brush::{BrushKind, BrushSettings, PatternShape};
 pub use camera_panel::{CameraResponse, camera_hud, camera_panel};
 pub use command::Command;
+pub use command_palette::{command_palette, CommandPaletteState};
 pub use depth_panel::{DepthResponse, depth_panel};
 pub use export_panel::{
     ContainerChoice, DitherChoice, ExportKind, ExportResponse, ExportState, GifOptions,

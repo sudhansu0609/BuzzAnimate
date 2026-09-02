@@ -7,6 +7,7 @@
 //! holes.
 
 pub mod assets;
+pub mod commands;
 pub mod autosave;
 pub mod format;
 pub mod history;
@@ -25,6 +26,7 @@ pub use format::{DocError, EXTENSION, MIMETYPE, Meta};
 pub use history::{History, UndoLabel};
 pub use project::{FilmError, PROJECT_EXTENSION, PROJECT_VERSION, Project, Shot};
 pub use serial::{FORMAT_VERSION, SerialError};
+pub use commands::{CommandLibrary, SavedCommand};
 pub use snapshots::SnapshotLibrary;
 pub use templates::{Template, TemplateLibrary};
 

@@ -34,6 +34,8 @@ pub struct ActionsState {
     pub error: Option<String>,
     /// One line about the last run, shown next to the Run button.
     pub summary: Option<String>,
+    /// The name being typed for Save Command.
+    pub save_name: String,
 }
 
 impl ActionsState {
@@ -68,11 +70,22 @@ pub struct SampleEntry {
     pub source: &'static str,
 }
 
+/// One of the user's own saved commands, offered in the Saved menu. Owned,
+/// unlike [`SampleEntry`], because a saved command's name and text are the
+/// user's, read from disk at run time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedScript {
+    pub name: String,
+    pub source: String,
+}
+
 /// What the user did.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ActionsResponse {
     /// Run what is in the box.
     pub run: bool,
+    /// Save the current script as a command under this name.
+    pub save: Option<String>,
 }
 
 /// Draw the Actions panel.
@@ -80,6 +93,7 @@ pub fn actions_panel(
     ui: &mut Ui,
     state: &mut ActionsState,
     samples: &[SampleEntry],
+    saved: &[SavedScript],
 ) -> ActionsResponse {
     let mut response = ActionsResponse::default();
 
@@ -114,6 +128,36 @@ pub fn actions_panel(
                     state.clear_output();
                     ui.close();
                 }
+            }
+        });
+
+        // The user's own saved commands, if any.
+        if !saved.is_empty() {
+            ui.menu_button("Saved ⏷", |ui| {
+                for script in saved {
+                    if ui.button(&script.name).clicked() {
+                        state.source = script.source.clone();
+                        state.clear_output();
+                        ui.close();
+                    }
+                }
+            });
+        }
+
+        // Save the current script as a named command, so it comes back in the
+        // Saved menu and the command palette.
+        ui.menu_button("Save ⏷", |ui| {
+            ui.label("Name");
+            ui.text_edit_singleline(&mut state.save_name);
+            if ui
+                .add_enabled(state.has_source(), egui::Button::new("Save command"))
+                .clicked()
+            {
+                let name = state.save_name.trim();
+                let name = if name.is_empty() { "Command".to_string() } else { name.to_string() };
+                response.save = Some(name);
+                state.save_name.clear();
+                ui.close();
             }
         });
 

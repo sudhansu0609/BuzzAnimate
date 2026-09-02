@@ -626,6 +626,8 @@ pub struct App {
     show_snapshots: bool,
     /// The camera panel's between-frames state (the angle name being typed).
     camera_panel_state: buzz_ui::CameraPanelState,
+    /// The user's saved commands (named Actions scripts).
+    commands: buzz_doc::CommandLibrary,
     /// The revision the crash snapshot was last taken at.
     last_crash_revision: Option<u64>,
     /// A scene being renamed from the edit bar: its index and the text so far.
@@ -766,6 +768,7 @@ impl App {
             snapshots: buzz_doc::SnapshotLibrary::user(),
             show_snapshots: false,
             camera_panel_state: buzz_ui::CameraPanelState::default(),
+            commands: buzz_doc::CommandLibrary::user(),
             last_crash_revision: None,
             scene_rename: None,
             animate_import: None,
@@ -2076,12 +2079,32 @@ impl App {
             }
 
             Actions => {
-                let response =
-                    buzz_ui::actions_panel(ui, &mut self.editor.actions, &script_samples());
+                let saved: Vec<buzz_ui::SavedScript> = self
+                    .commands
+                    .iter()
+                    .map(|c| buzz_ui::SavedScript {
+                        name: c.name.clone(),
+                        source: c.source.clone(),
+                    })
+                    .collect();
+                let response = buzz_ui::actions_panel(
+                    ui,
+                    &mut self.editor.actions,
+                    &script_samples(),
+                    &saved,
+                );
                 // Ctrl+Enter may already have raised it this frame; clicking
                 // Run as well should not run it twice.
                 if response.run && !commands.contains(&Command::RunScript) {
                     commands.push(Command::RunScript);
+                }
+                if let Some(name) = response.save {
+                    match self.commands.save(&name, &self.editor.actions.source) {
+                        Ok(c) => self.editor.status = Some(format!("Saved command: {}", c.name)),
+                        Err(e) => {
+                            self.editor.status = Some(format!("Could not save the command: {e}"))
+                        }
+                    }
                 }
             }
 

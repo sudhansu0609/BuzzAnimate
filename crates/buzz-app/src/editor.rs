@@ -2751,6 +2751,20 @@ impl Editor {
                     None => self.status = Some("The selection has no live modifiers".into()),
                 }
             }
+            BakeModifiers => {
+                let object = {
+                    let scene = self.doc.scene();
+                    self.selection.iter().find(|id| {
+                        scene
+                            .find_object(*id)
+                            .is_some_and(|(_, o)| !o.modifiers.is_empty())
+                    })
+                };
+                match object {
+                    Some(id) => self.bake_modifiers(id),
+                    None => self.status = Some("The selection has no live modifiers".into()),
+                }
+            }
             TogglePanel(panel) => {
                 self.workspace.toggle(panel);
                 self.workspace.save();
@@ -4469,6 +4483,79 @@ impl Editor {
             }
         });
         self.doc.end_gesture();
+    }
+
+    /// **Bake an object's live modifiers into keyframes**, then remove them —
+    /// the inverse of adding a live modifier. Evaluates the modifier stack across
+    /// the film and writes the result as ordinary keyframes on twos, so the
+    /// motion becomes hand-editable and no longer re-computes.
+    pub fn bake_modifiers(&mut self, id: ObjectId) {
+        let Some((layer, _)) = self.doc.scene().find_object(id) else {
+            return;
+        };
+        let span = self.doc.scene().frame_count().max(1);
+        let last = span - 1;
+        let step = 2u32;
+        let mut frames: Vec<u32> = (0..span).step_by(step as usize).collect();
+        if frames.last() != Some(&last) {
+            frames.push(last);
+        }
+
+        // Phase 1: read the modified state at each frame, with the modifiers
+        // still active. Collected before mutating so the borrow is done.
+        let mut baked: Vec<(u32, Affine, Option<Vec<f64>>)> = Vec::new();
+        {
+            let scene = self.doc.scene();
+            let Some(l) = scene.layers().get(layer) else {
+                return;
+            };
+            for &frame in &frames {
+                let resolved = l.frames.resolved_at(frame);
+                let Some(obj) = resolved.iter().find(|o| o.id == id).cloned() else {
+                    continue;
+                };
+                let Some(ev) = scene.modified_object_at(layer, &obj, frame) else {
+                    continue;
+                };
+                let base = ev.object.as_ref().unwrap_or(&obj);
+                let transform = ev.prepend * base.transform;
+                let pose = match &base.kind {
+                    ObjectKind::Armature(rig) => Some(rig.armature.pose()),
+                    _ => None,
+                };
+                baked.push((frame, transform, pose));
+            }
+        }
+        if baked.is_empty() {
+            return;
+        }
+
+        // Phase 2: write the keyframes and drop the modifiers, so the baked
+        // motion is not then applied a second time on top of itself.
+        self.doc.edit("Bake Modifiers", |scene| {
+            scene.update_layer(layer, |l| {
+                if l.frames.length() <= last {
+                    l.frames.insert_frame(last);
+                }
+            });
+            for (frame, transform, pose) in &baked {
+                scene.ensure_keyframe(layer, *frame);
+                scene.update_object_at(*frame, id, |o| {
+                    o.transform = *transform;
+                    if let (Some(p), ObjectKind::Armature(rig)) = (pose.as_ref(), &mut o.kind) {
+                        rig.armature.set_pose(p);
+                    }
+                });
+                if *frame != last {
+                    scene.update_layer(layer, |l| {
+                        l.frames.set_tween(*frame, buzz_scene::Tween::motion());
+                    });
+                }
+            }
+            scene.update_object_across(0, u32::MAX, id, |o| o.modifiers.clear());
+        });
+        self.doc.end_gesture();
+        self.status = Some("Baked the live modifiers into keyframes".into());
     }
 
     /// Move the camera at the playhead, keying it if needed.

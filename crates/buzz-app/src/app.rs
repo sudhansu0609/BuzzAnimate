@@ -2204,13 +2204,25 @@ impl App {
                 }
             }
         };
+        let current_frame = self.editor.current_frame;
         let editor = &mut self.editor;
         let state = &mut editor.light_panel;
         state.trimmed = trimmed;
+        state.current_frame = current_frame;
         let response = buzz_ui::light_panel(ui, editor.doc.scene().lights(), state);
 
         if let Some(id) = response.select {
             editor.light_panel.selected = Some(id);
+        }
+
+        // The Key / Remove-key button, keying the selected light at the playhead
+        // through the same commands the menu and timeline use.
+        if let Some(add) = response.key {
+            editor.run(if add {
+                Command::AddLightKeyframe
+            } else {
+                Command::RemoveLightKeyframe
+            });
         }
 
         if let Some(kind) = response.add {

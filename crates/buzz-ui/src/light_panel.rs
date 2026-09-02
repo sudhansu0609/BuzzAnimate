@@ -43,12 +43,18 @@ pub struct LightResponse {
     pub set_base: Option<Color>,
     /// How strongly shading and highlights are drawn.
     pub set_modelling: Option<f32>,
+    /// The keyframe button was pressed: `true` to key the selected light at the
+    /// playhead, `false` to remove the key there.
+    pub key: Option<bool>,
 }
 
 /// Panel state that is not part of the document.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LightPanelState {
     pub selected: Option<LightId>,
+    /// The playhead, so the keyframe button can key here and show whether the
+    /// selected light already has a key at this frame.
+    pub current_frame: u32,
     /// Draw the light handles on the stage, and let them be dragged.
     pub gizmos: bool,
     /// **What the renderer had to leave out of the last frame**, if anything.
@@ -65,6 +71,7 @@ impl Default for LightPanelState {
     fn default() -> Self {
         Self {
             selected: None,
+            current_frame: 0,
             // On: a light you cannot see is a light you cannot aim, and the
             // handles cost nothing when there are no lights to draw.
             gizmos: true,
@@ -536,6 +543,26 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
         if changed {
             out.changed = Some(edited);
         }
+
+        // Animate this light: key its whole state at the playhead, or clear the
+        // key there. The keys themselves show as a channel on the timeline.
+        ui.separator();
+        ui.horizontal(|ui| {
+            let has_key = light
+                .track
+                .as_ref()
+                .is_some_and(|t| t.has_key_at(state.current_frame));
+            if ui
+                .button(format!("\u{25C6} Key at {}", state.current_frame))
+                .on_hover_text("Add a keyframe for this light at the playhead")
+                .clicked()
+            {
+                out.key = Some(true);
+            }
+            if has_key && ui.button("Remove key").clicked() {
+                out.key = Some(false);
+            }
+        });
     }
 
     // -- the rig ------------------------------------------------------------

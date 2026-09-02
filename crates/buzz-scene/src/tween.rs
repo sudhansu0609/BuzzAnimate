@@ -267,6 +267,22 @@ fn interpolate_object(start: &Object, end: &Object, tween: &Tween, t: f64) -> Ob
     let mut out = start.clone();
     out.transform = lerp_affine(start.transform, end.transform, t, tween.extra_rotations);
 
+    // **Orient along the path.** Animate's "Orient to path" turns the object to
+    // face the way it is travelling rather than holding the rotation it was
+    // keyed with — a car following a bend, a fish nosing along a curve. The
+    // travel here is the straight line between the two keyframes' positions (a
+    // motion tween is a straight move); the rotation is replaced with that
+    // heading while the eased translation and the scale are kept.
+    if tween.orient_to_path {
+        let travel = end.transform.translation() - start.transform.translation();
+        if travel.hypot() > 1e-9 {
+            let (translation, _rotation, scale) = decompose(out.transform);
+            out.transform = Affine::translate(translation.to_vec2())
+                * Affine::rotate(travel.y.atan2(travel.x))
+                * Affine::scale_non_uniform(scale.0, scale.1);
+        }
+    }
+
     // Instance colour effects tween too, which is how a symbol fades out.
     if let (ObjectKind::Instance(a), ObjectKind::Instance(b)) = (&start.kind, &end.kind)
         && let ObjectKind::Instance(target) = &mut out.kind
@@ -578,6 +594,29 @@ mod tests {
             )
             .with_transform(transform),
         )
+    }
+
+    #[test]
+    fn orient_to_path_faces_the_direction_of_travel() {
+        let a = object(1, Affine::translate((0.0, 0.0)));
+        let b = object(2, Affine::translate((100.0, 50.0)));
+        let mut tween = Tween::motion();
+        tween.orient_to_path = true;
+
+        let mid = interpolate_object(&a, &b, &tween, 0.5);
+        let c = mid.transform.as_coeffs();
+        let angle = c[1].atan2(c[0]);
+        let want = 50.0_f64.atan2(100.0);
+        assert!((angle - want).abs() < 1e-6, "faced {angle} rad, expected {want}");
+    }
+
+    #[test]
+    fn without_orient_to_path_an_unrotated_move_stays_unrotated() {
+        let a = object(1, Affine::translate((0.0, 0.0)));
+        let b = object(2, Affine::translate((100.0, 50.0)));
+        let mid = interpolate_object(&a, &b, &Tween::motion(), 0.5);
+        let c = mid.transform.as_coeffs();
+        assert!(c[1].atan2(c[0]).abs() < 1e-9, "no orient should leave rotation alone");
     }
 
     // -- easing -------------------------------------------------------------

@@ -373,6 +373,10 @@ fn parameters(ui: &mut Ui, kind: &mut FilterKind) -> bool {
         FilterKind::Adjust(adjust) => {
             changed |= adjust_fields(ui, adjust);
         }
+        FilterKind::GradientMap(map) => {
+            changed |= colour_field(ui, "Shadow", &mut map.shadow);
+            changed |= colour_field(ui, "Highlight", &mut map.highlight);
+        }
     }
 
     changed

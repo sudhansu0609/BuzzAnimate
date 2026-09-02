@@ -1902,6 +1902,25 @@ impl App {
                             .prefix("copies "),
                     );
                 }
+
+                // Perspective guides: a horizon + rays to 1–3 vanishing points.
+                ui.separator();
+                ui.label("Perspective");
+                let stage = self.editor.doc.scene().stage().size;
+                ui.horizontal(|ui| {
+                    let showing = self.editor.view.perspective.show;
+                    if ui.selectable_label(!showing, "Off").clicked() {
+                        self.editor.view.perspective.show = false;
+                    }
+                    for n in 1..=3usize {
+                        let active = showing
+                            && self.editor.view.perspective.vanishing_points.len() == n;
+                        if ui.selectable_label(active, format!("{n}-pt")).clicked() {
+                            self.editor.view.perspective =
+                                buzz_ui::PerspectiveGuides::seed(stage.width, stage.height, n);
+                        }
+                    }
+                });
             }
 
             Assets => {

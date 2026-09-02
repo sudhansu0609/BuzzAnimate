@@ -65,6 +65,9 @@ pub struct ViewSettings {
     /// Grid spacing in document units.
     pub grid_spacing: f64,
     pub guides: Vec<Guide>,
+    /// Perspective drawing guides — vanishing points and the rays to them.
+    #[serde(default)]
+    pub perspective: PerspectiveGuides,
     /// How close, in *screen pixels*, a drag must come before it snaps.
     pub snap_tolerance_px: f64,
     /// How rough a drawing may be and still be recognised as a circle, a
@@ -85,8 +88,47 @@ impl Default for ViewSettings {
             // Animate's default grid.
             grid_spacing: 10.0,
             guides: Vec::new(),
+            perspective: PerspectiveGuides::default(),
             snap_tolerance_px: 8.0,
         }
+    }
+}
+
+/// One-, two- or three-point perspective guides: a horizon and up to three
+/// vanishing points, with rays fanning out from each so a drawing can be kept
+/// true to a common perspective. Overlay only — a drawing aid, not a snap (v1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerspectiveGuides {
+    pub show: bool,
+    /// The vanishing points, in document units. One to three of them.
+    pub vanishing_points: Vec<Point>,
+    /// The horizon line's y, in document units — where 1- and 2-point vanishing
+    /// points sit and a level to draw against.
+    pub horizon: f64,
+}
+
+impl Default for PerspectiveGuides {
+    fn default() -> Self {
+        Self { show: false, vanishing_points: Vec::new(), horizon: 0.0 }
+    }
+}
+
+impl PerspectiveGuides {
+    /// Sensible starting points for `n`-point perspective over a `width`×`height`
+    /// stage: the horizon across the middle, vanishing points spread along it.
+    pub fn seed(width: f64, height: f64, n: usize) -> Self {
+        let horizon = height / 2.0;
+        let vanishing_points = match n.clamp(1, 3) {
+            1 => vec![Point::new(width / 2.0, horizon)],
+            2 => vec![Point::new(-width * 0.5, horizon), Point::new(width * 1.5, horizon)],
+            _ => vec![
+                Point::new(-width * 0.5, horizon),
+                Point::new(width * 1.5, horizon),
+                // The third point sits below for a worm's-eye / above for bird's.
+                Point::new(width / 2.0, height * 2.0),
+            ],
+        };
+        Self { show: true, vanishing_points, horizon }
     }
 }
 
@@ -302,6 +344,19 @@ mod tests {
 
     fn settings() -> ViewSettings {
         ViewSettings::default()
+    }
+
+    #[test]
+    fn perspective_seed_makes_the_right_number_of_points() {
+        assert!(!ViewSettings::default().perspective.show, "off by default");
+        for n in 1..=3 {
+            let p = PerspectiveGuides::seed(800.0, 600.0, n);
+            assert!(p.show);
+            assert_eq!(p.vanishing_points.len(), n);
+            assert!((p.horizon - 300.0).abs() < 1e-9, "horizon at mid-height");
+        }
+        // Out-of-range counts are clamped, not panicked.
+        assert_eq!(PerspectiveGuides::seed(800.0, 600.0, 9).vanishing_points.len(), 3);
     }
 
     #[test]

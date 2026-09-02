@@ -1588,6 +1588,7 @@ fn draw_layer(
             ghost: layer_alpha,
             effect: ColorTransform::default(),
             adjust: None,
+            gradient_map: None,
             blur: None,
             stage_frame: frame,
             stage_size: scene.stage().size,
@@ -1736,12 +1737,13 @@ fn draw_layer(
             );
         }
 
-        let layer_ctx = match layer_fx.as_ref().and_then(|fx| fx.adjust) {
-            Some(adjust) => DrawCtx {
-                adjust: Some(adjust),
+        let layer_ctx = match layer_fx.as_ref() {
+            Some(fx) if fx.adjust.is_some() || fx.gradient_map.is_some() => DrawCtx {
+                adjust: fx.adjust.or(ctx.adjust),
+                gradient_map: fx.gradient_map.or(ctx.gradient_map),
                 ..ctx.clone()
             },
-            None => ctx.clone(),
+            _ => ctx.clone(),
         };
 
         // Depth of field: a layer off the focus plane is blurred in proportion
@@ -1879,6 +1881,9 @@ struct DrawCtx<'a> {
     /// Adjust Color from a filter on this object or its layer, applied to
     /// every colour inside it.
     adjust: Option<buzz_fx::ColorAdjust>,
+    /// A duotone gradient map from a filter on this object or its layer,
+    /// recolouring every colour inside it by brightness.
+    gradient_map: Option<buzz_fx::GradientMap>,
     /// A blur inherited from a filter, applied to each shape as it is drawn.
     blur: Option<(f64, f64, buzz_fx::Quality)>,
     depth: usize,
@@ -1925,7 +1930,13 @@ impl DrawCtx<'_> {
             Some(adjust) => adjust.apply(c),
             None => c,
         };
-        self.overlay(self.effect.apply(adjusted))
+        // The gradient map recolours by brightness, so it comes after any
+        // brightness/contrast adjustment has settled what "bright" means.
+        let mapped = match self.gradient_map {
+            Some(map) => map.apply(adjusted),
+            None => adjusted,
+        };
+        self.overlay(self.effect.apply(mapped))
     }
 
     /// Put document-space geometry where the lens says it goes.
@@ -2207,6 +2218,7 @@ fn draw_filtered(
     if !painted.hide_subject {
         let inner = DrawCtx {
             adjust: painted.adjust.or(ctx.adjust),
+            gradient_map: painted.gradient_map.or(ctx.gradient_map),
             blur: painted.blur.or(ctx.blur),
             ..ctx.clone()
         };
@@ -2465,6 +2477,7 @@ fn try_stamp_symbol(
         || ctx.faded
         || ctx.ghost.is_some()
         || ctx.adjust.is_some()
+        || ctx.gradient_map.is_some()
         || ctx.blur.is_some()
         || ctx.lighting.is_some()
         || !inner_ctx.effect.is_identity()
@@ -2544,6 +2557,7 @@ fn try_stamp_symbol(
             faded: false,
             ghost: None,
             adjust: None,
+            gradient_map: None,
             blur: None,
             projection: Projection::from_affine(Affine::IDENTITY),
             ..inner_ctx.clone()

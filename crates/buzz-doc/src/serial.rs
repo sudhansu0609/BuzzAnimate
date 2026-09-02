@@ -124,7 +124,10 @@ use serde::{Deserialize, Serialize};
 ///   which is how procedural and bundled textures are drawn. Absent (and off)
 ///   for imported photos, so an unchanged document is written exactly as version
 ///   30 wrote it.
-pub const FORMAT_VERSION: u32 = 31;
+/// * **32** — a new `gradientmap` filter kind (a duotone recolour by
+///   brightness), reusing the shadow/highlight colour keys. Files without one
+///   are unchanged from version 31.
+pub const FORMAT_VERSION: u32 = 32;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -731,6 +734,13 @@ impl FilterDto {
                 dto.saturation = Some(adjust.saturation);
                 dto.hue = Some(adjust.hue);
             }
+            GradientMap(map) => {
+                // A duotone: the two ends reuse the shadow/highlight fields the
+                // Bevel already carries, so no new keys are needed.
+                dto.kind = "gradientmap".into();
+                dto.shadow = Some(color_to_hex(map.shadow));
+                dto.highlight = Some(color_to_hex(map.highlight));
+            }
         }
         dto
     }
@@ -793,6 +803,10 @@ impl FilterDto {
                 contrast: self.contrast.unwrap_or_default(),
                 saturation: self.saturation.unwrap_or_default(),
                 hue: self.hue.unwrap_or_default(),
+            }),
+            "gradientmap" => FilterKind::GradientMap(buzz_scene::GradientMap {
+                shadow: colour(&self.shadow, Color::from_rgb8(0x2B, 0x1D, 0x10))?,
+                highlight: colour(&self.highlight, Color::from_rgb8(0xF2, 0xE6, 0xCF))?,
             }),
             other => {
                 return Err(SerialError::Unsupported(format!(
@@ -3440,6 +3454,19 @@ mod tests {
             hue: None,
         };
         assert!(dto.to_filter().is_err());
+    }
+
+    #[test]
+    fn a_gradient_map_filter_round_trips() {
+        let filter = buzz_scene::Filter::new(buzz_scene::FilterKind::GradientMap(
+            buzz_scene::GradientMap {
+                shadow: Color::from_rgb8(0x11, 0x22, 0x33),
+                highlight: Color::from_rgb8(0xEE, 0xDD, 0xCC),
+            },
+        ));
+        let dto = FilterDto::from_filter(&filter);
+        assert_eq!(dto.kind, "gradientmap");
+        assert_eq!(dto.to_filter().unwrap(), filter);
     }
 
     #[test]

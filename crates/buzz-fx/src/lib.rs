@@ -193,6 +193,50 @@ pub enum FilterKind {
 
     /// Brightness, contrast, saturation and hue — exact, and free.
     Adjust(ColorAdjust),
+
+    /// Recolour by brightness: dark tones take the `shadow` colour, light tones
+    /// the `highlight`, everything between a blend of the two. A duotone
+    /// gradient map — sepia, cyanotype, and every two-colour graded look.
+    GradientMap(GradientMap),
+}
+
+/// A duotone gradient map: luminance 0 maps to `shadow`, luminance 1 to
+/// `highlight`, linearly between. Alpha is left untouched, so a cut-out stays
+/// cut out.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GradientMap {
+    pub shadow: Color,
+    pub highlight: Color,
+}
+
+impl Default for GradientMap {
+    fn default() -> Self {
+        // A warm sepia, the most recognisable gradient map.
+        Self {
+            shadow: Color::from_rgb8(0x2B, 0x1D, 0x10),
+            highlight: Color::from_rgb8(0xF2, 0xE6, 0xCF),
+        }
+    }
+}
+
+impl GradientMap {
+    /// Remap one colour by its luminance, keeping its alpha.
+    pub fn apply(&self, c: Color) -> Color {
+        let [r, g, b, a] = c.to_rgba8().to_u8_array();
+        // Rec. 601 luma, which is what an eye reads as brightness.
+        let l = (0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64) / 255.0;
+        let mix = |lo: u8, hi: u8| (lo as f64 + (hi as f64 - lo as f64) * l).round() as u8;
+        let [sr, sg, sb, _] = self.shadow.to_rgba8().to_u8_array();
+        let [hr, hg, hb, _] = self.highlight.to_rgba8().to_u8_array();
+        Color::from_rgba8(mix(sr, hr), mix(sg, hg), mix(sb, hb), a)
+    }
+
+    pub fn lerp(&self, other: &Self, t: f64) -> Self {
+        Self {
+            shadow: lerp_color(self.shadow, other.shadow, t),
+            highlight: lerp_color(self.highlight, other.highlight, t),
+        }
+    }
 }
 
 impl FilterKind {
@@ -203,7 +247,12 @@ impl FilterKind {
             Self::Glow { .. } => "Glow",
             Self::Bevel { .. } => "Bevel",
             Self::Adjust(_) => "Adjust Color",
+            Self::GradientMap(_) => "Gradient Map",
         }
+    }
+
+    pub fn gradient_map() -> Self {
+        Self::GradientMap(GradientMap::default())
     }
 
     /// Animate's defaults, which are the ones an animator's hands expect.
@@ -385,6 +434,8 @@ impl FilterKind {
 
             (Self::Adjust(a), Self::Adjust(b)) => Self::Adjust(a.lerp(b, t)),
 
+            (Self::GradientMap(a), Self::GradientMap(b)) => Self::GradientMap(a.lerp(b, t)),
+
             // Different kinds: hold the start, as Animate does.
             _ => self.clone(),
         }
@@ -398,6 +449,7 @@ impl FilterKind {
             Self::glow(),
             Self::bevel(),
             Self::adjust(),
+            Self::gradient_map(),
         ]
     }
 
@@ -439,6 +491,7 @@ impl FilterKind {
                 _ => x.max(*y) + distance.abs(),
             },
             Self::Adjust(_) => 0.0,
+            Self::GradientMap(_) => 0.0,
         }
     }
 }
@@ -667,6 +720,19 @@ fn lerp_color(a: Color, b: Color, t: f64) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gradient_map_sends_black_to_shadow_and_white_to_highlight() {
+        let map = GradientMap {
+            shadow: Color::from_rgb8(0x10, 0x20, 0x30),
+            highlight: Color::from_rgb8(0xF0, 0xE0, 0xD0),
+        };
+        assert_eq!(map.apply(Color::BLACK).to_rgba8().to_u8_array()[..3], [0x10, 0x20, 0x30]);
+        assert_eq!(map.apply(Color::WHITE).to_rgba8().to_u8_array()[..3], [0xF0, 0xE0, 0xD0]);
+        // Alpha rides through untouched, so a cut-out stays cut out.
+        let translucent = Color::from_rgba8(0, 0, 0, 0x80);
+        assert_eq!(map.apply(translucent).to_rgba8().to_u8_array()[3], 0x80);
+    }
 
     #[test]
     fn nothing_set_changes_nothing() {
@@ -929,6 +995,6 @@ mod tests {
         for kind in FilterKind::all() {
             assert!(!kind.label().is_empty());
         }
-        assert_eq!(FilterKind::all().len(), 5);
+        assert_eq!(FilterKind::all().len(), 6);
     }
 }

@@ -71,5 +71,7 @@ pub use timeline_panel::{
     FrameAction, TimelineResponse, TimelineState, TweenRequest, Waveform, timeline_panel,
 };
 pub use tools::{ToolId, ToolStatus, all_tools, tool_for_key};
-pub use view::{Guide, Orientation, SnapSettings, SnapTarget, Snapped, ViewSettings};
+pub use view::{
+    Guide, Orientation, PerspectiveGuides, SnapSettings, SnapTarget, Snapped, ViewSettings,
+};
 pub use workspace::{Dock, GroupId, PanelId, Section, Slot, Workspace};

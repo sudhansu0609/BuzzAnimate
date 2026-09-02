@@ -326,6 +326,10 @@ pub fn draw_chrome(ui: &mut Ui, editor: &Editor, area: egui::Rect) -> ChromeResp
         draw_guides(&painter, area, view, to_screen);
     }
 
+    if view.perspective.show {
+        draw_perspective(&painter, area, view, to_screen);
+    }
+
     // Where the pointer is, so the rotate mark can appear on the corner it is
     // actually near rather than on all four at once.
     let pointer = ui.input(|i| i.pointer.hover_pos());
@@ -426,6 +430,49 @@ fn draw_guides(
                 }
             }
         }
+    }
+}
+
+/// Perspective guides: a horizon line and a fan of rays converging on each
+/// vanishing point, so freehand drawing can be kept true to one perspective.
+fn draw_perspective(
+    painter: &egui::Painter,
+    area: egui::Rect,
+    view: &buzz_ui::ViewSettings,
+    to_screen: impl Fn(Point) -> egui::Pos2,
+) {
+    let p = &view.perspective;
+    let ray = Stroke::new(1.0, Palette::guide().gamma_multiply(0.5));
+    let horizon = Stroke::new(1.0, Palette::guide());
+
+    // The horizon runs the width of the view at its document height.
+    let hy = to_screen(Point::new(0.0, p.horizon)).y;
+    if hy >= area.min.y && hy <= area.max.y {
+        painter.line_segment([egui::pos2(area.min.x, hy), egui::pos2(area.max.x, hy)], horizon);
+    }
+
+    // From each vanishing point, fan rays out to points walked around the edge
+    // of the view, so the lines converge exactly on the point at any zoom.
+    const RAYS: usize = 24;
+    for vp in &p.vanishing_points {
+        let v = to_screen(*vp);
+        for i in 0..RAYS {
+            let edge = border_point(area, i as f32 / RAYS as f32);
+            painter.line_segment([v, edge], ray);
+        }
+    }
+}
+
+/// A point walked `t` (0..1) of the way around the rectangle's perimeter,
+/// clockwise from the top-left.
+fn border_point(area: egui::Rect, t: f32) -> egui::Pos2 {
+    let per = (t.rem_euclid(1.0)) * 4.0;
+    let lerp = |a: f32, b: f32, u: f32| a + (b - a) * u;
+    match per as u32 {
+        0 => egui::pos2(lerp(area.min.x, area.max.x, per), area.min.y),
+        1 => egui::pos2(area.max.x, lerp(area.min.y, area.max.y, per - 1.0)),
+        2 => egui::pos2(lerp(area.max.x, area.min.x, per - 2.0), area.max.y),
+        _ => egui::pos2(area.min.x, lerp(area.max.y, area.min.y, per - 3.0)),
     }
 }
 

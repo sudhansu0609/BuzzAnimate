@@ -81,6 +81,8 @@ pub struct Painted {
     pub blur: Option<(f64, f64, Quality)>,
     /// Colour adjustment to apply to every colour in the subject.
     pub adjust: Option<ColorAdjust>,
+    /// A duotone gradient map to recolour every colour in the subject.
+    pub gradient_map: Option<crate::GradientMap>,
 }
 
 impl Painted {
@@ -90,6 +92,7 @@ impl Painted {
             && !self.hide_subject
             && self.blur.is_none()
             && self.adjust.is_none()
+            && self.gradient_map.is_none()
     }
 }
 
@@ -112,6 +115,10 @@ pub fn build(filters: &[Filter], silhouette: &BezPath) -> Painted {
                     Some(_) => *adjust,
                     None => *adjust,
                 });
+            }
+
+            FilterKind::GradientMap(map) => {
+                out.gradient_map = Some(*map);
             }
 
             FilterKind::Blur { x, y, quality } => {

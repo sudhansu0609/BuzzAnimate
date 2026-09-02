@@ -68,6 +68,24 @@ fn column_overflow(width: f32, draw: impl FnOnce(&mut egui::Ui)) -> f32 {
     over
 }
 
+/// A character's worth of loose drawings, named the way a tidy export names
+/// them — which is also the longest a part name usually gets.
+fn rig_parts() -> Vec<LoosePart> {
+    let names = [
+        "hips", "torso", "head", "L_upperArm", "L_forearm", "R_upperArm", "R_forearm", "L_thigh",
+        "L_shin", "R_thigh", "R_shin", "cape_back", "prop_walking_stick",
+    ];
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| LoosePart {
+            object: buzz_scene::ObjectId(index as u64 + 1),
+            layer: buzz_scene::LayerId(1),
+            name: (*name).to_string(),
+        })
+        .collect()
+}
+
 /// Draw a column of panels and report how tall it came out.
 fn column_height(width: f32, draw: impl FnOnce(&mut egui::Ui)) -> f32 {
     let ctx = egui::Context::default();
@@ -112,7 +130,9 @@ fn the_library_and_the_assets_panel_fit_side_by_side_in_one_column() {
     let used = column_height(240.0, |ui| {
         let _ = library_panel(ui, &mut scene, &mut lib_state, &Default::default(), &mut |_| None);
         ui.separator();
-        let _ = assets_panel(ui, &assets, &mut asset_state, false);
+        // No textures in a headless layout test: the thumbnails are what the
+        // closure is for, and their absence does not change a column's width.
+        let _ = assets_panel(ui, &assets, &mut asset_state, false, &mut |_| None);
     });
 
     assert!(
@@ -346,7 +366,18 @@ fn every_docked_panel_fits_the_narrowest_column() {
     check(
         "Armature",
         column_overflow(narrowest, |ui| {
-            let _ = rig_panel(ui, None, &[], &mut RigPanelState::default());
+            let _ = rig_panel(ui, None, &[], &[], None, &mut RigPanelState::default());
+        }),
+        &mut failures,
+    );
+    // The rigging half of the same panel, which is a different shape: a slot
+    // list with a name, a drop target and a clear button on every row, and a
+    // tray of loose drawings under it. Eleven of those rows in a column this
+    // narrow is exactly where a row runs off the right-hand edge.
+    check(
+        "Rigging",
+        column_overflow(narrowest, |ui| {
+            let _ = rig_panel(ui, None, &[], &rig_parts(), None, &mut RigPanelState::default());
         }),
         &mut failures,
     );
@@ -374,7 +405,7 @@ fn every_docked_panel_fits_the_narrowest_column() {
     check(
         "Assets",
         column_overflow(narrowest, |ui| {
-            let _ = assets_panel(ui, &assets, &mut assets_state, false);
+            let _ = assets_panel(ui, &assets, &mut assets_state, false, &mut |_| None);
         }),
         &mut failures,
     );

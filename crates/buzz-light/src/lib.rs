@@ -45,9 +45,10 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
 pub use geometry::{
-    HIGHLIGHT_SHARE, crescent_offset, highlight_reach, shade_reach,
-    GloomBand, LightPool, ShadeGeometry, cast_shadow, crescent_direction, crescents, gloom_at,
-    gloom_band, highlight_crescent, light_pool, shade_crescent, shadow_transform,
+    HIGHLIGHT_SHARE, RIM_REACH, crescent_offset, highlight_reach, shade_reach,
+    GloomBand, LightPool, RimGlow, ShadeGeometry, cast_shadow, crescent_direction, crescents,
+    gloom_at, gloom_band, highlight_crescent, light_pool, rim_glow, shade_crescent,
+    shadow_transform,
 };
 pub use track::{LightKey, LightTrack};
 
@@ -241,6 +242,32 @@ pub struct Light {
     /// see [`LightRig::aim`]. Brightness and colour turn nothing.
     #[serde(default)]
     pub flicker: f32,
+    /// **How brightly this light rims the artwork it reaches**, `0.0..=1.0`.
+    /// Zero is a light that does not, which is every light until this existed.
+    ///
+    /// # What it is
+    ///
+    /// A glow around the *outside* edge of a drawing, in the light's own
+    /// colour, spilling onto whatever is behind it. It is Animate's Glow filter
+    /// \u2014 the same geometry, through the same code \u2014 with two differences that
+    /// are the whole point: it is laid by the **light** rather than set on the
+    /// artwork, so it appears when the light comes up and goes when it goes;
+    /// and it takes the light's colour and the light's falloff, so a figure
+    /// walking out of a lamp's reach loses its rim as it goes.
+    ///
+    /// # Why a light needs one at all
+    ///
+    /// Everything else lighting does here happens *inside* the silhouette: the
+    /// tint, the terminator, the highlight. A cast shadow is the one thing that
+    /// leaves it, and it is dark. So a lit drawing had no way to be brighter
+    /// than the picture around it \u2014 which is exactly what a strong light on a
+    /// figure looks like, and what an animator draws by hand as a rim.
+    ///
+    /// Its *width* comes from this number too, so one slider makes it appear
+    /// rather than two making it appear and then be visible. See
+    /// [`Light::rim_glow`].
+    #[serde(default)]
+    pub rim: f32,
     /// The light's animation, if it has one. `None` is a static light — every
     /// document until Wave 9a, and most since. See [`LightTrack`], and
     /// [`LightRig::resolved_at`] for how the renderer reads it.
@@ -316,6 +343,11 @@ impl Light {
             // loudest thing in a full one. The slider still goes to one.
             glow: 0.35,
             flicker: 0.0,
+            // **Off by default.** A rim is a deliberate look, not a property of
+            // light, and switching one on for every document that has ever
+            // added a lamp would change finished films. It also costs a
+            // silhouette per lit layer, which nothing should pay for unasked.
+            rim: 0.0,
             track: None,
         };
 
@@ -374,6 +406,12 @@ impl Light {
         // the stage; a fire is a visible thing in the shot rather than a bulb,
         // and the glow around it is half of what says so.
         self.glow = self.glow.max(0.6);
+        // **A fire rims what stands in front of it.** It is the brightest thing
+        // in its own shot and close to whatever it lights, which is the one
+        // arrangement where an edge really does come up brighter than the
+        // picture \u2014 and, because the rim follows the light's intensity, it
+        // gutters with the flame rather than sitting there steadily.
+        self.rim = self.rim.max(0.5);
         if let LightKind::Lamp { radius, .. } = &mut self.kind {
             *radius *= 0.8;
         }
@@ -460,6 +498,7 @@ impl Light {
         f(hasher, self.softness);
         self.glow.to_bits().hash(hasher);
         self.flicker.to_bits().hash(hasher);
+        self.rim.to_bits().hash(hasher);
         match &self.kind {
             LightKind::Sun { azimuth, elevation } => {
                 0u8.hash(hasher);

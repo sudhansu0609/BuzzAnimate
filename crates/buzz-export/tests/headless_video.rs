@@ -74,7 +74,7 @@ fn export(
     let path = dir.join(format!("{name}.{}", video.container.extension()));
 
     match export_video(
-        &scene,
+        &buzz_export::Reel::single(&scene),
         frames,
         &path,
         &settings,
@@ -305,7 +305,7 @@ fn a_cancelled_export_leaves_no_file_behind() {
     let path = dir.path().join("cancelled.mp4");
 
     let result = export_video(
-        &scene,
+        &buzz_export::Reel::single(&scene),
         0..20,
         &path,
         &settings,
@@ -350,7 +350,7 @@ fn an_odd_size_is_refused_with_a_reason() {
     settings.width = 321;
 
     let result = export_video(
-        &scene,
+        &buzz_export::Reel::single(&scene),
         0..2,
         &dir.path().join("odd.mp4"),
         &settings,
@@ -403,7 +403,7 @@ fn a_soundtrack_is_muxed_in_at_its_cue() {
 
     // Two seconds of film at 24 fps, with the tone cued half a second in.
     let report = match export_video(
-        &scene,
+        &buzz_export::Reel::single(&scene),
         0..48,
         &path,
         &settings,
@@ -488,7 +488,7 @@ fn audio_can_be_switched_off() {
         ..Default::default()
     };
     let report = match export_video(
-        &scene,
+        &buzz_export::Reel::single(&scene),
         0..8,
         &path,
         &settings,

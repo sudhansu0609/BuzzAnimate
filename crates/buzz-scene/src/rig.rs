@@ -68,6 +68,23 @@ pub struct ArmatureData {
     /// into the Assets library, into another document — all of which copy
     /// objects whole.
     pub poses: Vec<NamedPose>,
+    /// The rig pattern this skeleton was assembled from, if it was.
+    ///
+    /// # Why a name and not the pattern itself
+    ///
+    /// Nothing here reads the pattern back to work out how the rig behaves —
+    /// the bones are the truth, and a rig whose bones have been edited by hand
+    /// is still that rig. The name is for the Rigging panel: it says which
+    /// slot list to show, so that a character can be opened a week later and
+    /// have a redrawn arm dropped back into "Elbow L" without rebuilding the
+    /// skeleton.
+    ///
+    /// Bone index and slot index are the same number, which is what makes that
+    /// work and is why `assemble` gives every slot a bone whether or not
+    /// anything was dropped on it. A name that no longer matches any pattern —
+    /// a file from a later version, a pattern that was renamed — leaves the
+    /// panel showing the plain bone list, which is what it showed before.
+    pub pattern: Option<String>,
 }
 
 /// A pose worth keeping, and what to call it.
@@ -91,6 +108,7 @@ impl ArmatureData {
             armature,
             parts: Vec::new(),
             poses: Vec::new(),
+            pattern: None,
         }
     }
 

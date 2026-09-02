@@ -302,7 +302,7 @@ pub fn top_banner(ctx: &egui::Context, rect: egui::Rect) {
 /// Orange to grey to blue, left to right: the studio's colour, the neutral
 /// that keeps the two from arguing, and the accent this program already uses
 /// for selection.
-fn brand_at(t: f32) -> Color32 {
+pub fn brand_at(t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let (from, to, local) = if t <= 0.5 {
         (BRAND[0], BRAND[1], t * 2.0)
@@ -321,7 +321,7 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
-fn vertex(pos: egui::Pos2, color: Color32) -> egui::epaint::Vertex {
+pub(crate) fn vertex(pos: egui::Pos2, color: Color32) -> egui::epaint::Vertex {
     egui::epaint::Vertex {
         pos,
         uv: egui::epaint::WHITE_UV,

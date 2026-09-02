@@ -127,6 +127,39 @@ impl Document {
         self.active
     }
 
+    /// **Every scene, in the order the film plays them.**
+    ///
+    /// Snapshots, for an export to take to its own thread. Copy-on-write, so
+    /// this is a handful of pointer copies rather than a copy of the artwork.
+    pub fn film(&self) -> Vec<Scene> {
+        self.scenes.iter().map(|s| s.scene.clone()).collect()
+    }
+
+    /// How long the whole film is, in frames — every scene end to end, each
+    /// counting its own looping section.
+    ///
+    /// What the export dialog's range runs over, so "all of it" means all of
+    /// the film rather than all of whichever scene happened to be open.
+    pub fn film_frames(&self) -> u32 {
+        self.scenes
+            .iter()
+            .map(|s| s.scene.rendered_frame_count())
+            .sum()
+    }
+
+    /// The first film frame of the scene at `index`.
+    ///
+    /// What turns "the frame I am looking at" into "the frame of the film I am
+    /// looking at" — which is what an exported still, and a range typed
+    /// against the film, both need.
+    pub fn film_start_of(&self, index: usize) -> u32 {
+        self.scenes
+            .iter()
+            .take(index)
+            .map(|s| s.scene.rendered_frame_count())
+            .sum()
+    }
+
     /// Add a new empty scene after the active one and switch to it. The stage
     /// size, frame rate and background carry over, as a new scene in Animate
     /// inherits the document's, so the shots match without setting them again.
@@ -145,11 +178,68 @@ impl Document {
         );
     }
 
+    /// **Duplicate a scene**, whole, and switch to the copy.
+    ///
+    /// The set, the cast, the lights, the camera track and every keyframe come
+    /// with it. This is the operation a conversation is built out of: two
+    /// people standing in a room is the *same* scene beat after beat, and only
+    /// the performance differs — so the second shot starts as a copy of the
+    /// first and is then changed, rather than being staged again or pasted
+    /// frame by frame onto the end of the one before it.
+    ///
+    /// The copy gets its **own history**, not the original's. Sharing one
+    /// would mean undoing in the new scene reaching back into the old one's
+    /// past and quietly rewriting a shot that was already finished.
+    pub fn duplicate_scene(&mut self, index: usize) {
+        let Some(source) = self.scenes.get(index) else {
+            return;
+        };
+        // Named after what it came from, so a duplicated "Kitchen" is
+        // "Kitchen 2" rather than "Scene 4" — the name is how a director finds
+        // a shot in a list of twenty.
+        let stem = source
+            .name
+            .trim_end_matches(|c: char| c.is_ascii_digit() || c.is_whitespace());
+        let stem = if stem.is_empty() { "Scene" } else { stem };
+        let name = self.unique_scene_name(stem);
+        let scene = source.scene.clone();
+
+        self.active = index + 1;
+        self.scenes.insert(
+            self.active,
+            SceneSlot {
+                name,
+                scene,
+                history: History::default(),
+            },
+        );
+    }
+
+    /// Move a scene to another position, and follow it.
+    ///
+    /// Scenes are an *ordered* list — they are the order the film plays in —
+    /// so being able to say "this beat comes before that one" is part of
+    /// having them at all.
+    pub fn move_scene(&mut self, from: usize, to: usize) {
+        if from >= self.scenes.len() || to >= self.scenes.len() || from == to {
+            return;
+        }
+        let slot = self.scenes.remove(from);
+        self.scenes.insert(to, slot);
+        self.active = to;
+    }
+
     /// A scene name not already taken, e.g. `Scene 3`.
+    ///
+    /// Numbering starts at two when the bare stem is itself a scene, because
+    /// a scene called "Kitchen" *is* the first Kitchen: the copy beside it
+    /// should be "Kitchen 2", not "Kitchen 1" sitting after it.
     fn unique_scene_name(&self, stem: &str) -> String {
-        for n in 1.. {
+        let taken = |name: &str| self.scenes.iter().any(|s| s.name == name);
+        let first = if taken(stem) { 2 } else { 1 };
+        for n in first.. {
             let candidate = format!("{stem} {n}");
-            if !self.scenes.iter().any(|s| s.name == candidate) {
+            if !taken(&candidate) {
                 return candidate;
             }
         }
@@ -478,6 +568,100 @@ mod tests {
         let reopened = Document::open(&path).unwrap();
         assert_eq!(reopened.scene_names(), vec!["Scene 1", "Chase"]);
         assert_eq!(reopened.active_scene(), 1, "the active scene is remembered");
+        assert_eq!(reopened.scene().shape_count(), 2);
+    }
+
+    /// **Duplicating a scene copies the whole thing.** The operation a
+    /// conversation is built out of: the next beat is the same room and the
+    /// same two people, so it starts as a copy rather than as an empty stage
+    /// or as frames pasted onto the end of the shot before it.
+    #[test]
+    fn duplicating_a_scene_copies_all_of_it_and_opens_the_copy() {
+        let mut doc = Document::default();
+        doc.rename_scene(0, "Kitchen");
+        doc.edit("Draw", add_shape);
+        doc.edit("Draw", add_shape);
+
+        doc.duplicate_scene(0);
+
+        assert_eq!(doc.active_scene(), 1, "the copy is opened for editing");
+        assert_eq!(
+            doc.scene_names(),
+            vec!["Kitchen", "Kitchen 2"],
+            "and is named after what it came from, next to it in the order"
+        );
+        assert_eq!(
+            doc.scene().shape_count(),
+            2,
+            "the copy carries the whole set, not an empty stage"
+        );
+
+        // The two are now separate: changing the copy leaves the original.
+        doc.edit("Draw", add_shape);
+        assert_eq!(doc.scene().shape_count(), 3);
+        doc.switch_scene(0);
+        assert_eq!(doc.scene().shape_count(), 2, "the original is untouched");
+    }
+
+    /// The copy gets its **own** history. Sharing one would let an undo in the
+    /// new shot reach back and rewrite the shot it was copied from.
+    #[test]
+    fn a_duplicated_scene_has_its_own_undo_history() {
+        let mut doc = Document::default();
+        doc.edit("Draw", add_shape);
+        doc.duplicate_scene(0);
+
+        // Fresh history: there is nothing of the original's past to undo.
+        assert!(
+            !doc.can_undo(),
+            "the copy starts with a clean history of its own"
+        );
+
+        doc.edit("Draw", add_shape);
+        assert!(doc.undo(), "and undoes its own edits");
+        assert_eq!(doc.scene().shape_count(), 1);
+        doc.switch_scene(0);
+        assert_eq!(doc.scene().shape_count(), 1, "the original never moved");
+    }
+
+    /// Scenes are the order the film plays in, so that order has to be
+    /// changeable.
+    #[test]
+    fn scenes_can_be_reordered() {
+        let mut doc = Document::default();
+        doc.rename_scene(0, "Opening");
+        doc.add_scene();
+        doc.rename_scene(1, "Chase");
+        doc.add_scene();
+        doc.rename_scene(2, "Ending");
+        assert_eq!(doc.scene_names(), vec!["Opening", "Chase", "Ending"]);
+
+        doc.move_scene(2, 0);
+        assert_eq!(doc.scene_names(), vec!["Ending", "Opening", "Chase"]);
+        assert_eq!(doc.active_scene(), 0, "the moved scene is followed");
+
+        // Nonsense is refused rather than panicking or reshuffling.
+        doc.move_scene(0, 9);
+        doc.move_scene(9, 0);
+        doc.move_scene(1, 1);
+        assert_eq!(doc.scene_names(), vec!["Ending", "Opening", "Chase"]);
+    }
+
+    /// Duplicated scenes survive the file, in order, like any other.
+    #[test]
+    fn a_duplicated_scene_round_trips_through_a_saved_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.buzz");
+
+        let mut doc = Document::default();
+        doc.rename_scene(0, "Kitchen");
+        doc.edit("Draw", add_shape);
+        doc.duplicate_scene(0);
+        doc.edit("Draw", add_shape);
+        doc.save_as(&path).unwrap();
+
+        let reopened = Document::open(&path).unwrap();
+        assert_eq!(reopened.scene_names(), vec!["Kitchen", "Kitchen 2"]);
         assert_eq!(reopened.scene().shape_count(), 2);
     }
 

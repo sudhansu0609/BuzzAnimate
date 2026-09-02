@@ -903,7 +903,7 @@ fn the_film_exports_at_a_usable_rate() {
     let chunk = 240; // ten seconds
     let started = Instant::now();
     let report = buzz_export::export_video(
-        &scene,
+        &buzz_export::Reel::single(&scene),
         0..chunk,
         &path,
         &settings,

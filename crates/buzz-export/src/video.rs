@@ -37,7 +37,6 @@ use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use buzz_render::GpuPreference;
-use buzz_scene::Scene;
 
 use crate::{ExportSettings, Exporter};
 
@@ -222,7 +221,7 @@ fn choose_encoder(settings: &VideoSettings) -> (String, bool) {
 /// no trailing index is a file that will not open.
 #[allow(clippy::too_many_arguments, reason = "one call site, all of it needed")]
 pub fn export_video(
-    scene: &Scene,
+    reel: &crate::Reel<'_>,
     frames: std::ops::Range<u32>,
     path: &Path,
     settings: &ExportSettings,
@@ -242,10 +241,15 @@ pub fn export_video(
         );
     }
 
-    // The same resolution through the playlist that a PNG sequence uses, so a
-    // looping section repeats in the video exactly as it does in the frames.
-    let playlist = scene.playlist();
-    let fps = scene.stage().frame_rate.max(1.0);
+    if reel.is_empty() {
+        bail!("there are no scenes to export");
+    }
+
+    // The same resolution through the reel that a PNG sequence uses, so scenes
+    // follow one another and a looping section repeats in the video exactly as
+    // it does in the frames.
+    let lead = reel.lead().expect("a non-empty reel has a lead scene");
+    let fps = lead.stage().frame_rate.max(1.0);
     let (encoder, fell_back) = choose_encoder(video);
 
     let mut exporter = Exporter::new(preference)?;
@@ -254,11 +258,10 @@ pub fn export_video(
     // Rendered once before the pipe opens, so a size ffmpeg cannot take is
     // reported before a process is started rather than after.
     let numbers: Vec<u32> = frames.collect();
-    let first = playlist
-        .get(numbers[0] as usize)
-        .copied()
-        .unwrap_or(numbers[0]);
-    let probe = exporter.render(scene, first, settings)?;
+    let (first_scene, first_frame) = reel
+        .at_clamped(numbers[0])
+        .expect("a non-empty reel always has a frame to hold on");
+    let probe = exporter.render(first_scene, first_frame, settings)?;
     let (width, height) = (probe.width, probe.height);
 
     // **H.264 and HEVC need even dimensions.** Their chroma is subsampled by
@@ -295,10 +298,9 @@ pub fn export_video(
 
     for (i, &index) in numbers.iter().enumerate() {
         if i > 0 {
-            let at = playlist
-                .get(index as usize)
-                .copied()
-                .unwrap_or(index.min(scene.frame_count().saturating_sub(1)));
+            let (scene, at) = reel
+                .at_clamped(index)
+                .expect("a non-empty reel always has a frame to hold on");
             frame = exporter.render(scene, at, settings)?;
         }
 
@@ -474,6 +476,7 @@ fn spawn_ffmpeg(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_scene::Scene;
 
     /// Every codec names both a hardware and a software encoder, and they are
     /// never the same string. A codec whose fallback *was* its hardware

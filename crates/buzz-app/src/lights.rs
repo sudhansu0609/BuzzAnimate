@@ -53,6 +53,20 @@ const DIAL: f64 = 0.42;
 const MAX_ELEVATION: f64 = 1.55;
 const MIN_ELEVATION: f64 = 0.03;
 
+/// **How close to the stage a lamp may be dragged.**
+///
+/// Not zero. A lamp level with the artwork throws a shadow that runs away to
+/// infinity — `shadow_transform`'s similar triangles divide by the gap — and it
+/// would collapse its own stalk onto its handle, leaving nothing to grab to
+/// bring it back out. Four units is close enough to be a lamp pressed against
+/// the picture and far enough to still have a handle.
+const MIN_LAMP_HEIGHT: f64 = 4.0;
+
+/// And how far back. Past this a lamp is a sun with extra arithmetic: its rays
+/// arrive very nearly parallel and moving it further changes nothing visible.
+/// The same bound the panel's slider uses.
+const MAX_LAMP_HEIGHT: f64 = 1200.0;
+
 /// A light gizmo, in document space, ready to draw.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Gizmo {
@@ -76,8 +90,9 @@ pub enum GizmoKind {
         /// this — not the angle — is what the animator is choosing.
         shadow: Point,
     },
-    /// A lamp: where it is, and how far it reaches.
-    Lamp { at: Point, radius: f64 },
+    /// A lamp: where it is, how far it reaches, and how far in front of the
+    /// stage it hangs.
+    Lamp { at: Point, radius: f64, height: f64 },
     /// A gloom: where its wall stands, which way it throws, how far, and how
     /// wide the wall is.
     Gloom {
@@ -108,6 +123,32 @@ impl Gizmo {
             _ => None,
         }
     }
+
+    /// **A lamp's third handle: how far in front of the stage it hangs.**
+    ///
+    /// A lamp is a point in three dimensions and the stage can only show two of
+    /// them, so the one an animator could not reach was the one that decides
+    /// how hard its light falls off, how far its shadows splay and how much of
+    /// the picture it covers. It was a slider in a panel, which is a poor way
+    /// to choose a position and no way at all to feel one.
+    ///
+    /// So it is drawn as a stalk standing off the lamp, in the way a lamp on a
+    /// stand is drawn in a plan: the knob's distance from the lamp *is* the
+    /// height, in the same document units as everything else here, and dragging
+    /// it out and in moves the lamp forwards and backwards. Up rather than down
+    /// so the stalk does not sit under the shadows the lamp is throwing, which
+    /// on flat artwork all run away from it and mostly downwards.
+    ///
+    /// `None` for anything but a lamp: a sun has no position to be in front of
+    /// and a gloom emits nothing.
+    pub fn depth_handle(&self) -> Option<Point> {
+        match self.kind {
+            GizmoKind::Lamp { at, height, .. } => {
+                Some(at - Vec2::new(0.0, height.max(MIN_LAMP_HEIGHT)))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A light drag in progress.
@@ -120,6 +161,9 @@ pub enum LightGesture {
     Move { light: LightId, grab: Vec2 },
     /// Widening a lamp's reach by dragging its ring.
     Reach { light: LightId },
+    /// **Moving a lamp forwards and backwards** by dragging the stalk that
+    /// stands off it. See [`Gizmo::depth_handle`].
+    Raise { light: LightId },
     /// Swinging a gloom by its far handle, which sets the bearing it throws
     /// along and how far it reaches together.
     Throw { light: LightId },
@@ -131,6 +175,7 @@ impl LightGesture {
             LightGesture::Aim { light }
             | LightGesture::Move { light, .. }
             | LightGesture::Reach { light }
+            | LightGesture::Raise { light }
             | LightGesture::Throw { light } => *light,
         }
     }
@@ -141,6 +186,7 @@ impl LightGesture {
             LightGesture::Aim { .. } => "Aim Light",
             LightGesture::Move { .. } => "Move Light",
             LightGesture::Reach { .. } => "Light Reach",
+            LightGesture::Raise { .. } => "Move Light Forward",
             LightGesture::Throw { .. } => "Aim Gloom",
         }
     }
@@ -185,10 +231,13 @@ pub fn gizmos(scene: &Scene) -> Vec<Gizmo> {
                     }
                 }
                 LightKind::Lamp {
-                    position, radius, ..
+                    position,
+                    radius,
+                    height,
                 } => GizmoKind::Lamp {
                     at: position,
                     radius,
+                    height,
                 },
                 LightKind::Gloom {
                     edge,
@@ -229,6 +278,19 @@ pub fn target_at(
     selected: Option<LightId>,
 ) -> Option<LightGesture> {
     let all = gizmos(scene);
+
+    // **The stalk knob first.** It stands off the lamp by the lamp's own height,
+    // so on a lamp pressed right up against the stage it sits within a few
+    // units of the handle that moves it sideways — and the one that moves it
+    // sideways would win every time, leaving a lamp that could be pushed
+    // forward but never pulled back. Tested before them, so the near case
+    // resolves in favour of the gesture that can undo itself.
+    if let Some(gizmo) = all.iter().find(|g| {
+        g.depth_handle()
+            .is_some_and(|knob| (knob - point).hypot() <= tolerance)
+    }) {
+        return Some(LightGesture::Raise { light: gizmo.id });
+    }
 
     let nearest = all
         .iter()
@@ -276,7 +338,7 @@ pub fn target_at(
             && match gizmo.kind {
                 // Not within a hair of the ring: that is the reach handle, and
                 // it has to stay reachable on the light you are working on.
-                GizmoKind::Lamp { at, radius } => {
+                GizmoKind::Lamp { at, radius, .. } => {
                     let distance = (point - at).hypot();
                     distance < radius - tolerance
                 }
@@ -296,7 +358,7 @@ pub fn target_at(
     // grabbed only once nothing nearer wanted the press, because moving is the
     // commoner intent and the two can sit close together on a short throw.
     all.iter().find_map(|gizmo| match gizmo.kind {
-        GizmoKind::Lamp { at, radius } => {
+        GizmoKind::Lamp { at, radius, .. } => {
             let distance = (point - at).hypot();
             ((distance - radius).abs() <= tolerance)
                 .then_some(LightGesture::Reach { light: gizmo.id })
@@ -344,6 +406,21 @@ pub fn drag(scene: &mut Scene, gesture: LightGesture, point: Point) -> bool {
                 radius,
             }
         }
+
+        (
+            LightGesture::Raise { .. },
+            LightKind::Lamp {
+                position, radius, ..
+            },
+        ) => LightKind::Lamp {
+            position,
+            // How far the knob has been pulled off the lamp, which is what the
+            // stalk draws. Only the vertical distance: the stalk stands
+            // straight up, so a hand that wanders sideways during the drag is
+            // choosing the same number it was.
+            height: (position.y - point.y).clamp(MIN_LAMP_HEIGHT, MAX_LAMP_HEIGHT),
+            radius,
+        },
 
         (
             LightGesture::Reach { .. },
@@ -755,4 +832,136 @@ mod tests {
             Point::new(90.0, 90.0)
         ));
     }
+
+    fn scene_with_lamp(at: Point) -> (Scene, LightId) {
+        let mut scene = Scene::default();
+        let id = scene.add_light(LightKind::lamp(at));
+        scene.lights_mut().enabled = true;
+        (scene, id)
+    }
+
+    /// **A lamp can be moved forwards and backwards, not only across.**
+    ///
+    /// Its height is the third coordinate — how far in front of the stage it
+    /// hangs — and it decides how hard the light falls off and how far the
+    /// shadows splay. It used to be reachable only from a slider in a panel.
+    #[test]
+    fn a_lamps_stalk_moves_it_forward_and_back() {
+        let (mut scene, id) = scene_with_lamp(Point::new(200.0, 200.0));
+        let before = match scene.lights().get(id).expect("the lamp").kind {
+            LightKind::Lamp { height, .. } => height,
+            _ => unreachable!("a lamp"),
+        };
+
+        // The knob stands off the lamp by its own height, so that is where a
+        // hand goes looking for it.
+        let knob = gizmos(&scene)
+            .into_iter()
+            .find(|g| g.id == id)
+            .and_then(|g| g.depth_handle())
+            .expect("a lamp has a stalk");
+        assert!(
+            (knob - Point::new(200.0, 200.0 - before)).hypot() < 1e-9,
+            "the stalk is as long as the lamp is forward, got {knob:?}"
+        );
+
+        let grabbed = target_at(&scene, knob, GRAB_PX, None);
+        assert!(
+            matches!(grabbed, Some(LightGesture::Raise { light }) if light == id),
+            "the knob is grabbed as a forward/back drag, got {grabbed:?}"
+        );
+
+        // Pulled further out: the lamp moves back off the stage.
+        assert!(drag(
+            &mut scene,
+            LightGesture::Raise { light: id },
+            Point::new(200.0, 200.0 - 400.0)
+        ));
+        let after = match scene.lights().get(id).expect("the lamp").kind {
+            LightKind::Lamp { height, .. } => height,
+            _ => unreachable!("a lamp"),
+        };
+        assert!(
+            (after - 400.0).abs() < 1e-9,
+            "the knob's distance is the height, got {after}"
+        );
+        assert!(after > before, "it went backwards, as the drag asked");
+    }
+
+    /// **A lamp dragged onto the stage stops short of it**, because a lamp
+    /// level with the artwork throws a shadow that runs away to infinity — and
+    /// because a stalk of zero length has no knob left to pull it back out
+    /// with.
+    #[test]
+    fn a_lamp_cannot_be_pushed_through_the_stage() {
+        let (mut scene, id) = scene_with_lamp(Point::new(120.0, 300.0));
+
+        // Dragged well past the lamp, and then well past it the other way.
+        drag(
+            &mut scene,
+            LightGesture::Raise { light: id },
+            Point::new(120.0, 900.0),
+        );
+        let height = match scene.lights().get(id).expect("the lamp").kind {
+            LightKind::Lamp { height, .. } => height,
+            _ => unreachable!("a lamp"),
+        };
+        assert!(
+            height >= MIN_LAMP_HEIGHT,
+            "it stops in front of the stage, got {height}"
+        );
+
+        drag(
+            &mut scene,
+            LightGesture::Raise { light: id },
+            Point::new(120.0, -100_000.0),
+        );
+        let height = match scene.lights().get(id).expect("the lamp").kind {
+            LightKind::Lamp { height, .. } => height,
+            _ => unreachable!("a lamp"),
+        };
+        assert!(
+            height <= MAX_LAMP_HEIGHT,
+            "and it stops before it becomes a sun, got {height}"
+        );
+    }
+
+    /// Moving a lamp sideways and moving it forwards are different gestures on
+    /// different handles, and neither may swallow the other. A lamp pressed
+    /// against the stage has them within a few units of each other.
+    #[test]
+    fn the_stalk_and_the_lamp_are_separate_handles() {
+        let (mut scene, id) = scene_with_lamp(Point::new(200.0, 200.0));
+        drag(
+            &mut scene,
+            LightGesture::Raise { light: id },
+            Point::new(200.0, 200.0 - MIN_LAMP_HEIGHT),
+        );
+
+        // Pressed on the lamp itself, the near knob must not win.
+        let on_the_lamp = target_at(&scene, Point::new(200.0, 200.0), GRAB_PX, Some(id));
+        // With the two all but on top of each other the knob is the one that
+        // can undo itself, so it takes the press; what matters is that the
+        // gesture is a light gesture at all rather than nothing.
+        assert!(
+            on_the_lamp.is_some(),
+            "a press on a lamp pressed against the stage still grabs it"
+        );
+
+        // Pulled back out, they separate and each does its own job.
+        drag(
+            &mut scene,
+            LightGesture::Raise { light: id },
+            Point::new(200.0, 200.0 - 160.0),
+        );
+        assert!(matches!(
+            target_at(&scene, Point::new(200.0, 200.0), GRAB_PX, Some(id)),
+            Some(LightGesture::Move { .. })
+        ));
+        assert!(matches!(
+            target_at(&scene, Point::new(200.0, 40.0), GRAB_PX, Some(id)),
+            Some(LightGesture::Raise { .. })
+        ));
+    }
+
 }

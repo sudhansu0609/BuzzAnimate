@@ -129,6 +129,7 @@ impl ShadeBuild {
 }
 
 use crate::editor::Editor;
+use crate::rigging;
 use crate::stage;
 use crate::tools::{Mods, ToolAction};
 
@@ -338,6 +339,17 @@ struct Active {
     last_frame: Instant,
     frame_ms: f32,
     last_autosave_check: Instant,
+
+    /// **Has the window been shown to anybody yet?**
+    ///
+    /// It is created hidden and revealed by [`Active::reveal`] once a whole
+    /// frame has been built for it — see [`App::init`] for why.
+    shown: bool,
+    /// When the window was created, so the reveal can be forced if the first
+    /// frame never gets that far. See [`Active::reveal_is_overdue`].
+    born: Instant,
+    /// What to say on the opening scene: the adapter this came up on.
+    adapter: String,
 }
 
 /// Why a path was asked for.
@@ -536,6 +548,12 @@ pub struct App {
     /// Every export, run one at a time on the task registry. Replaces the old
     /// single slot that refused a second export outright.
     exports: crate::export_service::ExportQueue,
+    /// The pressure the pen last reported, `0.0`–`1.0`.
+    ///
+    /// Remembered between events because a gesture's press and release arrive
+    /// on their own and do not always carry a force of their own; `None` is a
+    /// device with no sensor, which reads as drawing at full pressure.
+    pen_pressure: Option<f64>,
     /// True while the "an export is still running" quit prompt is up.
     ///
     /// A close request with work that would be lost raises this instead of
@@ -636,6 +654,9 @@ pub struct App {
     /// were born with. Recording the rects as they are laid out is the only
     /// way to be right about this that does not repeat the layout arithmetic.
     dock_rects: Vec<(buzz_ui::Dock, egui::Rect)>,
+    /// The opening scene, drawn over the interface for the first second or so
+    /// of a session and then dissolved. See [`buzz_ui::splash`].
+    splash: buzz_ui::SplashState,
 }
 
 impl App {
@@ -670,6 +691,7 @@ impl App {
             retain_stage: std::env::var("BUZZ_NO_RETAIN").is_err(),
             profiler: crate::profile::FrameProfiler::default(),
             exports: crate::export_service::ExportQueue::default(),
+            pen_pressure: None,
             quit_prompt: false,
             presets: crate::presets::PresetLibrary::load(),
             lights: {
@@ -700,6 +722,7 @@ impl App {
             picker: crate::dialogs::Pending::default(),
             tasks: crate::tasks::TaskRegistry::default(),
             dock_rects: Vec::new(),
+            splash: buzz_ui::SplashState::default(),
         };
         app.recovery = app.find_recoveries();
         app
@@ -722,6 +745,12 @@ impl App {
     /// difference between the old monitor-rate burn and a truly quiet window.
     fn wants_frame(&self) -> Redraw {
         if self.force_poll {
+            return Redraw::Now;
+        }
+        // The opening scene is an animation over a window that is otherwise
+        // idle, and the window it is covering may not be on screen yet: both
+        // want every frame they can get until they are done.
+        if self.splash.is_open() || matches!(&self.active, Some(a) if !a.shown) {
             return Redraw::Now;
         }
         // Anything mid-flight whose result lands on a future frame, or that is
@@ -790,9 +819,37 @@ impl App {
         #[cfg(windows)]
         name_this_application();
 
+        // **The interface theme is decided before the window exists.**
+        //
+        // It used to be read further down, after the device was up, purely
+        // because that is where egui was being styled. But the *title bar* is
+        // drawn by the desktop, from an attribute that is only read at creation
+        // — so a dark application opened inside a light window frame, and the
+        // two never agreed until something else forced a repaint. Deciding it
+        // here settles the chrome and the frame from the same value, at once.
+        let scheme = buzz_ui::Workspace::load().theme;
+        theme::set_theme(scheme);
+
         let attrs = Window::default_attributes()
             .with_title("BuzzAnimate")
             .with_window_icon(window_icon())
+            .with_theme(Some(match scheme {
+                buzz_ui::theme::Theme::Dark => winit::window::Theme::Dark,
+                buzz_ui::theme::Theme::Light => winit::window::Theme::Light,
+            }))
+            // **Hidden until there is something in it.**
+            //
+            // Everything below — choosing an adapter, creating the device,
+            // compiling Vello's shaders, configuring the surface — happens
+            // after the window exists and takes the best part of a second. A
+            // visible window during that is a blank client area painted by the
+            // desktop, and then a half-measured interface over a black stage:
+            // the flash of white-then-black this program was reported for.
+            //
+            // So nothing is shown until a whole frame has been built for it,
+            // and that first frame carries the opening scene. See
+            // `Active::reveal`, and `resumed` for what draws it.
+            .with_visible(false)
             // Sized to leave the status bar clear of a bottom taskbar.
             .with_inner_size(winit::dpi::LogicalSize::new(1560.0, 880.0));
         #[cfg(windows)]
@@ -808,6 +865,7 @@ impl App {
 
         let gpu = GpuContext::new_blocking(&self.preference)?;
         println!("{}", gpu.selection.report());
+        let adapter = gpu.selection.summary();
 
         let surface = gpu
             .instance
@@ -855,9 +913,8 @@ impl App {
                 let _ = proxy.send_event(UserEvent::Repaint);
             });
         }
-        // The saved layout carries the interface theme, so the window opens in
-        // whichever the user was last using rather than flashing dark first.
-        theme::set_theme(buzz_ui::Workspace::load().theme);
+        // The theme itself was settled before the window was created, above;
+        // this is where the context is styled from it.
         theme::apply(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -887,11 +944,49 @@ impl App {
             last_frame: Instant::now(),
             frame_ms: 0.0,
             last_autosave_check: Instant::now(),
+            shown: false,
+            born: Instant::now(),
+            adapter,
         })
     }
 }
 
 impl Active {
+    /// **Put the window on screen, now that there is a picture ready for it.**
+    ///
+    /// Called from the frame that is about to present, after everything in it
+    /// has been built — so the first thing the desktop ever composites for this
+    /// window is a finished picture rather than an empty rectangle. Idempotent,
+    /// because every caller means the same thing by it.
+    fn reveal(&mut self) {
+        if self.shown {
+            return;
+        }
+        self.shown = true;
+        self.window.set_visible(true);
+        // Shown is not the same as focused: a window revealed after its
+        // creation does not take the keyboard on its own, and an editor you
+        // have to click before you can type in is a worse first impression
+        // than the flash this replaced.
+        self.window.focus_window();
+    }
+
+    /// **Has the window waited long enough to be shown regardless?**
+    ///
+    /// The reveal hangs off a frame reaching the point of being presented, and
+    /// a frame can fail to get there for reasons that have nothing to do with
+    /// this program. Every one of those is recoverable, and none of them should
+    /// be able to leave a running process with no window at all — which is
+    /// indistinguishable from a crash.
+    ///
+    /// So there is a deadline, and past it the window is shown whatever
+    /// happened. It is a backstop and nothing routine should reach it: the
+    /// first frame is drawn directly in `resumed`, which reveals as part of
+    /// drawing it.
+    fn reveal_is_overdue(&self) -> bool {
+        !self.shown && self.born.elapsed() >= REVEAL_DEADLINE
+    }
+
     fn ensure_target(&mut self) {
         let (w, h) = (self.surface_config.width, self.surface_config.height);
         if matches!(&self.target, Some(t) if t.width == w && t.height == h) {
@@ -948,6 +1043,13 @@ fn usable_stage_area(area: egui::Rect) -> bool {
         && area.height() >= 1.0
 }
 
+/// How long the window may stay hidden waiting for its first frame.
+///
+/// Comfortably longer than a cold device and shader compilation, and far
+/// shorter than anybody would wait before deciding the program did not start.
+/// See [`Active::reveal_is_overdue`].
+const REVEAL_DEADLINE: Duration = Duration::from_millis(2500);
+
 /// What the stage is drawn through when nothing has ever been measured: the
 /// same default [`Active`] starts with, so the very first frame of a session
 /// draws the document rather than a black rectangle.
@@ -964,6 +1066,14 @@ fn mods_from(ctx: &egui::Context) -> Mods {
 }
 
 /// Change one bone of one armature.
+/// What to call a drawing inside a rig, in the slot list.
+fn part_label(object: &buzz_scene::Object) -> String {
+    object
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("Drawing {}", object.id.0))
+}
+
 fn update_bone(
     scene: &mut buzz_scene::Scene,
     object: buzz_scene::ObjectId,
@@ -1403,11 +1513,19 @@ impl App {
             // The edit-path breadcrumb. Animate keeps this strip directly above
             // the stage, and it is the only way back out of a symbol.
             //
-            // Added and removed rather than collapsed: whether it is there is
-            // decided by the document, not by the user, and egui's collapsible
-            // panel binds a `&mut bool` the user can also flip — which would
-            // let them hide their only way out of a symbol.
-            if !self.editor.scene().edit_path().is_empty() {
+            // **Always shown.** It used to appear only inside a symbol, which
+            // hid the thing at its left end: the scene name, and the menu
+            // behind it that switches, adds, duplicates and reorders scenes.
+            // A document's scenes were therefore unreachable unless you first
+            // opened a symbol — so a feature the file format, the timeline and
+            // the exporter all support could not be found at all. The strip
+            // costs one line of chrome and names the scene you are editing,
+            // which is worth that on its own.
+            //
+            // Not collapsible: egui's collapsible panel binds a `&mut bool`
+            // the user can also flip, which would let them hide their only way
+            // out of a symbol.
+            {
                 egui::Panel::top("breadcrumb")
                     .frame(egui::Frame::new().fill(Palette::chrome()).inner_margin(3))
                     .show(ui, |ui| {
@@ -1469,6 +1587,7 @@ impl App {
         self.quit_prompt_dialog(&ctx);
         self.export_dialog(&ctx);
         self.lip_sync_dialog(&ctx);
+        self.staging_dialog(&ctx);
         self.recovery_dialog(&ctx);
         buzz_ui::about_dialog(&ctx, &mut self.editor.about);
 
@@ -1730,6 +1849,7 @@ impl App {
                     current_frame: self.editor.current_frame,
                     active_layer: self.editor.selection.active_layer(),
                     camera_selected: self.editor.camera_selected,
+                    selected_light: self.editor.light_panel.selected,
                     playing: self.editor.playback.playing,
                     onion_enabled: self.editor.onion.enabled,
                     auto_keyframe: self.editor.auto_keyframe,
@@ -2117,13 +2237,53 @@ impl App {
             })
             .unwrap_or_default();
 
+        // Everything on the stage that could still become a limb, and — for a
+        // character that has already been rigged from a pattern — what is
+        // standing in each of its slots.
+        let parts = rigging::loose_parts(self.editor.scene(), self.editor.frame());
+        let bound = selected
+            .and_then(|id| self.editor.scene().find_object(id))
+            .and_then(|(_, object)| match &object.kind {
+                buzz_scene::ObjectKind::Armature(rig) => {
+                    let name = rig.pattern.clone()?;
+                    let filled = rig
+                        .parts
+                        .iter()
+                        .filter_map(|part| match part.binding {
+                            buzz_scene::RigBinding::Rigid(bone) => {
+                                Some((bone, part_label(&part.artwork)))
+                            }
+                            buzz_scene::RigBinding::Skin(_) => None,
+                        })
+                        .collect::<Vec<_>>();
+                    Some((name, filled))
+                }
+                _ => None,
+            });
+
         let response = buzz_ui::rig_panel(
             ui,
             armature.as_ref(),
             &poses,
+            &parts,
+            bound.as_ref().map(|(name, filled)| (name.as_str(), filled.as_slice())),
             &mut self.editor.rig_panel,
         );
+
+        // -- assembling, which does not need anything to be selected --------
+
+        if let Some((pattern, slots)) = response.build_rig {
+            self.rig_character(&pattern, &slots);
+        }
+        if let Some(id) = response.select_part {
+            self.editor.selection.set([id]);
+        }
+
         let Some(object) = selected else { return };
+
+        if let Some((slot, drawing)) = response.replace_part {
+            self.replace_rigged_part(object, slot, drawing);
+        }
 
         if let Some((bone, limits)) = response.set_limits {
             self.editor.doc.edit("Joint Limits", |scene| {
@@ -2286,6 +2446,84 @@ impl App {
         });
     }
 
+    // -- rigging a character by sorting its drawings into slots ------------
+
+    /// Build a skeleton from a pattern and move the sorted drawings into it.
+    ///
+    /// One undo step for the whole character. The work is in
+    /// [`rigging::rig_character`]; what is here is the report, because the
+    /// document layer has nowhere to say anything.
+    fn rig_character(&mut self, pattern_name: &str, slots: &[Option<buzz_scene::ObjectId>]) {
+        let Some(pattern) = buzz_rig::RigPattern::named(pattern_name) else {
+            self.editor.status = Some(format!("No rig pattern called {pattern_name}."));
+            return;
+        };
+        let frame = self.editor.frame();
+        let count = slots.iter().filter(|s| s.is_some()).count();
+        let mut built = None;
+
+        self.editor.doc.edit("Rig Character", |scene| {
+            built = rigging::rig_character(scene, frame, &pattern, slots);
+        });
+
+        match built {
+            Some(id) => {
+                // The slots empty themselves next frame — the drawings in them
+                // are inside the rig now, so they are no longer loose — but the
+                // note and the armed slot are about a job that is finished.
+                self.editor.rig_panel.armed = None;
+                self.editor.rig_panel.note = None;
+                self.editor.selection.set([id]);
+                self.editor.status = Some(format!(
+                    "Rigged {count} part{} as a {}.",
+                    if count == 1 { "" } else { "s" },
+                    pattern.name
+                ));
+            }
+            None => {
+                self.editor.status =
+                    Some("Nothing to rig: put a drawing in at least one slot first.".into());
+            }
+        }
+    }
+
+    /// Put a different drawing into one slot of a rig that already exists.
+    fn replace_rigged_part(
+        &mut self,
+        rig: buzz_scene::ObjectId,
+        slot: usize,
+        drawing: buzz_scene::ObjectId,
+    ) {
+        let mut done = false;
+        self.editor.doc.edit("Replace Part", |scene| {
+            done = rigging::replace_part(scene, rig, slot, drawing);
+        });
+        if done {
+            self.editor.selection.set([rig]);
+        }
+    }
+
+    /// Fill an armed slot with whatever drawing was clicked on the stage.
+    fn pick_part_for_slot(&mut self, slot: usize, screen: buzz_geom::Point) {
+        let at = self.editor.screen_to_edit(screen);
+        let frame = self.editor.frame();
+
+        match rigging::part_at(self.editor.scene(), frame, at) {
+            Some(part) => {
+                let name = part.name.clone();
+                self.editor.rig_panel.assign(slot, part.object);
+                self.editor.rig_panel.note = None;
+                self.editor.status = Some(format!("Put {name} in the slot."));
+            }
+            None => {
+                // Clicking past the artwork cancels, which is the way out of
+                // every other armed gesture in the program.
+                self.editor.rig_panel.armed = None;
+                self.editor.status = Some("Nothing there. The slot is still empty.".into());
+            }
+        }
+    }
+
     /// The trail of symbols currently open, with the document at its root.
     ///
     /// Clicking a level jumps straight back to it. Returning a [`Command`]
@@ -2347,11 +2585,46 @@ impl App {
                 self.editor.add_scene();
                 ui.close();
             }
+            // **The one a conversation is built out of.** Two people in a room
+            // is the same set, cast and lighting beat after beat; only the
+            // performance changes. Duplicating gives the next shot all of that
+            // to start from, which is the alternative to copying frames onto
+            // the end of the timeline by hand.
+            if ui
+                .button("Duplicate Scene")
+                .on_hover_text(
+                    "A copy of this scene, complete \u{2014} set, cast, lights and every \
+                     keyframe \u{2014} placed after it and opened for editing. What the \
+                     next beat of a conversation starts from.",
+                )
+                .clicked()
+            {
+                self.editor.duplicate_scene(active);
+                ui.close();
+            }
             if ui.button("Rename Scene\u{2026}").clicked() {
                 self.scene_rename = Some((active, names[active].clone()));
                 ui.close();
             }
             ui.add_enabled_ui(names.len() > 1, |ui| {
+                ui.horizontal(|ui| {
+                    // The running order is the order the film plays in, so it
+                    // has to be changeable.
+                    if ui
+                        .add_enabled(active > 0, egui::Button::new("Move Up"))
+                        .clicked()
+                    {
+                        self.editor.move_scene(active, active - 1);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(active + 1 < names.len(), egui::Button::new("Move Down"))
+                        .clicked()
+                    {
+                        self.editor.move_scene(active, active + 1);
+                        ui.close();
+                    }
+                });
                 if ui.button("Delete Scene").clicked() {
                     self.editor.delete_scene(active);
                     ui.close();
@@ -2393,19 +2666,23 @@ impl App {
                 }
             }
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Exit Symbol").clicked() {
-                    // One level out, not all the way: nested symbols are
-                    // normally stepped through one at a time.
-                    self.editor.doc.edit_view(|scene| {
-                        scene.exit_symbol();
-                    });
-                    self.editor.selection.clear();
-                    self.editor
-                        .selection
-                        .ensure_active_layer(self.editor.doc.scene());
-                }
-            });
+            // Only inside a symbol is there anything to exit. At the main
+            // timeline the strip is the scene crumb alone.
+            if !path.is_empty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Exit Symbol").clicked() {
+                        // One level out, not all the way: nested symbols are
+                        // normally stepped through one at a time.
+                        self.editor.doc.edit_view(|scene| {
+                            scene.exit_symbol();
+                        });
+                        self.editor.selection.clear();
+                        self.editor
+                            .selection
+                            .ensure_active_layer(self.editor.doc.scene());
+                    }
+                });
+            }
         });
 
         command
@@ -2539,6 +2816,18 @@ impl App {
             // Selecting the camera row selects the Camera tool, which is what
             // Animate does — the row and the tool are the same idea.
             commands.push(Command::SelectTool(ToolId::Camera));
+        }
+        if let Some(id) = response.select_light {
+            // Clicking a light's channel makes it the active light, the way
+            // clicking any row takes the highlight from the one before.
+            self.editor.light_panel.selected = Some(id);
+            self.editor.camera_selected = false;
+        }
+        if let Some((id, frame)) = response.light_key {
+            self.editor.key_light_at(id, frame);
+        }
+        if let Some((id, frame)) = response.light_unkey {
+            self.editor.unkey_light_at(id, frame);
         }
         if let Some(action) = response.action {
             commands.push(match action {
@@ -3436,7 +3725,7 @@ impl App {
         // Taken before anything else, because the release that ends a drag is
         // also a pointer release the tools would otherwise act on — a dropped
         // symbol must not additionally deselect what was under it.
-        if egui::DragAndDrop::has_any_payload(&ctx) {
+        if egui::DragAndDrop::has_payload_of_type::<buzz_ui::library_panel::DraggedSymbol>(&ctx) {
             let over = ctx
                 .input(|i| i.pointer.hover_pos())
                 .is_some_and(|p| area.contains(p));
@@ -3459,6 +3748,29 @@ impl App {
                 {
                     self.editor.place_symbol_at(dropped.0, local(p));
                 }
+                return;
+            }
+        }
+
+        // **A slot in the Rigging panel is waiting for a drawing.**
+        //
+        // Taken before the tools, because every tool already means something on
+        // the stage and none of them mean "this is the left forearm". The mode
+        // is visible in the panel — the armed slot is highlighted and says what
+        // it wants — and Escape or a click on empty space leaves it, so there is
+        // no way to be stuck in it without being told.
+        if let Some(slot) = self.editor.rig_panel.armed {
+            if response.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.editor.rig_panel.armed = None;
+                return;
+            }
+            if response.clicked()
+                && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
+            {
+                self.pick_part_for_slot(slot, local(pos));
                 return;
             }
         }
@@ -3495,11 +3807,26 @@ impl App {
         let pan_override =
             ctx.input(|i| i.key_down(egui::Key::Space)) || ctx.input(|i| i.pointer.middle_down());
 
+        // One clock for the whole gesture: the press, every move in it and the
+        // release are all stamped from egui's own time, so a brush measuring
+        // the gaps between them is measuring one thing. See
+        // `ToolMachine::pointer_down_at`.
+        let stamp = Some(ctx.input(|i| i.time));
+
         if response.drag_started()
             && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
         {
             if !pan_override {
-                self.editor.pointer_down(local(pos), mods);
+                // The force on the touch that began this gesture, if it was a
+                // pen. A press is one event and carries its own.
+                self.pen_pressure = ctx.input(|i| {
+                    i.events.iter().rev().find_map(|e| match e {
+                        egui::Event::Touch { force, .. } => force.map(f64::from),
+                        _ => None,
+                    })
+                });
+                self.editor
+                    .pointer_down_at(local(pos), mods, stamp, self.pen_pressure);
             }
             if let Some(active) = &mut self.active {
                 active.dragging = true;
@@ -3515,7 +3842,79 @@ impl App {
                     delta_screen: buzz_geom::Vec2::new(delta.x as f64, delta.y as f64),
                 });
             } else {
-                self.editor.pointer_move(local(pos), mods);
+                // **Every place the pointer went, not just where it ended up.**
+                //
+                // A mouse reports at 125 Hz and a pen at 200 or more, while
+                // this runs once a frame. Taking `interact_pos` alone threw
+                // away two samples in three and turned the rest into a polygon
+                // whose corners are wherever the frames happened to land — so
+                // a stroke drawn quickly came out visibly faceted, and the
+                // fluid brush read the speed off those few widely spaced
+                // samples and got it wrong as well. egui keeps the intermediate
+                // moves in `events`; a drag now draws through all of them and
+                // only falls back to the interact position when there were
+                // none (a frame in which the pointer was held still).
+                // **Pen pressure comes in on the touch events, not the pointer
+                // ones.** A pen on Windows arrives as `WM_POINTER`, which winit
+                // turns into a touch with a force and egui passes through as
+                // `Event::Touch { force }`; egui *also* synthesises the
+                // ordinary pointer events from it, which is how drawing with a
+                // pen worked at all while every stroke was recorded at full
+                // pressure. Where there are touch events this frame they are
+                // the better source — they carry the position and the force
+                // together — and a mouse, which has neither, still goes down
+                // the pointer path.
+                let (moves, now, interval) = ctx.input(|i| {
+                    let touches: Vec<(egui::Pos2, Option<f64>)> = i
+                        .events
+                        .iter()
+                        .filter_map(|e| match e {
+                            egui::Event::Touch { pos, force, .. } => {
+                                Some((*pos, force.map(f64::from)))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let moves = if touches.is_empty() {
+                        i.events
+                            .iter()
+                            .filter_map(|e| match e {
+                                egui::Event::PointerMoved(p) => Some((*p, None)),
+                                _ => None,
+                            })
+                            .collect()
+                    } else {
+                        touches
+                    };
+                    (moves, i.time, f64::from(i.unstable_dt))
+                });
+                if moves.is_empty() {
+                    self.editor
+                        .pointer_move_at(local(pos), mods, Some(now), self.pen_pressure);
+                } else {
+                    // **Spread across the frame they arrived in.** egui does
+                    // not stamp its events, but it does say how long the frame
+                    // took, and the moves in it happened over that span rather
+                    // than all at its end. Dividing it evenly is not the true
+                    // sampling instant of each one, but it is the right *scale*
+                    // — and scale is all a speed-driven width reads. Stamping
+                    // them all with one instant would make every stroke
+                    // hairline; stamping them microseconds apart, which is what
+                    // reading a wall clock in this loop does, is worse.
+                    let n = moves.len() as f64;
+                    let span = interval.clamp(1e-4, 0.25);
+                    for (k, (p, force)) in moves.into_iter().enumerate() {
+                        let at = now - span + span * ((k as f64 + 1.0) / n);
+                        // The last force seen is remembered, so the press and
+                        // the release — which arrive on their own events — are
+                        // recorded at the pressure the pen was actually at
+                        // rather than at full.
+                        if force.is_some() {
+                            self.pen_pressure = force;
+                        }
+                        self.editor.pointer_move_at(local(p), mods, Some(at), force);
+                    }
+                }
             }
         }
 
@@ -3523,7 +3922,8 @@ impl App {
             if let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
                 && !pan_override
             {
-                self.editor.pointer_up(local(pos));
+                self.editor
+                    .pointer_up_at(local(pos), stamp, self.pen_pressure);
             }
             if let Some(active) = &mut self.active {
                 active.dragging = false;
@@ -4245,11 +4645,30 @@ impl App {
         let (width, height) = preset.resolve_size(stage);
 
         let export = &mut self.editor.export;
+        let was = export.open;
         export.open = Some(kind);
         export.width = width;
         export.height = height;
         export.transparent = preset.transparent;
         export.ffmpeg = !kind.needs_ffmpeg() || buzz_export::ffmpeg_available();
+        // **The dialog says which preset these settings are.** Without this the
+        // combo went straight back to reading "Choose", so a chosen preset left
+        // no mark anywhere the user could see.
+        export.selected_preset = Some(preset.name.clone());
+
+        // **A preset that turns one frame into a film needs a film to export.**
+        //
+        // The kind can change here: "GIF preview" chosen while Export Image was
+        // open switches the whole export to a GIF. The range fields were last
+        // set by `ExportState::open`, and for a single-frame export that is
+        // frame zero to frame zero \u2014 so the GIF came out one frame long, with
+        // nothing in the dialog to suggest why. Widened to the whole film, and
+        // only when the export was not already a range one, so a range the user
+        // has narrowed by hand survives a preset that keeps the same kind.
+        if kind.is_range() && !was.is_some_and(|k| k.is_range()) {
+            export.from_frame = 0;
+            export.to_frame = export.frame_count().saturating_sub(1);
+        }
 
         match preset.format {
             PresetFormat::Mp4H264 => {
@@ -4333,14 +4752,17 @@ impl App {
         // the missing dependency is visible while the settings are still being
         // chosen instead of after a file name has been picked.
         let has_ffmpeg = !kind.needs_ffmpeg() || buzz_export::ffmpeg_available();
-        let (size, length) = {
-            let scene = self.editor.scene();
-            // The length of the **film**, not of the timeline: a looping
-            // section is repeated into the export, so the default range has to
-            // reach the end of what will actually be written. Without a loop
-            // region the two are the same number.
-            (scene.stage().size, scene.rendered_frame_count())
-        };
+        // The length of the **film**, not of the timeline: the scenes play one
+        // after another and a looping section is repeated into the export, so
+        // the default range has to reach the end of what will actually be
+        // written. With one scene and no loop region these are all the same
+        // number.
+        //
+        // The stage comes from the scene being edited, which is the one whose
+        // size the user has in mind; a film is one file at one size, and the
+        // reel takes its lead from the first scene.
+        let size = self.editor.scene().stage().size;
+        let length = self.editor.doc.film_frames();
         self.editor.export.ffmpeg = has_ffmpeg;
         self.editor.export.open(
             kind,
@@ -4350,6 +4772,41 @@ impl App {
             ),
             length,
         );
+    }
+
+    /// Draw the Set the Scene and Animate Selection dialogs, and act on them.
+    ///
+    /// The state is taken out of the editor for the duration, because the
+    /// dialog wants `&mut` on it while the commands want `&mut` on the whole
+    /// editor — the same trick every other dialog here uses.
+    fn staging_dialog(&mut self, ctx: &egui::Context) {
+        if self.editor.staging.open.is_none() {
+            return;
+        }
+        let mut state = std::mem::take(&mut self.editor.staging);
+        let can_perform = self.editor.selection_is_performable();
+        let response = buzz_ui::staging_dialog(ctx, &mut state, can_perform);
+
+        if response.set_scene {
+            self.editor.set_the_scene(&state);
+            state.close();
+        }
+        if response.perform {
+            self.editor.perform_selection(&mut state);
+        }
+        if response.direct {
+            self.editor.direct_story(&mut state);
+        }
+        if response.follow_path {
+            self.editor.follow_motion_path(&mut state);
+        }
+        if response.add_physics {
+            self.editor.add_follow_through(&mut state);
+        }
+        if response.add_wiggle {
+            self.editor.add_wiggle(&mut state);
+        }
+        self.editor.staging = state;
     }
 
     /// Draw the Export dialog and act on what the user chose.
@@ -4364,14 +4821,20 @@ impl App {
         }
         if response.save_preset {
             match self.preset_from_dialog() {
-                Some(preset) => match self.presets.add(preset) {
+                Some(preset) => {
+                    let name = preset.name.trim().to_string();
+                    match self.presets.add(preset) {
                     Ok(()) => {
                         self.editor.status =
-                            Some(format!("Saved preset \u{201C}{}\u{201D}", self.editor.export.preset_name));
+                            Some(format!("Saved preset \u{201C}{name}\u{201D}"));
+                        // Saved settings *are* that preset, so the combo says
+                        // so \u2014 the same as if it had just been chosen.
+                        self.editor.export.selected_preset = Some(name);
                         self.editor.export.preset_name.clear();
                     }
                     Err(e) => self.editor.status = Some(e),
-                },
+                    }
+                }
                 None => {
                     self.editor.status = Some("Nothing to save as a preset".into());
                 }
@@ -4439,9 +4902,11 @@ impl App {
             height: self.editor.export.height,
             transparent: self.editor.export.transparent,
         };
-        // A snapshot, so the export renders the document as it was when the user
-        // asked — and they can keep editing, or queue another, while it writes.
-        let scene = self.editor.scene().clone();
+        // **The whole film, not the scene being edited.** Snapshots, so the
+        // export renders the document as it was when the user asked — and they
+        // can keep editing, or queue another, while it writes. A document with
+        // one scene is one scene, exactly as before.
+        let scenes = self.editor.doc.film();
         let stem = self
             .editor
             .doc
@@ -4453,7 +4918,11 @@ impl App {
 
         let (target, label) = match kind {
             buzz_ui::ExportKind::Image => {
-                let frame = self.editor.current_frame;
+                // The frame of the **film** the playhead is on: the still has
+                // to come out of the scene being looked at, and past the first
+                // scene those are two different numbers.
+                let frame = self.editor.doc.film_start_of(self.editor.doc.active_scene())
+                    + self.editor.current_frame;
                 let label = file_name(&path);
                 (ExportTarget::Image { frame, path }, label)
             }
@@ -4529,7 +4998,7 @@ impl App {
 
         let busy = !self.exports.is_idle();
         self.exports.enqueue(ExportRequest {
-            scene,
+            scenes,
             settings,
             range,
             target,
@@ -4600,9 +5069,13 @@ impl App {
     fn import_sound_from(&mut self, path: std::path::PathBuf) {
         match self.editor.import_sound(&path) {
             Ok(name) => {
-                self.editor.status = Some(format!(
-                    "Imported {name} — put it on a keyframe with Control > Attach Sound to Frame"
-                ))
+                self.editor.status = Some(if self.editor.sound_was_placed() {
+                    format!("Imported {name}, on a layer of its own from frame 1")
+                } else {
+                    format!(
+                        "Imported {name} — put it on a keyframe with Control > Attach Sound"
+                    )
+                })
             }
             Err(e) => self.editor.status = Some(format!("Could not import that sound: {e:#}")),
         }
@@ -4789,21 +5262,33 @@ impl App {
     /// The whole import is one [`Document::edit`], so a file that brings in
     /// four hundred symbols is still a single Ctrl+Z.
     fn import_dialog(&mut self, target: buzz_scene::ImportTarget) {
+        // Sound sits in the "everything" filter too, or the one filter that is
+        // meant to accept anything would be the one that hid the mp3.
+        let mut importable = crate::import::IMPORTABLE.to_vec();
+        importable.extend_from_slice(crate::import::AUDIBLE);
         self.ask_for_path(
             crate::dialogs::Request::open_file()
-                .filter(
-                    "Everything BuzzAnimate can import",
-                    crate::import::IMPORTABLE,
-                )
+                .filter("Everything BuzzAnimate can import", &importable)
                 .filter("Animate document", &["fla", "xfl"])
                 .filter("Flash movie", &["swf"])
-                .filter("PDF or Illustrator artwork", &["pdf", "ai"]),
+                .filter("PDF or Illustrator artwork", &["pdf", "ai"])
+                .filter("Sound", crate::import::AUDIBLE),
             Pick::ImportInto(target),
         );
     }
 
     /// Merge a chosen file into the open document.
     fn import_file(&mut self, target: buzz_scene::ImportTarget, path: std::path::PathBuf) {
+        // **A sound picked here is imported, not refused.** File > Import is
+        // what anyone reaches for with a dialogue track in hand; sending it to
+        // the scene importers only produced "BuzzAnimate cannot import .mp3
+        // files" from a program that has a sound library. Nothing else about
+        // the command changes: a sound goes to the library and onto the
+        // timeline, exactly as File > Import Sound puts it.
+        if crate::import::is_audio(&path) {
+            self.import_sound_from(path);
+            return;
+        }
         if self.loading_already() {
             return;
         }
@@ -5310,10 +5795,16 @@ impl App {
         // `run_ui` rather than `begin_pass`/`end_pass`: egui 0.35 roots the UI
         // in a `Ui`, and panels attach to that rather than to the context.
         let mut stage_area = egui::Rect::NOTHING;
+        let adapter = active.adapter.clone();
         let output = egui_ctx.run_ui(raw_input, |ui| {
             stage_area = self.build_ui(ui);
             // Floats above the panels, so it is drawn after them.
             self.import_report_window(ui.ctx());
+            // And over everything, including the dialogs: the whole interface is
+            // still settling underneath it. Built *after* the real UI on
+            // purpose — the editor lays out, measures its stage and starts its
+            // thumbnails on exactly the frames nobody can see it doing so.
+            buzz_ui::opening_scene(ui.ctx(), &mut self.splash, &adapter);
         });
 
         // A theme change is asked for from *inside* the frame that is being
@@ -5510,10 +6001,7 @@ impl App {
         // elsewhere — no longer re-encodes a stage of thousands of shapes. Reuse
         // is refused whenever a tool preview is live or lighting is still being
         // built, because those change the stage without moving the stamp.
-        let paints_into_scene = matches!(
-            self.editor.preview(),
-            crate::tools::Preview::Ink { .. } | crate::tools::Preview::Painted { .. }
-        );
+        let paints_into_scene = self.editor.preview_paints_into_scene();
         let stamp = StageStamp {
             revision: self.editor.scene().revision(),
             frame: self.editor.current_frame,
@@ -5692,15 +6180,42 @@ impl App {
 
         self.profiler.enter(crate::profile::Section::Present);
 
+        // **The window becomes visible here: laid out, but one moment before it
+        // is presented into.**
+        //
+        // Not after the present, which is where this was first put and is where
+        // it reads as though it belongs. A window that has never been mapped is
+        // one the desktop compositor considers *occluded*, and an occluded
+        // surface declines to hand out a texture at all — so a reveal that
+        // waited for a successful present waited for something that could not
+        // happen, and the window only ever appeared when the deadline below
+        // fired, two and a half seconds late. The dependency runs the other
+        // way: showing the window is what makes presenting possible.
+        //
+        // Everything expensive is already behind us. The frame has been built,
+        // the stage encoded and the opening scene tessellated; what is left is
+        // an acquire, a submit and a present. So what the desktop composites
+        // for this window first is the opening scene, not an empty rectangle.
+        active.reveal();
+
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match active.surface.get_current_texture() {
             Cst::Success(f) | Cst::Suboptimal(f) => f,
             Cst::Outdated | Cst::Lost => {
                 let (w, h) = (active.surface_config.width, active.surface_config.height);
                 active.resize(w, h);
+                // A window that has never been shown has no other way back
+                // here: nothing will send it an input event, and `wants_frame`
+                // is what keeps asking until it is visible.
+                active.window.request_redraw();
                 return Ok(());
             }
-            Cst::Timeout | Cst::Occluded => return Ok(()),
+            // Genuinely occluded — another window over this one, or a session
+            // locked. Ask for the frame that will be wanted when it is not.
+            Cst::Timeout | Cst::Occluded => {
+                active.window.request_redraw();
+                return Ok(());
+            }
             other => return Err(anyhow::anyhow!("acquiring surface texture: {other:?}")),
         };
         let surface_view = frame
@@ -5856,11 +6371,35 @@ impl ApplicationHandler<UserEvent> for App {
         }
         match self.init(event_loop) {
             Ok(active) => {
-                // Ask for the first frame explicitly: with the loop idling on
-                // `ControlFlow::Wait`, nothing else would, and the window would
-                // open blank until the pointer moved.
-                active.window.request_redraw();
                 self.active = Some(active);
+
+                // **The first frame is drawn here, not asked for.**
+                //
+                // `request_redraw` cannot deliver it: the window is created
+                // hidden (see `init`), and a hidden window is not sent paint
+                // messages at all. Waiting for one waited forever, and the
+                // window only appeared when the safety deadline in
+                // `about_to_wait` fired seconds later — the exact fault this
+                // was meant to remove, in a new costume.
+                //
+                // Calling `render` directly builds the interface, encodes the
+                // stage and draws the opening scene over both, and it is the
+                // last few instructions of *that* which put the window on
+                // screen. See where `Active::reveal` is called.
+                if let Err(e) = self.render() {
+                    eprintln!("the first frame failed: {e:?}");
+                    // The window is still hidden if the failure came before the
+                    // reveal, and a process with no window reads as a crash.
+                    if let Some(active) = self.active.as_mut() {
+                        active.reveal();
+                    }
+                }
+
+                // And the second, so the opening scene animates from here on
+                // whatever the loop decides to do.
+                if let Some(active) = &self.active {
+                    active.window.request_redraw();
+                }
             }
             Err(e) => {
                 eprintln!("BuzzAnimate failed to start: {e:?}");
@@ -5924,6 +6463,15 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The last line of defence for the hidden window: if the first frame
+        // has still not arrived, show it anyway rather than leave a process
+        // running with nothing on screen.
+        if let Some(active) = self.active.as_mut()
+            && active.reveal_is_overdue()
+        {
+            active.reveal();
+        }
+
         // The window only redraws when something on screen could have changed.
         // An idle document sleeps here instead of re-rendering at monitor rate —
         // the fix for a static file burning a whole core (and a GPU) doing
@@ -6427,16 +6975,46 @@ mod tests {
 mod idle_tests {
     use super::*;
 
+    /// An app past its opening, which is where every question about *idling*
+    /// starts. A session that is still playing its opening scene is never idle
+    /// by design — see [`opening_frames_are_never_idle`] — so leaving it up
+    /// would make these tests ask a question they do not mean.
+    fn opened() -> App {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.splash.dismiss();
+        app
+    }
+
     #[test]
     fn a_quiet_document_wants_no_frame() {
-        let app = App::new(GpuPreference::Automatic);
+        let app = opened();
         // Nothing playing, no background work, egui idle: the loop should sleep.
         assert_eq!(app.wants_frame(), Redraw::Idle);
     }
 
+    /// **The opening scene is an animation, and the loop has to keep drawing
+    /// it.** The window sleeps unless something asks for a frame, and on a
+    /// brand-new document nothing else would: the scene would freeze on its
+    /// first frame and stay there until the pointer moved.
+    #[test]
+    fn opening_frames_are_never_idle() {
+        let mut app = App::new(GpuPreference::Automatic);
+        assert_eq!(
+            app.wants_frame(),
+            Redraw::Now,
+            "a session that has not finished opening must keep drawing"
+        );
+        app.splash.dismiss();
+        assert_eq!(
+            app.wants_frame(),
+            Redraw::Idle,
+            "and go quiet the moment it has"
+        );
+    }
+
     #[test]
     fn playback_and_background_work_keep_frames_coming() {
-        let mut app = App::new(GpuPreference::Automatic);
+        let mut app = opened();
 
         app.editor.playback.playing = true;
         assert_eq!(app.wants_frame(), Redraw::Now, "playback must animate");
@@ -6453,7 +7031,7 @@ mod idle_tests {
 
     #[test]
     fn egui_timed_repaint_is_honoured_when_otherwise_idle() {
-        let mut app = App::new(GpuPreference::Automatic);
+        let mut app = opened();
         let at = Instant::now() + Duration::from_millis(50);
         app.egui_repaint = Some(at);
         assert_eq!(app.wants_frame(), Redraw::At(at));
@@ -6461,7 +7039,7 @@ mod idle_tests {
 
     #[test]
     fn the_poll_escape_hatch_forces_frames() {
-        let mut app = App::new(GpuPreference::Automatic);
+        let mut app = opened();
         app.force_poll = true;
         assert_eq!(app.wants_frame(), Redraw::Now);
     }

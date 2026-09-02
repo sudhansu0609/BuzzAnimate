@@ -1665,15 +1665,66 @@ fn draw_layer(
             builder.push_isolation(bounds.intersect(builder.clip_bounds()));
         }
 
+        // **The rim the key light lays around this layer's artwork**, if it
+        // lays one. See `buzz_light::rim_glow`: a glow outside the silhouette,
+        // in the light's colour and at the light's strength, so the edges come
+        // up when the light does.
+        //
+        // Per *layer* rather than per shape, and from one union silhouette: a
+        // character is a hundred shapes and glowing each of them would rim
+        // every internal seam \u2014 the arm's edge against the body it is drawn
+        // over \u2014 which reads as a drawing coming apart rather than as light.
+        // The same reasoning, and the same shape, as the one cast shadow a
+        // layer throws.
+        //
+        // Trimmed away with the crescents at `LightDetail::Fill`: a rim is
+        // modelling, it costs a silhouette and a stack of strokes, and a frame
+        // that will not fit the rasteriser has to give something up.
+        let rim = (lit && cache.detail().models())
+            .then(|| rig.key())
+            .flatten()
+            .and_then(|key| {
+                let at = layer.bounds_at(frame).map(|b| b.center())?;
+                buzz_light::rim_glow(key, at, layer.depth)
+            });
+
         // Filters on the layer itself, which Animate does not have: the
         // whole layer is one subject, so a blurred background layer is one
         // effect rather than one per object on it.
-        let layer_fx = (!layer.filters.is_empty()).then(|| {
+        //
+        // The rim is built through exactly this path, from a `Glow` with the
+        // light's colour and reach, because a rim *is* Animate's Glow filter
+        // laid by a light instead of by hand \u2014 same geometry, same bands, same
+        // drawing code. Building it as a second mechanism would be two things
+        // to keep looking alike.
+        let needs_silhouette = !layer.filters.is_empty() || rim.is_some();
+        let layer_fx = needs_silhouette.then(|| {
             let mut silhouette = buzz_geom::BezPath::new();
             for object in resolved.iter() {
                 append_silhouette(object, Affine::IDENTITY, &mut silhouette);
             }
-            buzz_fx::build(&layer.filters, &silhouette)
+            let mut filters: Vec<buzz_fx::Filter> = Vec::with_capacity(layer.filters.len() + 1);
+            if let Some(rim) = rim {
+                filters.push(buzz_fx::Filter::new(buzz_fx::FilterKind::Glow {
+                    x: rim.reach,
+                    y: rim.reach,
+                    // The strength is already in the colour's alpha, so that a
+                    // rim which has fallen off across the stage arrives fainter
+                    // rather than narrower.
+                    strength: 1.0,
+                    color: rim.color,
+                    // Outside the line: what a hand-drawn rim is, and the only
+                    // thing lighting does here that can be brighter than the
+                    // picture around it.
+                    inner: false,
+                    knockout: false,
+                    quality: buzz_fx::Quality::default(),
+                }));
+            }
+            // The layer's own filters last, so one set by hand still sits over
+            // the rim rather than under it.
+            filters.extend(layer.filters.iter().cloned());
+            buzz_fx::build(&filters, &silhouette)
         });
 
         if let Some(fx) = &layer_fx {
@@ -1707,7 +1758,22 @@ fn draw_layer(
                 // field adds to it — the wider of the two wins, so a blurred
                 // background layer thrown out of focus is not blurred twice.
                 object_ctx.blur = combine_blur(layer_fx.as_ref().and_then(|fx| fx.blur), dof_blur);
-                draw_object(builder, object, owner, Affine::IDENTITY, &object_ctx, cache);
+
+                // Live modifiers (a spring, a wiggle) are evaluated here — the one
+                // place the window, the exporter and the headless tests all pass
+                // through, so what is drawn is what is exported. Almost every
+                // object has none and takes the cheap `None` path unchanged.
+                match scene.modified_object_at(layer.id, object, frame) {
+                    None => draw_object(builder, object, owner, Affine::IDENTITY, &object_ctx, cache),
+                    Some(eval) => {
+                        // A spring re-poses the rig into an owned copy (no `Arc`
+                        // identity); a wiggle only prepends a transform and keeps
+                        // the original, so its symbol/bounds caches still hit.
+                        let drawn = eval.object.as_ref().unwrap_or(object);
+                        let owner = if eval.object.is_some() { None } else { owner };
+                        draw_object(builder, drawn, owner, eval.prepend, &object_ctx, cache);
+                    }
+                }
             }
         }
 

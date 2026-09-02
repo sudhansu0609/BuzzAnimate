@@ -37,7 +37,6 @@ use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use buzz_render::GpuPreference;
-use buzz_scene::Scene;
 
 use crate::{ExportSettings, Exporter};
 
@@ -141,7 +140,7 @@ pub struct AnimatedReport {
 /// `false` cancels, and a cancelled export removes the partial file — half a
 /// GIF is no more use than half an MP4.
 pub fn export_gif(
-    scene: &Scene,
+    reel: &crate::Reel<'_>,
     frames: std::ops::Range<u32>,
     path: &Path,
     settings: &ExportSettings,
@@ -152,7 +151,7 @@ pub fn export_gif(
     let dither = gif.dither.arg().to_string();
     let loops = gif.loops;
     encode(
-        scene,
+        reel,
         frames,
         path,
         settings,
@@ -179,7 +178,7 @@ pub fn export_gif(
 
 /// Export a range of frames as an animated WebP.
 pub fn export_webp(
-    scene: &Scene,
+    reel: &crate::Reel<'_>,
     frames: std::ops::Range<u32>,
     path: &Path,
     settings: &ExportSettings,
@@ -189,7 +188,7 @@ pub fn export_webp(
 ) -> Result<AnimatedReport> {
     let webp = webp.clone();
     encode(
-        scene,
+        reel,
         frames,
         path,
         settings,
@@ -230,7 +229,7 @@ fn feed(command: &mut Command, width: u32, height: u32, fps: f64) {
 /// Render, pipe, and encode — everything the two formats share.
 #[allow(clippy::too_many_arguments, reason = "two call sites, all of it needed")]
 fn encode(
-    scene: &Scene,
+    reel: &crate::Reel<'_>,
     frames: std::ops::Range<u32>,
     path: &Path,
     settings: &ExportSettings,
@@ -250,19 +249,21 @@ fn encode(
         );
     }
 
-    let playlist = scene.playlist();
-    let fps = scene.stage().frame_rate.max(1.0);
+    if reel.is_empty() {
+        bail!("there are no scenes to export");
+    }
+    let lead = reel.lead().expect("a non-empty reel has a lead scene");
+    let fps = lead.stage().frame_rate.max(1.0);
     let mut exporter = Exporter::new(preference)?;
     let total = frames.len() as u32;
 
     // Rendered once before the pipe opens, so a size ffmpeg cannot take is
     // reported before a process is started.
     let numbers: Vec<u32> = frames.collect();
-    let first = playlist
-        .get(numbers[0] as usize)
-        .copied()
-        .unwrap_or(numbers[0]);
-    let probe = exporter.render(scene, first, settings)?;
+    let (first_scene, first_frame) = reel
+        .at_clamped(numbers[0])
+        .expect("a non-empty reel always has a frame to hold on");
+    let probe = exporter.render(first_scene, first_frame, settings)?;
     let (width, height) = (probe.width, probe.height);
 
     // Written to a temporary name and renamed into place: an interrupted encode
@@ -288,10 +289,9 @@ fn encode(
 
     for (i, &index) in numbers.iter().enumerate() {
         if i > 0 {
-            let at = playlist
-                .get(index as usize)
-                .copied()
-                .unwrap_or(index.min(scene.frame_count().saturating_sub(1)));
+            let (scene, at) = reel
+                .at_clamped(index)
+                .expect("a non-empty reel always has a frame to hold on");
             frame = exporter.render(scene, at, settings)?;
         }
 
@@ -341,6 +341,7 @@ fn encode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_scene::Scene;
     use buzz_geom::{Rect, Shape as _};
     use buzz_scene::{LayerKind, ShapeData};
     use peniko::Color;
@@ -381,7 +382,7 @@ mod tests {
         let settings = ExportSettings::scaled(&scene, 0.25);
 
         let report = export_gif(
-            &scene,
+            &crate::Reel::single(&scene),
             0..4,
             &path,
             &settings,
@@ -409,7 +410,7 @@ mod tests {
         let settings = ExportSettings::scaled(&scene, 0.25);
 
         let result = export_gif(
-            &scene,
+            &crate::Reel::single(&scene),
             0..4,
             &path,
             &settings,
@@ -435,7 +436,7 @@ mod tests {
         let settings = ExportSettings::scaled(&scene, 0.25);
 
         let report = export_webp(
-            &scene,
+            &crate::Reel::single(&scene),
             0..4,
             &path,
             &settings,

@@ -83,6 +83,55 @@ pub enum WidthResponse {
     Speed { reference_speed: f64 },
 }
 
+/// Which ends of a stroke narrow to a point.
+///
+/// A brush that tapers **one** end is the ordinary calligraphic mark: it
+/// starts where the nib was put down, full width, and lifts away to nothing.
+/// Tapering both is a leaf, and tapering neither is a marker pen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaperEnds {
+    /// Neither end tapers: both get a round cap.
+    Neither,
+    /// Both ends narrow to a point.
+    #[default]
+    Both,
+    /// The stroke starts fine and reaches full width — a pen being pressed
+    /// down. The end keeps its cap.
+    Start,
+    /// The stroke starts full and lifts away to nothing.
+    End,
+}
+
+impl TaperEnds {
+    pub const ALL: [TaperEnds; 4] = [Self::Both, Self::End, Self::Start, Self::Neither];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Neither => "Neither end",
+            Self::Both => "Both ends",
+            Self::Start => "Start only",
+            Self::End => "End only",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Neither => "A round cap at each end, like a marker pen",
+            Self::Both => "Narrows to a point at both ends, like a leaf",
+            Self::Start => "Starts fine and opens out — a pen being pressed down",
+            Self::End => "Starts full and lifts away to nothing, as a brush does",
+        }
+    }
+
+    fn tapers_start(self) -> bool {
+        matches!(self, Self::Both | Self::Start)
+    }
+
+    fn tapers_end(self) -> bool {
+        matches!(self, Self::Both | Self::End)
+    }
+}
+
 /// How a brush turns a stroke into artwork.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrushProfile {
@@ -94,9 +143,28 @@ pub struct BrushProfile {
     /// `0.0` follows the pointer exactly; `1.0` smooths hard. Animate's
     /// Smoothing setting is the same idea.
     pub smoothing: f64,
-    /// How much of the stroke, as a fraction of its length, tapers to a point
-    /// at each end. `0.0` gives round caps instead.
+    /// How far the ink is dragged behind the pointer. See
+    /// [`Conditioning::stabiliser`].
+    pub stabiliser: f64,
+    /// How much of the stroke, as a fraction of its length, tapers to a point.
+    /// `0.0` gives round caps instead.
     pub taper: f64,
+    /// Which ends [`Self::taper`] applies to.
+    pub taper_ends: TaperEnds,
+    /// **How much the paint resists spreading**, `0.0`–`1.0`.
+    ///
+    /// The outline of a stroke is a curve through the offset points either
+    /// side of its centreline, and a curve through points *bulges between
+    /// them* — outwards on the outside of every bend, and worst exactly where
+    /// a hand wobbles. That is what makes a finished stroke look as though it
+    /// flowed outwards a little after it was drawn: thin paint spreading.
+    ///
+    /// Viscosity is how far that curve is allowed to bulge. At `0.0` it is the
+    /// free Catmull-Rom construction, which is the loosest and the runniest; at
+    /// `1.0` the outline is pulled almost straight between its points and the
+    /// stroke keeps the width it was drawn at. It changes the silhouette only —
+    /// never where the stroke goes, and never how wide it is at any point.
+    pub viscosity: f64,
 }
 
 impl Default for BrushProfile {
@@ -108,7 +176,15 @@ impl Default for BrushProfile {
                 reference_speed: 900.0,
             },
             smoothing: 0.5,
+            // Off by default: the lag is a deliberate feel, and a brush that
+            // trailed behind the pointer without being asked would read as
+            // the application being slow.
+            stabiliser: 0.0,
             taper: 0.12,
+            taper_ends: TaperEnds::default(),
+            // Thick enough to hold its edge. Nought would be the free curve,
+            // which reads as paint that ran after it was put down.
+            viscosity: 0.65,
         }
     }
 }
@@ -128,6 +204,30 @@ impl BrushProfile {
             }
         };
         self.width * (min + (1.0 - min) * factor)
+    }
+
+    /// How this brush wants its samples cleaned up.
+    pub fn conditioning(&self) -> Conditioning {
+        Conditioning {
+            smoothing: self.smoothing,
+            stabiliser: self.stabiliser,
+        }
+    }
+
+    fn tapers_start(&self) -> bool {
+        self.taper > 0.0 && self.taper_ends.tapers_start()
+    }
+
+    fn tapers_end(&self) -> bool {
+        self.taper > 0.0 && self.taper_ends.tapers_end()
+    }
+
+    /// How tightly the outline is drawn between its points. See
+    /// [`Self::viscosity`].
+    fn outline_tension(&self) -> f64 {
+        // Never quite zero: a completely slack tension is a polyline, and the
+        // facets show on a big soft stroke.
+        1.0 - self.viscosity.clamp(0.0, 1.0) * 0.9
     }
 }
 
@@ -208,20 +308,136 @@ impl BrushOutput {
 // Conditioning
 // ---------------------------------------------------------------------------
 
-/// Decimate and smooth raw pointer samples.
+/// How a stroke's raw samples are cleaned up before anything is built from
+/// them.
 ///
-/// Two separate jobs, done in this order for a reason. Decimation first,
-/// because a pointer reporting at 1000 Hz produces runs of near-identical
-/// samples whose tangents are numerical noise; smoothing that noise averages
-/// it into the result instead of removing it. Once the samples are spaced,
-/// smoothing has real motion to work on.
+/// Two dials, and they are **not** the same dial twice.
+///
+/// [`Self::smoothing`] is a symmetric filter over the finished run: it pulls
+/// each sample towards the line between its neighbours. It cannot lag, because
+/// it can see both sides, and it evens out a shaky line without changing where
+/// that line went.
+///
+/// [`Self::stabiliser`] is what a heavy hand-rest does. The ink is dragged
+/// along **behind** the pointer instead of following it exactly, so jitter
+/// never reaches the paper at all. That lag is the whole feature — it is what
+/// makes a long confident curve possible with an unsteady hand — and it is
+/// also why it is a separate setting a user opts into rather than something
+/// smoothing does quietly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Conditioning {
+    /// `0.0` follows the samples exactly; `1.0` smooths hard.
+    pub smoothing: f64,
+    /// `0.0` is off; higher drags the ink further behind the pointer.
+    pub stabiliser: f64,
+}
+
+impl Default for Conditioning {
+    fn default() -> Self {
+        Self {
+            smoothing: 0.5,
+            stabiliser: 0.0,
+        }
+    }
+}
+
+impl Conditioning {
+    /// Smoothing alone, with no stabiliser — what every caller that has no
+    /// opinion about lag wants.
+    pub fn smoothing(smoothing: f64) -> Self {
+        Self {
+            smoothing,
+            stabiliser: 0.0,
+        }
+    }
+}
+
+/// Steady, decimate and smooth raw pointer samples.
+///
+/// Three jobs, in this order for a reason.
+///
+/// The stabiliser runs **first**, on the raw stream, because it is a filter
+/// over *time* and wants every sample the device reported: run after
+/// decimation it would be pulling against a signal that had already been
+/// thinned, and its lag would depend on how fast the stroke was drawn.
+///
+/// Decimation comes next, because a pointer reporting at 1000 Hz produces runs
+/// of near-identical samples whose tangents are numerical noise; smoothing
+/// that noise averages it into the result instead of removing it.
+///
+/// Smoothing comes last, once the samples are spaced and there is real motion
+/// to work on.
 pub fn condition(
     samples: &[StrokeSample],
-    smoothing: f64,
+    how: Conditioning,
     budget: &BrushBudget,
 ) -> Vec<StrokeSample> {
-    let decimated = decimate(samples, budget);
-    smooth_samples(&decimated, smoothing)
+    let steadied = stabilise(samples, how.stabiliser);
+    let decimated = decimate(&steadied, budget);
+    smooth_samples(&decimated, how.smoothing)
+}
+
+/// **Drag the ink along behind the pointer.**
+///
+/// Each sample is pulled from the previous *stabilised* position towards the
+/// one the device reported, rather than jumping to it. That is a one-pole
+/// filter, and it is what every drawing application calls a stabiliser: the
+/// hand's jitter is a fast wiggle, the stroke is a slow sweep, and lagging
+/// behind removes the first while following the second.
+///
+/// # It only ever looks backwards
+///
+/// A stabilised sample depends on the samples before it and on nothing after,
+/// which is what makes it usable live: as the stroke grows, everything already
+/// drawn stays exactly where it was and only the new end moves. A filter that
+/// looked ahead would redraw the whole stroke on every pointer move, and the
+/// line would crawl about under the hand.
+///
+/// # Catching up
+///
+/// Lag means the ink is behind the pointer when the button comes up, so a
+/// stabilised stroke would stop short of where it was released — by more the
+/// heavier the setting. The tail is therefore eased back onto the true samples
+/// over the last stretch of the stroke, so the ink arrives exactly where the
+/// pointer let go. That is the catch-up every stabiliser does when you stop
+/// moving, and it is the reason this cannot simply be a lag.
+pub fn stabilise(samples: &[StrokeSample], strength: f64) -> Vec<StrokeSample> {
+    let strength = strength.clamp(0.0, 1.0);
+    if strength <= 0.0 || samples.len() < 3 {
+        return samples.to_vec();
+    }
+
+    // How far towards the pointer each step travels. Never zero, or the ink
+    // would never move at all; 0.08 at full strength is heavy and still
+    // plainly following.
+    let follow = (1.0 - strength).max(0.08);
+
+    let mut out = samples.to_vec();
+    let mut position = samples[0].point.to_vec2();
+    for i in 1..samples.len() {
+        position = position.lerp(samples[i].point.to_vec2(), follow);
+        out[i].point = position.to_point();
+    }
+
+    // Ease the tail back onto the real samples, so the stroke ends where the
+    // pointer was released rather than however far behind the lag left it.
+    // Over a stretch rather than in one step: a single jump to the true end
+    // would put a corner on the end of every stabilised stroke.
+    let n = out.len();
+    let tail = ((n as f64 * 0.25) as usize).clamp(2, 24).min(n - 1);
+    for k in 0..tail {
+        let i = n - tail + k;
+        // Smoothstep, so the ink rejoins the pointer without a crease where
+        // the catch-up begins.
+        let t = (k + 1) as f64 / tail as f64;
+        let eased = t * t * (3.0 - 2.0 * t);
+        out[i].point = out[i]
+            .point
+            .to_vec2()
+            .lerp(samples[i].point.to_vec2(), eased)
+            .to_point();
+    }
+    out
 }
 
 /// Drop samples that are too close to the one before to carry information.
@@ -318,6 +534,18 @@ pub fn centreline(samples: &[StrokeSample]) -> BezPath {
 /// standard uniform Catmull-Rom-to-Bézier conversion, and it is exact — no
 /// iteration, no error metric, no possibility of divergence.
 pub fn catmull_rom(points: &[Point]) -> BezPath {
+    catmull_rom_tense(points, 1.0)
+}
+
+/// [`catmull_rom`], with a hold on how far it may bulge between its points.
+///
+/// `tension` scales the tangents: `1.0` is the free construction, `0.0` pulls
+/// the curve straight between consecutive points. Every value passes through
+/// exactly the same points — only the shape *between* them changes.
+///
+/// This is what a brush's viscosity turns: see [`BrushProfile::viscosity`] for
+/// why an outline that bulges reads as paint that ran.
+pub fn catmull_rom_tense(points: &[Point], tension: f64) -> BezPath {
     let mut path = BezPath::new();
     match points.len() {
         0 => return path,
@@ -332,6 +560,7 @@ pub fn catmull_rom(points: &[Point]) -> BezPath {
         }
         _ => {}
     }
+    let tension = tension.clamp(0.0, 1.0);
 
     path.move_to(points[0]);
     for i in 0..points.len() - 1 {
@@ -342,8 +571,23 @@ pub fn catmull_rom(points: &[Point]) -> BezPath {
         let p2 = points[i + 1];
         let p3 = points[(i + 2).min(points.len() - 1)];
 
-        let c1 = p1 + (p2 - p0) / 6.0;
-        let c2 = p2 - (p3 - p1) / 6.0;
+        // A handle longer than the segment it belongs to is precisely what
+        // makes a curve swing wide of its own points, and freehand input —
+        // where one sample can sit far off the line of its neighbours —
+        // produces those constantly. Held to a third of the chord, which is
+        // the length a handle has when the curve is a straight line.
+        let limit = (p2 - p1).hypot() / 3.0;
+        let hold = |v: Vec2| {
+            let length = v.hypot();
+            if length > limit && length > 1e-12 {
+                v * (limit / length)
+            } else {
+                v
+            }
+        };
+
+        let c1 = p1 + hold((p2 - p0) * (tension / 6.0));
+        let c2 = p2 - hold((p3 - p1) * (tension / 6.0));
         path.curve_to(c1, c2, p2);
     }
     path
@@ -366,7 +610,7 @@ pub fn fluid_outline(
     profile: &BrushProfile,
     budget: &BrushBudget,
 ) -> BrushOutput {
-    let conditioned = condition(samples, profile.smoothing, budget);
+    let conditioned = condition(samples, profile.conditioning(), budget);
     if conditioned.len() < 2 {
         // A tap, not a drag. Animate paints a dot, so we do too.
         if let Some(sample) = conditioned.first() {
@@ -395,12 +639,17 @@ pub fn fluid_outline(
     // a single continuous loop rather than two crossing strands.
     right.reverse();
 
-    let mut path = catmull_rom(&left);
-    let back = catmull_rom(&right);
+    // Held to the brush's viscosity, so the silhouette does not swing wide of
+    // the offsets it was built from. This is the only place it applies: the
+    // centreline is where the stroke *is*, and is never moved by it.
+    let tension = profile.outline_tension();
+    let mut path = catmull_rom_tense(&left, tension);
+    let back = catmull_rom_tense(&right, tension);
 
-    // Join the two sides. With a taper the ends have collapsed to a point and
-    // a straight join is invisible; without one this is where a cap belongs.
-    if profile.taper <= 0.0 {
+    // Join the two sides. A tapered end has collapsed to a point and a
+    // straight join across it is invisible; an untapered one is where a round
+    // cap belongs — so a stroke tapered at one end only gets exactly one cap.
+    if !profile.tapers_end() {
         append_cap(
             &mut path,
             conditioned[conditioned.len() - 1].point,
@@ -409,7 +658,7 @@ pub fn fluid_outline(
         );
     }
     append_without_move(&mut path, &back);
-    if profile.taper <= 0.0 {
+    if !profile.tapers_start() {
         append_cap(
             &mut path,
             conditioned[0].point,
@@ -462,13 +711,21 @@ fn widths_along(samples: &[StrokeSample], profile: &BrushProfile) -> Vec<f64> {
 
         let mut width = profile.width_at(samples[i].pressure, speed);
 
-        // Taper both ends towards a point.
+        // Taper whichever ends the profile asks for, towards a point.
         if profile.taper > 0.0 && total > 0.0 {
             let taper_length = (profile.taper.clamp(0.0, 0.5)) * total;
             if taper_length > 0.0 {
                 let from_start = distances[i];
                 let from_end = total - distances[i];
-                let nearest = from_start.min(from_end);
+                // Only a tapered end pulls the width in; an untapered one is
+                // infinitely far away as far as this is concerned, so a stroke
+                // tapered at one end keeps its full width at the other.
+                let nearest = match (profile.tapers_start(), profile.tapers_end()) {
+                    (true, true) => from_start.min(from_end),
+                    (true, false) => from_start,
+                    (false, true) => from_end,
+                    (false, false) => f64::INFINITY,
+                };
                 if nearest < taper_length {
                     // Square root rather than linear: a linear taper reads as a
                     // wedge, and a brush end is closer to an ellipse.
@@ -579,14 +836,57 @@ pub fn stamp_along(
     fit: PatternFit,
     budget: &BrushBudget,
 ) -> BrushOutput {
-    let table = ArcTable::build(path);
-    if table.total <= 0.0 || source.elements().is_empty() {
+    if source.elements().is_empty() {
+        return BrushOutput::plain(BezPath::new());
+    }
+    let plan = stamp_transforms(path, source.bounding_box(), fit, budget);
+    if plan.transforms.is_empty() {
         return BrushOutput::plain(BezPath::new());
     }
 
-    let bounds = source.bounding_box();
-    if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
-        return BrushOutput::plain(BezPath::new());
+    let mut out = BezPath::new();
+    let mut truncated = false;
+    for transform in &plan.transforms {
+        if out.elements().len() >= budget.max_elements {
+            truncated = true;
+            break;
+        }
+        append_all(&mut out, &(*transform * source.clone()));
+    }
+    // A single stretched stamp is placed whole and then cut, because there is
+    // no next stamp to stop before.
+    if plan.transforms.len() == 1 && out.elements().len() > budget.max_elements {
+        truncated = true;
+        out = truncate(out, budget.max_elements);
+    }
+
+    BrushOutput {
+        path: out,
+        stamps: plan.transforms.len(),
+        spacing_widened: plan.spacing_widened,
+        truncated,
+    }
+}
+
+/// **Where each stamp goes**, without building any geometry.
+///
+/// The arithmetic [`stamp_along`] runs, on its own, because a brush that
+/// stamps *painted artwork* rather than a bare outline needs the same
+/// placements and must not grow a second copy of the spacing rules — a
+/// pattern brush and a captured brush that disagreed about where stamp seven
+/// went would be two brushes wearing one name.
+///
+/// `source` is the source's bounding box in its own coordinates. The
+/// transforms map that space onto the stroke.
+pub fn stamp_transforms(
+    path: &BezPath,
+    source: kurbo::Rect,
+    fit: PatternFit,
+    budget: &BrushBudget,
+) -> StampPlan {
+    let table = ArcTable::build(path);
+    if table.total <= 0.0 || source.width() <= 0.0 || source.height() <= 0.0 {
+        return StampPlan::default();
     }
 
     match fit {
@@ -604,23 +904,15 @@ pub fn stamp_along(
                 0.0
             };
 
-            let scale_x = table.total / bounds.width();
-            let transform = kurbo::Affine::translate(start.to_vec2())
-                * kurbo::Affine::rotate(angle)
-                * kurbo::Affine::scale_non_uniform(scale_x, 1.0)
-                * kurbo::Affine::translate(-bounds.origin().to_vec2());
-
-            let mut out = BezPath::new();
-            append_all(&mut out, &(transform * source.clone()));
-            let truncated = out.elements().len() > budget.max_elements;
-            if truncated {
-                out = truncate(out, budget.max_elements);
-            }
-            BrushOutput {
-                path: out,
-                stamps: 1,
+            let scale_x = table.total / source.width();
+            StampPlan {
+                transforms: vec![
+                    kurbo::Affine::translate(start.to_vec2())
+                        * kurbo::Affine::rotate(angle)
+                        * kurbo::Affine::scale_non_uniform(scale_x, 1.0)
+                        * kurbo::Affine::translate(-source.origin().to_vec2()),
+                ],
                 spacing_widened: false,
-                truncated,
             }
         }
 
@@ -637,14 +929,8 @@ pub fn stamp_along(
             };
 
             let count = ((table.total / spacing).floor() as usize + 1).min(budget.max_stamps);
-            let mut out = BezPath::new();
-            let mut truncated = false;
-
+            let mut transforms = Vec::with_capacity(count);
             for i in 0..count {
-                if out.elements().len() >= budget.max_elements {
-                    truncated = true;
-                    break;
-                }
                 let distance = i as f64 * spacing;
                 let (point, tangent) = table.frame_at(distance);
                 let angle = if tangent.hypot() > 1e-9 {
@@ -656,20 +942,29 @@ pub fn stamp_along(
                 // Stamps are centred on the path, which is what makes a
                 // pattern read as running *along* the stroke rather than
                 // hanging off one side of it.
-                let transform = kurbo::Affine::translate(point.to_vec2())
-                    * kurbo::Affine::rotate(angle)
-                    * kurbo::Affine::translate(-bounds.center().to_vec2());
-                append_all(&mut out, &(transform * source.clone()));
+                transforms.push(
+                    kurbo::Affine::translate(point.to_vec2())
+                        * kurbo::Affine::rotate(angle)
+                        * kurbo::Affine::translate(-source.center().to_vec2()),
+                );
             }
 
-            BrushOutput {
-                path: out,
-                stamps: count,
+            StampPlan {
+                transforms,
                 spacing_widened: widened,
-                truncated,
             }
         }
     }
+}
+
+/// Where a stroke's stamps go. See [`stamp_transforms`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StampPlan {
+    /// One transform per stamp, from the source's own space onto the stroke.
+    pub transforms: Vec<kurbo::Affine>,
+    /// Set when the requested spacing was too fine for the budget and had to
+    /// be widened. The stroke still covers its whole length.
+    pub spacing_widened: bool,
 }
 
 fn append_all(path: &mut BezPath, other: &BezPath) {
@@ -843,6 +1138,136 @@ mod tests {
         );
     }
 
+    /// **A stabiliser keeps jitter off the paper.** A shaky line drawn with
+    /// one on is far straighter than the hand that drew it.
+    #[test]
+    fn a_stabiliser_takes_the_shake_out_of_a_shaky_line() {
+        // A straight sweep with a fast wobble on it: the wobble is the hand,
+        // the sweep is the stroke.
+        let samples: Vec<StrokeSample> = (0..300)
+            .map(|i| {
+                let t = i as f64;
+                StrokeSample::new(Point::new(t * 2.0, (t * 1.7).sin() * 9.0), t * 0.004)
+            })
+            .collect();
+
+        let wobble_of = |strength: f64| -> f64 {
+            stabilise(&samples, strength)
+                .iter()
+                // The middle of the stroke: past the settling-in at the start
+                // and before the catch-up at the end.
+                .skip(60)
+                .take(150)
+                .map(|s| s.point.y.abs())
+                .fold(0.0, f64::max)
+        };
+
+        let raw = wobble_of(0.0);
+        let steadied = wobble_of(0.9);
+        assert!(
+            steadied < raw * 0.5,
+            "a stabiliser should halve the shake at least: {steadied:.2} against {raw:.2}"
+        );
+    }
+
+    /// **And the stroke still ends where it was let go.** The lag is real, so
+    /// without the catch-up a stabilised stroke would stop short of the
+    /// pointer — by more, the heavier the setting.
+    #[test]
+    fn a_stabilised_stroke_still_reaches_the_pointer() {
+        let samples = drag(Point::ZERO, Point::new(400.0, 120.0), 200);
+        for strength in [0.3, 0.6, 0.9, 1.0] {
+            let out = stabilise(&samples, strength);
+            let ended = out.last().unwrap().point;
+            let asked = samples.last().unwrap().point;
+            assert!(
+                (ended - asked).hypot() < 1e-9,
+                "at {strength} the ink stopped at {ended:?} instead of {asked:?}"
+            );
+            assert_eq!(
+                out.first().unwrap().point,
+                samples.first().unwrap().point,
+                "and it starts where the pointer went down"
+            );
+        }
+    }
+
+    /// **It only looks backwards.** As a stroke grows, everything already
+    /// drawn has to stay exactly where it was, or the line crawls about under
+    /// the hand while it is being drawn.
+    #[test]
+    fn stabilising_never_moves_what_is_already_drawn() {
+        let whole = drag(Point::ZERO, Point::new(600.0, 200.0), 300);
+        let so_far = &whole[..180];
+
+        let early = stabilise(so_far, 0.8);
+        let late = stabilise(&whole, 0.8);
+
+        // Everything before the early stroke's own catch-up tail must be
+        // identical in both — the later samples cannot have reached back.
+        let settled = early.len() - (early.len() / 4).clamp(2, 24) - 1;
+        for i in 0..settled {
+            assert!(
+                (early[i].point - late[i].point).hypot() < 1e-9,
+                "sample {i} moved when the stroke grew: {:?} then {:?}",
+                early[i].point,
+                late[i].point
+            );
+        }
+    }
+
+    /// Off is off: a stabiliser at zero must hand back exactly what it was
+    /// given, or every brush pays for a feature nobody switched on.
+    #[test]
+    fn a_stabiliser_at_zero_changes_nothing() {
+        let samples = drag(Point::ZERO, Point::new(50.0, 20.0), 40);
+        assert_eq!(stabilise(&samples, 0.0), samples);
+
+        // And it survives the degenerate inputs every filter here has to.
+        assert!(stabilise(&[], 1.0).is_empty());
+        assert_eq!(stabilise(&samples[..1], 1.0).len(), 1);
+        assert_eq!(stabilise(&samples[..2], 1.0).len(), 2);
+        let stacked = vec![StrokeSample::new(Point::new(2.0, 2.0), 0.0); 30];
+        assert_eq!(stabilise(&stacked, 1.0).len(), 30);
+    }
+
+    /// The two dials are different dials. Smoothing cannot lag — it sees both
+    /// sides — and the stabiliser is exactly a lag, so a stroke run through
+    /// each comes out differently.
+    #[test]
+    fn the_stabiliser_and_smoothing_are_not_the_same_filter() {
+        let samples: Vec<StrokeSample> = (0..120)
+            .map(|i| {
+                let t = i as f64;
+                StrokeSample::new(Point::new(t * 3.0, (t * 1.3).sin() * 12.0), t * 0.01)
+            })
+            .collect();
+        let budget = BrushBudget::default();
+
+        let smoothed = condition(&samples, Conditioning::smoothing(0.9), &budget);
+        let steadied = condition(
+            &samples,
+            Conditioning {
+                smoothing: 0.0,
+                stabiliser: 0.9,
+            },
+            &budget,
+        );
+        assert_ne!(
+            smoothed, steadied,
+            "the two settings must not be one setting twice"
+        );
+
+        // Both still start and end where the stroke did.
+        for run in [&smoothed, &steadied] {
+            assert_eq!(run.first().unwrap().point, samples.first().unwrap().point);
+            assert!(
+                (run.last().unwrap().point - samples.last().unwrap().point).hypot() < 1e-9,
+                "a conditioned stroke must still end at the pointer"
+            );
+        }
+    }
+
     #[test]
     fn no_smoothing_changes_nothing() {
         let samples = drag(Point::ZERO, Point::new(50.0, 20.0), 12);
@@ -964,6 +1389,7 @@ mod tests {
             smoothing: 0.0,
             width: 20.0,
             min_ratio: 0.1,
+            ..BrushProfile::default()
         };
 
         let at = |pressure: f64| -> f64 {
@@ -998,6 +1424,177 @@ mod tests {
         );
         let bounds = out.path.bounding_box();
         assert!(bounds.width() > 0.0 && bounds.height() > 0.0);
+    }
+
+    /// **A viscous brush does not spread.** The complaint this answers: a
+    /// finished stroke looked as though the paint had run outwards a little
+    /// after it was drawn. That spread is the outline curve bulging past the
+    /// offsets it was built from, worst where a hand wobbles — so a wobbly
+    /// stroke drawn thick must cover *less* ground than the same stroke drawn
+    /// thin, while still being the same stroke down the middle.
+    #[test]
+    fn a_viscous_brush_spreads_less_than_a_runny_one() {
+        // A deliberately shaky stroke, which is what freehand input is.
+        let samples: Vec<StrokeSample> = (0..120)
+            .map(|i| {
+                let t = i as f64;
+                StrokeSample::new(
+                    Point::new(t * 4.0, (t * 0.9).sin() * 26.0 + (t * 2.3).sin() * 9.0),
+                    t * 0.02,
+                )
+            })
+            .collect();
+
+        let area_of = |viscosity: f64| -> f64 {
+            let profile = BrushProfile {
+                width: 26.0,
+                taper: 0.0,
+                smoothing: 0.0,
+                response: WidthResponse::Uniform,
+                viscosity,
+                ..BrushProfile::default()
+            };
+            let out = fluid_outline(&samples, &profile, &BrushBudget::default());
+            // Signed area by the shoelace formula over the flattened outline:
+            // how much stage the silhouette actually covers.
+            let mut points: Vec<Point> = Vec::new();
+            kurbo::flatten(out.path.iter(), 0.05, |el| match el {
+                kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => points.push(p),
+                _ => {}
+            });
+            let mut area = 0.0;
+            for pair in points.windows(2) {
+                area += pair[0].x * pair[1].y - pair[1].x * pair[0].y;
+            }
+            (area / 2.0).abs()
+        };
+
+        let runny = area_of(0.0);
+        let thick = area_of(1.0);
+        assert!(
+            thick < runny,
+            "a viscous stroke should cover less ground: thick {thick:.0} against runny {runny:.0}"
+        );
+        // And it is still the same stroke, not a shrivelled one.
+        assert!(
+            thick > runny * 0.75,
+            "viscosity must hold the edge, not eat the stroke: {thick:.0} against {runny:.0}"
+        );
+    }
+
+    /// Viscosity changes the silhouette and nothing else: the stroke still
+    /// runs from where it was started to where it was let go.
+    #[test]
+    fn viscosity_does_not_move_the_stroke() {
+        let samples = drag(Point::new(10.0, 10.0), Point::new(210.0, 90.0), 40);
+        let bounds_at = |viscosity: f64| {
+            let profile = BrushProfile {
+                viscosity,
+                taper: 0.0,
+                ..BrushProfile::default()
+            };
+            fluid_outline(&samples, &profile, &BrushBudget::default())
+                .path
+                .bounding_box()
+        };
+        let runny = bounds_at(0.0);
+        let thick = bounds_at(1.0);
+
+        // The ends are pinned, so the extremes agree to within the cap.
+        assert!((runny.x0 - thick.x0).abs() < 2.0, "{runny:?} {thick:?}");
+        assert!((runny.x1 - thick.x1).abs() < 2.0, "{runny:?} {thick:?}");
+    }
+
+    /// A tension of zero cannot bulge at all: every handle collapses and the
+    /// curve is the polyline through its points.
+    #[test]
+    fn a_slack_tension_is_the_polyline_through_the_points() {
+        let points = vec![
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 40.0),
+            Point::new(20.0, 0.0),
+            Point::new(30.0, 40.0),
+        ];
+        let tight = catmull_rom_tense(&points, 0.0).bounding_box();
+        assert!(
+            tight.y0 >= -1e-9 && tight.y1 <= 40.0 + 1e-9,
+            "a slack curve must stay inside its own points: {tight:?}"
+        );
+
+        // And the free one is allowed to swing wider, which is the difference
+        // viscosity turns.
+        let free = catmull_rom_tense(&points, 1.0).bounding_box();
+        assert!(free.y0 <= tight.y0 && free.y1 >= tight.y1);
+    }
+
+    /// **One end tapered, the other not** — the calligraphic mark the brush
+    /// options offer, and the thing a single taper setting could not express.
+    #[test]
+    fn a_stroke_can_taper_at_one_end_only() {
+        let samples = drag(Point::ZERO, Point::new(200.0, 0.0), 100);
+        let extent_near = |out: &BrushOutput, x: f64| -> f64 {
+            let ys: Vec<f64> = out
+                .path
+                .elements()
+                .iter()
+                .filter_map(|e| match e {
+                    kurbo::PathEl::MoveTo(p)
+                    | kurbo::PathEl::LineTo(p)
+                    | kurbo::PathEl::CurveTo(_, _, p) => Some(*p),
+                    _ => None,
+                })
+                .filter(|p| (p.x - x).abs() < 5.0)
+                .map(|p| p.y)
+                .collect();
+            match (
+                ys.iter().cloned().fold(f64::INFINITY, f64::min),
+                ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            ) {
+                (lo, hi) if lo.is_finite() && hi.is_finite() => hi - lo,
+                _ => 0.0,
+            }
+        };
+        let build = |ends: TaperEnds| {
+            fluid_outline(
+                &samples,
+                &BrushProfile {
+                    taper: 0.3,
+                    taper_ends: ends,
+                    smoothing: 0.0,
+                    response: WidthResponse::Uniform,
+                    width: 20.0,
+                    ..BrushProfile::default()
+                },
+                &BrushBudget::default(),
+            )
+        };
+
+        let end_only = build(TaperEnds::End);
+        assert!(
+            extent_near(&end_only, 198.0) < extent_near(&end_only, 100.0) * 0.7,
+            "tapering the end should narrow it"
+        );
+        assert!(
+            extent_near(&end_only, 2.0) > extent_near(&end_only, 100.0) * 0.8,
+            "and must leave the start at full width"
+        );
+
+        let start_only = build(TaperEnds::Start);
+        assert!(
+            extent_near(&start_only, 2.0) < extent_near(&start_only, 100.0) * 0.7,
+            "tapering the start should narrow it"
+        );
+        assert!(
+            extent_near(&start_only, 198.0) > extent_near(&start_only, 100.0) * 0.8,
+            "and must leave the end at full width"
+        );
+
+        let neither = build(TaperEnds::Neither);
+        assert!(
+            extent_near(&neither, 2.0) > extent_near(&neither, 100.0) * 0.8
+                && extent_near(&neither, 198.0) > extent_near(&neither, 100.0) * 0.8,
+            "neither end should narrow"
+        );
     }
 
     #[test]

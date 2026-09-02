@@ -28,6 +28,8 @@ png = "0.18"
 tempfile = "3"
 png = "0.18"
 serde_json.workspace = true
+# For the motion-path headless test: bake an object along a curve, then render.
+buzz-act.workspace = true
 # For the `shot` example only: rendering a frame of a real Animate document
 # straight to a PNG is how import fidelity is checked by eye.
 buzz-doc.workspace = true

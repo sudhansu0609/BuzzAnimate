@@ -270,7 +270,7 @@ fn a_sequence_writes_a_numbered_file_for_every_frame() {
 
     let mut seen = Vec::new();
     let report = buzz_export::export_sequence(
-        &scene,
+        &buzz_export::Reel::single(&scene),
         0..5,
         dir.path(),
         "frame",

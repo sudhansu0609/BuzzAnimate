@@ -147,7 +147,7 @@ fn an_exported_sequence_repeats_the_looping_section() {
     let dir = tempfile::tempdir().expect("temp dir");
     let settings = ExportSettings::scaled(&scene, 0.25);
     let report = buzz_export::export_sequence(
-        &scene,
+        &buzz_export::Reel::single(&scene),
         0..scene.rendered_frame_count(),
         dir.path(),
         "loop",
@@ -190,7 +190,7 @@ fn a_document_without_a_loop_is_unchanged() {
     let dir = tempfile::tempdir().expect("temp dir");
     let settings = ExportSettings::scaled(&scene, 0.25);
     let report = buzz_export::export_sequence(
-        &scene,
+        &buzz_export::Reel::single(&scene),
         0..4,
         dir.path(),
         "plain",
@@ -232,7 +232,7 @@ fn a_partial_range_is_numbered_in_film_frames() {
     let settings = ExportSettings::scaled(&scene, 0.25);
     // Film frames 4..6 are the second pass over the section: green, blue.
     buzz_export::export_sequence(
-        &scene,
+        &buzz_export::Reel::single(&scene),
         3..5,
         dir.path(),
         "part",

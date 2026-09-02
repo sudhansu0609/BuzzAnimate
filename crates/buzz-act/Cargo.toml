@@ -1,0 +1,18 @@
+[package]
+name = "buzz-act"
+description = "Staging and performance: building a scene, and animating people in it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+buzz-geom.workspace = true
+buzz-rig.workspace = true
+buzz-scene.workspace = true
+buzz-light.workspace = true
+buzz-physics.workspace = true
+
+kurbo.workspace = true
+peniko.workspace = true

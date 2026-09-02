@@ -89,7 +89,15 @@ pub struct Editor {
     /// film and came back a week later would be a surprise, and one that
     /// travelled inside a `.buzz` file handed to somebody else would be a
     /// stranger one.
-    pub frame_clipboard: Option<Vec<std::sync::Arc<Object>>>,
+    /// **What Copy Frames took: one frame of every layer.**
+    ///
+    /// Per layer rather than for the active one alone, because a frame of a
+    /// drawing is a frame of the *whole* drawing — the character, the
+    /// background and the overlay are on three layers and copying one of them
+    /// is never what anybody means. The layer each came from is kept so the
+    /// paste puts it back where it belongs rather than piling every layer's
+    /// artwork onto whichever one happens to be active.
+    pub frame_clipboard: Option<Vec<(LayerId, Vec<std::sync::Arc<Object>>)>>,
     /// Artwork on the clipboard, from Cut or Copy.
     ///
     /// # Why a whole `Scene`
@@ -162,6 +170,15 @@ pub struct Editor {
     pub sound: crate::sound::SoundBank,
     /// The Lip Sync dialog.
     pub lip_sync: buzz_ui::LipSyncState,
+    /// Whether the last sound import also landed on the timeline. See
+    /// [`Self::sound_was_placed`].
+    sound_placed: bool,
+    /// The Set the Scene and Animate Selection dialogs. See `crate::staging`.
+    pub staging: buzz_ui::StagingState,
+    /// A motion path just drawn, waiting on the dialog: the curve and the object
+    /// it will send along it, captured at draw time so a later change of
+    /// selection cannot send the wrong thing. See `crate::staging`.
+    pub pending_motion_path: Option<(buzz_geom::BezPath, ObjectId)>,
     /// Set when the user asks to quit.
     pub should_quit: bool,
     /// Transient message for the status bar.
@@ -296,6 +313,9 @@ impl Editor {
             light_gesture: None,
             sound: crate::sound::SoundBank::new(stage_fps),
             lip_sync: buzz_ui::LipSyncState::default(),
+            sound_placed: false,
+            staging: buzz_ui::StagingState::default(),
+            pending_motion_path: None,
             import_summary: None,
             should_quit: false,
             status: None,
@@ -865,6 +885,30 @@ impl Editor {
         self.machine.preview(&self.tool_context())
     }
 
+    /// Will [`Self::preview`] paint into the Vello scene rather than the
+    /// chrome?
+    ///
+    /// Answered without building the preview. The artwork itself is built
+    /// once a frame, by the stage; this question is asked twice more — by the
+    /// encode-reuse check and by the chrome, which draws nothing for such a
+    /// preview — and a brush preview is rebuilt on every pointer move, so
+    /// answering it by building the artwork two extra times per frame is
+    /// exactly the lag the preview budgets exist to prevent.
+    pub fn preview_paints_into_scene(&self) -> bool {
+        if !self.machine.painting_preview() {
+            return false;
+        }
+        // A pattern brush with no source shape falls back to a chrome-drawn
+        // centreline — the one brush preview that is *not* painted artwork —
+        // and skipping the chrome for it would leave the drag invisible.
+        match self.style.brush.kind {
+            buzz_ui::BrushKind::Pattern | buzz_ui::BrushKind::Art => {
+                self.style.brush.pattern_path().is_some()
+            }
+            _ => true,
+        }
+    }
+
     /// Document-space tolerance equivalent to a few screen pixels.
     pub(crate) fn pick_tolerance(&self) -> f64 {
         PICK_TOLERANCE_PX / self.camera.zoom.max(f64::MIN_POSITIVE)
@@ -919,9 +963,40 @@ impl Editor {
         }
     }
 
+    /// The inverse of [`Self::screen_to_edit`]'s document half: from the space
+    /// the tools work in, back onto the stage.
+    ///
+    /// A tool is handed points that have been carried back through the
+    /// document camera and through the place of any symbol opened for editing,
+    /// so that what it builds lands in the right coordinates when it is
+    /// committed. Anything drawn from those points *before* they are committed
+    /// — a live preview — has to be carried forward again, or it is drawn
+    /// wherever those two transforms would have moved it.
+    ///
+    /// Identity for a document on its main timeline with no camera, which is
+    /// most of them.
+    pub fn edit_to_stage(&self) -> buzz_geom::Projection {
+        let scene = self.doc.scene();
+        let shot = scene
+            .camera_projection_at_depth(self.current_frame, 0.0)
+            .unwrap_or(buzz_geom::Projection::IDENTITY);
+        shot.pre_affine(scene.edit_place())
+    }
+
     pub fn pointer_down(&mut self, screen: Point, mods: Mods) {
+        self.pointer_down_at(screen, mods, None, None);
+    }
+
+    /// A pointer press the window has timed. See [`Self::pointer_move_at`].
+    pub fn pointer_down_at(
+        &mut self,
+        screen: Point,
+        mods: Mods,
+        time: Option<f64>,
+        pressure: Option<f64>,
+    ) {
         let doc = self.screen_to_edit(screen);
-        let doc = self.snap(doc);
+        let doc = self.snap_for_tool(doc);
 
         // Rigging asks what is *under* the pointer before the drag begins —
         // a question the tool machine deliberately cannot answer, because it
@@ -956,10 +1031,25 @@ impl Editor {
             pivot,
             gradient,
         };
-        self.machine.pointer_down(doc, screen, mods, &ctx);
+        self.machine
+            .pointer_down_at(doc, screen, mods, &ctx, time, pressure);
     }
 
     pub fn pointer_move(&mut self, screen: Point, mods: Mods) {
+        self.pointer_move_at(screen, mods, None, None);
+    }
+
+    /// A pointer move the window has timed.
+    ///
+    /// See [`crate::tools::ToolMachine::pointer_move_at`]: several moves arrive
+    /// per frame and a brush's width is read off how far apart they were.
+    pub fn pointer_move_at(
+        &mut self,
+        screen: Point,
+        mods: Mods,
+        time: Option<f64>,
+        pressure: Option<f64>,
+    ) {
         if self.rig_gesture.is_some() {
             // Unsnapped, for the same reason: an IK target that jumped to the
             // nearest edge would make posing feel like it was fighting back.
@@ -973,12 +1063,19 @@ impl Editor {
             });
             return;
         }
-        let doc = self.snap(self.screen_to_edit(screen));
-        let action = self.machine.pointer_move(doc, screen, mods);
+        let doc = self.snap_for_tool(self.screen_to_edit(screen));
+        let action = self
+            .machine
+            .pointer_move_at(doc, screen, mods, time, pressure);
         self.apply(action);
     }
 
     pub fn pointer_up(&mut self, screen: Point) {
+        self.pointer_up_at(screen, None, None);
+    }
+
+    /// A pointer release the window has timed. See [`Self::pointer_move_at`].
+    pub fn pointer_up_at(&mut self, screen: Point, time: Option<f64>, pressure: Option<f64>) {
         if self.rig_gesture.is_some() {
             self.finish_rig_gesture(self.screen_to_edit(screen));
             self.doc.end_gesture();
@@ -986,14 +1083,27 @@ impl Editor {
         }
         if let Some(gesture) = self.light_gesture.take() {
             let doc = self.screen_to_edit(screen);
+            let frame = self.current_frame;
             self.doc.edit(gesture.label(), |scene| {
                 crate::lights::drag(scene, gesture, doc);
+                // If the light is already animated, the drag re-keys it at the
+                // playhead so the new placement lands on this frame rather than
+                // silently editing a base the animation overrides — the same
+                // auto-key a camera drag does.
+                if let Some(light) = scene.lights_mut().get_mut(gesture.light())
+                    && light.track.as_ref().is_some_and(|t| t.animates())
+                {
+                    let key = buzz_scene::LightKey::from_light(frame, light);
+                    if let Some(track) = light.track.as_mut() {
+                        track.set_key(key);
+                    }
+                }
             });
             // One drag, one undo step — as with every other gesture.
             self.doc.end_gesture();
             return;
         }
-        let doc = self.snap(self.screen_to_edit(screen));
+        let doc = self.snap_for_tool(self.screen_to_edit(screen));
 
         // Built from disjoint fields rather than via `tool_context`, which
         // would borrow all of `self` and conflict with `&mut self.machine`.
@@ -1010,10 +1120,33 @@ impl Editor {
             pivot,
             gradient,
         };
-        let action = self.machine.pointer_up(doc, screen, &ctx);
+        let action = self.machine.pointer_up_at(doc, screen, &ctx, time, pressure);
 
         self.apply(action);
         self.doc.end_gesture();
+    }
+
+    /// Snap a point for the *active* tool, which for a freehand tool means not
+    /// snapping it at all.
+    ///
+    /// **A drawn line is not a placed one.** Snapping exists so that a
+    /// rectangle's corner meets the guide the animator put there, and it does
+    /// that by yanking a point up to eight screen pixels sideways onto the
+    /// nearest edge, guide or grid line. That is the right answer for one
+    /// point chosen deliberately, and the wrong one for the hundreds a brush
+    /// stroke is made of: every sample that passes within eight pixels of a
+    /// shape already on the stage is pulled onto its bounding box, so a stroke
+    /// drawn across a drawing comes out with flats and steps in it where the
+    /// hand drew a curve, and object snapping is on by default. Animate snaps
+    /// what you place and never what you draw.
+    ///
+    /// The pen, which places anchors one at a time, still snaps — that is a
+    /// placed point in every sense.
+    fn snap_for_tool(&self, point: Point) -> Point {
+        match self.machine.tool() {
+            ToolId::Brush | ToolId::Pencil | ToolId::Eraser | ToolId::Lasso => point,
+            _ => self.snap(point),
+        }
     }
 
     /// Snap a document point using the current view settings.
@@ -1086,6 +1219,12 @@ impl Editor {
             ToolAction::PickInRegion { region, additive } => self.pick_in_region(&region, additive),
 
             ToolAction::PaintRaster { canvas, brush } => self.paint_raster(&canvas, &brush),
+
+            ToolAction::AddArtwork { pieces, label } => self.add_artwork(pieces, label),
+
+            ToolAction::AddArtworkFrames { frames, label } => {
+                self.add_artwork_frames(frames, label);
+            }
 
             ToolAction::WandAt { point, additive } => self.wand_at(point, additive),
 
@@ -1210,6 +1349,7 @@ impl Editor {
             ToolAction::SetTransformPoint { at } => self.set_pivot(at),
             ToolAction::ResetTransformPoint => self.reset_pivot(),
             ToolAction::DragGradient { grip, to } => self.drag_gradient(grip, to),
+            ToolAction::DrawMotionPath { path } => self.begin_motion_path(path),
         }
     }
 
@@ -1446,13 +1586,54 @@ impl Editor {
 
             for id in ids {
                 let mut became_empty = false;
+                // **What the rub divided becomes separate shapes.**
+                //
+                // A difference returns one path holding every piece that
+                // survived, so rubbing through the middle of a drawing left the
+                // two halves welded into one object: clicking either selected
+                // both, and dragging one dragged the other. Splitting is what
+                // an eraser is *for* — it is how you cut a shape in two — and
+                // `split_disjoint` keeps each piece's holes with it rather than
+                // turning them into discs.
+                let mut pieces: Vec<buzz_geom::BezPath> = Vec::new();
                 update_shape(scene, at, id, |s| {
-                    s.path =
+                    let cut =
                         buzz_geom::boolean(&s.path, &cutter, buzz_geom::BoolOp::Difference, opts);
-                    became_empty = s.path.elements().is_empty();
+                    became_empty = cut.elements().is_empty();
+                    let mut parts = buzz_geom::split_disjoint(&cut);
+                    // The first piece stays in the object that was already
+                    // there, so it keeps its id, its name and its place in the
+                    // stacking order; only the extra pieces are new.
+                    s.path = if parts.is_empty() {
+                        cut
+                    } else {
+                        parts.remove(0)
+                    };
+                    pieces = parts;
                 });
                 if became_empty {
                     scene.remove_object(id);
+                    continue;
+                }
+                // The offcuts, as objects of their own, carrying the same paint
+                // as the shape they came from.
+                let template = scene
+                    .find_object(id)
+                    .and_then(|(_, o)| match &o.kind {
+                        ObjectKind::Shape(s) => Some(s.clone()),
+                        _ => None,
+                    });
+                if let Some(template) = template {
+                    for path in pieces {
+                        scene.add_shape_at(
+                            layer,
+                            frame,
+                            ShapeData {
+                                path,
+                                ..template.clone()
+                            },
+                        );
+                    }
                 }
             }
         });
@@ -1844,6 +2025,172 @@ impl Editor {
         match painted {
             Some(id) => self.selection.set([id]),
             None => self.status = Some("Could not paint on this frame".into()),
+        }
+    }
+
+    /// Place an effect stroke's artwork: vector shapes and painted bitmaps
+    /// together, in one undo step.
+    ///
+    /// Bitmap pieces go through the document's image library exactly as a
+    /// soft-brush stroke does; every piece then lands as an ordinary shape.
+    /// More than one piece is committed as a **group**, because one stroke
+    /// should be one thing — the gesture after "paint snow" is "move the
+    /// snow", and asking the user to gather up nine shapes first would make
+    /// the brush feel like a spill rather than a stroke.
+    fn add_artwork(&mut self, pieces: Vec<buzz_scene::ArtPiece>, label: &'static str) {
+        let Some(layer) = self.active_layer() else {
+            self.status = Some("No layer available to draw on".into());
+            return;
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return;
+        }
+        if pieces.is_empty() {
+            return;
+        }
+
+        let frame = self.current_frame;
+        let auto = self.auto_keyframe;
+        let mut created: Option<ObjectId> = None;
+        self.doc.edit(label, |scene| {
+            if auto {
+                scene.ensure_keyframe(layer, frame);
+            }
+            // Painted pieces go into the document's image library, exactly as
+            // a soft-brush stroke does — which is what makes their pixels
+            // part of the file rather than of this session.
+            let mut register = |canvas: &buzz_scene::Canvas, brush: &buzz_scene::SoftBrush| {
+                let id = scene.next_image_id();
+                let name = scene.images().unique_name(label);
+                scene.images_mut().insert(canvas.to_asset(id, name, brush))
+            };
+            let mut shapes = buzz_scene::art::to_shapes(&pieces, &mut register);
+
+            // **A brush can carry a bitmap in from somewhere else.** Artwork
+            // captured as a brush keeps a *shared* handle on its texture, and
+            // that brush outlives the document it was made in: paint with it
+            // in a new file and the pixels would be referred to by an id that
+            // file's library has never heard of, which saves as a picture
+            // that is not there. Adopting them here costs a lookup per stroke
+            // and nothing at all once they are in.
+            for shape in &mut shapes {
+                adopt_textures(scene, shape);
+            }
+
+            created = if shapes.len() == 1 {
+                let shape = shapes.into_iter().next().expect("checked length");
+                scene.add_shape_at(layer, frame, shape)
+            } else {
+                let children: Vec<std::sync::Arc<buzz_scene::Object>> = shapes
+                    .into_iter()
+                    .map(|shape| {
+                        let id = scene.next_object_id();
+                        std::sync::Arc::new(buzz_scene::Object::shape(id, shape))
+                    })
+                    .collect();
+                let id = scene.next_object_id();
+                scene.add_object_at(layer, frame, buzz_scene::Object::group(id, children))
+            };
+        });
+        self.doc.end_gesture();
+        match created {
+            Some(id) => self.selection.select_one(id),
+            None => self.status = Some("Could not draw on this frame".into()),
+        }
+    }
+
+    /// Place one drawing per frame: a stroke that commits an **animation**.
+    ///
+    /// The Wave brush hands over a whole cycle — see [`buzz_scene::wave`] — and
+    /// this lays it out from the current frame onwards, one keyframe each, as a
+    /// single undo step. Each frame's pieces are grouped exactly as
+    /// [`Self::add_artwork`] groups a still, so the result is one thing per
+    /// frame rather than a scatter of shapes to gather up.
+    ///
+    /// # Why every keyframe is made before any artwork is
+    ///
+    /// The keyframes are inserted the way **F6** inserts one: carrying whatever
+    /// the layer was already showing, so baking a plume over a held background
+    /// does not blank the background on the frames it covers. That only works
+    /// if the whole run is created *first* — insert a keyframe after the wave's
+    /// first frame is down and it carries the wave with it, and every frame
+    /// after the first ends up holding one more copy of the plume than the
+    /// frame before.
+    ///
+    /// A frame that is already a keyframe is left as it is and drawn onto, so a
+    /// wave can be laid over an animation that is already there.
+    fn add_artwork_frames(&mut self, frames: Vec<Vec<buzz_scene::ArtPiece>>, label: &'static str) {
+        let Some(layer) = self.active_layer() else {
+            self.status = Some("No layer available to draw on".into());
+            return;
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return;
+        }
+        if frames.iter().all(Vec::is_empty) {
+            return;
+        }
+
+        let start = self.current_frame;
+        let count = frames.len() as u32;
+        let mut created: Option<ObjectId> = None;
+        self.doc.edit(label, |scene| {
+            // Every keyframe first. See the doc comment: this order is the
+            // difference between a plume and a plume stacked on itself.
+            scene.update_layer(layer, |l| {
+                for i in 0..count {
+                    l.frames.insert_keyframe(start + i);
+                }
+            });
+
+            for (i, pieces) in frames.into_iter().enumerate() {
+                if pieces.is_empty() {
+                    continue;
+                }
+                let frame = start + i as u32;
+
+                // Painted pieces go into the document's image library, exactly
+                // as a still's do.
+                let mut register = |canvas: &buzz_scene::Canvas, brush: &buzz_scene::SoftBrush| {
+                    let id = scene.next_image_id();
+                    let name = scene.images().unique_name(label);
+                    scene.images_mut().insert(canvas.to_asset(id, name, brush))
+                };
+                let mut shapes = buzz_scene::art::to_shapes(&pieces, &mut register);
+                for shape in &mut shapes {
+                    adopt_textures(scene, shape);
+                }
+
+                let placed = if shapes.len() == 1 {
+                    let shape = shapes.into_iter().next().expect("checked length");
+                    scene.add_shape_at(layer, frame, shape)
+                } else {
+                    let children: Vec<std::sync::Arc<buzz_scene::Object>> = shapes
+                        .into_iter()
+                        .map(|shape| {
+                            let id = scene.next_object_id();
+                            std::sync::Arc::new(buzz_scene::Object::shape(id, shape))
+                        })
+                        .collect();
+                    let id = scene.next_object_id();
+                    scene.add_object_at(layer, frame, buzz_scene::Object::group(id, children))
+                };
+                // The first frame's drawing is the one selected afterwards:
+                // it is the frame the user was looking at while drawing.
+                if created.is_none() {
+                    created = placed;
+                }
+            }
+        });
+        self.doc.end_gesture();
+        match created {
+            Some(id) => {
+                self.selection.select_one(id);
+                self.status = Some(format!("{label}: {count} frames"));
+            }
+            None => self.status = Some("Could not draw on this frame".into()),
         }
     }
 
@@ -2294,6 +2641,10 @@ impl Editor {
                 });
             }
 
+            // -- lights ------------------------------------------------------
+            AddLightKeyframe => self.add_light_key(),
+            RemoveLightKeyframe => self.remove_light_key(),
+
             // -- symbols and library -----------------------------------------
             ConvertToSymbol => self.convert_selection_to_symbol(),
             BrushFromSelection => self.brush_from_selection(),
@@ -2307,6 +2658,99 @@ impl Editor {
             // keeps every kind arriving by the same door.
             AddGloom => self.add_light(buzz_scene::LightKind::gloom(self.camera.center)),
             AddFire => self.add_fire(),
+
+            // -- staging and performance --------------------------------------
+            SetScene => {
+                let frames = self.doc.scene().frame_count();
+                self.staging.open_scene(frames);
+            }
+            DirectScene => self.staging.open_direct(),
+            AddScene => {
+                self.add_scene();
+                let n = self.doc.active_scene() + 1;
+                self.status = Some(format!("Scene {n} of {}", self.doc.scene_names().len()));
+            }
+            DuplicateScene => {
+                let from = self.doc.active_scene();
+                self.duplicate_scene(from);
+                let name = self
+                    .doc
+                    .scene_names()
+                    .get(self.doc.active_scene())
+                    .cloned()
+                    .unwrap_or_default();
+                self.status = Some(format!("Duplicated as {name}"));
+            }
+            AddPerson => self.add_person(),
+            Perform => {
+                // Over the whole film from the playhead, which is what an
+                // animator standing on frame 12 means by "animate this".
+                let last = self.doc.scene().frame_count().saturating_sub(1);
+                let from = self.current_frame.min(last);
+                self.staging.open_perform(from, last);
+            }
+            AddFollowThrough => {
+                // The chain is chosen by name, so the dialog needs the selected
+                // rig's bones. Gathered here and passed in, the same way the
+                // performance dialog is handed a frame range.
+                let bones = {
+                    let scene = self.doc.scene();
+                    self.selection.iter().find_map(|id| {
+                        scene.find_object(id).and_then(|(_, o)| match &o.kind {
+                            ObjectKind::Armature(rig) => {
+                                Some(rig.armature.bones.iter().map(|b| b.name.clone()).collect::<Vec<String>>())
+                            }
+                            _ => None,
+                        })
+                    })
+                };
+                match bones {
+                    Some(names) => {
+                        let last = self.doc.scene().frame_count().saturating_sub(1);
+                        let from = self.current_frame.min(last);
+                        self.staging.open_physics(from, last, names);
+                    }
+                    None => {
+                        self.status =
+                            Some("Select a rigged character to add follow-through to".into())
+                    }
+                }
+            }
+            AddWiggle => {
+                let has_object = {
+                    let scene = self.doc.scene();
+                    self.selection
+                        .iter()
+                        .any(|id| scene.find_object(id).is_some())
+                };
+                if has_object {
+                    let last = self.doc.scene().frame_count().saturating_sub(1);
+                    let from = self.current_frame.min(last);
+                    self.staging.open_wiggle(from, last);
+                } else {
+                    self.status = Some("Select an object to add a wiggle to".into());
+                }
+            }
+            ClearModifiers => {
+                let object = {
+                    let scene = self.doc.scene();
+                    self.selection.iter().find(|id| {
+                        scene
+                            .find_object(*id)
+                            .is_some_and(|(_, o)| !o.modifiers.is_empty())
+                    })
+                };
+                match object {
+                    Some(id) => {
+                        self.doc.edit("Clear Modifiers", |scene| {
+                            scene.update_object_across(0, u32::MAX, id, |o| o.modifiers.clear());
+                        });
+                        self.doc.end_gesture();
+                        self.status = Some("Cleared the object's live modifiers".into());
+                    }
+                    None => self.status = Some("The selection has no live modifiers".into()),
+                }
+            }
             TogglePanel(panel) => {
                 self.workspace.toggle(panel);
                 self.workspace.save();
@@ -2335,9 +2779,14 @@ impl Editor {
             }
             About => self.about.open = true,
             ResetWorkspace => {
-                self.workspace = buzz_ui::Workspace::animate();
+                // The layout, and only the layout: the theme, the new-document
+                // settings and the crash-recovery directories are preferences
+                // that live in the same struct and are not what "reset the
+                // layout" asks for. See `Workspace::reset_layout`.
+                self.workspace.reset_layout();
                 self.workspace.save();
-                self.status = Some("Layout reset".into());
+                self.status =
+                    Some("Every panel put back where it started".into());
             }
 
             ToggleLightGizmos => {
@@ -2810,7 +3259,12 @@ impl Editor {
 
     // -- sound ---------------------------------------------------------------
 
-    /// Bring a sound file into the library.
+    /// Bring a sound file into the library, and onto the timeline.
+    ///
+    /// Returns the name it took in the library. Whether it was also *placed* is
+    /// asked separately with [`Self::sound_was_placed`], so that this keeps
+    /// answering the one question its callers ask it — folding "and it went on
+    /// a layer" into the returned name would make the name unusable as a name.
     pub fn import_sound(&mut self, path: &std::path::Path) -> anyhow::Result<String> {
         // Decoded once here to learn its shape and to fail *before* the
         // document is touched: a file that cannot be decoded should not leave
@@ -2825,17 +3279,31 @@ impl Editor {
         let (rate, channels, length) = (clip.sample_rate, clip.channels, clip.len() as u64);
 
         let mut imported = None;
+        let mut placed = false;
+        let fps = self.doc.scene().stage().frame_rate.max(1.0);
         self.doc.edit("Import Sound", |scene| {
-            imported = Some(scene.add_sound(&name, bytes, &format, rate, channels, length));
+            let id = scene.add_sound(&name, bytes, &format, rate, channels, length);
+            imported = Some(id);
+            placed = place_sound_on_stage(scene, id, fps);
         });
         self.doc.end_gesture();
 
         let scene = self.doc.scene().clone();
         self.sound.refresh(&scene);
 
+        self.sound_placed = placed;
         Ok(imported
             .and_then(|id| scene.sounds().get(id).map(|s| s.name.clone()))
             .unwrap_or(name))
+    }
+
+    /// Did the last [`Self::import_sound`] also put the sound on the timeline?
+    ///
+    /// The shell says so in the status bar: a sound that arrived on a layer of
+    /// its own has changed the timeline, and an animator who is not told that
+    /// finds a layer they did not make.
+    pub fn sound_was_placed(&self) -> bool {
+        self.sound_placed
     }
 
     /// Animate's File ▸ Import Image, arriving already broken apart.
@@ -2933,6 +3401,23 @@ impl Editor {
             self.status = Some("Import a sound first: File > Import Sound".into());
             return;
         };
+
+        // **A sound inside a symbol is a sound nobody hears.**
+        //
+        // What plays and what is exported is `Scene::stage_cues`, which reads
+        // the document's own timeline; a cue put on a layer of the symbol that
+        // happened to be open would sit there for ever, silent on the stage and
+        // absent from the film, with the status bar cheerfully reporting that
+        // it was attached. Saying so is the only honest answer \u2014 attaching it
+        // somewhere the animator did not ask for would be worse.
+        if !self.doc.scene().edit_path().is_empty() {
+            self.status = Some(
+                "Sound goes on the main timeline. Leave this symbol first \
+                 (the breadcrumb above the stage), then attach it."
+                    .into(),
+            );
+            return;
+        }
 
         let frame = self.current_frame;
         let mut attached = false;
@@ -3292,6 +3777,32 @@ impl Editor {
         self.playback.playing = false;
     }
 
+    /// Duplicate a scene, whole, and edit the copy.
+    ///
+    /// The playhead goes back to the start, because what you do next is play
+    /// the beat you have just copied and change it — see
+    /// [`buzz_doc::Document::duplicate_scene`].
+    pub fn duplicate_scene(&mut self, index: usize) {
+        self.doc.duplicate_scene(index);
+        self.bounds_cache.borrow_mut().take();
+        self.selection.clear();
+        self.camera_selected = false;
+        self.selection.ensure_active_layer(self.doc.scene());
+        self.set_frame(0);
+        self.playback.playing = false;
+    }
+
+    /// Move a scene in the running order and follow it.
+    pub fn move_scene(&mut self, from: usize, to: usize) {
+        self.doc.move_scene(from, to);
+        self.bounds_cache.borrow_mut().take();
+        self.selection.clear();
+        self.camera_selected = false;
+        self.selection.ensure_active_layer(self.doc.scene());
+        self.set_frame(self.current_frame);
+        self.playback.playing = false;
+    }
+
     /// Delete a scene. The last remaining scene cannot be removed.
     pub fn delete_scene(&mut self, index: usize) {
         self.doc.delete_scene(index);
@@ -3318,49 +3829,52 @@ impl Editor {
             .select_active_layer_contents(self.doc.scene(), self.current_frame);
     }
 
-    /// Animate's *Create Brush From Selection*: adopt the selected artwork as
-    /// the shape a pattern brush stamps.
+    /// Animate's *Create Brush From Selection* — **with the artwork's paint**.
     ///
-    /// The shape is recentred on its own origin, because stamps are placed
-    /// centred on the stroke — artwork drawn at (400, 300) would otherwise
-    /// stamp 500 units away from the pointer.
+    /// Animate takes the shape and leaves the colours behind, so a brush made
+    /// from a red leaf with a gradient down it comes out as a grey silhouette.
+    /// What is captured here is the artwork: its fills, its gradients and its
+    /// bitmaps, so the brush stamps the thing that was pointed at. See
+    /// [`buzz_scene::BrushStamp`] for the normalisation and for what happens
+    /// to that paint when the stamp is placed.
+    ///
+    /// The Artwork Colours switch in the tool options turns it back into
+    /// Animate's behaviour for artwork drawn deliberately to be a nib.
     fn brush_from_selection(&mut self) {
-        let mut combined = buzz_geom::BezPath::new();
+        // Flattening resolves groups and applies each object's transform, so a
+        // brush made from a group comes out as it looked on stage — and each
+        // part keeps the shape data it was drawn with rather than only its
+        // outline.
+        let mut parts: Vec<(buzz_geom::Affine, ShapeData)> = Vec::new();
         for id in self.selection.iter() {
             let Some((_, object)) = self.doc.scene().find_object(id) else {
                 continue;
             };
-            // Flattening resolves groups and applies each object's transform,
-            // so a brush made from a group comes out as it looked on stage.
-            let mut parts = Vec::new();
             object.flatten(buzz_geom::Affine::IDENTITY, &mut parts);
-            for (transform, shape) in parts {
-                for element in (transform * shape.path).elements() {
-                    combined.push(*element);
-                }
-            }
         }
 
-        if combined.elements().is_empty() {
+        if parts.is_empty() {
             self.status = Some("Select some artwork to make a brush from".into());
             return;
         }
-
-        let bounds = buzz_geom::Shape::bounding_box(&combined);
-        if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+        let Some(stamp) = buzz_scene::BrushStamp::capture(&parts) else {
             self.status = Some("That selection has no area to make a brush from".into());
             return;
-        }
-        let centred = buzz_geom::Affine::translate(-bounds.center().to_vec2()) * combined;
+        };
 
+        let painted = stamp.is_painted();
         // Selecting the brush too: making a brush and not being given it is a
         // step the user would always have to take next.
-        self.style.brush.set_custom_pattern(centred);
+        self.style.brush.set_custom_stamp(stamp);
         if !self.style.brush.kind.uses_pattern() {
             self.style.brush.kind = buzz_ui::BrushKind::Pattern;
         }
         self.set_tool(ToolId::Brush);
-        self.status = Some("Brush created from the selection".into());
+        self.status = Some(if painted && self.style.brush.keep_source_paint {
+            "Brush created from the selection, with its colours".into()
+        } else {
+            "Brush created from the selection".to_string()
+        });
     }
 
     /// Animate's F8: replace the selection with an instance of a new symbol.
@@ -3739,76 +4253,132 @@ impl Editor {
 
     /// **Copy Frames**, and **Cut Frames** when `and_clear`.
     ///
-    /// The artwork of the keyframe the playhead is inside, taken as it is.
-    /// Animate copies a *selected span* of frames; there is no span selection
-    /// here yet, so this is the frame you are looking at — recorded in §7.
+    /// The artwork the playhead is standing on, **across every layer** — the
+    /// character, the background and the overlay together, because that is
+    /// what "this frame" means to the person looking at it. It used to take
+    /// the active layer alone, which made copying a drawing a job of selecting
+    /// each layer and repeating yourself.
+    ///
+    /// Animate copies a *selected span* of frames; there is still no span
+    /// selection in the timeline here, so this is the one frame the playhead
+    /// is on — recorded in §7.
     fn copy_frames(&mut self, and_clear: bool) {
-        let Some(layer) = self.active_layer() else {
-            self.status = Some("No layer to copy from".into());
-            return;
-        };
         let frame = self.current_frame;
-        let contents = self
-            .doc
-            .scene()
+        let scene = self.doc.scene();
+        let taken: Vec<(LayerId, Vec<std::sync::Arc<Object>>)> = scene
             .layers()
-            .get(layer)
-            .and_then(|l| l.frames.frame_contents(frame));
+            .iter()
+            .filter_map(|layer| {
+                let contents = layer.frames.frame_contents(frame)?;
+                Some((layer.id, contents))
+            })
+            .collect();
 
-        let Some(contents) = contents else {
+        if taken.is_empty() {
             self.status = Some("There is no frame here to copy".into());
             return;
-        };
-        let count = contents.len();
-        self.frame_clipboard = Some(contents);
+        }
+        let layers = taken.len();
+        let count: usize = taken.iter().map(|(_, objects)| objects.len()).sum();
+        self.frame_clipboard = Some(taken);
 
         if and_clear {
-            self.frame_op(FrameOp::ClearFrames);
+            // Cleared on every layer it was taken from, or a cut would leave
+            // most of the drawing where it was.
+            let layers: Vec<LayerId> = self
+                .frame_clipboard
+                .iter()
+                .flatten()
+                .map(|(layer, _)| *layer)
+                .collect();
+            self.doc.edit("Cut Frames", |scene| {
+                for layer in layers {
+                    if scene.layers().is_effectively_locked(layer) {
+                        continue;
+                    }
+                    scene.update_layer(layer, |l| {
+                        l.frames.clear_frames(frame);
+                    });
+                }
+            });
+            self.selection.prune(self.doc.scene());
         }
         self.status = Some(format!(
-            "{} {count} object{} from frame {}",
+            "{} {count} object{} from frame {} of {layers} layer{}",
             if and_clear { "Cut" } else { "Copied" },
             if count == 1 { "" } else { "s" },
-            frame + 1
+            frame + 1,
+            if layers == 1 { "" } else { "s" },
         ));
     }
 
     /// **Paste Frames** onto the frame the playhead is on.
     ///
-    /// Makes a keyframe there first, as Animate does: pasting into the middle
-    /// of a span would otherwise change the artwork from wherever that span
-    /// began. The objects are given fresh ids, so pasting twice gives two
-    /// drawings rather than one shared between two frames.
+    /// Each layer's artwork goes back onto **the layer it came from**, so a
+    /// copied drawing arrives assembled rather than flattened onto whichever
+    /// layer happened to be active. A layer that has since been deleted is
+    /// skipped rather than guessed at.
+    ///
+    /// A keyframe is made on each of them first, as Animate does: pasting into
+    /// the middle of a span would otherwise change the artwork from wherever
+    /// that span began. The objects are given fresh ids, so pasting twice
+    /// gives two drawings rather than one shared between two frames.
     fn paste_frames(&mut self) {
-        let Some(contents) = self.frame_clipboard.clone() else {
+        let Some(clipboard) = self.frame_clipboard.clone() else {
             self.status = Some("There are no frames on the clipboard".into());
             return;
         };
-        let Some(layer) = self.active_layer() else {
-            return;
-        };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            self.status = Some("The active layer is locked".into());
-            return;
-        }
 
         let frame = self.current_frame;
-        let count = contents.len();
+        let mut pasted = 0usize;
+        let mut layers = 0usize;
+        let mut locked = 0usize;
         self.doc.edit("Paste Frames", |scene| {
-            scene.update_layer(layer, |l| {
-                l.frames.insert_frame(frame);
-                l.frames.insert_blank_keyframe(frame);
-            });
-            for object in &contents {
-                let mut copy = (**object).clone();
-                copy.id = scene.next_object_id();
-                scene.add_object_at(layer, frame, copy);
+            for (layer, objects) in &clipboard {
+                if scene.layers().get(*layer).is_none() {
+                    continue;
+                }
+                if scene.layers().is_effectively_locked(*layer) {
+                    locked += 1;
+                    continue;
+                }
+                scene.update_layer(*layer, |l| {
+                    l.frames.insert_frame(frame);
+                    l.frames.insert_blank_keyframe(frame);
+                });
+                for object in objects {
+                    let mut copy = (**object).clone();
+                    copy.id = scene.next_object_id();
+                    if scene.add_object_at(*layer, frame, copy).is_some() {
+                        pasted += 1;
+                    }
+                }
+                layers += 1;
             }
         });
+
+        if layers == 0 {
+            // Nothing was undone here on purpose. The edit changed nothing, so
+            // `Document::edit` recorded nothing, and calling `undo` would take
+            // back whatever the user did *before* this — which is how a paste
+            // that landed nowhere could delete a layer.
+            self.status = Some(if locked > 0 {
+                "Every layer on the clipboard is locked".into()
+            } else {
+                "The layers these frames came from are gone".to_string()
+            });
+            return;
+        }
         self.status = Some(format!(
-            "Pasted {count} object{} onto frame {}",
-            if count == 1 { "" } else { "s" },
-            frame + 1
+            "Pasted {pasted} object{} onto frame {} of {layers} layer{}{}",
+            if pasted == 1 { "" } else { "s" },
+            frame + 1,
+            if layers == 1 { "" } else { "s" },
+            if locked > 0 {
+                format!(" \u{2014} {locked} locked layer(s) skipped")
+            } else {
+                String::new()
+            }
         ));
     }
 
@@ -3846,6 +4416,59 @@ impl Editor {
                 .unwrap_or(buzz_scene::CameraKey::new(frame, centre));
             scene.camera_mut().set_key(key);
         });
+    }
+
+    /// Key the selected light's current state at the playhead.
+    fn add_light_key(&mut self) {
+        let frame = self.current_frame;
+        match self.light_panel.selected {
+            Some(id) => {
+                self.key_light_at(id, frame);
+                self.status = Some("Light keyframe added".into());
+            }
+            None => self.status = Some("Select a light first".into()),
+        }
+    }
+
+    /// Remove the selected light's key at the playhead.
+    fn remove_light_key(&mut self) {
+        let frame = self.current_frame;
+        if let Some(id) = self.light_panel.selected {
+            self.unkey_light_at(id, frame);
+        }
+    }
+
+    /// Key one light's current state at `frame` — the shared path for the panel
+    /// button, the menu command and the timeline channel. Keying turns the
+    /// light's track on and snapshots its whole state, exactly as a camera key
+    /// captures the whole camera.
+    pub fn key_light_at(&mut self, id: buzz_scene::LightId, frame: u32) {
+        self.doc.edit("Light Keyframe", |scene| {
+            let key = scene
+                .lights()
+                .get(id)
+                .map(|light| buzz_scene::LightKey::from_light(frame, light));
+            if let Some(key) = key
+                && let Some(light) = scene.lights_mut().get_mut(id)
+            {
+                let track = light.track.get_or_insert_with(buzz_scene::LightTrack::new);
+                track.enabled = true;
+                track.set_key(key);
+            }
+        });
+        self.doc.end_gesture();
+    }
+
+    /// Remove one light's key at `frame`.
+    pub fn unkey_light_at(&mut self, id: buzz_scene::LightId, frame: u32) {
+        self.doc.edit("Remove Light Keyframe", |scene| {
+            if let Some(light) = scene.lights_mut().get_mut(id)
+                && let Some(track) = light.track.as_mut()
+            {
+                track.remove_key(frame);
+            }
+        });
+        self.doc.end_gesture();
     }
 
     /// Move the camera at the playhead, keying it if needed.
@@ -4484,6 +5107,48 @@ fn update_shape(scene: &mut Scene, at: EditAt, id: ObjectId, mut f: impl FnMut(&
     });
 }
 
+/// **Make this document the home of any bitmap the shape paints with.**
+///
+/// A brush captured from artwork keeps a shared handle on that artwork's
+/// texture, and a brush outlives the document it was made in. Painting with it
+/// somewhere else would leave a picture referred to by an identity the new
+/// file's library never issued: on screen while the handle is alive, gone the
+/// moment it is saved and reopened.
+fn adopt_textures(scene: &mut Scene, shape: &mut ShapeData) {
+    if let Some(fill) = shape.fill.as_mut() {
+        adopt_texture(scene, &mut fill.paint);
+    }
+    if let Some(stroke) = shape.stroke.as_mut() {
+        adopt_texture(scene, &mut stroke.paint);
+    }
+}
+
+/// See [`adopt_textures`]. Anything that is not a bitmap is left alone.
+fn adopt_texture(scene: &mut Scene, paint: &mut buzz_scene::Paint) {
+    let buzz_scene::Paint::Image(fill) = paint else {
+        return;
+    };
+    match scene.images().get(fill.asset.id).map(|a| a.blob_id()) {
+        // Already this document's own pixels: nothing to do, nothing copied.
+        Some(blob) if blob == fill.asset.blob_id() => {}
+        // The same id holding **different pixels** — a document opened twice,
+        // an import run again, a brush carried in from another file. Re-homed
+        // under an id this document has not issued, because the renderer's
+        // atlas keeps whichever picture arrived under an identity first and
+        // would serve it for both. See `ImageAsset::blob_id`.
+        Some(_) => {
+            let mut copy = (*fill.asset).clone();
+            copy.id = scene.next_image_id();
+            copy.name = scene.images().unique_name(&copy.name);
+            fill.asset = scene.images_mut().insert(copy);
+        }
+        // Not here yet: adopt it under the id it already carries.
+        None => {
+            fill.asset = scene.images_mut().insert((*fill.asset).clone());
+        }
+    }
+}
+
 /// Collect the walls the paint bucket must respect from one object, recursing
 /// into groups. Instances, rigs and warped artwork are left out: the bucket
 /// fills flat drawing, which is the only place the question is well posed.
@@ -4775,15 +5440,143 @@ impl DerefVector for Affine {
 /// objects, and it is why `buzz-geom`'s boolean operations exist.
 ///
 /// Strokes are left alone: Animate merges fills, not strokes.
+/// Fuse an unfilled, stroked shape — a line — with the lines it crosses.
+///
+/// # Why concatenation rather than a boolean
+///
+/// A filled shape fuses by unioning two regions, which is well defined. Two
+/// *lines* have no region: a union of two open paths is not a thing, and
+/// outlining them into regions to union would turn editable centrelines into
+/// closed outlines that can never be a line again. So the paths are simply
+/// carried into one object, each keeping its own subpath. That is exactly what
+/// "these are one thing now" has to mean here: one object to click, one to
+/// drag, one to undo — and every line still its own curve underneath.
+///
+/// # What counts as touching
+///
+/// The centrelines are outlined at their own widths and intersected, so two
+/// lines fuse when the **ink** meets, not when the bounding boxes do. A page of
+/// separate parallel lines has boxes that cross constantly and no ink in
+/// common; fusing those would make one object of a whole drawing, which is the
+/// failure the filled path documents at length just below.
+fn merge_stroke_into_layer(
+    scene: &mut Scene,
+    layer: LayerId,
+    frame: u32,
+    incoming: ShapeData,
+) -> Option<ObjectId> {
+    let Some(new_stroke) = incoming.stroke.clone() else {
+        // Neither fill nor stroke: nothing that can fuse, and nothing visible
+        // either. Placed as it is, and refused earlier by `can_draw` anyway.
+        return scene.add_shape_at(layer, frame, incoming);
+    };
+
+    let bb = incoming.path.bounding_box();
+    let opts = buzz_geom::BooleanOptions::for_shape_size(bb.width().hypot(bb.height()));
+    let ink = |path: &BezPath, width: f64| {
+        buzz_geom::outline_stroke(
+            path,
+            buzz_geom::StrokeStyle::new(width.max(0.01)),
+            (width / 40.0).max(1e-4),
+        )
+    };
+    let same_paint = |a: &Paint, b: &Paint| match (a, b) {
+        (Paint::Solid(a), Paint::Solid(b)) => {
+            a.to_rgba8().to_u8_array() == b.to_rgba8().to_u8_array()
+        }
+        (Paint::Gradient(a), Paint::Gradient(b)) => a == b,
+        _ => false,
+    };
+
+    // Lines already on the frame that share this one's ink and could touch it.
+    let candidates: Vec<(ObjectId, BezPath)> = scene
+        .layers()
+        .get(layer)
+        .map(|l| {
+            l.objects_at(frame)
+                .iter()
+                .filter(|o| o.visible && !o.locked)
+                .filter_map(|o| match &o.kind {
+                    // Only an unfilled line fuses with an unfilled line. A
+                    // stroked *fill* is a shape with an outline: fusing its
+                    // centreline into a line would throw its fill away.
+                    ObjectKind::Shape(s) if s.fill.is_none() => {
+                        let stroke = s.stroke.as_ref()?;
+                        (same_paint(&stroke.paint, &new_stroke.paint)
+                            && (stroke.width - new_stroke.width).abs() < 1e-9
+                            && stroke.hairline == new_stroke.hairline)
+                            .then(|| (o.id, s.path.clone()))
+                    }
+                    _ => None,
+                })
+                .filter(|(_, path)| path.bounding_box().overlaps(bb))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut merged = incoming.path.clone();
+    let mut absorbed = Vec::new();
+    let width = if new_stroke.hairline {
+        // A hairline is one screen pixel however far in you are, so it has no
+        // document width to outline. Its own length gives the scale at which
+        // "these meet" is a sensible question.
+        (bb.width().hypot(bb.height()) * 1e-3).max(0.05)
+    } else {
+        new_stroke.width
+    };
+
+    for (id, path) in candidates {
+        // Measured against everything fused so far, so a chain of three
+        // touching lines comes in as one even though the first and last never
+        // meet — the same rule the filled path follows.
+        let touches = buzz_geom::boolean(
+            &ink(&merged, width),
+            &ink(&path, width),
+            buzz_geom::BoolOp::Intersect,
+            opts.fast(),
+        )
+        .area()
+        .abs()
+            > 1e-9;
+        if !touches {
+            continue;
+        }
+        merged.extend(path.iter());
+        absorbed.push(id);
+    }
+
+    for id in absorbed {
+        scene.remove_object(id);
+    }
+
+    scene.add_shape_at(
+        layer,
+        frame,
+        ShapeData {
+            path: merged,
+            fill: None,
+            stroke: Some(new_stroke),
+            blend: incoming.blend,
+        },
+    )
+}
+
 fn merge_shape_into_layer(
     scene: &mut Scene,
     layer: LayerId,
     frame: u32,
     incoming: ShapeData,
 ) -> Option<ObjectId> {
-    let Some(new_fill) = incoming.fill else {
-        // Nothing to merge with, so it behaves like an ordinary object.
-        return scene.add_shape_at(layer, frame, incoming);
+    let Some(new_fill) = incoming.fill.clone() else {
+        // **A line has no fill, and lines fuse too.**
+        //
+        // Merge Shape used to send anything without a fill straight through as
+        // its own object, so two pencil lines drawn across each other stayed
+        // two objects: clicking the join selected one of them and dragging it
+        // pulled it out of the drawing it plainly belonged to. In Merge Shape
+        // what touches is one thing, and that has to hold for the strokes as
+        // well as for the paint.
+        return merge_stroke_into_layer(scene, layer, frame, incoming);
     };
 
     let bb = incoming.path.bounding_box();
@@ -4797,7 +5590,27 @@ fn merge_shape_into_layer(
     // spread. A gradient and a solid never fuse.
     let same_paint = |a: &Paint, b: &Paint| match (a, b) {
         (Paint::Solid(a), Paint::Solid(b)) => same_color(*a, *b),
-        (Paint::Gradient(a), Paint::Gradient(b)) => a == b,
+        // **The same ramp, wherever it was laid.** Two shapes drawn with one
+        // gradient setting never carry the same gradient: a new fill is fitted
+        // to the shape's own bounding box, so every stroke gets a different
+        // transform. Comparing the whole gradient therefore answered "these
+        // are different paints" for two strokes the user drew with the same
+        // swatch — and different paints *cut*, so the second stroke took a
+        // bite out of the first instead of joining it. Which is worse the
+        // larger the brush, because the bite is bigger.
+        //
+        // The ramp is what "the same paint" means here; where it was placed is
+        // a consequence of the shape, and the merged shape gets its own
+        // placement below.
+        (Paint::Gradient(a), Paint::Gradient(b)) => {
+            a.kind == b.kind
+                && a.spread == b.spread
+                && (a.focal - b.focal).abs() < 1e-9
+                && a.stops().len() == b.stops().len()
+                && a.stops().iter().zip(b.stops()).all(|(x, y)| {
+                    (x.offset - y.offset).abs() < 1e-9 && same_color(x.color, y.color)
+                })
+        }
         _ => false,
     };
 
@@ -4835,6 +5648,25 @@ fn merge_shape_into_layer(
 
     for (id, paint, path) in candidates {
         if same_paint(&paint, &new_fill.paint) {
+            // A bounding-box overlap only says the two shapes are *near* each
+            // other, not that they touch — two brush strokes can sit side by
+            // side with their boxes crossing while their fills never meet. A
+            // union does not care: it happily returns one path with two
+            // disjoint contours, and that one path is one object from here
+            // on. Draw a page full of separate same-coloured strokes and
+            // every one of them near enough to another would silently fuse
+            // into a single object, so a click on any of them selected the
+            // whole cluster — exactly what Merge Shape is not supposed to do.
+            // Checked against the fill accumulated so far, not just the
+            // incoming stroke, so a chain of three touching shapes still
+            // fuses as one even though the first and last never meet.
+            let touches = buzz_geom::boolean(&merged, &path, buzz_geom::BoolOp::Intersect, opts.fast())
+                .area()
+                .abs()
+                > 1e-9;
+            if !touches {
+                continue;
+            }
             merged = buzz_geom::boolean(&merged, &path, buzz_geom::BoolOp::Union, opts);
             absorbed.push(id);
         } else {
@@ -4855,8 +5687,24 @@ fn merge_shape_into_layer(
         }
     }
 
+    let fused = !absorbed.is_empty();
     for id in absorbed {
         scene.remove_object(id);
+    }
+
+    // **One shape, one ramp across it.** A gradient is laid across the shape it
+    // fills, and the shape has just changed: keeping the incoming stroke's
+    // placement would run the ramp across the width of the last stroke drawn
+    // and repeat it over everything it fused with. Refitted only when
+    // something actually fused, so a stroke that landed on its own keeps
+    // exactly the fill it was drawn with.
+    let mut new_fill = new_fill;
+    if fused
+        && let Paint::Gradient(gradient) = &new_fill.paint
+    {
+        let mut ramp = (**gradient).clone();
+        ramp.fit_to(merged.bounding_box());
+        new_fill.paint = Paint::Gradient(std::sync::Arc::new(ramp));
     }
 
     scene.add_shape_at(
@@ -4871,6 +5719,60 @@ fn merge_shape_into_layer(
             blend: incoming.blend,
         },
     )
+}
+
+/// **Put a freshly imported sound on the document's own timeline.**
+///
+/// # Why importing places it
+///
+/// A sound in the library and nowhere else is silent, and \u2014 the report this
+/// exists to answer \u2014 it is *not exported*, because what the exporter writes
+/// is `Scene::stage_cues`: the sounds attached to keyframes on the document's
+/// timeline. An animator who imports a dialogue track, hears nothing on
+/// playback and finds no audio in the finished MP4 has every reason to conclude
+/// that sound does not work. Animate leaves it in the library too, and Animate
+/// is wrong about this in a way that costs a beginner an afternoon.
+///
+/// So the sound arrives on a layer of its own, named after itself, running from
+/// the first frame and spanning its own length. Everything about that is
+/// ordinary editing and one Ctrl+Z undoes the lot, including the import.
+///
+/// # On the stage timeline, whatever is open
+///
+/// Deliberately `edit_stage_layers` and not `edit_layers`. What plays and what
+/// exports is the document's own timeline; a sound put inside whichever symbol
+/// happened to be open for editing would be neither heard nor written, which is
+/// the same silence by a different route.
+///
+/// `false` when there was nothing to place \u2014 a sound of no length.
+fn place_sound_on_stage(scene: &mut buzz_scene::Scene, sound: buzz_scene::SoundId, fps: f64) -> bool {
+    let frames = scene
+        .sounds()
+        .get(sound)
+        .map(|asset| asset.duration_frames(fps))
+        .unwrap_or(0);
+    if frames == 0 {
+        return false;
+    }
+    let name = scene
+        .sounds()
+        .get(sound)
+        .map(|asset| asset.name.clone())
+        .unwrap_or_else(|| "Sound".to_string());
+
+    let id = scene.add_stage_layer(name, buzz_scene::LayerKind::Normal);
+    scene.update_stage_layer(id, |layer| {
+        // The span the sound covers, so the timeline shows how long it runs,
+        // the waveform has somewhere to be drawn, and the export range \u2014 which
+        // defaults to the length of the timeline \u2014 reaches the end of it.
+        layer.frames.insert_frame(frames.saturating_sub(1));
+        // Stream, which is what dialogue is: tied to the playhead, so scrubbing
+        // moves the sound and the picture cannot drift from it.
+        if let Some(keyframe) = layer.frames.keyframe_at_mut(0) {
+            keyframe.sound = Some(buzz_scene::SoundRef::stream(sound));
+        }
+    });
+    true
 }
 
 #[cfg(test)]
@@ -4986,6 +5888,829 @@ mod tests {
         assert_eq!(e.scene().shape_count(), 0);
     }
 
+    /// An effect stroke is many pieces — vector shapes and painted bitmaps —
+    /// but it lands as **one** object, one undo step, selected. The gesture
+    /// after "paint snow" is "move the snow", and that only works if the
+    /// stroke came in whole.
+    #[test]
+    fn an_effect_stroke_commits_as_one_grouped_undoable_object() {
+        let mut e = editor();
+        let samples: Vec<buzz_geom::StrokeSample> = (0..60)
+            .map(|i| {
+                let t = i as f64 / 59.0;
+                buzz_geom::StrokeSample::new(Point::new(t * 400.0, 200.0), t)
+            })
+            .collect();
+        let pieces = buzz_scene::effect_artwork(
+            buzz_scene::EffectKind::Snow,
+            &buzz_scene::EffectStroke {
+                samples: &samples,
+                size: 24.0,
+                color: Color::WHITE,
+                conditioning: buzz_geom::Conditioning::smoothing(0.5),
+            },
+        );
+        assert!(pieces.len() > 1, "snow should be several depth buckets");
+
+        e.apply(ToolAction::AddArtwork {
+            pieces,
+            label: "Snow",
+        });
+
+        // One object on the layer: the group.
+        let objects: Vec<ObjectId> = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter().map(|o| o.id))
+            .collect();
+        assert_eq!(objects.len(), 1, "the pieces should arrive grouped");
+        assert_eq!(
+            e.selection.ids(),
+            objects,
+            "the stroke should come in selected, like any other drawing"
+        );
+
+        // And leave as one undo step.
+        assert!(e.doc.undo());
+        assert_eq!(e.scene().shape_count(), 0, "undo should remove the whole stroke");
+    }
+
+    /// A wave stroke, as the Wave brush hands one over.
+    fn wave_frames(kind: buzz_scene::WaveKind, frames: u32) -> Vec<Vec<buzz_scene::ArtPiece>> {
+        let samples: Vec<buzz_geom::StrokeSample> = (0..60)
+            .map(|i| {
+                let t = i as f64 / 59.0;
+                buzz_geom::StrokeSample::new(Point::new(200.0, 400.0 - t * 300.0), t)
+            })
+            .collect();
+        let mut settings = kind.preset();
+        settings.frames = frames;
+        buzz_scene::wave_loop(
+            kind,
+            &buzz_scene::WaveStroke {
+                samples: &samples,
+                size: 24.0,
+                color: Color::WHITE,
+                conditioning: buzz_geom::Conditioning::smoothing(0.5),
+                settings,
+            },
+        )
+    }
+
+    /// **One stroke, one animation.** A wave commits a whole cycle: a keyframe
+    /// per frame, each holding that frame's drawing, and all of it one undo
+    /// step.
+    #[test]
+    fn a_wave_stroke_bakes_a_keyframe_for_every_frame() {
+        let mut e = editor();
+        let frames = wave_frames(buzz_scene::WaveKind::Smoke, 8);
+        assert_eq!(frames.len(), 8);
+
+        e.apply(ToolAction::AddArtworkFrames {
+            frames,
+            label: "Smoke",
+        });
+
+        let layer = e.active_layer().expect("a layer");
+        let timeline = &e.scene().layers().get(layer).expect("the layer").frames;
+        assert_eq!(timeline.keyframe_count(), 8, "one keyframe per frame");
+        assert!(timeline.length() >= 8, "the layer should reach the last frame");
+
+        for frame in 0..8u32 {
+            assert_eq!(
+                timeline.objects_at(frame).len(),
+                1,
+                "frame {frame} should hold exactly one drawing"
+            );
+        }
+
+        // And it leaves as one undo step, like every other stroke.
+        assert!(e.doc.undo());
+        let after = &e.scene().layers().get(layer).expect("the layer").frames;
+        assert_eq!(after.keyframe_count(), 1, "undo should take the whole cycle");
+    }
+
+    /// The bug this order was chosen to avoid: every keyframe is made before
+    /// any of the artwork, so frame *n* holds one plume rather than *n* of
+    /// them.
+    #[test]
+    fn a_baked_wave_does_not_stack_up_frame_by_frame() {
+        let mut e = editor();
+        e.apply(ToolAction::AddArtworkFrames {
+            frames: wave_frames(buzz_scene::WaveKind::Smoke, 6),
+            label: "Smoke",
+        });
+
+        let layer = e.active_layer().expect("a layer");
+        let timeline = &e.scene().layers().get(layer).expect("the layer").frames;
+        for frame in 0..6u32 {
+            assert_eq!(
+                timeline.objects_at(frame).len(),
+                1,
+                "frame {frame} carries copies of the frames before it"
+            );
+        }
+    }
+
+    /// Baking a wave over a held drawing must not blank the frames it covers:
+    /// the keyframes are inserted the way F6 inserts one, carrying what the
+    /// layer was already showing.
+    #[test]
+    fn baking_a_wave_keeps_the_background_it_was_drawn_over() {
+        let mut e = editor();
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(square(0.0, 0.0, 500.0), Color::from_rgb8(0x20, 0x30, 0x40)),
+            label: "Background",
+        });
+        let layer = e.active_layer().expect("a layer");
+        // Held for a while, as a background is.
+        e.doc.edit("Extend", |scene| {
+            scene.update_layer(layer, |l| {
+                l.frames.insert_frame(11);
+            });
+        });
+
+        e.apply(ToolAction::AddArtworkFrames {
+            frames: wave_frames(buzz_scene::WaveKind::Smoke, 6),
+            label: "Smoke",
+        });
+
+        let timeline = &e.scene().layers().get(layer).expect("the layer").frames;
+        for frame in 0..6u32 {
+            assert_eq!(
+                timeline.objects_at(frame).len(),
+                2,
+                "frame {frame} lost the background it was drawn over"
+            );
+        }
+    }
+
+    /// **The eraser cuts a shape in two.** Rubbing through the middle left one
+    /// object holding two disconnected halves, so clicking either selected
+    /// both and dragging one dragged the other — which is the opposite of what
+    /// an eraser is for.
+    #[test]
+    fn rubbing_through_a_shape_leaves_two_shapes() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        e.style.stroke_enabled = false;
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(square(0.0, 0.0, 200.0), Color::WHITE),
+            label: "Draw",
+        });
+        assert_eq!(e.scene().shape_count_at(0), 1);
+
+        // A rub straight down the middle, wide enough to part it.
+        e.style.eraser_size = 20.0;
+        e.apply(ToolAction::Erase {
+            path: {
+                let mut path = buzz_geom::BezPath::new();
+                path.move_to(Point::new(100.0, -40.0));
+                path.line_to(Point::new(100.0, 240.0));
+                path
+            },
+            width: e.style.eraser_size,
+        });
+
+        assert_eq!(
+            e.scene().shape_count_at(0),
+            2,
+            "a shape rubbed through the middle becomes two shapes"
+        );
+        // Each half is on its own side of the cut.
+        let mut middles: Vec<f64> = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .map(|o| o.bounds().center().x)
+            .collect();
+        middles.sort_by(f64::total_cmp);
+        assert!(
+            middles[0] < 100.0 && middles[1] > 100.0,
+            "the halves should sit either side of the rub: {middles:?}"
+        );
+    }
+
+    /// A rub that only takes a bite leaves one shape — splitting must not
+    /// invent pieces that are still joined.
+    #[test]
+    fn a_rub_that_does_not_part_a_shape_leaves_one() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        e.style.stroke_enabled = false;
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(square(0.0, 0.0, 200.0), Color::WHITE),
+            label: "Draw",
+        });
+        e.apply(ToolAction::Erase {
+            path: {
+                let mut path = buzz_geom::BezPath::new();
+                path.move_to(Point::new(100.0, -40.0));
+                path.line_to(Point::new(100.0, 60.0));
+                path
+            },
+            width: 20.0,
+        });
+        assert_eq!(e.scene().shape_count_at(0), 1, "a notch is still one shape");
+    }
+
+    /// **Two strokes drawn with one gradient fuse.** A new fill is fitted to
+    /// its own shape's bounds, so every stroke carried a different gradient
+    /// transform — and "different paint" *cuts* in Merge Shape, so the second
+    /// stroke took a bite out of the first instead of joining it.
+    #[test]
+    fn strokes_sharing_a_gradient_merge_rather_than_cutting() {
+        let mut e = editor();
+        e.style.stroke_enabled = false;
+        let ramp = |bounds: buzz_geom::Rect| {
+            buzz_scene::Gradient::linear(Color::BLACK, Color::WHITE, bounds)
+        };
+
+        let first = square(0.0, 0.0, 100.0);
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData {
+                path: first.clone(),
+                fill: Some(FillSpec::gradient(ramp(buzz_geom::Shape::bounding_box(
+                    &first,
+                )))),
+                stroke: None,
+                blend: buzz_scene::PaintBlend::Normal,
+            },
+            label: "Draw",
+        });
+        let second = square(50.0, 0.0, 100.0);
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData {
+                path: second.clone(),
+                fill: Some(FillSpec::gradient(ramp(buzz_geom::Shape::bounding_box(
+                    &second,
+                )))),
+                stroke: None,
+                blend: buzz_scene::PaintBlend::Normal,
+            },
+            label: "Draw",
+        });
+
+        assert_eq!(
+            e.scene().shape_count_at(0),
+            1,
+            "two overlapping strokes of the same gradient are one shape"
+        );
+        let fused = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .next()
+            .expect("the fused shape")
+            .bounds();
+        assert!(
+            fused.width() > 140.0,
+            "and it spans both strokes rather than one biting the other: {fused:?}"
+        );
+    }
+
+    /// **The scene commands are reachable from the menu.** The only way to
+    /// make a scene used to be a menu on the breadcrumb above the stage, and
+    /// that strip was drawn only while a symbol was open — so on the main
+    /// timeline, where everybody works, a document's scenes could not be
+    /// reached at all.
+    #[test]
+    fn scenes_can_be_added_and_duplicated_from_a_command() {
+        let mut e = editor();
+        assert_eq!(e.doc.scene_names().len(), 1);
+
+        e.run(buzz_ui::Command::AddScene);
+        assert_eq!(e.doc.scene_names().len(), 2, "Add Scene makes one");
+        assert_eq!(e.doc.active_scene(), 1, "and opens it");
+
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(square(0.0, 0.0, 20.0), Color::WHITE),
+            label: "Draw",
+        });
+        e.run(buzz_ui::Command::DuplicateScene);
+        assert_eq!(e.doc.scene_names().len(), 3);
+        assert_eq!(
+            e.scene().shape_count_at(0),
+            1,
+            "the duplicate carries the artwork with it"
+        );
+        assert!(
+            e.status.as_deref().unwrap_or_default().contains("Duplicated"),
+            "and says what it did: {:?}",
+            e.status
+        );
+    }
+
+    /// **The length the export dialog offers is the length the exporter
+    /// renders.** Two crates count the film — `Document` for the range the
+    /// user is given, and the exporter's reel for what is actually written —
+    /// and if they ever disagreed the default range would quietly stop short
+    /// of the end of the film or ask for frames that do not exist.
+    #[test]
+    fn the_films_length_agrees_with_what_the_exporter_will_render() {
+        let mut e = editor();
+
+        // Three scenes of different lengths, one of them looping.
+        let lengths = [4u32, 7, 2];
+        for (i, length) in lengths.iter().enumerate() {
+            if i > 0 {
+                e.doc.add_scene();
+            }
+            let last = length.saturating_sub(1);
+            e.doc.edit("Lengthen", |scene| {
+                let layer = scene.add_layer("Art", buzz_scene::LayerKind::Normal);
+                scene.update_layer(layer, |l| {
+                    l.frames.insert_frame(last);
+                });
+            });
+        }
+        e.doc.switch_scene(1);
+        e.doc.edit("Loop", |scene| {
+            *scene.looping_mut() = buzz_scene::LoopRegion {
+                enabled: true,
+                start: 1,
+                end: 3,
+                repeats: 3,
+            };
+        });
+
+        let scenes = e.doc.film();
+        assert_eq!(scenes.len(), 3);
+        let reel = buzz_export::Reel::of(scenes.iter());
+
+        assert_eq!(
+            e.doc.film_frames(),
+            reel.frames(),
+            "the dialog and the exporter disagree about how long the film is"
+        );
+        for (index, (_, start)) in reel.scenes().enumerate() {
+            assert_eq!(
+                e.doc.film_start_of(index),
+                start,
+                "scene {index} starts in a different place for each of them"
+            );
+        }
+        // And the loop really lengthened the film, so this is not a test of
+        // three plain scenes.
+        assert!(
+            reel.frames() > lengths.iter().sum::<u32>(),
+            "the looping scene should make the film longer than its timelines"
+        );
+    }
+
+    /// Drag a freehand stroke through the tool, at an optional pen pressure.
+    fn draw_freehand(e: &mut Editor, tool: ToolId, from: Point, to: Point, pressure: Option<f64>) {
+        e.set_tool(tool);
+        e.pointer_down_at(from, Mods::default(), Some(0.0), pressure);
+        for i in 1..=12 {
+            let t = f64::from(i) / 12.0;
+            e.pointer_move_at(from.lerp(to, t), Mods::default(), Some(t * 0.4), pressure);
+        }
+        e.pointer_up_at(to, Some(0.4), pressure);
+    }
+
+    /// **Crossing lines are one thing.** In Merge Shape mode two pencil lines
+    /// drawn across each other used to stay two objects, so clicking the join
+    /// selected one of them and dragging pulled it out of the drawing it
+    /// belonged to.
+    #[test]
+    fn lines_that_cross_fuse_into_one_object() {
+        let mut e = editor();
+        assert_eq!(e.style.drawing_mode, DrawingMode::MergeShape);
+
+        draw_freehand(
+            &mut e,
+            ToolId::Pencil,
+            Point::new(100.0, 100.0),
+            Point::new(300.0, 100.0),
+            None,
+        );
+        assert_eq!(e.scene().shape_count_at(0), 1, "the first line is drawn");
+
+        draw_freehand(
+            &mut e,
+            ToolId::Pencil,
+            Point::new(200.0, 20.0),
+            Point::new(200.0, 200.0),
+            None,
+        );
+        assert_eq!(
+            e.scene().shape_count_at(0),
+            1,
+            "a line drawn across another should fuse with it, not sit beside it"
+        );
+
+        // And the one object really holds both arms, so selecting it takes
+        // the whole cross and dragging moves it together.
+        let fused = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .next()
+            .expect("the fused line")
+            .bounds();
+        assert!(
+            fused.width() > 100.0 && fused.height() > 50.0,
+            "the fused object should span both arms of the cross: {fused:?}"
+        );
+    }
+
+    /// Lines that never touch stay separate, or a page of parallel strokes
+    /// would silently become one object — the same failure the filled merge
+    /// guards against.
+    #[test]
+    fn lines_that_never_touch_stay_separate() {
+        let mut e = editor();
+        for y in [100.0, 160.0] {
+            draw_freehand(
+                &mut e,
+                ToolId::Pencil,
+                Point::new(100.0, y),
+                Point::new(300.0, y),
+                None,
+            );
+        }
+        assert_eq!(
+            e.scene().shape_count_at(0),
+            2,
+            "parallel lines share bounding boxes but no ink"
+        );
+    }
+
+    /// Object Drawing means every stroke is its own object, crossing or not —
+    /// the whole point of the mode.
+    #[test]
+    fn object_drawing_keeps_crossing_lines_apart() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        draw_freehand(
+            &mut e,
+            ToolId::Pencil,
+            Point::new(100.0, 100.0),
+            Point::new(300.0, 100.0),
+            None,
+        );
+        draw_freehand(
+            &mut e,
+            ToolId::Pencil,
+            Point::new(200.0, 20.0),
+            Point::new(200.0, 200.0),
+            None,
+        );
+        assert_eq!(e.scene().shape_count_at(0), 2);
+    }
+
+    /// **Pen pressure reaches the artwork.** The window reports a force per
+    /// sample and it was thrown away, so every stroke was recorded at full
+    /// pressure and the Pressure setting appeared to do nothing at all.
+    #[test]
+    fn a_pens_pressure_reaches_the_stroke() {
+        let width_at = |pressure: Option<f64>| -> f64 {
+            let mut e = editor();
+            e.style.brush.kind = buzz_ui::BrushKind::Fluid;
+            e.style.brush.use_pressure = true;
+            e.style.brush.size = 40.0;
+            e.style.brush.min_ratio = 0.05;
+            e.style.brush.taper = 0.0;
+            e.style.brush.smoothing = 0.0;
+            draw_freehand(
+                &mut e,
+                ToolId::Brush,
+                Point::new(100.0, 200.0),
+                Point::new(400.0, 200.0),
+                pressure,
+            );
+            e.scene()
+                .layers()
+                .iter()
+                .flat_map(|l| l.objects_at(0).iter())
+                .map(|o| o.bounds().height())
+                .fold(0.0, f64::max)
+        };
+
+        // Both well under full pressure, as a real pen stroke is: a stroke
+        // that never once came in under maximum is treated as a device with
+        // no sensor — see `brush_profile_for`, and the test below.
+        let light = width_at(Some(0.15));
+        let heavy = width_at(Some(0.9));
+        assert!(light > 0.0 && heavy > 0.0, "both strokes drew something");
+        assert!(
+            heavy > light * 2.0,
+            "a hard press should paint far wider than a light one: {heavy:.2} against {light:.2}"
+        );
+    }
+
+    /// **A mouse still gets a fluid stroke.** With Pressure on and no sensor
+    /// to answer it, every sample is full pressure — so the brush falls back
+    /// to speed rather than painting a dead constant width, which is what made
+    /// the setting look broken.
+    #[test]
+    fn a_device_with_no_pressure_falls_back_to_speed() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Fluid;
+        style.brush.use_pressure = true;
+
+        let mouse: Vec<buzz_geom::StrokeSample> = (0..40)
+            .map(|i| {
+                let t = f64::from(i) / 39.0;
+                buzz_geom::StrokeSample::new(Point::new(t * 300.0, 0.0), t * 0.5)
+            })
+            .collect();
+        assert!(
+            matches!(
+                crate::tools::brush_profile_for(&mouse, &style.brush).response,
+                buzz_geom::WidthResponse::Speed { .. }
+            ),
+            "a stroke that never came in under full pressure is not a pen"
+        );
+
+        // And a pen's stroke keeps the pressure response.
+        let mut pen = mouse.clone();
+        pen[10].pressure = 0.4;
+        assert_eq!(
+            crate::tools::brush_profile_for(&pen, &style.brush).response,
+            buzz_geom::WidthResponse::Pressure
+        );
+    }
+
+    /// **Copy Frames takes every layer.** A frame of a drawing is a frame of
+    /// the whole drawing — character, background and overlay — and copying one
+    /// layer of it was never what anybody meant.
+    #[test]
+    fn copying_a_frame_takes_every_layer_and_pastes_them_all_back() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+
+        // Three layers, each with its own drawing on frame 0.
+        let mut layers = vec![e.selection.active_layer().expect("a first layer")];
+        for name in ["Middle", "Front"] {
+            let id = e.doc_add_layer(name, buzz_scene::LayerKind::Normal);
+            e.selection.set_active_layer(Some(id));
+            layers.push(id);
+        }
+        for (i, layer) in layers.iter().enumerate() {
+            e.selection.set_active_layer(Some(*layer));
+            e.apply(ToolAction::AddShape {
+                shape: ShapeData::filled(square(i as f64 * 50.0, 0.0, 30.0), Color::WHITE),
+                label: "Draw",
+            });
+        }
+        let on_frame = |e: &Editor, frame: u32, layer: LayerId| -> usize {
+            e.scene()
+                .layers()
+                .get(layer)
+                .map(|l| l.objects_at(frame).len())
+                .unwrap_or(0)
+        };
+        for layer in &layers {
+            assert_eq!(on_frame(&e, 0, *layer), 1, "each layer drew something");
+        }
+
+        e.run(buzz_ui::Command::CopyFrames);
+        e.set_frame(10);
+        e.run(buzz_ui::Command::PasteFrames);
+
+        // Every layer got its own artwork back, on the layer it came from.
+        for layer in &layers {
+            assert_eq!(
+                on_frame(&e, 10, *layer),
+                1,
+                "a layer's artwork did not come back onto its own layer"
+            );
+        }
+        // And the originals are untouched.
+        for layer in &layers {
+            assert_eq!(on_frame(&e, 0, *layer), 1);
+        }
+    }
+
+    /// Cut clears every layer it took from, or most of the drawing stays put.
+    #[test]
+    fn cutting_a_frame_clears_every_layer_it_took_from() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let first = e.selection.active_layer().expect("a layer");
+        let second = e.doc_add_layer("Second", buzz_scene::LayerKind::Normal);
+        for layer in [first, second] {
+            e.selection.set_active_layer(Some(layer));
+            e.apply(ToolAction::AddShape {
+                shape: ShapeData::filled(square(0.0, 0.0, 20.0), Color::WHITE),
+                label: "Draw",
+            });
+        }
+        assert_eq!(e.scene().shape_count_at(0), 2);
+
+        e.run(buzz_ui::Command::CutFrames);
+        assert_eq!(
+            e.scene().shape_count_at(0),
+            0,
+            "a cut should empty the frame on every layer, not just the active one"
+        );
+        assert!(e.frame_clipboard.is_some(), "and it is on the clipboard");
+
+        e.set_frame(6);
+        e.run(buzz_ui::Command::PasteFrames);
+        assert_eq!(e.scene().shape_count_at(6), 2, "both layers came back");
+    }
+
+    /// Pasting when the layers are gone says so and leaves no empty step in
+    /// the history for the user to undo past.
+    #[test]
+    fn pasting_frames_whose_layers_are_gone_says_so() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let layer = e.doc_add_layer("Doomed", buzz_scene::LayerKind::Normal);
+        e.selection.set_active_layer(Some(layer));
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(square(0.0, 0.0, 20.0), Color::WHITE),
+            label: "Draw",
+        });
+        e.run(buzz_ui::Command::CopyFrames);
+
+        // Take every layer the clipboard refers to away.
+        let all: Vec<LayerId> = e.scene().layers().iter().map(|l| l.id).collect();
+        e.doc.edit("Delete Layers", |scene| {
+            for id in all {
+                scene.remove_layer(id);
+            }
+        });
+
+        let before = e.scene().revision();
+        e.set_frame(4);
+        e.run(buzz_ui::Command::PasteFrames);
+        let said = e.status.clone().unwrap_or_default();
+        assert!(
+            said.contains("gone") || said.contains("locked"),
+            "it should say why nothing was pasted, and said {said:?}"
+        );
+        assert_eq!(
+            e.scene().revision(),
+            before,
+            "and left the document exactly as it was"
+        );
+    }
+
+    /// **A brush made from artwork keeps that artwork's colour.** The whole
+    /// request: select something red, make a brush, and paint red — not a
+    /// grey silhouette in whatever the fill swatch happened to be.
+    #[test]
+    fn a_brush_made_from_a_selection_keeps_its_colour() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let red = Color::from_rgb8(0xFF, 0x00, 0x00);
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(square(400.0, 300.0, 40.0), red),
+            label: "Draw",
+        });
+        let drawn = e.selection.ids();
+        assert_eq!(drawn.len(), 1, "the artwork is selected after drawing it");
+
+        // The fill swatch is deliberately something else entirely, so a brush
+        // that painted with the swatch could not pass by accident.
+        e.style.fill_color = Color::from_rgb8(0x00, 0xFF, 0x00);
+        e.run(buzz_ui::Command::BrushFromSelection);
+
+        let brush = &e.style.brush;
+        assert_eq!(brush.pattern, buzz_ui::PatternShape::Custom);
+        assert!(brush.kind.uses_pattern(), "and it is a stamping brush");
+        assert!(
+            brush.stamps_its_own_paint(),
+            "it should stamp the artwork's own paint"
+        );
+        let stamp = brush.pattern_stamp().expect("the captured artwork");
+        assert_eq!(
+            stamp.place(buzz_geom::Affine::scale(20.0))[0]
+                .fill
+                .as_ref()
+                .expect("a fill")
+                .paint
+                .color(),
+            red,
+            "the brush stamps red, not the swatch"
+        );
+    }
+
+    /// And the stroke it paints really lands in that colour, through the
+    /// tool: press, drag, release, and read the artwork back off the layer.
+    #[test]
+    fn painting_with_a_captured_brush_lays_down_its_colours() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let blue = Color::from_rgb8(0x20, 0x40, 0xE0);
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(square(0.0, 0.0, 30.0), blue),
+            label: "Draw",
+        });
+        e.run(buzz_ui::Command::BrushFromSelection);
+        e.style.fill_color = Color::from_rgb8(0xFF, 0xFF, 0x00);
+        e.selection.clear();
+
+        let before: Vec<ObjectId> = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .map(|o| o.id)
+            .collect();
+
+        // A drag across the stage with the Brush.
+        let ctx_points: Vec<Point> = (0..24)
+            .map(|i| Point::new(100.0 + f64::from(i) * 12.0, 200.0))
+            .collect();
+        e.set_tool(ToolId::Brush);
+        e.pointer_down(ctx_points[0], Mods::default());
+        for p in &ctx_points[1..] {
+            e.pointer_move(*p, Mods::default());
+        }
+        e.pointer_up(*ctx_points.last().unwrap());
+
+        // Whatever arrived, every fill in it is the captured blue.
+        let mut painted = Vec::new();
+        for layer in e.scene().layers().iter() {
+            for object in layer.objects_at(0).iter() {
+                if !before.contains(&object.id) {
+                    object.flatten(buzz_geom::Affine::IDENTITY, &mut painted);
+                }
+            }
+        }
+        assert!(!painted.is_empty(), "the brush painted nothing");
+        for (_, shape) in &painted {
+            assert_eq!(
+                shape.fill.as_ref().expect("a fill").paint.color(),
+                blue,
+                "a stamp came out in the swatch colour instead of the brush's"
+            );
+        }
+    }
+
+    /// Turning Artwork Colours off is Animate's behaviour, and must still
+    /// work: the silhouette, painted by the current swatch.
+    #[test]
+    fn a_captured_brush_can_still_be_painted_with_the_swatch() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(square(0.0, 0.0, 30.0), Color::from_rgb8(0xFF, 0, 0)),
+            label: "Draw",
+        });
+        e.run(buzz_ui::Command::BrushFromSelection);
+
+        e.style.brush.keep_source_paint = false;
+        assert!(
+            !e.style.brush.stamps_its_own_paint(),
+            "with the switch off it stamps an outline for the swatch to paint"
+        );
+        assert!(
+            e.style.brush.pattern_path().is_some(),
+            "and the silhouette is still there to stamp"
+        );
+    }
+
+    /// A painted effect piece — clouds — lands its pixels in the image
+    /// library and its shape on the layer, exactly as a soft-brush stroke
+    /// does, so every vector tool works on it afterwards.
+    #[test]
+    fn a_painted_effect_piece_becomes_an_ordinary_image_fill() {
+        let mut e = editor();
+        let samples: Vec<buzz_geom::StrokeSample> = (0..40)
+            .map(|i| {
+                let t = i as f64 / 39.0;
+                buzz_geom::StrokeSample::new(Point::new(50.0 + t * 300.0, 100.0), t)
+            })
+            .collect();
+        let pieces = buzz_scene::effect_artwork(
+            buzz_scene::EffectKind::Clouds,
+            &buzz_scene::EffectStroke {
+                samples: &samples,
+                size: 30.0,
+                color: Color::WHITE,
+                conditioning: buzz_geom::Conditioning::smoothing(0.5),
+            },
+        );
+        assert!(
+            pieces
+                .iter()
+                .any(|p| matches!(p, buzz_scene::ArtPiece::Painting { .. })),
+            "clouds should carry painted pixels"
+        );
+
+        let images_before = e.scene().images().len();
+        e.apply(ToolAction::AddArtwork {
+            pieces,
+            label: "Clouds",
+        });
+        assert!(
+            e.scene().images().len() > images_before,
+            "the painting should be in the image library"
+        );
+        assert!(e.scene().shape_count() >= 1);
+    }
+
     /// Animate's merge model: same colour fuses.
     #[test]
     fn overlapping_same_coloured_shapes_merge_into_one() {
@@ -5052,6 +6777,38 @@ mod tests {
             e.scene().shape_count(),
             2,
             "object drawing must not merge shapes"
+        );
+    }
+
+    /// A bounding box is not the shape. An object with two contours far apart
+    /// has a box spanning the gap between them, and a new stroke drawn inside
+    /// that gap crosses the box without ever touching the artwork — merging
+    /// it anyway would leave a single click selecting both, the same as if
+    /// Object Drawing were on.
+    #[test]
+    fn a_shape_merely_inside_another_shapes_bounding_box_does_not_fuse_with_it() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::MergeShape;
+        e.style.fill_color = Color::WHITE;
+        e.style.stroke_enabled = false;
+
+        // One object, two corners far apart: its bounding box is [0,0..220,220]
+        // but nothing is actually drawn in the middle of it.
+        let mut two_corners = square(0.0, 0.0, 20.0);
+        two_corners.extend(square(200.0, 200.0, 20.0).iter());
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(two_corners, Color::WHITE),
+            label: "Draw",
+        });
+        assert_eq!(e.scene().shape_count(), 1);
+
+        // Drawn well inside that bounding box, nowhere near either corner.
+        draw_square(&mut e, 90.0, 90.0, 20.0, Color::WHITE);
+
+        assert_eq!(
+            e.scene().shape_count(),
+            2,
+            "a shape merely inside another's bounding box must not fuse with it"
         );
     }
 
@@ -9631,4 +11388,205 @@ mod tests {
 
         assert_eq!(sun_of(&e), before, "a hidden handle was still grabbed");
     }
+
+    /// **The brush preview is drawn where the brush will paint.**
+    ///
+    /// A tool receives points carried back through the document camera and
+    /// through the place of any symbol opened for editing; the preview is built
+    /// from those points and used to be drawn straight into document space, so
+    /// with a shot framed off centre the ink appeared a fixed distance from the
+    /// pointer and jumped back the moment the stroke was committed. The fix is
+    /// one transform, and this is it: carrying a tool-space point forward has to
+    /// undo exactly what `screen_to_edit` did to it.
+    #[test]
+    fn a_preview_maps_back_onto_the_stage_it_was_taken_from() {
+        let mut e = Editor::default();
+
+        // A shot framed well off centre — the case where the old code drew the
+        // preview a couple of hundred units from the pointer.
+        e.doc.edit("Camera", |scene| {
+            let stage = scene.stage().size;
+            scene.camera_mut().enabled = true;
+            scene.camera_mut().set_key(buzz_scene::CameraKey::new(
+                0,
+                Point::new(stage.width / 2.0 + 200.0, stage.height / 2.0 - 60.0),
+            ));
+        });
+        e.doc.end_gesture();
+
+        let onto_stage = e.edit_to_stage();
+        for screen in [
+            Point::new(12.0, 34.0),
+            Point::new(400.0, 220.0),
+            Point::new(-80.0, 500.0),
+        ] {
+            let in_tool_space = e.screen_to_edit(screen);
+            let back = onto_stage
+                .map_point(in_tool_space)
+                .expect("the point is in front of the lens");
+            let straight = e.camera.screen_to_doc(screen);
+            assert!(
+                (back - straight).hypot() < 1e-6,
+                "a tool-space point must come back to where the pointer was:                  {back:?} against {straight:?}"
+            );
+        }
+    }
+
+    /// **A drawn line is not a placed one, so it does not snap.**
+    ///
+    /// Object snapping is on by default and reaches eight screen pixels. Applied
+    /// to a brush stroke it pulls every sample that passes near existing artwork
+    /// onto that artwork's bounding box, which puts flats and steps into a
+    /// curve the hand drew smoothly.
+    #[test]
+    fn a_freehand_stroke_is_never_snapped() {
+        let mut e = Editor::default();
+        // A square to snap to, and snapping left at its default (objects on).
+        draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE).unwrap();
+        assert!(e.view.snap.to_objects, "the default this test is about");
+
+        // Just inside the snap radius of the square's right-hand edge.
+        let near_the_edge = Point::new(103.0, 50.0);
+        let screen = e.camera.doc_to_screen(near_the_edge);
+
+        // Compared with a tolerance because the point has been through the
+        // view and back; what is being tested is that snapping moved it, and
+        // snapping moves things by whole pixels.
+        e.set_tool(ToolId::Brush);
+        let drawn = e.snap_for_tool(e.screen_to_edit(screen));
+        assert!(
+            (drawn - near_the_edge).hypot() < 1e-6,
+            "the brush draws where the hand went, got {drawn:?}"
+        );
+
+        // The pen places anchors deliberately, so it still snaps.
+        e.set_tool(ToolId::Pen);
+        let placed = e.snap_for_tool(e.screen_to_edit(screen));
+        assert!(
+            (placed.x - 100.0).abs() < 1e-6,
+            "a placed point still snaps to the edge it is beside, got {placed:?}"
+        );
+    }
+
+
+    /// **An imported sound is a sound the film carries.**
+    ///
+    /// It used to land in the library and nowhere else, so it was silent on
+    /// playback and \u2014 the report \u2014 missing from the exported video, because
+    /// what the exporter writes is `Scene::stage_cues`: sounds attached to
+    /// keyframes on the document's own timeline. An empty cue list is an export
+    /// with no audio in it, and nothing anywhere says why.
+    #[test]
+    fn an_imported_sound_lands_on_the_timeline_the_export_reads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("Dialogue.wav");
+        std::fs::write(&path, test_wav(1.0)).expect("wrote the tone");
+
+        let mut e = Editor::default();
+        assert!(
+            e.scene().stage_cues().is_empty(),
+            "nothing is cued before the import"
+        );
+
+        e.import_sound(&path).expect("the sound imports");
+
+        let cues = e.scene().stage_cues();
+        assert_eq!(cues.len(), 1, "the import put it where the film can see it");
+        assert_eq!(cues[0].start_frame, 0, "from the first frame");
+
+        // And on the document's timeline rather than inside anything, which is
+        // the only place `stage_cues` looks.
+        assert!(
+            e.scene()
+                .stage_layers()
+                .iter()
+                .any(|l| l.name == "Dialogue"),
+            "on a layer named after the sound"
+        );
+
+        // Long enough to hold the whole second of audio at the default rate.
+        let fps = e.scene().stage().frame_rate;
+        assert!(
+            e.scene().frame_count() >= (fps.round() as u32),
+            "the layer spans the sound, so the default export range reaches its end"
+        );
+
+        // One undo takes the import and the placement together.
+        e.doc.undo();
+        assert!(
+            e.scene().stage_cues().is_empty() && e.scene().sounds().iter().count() == 0,
+            "the import is one step in the history"
+        );
+    }
+
+    /// A sound attached while a symbol is open would be neither heard nor
+    /// exported, so it is refused with the reason rather than silently lost.
+    #[test]
+    fn sound_is_not_attached_inside_a_symbol() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("Line.wav");
+        std::fs::write(&path, test_wav(0.2)).expect("wrote the tone");
+
+        let mut e = Editor::default();
+        e.import_sound(&path).expect("the sound imports");
+
+        let symbol = e.doc.scene().library().iter().next().map(|s| s.id);
+        let symbol = match symbol {
+            Some(id) => id,
+            None => {
+                let mut made = None;
+                e.doc.edit("Symbol", |scene| {
+                    made = Some(scene.add_symbol(
+                        "Head",
+                        buzz_scene::SymbolKind::Graphic,
+                        None,
+                    ));
+                });
+                e.doc.end_gesture();
+                made.expect("a symbol")
+            }
+        };
+        e.doc.edit("Enter", |scene| {
+            scene.enter_symbol(symbol);
+        });
+        e.doc.end_gesture();
+
+        let before = e.scene().stage_cues().len();
+        e.attach_sound_to_frame();
+        assert_eq!(
+            e.scene().stage_cues().len(),
+            before,
+            "nothing was attached where nothing could be heard"
+        );
+        let said = e.status.clone().unwrap_or_default();
+        assert!(
+            said.contains("main timeline"),
+            "and the reason was given, got {said:?}"
+        );
+    }
+
+    /// A WAV of a 440 Hz tone, written rather than committed: a fixture would be
+    /// a binary blob for a test that needs "some sound, of a known length".
+    fn test_wav(seconds: f64) -> Vec<u8> {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut out = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(&mut out, spec).expect("writer");
+            for i in 0..(seconds * 44_100.0) as usize {
+                let t = i as f64 / 44_100.0;
+                let v = (t * 440.0 * std::f64::consts::TAU).sin() * 0.6;
+                writer.write_sample((v * 32_000.0) as i16).expect("sample");
+            }
+            writer.finalize().expect("finalize");
+        }
+        out.into_inner()
+    }
+
 }
+
+

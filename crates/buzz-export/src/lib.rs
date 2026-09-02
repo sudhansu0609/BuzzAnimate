@@ -40,11 +40,13 @@ const COPY_ALIGNMENT: u32 = 256;
 pub mod film;
 pub mod gif;
 pub mod preset;
+pub mod reel;
 pub mod video;
 pub mod xfl;
 
 pub use film::concat_segments;
 pub use preset::{ExportPreset, PresetFormat};
+pub use reel::Reel;
 pub use xfl::{FlaError, FlaReport, export_fla, fla_bytes};
 
 pub use gif::{
@@ -631,7 +633,7 @@ const BATCH: usize = 16;
 /// what has already been written stays on disk, since half a sequence is
 /// usually still worth having.
 pub fn export_sequence(
-    scene: &Scene,
+    reel: &Reel<'_>,
     frames: std::ops::Range<u32>,
     directory: &Path,
     base_name: &str,
@@ -642,14 +644,17 @@ pub fn export_sequence(
     if frames.is_empty() {
         bail!("there are no frames in that range to export");
     }
+    if reel.is_empty() {
+        bail!("there are no scenes to export");
+    }
 
-    // **The range is in film frames, not timeline frames.** A document with a
-    // looping section is longer than its timeline, and the whole point of that
-    // feature is that the repeats are in the finished file — so the numbering
-    // the user asked for is resolved through the playlist before anything is
-    // rendered. Without a loop region the playlist is every frame once and
-    // this is exactly what it always was.
-    let playlist = scene.playlist();
+    // **The range is in film frames, not timeline frames.** A film is its
+    // scenes end to end, and a scene with a looping section is longer than its
+    // own timeline — the whole point of both features being that they are in
+    // the finished file. So the numbering the user asked for is resolved
+    // through the reel before anything is rendered, and it says which scene as
+    // well as which frame. For a single scene with no loop this is exactly
+    // what it always was: frame `n` is frame `n`.
     std::fs::create_dir_all(directory)
         .with_context(|| format!("creating {}", directory.display()))?;
 
@@ -657,16 +662,16 @@ pub fn export_sequence(
     let total = frames.len() as u32;
     let mut report = SequenceReport::default();
 
-    // Numbered by their place in the film, drawn from wherever the playlist
-    // says — so a looped section writes several files from one timeline frame.
+    // Numbered by their place in the film, drawn from wherever the reel says —
+    // so a looped section writes several files from one timeline frame, and a
+    // second scene carries on the numbering rather than restarting it.
     let numbers: Vec<u32> = frames.collect();
     for batch in numbers.chunks(BATCH) {
         let mut rendered = Vec::with_capacity(batch.len());
         for &index in batch {
-            let frame = playlist
-                .get(index as usize)
-                .copied()
-                .unwrap_or(index.min(scene.frame_count().saturating_sub(1)));
+            let (scene, frame) = reel
+                .at_clamped(index)
+                .expect("a non-empty reel always has a frame to hold on");
             rendered.push((index, exporter.render(scene, frame, settings)?));
         }
 

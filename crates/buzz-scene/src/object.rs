@@ -464,6 +464,12 @@ pub struct Object {
     /// Resolving `None` needs the library for an instance, so ask the scene:
     /// [`crate::Scene::pivot_of`].
     pub pivot: Option<Point>,
+
+    /// **Live modifiers** — spring follow-through, wiggle — evaluated when the
+    /// object is drawn rather than baked to keyframes (see [`crate::Modifier`]).
+    /// Empty for almost every object, and an empty `Vec` allocates nothing, so
+    /// this costs those objects nothing.
+    pub modifiers: Vec<crate::Modifier>,
 }
 
 impl Object {
@@ -479,6 +485,7 @@ impl Object {
             blend: buzz_fx::Blend::Normal,
             spatial: Default::default(),
             pivot: None,
+            modifiers: Vec::new(),
         }
     }
 
@@ -494,6 +501,7 @@ impl Object {
             blend: buzz_fx::Blend::Normal,
             spatial: Default::default(),
             pivot: None,
+            modifiers: Vec::new(),
         }
     }
 
@@ -623,6 +631,7 @@ impl Object {
             blend: buzz_fx::Blend::Normal,
             spatial: Default::default(),
             pivot: None,
+            modifiers: Vec::new(),
         }
     }
 }

@@ -19,12 +19,14 @@ pub mod recognise;
 
 pub use boolean::{BoolOp, BooleanOptions, FillMode, boolean, boolean_many, union_all};
 pub use brush::{
-    BrushBudget, BrushOutput, BrushProfile, PatternFit, StrokeSample, WidthResponse, catmull_rom,
-    centreline, fluid_outline, stamp_along,
+    BrushBudget, BrushOutput, BrushProfile, Conditioning, PatternFit, StampPlan, StrokeSample,
+    TaperEnds,
+    WidthResponse, catmull_rom, catmull_rom_tense, centreline, fluid_outline, stabilise,
+    stamp_along, stamp_transforms,
 };
 pub use camera::{Camera, RebasedTransform, RenderSplit};
 pub use clip::RenderClip;
-pub use edit::{StrokeStyle, expand_fill, outline_stroke, smooth, straighten};
+pub use edit::{StrokeStyle, expand_fill, outline_stroke, smooth, split_disjoint, straighten};
 pub use hit::{Hit, HitPart, HitTarget, NearestPoint, hit_test_all, hit_test_topmost};
 pub use path_edit::{Anchor, anchors, move_anchor, nearest_anchor};
 pub use projection::Projection;

@@ -39,6 +39,7 @@ fn state() -> TimelineState {
         current_frame: 0,
         active_layer: None,
         camera_selected: false,
+        selected_light: None,
         playing: false,
         onion_enabled: false,
         auto_keyframe: false,

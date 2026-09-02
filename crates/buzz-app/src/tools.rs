@@ -65,6 +65,30 @@ pub enum ToolAction {
         canvas: buzz_scene::Canvas,
         brush: buzz_scene::SoftBrush,
     },
+    /// Place an effect stroke's artwork: vector shapes and painted bitmaps
+    /// together, in order, as one undo step and one selectable thing.
+    ///
+    /// Handed over as pieces rather than finished shapes for the same reason
+    /// [`Self::PaintRaster`] is: the bitmaps in it need ids from the
+    /// document's library, and this module cannot see the document.
+    AddArtwork {
+        pieces: Vec<buzz_scene::ArtPiece>,
+        label: &'static str,
+    },
+    /// Place **one drawing per frame**: an animation, from a single stroke.
+    ///
+    /// The Wave brush is the one brush whose stroke is not a drawing but a
+    /// cycle — see [`buzz_scene::wave`]. Handing over a list of frames rather
+    /// than asking the editor to re-run the generator keeps the promise every
+    /// other brush here keeps, that what was previewed is what is committed:
+    /// `frames[0]` *is* the artwork that was on screen.
+    ///
+    /// One entry per frame, laid down from the current frame onwards, as one
+    /// undo step.
+    AddArtworkFrames {
+        frames: Vec<Vec<buzz_scene::ArtPiece>>,
+        label: &'static str,
+    },
     /// Erase within a stroked path.
     Erase { path: BezPath, width: f64 },
     /// Fill whatever is under the point with the current fill colour.
@@ -99,6 +123,13 @@ pub enum ToolAction {
     /// Drag one grip of the selected shape's gradient — Animate's Gradient
     /// Transform tool.
     DragGradient { grip: GradientGrip, to: Point },
+    /// A drawn motion path, to bind the selected object to.
+    ///
+    /// Like [`Self::AddArtwork`] the tool cannot finish the job itself: which
+    /// object travels, over which frames, with what timing, is a decision the
+    /// editor takes with the selection and a dialog in front of it. The tool's
+    /// part is only the curve.
+    DrawMotionPath { path: BezPath },
 }
 
 /// Which handle of a gradient is being dragged.
@@ -140,14 +171,16 @@ pub enum Preview {
         path: BezPath,
         width: f64,
     },
-    /// Brush artwork as it will actually be painted, in its real colour.
+    /// Brush artwork **exactly as the release will commit it** — same
+    /// geometry, same paint, same blend, built by the same function under the
+    /// same budget.
     ///
     /// Drawn by the artwork renderer rather than the chrome, because for a
-    /// brush the preview is the result.
-    Ink {
-        path: BezPath,
-        color: Color,
-    },
+    /// brush the preview is the result — and it has to be *the* result: a
+    /// preview that differs from the commit, even slightly, is the stroke
+    /// visibly changing the moment the pointer lifts, which breaks the feel
+    /// of drawing more than any lag does.
+    Artwork(Vec<ShapeData>),
     /// Artwork as it will be painted, in its real paint.
     ///
     /// For the soft brush, whose result is a bitmap rather than an outline:
@@ -352,11 +385,35 @@ impl ToolMachine {
         mods: Mods,
         ctx: &ToolContext<'_>,
     ) -> ToolAction {
+        self.pointer_down_at(doc, screen, mods, ctx, None, None)
+    }
+
+    /// A pointer press the window has timed. See [`Self::pointer_move_at`].
+    ///
+    /// **A stroke's samples must all be on one clock.** The first one is taken
+    /// here and the rest as the pointer moves, so if the press read a wall
+    /// clock while the moves were stamped by the window the two would have
+    /// different origins entirely — and the very first segment of every
+    /// stroke would be measured against a gap of seconds or a negative one.
+    pub fn pointer_down_at(
+        &mut self,
+        doc: Point,
+        screen: Point,
+        mods: Mods,
+        ctx: &ToolContext<'_>,
+        time: Option<f64>,
+        pressure: Option<f64>,
+    ) -> ToolAction {
+        let now = match self.clock {
+            Clock::Manual(t) => t,
+            Clock::Wall(_) => time.unwrap_or_else(|| self.clock.now()),
+        };
         self.last_screen = screen;
         match self.tool {
-            ToolId::Pencil | ToolId::Brush | ToolId::Eraser | ToolId::Lasso => {
+            ToolId::Pencil | ToolId::Brush | ToolId::Eraser | ToolId::Lasso
+            | ToolId::MotionPath => {
                 self.gesture = Gesture::Freehand {
-                    samples: vec![buzz_geom::StrokeSample::new(doc, self.clock.now())],
+                    samples: vec![sample_at(doc, now, pressure)],
                     mods,
                 };
             }
@@ -477,6 +534,34 @@ impl ToolMachine {
 
 
     pub fn pointer_move(&mut self, doc: Point, screen: Point, mods: Mods) -> ToolAction {
+        self.pointer_move_at(doc, screen, mods, None, None)
+    }
+
+    /// A pointer move that already knows *when* it happened.
+    ///
+    /// **Several pointer moves arrive per frame and they are not simultaneous.**
+    /// A pen reports at 200 Hz or more, so a frame carries three or four of
+    /// them; read off a wall clock in the loop that dispatches them they come
+    /// out microseconds apart, and a fluid brush divides distance by that to
+    /// get its width. Every stroke would be drawn at the minimum. The window
+    /// knows the interval those moves were spread over, so it says.
+    ///
+    /// `None` keeps the old behaviour — read the clock — which is what a
+    /// single move a frame wants and what every test does.
+    pub fn pointer_move_at(
+        &mut self,
+        doc: Point,
+        screen: Point,
+        mods: Mods,
+        time: Option<f64>,
+        pressure: Option<f64>,
+    ) -> ToolAction {
+        // A manual clock is a test driving the brush deliberately; nothing the
+        // window says about timing may override it.
+        let now = match self.clock {
+            Clock::Manual(t) => t,
+            Clock::Wall(_) => time.unwrap_or_else(|| self.clock.now()),
+        };
         let delta_screen = screen - self.last_screen;
         self.last_screen = screen;
 
@@ -495,7 +580,7 @@ impl ToolMachine {
                     .last()
                     .is_none_or(|s| (doc - s.point).hypot() > f64::EPSILON)
                 {
-                    samples.push(buzz_geom::StrokeSample::new(doc, self.clock.now()));
+                    samples.push(sample_at(doc, now, pressure));
                 }
                 ToolAction::None
             }
@@ -572,6 +657,22 @@ impl ToolMachine {
     }
 
     pub fn pointer_up(&mut self, doc: Point, screen: Point, ctx: &ToolContext<'_>) -> ToolAction {
+        self.pointer_up_at(doc, screen, ctx, None, None)
+    }
+
+    /// A pointer release the window has timed. See [`Self::pointer_down_at`].
+    pub fn pointer_up_at(
+        &mut self,
+        doc: Point,
+        screen: Point,
+        ctx: &ToolContext<'_>,
+        time: Option<f64>,
+        pressure: Option<f64>,
+    ) -> ToolAction {
+        let now = match self.clock {
+            Clock::Manual(t) => t,
+            Clock::Wall(_) => time.unwrap_or_else(|| self.clock.now()),
+        };
         let gesture = std::mem::replace(&mut self.gesture, Gesture::Idle);
         self.last_screen = screen;
 
@@ -589,7 +690,7 @@ impl ToolMachine {
             }
             Gesture::Freehand { mut samples, mods } => {
                 if samples.last().is_none_or(|s| s.point != doc) {
-                    samples.push(buzz_geom::StrokeSample::new(doc, self.clock.now()));
+                    samples.push(sample_at(doc, now, pressure));
                 }
                 self.finish_freehand(samples, mods, ctx)
             }
@@ -601,6 +702,16 @@ impl ToolMachine {
                 ..
             } => self.finish_drag(origin, doc, mods, moving || transforming.is_some(), ctx),
         }
+    }
+
+    /// Does the current gesture preview as painted artwork
+    /// ([`Preview::Artwork`] or [`Preview::Painted`]) rather than as chrome?
+    ///
+    /// The cheap form of asking [`Self::preview`] and matching, for callers
+    /// that only need the yes or no: building a brush preview costs real work
+    /// per call, and it is already built once a frame to be drawn.
+    pub fn painting_preview(&self) -> bool {
+        matches!(self.gesture, Gesture::Freehand { .. }) && self.tool == ToolId::Brush
     }
 
     /// The current preview, for drawing feedback on the stage.
@@ -620,14 +731,8 @@ impl ToolMachine {
                 },
                 ToolId::Eraser => Preview::Stroke {
                     path: centreline_of(samples),
-                    width: ctx.style.stroke_width.max(1.0) * 4.0,
+                    width: ctx.style.eraser_size.max(0.5),
                 },
-                // The brush previews what it will actually paint, under the
-                // *preview* budget. That budget is what keeps a long stroke
-                // interactive: this runs on every pointer move, so it has to
-                // cost a fraction of the committed geometry, and a pattern
-                // brush at close spacing would otherwise place thousands of
-                // stamps per frame.
                 // A soft brush previews its own pixels, because the pixels are
                 // the point: an outline of where the paint would go says
                 // nothing about how it fades.
@@ -654,19 +759,52 @@ impl ToolMachine {
                         None => Preview::None,
                     }
                 }
+                // An effect brush previews the exact artwork the release will
+                // commit: same pieces, same seed, same everything. Bitmap
+                // pieces are given a throwaway identity, exactly as the soft
+                // brush's preview is.
+                ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Effect => {
+                    let pieces = build_effect_pieces(samples, ctx.style);
+                    if pieces.is_empty() {
+                        Preview::None
+                    } else {
+                        Preview::Artwork(art_pieces_as_shapes(&pieces))
+                    }
+                }
+                // A wave previews its **first frame**, which is the frame the
+                // release commits first. Previewing the whole cycle at once
+                // would show a smear nobody is going to draw.
+                ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Wave => {
+                    let pieces = build_wave_pieces(samples, ctx.style, 0.0);
+                    if pieces.is_empty() {
+                        Preview::None
+                    } else {
+                        Preview::Artwork(art_pieces_as_shapes(&pieces))
+                    }
+                }
+                // A brush captured from artwork, stamping that artwork's own
+                // colours and textures. Same builder and budget as the commit,
+                // so what is on screen while drawing is what lands.
+                ToolId::Brush if ctx.style.brush.stamps_its_own_paint() => {
+                    let budget = buzz_geom::BrushBudget::default();
+                    let shapes = build_stamped_artwork(samples, ctx.style, &budget);
+                    if shapes.is_empty() {
+                        Preview::None
+                    } else {
+                        Preview::Artwork(shapes)
+                    }
+                }
+                // **The brush previews the committed stroke itself.** Same
+                // builder, same budget as the release — smoothing, taper and
+                // width response all happen *while drawing*, and nothing
+                // changes when the pointer lifts. The budgets already bound
+                // the cost of one stroke; a preview that took a cheaper path
+                // here would buy a little speed by re-shaping the artwork on
+                // release, which is the wrong trade for a drawing tool.
                 ToolId::Brush => {
-                    let budget = buzz_geom::BrushBudget::preview();
-                    // The preview is drawn in one colour: it is redrawn on
-                    // every pointer move, and the stroke it previews has no
-                    // final bounds yet to lay a ramp across.
-                    let color = ctx
-                        .style
-                        .fill_color_for_preview()
-                        // Slightly transparent, so the preview reads as
-                        // provisional without misrepresenting its shape.
-                        .multiply_alpha(0.85);
-                    match build_brush_path(samples, ctx.style, &budget) {
-                        Some(path) => Preview::Ink { path, color },
+                    let budget = buzz_geom::BrushBudget::default();
+                    match vector_brush_shape(samples, ctx.style, &budget) {
+                        Some(shape) => Preview::Artwork(vec![shape]),
                         None => Preview::Stroke {
                             path: centreline_of(samples),
                             width: ctx.style.brush.size.max(1.0),
@@ -781,7 +919,7 @@ impl ToolMachine {
             },
             ToolId::Eraser => ToolAction::Erase {
                 path: centreline_of(&samples),
-                width: ctx.style.stroke_width.max(1.0) * 4.0,
+                width: ctx.style.eraser_size.max(0.5),
             },
             ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Raster => {
                 match paint_soft_stroke(&samples, ctx.style) {
@@ -789,33 +927,70 @@ impl ToolMachine {
                     None => ToolAction::None,
                 }
             }
-            ToolId::Brush => {
-                // The brush paints a filled stroke, so its colour comes from
-                // the fill swatch — as in Animate.
-                let budget = buzz_geom::BrushBudget::default();
-                let Some(path) = build_brush_path(&samples, ctx.style, &budget) else {
-                    return ToolAction::None;
-                };
-                if path.elements().is_empty() {
+            ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Effect => {
+                let pieces = build_effect_pieces(&samples, ctx.style);
+                if pieces.is_empty() {
                     return ToolAction::None;
                 }
-                let bounds = buzz_geom::Shape::bounding_box(&path);
-                let paint = ctx
-                    .style
-                    .fill_for_new_shape(bounds)
-                    .unwrap_or(buzz_scene::Paint::Solid(Color::BLACK));
-                ToolAction::AddShape {
-                    shape: ShapeData {
-                        path,
-                        fill: Some(buzz_scene::FillSpec {
-                            paint,
-                            rule: buzz_geom::FillMode::NonZero,
-                        }),
-                        stroke: None,
-                        blend: ctx.style.brush.blend(),
-                    },
+                ToolAction::AddArtwork {
+                    pieces,
+                    label: ctx.style.brush.effect.label(),
+                }
+            }
+            // A wave commits a *cycle*: one drawing per frame, seamlessly
+            // looping, starting with the frame that was previewed. At one
+            // frame it is an ordinary still, and goes down the ordinary path
+            // so it costs no extra keyframe.
+            ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Wave => {
+                let label = ctx.style.brush.wave.label();
+                if !ctx.style.brush.wave_settings.is_animated() {
+                    let pieces = build_wave_pieces(&samples, ctx.style, 0.0);
+                    if pieces.is_empty() {
+                        return ToolAction::None;
+                    }
+                    return ToolAction::AddArtwork { pieces, label };
+                }
+                let frames = buzz_scene::wave_loop(
+                    ctx.style.brush.wave,
+                    &wave_stroke(&samples, ctx.style),
+                );
+                if frames.iter().all(Vec::is_empty) {
+                    return ToolAction::None;
+                }
+                ToolAction::AddArtworkFrames { frames, label }
+            }
+            ToolId::Brush if ctx.style.brush.stamps_its_own_paint() => {
+                let budget = buzz_geom::BrushBudget::default();
+                let shapes = build_stamped_artwork(&samples, ctx.style, &budget);
+                if shapes.is_empty() {
+                    return ToolAction::None;
+                }
+                ToolAction::AddArtwork {
+                    pieces: shapes.into_iter().map(buzz_scene::ArtPiece::Shape).collect(),
                     label: "Brush",
                 }
+            }
+            ToolId::Brush => {
+                // The same builder, budget and paint the preview used on every
+                // pointer move, so what was on screen while drawing is what is
+                // committed — see `Preview::Artwork`.
+                let budget = buzz_geom::BrushBudget::default();
+                match vector_brush_shape(&samples, ctx.style, &budget) {
+                    Some(shape) => ToolAction::AddShape {
+                        shape,
+                        label: "Brush",
+                    },
+                    None => ToolAction::None,
+                }
+            }
+            // The motion-path tool hands over the drawn curve, smoothed the same
+            // way the pencil's is. A tap with no length is not a path.
+            ToolId::MotionPath => {
+                let path = centreline_of(&samples);
+                if path.segments().next().is_none() {
+                    return ToolAction::None;
+                }
+                ToolAction::DrawMotionPath { path }
             }
             _ => {
                 let (color, width, hairline) =
@@ -1184,17 +1359,21 @@ fn build_brush_path(
     let settings = &style.brush;
 
     match settings.kind {
-        buzz_ui::BrushKind::Fluid => {
-            Some(buzz_geom::fluid_outline(samples, &settings.profile(), budget).path)
-        }
-        // Not geometry at all: a soft stroke is pixels, built by
-        // `paint_soft_stroke`. Nothing here can describe it.
-        buzz_ui::BrushKind::Raster => None,
+        // Both outlined brushes are the same construction; what differs is
+        // whether the width answers to anything, which the profile says.
+        buzz_ui::BrushKind::Fluid | buzz_ui::BrushKind::Normal => Some(
+            buzz_geom::fluid_outline(samples, &brush_profile_for(samples, settings), budget).path,
+        ),
+        // Not a single path at all: a soft stroke is pixels, built by
+        // `paint_soft_stroke`; an effect stroke is a list of pieces, built by
+        // `build_effect_pieces`; and a wave is a bundle of them per frame,
+        // built by `build_wave_pieces`. Nothing here can describe them.
+        buzz_ui::BrushKind::Raster | buzz_ui::BrushKind::Effect | buzz_ui::BrushKind::Wave => None,
         buzz_ui::BrushKind::Pattern | buzz_ui::BrushKind::Art => {
             let source = settings.pattern_path()?;
             // The stroke is conditioned first, so stamps follow the smoothed
             // curve rather than the jitter of the raw pointer.
-            let conditioned = buzz_geom::brush::condition(samples, settings.smoothing, budget);
+            let conditioned = buzz_geom::brush::condition(samples, settings.conditioning(), budget);
             if conditioned.len() < 2 {
                 // A tap with a pattern brush lays down a single stamp, which
                 // is what a stamp tool should do.
@@ -1205,6 +1384,175 @@ fn build_brush_path(
             Some(buzz_geom::stamp_along(&spine, &source, settings.fit(), budget).path)
         }
     }
+}
+
+/// One pointer sample, carrying the device's pressure when it reported any.
+///
+/// `None` is a device with no pressure sensor — a mouse, a trackpad, or a pen
+/// whose driver did not send a force with this event — and reads as full
+/// pressure, which is what a mouse is doing when it draws.
+fn sample_at(point: Point, time: f64, pressure: Option<f64>) -> buzz_geom::StrokeSample {
+    match pressure {
+        Some(p) => buzz_geom::StrokeSample::with_pressure(point, p, time),
+        None => buzz_geom::StrokeSample::new(point, time),
+    }
+}
+
+/// The width profile to build this stroke with.
+///
+/// **Pressure falls back to speed when there was no pressure.** A device with
+/// no sensor reports full pressure for every sample, so a pressure-driven
+/// brush on a mouse paints a dead constant width — the setting appears to do
+/// nothing, which is exactly the complaint. A stroke that never once came in
+/// under full pressure did not come from a pen, so it is drawn the way a mouse
+/// stroke should be: answering to speed.
+///
+/// A pen held at maximum for a whole stroke is treated as a mouse by this
+/// rule. That is the honest cost of not being able to ask the device directly,
+/// and it costs nothing visible: a stroke at one pressure throughout is a
+/// stroke of one width, which is what speed gives it at one speed too.
+pub(crate) fn brush_profile_for(
+    samples: &[buzz_geom::StrokeSample],
+    settings: &buzz_ui::BrushSettings,
+) -> buzz_geom::BrushProfile {
+    let mut profile = settings.profile();
+    let saw_pressure = samples.iter().any(|s| s.pressure < 1.0);
+    if matches!(profile.response, buzz_geom::WidthResponse::Pressure) && !saw_pressure {
+        profile.response = buzz_geom::WidthResponse::Speed {
+            reference_speed: settings.reference_speed.max(1.0),
+        };
+    }
+    profile
+}
+
+/// The finished shape a vector brush stroke commits — and previews.
+///
+/// One function used by both, with the same budget, because they must be the
+/// same artwork: the brush paints a filled stroke whose colour comes from the
+/// fill swatch (as in Animate), and a gradient fill is laid across the
+/// stroke's own bounds as they are *right now*, so the ramp settles into
+/// place while the stroke is still being drawn instead of appearing on
+/// release.
+fn vector_brush_shape(
+    samples: &[buzz_geom::StrokeSample],
+    style: &DrawStyle,
+    budget: &buzz_geom::BrushBudget,
+) -> Option<ShapeData> {
+    let path = build_brush_path(samples, style, budget)?;
+    if path.elements().is_empty() {
+        return None;
+    }
+    let bounds = buzz_geom::Shape::bounding_box(&path);
+    let paint = style
+        .fill_for_new_shape(bounds)
+        .unwrap_or(buzz_scene::Paint::Solid(Color::BLACK));
+    Some(ShapeData {
+        path,
+        fill: Some(buzz_scene::FillSpec {
+            paint,
+            rule: buzz_geom::FillMode::NonZero,
+        }),
+        stroke: None,
+        blend: style.brush.blend(),
+    })
+}
+
+/// The artwork an effect stroke lays down, preview and commit alike.
+fn build_effect_pieces(
+    samples: &[buzz_geom::StrokeSample],
+    style: &DrawStyle,
+) -> Vec<buzz_scene::ArtPiece> {
+    buzz_scene::effect_artwork(
+        style.brush.effect,
+        &buzz_scene::EffectStroke {
+            samples,
+            size: style.brush.size.max(1.0),
+            color: style.fill_color_for_preview(),
+            conditioning: style.brush.conditioning(),
+        },
+    )
+}
+
+/// The gesture a wave is generated from, as the style describes it.
+///
+/// One place, so the preview, the commit and the tests all ask for the same
+/// wave — the same reason `build_effect_pieces` exists.
+fn wave_stroke<'a>(
+    samples: &'a [buzz_geom::StrokeSample],
+    style: &DrawStyle,
+) -> buzz_scene::WaveStroke<'a> {
+    buzz_scene::WaveStroke {
+        samples,
+        size: style.brush.size.max(1.0),
+        color: style.fill_color_for_preview(),
+        conditioning: style.brush.conditioning(),
+        settings: style.brush.wave_settings,
+    }
+}
+
+/// One frame of a wave, at `phase`.
+fn build_wave_pieces(
+    samples: &[buzz_geom::StrokeSample],
+    style: &DrawStyle,
+    phase: f64,
+) -> Vec<buzz_scene::ArtPiece> {
+    buzz_scene::wave_artwork(style.brush.wave, &wave_stroke(samples, style), phase)
+}
+
+/// The artwork one stroke of a **captured** brush stamps.
+///
+/// Shared by the preview and the commit, under the same budget, for the same
+/// reason every other brush here shares one: a stroke that changed the moment
+/// the pointer lifted would not be the stroke the user drew.
+///
+/// The placements come from [`buzz_geom::stamp_transforms`] — the very
+/// arithmetic an ordinary pattern brush uses — so a captured brush and a
+/// built-in one put stamp seven in the same place.
+fn build_stamped_artwork(
+    samples: &[buzz_geom::StrokeSample],
+    style: &DrawStyle,
+    budget: &buzz_geom::BrushBudget,
+) -> Vec<ShapeData> {
+    let Some(stamp) = style.brush.pattern_stamp() else {
+        return Vec::new();
+    };
+    let size = style.brush.size.max(0.01);
+
+    // Conditioned first, so stamps follow the smoothed curve rather than the
+    // jitter of the raw pointer — as the outline path does.
+    let conditioned = buzz_geom::brush::condition(samples, style.brush.conditioning(), budget);
+    let placements: Vec<buzz_geom::Affine> = if conditioned.len() < 2 {
+        // A tap lays down a single stamp, which is what a stamp tool should
+        // do — and what the outline path already does.
+        match conditioned.first() {
+            Some(sample) => vec![buzz_scene::stamp::tap_transform(sample.point, size)],
+            None => return Vec::new(),
+        }
+    } else {
+        let spine = buzz_geom::centreline(&conditioned);
+        buzz_geom::stamp_transforms(&spine, stamp.source_rect(size), style.brush.fit(), budget)
+            .transforms
+            .iter()
+            // The placements are in the *scaled* stamp's space; the artwork
+            // is held in unit stamp space, so the size goes on here.
+            .map(|t| *t * buzz_geom::Affine::scale(size))
+            .collect()
+    };
+
+    stamp.place_many(&placements).shapes
+}
+
+/// Art pieces as drawable shapes, for the preview.
+///
+/// Bitmap pieces are developed into throwaway image fills — identity zero,
+/// exactly as the soft brush's preview does — because the preview renderer
+/// draws paints, not coverage buffers. The committed artwork gets real ids
+/// from the document's library instead; see `Editor::add_artwork`.
+fn art_pieces_as_shapes(pieces: &[buzz_scene::ArtPiece]) -> Vec<ShapeData> {
+    let mut register = |canvas: &buzz_scene::Canvas, brush: &buzz_scene::SoftBrush| {
+        std::sync::Arc::new(canvas.to_asset(buzz_scene::ImageId(0), "preview", brush))
+    };
+    buzz_scene::art::to_shapes(pieces, &mut register)
 }
 
 fn contains(rect: Rect, p: Point) -> bool {
@@ -2120,6 +2468,176 @@ mod tests {
         }
     }
 
+    /// **What you watch being drawn is what you get.** The preview on the
+    /// last pointer move and the shape the release commits are built by the
+    /// same function under the same budget, so they must be identical — the
+    /// stroke may not change, even slightly, when the pointer lifts. This is
+    /// the regression test for the era when the preview ran under a cheaper
+    /// budget and every stroke visibly re-smoothed itself on release.
+    #[test]
+    fn the_stroke_does_not_change_when_the_pointer_lifts() {
+        for kind in [
+            buzz_ui::BrushKind::Fluid,
+            buzz_ui::BrushKind::Normal,
+            buzz_ui::BrushKind::Pattern,
+            buzz_ui::BrushKind::Art,
+        ] {
+            let mut style = DrawStyle::default();
+            style.brush.kind = kind;
+            style.brush.smoothing = 0.8;
+            // With the stabiliser on too: a lagging filter that was not
+            // deterministic would show up here as a stroke that changed on
+            // release, which is exactly what this test exists to catch.
+            style.brush.stabiliser = 0.7;
+
+            let mut m = ToolMachine::new(ToolId::Brush);
+            let points = wavy(300, 900.0);
+
+            m.set_time(0.0);
+            m.pointer_down(points[0], points[0], Mods::default(), &ctx(&style));
+            for (i, p) in points.iter().enumerate().skip(1) {
+                m.set_time(i as f64 * 0.004);
+                m.pointer_move(*p, *p, Mods::default());
+            }
+
+            let previewed = match m.preview(&ctx(&style)) {
+                Preview::Artwork(shapes) => shapes,
+                other => panic!("{kind:?} previewed {other:?}"),
+            };
+            let last = *points.last().unwrap();
+            let committed = match m.pointer_up(last, last, &ctx(&style)) {
+                ToolAction::AddShape { shape, .. } => shape,
+                other => panic!("{kind:?} committed {other:?}"),
+            };
+
+            assert_eq!(
+                previewed.len(),
+                1,
+                "a vector brush previews exactly its one shape"
+            );
+            assert_eq!(
+                previewed[0], committed,
+                "{kind:?}: the committed stroke differs from the last preview"
+            );
+        }
+    }
+
+    /// The effect brush keeps the same promise: the pieces previewed on the
+    /// last move are the pieces the release hands over.
+    #[test]
+    fn an_effect_stroke_commits_exactly_what_it_previewed() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Effect;
+        style.brush.effect = buzz_scene::EffectKind::Snow;
+
+        let mut m = ToolMachine::new(ToolId::Brush);
+        let points = wavy(120, 500.0);
+
+        m.set_time(0.0);
+        m.pointer_down(points[0], points[0], Mods::default(), &ctx(&style));
+        for (i, p) in points.iter().enumerate().skip(1) {
+            m.set_time(i as f64 * 0.004);
+            m.pointer_move(*p, *p, Mods::default());
+        }
+
+        let previewed = match m.preview(&ctx(&style)) {
+            Preview::Artwork(shapes) => shapes,
+            other => panic!("previewed {other:?}"),
+        };
+        assert!(!previewed.is_empty(), "snow should preview its flakes");
+
+        let last = *points.last().unwrap();
+        let committed = match m.pointer_up(last, last, &ctx(&style)) {
+            ToolAction::AddArtwork { pieces, label } => {
+                assert_eq!(label, "Snow");
+                pieces
+            }
+            other => panic!("committed {other:?}"),
+        };
+        assert_eq!(
+            art_pieces_as_shapes(&committed),
+            previewed,
+            "the committed pieces differ from the last preview"
+        );
+    }
+
+    /// A wave keeps the promise across an *animation*: the frame previewed on
+    /// the last move is the **first frame** the release hands over. The rest of
+    /// the cycle follows from it, so what was drawn is where the animation
+    /// starts rather than something near it.
+    #[test]
+    fn a_wave_stroke_commits_a_cycle_that_starts_with_what_it_previewed() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Wave;
+        style.brush.set_wave(buzz_scene::WaveKind::Smoke);
+        style.brush.wave_settings.frames = 10;
+
+        let mut m = ToolMachine::new(ToolId::Brush);
+        let points = wavy(120, 500.0);
+
+        m.set_time(0.0);
+        m.pointer_down(points[0], points[0], Mods::default(), &ctx(&style));
+        for (i, p) in points.iter().enumerate().skip(1) {
+            m.set_time(i as f64 * 0.004);
+            m.pointer_move(*p, *p, Mods::default());
+        }
+
+        let previewed = match m.preview(&ctx(&style)) {
+            Preview::Artwork(shapes) => shapes,
+            other => panic!("previewed {other:?}"),
+        };
+        assert!(!previewed.is_empty(), "smoke should preview its plume");
+
+        let last = *points.last().unwrap();
+        let frames = match m.pointer_up(last, last, &ctx(&style)) {
+            ToolAction::AddArtworkFrames { frames, label } => {
+                assert_eq!(label, "Smoke");
+                frames
+            }
+            other => panic!("committed {other:?}"),
+        };
+        assert_eq!(frames.len(), 10, "the whole cycle should be handed over");
+        assert_eq!(
+            art_pieces_as_shapes(&frames[0]),
+            previewed,
+            "the first committed frame differs from the last preview"
+        );
+        assert_ne!(
+            art_pieces_as_shapes(&frames[5]),
+            previewed,
+            "the cycle should move rather than repeat one drawing"
+        );
+    }
+
+    /// At one frame a wave is an ordinary still, and must go down the ordinary
+    /// path — otherwise drawing a static ribbon would cost a keyframe.
+    #[test]
+    fn a_one_frame_wave_commits_as_a_plain_drawing() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Wave;
+        style.brush.set_wave(buzz_scene::WaveKind::Ribbon);
+        style.brush.wave_settings.frames = 1;
+
+        let mut m = ToolMachine::new(ToolId::Brush);
+        let points = wavy(120, 500.0);
+
+        m.set_time(0.0);
+        m.pointer_down(points[0], points[0], Mods::default(), &ctx(&style));
+        for (i, p) in points.iter().enumerate().skip(1) {
+            m.set_time(i as f64 * 0.004);
+            m.pointer_move(*p, *p, Mods::default());
+        }
+
+        let last = *points.last().unwrap();
+        match m.pointer_up(last, last, &ctx(&style)) {
+            ToolAction::AddArtwork { pieces, label } => {
+                assert_eq!(label, "Ribbon");
+                assert!(!pieces.is_empty());
+            }
+            other => panic!("a still wave committed {other:?}"),
+        }
+    }
+
     /// The live preview is what runs on every pointer move, so it is where a
     /// hang would actually show up. It must stay far inside a frame even when
     /// the stroke is already enormous and the spacing is absurd.
@@ -2145,7 +2663,7 @@ mod tests {
         let preview = m.preview(&ctx(&style));
         let elapsed = started.elapsed();
 
-        assert!(matches!(preview, Preview::Ink { .. }), "got {preview:?}");
+        assert!(matches!(preview, Preview::Artwork(_)), "got {preview:?}");
         assert!(
             elapsed.as_millis() < 16,
             "one preview frame of a 6000-sample pattern stroke took {elapsed:?}; \

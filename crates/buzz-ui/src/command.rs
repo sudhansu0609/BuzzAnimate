@@ -149,6 +149,34 @@ pub enum Command {
     /// Show or hide the light handles on the stage.
     ToggleLightGizmos,
 
+    // Staging and performance
+    /// **Set a scene**: ground, backdrop, lights and a cast standing in it.
+    ///
+    /// Not a template and not clip art — the arrangement, which is the part
+    /// that is arithmetic rather than drawing. See `buzz_act::staging`.
+    SetScene,
+    /// **Direct a story**: a few lines of prose in, a staged scene with the
+    /// walks and talks already on the timeline. See `buzz_act::direct`.
+    DirectScene,
+    /// A new, empty scene after this one — the next shot of the film.
+    AddScene,
+    /// A complete copy of this scene, opened for editing. What the next beat
+    /// of a conversation starts from.
+    DuplicateScene,
+    /// Put one more rigged person on the stage, on a layer of their own.
+    AddPerson,
+    /// **Animate the selected rig**: a walk, a run, talking, or standing and
+    /// breathing, written onto the timeline as ordinary poses.
+    Perform,
+    /// **Add follow-through**: bake a damped-spring response of a chosen chain
+    /// (hair, a tail) to the selected rig's keyed motion. See `buzz_act::physics`.
+    AddFollowThrough,
+    /// **Add wiggle**: bake a deterministic jitter onto the selected object — an
+    /// idle sway, a breeze, a handheld shake. See `buzz_act::physics`.
+    AddWiggle,
+    /// **Clear modifiers**: remove all live modifiers from the selected object.
+    ClearModifiers,
+
     // Commands (scripting)
     /// Show or hide the Actions panel.
     ToggleActionsPanel,
@@ -193,6 +221,12 @@ pub enum Command {
     AddCameraKeyframe,
     RemoveCameraKeyframe,
     ResetCamera,
+
+    // Lights
+    /// Key the selected light's current state at the playhead.
+    AddLightKeyframe,
+    /// Remove the selected light's key at the playhead.
+    RemoveLightKeyframe,
 
     // Tools
     SelectTool(super::tools::ToolId),
@@ -321,6 +355,16 @@ impl Command {
             AddFire => "Fire",
             ToggleLightGizmos => "Light Handles",
 
+            SetScene => "Set the Scene\u{2026}",
+            DirectScene => "Direct a Story\u{2026}",
+            AddScene => "Add Scene",
+            DuplicateScene => "Duplicate Scene",
+            AddPerson => "Add Person",
+            Perform => "Animate Selection\u{2026}",
+            AddFollowThrough => "Add Follow-Through\u{2026}",
+            AddWiggle => "Add Wiggle\u{2026}",
+            ClearModifiers => "Clear Modifiers",
+
             ToggleActionsPanel => "Actions",
             RunScript => "Run Script",
             ClearScriptOutput => "Clear Output",
@@ -352,6 +396,8 @@ impl Command {
             ToggleCamera => "Enable Camera",
             AddCameraKeyframe => "Add Camera Keyframe",
             RemoveCameraKeyframe => "Remove Camera Keyframe",
+            AddLightKeyframe => "Add Light Keyframe",
+            RemoveLightKeyframe => "Remove Light Keyframe",
             ResetCamera => "Reset Camera",
 
             SelectTool(_) => "Tool",
@@ -466,6 +512,10 @@ impl Command {
             About => None,
 
             AddSun | AddSky | AddLamp | AddGloom | AddFire => None,
+            // No Animate binding to follow, and these open dialogs rather than
+            // acting straight away, so a key would only save the menu.
+            SetScene | DirectScene | AddScene | DuplicateScene | AddPerson | Perform
+            | AddFollowThrough | AddWiggle | ClearModifiers => None,
             ToggleLightGizmos => sc(ctrl_shift, Key::L),
 
             // F9 is Animate's own Actions panel key on Windows.
@@ -505,6 +555,8 @@ impl Command {
             ToggleCamera => None,
             AddCameraKeyframe => None,
             RemoveCameraKeyframe => None,
+            AddLightKeyframe => None,
+            RemoveLightKeyframe => None,
             ResetCamera => None,
 
             SelectTool(_) => None,
@@ -545,6 +597,7 @@ impl Command {
                 | StraightenSelection
                 | ConvertToSymbol
                 | BrushFromSelection
+                | ClearModifiers
                 | Nudge { .. }
                 | Align { .. }
                 | Distribute(_)
@@ -630,6 +683,8 @@ pub fn all_with_shortcuts() -> Vec<Command> {
         ToggleCamera,
         AddCameraKeyframe,
         RemoveCameraKeyframe,
+        AddLightKeyframe,
+        RemoveLightKeyframe,
         ResetCamera,
         ImportToLibrary,
         ImportToStage,
@@ -652,6 +707,15 @@ pub fn all_with_shortcuts() -> Vec<Command> {
         AddGloom,
         AddFire,
         ToggleLightGizmos,
+        SetScene,
+        DirectScene,
+        AddScene,
+        DuplicateScene,
+        AddPerson,
+        Perform,
+        AddFollowThrough,
+        AddWiggle,
+        ClearModifiers,
         ToggleLayoutLock,
         ToggleTheme,
         About,
@@ -758,6 +822,8 @@ mod tests {
             ToggleCamera,
             AddCameraKeyframe,
             RemoveCameraKeyframe,
+            AddLightKeyframe,
+            RemoveLightKeyframe,
             ResetCamera,
             ImportToLibrary,
             ImportToStage,
@@ -780,6 +846,15 @@ mod tests {
             AddGloom,
             AddFire,
             ToggleLightGizmos,
+            SetScene,
+            DirectScene,
+            AddScene,
+            DuplicateScene,
+            AddPerson,
+            Perform,
+            AddFollowThrough,
+            AddWiggle,
+            ClearModifiers,
             ToggleLayoutLock,
             ToggleTheme,
             About,

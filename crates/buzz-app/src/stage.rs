@@ -192,16 +192,69 @@ fn encode(
     // as chrome. A brush stroke is the one gesture where the preview *is* the
     // result: outlining it in the selection colour would show its silhouette
     // but not its weight, and weight is the whole point of a fluid brush.
+    //
+    // **Through the same transform the committed artwork takes.** A tool works
+    // in the space `Editor::screen_to_edit` hands it — the pointer carried
+    // back through the document camera and through the place of any symbol
+    // opened for editing — so a preview drawn straight into document space
+    // lands wherever those two transforms would have moved it. With a shot
+    // framed off centre that is a fixed offset between the ink and the pointer,
+    // and the stroke then jumps back into place the instant it is committed and
+    // drawn properly: draw to the right of the cursor, let go, watch it shift
+    // left. Every other preview already went through `to_screen_art` in the
+    // chrome; this is the one that did not.
+    let onto_stage = editor.edit_to_stage();
     match editor.preview() {
-        Preview::Ink { path, color } => builder.fill_shape(&path, color),
+        // The stroke exactly as the release will commit it: same shapes, same
+        // paints, same blends. Drawn through the flat approximation of the
+        // edit transform, as the soft brush's preview is, because a gradient
+        // or bitmap paint travels by affine.
+        Preview::Artwork(shapes) => {
+            let to_doc = onto_stage
+                .as_affine()
+                .unwrap_or(buzz_geom::Affine::IDENTITY);
+            for shape in &shapes {
+                let path = to_doc * shape.path.clone();
+                if let Some(fill) = &shape.fill {
+                    if shape.blend.is_additive() {
+                        builder.fill_shape_paint_additive(&path, &fill.paint, to_doc);
+                    } else {
+                        // **Sealed, exactly as the committed artwork is.**
+                        // Opaque fills are drawn with a sub-pixel stroke of
+                        // their own paint to close rasteriser seams, which
+                        // grows the silhouette by half a pixel a side. Drawing
+                        // the preview unsealed made every stroke *expand* the
+                        // moment the pointer lifted — the geometry was already
+                        // identical, and this was the last half pixel of
+                        // difference. See `fill_shape_paint_sealed`.
+                        builder.fill_shape_paint_sealed(&path, &fill.paint, to_doc);
+                    }
+                }
+                if let Some(stroke) = &shape.stroke {
+                    builder.stroke_shape_paint(&path, &stroke.paint, stroke.width, to_doc);
+                }
+            }
+        }
         // A soft brush's preview is a bitmap filling the rectangle it will
         // occupy — the same paint, in the same place, as the artwork it is
         // about to become.
-        Preview::Painted { area, paint } => builder.fill_shape_paint(
-            &buzz_geom::Shape::to_path(&area, 1e-9),
-            &paint,
-            buzz_geom::Affine::IDENTITY,
-        ),
+        //
+        // The image fill is anchored to `area` in the tool's own space, so the
+        // paint travels with the same affine rather than being remapped: a
+        // bitmap put through a tilted lens is not a bitmap in a rectangle any
+        // more. A tilted camera therefore places a soft-brush preview by its
+        // flat approximation, which is where the pixels it is about to become
+        // will be drawn from anyway.
+        Preview::Painted { area, paint } => {
+            let to_doc = onto_stage
+                .as_affine()
+                .unwrap_or(buzz_geom::Affine::IDENTITY);
+            builder.fill_shape_paint(
+                &(to_doc * buzz_geom::Shape::to_path(&area, 1e-9)),
+                &paint,
+                to_doc,
+            );
+        }
         _ => {}
     }
 
@@ -724,11 +777,28 @@ fn draw_lights(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poin
                 }
             }
 
-            crate::lights::GizmoKind::Lamp { at, radius } => {
+            crate::lights::GizmoKind::Lamp { at, radius, .. } => {
                 let middle = to_screen(at);
                 let edge = to_screen(at + Vec2::new(radius, 0.0));
                 // The reach ring, which is also a drag handle.
                 painter.circle_stroke(middle, edge.x - middle.x, Stroke::new(1.0, ghost));
+
+                // **The stalk: how far in front of the stage the lamp hangs.**
+                //
+                // A lamp is a point in three dimensions and the stage shows
+                // two, so the third — the one that decides how hard its light
+                // falls off and how far its shadows splay — could only be
+                // reached through a slider. Drawn the way a lamp on a stand is
+                // drawn in a plan: the knob's distance from the lamp is the
+                // height, and pulling it out and in moves the lamp back and
+                // forward. See `lights::Gizmo::depth_handle`.
+                if let Some(knob) = gizmo.depth_handle() {
+                    let knob = to_screen(knob);
+                    painter.line_segment([middle, knob], Stroke::new(1.0, ghost));
+                    let grip = if selected { 4.5 } else { 3.5 };
+                    painter.circle_filled(knob, grip, colour);
+                    painter.circle_stroke(knob, grip, Stroke::new(1.5, ink));
+                }
 
                 let size = if selected { 6.0 } else { 5.0 };
                 painter.circle_filled(middle, size, colour);
@@ -880,12 +950,19 @@ fn bone_width(editor: &Editor, head: Point, tip: Point) -> f64 {
 }
 
 fn draw_preview(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point) -> egui::Pos2) {
+    // A painting preview lives in the Vello scene, drawn by `build_scene`;
+    // there is nothing for the chrome to add, and *building* the artwork
+    // here just to match it away would cost a second full build per frame.
+    if editor.preview_paints_into_scene() {
+        return;
+    }
+
     let stroke = Stroke::new(1.0, Palette::selection());
 
     match editor.preview() {
         Preview::None => {}
         // Painted into the Vello scene by `build_scene`, in its real colour.
-        Preview::Ink { .. } | Preview::Painted { .. } => {}
+        Preview::Artwork(_) | Preview::Painted { .. } => {}
         // Drawn with the transform gizmo, where the circle belongs.
         Preview::Pivot(_) => {}
         Preview::Marquee(rect) => {

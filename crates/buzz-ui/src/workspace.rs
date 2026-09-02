@@ -58,7 +58,7 @@ impl PanelId {
             Self::Color => "Color",
             Self::Swatches => "Swatches",
             Self::Depth => "Layer Depth",
-            Self::Rig => "Armature",
+            Self::Rig => "Rigging",
             Self::Filters => "Filters",
             Self::Lighting => "Lighting",
             Self::Sound => "Sound",
@@ -73,7 +73,7 @@ impl PanelId {
     /// The name on a tab, which has a column to share rather than fill.
     ///
     /// Five tabs in a 216-point section is the arrangement this was added for,
-    /// and "Layer Depth" and "Armature" spelled out do not fit in it. Animate
+    /// and "Layer Depth" and "Rigging" spelled out do not fit in it. Animate
     /// abbreviates its own tabs for the same reason. Only the four long ones
     /// differ; the rest are already short, and a second name for a panel that
     /// does not need one is just something else to keep in step.
@@ -375,6 +375,43 @@ impl Default for Workspace {
 }
 
 impl Workspace {
+    /// **Put every panel back where it started, and change nothing else.**
+    ///
+    /// Panels can be docked, undocked, tabbed, rolled up, resized and closed,
+    /// and a layout can end up in a state there is no obvious way back from —
+    /// so there has to be one button that undoes all of it at once.
+    ///
+    /// # What it deliberately keeps
+    ///
+    /// This struct is where the *layout* lives, and it is also where a few
+    /// things live that are not layout at all: the theme, the settings the
+    /// next new document opens with, and the list of directories to look in
+    /// for recovered work after a crash. Resetting by replacing the whole
+    /// workspace — which is what this used to do — threw those away with it.
+    /// Losing your dark theme is an irritation; losing the only record of
+    /// where an autosave went is losing work, and nobody pressing "Reset
+    /// Layout" is asking for either.
+    /// # Everything else goes back
+    ///
+    /// Written as "the fresh layout, except these three", rather than as a
+    /// list of what to reset. A field added to this struct later is then part
+    /// of the reset by default, which is the safe way round: forgetting to add
+    /// one here leaves a button called Reset Layout that does not reset the
+    /// layout, and the mistake is invisible until somebody's panels will not
+    /// go back.
+    pub fn reset_layout(&mut self) {
+        let recovery_dirs = std::mem::take(&mut self.recovery_dirs);
+        let new_document = self.new_document.clone();
+        let theme = self.theme;
+
+        *self = Self {
+            recovery_dirs,
+            new_document,
+            theme,
+            ..Self::animate()
+        };
+    }
+
     /// The layout this program opens with: Animate's, near enough — tools down
     /// the left, properties and the library on the right, timeline along the
     /// bottom.
@@ -1288,6 +1325,81 @@ mod tests {
             "a test process resolved to the user's own layout file: {}",
             workspace_path().display()
         );
+    }
+
+    /// **Reset puts every panel back.** Panels can be docked, undocked,
+    /// tabbed, rolled up, resized, closed and locked in place, and there has
+    /// to be one button that undoes all of it at once.
+    #[test]
+    fn resetting_the_layout_puts_every_panel_back() {
+        let mut workspace = Workspace::animate();
+        let fresh = Workspace::animate();
+
+        // Make a mess of it: float a panel, hide another, roll one up, drag
+        // the sides about and lock the lot.
+        workspace.move_to(PanelId::Layers, Dock::Float);
+        workspace.move_to(PanelId::Tools, Dock::Hidden);
+        if let Some(slot) = workspace.slots.iter_mut().find(|s| s.id == PanelId::Color) {
+            slot.collapsed = true;
+        }
+        workspace.left_width += 120.0;
+        workspace.bottom_height += 90.0;
+        workspace.locked = true;
+
+        workspace.reset_layout();
+
+        assert_eq!(workspace.locked, fresh.locked, "the lock comes off");
+        assert_eq!(workspace.left_width, fresh.left_width);
+        assert_eq!(workspace.bottom_height, fresh.bottom_height);
+        for expected in &fresh.slots {
+            let actual = workspace
+                .slots
+                .iter()
+                .find(|s| s.id == expected.id)
+                .unwrap_or_else(|| panic!("{:?} went missing", expected.id));
+            assert_eq!(
+                (actual.dock, actual.collapsed, actual.order),
+                (expected.dock, expected.collapsed, expected.order),
+                "{:?} did not go back where it started",
+                expected.id
+            );
+        }
+    }
+
+    /// **And it keeps what is not layout.** The theme, the settings the next
+    /// new document opens with, and the directories to look in for recovered
+    /// work all live in this struct and are none of them layout. Resetting by
+    /// replacing the whole workspace threw them away with it — losing a theme
+    /// is an irritation, losing the only record of where an autosave went is
+    /// losing work.
+    #[test]
+    fn resetting_the_layout_keeps_the_preferences_that_are_not_layout() {
+        let mut workspace = Workspace::animate();
+        workspace.theme = crate::theme::Theme::Light;
+        workspace.recovery_dirs = vec![
+            std::path::PathBuf::from("B:/films/one"),
+            std::path::PathBuf::from("B:/films/two"),
+        ];
+        workspace.new_document.width = 1920.0;
+        workspace.locked = true;
+
+        workspace.reset_layout();
+
+        assert_eq!(
+            workspace.theme,
+            crate::theme::Theme::Light,
+            "resetting the layout must not change the theme"
+        );
+        assert_eq!(
+            workspace.recovery_dirs.len(),
+            2,
+            "and must not forget where recovered work is"
+        );
+        assert_eq!(
+            workspace.new_document.width, 1920.0,
+            "and must not undo the new-document settings"
+        );
+        assert!(!workspace.locked, "while still resetting the layout itself");
     }
 
     /// A layout file that is missing, empty or nonsense must not stop the

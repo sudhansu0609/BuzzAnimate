@@ -18,6 +18,7 @@ pub mod presets;
 pub mod profile;
 pub mod rigging;
 pub mod sound;
+pub mod staging;
 pub mod stage;
 pub mod tasks;
 pub mod thumbnails;

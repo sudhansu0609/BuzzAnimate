@@ -339,10 +339,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "buzz-act"
+version = "0.1.0"
+dependencies = [
+ "buzz-geom",
+ "buzz-light",
+ "buzz-physics",
+ "buzz-rig",
+ "buzz-scene",
+ "kurbo",
+ "peniko",
+]
+
+[[package]]
 name = "buzz-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "buzz-act",
  "buzz-audio",
  "buzz-doc",
  "buzz-export",
@@ -416,6 +430,7 @@ name = "buzz-export"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "buzz-act",
  "buzz-doc",
  "buzz-geom",
  "buzz-import-swf",
@@ -515,6 +530,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-physics"
+version = "0.1.0"
+
+[[package]]
 name = "buzz-render"
 version = "0.1.0"
 dependencies = [
@@ -538,6 +557,7 @@ name = "buzz-rig"
 version = "0.1.0"
 dependencies = [
  "buzz-geom",
+ "buzz-physics",
  "kurbo",
  "rayon",
  "serde",
@@ -552,6 +572,7 @@ dependencies = [
  "buzz-fx",
  "buzz-geom",
  "buzz-light",
+ "buzz-physics",
  "buzz-rig",
  "image",
  "kurbo",

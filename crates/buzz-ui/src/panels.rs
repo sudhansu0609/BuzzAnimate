@@ -306,6 +306,36 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 ] {
                     item(ui, c, true, &mut raised);
                 }
+                ui.separator();
+                // Animate the selected light: key its state at the playhead, or
+                // clear the key there. The editor reports if no light is chosen.
+                item(ui, Command::AddLightKeyframe, true, &mut raised);
+                item(ui, Command::RemoveLightKeyframe, true, &mut raised);
+            });
+
+            // **Staging, beside the lights and for the same reason.** Neither
+            // is in Animate at all, and both answer the same question — what is
+            // in this shot before anything is drawn? Insert is where somebody
+            // coming from either Animate or Blender looks first.
+            ui.separator();
+            ui.menu_button("Scene", |ui| {
+                // The scenes of the film first: they are what the menu is
+                // named after, and the breadcrumb above the stage is too
+                // quiet a home for the only way to make one.
+                item(ui, Command::AddScene, true, &mut raised);
+                item(ui, Command::DuplicateScene, true, &mut raised);
+                ui.separator();
+                item(ui, Command::SetScene, true, &mut raised);
+                item(ui, Command::DirectScene, true, &mut raised);
+                item(ui, Command::AddPerson, true, &mut raised);
+                ui.separator();
+                // Left enabled whatever is selected: the dialog is where the
+                // reason belongs, because "select a rigged character" is
+                // something to read, not something to infer from a grey item.
+                item(ui, Command::Perform, true, &mut raised);
+                item(ui, Command::AddFollowThrough, true, &mut raised);
+                item(ui, Command::AddWiggle, true, &mut raised);
+                item(ui, Command::ClearModifiers, has_selection, &mut raised);
             });
         });
 
@@ -950,6 +980,35 @@ fn wand_properties(ui: &mut Ui, style: &mut DrawStyle) {
     });
 }
 
+/// Eraser settings: how wide it rubs.
+///
+/// Its own size, rather than four times the stroke-width slider — which is a
+/// number about outlines, defaults to one, and left the eraser four units
+/// across whatever the brush was set to, with nothing in the options saying so.
+fn eraser_properties(ui: &mut Ui, style: &mut DrawStyle) {
+    egui::Grid::new("eraser-props").num_columns(2).show(ui, |ui| {
+        ui.label("Size");
+        ui.add(
+            egui::Slider::new(&mut style.eraser_size, 1.0..=200.0)
+                .logarithmic(true)
+                .suffix(" px"),
+        )
+        .on_hover_text(
+            "How wide the eraser rubs, in document units \u{2014} the same units the \
+             brush size is in.",
+        );
+        ui.end_row();
+    });
+    ui.label(
+        RichText::new(
+            "Rubbing through a shape cuts it in two: each piece becomes a shape of \
+             its own, so they can be moved apart.",
+        )
+        .small()
+        .weak(),
+    );
+}
+
 /// Paint Bucket settings: the gap size the fill will bridge.
 fn bucket_properties(ui: &mut Ui, style: &mut DrawStyle) {
     egui::Grid::new("bucket-props").num_columns(2).show(ui, |ui| {
@@ -985,12 +1044,51 @@ fn brush_properties(ui: &mut Ui, style: &mut DrawStyle) {
         egui::ComboBox::from_id_salt("brush-kind")
             .selected_text(style.brush.kind.label())
             .show_ui(ui, |ui| {
-                for kind in [BrushKind::Fluid, BrushKind::Pattern, BrushKind::Art] {
+                for kind in BrushKind::ALL {
                     ui.selectable_value(&mut style.brush.kind, kind, kind.label())
                         .on_hover_text(kind.description());
                 }
             });
         ui.end_row();
+
+        if style.brush.kind == BrushKind::Effect {
+            ui.label("Effect");
+            egui::ComboBox::from_id_salt("brush-effect")
+                .selected_text(style.brush.effect.label())
+                .show_ui(ui, |ui| {
+                    for effect in buzz_scene::EffectKind::ALL {
+                        ui.selectable_value(&mut style.brush.effect, effect, effect.label())
+                            .on_hover_text(effect.description());
+                    }
+                })
+                .response
+                .on_hover_text(style.brush.effect.description());
+            ui.end_row();
+        }
+
+        if style.brush.kind == BrushKind::Wave {
+            ui.label("Wave");
+            // Not `selectable_value`: picking a kind has to load its preset,
+            // so the choice goes through `set_wave` rather than writing the
+            // field behind its back.
+            egui::ComboBox::from_id_salt("brush-wave")
+                .selected_text(style.brush.wave.label())
+                .show_ui(ui, |ui| {
+                    for wave in buzz_scene::WaveKind::ALL {
+                        let chosen = style.brush.wave == wave;
+                        if ui
+                            .selectable_label(chosen, wave.label())
+                            .on_hover_text(wave.description())
+                            .clicked()
+                        {
+                            style.brush.set_wave(wave);
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(style.brush.wave.description());
+            ui.end_row();
+        }
 
         ui.label("Size");
         ui.add(
@@ -1002,15 +1100,52 @@ fn brush_properties(ui: &mut Ui, style: &mut DrawStyle) {
 
         ui.label("Smoothing");
         ui.add(egui::Slider::new(&mut style.brush.smoothing, 0.0..=1.0))
-            .on_hover_text("Steadies a shaky hand. The ends never move.");
-        ui.end_row();
-
-        ui.label("Build up");
-        ui.checkbox(&mut style.brush.build_up, "")
             .on_hover_text(
-                "Opacity adds where strokes overlap: 20% crossing 30% gives                  50%, not 44%. Paint deepens as you work over it, the way ink                  does.",
+                "Evens out a line after it is drawn, by pulling each point towards \
+                 its neighbours. It sees the whole stroke, so it cannot lag \u{2014} and \
+                 the ends never move.",
             );
         ui.end_row();
+
+        ui.label("Stabiliser");
+        ui.add(egui::Slider::new(&mut style.brush.stabiliser, 0.0..=1.0))
+            .on_hover_text(
+                "Drags the ink along behind the pointer, the way a heavy hand-rest \
+                 does, so the shake never reaches the paper. The line catches up \
+                 when you let go. Different from Smoothing: this one is a lag, and \
+                 that is the point of it.",
+            );
+        ui.end_row();
+
+        // A generated stroke chooses its own compositing per piece — a glow
+        // adds, a silhouette covers — so Build up would be a lie there. What
+        // those brushes show instead is what they do with the fill swatch,
+        // which is the question their colour actually raises.
+        if !style.brush.kind.composites_itself() {
+            ui.label("Build up");
+            ui.checkbox(&mut style.brush.build_up, "")
+                .on_hover_text(
+                    "Opacity adds where strokes overlap: 20% crossing 30% gives                  50%, not 44%. Paint deepens as you work over it, the way ink                  does.",
+                );
+            ui.end_row();
+        } else {
+            let hint = if style.brush.kind == BrushKind::Wave {
+                style.brush.wave.color_hint()
+            } else {
+                style.brush.effect.color_hint()
+            };
+            ui.label("Colour");
+            ui.label(
+                egui::RichText::new(hint)
+                    .size(10.5)
+                    .color(Palette::text_dim()),
+            );
+            ui.end_row();
+        }
+
+        if style.brush.kind == BrushKind::Wave {
+            wave_settings(ui, &mut style.brush.wave_settings);
+        }
 
         if style.brush.kind == BrushKind::Raster {
             ui.label("Hardness");
@@ -1027,15 +1162,44 @@ fn brush_properties(ui: &mut Ui, style: &mut DrawStyle) {
             ui.end_row();
         }
 
-        if style.brush.kind == BrushKind::Fluid {
-            ui.label("Thinnest");
-            ui.add(egui::Slider::new(&mut style.brush.min_ratio, 0.0..=1.0))
-                .on_hover_text("How thin the stroke gets at full speed or lightest pressure");
+        // Width, taper and viscosity belong to both brushes that draw a filled
+        // outline; only the *response* is what makes one of them fluid.
+        if style.brush.kind.is_outlined() {
+            ui.label("Viscosity");
+            ui.add(egui::Slider::new(&mut style.brush.viscosity, 0.0..=1.0))
+                .on_hover_text(
+                    "How much the paint resists spreading. Thin paint lets the \
+                     stroke's edge bulge outwards between the points it was drawn \
+                     through, which reads as ink that ran after you drew it; thick \
+                     paint holds the edge you made.",
+                );
             ui.end_row();
 
             ui.label("Taper");
             ui.add(egui::Slider::new(&mut style.brush.taper, 0.0..=0.5))
-                .on_hover_text("How much of each end narrows to a point");
+                .on_hover_text("How much of the stroke narrows to a point");
+            ui.end_row();
+
+            if style.brush.taper > 0.0 {
+                ui.label("Taper ends");
+                egui::ComboBox::from_id_salt("brush-taper-ends")
+                    .selected_text(style.brush.taper_ends.label())
+                    .show_ui(ui, |ui| {
+                        for ends in buzz_geom::TaperEnds::ALL {
+                            ui.selectable_value(&mut style.brush.taper_ends, ends, ends.label())
+                                .on_hover_text(ends.description());
+                        }
+                    })
+                    .response
+                    .on_hover_text(style.brush.taper_ends.description());
+                ui.end_row();
+            }
+        }
+
+        if style.brush.kind == BrushKind::Fluid {
+            ui.label("Thinnest");
+            ui.add(egui::Slider::new(&mut style.brush.min_ratio, 0.0..=1.0))
+                .on_hover_text("How thin the stroke gets at full speed or lightest pressure");
             ui.end_row();
 
             ui.label("Pressure");
@@ -1066,7 +1230,7 @@ fn brush_properties(ui: &mut Ui, style: &mut DrawStyle) {
                         ui.selectable_value(&mut style.brush.pattern, shape, shape.label());
                     }
                     // Only offered once there is something to offer.
-                    if style.brush.custom_pattern.is_some() {
+                    if style.brush.custom_stamp.is_some() {
                         ui.selectable_value(
                             &mut style.brush.pattern,
                             PatternShape::Custom,
@@ -1075,6 +1239,19 @@ fn brush_properties(ui: &mut Ui, style: &mut DrawStyle) {
                     }
                 });
             ui.end_row();
+
+            // Only a captured brush has paint of its own to keep, so the
+            // choice is only offered where it means something.
+            if style.brush.pattern_stamp().is_some_and(|s| s.is_painted()) {
+                ui.label("Artwork colours");
+                ui.checkbox(&mut style.brush.keep_source_paint, "")
+                    .on_hover_text(
+                        "Stamp the artwork exactly as you drew it \u{2014} its colours, \
+                         gradients and bitmaps. Off stamps its outline only, painted \
+                         by the fill swatch.",
+                    );
+                ui.end_row();
+            }
 
             if style.brush.kind == BrushKind::Pattern {
                 ui.label("Spacing");
@@ -1098,6 +1275,78 @@ fn brush_properties(ui: &mut Ui, style: &mut DrawStyle) {
     }
 }
 
+/// The Wave brush's own settings — how the flow is shaped, and how long it
+/// runs for.
+///
+/// Emitted into the caller's grid, in the order you would reach for them:
+/// the shape of the wave first, then the bundle it is drawn as, then the
+/// animation it commits. Lengths are in brush sizes rather than pixels, which
+/// is what makes a wave the same wave when the brush is resized — so the
+/// sliders say so.
+fn wave_settings(ui: &mut Ui, wave: &mut buzz_scene::WaveSettings) {
+    ui.label("Amplitude");
+    ui.add(egui::Slider::new(&mut wave.amplitude, 0.0..=4.0).suffix("\u{d7}"))
+        .on_hover_text("How far a strand swings across the stroke, in brush sizes");
+    ui.end_row();
+
+    ui.label("Wavelength");
+    ui.add(egui::Slider::new(&mut wave.wavelength, 0.5..=16.0).suffix("\u{d7}"))
+        .on_hover_text("Distance from one crest to the next, in brush sizes");
+    ui.end_row();
+
+    ui.label("Turbulence");
+    ui.add(egui::Slider::new(&mut wave.turbulence, 0.0..=1.0))
+        .on_hover_text(
+            "A second, shorter wave laid over the first. Without it a bundle \
+             reads as a drawn sine; with it, as something moving in air or \
+             water.",
+        );
+    ui.end_row();
+
+    ui.label("Drift");
+    ui.add(egui::Slider::new(&mut wave.drift, -3.0..=3.0).suffix("\u{d7}"))
+        .on_hover_text("A lean that grows along the stroke \u{2014} the draught that bends a plume");
+    ui.end_row();
+
+    ui.label("Strands");
+    ui.add(egui::Slider::new(&mut wave.strands, 1..=64))
+        .on_hover_text("How many strands the bundle holds");
+    ui.end_row();
+
+    ui.label("Spread");
+    ui.add(egui::Slider::new(&mut wave.spread, 0.0..=8.0).suffix("\u{d7}"))
+        .on_hover_text("How far the bundle spreads across the stroke, in brush sizes");
+    ui.end_row();
+
+    ui.label("Thickness");
+    ui.add(egui::Slider::new(&mut wave.thickness, 0.02..=2.0))
+        .on_hover_text("Strand width, as a fraction of the brush size");
+    ui.end_row();
+
+    ui.label("Taper");
+    ui.add(egui::Slider::new(&mut wave.taper, 0.0..=1.0))
+        .on_hover_text("How much a strand narrows towards its far end. At 1 it finishes in a point.");
+    ui.end_row();
+
+    ui.label("Frames");
+    ui.add(egui::Slider::new(&mut wave.frames, 1..=240))
+        .on_hover_text(
+            "Frames one stroke commits. At 1 the wave is a still drawing; above \
+             that it is baked onto that many keyframes and loops seamlessly.",
+        );
+    ui.end_row();
+
+    if wave.is_animated() {
+        ui.label("Cycles");
+        ui.add(egui::Slider::new(&mut wave.cycles, 1..=8))
+            .on_hover_text(
+                "Whole waves that pass in one loop \u{2014} the speed of the flow. Whole, \
+                 because a fractional count is a loop that jolts when it repeats.",
+            );
+        ui.end_row();
+    }
+}
+
 /// Draw the pattern as it will be stamped, along a short sample stroke.
 ///
 /// Worth the few lines: the difference between spacing 4 and spacing 40 is
@@ -1110,7 +1359,68 @@ fn brush_pattern_preview(ui: &mut Ui, style: &DrawStyle) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 2.0, Palette::panel());
 
-    let Some(source) = style.brush.pattern_path() else {
+    // A gentle S, so the rotation of the stamps is visible.
+    let span = rect.width() as f64 - 16.0;
+    let spine = buzz_geom::catmull_rom(&[
+        buzz_geom::Point::new(0.0, 6.0),
+        buzz_geom::Point::new(span * 0.33, -6.0),
+        buzz_geom::Point::new(span * 0.66, 6.0),
+        buzz_geom::Point::new(span, -6.0),
+    ]);
+    // The preview budget, because this is drawn every frame the panel is open.
+    let budget = buzz_geom::BrushBudget::preview();
+
+    // **What to draw, and in what colour.** A captured brush that keeps its
+    // own paint contributes one entry per piece, each in that piece's own
+    // colour, so the strip shows the brush the user actually made. Everything
+    // else is one silhouette in the fill swatch, as before.
+    let mut parts: Vec<(buzz_geom::BezPath, egui::Color32)> = Vec::new();
+    if style.brush.stamps_its_own_paint()
+        && let Some(stamp) = style.brush.pattern_stamp()
+    {
+        let size = style.brush.size.max(1.0);
+        let plan = buzz_geom::stamp_transforms(
+            &spine,
+            stamp.source_rect(size),
+            style.brush.fit(),
+            &budget,
+        );
+        // The placements are in the scaled stamp's space; the artwork itself
+        // is in unit stamp space, so the size goes on here.
+        let placed: Vec<buzz_geom::Affine> = plan
+            .transforms
+            .iter()
+            .map(|t| *t * buzz_geom::Affine::scale(size))
+            .collect();
+        for shape in stamp.place_many(&placed).shapes {
+            // egui's painter has no gradient or bitmap brush, so a piece's one
+            // standing colour is what the strip can show. It is enough to
+            // judge spacing, size and *which brush this is*, which is what the
+            // strip is for; the stage draws the real thing.
+            let colour = shape
+                .fill
+                .as_ref()
+                .map(|f| f.paint.color())
+                .or_else(|| shape.stroke.as_ref().map(|s| s.paint.color()))
+                .unwrap_or(Color::BLACK);
+            parts.push((shape.path, to_egui(colour)));
+        }
+    } else if let Some(source) = style.brush.pattern_path() {
+        let swatch = to_egui(if style.fill_enabled {
+            style.fill_color_for_preview()
+        } else {
+            Color::BLACK
+        });
+        let stamped = buzz_geom::stamp_along(&spine, &source, style.brush.fit(), &budget);
+        parts.push((stamped.path, swatch));
+    }
+
+    // Fit whatever came out into the strip.
+    let bounds = parts
+        .iter()
+        .map(|(path, _)| buzz_geom::Shape::bounding_box(path))
+        .reduce(|a, b| a.union(b));
+    let Some(bounds) = bounds.filter(|b| b.width() > 0.0 && b.height() > 0.0) else {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -1120,41 +1430,10 @@ fn brush_pattern_preview(ui: &mut Ui, style: &DrawStyle) {
         );
         return;
     };
-
-    // A gentle S, so the rotation of the stamps is visible.
-    let span = rect.width() as f64 - 16.0;
-    let spine = buzz_geom::catmull_rom(&[
-        buzz_geom::Point::new(0.0, 6.0),
-        buzz_geom::Point::new(span * 0.33, -6.0),
-        buzz_geom::Point::new(span * 0.66, 6.0),
-        buzz_geom::Point::new(span, -6.0),
-    ]);
-
-    // The preview budget, because this is drawn every frame the panel is open.
-    let stamped = buzz_geom::stamp_along(
-        &spine,
-        &source,
-        style.brush.fit(),
-        &buzz_geom::BrushBudget::preview(),
-    );
-
-    // Fit whatever came out into the strip.
-    let bounds = buzz_geom::Shape::bounding_box(&stamped.path);
-    if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
-        return;
-    }
     let scale = ((rect.width() as f64 - 12.0) / bounds.width())
         .min((rect.height() as f64 - 12.0) / bounds.height())
         .min(1.0);
 
-    // The brush preview is chrome drawn with egui's painter, which has no
-    // gradient brush — one colour standing in for the ramp is enough to judge
-    // spacing and stamp size, which is what this strip is for.
-    let colour = to_egui(if style.fill_enabled {
-        style.fill_color_for_preview()
-    } else {
-        Color::BLACK
-    });
     let to_screen = |p: buzz_geom::Point| -> egui::Pos2 {
         egui::pos2(
             rect.center().x + ((p.x - bounds.center().x) * scale) as f32,
@@ -1164,22 +1443,20 @@ fn brush_pattern_preview(ui: &mut Ui, style: &DrawStyle) {
 
     // Each subpath is one stamp, so they are drawn separately rather than
     // joined into a single polyline that would connect them all together.
-    let mut current: Vec<egui::Pos2> = Vec::new();
-    let flush = |points: &mut Vec<egui::Pos2>| {
-        if points.len() >= 3 {
-            painter.add(egui::Shape::convex_polygon(
-                std::mem::take(points),
-                colour,
-                egui::Stroke::NONE,
-            ));
-        } else {
-            points.clear();
-        }
-    };
-    kurbo::flatten(
-        stamped.path.iter(),
-        0.2 / scale.max(1e-6),
-        |element| match element {
+    for (path, colour) in &parts {
+        let mut current: Vec<egui::Pos2> = Vec::new();
+        let flush = |points: &mut Vec<egui::Pos2>| {
+            if points.len() >= 3 {
+                painter.add(egui::Shape::convex_polygon(
+                    std::mem::take(points),
+                    *colour,
+                    egui::Stroke::NONE,
+                ));
+            } else {
+                points.clear();
+            }
+        };
+        kurbo::flatten(path.iter(), 0.2 / scale.max(1e-6), |element| match element {
             kurbo::PathEl::MoveTo(p) => {
                 flush(&mut current);
                 current.push(to_screen(p));
@@ -1187,9 +1464,9 @@ fn brush_pattern_preview(ui: &mut Ui, style: &DrawStyle) {
             kurbo::PathEl::LineTo(p) => current.push(to_screen(p)),
             kurbo::PathEl::ClosePath => flush(&mut current),
             _ => {}
-        },
-    );
-    flush(&mut current);
+        });
+        flush(&mut current);
+    }
 }
 
 /// Contextual properties for the current selection.
@@ -1481,6 +1758,10 @@ pub fn properties_panel(
         .id_salt("brush-section")
         .default_open(false)
         .show(ui, |ui| brush_properties(ui, style));
+    egui::CollapsingHeader::new(RichText::new("Eraser").strong())
+        .id_salt("eraser-section")
+        .default_open(false)
+        .show(ui, |ui| eraser_properties(ui, style));
     egui::CollapsingHeader::new(RichText::new("Magic Wand").strong())
         .id_salt("wand-section")
         .default_open(false)
@@ -2275,11 +2556,31 @@ pub fn layers_panel(
                         LayerKind::Normal => "",
                     };
                     let width = ui.available_width().max(1.0);
-                    let response = ui.add_sized(
-                        egui::vec2(width, ui.spacing().interact_size.y),
-                        egui::Button::selectable(active == Some(id), format!("{mark}{name}"))
-                            .truncate(),
-                    );
+                    // **A layer row is a drag source, for the Rigging panel.**
+                    //
+                    // Sorting a character's parts into a skeleton is done by
+                    // name, by clicking, or by dragging — and the drawings are
+                    // already listed here, one to a layer, which is where an
+                    // animator who has just imported a character is looking.
+                    // Dropping anywhere else does nothing at all: only a rig
+                    // slot accepts this payload. See `rig_panel::DraggedPart`.
+                    let drag_id = ui.id().with(("layer-drag", id.0));
+                    let response = ui
+                        .dnd_drag_source(
+                            drag_id,
+                            crate::rig_panel::DraggedPart::Layer(id),
+                            |ui| {
+                                ui.add_sized(
+                                    egui::vec2(width, ui.spacing().interact_size.y),
+                                    egui::Button::selectable(
+                                        active == Some(id),
+                                        format!("{mark}{name}"),
+                                    )
+                                    .truncate(),
+                                )
+                            },
+                        )
+                        .inner;
                     if response.clicked() {
                         // Animate selects the layer's artwork with it, so the
                         // obvious next move needs no second gesture.
@@ -2523,6 +2824,36 @@ pub fn layers_panel(
     if let Some((layer, kind)) = set_kind {
         scene.update_layer(layer, |l| l.kind = kind);
     }
+
+    // **The camera, at the foot of the layer list.**
+    //
+    // The camera is not a layer — it is one shot the whole stack is seen
+    // through, which is why it has never been in this list — but the layer
+    // list is where somebody goes looking for it, because that is where
+    // Animate puts its button and because "add a camera" is the same kind of
+    // act as "add a layer". So it is offered here, in the place it is looked
+    // for, and turning it on adds a camera keyframe rather than a row.
+    ui.separator();
+    ui.horizontal(|ui| {
+        let on = scene.camera().enabled;
+        let button = egui::Button::new(
+            RichText::new(if on { "\u{1F3A5} Camera on" } else { "\u{1F3A5} Add Camera" }).small(),
+        )
+        .selected(on);
+        if ui
+            .add(button)
+            .on_hover_text(if on {
+                "The shot the whole stack is seen through. Click to turn it off \u{2014} \
+                 the keyframes it has are kept."
+            } else {
+                "Frame the film through a camera: pan, zoom and turn the whole stack \
+                 over time. Adds a first keyframe so there is something to aim."
+            })
+            .clicked()
+        {
+            command = Some(Command::ToggleCamera);
+        }
+    });
 
     command
 }

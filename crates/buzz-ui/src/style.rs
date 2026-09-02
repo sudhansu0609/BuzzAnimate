@@ -118,6 +118,13 @@ pub struct DrawStyle {
     /// `None` means the "no fill" swatch.
     pub fill_enabled: bool,
     pub stroke_width: f64,
+    /// **How wide the eraser rubs**, in document units.
+    ///
+    /// Its own setting, because it used to be four times the *stroke width*
+    /// slider — a number about outlines, defaulting to one, so the eraser was
+    /// four units across however large the brush was and nothing in the tool
+    /// options said so.
+    pub eraser_size: f64,
     /// Animate's hairline: always one pixel, whatever the zoom.
     pub hairline: bool,
     pub stroke_kind: StrokeKind,
@@ -173,6 +180,8 @@ impl Default for DrawStyle {
             stroke_enabled: true,
             fill_enabled: true,
             stroke_width: 1.0,
+            // A little wider than the default brush, as a rubber is.
+            eraser_size: 16.0,
             hairline: false,
             stroke_kind: StrokeKind::Solid,
             drawing_mode: DrawingMode::default(),

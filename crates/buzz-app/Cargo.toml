@@ -20,6 +20,7 @@ buzz-geom.workspace = true
 buzz-jobs.workspace = true
 buzz-render.workspace = true
 buzz-scene.workspace = true
+buzz-act.workspace = true
 buzz-doc.workspace = true
 buzz-ui.workspace = true
 buzz-import-xfl.workspace = true

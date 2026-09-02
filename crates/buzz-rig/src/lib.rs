@@ -20,14 +20,18 @@
 //! is where the bone is now. A document keyframe stores angles, so tweening
 //! between poses is interpolating numbers rather than rebuilding a rig.
 
+pub mod follow;
 pub mod ik;
+pub mod pattern;
 pub mod skin;
 pub mod warp;
 
 use buzz_geom::{Affine, Point, Vec2};
 use serde::{Deserialize, Serialize};
 
+pub use follow::{follow_through, follow_through_coupled};
 pub use ik::{IkOptions, IkOutcome, solve_to};
+pub use pattern::{RigPattern, Side, Slot, match_parts};
 pub use skin::{SkinBinding, bind_path, deform_path};
 pub use warp::{WarpHandle, warp_path};
 

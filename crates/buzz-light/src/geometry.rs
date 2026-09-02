@@ -626,6 +626,89 @@ fn difference(a: &BezPath, b: &BezPath) -> Option<BezPath> {
     (!result.elements().is_empty()).then_some(result)
 }
 
+// ---------------------------------------------------------------------------
+// The rim
+// ---------------------------------------------------------------------------
+
+/// **The widest a rim spreads**, in document units, at `rim == 1.0`.
+///
+/// A rim reads as light catching an edge only while it is *narrower than the
+/// thing it is on*. Past that it stops being an edge and becomes a halo, and a
+/// halo on every character in a shot is fog. Thirty units on a stage a few
+/// hundred across is a strong rim on a limb and a visible one on a head.
+pub const RIM_REACH: f64 = 30.0;
+
+/// A glow to lay around the outside of a silhouette.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RimGlow {
+    /// The colour to glow, already carrying how much of it arrives: a rim that
+    /// has fallen off across the stage arrives more transparent, not smaller,
+    /// because a narrower rim reads as a *nearer* light rather than a dimmer
+    /// one.
+    pub color: Color,
+    /// How far it spreads, in document units.
+    pub reach: f64,
+}
+
+/// **The edge glow one light lays around artwork at `at` on a layer at
+/// `depth`.**
+///
+/// The answer to "when the light comes up, the edges come up": the strength is
+/// the light's own, so anything that moves the light's brightness \u2014 a
+/// keyframed intensity, a fire's gutter, walking out of a lamp's reach \u2014 moves
+/// the rim with it, and none of it needs a second track to animate.
+///
+/// # Why this is not a crescent
+///
+/// A highlight crescent is the artwork minus a copy of itself, so it lives
+/// *inside* the silhouette and can never be brighter than the picture around
+/// it. What an animator draws as a rim is outside the line, spilling onto the
+/// background. It is the same shape a Glow filter makes, and it is built by the
+/// same code (`buzz_fx::soft_edge`) from this colour and this reach.
+///
+/// `None` when there is no rim to draw: the light is off, its rim is turned
+/// down, it is not a light at all (a gloom emits nothing), or it is too far
+/// away for anything of it to arrive.
+pub fn rim_glow(light: &Light, at: Point, depth: f64) -> Option<RimGlow> {
+    if !light.enabled {
+        return None;
+    }
+    let rim = light.rim.clamp(0.0, 1.0);
+    if rim <= 0.001 {
+        return None;
+    }
+
+    // How much of this light arrives here. A sun arrives the same everywhere,
+    // so it is simply its strength; a lamp's falls off, which is what makes a
+    // figure lose its rim as it walks out of the pool. A sky has no direction
+    // and a gloom has no light: neither rims anything.
+    let arriving = match light.kind {
+        LightKind::Sky { .. } | LightKind::Gloom { .. } => return None,
+        _ => {
+            let (towards, strength) = light.towards(at, depth)?;
+            // Square-on to the stage, as everything else here reads it: a light
+            // grazing along the plane is the *most* interesting one for a rim,
+            // so unlike fill this does not fall to nothing at the horizon. Held
+            // off zero so a low sun still rims.
+            let facing = (towards.z.max(0.0) as f32).max(0.35);
+            strength * facing
+        }
+    };
+
+    let alpha = (rim * arriving).clamp(0.0, 1.0);
+    if alpha <= 0.004 {
+        return None;
+    }
+
+    Some(RimGlow {
+        color: light.color.multiply_alpha(alpha),
+        // From the same number, so one slider both switches the rim on and
+        // makes it wide enough to see. A rim at a tenth is a hairline catching
+        // the edge; at full it is a figure standing in front of the sun.
+        reach: RIM_REACH * f64::from(rim),
+    })
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1200,4 +1283,94 @@ mod tests {
             );
         }
     }
+
+    // -- the rim ------------------------------------------------------------
+
+    /// A light that has not been asked for a rim does not lay one, so every
+    /// document that existed before this is untouched.
+    #[test]
+    fn no_rim_unless_it_is_asked_for() {
+        let light = sun(0.0, 0.7);
+        assert_eq!(light.rim, 0.0, "off by default");
+        assert!(rim_glow(&light, Point::ZERO, 0.0).is_none());
+    }
+
+    /// **The edges come up as the light comes up.** The whole point of tying
+    /// the rim to the light rather than to the artwork: turn the light down and
+    /// the glow follows it without a second thing to animate.
+    #[test]
+    fn a_brighter_light_rims_more_brightly() {
+        let mut dim = sun(0.0, 0.7);
+        dim.rim = 0.6;
+        dim.intensity = 0.3;
+        let mut bright = dim.clone();
+        bright.intensity = 1.3;
+
+        let dim = rim_glow(&dim, Point::ZERO, 0.0).expect("a rim");
+        let bright = rim_glow(&bright, Point::ZERO, 0.0).expect("a rim");
+
+        assert!(
+            bright.color.components[3] > dim.color.components[3],
+            "the brighter light glows harder: {} against {}",
+            bright.color.components[3],
+            dim.color.components[3]
+        );
+        assert_eq!(
+            bright.reach, dim.reach,
+            "and it is the same width: a dimmer light is fainter, not narrower"
+        );
+    }
+
+    /// A lamp falls off, so a figure across the stage from it loses its rim on
+    /// the way. This is what makes a rim read as light rather than as an
+    /// outline switched on.
+    #[test]
+    fn a_lamps_rim_falls_off_with_distance() {
+        let mut lamp = Light::new(LightId(1), "Lamp", LightKind::lamp(Point::ZERO));
+        lamp.rim = 0.8;
+
+        let near = rim_glow(&lamp, Point::new(20.0, 0.0), 0.0).expect("a rim close in");
+        let far = rim_glow(&lamp, Point::new(900.0, 0.0), 0.0);
+
+        match far {
+            Some(far) => assert!(
+                far.color.components[3] < near.color.components[3],
+                "further away is fainter: {} against {}",
+                far.color.components[3],
+                near.color.components[3]
+            ),
+            // Faded away entirely, which is the same statement more strongly.
+            None => {}
+        }
+    }
+
+    /// Neither a sky nor a gloom rims anything: one arrives from every
+    /// direction at once and the other emits nothing at all.
+    #[test]
+    fn only_a_light_with_a_direction_rims() {
+        for kind in [
+            LightKind::sky(),
+            LightKind::gloom(Point::new(-400.0, 0.0)),
+        ] {
+            let mut light = Light::new(LightId(9), "L", kind);
+            light.rim = 1.0;
+            light.enabled = true;
+            assert!(
+                rim_glow(&light, Point::ZERO, 0.0).is_none(),
+                "{} must not rim",
+                light.kind.label()
+            );
+        }
+    }
+
+    /// A rim is a look, not a property of light, so switching the light off
+    /// takes it with it.
+    #[test]
+    fn a_light_that_is_off_rims_nothing() {
+        let mut light = sun(0.0, 0.7);
+        light.rim = 1.0;
+        light.enabled = false;
+        assert!(rim_glow(&light, Point::ZERO, 0.0).is_none());
+    }
+
 }

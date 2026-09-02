@@ -154,6 +154,7 @@ pub fn write_track(
                 blend: buzz_scene::Blend::Normal,
                 spatial: Default::default(),
                 pivot: None,
+                modifiers: Vec::new(),
             };
             target.frames.set_objects(frame, vec![Arc::new(object)]);
         }
@@ -237,6 +238,7 @@ pub fn placeholder_mouth(scene: &mut Scene, name: &str) -> SymbolId {
                     blend: buzz_scene::Blend::Normal,
                     spatial: Default::default(),
                     pivot: None,
+                    modifiers: Vec::new(),
                 };
                 l.frames.set_objects(frame, vec![Arc::new(object)]);
             }

@@ -28,6 +28,14 @@ pub enum BrushKind {
     /// A filled stroke whose width follows pressure or speed.
     #[default]
     Fluid,
+    /// **A plain brush: one width, all the way along.**
+    ///
+    /// The same filled outline as [`Self::Fluid`], with the response taken
+    /// out — what a marker or a technical pen does, and what you want when a
+    /// line has to read as one weight rather than as a gesture. It still
+    /// tapers if asked, because a taper is a shape you choose rather than
+    /// something the stroke's speed decided for you.
+    Normal,
     /// A source shape repeated along the stroke.
     Pattern,
     /// A single source shape stretched over the whole stroke.
@@ -38,30 +46,70 @@ pub enum BrushKind {
     /// at its edge: a soft edge is a different opacity at every point of a
     /// region, which no outline describes. See [`buzz_scene::raster`].
     Raster,
+    /// A stroke that paints scenery: snow, clouds, skylines, strings of
+    /// lights. See [`buzz_scene::effect_brush`] — one drag lays down vector
+    /// silhouettes, gradient glows and painted pixels together, which is what
+    /// mixed raster-and-vector drawing on one layer is for.
+    Effect,
+    /// A stroke that **flows**: smoke, water, wavy hair, ribbons.
+    ///
+    /// See [`buzz_scene::wave`]. The one brush here whose stroke can commit an
+    /// *animation* rather than a drawing — a wave has a phase, and advancing it
+    /// across frames is what makes smoke rise rather than merely sit there.
+    Wave,
 }
 
 impl BrushKind {
+    /// Every kind, in the order the Type picker offers them.
+    pub const ALL: [BrushKind; 7] = [
+        Self::Fluid,
+        Self::Normal,
+        Self::Raster,
+        Self::Pattern,
+        Self::Art,
+        Self::Effect,
+        Self::Wave,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Fluid => "Fluid",
+            Self::Normal => "Normal",
             Self::Pattern => "Pattern",
             Self::Art => "Art",
             Self::Raster => "Soft",
+            Self::Effect => "Effect",
+            Self::Wave => "Wave",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
             Self::Fluid => "A filled stroke that thins as you draw faster",
+            Self::Normal => "A filled stroke of one steady width, like a marker",
             Self::Pattern => "Repeats a shape along the stroke",
             Self::Art => "Stretches one shape over the whole stroke",
             Self::Raster => "Paints pixels with a soft edge, as an airbrush does",
+            Self::Effect => "Paints scenery: snow, clouds, skylines, lights",
+            Self::Wave => "Draws what flows: smoke, water, wavy hair — and animates it",
         }
+    }
+
+    /// Does this brush choose its own compositing, piece by piece, rather than
+    /// answering to the Build up setting?
+    pub fn composites_itself(self) -> bool {
+        matches!(self, Self::Effect | Self::Wave)
     }
 
     /// Does this brush stamp a source shape?
     pub fn uses_pattern(self) -> bool {
         matches!(self, Self::Pattern | Self::Art)
+    }
+
+    /// Does this brush draw a filled outline along the stroke — the two that
+    /// share the width, taper and viscosity settings?
+    pub fn is_outlined(self) -> bool {
+        matches!(self, Self::Fluid | Self::Normal)
     }
 }
 
@@ -179,6 +227,18 @@ pub struct BrushSettings {
     pub size: f64,
     /// `0.0`–`1.0`, matching Animate's Smoothing slider.
     pub smoothing: f64,
+    /// **How far the ink is dragged behind the pointer**, `0.0`–`1.0`.
+    ///
+    /// A separate dial from [`Self::smoothing`] because it is a separate
+    /// thing: smoothing evens out a line it can see all of, and a stabiliser
+    /// keeps the shake from reaching the paper in the first place by lagging.
+    /// See [`buzz_geom::Conditioning`].
+    pub stabiliser: f64,
+    /// How much the paint resists spreading. See
+    /// [`buzz_geom::BrushProfile::viscosity`].
+    pub viscosity: f64,
+    /// Which ends [`Self::taper`] applies to.
+    pub taper_ends: buzz_geom::TaperEnds,
     /// Narrowest width as a fraction of [`Self::size`].
     pub min_ratio: f64,
     /// How much of each end tapers to a point.
@@ -195,8 +255,20 @@ pub struct BrushSettings {
     pub pattern: PatternShape,
     /// Distance between stamps, in document units.
     pub spacing: f64,
-    /// Geometry for [`PatternShape::Custom`].
-    pub custom_pattern: Option<BezPath>,
+    /// The artwork for [`PatternShape::Custom`] — **with its paint**.
+    ///
+    /// Behind an `Arc` because a brush is copied wherever the style is, and a
+    /// brush made from a detailed drawing can carry a bitmap: sharing it makes
+    /// a style clone a pointer rather than a photograph.
+    pub custom_stamp: Option<std::sync::Arc<buzz_scene::BrushStamp>>,
+    /// Stamp the captured artwork's **own colours and textures** rather than
+    /// a silhouette in the fill swatch.
+    ///
+    /// On by default, because a brush made from a drawing that came out flat
+    /// grey is not the brush anyone was pointing at. Turned off it is
+    /// Animate's behaviour: the outline, painted by the current swatch — which
+    /// is what you want when the artwork is a shape you drew to *be* a nib.
+    pub keep_source_paint: bool,
     /// Paint that **builds up** where strokes overlap.
     ///
     /// With this on, a stroke at alpha 0.2 crossing one at 0.3 gives exactly
@@ -211,6 +283,19 @@ pub struct BrushSettings {
     pub hardness: f64,
     /// How much paint a soft brush lays down, `0.0`–`1.0`.
     pub flow: f64,
+    /// Which scenery the Effect brush paints. Only [`BrushKind::Effect`]
+    /// reads it.
+    pub effect: buzz_scene::EffectKind,
+    /// Which flowing thing the Wave brush draws. Only [`BrushKind::Wave`]
+    /// reads it, and it reads [`Self::wave_settings`] with it.
+    pub wave: buzz_scene::WaveKind,
+    /// How that wave is shaped — amplitude, wavelength, how many strands, and
+    /// how many frames a commit bakes.
+    ///
+    /// Kept beside the kind rather than inside it because the kind is a
+    /// *preset*: picking Smoke loads smoke-ish numbers here, and every one of
+    /// them is then a slider. See [`buzz_scene::WaveKind::preset`].
+    pub wave_settings: buzz_scene::WaveSettings,
 }
 
 impl Default for BrushSettings {
@@ -219,13 +304,19 @@ impl Default for BrushSettings {
             kind: BrushKind::default(),
             size: 12.0,
             smoothing: 0.5,
+            // Off unless asked for: a brush that trailed behind the pointer
+            // without being switched on reads as the application being slow.
+            stabiliser: 0.0,
+            viscosity: 0.65,
+            taper_ends: buzz_geom::TaperEnds::default(),
             min_ratio: 0.35,
             taper: 0.12,
             use_pressure: false,
             reference_speed: 900.0,
             pattern: PatternShape::default(),
             spacing: 12.0,
-            custom_pattern: None,
+            custom_stamp: None,
+            keep_source_paint: true,
             // Half soft: plainly a soft brush at a glance, and still definite
             // enough to draw an edge with.
             hardness: 0.5,
@@ -234,25 +325,56 @@ impl Default for BrushSettings {
             // whose overlaps silently deepen would surprise anyone who did
             // not ask for it.
             build_up: false,
+            effect: buzz_scene::EffectKind::default(),
+            wave: buzz_scene::WaveKind::default(),
+            wave_settings: buzz_scene::WaveSettings::default(),
         }
     }
 }
 
 impl BrushSettings {
-    /// The geometry profile for the fluid brush.
+    /// The geometry profile for the brushes that draw a filled outline.
     pub fn profile(&self) -> BrushProfile {
         BrushProfile {
             width: self.size.max(0.0),
             min_ratio: self.min_ratio.clamp(0.0, 1.0),
-            response: if self.use_pressure {
-                WidthResponse::Pressure
-            } else {
-                WidthResponse::Speed {
+            // A plain brush is one width all the way along — the response is
+            // exactly what it does not have.
+            response: match (self.kind, self.use_pressure) {
+                (BrushKind::Normal, _) => WidthResponse::Uniform,
+                (_, true) => WidthResponse::Pressure,
+                (_, false) => WidthResponse::Speed {
                     reference_speed: self.reference_speed.max(1.0),
-                }
+                },
             },
             smoothing: self.smoothing.clamp(0.0, 1.0),
+            stabiliser: self.stabiliser.clamp(0.0, 1.0),
             taper: self.taper.clamp(0.0, 0.5),
+            taper_ends: self.taper_ends,
+            viscosity: self.viscosity.clamp(0.0, 1.0),
+        }
+    }
+
+    /// How this brush wants raw pointer samples cleaned up — for the brushes
+    /// that stamp rather than outline, which have no profile to carry it.
+    pub fn conditioning(&self) -> buzz_geom::Conditioning {
+        buzz_geom::Conditioning {
+            smoothing: self.smoothing.clamp(0.0, 1.0),
+            stabiliser: self.stabiliser.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Choose which flowing thing the Wave brush draws, **and load its
+    /// preset**.
+    ///
+    /// Picking "Smoke" has to give you smoke, not the last wave's numbers
+    /// under a new name — a preset that does not load is a preset that is not
+    /// there. Re-picking the kind already chosen leaves the sliders alone, so
+    /// a tweaked wave is not thrown away by a stray click on its own name.
+    pub fn set_wave(&mut self, kind: buzz_scene::WaveKind) {
+        if self.wave != kind {
+            self.wave = kind;
+            self.wave_settings = kind.preset();
         }
     }
 
@@ -273,7 +395,10 @@ impl BrushSettings {
     /// leaving the user wondering.
     pub fn pattern_path(&self) -> Option<BezPath> {
         let base = match self.pattern {
-            PatternShape::Custom => self.custom_pattern.clone()?,
+            // The captured artwork's silhouette. Already centred and
+            // normalised in stamp space, so the scaling below is the identity
+            // apart from the size setting.
+            PatternShape::Custom => self.custom_stamp.as_ref()?.outline(),
             other => other.path()?,
         };
         if base.elements().is_empty() {
@@ -301,10 +426,37 @@ impl BrushSettings {
         }
     }
 
-    /// Adopt a shape from the document as the custom pattern.
-    pub fn set_custom_pattern(&mut self, path: BezPath) {
-        self.custom_pattern = Some(path);
+    /// The captured artwork, when a custom brush is the one selected.
+    pub fn pattern_stamp(&self) -> Option<&std::sync::Arc<buzz_scene::BrushStamp>> {
+        (self.pattern == PatternShape::Custom)
+            .then_some(self.custom_stamp.as_ref())
+            .flatten()
+    }
+
+    /// **Will this brush stamp the artwork's own colours and textures?**
+    ///
+    /// Only a captured brush can: there is nothing else with paint of its own
+    /// to keep. The three conditions are exactly the three things that have to
+    /// be true, and the caller uses this to choose between stamping artwork
+    /// and stamping an outline.
+    pub fn stamps_its_own_paint(&self) -> bool {
+        self.kind.uses_pattern()
+            && self.keep_source_paint
+            && self.pattern_stamp().is_some_and(|s| s.is_painted())
+    }
+
+    /// Adopt artwork from the document as the custom brush, paint and all.
+    pub fn set_custom_stamp(&mut self, stamp: buzz_scene::BrushStamp) {
+        self.custom_stamp = Some(std::sync::Arc::new(stamp));
         self.pattern = PatternShape::Custom;
+    }
+
+    /// Adopt a bare shape as the custom pattern, to be painted by the stroke's
+    /// own swatch. For the scripting API and for geometry with no paint.
+    pub fn set_custom_pattern(&mut self, path: BezPath) {
+        if let Some(stamp) = buzz_scene::BrushStamp::from_path(path) {
+            self.set_custom_stamp(stamp);
+        }
     }
 }
 
@@ -412,6 +564,84 @@ mod tests {
         assert_eq!(pattern.fit(), PatternFit::Repeat { spacing: 7.0 });
     }
 
+    /// **A normal brush is one steady width.** The whole difference between
+    /// it and the fluid brush, and it must hold whatever the speed and
+    /// pressure settings happen to say.
+    #[test]
+    fn a_normal_brush_ignores_speed_and_pressure() {
+        for use_pressure in [false, true] {
+            let settings = BrushSettings {
+                kind: BrushKind::Normal,
+                use_pressure,
+                ..Default::default()
+            };
+            assert_eq!(
+                settings.profile().response,
+                WidthResponse::Uniform,
+                "a normal brush must not answer to anything"
+            );
+        }
+
+        // And the fluid brush still does.
+        let fluid = BrushSettings {
+            kind: BrushKind::Fluid,
+            ..Default::default()
+        };
+        assert!(matches!(
+            fluid.profile().response,
+            WidthResponse::Speed { .. }
+        ));
+    }
+
+    /// Both outlined brushes share the width, taper and viscosity settings —
+    /// which is what the tool options key on to decide what to show.
+    #[test]
+    fn both_outlined_brushes_share_the_outline_settings() {
+        assert!(BrushKind::Fluid.is_outlined());
+        assert!(BrushKind::Normal.is_outlined());
+        for other in [
+            BrushKind::Pattern,
+            BrushKind::Art,
+            BrushKind::Raster,
+            BrushKind::Effect,
+            BrushKind::Wave,
+        ] {
+            assert!(!other.is_outlined(), "{other:?} does not draw an outline");
+        }
+    }
+
+    /// The taper mode, the viscosity and the stabiliser all have to reach the
+    /// geometry, or they are three sliders that do nothing.
+    #[test]
+    fn the_new_settings_reach_the_profile() {
+        let settings = BrushSettings {
+            kind: BrushKind::Normal,
+            taper: 0.3,
+            taper_ends: buzz_geom::TaperEnds::End,
+            viscosity: 0.8,
+            stabiliser: 0.45,
+            ..Default::default()
+        };
+        let profile = settings.profile();
+        assert_eq!(profile.taper_ends, buzz_geom::TaperEnds::End);
+        assert!((profile.viscosity - 0.8).abs() < 1e-9);
+        assert!((profile.stabiliser - 0.45).abs() < 1e-9);
+
+        // And the stamping brushes, which have no profile, still carry the
+        // same two conditioning dials.
+        let conditioning = settings.conditioning();
+        assert!((conditioning.stabiliser - 0.45).abs() < 1e-9);
+        assert!((conditioning.smoothing - settings.smoothing).abs() < 1e-9);
+    }
+
+    /// The stabiliser is off until it is asked for: a brush that lagged
+    /// without being switched on reads as the application being slow.
+    #[test]
+    fn the_stabiliser_is_off_by_default() {
+        assert_eq!(BrushSettings::default().stabiliser, 0.0);
+        assert_eq!(BrushSettings::default().profile().stabiliser, 0.0);
+    }
+
     /// Settings a user can drag to zero must not produce a nonsensical
     /// profile.
     #[test]
@@ -443,12 +673,70 @@ mod tests {
 
     #[test]
     fn brush_kinds_describe_themselves_for_the_tool_options() {
-        for kind in [BrushKind::Fluid, BrushKind::Pattern, BrushKind::Art] {
+        for kind in BrushKind::ALL {
             assert!(!kind.label().is_empty());
             assert!(!kind.description().is_empty());
         }
         assert!(!BrushKind::Fluid.uses_pattern());
         assert!(BrushKind::Pattern.uses_pattern());
         assert!(BrushKind::Art.uses_pattern());
+    }
+
+    /// Every brush the settings can describe must be offered by the picker —
+    /// the soft brush existed for a whole phase without being reachable, and
+    /// this is the test that would have said so.
+    #[test]
+    fn the_type_picker_offers_every_brush_kind() {
+        for kind in [
+            BrushKind::Fluid,
+            BrushKind::Pattern,
+            BrushKind::Art,
+            BrushKind::Raster,
+            BrushKind::Effect,
+            BrushKind::Wave,
+        ] {
+            assert!(
+                BrushKind::ALL.contains(&kind),
+                "{kind:?} is not offered in the Type picker"
+            );
+        }
+    }
+
+    /// Picking a wave kind has to bring its preset with it, and re-picking the
+    /// one already chosen has to leave a tweaked wave alone.
+    #[test]
+    fn choosing_a_wave_kind_loads_its_preset_without_discarding_tweaks() {
+        let mut settings = BrushSettings::default();
+        settings.set_wave(buzz_scene::WaveKind::River);
+        assert_eq!(settings.wave, buzz_scene::WaveKind::River);
+        assert_eq!(
+            settings.wave_settings,
+            buzz_scene::WaveKind::River.preset(),
+            "picking a kind must load its preset"
+        );
+
+        settings.wave_settings.amplitude = 4.25;
+        settings.set_wave(buzz_scene::WaveKind::River);
+        assert_eq!(
+            settings.wave_settings.amplitude, 4.25,
+            "re-picking the same kind threw away a tweaked wave"
+        );
+    }
+
+    /// The two brushes that composite themselves piece by piece are the two
+    /// that must not be offered the Build up switch — it would be a lie there.
+    #[test]
+    fn the_generated_brushes_composite_themselves() {
+        assert!(BrushKind::Effect.composites_itself());
+        assert!(BrushKind::Wave.composites_itself());
+        for other in [
+            BrushKind::Fluid,
+            BrushKind::Normal,
+            BrushKind::Pattern,
+            BrushKind::Art,
+            BrushKind::Raster,
+        ] {
+            assert!(!other.composites_itself(), "{other:?}");
+        }
     }
 }

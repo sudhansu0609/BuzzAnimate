@@ -32,6 +32,8 @@ pub enum ToolId {
     Bone,
     /// Animate's Asset Warp: handles dropped on artwork, dragged to deform it.
     AssetWarp,
+    /// Draw a curve; the selected object is baked travelling along it.
+    MotionPath,
     PaintBucket,
     InkBottle,
     Eyedropper,
@@ -73,6 +75,7 @@ impl ToolId {
             Brush => "Brush",
             Bone => "Bone",
             AssetWarp => "Asset Warp",
+            MotionPath => "Motion Path",
             PaintBucket => "Paint Bucket",
             InkBottle => "Ink Bottle",
             Eyedropper => "Eyedropper",
@@ -105,6 +108,9 @@ impl ToolId {
             Bone => Some(Key::M),
             // Animate's own letter for Asset Warp.
             AssetWarp => Some(Key::W),
+            // Animate has no motion-path tool; J is free and next to nothing
+            // that would be confused with it.
+            MotionPath => Some(Key::J),
             PaintBucket => Some(Key::K),
             InkBottle => Some(Key::S),
             Eyedropper => Some(Key::I),
@@ -150,6 +156,7 @@ impl ToolId {
             Brush => "B",
             Bone => "M",
             AssetWarp => "W",
+            MotionPath => "J",
             PaintBucket => "K",
             InkBottle => "S",
             Eyedropper => "I",
@@ -166,7 +173,7 @@ impl ToolId {
         match self {
             Selection | Subselection | Lasso | MagicWand | FreeTransform | Line | Rectangle
             | Oval | PolyStar | Pencil | Brush | Eraser | PaintBucket | InkBottle | Eyedropper
-            | Hand | Zoom | Pen | Camera | Bone | AssetWarp | GradientTransform => {
+            | Hand | Zoom | Pen | Camera | Bone | AssetWarp | MotionPath | GradientTransform => {
                 ToolStatus::Ready
             }
             Text => ToolStatus::Planned("Text arrives with Phase 2 follow-up"),
@@ -219,7 +226,7 @@ pub const TOOL_GROUPS: &[&[ToolId]] = &[
         ToolId::PolyStar,
     ],
     &[ToolId::Pencil, ToolId::Brush],
-    &[ToolId::Bone, ToolId::AssetWarp],
+    &[ToolId::Bone, ToolId::AssetWarp, ToolId::MotionPath],
     &[
         ToolId::PaintBucket,
         ToolId::InkBottle,
@@ -255,8 +262,8 @@ mod tests {
         );
         // 21 through Phase 5, plus Asset Warp when rigging landed in Phase 7,
         // plus the Lasso and the Magic Wand once bitmaps arrived and there was
-        // something for them to cut.
-        assert_eq!(tools.len(), 23, "unexpected tool count");
+        // something for them to cut, plus the Motion Path tool.
+        assert_eq!(tools.len(), 24, "unexpected tool count");
     }
 
     /// **Two *object* selection tools, and only two.** Animate's first group is

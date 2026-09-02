@@ -25,8 +25,10 @@
 //! [`SpatialIndex`] records the revision it was built from, so a consumer can
 //! tell whether what it holds is current instead of trusting it blindly.
 
+pub mod art;
 pub mod bucket;
 pub mod camera_track;
+pub mod effect_brush;
 pub mod gradient;
 pub mod image;
 pub mod index;
@@ -35,14 +37,17 @@ pub mod looping;
 pub mod merge;
 pub mod object;
 pub mod post;
+pub mod modifier;
 pub mod raster;
 pub mod rig;
 pub mod sound;
+pub mod stamp;
 pub mod swatch;
 pub mod symbol;
 pub mod timeline;
 pub mod tween;
 pub mod wand;
+pub mod wave;
 
 use std::sync::Arc;
 
@@ -56,7 +61,10 @@ use serde::{Deserialize, Serialize};
 
 pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, Quality};
 pub use buzz_light::{Light, LightId, LightKey, LightKind, LightRig, LightTrack};
+pub use art::ArtPiece;
 pub use bucket::{Boundary, GapSize, fill_region};
+pub use effect_brush::{EffectKind, EffectStroke, effect_artwork};
+pub use stamp::{BrushStamp, StampedArt};
 pub use camera_track::{
     CameraKey, CameraTrack, DEFAULT_FOCAL_DISTANCE, MAX_TILT, NamedAngle,
 };
@@ -68,6 +76,7 @@ pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
 pub use looping::{LoopRegion, MAX_REPEATS};
 pub use merge::{ImportTarget, MergeReport};
+pub use modifier::Modifier;
 pub use object::{
     FillSpec, Object, ObjectId, ObjectKind, Paint, PaintBlend, ShapeData, Spatial, StrokeSpec,
 };
@@ -82,6 +91,7 @@ pub use symbol::{
 pub use timeline::{FrameKind, Keyframe, LayerTimeline, ResolvedFrame, TweenSpan};
 pub use tween::{Easing, Tween, TweenKind};
 pub use wand::{WandOptions, region_at as wand_region};
+pub use wave::{WaveKind, WaveSettings, WaveStroke, wave_artwork, wave_bounds, wave_loop};
 
 /// Stage setup, matching Animate's Document Properties dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -243,6 +253,12 @@ pub struct Scene {
     /// steady document pays for it once. Interior-mutable and never part of the
     /// document's identity — not serialised, not compared, not undone.
     bounds_cache: std::sync::RwLock<Option<(u64, Arc<BoundsTable>)>>,
+    /// Memoised live-spring pose sequences, tagged with the revision they were
+    /// built for. A spring modifier must be integrated forward across the whole
+    /// span, which is too costly to redo for every ghost and scrub; computed
+    /// once per `(object, chain root)` and held here. Interior-mutable and never
+    /// part of the document's identity — same rules as [`Self::bounds_cache`].
+    modifier_cache: std::sync::RwLock<Option<(u64, crate::modifier::SpringTable)>>,
 }
 
 impl Clone for Scene {
@@ -264,6 +280,7 @@ impl Clone for Scene {
             // A fresh, empty cache: a snapshot rebuilds its own on first use,
             // so a clone shares no mutable state with the scene it came from.
             bounds_cache: std::sync::RwLock::new(None),
+            modifier_cache: std::sync::RwLock::new(None),
         }
     }
 }
@@ -335,6 +352,7 @@ impl Default for Scene {
             editing: Vec::new(),
             edit_places: Vec::new(),
             bounds_cache: std::sync::RwLock::new(None),
+            modifier_cache: std::sync::RwLock::new(None),
         };
         // Animate starts every document with one layer named "Layer_1".
         scene.add_layer("Layer_1", LayerKind::Normal);
@@ -364,6 +382,7 @@ impl Scene {
             editing: Vec::new(),
             edit_places: Vec::new(),
             bounds_cache: std::sync::RwLock::new(None),
+            modifier_cache: std::sync::RwLock::new(None),
         }
     }
 
@@ -1231,6 +1250,35 @@ impl Scene {
         self.active_layers_mut().push_front(layer);
         self.bump();
         id
+    }
+
+    /// Add a layer to the **document's own** timeline, whatever is open for
+    /// editing.
+    ///
+    /// [`Self::add_layer`] adds to whichever timeline is being edited, which is
+    /// right for artwork: a layer made while a character symbol is open belongs
+    /// inside that character. Sound is the exception. What plays and what is
+    /// exported is [`Self::stage_cues`], which reads the document's timeline and
+    /// nothing else, so a sound layer made inside a symbol would be neither
+    /// heard nor written.
+    pub fn add_stage_layer(&mut self, name: impl Into<String>, kind: LayerKind) -> LayerId {
+        let id = LayerId(self.ids.take());
+        let mut layer = Layer::new(id, name, kind);
+        layer.color = crate::layer::default_color(self.stage_layers().len());
+        self.layers.push_front(layer);
+        self.bump();
+        id
+    }
+
+    /// Edit a layer on the document's own timeline, whatever is open for
+    /// editing. The companion to [`Self::add_stage_layer`], and there for the
+    /// same reason.
+    pub fn update_stage_layer(&mut self, id: LayerId, f: impl FnOnce(&mut Layer)) -> bool {
+        let changed = self.layers.update(id, f);
+        if changed {
+            self.bump();
+        }
+        changed
     }
 
     pub fn remove_layer(&mut self, id: LayerId) -> Option<Arc<Layer>> {

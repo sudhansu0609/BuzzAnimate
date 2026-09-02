@@ -12,6 +12,7 @@ buzz-geom.workspace = true
 buzz-rig.workspace = true
 buzz-light.workspace = true
 buzz-fx.workspace = true
+buzz-physics.workspace = true
 
 kurbo.workspace = true
 peniko.workspace = true

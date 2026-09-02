@@ -60,6 +60,7 @@ pub fn tool_shapes(rect: Rect, tool: ToolId, color: Color32) -> Vec<Shape> {
         Brush => brush(&d),
         Bone => bone(&d),
         AssetWarp => warp(&d),
+        MotionPath => motion_path(&d),
         PaintBucket => bucket(&d),
         InkBottle => ink_bottle(&d),
         Eyedropper => eyedropper(&d),
@@ -211,6 +212,23 @@ fn magic_wand(d: &Draw) {
     ] {
         d.hairline(a, b);
     }
+}
+
+/// A curving path with a start dot and an arrowhead: something travelling along
+/// a route, which is exactly what the tool bakes.
+fn motion_path(d: &Draw) {
+    // An S-curve climbing from lower-left to upper-right.
+    d.curve(&[
+        (0.16, 0.82),
+        (0.30, 0.56),
+        (0.50, 0.62),
+        (0.66, 0.38),
+        (0.78, 0.26),
+    ]);
+    // Where it starts.
+    d.circle((0.16, 0.82), 0.05, true);
+    // The arrowhead at the end, pointing up the path's heading.
+    d.solid(&[(0.86, 0.18), (0.70, 0.26), (0.78, 0.38)]);
 }
 
 /// A box with corner handles: the transform frame Animate puts round a

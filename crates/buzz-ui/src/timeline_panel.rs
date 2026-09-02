@@ -12,7 +12,7 @@
 //! | Hollow rectangle | Last frame of a span |
 //! | Empty cell | The layer does not reach here |
 
-use buzz_scene::{FrameKind, LayerId, LayerKind, LoopRegion, MAX_REPEATS, Scene};
+use buzz_scene::{FrameKind, LayerId, LayerKind, Light, LightId, LoopRegion, MAX_REPEATS, Scene};
 use egui::{Align2, Color32, FontId, Sense, Stroke, StrokeKind, Ui};
 
 use crate::theme::{Metrics, Palette};
@@ -27,6 +27,12 @@ pub struct TimelineResponse {
     pub select_camera: bool,
     /// A layer row was clicked.
     pub select_layer: Option<LayerId>,
+    /// A light's channel was clicked: make it the selected light.
+    pub select_light: Option<LightId>,
+    /// Add a keyframe to this light at this frame (from the channel's menu).
+    pub light_key: Option<(LightId, u32)>,
+    /// Remove this light's keyframe at this frame.
+    pub light_unkey: Option<(LightId, u32)>,
     /// The parenting view was switched on or off.
     pub toggle_parenting: bool,
     /// The depth view was switched on or off.
@@ -146,6 +152,9 @@ pub struct TimelineState {
     /// The camera row is the selected one, so the camera is what the Camera
     /// menu's keyframe commands act on.
     pub camera_selected: bool,
+    /// Which light's channel is highlighted — the one the light keyframe
+    /// commands act on, and the one whose row is always shown so it can be keyed.
+    pub selected_light: Option<LightId>,
     pub playing: bool,
     pub onion_enabled: bool,
     /// Auto Keyframe: changing artwork at a frame with no keyframe of its own
@@ -443,6 +452,28 @@ pub fn timeline_panel(ui: &mut Ui, scene: &Scene, state: &TimelineState) -> Time
             // only on the document's own timeline. See [`shows_camera_row`].
             if shows_camera_row(scene) {
                 camera_row(ui, scene, columns, state, &mut response);
+            }
+
+            // A channel per light that is already keyed, plus the one currently
+            // selected so it can be keyed — on the document timeline only, since
+            // lights are global. Cloned ids first to avoid holding a scene borrow
+            // across the row draws.
+            if scene.edit_path().is_empty() {
+                let lit: Vec<LightId> = scene
+                    .lights()
+                    .lights
+                    .iter()
+                    .filter(|l| {
+                        l.track.as_ref().is_some_and(|t| !t.keys().is_empty())
+                            || Some(l.id) == state.selected_light
+                    })
+                    .map(|l| l.id)
+                    .collect();
+                for id in lit {
+                    if let Some(light) = scene.lights().lights.iter().find(|l| l.id == id) {
+                        light_row(ui, scene, light, columns, state, &mut response);
+                    }
+                }
             }
 
             // The node table is rebuilt every frame the view is on: rows come
@@ -1235,6 +1266,110 @@ fn camera_row(
             out.scrub_to = Some(frame.min(columns.saturating_sub(1)));
         }
     }
+}
+
+/// A light's row: its keyframes on the timeline, the same way the camera's are.
+///
+/// Shown for any light that is keyed, plus the selected one so it can be keyed
+/// in the first place. Clicking selects the light and scrubs; the right-click
+/// menu adds or removes a key at the frame under the pointer.
+fn light_row(
+    ui: &mut Ui,
+    scene: &Scene,
+    light: &Light,
+    columns: u32,
+    state: &TimelineState,
+    out: &mut TimelineResponse,
+) {
+    let _ = scene;
+    let height = Metrics::LAYER_ROW * state.row_scale;
+    let cell_width = state.frame_width;
+    let width = columns as f32 * cell_width;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(LAYER_COLUMN + width, height), Sense::click());
+    let pinned_left = ui.clip_rect().min.x;
+    let name_row = egui::Rect::from_min_size(
+        egui::pos2(pinned_left, rect.min.y),
+        egui::vec2(LAYER_COLUMN, height),
+    );
+    let grid_left = rect.min.x + LAYER_COLUMN;
+    let painter = ui.painter_at(
+        egui::Rect::from_min_max(egui::pos2(pinned_left + LAYER_COLUMN, rect.min.y), rect.max)
+            .intersect(ui.clip_rect()),
+    );
+
+    let track = light.track.as_ref();
+    let has_key = |frame: u32| track.is_some_and(|t| t.has_key_at(frame));
+    let is_empty = track.is_none_or(|t| t.is_empty());
+    let last = track.map_or(0, |t| t.last_frame());
+    // A warm amber for the interpolated run, distinct from the camera's blue.
+    let tint = Color32::from_rgb(0x63, 0x54, 0x2A);
+
+    for frame in visible_columns(ui.clip_rect(), grid_left, cell_width, columns) {
+        let x = grid_left + frame as f32 * cell_width;
+        let cell =
+            egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(cell_width, height));
+        let kind = if has_key(frame) {
+            FrameKind::Keyframe
+        } else if !is_empty && frame < last {
+            FrameKind::Span
+        } else if !is_empty && frame == last {
+            FrameKind::SpanEnd
+        } else {
+            FrameKind::Empty
+        };
+        let tween = (!is_empty && frame <= last && !has_key(frame)).then_some(TweenCell {
+            tint,
+            complete: true,
+            arrow: false,
+        });
+        draw_frame_cell(&painter, cell, kind, tween, frame == state.current_frame);
+    }
+
+    let names = ui.painter_at(name_row.intersect(ui.clip_rect()));
+    names.rect_filled(
+        name_row,
+        0.0,
+        if Some(light.id) == state.selected_light {
+            Color32::from_rgb(0x35, 0x61, 0x91)
+        } else {
+            NAMES_BG
+        },
+    );
+    names.text(
+        egui::pos2(name_row.min.x + 4.0, name_row.center().y),
+        Align2::LEFT_CENTER,
+        &light.name,
+        FontId::proportional(11.0),
+        Palette::text(),
+    );
+
+    if response.clicked() {
+        out.select_light = Some(light.id);
+        if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
+            && pos.x > grid_left
+        {
+            let frame = ((pos.x - grid_left) / cell_width) as u32;
+            out.scrub_to = Some(frame.min(columns.saturating_sub(1)));
+        }
+    }
+
+    let id = light.id;
+    let menu_frame = response
+        .interact_pointer_pos()
+        .filter(|p| p.x > grid_left)
+        .map(|p| (((p.x - grid_left) / cell_width) as u32).min(columns.saturating_sub(1)))
+        .unwrap_or(state.current_frame);
+    response.context_menu(|ui| {
+        if ui.button("Add Keyframe Here").clicked() {
+            out.light_key = Some((id, menu_frame));
+            ui.close();
+        }
+        if has_key(menu_frame) && ui.button("Remove Keyframe").clicked() {
+            out.light_unkey = Some((id, menu_frame));
+            ui.close();
+        }
+    });
 }
 
 /// One layer's row: name on the left, frames on the right.
@@ -2140,6 +2275,7 @@ mod tests {
             current_frame: 4,
             active_layer: None,
             camera_selected: false,
+            selected_light: None,
             playing: false,
             onion_enabled: false,
             auto_keyframe: false,
@@ -2423,6 +2559,7 @@ mod tests {
 
         let selected = TimelineState {
             camera_selected: true,
+            selected_light: None,
             ..state()
         };
         let _ = ctx.run_ui(Default::default(), |ui| {

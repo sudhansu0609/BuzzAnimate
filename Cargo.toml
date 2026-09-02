@@ -92,6 +92,8 @@ buzz-rig = { path = "crates/buzz-rig" }
 buzz-audio = { path = "crates/buzz-audio" }
 buzz-light = { path = "crates/buzz-light" }
 buzz-fx = { path = "crates/buzz-fx" }
+buzz-act = { path = "crates/buzz-act" }
+buzz-physics = { path = "crates/buzz-physics" }
 
 [profile.dev]
 opt-level = 1

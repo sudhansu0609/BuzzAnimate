@@ -64,6 +64,9 @@ pub struct ExportState {
     pub to_frame: u32,
     /// The stage size the sizes were derived from, so the ratio survives.
     stage: (u32, u32),
+    /// How long the film is, remembered from the last `open`. See
+    /// [`Self::frame_count`].
+    frames: u32,
     /// A run in progress: frames done, frames total.
     pub progress: Option<(u32, u32)>,
     /// Video settings. Remembered between exports, unlike the size — a codec
@@ -79,6 +82,12 @@ pub struct ExportState {
     pub ffmpeg: bool,
     /// The name being typed for "save these settings as a preset".
     pub preset_name: String,
+    /// **Which preset the settings currently came from**, by name.
+    ///
+    /// By name rather than by index: the list is the built-ins followed by the
+    /// user's own, so saving or removing one shifts every index after it and a
+    /// remembered number would start pointing at a different preset.
+    pub selected_preset: Option<String>,
 }
 
 /// The video choices the dialog offers.
@@ -215,12 +224,14 @@ impl Default for ExportState {
             from_frame: 0,
             to_frame: 0,
             stage: (550, 400),
+            frames: 1,
             progress: None,
             video: VideoOptions::default(),
             gif: GifOptions::default(),
             webp: WebpOptions::default(),
             ffmpeg: true,
             preset_name: String::new(),
+            selected_preset: None,
         }
     }
 }
@@ -233,12 +244,42 @@ impl ExportState {
     /// resized is a silent way to produce the wrong file.
     pub fn open(&mut self, kind: ExportKind, stage: (u32, u32), frame_count: u32) {
         self.open = Some(kind);
+        self.frames = frame_count.max(1);
         self.stage = (stage.0.max(1), stage.1.max(1));
         self.width = self.stage.0;
         self.height = self.stage.1;
         self.from_frame = 0;
         self.to_frame = frame_count.saturating_sub(1);
         self.progress = None;
+        // The size has just been reset to the stage, so whatever preset was
+        // showing no longer describes these settings.
+        self.selected_preset = None;
+    }
+
+    /// The frames this document has, remembered from the last `open`.
+    ///
+    /// A preset can change the export from one frame to a whole film —
+    /// "GIF preview" chosen while Export Image was open — and the range
+    /// fields were then still whatever the single-frame export left them at,
+    /// which is frame zero to frame zero. One frame of GIF.
+    pub fn frame_count(&self) -> u32 {
+        self.frames
+    }
+
+    /// Everything a preset sets, as one comparable value.
+    ///
+    /// The frame range is deliberately not in it: a preset does not carry one,
+    /// so narrowing the range does not stop the settings being that preset.
+    fn fingerprint(&self) -> (Option<ExportKind>, u32, u32, bool, VideoOptions, GifOptions, WebpOptions) {
+        (
+            self.open,
+            self.width,
+            self.height,
+            self.transparent,
+            self.video,
+            self.gif,
+            self.webp,
+        )
     }
 
     pub fn close(&mut self) {
@@ -333,7 +374,18 @@ pub fn export_dialog(
                 return;
             }
             preset_view(ui, state, presets, &mut response);
+            // **Edit a setting by hand and it is no longer that preset.**
+            //
+            // Otherwise the box goes on naming "YouTube 1080p" over a height
+            // the user has since changed, and the one thing it is there to say
+            // \u2014 what these settings are \u2014 is wrong. Compared rather than
+            // hooked into every control: there are a dozen of them and a
+            // forgotten one would be this bug again.
+            let before = state.fingerprint();
             settings_view(ui, kind, state, &mut response);
+            if state.fingerprint() != before {
+                state.selected_preset = None;
+            }
         });
 
     // The window's own close button counts as cancelling.
@@ -356,16 +408,41 @@ fn preset_view(
 ) {
     ui.horizontal(|ui| {
         ui.label("Preset");
+        // **What is showing is what is selected.** Every entry used to be drawn
+        // unselected and the box always read "Choose", so choosing one gave no
+        // sign that anything had happened: the settings below did change, but
+        // nothing said which preset they had come from, and opening the box
+        // again showed nothing ticked either. A preset that is applied and then
+        // immediately forgotten by the only part of the dialog that could show
+        // it is a preset that, as far as the user can tell, was never selected.
+        //
+        // A remembered name no longer in the list \u2014 a user preset since
+        // removed \u2014 falls back to the prompt rather than naming something
+        // that is not there.
+        let shown = state
+            .selected_preset
+            .as_deref()
+            .filter(|name| presets.iter().any(|p| p == name))
+            .unwrap_or("Choose\u{2026}");
         egui::ComboBox::from_id_salt("export-preset")
-            .selected_text("Choose\u{2026}")
+            .selected_text(shown)
             .width(220.0)
             .show_ui(ui, |ui| {
                 for (i, name) in presets.iter().enumerate() {
-                    if ui.selectable_label(false, name).clicked() {
+                    let current = state.selected_preset.as_deref() == Some(name.as_str());
+                    if ui.selectable_label(current, name).clicked() {
                         response.apply_preset = Some(i);
                     }
                 }
             });
+        if state.selected_preset.is_some()
+            && ui
+                .small_button("\u{2715}")
+                .on_hover_text("Forget the preset; keep these settings")
+                .clicked()
+        {
+            state.selected_preset = None;
+        }
     });
 
     ui.horizontal(|ui| {

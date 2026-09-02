@@ -114,7 +114,12 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
             );
     }
 
-    ui.horizontal(|ui| {
+    // **Wrapped, not in one row.** Five buttons side by side are wider than the
+    // narrowest column the dock allows, so in a narrow dock the last of them —
+    // Gloom and Fire — were simply off the edge of the panel with no way to
+    // reach them. Wrapping costs a line of height when the column is narrow and
+    // nothing at all when it is not.
+    ui.horizontal_wrapped(|ui| {
         if ui
             .small_button("+ Sun")
             .on_hover_text("Parallel light: one direction everywhere, one shadow direction")
@@ -338,11 +343,20 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
                         )
                         .changed();
                 });
+                // **Front and back.** A lamp is a point in three dimensions:
+                // `position` is where it stands across the stage and this is
+                // how far in front of it. Dragging the stalk on the stage sets
+                // the same number \u{2014} see `crate::lights::LightGesture::Raise`.
                 ui.horizontal(|ui| {
-                    ui.label("Height");
+                    ui.label("Forward");
                     changed |= ui
-                        .add(egui::Slider::new(height, 20.0..=1200.0).suffix(" px"))
-                        .on_hover_text("How far in front of the stage it hangs")
+                        .add(egui::Slider::new(height, 4.0..=1200.0).suffix(" px"))
+                        .on_hover_text(
+                            "How far in front of the stage it hangs. Close in, its light \
+                             falls off hard across the picture and its shadows splay; far \
+                             back, it behaves more and more like a sun. Draggable on the \
+                             stage by the stalk on the lamp.",
+                        )
                         .changed();
                 });
                 ui.horizontal(|ui| {
@@ -497,6 +511,24 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
                 changed |= ui
                     .add(egui::Slider::new(&mut edited.softness, 0.02..=0.9).fixed_decimals(2))
                     .on_hover_text("How wide the shaded edge is. Narrow reads as a hard light.")
+                    .changed();
+            });
+
+            // **The one thing lighting does that leaves the silhouette
+            // bright.** Everything else \u{2014} the tint, the terminator, the
+            // highlight \u{2014} happens inside the line, so a lit drawing could
+            // never come up brighter than the picture around it. See
+            // `buzz_light::rim_glow`.
+            ui.horizontal(|ui| {
+                ui.label("Edge glow");
+                changed |= ui
+                    .add(egui::Slider::new(&mut edited.rim, 0.0..=1.0).fixed_decimals(2))
+                    .on_hover_text(
+                        "A glow around the outside edge of everything this light reaches, in \
+                         its colour \u{2014} Animate's Glow filter, laid by the light instead of \
+                         by hand. It comes up as the light comes up and falls off with it, so \
+                         a figure walking out of a lamp loses its rim on the way. Zero is off.",
+                    )
                     .changed();
             });
         }

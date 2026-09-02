@@ -47,19 +47,14 @@ fn editor_with_dialogue() -> (Editor, tempfile::TempDir) {
     std::fs::write(&path, dialogue_wav()).expect("write wav");
 
     let mut editor = Editor::default();
-    // The audio layer, on the root timeline.
-    let audio_layer = {
-        let mut made = None;
-        editor.doc.edit("Audio layer", |scene| {
-            made = Some(scene.add_layer("Audio", LayerKind::Normal));
-        });
-        made.expect("a layer")
-    };
-    editor.selection.set_active_layer(Some(audio_layer));
-
+    // **Importing is all it takes.** The sound arrives in the library *and* on
+    // a layer of its own on the root timeline, cued from frame one, which is
+    // what makes it audible on playback and present in an export. This fixture
+    // used to make an audio layer and run Attach Sound to Frame by hand; doing
+    // both now would cue the same line twice.
     let name = editor.import_sound(&path).expect("the sound should import");
     assert_eq!(name, "line");
-    editor.run(buzz_ui::Command::AttachSound);
+    assert!(editor.sound_was_placed(), "the import placed it as well");
 
     (editor, dir)
 }
@@ -95,6 +90,7 @@ fn character_with_head(editor: &mut Editor) -> (buzz_scene::SymbolId, buzz_scene
                         blend: Default::default(),
                         spatial: Default::default(),
                         pivot: None,
+                        modifiers: Vec::new(),
                     })],
                 );
             });
@@ -281,15 +277,15 @@ fn lip_sync_inside_the_head_symbol_uses_the_root_dialogue() {
     editor.doc.edit_view(|scene| {
         scene.edit_document();
     });
-    let root_audio = editor
-        .scene()
-        .layers()
-        .iter()
-        .find(|l| l.name == "Audio")
-        .expect("the audio layer")
-        .clone();
+    // Found by what is on it rather than by its name: the import names the
+    // layer after the sound, and a test that hard-codes "Audio" is a test of
+    // the naming rather than of the timeline.
     assert!(
-        root_audio.frames.keyframes()[0].sound.is_some(),
+        editor
+            .scene()
+            .layers()
+            .iter()
+            .any(|l| l.frames.keyframes().iter().any(|k| k.sound.is_some())),
         "the dialogue should still be on the root"
     );
 }

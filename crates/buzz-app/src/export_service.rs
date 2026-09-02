@@ -60,9 +60,12 @@ impl ExportTarget {
 
 /// One export, everything it needs owned outright so it can cross to its thread.
 pub struct ExportRequest {
-    /// A copy-on-write snapshot — pointer copies, not the artwork — so the user
-    /// can keep editing while it renders.
-    pub scene: Scene,
+    /// **The film's scenes, in the order they play.**
+    ///
+    /// Copy-on-write snapshots — pointer copies, not the artwork — so the user
+    /// can keep editing while it renders. A film of one scene is the ordinary
+    /// case and behaves exactly as a single-scene export always did.
+    pub scenes: Vec<Scene>,
     pub settings: ExportSettings,
     /// The frames to render, for everything but a single image.
     pub range: std::ops::Range<u32>,
@@ -190,7 +193,7 @@ impl ExportQueue {
 /// Do the export. Runs on a task thread; reports through `ctx`.
 pub fn run_export(request: ExportRequest, ctx: &TaskCtx) -> TaskOutcome {
     let ExportRequest {
-        scene,
+        scenes,
         settings,
         range,
         target,
@@ -198,18 +201,23 @@ pub fn run_export(request: ExportRequest, ctx: &TaskCtx) -> TaskOutcome {
         label: _,
     } = request;
 
+    // The film: every scene end to end, each still resolving its own looping
+    // section. Built here rather than by the caller because it borrows the
+    // scenes, and the scenes had to cross to this thread owned.
+    let reel = buzz_export::Reel::of(scenes.iter());
+
     let result = match target {
-        ExportTarget::Image { frame, path } => run_image(&scene, frame, &path, &settings, &gpu, ctx),
+        ExportTarget::Image { frame, path } => run_image(&reel, frame, &path, &settings, &gpu, ctx),
         ExportTarget::Sequence {
             directory,
             base_name,
-        } => run_sequence(&scene, range, &directory, &base_name, &settings, &gpu, ctx),
+        } => run_sequence(&reel, range, &directory, &base_name, &settings, &gpu, ctx),
         ExportTarget::Video { path, video } => {
-            run_video(&scene, range, &path, &settings, &video, &gpu, ctx)
+            run_video(&reel, range, &path, &settings, &video, &gpu, ctx)
         }
         ExportTarget::Gif { path, gif } => {
             let report = buzz_export::export_gif(
-                &scene,
+                &reel,
                 range,
                 &path,
                 &settings,
@@ -221,7 +229,7 @@ pub fn run_export(request: ExportRequest, ctx: &TaskCtx) -> TaskOutcome {
         }
         ExportTarget::Webp { path, webp } => {
             let report = buzz_export::export_webp(
-                &scene,
+                &reel,
                 range,
                 &path,
                 &settings,
@@ -258,15 +266,20 @@ fn report_progress(ctx: &TaskCtx) -> impl FnMut(u32, u32) -> bool + '_ {
 }
 
 fn run_image(
-    scene: &Scene,
+    reel: &buzz_export::Reel<'_>,
     frame: u32,
     path: &Path,
     settings: &ExportSettings,
     gpu: &GpuPreference,
     ctx: &TaskCtx,
 ) -> anyhow::Result<String> {
+    // A film frame, so a still taken from the third scene is the third
+    // scene — see `ExportTarget::Image`.
+    let (scene, at) = reel
+        .at_clamped(frame)
+        .context("there are no frames to export")?;
     let mut exporter = buzz_export::Exporter::new(gpu)?;
-    let rendered = exporter.render(scene, frame, settings)?;
+    let rendered = exporter.render(scene, at, settings)?;
     rendered.write_png(path)?;
     ctx.progress.set(1, 1);
     Ok(format!(
@@ -278,7 +291,7 @@ fn run_image(
 }
 
 fn run_sequence(
-    scene: &Scene,
+    reel: &buzz_export::Reel<'_>,
     range: std::ops::Range<u32>,
     directory: &Path,
     base_name: &str,
@@ -287,7 +300,7 @@ fn run_sequence(
     ctx: &TaskCtx,
 ) -> anyhow::Result<String> {
     let report = buzz_export::export_sequence(
-        scene,
+        reel,
         range,
         directory,
         base_name,
@@ -309,7 +322,7 @@ fn run_sequence(
 }
 
 fn run_video(
-    scene: &Scene,
+    reel: &buzz_export::Reel<'_>,
     range: std::ops::Range<u32>,
     path: &Path,
     settings: &ExportSettings,
@@ -320,13 +333,13 @@ fn run_video(
     // Held for the whole encode; dropping it removes the soundtrack files.
     let scratch = tempfile::tempdir().context("making room for the soundtrack")?;
     let audio = if video.audio {
-        soundtrack(scene, &range, scratch.path())?
+        soundtrack(reel, &range, scratch.path())?
     } else {
         Vec::new()
     };
 
     let report = buzz_export::export_video(
-        scene,
+        reel,
         range,
         path,
         settings,
@@ -360,35 +373,56 @@ fn run_video(
 ///
 /// The document's cues, resolved through the same rules the player uses — so
 /// what is in the file is what was heard while animating. Offsets are measured
-/// from the start of the exported range, a cue before the range is dropped
+/// from the start of the exported range, a cue outside the range is dropped
 /// rather than clamped, and stop cues never arrive here because `stage_cues`
 /// drops them. (Moved here from the retired `export_job`; the reasoning is the
 /// same, and is set out at length in PROGRESS.md §4 and §7.)
+///
+/// # Across scenes
+///
+/// **A cue belongs to its scene, not to the film.** A line of dialogue on
+/// frame 3 of the third shot is heard when the third shot reaches its frame 3,
+/// which is a long way into the film — so every cue is carried through the
+/// reel to find where its own scene lands. Getting this wrong would play the
+/// whole conversation on top of the opening shot.
+///
+/// Two scenes can name the same sound file, so the files are written under a
+/// name that includes the scene: writing both to one path would leave whichever
+/// was written last standing in for both.
 fn soundtrack(
-    scene: &Scene,
+    reel: &buzz_export::Reel<'_>,
     frames: &std::ops::Range<u32>,
     scratch: &Path,
 ) -> anyhow::Result<Vec<buzz_export::AudioTrack>> {
-    let fps = scene.stage().frame_rate.max(1.0);
+    let fps = reel
+        .lead()
+        .map(|s| s.stage().frame_rate.max(1.0))
+        .unwrap_or(24.0);
     let mut tracks = Vec::new();
 
-    for cue in scene.stage_cues() {
-        if cue.start_frame < frames.start || cue.start_frame >= frames.end {
-            continue;
+    for (index, (scene, _start)) in reel.scenes().enumerate() {
+        for cue in scene.stage_cues() {
+            // Where this scene's own frame lands in the finished film.
+            let Some(at) = reel.film_frame_of(index, cue.start_frame) else {
+                continue;
+            };
+            if at < frames.start || at >= frames.end {
+                continue;
+            }
+            let Some(asset) = scene.sounds().get(cue.sound) else {
+                continue;
+            };
+
+            let path = scratch.join(format!("{index}-{}", asset.file_name()));
+            std::fs::write(&path, asset.data.as_slice())
+                .with_context(|| format!("writing {} for the encoder", asset.name))?;
+
+            tracks.push(buzz_export::AudioTrack {
+                path,
+                offset_seconds: f64::from(at - frames.start) / fps,
+                volume: cue.volume,
+            });
         }
-        let Some(asset) = scene.sounds().get(cue.sound) else {
-            continue;
-        };
-
-        let path = scratch.join(asset.file_name());
-        std::fs::write(&path, asset.data.as_slice())
-            .with_context(|| format!("writing {} for the encoder", asset.name))?;
-
-        tracks.push(buzz_export::AudioTrack {
-            path,
-            offset_seconds: f64::from(cue.start_frame - frames.start) / fps,
-            volume: cue.volume,
-        });
     }
 
     Ok(tracks)
@@ -406,7 +440,7 @@ mod tests {
 
     fn request(label: &str) -> ExportRequest {
         ExportRequest {
-            scene: Scene::default(),
+            scenes: vec![Scene::default()],
             settings: ExportSettings::for_stage(&Scene::default()),
             range: 0..1,
             target: ExportTarget::Image {

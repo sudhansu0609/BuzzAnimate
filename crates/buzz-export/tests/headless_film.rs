@@ -49,7 +49,7 @@ fn encode(dir: &Path, name: &str, frames: std::ops::Range<u32>) -> Option<std::p
     let settings = ExportSettings::for_stage(&scene);
     let path = dir.join(name);
     match export_video(
-        &scene,
+        &buzz_export::Reel::single(&scene),
         frames,
         &path,
         &settings,

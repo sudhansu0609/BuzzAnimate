@@ -25,10 +25,22 @@
 //! already means "move the whole object" and a rig you cannot move as a whole
 //! would be worse than one you pose with the tool you built it with. Recorded
 //! as a deviation rather than left to be discovered.
+//!
+//! # The other way to build a rig
+//!
+//! Everything above is a bone at a time. The foot of this file is the other
+//! way — sorting a character's drawings into the named slots of a
+//! [`RigPattern`] and building the whole skeleton at once. That is what the
+//! Rigging panel drives, and it is here rather than in the panel for the
+//! reason everything else here is: it is a document edit, and the panel cannot
+//! reach the document.
 
-use buzz_geom::{Point, Vec2};
+use std::sync::Arc;
+
+use buzz_geom::{Affine, Point, Vec2};
 use buzz_rig::{Armature, Bone, IkOptions};
-use buzz_scene::{ArmatureData, ObjectId, ObjectKind, Scene, WarpData};
+use buzz_rig::RigPattern;
+use buzz_scene::{ArmatureData, Object, ObjectId, ObjectKind, Scene, WarpData};
 
 /// Invert an affine, or `None` if it is singular.
 ///
@@ -178,6 +190,7 @@ pub fn rig_object(
             blend: buzz_scene::Blend::Normal,
             spatial: Default::default(),
             pivot: None,
+            modifiers: Vec::new(),
         };
 
         let mut rig = ArmatureData::new(armature);
@@ -342,6 +355,182 @@ pub fn selected_bone(scene: &Scene, object: ObjectId) -> Option<Bone> {
         ObjectKind::Armature(rig) => rig.armature.bones.first().cloned(),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rigging a character by sorting its drawings into a pattern.
+// ---------------------------------------------------------------------------
+
+/// Every drawing on the stage that could still become a limb.
+///
+/// **In paint order, back to front**, because that is the order
+/// [`buzz_act::assemble`] wants: the layer stack the animator arranged is what
+/// decides whether the head draws in front of the shoulders, and binding in
+/// slot order instead throws it away.
+///
+/// Anything already rigged or warped is left out — it is not a loose part, it
+/// is a rig — and so is anything on a locked or hidden layer, which is the same
+/// rule [`target_at`] uses for what a click can reach.
+pub fn loose_parts(scene: &Scene, frame: u32) -> Vec<buzz_ui::LoosePart> {
+    let mut out = Vec::new();
+    for layer in scene.layers().selectable() {
+        let objects = layer.objects_at(frame);
+        // A layer holding one drawing lends it its name, which is what makes
+        // auto-assignment work on an import at all: Photoshop and Animate both
+        // put the name of the part on the *layer*, not on the artwork.
+        let alone = objects.len() == 1;
+        for object in objects {
+            if !object.visible
+                || object.locked
+                || matches!(object.kind, ObjectKind::Armature(_) | ObjectKind::Warp(_))
+            {
+                continue;
+            }
+            let name = object
+                .name
+                .clone()
+                .or_else(|| alone.then(|| layer.name.clone()))
+                .unwrap_or_else(|| format!("Drawing {}", object.id.0));
+            out.push(buzz_ui::LoosePart {
+                object: object.id,
+                layer: layer.id,
+                name,
+            });
+        }
+    }
+    out
+}
+
+/// The topmost unrigged drawing under `at`, for filling an armed slot.
+///
+/// Front to back, so what is clicked is what is on top — the same rule a
+/// selection follows, and the reason clicking a slot then clicking the stage
+/// exists at all: on a character standing in a rest pose the arms are over the
+/// body, and a drag cannot choose between two things under one pixel.
+pub fn part_at(scene: &Scene, frame: u32, at: Point) -> Option<buzz_ui::LoosePart> {
+    loose_parts(scene, frame).into_iter().rev().find(|part| {
+        scene
+            .find_object(part.object)
+            .is_some_and(|(_, object)| object.bounds().contains(at))
+    })
+}
+
+/// Build a skeleton from `pattern` and move the sorted drawings into it.
+///
+/// `slots` says, for each slot of the pattern, which drawing was put in it.
+/// Returns the new armature, or `None` if nothing was sorted — which is a rig
+/// with nothing in it rather than an error worth a type of its own.
+///
+/// Nothing is taken out of its layer until the armature has actually been
+/// assembled, so a refusal leaves the artwork exactly where it was rather than
+/// half consumed. The caller wraps this in one `Document::edit`: rigging a
+/// character is a single decision, and an animator who regrets it should press
+/// Ctrl+Z once rather than eleven times.
+pub fn rig_character(
+    scene: &mut Scene,
+    frame: u32,
+    pattern: &RigPattern,
+    slots: &[Option<ObjectId>],
+) -> Option<ObjectId> {
+    // Walked in paint order rather than in slot order — see `loose_parts`.
+    let mut ordered: Vec<(usize, ObjectId)> = Vec::new();
+    let mut home = None;
+    for layer in scene.layers().selectable() {
+        for object in layer.objects_at(frame) {
+            if let Some(slot) = slots.iter().position(|s| *s == Some(object.id)) {
+                ordered.push((slot, object.id));
+                // The rig lands on the layer of the frontmost part, so the
+                // character stays where it was in the stack.
+                home = Some(layer.id);
+            }
+        }
+    }
+    let home = home?;
+
+    let taken: Vec<(usize, Arc<Object>)> = ordered
+        .iter()
+        .filter_map(|(slot, id)| scene.find_object(*id).map(|(_, art)| (*slot, art.clone())))
+        .collect();
+    let rig = buzz_act::assemble(pattern, &taken)?;
+
+    // The artwork moves *into* the armature rather than being copied, the same
+    // way F8 moves a selection into a symbol: two copies of one drawing, one
+    // rigged and one not, is not what anybody means by rigging it.
+    for (_, id) in &ordered {
+        scene.remove_object(*id);
+    }
+
+    let id = scene.next_object_id();
+    // Identity, because the parts inside kept the transforms they were drawn
+    // with: the character does not move when it is rigged.
+    scene.add_object(
+        home,
+        Object {
+            id,
+            name: None,
+            transform: Affine::IDENTITY,
+            kind: ObjectKind::Armature(rig),
+            locked: false,
+            visible: true,
+            filters: Vec::new(),
+            blend: Default::default(),
+            spatial: Default::default(),
+            pivot: None,
+            modifiers: Vec::new(),
+        },
+    )
+}
+
+/// Put a different drawing into one slot of a rig that already exists.
+///
+/// The bone stays exactly as it is; only the artwork on it changes. That is
+/// what makes redrawing a limb cheap — the pose library, the joint limits and
+/// every keyframe of animation are facts about the skeleton, and none of them
+/// care which picture is riding on it.
+pub fn replace_part(scene: &mut Scene, rig: ObjectId, slot: usize, drawing: ObjectId) -> bool {
+    let Some((_, art)) = scene.find_object(drawing) else {
+        return false;
+    };
+    let replacement = art.clone();
+
+    let Some((_, holder)) = scene.find_object(rig) else {
+        return false;
+    };
+    // Parts live in the coordinates of the armature and the drawing was
+    // dropped in the coordinates of the layer. Without this a rig that had been
+    // moved or scaled would fling the new part across the stage.
+    let into_rig = invert(holder.transform).unwrap_or(Affine::IDENTITY);
+    let ObjectKind::Armature(data) = &holder.kind else {
+        return false;
+    };
+    // Undoing the *current* pose as well as the placement, so the drawing stays
+    // where it was dropped rather than jumping by however far the bone happens
+    // to be posed.
+    let posed = invert(data.armature.pose_transform(slot)).unwrap_or(Affine::IDENTITY);
+
+    scene.remove_object(drawing);
+
+    let mut done = false;
+    scene.update_object(rig, |target| {
+        let ObjectKind::Armature(data) = &mut target.kind else {
+            return;
+        };
+        let mut artwork = (*replacement).clone();
+        artwork.transform = posed * into_rig * artwork.transform;
+        let artwork = Arc::new(artwork);
+
+        match data
+            .parts
+            .iter_mut()
+            .find(|part| matches!(part.binding, buzz_scene::RigBinding::Rigid(b) if b == slot))
+        {
+            // In place, so the new drawing paints where the old one did.
+            Some(part) => part.artwork = artwork,
+            None => data.bind_rigid(artwork, slot),
+        }
+        done = true;
+    });
+    done
 }
 
 #[cfg(test)]

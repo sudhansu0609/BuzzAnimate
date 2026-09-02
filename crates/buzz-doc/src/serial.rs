@@ -93,7 +93,22 @@ use serde::{Deserialize, Serialize};
 /// * **24** — a light carries a `flicker`: how much it gutters, which is what
 ///   turns a lamp into a fire. Absent in older files and in every steady light,
 ///   so a document with no fire in it is written exactly as version 23 wrote it.
-pub const FORMAT_VERSION: u32 = 24;
+/// * **25** — a light carries a `rim`: how brightly it glows the outside edge of
+///   the artwork it reaches. Absent in older files and in every light that does
+///   not rim, which is the default, so a document that never asks for one is
+///   written exactly as version 24 wrote it.
+/// * **26** — an armature carries the name of the rig `pattern` it was
+///   assembled from, so the Rigging panel can show a character's slots again a
+///   week later and take a redrawn arm back into the one it belongs in. Absent
+///   in older files and in every rig built a bone at a time with the Bone tool,
+///   which is what a rig from version 25 is — those load with no pattern and
+///   are written exactly as version 25 wrote them.
+/// * **27** — an object carries a stack of live `modifiers` (a spring for
+///   follow-through, a wiggle for idle motion), evaluated at draw time rather
+///   than baked to keyframes. Absent in older files and in every object without
+///   one, which is almost all of them, so an unchanged document is written
+///   exactly as version 26 wrote it.
+pub const FORMAT_VERSION: u32 = 27;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -234,6 +249,10 @@ pub struct LightDto {
     /// every steady light, which is nearly all of them.
     #[serde(default, skip_serializing_if = "is_steady")]
     pub flicker: f32,
+    /// How brightly this light rims what it reaches. Version 25. Absent in
+    /// older files and in every light that does not rim, which is the default.
+    #[serde(default, skip_serializing_if = "is_unrimmed")]
+    pub rim: f32,
     /// Sun: the compass bearing and how high it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azimuth: Option<f64>,
@@ -316,6 +335,11 @@ struct FlatKind {
 /// byte-identical to what the version before this wrote.
 fn is_steady(flicker: &f32) -> bool {
     *flicker == 0.0
+}
+
+/// A light that lays no rim writes no `rim`, for the same reason.
+fn is_unrimmed(rim: &f32) -> bool {
+    *rim == 0.0
 }
 
 fn kind_to_flat(kind: buzz_scene::LightKind) -> FlatKind {
@@ -1148,6 +1172,81 @@ pub struct CameraKeyDto {
     pub yaw: f64,
 }
 
+/// One live modifier on an object — a spring or a wiggle. Version 27.
+///
+/// Flat and hand-written like [`FilterDto`], for the same contract reason: the
+/// stored form must not be chained to the shape of an internal Rust enum.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModifierDto {
+    /// "wiggle" or "spring".
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amplitude: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stiffness: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub damping: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coupling: Option<f64>,
+}
+
+impl ModifierDto {
+    fn from_modifier(m: &buzz_scene::Modifier) -> Self {
+        use buzz_scene::Modifier;
+        match *m {
+            Modifier::Wiggle {
+                amplitude,
+                frequency,
+            } => Self {
+                kind: "wiggle".to_string(),
+                amplitude: Some(amplitude),
+                frequency: Some(frequency),
+                root: None,
+                stiffness: None,
+                damping: None,
+                coupling: None,
+            },
+            Modifier::Spring {
+                root,
+                stiffness,
+                damping,
+                coupling,
+            } => Self {
+                kind: "spring".to_string(),
+                amplitude: None,
+                frequency: None,
+                root: Some(root as u64),
+                stiffness: Some(stiffness),
+                damping: Some(damping),
+                coupling: Some(coupling),
+            },
+        }
+    }
+
+    /// The model modifier, or `None` for a kind this version does not know —
+    /// a modifier from a newer file is dropped rather than failing the load.
+    fn to_modifier(&self) -> Option<buzz_scene::Modifier> {
+        use buzz_scene::Modifier;
+        match self.kind.as_str() {
+            "wiggle" => Some(Modifier::Wiggle {
+                amplitude: self.amplitude.unwrap_or(0.0),
+                frequency: self.frequency.unwrap_or(1.0),
+            }),
+            "spring" => Some(Modifier::Spring {
+                root: self.root.unwrap_or(0) as usize,
+                stiffness: self.stiffness.unwrap_or(120.0),
+                damping: self.damping.unwrap_or(12.0),
+                coupling: self.coupling.unwrap_or(0.0),
+            }),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectDto {
     pub id: u64,
@@ -1175,6 +1274,10 @@ pub struct ObjectDto {
     /// written before it used and what an untouched one still uses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pivot: Option<[f64; 2]>,
+    /// Live modifiers on this object. Version 27; absent means none, which is
+    /// every object written before it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modifiers: Vec<ModifierDto>,
     pub kind: ObjectKindDto,
 }
 
@@ -1238,6 +1341,13 @@ pub enum ObjectKindDto {
         /// with none.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         poses: Vec<NamedPoseDto>,
+        /// The rig pattern this skeleton was assembled from. Version 26.
+        ///
+        /// A name, not the pattern: see `ArmatureData::pattern` for why the
+        /// bones remain the truth. Absent for a rig built with the Bone tool,
+        /// which is every rig written before version 26.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
     },
     /// Artwork with warp handles on it. Version 6.
     Warp {
@@ -1859,6 +1969,7 @@ impl DocumentDto {
                             softness: light.softness,
                             glow: light.glow,
                             flicker: light.flicker,
+                            rim: light.rim,
                             azimuth: None,
                             elevation: None,
                             horizon: None,
@@ -2096,6 +2207,7 @@ impl DocumentDto {
                     softness: dto.softness,
                     glow: dto.glow,
                     flicker: dto.flicker,
+                    rim: dto.rim,
                     track: dto.track.as_ref().map(LightTrackDto::to_track).transpose()?,
                 });
             }
@@ -2174,6 +2286,7 @@ impl ObjectDto {
                         angles: p.angles.clone(),
                     })
                     .collect(),
+                pattern: rig.pattern.clone(),
             },
             ObjectKind::Warp(warp) => ObjectKindDto::Warp {
                 path: warp.shape.path.to_svg(),
@@ -2215,6 +2328,11 @@ impl ObjectDto {
             // Likewise omitted when it is the centre, which is every object
             // nobody has moved a transformation point on.
             pivot: object.pivot.map(|p| [p.x, p.y]),
+            modifiers: object
+                .modifiers
+                .iter()
+                .map(ModifierDto::from_modifier)
+                .collect(),
             kind,
         }
     }
@@ -2267,6 +2385,7 @@ impl ObjectDto {
                 bones,
                 parts,
                 poses,
+                pattern,
             } => {
                 let mut armature = buzz_rig::Armature::new(buzz_geom::Point::new(root[0], root[1]));
                 for dto in bones {
@@ -2304,6 +2423,7 @@ impl ObjectDto {
                         angles: p.angles.clone(),
                     })
                     .collect();
+                rig.pattern = pattern.clone();
                 ObjectKind::Armature(rig)
             }
             ObjectKindDto::Warp {
@@ -2370,6 +2490,7 @@ impl ObjectDto {
                 .pivot
                 .filter(|p| p[0].is_finite() && p[1].is_finite())
                 .map(|p| buzz_geom::Point::new(p[0], p[1])),
+            modifiers: self.modifiers.iter().filter_map(ModifierDto::to_modifier).collect(),
         })
     }
 }
@@ -2591,6 +2712,115 @@ mod tests {
         let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
         let (_, object) = back.find_object(id).expect("the object");
         assert_eq!(object.pivot, Some(buzz_geom::Point::new(0.0, 10.0)));
+    }
+
+    /// Live modifiers — a wiggle and a spring, with all their parameters — come
+    /// back exactly as they went in.
+    #[test]
+    fn modifiers_survive_a_round_trip() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        scene.update_object_across(0, u32::MAX, id, |o| {
+            o.modifiers.push(buzz_scene::Modifier::Wiggle {
+                amplitude: 7.5,
+                frequency: 2.0,
+            });
+            o.modifiers.push(buzz_scene::Modifier::Spring {
+                root: 3,
+                stiffness: 90.0,
+                damping: 8.0,
+                coupling: 0.02,
+            });
+        });
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        let (_, object) = back.find_object(id).expect("the object");
+        assert_eq!(
+            object.modifiers,
+            vec![
+                buzz_scene::Modifier::Wiggle {
+                    amplitude: 7.5,
+                    frequency: 2.0
+                },
+                buzz_scene::Modifier::Spring {
+                    root: 3,
+                    stiffness: 90.0,
+                    damping: 8.0,
+                    coupling: 0.02
+                },
+            ]
+        );
+    }
+
+    /// An object with no modifiers writes no `modifiers` key, so a document that
+    /// uses none is byte-identical to what version 26 wrote.
+    #[test]
+    fn an_object_without_modifiers_writes_no_field() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        let json = serde_json::to_string(&DocumentDto::from_scene(&scene)).unwrap();
+        assert!(!json.contains("modifiers"), "the empty stack should not be written");
+    }
+
+    /// A file written before version 27 has no `modifiers` key; it must load with
+    /// an empty stack rather than fail.
+    #[test]
+    fn a_file_from_before_modifiers_still_loads() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        scene.update_object_across(0, u32::MAX, id, |o| {
+            o.modifiers.push(buzz_scene::Modifier::Wiggle {
+                amplitude: 5.0,
+                frequency: 1.0,
+            });
+        });
+
+        let mut json = serde_json::to_value(&DocumentDto::from_scene(&scene)).unwrap();
+        fn strip(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("modifiers");
+                    for (_, v) in map.iter_mut() {
+                        strip(v);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        strip(&mut json);
+
+        let back: DocumentDto = serde_json::from_value(json).expect("deserialise");
+        let loaded = back.to_scene().expect("to scene");
+        let (_, object) = loaded.find_object(id).expect("the object");
+        assert!(object.modifiers.is_empty(), "an old file must load with no modifiers");
     }
 
     /// Every part of a gradient comes back: the stops with their offsets, the
@@ -3295,6 +3525,8 @@ mod tests {
             )),
             2,
         );
+        // The pattern it was assembled from — version 26.
+        rig.pattern = Some("Prop".into());
 
         scene.add_object(
             layer,
@@ -3309,6 +3541,7 @@ mod tests {
                 blend: Default::default(),
                 spatial: Default::default(),
                 pivot: None,
+                modifiers: Vec::new(),
             },
         );
         scene
@@ -3355,6 +3588,71 @@ mod tests {
         assert_eq!(rig.poses[0].name, "Reach");
         assert!((rig.poses[0].angles[1] - -0.9).abs() < 1e-12);
         assert_eq!(rig.poses[1].name, "Rest");
+
+        // The pattern, version 26: without it the Rigging panel reopens a
+        // character as a plain list of bones and there is nowhere to drop a
+        // redrawn arm.
+        assert_eq!(rig.pattern.as_deref(), Some("Prop"));
+    }
+
+    /// **A rig from before version 26 loads, with no pattern.**
+    ///
+    /// Which is every rig built with the Bone tool, then and now: the field is
+    /// `#[serde(default)]` and absent means "not assembled from a pattern".
+    #[test]
+    fn a_rig_from_before_patterns_still_loads() {
+        let scene = rigged_scene();
+        let dto = DocumentDto::from_scene(&scene);
+        let mut json = serde_json::to_value(&dto).expect("serialise");
+
+        // Remove the field entirely, exactly as a version-25 file has it.
+        fn strip(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("pattern");
+                    for (_, v) in map.iter_mut() {
+                        strip(v);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        strip(&mut json);
+
+        let back: DocumentDto = serde_json::from_value(json).expect("deserialise");
+        let loaded = back.to_scene().expect("to scene");
+        let object = loaded
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .next()
+            .expect("the armature")
+            .clone();
+
+        let ObjectKind::Armature(rig) = &object.kind else {
+            panic!("expected an armature");
+        };
+        assert!(rig.pattern.is_none());
+        assert_eq!(rig.armature.len(), 3, "the rest of the rig came through");
+    }
+
+    /// A rig that was never assembled from a pattern writes exactly what it
+    /// wrote in version 25 — the field is skipped, not written as `null`.
+    #[test]
+    fn a_pattern_less_rig_writes_no_pattern_field() {
+        let mut scene = rigged_scene();
+        scene.update_object(ObjectId(60), |object| {
+            if let ObjectKind::Armature(rig) = &mut object.kind {
+                rig.pattern = None;
+            }
+        });
+
+        let json = serde_json::to_string(&DocumentDto::from_scene(&scene)).expect("serialise");
+        assert!(
+            !json.contains("\"pattern\""),
+            "an unpatterned rig wrote a pattern field"
+        );
     }
 
     /// **A file from before version 19 loads, with no poses.**
@@ -3469,6 +3767,7 @@ mod tests {
                 blend: Default::default(),
                 spatial: Default::default(),
                 pivot: None,
+                modifiers: Vec::new(),
             },
         );
 

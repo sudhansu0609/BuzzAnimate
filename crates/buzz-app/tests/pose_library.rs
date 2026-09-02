@@ -137,10 +137,11 @@ fn poses_travel_with_the_character_through_the_clipboard() {
     editor.run(buzz_ui::Command::Copy);
 
     // A different document, as `App::adopt_document` hands the clipboard on.
-    let mut other = Editor {
-        clipboard: editor.clipboard.clone(),
-        ..Editor::default()
-    };
+    // Built and then given the clipboard, rather than by struct update: the
+    // editor has private fields (its caches), so `..Editor::default()` cannot
+    // name them from outside the crate.
+    let mut other = Editor::default();
+    other.clipboard = editor.clipboard.clone();
     other.run(buzz_ui::Command::Paste);
 
     let pasted = other.selection.ids();

@@ -384,7 +384,7 @@ fn every_docked_panel_fits_the_narrowest_column() {
     check(
         "Filters",
         column_overflow(narrowest, |ui| {
-            let _ = filter_panel(ui, &[], None, &mut filters, false);
+            let _ = filter_panel(ui, &[], None, &[], &mut filters, false);
         }),
         &mut failures,
     );

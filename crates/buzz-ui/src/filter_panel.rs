@@ -14,7 +14,7 @@
 //!   is nothing to express them with. They are left out rather than mapped
 //!   onto something that looks nearly right.
 
-use buzz_scene::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, Quality};
+use buzz_scene::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, Modifier, Quality};
 use egui::{RichText, Ui};
 
 use crate::panels::{from_egui, to_egui};
@@ -50,6 +50,12 @@ pub struct FilterResponse {
     pub reorder: Option<(usize, i32)>,
     /// A new blend mode for the selected object.
     pub set_blend: Option<Blend>,
+    /// Attach this live modifier to the selected object.
+    pub add_modifier: Option<Modifier>,
+    /// Remove the modifier at this index.
+    pub remove_modifier: Option<usize>,
+    /// Replace the modifier at this index (a parameter was dragged).
+    pub set_modifier: Option<(usize, Modifier)>,
 }
 
 /// Draw the panel.
@@ -60,6 +66,7 @@ pub fn filter_panel(
     ui: &mut Ui,
     filters: &[Filter],
     blend: Option<Blend>,
+    modifiers: &[Modifier],
     state: &mut FilterPanelState,
     has_selection: bool,
 ) -> FilterResponse {
@@ -106,6 +113,74 @@ pub fn filter_panel(
                     }
                 });
         });
+    }
+
+    // -- live motion (procedural modifiers) ---------------------------------
+    if state.target == FilterTarget::Object {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Live Motion").strong());
+            if !modifiers.is_empty() {
+                ui.label(RichText::new(format!("{}", modifiers.len())).small().weak());
+            }
+            ui.menu_button("+", |ui| {
+                if ui.button("Look At").clicked() {
+                    out.add_modifier = Some(Modifier::LookAt { x: 0.0, y: 0.0 });
+                    ui.close();
+                }
+                if ui.button("Squash & Stretch").clicked() {
+                    out.add_modifier = Some(Modifier::AutoSquashStretch { amount: 0.01 });
+                    ui.close();
+                }
+            });
+        });
+        if modifiers.is_empty() {
+            ui.label(
+                RichText::new(
+                    "Springs and wiggles are added from the Scene menu; look-at and \
+                     squash & stretch, here.",
+                )
+                .small()
+                .weak(),
+            );
+        }
+        for (i, modifier) in modifiers.iter().enumerate() {
+            let mut edited = *modifier;
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                if ui.small_button("\u{2715}").on_hover_text("Remove").clicked() {
+                    out.remove_modifier = Some(i);
+                }
+                ui.label(modifier.label());
+                match &mut edited {
+                    Modifier::Wiggle {
+                        amplitude,
+                        frequency,
+                    } => {
+                        changed |= ui.add(egui::DragValue::new(amplitude).prefix("amp ").speed(0.2)).changed();
+                        changed |= ui.add(egui::DragValue::new(frequency).prefix("Hz ").speed(0.05)).changed();
+                    }
+                    Modifier::Spring {
+                        stiffness, damping, ..
+                    } => {
+                        changed |= ui.add(egui::DragValue::new(stiffness).prefix("k ").speed(1.0)).changed();
+                        changed |= ui.add(egui::DragValue::new(damping).prefix("d ").speed(0.2)).changed();
+                    }
+                    Modifier::LookAt { x, y } => {
+                        changed |= ui.add(egui::DragValue::new(x).prefix("x ")).changed();
+                        changed |= ui.add(egui::DragValue::new(y).prefix("y ")).changed();
+                    }
+                    Modifier::AutoSquashStretch { amount } => {
+                        changed |= ui
+                            .add(egui::DragValue::new(amount).prefix("amount ").speed(0.001))
+                            .changed();
+                    }
+                }
+            });
+            if changed {
+                out.set_modifier = Some((i, edited));
+            }
+        }
     }
 
     // -- add ----------------------------------------------------------------
@@ -425,7 +500,7 @@ mod tests {
         crate::theme::apply(&ctx);
         let mut response = FilterResponse::default();
         let _ = ctx.run_ui(Default::default(), |ui| {
-            response = filter_panel(ui, filters, Some(Blend::Normal), state, has_selection);
+            response = filter_panel(ui, filters, Some(Blend::Normal), &[], state, has_selection);
         });
         response
     }

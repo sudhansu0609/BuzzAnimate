@@ -1192,11 +1192,31 @@ pub struct ModifierDto {
     pub damping: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coupling: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<f64>,
 }
 
 impl ModifierDto {
     fn from_modifier(m: &buzz_scene::Modifier) -> Self {
         use buzz_scene::Modifier;
+        // Every field starts absent; each arm fills only the ones it uses, so an
+        // unused field is skipped rather than written as null.
+        let base = Self {
+            kind: String::new(),
+            amplitude: None,
+            frequency: None,
+            root: None,
+            stiffness: None,
+            damping: None,
+            coupling: None,
+            x: None,
+            y: None,
+            amount: None,
+        };
         match *m {
             Modifier::Wiggle {
                 amplitude,
@@ -1205,10 +1225,7 @@ impl ModifierDto {
                 kind: "wiggle".to_string(),
                 amplitude: Some(amplitude),
                 frequency: Some(frequency),
-                root: None,
-                stiffness: None,
-                damping: None,
-                coupling: None,
+                ..base
             },
             Modifier::Spring {
                 root,
@@ -1217,12 +1234,22 @@ impl ModifierDto {
                 coupling,
             } => Self {
                 kind: "spring".to_string(),
-                amplitude: None,
-                frequency: None,
                 root: Some(root as u64),
                 stiffness: Some(stiffness),
                 damping: Some(damping),
                 coupling: Some(coupling),
+                ..base
+            },
+            Modifier::LookAt { x, y } => Self {
+                kind: "lookat".to_string(),
+                x: Some(x),
+                y: Some(y),
+                ..base
+            },
+            Modifier::AutoSquashStretch { amount } => Self {
+                kind: "squashstretch".to_string(),
+                amount: Some(amount),
+                ..base
             },
         }
     }
@@ -1241,6 +1268,13 @@ impl ModifierDto {
                 stiffness: self.stiffness.unwrap_or(120.0),
                 damping: self.damping.unwrap_or(12.0),
                 coupling: self.coupling.unwrap_or(0.0),
+            }),
+            "lookat" => Some(Modifier::LookAt {
+                x: self.x.unwrap_or(0.0),
+                y: self.y.unwrap_or(0.0),
+            }),
+            "squashstretch" => Some(Modifier::AutoSquashStretch {
+                amount: self.amount.unwrap_or(0.0),
             }),
             _ => None,
         }
@@ -2740,6 +2774,9 @@ mod tests {
                 damping: 8.0,
                 coupling: 0.02,
             });
+            o.modifiers.push(buzz_scene::Modifier::LookAt { x: 12.5, y: -30.0 });
+            o.modifiers
+                .push(buzz_scene::Modifier::AutoSquashStretch { amount: 0.015 });
         });
 
         let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
@@ -2757,6 +2794,8 @@ mod tests {
                     damping: 8.0,
                     coupling: 0.02
                 },
+                buzz_scene::Modifier::LookAt { x: 12.5, y: -30.0 },
+                buzz_scene::Modifier::AutoSquashStretch { amount: 0.015 },
             ]
         );
     }

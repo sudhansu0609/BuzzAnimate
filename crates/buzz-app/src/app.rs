@@ -2003,10 +2003,19 @@ impl App {
             ),
         };
 
+        let modifiers = match target {
+            buzz_ui::FilterTarget::Object => object
+                .and_then(|id| editor.scene().find_object(id))
+                .map(|(_, found)| found.modifiers.clone())
+                .unwrap_or_default(),
+            buzz_ui::FilterTarget::Layer => Vec::new(),
+        };
+
         let response = buzz_ui::filter_panel(
             ui,
             &filters,
             blend,
+            &modifiers,
             &mut editor.filter_panel,
             object.is_some(),
         );
@@ -2068,6 +2077,42 @@ impl App {
             if to >= 0 {
                 editor.filter_panel.selected = to as usize;
             }
+        }
+
+        // Live modifiers on the selected object. They live on every keyframe copy
+        // of the object (Edit-Multiple-Frames style) so they never flicker.
+        if let Some(modifier) = response.add_modifier
+            && let Some(id) = object
+        {
+            editor.doc.edit("Add Modifier", |scene| {
+                scene.update_object_across(0, u32::MAX, id, |o| o.modifiers.push(modifier));
+            });
+            editor.doc.end_gesture();
+            editor.status = Some(format!("Added {}", modifier.label()));
+        }
+        if let Some(index) = response.remove_modifier
+            && let Some(id) = object
+        {
+            editor.doc.edit("Remove Modifier", |scene| {
+                scene.update_object_across(0, u32::MAX, id, |o| {
+                    if index < o.modifiers.len() {
+                        o.modifiers.remove(index);
+                    }
+                });
+            });
+            editor.doc.end_gesture();
+        }
+        if let Some((index, modifier)) = response.set_modifier
+            && let Some(id) = object
+        {
+            // No end_gesture: consecutive drags coalesce into one undo step.
+            editor.doc.edit("Edit Modifier", |scene| {
+                scene.update_object_across(0, u32::MAX, id, |o| {
+                    if let Some(slot) = o.modifiers.get_mut(index) {
+                        *slot = modifier;
+                    }
+                });
+            });
         }
 
         if let Some(blend) = response.set_blend

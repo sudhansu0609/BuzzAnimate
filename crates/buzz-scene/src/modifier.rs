@@ -37,6 +37,13 @@ pub enum Modifier {
         damping: f64,
         coupling: f64,
     },
+    /// Turn the object to face a point in stage space — eyes and heads that
+    /// track a target. Its own +x axis is aimed at `(x, y)`.
+    LookAt { x: f64, y: f64 },
+    /// Stretch the object along its direction of motion and squash it across,
+    /// by `amount` per unit of speed. Volume-preserving: a fast move thins and
+    /// lengthens the drawing, the oldest trick for selling weight and speed.
+    AutoSquashStretch { amount: f64 },
 }
 
 impl Modifier {
@@ -45,6 +52,8 @@ impl Modifier {
         match self {
             Modifier::Wiggle { .. } => "Wiggle",
             Modifier::Spring { .. } => "Spring",
+            Modifier::LookAt { .. } => "Look At",
+            Modifier::AutoSquashStretch { .. } => "Squash & Stretch",
         }
     }
 
@@ -131,6 +140,54 @@ impl Scene {
                                 rig.armature.set_pose(pose);
                             }
                         }
+                    }
+                }
+                Modifier::LookAt { x, y } => {
+                    // Turn the object about its own anchor so its +x axis points
+                    // at the target, on top of whatever rotation it already has.
+                    let base = object.transform;
+                    let anchor = base.translation();
+                    let coeffs = base.as_coeffs();
+                    let base_angle = coeffs[1].atan2(coeffs[0]);
+                    let desired = (y - anchor.y).atan2(x - anchor.x);
+                    let turn = desired - base_angle;
+                    prepend = Affine::translate(anchor)
+                        * Affine::rotate(turn)
+                        * Affine::translate(-anchor)
+                        * prepend;
+                }
+                Modifier::AutoSquashStretch { amount } => {
+                    // Speed from the previous frame's placement of this same
+                    // object — one look-back, no integration.
+                    let here = object.transform.translation();
+                    let before = if frame == 0 {
+                        here
+                    } else {
+                        self.layers()
+                            .get(layer)
+                            .and_then(|l| {
+                                l.frames
+                                    .resolved_at(frame - 1)
+                                    .iter()
+                                    .find(|o| o.id == object.id)
+                                    .map(|o| o.transform.translation())
+                            })
+                            .unwrap_or(here)
+                    };
+                    let velocity = here - before;
+                    let speed = velocity.hypot();
+                    if speed > 1e-6 {
+                        // Stretch along motion, squash across it; clamped so a
+                        // teleport does not turn the drawing into a needle.
+                        let stretch = (1.0 + amount * speed).clamp(0.25, 4.0);
+                        let heading = velocity.y.atan2(velocity.x);
+                        let squash = Affine::rotate(heading)
+                            * Affine::scale_non_uniform(stretch, 1.0 / stretch)
+                            * Affine::rotate(-heading);
+                        prepend = Affine::translate(here)
+                            * squash
+                            * Affine::translate(-here)
+                            * prepend;
                     }
                 }
             }
@@ -221,7 +278,7 @@ impl Scene {
 mod tests {
     use super::*;
     use crate::{ArmatureData, LayerKind, Object, ShapeData, Tween};
-    use buzz_geom::{Point, Rect, Shape as _};
+    use buzz_geom::{Affine, Point, Rect, Shape as _};
     use buzz_rig::{Armature, Bone};
     use peniko::Color;
 
@@ -373,6 +430,65 @@ mod tests {
             };
             assert_eq!(live, expected[frame as usize], "frame {frame} differs from the solver");
         }
+    }
+
+    #[test]
+    fn look_at_turns_the_object_toward_its_target() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let mut object = Object::shape(
+            ObjectId(3),
+            ShapeData::filled(Rect::new(-5.0, -5.0, 5.0, 5.0).to_path(1e-9), Color::WHITE),
+        );
+        // At (100,100), facing +x. Target straight below (+y), so it should turn
+        // a quarter turn.
+        object.transform = Affine::translate((100.0, 100.0));
+        object.modifiers.push(Modifier::LookAt { x: 100.0, y: 300.0 });
+        let id = scene.add_object(layer, object).unwrap();
+
+        let obj = resolved(&scene, layer, id, 0);
+        let eval = scene.modified_object_at(layer, &obj, 0).unwrap();
+        let c = eval.prepend.as_coeffs();
+        let angle = c[1].atan2(c[0]);
+        assert!(
+            (angle - std::f64::consts::FRAC_PI_2).abs() < 1e-6,
+            "aimed {angle} rad, not down at the target"
+        );
+    }
+
+    #[test]
+    fn squash_stretch_lengthens_along_the_motion() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let mut object = Object::shape(
+            ObjectId(4),
+            ShapeData::filled(Rect::new(-5.0, -5.0, 5.0, 5.0).to_path(1e-9), Color::WHITE),
+        );
+        object.transform = Affine::translate((0.0, 100.0));
+        object.modifiers.push(Modifier::AutoSquashStretch { amount: 0.02 });
+        let id = scene.add_object(layer, object).unwrap();
+
+        // Slide it along +x from 0 to 200 over ten frames.
+        scene.update_layer(layer, |l| {
+            if l.frames.length() <= 10 {
+                l.frames.insert_frame(10);
+            }
+        });
+        scene.ensure_keyframe(layer, 10);
+        scene.update_object_at(10, id, |o| {
+            o.transform = Affine::translate((200.0, 100.0));
+        });
+        scene.update_layer(layer, |l| {
+            l.frames.set_tween(0, Tween::motion());
+        });
+
+        let obj = resolved(&scene, layer, id, 5);
+        let c = scene.modified_object_at(layer, &obj, 5).unwrap().prepend.as_coeffs();
+        // Motion is +x, so the linear part scales x up and y down, and preserves
+        // area (x scale * y scale ~= 1).
+        assert!(c[0] > 1.1, "x should stretch, was {}", c[0]);
+        assert!(c[3] < 0.95, "y should squash, was {}", c[3]);
+        assert!((c[0] * c[3] - 1.0).abs() < 0.02, "should preserve area");
     }
 
     #[test]

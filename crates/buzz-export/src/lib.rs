@@ -68,6 +68,10 @@ pub struct ExportSettings {
     /// and a file that silently lost its background would surprise anyone who
     /// did not ask for it.
     pub transparent: bool,
+    /// Render only this rectangle of the stage (in document units), scaled to
+    /// fill `width`×`height`. `None` frames the whole stage — the usual case.
+    /// A render region, for re-rendering a corner without redoing the frame.
+    pub region: Option<buzz_geom::Rect>,
 }
 
 impl ExportSettings {
@@ -79,6 +83,7 @@ impl ExportSettings {
             width: size.width.round().max(1.0) as u32,
             height: size.height.round().max(1.0) as u32,
             transparent: false,
+            region: None,
         }
     }
 
@@ -295,11 +300,16 @@ impl Exporter {
         self.ensure_target(settings.width, settings.height)?;
 
         // The camera frames the stage exactly: the stage centre in the middle
-        // of the image, and one document unit to `zoom` pixels.
+        // of the image, and one document unit to `zoom` pixels. A render region
+        // frames that rectangle instead, scaled to fill the output.
         let stage = scene.stage().stage_rect();
+        let (center, zoom) = match settings.region {
+            Some(r) => (r.center(), settings.width as f64 / r.width().max(1e-6)),
+            None => (stage.center(), settings.zoom(scene)),
+        };
         let camera = Camera::new(
-            stage.center(),
-            settings.zoom(scene),
+            center,
+            zoom,
             Size::new(settings.width as f64, settings.height as f64),
         );
 

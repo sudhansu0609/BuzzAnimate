@@ -241,6 +241,7 @@ fn an_image_beyond_the_gpus_limit_is_refused_with_the_reason() {
             width: limit + 1,
             height: 100,
             transparent: false,
+            region: None,
         };
 
         let error = exporter

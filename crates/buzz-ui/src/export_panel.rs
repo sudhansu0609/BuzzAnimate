@@ -57,6 +57,9 @@ pub struct ExportState {
     pub height: u32,
     /// Export with no background.
     pub transparent: bool,
+    /// Render only the selection's bounds (a render region) rather than the
+    /// whole stage — for re-rendering one corner without redoing the frame.
+    pub region_to_selection: bool,
     /// Keep the stage's proportions when either size is edited.
     pub link_aspect: bool,
     /// First and last frame of a sequence, inclusive.
@@ -230,6 +233,7 @@ impl Default for ExportState {
             width: 550,
             height: 400,
             transparent: false,
+            region_to_selection: false,
             link_aspect: true,
             from_frame: 0,
             to_frame: 0,
@@ -531,6 +535,11 @@ fn settings_view(
     ui.add_space(4.0);
     ui.checkbox(&mut state.transparent, "Transparent background")
         .on_hover_text("Leave the stage colour out, so the artwork can be composited elsewhere");
+    ui.checkbox(&mut state.region_to_selection, "Render only the selection")
+        .on_hover_text(
+            "Render just the selection's bounds, scaled to the export size — a render region \
+             for re-doing one corner. Ignored with nothing selected.",
+        );
 
     if kind.needs_ffmpeg() && !state.ffmpeg {
         ui.add_space(4.0);

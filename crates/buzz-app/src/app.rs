@@ -5302,10 +5302,20 @@ impl App {
     fn start_export(&mut self, kind: buzz_ui::ExportKind, path: std::path::PathBuf) {
         use crate::export_service::{ExportRequest, ExportTarget};
 
+        // A render region: the selection's bounds at the playhead, when asked
+        // for and there is a selection. Otherwise the whole stage.
+        let region = if self.editor.export.region_to_selection {
+            self.editor
+                .selection
+                .bounds_at(self.editor.scene(), self.editor.current_frame)
+        } else {
+            None
+        };
         let settings = buzz_export::ExportSettings {
             width: self.editor.export.width,
             height: self.editor.export.height,
             transparent: self.editor.export.transparent,
+            region,
         };
         // **The whole film, not the scene being edited.** Snapshots, so the
         // export renders the document as it was when the user asked — and they

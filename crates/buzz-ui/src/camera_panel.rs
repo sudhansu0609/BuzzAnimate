@@ -467,8 +467,9 @@ mod tests {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
         let mut response = CameraResponse::default();
+        let mut state = CameraPanelState::default();
         let _ = ctx.run_ui(Default::default(), |ui| {
-            response = camera_panel(ui, camera, frame);
+            response = camera_panel(ui, camera, frame, &mut state);
         });
         response
     }

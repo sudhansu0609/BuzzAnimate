@@ -27,7 +27,9 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 
-pub use analysis::{LipSyncOptions, Viseme, VisemeTrack, analyse_visemes};
+pub use analysis::{
+    LipSyncOptions, Viseme, VisemeTrack, analyse_visemes, beats_from_levels, detect_beats,
+};
 pub use player::{Player, PlayerState};
 
 /// Decoded audio, ready to play, draw and analyse.

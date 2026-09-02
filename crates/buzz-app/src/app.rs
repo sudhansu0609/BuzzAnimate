@@ -2069,6 +2069,7 @@ impl App {
                     focal_distance: self.editor.scene().camera().focal_distance,
                     nearest_depth: self.editor.scene().camera().nearest_depth(),
                     waveforms: self.editor.waveforms(),
+                    beats: self.editor.beat_markers.clone(),
                 };
                 let response = buzz_ui::timeline_panel(ui, self.editor.scene(), &state);
                 self.apply_timeline(response, commands);

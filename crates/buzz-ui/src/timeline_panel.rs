@@ -190,6 +190,9 @@ pub struct TimelineState {
     /// document stores the *file* and the envelope only exists once it has
     /// been decoded — which is view state, and belongs outside the model.
     pub waveforms: std::collections::BTreeMap<LayerId, Waveform>,
+    /// Detected beat frames, drawn as ticks on the ruler. Empty until the user
+    /// runs Detect Beats.
+    pub beats: Vec<u32>,
 }
 
 /// A sound's envelope, positioned on the timeline.
@@ -1048,6 +1051,20 @@ fn ruler(
             format!("{number}"),
             font.clone(),
             Palette::ruler_text(),
+        );
+    }
+
+    // Beat ticks, under the numbers: a small mark at each detected beat so
+    // action can be keyed to the music. Drawn before the playhead, which stays
+    // the brightest thing on the strip.
+    for &beat in &state.beats {
+        if beat >= columns {
+            continue;
+        }
+        let x = grid_left + (beat as f32 + 0.5) * cell_width;
+        painter.line_segment(
+            [egui::pos2(x, rect.max.y - 5.0), egui::pos2(x, rect.max.y)],
+            egui::Stroke::new(1.5, Color32::from_rgb(0x5C, 0xC8, 0xE0)),
         );
     }
 
@@ -2271,6 +2288,7 @@ mod tests {
 
     fn state() -> TimelineState {
         TimelineState {
+            beats: Vec::new(),
             waveforms: Default::default(),
             current_frame: 4,
             active_layer: None,

@@ -175,6 +175,9 @@ pub struct Editor {
     /// While scrubbing the playhead with sound, the moment the short burst of
     /// audio should stop if the drag has paused. `None` when not scrubbing.
     scrub_until: Option<std::time::Instant>,
+    /// Beat frames detected from the soundtrack, shown as ticks on the ruler.
+    /// View state, not saved — a guide the animator keys action to.
+    pub beat_markers: Vec<u32>,
     /// The Lip Sync dialog.
     pub lip_sync: buzz_ui::LipSyncState,
     /// Whether the last sound import also landed on the timeline. See
@@ -321,6 +324,7 @@ impl Editor {
             light_gesture: None,
             sound: crate::sound::SoundBank::new(stage_fps),
             scrub_until: None,
+            beat_markers: Vec::new(),
             lip_sync: buzz_ui::LipSyncState::default(),
             sound_placed: false,
             staging: buzz_ui::StagingState::default(),
@@ -641,6 +645,25 @@ impl Editor {
         }
         self.scrub_until =
             Some(std::time::Instant::now() + std::time::Duration::from_millis(140));
+    }
+
+    /// **Find the beats in the document's soundtrack** and mark them on the
+    /// ruler, so action can be keyed to the music. Re-detects each time; clears
+    /// the marks when there is no soundtrack.
+    pub fn detect_beats(&mut self) {
+        let scene = self.doc.scene();
+        let fps = scene.stage().frame_rate.max(1.0);
+        match self.sound.stage_track(scene) {
+            Some((_, _, clip)) => {
+                self.beat_markers = buzz_audio::detect_beats(clip.as_ref(), fps);
+                let n = self.beat_markers.len();
+                self.status = Some(format!("Found {n} beats — marked on the ruler"));
+            }
+            None => {
+                self.beat_markers.clear();
+                self.status = Some("There is no soundtrack to find beats in".into());
+            }
+        }
     }
 
     /// Stop the scrub burst once the drag has paused. Call once per frame.
@@ -2979,6 +3002,7 @@ impl Editor {
                 let symbol = self.new_mouth_symbol();
                 self.lip_sync.mouth = Some(symbol.0);
             }
+            DetectBeats => self.detect_beats(),
 
             ToggleActionsPanel => {
                 self.workspace.toggle(buzz_ui::PanelId::Actions);

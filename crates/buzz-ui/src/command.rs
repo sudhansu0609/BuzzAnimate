@@ -51,6 +51,8 @@ pub enum Command {
     LipSync,
     /// Make a mouth symbol with a frame per shape, to draw over.
     NewMouthSymbol,
+    /// Mark the soundtrack's beats on the timeline ruler.
+    DetectBeats,
 
     // Edit
     Undo,
@@ -300,6 +302,7 @@ impl Command {
             RemoveSound => "Remove Sound from Frame",
             LipSync => "Lip Sync…",
             NewMouthSymbol => "New Mouth Symbol",
+            DetectBeats => "Detect Beats",
 
             Undo => "Undo",
             Redo => "Redo",
@@ -528,6 +531,7 @@ impl Command {
             ToggleTheme => None,
             About => None,
             SaveSnapshot | Snapshots => None,
+            DetectBeats => None,
 
             AddSun | AddSky | AddLamp | AddGloom | AddFire => None,
             // No Animate binding to follow, and these open dialogs rather than
@@ -771,6 +775,7 @@ pub fn palette_commands() -> Vec<Command> {
         RemoveSound,
         LipSync,
         NewMouthSymbol,
+        DetectBeats,
     ]
 }
 

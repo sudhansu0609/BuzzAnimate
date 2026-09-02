@@ -423,6 +423,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         ui.menu_button("Commands", |ui| {
             item(ui, Command::LipSync, true, &mut raised);
             item(ui, Command::NewMouthSymbol, true, &mut raised);
+            item(ui, Command::DetectBeats, true, &mut raised);
             ui.separator();
             item(ui, Command::ToggleActionsPanel, true, &mut raised);
             ui.separator();

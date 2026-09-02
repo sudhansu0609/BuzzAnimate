@@ -173,6 +173,63 @@ impl Default for LipSyncOptions {
     }
 }
 
+/// **Find the beats in a clip**, as animation-frame indices.
+///
+/// Honest signal analysis, like the lip sync above and with the same caveat: no
+/// trained tempo model, just onset detection. It measures how sharply the
+/// loudness *rises* frame to frame (a beat is an attack, not just loudness),
+/// and picks the peaks that stand out against their neighbourhood, spaced so two
+/// beats cannot land on top of each other. The result is a starting set of beat
+/// markers an animator can key action to — right far more often than not, and
+/// easy to ignore where it is not.
+pub fn detect_beats(clip: &Clip, fps: f64) -> Vec<u32> {
+    if fps <= 0.0 || clip.is_empty() {
+        return Vec::new();
+    }
+    beats_from_levels(&clip.frame_levels(fps), fps)
+}
+
+/// The beat picker, over a per-frame loudness envelope. Split out so it can be
+/// tested against a synthetic envelope without decoding audio.
+pub fn beats_from_levels(levels: &[f32], fps: f64) -> Vec<u32> {
+    if levels.len() < 3 {
+        return Vec::new();
+    }
+    // Onset strength: the positive rise in loudness, so a sustained loud note is
+    // one beat at its attack, not a beat every frame it holds.
+    let flux: Vec<f32> = (0..levels.len())
+        .map(|i| if i == 0 { 0.0 } else { (levels[i] - levels[i - 1]).max(0.0) })
+        .collect();
+
+    let window = ((fps * 0.2).round() as usize).max(3); // ~200 ms neighbourhood
+    let min_gap = ((fps / 8.0).round() as u32).max(2); // no faster than 8 a second
+    let mut beats = Vec::new();
+    let mut last: Option<u32> = None;
+    for i in 1..flux.len() - 1 {
+        // A local peak in the onset strength.
+        if flux[i] <= flux[i - 1] || flux[i] < flux[i + 1] {
+            continue;
+        }
+        // Standing clear of the local average, with a small floor so near-silence
+        // does not manufacture beats out of noise.
+        let lo = i.saturating_sub(window);
+        let hi = (i + window + 1).min(flux.len());
+        let mean = flux[lo..hi].iter().sum::<f32>() / (hi - lo) as f32;
+        if flux[i] < mean * 1.5 + 0.02 {
+            continue;
+        }
+        let frame = i as u32;
+        if let Some(l) = last {
+            if frame - l < min_gap {
+                continue;
+            }
+        }
+        beats.push(frame);
+        last = Some(frame);
+    }
+    beats
+}
+
 /// Work out a mouth shape for every frame of `clip`.
 pub fn analyse_visemes(clip: &Clip, fps: f64, options: &LipSyncOptions) -> VisemeTrack {
     if fps <= 0.0 || clip.is_empty() {
@@ -429,6 +486,29 @@ fn fft(real: &mut [f32], imaginary: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn beats_land_on_the_attacks_of_a_click_track() {
+        // A per-frame loudness envelope with a sharp spike every 12 frames — a
+        // steady beat at 24 fps / 2 Hz. Between spikes it is near silent.
+        let fps = 24.0;
+        let mut levels = vec![0.02f32; 120];
+        let hits: Vec<usize> = (12..120).step_by(12).collect();
+        for &h in &hits {
+            levels[h] = 0.9;
+        }
+        let beats = beats_from_levels(&levels, fps);
+        // Every spike is found, and nothing spurious between them.
+        assert_eq!(beats.len(), hits.len(), "beats: {beats:?}");
+        for (b, h) in beats.iter().zip(&hits) {
+            assert_eq!(*b as usize, *h);
+        }
+    }
+
+    #[test]
+    fn silence_has_no_beats() {
+        assert!(beats_from_levels(&vec![0.0f32; 100], 24.0).is_empty());
+    }
 
     /// A clip of one tone, so the spectrum is known exactly.
     fn tone(hz: f64, seconds: f64, amplitude: f32) -> Clip {

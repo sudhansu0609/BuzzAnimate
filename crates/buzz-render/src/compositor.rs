@@ -61,6 +61,8 @@ mod flag {
     pub const GRADE: u32 = 2;
     pub const VIGNETTE: u32 = 4;
     pub const GRAIN: u32 = 8;
+    pub const POSTERISE: u32 = 16;
+    pub const HALFTONE: u32 = 32;
 }
 
 /// Half-resolution bloom targets and their current size.
@@ -523,6 +525,12 @@ fn pack_composite(
     if post.enabled && post.grain.enabled && post.grain.amount > 0.0 {
         flags |= flag::GRAIN;
     }
+    if post.enabled && post.posterise.enabled {
+        flags |= flag::POSTERISE;
+    }
+    if post.enabled && post.halftone.enabled {
+        flags |= flag::HALFTONE;
+    }
 
     let g = &post.grade;
     let v = &post.vignette;
@@ -552,13 +560,15 @@ fn pack_composite(
         (60, gr.amount),
         // row 4
         (64, gr.size),
+        // Two former padding slots now carry the stylise passes' one parameter
+        // each; the shader names them poster_levels and halftone_scale.
+        (68, post.posterise.levels.max(2) as f32),
+        (72, post.halftone.scale.max(2.0)),
         // row 5: vignette colour (vec3) on its own 16-byte-aligned row
         (80, vr as f32 / 255.0),
         (84, vg as f32 / 255.0),
         (88, vb as f32 / 255.0),
-        // padding slots kept explicit so the layout reads whole
-        (68, 0.0),
-        (72, 0.0),
+        // the remaining padding slot, kept explicit so the layout reads whole
         (76, 0.0),
     ];
 

@@ -127,7 +127,10 @@ use serde::{Deserialize, Serialize};
 /// * **32** — a new `gradientmap` filter kind (a duotone recolour by
 ///   brightness), reusing the shadow/highlight colour keys. Files without one
 ///   are unchanged from version 31.
-pub const FORMAT_VERSION: u32 = 32;
+/// * **33** — the compositor gains posterise and halftone passes, written flat
+///   on the post settings and defaulted off, so files without them are unchanged
+///   from version 32.
+pub const FORMAT_VERSION: u32 = 33;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -897,6 +900,16 @@ pub struct PostDto {
     pub grade: GradeDto,
     pub vignette: VignetteDto,
     pub grain: GrainDto,
+    /// Posterise and halftone, flat and defaulted so older files (which have
+    /// neither) load with both off. Version 33.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub posterise: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posterise_levels: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub halftone: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halftone_scale: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -973,6 +986,10 @@ impl PostDto {
                 amount: p.grain.amount,
                 size: p.grain.size,
             },
+            posterise: p.posterise.enabled,
+            posterise_levels: Some(p.posterise.levels),
+            halftone: p.halftone.enabled,
+            halftone_scale: Some(p.halftone.scale),
         })
     }
 
@@ -1006,6 +1023,14 @@ impl PostDto {
                 enabled: self.grain.enabled,
                 amount: self.grain.amount,
                 size: self.grain.size,
+            },
+            posterise: buzz_scene::PosteriseSettings {
+                enabled: self.posterise,
+                levels: self.posterise_levels.unwrap_or(6),
+            },
+            halftone: buzz_scene::HalftoneSettings {
+                enabled: self.halftone,
+                scale: self.halftone_scale.unwrap_or(6.0),
             },
         })
     }
@@ -4152,6 +4177,8 @@ mod layer_alpha_tests {
                 gamma: 0.9,
                 gain: 1.1,
             },
+            posterise: buzz_scene::PosteriseSettings { enabled: true, levels: 4 },
+            halftone: buzz_scene::HalftoneSettings { enabled: true, scale: 10.0 },
             ..Default::default()
         };
 

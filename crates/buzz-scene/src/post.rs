@@ -42,6 +42,10 @@ pub struct PostSettings {
     pub grade: GradeSettings,
     pub vignette: VignetteSettings,
     pub grain: GrainSettings,
+    #[serde(default)]
+    pub posterise: PosteriseSettings,
+    #[serde(default)]
+    pub halftone: HalftoneSettings,
 }
 
 impl PostSettings {
@@ -53,7 +57,39 @@ impl PostSettings {
             || (!self.bloom.enabled
                 && self.grade.is_neutral()
                 && !self.vignette.enabled
-                && !self.grain.enabled)
+                && !self.grain.enabled
+                && !self.posterise.enabled
+                && !self.halftone.enabled)
+    }
+}
+
+/// Posterise: flatten each colour channel to a few levels, for a graphic,
+/// screen-printed look.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PosteriseSettings {
+    pub enabled: bool,
+    /// Levels per channel, 2..=16. Fewer is flatter.
+    pub levels: u32,
+}
+
+impl Default for PosteriseSettings {
+    fn default() -> Self {
+        Self { enabled: false, levels: 6 }
+    }
+}
+
+/// Halftone: render the frame as dots whose size follows the brightness, on
+/// white — the comic-book / newsprint look.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HalftoneSettings {
+    pub enabled: bool,
+    /// Dot cell size in output pixels. Larger is coarser.
+    pub scale: f32,
+}
+
+impl Default for HalftoneSettings {
+    fn default() -> Self {
+        Self { enabled: false, scale: 6.0 }
     }
 }
 

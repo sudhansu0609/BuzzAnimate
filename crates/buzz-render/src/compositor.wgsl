@@ -96,6 +96,8 @@ const FLAG_BLOOM: u32 = 1u;
 const FLAG_GRADE: u32 = 2u;
 const FLAG_VIGNETTE: u32 = 4u;
 const FLAG_GRAIN: u32 = 8u;
+const FLAG_POSTERISE: u32 = 16u;
+const FLAG_HALFTONE: u32 = 32u;
 
 struct CompositeU {
     resolution: vec2<f32>,
@@ -118,8 +120,8 @@ struct CompositeU {
     grain_amount: f32,
 
     grain_size: f32,
-    _pad0: f32,
-    _pad1: f32,
+    poster_levels: f32,
+    halftone_scale: f32,
     _pad2: f32,
 
     vignette_color: vec3<f32>,
@@ -172,6 +174,24 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
 
     if ((comp.flags & FLAG_GRADE) != 0u) {
         color = apply_grade(color);
+    }
+
+    // Posterise: flatten each channel to a few levels.
+    if ((comp.flags & FLAG_POSTERISE) != 0u) {
+        let n = max(comp.poster_levels, 2.0);
+        color = round(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)) * (n - 1.0)) / (n - 1.0);
+    }
+
+    // Halftone: dots whose radius grows as the frame darkens, on white.
+    if ((comp.flags & FLAG_HALFTONE) != 0u) {
+        let scale = max(comp.halftone_scale, 2.0);
+        let cell = floor(in.pos.xy / scale);
+        let centre = (cell + vec2<f32>(0.5)) * scale;
+        let d = distance(in.pos.xy, centre) / (scale * 0.5);
+        let l = clamp(luma(color), 0.0, 1.0);
+        let radius = sqrt(1.0 - l);
+        let ink = 1.0 - smoothstep(radius - 0.15, radius + 0.15, d);
+        color = mix(vec3<f32>(1.0), color, ink);
     }
 
     if ((comp.flags & FLAG_VIGNETTE) != 0u) {

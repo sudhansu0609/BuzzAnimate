@@ -82,7 +82,10 @@ pub use object::{
     FillSpec, Object, ObjectId, ObjectKind, Paint, PaintBlend, ShapeData, Spatial, StrokeSpec,
     TextData,
 };
-pub use post::{BloomSettings, GradeSettings, GrainSettings, PostSettings, VignetteSettings};
+pub use post::{
+    BloomSettings, GradeSettings, GrainSettings, HalftoneSettings, PosteriseSettings, PostSettings,
+    VignetteSettings,
+};
 pub use texture::TextureKind;
 pub use raster::{Canvas, SoftBrush};
 pub use rig::{ArmatureData, NamedPose, RigBinding, RigPart, WarpData};

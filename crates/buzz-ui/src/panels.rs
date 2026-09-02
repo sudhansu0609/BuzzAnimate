@@ -1499,6 +1499,8 @@ fn effects_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
                 changed |= grade_controls(ui, &mut post.grade);
                 changed |= vignette_controls(ui, &mut post.vignette);
                 changed |= grain_controls(ui, &mut post.grain);
+                changed |= posterise_controls(ui, &mut post.posterise);
+                changed |= halftone_controls(ui, &mut post.halftone);
             });
         });
 
@@ -1641,6 +1643,34 @@ fn grain_controls(ui: &mut Ui, g: &mut buzz_scene::GrainSettings) -> bool {
                 ui.label("Size");
                 changed |= ui.add(egui::Slider::new(&mut g.size, 1.0..=8.0)).changed();
                 ui.end_row();
+            });
+        });
+    changed
+}
+
+fn posterise_controls(ui: &mut Ui, p: &mut buzz_scene::PosteriseSettings) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new("Posterise")
+        .id_salt("fx-posterise")
+        .show(ui, |ui| {
+            changed |= ui.checkbox(&mut p.enabled, "On").changed();
+            ui.horizontal(|ui| {
+                ui.label("Levels");
+                changed |= ui.add(egui::Slider::new(&mut p.levels, 2..=16)).changed();
+            });
+        });
+    changed
+}
+
+fn halftone_controls(ui: &mut Ui, h: &mut buzz_scene::HalftoneSettings) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new("Halftone")
+        .id_salt("fx-halftone")
+        .show(ui, |ui| {
+            changed |= ui.checkbox(&mut h.enabled, "On").changed();
+            ui.horizontal(|ui| {
+                ui.label("Dot size");
+                changed |= ui.add(egui::Slider::new(&mut h.scale, 2.0..=24.0)).changed();
             });
         });
     changed

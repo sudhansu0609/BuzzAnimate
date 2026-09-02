@@ -3081,6 +3081,8 @@ impl App {
             // taken manual control of the playhead.
             self.editor.playback.playing = false;
             self.editor.set_frame(frame);
+            // ...but you still hear it, so the beat can be found by ear.
+            self.editor.scrub_audio(frame);
         }
         if let Some(layer) = response.select_layer {
             // As in the Layers panel: the layer's artwork comes with it.
@@ -6192,6 +6194,8 @@ impl App {
         // Playback runs on wall-clock time, so the document plays at its
         // authored rate regardless of the display's refresh rate.
         self.editor.advance_playback(elapsed.as_secs_f64());
+        // Stop a scrub's short audio burst once the drag has paused.
+        self.editor.tick_scrub();
         let Some(active) = self.active.as_mut() else {
             return Ok(());
         };

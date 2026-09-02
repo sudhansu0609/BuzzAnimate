@@ -172,6 +172,9 @@ pub struct Editor {
     /// View state: which sounds happen to be decoded is not part of the
     /// document, and the document is the authority on what should be heard.
     pub sound: crate::sound::SoundBank,
+    /// While scrubbing the playhead with sound, the moment the short burst of
+    /// audio should stop if the drag has paused. `None` when not scrubbing.
+    scrub_until: Option<std::time::Instant>,
     /// The Lip Sync dialog.
     pub lip_sync: buzz_ui::LipSyncState,
     /// Whether the last sound import also landed on the timeline. See
@@ -317,6 +320,7 @@ impl Editor {
             workspace: buzz_ui::Workspace::load(),
             light_gesture: None,
             sound: crate::sound::SoundBank::new(stage_fps),
+            scrub_until: None,
             lip_sync: buzz_ui::LipSyncState::default(),
             sound_placed: false,
             staging: buzz_ui::StagingState::default(),
@@ -612,6 +616,45 @@ impl Editor {
     pub fn step_frame(&mut self, delta: i64) {
         let target = (self.current_frame as i64 + delta).max(0) as u32;
         self.set_frame(target);
+    }
+
+    /// **Play a short burst of the soundtrack while scrubbing the playhead.**
+    ///
+    /// Dragging the playhead over a scene with sound should be audible, the way
+    /// it is in every editor — you find the beat by ear. This starts the audio
+    /// at `frame` (or moves it there if it is already rolling from the drag) and
+    /// arms a short deadline; [`Self::tick_scrub`] stops it once the drag pauses,
+    /// so it is a scrub, not playback. A no-op while the transport is playing or
+    /// the scene has no soundtrack.
+    pub fn scrub_audio(&mut self, frame: u32) {
+        if self.playback.playing {
+            return;
+        }
+        let scene = self.doc.scene();
+        if self.sound.stage_track(scene).is_none() {
+            return;
+        }
+        if self.scrub_until.is_some() && self.sound.playing_frame().is_some() {
+            self.sound.seek(frame);
+        } else {
+            self.sound.play(scene, frame);
+        }
+        self.scrub_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(140));
+    }
+
+    /// Stop the scrub burst once the drag has paused. Call once per frame.
+    pub fn tick_scrub(&mut self) {
+        if self.playback.playing {
+            self.scrub_until = None;
+            return;
+        }
+        if let Some(deadline) = self.scrub_until {
+            if std::time::Instant::now() >= deadline {
+                self.sound.stop();
+                self.scrub_until = None;
+            }
+        }
     }
 
     /// Advance playback by `elapsed` seconds. Call once per frame.

@@ -333,6 +333,7 @@ pub fn draw_chrome(ui: &mut Ui, editor: &Editor, area: egui::Rect) -> ChromeResp
     // Where the pointer is, so the rotate mark can appear on the corner it is
     // actually near rather than on all four at once.
     let pointer = ui.input(|i| i.pointer.hover_pos());
+    draw_trail(&painter, editor, to_screen_art);
     draw_selection(&painter, editor, pointer, to_screen_art, to_screen);
     draw_rigs(&painter, editor, to_screen_art);
     draw_lights(&painter, editor, to_screen_art);
@@ -430,6 +431,50 @@ fn draw_guides(
                 }
             }
         }
+    }
+}
+
+/// Motion trail: the path the selection's centre traces across every frame,
+/// with a tick per frame — bunched ticks read as slow, spread ticks as fast, so
+/// the arc and its timing are both visible. Shown while onion skin is on, which
+/// is the "see the motion over time" mode; hidden during playback with it.
+fn draw_trail(
+    painter: &egui::Painter,
+    editor: &crate::editor::Editor,
+    to_screen_art: impl Fn(Point) -> egui::Pos2,
+) {
+    if editor.onion_frames().is_empty() || editor.selection.is_empty() {
+        return;
+    }
+    let scene = editor.scene();
+    let count = scene.frame_count();
+    if count < 2 {
+        return;
+    }
+    let points: Vec<(u32, egui::Pos2)> = (0..count)
+        .filter_map(|f| {
+            editor.selection.bounds_at(scene, f).map(|b| {
+                let c = b.center();
+                (f, to_screen_art(Point::new(c.x, c.y)))
+            })
+        })
+        .collect();
+    if points.len() < 2 {
+        return;
+    }
+    let arc = Stroke::new(1.5, Palette::guide().gamma_multiply(0.7));
+    for w in points.windows(2) {
+        painter.line_segment([w[0].1, w[1].1], arc);
+    }
+    for (f, p) in &points {
+        let here = *f == editor.current_frame;
+        let radius = if here { 3.5 } else { 2.0 };
+        let colour = if here {
+            egui::Color32::from_rgb(0xFF, 0xB4, 0x28)
+        } else {
+            Palette::guide()
+        };
+        painter.circle_filled(*p, radius, colour);
     }
 }
 

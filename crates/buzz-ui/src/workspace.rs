@@ -316,6 +316,84 @@ pub struct Workspace {
     /// Mutually exclusive with the parenting view: one column, one question.
     #[serde(default)]
     pub depth_view: bool,
+    /// The user's keyboard-shortcut overrides, keyed by a stable command id.
+    ///
+    /// `Some(chord)` rebinds a command; `None` explicitly unbinds one that has a
+    /// default. A command absent from the map keeps its built-in shortcut. Held
+    /// here because a keymap belongs to the person, not to any one film.
+    #[serde(default)]
+    pub keymap: std::collections::BTreeMap<String, Option<KeyChord>>,
+}
+
+/// A serialisable keyboard chord — the modifiers and the key, stored by name so
+/// the keymap is plain, editable JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyChord {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub command: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ctrl: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub alt: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shift: bool,
+    /// The key's egui name, e.g. "A", "F5", "Enter".
+    pub key: String,
+}
+
+impl KeyChord {
+    /// Capture the chord for a shortcut.
+    pub fn from_shortcut(shortcut: egui::KeyboardShortcut) -> Self {
+        let m = shortcut.modifiers;
+        Self {
+            command: m.command,
+            ctrl: m.ctrl,
+            alt: m.alt,
+            shift: m.shift,
+            key: shortcut.logical_key.name().to_string(),
+        }
+    }
+
+    /// Rebuild an egui shortcut, or `None` if the key name is not one egui knows.
+    pub fn to_shortcut(&self) -> Option<egui::KeyboardShortcut> {
+        let key = egui::Key::ALL.iter().copied().find(|k| k.name() == self.key)?;
+        let modifiers = egui::Modifiers {
+            alt: self.alt,
+            ctrl: self.ctrl,
+            shift: self.shift,
+            mac_cmd: false,
+            command: self.command,
+        };
+        Some(egui::KeyboardShortcut::new(modifiers, key))
+    }
+
+    /// How this chord reads on screen — "Ctrl+Shift+S" and the like.
+    pub fn label(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if self.command || self.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.alt {
+            parts.push("Alt");
+        }
+        if self.shift {
+            parts.push("Shift");
+        }
+        let mut out = parts.join("+");
+        if !out.is_empty() {
+            out.push('+');
+        }
+        out.push_str(&self.key);
+        out
+    }
+}
+
+/// The stable id a shortcut override is stored under: the command's own name.
+/// For the unit commands a keymap can touch, `Debug` is exactly the variant
+/// name and never changes unless the variant is renamed — as stable as a
+/// hand-written id, without a match over the whole enum.
+pub fn command_id(command: crate::command::Command) -> String {
+    format!("{command:?}")
 }
 
 /// Bounds for the timeline's two zooms.
@@ -380,6 +458,42 @@ impl Default for Workspace {
 }
 
 impl Workspace {
+    /// The shortcut a command runs on now: the user's override if there is one,
+    /// otherwise the command's built-in default. An override of `None` means the
+    /// user has unbound it, so it has no shortcut at all.
+    pub fn shortcut_for(&self, command: crate::command::Command) -> Option<egui::KeyboardShortcut> {
+        match self.keymap.get(&command_id(command)) {
+            Some(Some(chord)) => chord.to_shortcut(),
+            Some(None) => None,
+            None => command.shortcut(),
+        }
+    }
+
+    /// Whether the user has changed this command's shortcut from its default.
+    pub fn has_shortcut_override(&self, command: crate::command::Command) -> bool {
+        self.keymap.contains_key(&command_id(command))
+    }
+
+    /// Rebind a command to a chord.
+    pub fn rebind(&mut self, command: crate::command::Command, chord: KeyChord) {
+        self.keymap.insert(command_id(command), Some(chord));
+    }
+
+    /// Unbind a command — leave it with no shortcut, overriding any default.
+    pub fn unbind(&mut self, command: crate::command::Command) {
+        self.keymap.insert(command_id(command), None);
+    }
+
+    /// Drop any override, returning the command to its built-in shortcut.
+    pub fn reset_shortcut(&mut self, command: crate::command::Command) {
+        self.keymap.remove(&command_id(command));
+    }
+
+    /// Forget every override.
+    pub fn reset_all_shortcuts(&mut self) {
+        self.keymap.clear();
+    }
+
     /// **Put every panel back where it started, and change nothing else.**
     ///
     /// Panels can be docked, undocked, tabbed, rolled up, resized and closed,
@@ -534,6 +648,7 @@ impl Workspace {
             parenting_view: false,
             depth_view: false,
             asset_thumbnail_size: crate::assets_panel::ThumbnailSize::default(),
+            keymap: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1093,6 +1208,63 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::Command;
+
+    #[test]
+    fn a_key_chord_round_trips_through_egui() {
+        let shortcut = egui::KeyboardShortcut::new(
+            egui::Modifiers { ctrl: true, shift: true, ..Default::default() },
+            egui::Key::S,
+        );
+        let chord = KeyChord::from_shortcut(shortcut);
+        assert_eq!(chord.key, "S");
+        assert!(chord.ctrl && chord.shift && !chord.alt);
+        assert_eq!(chord.to_shortcut(), Some(shortcut));
+        assert_eq!(chord.label(), "Ctrl+Shift+S");
+    }
+
+    #[test]
+    fn the_keymap_overrides_then_resets_a_shortcut() {
+        let mut ws = Workspace::animate();
+        let cmd = Command::PlayPause;
+        let default = cmd.shortcut();
+        assert_eq!(ws.shortcut_for(cmd), default, "unset resolves to the default");
+
+        // Rebind to a new chord.
+        let chord = KeyChord {
+            command: false,
+            ctrl: true,
+            alt: true,
+            shift: false,
+            key: "P".to_string(),
+        };
+        ws.rebind(cmd, chord.clone());
+        assert_eq!(ws.shortcut_for(cmd), chord.to_shortcut());
+        assert!(ws.has_shortcut_override(cmd));
+
+        // Unbind: no shortcut at all, overriding the default.
+        ws.unbind(cmd);
+        assert_eq!(ws.shortcut_for(cmd), None);
+
+        // Reset: back to the built-in.
+        ws.reset_shortcut(cmd);
+        assert_eq!(ws.shortcut_for(cmd), default);
+        assert!(!ws.has_shortcut_override(cmd));
+    }
+
+    #[test]
+    fn the_keymap_survives_a_serde_round_trip() {
+        let mut ws = Workspace::animate();
+        ws.rebind(
+            Command::Save,
+            KeyChord { command: true, ctrl: false, alt: false, shift: true, key: "S".into() },
+        );
+        ws.unbind(Command::PlayPause);
+        let json = serde_json::to_string(&ws).unwrap();
+        let back: Workspace = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.shortcut_for(Command::Save), ws.shortcut_for(Command::Save));
+        assert_eq!(back.shortcut_for(Command::PlayPause), None);
+    }
 
     #[test]
     fn the_default_workspace_places_every_panel() {

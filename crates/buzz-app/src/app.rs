@@ -624,6 +624,8 @@ pub struct App {
     /// Named version snapshots of the document, and whether the list is open.
     snapshots: buzz_doc::SnapshotLibrary,
     show_snapshots: bool,
+    /// The keyboard-shortcut editor's open/capture state.
+    shortcut_editor: buzz_ui::ShortcutEditorState,
     /// The camera panel's between-frames state (the angle name being typed).
     camera_panel_state: buzz_ui::CameraPanelState,
     /// The user's saved commands (named Actions scripts).
@@ -767,6 +769,7 @@ impl App {
             command_palette: buzz_ui::CommandPaletteState::default(),
             snapshots: buzz_doc::SnapshotLibrary::user(),
             show_snapshots: false,
+            shortcut_editor: buzz_ui::ShortcutEditorState::default(),
             camera_panel_state: buzz_ui::CameraPanelState::default(),
             commands: buzz_doc::CommandLibrary::user(),
             last_crash_revision: None,
@@ -1280,7 +1283,9 @@ fn keyboard_commands(ctx: &egui::Context, editor: &Editor) -> Vec<Command> {
 
     let all = KEYBOARD_COMMANDS;
     for &command in all {
-        if let Some(shortcut) = command.shortcut()
+        // The user's keymap override wins over the built-in shortcut; an
+        // unbound command resolves to `None` and matches no key.
+        if let Some(shortcut) = editor.workspace.shortcut_for(command)
             && ctx.input_mut(|i| i.consume_shortcut(&shortcut))
         {
             out.push(command);
@@ -1654,6 +1659,11 @@ impl App {
         self.staging_dialog(&ctx);
         self.recovery_dialog(&ctx);
         self.snapshots_dialog(&ctx);
+        // The shortcut editor writes straight into the workspace keymap; save it
+        // when it reports a change, the way every other preference is saved.
+        if buzz_ui::shortcut_editor(&ctx, &mut self.shortcut_editor, &mut self.editor.workspace) {
+            self.editor.workspace.save();
+        }
         buzz_ui::about_dialog(&ctx, &mut self.editor.about);
 
         // File ▸ New asks before it acts, and the answer is remembered.
@@ -4334,6 +4344,7 @@ impl App {
                 self.snapshots.rescan();
                 self.show_snapshots = true;
             }
+            Command::ShortcutEditor => self.shortcut_editor.open(),
             other => self.editor.run(other),
         }
     }

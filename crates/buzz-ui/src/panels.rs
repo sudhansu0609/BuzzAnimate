@@ -84,7 +84,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         let has_selection = !selection.is_empty();
 
         let item = |ui: &mut Ui, command: Command, enabled: bool, out: &mut Vec<Command>| {
-            let shortcut = shortcut_text(ui.ctx(), command);
+            let shortcut =
+                crate::command::format_shortcut(ui.ctx(), workspace.shortcut_for(command));
             let button = egui::Button::new(command.label()).shortcut_text(shortcut);
             if ui.add_enabled(enabled, button).clicked() {
                 out.push(command);
@@ -269,6 +270,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 raised.push(Command::ResetWorkspace);
                 ui.close();
             }
+            ui.separator();
+            item(ui, Command::ShortcutEditor, true, &mut raised);
         });
 
         ui.menu_button("Insert", |ui| {

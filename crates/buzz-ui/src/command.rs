@@ -142,6 +142,8 @@ pub enum Command {
     SaveSnapshot,
     /// Open the list of saved snapshots, to restore one.
     Snapshots,
+    /// Open the keyboard-shortcut editor.
+    ShortcutEditor,
 
     // Lighting
     /// Add a sun: one direction for the whole stage.
@@ -368,6 +370,7 @@ impl Command {
             ResetWorkspace => "Reset Layout",
             SaveSnapshot => "Save Snapshot",
             Snapshots => "Snapshots\u{2026}",
+            ShortcutEditor => "Keyboard Shortcuts\u{2026}",
 
             AddSun => "Sun",
             AddSky => "Sky",
@@ -535,6 +538,7 @@ impl Command {
             ToggleTheme => None,
             About => None,
             SaveSnapshot | Snapshots => None,
+            ShortcutEditor => None,
             DetectBeats => None,
             NewReferenceLayer => None,
 
@@ -766,6 +770,7 @@ pub fn palette_commands() -> Vec<Command> {
         About,
         SaveSnapshot,
         Snapshots,
+        ShortcutEditor,
         ToggleActionsPanel,
         RunScript,
         ClearScriptOutput,
@@ -785,12 +790,15 @@ pub fn palette_commands() -> Vec<Command> {
     ]
 }
 
-/// Format a shortcut the way a menu shows it.
+/// Format a command's built-in shortcut the way a menu shows it.
 pub fn shortcut_text(ctx: &egui::Context, command: Command) -> String {
-    command
-        .shortcut()
-        .map(|s| ctx.format_shortcut(&s))
-        .unwrap_or_default()
+    format_shortcut(ctx, command.shortcut())
+}
+
+/// Format an already-resolved shortcut (which may be the user's override or
+/// `None`) the way a menu shows it.
+pub fn format_shortcut(ctx: &egui::Context, shortcut: Option<egui::KeyboardShortcut>) -> String {
+    shortcut.map(|s| ctx.format_shortcut(&s)).unwrap_or_default()
 }
 
 #[cfg(test)]

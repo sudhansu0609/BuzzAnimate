@@ -624,6 +624,8 @@ pub struct App {
     /// Named version snapshots of the document, and whether the list is open.
     snapshots: buzz_doc::SnapshotLibrary,
     show_snapshots: bool,
+    /// The camera panel's between-frames state (the angle name being typed).
+    camera_panel_state: buzz_ui::CameraPanelState,
     /// The revision the crash snapshot was last taken at.
     last_crash_revision: Option<u64>,
     /// A scene being renamed from the edit bar: its index and the text so far.
@@ -763,6 +765,7 @@ impl App {
             command_palette: buzz_ui::CommandPaletteState::default(),
             snapshots: buzz_doc::SnapshotLibrary::user(),
             show_snapshots: false,
+            camera_panel_state: buzz_ui::CameraPanelState::default(),
             last_crash_revision: None,
             scene_rename: None,
             animate_import: None,
@@ -2118,7 +2121,12 @@ impl App {
     /// and typing a number into a box do the same thing.
     fn camera_panel(&mut self, ui: &mut egui::Ui) {
         let frame = self.editor.current_frame;
-        let response = buzz_ui::camera_panel(ui, self.editor.scene().camera(), frame);
+        let response = buzz_ui::camera_panel(
+            ui,
+            self.editor.scene().camera(),
+            frame,
+            &mut self.camera_panel_state,
+        );
         self.apply_camera(response);
     }
 
@@ -2201,6 +2209,37 @@ impl App {
                 buzz_ui::ToolId::Camera
             };
             self.editor.set_tool(tool);
+        }
+
+        let frame = self.editor.current_frame;
+        if let Some(name) = response.save_angle {
+            self.editor.doc.edit("Save Angle", |scene| {
+                scene.camera_mut().enabled = true;
+                scene.camera_mut().save_angle(name.clone(), frame);
+            });
+            self.editor.doc.end_gesture();
+            self.editor.status = Some("Angle saved".into());
+        }
+        if let Some(i) = response.cut_angle {
+            // Cut to a saved angle: key the camera to its state at the playhead,
+            // so the shot jumps to that viewpoint here.
+            self.editor.doc.edit("Cut to Angle", |scene| {
+                if let Some(angle) = scene.camera().angles.get(i).cloned() {
+                    let mut key = angle.state;
+                    key.frame = frame;
+                    scene.camera_mut().enabled = true;
+                    scene.camera_mut().set_key(key.clamped());
+                }
+            });
+            self.editor.doc.end_gesture();
+        }
+        if let Some(i) = response.delete_angle {
+            self.editor.doc.edit("Delete Angle", |scene| {
+                if i < scene.camera().angles.len() {
+                    scene.camera_mut().angles.remove(i);
+                }
+            });
+            self.editor.doc.end_gesture();
         }
     }
 

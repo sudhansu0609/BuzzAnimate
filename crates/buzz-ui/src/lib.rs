@@ -43,7 +43,7 @@ pub use align::{Align, Distribute, MatchSize};
 pub use actions_panel::{ActionsResponse, ActionsState, SampleEntry, actions_panel};
 pub use assets_panel::{AssetAction, AssetPanelState, ThumbnailSize, assets_panel};
 pub use brush::{BrushKind, BrushSettings, PatternShape};
-pub use camera_panel::{CameraResponse, camera_hud, camera_panel};
+pub use camera_panel::{CameraPanelState, CameraResponse, camera_hud, camera_panel};
 pub use command::Command;
 pub use command_palette::{command_palette, CommandPaletteState};
 pub use depth_panel::{DepthResponse, depth_panel};

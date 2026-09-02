@@ -15,7 +15,7 @@ use buzz_scene::{CameraKey, CameraTrack, MAX_TILT};
 use egui::{RichText, Ui};
 
 /// What the user changed. Each field is its own undo step in the editor.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct CameraResponse {
     /// The camera was switched on or off.
     pub toggle: bool,
@@ -29,10 +29,28 @@ pub struct CameraResponse {
     /// Take hold of the camera: pick up the Camera tool so dragging the stage
     /// moves the shot.
     pub grab_camera: bool,
+    /// Save the camera's current state as a named angle under this name.
+    pub save_angle: Option<String>,
+    /// Cut to a saved angle at the playhead — key the camera to it now.
+    pub cut_angle: Option<usize>,
+    /// Forget a saved angle.
+    pub delete_angle: Option<usize>,
+}
+
+/// Panel-side state the camera panel needs to keep between frames — the name
+/// being typed for a new angle.
+#[derive(Debug, Default, Clone)]
+pub struct CameraPanelState {
+    pub new_angle_name: String,
 }
 
 /// Draw the camera's properties for `frame`.
-pub fn camera_panel(ui: &mut Ui, camera: &CameraTrack, frame: u32) -> CameraResponse {
+pub fn camera_panel(
+    ui: &mut Ui,
+    camera: &CameraTrack,
+    frame: u32,
+    state: &mut CameraPanelState,
+) -> CameraResponse {
     let mut out = CameraResponse::default();
 
     ui.horizontal(|ui| {
@@ -159,6 +177,41 @@ pub fn camera_panel(ui: &mut Ui, camera: &CameraTrack, frame: u32) -> CameraResp
             out.reset = true;
         }
     });
+
+    // Named angles: save the current shot under a name, then cut to it at the
+    // playhead later — the same staged scene, shot from a saved viewpoint.
+    ui.separator();
+    ui.label("Angles");
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut state.new_angle_name)
+                .hint_text("Name")
+                .desired_width(120.0),
+        );
+        if ui.small_button("Save Angle").on_hover_text("Save this shot under the name").clicked()
+        {
+            let name = state.new_angle_name.trim();
+            let name = if name.is_empty() {
+                format!("Angle {}", camera.angles.len() + 1)
+            } else {
+                name.to_string()
+            };
+            out.save_angle = Some(name);
+            state.new_angle_name.clear();
+        }
+    });
+    for (i, angle) in camera.angles.iter().enumerate() {
+        ui.horizontal(|ui| {
+            if ui.small_button("Cut").on_hover_text("Cut to this angle at the playhead").clicked()
+            {
+                out.cut_angle = Some(i);
+            }
+            if ui.add(egui::Button::new("✕").small()).on_hover_text("Delete").clicked() {
+                out.delete_angle = Some(i);
+            }
+            ui.label(&angle.name);
+        });
+    }
 
     if changed {
         out.set = Some(key);

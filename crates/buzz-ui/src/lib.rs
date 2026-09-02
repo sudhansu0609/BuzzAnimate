@@ -17,6 +17,7 @@ pub mod export_panel;
 pub mod filter_panel;
 pub mod icons;
 pub mod library_panel;
+pub mod motion_editor;
 pub mod light_panel;
 pub mod lipsync_panel;
 pub mod new_document;
@@ -49,6 +50,7 @@ pub use export_panel::{
     VideoChoice, VideoOptions, WebpOptions, export_dialog,
 };
 pub use filter_panel::{FilterPanelState, FilterResponse, FilterTarget, filter_panel};
+pub use motion_editor::{MotionEditorResponse, MotionEditorState, motion_editor_panel};
 pub use library_panel::{LibraryState, library_panel};
 pub use light_panel::{LightPanelState, LightResponse, light_panel};
 pub use lipsync_panel::{Choice, LipSyncResponse, LipSyncState, lip_sync_dialog};

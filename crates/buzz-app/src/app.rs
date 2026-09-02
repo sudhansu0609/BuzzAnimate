@@ -1879,6 +1879,32 @@ impl App {
             }
 
             Tasks => self.tasks_panel(ui),
+            MotionEditor => self.motion_editor_panel(ui),
+        }
+    }
+
+    /// The Motion Editor: shape the easing of the tween under the playhead.
+    fn motion_editor_panel(&mut self, ui: &mut egui::Ui) {
+        let editor = &mut self.editor;
+        // The tween on the active layer's keyframe at the playhead, if it is an
+        // active one — the same target the tween commands act on.
+        let frame = editor.current_frame;
+        let tween = editor
+            .selection
+            .active_layer()
+            .and_then(|id| editor.doc.scene().layers().get(id))
+            .map(|l| l.frames.tween_at(frame))
+            .filter(|t| t.is_active());
+
+        let response = buzz_ui::motion_editor_panel(
+            ui,
+            tween.map(|t| t.easing),
+            tween.map(|t| t.kind),
+            &mut editor.motion_editor,
+        );
+
+        if let Some(easing) = response.set_easing {
+            editor.set_ease_curve(easing);
         }
     }
 

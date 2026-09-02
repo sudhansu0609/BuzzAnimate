@@ -150,6 +150,9 @@ pub struct Editor {
     pub light_panel: buzz_ui::LightPanelState,
     /// The Filters panel: which target and which row. View state.
     pub filter_panel: buzz_ui::FilterPanelState,
+    /// The Motion Editor's view state (it holds none of the curve; that lives on
+    /// the keyframe).
+    pub motion_editor: buzz_ui::MotionEditorState,
     /// The camera row is the selected one in the timeline.
     ///
     /// Animate's camera is shown as a layer and selected like one, but it is
@@ -308,6 +311,7 @@ impl Editor {
             rig_gesture: None,
             light_panel: buzz_ui::LightPanelState::default(),
             filter_panel: buzz_ui::FilterPanelState::default(),
+            motion_editor: buzz_ui::MotionEditorState::default(),
             camera_selected: false,
             workspace: buzz_ui::Workspace::load(),
             light_gesture: None,
@@ -4210,6 +4214,24 @@ impl Editor {
             self.status =
                 Some("Tween set, but there is no following keyframe to tween towards".into());
         }
+    }
+
+    /// Replace only the *easing* of the tween on the keyframe governing the
+    /// playhead — the Motion Editor's write. Read-modify-write keeps the tween's
+    /// kind, extra rotations and orient-to-path; no `end_gesture`, so a drag of
+    /// the curve coalesces into one undo step.
+    pub fn set_ease_curve(&mut self, easing: buzz_scene::Easing) {
+        let Some(layer) = self.active_layer() else {
+            return;
+        };
+        let frame = self.current_frame;
+        self.doc.edit("Ease Curve", |scene| {
+            scene.update_layer(layer, |l| {
+                let mut tween = l.frames.tween_at(frame);
+                tween.easing = easing;
+                l.frames.set_tween(frame, tween);
+            });
+        });
     }
 
     /// Frames between this keyframe and the next, for diagnostics.

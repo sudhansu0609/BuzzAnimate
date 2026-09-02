@@ -43,6 +43,9 @@ pub enum PanelId {
     Assets,
     Timeline,
     Actions,
+    /// The easing-curve editor for the tween under the playhead. Hidden until
+    /// asked for, from the Window menu.
+    MotionEditor,
     /// Everything the program is doing in the background: exports, imports,
     /// asset scans. Global rather than per-document; hidden until asked for.
     Tasks,
@@ -66,6 +69,7 @@ impl PanelId {
             Self::Assets => "Assets",
             Self::Timeline => "Timeline",
             Self::Actions => "Actions",
+            Self::MotionEditor => "Motion Editor",
             Self::Tasks => "Tasks",
         }
     }
@@ -96,7 +100,7 @@ impl PanelId {
         !matches!(self, Self::Tools | Self::Timeline)
     }
 
-    pub const ALL: [PanelId; 15] = [
+    pub const ALL: [PanelId; 16] = [
         PanelId::Tools,
         PanelId::Layers,
         PanelId::Properties,
@@ -111,6 +115,7 @@ impl PanelId {
         PanelId::Assets,
         PanelId::Timeline,
         PanelId::Actions,
+        PanelId::MotionEditor,
         PanelId::Tasks,
     ];
 }
@@ -509,6 +514,9 @@ impl Workspace {
                 // Hidden until there is something to watch; opened from the
                 // Window menu, or by the shell when an export is enqueued.
                 slot(PanelId::Tasks, Dock::Hidden, 2, Dock::Bottom),
+                // Closed until asked for; docks on the right beside Properties,
+                // where a curve editor sits next to the tween's settings.
+                slot(PanelId::MotionEditor, Dock::Hidden, 3, Dock::Right),
             ],
             locked: false,
             theme: crate::theme::Theme::default(),

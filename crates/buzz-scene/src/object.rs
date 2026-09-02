@@ -476,6 +476,12 @@ pub struct Object {
     /// what they were made from, kept so the words stay editable. `None` for
     /// everything that is not text, which is almost everything.
     pub text: Option<TextData>,
+
+    /// **The drawing shown when this object is turned to face away** — a real
+    /// turnaround's back view, rather than the front mirrored. The renderer
+    /// swaps to it once the object's yaw passes edge-on. `None` for everything
+    /// that has no separate back, which is almost everything.
+    pub reverse: Option<Arc<Object>>,
 }
 
 /// The source of a text object: the string and its size. The rendered outlines
@@ -503,6 +509,7 @@ impl Object {
             pivot: None,
             modifiers: Vec::new(),
             text: None,
+            reverse: None,
         }
     }
 
@@ -520,6 +527,7 @@ impl Object {
             pivot: None,
             modifiers: Vec::new(),
             text: None,
+            reverse: None,
         }
     }
 
@@ -651,6 +659,7 @@ impl Object {
             pivot: None,
             modifiers: Vec::new(),
             text: None,
+            reverse: None,
         }
     }
 }

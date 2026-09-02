@@ -179,6 +179,11 @@ pub enum Command {
     /// **Bake modifiers**: evaluate the selected object's live modifiers across
     /// the film into keyframes, then remove them — live becomes editable.
     BakeModifiers,
+    /// **Set reverse drawing**: make the second selected object the back view of
+    /// the first, shown when it is turned to face away.
+    SetReverse,
+    /// **Clear reverse drawing**: remove the selected object's back view.
+    ClearReverse,
 
     // Commands (scripting)
     /// Show or hide the Actions panel.
@@ -368,6 +373,8 @@ impl Command {
             AddWiggle => "Add Wiggle\u{2026}",
             ClearModifiers => "Clear Modifiers",
             BakeModifiers => "Bake Modifiers",
+            SetReverse => "Set Reverse Drawing",
+            ClearReverse => "Clear Reverse Drawing",
 
             ToggleActionsPanel => "Actions",
             RunScript => "Run Script",
@@ -519,7 +526,8 @@ impl Command {
             // No Animate binding to follow, and these open dialogs rather than
             // acting straight away, so a key would only save the menu.
             SetScene | DirectScene | AddScene | DuplicateScene | AddPerson | Perform
-            | AddFollowThrough | AddWiggle | ClearModifiers | BakeModifiers => None,
+            | AddFollowThrough | AddWiggle | ClearModifiers | BakeModifiers | SetReverse
+            | ClearReverse => None,
             ToggleLightGizmos => sc(ctrl_shift, Key::L),
 
             // F9 is Animate's own Actions panel key on Windows.
@@ -603,6 +611,8 @@ impl Command {
                 | BrushFromSelection
                 | ClearModifiers
                 | BakeModifiers
+                | SetReverse
+                | ClearReverse
                 | Nudge { .. }
                 | Align { .. }
                 | Distribute(_)
@@ -722,6 +732,8 @@ pub fn all_with_shortcuts() -> Vec<Command> {
         AddWiggle,
         ClearModifiers,
         BakeModifiers,
+        SetReverse,
+        ClearReverse,
         ToggleLayoutLock,
         ToggleTheme,
         About,
@@ -862,6 +874,8 @@ mod tests {
             AddWiggle,
             ClearModifiers,
             BakeModifiers,
+            SetReverse,
+            ClearReverse,
             ToggleLayoutLock,
             ToggleTheme,
             About,

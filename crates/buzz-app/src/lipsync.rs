@@ -156,6 +156,7 @@ pub fn write_track(
                 pivot: None,
                 modifiers: Vec::new(),
                 text: None,
+                reverse: None,
             };
             target.frames.set_objects(frame, vec![Arc::new(object)]);
         }
@@ -241,6 +242,7 @@ pub fn placeholder_mouth(scene: &mut Scene, name: &str) -> SymbolId {
                     pivot: None,
                     modifiers: Vec::new(),
                     text: None,
+                    reverse: None,
                 };
                 l.frames.set_objects(frame, vec![Arc::new(object)]);
             }

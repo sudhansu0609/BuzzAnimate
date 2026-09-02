@@ -337,6 +337,9 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 item(ui, Command::AddWiggle, true, &mut raised);
                 item(ui, Command::BakeModifiers, has_selection, &mut raised);
                 item(ui, Command::ClearModifiers, has_selection, &mut raised);
+                ui.separator();
+                item(ui, Command::SetReverse, has_selection, &mut raised);
+                item(ui, Command::ClearReverse, has_selection, &mut raised);
             });
         });
 

@@ -112,7 +112,11 @@ use serde::{Deserialize, Serialize};
 ///   its size), so the words stay editable; the glyph outlines themselves are an
 ///   ordinary shape path. Absent in older files and in every non-text object, so
 ///   an unchanged document is written exactly as version 27 wrote it.
-pub const FORMAT_VERSION: u32 = 28;
+/// * **29** — an object may carry a `reverse` drawing (a whole nested object),
+///   shown when it is turned to face away — a real turnaround rather than the
+///   front mirrored. Absent in older files and in every object without a back,
+///   so an unchanged document is written exactly as version 28 wrote it.
+pub const FORMAT_VERSION: u32 = 29;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -1327,6 +1331,10 @@ pub struct ObjectDto {
     /// The text this object was typed as, when it is text. Version 28.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<TextDataDto>,
+    /// The back drawing shown when the object faces away. Version 29. `Box`d so
+    /// the DTO is not infinitely sized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse: Option<Box<ObjectDto>>,
     pub kind: ObjectKindDto,
 }
 
@@ -2386,6 +2394,10 @@ impl ObjectDto {
                 content: t.content.clone(),
                 size: t.size,
             }),
+            reverse: object
+                .reverse
+                .as_ref()
+                .map(|r| Box::new(Self::from_object(r, max_id))),
             kind,
         }
     }
@@ -2548,6 +2560,11 @@ impl ObjectDto {
                 content: t.content.clone(),
                 size: t.size,
             }),
+            reverse: self
+                .reverse
+                .as_ref()
+                .map(|r| r.to_object(images).map(std::sync::Arc::new))
+                .transpose()?,
         })
     }
 }
@@ -2858,6 +2875,39 @@ mod tests {
         // An object without text writes no `text` key.
         let plain = serde_json::to_string(&DocumentDto::from_scene(&Scene::empty())).unwrap();
         assert!(!plain.contains("\"text\""), "no text object should write the key");
+    }
+
+    /// A reverse (back) drawing — a whole nested object — round-trips, and an
+    /// object without one writes no `reverse` key.
+    #[test]
+    fn a_reverse_drawing_survives_a_round_trip() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let front = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a front");
+        scene.update_object(front, |o| {
+            o.reverse = Some(std::sync::Arc::new(buzz_scene::Object::shape(
+                buzz_scene::ObjectId(4242),
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::BLACK,
+                ),
+            )));
+        });
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        let (_, object) = back.find_object(front).expect("the front object");
+        assert!(object.reverse.is_some(), "the back view came back");
+
+        let plain = serde_json::to_string(&DocumentDto::from_scene(&Scene::empty())).unwrap();
+        assert!(!plain.contains("\"reverse\""), "no back → no key");
     }
 
     /// An object with no modifiers writes no `modifiers` key, so a document that
@@ -3642,6 +3692,7 @@ mod tests {
                 pivot: None,
                 modifiers: Vec::new(),
                 text: None,
+                reverse: None,
             },
         );
         scene
@@ -3869,6 +3920,7 @@ mod tests {
                 pivot: None,
                 modifiers: Vec::new(),
                 text: None,
+                reverse: None,
             },
         );
 

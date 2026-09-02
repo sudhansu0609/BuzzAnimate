@@ -2263,6 +2263,20 @@ fn draw_object_inner(
         &turned
     };
 
+    // **Turned to face away — show the back drawing.** Past edge-on the plane's
+    // own mirror would otherwise show the front reversed (the back of the paper);
+    // if the object carries a real back view, draw that instead, through the same
+    // turned projection so it foreshortens with the turn. Counter-flipped in X so
+    // a naturally drawn back reads the right way round despite that mirror.
+    if !object.spatial.is_flat()
+        && object.spatial.rotation_y.cos() < 0.0
+        && let Some(reverse) = &object.reverse
+    {
+        let doc = doc * Affine::scale_non_uniform(-1.0, 1.0);
+        draw_object(builder, reverse, Some(reverse), doc, ctx, cache);
+        return;
+    }
+
     match &object.kind {
         ObjectKind::Group(children) => {
             for child in children {

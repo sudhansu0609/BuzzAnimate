@@ -197,6 +197,7 @@ impl Remapper<'_> {
             pivot: source.pivot,
             modifiers: source.modifiers.clone(),
             text: source.text.clone(),
+            reverse: source.reverse.clone(),
         }
     }
 }

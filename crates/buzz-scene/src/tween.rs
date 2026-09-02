@@ -968,6 +968,7 @@ mod tests {
             pivot: None,
             modifiers: Vec::new(),
             text: None,
+            reverse: None,
         }
     }
 
@@ -1042,6 +1043,7 @@ mod tests {
             pivot: None,
             modifiers: Vec::new(),
             text: None,
+            reverse: None,
         };
 
         let mid = interpolate_object(

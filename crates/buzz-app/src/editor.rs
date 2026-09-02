@@ -2832,6 +2832,8 @@ impl Editor {
                     None => self.status = Some("The selection has no live modifiers".into()),
                 }
             }
+            SetReverse => self.set_reverse(),
+            ClearReverse => self.clear_reverse(),
             TogglePanel(panel) => {
                 self.workspace.toggle(panel);
                 self.workspace.save();
@@ -4295,6 +4297,57 @@ impl Editor {
                 l.frames.set_tween(frame, tween);
             });
         });
+    }
+
+    /// **Make one object the reverse (back view) of another.** With two objects
+    /// selected, the earlier-drawn one becomes the front and the other its back,
+    /// shown when the front is turned to face away. The back is anchored to the
+    /// front (stored relative to it) so it travels with it.
+    fn set_reverse(&mut self) {
+        if self.selection.len() != 2 {
+            self.status =
+                Some("Select two: the front (drawn first) and its back (drawn second)".into());
+            return;
+        }
+        let ids = self.selection.ids();
+        let (front, back) = (ids[0], ids[1]);
+        self.doc.edit("Set Reverse", |scene| {
+            let front_transform = scene.find_object(front).map(|(_, o)| o.transform);
+            if let (Some(front_transform), Some(mut back_obj)) =
+                (front_transform, scene.remove_object(back))
+            {
+                // Relative to the front, so it overlays where it was drawn and
+                // follows the front when the front is moved.
+                let relative = buzz_scene::invert_affine(front_transform)
+                    .unwrap_or(Affine::IDENTITY)
+                    * back_obj.transform;
+                std::sync::Arc::make_mut(&mut back_obj).transform = relative;
+                scene.update_object(front, |o| o.reverse = Some(back_obj));
+            }
+        });
+        self.doc.end_gesture();
+        self.selection.select_one(front);
+        self.status = Some("Reverse drawing set \u{2014} turn the object to see its back".into());
+    }
+
+    /// Remove the selected object's reverse (back) drawing.
+    fn clear_reverse(&mut self) {
+        let target = {
+            let scene = self.doc.scene();
+            self.selection
+                .iter()
+                .find(|id| scene.find_object(*id).is_some_and(|(_, o)| o.reverse.is_some()))
+        };
+        match target {
+            Some(id) => {
+                self.doc.edit("Clear Reverse", |scene| {
+                    scene.update_object(id, |o| o.reverse = None);
+                });
+                self.doc.end_gesture();
+                self.status = Some("Reverse drawing removed".into());
+            }
+            None => self.status = Some("The selection has no reverse drawing".into()),
+        }
     }
 
     /// Frames between this keyframe and the next, for diagnostics.

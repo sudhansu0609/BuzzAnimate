@@ -155,6 +155,25 @@ impl From<Gradient> for Paint {
 pub struct FillSpec {
     pub paint: Paint,
     pub rule: FillMode,
+    /// **The palette colour this fill came from**, when it came from one.
+    ///
+    /// # Why the link is here and not inside [`Paint`]
+    ///
+    /// A paint is a *value* — the renderer, the lighting model and every filter
+    /// take it and ask what colour it is. Putting a palette reference inside it
+    /// would mean every one of those needed the document's palette in hand to
+    /// answer, which is a scene lookup in the middle of the draw walk. So the
+    /// paint keeps the resolved colour, exactly as it always did, and the link
+    /// sits on the *fill* — the place a colour was chosen, which is the only
+    /// place that needs to know where it came from.
+    ///
+    /// `None` for every fill painted with a colour picked freehand, which is
+    /// what every fill in every older document is.
+    ///
+    /// See [`crate::Scene::recolour_swatch`] for what the link buys: change the
+    /// swatch and every fill wearing it changes, everywhere in the document, in
+    /// one step.
+    pub swatch: Option<crate::SwatchId>,
 }
 
 impl FillSpec {
@@ -162,6 +181,16 @@ impl FillSpec {
         Self {
             paint: Paint::Solid(color),
             rule: FillMode::NonZero,
+            swatch: None,
+        }
+    }
+
+    /// A fill taking its colour from a palette swatch, and keeping the link.
+    pub fn from_swatch(swatch: crate::SwatchId, color: Color) -> Self {
+        Self {
+            paint: Paint::Solid(color),
+            rule: FillMode::NonZero,
+            swatch: Some(swatch),
         }
     }
 
@@ -169,6 +198,7 @@ impl FillSpec {
         Self {
             paint: Paint::Gradient(Arc::new(gradient)),
             rule: FillMode::NonZero,
+            swatch: None,
         }
     }
 
@@ -177,6 +207,7 @@ impl FillSpec {
         Self {
             paint: Paint::Image(Box::new(image)),
             rule: FillMode::NonZero,
+            swatch: None,
         }
     }
 
@@ -194,6 +225,8 @@ pub struct StrokeSpec {
     pub width: f64,
     /// Animate's "hairline": always one pixel regardless of zoom.
     pub hairline: bool,
+    /// The palette colour this stroke came from. See [`FillSpec::swatch`].
+    pub swatch: Option<crate::SwatchId>,
 }
 
 impl StrokeSpec {
@@ -202,6 +235,17 @@ impl StrokeSpec {
             paint: Paint::Solid(color),
             width,
             hairline: false,
+            swatch: None,
+        }
+    }
+
+    /// A stroke taking its colour from a palette swatch, and keeping the link.
+    pub fn from_swatch(swatch: crate::SwatchId, color: Color, width: f64) -> Self {
+        Self {
+            paint: Paint::Solid(color),
+            width,
+            hairline: false,
+            swatch: Some(swatch),
         }
     }
 
@@ -210,6 +254,7 @@ impl StrokeSpec {
             paint: Paint::Gradient(Arc::new(gradient)),
             width,
             hairline: false,
+            swatch: None,
         }
     }
 
@@ -218,6 +263,7 @@ impl StrokeSpec {
             paint: Paint::Solid(color),
             width: 0.0,
             hairline: true,
+            swatch: None,
         }
     }
 

@@ -1424,6 +1424,117 @@ impl Scene {
         self.add_object_at(layer, 0, object)
     }
 
+    // -- the palette ---------------------------------------------------------
+
+    /// **Change a swatch, and everything painted with it changes.**
+    ///
+    /// # What this is for
+    ///
+    /// Until now a palette was a picker: it handed you a colour and forgot. So
+    /// "make the coat green" meant finding every shape wearing that colour, on
+    /// every frame, inside every symbol, and repainting each one by hand — and
+    /// getting it wrong somewhere, which is how a character ends up with two
+    /// slightly different coats in one film. A fill that remembers *which
+    /// swatch* it came from turns that afternoon into one edit.
+    ///
+    /// Returns how many fills and strokes were repainted, so the caller can say
+    /// so rather than leaving the user wondering whether it worked.
+    ///
+    /// Reaches the whole document: every layer, every keyframe, and every
+    /// symbol in the library, because a character is usually a symbol and
+    /// recolouring one that stopped at the stage would be worse than useless.
+    pub fn recolour_swatch(&mut self, swatch: SwatchId, color: Color) -> usize {
+        self.swatches_mut().update(swatch, |s| s.color = color);
+        self.repaint_links(&|id| (id == swatch).then_some(color))
+    }
+
+    /// **Swap one palette for another** — the same drawing in a second set of
+    /// colours.
+    ///
+    /// `mapping` answers, for each swatch a fill is linked to, what colour it
+    /// should now be; `None` leaves that fill alone. A night version of a scene
+    /// is this with a mapping built from two palettes, and it is one undo step.
+    pub fn recolour_by(&mut self, mapping: &dyn Fn(SwatchId) -> Option<Color>) -> usize {
+        self.repaint_links(mapping)
+    }
+
+    /// The walk both of the above are: every fill and stroke in the document
+    /// that carries a swatch link the mapping answers for.
+    fn repaint_links(&mut self, mapping: &dyn Fn(SwatchId) -> Option<Color>) -> usize {
+        let mut changed = 0;
+
+        let repaint = |shape: &mut crate::ShapeData, changed: &mut usize| {
+            if let Some(fill) = &mut shape.fill
+                && let Some(swatch) = fill.swatch
+                && let Some(color) = mapping(swatch)
+                && fill.paint.color() != color
+            {
+                fill.paint = Paint::Solid(color);
+                *changed += 1;
+            }
+            if let Some(stroke) = &mut shape.stroke
+                && let Some(swatch) = stroke.swatch
+                && let Some(color) = mapping(swatch)
+                && stroke.paint.color() != color
+            {
+                stroke.paint = Paint::Solid(color);
+                *changed += 1;
+            }
+        };
+
+        // Every object on the stage, and everything nested inside it.
+        let layers: Vec<LayerId> = self.layers().iter().map(|l| l.id).collect();
+        for layer in layers {
+            let frames: Vec<u32> = self
+                .layers()
+                .get(layer)
+                .map(|l| l.frames.keyframes().iter().map(|k| k.start).collect())
+                .unwrap_or_default();
+            for frame in frames {
+                let ids: Vec<ObjectId> = self
+                    .layers()
+                    .get(layer)
+                    .map(|l| l.frames.objects_at(frame).iter().map(|o| o.id).collect())
+                    .unwrap_or_default();
+                for id in ids {
+                    self.update_object_at(frame, id, |object| {
+                        repaint_object(object, &repaint, &mut changed);
+                    });
+                }
+            }
+        }
+
+        // And every symbol in the library, because a character is usually one.
+        let symbols: Vec<crate::SymbolId> = self.library().iter().map(|s| s.id).collect();
+        for id in symbols {
+            let layer_ids: Vec<LayerId> = self
+                .library()
+                .get(id)
+                .map(|s| s.layers.iter().map(|l| l.id).collect())
+                .unwrap_or_default();
+            self.library_mut().update(id, |symbol| {
+                for layer in layer_ids {
+                    symbol.layers.update(layer, |l| {
+                        for keyframe in l.frames.keyframes_mut() {
+                            for object in std::sync::Arc::make_mut(&mut keyframe.objects).iter_mut() {
+                                repaint_object(
+                                    std::sync::Arc::make_mut(object),
+                                    &repaint,
+                                    &mut changed,
+                                );
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        if changed > 0 {
+            self.bump();
+        }
+        changed
+    }
+
     /// Frames in the document: the longest layer, and at least one.
     pub fn frame_count(&self) -> u32 {
         self.layers()
@@ -1972,6 +2083,50 @@ impl Scene {
 
     pub fn flatten_for_render(&self) -> Vec<(Affine, ShapeData)> {
         self.flatten_at(0)
+    }
+}
+
+/// Repaint one object and everything drawn inside it.
+///
+/// A group holds shapes, and a rig holds artwork per part; both are drawings
+/// with fills of their own, and a recolour that stopped at the top level would
+/// leave a character's own pieces untouched.
+fn repaint_object(
+    object: &mut Object,
+    repaint: &dyn Fn(&mut crate::ShapeData, &mut usize),
+    changed: &mut usize,
+) {
+    match &mut object.kind {
+        ObjectKind::Shape(shape) => repaint(shape, changed),
+        ObjectKind::Group(children) => {
+            for child in children.iter_mut() {
+                repaint_object(std::sync::Arc::make_mut(child), repaint, changed);
+            }
+        }
+        ObjectKind::Armature(rig) => {
+            for part in rig.parts.iter_mut() {
+                repaint_object(std::sync::Arc::make_mut(&mut part.artwork), repaint, changed);
+            }
+        }
+        // An instance carries no artwork of its own — the symbol it points at
+        // is repainted in its own right, once, however many instances there are.
+        ObjectKind::Instance(_) | ObjectKind::Warp(_) => {}
+    }
+
+    // A turnaround's other views are drawings too.
+    let views: Vec<usize> = (0..object.turnaround.views().len()).collect();
+    if !views.is_empty() {
+        let mut updated = object.turnaround.clone();
+        for view in views {
+            let (angle, drawing) = {
+                let v = &updated.views()[view];
+                (v.angle, std::sync::Arc::clone(&v.drawing))
+            };
+            let mut drawing = (*drawing).clone();
+            repaint_object(&mut drawing, repaint, changed);
+            updated.set(angle, std::sync::Arc::new(drawing));
+        }
+        object.turnaround = updated;
     }
 }
 

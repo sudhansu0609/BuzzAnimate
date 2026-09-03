@@ -294,11 +294,13 @@ fn transformed_shape(shape: &ShapeData, transform: Affine) -> ShapeData {
         fill: shape.fill.as_ref().map(|f| FillSpec {
             paint: f.paint.transformed(transform),
             rule: f.rule,
+            swatch: None,
         }),
         stroke: shape.stroke.as_ref().map(|s| StrokeSpec {
             paint: s.paint.transformed(transform),
             width: s.width * scale_factor(transform),
             hairline: s.hairline,
+            swatch: None,
         }),
         blend: shape.blend,
     }

@@ -233,6 +233,7 @@ fn what_cannot_travel_is_reported() {
             fill: Some(buzz_scene::FillSpec {
                 paint: buzz_scene::Paint::Gradient(Box::new(gradient).into()),
                 rule: buzz_geom::FillMode::NonZero,
+                swatch: None,
             }),
             stroke: None,
             blend: buzz_scene::PaintBlend::Normal,

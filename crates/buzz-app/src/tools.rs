@@ -1008,6 +1008,7 @@ impl ToolMachine {
                             paint: buzz_scene::Paint::Solid(color),
                             width,
                             hairline,
+                            swatch: None,
                         }),
                         blend: buzz_scene::PaintBlend::Normal,
                     },
@@ -1207,6 +1208,7 @@ impl ToolMachine {
                             .map(|paint| buzz_scene::FillSpec {
                                 paint,
                                 rule: buzz_geom::FillMode::NonZero,
+                                swatch: None,
                             }),
                         blend: buzz_scene::PaintBlend::Normal,
                         stroke: ctx
@@ -1216,6 +1218,7 @@ impl ToolMachine {
                                 paint: buzz_scene::Paint::Solid(color),
                                 width,
                                 hairline,
+                                swatch: None,
                             }),
                     },
                     label: shape_label(self.tool),
@@ -1463,6 +1466,7 @@ fn vector_brush_shape(
         fill: Some(buzz_scene::FillSpec {
             paint,
             rule: buzz_geom::FillMode::NonZero,
+            swatch: None,
         }),
         stroke: None,
         blend: style.brush.blend(),

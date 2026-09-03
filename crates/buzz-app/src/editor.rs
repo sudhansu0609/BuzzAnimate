@@ -1375,6 +1375,7 @@ impl Editor {
                                 s.fill = Some(FillSpec {
                                     paint,
                                     rule: buzz_geom::FillMode::NonZero,
+                                    swatch: None,
                                 });
                             }
                         });
@@ -1397,6 +1398,7 @@ impl Editor {
                                 paint: Paint::Solid(color),
                                 width,
                                 hairline,
+                                swatch: None,
                             })
                         });
                     });
@@ -1526,6 +1528,7 @@ impl Editor {
             fill: Some(FillSpec {
                 paint,
                 rule: buzz_scene::bucket::FILL_RULE,
+                swatch: None,
             }),
             stroke: None,
             blend: buzz_scene::PaintBlend::default(),
@@ -2856,6 +2859,7 @@ impl Editor {
                 };
                 self.selection.set(all);
             }
+            SelectSameColour => self.select_same_colour(),
             Deselect => self.selection.clear(),
             DuplicateSelection => self.duplicate_selection(),
             Align { op, to_stage } => self.align_selection(op, to_stage),
@@ -4657,6 +4661,135 @@ impl Editor {
             .then(|| object.turnaround.views().iter().map(|v| v.angle).collect())
     }
 
+    // -- colour --------------------------------------------------------------
+
+    /// **Repaint every fill and stroke linked to a swatch.**
+    ///
+    /// The whole point of a palette that links: change the coat's colour once
+    /// and the coat changes on every frame, in every symbol, everywhere in the
+    /// film. One undo step for all of it.
+    pub fn recolour_swatch(&mut self, swatch: buzz_scene::SwatchId, colour: Color) {
+        let mut painted = 0;
+        self.doc.edit("Recolour", |scene| {
+            painted = scene.recolour_swatch(swatch, colour);
+        });
+        self.doc.end_gesture();
+        self.status = Some(match painted {
+            0 => "Swatch changed — nothing in the document is linked to it yet".into(),
+            1 => "Swatch changed, and repainted 1 fill".to_string(),
+            n => format!("Swatch changed, and repainted {n} fills"),
+        });
+    }
+
+    /// **Link the selection to a swatch**, and take its colour.
+    ///
+    /// The step that makes the palette worth having: a shape painted this way
+    /// remembers where its colour came from, so the next change to that swatch
+    /// finds it. Applied across the whole film, because a fill is a property of
+    /// the artwork rather than of the moment.
+    pub fn link_selection_to_swatch(&mut self, swatch: buzz_scene::SwatchId) {
+        let Some(colour) = self
+            .doc
+            .scene()
+            .swatches()
+            .get(swatch)
+            .map(|s| s.color)
+        else {
+            self.status = Some("That swatch is no longer in the palette".into());
+            return;
+        };
+        let ids: Vec<ObjectId> = self.selection.ids();
+        if ids.is_empty() {
+            self.status = Some("Select the artwork to paint from the swatch".into());
+            return;
+        }
+        let mut painted = 0;
+        self.doc.edit("Paint from Swatch", |scene| {
+            for id in &ids {
+                scene.update_object_across(0, u32::MAX, *id, |object| {
+                    if let ObjectKind::Shape(shape) = &mut object.kind {
+                        if let Some(fill) = &mut shape.fill {
+                            fill.paint = buzz_scene::Paint::Solid(colour);
+                            fill.swatch = Some(swatch);
+                            painted += 1;
+                        }
+                        if let Some(stroke) = &mut shape.stroke {
+                            stroke.paint = buzz_scene::Paint::Solid(colour);
+                            stroke.swatch = Some(swatch);
+                            painted += 1;
+                        }
+                    }
+                });
+            }
+        });
+        self.doc.end_gesture();
+        self.status = Some(if painted == 0 {
+            "Nothing selected has a fill or a stroke to paint".into()
+        } else {
+            format!("{painted} painted from the swatch, and linked to it")
+        });
+    }
+
+    /// **Select everything painted the same colour as what is already selected.**
+    ///
+    /// The enabling primitive for recolouring a document that predates linked
+    /// swatches — and for the ordinary job of finding every piece of a
+    /// character's coat before doing anything to it. Matches on the *fill*
+    /// colour, which is what "this colour" means when looking at a drawing.
+    ///
+    /// Searches this frame, on every unlocked layer, because a selection that
+    /// reached frames you cannot see would be a selection you cannot check.
+    pub fn select_same_colour(&mut self) {
+        let Some(wanted) = self.selection_fill_colour() else {
+            self.status = Some("Select a filled shape first, to say which colour".into());
+            return;
+        };
+        let frame = self.current_frame;
+        let found: Vec<ObjectId> = {
+            let scene = self.doc.scene();
+            scene
+                .layers()
+                .selectable()
+                .flat_map(|layer| layer.objects_at(frame))
+                .filter(|object| match &object.kind {
+                    ObjectKind::Shape(shape) => shape
+                        .fill
+                        .as_ref()
+                        .is_some_and(|f| same_colour(f.paint.color(), wanted)),
+                    _ => false,
+                })
+                .map(|object| object.id)
+                .collect()
+        };
+        let count = found.len();
+        self.selection.set(found);
+        self.status = Some(match count {
+            0 => "Nothing else is painted that colour".into(),
+            1 => "One shape is painted that colour".into(),
+            n => format!("{n} shapes are painted that colour"),
+        });
+    }
+
+    /// The fill colour of the selection, when they agree on one.
+    fn selection_fill_colour(&self) -> Option<Color> {
+        let scene = self.doc.scene();
+        let mut found: Option<Color> = None;
+        for id in self.selection.iter() {
+            let (_, object) = scene.find_object(id)?;
+            let ObjectKind::Shape(shape) = &object.kind else {
+                continue;
+            };
+            let colour = shape.fill.as_ref()?.paint.color();
+            match found {
+                None => found = Some(colour),
+                // Two colours selected is no answer at all.
+                Some(existing) if same_colour(existing, colour) => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
     /// **Fill the selected shapes with a procedural texture.** The texture is
     /// baked to one seamless tile from the current fill colour (foreground) and
     /// stroke colour (background), added to the image library once, and set as a
@@ -5777,6 +5910,7 @@ impl Editor {
                     s.fill = Some(FillSpec {
                         paint: stroke.paint.clone(),
                         rule: buzz_geom::FillMode::NonZero,
+                        swatch: None,
                     });
                     s.stroke = None;
                 });
@@ -6695,6 +6829,17 @@ fn place_sound_on_stage(scene: &mut buzz_scene::Scene, sound: buzz_scene::SoundI
         }
     });
     true
+}
+
+/// Are these the same colour, as far as a person looking at a drawing is
+/// concerned?
+///
+/// Compared as bytes rather than as floats: a colour that has been through a
+/// round trip is not bit-identical to the one that was picked, and a Select
+/// Same Colour that missed half the coat because of a rounding error would be
+/// worse than not having it.
+fn same_colour(a: Color, b: Color) -> bool {
+    a.to_rgba8().to_u8_array() == b.to_rgba8().to_u8_array()
 }
 
 #[cfg(test)]
@@ -9631,6 +9776,7 @@ mod tests {
                 paint: Paint::Solid(Color::BLACK),
                 width: 2.0,
                 hairline: false,
+                swatch: None,
             }),
             blend: buzz_scene::PaintBlend::default(),
         };
@@ -9692,6 +9838,7 @@ mod tests {
                 paint: Paint::Solid(Color::BLACK),
                 width: 2.0,
                 hairline: false,
+                swatch: None,
             }),
             blend: buzz_scene::PaintBlend::default(),
         };
@@ -9737,6 +9884,7 @@ mod tests {
                 paint: Paint::Solid(Color::BLACK),
                 width: 2.0,
                 hairline: false,
+                swatch: None,
             }),
             blend: buzz_scene::PaintBlend::default(),
         };

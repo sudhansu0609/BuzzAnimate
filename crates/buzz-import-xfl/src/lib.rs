@@ -1276,11 +1276,13 @@ impl FrameContext {
                         fill: fill.map(|paint| FillSpec {
                             paint,
                             rule: buzz_geom::FillMode::NonZero,
+                            swatch: None,
                         }),
                         stroke: stroke.map(|(paint, width)| StrokeSpec {
                             paint,
                             width,
                             hairline: false,
+                            swatch: None,
                         }),
                         // No source format expresses build-up paint, so imported
                         // artwork always composites normally.

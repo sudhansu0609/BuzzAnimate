@@ -28,6 +28,10 @@ pub struct SwatchState {
     expanded: std::collections::BTreeSet<String>,
     /// Free-text filter over names.
     pub search: String,
+    /// The last swatch recoloured and how many fills it repainted, so the panel
+    /// can say what just happened. A colour change that silently reaches across
+    /// a whole film should say how far it reached.
+    pub last_repaint: Option<(SwatchId, usize)>,
     /// Show the palette as a grid of chips rather than as named rows.
     ///
     /// The grid is Animate's presentation and is faster to pick from once the
@@ -81,6 +85,20 @@ pub fn swatch_panel(
             }
         });
     });
+
+    // What a colour change just reached, so a swatch that repainted forty
+    // shapes across the film says so rather than doing it silently.
+    if let Some((_, painted)) = state.last_repaint {
+        ui.label(
+            RichText::new(match painted {
+                0 => "Nothing is linked to that swatch yet".to_string(),
+                1 => "Repainted 1 fill".to_string(),
+                n => format!("Repainted {n} fills"),
+            })
+            .small()
+            .weak(),
+        );
+    }
 
     // What the tools are set to now, and — the point of the whole panel —
     // which named colour that is.
@@ -290,6 +308,19 @@ fn swatch_row(
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // **Editing the colour is what makes a palette a palette.**
+            //
+            // Until this, a swatch could be renamed, moved and deleted but not
+            // *changed* — so the palette was a list of colours somebody had
+            // picked, and changing a character's coat meant finding every piece
+            // of it by eye. Changing it here repaints every fill and stroke
+            // linked to this swatch, everywhere in the document, in one step.
+            let mut edited = color;
+            if crate::panels::color_row(ui, &format!("swatch-{}", id.0), &mut edited) {
+                let painted = scene.recolour_swatch(id, edited);
+                state.last_repaint = Some((id, painted));
+            }
+
             // The trash can, as the Layers panel uses: `✕` (U+2715) has no
             // glyph in egui's bundled fonts and draws as an empty box — this
             // project has been caught by it before, and `theme::font_has`

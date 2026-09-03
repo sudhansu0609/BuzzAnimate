@@ -513,11 +513,13 @@ fn build_shape_symbol(id: CharacterId, paths: &[StyledPath], ids: &mut IdSource)
                 fill: styled.fill.clone().map(|paint| FillSpec {
                     paint,
                     rule: buzz_geom::FillMode::NonZero,
+                    swatch: None,
                 }),
                 stroke: styled.stroke.clone().map(|(paint, width)| StrokeSpec {
                     paint,
                     width,
                     hairline: false,
+                    swatch: None,
                 }),
                 blend: buzz_scene::PaintBlend::Normal,
             };

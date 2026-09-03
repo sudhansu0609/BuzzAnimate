@@ -169,6 +169,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::DuplicateSelection, has_selection, &mut raised);
             item(ui, Command::SelectAll, true, &mut raised);
             item(ui, Command::Deselect, has_selection, &mut raised);
+            item(ui, Command::SelectSameColour, has_selection, &mut raised);
             ui.separator();
             // Animate's Edit menu is also where you step in and out of a
             // symbol. Edit Symbol works on a selected instance; Edit Document

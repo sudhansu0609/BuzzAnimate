@@ -410,6 +410,7 @@ fn glow(center: Point, r: f64, color: Color, alpha: f64) -> ShapeData {
         fill: Some(FillSpec {
             paint: ramp.into(),
             rule: buzz_geom::FillMode::NonZero,
+            swatch: None,
         }),
         stroke: None,
         blend: PaintBlend::Additive,
@@ -784,6 +785,7 @@ fn light_rays(fx: &Fx<'_>) -> Vec<ArtPiece> {
             fill: Some(FillSpec {
                 paint: ramp.into(),
                 rule: buzz_geom::FillMode::NonZero,
+                swatch: None,
             }),
             stroke: None,
             blend: PaintBlend::Additive,
@@ -911,6 +913,7 @@ fn lamps(fx: &Fx<'_>) -> Vec<ArtPiece> {
             fill: Some(FillSpec {
                 paint: pool_ramp.into(),
                 rule: buzz_geom::FillMode::NonZero,
+                swatch: None,
             }),
             stroke: None,
             blend: PaintBlend::Additive,
@@ -940,6 +943,7 @@ fn lamps(fx: &Fx<'_>) -> Vec<ArtPiece> {
             fill: Some(FillSpec {
                 paint: cone_ramp.into(),
                 rule: buzz_geom::FillMode::NonZero,
+                swatch: None,
             }),
             stroke: None,
             blend: PaintBlend::Additive,

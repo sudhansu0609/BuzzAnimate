@@ -138,6 +138,12 @@ use serde::{Deserialize, Serialize};
 ///   fraction of a frame, and how many instants across it an export adds up.
 ///   Zero — absent — is the infinitely fast shutter every older file has, so a
 ///   document without motion blur is written exactly as version 34 wrote it.
+/// * **40** — a fill or a stroke may record **which palette swatch** its colour
+///   came from. That link is what lets one change to a swatch repaint every
+///   piece of artwork wearing it, everywhere in the document, instead of the
+///   animator finding them by eye. Absent for every colour picked freehand,
+///   which is every colour in every older file, so a document that uses no
+///   linked colour is written exactly as version 39 wrote it.
 /// * **39** — a bitmap records whether it was **painted** with the brush. That
 ///   is what lets a stroke fuse into the paint under it after the document has
 ///   been reopened; an imported picture is not paint and merges with nothing.
@@ -159,7 +165,7 @@ use serde::{Deserialize, Serialize};
 ///   document with no procedural texture in it is written exactly as version 35
 ///   wrote it. A file written *with* one and opened by an older build loses that
 ///   image, which is what the bump is for.
-pub const FORMAT_VERSION: u32 = 39;
+pub const FORMAT_VERSION: u32 = 40;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -1694,6 +1700,10 @@ pub struct FillDto {
     pub image: Option<ImageFillDto>,
     #[serde(default)]
     pub rule: FillMode,
+    /// **The palette swatch this colour came from.** Version 40; absent for
+    /// every colour picked freehand, which is every colour in every older file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swatch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1709,6 +1719,10 @@ pub struct StrokeDto {
     pub width: f64,
     #[serde(default)]
     pub hairline: bool,
+    /// **The palette swatch this colour came from.** Version 40; absent for
+    /// every colour picked freehand, which is every colour in every older file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swatch: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1956,6 +1970,7 @@ fn fill_to_dto(f: &FillSpec) -> FillDto {
         gradient,
         image,
         rule: f.rule,
+        swatch: f.swatch.map(|id| id.0),
     }
 }
 
@@ -1968,6 +1983,7 @@ fn fill_from_dto(f: &FillDto, images: &buzz_scene::ImageLibrary) -> Result<FillS
             images,
         )?,
         rule: f.rule,
+        swatch: f.swatch.map(buzz_scene::SwatchId),
     })
 }
 
@@ -1979,6 +1995,7 @@ fn stroke_to_dto(s: &StrokeSpec) -> StrokeDto {
         image,
         width: s.width,
         hairline: s.hairline,
+        swatch: s.swatch.map(|id| id.0),
     }
 }
 
@@ -1995,6 +2012,7 @@ fn stroke_from_dto(
         )?,
         width: s.width,
         hairline: s.hairline,
+        swatch: s.swatch.map(buzz_scene::SwatchId),
     })
 }
 

@@ -85,6 +85,9 @@ pub enum Command {
     BringForward,
     SendBackward,
     SendToBack,
+    /// **Select same colour**: everything on this frame painted the colour the
+    /// selection is painted.
+    SelectSameColour,
     ConvertLinesToFills,
     ExpandFill,
     SmoothSelection,
@@ -350,6 +353,7 @@ impl Command {
             BringForward => "Bring Forward",
             SendBackward => "Send Backward",
             SendToBack => "Send to Back",
+            SelectSameColour => "Select Same Colour",
             ConvertLinesToFills => "Convert Lines to Fills",
             ExpandFill => "Expand Fill…",
             SmoothSelection => "Smooth",
@@ -558,7 +562,7 @@ impl Command {
             SaveSnapshot | Snapshots => None,
             ShortcutEditor => None,
             DetectBeats => None,
-            NewReferenceLayer | ImportVideoReference => None,
+            NewReferenceLayer | ImportVideoReference | SelectSameColour => None,
 
             AddSun | AddSky | AddLamp | AddGloom | AddFire => None,
             // No Animate binding to follow, and these open dialogs rather than

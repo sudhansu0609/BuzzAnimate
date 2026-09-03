@@ -724,6 +724,7 @@ fn smoke_shape(path: BezPath, wave: &Wave<'_>, color: Color, alpha: f64) -> Shap
         fill: Some(FillSpec {
             paint: ramp.into(),
             rule: buzz_geom::FillMode::NonZero,
+            swatch: None,
         }),
         stroke: None,
         blend: PaintBlend::Normal,

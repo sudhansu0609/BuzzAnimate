@@ -3994,6 +3994,66 @@ previous version wrote it. The bumps are listed, each with that reasoning, on
 
 ---
 
+### ✅ Automation: a script that can direct, and inbetweens that pair correctly
+
+Two findings from asking where an animator's hours actually go, and what of
+that this program could take on.
+
+**Scripts could not reach anything built in the last month.** The host API had
+rectangles, ovals, layers, frames, selection and the library — and not tweens,
+the camera, modifiers, text, or the performance and the director, which are the
+features that exist precisely to save effort. A user could not automate their own
+repetitive work with the tools built to reduce it.
+
+That is fixed by extending the model's own vocabulary rather than by exposing
+the menu. A `runCommand` binding was the obvious idea and is the wrong one: a
+command needs the editor's selection, style and undo stack, while a script holds
+a working copy of the scene and reads back what it wrote — running one mid-script
+would be writing to a different document from the one the next line reads. So
+scripts gained `setTween`/`setEase`, a `camera` object (keys, focus pull,
+shutter), `addWiggle`/`addSpring`/`clearModifiers`, `addText`, and the two that
+change what a script is for:
+
+```js
+document.perform(characterId, "walk", 0, 48);
+document.direct("Night. Ana walks in from the left.\nAna talks to Ben.");
+```
+
+Everything they leave behind is ordinary layers, keyframes and poses, which the
+next line of the same script can read and edit. Three samples ship with them, and
+the shelf test runs every sample, so an example that stops working fails the
+build rather than misleading somebody.
+
+**Shape tweens paired the two keyframes' artwork by array position.** Shapes
+carry no ids, so shape *n* of one drawing was tweened into shape *n* of the
+other. That is right exactly when both drawings were made in the same order, and
+hand-drawn frames never are: draw the head before the arm on one frame and after
+it on the next, and the head crossed the frame to become the arm. The only remedy
+available was to redraw a keyframe in a particular order to appease the tweener.
+
+Pairing is now made from what the drawings *are* — where each piece sits, how big
+it is, whether it closes, and what colour it is painted — costed, sorted, and
+taken best-first while both sides are free. Greedy rather than optimal on
+purpose: a true assignment would differ only where two pieces are nearly equally
+good partners, which is where the animator corrects it whatever we choose, and a
+tween that is understandable when it goes wrong is worth more than one that is
+optimal and inscrutable.
+
+Distances are measured against the extent of **both** keyframes together. Against
+a piece's own size, every classic one-shape morph looked like two unrelated
+pieces — which the test that pins the single-shape case down is there to catch.
+A piece with no partner now shrinks away about its own centre, and one that
+arrives grows in, instead of being held through the tween and popping on the last
+frame.
+
+**Still open, and worth naming.** This pairs *pieces*; it does not match the
+strokes *within* a piece, so a single many-stroke drawing tweened to another is
+still one outline resampled against another. And ink-and-paint across a sequence
+— colouring frame one and having the fills follow — has no automation at all.
+Those are the next two, in that order.
+
+---
+
 ## 5. Current metrics
 
 | Measure | Value |
@@ -4004,7 +4064,7 @@ previous version wrote it. The bumps are listed, each with that reasoning, on
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 2 226 passing across 105 binaries, clippy clean |
+| Tests | 2 242 passing across 105 binaries, clippy clean |
 | Rust source | ~154 000 lines |
 | Crates built | 19 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |

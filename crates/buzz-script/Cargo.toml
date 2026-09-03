@@ -10,6 +10,12 @@ authors.workspace = true
 [dependencies]
 buzz-geom.workspace = true
 buzz-scene.workspace = true
+# The performance and the director. A script that can stage a scene and
+# animate the people in it is the difference between automating a drawing
+# and automating a shot.
+buzz-act.workspace = true
+# For the glyph outlines a text object is made of.
+buzz-text.workspace = true
 
 kurbo.workspace = true
 peniko.workspace = true

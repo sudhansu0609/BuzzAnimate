@@ -248,18 +248,251 @@ pub fn interpolate_objects(
             })
             .collect(),
 
-        TweenKind::Shape => from
-            .iter()
-            .enumerate()
-            .map(|(index, start)| {
-                // Shapes have no ids to match on, so pair by position.
-                match to.get(index) {
-                    Some(end) => interpolate_shape_object(start, end, t),
-                    None => (**start).clone(),
+        TweenKind::Shape => {
+            // **Paired by what the drawings are, not by the order they were
+            // drawn in.** See `match_drawings` for why that is the whole
+            // difference between a rough inbetween and a shape crossing the
+            // frame to become something unrelated.
+            let pairing = match_drawings(from, to);
+            let mut out: Vec<Object> = Vec::with_capacity(from.len().max(to.len()));
+            let mut matched = vec![false; to.len()];
+
+            for (index, start) in from.iter().enumerate() {
+                match pairing.get(index).copied().flatten() {
+                    Some(j) => {
+                        matched[j] = true;
+                        out.push(interpolate_shape_object(start, &to[j], t));
+                    }
+                    // Nothing on the far keyframe is this piece: it is on its
+                    // way out.
+                    None => out.push(vanishing(start, t)),
                 }
-            })
-            .collect(),
+            }
+
+            // And whatever the far keyframe has that this one does not is on
+            // its way in. Without this a drawing that gains a piece gained it
+            // all at once, on the last frame.
+            for (j, end) in to.iter().enumerate() {
+                if !matched[j] {
+                    out.push(arriving(end, t));
+                }
+            }
+            out
+        }
     }
+}
+
+/// **Which drawing on the first keyframe becomes which on the second.**
+///
+/// # Why this is not the order they were drawn in
+///
+/// A shape tween used to pair the two keyframes' artwork by *array position* —
+/// shape 1 with shape 1, shape 2 with shape 2 — because shapes carry no ids to
+/// match on. That is right exactly when both drawings were made in the same
+/// order, and hand-drawn frames never are: draw the head before the arm on one
+/// frame and after it on the next, and the head morphs into the arm. What came
+/// out was not a rough inbetween, it was a shape crossing the frame to become
+/// something unrelated, and the only fix available was to redraw a keyframe in
+/// a particular order to appease the tweener.
+///
+/// So the pairing is made from what the drawings *are*: where each piece sits,
+/// how big it is, whether it closes, and what colour it is painted. Four cheap
+/// measures, none of them clever, and together they put the head with the head.
+///
+/// # Greedy, on purpose
+///
+/// Every pair is costed, sorted, and taken best-first while both sides are
+/// still free. A true optimal assignment (Hungarian) is O(n³) and would differ
+/// only where two pieces are nearly equally good partners — which is the case
+/// where the animator will correct it whatever we choose. Greedy is predictable
+/// and easy to read, and a tween that is understandable when it goes wrong is
+/// worth more here than one that is optimal and inscrutable.
+///
+/// Returns, for each shape of `from`, the index in `to` it becomes — or `None`
+/// where it has no partner and should vanish. Pieces that are not plain shapes
+/// (a group, an instance, a rig) are paired by position as before: they are not
+/// drawings and have no outline to compare.
+pub fn match_drawings(from: &[std::sync::Arc<Object>], to: &[std::sync::Arc<Object>]) -> Vec<Option<usize>> {
+    let mut pairing = vec![None; from.len()];
+    let mut taken = vec![false; to.len()];
+
+    // Anything that is not a shape keeps the old positional pairing: there is
+    // nothing to measure, and changing how those behave is not what this is for.
+    for (i, start) in from.iter().enumerate() {
+        if !matches!(start.kind, ObjectKind::Shape(_)) {
+            if let Some(j) = to.get(i)
+                && !matches!(to[i].kind, ObjectKind::Shape(_))
+            {
+                let _ = j;
+                pairing[i] = Some(i);
+                taken[i] = true;
+            }
+        }
+    }
+
+    // The scale everything is measured against: the extent of **both**
+    // keyframes together, so a costume detail on a small figure is judged by
+    // the same yardstick as one on a large one — and, more importantly, so a
+    // lone shape crossing the stage is measured against the distance it
+    // crossed rather than against its own width. Measured against itself, every
+    // classic one-shape morph looked like two unrelated pieces.
+    let span = drawing_span(from)
+        .max(drawing_span(to))
+        .max(both_span(from, to));
+
+    let mut costs: Vec<(f64, usize, usize)> = Vec::new();
+    for (i, start) in from.iter().enumerate() {
+        if pairing[i].is_some() {
+            continue;
+        }
+        let Some(a) = Trait::of(start) else { continue };
+        for (j, end) in to.iter().enumerate() {
+            if taken[j] {
+                continue;
+            }
+            let Some(b) = Trait::of(end) else { continue };
+            costs.push((a.cost(&b, span), i, j));
+        }
+    }
+    costs.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    for (cost, i, j) in costs {
+        if pairing[i].is_some() || taken[j] {
+            continue;
+        }
+        // Past this the two are not the same piece of drawing by any reading,
+        // and morphing them together looks worse than letting one go and the
+        // other arrive.
+        if cost > MAX_PAIR_COST {
+            break;
+        }
+        pairing[i] = Some(j);
+        taken[j] = true;
+    }
+    pairing
+}
+
+/// How far apart two pieces may be before they are not the same piece.
+///
+/// In the units [`Trait::cost`] returns, whose distance term is measured
+/// against the extent of both keyframes together. Just under one, so that two
+/// pieces at opposite ends of the action are not held to be the same piece,
+/// while a single shape crossing that action still is — which is the classic
+/// morph, and the thing a shape tween is chiefly used for.
+const MAX_PAIR_COST: f64 = 0.9;
+
+/// The measurable facts about one drawn piece.
+struct Trait {
+    centre: Point,
+    /// Square root of the area of its box: a length, so it compares linearly.
+    size: f64,
+    closed: bool,
+    colour: [f64; 3],
+}
+
+impl Trait {
+    fn of(object: &Object) -> Option<Trait> {
+        let ObjectKind::Shape(shape) = &object.kind else {
+            return None;
+        };
+        let box_ = object.transform.transform_rect_bbox(shape.path.bounding_box());
+        let colour = shape
+            .fill
+            .as_ref()
+            .map(|f| f.paint.color())
+            .or_else(|| shape.stroke.as_ref().map(|s| s.paint.color()))
+            .unwrap_or(peniko::Color::BLACK)
+            .to_rgba8()
+            .to_u8_array();
+        Some(Trait {
+            centre: box_.center(),
+            size: (box_.width().max(0.0) * box_.height().max(0.0)).sqrt().max(1e-6),
+            closed: is_closed(&shape.path),
+            colour: [
+                f64::from(colour[0]) / 255.0,
+                f64::from(colour[1]) / 255.0,
+                f64::from(colour[2]) / 255.0,
+            ],
+        })
+    }
+
+    /// How unlike another piece this one is. Zero is identical.
+    fn cost(&self, other: &Trait, span: f64) -> f64 {
+        // Where it sits, as a fraction of the whole drawing. The heaviest term:
+        // a piece that has not moved much is almost always the same piece.
+        let moved = self.centre.distance(other.centre) / span;
+
+        // How much bigger or smaller, judged as a ratio so doubling and halving
+        // cost the same.
+        let grew = (self.size / other.size).ln().abs() / 2.0;
+
+        // A closed outline and an open line are different kinds of mark.
+        let shape = if self.closed == other.closed { 0.0 } else { 0.35 };
+
+        // And colour, lightly: an animator redrawing a red shape draws it red,
+        // but a shape may legitimately change colour through a tween.
+        let recoloured = (0..3)
+            .map(|c| (self.colour[c] - other.colour[c]).abs())
+            .sum::<f64>()
+            / 3.0
+            * 0.4;
+
+        moved + grew + shape + recoloured
+    }
+}
+
+/// The extent of both keyframes at once — how far the whole action ranges.
+fn both_span(from: &[std::sync::Arc<Object>], to: &[std::sync::Arc<Object>]) -> f64 {
+    let mut all: Vec<std::sync::Arc<Object>> = Vec::with_capacity(from.len() + to.len());
+    all.extend(from.iter().cloned());
+    all.extend(to.iter().cloned());
+    drawing_span(&all)
+}
+
+/// The size of a whole drawing, for judging distances against.
+fn drawing_span(objects: &[std::sync::Arc<Object>]) -> f64 {
+    let mut bounds: Option<buzz_geom::Rect> = None;
+    for object in objects {
+        let ObjectKind::Shape(shape) = &object.kind else {
+            continue;
+        };
+        let box_ = object.transform.transform_rect_bbox(shape.path.bounding_box());
+        bounds = Some(match bounds {
+            Some(b) => b.union(box_),
+            None => box_,
+        });
+    }
+    bounds
+        .map(|b| b.width().hypot(b.height()))
+        .unwrap_or(1.0)
+        .max(1.0)
+}
+
+/// A piece with no partner, on its way out: shrunk towards its own middle as
+/// the tween runs.
+///
+/// Held in place is what this used to do, and it is the worse answer — the
+/// piece sits there through the whole tween and then pops out of existence on
+/// the last frame. Shrinking says what is happening, and shrinking *about its
+/// own centre* keeps it where it was rather than sliding it to the origin.
+fn vanishing(object: &Object, t: f64) -> Object {
+    let mut out = object.clone();
+    let ObjectKind::Shape(shape) = &object.kind else {
+        return out;
+    };
+    let centre = shape.path.bounding_box().center();
+    let scale = (1.0 - t).clamp(0.0, 1.0);
+    out.transform = object.transform
+        * Affine::translate(centre.to_vec2())
+        * Affine::scale(scale.max(1e-4))
+        * Affine::translate(-centre.to_vec2());
+    out
+}
+
+/// The mirror of [`vanishing`]: a piece with no partner that is arriving, grown
+/// from its own middle.
+fn arriving(object: &Object, t: f64) -> Object {
+    vanishing(object, 1.0 - t)
 }
 
 /// Interpolate one object's transform and colour effect.
@@ -572,6 +805,219 @@ fn resample(path: &BezPath, count: usize) -> Vec<Point> {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod inbetween_tests {
+    use super::*;
+    use crate::{FillSpec, ObjectId, ShapeData};
+    use buzz_geom::Shape as _;
+    use std::sync::Arc;
+
+    const RED: peniko::Color = peniko::Color::from_rgb8(0xE0, 0x20, 0x20);
+    const BLUE: peniko::Color = peniko::Color::from_rgb8(0x20, 0x40, 0xE0);
+
+    fn blob(id: u64, centre: (f64, f64), size: f64, colour: peniko::Color) -> Arc<Object> {
+        let (x, y) = centre;
+        let r = size / 2.0;
+        let path = buzz_geom::Rect::new(x - r, y - r, x + r, y + r).to_path(1e-9);
+        Arc::new(Object::shape(
+            ObjectId(id),
+            ShapeData {
+                path,
+                fill: Some(FillSpec::solid(colour)),
+                stroke: None,
+                blend: Default::default(),
+            },
+        ))
+    }
+
+    fn centre_of(object: &Object) -> Point {
+        let ObjectKind::Shape(shape) = &object.kind else {
+            panic!("expected a shape")
+        };
+        object
+            .transform
+            .transform_rect_bbox(shape.path.bounding_box())
+            .center()
+    }
+
+    /// **The defect this exists to fix.** Two drawings of the same two things,
+    /// drawn in opposite orders. Pairing by array position sends the head across
+    /// the frame to become the arm; pairing by what they *are* keeps each with
+    /// itself.
+    #[test]
+    fn drawings_pair_by_what_they_are_not_by_draw_order() {
+        // Frame 1: a head high on the left, an arm low on the right.
+        let from = vec![
+            blob(1, (100.0, 100.0), 40.0, RED),
+            blob(2, (300.0, 300.0), 20.0, BLUE),
+        ];
+        // Frame 2: the same two, barely moved — but drawn the other way round.
+        let to = vec![
+            blob(3, (310.0, 305.0), 20.0, BLUE),
+            blob(4, (110.0, 105.0), 40.0, RED),
+        ];
+
+        let pairing = match_drawings(&from, &to);
+        assert_eq!(
+            pairing,
+            vec![Some(1), Some(0)],
+            "the head should become the head and the arm the arm"
+        );
+    }
+
+    /// And the whole point of that: halfway through, nothing has crossed the
+    /// frame.
+    #[test]
+    fn nothing_crosses_the_frame_halfway_through() {
+        let from = vec![
+            blob(1, (100.0, 100.0), 40.0, RED),
+            blob(2, (300.0, 300.0), 20.0, BLUE),
+        ];
+        let to = vec![
+            blob(3, (310.0, 305.0), 20.0, BLUE),
+            blob(4, (110.0, 105.0), 40.0, RED),
+        ];
+
+        let middle = interpolate_objects(&from, &to, &Tween::shape(), 0.5);
+        assert_eq!(middle.len(), 2);
+
+        // Each piece should still be near where it started, not halfway across.
+        for object in &middle {
+            let c = centre_of(object);
+            let near_head = c.distance(Point::new(105.0, 102.5)) < 30.0;
+            let near_arm = c.distance(Point::new(305.0, 302.5)) < 30.0;
+            assert!(
+                near_head || near_arm,
+                "a piece ended up at {c:?}, which is neither where it was nor where it is going"
+            );
+        }
+    }
+
+    /// A single shape, which is the overwhelmingly common case, must be
+    /// untouched by any of this.
+    #[test]
+    fn one_shape_still_pairs_with_the_one_shape() {
+        let from = vec![blob(1, (100.0, 100.0), 40.0, RED)];
+        let to = vec![blob(2, (200.0, 100.0), 40.0, RED)];
+        assert_eq!(match_drawings(&from, &to), vec![Some(0)]);
+
+        let middle = interpolate_objects(&from, &to, &Tween::shape(), 0.5);
+        assert_eq!(middle.len(), 1);
+        let c = centre_of(&middle[0]);
+        assert!(
+            (c.x - 150.0).abs() < 1.0,
+            "it should be halfway across, got {c:?}"
+        );
+    }
+
+    /// A piece with no partner leaves rather than sitting there and popping.
+    #[test]
+    fn a_piece_with_no_partner_shrinks_away() {
+        let from = vec![
+            blob(1, (100.0, 100.0), 40.0, RED),
+            blob(2, (300.0, 300.0), 20.0, BLUE),
+        ];
+        // The blue one is gone on the far keyframe.
+        let to = vec![blob(3, (105.0, 100.0), 40.0, RED)];
+
+        let pairing = match_drawings(&from, &to);
+        assert_eq!(pairing, vec![Some(0), None], "the blue one has no partner");
+
+        let size_at = |t: f64| {
+            let drawn = interpolate_objects(&from, &to, &Tween::shape(), t);
+            let leaving = &drawn[1];
+            let ObjectKind::Shape(shape) = &leaving.kind else {
+                panic!("expected a shape")
+            };
+            let box_ = leaving
+                .transform
+                .transform_rect_bbox(shape.path.bounding_box());
+            box_.width()
+        };
+        let early = size_at(0.25);
+        let late = size_at(0.75);
+        assert!(
+            late < early,
+            "an unpartnered piece should be on its way out: {early} then {late}"
+        );
+    }
+
+    /// And one that arrives grows in, rather than appearing whole on the last
+    /// frame.
+    #[test]
+    fn a_piece_that_arrives_grows_in() {
+        let from = vec![blob(1, (100.0, 100.0), 40.0, RED)];
+        let to = vec![
+            blob(2, (105.0, 100.0), 40.0, RED),
+            blob(3, (300.0, 300.0), 20.0, BLUE),
+        ];
+
+        let drawn = interpolate_objects(&from, &to, &Tween::shape(), 0.5);
+        assert_eq!(drawn.len(), 2, "the arriving piece is drawn while arriving");
+
+        let arriving_piece = &drawn[1];
+        let ObjectKind::Shape(shape) = &arriving_piece.kind else {
+            panic!("expected a shape")
+        };
+        let box_ = arriving_piece
+            .transform
+            .transform_rect_bbox(shape.path.bounding_box());
+        assert!(
+            box_.width() > 1.0 && box_.width() < 20.0,
+            "halfway in it should be about half size, got {}",
+            box_.width()
+        );
+    }
+
+    /// Colour helps, but does not overrule where a piece is: an animator may
+    /// recolour a shape through a tween, and it is still that shape.
+    #[test]
+    fn a_recoloured_piece_is_still_the_same_piece() {
+        let from = vec![blob(1, (100.0, 100.0), 40.0, RED)];
+        let to = vec![blob(2, (105.0, 100.0), 40.0, BLUE)];
+        assert_eq!(match_drawings(&from, &to), vec![Some(0)]);
+    }
+
+    /// Two pieces at opposite ends of the drawing are not each other, and
+    /// morphing them together looks worse than letting one go.
+    /// Two pieces at opposite ends of the action are not each other: a leftover
+    /// with nowhere sensible to go leaves, rather than being dragged across the
+    /// frame to pair with whatever happened to be free.
+    ///
+    /// A *lone* shape crossing the stage is the opposite case and must still
+    /// pair — that is the classic morph, pinned down by
+    /// `one_shape_still_pairs_with_the_one_shape`.
+    #[test]
+    fn a_leftover_is_not_dragged_across_the_frame() {
+        let from = vec![
+            blob(1, (0.0, 0.0), 20.0, RED),
+            blob(2, (1000.0, 1000.0), 20.0, RED),
+        ];
+        let to = vec![blob(3, (5.0, 5.0), 20.0, RED)];
+        assert_eq!(
+            match_drawings(&from, &to),
+            vec![Some(0), None],
+            "the near one pairs; the far one leaves"
+        );
+    }
+
+    /// Size counts too: a drawing that keeps one piece and replaces another
+    /// with something of a very different size pairs them the right way round.
+    #[test]
+    fn size_tells_two_nearby_pieces_apart() {
+        let from = vec![
+            blob(1, (100.0, 100.0), 80.0, RED),
+            blob(2, (140.0, 100.0), 10.0, RED),
+        ];
+        // Drawn in the other order again, and close together.
+        let to = vec![
+            blob(3, (145.0, 100.0), 10.0, RED),
+            blob(4, (105.0, 100.0), 80.0, RED),
+        ];
+        assert_eq!(match_drawings(&from, &to), vec![Some(1), Some(0)]);
+    }
 }
 
 #[cfg(test)]

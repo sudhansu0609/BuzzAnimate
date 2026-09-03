@@ -212,6 +212,101 @@
       );
     };
 
+    // ---- animation --------------------------------------------------------
+    //
+    // Animate's JSFL has none of this, so these are BuzzAnimate's own and are
+    // named for what they do rather than for a function somebody already knows.
+    // The rule they follow is the one the rest of the API follows: they drive
+    // the document model, and what they leave behind is ordinary layers,
+    // keyframes and poses that a later line of the same script can edit.
+
+    this.setTween = function (layerIndex, frame, kind) {
+      host.setTween(Number(layerIndex), Number(frame), String(kind || "motion"));
+    };
+    this.removeTween = function (layerIndex, frame) {
+      host.setTween(Number(layerIndex), Number(frame), "none");
+    };
+    // Animate's ease slider: -100 slows in, +100 slows out, 0 is linear.
+    this.setEase = function (layerIndex, frame, strength) {
+      host.setEase(Number(layerIndex), Number(frame), Number(strength) || 0);
+    };
+
+    this.camera = {
+      setEnabled: function (on) { host.setCameraEnabled(!!on); },
+      // A shot: where the camera looks, how close, and how the horizon tips.
+      setKey: function (frame, shot) {
+        var s = shot || {};
+        host.setCameraKey(
+          Number(frame),
+          Number(s.x) || 0,
+          Number(s.y) || 0,
+          s.zoom === undefined ? 1 : Number(s.zoom),
+          Number(s.rotation) || 0
+        );
+      },
+      removeKey: function (frame) { return host.removeCameraKey(Number(frame)); },
+      // A focus pull: key the depth that stays sharp, and how open the lens is.
+      setFocusKey: function (frame, depth, aperture) {
+        host.setFocusKey(Number(frame), Number(depth) || 0, Number(aperture) || 0);
+      },
+      // How long the shutter stays open, as a fraction of a frame. 0.5 is the
+      // 180-degree shutter most film is shot at.
+      setShutter: function (shutter, samples) {
+        host.setShutter(Number(shutter) || 0, samples === undefined ? 0 : Number(samples));
+      },
+    };
+
+    // Live modifiers, on whatever is selected.
+    this.addWiggle = function (amplitude, frequency) {
+      host.addWiggle(
+        amplitude === undefined ? 4 : Number(amplitude),
+        frequency === undefined ? 2 : Number(frequency)
+      );
+    };
+    this.addSpring = function (options) {
+      var o = options || {};
+      host.addSpring(
+        o.stiffness === undefined ? 8 : Number(o.stiffness),
+        o.damping === undefined ? 0.5 : Number(o.damping),
+        o.coupling === undefined ? 0.5 : Number(o.coupling)
+      );
+    };
+    this.clearModifiers = function () { host.clearModifiers(); };
+
+    this.addText = function (x, y, content, options) {
+      var o = options || {};
+      return host.addText(
+        Number(x) || 0,
+        Number(y) || 0,
+        String(content === undefined ? "" : content),
+        o.size === undefined ? 48 : Number(o.size),
+        o.font === undefined ? "" : String(o.font)
+      );
+    };
+
+    // ---- the performance --------------------------------------------------
+    //
+    // The two that make a script worth writing.
+
+    // Animate a character: "walk", "run", "talk" or "idle", over a range of
+    // frames. Returns how many keyframes were written.
+    this.perform = function (objectId, action, from, to) {
+      return host.perform(
+        Number(objectId),
+        String(action),
+        Number(from) || 0,
+        Number(to)
+      );
+    };
+
+    // A whole staged, animated scene from a few lines of prose. Returns how
+    // long the shot came out, in frames.
+    //
+    //   document.direct("Night. Ana walks in from the left.\nAna talks to Ben.");
+    this.direct = function (story) {
+      return host.direct(String(story === undefined ? "" : story));
+    };
+
     this.getTimeline = function () { return new Timeline(); };
   }
 

@@ -451,6 +451,184 @@ mod tests {
         run(scene, ScriptContext::default(), source, &Limits::default())
     }
 
+    // -- animation ----------------------------------------------------------
+    //
+    // The point of these: everything the program learned to do in the last
+    // stretch of work was unreachable from a script, so a user could not
+    // automate their own repetitive work with the very features built to save
+    // them effort. Each of these proves one of them is reachable now, and — the
+    // part that matters — that what it leaves behind is ordinary document data
+    // the next line of the same script can read.
+
+    #[test]
+    fn a_script_can_tween_and_ease() {
+        let mut scene = document();
+        let outcome = run_source(
+            &mut scene,
+            r##"
+            var doc = fl.getDocumentDOM();
+            doc.setFillColor("#3366AA");
+            doc.addNewRectangle({left: 0, top: 0, right: 50, bottom: 50});
+            doc.setTween(0, 0, "motion");
+            doc.setEase(0, 0, 60);
+            "##,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let tween = scene
+            .layers()
+            .get(layer)
+            .expect("the layer")
+            .frames
+            .tween_at(0);
+        assert!(tween.is_active(), "the script set a tween");
+        assert_eq!(tween.easing, buzz_scene::Easing::Strength(60.0));
+    }
+
+    #[test]
+    fn a_script_that_tweens_an_empty_frame_says_so() {
+        let mut scene = document();
+        let outcome = run_source(
+            &mut scene,
+            r#"fl.getDocumentDOM().setTween(0, 40, "motion");"#,
+        );
+        let error = outcome.error.expect("tweening frame 40 should fail");
+        assert!(
+            error.contains("keyframe"),
+            "the message should name the reason, got {error}"
+        );
+    }
+
+    #[test]
+    fn a_script_can_shoot_the_scene() {
+        let mut scene = document();
+        let outcome = run_source(
+            &mut scene,
+            r#"
+            var doc = fl.getDocumentDOM();
+            doc.camera.setKey(0, {x: 100, y: 100, zoom: 1});
+            doc.camera.setKey(24, {x: 400, y: 100, zoom: 2});
+            doc.camera.setShutter(0.5, 12);
+            doc.camera.setFocusKey(0, 600, 0.04);
+            doc.camera.setFocusKey(24, 0, 0.04);
+            "#,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        let camera = scene.camera();
+        assert!(camera.enabled, "keying the camera switches it on");
+        assert_eq!(camera.keys().len(), 2);
+        assert!((camera.shutter - 0.5).abs() < 1e-9, "the shutter is open");
+        assert_eq!(camera.blur_samples, 12);
+
+        // And it is a real focus pull: the same depth is sharp at one end and
+        // soft at the other.
+        assert_eq!(camera.dof_blur_at(0u32, 600.0), None);
+        assert!(camera.dof_blur_at(24u32, 600.0).is_some());
+    }
+
+    #[test]
+    fn a_script_can_put_a_modifier_on_the_selection() {
+        let mut scene = document();
+        let outcome = run_source(
+            &mut scene,
+            r#"
+            var doc = fl.getDocumentDOM();
+            doc.addNewRectangle({left: 0, top: 0, right: 50, bottom: 50});
+            doc.selectAll();
+            doc.addWiggle(6, 3);
+            "#,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        let modifiers: Vec<_> = scene
+            .layers()
+            .iter()
+            .flat_map(|l| l.frames.resolved_at(0u32).iter().cloned().collect::<Vec<_>>())
+            .flat_map(|o| o.modifiers.clone())
+            .collect();
+        assert_eq!(modifiers.len(), 1, "one wiggle landed");
+        assert!(matches!(
+            modifiers[0],
+            buzz_scene::Modifier::Wiggle { .. }
+        ));
+    }
+
+    #[test]
+    fn a_modifier_with_nothing_selected_says_so() {
+        let mut scene = document();
+        let outcome = run_source(&mut scene, "fl.getDocumentDOM().addWiggle(4, 2);");
+        let error = outcome.error.expect("it should refuse");
+        assert!(error.contains("selected"), "got {error}");
+    }
+
+    #[test]
+    fn a_script_can_set_type() {
+        let mut scene = document();
+        let outcome = run_source(
+            &mut scene,
+            r#"fl.getDocumentDOM().addText(20, 60, "Hello", {size: 36});"#,
+        );
+        // A machine with no font at all cannot draw text; that is a fact about
+        // the machine, not a failure of the binding.
+        if outcome.error.is_some() {
+            eprintln!("skipping: no font on this machine");
+            return;
+        }
+        let text = scene
+            .layers()
+            .iter()
+            .flat_map(|l| l.frames.resolved_at(0u32).iter().cloned().collect::<Vec<_>>())
+            .find_map(|o| o.text.clone())
+            .expect("the text object records what it was typed as");
+        assert_eq!(text.content, "Hello");
+        assert_eq!(text.size, 36.0);
+    }
+
+    /// **The one that changes what a script is for.** A few lines of prose
+    /// become a staged scene with a cast animated onto the timeline — and it is
+    /// ordinary layers and keyframes afterwards, which the script goes on to
+    /// read.
+    #[test]
+    fn a_script_can_direct_a_whole_scene() {
+        let mut scene = Scene::default();
+        let outcome = run_source(
+            &mut scene,
+            r#"
+            var doc = fl.getDocumentDOM();
+            var frames = doc.direct("Night. Ana walks in from the left.\nAna talks to Ben.");
+            fl.trace("frames=" + frames);
+            fl.trace("layers=" + doc.getTimeline().layers.length);
+            "#,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        let traced = outcome.trace.join("\n");
+        let frames: u32 = traced
+            .lines()
+            .find_map(|l| l.strip_prefix("frames=")?.parse().ok())
+            .expect("the shot's length came back to the script");
+        assert!(frames > 0, "a directed shot has a length");
+
+        // The cast is really there, as layers with artwork on them.
+        assert!(
+            scene.layers().len() > 2,
+            "a set and a cast is more than one layer, got {}",
+            scene.layers().len()
+        );
+    }
+
+    #[test]
+    fn a_story_the_director_cannot_read_says_so() {
+        let mut scene = Scene::default();
+        let outcome = run_source(&mut scene, r#"fl.getDocumentDOM().direct("");"#);
+        assert!(
+            outcome.error.is_some(),
+            "an empty brief is nothing to direct"
+        );
+    }
+
     // -- the script shelf ---------------------------------------------------
 
     /// **The line every command on a shelf opens with.**

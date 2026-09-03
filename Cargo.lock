@@ -590,8 +590,10 @@ dependencies = [
 name = "buzz-script"
 version = "0.1.0"
 dependencies = [
+ "buzz-act",
  "buzz-geom",
  "buzz-scene",
+ "buzz-text",
  "kurbo",
  "peniko",
  "rquickjs",

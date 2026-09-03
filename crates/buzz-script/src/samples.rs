@@ -114,6 +114,67 @@ if (d.selection.length === 0) {
 }
 "#,
     },
+    Sample {
+        name: "Direct a scene from a brief",
+        summary: "A few lines of prose become a staged, animated shot",
+        source: r#"// The director reads plain sentences and does what an animator would do
+// with them: set the scene, stand the cast in it, and write the walks,
+// talks and waits onto the timeline as ordinary pose keyframes.
+//
+// Everything it leaves behind is editable — one Ctrl+Z takes all of it back.
+var d = fl.getDocumentDOM();
+
+var frames = d.direct(
+    'Night. Ana walks in from the left.\n' +
+    'Ana talks to Ben. Ben listens.\n' +
+    'Ben walks off right.'
+);
+
+fl.trace('The shot came out ' + frames + ' frames long.');
+fl.trace('Layers now: ' + d.getTimeline().layerCount);
+"#,
+    },
+    Sample {
+        name: "Shoot it: a camera move and a focus pull",
+        summary: "Keys the camera across the shot and pulls focus as it goes",
+        source: r#"// A push in, with the focus travelling from the background to the
+// foreground as it arrives — the move that carries the eye to a face.
+var d = fl.getDocumentDOM();
+var last = Math.max(24, d.getTimeline().frameCount - 1);
+
+d.camera.setKey(0,    { x: d.width / 2, y: d.height / 2, zoom: 1.0 });
+d.camera.setKey(last, { x: d.width / 2, y: d.height / 2, zoom: 1.6 });
+
+// Focus starts on the layer at depth 600 and ends on the stage plane.
+d.camera.setFocusKey(0,    600, 0.03);
+d.camera.setFocusKey(last, 0,   0.03);
+
+// And a shutter, so fast motion smears rather than strobing.
+d.camera.setShutter(0.5, 8);
+
+fl.trace('Shot keyed over ' + last + ' frames.');
+"#,
+    },
+    Sample {
+        name: "Give everything a little life",
+        summary: "Puts a wiggle on the whole selection so nothing sits dead still",
+        source: r#"// The cheapest thing that stops a held drawing looking like a mistake.
+// Select what should breathe, then run this.
+var d = fl.getDocumentDOM();
+
+if (d.selection.length === 0) {
+    d.selectAll();
+}
+
+if (d.selection.length === 0) {
+    fl.trace('Nothing on the stage to wiggle yet — draw something first.');
+} else {
+    fl.trace('Wiggling ' + d.selection.length + ' object(s).');
+    // Small and slow: this is life, not a shiver.
+    d.addWiggle(3, 1.5);
+}
+"#,
+    },
 ];
 
 #[cfg(test)]

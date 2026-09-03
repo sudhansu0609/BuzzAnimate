@@ -327,6 +327,253 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         }
     );
 
+    // -- animation ----------------------------------------------------------
+    //
+    // Everything below drives the *document model*, not the editor's commands.
+    //
+    // A script holds a working copy of the scene and reads back what it wrote;
+    // a command needs the editor's selection, style and undo stack, and running
+    // one in the middle of a script would be writing to a different document
+    // from the one the next line reads. So the automation a script gets is the
+    // model's own vocabulary — tweens, camera keys, modifiers, performances —
+    // rather than a way to press the menu items.
+
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setTween",
+        |state, layer: i32, frame: u32, kind: String| {
+            let mut s = state.borrow_mut();
+            let id = layer_id(&s, layer)?;
+            let tween = match kind.as_str() {
+                "motion" => buzz_scene::Tween::motion(),
+                "classic" => buzz_scene::Tween::classic(),
+                "shape" => buzz_scene::Tween::shape(),
+                "none" => buzz_scene::Tween::default(),
+                other => {
+                    return Err(throw(&format!(
+                        "unknown tween {other:?}; expected motion, classic, shape or none"
+                    )));
+                }
+            };
+            let mut set = false;
+            s.scene.update_layer(id, |l| {
+                set = l.frames.set_tween(frame, tween);
+            });
+            if !set {
+                return Err(throw(&format!(
+                    "frame {frame} of layer {layer} has no keyframe to tween from"
+                )));
+            }
+            Ok(())
+        }
+    );
+
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setEase",
+        |state, layer: i32, frame: u32, strength: f64| {
+            let mut s = state.borrow_mut();
+            let id = layer_id(&s, layer)?;
+            let mut set = false;
+            s.scene.update_layer(id, |l| {
+                let mut tween = l.frames.tween_at(frame);
+                if !tween.is_active() {
+                    return;
+                }
+                // Animate's own number: -100 slows in, +100 slows out.
+                tween.easing = buzz_scene::Easing::Strength(strength.clamp(-100.0, 100.0));
+                set = l.frames.set_tween(frame, tween);
+            });
+            if !set {
+                return Err(throw(&format!(
+                    "frame {frame} of layer {layer} has no tween to ease"
+                )));
+            }
+            Ok(())
+        }
+    );
+
+    // -- the camera ---------------------------------------------------------
+    host_fn!(ctx, host, state, "setCameraEnabled", |state, on: bool| {
+        state.borrow_mut().scene.camera_mut().enabled = on;
+        Ok(())
+    });
+
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setCameraKey",
+        |state, frame: u32, x: f64, y: f64, zoom: f64, rotation: f64| {
+            let mut s = state.borrow_mut();
+            let camera = s.scene.camera_mut();
+            camera.enabled = true;
+            let mut key = buzz_scene::CameraKey::new(frame, buzz_geom::Point::new(x, y));
+            key.zoom = if zoom > 0.0 { zoom } else { 1.0 };
+            key.rotation = rotation.to_radians();
+            camera.set_key(key.clamped());
+            Ok(())
+        }
+    );
+
+    host_fn!(ctx, host, state, "removeCameraKey", |state, frame: u32| {
+        Ok(state.borrow_mut().scene.camera_mut().remove_key(frame))
+    });
+
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setFocusKey",
+        |state, frame: u32, depth: f64, aperture: f64| {
+            let mut s = state.borrow_mut();
+            s.scene.camera_mut().set_focus_key(buzz_scene::FocusKey {
+                frame,
+                focus_depth: depth,
+                aperture: aperture.max(0.0),
+            });
+            Ok(())
+        }
+    );
+
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setShutter",
+        |state, shutter: f64, samples: i32| {
+            let mut s = state.borrow_mut();
+            let camera = s.scene.camera_mut();
+            camera.shutter = shutter.max(0.0);
+            if samples > 0 {
+                camera.blur_samples = samples as u32;
+            }
+            Ok(())
+        }
+    );
+
+    // -- live modifiers -----------------------------------------------------
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "addWiggle",
+        |state, amplitude: f64, frequency: f64| {
+            let modifier = buzz_scene::Modifier::Wiggle {
+                amplitude,
+                frequency,
+            };
+            add_modifier(state, modifier)
+        }
+    );
+
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "addSpring",
+        |state, stiffness: f64, damping: f64, coupling: f64| {
+            let modifier = buzz_scene::Modifier::Spring {
+                root: 0,
+                stiffness,
+                damping,
+                coupling,
+            };
+            add_modifier(state, modifier)
+        }
+    );
+
+    host_fn!(ctx, host, state, "clearModifiers", |state| {
+        let mut s = state.borrow_mut();
+        let ids = s.context.selection.clone();
+        if ids.is_empty() {
+            return Err(throw("nothing is selected to clear modifiers from"));
+        }
+        for id in ids {
+            s.scene.update_object_across(0, u32::MAX, id, |o| {
+                o.modifiers.clear();
+            });
+        }
+        Ok(())
+    });
+
+    // -- text ---------------------------------------------------------------
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "addText",
+        |state, x: f64, y: f64, content: String, size: f64, font: String| {
+            let mut s = state.borrow_mut();
+            let layer = s
+                .context
+                .active_layer
+                .or_else(|| s.scene.layers().iter().next().map(|l| l.id))
+                .ok_or_else(|| throw("the document has no layer to put text on"))?;
+            let frame = s.context.current_frame;
+            let family = (!font.is_empty()).then(|| font.clone());
+            let size = if size > 0.0 { size } else { 48.0 };
+            let path = buzz_text::outline(&content, size, family.as_deref())
+                .ok_or_else(|| throw("there is no font available to draw text with"))?;
+            let colour = Color::BLACK;
+            let id = s
+                .scene
+                .add_shape_at(layer, frame, ShapeData::filled(path, colour))
+                .ok_or_else(|| throw("could not put text on that frame"))?;
+            s.scene.update_object_at(frame, id, |o| {
+                o.transform = Affine::translate((x, y));
+                o.text = Some(buzz_scene::TextData::new(&content, size, family.clone()));
+            });
+            Ok(id.0)
+        }
+    );
+
+    // -- the performance ----------------------------------------------------
+    //
+    // The two calls that make a script worth writing: a walk on a character,
+    // and a whole staged scene from a line of prose. Both are ordinary layers,
+    // shapes and keyframes when they land, so a script can go on to edit what
+    // it just produced.
+
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "perform",
+        |state, object: u64, action: String, from: u32, to: u32| {
+            let mut s = state.borrow_mut();
+            let action = match action.to_ascii_lowercase().as_str() {
+                "walk" => buzz_act::perform::Action::Walk,
+                "run" => buzz_act::perform::Action::Run,
+                "talk" => buzz_act::perform::Action::Talk,
+                "idle" => buzz_act::perform::Action::Idle,
+                other => {
+                    return Err(throw(&format!(
+                        "unknown action {other:?}; expected walk, run, talk or idle"
+                    )));
+                }
+            };
+            if to <= from {
+                return Err(throw("a performance needs at least one frame"));
+            }
+            let performance = buzz_act::perform::Performance::new(action, from..to);
+            buzz_act::perform::apply(&mut s.scene, ObjectId(object), &performance)
+                .map(|report| report.keyframes as i32)
+                .map_err(|e| throw(&format!("{e}")))
+        }
+    );
+
+    host_fn!(ctx, host, state, "direct", |state, story: String| {
+        let mut s = state.borrow_mut();
+        buzz_act::direct(&mut s.scene, &story)
+            .map(|scene| scene.frames as i32)
+            .map_err(|e| throw(&format!("{e}")))
+    });
+
     // -- selection ----------------------------------------------------------
     host_fn!(ctx, host, state, "selectionCount", |state| {
         Ok(state.borrow().context.selection.len() as i32)
@@ -548,6 +795,28 @@ fn uri_to_path(uri: &str) -> JsResult<std::path::PathBuf> {
         return Err(throw("expected the path of a script"));
     }
     Ok(std::path::PathBuf::from(text))
+}
+
+/// Put a live modifier on everything selected.
+///
+/// Across the whole film rather than on one frame, because a modifier is a
+/// property of the object and not of a moment — the same reason the editor's
+/// own Add Wiggle writes it that way.
+fn add_modifier(
+    state: &Rc<RefCell<State>>,
+    modifier: buzz_scene::Modifier,
+) -> JsResult<()> {
+    let mut s = state.borrow_mut();
+    let ids = s.context.selection.clone();
+    if ids.is_empty() {
+        return Err(throw("nothing is selected to put a modifier on"));
+    }
+    for id in ids {
+        s.scene.update_object_across(0, u32::MAX, id, |o| {
+            o.modifiers.push(modifier);
+        });
+    }
+    Ok(())
 }
 
 fn throw(message: &str) -> rquickjs::Error {

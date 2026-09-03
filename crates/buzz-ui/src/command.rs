@@ -85,6 +85,9 @@ pub enum Command {
     BringForward,
     SendBackward,
     SendToBack,
+    /// **Ink and paint**: carry this frame's bucket fills onto every keyframe
+    /// after it, seeded where each colour already sits.
+    PaintThrough,
     /// **On twos**: hold each drawing for two frames over the selected span,
     /// which halves the drawings a shot needs.
     ExposeOnTwos,
@@ -118,6 +121,9 @@ pub enum Command {
     /// **Import a video to trace over**: one frame of it per frame of the film,
     /// on a guide layer.
     ImportVideoReference,
+    /// **Import an image sequence**: a folder of numbered pictures, one drawing
+    /// to a frame.
+    ImportSequenceFolder,
     DeleteLayer,
 
     // Symbols and library
@@ -358,6 +364,7 @@ impl Command {
             BringForward => "Bring Forward",
             SendBackward => "Send Backward",
             SendToBack => "Send to Back",
+            PaintThrough => "Paint Through",
             ExposeOnTwos => "On Twos",
             ExposeOnThrees => "On Threes",
             SelectSameColour => "Select Same Colour",
@@ -375,6 +382,7 @@ impl Command {
             NewLayerFolder => "New Folder",
             NewReferenceLayer => "New Reference Layer",
             ImportVideoReference => "Import Video Reference\u{2026}",
+            ImportSequenceFolder => "Import Image Sequence\u{2026}",
             DeleteLayer => "Delete Layer",
 
             ConvertToSymbol => "Convert to Symbol…",
@@ -570,7 +578,7 @@ impl Command {
             ShortcutEditor => None,
             DetectBeats => None,
             NewReferenceLayer | ImportVideoReference | SelectSameColour
-            | ExposeOnTwos | ExposeOnThrees => None,
+            | ExposeOnTwos | ExposeOnThrees | PaintThrough | ImportSequenceFolder => None,
 
             AddSun | AddSky | AddLamp | AddGloom | AddFire => None,
             // No Animate binding to follow, and these open dialogs rather than

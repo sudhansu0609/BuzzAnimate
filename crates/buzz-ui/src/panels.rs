@@ -296,6 +296,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 Command::NewLayerFolder,
                 Command::NewReferenceLayer,
                 Command::ImportVideoReference,
+                Command::ImportSequenceFolder,
             ] {
                 item(ui, c, true, &mut raised);
             }
@@ -392,6 +393,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 Command::ReverseFrames,
                 Command::ExposeOnTwos,
                 Command::ExposeOnThrees,
+                Command::PaintThrough,
             ] {
                 item(ui, c, true, &mut raised);
             }

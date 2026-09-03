@@ -2860,6 +2860,16 @@ impl Editor {
                 self.selection.set(all);
             }
             SelectSameColour => self.select_same_colour(),
+            PaintThrough => {
+                // To the end of the layer: colouring is a pass over a whole
+                // shot, not over the next frame or two.
+                let last = self
+                    .active_layer()
+                    .and_then(|l| self.doc.scene().layers().get(l).map(|l| l.frames.length()))
+                    .unwrap_or(0)
+                    .saturating_sub(1);
+                self.propagate_fills(last);
+            }
             ExposeOnTwos => self.expose_on(2),
             ExposeOnThrees => self.expose_on(3),
             Deselect => self.selection.clear(),
@@ -3190,7 +3200,8 @@ impl Editor {
                 debug_assert!(false, "{command:?} must be dispatched by the shell");
             }
 
-            ImportSound | ImportImage | LipSync | ImportVideoReference => {
+            ImportSound | ImportImage | LipSync | ImportVideoReference
+            | ImportSequenceFolder => {
                 // The shell owns the file dialog and the modal window, as with
                 // Open and Export.
                 debug_assert!(false, "{command:?} must be dispatched by the shell");
@@ -4768,6 +4779,155 @@ impl Editor {
         directed
     }
 
+    /// **Carry this frame's colouring onto the frames after it** — ink and paint.
+    ///
+    /// # The job this is
+    ///
+    /// Colouring is half the labour of drawn animation and almost none of the
+    /// craft. The line art is redrawn every frame and the *colours are the
+    /// same every frame*: the coat is the same red on frame 40 as on frame 1,
+    /// and somebody has to click it forty times. Traditional pipelines have had
+    /// a name for automating this for decades — ink and paint — and it is the
+    /// single largest saving available in a program like this one.
+    ///
+    /// # How the regions are matched
+    ///
+    /// Not by comparing shapes: on the next frame the region is a *different
+    /// enclosure*, drawn afresh, and there is nothing to compare it to. What is
+    /// stable is roughly **where it is**. So each fill on this frame offers a
+    /// point inside itself as a seed, and the next frame is flooded from that
+    /// point with the same colour, through the same gap-aware bucket a person
+    /// would have clicked with. A region that has moved less than its own size —
+    /// which is nearly all of them, between two frames of the same drawing —
+    /// still contains the seed and comes out the same colour.
+    ///
+    /// # Where it stops, and why it says so
+    ///
+    /// A seed that lands outside every enclosure on the next frame — the arm
+    /// swung further than its own width, or the line has a gap the bucket cannot
+    /// close — is **left uncoloured and counted**. It is not guessed at. A
+    /// wrong colour looks deliberate and survives to the film; a missing one is
+    /// visible immediately and is a click to fix, which is the right way round
+    /// for something automatic.
+    ///
+    /// Frames that already carry a fill covering the seed are left alone, so
+    /// running this twice does nothing the second time and colouring done by
+    /// hand is never overwritten.
+    pub fn propagate_fills(&mut self, through: u32) -> (usize, usize) {
+        let Some(layer) = self.active_layer() else {
+            self.status = Some("No layer to carry the colours along".into());
+            return (0, 0);
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return (0, 0);
+        }
+        let from = self.current_frame;
+        let gap = self.style.gap_size;
+
+        // What this frame has been coloured with: the bucket's own fills, each
+        // with a point inside itself to seed the next frame from.
+        let sources: Vec<(Point, buzz_scene::FillSpec)> = {
+            let scene = self.doc.scene();
+            let Some(layer_ref) = scene.layers().get(layer) else {
+                return (0, 0);
+            };
+            layer_ref
+                .frames
+                .resolved_at(from)
+                .iter()
+                .filter_map(|object| {
+                    let ObjectKind::Shape(shape) = &object.kind else {
+                        return None;
+                    };
+                    let fill = shape.fill.as_ref()?;
+                    // The bucket's own rule is what marks a fill as *paint*
+                    // rather than as line art: a brush stroke is a filled shape
+                    // too, and carrying those forward would draw the drawing
+                    // twice.
+                    if fill.rule != buzz_scene::bucket::FILL_RULE {
+                        return None;
+                    }
+                    let path = object.transform * shape.path.clone();
+                    interior_point(&path).map(|seed| (seed, fill.clone()))
+                })
+                .collect()
+        };
+
+        if sources.is_empty() {
+            self.status =
+                Some("This frame has no bucket fills to carry — colour one first".into());
+            return (0, 0);
+        }
+
+        let last = through.max(from);
+        let mut painted = 0;
+        let mut missed = 0;
+
+        self.doc.edit("Ink and Paint", |scene| {
+            for frame in (from + 1)..=last {
+                // Nothing drawn here means nothing to colour; a held frame is
+                // the same drawing and already carries its own colour.
+                let Some(layer_ref) = scene.layers().get(layer) else {
+                    break;
+                };
+                if !layer_ref.frames.is_keyframe(frame) {
+                    continue;
+                }
+
+                let mut boundaries = Vec::new();
+                let mut already: Vec<buzz_geom::BezPath> = Vec::new();
+                for object in layer_ref.frames.resolved_at(frame).iter() {
+                    collect_bucket_boundaries(object, buzz_geom::Affine::IDENTITY, &mut boundaries);
+                    if let ObjectKind::Shape(shape) = &object.kind
+                        && shape
+                            .fill
+                            .as_ref()
+                            .is_some_and(|f| f.rule == buzz_scene::bucket::FILL_RULE)
+                    {
+                        already.push(object.transform * shape.path.clone());
+                    }
+                }
+
+                for (seed, fill) in &sources {
+                    // Painted here already, by hand or by an earlier run.
+                    if already.iter().any(|path| {
+                        buzz_geom::fill_contains(path, *seed, buzz_scene::bucket::FILL_RULE)
+                    }) {
+                        continue;
+                    }
+                    match buzz_scene::fill_region(&boundaries, *seed, gap) {
+                        Some(path) => {
+                            let shape = ShapeData {
+                                path,
+                                fill: Some(fill.clone()),
+                                stroke: None,
+                                blend: buzz_scene::PaintBlend::default(),
+                            };
+                            // Behind the line art, as the bucket puts its own.
+                            scene.add_shape_behind_at(layer, frame, shape);
+                            painted += 1;
+                        }
+                        None => missed += 1,
+                    }
+                }
+            }
+        });
+        self.doc.end_gesture();
+
+        self.status = Some(match (painted, missed) {
+            (0, 0) => "Nothing after this frame to colour".to_string(),
+            (n, 0) => format!("Carried the colours onto {n} region(s)"),
+            (0, m) => format!(
+                "Could not place {m} region(s) — the drawing moved too far, or a line has a gap"
+            ),
+            (n, m) => format!(
+                "Coloured {n} region(s); {m} could not be placed and are left for you"
+            ),
+        });
+        (painted, missed)
+    }
+
     // -- colour --------------------------------------------------------------
 
     /// **Repaint every fill and stroke linked to a swatch.**
@@ -5072,6 +5232,132 @@ impl Editor {
     ///
     /// Frames are taken at the *document's* rate, so frame 1 of the film is the
     /// video a frame in, whatever rate the file was shot at.
+    /// **Import a folder of numbered pictures as one drawing per frame.**
+    ///
+    /// # Why this was missing and shouldn't have been
+    ///
+    /// The exporter has written PNG sequences from the start, and the frame
+    /// machinery to place many pictures on many frames arrived with the video
+    /// reference layer — but importing a sequence took the pictures one file at
+    /// a time. Scanned drawings, frames from another program, a render from
+    /// somewhere else: all of them arrive as a numbered folder, and all of them
+    /// had to be brought in by hand.
+    ///
+    /// # Ordered by their numbers, not by their names
+    ///
+    /// `frame2.png` comes before `frame10.png`, which sorting by name gets
+    /// exactly backwards — and getting the order wrong on an import of two
+    /// hundred drawings is not something anybody would enjoy discovering later.
+    /// Files with no number in them keep their name order, after the numbered
+    /// ones.
+    ///
+    /// Each picture lands on a **blank** keyframe of its own: an ordinary
+    /// keyframe carries the frame before it forward, which would stack the whole
+    /// sequence on its own last frame.
+    pub fn import_image_sequence(&mut self, folder: &std::path::Path) -> anyhow::Result<usize> {
+        let entries = anyhow::Context::with_context(std::fs::read_dir(folder), || {
+            format!("reading {}", folder.display())
+        })?;
+        let mut files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .is_some_and(|e| {
+                        matches!(e.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp")
+                    })
+            })
+            .collect();
+        if files.is_empty() {
+            anyhow::bail!("no pictures in {}", folder.display());
+        }
+        files.sort_by_key(|p| {
+            let name = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (trailing_number(&name).is_none(), trailing_number(&name), name)
+        });
+
+        // Read and decode before the document is touched, so a folder with one
+        // bad file in it does not leave half a sequence behind.
+        let mut pictures = Vec::with_capacity(files.len());
+        for file in &files {
+            let bytes = anyhow::Context::with_context(std::fs::read(file), || {
+                format!("reading {}", file.display())
+            })?;
+            let name = file
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Frame".to_string());
+            pictures.push((name, bytes));
+        }
+
+        let folder_name = folder
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Sequence".to_string());
+        let stage = self.doc.scene().stage().size;
+        let layer = self.doc_add_layer(&folder_name, LayerKind::Normal);
+        let count = pictures.len() as u32;
+        let mut placed = 0usize;
+
+        self.doc.edit("Import Sequence", |scene| {
+            scene.update_layer(layer, |l| {
+                while l.frames.length() < count {
+                    l.frames.insert_frame(l.frames.length());
+                }
+            });
+
+            for (index, (name, bytes)) in pictures.iter().enumerate() {
+                let frame = index as u32;
+                let id = scene.next_image_id();
+                let Ok(asset) = buzz_scene::ImageAsset::decode(id, name.clone(), bytes) else {
+                    continue;
+                };
+                let asset = scene.images_mut().insert(asset);
+
+                // Centred on the stage at its own size, as an imported picture
+                // is: a sequence is usually already the size it was rendered at.
+                let (w, h) = (f64::from(asset.width), f64::from(asset.height));
+                let rect = buzz_geom::Rect::new(
+                    (stage.width - w) / 2.0,
+                    (stage.height - h) / 2.0,
+                    (stage.width + w) / 2.0,
+                    (stage.height + h) / 2.0,
+                );
+                let fill = buzz_scene::ImageFill::new(asset, rect);
+
+                scene.update_layer(layer, |l| {
+                    l.frames.insert_blank_keyframe(frame);
+                });
+                if scene
+                    .add_shape_at(
+                        layer,
+                        frame,
+                        ShapeData {
+                            path: buzz_geom::Shape::to_path(&rect, 1e-9),
+                            fill: Some(buzz_scene::FillSpec::image(fill)),
+                            stroke: None,
+                            blend: buzz_scene::PaintBlend::Normal,
+                            },
+                    )
+                    .is_some()
+                {
+                    placed += 1;
+                }
+            }
+        });
+        self.doc.end_gesture();
+        self.selection.set_active_layer(Some(layer));
+        self.status = Some(format!(
+            "{placed} drawings from {folder_name}, one to a frame"
+        ));
+        Ok(placed)
+    }
+
     pub fn import_video_reference(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         /// As many frames as a reference layer will take. Twenty seconds at
         /// twenty-four is a long shot to rotoscope in one go, and ten times
@@ -6936,6 +7222,61 @@ fn place_sound_on_stage(scene: &mut buzz_scene::Scene, sound: buzz_scene::SoundI
         }
     });
     true
+}
+
+/// The number a file name ends with, for putting a sequence in its own order.
+///
+/// `frame2` before `frame10`, which sorting by name gets exactly backwards.
+/// `None` for a name with no trailing number, which then sorts by name after
+/// every numbered file.
+fn trailing_number(name: &str) -> Option<u64> {
+    let digits: String = name
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    digits.parse().ok()
+}
+
+/// **A point inside a filled region**, to seed the next frame's bucket from.
+///
+/// The centre of the box first, which is inside almost every shape anybody
+/// draws. Where it is not — a crescent, a horseshoe, anything that wraps around
+/// its own middle — the box is sampled on a small grid and the first point that
+/// is really inside wins. `None` for a shape with no inside worth the name,
+/// which is a hairline or an empty path.
+fn interior_point(path: &buzz_geom::BezPath) -> Option<Point> {
+    use buzz_geom::Shape as _;
+    let box_ = path.bounding_box();
+    if !(box_.width() > 0.0) || !(box_.height() > 0.0) {
+        return None;
+    }
+    let rule = buzz_scene::bucket::FILL_RULE;
+
+    let centre = box_.center();
+    if buzz_geom::fill_contains(path, centre, rule) {
+        return Some(centre);
+    }
+
+    // Odd fractions, so a sample never lands exactly on the axis of a shape
+    // that is symmetric about its own middle — which is where a crescent's
+    // hole is, and would fail every time.
+    const STEPS: [f64; 5] = [0.3, 0.7, 0.5, 0.2, 0.8];
+    for fy in STEPS {
+        for fx in STEPS {
+            let point = Point::new(
+                box_.x0 + box_.width() * fx,
+                box_.y0 + box_.height() * fy,
+            );
+            if buzz_geom::fill_contains(path, point, rule) {
+                return Some(point);
+            }
+        }
+    }
+    None
 }
 
 /// Are these the same colour, as far as a person looking at a drawing is

@@ -368,6 +368,8 @@ pub enum Pick {
     FillWithImage,
     /// A video to pull apart onto a reference layer, a frame at a time.
     VideoReference,
+    /// A folder of numbered pictures, one drawing to a frame.
+    SequenceFolder,
     ImportSound,
     /// File ▸ Import, into the stage or into the library.
     ImportInto(buzz_scene::ImportTarget),
@@ -4537,6 +4539,7 @@ impl App {
         match command {
             Command::ImportSound => self.import_sound_dialog(),
             Command::ImportVideoReference => self.video_reference_dialog(),
+            Command::ImportSequenceFolder => self.sequence_folder_dialog(),
             Command::ImportImage => self.import_image_dialog(),
             Command::LipSync => self.open_lip_sync(),
             Command::ExportFla => self.export_fla_dialog(),
@@ -4845,6 +4848,7 @@ impl App {
             Pick::ImportImage => self.import_image_from(path),
             Pick::FillWithImage => self.fill_with_image_from(path),
             Pick::VideoReference => self.video_reference_from(path),
+            Pick::SequenceFolder => self.sequence_folder_from(path),
             Pick::ImportSound => self.import_sound_from(path),
             Pick::ImportInto(target) => self.import_file(target, path),
             Pick::AnimateAssets => self.import_animate_assets_from(path),
@@ -5740,6 +5744,20 @@ impl App {
         match self.editor.fill_selection_with_image(&path, false) {
             Ok(()) => self.editor.status = Some("Filled the selection with the image".into()),
             Err(e) => self.editor.status = Some(format!("Could not fill with that image: {e:#}")),
+        }
+    }
+
+    /// Pick a folder of numbered drawings.
+    fn sequence_folder_dialog(&mut self) {
+        self.ask_for_path(
+            crate::dialogs::Request::folder().title("Choose a folder of numbered pictures"),
+            Pick::SequenceFolder,
+        );
+    }
+
+    fn sequence_folder_from(&mut self, path: std::path::PathBuf) {
+        if let Err(e) = self.editor.import_image_sequence(&path) {
+            self.editor.status = Some(format!("Could not import that sequence: {e:#}"));
         }
     }
 

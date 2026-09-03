@@ -53,6 +53,7 @@ fn state() -> TimelineState {
         focal_distance: buzz_scene::DEFAULT_FOCAL_DISTANCE,
         nearest_depth: -buzz_scene::DEFAULT_FOCAL_DISTANCE * 0.9,
         waveforms: std::collections::BTreeMap::new(),
+        beats: Vec::new(),
     }
 }
 

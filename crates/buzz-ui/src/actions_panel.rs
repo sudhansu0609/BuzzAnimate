@@ -103,7 +103,11 @@ pub fn actions_panel(
     });
 
     // -- the toolbar --------------------------------------------------------
-    ui.horizontal(|ui| {
+    //
+    // **Wrapped**, because this row grows: Run, Examples, Saved, Save and Clear
+    // together run past the end of the narrowest dock column, and a row that
+    // does not fit does not scroll — its last buttons are simply not there.
+    ui.horizontal_wrapped(|ui| {
         let run = ui
             .add_enabled(state.has_source(), egui::Button::new("▶ Run"))
             .on_hover_text("Run the script against this document (Ctrl+Enter)");

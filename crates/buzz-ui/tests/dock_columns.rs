@@ -412,14 +412,14 @@ fn every_docked_panel_fits_the_narrowest_column() {
     check(
         "Actions",
         column_overflow(narrowest, |ui| {
-            let _ = actions_panel(ui, &mut actions, &[]);
+            let _ = actions_panel(ui, &mut actions, &[], &[]);
         }),
         &mut failures,
     );
     check(
         "Camera",
         column_overflow(narrowest, |ui| {
-            let _ = camera_panel(ui, scene.camera(), 0);
+            let _ = camera_panel(ui, scene.camera(), 0, &mut Default::default());
         }),
         &mut failures,
     );

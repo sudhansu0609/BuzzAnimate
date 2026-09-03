@@ -133,6 +133,7 @@ fn the_timeline_panel_is_bounded_on_the_monster() {
         focal_distance: buzz_scene::DEFAULT_FOCAL_DISTANCE,
         nearest_depth: -buzz_scene::DEFAULT_FOCAL_DISTANCE * 0.9,
         waveforms: std::collections::BTreeMap::new(),
+        beats: Vec::new(),
     };
 
     let ctx = egui::Context::default();
@@ -227,6 +228,7 @@ fn committing_a_merged_monster_and_drawing_is_bounded() {
         focal_distance: buzz_scene::DEFAULT_FOCAL_DISTANCE,
         nearest_depth: -buzz_scene::DEFAULT_FOCAL_DISTANCE * 0.9,
         waveforms: std::collections::BTreeMap::new(),
+        beats: Vec::new(),
     };
     let ctx = egui::Context::default();
     buzz_ui::theme::apply(&ctx);

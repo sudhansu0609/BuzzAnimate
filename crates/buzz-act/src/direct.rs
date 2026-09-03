@@ -39,8 +39,8 @@
 //! reason, everyone left standing when their part ends idles quietly to the
 //! end of the shot: breathing, not stopped.
 
-use buzz_geom::Affine;
-use buzz_scene::Scene;
+use buzz_geom::{Affine, Point};
+use buzz_scene::{CameraKey, Scene};
 
 use crate::perform::{self, Action, Performance};
 use crate::staging::{self, SceneRecipe, Setting, StagedScene};
@@ -443,6 +443,141 @@ impl ActorState {
 /// Builds the set, casts everyone the story names, and writes their
 /// performances onto the timeline in story order. One call; the caller wraps
 /// it in one `Document::edit` so the whole scene is one undo step.
+/// **Frame the shot** — where the camera looks, and when it cuts.
+///
+/// # Why the director should do this at all
+///
+/// A staged, performed scene with a locked-off camera is a stage play seen from
+/// row H. It is not wrong, and it is not a film: what makes a shot read is that
+/// the camera is *near the thing that matters*, and that it changes when the
+/// thing that matters changes. That is a decision, but it is a decision with an
+/// obvious default — look at whoever is doing something — and the obvious
+/// default is exactly what an animator should not have to type out for every
+/// beat of every shot.
+///
+/// # The rules, and they are few
+///
+/// * **Somebody talking is who the shot is about.** The camera comes in on
+///   them: closer, centred on the figure. Between two speakers this **cuts** —
+///   keys on adjacent frames, so the change happens between one frame and the
+///   next, because a camera that drifts across the room during a conversation is
+///   a camera nobody asked for.
+/// * **Somebody walking is followed.** Keys at both ends of the beat, so the
+///   camera moves with them — a pan, not a cut, because the movement is the
+///   point of the beat.
+/// * **Nothing else moves the camera.** An idle holds whatever framing it
+///   inherited. A shot with no talking and no walking gets one wide key and
+///   stays there, which is the locked-off camera it had before.
+///
+/// # It never frames tighter than the figure
+///
+/// The zoom is worked out from the actor's own height so a close shot is close
+/// *on them* rather than by some number of pixels, and it is bounded so nobody's
+/// head leaves the frame. Guessing a framing that cuts somebody's head off is
+/// worse than not framing at all.
+///
+/// Returns how many camera keys were written. Nothing is written for a shot
+/// with no cast, which has nothing to look at.
+pub fn frame_the_shot(scene: &mut Scene, directed: &DirectedScene) -> usize {
+    if directed.staged.cast.is_empty() {
+        return 0;
+    }
+    let stage = scene.stage().stage_rect();
+    let centre = stage.center();
+
+    /// How much of the frame's height a figure fills in a close shot.
+    const CLOSE_FILL: f64 = 0.72;
+    /// And how much of it a walk is framed at — room to travel into.
+    const WIDE_FILL: f64 = 0.45;
+    /// Never past this, whatever the arithmetic says: a shot that is more
+    /// magnified than this is somebody's chin.
+    const MAX_ZOOM: f64 = 2.2;
+
+    // Where an actor is, and how tall, at a frame.
+    let look_at = |scene: &Scene, actor: usize, frame: u32| -> Option<(Point, f64)> {
+        let (layer, _) = directed.staged.cast.get(actor)?;
+        let bounds = scene.layers().get(*layer)?.bounds_at(frame)?;
+        Some((bounds.center(), bounds.height().max(1.0)))
+    };
+
+    let zoom_for = |height: f64, fill: f64| {
+        ((stage.height() * fill) / height).clamp(1.0, MAX_ZOOM)
+    };
+
+    let mut keys: Vec<CameraKey> = Vec::new();
+    fn push(keys: &mut Vec<CameraKey>, frame: u32, at: Point, zoom: f64) {
+        let mut key = CameraKey::new(frame, at);
+        key.zoom = zoom;
+        keys.push(key);
+    }
+
+    // The shot opens wide on the whole stage, so the first cut has something to
+    // cut *from*.
+    push(&mut keys, 0, centre, 1.0);
+
+    for beat in &directed.beats {
+        match beat.action {
+            Action::Talk => {
+                let Some((at, height)) = look_at(scene, beat.actor, beat.frames.start) else {
+                    continue;
+                };
+                let zoom = zoom_for(height, CLOSE_FILL);
+                // A cut: the frame before keeps the old framing, and this one
+                // has the new. Adjacent keys give no time to interpolate.
+                if beat.frames.start > 0
+                    && let Some(previous) = keys.last().copied()
+                {
+                    push(&mut keys, beat.frames.start - 1, previous.center, previous.zoom);
+                }
+                push(&mut keys, beat.frames.start, at, zoom);
+            }
+            Action::Walk | Action::Run => {
+                // Followed, at both ends, so the camera travels with them.
+                if let Some((from, height)) = look_at(scene, beat.actor, beat.frames.start) {
+                    push(&mut keys, beat.frames.start, from, zoom_for(height, WIDE_FILL));
+                }
+                if beat.frames.end > beat.frames.start + 1
+                    && let Some((to, height)) = look_at(scene, beat.actor, beat.frames.end - 1)
+                {
+                    push(&mut keys, beat.frames.end - 1, to, zoom_for(height, WIDE_FILL));
+                }
+            }
+            // Standing still is not a reason to move the camera.
+            Action::Idle => {}
+        }
+    }
+
+    // A beat that starts on frame 0 lands on the opening wide key; the later
+    // one is the framing that was actually chosen, so it wins. Deduplicated
+    // here rather than left to `set_key` so the count below is honest.
+    let mut seen: Vec<CameraKey> = Vec::new();
+    for key in keys {
+        match seen.iter_mut().find(|k| k.frame == key.frame) {
+            Some(existing) => *existing = key,
+            None => seen.push(key),
+        }
+    }
+    let keys = seen;
+
+    // Every key still the opening wide one means nothing was worth cutting to,
+    // and a locked-off camera says that with less machinery than a camera track
+    // holding one key.
+    let untouched = keys
+        .iter()
+        .all(|k| k.zoom == 1.0 && k.center == centre);
+    if untouched {
+        return 0;
+    }
+
+    let written = keys.len();
+    let camera = scene.camera_mut();
+    camera.enabled = true;
+    for key in keys {
+        camera.set_key(key.clamped());
+    }
+    written
+}
+
 /// **One shot of a longer brief**: what to call it, and the prose that makes it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlannedShot {
@@ -909,14 +1044,21 @@ pub fn direct(scene: &mut Scene, story: &str) -> Result<DirectedScene, DirectErr
         ));
     }
 
-    Ok(DirectedScene {
+    let directed = DirectedScene {
         staged,
         names: parsed.names,
         beats,
         frames: total,
         ignored: parsed.ignored,
         message,
-    })
+    };
+
+    // **And then it is shot.** Staging and performing put the scene on the
+    // stage; framing is what makes it a shot rather than a stage play seen from
+    // row H. A scene with nothing worth cutting to keeps its locked-off camera.
+    frame_the_shot(scene, &directed);
+
+    Ok(directed)
 }
 
 #[cfg(test)]
@@ -1172,6 +1314,107 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+
+    fn shot(story: &str) -> (Scene, DirectedScene) {
+        let mut scene = Scene::default();
+        let directed = direct(&mut scene, story).expect("it directs");
+        (scene, directed)
+    }
+
+    /// A scene where somebody talks gets a camera: the shot is about them.
+    ///
+    /// A brief whose talking starts on the very first frame has nothing to cut
+    /// *from*, so it opens on the speaker rather than cutting to them — one
+    /// key, and a closer one than the stage.
+    #[test]
+    fn a_conversation_is_shot_rather_than_watched_from_row_h() {
+        let (scene, _) = shot("Ana talks to Ben.");
+        assert!(scene.camera().enabled, "the shot is framed");
+        assert!(
+            scene.camera().keys().iter().any(|k| k.zoom > 1.0),
+            "and framed on the speaker rather than on the whole stage"
+        );
+    }
+
+    /// **The cut is a cut.** Two keys on adjacent frames leave no room to
+    /// interpolate, which is what stops the camera drifting across the room in
+    /// the middle of a conversation.
+    #[test]
+    fn coming_in_on_a_speaker_cuts_rather_than_drifts() {
+        let (scene, _) = shot("Ana waits for 2 seconds. Ana talks to Ben.");
+        let frames: Vec<u32> = scene.camera().keys().iter().map(|k| k.frame).collect();
+        assert!(
+            frames.windows(2).any(|w| w[1] == w[0] + 1),
+            "there should be a pair of adjacent keys — a cut. Got {frames:?}"
+        );
+    }
+
+    /// A close shot is closer than the wide one it cut from. Given something
+    /// to open on first, so there is a wide framing for the cut to leave.
+    #[test]
+    fn the_shot_comes_in_on_whoever_is_talking() {
+        let (scene, _) = shot("Ana walks in from the left.
+Ana talks to Ben.");
+        let zooms: Vec<f64> = scene.camera().keys().iter().map(|k| k.zoom).collect();
+        let widest = zooms.iter().copied().fold(f64::MAX, f64::min);
+        let closest = zooms.iter().copied().fold(0.0f64, f64::max);
+        assert!(
+            closest > widest,
+            "it should come in on the speaker: {zooms:?}"
+        );
+    }
+
+    /// **And never so close that somebody loses their head.** A framing that
+    /// guessed a crop is worse than no framing at all.
+    #[test]
+    fn it_never_frames_tighter_than_a_person() {
+        let (scene, _) = shot("Ana talks to Ben. Ben talks to Ana.");
+        for key in scene.camera().keys() {
+            assert!(
+                key.zoom <= 2.2,
+                "a zoom of {} is somebody's chin",
+                key.zoom
+            );
+            assert!(key.zoom >= 1.0, "and never further out than the stage");
+        }
+    }
+
+    /// A walk is followed rather than cut to: keys at both ends of the beat, so
+    /// the camera travels with the actor.
+    #[test]
+    fn a_walk_is_followed() {
+        let (scene, directed) = shot("Ana walks in from the left.");
+        let walk = directed
+            .beats
+            .iter()
+            .find(|b| b.action == Action::Walk)
+            .expect("a walk was planned");
+        let frames: Vec<u32> = scene.camera().keys().iter().map(|k| k.frame).collect();
+        assert!(
+            frames.contains(&walk.frames.start),
+            "keyed where the walk starts: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| *f >= walk.frames.end - 1),
+            "and where it ends: {frames:?}"
+        );
+    }
+
+    /// Standing still is not a reason to move the camera. A shot with nothing
+    /// but an idle keeps the locked-off camera it always had.
+    #[test]
+    fn a_still_scene_keeps_its_locked_off_camera() {
+        let (scene, _) = shot("Ana waits.");
+        assert!(
+            !scene.camera().enabled,
+            "nothing happened that was worth cutting to"
+        );
+    }
+}
 
 #[cfg(test)]
 mod sequence_tests {

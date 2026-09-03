@@ -1424,6 +1424,99 @@ impl Scene {
         self.add_object_at(layer, 0, object)
     }
 
+    // -- the library ----------------------------------------------------------
+
+    /// **Point every instance of one symbol at another.**
+    ///
+    /// # What this is for
+    ///
+    /// A prop, a costume, a character drawn a second way: the animation is
+    /// already right and only the drawing is to change. Without this, that means
+    /// finding every instance across every frame and every symbol that contains
+    /// one, and replacing each by hand — and the instances are the *placements*,
+    /// so each one carries a position, a scale and a colour effect that would
+    /// have to be typed back in.
+    ///
+    /// Swapping keeps all of that. Only what the instance *points at* changes,
+    /// so a character swapped for their second costume stands where they stood,
+    /// at the size they were, with the same tint.
+    ///
+    /// Returns how many instances were repointed. Swapping a symbol for itself
+    /// changes nothing and says so by returning zero.
+    pub fn swap_symbol(&mut self, from: SymbolId, to: SymbolId) -> usize {
+        if from == to || self.library().get(to).is_none() {
+            return 0;
+        }
+        let mut swapped = 0;
+
+        let repoint = |object: &mut Object, swapped: &mut usize| {
+            if let ObjectKind::Instance(instance) = &mut object.kind
+                && instance.symbol == from
+            {
+                instance.symbol = to;
+                *swapped += 1;
+            }
+        };
+
+        let layers: Vec<LayerId> = self.layers().iter().map(|l| l.id).collect();
+        for layer in layers {
+            let frames: Vec<u32> = self
+                .layers()
+                .get(layer)
+                .map(|l| l.frames.keyframes().iter().map(|k| k.start).collect())
+                .unwrap_or_default();
+            for frame in frames {
+                let ids: Vec<ObjectId> = self
+                    .layers()
+                    .get(layer)
+                    .map(|l| l.frames.objects_at(frame).iter().map(|o| o.id).collect())
+                    .unwrap_or_default();
+                for id in ids {
+                    self.update_object_at(frame, id, |object| {
+                        walk_objects(object, &repoint, &mut swapped);
+                    });
+                }
+            }
+        }
+
+        // And inside every symbol — a costume worn by a character inside another
+        // symbol is exactly the case this exists for. The symbol being swapped
+        // *to* is skipped: pointing it at itself would be a loop.
+        let symbols: Vec<SymbolId> = self.library().iter().map(|s| s.id).collect();
+        for id in symbols {
+            if id == to {
+                continue;
+            }
+            let layer_ids: Vec<LayerId> = self
+                .library()
+                .get(id)
+                .map(|s| s.layers.iter().map(|l| l.id).collect())
+                .unwrap_or_default();
+            self.library_mut().update(id, |symbol| {
+                for layer in layer_ids {
+                    symbol.layers.update(layer, |l| {
+                        for keyframe in l.frames.keyframes_mut() {
+                            for object in
+                                std::sync::Arc::make_mut(&mut keyframe.objects).iter_mut()
+                            {
+                                walk_objects(
+                                    std::sync::Arc::make_mut(object),
+                                    &repoint,
+                                    &mut swapped,
+                                );
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        if swapped > 0 {
+            self.bump();
+        }
+        swapped
+    }
+
     // -- the palette ---------------------------------------------------------
 
     /// **Change a swatch, and everything painted with it changes.**
@@ -2083,6 +2176,47 @@ impl Scene {
 
     pub fn flatten_for_render(&self) -> Vec<(Affine, ShapeData)> {
         self.flatten_at(0)
+    }
+}
+
+/// Run `f` over one object and everything nested inside it.
+///
+/// The same walk the recolour does, with the visit left to the caller: a group
+/// holds objects, a rig holds artwork per part, and a turnaround holds whole
+/// drawings of its other sides. Anything that stops at the top level misses
+/// most of a character.
+fn walk_objects(
+    object: &mut Object,
+    f: &dyn Fn(&mut Object, &mut usize),
+    count: &mut usize,
+) {
+    f(object, count);
+    match &mut object.kind {
+        ObjectKind::Group(children) => {
+            for child in children.iter_mut() {
+                walk_objects(std::sync::Arc::make_mut(child), f, count);
+            }
+        }
+        ObjectKind::Armature(rig) => {
+            for part in rig.parts.iter_mut() {
+                walk_objects(std::sync::Arc::make_mut(&mut part.artwork), f, count);
+            }
+        }
+        ObjectKind::Shape(_) | ObjectKind::Instance(_) | ObjectKind::Warp(_) => {}
+    }
+    let views: Vec<usize> = (0..object.turnaround.views().len()).collect();
+    if !views.is_empty() {
+        let mut updated = object.turnaround.clone();
+        for view in views {
+            let (angle, drawing) = {
+                let v = &updated.views()[view];
+                (v.angle, std::sync::Arc::clone(&v.drawing))
+            };
+            let mut drawing = (*drawing).clone();
+            walk_objects(&mut drawing, f, count);
+            updated.set(angle, std::sync::Arc::new(drawing));
+        }
+        object.turnaround = updated;
     }
 }
 

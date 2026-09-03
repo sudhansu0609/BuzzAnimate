@@ -85,6 +85,12 @@ pub enum Command {
     BringForward,
     SendBackward,
     SendToBack,
+    /// **Retarget a performance**: copy one rig's poses onto another with the
+    /// same skeleton, so one walk drives a whole cast.
+    RetargetPerformance,
+    /// **Swap symbol**: point every instance of one symbol at another, keeping
+    /// where each stands and how big it is.
+    SwapSymbol,
     /// **Ink and paint**: carry this frame's bucket fills onto every keyframe
     /// after it, seeded where each colour already sits.
     PaintThrough,
@@ -364,6 +370,8 @@ impl Command {
             BringForward => "Bring Forward",
             SendBackward => "Send Backward",
             SendToBack => "Send to Back",
+            RetargetPerformance => "Retarget Performance",
+            SwapSymbol => "Swap Symbol",
             PaintThrough => "Paint Through",
             ExposeOnTwos => "On Twos",
             ExposeOnThrees => "On Threes",
@@ -578,7 +586,8 @@ impl Command {
             ShortcutEditor => None,
             DetectBeats => None,
             NewReferenceLayer | ImportVideoReference | SelectSameColour
-            | ExposeOnTwos | ExposeOnThrees | PaintThrough | ImportSequenceFolder => None,
+            | ExposeOnTwos | ExposeOnThrees | PaintThrough | ImportSequenceFolder
+            | RetargetPerformance | SwapSymbol => None,
 
             AddSun | AddSky | AddLamp | AddGloom | AddFire => None,
             // No Animate binding to follow, and these open dialogs rather than

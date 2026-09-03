@@ -2860,6 +2860,8 @@ impl Editor {
                 self.selection.set(all);
             }
             SelectSameColour => self.select_same_colour(),
+            RetargetPerformance => self.retarget_performance(),
+            SwapSymbol => self.swap_selected_symbol(),
             PaintThrough => {
                 // To the end of the layer: colouring is a pass over a whole
                 // shot, not over the next frame or two.
@@ -4926,6 +4928,161 @@ impl Editor {
             ),
         });
         (painted, missed)
+    }
+
+    // -- reuse -----------------------------------------------------------------
+
+    /// **Make one character perform what another already performs.**
+    ///
+    /// # Why a pose transfers at all
+    ///
+    /// A pose here is one angle per bone, in bone order. Two rigs assembled from
+    /// the same pattern have the same bones in the same order, so the same list
+    /// of angles means the same thing on both — a walk authored once drives the
+    /// whole cast, which is the multiplier a solo animator actually needs.
+    ///
+    /// # It refuses rather than mangling
+    ///
+    /// Two rigs with different skeletons have no shared meaning for angle four,
+    /// and applying one to the other would produce a character folded through
+    /// itself. Where the bone counts differ this says so and does nothing. Where
+    /// they match but the patterns differ it goes ahead: an animator who built
+    /// two five-bone rigs by hand knows what they meant better than a name does.
+    ///
+    /// With two armatures selected: the first performs, the second follows.
+    pub fn retarget_performance(&mut self) {
+        let ids = self.selection.ids();
+        if ids.len() != 2 {
+            self.status = Some(
+                "Select two rigs: the one that performs, then the one to copy it onto".into(),
+            );
+            return;
+        }
+        let (source, target) = (ids[0], ids[1]);
+
+        // Read the whole performance before anything is written, so a rig that
+        // turns out not to match leaves the document untouched.
+        let (layer, poses, bones) = {
+            let scene = self.doc.scene();
+            let Some((layer, _)) = scene.find_object(source) else {
+                self.status = Some("The first selection is no longer there".into());
+                return;
+            };
+            let Some(layer_ref) = scene.layers().get(layer) else {
+                return;
+            };
+            let mut poses: Vec<(u32, Vec<f64>)> = Vec::new();
+            let mut bones = 0usize;
+            for keyframe in layer_ref.frames.keyframes() {
+                let frame = keyframe.start;
+                if let Some(pose) = layer_ref
+                    .frames
+                    .resolved_at(frame)
+                    .iter()
+                    .find(|o| o.id == source)
+                    .and_then(|o| match &o.kind {
+                        ObjectKind::Armature(rig) => Some(rig.armature.pose()),
+                        _ => None,
+                    })
+                {
+                    bones = bones.max(pose.len());
+                    poses.push((frame, pose));
+                }
+            }
+            (layer, poses, bones)
+        };
+
+        if poses.is_empty() {
+            self.status = Some("The first selection is not a rig with any poses on it".into());
+            return;
+        }
+
+        let target_bones = self
+            .doc
+            .scene()
+            .find_object(target)
+            .and_then(|(_, o)| match &o.kind {
+                ObjectKind::Armature(rig) => Some(rig.armature.pose().len()),
+                _ => None,
+            });
+        let Some(target_bones) = target_bones else {
+            self.status = Some("The second selection is not a rig".into());
+            return;
+        };
+        if target_bones != bones {
+            self.status = Some(format!(
+                "These rigs have different skeletons — {bones} bones and {target_bones} — so a pose                  from one means nothing on the other"
+            ));
+            return;
+        }
+
+        let _ = layer;
+        let target_layer = self.doc.scene().find_object(target).map(|(l, _)| l);
+        let last = poses.iter().map(|(f, _)| *f).max().unwrap_or(0);
+
+        let mut written = 0;
+        self.doc.edit("Retarget", |scene| {
+            // The performance is as long as it is; a rig standing on a
+            // one-frame layer has no frames to be posed on, and without this
+            // every pose after the first landed nowhere.
+            if let Some(target_layer) = target_layer {
+                scene.update_layer(target_layer, |l| {
+                    while l.frames.length() <= last {
+                        l.frames.insert_frame(l.frames.length());
+                    }
+                });
+            }
+            for (frame, pose) in &poses {
+                scene.ensure_keyframe_for(*frame, target);
+                scene.update_object_at(*frame, target, |object| {
+                    if let ObjectKind::Armature(rig) = &mut object.kind {
+                        rig.armature.set_pose(pose);
+                        written += 1;
+                    }
+                });
+            }
+        });
+        self.doc.end_gesture();
+        self.status = Some(match written {
+            0 => "Nothing could be copied onto that rig".to_string(),
+            n => format!("Copied {n} pose(s) onto the second rig"),
+        });
+    }
+
+    /// **Point every instance of one symbol at another.**
+    ///
+    /// With two instances selected: everything wearing the first symbol now
+    /// wears the second, keeping where it stands, how big it is and what colour
+    /// effect it carries — only the drawing changes. A costume change across a
+    /// whole film, in one step.
+    pub fn swap_selected_symbol(&mut self) {
+        let ids = self.selection.ids();
+        let symbols: Vec<buzz_scene::SymbolId> = {
+            let scene = self.doc.scene();
+            ids.iter()
+                .filter_map(|id| match &scene.find_object(*id)?.1.kind {
+                    ObjectKind::Instance(instance) => Some(instance.symbol),
+                    _ => None,
+                })
+                .collect()
+        };
+        if symbols.len() != 2 {
+            self.status = Some(
+                "Select two instances: the one to replace, then the one to replace it with".into(),
+            );
+            return;
+        }
+
+        let mut swapped = 0;
+        self.doc.edit("Swap Symbol", |scene| {
+            swapped = scene.swap_symbol(symbols[0], symbols[1]);
+        });
+        self.doc.end_gesture();
+        self.status = Some(match swapped {
+            0 => "Nothing was wearing that symbol".to_string(),
+            1 => "One instance now wears the other symbol".to_string(),
+            n => format!("{n} instances now wear the other symbol"),
+        });
     }
 
     // -- colour --------------------------------------------------------------

@@ -4091,6 +4091,53 @@ film. What was missing was anything to fill them.
 
 ---
 
+### ✅ The rest of the automation survey: paint, sequences, shots and reuse
+
+**Ink and paint.** Paint Through carries a frame's bucket fills onto every
+keyframe after it — the largest saving available here, because colouring is half
+the labour of drawn animation and almost none of the craft. Not by comparing
+shapes: on the next frame the region is a different enclosure, drawn afresh, with
+nothing to compare it to. What is stable is roughly *where* it is, so each fill
+offers a point inside itself as a seed and the next frame is flooded from there
+through the same gap-aware bucket a person would have clicked with.
+
+A seed that lands outside every enclosure is left uncoloured **and counted**,
+never guessed at: a wrong colour looks deliberate and survives to the film, while
+a missing one is visible at once and is a click to fix. A frame coloured by hand
+keeps its own colour, and running it twice does nothing the second time. Line art
+is not mistaken for paint — a brush stroke is a filled shape too, so only the
+bucket's own fill rule travels.
+
+**Image sequences import.** The exporter has written PNG sequences from the
+start; importing one took the files one at a time, which is how scanned drawings
+and renders from other programs arrive. A folder now lands as one drawing to a
+frame, on blank keyframes, ordered by the numbers in the names rather than by the
+names — `frame2` before `frame10`, which sorting by name gets exactly backwards.
+
+**The director frames the shot.** A staged, performed scene with a locked-off
+camera is a stage play seen from row H. The director now looks at whoever is
+doing something: it comes in on a speaker and **cuts** to do it (keys on adjacent
+frames, so the change happens between one frame and the next rather than drifting
+across the room mid-conversation), and it follows a walk with keys at both ends
+of the beat. Nothing else moves it — an idle holds what it inherited, and a shot
+with nothing worth cutting to keeps the locked-off camera it always had. The zoom
+comes from the actor's own height and is bounded, because guessing a framing that
+crops somebody's head is worse than not framing at all.
+
+**Reuse: one performance, many characters.** A pose is one angle per bone in bone
+order, so two rigs with the same skeleton mean the same thing by the same list —
+a walk authored once drives the whole cast. Rigs whose skeletons differ are
+refused with the reason rather than folded through each other. And Swap Symbol
+points every instance of one symbol at another, keeping where each stands, how
+big it is and what colour effect it carries: only the drawing changes.
+
+**What the survey leaves open.** Stroke-level correspondence *within* a drawing
+(the inbetweener pairs pieces, not the strokes inside one), audio-driven timing
+beyond lipsync and beat markers, crowd variation, batch cleanup across frames,
+and repetition detection that offers to make a redrawn prop a symbol.
+
+---
+
 ## 5. Current metrics
 
 | Measure | Value |
@@ -4101,7 +4148,7 @@ film. What was missing was anything to fill them.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 2 268 passing across 107 binaries, clippy clean |
+| Tests | 2 289 passing across 110 binaries, clippy clean |
 | Rust source | ~154 000 lines |
 | Crates built | 19 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |

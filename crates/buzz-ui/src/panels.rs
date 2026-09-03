@@ -353,6 +353,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 item(ui, Command::ClearModifiers, has_selection, &mut raised);
                 ui.separator();
                 item(ui, Command::SetReverse, has_selection, &mut raised);
+                item(ui, Command::RetargetPerformance, has_selection, &mut raised);
+                item(ui, Command::SwapSymbol, has_selection, &mut raised);
                 item(ui, Command::AddThreeQuarterRight, has_selection, &mut raised);
                 item(ui, Command::AddProfileRight, has_selection, &mut raised);
                 item(ui, Command::AddThreeQuarterLeft, has_selection, &mut raised);

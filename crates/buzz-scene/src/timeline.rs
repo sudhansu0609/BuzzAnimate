@@ -449,6 +449,58 @@ impl LayerTimeline {
         }
     }
 
+    /// **Re-expose this layer on `step`s** — animation "on twos", or threes.
+    ///
+    /// # What it is
+    ///
+    /// A drawing that changes every frame is animated *on ones*. Most hand-drawn
+    /// animation is *on twos*: each drawing is held for two frames, which halves
+    /// the drawings and, at twenty-four a second, is what a great deal of
+    /// animation people admire actually looks like. Threes are common for slow
+    /// or distant action.
+    ///
+    /// This keeps the keyframe at the start of the range and every `step`th one
+    /// after it, and hands the frames in between back to the drawing before them.
+    /// **Nothing is deleted that was not a keyframe**, and no artwork is thrown
+    /// away by re-exposing a range twice — the drawings that remain are the ones
+    /// that were on the kept frames.
+    ///
+    /// # Why it is destructive at all
+    ///
+    /// The dropped keyframes' artwork does go. There is no way to hold a drawing
+    /// for two frames while also keeping the one it replaced, and pretending
+    /// otherwise — a "hidden" copy — would be a second answer to what is on a
+    /// frame. Undo is the safety net, as it is for every other frame operation.
+    ///
+    /// Returns how many keyframes were dropped. `step` below two does nothing:
+    /// on ones is what the layer already is.
+    pub fn expose_on(&mut self, from: u32, to: u32, step: u32) -> usize {
+        if step < 2 || to < from {
+            return 0;
+        }
+        let doomed: Vec<u32> = self
+            .keyframes
+            .iter()
+            .map(|k| k.start)
+            .filter(|start| {
+                *start > from
+                    && *start <= to
+                    // Kept: the ones that land on the beat of the step, counted
+                    // from the start of the range rather than from frame zero,
+                    // so re-exposing a range keeps the drawing it starts with.
+                    && (*start - from) % step != 0
+            })
+            .collect();
+
+        let mut dropped = 0;
+        for frame in doomed {
+            if self.clear_keyframe(frame) {
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+
     /// **Reverse Frames** \u2014 play this layer's keyframes back to front.
     ///
     /// The artwork of the first keyframe ends up on the last, and so on. The
@@ -921,5 +973,85 @@ mod tests {
             t.tween_span_at(500).is_none(),
             "a frame the layer does not reach cannot be tweened"
         );
+    }
+}
+
+#[cfg(test)]
+mod exposure_tests {
+    use super::*;
+
+    /// A layer with a drawing on every frame — animation on ones.
+    fn on_ones(frames: u32) -> LayerTimeline {
+        let mut t = LayerTimeline::default();
+        for frame in 0..frames {
+            t.insert_frame(frame);
+            t.insert_blank_keyframe(frame);
+        }
+        t
+    }
+
+    #[test]
+    fn on_twos_keeps_every_other_drawing() {
+        let mut t = on_ones(8);
+        assert_eq!(t.keyframe_count(), 8, "it starts on ones");
+
+        let dropped = t.expose_on(0, 7, 2);
+        assert_eq!(dropped, 4, "half the drawings fold into the ones they follow");
+
+        let kept: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
+        assert_eq!(kept, vec![0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn on_threes_keeps_every_third() {
+        let mut t = on_ones(9);
+        t.expose_on(0, 8, 3);
+        let kept: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
+        assert_eq!(kept, vec![0, 3, 6]);
+    }
+
+    /// The frames in between are still there, holding the drawing before them.
+    /// Re-exposing must not shorten the shot.
+    #[test]
+    fn the_shot_is_the_same_length_afterwards() {
+        let mut t = on_ones(8);
+        let before = t.length();
+        t.expose_on(0, 7, 2);
+        assert_eq!(t.length(), before, "no frames were removed, only keyframes");
+        assert!(!t.is_keyframe(1), "frame 2 is no longer a keyframe");
+        assert!(
+            t.keyframe_start(1) == Some(0),
+            "and it holds the drawing before it"
+        );
+    }
+
+    /// Counted from the start of the range, so re-exposing part of a shot keeps
+    /// the drawing that part starts on.
+    #[test]
+    fn the_range_keeps_its_own_first_drawing() {
+        let mut t = on_ones(8);
+        t.expose_on(3, 7, 2);
+        let kept: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
+        assert_eq!(kept, vec![0, 1, 2, 3, 5, 7], "outside the range is untouched");
+    }
+
+    #[test]
+    fn on_ones_is_what_it_already_is() {
+        let mut t = on_ones(6);
+        assert_eq!(t.expose_on(0, 5, 1), 0, "a step of one changes nothing");
+        assert_eq!(t.expose_on(0, 5, 0), 0);
+        assert_eq!(t.keyframe_count(), 6);
+    }
+
+    /// Doing it twice is doing it once: the second pass has nothing left to
+    /// drop, which is what stops a repeated menu click eating a shot.
+    #[test]
+    fn re_exposing_the_same_range_is_idempotent() {
+        let mut t = on_ones(8);
+        t.expose_on(0, 7, 2);
+        let after_first: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
+        assert_eq!(t.expose_on(0, 7, 2), 0, "nothing left to fold");
+        let after_second: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
+        assert_eq!(after_first, after_second);
     }
 }

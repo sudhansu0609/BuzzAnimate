@@ -79,6 +79,25 @@ impl Editor {
     /// document exactly as it was.
     pub fn direct_story(&mut self, state: &mut buzz_ui::StagingState) {
         let story = state.story.clone();
+
+        // **A brief with more than one shot in it becomes more than one scene.**
+        //
+        // The writing already says where the cuts go — a blank line, or a line
+        // that is only a setting — so a page of prose comes out as an animatic
+        // rather than as one impossibly busy scene. A short brief splits into
+        // one shot and takes exactly the path it always did, which is why this
+        // needed no second button.
+        if buzz_act::split_shots(&story).len() > 1 {
+            let directed = self.direct_sequence(&story);
+            if directed > 0 {
+                state.problem = None;
+                state.close();
+            } else {
+                state.problem = self.status.clone();
+            }
+            return;
+        }
+
         let mut outcome: Option<Result<buzz_act::DirectedScene, buzz_act::DirectError>> = None;
         self.doc.edit("Direct a Story", |scene| {
             outcome = Some(buzz_act::direct(scene, &story));

@@ -4054,6 +4054,43 @@ Those are the next two, in that order.
 
 ---
 
+### ✅ On twos, and a brief that becomes an animatic
+
+Two more from the automation survey, and both are small next to what they save.
+
+**On twos.** `LayerTimeline::expose_on` keeps the keyframe at the start of a
+range and every *n*th one after it, handing the frames between back to the
+drawing before them. Most hand-drawn animation is on twos; deciding it early
+halves the drawings a shot needs, and it was a decision that could only be made
+by hand, frame by frame. Counted from the start of the *range* rather than from
+frame zero, so re-exposing part of a shot keeps the drawing that part opens on,
+and doing it twice does nothing the second time — which is what stops a repeated
+menu click eating a shot.
+
+It is honestly destructive: the dropped keyframes' artwork goes. There is no way
+to hold a drawing for two frames while also keeping the one it replaced, and a
+hidden copy would be a second answer to what is on a frame. Undo is the safety
+net, as it is for every other frame operation.
+
+**A brief becomes an animatic.** The director staged one shot; a story is
+several. `split_shots` cuts a brief where the writing already cuts it — a blank
+line, or a line that is only a setting, which is the screenplay's own slug line
+doing exactly this job — and each shot gets a scene of its own, named after its
+own first words so the scene list reads like the brief rather than "Scene 1,
+Scene 2". The setting carries forward, because nobody restates the time of day
+every paragraph.
+
+A sentence that merely *opens* with a setting word is action, not a slug line,
+and is not cut on: "Night falls and Ana walks in" is one shot. A brief with
+nothing to cut takes exactly the path it always did, which is why this needed no
+second button — the existing Direct It does it when there is more than one shot
+in the box.
+
+The document already knew how to hold several scenes and export them as one
+film. What was missing was anything to fill them.
+
+---
+
 ## 5. Current metrics
 
 | Measure | Value |
@@ -4064,11 +4101,11 @@ Those are the next two, in that order.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 2 242 passing across 105 binaries, clippy clean |
+| Tests | 2 268 passing across 107 binaries, clippy clean |
 | Rust source | ~154 000 lines |
 | Crates built | 19 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
-| Format version | 39 — adds whether a bitmap was painted, so a stroke still fuses after reopening |
+| Format version | 40 — adds the palette swatch a fill's colour came from |
 | Formats heard | `.wav`, `.mp3`, `.ogg`, `.flac`, `.m4a`, `.aac` |
 | IK budget | 50 six-bone rigs solved in parallel, well inside one frame |
 | Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |

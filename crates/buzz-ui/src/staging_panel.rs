@@ -438,14 +438,16 @@ fn direct_view(ui: &mut Ui, state: &mut StagingState, response: &mut StagingResp
              the setting, and verbs like walk, run, talk and wait \u{2014} \u{201c}in from the \
              left\u{201d}, \u{201c}off right\u{201d}, \u{201c}to Ben\u{201d}, \u{201c}for 3 \
              seconds\u{201d}. Everything it makes is ordinary layers and keyframes: one \
-             Ctrl+Z takes the whole scene back.",
+             Ctrl+Z takes the whole scene back.\n\nLeave a blank line, or write a \
+             setting on its own line, and the next part becomes its own shot \u{2014} \
+             a scene each, which the film plays in order.",
         )
         .small()
         .weak(),
     );
     ui.add_space(6.0);
 
-    let hint = "Night. Ana walks in from the left.\nAna talks to Ben for 4 seconds.\nBen walks off right.";
+    let hint = "Night. Ana walks in from the left.\nAna talks to Ben for 4 seconds.\n\nDay.\nBen walks off right.";
     ui.add(
         egui::TextEdit::multiline(&mut state.story)
             .hint_text(hint)

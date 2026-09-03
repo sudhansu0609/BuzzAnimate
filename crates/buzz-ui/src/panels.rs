@@ -390,6 +390,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 Command::PasteFrames,
                 Command::ClearFrames,
                 Command::ReverseFrames,
+                Command::ExposeOnTwos,
+                Command::ExposeOnThrees,
             ] {
                 item(ui, c, true, &mut raised);
             }

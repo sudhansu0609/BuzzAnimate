@@ -443,6 +443,132 @@ impl ActorState {
 /// Builds the set, casts everyone the story names, and writes their
 /// performances onto the timeline in story order. One call; the caller wraps
 /// it in one `Document::edit` so the whole scene is one undo step.
+/// **One shot of a longer brief**: what to call it, and the prose that makes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedShot {
+    /// A name for the scene, taken from the shot's own first words so the
+    /// timeline reads like the brief rather than "Scene 1, Scene 2, Scene 3".
+    pub title: String,
+    /// The sentences of this shot, which [`direct`] reads as a whole brief.
+    pub story: String,
+}
+
+/// **Cut a brief into shots.**
+///
+/// # Why a film is not one long shot
+///
+/// [`direct`] stages one scene and animates the cast in it, which is a shot. A
+/// story is several: the cast changes, the place changes, and the camera cuts.
+/// Given a longer brief this splits it the way the writing already does, so a
+/// page of prose becomes an animatic rather than one impossibly busy scene.
+///
+/// # Where the cuts go
+///
+/// Two marks, both of which people already use without being asked:
+///
+/// * A **blank line**. Paragraphs are how prose separates beats, and a writer
+///   who has put a gap between two of them has already said they are apart.
+/// * A **line that is only a setting** — "Night.", "Interior." — which is the
+///   screenplay's own slug line, doing exactly this job.
+///
+/// A brief with neither is one shot, which is what it was before this existed
+/// and what a two-sentence description should stay.
+///
+/// The setting carries forward: a shot that does not name a time of day is in
+/// the same one as the shot before it, because that is what a reader assumes
+/// and re-establishing it every paragraph is not how anybody writes.
+pub fn split_shots(story: &str) -> Vec<PlannedShot> {
+    let mut shots: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    // The setting in force, so a later shot that does not restate it keeps it.
+    let mut standing: Option<String> = None;
+
+    let push = |current: &mut Vec<String>, shots: &mut Vec<Vec<String>>| {
+        if current.iter().any(|l| !l.trim().is_empty()) {
+            shots.push(std::mem::take(current));
+        } else {
+            current.clear();
+        }
+    };
+
+    for line in story.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            push(&mut current, &mut shots);
+            continue;
+        }
+        if is_setting_line(trimmed) {
+            // A slug line starts a shot and stands as its setting.
+            push(&mut current, &mut shots);
+            standing = Some(trimmed.to_string());
+            current.push(trimmed.to_string());
+            continue;
+        }
+        // A shot that opens without a setting inherits the standing one.
+        if current.is_empty()
+            && let Some(setting) = &standing
+            && !is_setting_line(trimmed)
+        {
+            current.push(setting.clone());
+        }
+        current.push(trimmed.to_string());
+    }
+    push(&mut current, &mut shots);
+
+    shots
+        .into_iter()
+        .map(|lines| {
+            let story = lines.join("\n");
+            PlannedShot {
+                title: shot_title(&lines),
+                story,
+            }
+        })
+        .collect()
+}
+
+/// Is this line nothing but a setting — the screenplay's slug line?
+///
+/// Deliberately strict: three words at most, and every one of them either a
+/// setting word or punctuation. "Night." is a slug; "Night falls and Ana walks
+/// in" is a sentence that happens to open with one, and cutting there would
+/// throw away the action.
+fn is_setting_line(line: &str) -> bool {
+    let words = words_of(line);
+    if words.is_empty() || words.len() > 3 {
+        return false;
+    }
+    const SETTING_WORDS: &[&str] = &[
+        "night", "evening", "dark", "midnight", "dusk", "sunset", "sundown",
+        "interior", "inside", "indoors", "kitchen", "room", "day", "daylight",
+        "morning", "noon", "afternoon", "exterior", "outside", "later", "then",
+    ];
+    words
+        .iter()
+        .all(|w| SETTING_WORDS.contains(&w.to_lowercase().as_str()))
+}
+
+/// A short name for a shot, from its own words.
+///
+/// The first line that is not just a setting, cut to a few words — so a scene
+/// list reads "Ana walks in", not "Scene 2".
+fn shot_title(lines: &[String]) -> String {
+    let line = lines
+        .iter()
+        .find(|l| !is_setting_line(l))
+        .or_else(|| lines.first())
+        .map(|l| l.as_str())
+        .unwrap_or("Shot");
+    let words: Vec<&str> = line.split_whitespace().take(5).collect();
+    let title = words.join(" ");
+    let title = title.trim_end_matches(['.', ',', ';', ':']).to_string();
+    if title.is_empty() {
+        "Shot".to_string()
+    } else {
+        title
+    }
+}
+
 pub fn direct(scene: &mut Scene, story: &str) -> Result<DirectedScene, DirectError> {
     let parsed = parse(story);
     if parsed.names.is_empty() || parsed.events.is_empty() {
@@ -1046,3 +1172,69 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_brief_is_one_shot() {
+        let shots = split_shots("Night. Ana walks in from the left.");
+        assert_eq!(shots.len(), 1, "nothing said to cut");
+    }
+
+    #[test]
+    fn a_blank_line_starts_a_new_shot() {
+        let shots = split_shots(
+            "Night. Ana walks in from the left.\n\nBen walks off right.",
+        );
+        assert_eq!(shots.len(), 2);
+        assert!(shots[1].story.contains("Ben walks off"));
+    }
+
+    #[test]
+    fn a_setting_on_its_own_line_starts_a_new_shot() {
+        let shots = split_shots(
+            "Night.\nAna walks in from the left.\nDay.\nBen walks off right.",
+        );
+        assert_eq!(shots.len(), 2, "the slug line cuts");
+        assert!(shots[0].story.starts_with("Night."));
+        assert!(shots[1].story.starts_with("Day."));
+    }
+
+    /// A sentence that merely *opens* with a setting word is action, not a slug
+    /// line, and cutting there would throw the action away.
+    #[test]
+    fn a_sentence_beginning_with_a_setting_is_not_a_cut() {
+        let shots = split_shots("Night falls and Ana walks in from the left.");
+        assert_eq!(shots.len(), 1);
+        assert!(shots[0].story.contains("Ana walks in"));
+    }
+
+    /// The setting carries forward, because that is what a reader assumes and
+    /// nobody restates the time of day every paragraph.
+    #[test]
+    fn a_later_shot_keeps_the_setting_in_force() {
+        let shots = split_shots("Night.\nAna waits.\n\nBen walks off right.");
+        assert_eq!(shots.len(), 2);
+        assert!(
+            shots[1].story.to_lowercase().contains("night"),
+            "the second shot is still at night: {:?}",
+            shots[1].story
+        );
+    }
+
+    /// A scene list should read like the brief, not like "Scene 1, Scene 2".
+    #[test]
+    fn a_shot_is_named_after_its_own_words() {
+        let shots = split_shots("Night.\nAna walks in from the left.\n\nBen waits.");
+        assert_eq!(shots[0].title, "Ana walks in from the");
+        assert_eq!(shots[1].title, "Ben waits");
+    }
+
+    #[test]
+    fn blank_lines_alone_are_no_shots_at_all() {
+        assert!(split_shots("").is_empty());
+        assert!(split_shots("\n\n   \n").is_empty());
+    }
+}

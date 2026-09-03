@@ -2860,6 +2860,8 @@ impl Editor {
                 self.selection.set(all);
             }
             SelectSameColour => self.select_same_colour(),
+            ExposeOnTwos => self.expose_on(2),
+            ExposeOnThrees => self.expose_on(3),
             Deselect => self.selection.clear(),
             DuplicateSelection => self.duplicate_selection(),
             Align { op, to_stage } => self.align_selection(op, to_stage),
@@ -4659,6 +4661,111 @@ impl Editor {
         let (_, object) = scene.find_object(id)?;
         (!object.turnaround.is_empty())
             .then(|| object.turnaround.views().iter().map(|v| v.angle).collect())
+    }
+
+    /// **Re-expose the active layer on twos** — or threes, or whatever `step`
+    /// says.
+    ///
+    /// Over the selected span of frames when there is one, and over the whole
+    /// layer otherwise, because "put this on twos" is nearly always a decision
+    /// about a shot rather than about six frames of it.
+    pub fn expose_on(&mut self, step: u32) {
+        let Some(layer) = self.active_layer() else {
+            self.status = Some("No layer to re-expose".into());
+            return;
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return;
+        }
+        let (from, to) = self.multi_frame_range().unwrap_or_else(|| {
+            let last = self
+                .doc
+                .scene()
+                .layers()
+                .get(layer)
+                .map(|l| l.frames.length().saturating_sub(1))
+                .unwrap_or(0);
+            (0, last)
+        });
+
+        let mut dropped = 0;
+        self.doc.edit("Expose on Twos", |scene| {
+            scene.update_layer(layer, |l| {
+                dropped = l.frames.expose_on(from, to, step);
+            });
+        });
+        self.doc.end_gesture();
+        self.status = Some(match dropped {
+            0 => format!("Already on {step}s over frames {}–{}", from + 1, to + 1),
+            1 => format!("On {step}s — one drawing now holds longer"),
+            n => format!("On {step}s — {n} drawings folded into the ones they follow"),
+        });
+    }
+
+    /// **Direct a whole sequence** — a page of prose becomes an animatic.
+    ///
+    /// # What this adds over directing a shot
+    ///
+    /// [`buzz_act::direct`] stages one scene and animates the cast in it, which
+    /// is a *shot*. A story is several: the place changes, the cast changes, and
+    /// the film cuts between them. This reads the brief the way the writing
+    /// already separates its beats — a blank line, or a line that is only a
+    /// setting — and gives each one a scene of its own, named after its own
+    /// first words so the scene list reads like the brief.
+    ///
+    /// The document already knows how to hold several scenes and export them as
+    /// one film; what was missing was anything to fill them.
+    ///
+    /// # It stops at the first shot it cannot read
+    ///
+    /// Rather than leaving half a film and no explanation. Everything directed
+    /// before the failure stays — the same rule the scripting host follows, and
+    /// far more useful than discarding an hour's brief because the last
+    /// paragraph was a sentence fragment.
+    pub fn direct_sequence(&mut self, brief: &str) -> usize {
+        let shots = buzz_act::split_shots(brief);
+        if shots.is_empty() {
+            self.status = Some("There is nothing in that brief to direct".into());
+            return 0;
+        }
+
+        let mut directed = 0;
+        let mut trouble: Option<String> = None;
+
+        for (index, shot) in shots.iter().enumerate() {
+            // The first shot fills the scene that is open; each one after it
+            // gets a scene of its own, which is what makes this a sequence.
+            if index > 0 {
+                self.doc.add_scene();
+            }
+            let mut failed = None;
+            self.doc.edit("Direct", |scene| {
+                if let Err(e) = buzz_act::direct(scene, &shot.story) {
+                    failed = Some(format!("{e}"));
+                }
+            });
+            match failed {
+                None => {
+                    let at = self.doc.active_scene();
+                    self.doc.rename_scene(at, &shot.title);
+                    directed += 1;
+                }
+                Some(message) => {
+                    trouble = Some(format!("shot {}: {message}", index + 1));
+                    break;
+                }
+            }
+        }
+        self.doc.end_gesture();
+
+        self.status = Some(match (directed, trouble) {
+            (0, Some(why)) => format!("Could not direct that brief — {why}"),
+            (n, Some(why)) => format!("Directed {n} shot(s), then stopped at {why}"),
+            (1, None) => "Directed one shot".to_string(),
+            (n, None) => format!("Directed {n} shots, one scene each"),
+        });
+        directed
     }
 
     // -- colour --------------------------------------------------------------

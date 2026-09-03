@@ -48,7 +48,7 @@ pub mod staging;
 
 pub use autorig::assemble;
 pub use buzz_physics::{Spring, Wiggle};
-pub use direct::{DirectError, DirectedScene, PlannedBeat, direct};
+pub use direct::{DirectError, DirectedScene, PlannedBeat, PlannedShot, direct, split_shots};
 pub use figure::{FigureSpec, Joint, Palette, build as build_figure, is_figure, rest_pose};
 pub use motion_path::{MotionError, MotionPathOptions, MotionReport, follow as follow_path};
 pub use physics::{PhysicsError, PhysicsReport, bake as follow_through_bake, wiggle as wiggle_bake};

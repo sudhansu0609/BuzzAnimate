@@ -85,6 +85,11 @@ pub enum Command {
     BringForward,
     SendBackward,
     SendToBack,
+    /// **On twos**: hold each drawing for two frames over the selected span,
+    /// which halves the drawings a shot needs.
+    ExposeOnTwos,
+    /// The same, on threes.
+    ExposeOnThrees,
     /// **Select same colour**: everything on this frame painted the colour the
     /// selection is painted.
     SelectSameColour,
@@ -353,6 +358,8 @@ impl Command {
             BringForward => "Bring Forward",
             SendBackward => "Send Backward",
             SendToBack => "Send to Back",
+            ExposeOnTwos => "On Twos",
+            ExposeOnThrees => "On Threes",
             SelectSameColour => "Select Same Colour",
             ConvertLinesToFills => "Convert Lines to Fills",
             ExpandFill => "Expand Fill…",
@@ -562,7 +569,8 @@ impl Command {
             SaveSnapshot | Snapshots => None,
             ShortcutEditor => None,
             DetectBeats => None,
-            NewReferenceLayer | ImportVideoReference | SelectSameColour => None,
+            NewReferenceLayer | ImportVideoReference | SelectSameColour
+            | ExposeOnTwos | ExposeOnThrees => None,
 
             AddSun | AddSky | AddLamp | AddGloom | AddFire => None,
             // No Animate binding to follow, and these open dialogs rather than

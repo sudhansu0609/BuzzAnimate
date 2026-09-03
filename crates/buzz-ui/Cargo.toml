@@ -10,6 +10,9 @@ authors.workspace = true
 [dependencies]
 buzz-geom.workspace = true
 buzz-scene.workspace = true
+# For the font picker's previews, which outline each family in itself with the
+# same call the Text tool draws with.
+buzz-text.workspace = true
 buzz-rig.workspace = true
 buzz-doc.workspace = true
 

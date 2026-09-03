@@ -42,25 +42,169 @@ use skrifa::{
 /// Line advance as a multiple of the em size, used to stack lines of text.
 const LINE_SPACING: f64 = 1.25;
 
-/// One font face the Text tool can draw with: a family name and, privately,
-/// where its bytes live. `devanagari` flags faces that cover Hindi, so the UI
-/// can surface them for users who want them.
+/// **Bold, italic, both, or neither** — which cut of a family a face is.
+///
+/// A pair of flags rather than a list of names because that is what a picker
+/// offers and what a document should record: "Bold Italic", "Heavy Oblique" and
+/// "Black Italic" are three spellings of the same two questions, and a file that
+/// stored the spelling would not find the face again on another machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct FontStyle {
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl FontStyle {
+    pub const REGULAR: FontStyle = FontStyle { bold: false, italic: false };
+
+    pub fn new(bold: bool, italic: bool) -> Self {
+        Self { bold, italic }
+    }
+
+    /// What to call this cut, in a menu.
+    pub fn label(self) -> &'static str {
+        match (self.bold, self.italic) {
+            (false, false) => "Regular",
+            (true, false) => "Bold",
+            (false, true) => "Italic",
+            (true, true) => "Bold Italic",
+        }
+    }
+
+    /// Read the two flags out of a face's subfamily name.
+    ///
+    /// Names are matched case-insensitively and by *word*, so "Semibold" counts
+    /// as bold and "Oblique" as italic, while a family called "Bolder" does not
+    /// accidentally become one — the check is on the style name, which is a
+    /// short controlled vocabulary, not on the family.
+    fn from_subfamily(name: &str) -> Self {
+        let lower = name.to_ascii_lowercase();
+        let bold = lower.contains("bold") || lower.contains("black") || lower.contains("heavy");
+        let italic = lower.contains("italic") || lower.contains("oblique");
+        Self { bold, italic }
+    }
+}
+
+/// One font face the Text tool can draw with: a family name, which cut of that
+/// family it is, and privately where its bytes live. `devanagari` flags faces
+/// that cover Hindi, so the UI can surface them for users who want them.
 #[derive(Debug, Clone)]
 pub struct FontFace {
     /// The family name shown in the picker, e.g. "Nirmala UI" or "Segoe Script".
     pub family: String,
+    /// Which cut of the family this face is.
+    pub style: FontStyle,
     /// True if the face has a glyph for अ (U+0905) — i.e. it can render Hindi.
     pub devanagari: bool,
     path: PathBuf,
     index: u32,
 }
 
-/// Every distinct font family installed on the system (and under `assets/fonts`),
-/// sorted by name with one entry per family. Enumerated once and cached, because
-/// it reads the name table of every font file on disk.
+/// **How lines of text line up with each other.**
+///
+/// Only visible on text of more than one line — a single line is the same
+/// picture whichever edge it is measured from — which is why the whole layout
+/// is done relative to the *widest* line rather than to a box: text here has no
+/// box, it has words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Centre,
+    Right,
+}
+
+impl TextAlign {
+    pub const ALL: [TextAlign; 3] = [TextAlign::Left, TextAlign::Centre, TextAlign::Right];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TextAlign::Left => "Left",
+            TextAlign::Centre => "Centre",
+            TextAlign::Right => "Right",
+        }
+    }
+
+    /// Where a line `width` wide starts, when the widest line is `widest`.
+    fn offset(self, width: f64, widest: f64) -> f64 {
+        match self {
+            TextAlign::Left => 0.0,
+            TextAlign::Centre => (widest - width) / 2.0,
+            TextAlign::Right => widest - width,
+        }
+    }
+}
+
+/// **Every face** installed on the system (and under `assets/fonts`), sorted by
+/// family and then by cut. Enumerated once and cached, because it reads the name
+/// table of every font file on disk.
+///
+/// Several entries share a family — that is the point: the bold and the italic
+/// of one family are separate files, and picking "Bold" means drawing with a
+/// different face rather than thickening the regular one.
 pub fn available_fonts() -> &'static [FontFace] {
     static FONTS: OnceLock<Vec<FontFace>> = OnceLock::new();
     FONTS.get_or_init(enumerate_fonts)
+}
+
+/// One entry per family, for the picker: the family's name, whether it can set
+/// Hindi, and which cuts of it are installed.
+pub fn font_families() -> &'static [FontFamily] {
+    static FAMILIES: OnceLock<Vec<FontFamily>> = OnceLock::new();
+    FAMILIES.get_or_init(|| {
+        let mut out: Vec<FontFamily> = Vec::new();
+        for face in available_fonts() {
+            match out.last_mut() {
+                Some(family) if family.name.eq_ignore_ascii_case(&face.family) => {
+                    family.styles.push(face.style);
+                    family.devanagari |= face.devanagari;
+                }
+                _ => out.push(FontFamily {
+                    name: face.family.clone(),
+                    devanagari: face.devanagari,
+                    styles: vec![face.style],
+                }),
+            }
+        }
+        out
+    })
+}
+
+/// A family and the cuts of it that are actually installed.
+#[derive(Debug, Clone)]
+pub struct FontFamily {
+    pub name: String,
+    pub devanagari: bool,
+    /// Every cut found, in the order the faces enumerated.
+    pub styles: Vec<FontStyle>,
+}
+
+impl FontFamily {
+    /// Is this cut of the family installed?
+    ///
+    /// The picker asks before offering it. A family with no italic must not
+    /// offer one: there is nothing to draw it with, and a button that changes
+    /// nothing is worse than a button that is not there.
+    pub fn has(&self, style: FontStyle) -> bool {
+        self.styles.contains(&style)
+    }
+
+    /// Does the family have any bold cut at all?
+    pub fn has_bold(&self) -> bool {
+        self.styles.iter().any(|s| s.bold)
+    }
+
+    /// Does the family have any italic cut at all?
+    pub fn has_italic(&self) -> bool {
+        self.styles.iter().any(|s| s.italic)
+    }
+}
+
+/// The family of this name, if it is installed.
+pub fn family(name: &str) -> Option<&'static FontFamily> {
+    font_families()
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(name))
 }
 
 /// The outlines of `content` at `size_px` in the named `font` (or a system
@@ -71,10 +215,25 @@ pub fn available_fonts() -> &'static [FontFace] {
 /// The winding matches the fill rule glyphs need (`NonZero`), so counters — the
 /// holes in "o" and "a" — come out as holes when the path is filled.
 pub fn outline(content: &str, size_px: f64, font: Option<&str>) -> Option<BezPath> {
+    outline_styled(content, size_px, font, FontStyle::REGULAR, TextAlign::Left)
+}
+
+/// The same, in a chosen cut of the family and with the lines lined up.
+///
+/// A cut the family does not have falls back to the nearest one it does — the
+/// regular — rather than refusing to draw: a document written on a machine with
+/// the bold installed must still open on one without it.
+pub fn outline_styled(
+    content: &str,
+    size_px: f64,
+    font: Option<&str>,
+    style: FontStyle,
+    align: TextAlign,
+) -> Option<BezPath> {
     if content.is_empty() {
         return None;
     }
-    let data = resolve_font(font)?;
+    let data = resolve_font(font, style)?;
     let font_ref = FontRef::from_index(data.bytes(), data.index).ok()?;
     let size = Size::new(size_px as f32);
     let location = LocationRef::default();
@@ -85,10 +244,30 @@ pub fn outline(content: &str, size_px: f64, font: Option<&str>) -> Option<BezPat
     let scale = size_px / shaper.units_per_em() as f64;
     let line_height = size_px * LINE_SPACING;
 
+    // Every line is measured before any is drawn, because where a line starts
+    // depends on how wide the *widest* one is. Left-aligned text skips the
+    // arithmetic entirely and comes out byte-for-byte as it always did.
+    let lines: Vec<&str> = content.split('\n').collect();
+    let widths: Vec<f64> = if align == TextAlign::Left {
+        vec![0.0; lines.len()]
+    } else {
+        lines
+            .iter()
+            .map(|line| {
+                shape_line(&shaper, line)
+                    .glyph_positions()
+                    .iter()
+                    .map(|pos| pos.x_advance as f64 * scale)
+                    .sum::<f64>()
+            })
+            .collect()
+    };
+    let widest = widths.iter().copied().fold(0.0f64, f64::max);
+
     let mut pen = OutlineToPath { path: BezPath::new(), origin_x: 0.0, origin_y: 0.0 };
-    for (line_index, line) in content.split('\n').enumerate() {
+    for (line_index, line) in lines.iter().enumerate() {
         let baseline = line_index as f64 * line_height;
-        let mut cursor_x = 0.0;
+        let mut cursor_x = align.offset(widths[line_index], widest);
         let shaped = shape_line(&shaper, line);
         for (info, pos) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
             pen.origin_x = cursor_x + pos.x_offset as f64 * scale;
@@ -107,7 +286,18 @@ pub fn outline(content: &str, size_px: f64, font: Option<&str>) -> Option<BezPat
 /// named `font`, for placing a caret or sizing a box. `(0, size_px)` when there
 /// is no font. Width is the widest line; height covers every line.
 pub fn measure(content: &str, size_px: f64, font: Option<&str>) -> (f64, f64) {
-    let Some(data) = resolve_font(font) else {
+    measure_styled(content, size_px, font, FontStyle::REGULAR)
+}
+
+/// The same, in a chosen cut. Alignment does not change the extent — it moves
+/// the lines within it — so it is not asked for here.
+pub fn measure_styled(
+    content: &str,
+    size_px: f64,
+    font: Option<&str>,
+    style: FontStyle,
+) -> (f64, f64) {
+    let Some(data) = resolve_font(font, style) else {
         return (0.0, size_px);
     };
     let Ok(font_ref) = FontRef::from_index(data.bytes(), data.index) else {
@@ -212,12 +402,20 @@ impl FontData {
 
 /// Pick the bytes to draw with: the named family if it enumerated and its file
 /// still reads, otherwise a common system default so text always works.
-fn resolve_font(name: Option<&str>) -> Option<ResolvedFont> {
+fn resolve_font(name: Option<&str>, style: FontStyle) -> Option<ResolvedFont> {
     if let Some(name) = name.filter(|n| !n.is_empty()) {
-        if let Some(face) = available_fonts()
-            .iter()
-            .find(|f| f.family.eq_ignore_ascii_case(name))
-        {
+        let of_family = || {
+            available_fonts()
+                .iter()
+                .filter(move |f| f.family.eq_ignore_ascii_case(name))
+        };
+        // The cut asked for, then the plain one, then whatever the family has:
+        // a family installed without its italic still sets the words.
+        let face = of_family()
+            .find(|f| f.style == style)
+            .or_else(|| of_family().find(|f| f.style == FontStyle::REGULAR))
+            .or_else(|| of_family().next());
+        if let Some(face) = face {
             if let Some(bytes) = load_bytes(&face.path) {
                 return Some(ResolvedFont { data: FontData::Shared(bytes), index: face.index });
             }
@@ -274,8 +472,17 @@ fn enumerate_fonts() -> Vec<FontFace> {
     for dir in font_dirs() {
         collect_dir(&dir, &mut faces, 0);
     }
-    faces.sort_by(|a, b| a.family.to_lowercase().cmp(&b.family.to_lowercase()));
-    faces.dedup_by(|a, b| a.family.eq_ignore_ascii_case(&b.family));
+    // Sorted by family, and within a family by cut, so `font_families` can
+    // group by simply walking the list. The de-duplication is now by *face*:
+    // one family may legitimately appear four times, but the same cut of it
+    // turning up in two font directories should not.
+    faces.sort_by(|a, b| {
+        a.family
+            .to_lowercase()
+            .cmp(&b.family.to_lowercase())
+            .then((a.style.bold, a.style.italic).cmp(&(b.style.bold, b.style.italic)))
+    });
+    faces.dedup_by(|a, b| a.family.eq_ignore_ascii_case(&b.family) && a.style == b.style);
     faces
 }
 
@@ -374,7 +581,20 @@ fn face_info(font: &FontRef, path: &Path, index: u32) -> Option<FontFace> {
         return None;
     }
     let devanagari = font.charmap().map('\u{0905}').is_some();
-    Some(FontFace { family, devanagari, path: path.to_path_buf(), index })
+    // The subfamily is the face's own name for its cut — "Bold Italic",
+    // "Semibold", "Oblique". Absent on a few old files, which are regular.
+    let subfamily = font
+        .localized_strings(StringId::SUBFAMILY_NAME)
+        .english_or_first()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    Some(FontFace {
+        family,
+        style: FontStyle::from_subfamily(&subfamily),
+        devanagari,
+        path: path.to_path_buf(),
+        index,
+    })
 }
 
 #[cfg(test)]
@@ -446,5 +666,122 @@ mod tests {
             outline("Hi", 48.0, Some(&name)).is_some(),
             "named font {name:?} produced no outline"
         );
+    }
+}
+
+#[cfg(test)]
+mod style_tests {
+    use super::*;
+
+    #[test]
+    fn a_subfamily_name_says_which_cut_it_is() {
+        let cut = |name| FontStyle::from_subfamily(name);
+        assert_eq!(cut("Regular"), FontStyle::REGULAR);
+        assert_eq!(cut("Bold"), FontStyle::new(true, false));
+        assert_eq!(cut("Italic"), FontStyle::new(false, true));
+        assert_eq!(cut("Bold Italic"), FontStyle::new(true, true));
+        // The spellings real fonts actually ship with.
+        assert_eq!(cut("Semibold"), FontStyle::new(true, false));
+        assert_eq!(cut("Oblique"), FontStyle::new(false, true));
+        assert_eq!(cut("Black Oblique"), FontStyle::new(true, true));
+        assert_eq!(cut(""), FontStyle::REGULAR, "unnamed is regular");
+    }
+
+    #[test]
+    fn a_cut_knows_what_to_call_itself() {
+        assert_eq!(FontStyle::REGULAR.label(), "Regular");
+        assert_eq!(FontStyle::new(true, true).label(), "Bold Italic");
+    }
+
+    /// A family only offers the cuts it actually has, which is what stops the
+    /// picker showing an italic button for a font with no italic.
+    #[test]
+    fn a_family_reports_only_the_cuts_it_has() {
+        let family = FontFamily {
+            name: "Test".into(),
+            devanagari: false,
+            styles: vec![FontStyle::REGULAR, FontStyle::new(true, false)],
+        };
+        assert!(family.has(FontStyle::REGULAR));
+        assert!(family.has_bold());
+        assert!(!family.has_italic());
+        assert!(!family.has(FontStyle::new(false, true)));
+    }
+
+    /// Every face enumerated belongs to a family that lists its cut — the two
+    /// views of the same list must agree, or the picker offers a cut that
+    /// `resolve_font` cannot find.
+    #[test]
+    fn families_and_faces_agree() {
+        for face in available_fonts() {
+            let family = family(&face.family).expect("every face has a family");
+            assert!(
+                family.has(face.style),
+                "{} {} is not listed among its family's cuts",
+                face.family,
+                face.style.label()
+            );
+        }
+    }
+
+    /// Alignment moves the lines within the block, so a single line is the same
+    /// picture however it is aligned.
+    #[test]
+    fn one_line_looks_the_same_however_it_is_aligned() {
+        let Some(left) = outline_styled("Hi", 32.0, None, FontStyle::REGULAR, TextAlign::Left)
+        else {
+            eprintln!("skipping: no font on this machine");
+            return;
+        };
+        let centred =
+            outline_styled("Hi", 32.0, None, FontStyle::REGULAR, TextAlign::Centre).expect("set");
+        assert_eq!(
+            format!("{:?}", left.to_svg()),
+            format!("{:?}", centred.to_svg()),
+            "one line has nothing to line up against"
+        );
+    }
+
+    /// Two lines of different lengths do move, and each alignment moves them
+    /// its own way.
+    #[test]
+    fn alignment_moves_the_shorter_line() {
+        use buzz_geom::Shape as _;
+        let text = "Wide line here\nshort";
+        let Some(left) = outline_styled(text, 32.0, None, FontStyle::REGULAR, TextAlign::Left)
+        else {
+            eprintln!("skipping: no font on this machine");
+            return;
+        };
+        let centred =
+            outline_styled(text, 32.0, None, FontStyle::REGULAR, TextAlign::Centre).expect("set");
+        let right =
+            outline_styled(text, 32.0, None, FontStyle::REGULAR, TextAlign::Right).expect("set");
+
+        // The block is the same width whichever way it is set — alignment moves
+        // lines inside it, it does not stretch it.
+        let width = |p: &BezPath| p.bounding_box().width();
+        assert!((width(&left) - width(&centred)).abs() < 1.0);
+        assert!((width(&left) - width(&right)).abs() < 1.0);
+
+        // But the pictures differ, and centre sits between the two.
+        assert_ne!(left.to_svg(), centred.to_svg());
+        assert_ne!(centred.to_svg(), right.to_svg());
+    }
+
+    /// Asking for a cut a family does not have still sets the words, in
+    /// whatever the family does have.
+    #[test]
+    fn a_missing_cut_still_draws() {
+        let drawn = outline_styled(
+            "Hi",
+            32.0,
+            Some("A Font That Is Not Installed"),
+            FontStyle::new(true, true),
+            TextAlign::Left,
+        );
+        if default_font().is_some() {
+            assert!(drawn.is_some(), "it falls back rather than refusing");
+        }
     }
 }

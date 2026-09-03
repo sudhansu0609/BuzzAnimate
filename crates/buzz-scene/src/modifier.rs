@@ -99,11 +99,17 @@ impl Scene {
         &self,
         layer: LayerId,
         object: &Object,
-        frame: u32,
+        at: impl crate::time::AtTime,
     ) -> Option<ModifierEval> {
         if object.modifiers.is_empty() {
             return None;
         }
+        // A wiggle is a function of *time* and shakes fast enough to smear
+        // within one frame, so it is sampled continuously. A spring's pose and
+        // a squash's look-back are computed frame by frame and are held at the
+        // frame the shutter opened on — see the note on each below.
+        let time = at.as_time();
+        let frame = at.frame();
         let fps = self.stage().frame_rate.max(1.0);
         let mut prepend = Affine::IDENTITY;
         let mut posed: Option<Object> = None;
@@ -120,7 +126,8 @@ impl Scene {
                             frequency,
                         },
                         object.id.0,
-                        frame as f64 / fps,
+                        // Continuous: this is what lets a shake blur.
+                        time / fps,
                     );
                     prepend = Affine::translate((sample.dx, sample.dy)) * prepend;
                 }
@@ -130,6 +137,8 @@ impl Scene {
                     damping,
                     coupling,
                 } => {
+                    // Integrated frame by frame, so there is no state between two of
+                    // them to ask for: the pose is held across the shutter.
                     let spring = Spring { stiffness, damping };
                     if let Some(seq) = self.spring_sequence(layer, object, root, spring, coupling, fps)
                     {

@@ -69,28 +69,43 @@ impl StrokeKind {
 /// Animate's Color panel "type": what a new fill is painted with.
 ///
 /// Animate's list also has None and Bitmap fill. None is the `fill_enabled`
-/// flag this already had, and bitmaps are not imported at all (PROGRESS.md §7
-/// item 22), so they would be a menu entry that could not be honoured.
+/// flag this already had; Bitmap is [`FillKind::Texture`], which paints a new
+/// shape with a procedural tile instead of a colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FillKind {
     #[default]
     Solid,
     Linear,
     Radial,
+    /// A procedural texture, tiled across whatever is drawn.
+    ///
+    /// The recipe is [`DrawStyle::fill_texture`]; the tile it has been baked
+    /// into is [`DrawStyle::fill_texture_asset`], which the editor keeps in step
+    /// because only the document can hold an image.
+    Texture,
 }
 
 impl FillKind {
+    /// Every fill kind, in menu order.
+    pub const ALL: [FillKind; 4] = [
+        FillKind::Solid,
+        FillKind::Linear,
+        FillKind::Radial,
+        FillKind::Texture,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Solid => "Solid",
             Self::Linear => "Linear gradient",
             Self::Radial => "Radial gradient",
+            Self::Texture => "Texture",
         }
     }
 
     pub fn gradient_kind(self) -> Option<GradientKind> {
         match self {
-            Self::Solid => None,
+            Self::Solid | Self::Texture => None,
             Self::Linear => Some(GradientKind::Linear),
             Self::Radial => Some(GradientKind::Radial),
         }
@@ -113,6 +128,17 @@ pub struct DrawStyle {
     /// rectangle" produce a ramp across the rectangle rather than a ramp
     /// somewhere near the origin.
     pub fill_gradient: Gradient,
+    /// The texture a new shape is filled with when [`FillKind::Texture`] is
+    /// chosen.
+    pub fill_texture: buzz_scene::TextureRecipe,
+    /// **The tile that recipe has been baked into**, once the document holds it.
+    ///
+    /// Held here rather than made on the spot because an image has to live in
+    /// the document's library to survive being saved, and a style has no
+    /// document — so the editor bakes it, puts it in the library, and hands the
+    /// result back. `None` until then, and a shape drawn in that gap simply
+    /// takes the texture's average colour rather than refusing to be drawn.
+    pub fill_texture_asset: Option<std::sync::Arc<buzz_scene::ImageAsset>>,
     /// `None` means the "no stroke" swatch.
     pub stroke_enabled: bool,
     /// `None` means the "no fill" swatch.
@@ -226,6 +252,12 @@ impl Default for DrawStyle {
             stroke_color: Color::BLACK,
             fill_color: Color::from_rgb8(0x00, 0x66, 0xCC),
             fill_kind: FillKind::Solid,
+            fill_texture: buzz_scene::TextureRecipe::new(
+                buzz_scene::TextureKind::Paper,
+                Color::from_rgb8(0x33, 0x33, 0x33),
+                Color::WHITE,
+            ),
+            fill_texture_asset: None,
             // The fill colour fading to nothing: switching to a gradient then
             // shows the colour that was already chosen, rather than replacing
             // it with two arbitrary ones.
@@ -295,6 +327,20 @@ impl DrawStyle {
         if !self.fill_enabled {
             return None;
         }
+        if self.fill_kind == FillKind::Texture {
+            return Some(match &self.fill_texture_asset {
+                Some(asset) => {
+                    // A few repeats across the shape, the same rule applying a
+                    // texture to an existing shape uses.
+                    let cell = (bounds.width().min(bounds.height()) / 5.0).max(16.0);
+                    Paint::Image(Box::new(buzz_scene::ImageFill::tiled(
+                        std::sync::Arc::clone(asset),
+                        cell,
+                    )))
+                }
+                None => Paint::Solid(self.fill_texture.fg),
+            });
+        }
         Some(match self.fill_kind.gradient_kind() {
             None => Paint::Solid(self.fill_color),
             Some(kind) => {
@@ -313,6 +359,7 @@ impl DrawStyle {
     pub fn fill_color_for_preview(&self) -> Color {
         match self.fill_kind {
             FillKind::Solid => self.fill_color,
+            FillKind::Texture => self.fill_texture.fg,
             _ => self.fill_gradient.average_color(),
         }
     }

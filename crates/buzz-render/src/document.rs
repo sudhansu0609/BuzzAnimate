@@ -68,6 +68,15 @@ pub struct FrameOptions {
     /// opened, so a head stays on the shoulders it belongs to instead of
     /// jumping to the origin — see [`buzz_scene::Scene::edit_place`].
     pub place: Affine,
+    /// **How far into the frame the shutter is**, in frames, for motion blur.
+    ///
+    /// Zero — the default, and every pass but one — draws the frame at its own
+    /// instant, exactly as it always has. A motion-blurred export renders the
+    /// same frame at a succession of these offsets and adds the results up; the
+    /// offset is what makes each of those a *different* picture, by moving the
+    /// camera, the tweens and the wiggles on to where they are part-way through
+    /// the frame. See [`FrameOptions::at`].
+    pub subframe: f64,
     /// The visible rectangle in **document space**, for culling.
     ///
     /// **Display-only.** The window passes the viewport rect so artwork far off
@@ -93,8 +102,21 @@ impl Default for FrameOptions {
             pools: true,
             layer_alpha: false,
             place: Affine::IDENTITY,
+            subframe: 0.0,
             cull: None,
         }
+    }
+}
+
+impl FrameOptions {
+    /// The instant this pass is drawing: `frame`, moved on by the shutter
+    /// offset.
+    ///
+    /// With no offset this is the whole frame, and every lookup it is handed to
+    /// answers bit-for-bit what it answered before there was such a thing as a
+    /// sub-frame — which is the parity the un-blurred export depends on.
+    pub fn at(&self, frame: u32) -> f64 {
+        frame as f64 + self.subframe
     }
 }
 
@@ -1110,7 +1132,17 @@ fn draw_layers(
     let masks = active_masks(layers, options.masks);
     let mut open: Option<OpenMask> = None;
 
+    // The instant this pass draws. The frame itself for every pass but a
+    // motion-blurred one, where it is part-way into the frame.
+    let time = options.at(frame);
+
     // Resolve the light rig once for the whole stack, not once per layer.
+    //
+    // At the whole frame, deliberately: a light's keys are held across the
+    // shutter rather than swept through it. What smears is the artwork the
+    // light falls on; a lamp creeping a hundredth of a frame is not something
+    // a viewer can see, and sweeping it would clone the whole rig per sample
+    // to prove it.
     let lights = Arc::new(scene.lights().resolved_at(frame).into_owned());
 
     // Depth ordering is opt-in on the stage. The masked run stays contiguous
@@ -1153,10 +1185,10 @@ fn draw_layers(
                 && let Some(path) = mask_geometry(
                     layers,
                     mask_id,
-                    frame,
+                    time,
                     Affine::IDENTITY,
                     &scene
-                        .camera_projection_at_depth(frame, 0.0)
+                        .camera_projection_at_depth(time, 0.0)
                         .unwrap_or_else(|| Projection::from_affine(camera))
                         // The mask travels with the stack it belongs to, or it
                         // would clip the wrong part of the stage.
@@ -1164,13 +1196,13 @@ fn draw_layers(
                     builder.tolerance(),
                 )
             {
-                open = open_mask(builder, layers, mask_id, &masks, frame, path);
+                open = open_mask(builder, layers, mask_id, &masks, time, path);
             }
         }
 
         // Layer parenting: what this layer inherits from the layer it
         // follows. Resolved here because only the stack knows the chain.
-        let follows = layers.inherited_transform(layer.id, frame);
+        let follows = layers.inherited_transform(layer.id, time);
         draw_layer(
             builder, scene, layer, frame, camera, follows, options, &lights, cache,
         );
@@ -1332,7 +1364,7 @@ fn open_mask(
     layers: &buzz_scene::LayerStack,
     mask: buzz_scene::LayerId,
     masks: &std::collections::BTreeMap<buzz_scene::LayerId, buzz_scene::LayerId>,
-    frame: u32,
+    at: impl buzz_scene::AtTime,
     path: buzz_geom::BezPath,
 ) -> Option<OpenMask> {
     let inverted = layers.get(mask).is_some_and(|l| l.kind.is_inverted_mask());
@@ -1345,7 +1377,7 @@ fn open_mask(
         .iter()
         .filter(|(_, m)| **m == mask)
         .filter_map(|(id, _)| layers.get(*id))
-        .filter_map(|l| l.bounds_at(frame))
+        .filter_map(|l| l.bounds_at(at.frame()))
         .reduce(|a, b| a.union(b))?;
 
     // A margin, because a stroke is drawn about its path and a filter reaches
@@ -1398,7 +1430,7 @@ fn active_masks(
 fn mask_geometry(
     layers: &buzz_scene::LayerStack,
     mask: buzz_scene::LayerId,
-    frame: u32,
+    at: impl buzz_scene::AtTime,
     place: Affine,
     projection: &Projection,
     tolerance: f64,
@@ -1408,9 +1440,9 @@ fn mask_geometry(
     // Built in document space and projected once, like everything else: a mask
     // on a tilted layer has to be foreshortened by exactly the same lens as the
     // artwork it clips, or it would clip the wrong region.
-    let place = place * layers.inherited_transform(mask, frame);
+    let place = place * layers.inherited_transform(mask, at);
 
-    for object in layer.frames.resolved_at(frame).iter() {
+    for object in layer.frames.resolved_at(at).iter() {
         let mut flat = Vec::new();
         object.flatten(place, &mut flat);
         for (transform, shape) in flat {
@@ -1455,6 +1487,13 @@ fn draw_layer(
     {
         // How this layer is projected onto the frame.
         //
+        // The instant this layer is drawn at — the frame, or part-way into it
+        // while a shutter is open. Everything below that varies *within* a
+        // frame reads it; everything keyed to whole frames (the keyframe
+        // lookup, a symbol's own timeline, a spring's integration) keeps taking
+        // `frame`, because those genuinely do not move between two of them.
+        let time = options.at(frame);
+
         // Layer depth draws artwork further from the camera smaller, and slides
         // it less as the camera pans; a **tilted** camera also foreshortens it,
         // turning the layer's rectangle into a trapezoid. Both fall out of the
@@ -1467,7 +1506,7 @@ fn draw_layer(
         let projection = if layer.depth == 0.0 && !scene.camera_has_tilt() {
             Projection::from_affine(camera)
         } else {
-            match scene.camera_projection_at_depth(frame, layer.depth) {
+            match scene.camera_projection_at_depth(time, layer.depth) {
                 Some(projection) => projection,
                 None => return,
             }
@@ -1597,7 +1636,7 @@ fn draw_layer(
             layer_depth: layer.depth,
             projection,
         };
-        let resolved = layer.frames.resolved_at(frame);
+        let resolved = layer.frames.resolved_at(time);
 
         // **Shadows first, and all of them, before any of this layer's
         // artwork.** A shadow falls on what is *behind* its caster: drawing
@@ -1751,7 +1790,10 @@ fn draw_layer(
         // reuses the per-shape blur the filter path already draws, so it costs
         // no new pipeline. `None` for a pinhole camera or a layer in focus, so
         // a document that sets no aperture is untouched.
-        let dof_blur = scene.camera().dof_blur(layer.depth);
+        //
+        // Resolved at `frame`, so a **focus pull** — focus keyed to travel from
+        // one depth to another — softens this layer as the shot goes on.
+        let dof_blur = scene.camera().dof_blur_at(time, layer.depth);
 
         if !layer_fx.as_ref().is_some_and(|fx| fx.hide_subject) {
             for (object, owner) in resolved.iter_owned() {
@@ -1765,7 +1807,7 @@ fn draw_layer(
                 // place the window, the exporter and the headless tests all pass
                 // through, so what is drawn is what is exported. Almost every
                 // object has none and takes the cheap `None` path unchanged.
-                match scene.modified_object_at(layer.id, object, frame) {
+                match scene.modified_object_at(layer.id, object, time) {
                     None => draw_object(builder, object, owner, Affine::IDENTITY, &object_ctx, cache),
                     Some(eval) => {
                         // A spring re-poses the rig into an owned copy (no `Arc`
@@ -2251,6 +2293,52 @@ fn draw_object_inner(
     //
     // Everything below this point then proceeds exactly as before: the plane
     // it is drawn on has changed, and nothing else has.
+    // **Which way round the object is, as the camera sees it.**
+    //
+    // Its own yaw *less the camera's*: a camera that has swung round to the far
+    // side of a character sees its back without the character having turned at
+    // all. With the shot facing straight on this is the object's own yaw, which
+    // is what it has always been.
+    let apparent_yaw = object.spatial.rotation_y
+        - ctx
+            .scene
+            .camera()
+            .state_at(ctx.stage_frame)
+            .map(|s| s.yaw)
+            .unwrap_or(0.0);
+
+    // **Turned far enough round to be another drawing.** An animator does not
+    // foreshorten a face to nothing to show its profile, they draw the profile;
+    // so the nearest view in the turnaround is swapped in, and only the turn
+    // *left over* after it foreshortens what is drawn. A back view on an object
+    // facing exactly backwards therefore comes out square to the camera, and a
+    // profile at ninety degrees is visible at all — the object's own plane is
+    // edge-on there and has no width to draw in.
+    if let Some((view, residual)) = object.turnaround.view_at(apparent_yaw) {
+        let mut swapped = (**view).clone();
+        swapped.spatial = buzz_scene::Spatial {
+            rotation_y: residual,
+            ..object.spatial
+        };
+
+        // **It turns about the front's transformation point, not its own.**
+        //
+        // The view is standing in for the front, so the two have to pivot on
+        // the same physical spot or the drawing steps sideways at the moment
+        // the swap happens — a head that turns about the neck on the way round
+        // and about its own middle once it is there. The front's pivot is in the
+        // front's coordinates; the view is placed relative to the front, so it
+        // comes back through the view's own transform.
+        let front_pivot = ctx.scene.pivot_local_of(object);
+        swapped.pivot = buzz_scene::invert_affine(swapped.transform)
+            .map(|inverse| inverse * front_pivot)
+            .or(swapped.pivot);
+
+        let swapped = Arc::new(swapped);
+        draw_object(builder, &swapped, Some(&swapped), doc, ctx, cache);
+        return;
+    }
+
     let turned;
     let ctx = if object.spatial.is_flat() {
         ctx
@@ -2274,20 +2362,6 @@ fn draw_object_inner(
         };
         &turned
     };
-
-    // **Turned to face away — show the back drawing.** Past edge-on the plane's
-    // own mirror would otherwise show the front reversed (the back of the paper);
-    // if the object carries a real back view, draw that instead, through the same
-    // turned projection so it foreshortens with the turn. Counter-flipped in X so
-    // a naturally drawn back reads the right way round despite that mirror.
-    if !object.spatial.is_flat()
-        && object.spatial.rotation_y.cos() < 0.0
-        && let Some(reverse) = &object.reverse
-    {
-        let doc = doc * Affine::scale_non_uniform(-1.0, 1.0);
-        draw_object(builder, reverse, Some(reverse), doc, ctx, cache);
-        return;
-    }
 
     match &object.kind {
         ObjectKind::Group(children) => {

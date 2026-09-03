@@ -130,7 +130,31 @@ use serde::{Deserialize, Serialize};
 /// * **33** — the compositor gains posterise, halftone and hatching passes,
 ///   written flat on the post settings and defaulted off, so files without them
 ///   are unchanged from version 32.
-pub const FORMAT_VERSION: u32 = 33;
+/// * **34** — the camera carries a **focus pull**: `focus_keys`, each a focus
+///   depth and an aperture at a frame, so focus can travel during a shot. The
+///   static `aperture`/`focus_depth` stay and are what an empty list means, so a
+///   document that never pulls focus is written exactly as version 33 wrote it.
+/// * **35** — the camera carries a **shutter**: how long it stays open, as a
+///   fraction of a frame, and how many instants across it an export adds up.
+///   Zero — absent — is the infinitely fast shutter every older file has, so a
+///   document without motion blur is written exactly as version 34 wrote it.
+/// * **38** — an object may carry a whole **turnaround**: drawings of itself
+///   seen from other angles, each against the yaw it is the view of. A plain
+///   back view still writes as `reverse`, exactly as version 29 introduced it,
+///   so every document that has only a back is unchanged from version 37; the
+///   new `views` list appears only once there is a third angle.
+/// * **37** — a text object records **which cut** of its family it is set in
+///   (bold, italic) and **how its lines line up**. Absent for regular,
+///   left-aligned text, which is all text written before this, so an unchanged
+///   document is written exactly as version 36 wrote it.
+/// * **36** — a procedural texture is stored as its **recipe** rather than as a
+///   baked tile: the image entry carries the kind, its two colours, how coarse
+///   it is and how hard, and the container writes no media file for it. Absent
+///   for every imported bitmap, which still travels as its own bytes, so a
+///   document with no procedural texture in it is written exactly as version 35
+///   wrote it. A file written *with* one and opened by an older build loses that
+///   image, which is what the bump is for.
+pub const FORMAT_VERSION: u32 = 38;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -1186,6 +1210,22 @@ pub struct CameraDto {
     /// saves none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub angles: Vec<NamedAngleDto>,
+    /// The focus pull. Version 34. Absent in every document whose focus never
+    /// moves, which then reads as the static `aperture` and `focus_depth`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub focus_keys: Vec<FocusKeyDto>,
+    /// How long the shutter is open, in frames. Version 35; absent (0) is the
+    /// instantaneous shutter, and no motion blur.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shutter: f64,
+    /// Instants sampled across the open shutter. Version 35. Written only
+    /// alongside a shutter that is actually open — on its own it says nothing.
+    #[serde(default = "default_blur_samples")]
+    pub blur_samples: u32,
+}
+
+fn default_blur_samples() -> u32 {
+    buzz_scene::camera_track::DEFAULT_BLUR_SAMPLES
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1235,6 +1275,20 @@ pub struct CameraKeyDto {
     /// Turn left and right, in radians. Version 10.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub yaw: f64,
+}
+
+/// One focus keyframe — the lens at a frame. Version 34.
+///
+/// `focus_depth` and `aperture` are both skipped when zero, so a key that
+/// focuses on the stage plane with the lens shut costs two fields' worth of
+/// nothing; the frame is always written because it is what orders the pull.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct FocusKeyDto {
+    pub frame: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub focus_depth: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub aperture: f64,
 }
 
 /// One live modifier on an object — a spring or a wiggle. Version 27.
@@ -1356,6 +1410,43 @@ pub struct TextDataDto {
     /// meaning "system default") in older files and any default-font text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
+    /// Bold. Version 37; absent in every older file, which is regular.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bold: bool,
+    /// Italic. Version 37.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub italic: bool,
+    /// How the lines line up: `"left"` (the default, and absent), `"centre"` or
+    /// `"right"`. Version 37.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<String>,
+}
+
+/// The stable name an alignment is written under.
+fn align_name(align: buzz_scene::TextAlign) -> &'static str {
+    match align {
+        buzz_scene::TextAlign::Left => "left",
+        buzz_scene::TextAlign::Centre => "centre",
+        buzz_scene::TextAlign::Right => "right",
+    }
+}
+
+fn align_from_name(name: &str) -> buzz_scene::TextAlign {
+    match name {
+        "centre" | "center" => buzz_scene::TextAlign::Centre,
+        "right" => buzz_scene::TextAlign::Right,
+        // Anything unrecognised is left, which is what text with no alignment
+        // has always been.
+        _ => buzz_scene::TextAlign::Left,
+    }
+}
+
+/// One drawing of a character seen from a particular way round. Version 38.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnaroundViewDto {
+    /// The apparent yaw this drawing is the view at, in radians.
+    pub angle: f64,
+    pub drawing: Box<ObjectDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1396,6 +1487,11 @@ pub struct ObjectDto {
     /// the DTO is not infinitely sized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reverse: Option<Box<ObjectDto>>,
+    /// **The rest of the turnaround** — every view that is not a plain back.
+    /// Version 38. Absent for the front-and-back turnarounds every older file
+    /// can hold, which keep writing `reverse` as they always did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<TurnaroundViewDto>,
     pub kind: ObjectKindDto,
 }
 
@@ -1717,6 +1813,76 @@ pub struct ImageAssetDto {
     pub format: String,
     pub width: u32,
     pub height: u32,
+    /// **How to make this image, rather than the image.** Version 36.
+    ///
+    /// Present only for a procedural texture, and when it is present the
+    /// container writes no media file at all: the tile is baked again on load
+    /// from a handful of numbers. A wall of brick costs about ninety bytes
+    /// instead of a quarter of a megabyte, and — the point of it — the texture
+    /// is still a texture when the file comes back, not a picture of one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<TextureRecipeDto>,
+}
+
+/// A procedural texture's recipe. Version 36.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextureRecipeDto {
+    pub kind: String,
+    /// The two colours, as the same hex strings every other colour in the
+    /// format uses.
+    pub fg: String,
+    pub bg: String,
+    pub detail: u32,
+    pub contrast: f64,
+}
+
+impl TextureRecipeDto {
+    pub fn from_recipe(r: &buzz_scene::TextureRecipe) -> Self {
+        Self {
+            kind: texture_kind_name(r.kind).to_string(),
+            fg: color_to_hex(r.fg),
+            bg: color_to_hex(r.bg),
+            detail: r.detail,
+            contrast: r.contrast,
+        }
+    }
+
+    pub fn to_recipe(&self) -> Option<buzz_scene::TextureRecipe> {
+        Some(buzz_scene::TextureRecipe {
+            kind: texture_kind_from_name(&self.kind)?,
+            // A colour that will not parse is not worth losing the texture
+            // over: the recipe keeps its shape and takes plain black or white.
+            fg: color_from_hex(&self.fg).unwrap_or(Color::BLACK),
+            bg: color_from_hex(&self.bg).unwrap_or(Color::WHITE),
+            detail: self.detail,
+            contrast: self.contrast,
+        })
+    }
+}
+
+/// The stable name a texture kind is written under.
+///
+/// Its own spelling rather than the enum's, because the label on a button is
+/// free to change and this is in people's files.
+fn texture_kind_name(kind: buzz_scene::TextureKind) -> &'static str {
+    use buzz_scene::TextureKind as K;
+    match kind {
+        K::Paper => "paper",
+        K::Canvas => "canvas",
+        K::Noise => "noise",
+        K::Checker => "checker",
+        K::Dots => "dots",
+        K::Stripes => "stripes",
+        K::Bricks => "bricks",
+        K::Wood => "wood",
+        K::Hatch => "hatch",
+    }
+}
+
+fn texture_kind_from_name(name: &str) -> Option<buzz_scene::TextureKind> {
+    buzz_scene::TextureKind::ALL
+        .into_iter()
+        .find(|k| texture_kind_name(*k) == name)
 }
 
 /// Write a paint out as the fields the DTOs carry.
@@ -2007,7 +2173,11 @@ impl DocumentDto {
                 let has_content = !cam.is_empty()
                     || cam.enabled
                     || cam.aperture != 0.0
-                    || !cam.angles.is_empty();
+                    || cam.shutter != 0.0
+                    || !cam.angles.is_empty()
+                    // A shot whose only camera work is a focus pull still has a
+                    // camera worth writing.
+                    || !cam.focus_keys().is_empty();
                 has_content.then(|| CameraDto {
                     enabled: cam.enabled,
                     focal_distance: cam.focal_distance,
@@ -2020,6 +2190,17 @@ impl DocumentDto {
                         .map(|a| NamedAngleDto {
                             name: a.name.clone(),
                             state: camera_key_to_dto(&a.state),
+                        })
+                        .collect(),
+                    shutter: cam.shutter,
+                    blur_samples: cam.blur_samples,
+                    focus_keys: cam
+                        .focus_keys()
+                        .iter()
+                        .map(|k| FocusKeyDto {
+                            frame: k.frame,
+                            focus_depth: k.focus_depth,
+                            aperture: k.aperture,
                         })
                         .collect(),
                 })
@@ -2062,6 +2243,7 @@ impl DocumentDto {
                         format: image.format.clone(),
                         width: image.width,
                         height: image.height,
+                        recipe: image.recipe.as_ref().map(TextureRecipeDto::from_recipe),
                     }
                 })
                 .collect(),
@@ -2173,6 +2355,21 @@ impl DocumentDto {
         let mut scene = Scene::empty();
         // Installed before anything is converted, so a fill can resolve
         // against it as the layers are read.
+        let mut images = images;
+        // **A procedural texture is baked from its recipe, here.** It has no
+        // media file for the container to have read — the recipe *is* the file —
+        // so it is rebuilt from the document alone, which also means the plain
+        // DTO round-trip reconstructs it without an archive.
+        for entry in &self.images {
+            if let Some(recipe) = entry.recipe.as_ref().and_then(|r| r.to_recipe()) {
+                images.insert(buzz_scene::ImageAsset::from_recipe(
+                    buzz_scene::ImageId(entry.id),
+                    entry.name.clone(),
+                    recipe,
+                    entry.width.max(16),
+                ));
+            }
+        }
         *scene.images_mut() = images.clone();
         let images = &images;
         *scene.stage_mut() = StageProperties {
@@ -2216,6 +2413,30 @@ impl DocumentDto {
             );
             track.aperture = camera.aperture.max(0.0);
             track.focus_depth = camera.focus_depth;
+            // A negative or nonsense shutter is simply a shut one; the sample
+            // count is bounded where it is used, so a silly number here costs
+            // nothing but is not carried around either.
+            track.shutter = if camera.shutter.is_finite() {
+                camera.shutter.max(0.0)
+            } else {
+                0.0
+            };
+            track.blur_samples = camera
+                .blur_samples
+                .clamp(1, buzz_scene::camera_track::MAX_BLUR_SAMPLES);
+            // Sorted and clamped on the way in, for the same reason the camera's
+            // own keys are: nothing about a file guarantees their order.
+            track.set_focus_keys(
+                camera
+                    .focus_keys
+                    .iter()
+                    .map(|k| buzz_scene::FocusKey {
+                        frame: k.frame,
+                        focus_depth: k.focus_depth,
+                        aperture: k.aperture,
+                    })
+                    .collect(),
+            );
             track.angles = camera
                 .angles
                 .iter()
@@ -2461,11 +2682,26 @@ impl ObjectDto {
                 content: t.content.clone(),
                 size: t.size,
                 font: t.font.clone(),
+                bold: t.style.bold,
+                italic: t.style.italic,
+                // Left is what text has always been, so it is written as
+                // nothing: a document that does not align stays byte-identical.
+                align: (t.align != buzz_scene::TextAlign::Left)
+                    .then(|| align_name(t.align).to_string()),
             }),
-            reverse: object
-                .reverse
-                .as_ref()
+            // **A plain back view still writes as `reverse`.** That is what a
+            // turnaround of one drawing at a hundred and eighty degrees has
+            // always been, and writing it any other way would change every
+            // document that has one for no gain. Anything richer — a profile, a
+            // three-quarter — goes in `views`.
+            reverse: plain_back(&object.turnaround)
                 .map(|r| Box::new(Self::from_object(r, max_id))),
+            views: extra_views(&object.turnaround)
+                .map(|v| TurnaroundViewDto {
+                    angle: v.angle,
+                    drawing: Box::new(Self::from_object(&v.drawing, max_id)),
+                })
+                .collect(),
             kind,
         }
     }
@@ -2628,14 +2864,45 @@ impl ObjectDto {
                 content: t.content.clone(),
                 size: t.size,
                 font: t.font.clone(),
+                style: buzz_scene::FontStyle::new(t.bold, t.italic),
+                align: t.align.as_deref().map(align_from_name).unwrap_or_default(),
             }),
-            reverse: self
-                .reverse
-                .as_ref()
-                .map(|r| r.to_object(images).map(std::sync::Arc::new))
-                .transpose()?,
+            turnaround: {
+                let mut turnaround = buzz_scene::Turnaround::default();
+                // The old single back view is a view at a hundred and eighty
+                // degrees, which is exactly what it always meant.
+                if let Some(back) = &self.reverse {
+                    turnaround.set(
+                        std::f64::consts::PI,
+                        std::sync::Arc::new(back.to_object(images)?),
+                    );
+                }
+                for view in &self.views {
+                    turnaround.set(
+                        view.angle,
+                        std::sync::Arc::new(view.drawing.to_object(images)?),
+                    );
+                }
+                turnaround
+            },
         })
     }
+}
+
+/// The turnaround's back view, when that is the *whole* turnaround.
+///
+/// A document whose character has only a back is written exactly as it was
+/// before there were other angles, so this asks for both conditions at once.
+fn plain_back(turnaround: &buzz_scene::Turnaround) -> Option<&std::sync::Arc<buzz_scene::Object>> {
+    (turnaround.views().len() == 1).then(|| turnaround.back()).flatten()
+}
+
+/// Every view that is not that plain back — what `views` carries.
+fn extra_views(
+    turnaround: &buzz_scene::Turnaround,
+) -> impl Iterator<Item = &buzz_scene::TurnaroundView> {
+    let plain = plain_back(turnaround).is_some();
+    turnaround.views().iter().filter(move |_| !plain)
 }
 
 #[cfg(test)]
@@ -2925,22 +3192,22 @@ mod tests {
             )
             .expect("a shape");
         scene.update_object_across(0, u32::MAX, id, |o| {
-            o.text = Some(buzz_scene::TextData {
-                content: "Hello".to_string(),
-                size: 36.0,
-                font: Some("Nirmala UI".to_string()),
-            });
+            o.text = Some(buzz_scene::TextData::new(
+                "Hello",
+                36.0,
+                Some("Nirmala UI".to_string()),
+            ));
         });
 
         let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
         let (_, object) = back.find_object(id).expect("the object");
         assert_eq!(
             object.text,
-            Some(buzz_scene::TextData {
-                content: "Hello".to_string(),
-                size: 36.0,
-                font: Some("Nirmala UI".to_string()),
-            })
+            Some(buzz_scene::TextData::new(
+                "Hello",
+                36.0,
+                Some("Nirmala UI".to_string()),
+            ))
         );
 
         // An object without text writes no `text` key.
@@ -3004,18 +3271,21 @@ mod tests {
             )
             .expect("a front");
         scene.update_object(front, |o| {
-            o.reverse = Some(std::sync::Arc::new(buzz_scene::Object::shape(
+            o.turnaround.set(
+                std::f64::consts::PI,
+                std::sync::Arc::new(buzz_scene::Object::shape(
                 buzz_scene::ObjectId(4242),
                 ShapeData::filled(
                     kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
                     Color::BLACK,
                 ),
-            )));
+            )),
+            );
         });
 
         let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
         let (_, object) = back.find_object(front).expect("the front object");
-        assert!(object.reverse.is_some(), "the back view came back");
+        assert!(object.turnaround.back().is_some(), "the back view came back");
 
         let plain = serde_json::to_string(&DocumentDto::from_scene(&Scene::empty())).unwrap();
         assert!(!plain.contains("\"reverse\""), "no back → no key");
@@ -3816,7 +4086,7 @@ mod tests {
                 pivot: None,
                 modifiers: Vec::new(),
                 text: None,
-                reverse: None,
+                turnaround: Default::default(),
             },
         );
         scene
@@ -4044,7 +4314,7 @@ mod tests {
                 pivot: None,
                 modifiers: Vec::new(),
                 text: None,
-                reverse: None,
+                turnaround: Default::default(),
             },
         );
 
@@ -4437,6 +4707,290 @@ mod layer_alpha_tests {
         on.stage_mut().sort_by_depth = true;
         let back = DocumentDto::from_scene(&on).to_scene().expect("round trip");
         assert!(back.stage().sort_by_depth);
+    }
+
+    /// A whole turnaround survives, and each drawing stays at its own angle.
+    #[test]
+    fn a_multi_angle_turnaround_survives_the_round_trip() {
+        use buzz_geom::Shape as _;
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let view = |id: u64| {
+            std::sync::Arc::new(buzz_scene::Object::shape(
+                buzz_scene::ObjectId(id),
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::BLACK,
+                ),
+            ))
+        };
+        let front = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a front");
+        scene.update_object(front, |o| {
+            o.turnaround.set(std::f64::consts::PI, view(101));
+            o.turnaround.set(std::f64::consts::FRAC_PI_2, view(102));
+            o.turnaround.set(-std::f64::consts::FRAC_PI_2, view(103));
+        });
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        let (_, object) = back.find_object(front).expect("the front object");
+        assert_eq!(object.turnaround.views().len(), 3, "all three came back");
+        assert!(object.turnaround.back().is_some(), "including the back");
+
+        // And each one is still the view at its own angle.
+        let profile = object
+            .turnaround
+            .view_at(std::f64::consts::FRAC_PI_2)
+            .expect("a profile");
+        assert!(profile.1.abs() < 1e-9, "matched exactly, no turn left over");
+    }
+
+    /// **A plain back is still written the old way.** A document whose
+    /// character has only a back view must not gain a `views` list it does not
+    /// need — an older build reads it, and the file should not change.
+    #[test]
+    fn a_back_view_alone_writes_no_views_list() {
+        use buzz_geom::Shape as _;
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let front = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a front");
+        scene.update_object(front, |o| {
+            o.turnaround.set(
+                std::f64::consts::PI,
+                std::sync::Arc::new(buzz_scene::Object::shape(
+                    buzz_scene::ObjectId(4242),
+                    ShapeData::filled(
+                        kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                        Color::BLACK,
+                    ),
+                )),
+            );
+        });
+
+        let json = serde_json::to_string(&DocumentDto::from_scene(&scene)).unwrap();
+        assert!(json.contains("\"reverse\""), "it still writes `reverse`");
+        assert!(!json.contains("\"views\""), "and no `views` list");
+
+        // Add a third angle and the list appears.
+        scene.update_object(front, |o| {
+            o.turnaround.set(
+                std::f64::consts::FRAC_PI_2,
+                std::sync::Arc::new(buzz_scene::Object::shape(
+                    buzz_scene::ObjectId(4243),
+                    ShapeData::filled(
+                        kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                        Color::BLACK,
+                    ),
+                )),
+            );
+        });
+        let json = serde_json::to_string(&DocumentDto::from_scene(&scene)).unwrap();
+        assert!(json.contains("\"views\""), "now there is more than a back");
+    }
+
+    /// Text keeps its cut and its alignment; text that has neither writes
+    /// neither, so an unchanged document does not grow.
+    #[test]
+    fn a_text_cut_and_alignment_survive_the_round_trip() {
+        use buzz_geom::Shape as _;
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        scene.update_object_across(0, u32::MAX, id, |o| {
+            o.text = Some(buzz_scene::TextData {
+                style: buzz_scene::FontStyle::new(true, true),
+                align: buzz_scene::TextAlign::Centre,
+                ..buzz_scene::TextData::new("Hello", 36.0, None)
+            });
+        });
+
+        let json = serde_json::to_string(&DocumentDto::from_scene(&scene)).unwrap();
+        assert!(json.contains("centre"), "the alignment is written");
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        let text = back.find_object(id).expect("the object").1.text.clone().expect("text");
+        assert_eq!(text.style, buzz_scene::FontStyle::new(true, true));
+        assert_eq!(text.align, buzz_scene::TextAlign::Centre);
+    }
+
+    /// A procedural texture is stored as its recipe and baked again on the way
+    /// back, so what returns is a texture rather than a picture of one.
+    #[test]
+    fn a_texture_recipe_survives_the_round_trip() {
+        let mut scene = Scene::default();
+        let recipe = buzz_scene::TextureRecipe {
+            detail: 4,
+            contrast: 1.5,
+            ..buzz_scene::TextureRecipe::new(
+                buzz_scene::TextureKind::Bricks,
+                Color::from_rgb8(0x88, 0x33, 0x22),
+                Color::from_rgb8(0xDD, 0xDD, 0xD0),
+            )
+        };
+        let id = scene.next_image_id();
+        let asset = buzz_scene::ImageAsset::from_recipe(id, "Wall", recipe, 64);
+        let before = asset.pixels.clone();
+        scene.images_mut().insert(asset);
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        let returned = back.images().get(id).expect("the texture came back");
+        assert_eq!(returned.recipe, Some(recipe), "with its recipe");
+        assert_eq!(returned.pixels, before, "and the same tile, baked again");
+    }
+
+    /// The shutter is what makes an export smear, so a file that lost it would
+    /// come back rendering a different film.
+    #[test]
+    fn a_shutter_survives_the_round_trip() {
+        let mut scene = Scene::default();
+        {
+            let cam = scene.camera_mut();
+            cam.shutter = 0.5;
+            cam.blur_samples = 24;
+        }
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        assert!((back.camera().shutter - 0.5).abs() < 1e-9);
+        assert_eq!(back.camera().blur_samples, 24);
+        assert_eq!(
+            back.camera().shutter_offsets().map(|o| o.len()),
+            Some(24),
+            "and it still asks for the same instants"
+        );
+    }
+
+    /// Every file written before version 35 has no shutter, and must go on
+    /// meaning what it meant: a clean instant per frame.
+    #[test]
+    fn a_document_without_a_shutter_has_no_motion_blur() {
+        let mut scene = Scene::default();
+        scene.camera_mut().aperture = 0.01; // so a camera is written at all
+        let mut json = serde_json::to_value(DocumentDto::from_scene(&scene)).unwrap();
+        let camera = json
+            .get_mut("camera")
+            .and_then(|c| c.as_object_mut())
+            .expect("a camera was written");
+        camera.remove("shutter");
+        camera.remove("blur_samples");
+
+        let dto: DocumentDto = serde_json::from_value(json).unwrap();
+        let back = dto.to_scene().unwrap();
+
+        assert_eq!(back.camera().shutter, 0.0);
+        assert!(back.camera().shutter_offsets().is_none());
+        assert_eq!(
+            back.camera().blur_samples,
+            buzz_scene::camera_track::DEFAULT_BLUR_SAMPLES,
+            "and gets a sensible count for when one is asked for"
+        );
+    }
+
+    /// A hand-edited file must not be able to ask for a nonsense exposure.
+    #[test]
+    fn a_corrupt_shutter_loads_as_a_shut_one() {
+        for bad in [-1.0, f64::NAN] {
+            let mut scene = Scene::default();
+            scene.camera_mut().aperture = 0.01;
+            let mut json = serde_json::to_value(DocumentDto::from_scene(&scene)).unwrap();
+            let camera = json
+                .get_mut("camera")
+                .and_then(|c| c.as_object_mut())
+                .expect("a camera");
+            camera.insert(
+                "shutter".into(),
+                serde_json::Number::from_f64(bad)
+                    .map(serde_json::Value::Number)
+                    // NaN has no JSON number, so it arrives as a string and is
+                    // refused by serde before it can reach the model at all.
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            let Ok(dto) = serde_json::from_value::<DocumentDto>(json) else {
+                continue;
+            };
+            let back = dto.to_scene().unwrap();
+            assert_eq!(back.camera().shutter, 0.0, "for {bad}");
+        }
+    }
+
+    /// A focus pull is animation: losing it on save would lose the shot's
+    /// move, not just a setting.
+    #[test]
+    fn a_focus_pull_survives_the_round_trip() {
+        let mut scene = Scene::default();
+        {
+            let cam = scene.camera_mut();
+            cam.set_focus_key(buzz_scene::FocusKey {
+                frame: 0,
+                focus_depth: 600.0,
+                aperture: 0.05,
+            });
+            cam.set_focus_key(buzz_scene::FocusKey {
+                frame: 24,
+                focus_depth: 0.0,
+                aperture: 0.05,
+            });
+        }
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        let keys = back.camera().focus_keys();
+        assert_eq!(keys.len(), 2, "both ends of the pull come back");
+        assert_eq!(keys[0].frame, 0);
+        assert!((keys[0].focus_depth - 600.0).abs() < 1e-9);
+        assert_eq!(keys[1].frame, 24);
+        assert!((keys[1].aperture - 0.05).abs() < 1e-9);
+        // And it still reads as a pull, not as two stored numbers.
+        assert_eq!(back.camera().dof_blur_at(0, 600.0), None, "sharp at the start");
+        assert!(back.camera().dof_blur_at(24, 600.0).is_some(), "soft at the end");
+    }
+
+    /// Every file written before version 34 has no `focus_keys`, and must go on
+    /// meaning exactly what it meant: a focus that never moves.
+    #[test]
+    fn a_document_without_focus_keys_keeps_its_static_focus() {
+        let mut scene = Scene::default();
+        {
+            let cam = scene.camera_mut();
+            cam.aperture = 0.03;
+            cam.focus_depth = 250.0;
+        }
+        let mut json = serde_json::to_value(DocumentDto::from_scene(&scene)).unwrap();
+        json.get_mut("camera")
+            .and_then(|c| c.as_object_mut())
+            .expect("a camera was written")
+            .remove("focus_keys");
+
+        let dto: DocumentDto = serde_json::from_value(json).unwrap();
+        let back = dto.to_scene().unwrap();
+
+        assert!(back.camera().focus_keys().is_empty(), "no pull");
+        for frame in [0, 30, 900] {
+            let lens = back.camera().focus_at(frame);
+            assert!((lens.aperture - 0.03).abs() < 1e-9, "frame {frame}");
+            assert!((lens.focus_depth - 250.0).abs() < 1e-9, "frame {frame}");
+        }
     }
 
     #[test]

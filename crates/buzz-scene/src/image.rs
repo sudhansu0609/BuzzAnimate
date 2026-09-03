@@ -54,6 +54,15 @@ pub struct ImageAsset {
     /// or a half-transparent red and an opaque dark red become the same
     /// number and the wand selects across an edge that is plainly there.
     pub pixels: Arc<Vec<u8>>,
+    /// **The recipe that made these pixels**, when they were generated rather
+    /// than imported.
+    ///
+    /// This is what makes a procedural texture re-editable instead of a one-way
+    /// bake: the panel reads it back to show what the texture *is*, and a saved
+    /// document keeps the recipe rather than the tile — a handful of numbers
+    /// instead of an embedded PNG. `None` for every imported photograph, which
+    /// has no recipe and never will.
+    pub recipe: Option<crate::texture::TextureRecipe>,
     /// What the renderer's cache calls **these exact pixels**.
     ///
     /// # Why this exists
@@ -153,6 +162,7 @@ impl ImageAsset {
             width,
             height,
             pixels: Arc::new(rgba.into_raw()),
+            recipe: None,
             identity: next_identity(),
         })
     }
@@ -169,6 +179,7 @@ impl ImageAsset {
             width,
             height,
             pixels: Arc::new(vec![0; (width as usize) * (height as usize) * 4]),
+            recipe: None,
             identity: next_identity(),
         }
     }
@@ -231,7 +242,28 @@ impl ImageAsset {
             width,
             height,
             pixels,
+            recipe: None,
             identity: next_identity(),
+        }
+    }
+
+    /// **Bake a procedural texture into an asset**, keeping the recipe.
+    ///
+    /// The tile is square and seamless, so `size` is one side of it; the recipe
+    /// travels with the pixels so the texture can be re-tuned later.
+    pub fn from_recipe(
+        id: ImageId,
+        name: impl Into<String>,
+        recipe: crate::texture::TextureRecipe,
+        size: u32,
+    ) -> Self {
+        let pixels = recipe.bake(size);
+        // `bake` clamps and rounds the size it was given, so the asset must be
+        // told what actually came back rather than what was asked for.
+        let side = ((pixels.len() / 4) as f64).sqrt().round() as u32;
+        Self {
+            recipe: Some(recipe),
+            ..Self::from_pixels(id, name, side, side, Arc::new(pixels))
         }
     }
 
@@ -320,6 +352,82 @@ impl ImageFill {
             smooth: true,
             tile: true,
         }
+    }
+
+    /// **How big one tile is** on the shape, in object units.
+    ///
+    /// Taken from the transform's own x axis, so it is the number
+    /// [`Self::tiled`] was given however the fill has been turned since.
+    pub fn cell(&self) -> f64 {
+        let c = self.transform.as_coeffs();
+        c[0].hypot(c[1])
+    }
+
+    /// **Which way the tile is turned**, in radians.
+    pub fn rotation(&self) -> f64 {
+        let c = self.transform.as_coeffs();
+        c[1].atan2(c[0])
+    }
+
+    /// The same fill, tiled at `cell` and turned by `rotation` radians.
+    ///
+    /// Rebuilt from the two numbers rather than multiplied onto what is there,
+    /// so dragging a handle back and forth cannot accumulate skew out of a long
+    /// chain of transforms.
+    pub fn with_cell_rotation(&self, cell: f64, rotation: f64) -> Self {
+        let cell = cell.max(1e-6);
+        let origin = self.transform.translation();
+        Self {
+            transform: Affine::translate(origin) * Affine::rotate(rotation) * Affine::scale(cell),
+            ..self.clone()
+        }
+    }
+
+    /// **The grips that transform this fill**, in the object's own space.
+    ///
+    /// The same three points a gradient offers, and for the same reason: an
+    /// image fill is a unit square mapped by a matrix, exactly as a ramp is, so
+    /// the grips *are* the matrix's own parts — the centre is its translation,
+    /// the end is its first column, the width its second. That is what lets
+    /// Animate's Gradient Transform tool work a bitmap fill too, which is what
+    /// Animate's does.
+    ///
+    /// `focus` has no meaning here and is the centre, so nothing draws a grip
+    /// for it.
+    pub fn handles(&self) -> crate::GradientHandles {
+        let c = self.transform.as_coeffs();
+        let centre = Point::new(c[4], c[5]);
+        crate::GradientHandles {
+            center: centre,
+            end: Point::new(centre.x + c[0], centre.y + c[1]),
+            width: Point::new(centre.x + c[2], centre.y + c[3]),
+            focus: centre,
+        }
+    }
+
+    /// Move the whole fill so its centre lands on `p`.
+    pub fn set_center(&mut self, p: Point) {
+        let mut c = self.transform.as_coeffs();
+        c[4] = p.x;
+        c[5] = p.y;
+        self.transform = Affine::new(c);
+    }
+
+    /// Put the end of the fill's first axis on `p` — its scale and its angle
+    /// together, which is what makes one grip enough to turn a texture.
+    pub fn set_end(&mut self, p: Point) {
+        let mut c = self.transform.as_coeffs();
+        c[0] = p.x - c[4];
+        c[1] = p.y - c[5];
+        self.transform = Affine::new(c);
+    }
+
+    /// The same for the second axis — how tall one tile is, and its shear.
+    pub fn set_width_handle(&mut self, p: Point) {
+        let mut c = self.transform.as_coeffs();
+        c[2] = p.x - c[4];
+        c[3] = p.y - c[5];
+        self.transform = Affine::new(c);
     }
 
     /// The rectangle this image covers, at its own pixel size, placed at the
@@ -430,6 +538,21 @@ impl ImageLibrary {
     }
 
     /// A name no existing bitmap has, so the Library stays readable.
+    /// **The asset already baked from this exact recipe**, if there is one.
+    ///
+    /// Applying the same texture to a second shape, or nudging a slider back to
+    /// where it was, should not leave a second identical tile in the library —
+    /// and shapes that share one asset share one GPU upload.
+    pub fn find_by_recipe(
+        &self,
+        recipe: &crate::texture::TextureRecipe,
+    ) -> Option<Arc<ImageAsset>> {
+        self.images
+            .values()
+            .find(|a| a.recipe.as_ref() == Some(recipe))
+            .map(Arc::clone)
+    }
+
     pub fn unique_name(&self, wanted: &str) -> String {
         if !self.images.values().any(|i| i.name == wanted) {
             return wanted.to_string();

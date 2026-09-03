@@ -193,8 +193,18 @@ pub enum Command {
     /// **Set reverse drawing**: make the second selected object the back view of
     /// the first, shown when it is turned to face away.
     SetReverse,
-    /// **Clear reverse drawing**: remove the selected object's back view.
+    /// **Clear reverse drawing**: remove the selected object's whole turnaround.
     ClearReverse,
+    /// **Add a profile view**: make the second selected object the drawing shown
+    /// when the first is turned a quarter turn to its right.
+    AddProfileRight,
+    /// The same, a quarter turn to its left.
+    AddProfileLeft,
+    /// **Add a three-quarter view**: the drawing shown part way between the
+    /// front and a profile, which is where most acting happens.
+    AddThreeQuarterRight,
+    /// The same, on the other side.
+    AddThreeQuarterLeft,
 
     // Commands (scripting)
     /// Show or hide the Actions panel.
@@ -390,7 +400,11 @@ impl Command {
             ClearModifiers => "Clear Modifiers",
             BakeModifiers => "Bake Modifiers",
             SetReverse => "Set Reverse Drawing",
-            ClearReverse => "Clear Reverse Drawing",
+            ClearReverse => "Clear Turnaround",
+            AddProfileRight => "Add Profile (right)",
+            AddProfileLeft => "Add Profile (left)",
+            AddThreeQuarterRight => "Add Three-Quarter (right)",
+            AddThreeQuarterLeft => "Add Three-Quarter (left)",
 
             ToggleActionsPanel => "Actions",
             RunScript => "Run Script",
@@ -547,7 +561,8 @@ impl Command {
             // acting straight away, so a key would only save the menu.
             SetScene | DirectScene | AddScene | DuplicateScene | AddPerson | Perform
             | AddFollowThrough | AddWiggle | ClearModifiers | BakeModifiers | SetReverse
-            | ClearReverse => None,
+            | ClearReverse | AddProfileRight | AddProfileLeft | AddThreeQuarterRight
+            | AddThreeQuarterLeft => None,
             ToggleLightGizmos => sc(ctrl_shift, Key::L),
 
             // F9 is Animate's own Actions panel key on Windows.

@@ -482,7 +482,7 @@ impl LayerStack {
     /// place must stay in the right place the moment it is parented; inheriting
     /// the body's absolute transform would fling it across the stage as soon as
     /// the link was made, which is not what parenting means to an animator.
-    pub fn inherited_transform(&self, id: LayerId, frame: u32) -> Affine {
+    pub fn inherited_transform(&self, id: LayerId, at: impl crate::time::AtTime) -> Affine {
         let mut chain = Vec::new();
         let mut current = self.get(id).and_then(|l| l.follows);
         // Bounded by the layer count: a corrupt file can hold a follow cycle,
@@ -500,7 +500,7 @@ impl LayerStack {
         // and both apply to this layer.
         let mut out = Affine::IDENTITY;
         for followed in chain.iter().rev() {
-            out *= self.motion_of(*followed, frame);
+            out *= self.motion_of(*followed, at.as_time());
         }
         out
     }
@@ -518,11 +518,11 @@ impl LayerStack {
     ///
     /// Recorded as a deviation rather than hidden: Animate tracks a
     /// transformation for the layer itself.
-    pub fn motion_of(&self, id: LayerId, frame: u32) -> Affine {
+    pub fn motion_of(&self, id: LayerId, at: impl crate::time::AtTime) -> Affine {
         let Some(layer) = self.get(id) else {
             return Affine::IDENTITY;
         };
-        let anchor = |at: u32| {
+        let anchor = |at: f64| {
             layer
                 .frames
                 .resolved_at(at)
@@ -530,7 +530,7 @@ impl LayerStack {
                 .next()
                 .map(|object| object.transform)
         };
-        let Some(now) = anchor(frame) else {
+        let Some(now) = anchor(at.as_time()) else {
             return Affine::IDENTITY;
         };
         // The pose the link was made at, when there is one. Falling back to the
@@ -543,7 +543,7 @@ impl LayerStack {
                 let Some(rest_frame) = layer.frames.keyframes().first().map(|k| k.start) else {
                     return Affine::IDENTITY;
                 };
-                let Some(rest) = anchor(rest_frame) else {
+                let Some(rest) = anchor(rest_frame as f64) else {
                     return Affine::IDENTITY;
                 };
                 rest

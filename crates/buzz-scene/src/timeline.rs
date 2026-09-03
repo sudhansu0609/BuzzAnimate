@@ -227,8 +227,8 @@ impl LayerTimeline {
     /// Returns borrowed objects when there is no tween, so the common case
     /// allocates nothing; a tween has to build new objects because the
     /// interpolated state does not exist anywhere in the document.
-    pub fn resolved_at(&self, frame: u32) -> ResolvedFrame<'_> {
-        let Some(index) = self.index_at(frame) else {
+    pub fn resolved_at(&self, at: impl crate::time::AtTime) -> ResolvedFrame<'_> {
+        let Some(index) = self.index_at(at.frame()) else {
             return ResolvedFrame::Stored(&[]);
         };
         let keyframe = &self.keyframes[index];
@@ -247,7 +247,10 @@ impl LayerTimeline {
         if span == 0 {
             return ResolvedFrame::Stored(&keyframe.objects);
         }
-        let progress = (frame - keyframe.start) as f64 / span as f64;
+        // Continuous in time, not in frames: with the shutter open between two
+        // frames a tween is *between* them too, which is the motion the smear
+        // is made of. On a whole frame this is the same division it always was.
+        let progress = (at.as_time() - keyframe.start as f64) / span as f64;
         if progress <= 0.0 {
             return ResolvedFrame::Stored(&keyframe.objects);
         }

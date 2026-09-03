@@ -199,6 +199,11 @@ fn write_media<W: Write + Seek>(
         zip.write_all(&sound.data)?;
     }
     for image in scene.images().iter() {
+        // A procedural texture travels as its recipe in the document JSON, so
+        // there is nothing to put in the archive for it — see `ImageAssetDto`.
+        if image.recipe.is_some() {
+            continue;
+        }
         match image.bytes_for_storage() {
             Ok(bytes) => {
                 zip.start_file(format!("{prefix}{}", image.file_name()), stored)?;
@@ -272,6 +277,13 @@ fn read_scene<R: Read + Seek>(
     // first.
     let mut images = buzz_scene::ImageLibrary::default();
     for entry in &dto.images {
+        // A procedural texture has no media entry to read: the recipe is the
+        // file, and `to_scene_with_images` bakes it. A recipe naming a kind
+        // this build does not know falls through to the media path and, finding
+        // nothing, warns like any other missing image.
+        if entry.recipe.as_ref().and_then(|r| r.to_recipe()).is_some() {
+            continue;
+        }
         let name = format!("{prefix}image-{}.{}", entry.id, entry.format);
         let mut bytes = Vec::new();
         match archive.by_name(&name) {

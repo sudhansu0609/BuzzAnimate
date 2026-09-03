@@ -376,7 +376,7 @@ mod tests {
                         pivot: None,
                         modifiers: Vec::new(),
                         text: None,
-                        reverse: None,
+                        turnaround: Default::default(),
                     })],
                 );
             });

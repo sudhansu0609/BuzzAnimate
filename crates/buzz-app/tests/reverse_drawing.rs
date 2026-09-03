@@ -38,7 +38,7 @@ fn has_reverse(editor: &Editor, id: ObjectId) -> bool {
         .doc
         .scene()
         .find_object(id)
-        .is_some_and(|(_, o)| o.reverse.is_some())
+        .is_some_and(|(_, o)| !o.turnaround.is_empty())
 }
 
 #[test]

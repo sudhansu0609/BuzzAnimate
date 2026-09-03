@@ -281,6 +281,139 @@ impl Exporter {
         settings: &ExportSettings,
         options: &document::FrameOptions,
     ) -> Result<Frame> {
+        // **Motion blur.** A shutter that is open for part of the frame records
+        // everything that happens while it is, so the frame is drawn at several
+        // instants across it and the results are added up.
+        //
+        // Gated on `lit`, exactly as the compositor is and for the same reason:
+        // `lit` is the film's own flag, and the working-view and comparison
+        // passes must stay the raw artwork at a clean instant.
+        match scene.camera().shutter_offsets() {
+            Some(offsets) if options.lit => {
+                self.render_blurred(scene, frame, settings, options, &offsets)
+            }
+            _ => self.render_at(scene, frame, settings, options, 0.0),
+        }
+    }
+
+    /// Draw the frame at every instant the shutter is open and add them up.
+    ///
+    /// # Why the samples are added on the CPU
+    ///
+    /// The obvious place is the GPU — accumulate into a float target and never
+    /// read a sample back. That needs a new pipeline and a new intermediate
+    /// format in the compositor; this needs neither, and an export is already
+    /// paying the cost of drawing the frame `n` times, next to which the
+    /// read-backs are not what makes it slow.
+    ///
+    /// # The post chain runs once, at the end
+    ///
+    /// A shutter integrates *light*; the film's look is the response to what it
+    /// collected. So the samples are drawn raw, added, uploaded back into the
+    /// target — which is a copy destination precisely so the compositor's
+    /// result can go back into it — and only then graded, bloomed and grained.
+    /// Doing it per sample would average the grain away, which is the one part
+    /// of the look that is meant to be different on every frame.
+    fn render_blurred(
+        &mut self,
+        scene: &Scene,
+        frame: u32,
+        settings: &ExportSettings,
+        options: &document::FrameOptions,
+        offsets: &[f64],
+    ) -> Result<Frame> {
+        // Each sample is the frame as it would ordinarily be drawn — lit and
+        // shadowed, because that is part of the picture the shutter collects.
+        // Only the compositor is held back, and it runs once at the end.
+        let mut raw = options.clone();
+
+        let mut sum: Vec<f32> = Vec::new();
+        let weight = 1.0 / offsets.len() as f32;
+        let (mut width, mut height) = (0u32, 0u32);
+
+        for &offset in offsets {
+            raw.subframe = offset;
+            self.draw_into_target(scene, frame, settings, &raw)?;
+            let sample = self.read_raw()?;
+            if sum.is_empty() {
+                width = sample.width;
+                height = sample.height;
+                sum = vec![0.0; sample.pixels.len()];
+            }
+            // **Added as light, not as bytes.** A shutter integrates what
+            // arrives at the film, and the bytes are gamma-encoded, so adding
+            // them directly makes every smear darker than the thing that made
+            // it — a white shape crossing black comes out grey rather than
+            // half-bright. Alpha is a coverage fraction and is already linear,
+            // so it is added as it is.
+            for (i, (acc, byte)) in sum.iter_mut().zip(sample.pixels.iter()).enumerate() {
+                let value = if i % 4 == 3 {
+                    *byte as f32 / 255.0
+                } else {
+                    srgb_to_linear(*byte)
+                };
+                *acc += weight * value;
+            }
+        }
+
+        if sum.is_empty() {
+            return self.render_at(scene, frame, settings, options, 0.0);
+        }
+
+        let mut pixels = vec![0u8; sum.len()];
+        for (i, (out, acc)) in pixels.iter_mut().zip(sum.iter()).enumerate() {
+            *out = if i % 4 == 3 {
+                (acc * 255.0).round().clamp(0.0, 255.0) as u8
+            } else {
+                linear_to_srgb(*acc)
+            };
+        }
+
+        self.upload(&pixels, width, height)?;
+
+        let post = scene.stage().post;
+        if options.lit && !post.is_identity() {
+            self.apply_post(frame, &post, settings.width, settings.height);
+        }
+        self.read_back(settings.transparent)
+    }
+
+    /// One clean frame, at one instant.
+    fn render_at(
+        &mut self,
+        scene: &Scene,
+        frame: u32,
+        settings: &ExportSettings,
+        options: &document::FrameOptions,
+        subframe: f64,
+    ) -> Result<Frame> {
+        let options = document::FrameOptions {
+            subframe,
+            ..options.clone()
+        };
+        self.draw_into_target(scene, frame, settings, &options)?;
+
+        // The finished picture carries the document's look. Gated on `lit`,
+        // which is the film's own flag — the working-view and comparison passes
+        // render `lit: false` and must stay the raw artwork. The compositor is
+        // the *same* `Compositor::run` the window calls, so the film matches the
+        // stage frame for frame.
+        let post = scene.stage().post;
+        if options.lit && !post.is_identity() {
+            self.apply_post(frame, &post, settings.width, settings.height);
+        }
+
+        self.read_back(settings.transparent)
+    }
+
+    /// Draw one instant of one frame into the render target, and stop there.
+    fn draw_into_target(
+        &mut self,
+        scene: &Scene,
+        frame: u32,
+        settings: &ExportSettings,
+        options: &document::FrameOptions,
+    ) -> Result<()> {
         let limit = self.max_dimension();
         if settings.width == 0 || settings.height == 0 {
             bail!("an exported image needs a width and a height");
@@ -329,7 +462,9 @@ impl Exporter {
                     &mut builder,
                     scene,
                     frame,
-                    scene.camera_transform(frame),
+                    // The camera moves within the frame too, so it is asked
+                    // for the same instant the artwork is.
+                    scene.camera_transform(options.at(frame)),
                     options,
                     &mut self.lights,
                 );
@@ -363,17 +498,7 @@ impl Exporter {
             )
             .context("rendering the frame")?;
 
-        // The finished picture carries the document's look. Gated on `lit`,
-        // which is the film's own flag — the working-view and comparison passes
-        // render `lit: false` and must stay the raw artwork. The compositor is
-        // the *same* `Compositor::run` the window calls, so the film matches the
-        // stage frame for frame.
-        let post = scene.stage().post;
-        if options.lit && !post.is_identity() {
-            self.apply_post(frame, &post, settings.width, settings.height);
-        }
-
-        self.read_back(settings.transparent)
+        Ok(())
     }
 
     /// Make sure the render target matches the requested size.
@@ -511,6 +636,17 @@ impl Exporter {
 
     /// Copy the rendered texture back to the CPU and strip the row padding.
     fn read_back(&mut self, transparent: bool) -> Result<Frame> {
+        let mut frame = self.read_raw()?;
+        if transparent {
+            unpremultiply(&mut frame.pixels);
+        }
+        Ok(frame)
+    }
+
+    /// The target's pixels exactly as the GPU left them — premultiplied, and
+    /// gamma-encoded. What the shutter adds up, and what [`Self::read_back`]
+    /// then straightens the alpha of.
+    fn read_raw(&mut self) -> Result<Frame> {
         let target = self.target.as_ref().expect("a target has been made");
         let (width, height, padded_row) = (target.width, target.height, target.padded_row);
 
@@ -568,16 +704,66 @@ impl Exporter {
         }
         target.readback.unmap();
 
-        if transparent {
-            unpremultiply(&mut pixels);
-        }
-
         Ok(Frame {
             width,
             height,
             pixels,
         })
     }
+
+    /// Put a finished picture back into the render target.
+    ///
+    /// The target is a copy destination already — that is how the compositor's
+    /// result gets back into it — so the accumulated frame can take the same
+    /// road and be graded by the same pass as any other.
+    fn upload(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<()> {
+        let target = self.target.as_ref().expect("a target has been made");
+        if target.width != width || target.height != height {
+            bail!("the accumulated frame is not the size of the target");
+        }
+        self.gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.gpu.queue.submit([]);
+        Ok(())
+    }
+}
+
+/// One gamma-encoded byte as linear light.
+fn srgb_to_linear(byte: u8) -> f32 {
+    let c = byte as f32 / 255.0;
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear light back to a gamma-encoded byte.
+fn linear_to_srgb(linear: f32) -> u8 {
+    let c = linear.clamp(0.0, 1.0);
+    let encoded = if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 /// Vello composites in premultiplied alpha; PNG stores straight alpha.

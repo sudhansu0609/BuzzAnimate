@@ -5,6 +5,7 @@
 //! window, including the shortcut map, the snapping arithmetic and the panels
 //! themselves.
 
+pub mod font_preview;
 pub mod about;
 pub mod actions_panel;
 pub mod align;
@@ -67,7 +68,8 @@ pub use splash::{SplashState, opening_scene};
 pub use staging_panel::{
     ActionChoice, SettingChoice, StagingDialog, StagingResponse, StagingState, staging_dialog,
 };
-pub use style::{DrawStyle, DrawingMode, StrokeKind, SymmetryMode, SymmetrySettings};
+pub use font_preview::FontPreviews;
+pub use style::{DrawStyle, DrawingMode, FillKind, StrokeKind, SymmetryMode, SymmetrySettings};
 pub use swatch_panel::{SwatchState, swatch_panel};
 pub use tasks_panel::{FinishedRow, TaskAction, TaskRow, TasksView, tasks_panel};
 pub use theme::{Metrics, Palette};

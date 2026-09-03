@@ -477,11 +477,139 @@ pub struct Object {
     /// everything that is not text, which is almost everything.
     pub text: Option<TextData>,
 
-    /// **The drawing shown when this object is turned to face away** — a real
-    /// turnaround's back view, rather than the front mirrored. The renderer
-    /// swaps to it once the object's yaw passes edge-on. `None` for everything
-    /// that has no separate back, which is almost everything.
-    pub reverse: Option<Arc<Object>>,
+    /// **The other ways round this object can be seen** — a real turnaround.
+    ///
+    /// Empty for everything that has only one view, which is almost everything.
+    /// See [`Turnaround`].
+    pub turnaround: Turnaround,
+}
+
+/// One drawing of an object, seen from a particular way round.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnaroundView {
+    /// The apparent yaw this drawing *is* the view at, in radians, normalised
+    /// to `(-PI, PI]`. Zero is the object itself and is never stored here.
+    pub angle: f64,
+    pub drawing: Arc<Object>,
+}
+
+/// **A character drawn from more than one side.**
+///
+/// An animator does not turn a drawing in space to show its other side; they
+/// draw the other side. This holds those drawings against the angle each one is
+/// the view at — a back at 180 degrees, a profile at 90 — and the renderer swaps
+/// to whichever is nearest to how the object is actually facing.
+///
+/// The **front is implicit**: it is the object itself, at angle zero, and is
+/// never one of these. That is what makes an object with an empty turnaround
+/// exactly the object it always was.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Turnaround {
+    /// Sorted by angle, one drawing per angle, never any at zero.
+    views: Vec<TurnaroundView>,
+}
+
+impl Turnaround {
+    pub fn is_empty(&self) -> bool {
+        self.views.is_empty()
+    }
+
+    pub fn views(&self) -> &[TurnaroundView] {
+        &self.views
+    }
+
+    /// Add or replace the drawing seen at `angle`.
+    ///
+    /// An angle within a degree of straight ahead is refused: that view is the
+    /// object itself, and a second drawing claiming it would make which one gets
+    /// drawn a matter of floating-point luck.
+    pub fn set(&mut self, angle: f64, drawing: Arc<Object>) -> bool {
+        let angle = normalise_angle(angle);
+        if !angle.is_finite() || angle.abs() < 0.02 {
+            return false;
+        }
+        let view = TurnaroundView { angle, drawing };
+        match self.views.iter().position(|v| (v.angle - angle).abs() < 0.02) {
+            Some(index) => self.views[index] = view,
+            None => {
+                let at = self.views.partition_point(|v| v.angle < angle);
+                self.views.insert(at, view);
+            }
+        }
+        true
+    }
+
+    /// Forget the view nearest to `angle`, if there is one.
+    pub fn remove_nearest(&mut self, angle: f64) -> bool {
+        let angle = normalise_angle(angle);
+        let Some(index) = self
+            .views
+            .iter()
+            .enumerate()
+            .min_by(|a, b| {
+                angle_gap(a.1.angle, angle)
+                    .partial_cmp(&angle_gap(b.1.angle, angle))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+        else {
+            return false;
+        };
+        self.views.remove(index);
+        true
+    }
+
+    /// The view at 180 degrees — the back — if there is one.
+    pub fn back(&self) -> Option<&Arc<Object>> {
+        self.views
+            .iter()
+            .find(|v| angle_gap(v.angle, std::f64::consts::PI) < 0.02)
+            .map(|v| &v.drawing)
+    }
+
+    /// **Which drawing to show at this apparent yaw**, and how much of the turn
+    /// is left over once it has been chosen.
+    ///
+    /// `None` means the object's own front is the nearest view — which is the
+    /// answer for every object with no turnaround, and for any object turned
+    /// less than half way to its first other view.
+    ///
+    /// The leftover angle is what the drawing is still turned by: a back view
+    /// on an object facing exactly backwards has none, and is drawn square to
+    /// the camera, while one caught part way round is foreshortened by the
+    /// difference. That is what lets a profile drawing exist at all — at ninety
+    /// degrees the object's own plane is edge-on and has no width to draw in.
+    pub fn view_at(&self, yaw: f64) -> Option<(&Arc<Object>, f64)> {
+        let yaw = normalise_angle(yaw);
+        let front_gap = yaw.abs();
+        let nearest = self.views.iter().min_by(|a, b| {
+            angle_gap(a.angle, yaw)
+                .partial_cmp(&angle_gap(b.angle, yaw))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        (angle_gap(nearest.angle, yaw) < front_gap)
+            .then(|| (&nearest.drawing, normalise_angle(yaw - nearest.angle)))
+    }
+}
+
+/// An angle brought into `(-PI, PI]`.
+fn normalise_angle(angle: f64) -> f64 {
+    if !angle.is_finite() {
+        return 0.0;
+    }
+    let tau = std::f64::consts::TAU;
+    let mut a = angle % tau;
+    if a > std::f64::consts::PI {
+        a -= tau;
+    } else if a <= -std::f64::consts::PI {
+        a += tau;
+    }
+    a
+}
+
+/// How far apart two angles are, the short way round.
+fn angle_gap(a: f64, b: f64) -> f64 {
+    normalise_angle(a - b).abs()
 }
 
 /// The source of a text object: the string and its size. The rendered outlines
@@ -495,6 +623,27 @@ pub struct TextData {
     /// Font family to render with, e.g. "Nirmala UI" for Hindi. `None` uses a
     /// system default, so old documents and the default Text tool still work.
     pub font: Option<String>,
+    /// **Which cut of the family** — bold, italic, both or neither.
+    ///
+    /// A choice, not a face: a document that named the face would not find it
+    /// again on a machine that spells the same weight differently. Regular for
+    /// every document written before there was a choice.
+    pub style: buzz_text::FontStyle,
+    /// How the lines line up with each other. Only visible on more than one.
+    pub align: buzz_text::TextAlign,
+}
+
+impl TextData {
+    /// Plain text: the words, a size, and a family to set them in.
+    pub fn new(content: impl Into<String>, size: f64, font: Option<String>) -> Self {
+        Self {
+            content: content.into(),
+            size,
+            font,
+            style: buzz_text::FontStyle::REGULAR,
+            align: buzz_text::TextAlign::Left,
+        }
+    }
 }
 
 impl Object {
@@ -512,7 +661,7 @@ impl Object {
             pivot: None,
             modifiers: Vec::new(),
             text: None,
-            reverse: None,
+            turnaround: Turnaround::default(),
         }
     }
 
@@ -530,7 +679,7 @@ impl Object {
             pivot: None,
             modifiers: Vec::new(),
             text: None,
-            reverse: None,
+            turnaround: Turnaround::default(),
         }
     }
 
@@ -662,7 +811,7 @@ impl Object {
             pivot: None,
             modifiers: Vec::new(),
             text: None,
-            reverse: None,
+            turnaround: Turnaround::default(),
         }
     }
 }
@@ -684,6 +833,123 @@ pub fn transform_rect(t: Affine, r: Rect) -> Rect {
         out = out.union_pt(*c);
     }
     out
+}
+
+#[cfg(test)]
+mod turnaround_tests {
+    use super::*;
+    use std::f64::consts::{FRAC_PI_2, PI};
+
+    fn drawing(id: u64) -> Arc<Object> {
+        Arc::new(Object::shape(
+            ObjectId(id),
+            ShapeData::filled(buzz_geom::BezPath::new(), peniko::Color::BLACK),
+        ))
+    }
+
+    #[test]
+    fn an_object_with_no_turnaround_is_always_its_own_front() {
+        let turnaround = Turnaround::default();
+        for yaw in [0.0, 1.0, PI, -2.0, 6.0] {
+            assert!(turnaround.view_at(yaw).is_none(), "at {yaw}");
+        }
+    }
+
+    #[test]
+    fn the_front_holds_until_another_view_is_nearer() {
+        let mut turnaround = Turnaround::default();
+        turnaround.set(PI, drawing(2));
+
+        assert!(turnaround.view_at(0.0).is_none(), "facing forwards");
+        assert!(turnaround.view_at(1.0).is_none(), "barely turned");
+        assert!(
+            turnaround.view_at(PI - 0.1).is_some(),
+            "nearly backwards is the back"
+        );
+        assert!(turnaround.view_at(PI).is_some(), "and so is backwards");
+    }
+
+    /// The point of the leftover angle: a back view on an object facing exactly
+    /// backwards is square to the camera, not foreshortened to nothing.
+    #[test]
+    fn a_matched_view_has_no_turn_left_over() {
+        let mut turnaround = Turnaround::default();
+        turnaround.set(PI, drawing(2));
+        let (_, residual) = turnaround.view_at(PI).expect("the back");
+        assert!(residual.abs() < 1e-9, "no turn left, got {residual}");
+    }
+
+    /// And a profile at ninety degrees is visible at all — the object's own
+    /// plane is edge-on there.
+    #[test]
+    fn a_profile_is_drawn_square_when_the_object_is_side_on() {
+        let mut turnaround = Turnaround::default();
+        turnaround.set(FRAC_PI_2, drawing(3));
+        let (_, residual) = turnaround.view_at(FRAC_PI_2).expect("the profile");
+        assert!(residual.abs() < 1e-9);
+
+        // Part way to it, the profile is chosen and the rest of the turn
+        // foreshortens it.
+        let (_, partial) = turnaround
+            .view_at(FRAC_PI_2 - 0.3)
+            .expect("nearer the profile than the front");
+        assert!((partial + 0.3).abs() < 1e-9, "got {partial}");
+    }
+
+    #[test]
+    fn the_nearest_view_wins_the_short_way_round() {
+        let mut turnaround = Turnaround::default();
+        turnaround.set(FRAC_PI_2, drawing(3));
+        turnaround.set(-FRAC_PI_2, drawing(4));
+        turnaround.set(PI, drawing(2));
+
+        let id = |yaw: f64| {
+            turnaround
+                .view_at(yaw)
+                .map(|(d, _)| d.id.0)
+                .expect("some view")
+        };
+        assert_eq!(id(1.4), 3, "just short of the right profile");
+        assert_eq!(id(-1.4), 4, "and the left one");
+        assert_eq!(id(3.0), 2, "nearly backwards");
+        // Past PI it wraps: -3.0 is nearer the back than either profile.
+        assert_eq!(id(-3.0), 2, "the short way round");
+    }
+
+    #[test]
+    fn a_view_at_the_front_is_refused() {
+        let mut turnaround = Turnaround::default();
+        assert!(!turnaround.set(0.0, drawing(2)), "that view is the object");
+        assert!(!turnaround.set(0.001, drawing(2)), "and so is this one");
+        assert!(turnaround.is_empty());
+    }
+
+    #[test]
+    fn setting_the_same_angle_twice_replaces_it() {
+        let mut turnaround = Turnaround::default();
+        turnaround.set(PI, drawing(2));
+        turnaround.set(PI, drawing(5));
+        assert_eq!(turnaround.views().len(), 1);
+        assert_eq!(turnaround.back().expect("a back").id.0, 5);
+    }
+
+    #[test]
+    fn an_angle_is_stored_the_short_way_round() {
+        let mut turnaround = Turnaround::default();
+        // Three full turns plus a half is still a half.
+        turnaround.set(PI + std::f64::consts::TAU * 3.0, drawing(2));
+        assert!(turnaround.back().is_some(), "it is still the back view");
+    }
+
+    #[test]
+    fn removing_takes_the_nearest_one() {
+        let mut turnaround = Turnaround::default();
+        turnaround.set(FRAC_PI_2, drawing(3));
+        turnaround.set(PI, drawing(2));
+        assert!(turnaround.remove_nearest(1.4));
+        assert_eq!(turnaround.views().len(), 1);
+        assert!(turnaround.back().is_some(), "the profile went, not the back");
+    }
 }
 
 #[cfg(test)]

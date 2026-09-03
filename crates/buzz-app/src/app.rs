@@ -551,6 +551,9 @@ pub struct App {
     editor: Editor,
     jobs: Arc<JobSystem>,
     preference: GpuPreference,
+    /// Each font family traced in its own face, for the picker. View state, and
+    /// built lazily: a family is outlined the first time its row is drawn.
+    font_previews: buzz_ui::FontPreviews,
     /// Wakes the event loop from an idle wait. Handed in by `main` and given to
     /// egui's repaint callback in `init`. `None` in tests, which never run a
     /// real loop.
@@ -740,6 +743,7 @@ impl App {
             editor,
             jobs: Arc::new(JobSystem::new()),
             preference,
+            font_previews: buzz_ui::FontPreviews::default(),
             proxy: None,
             egui_repaint: None,
             force_poll: std::env::var("BUZZ_POLL").is_ok(),
@@ -1853,45 +1857,120 @@ impl App {
                 // the glyph outlines needs the font, which lives in the editor.
                 // The current values are pulled out first so the scene borrow is
                 // done before `set_text` takes a mutable one.
-                let text_of = self.editor.selection.iter().next().and_then(|id| {
-                    self.editor.doc.scene().find_object(id).and_then(|(_, o)| {
-                        o.text.as_ref().map(|t| (id, t.content.clone(), t.size, t.font.clone()))
-                    })
-                });
-                if let Some((id, mut content, mut size, mut font)) = text_of {
+                let text_of = self
+                    .editor
+                    .selection
+                    .iter()
+                    .next()
+                    .and_then(|id| self.editor.text_of(id).map(|t| (id, t)));
+                if let Some((id, text)) = text_of {
+                    let mut content = text.content.clone();
+                    let mut size = text.size;
+                    let mut font = text.font.clone();
+                    let mut style = text.style;
+                    let mut align = text.align;
+
                     ui.separator();
                     ui.label("Text");
-                    let typed = ui.text_edit_multiline(&mut content).changed();
-                    let resized = ui
+                    let mut changed = ui.text_edit_multiline(&mut content).changed();
+                    changed |= ui
                         .add(egui::DragValue::new(&mut size).range(4.0..=400.0).prefix("size "))
                         .changed();
+
                     // Font picker: "Default" plus every family installed on the
-                    // system (Hindi ones flagged), so calligraphy and Devanagari
-                    // faces are one click away.
-                    let mut refont = false;
+                    // system (Hindi ones flagged), each row **set in its own
+                    // face** — a list of names in the interface's own font
+                    // answers the one question nobody is asking while scrolling.
                     let current = font.clone().unwrap_or_else(|| "Default".to_string());
+                    let previews = &mut self.font_previews;
                     egui::ComboBox::from_id_salt("text-font")
                         .selected_text(current)
+                        .width(260.0)
                         .show_ui(ui, |ui| {
-                            if ui.selectable_label(font.is_none(), "Default").clicked() {
-                                font = None;
-                                refont = true;
-                            }
-                            for face in buzz_text::available_fonts() {
-                                let label = if face.devanagari {
-                                    format!("{}  \u{0905}", face.family)
-                                } else {
-                                    face.family.clone()
-                                };
-                                let selected = font.as_deref() == Some(face.family.as_str());
-                                if ui.selectable_label(selected, label).clicked() {
-                                    font = Some(face.family.clone());
-                                    refont = true;
+                            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                if ui.selectable_label(font.is_none(), "Default").clicked() {
+                                    font = None;
+                                    changed = true;
                                 }
-                            }
+                                for family in buzz_text::font_families() {
+                                    let suffix = if family.devanagari { "\u{0905}" } else { "" };
+                                    let selected = font.as_deref() == Some(family.name.as_str());
+                                    // Previewed in the cut being edited, so
+                                    // choosing a family while bold is on shows
+                                    // that family's bold.
+                                    let cut = if family.has(style) {
+                                        style
+                                    } else {
+                                        buzz_scene::FontStyle::REGULAR
+                                    };
+                                    if previews
+                                        .row(ui, &family.name, cut, selected, suffix)
+                                        .clicked()
+                                    {
+                                        font = Some(family.name.clone());
+                                        changed = true;
+                                    }
+                                }
+                            });
                         });
-                    if typed || resized || refont {
-                        self.editor.set_text(id, content, size, font);
+
+                    // **Bold and italic are offered only where they exist.** A
+                    // family installed without an italic has nothing to draw one
+                    // with, and a toggle that changes nothing is worse than no
+                    // toggle at all.
+                    let family = font.as_deref().and_then(buzz_text::family);
+                    let has_bold = family.is_none_or(|f| f.has_bold());
+                    let has_italic = family.is_none_or(|f| f.has_italic());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                has_bold,
+                                egui::Button::new(egui::RichText::new("B").strong())
+                                    .small()
+                                    .selected(style.bold),
+                            )
+                            .on_hover_text("Bold")
+                            .on_disabled_hover_text("This family has no bold")
+                            .clicked()
+                        {
+                            style.bold = !style.bold;
+                            changed = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                has_italic,
+                                egui::Button::new(egui::RichText::new("I").italics())
+                                    .small()
+                                    .selected(style.italic),
+                            )
+                            .on_hover_text("Italic")
+                            .on_disabled_hover_text("This family has no italic")
+                            .clicked()
+                        {
+                            style.italic = !style.italic;
+                            changed = true;
+                        }
+
+                        ui.separator();
+                        for option in buzz_scene::TextAlign::ALL {
+                            if ui
+                                .add(
+                                    egui::Button::new(option.label())
+                                        .small()
+                                        .selected(align == option),
+                                )
+                                .on_hover_text("How the lines line up with each other")
+                                .clicked()
+                            {
+                                align = option;
+                                changed = true;
+                            }
+                        }
+                    });
+
+                    if changed {
+                        self.editor
+                            .set_text_styled(id, content, size, font, style, align);
                     }
                 }
             }
@@ -1899,6 +1978,10 @@ impl App {
             Color => {
                 let editor = &mut self.editor;
                 panels::color_panel(ui, editor.doc.scene(), &mut editor.style);
+                // Choosing the Texture fill needs a tile in the document to
+                // paint with; this bakes one the first time and then does
+                // nothing until the recipe changes.
+                editor.ensure_fill_texture();
 
                 // Textures fill the selected shapes: procedural tiles baked from
                 // the fill (foreground) and stroke (background) colours, plus any
@@ -1943,6 +2026,137 @@ impl App {
                 });
                 if !has_shape {
                     ui.label(egui::RichText::new("Select a shape to texture it").weak());
+                }
+
+                // **What new shapes will be drawn with**, when the fill kind is
+                // a texture. The same recipe controls as below, aimed at the
+                // pencil rather than at the selection.
+                if self.editor.style.fill_kind == buzz_ui::FillKind::Texture {
+                    ui.separator();
+                    ui.label("New shapes");
+                    let style = &mut self.editor.style;
+                    let recipe = &mut style.fill_texture;
+                    egui::Grid::new("new-shape-texture")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.label("Ink");
+                            panels::color_row(ui, "new-tex-fg", &mut recipe.fg);
+                            ui.end_row();
+                            ui.label("Ground");
+                            panels::color_row(ui, "new-tex-bg", &mut recipe.bg);
+                            ui.end_row();
+                            ui.label("Contrast");
+                            ui.add(egui::Slider::new(&mut recipe.contrast, 0.0..=4.0).step_by(0.05));
+                            ui.end_row();
+                        });
+                    ui.horizontal_wrapped(|ui| {
+                        for kind in buzz_scene::TextureKind::ALL {
+                            if ui
+                                .add(
+                                    egui::Button::new(kind.label())
+                                        .small()
+                                        .selected(kind == recipe.kind),
+                                )
+                                .clicked()
+                            {
+                                recipe.kind = kind;
+                                recipe.detail = kind.default_detail();
+                            }
+                        }
+                    });
+                    self.editor.ensure_fill_texture();
+                }
+
+                // **Re-tuning what is already there.** A texture keeps the
+                // recipe that made it, so the selection's own texture can be
+                // adjusted in place rather than undone and re-applied — and the
+                // shape under the cursor updates as the slider moves.
+                if let Some((recipe, cell, rotation)) = self.editor.selected_texture() {
+                    ui.separator();
+                    ui.label(format!("{} texture", recipe.kind.label()));
+                    let mut edited = recipe;
+                    let mut placement = (cell, rotation);
+                    let mut changed = false;
+
+                    egui::Grid::new("texture-recipe").num_columns(2).show(ui, |ui| {
+                        ui.label("Ink");
+                        changed |= panels::color_row(ui, "tex-fg", &mut edited.fg);
+                        ui.end_row();
+
+                        ui.label("Ground");
+                        changed |= panels::color_row(ui, "tex-bg", &mut edited.bg);
+                        ui.end_row();
+
+                        ui.label("Detail").on_hover_text(
+                            "How many repeats of the pattern fit in one tile. \
+                             Snapped to what can wrap without a seam.",
+                        );
+                        let mut detail = edited.detail();
+                        if ui
+                            .add(egui::Slider::new(&mut detail, recipe.kind.min_detail()..=16))
+                            .changed()
+                        {
+                            edited.detail = detail;
+                            changed = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("Contrast")
+                            .on_hover_text("How far apart the two colours are pushed");
+                        changed |= ui
+                            .add(egui::Slider::new(&mut edited.contrast, 0.0..=4.0).step_by(0.05))
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Tile size")
+                            .on_hover_text("How big one repeat is on the shape");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut placement.0)
+                                    .range(1.0..=4096.0)
+                                    .speed(0.5),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Angle").on_hover_text("Which way the tile is turned");
+                        let mut degrees = placement.1.to_degrees();
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut degrees, -180.0..=180.0)
+                                    .suffix("\u{b0}")
+                                    .fixed_decimals(0),
+                            )
+                            .changed()
+                        {
+                            placement.1 = degrees.to_radians();
+                            changed = true;
+                        }
+                        ui.end_row();
+                    });
+
+                    ui.horizontal_wrapped(|ui| {
+                        for kind in buzz_scene::TextureKind::ALL {
+                            if ui
+                                .add(
+                                    egui::Button::new(kind.label())
+                                        .small()
+                                        .selected(kind == recipe.kind),
+                                )
+                                .clicked()
+                            {
+                                edited.kind = kind;
+                                // The new pattern's own detail, since what suits
+                                // a weave does not suit a wall.
+                                edited.detail = kind.default_detail();
+                                changed = true;
+                            }
+                        }
+                    });
+
+                    if changed {
+                        self.editor.retexture(edited, Some(placement));
+                    }
                 }
 
                 // Symmetry drawing: everything drawn is mirrored across the

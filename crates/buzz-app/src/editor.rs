@@ -894,8 +894,20 @@ impl Editor {
         let ObjectKind::Shape(shape) = &object.kind else {
             return None;
         };
-        let g = shape.fill.as_ref()?.paint.gradient()?;
-        let local = g.handles();
+        let paint = &shape.fill.as_ref()?.paint;
+
+        // **A bitmap or texture fill has the same grips**, because it is the
+        // same kind of matrix: Animate's Gradient Transform tool adjusts a
+        // bitmap fill too, and this is how a texture is scaled and turned on the
+        // stage rather than by typing numbers. Reported as a *linear* gradient
+        // so no focus grip is drawn — an image has no hot spot.
+        let (local, kind) = match paint {
+            buzz_scene::Paint::Gradient(g) => (g.handles(), g.kind),
+            buzz_scene::Paint::Image(image) => {
+                (image.handles(), buzz_scene::GradientKind::Linear)
+            }
+            _ => return None,
+        };
         Some((
             buzz_scene::GradientHandles {
                 center: object.transform * local.center,
@@ -903,7 +915,7 @@ impl Editor {
                 width: object.transform * local.width,
                 focus: object.transform * local.focus,
             },
-            g.kind,
+            kind,
         ))
     }
 
@@ -935,6 +947,18 @@ impl Editor {
         self.doc.edit("Gradient Transform", |scene| {
             update_shape(scene, at, id, |s| {
                 let Some(fill) = &mut s.fill else { return };
+                // A bitmap or texture fill is transformed by the same three
+                // grips — see `ImageFill::handles`.
+                if let Paint::Image(image) = &mut fill.paint {
+                    match grip {
+                        crate::tools::GradientGrip::Center => image.set_center(local),
+                        crate::tools::GradientGrip::End => image.set_end(local),
+                        crate::tools::GradientGrip::Width => image.set_width_handle(local),
+                        // An image has no hot spot, and no grip is drawn for one.
+                        crate::tools::GradientGrip::Focus => {}
+                    }
+                    return;
+                }
                 let Paint::Gradient(g) = &mut fill.paint else {
                     return;
                 };
@@ -1602,11 +1626,7 @@ impl Editor {
             if let Some(id) = created {
                 scene.update_object_at(frame, id, |o| {
                     o.transform = Affine::translate(at.to_vec2());
-                    o.text = Some(buzz_scene::TextData {
-                        content: DEFAULT.to_string(),
-                        size,
-                        font: None,
-                    });
+                    o.text = Some(buzz_scene::TextData::new(DEFAULT, size, None));
                 });
             }
         });
@@ -1620,7 +1640,36 @@ impl Editor {
     /// and keep the string on it. One undo step across a typing burst (no
     /// `end_gesture`, so consecutive edits coalesce).
     pub fn set_text(&mut self, id: ObjectId, content: String, size: f64, font: Option<String>) {
-        let path = buzz_text::outline(&content, size, font.as_deref()).unwrap_or_default();
+        let style = self.text_of(id).map(|t| t.style).unwrap_or_default();
+        let align = self.text_of(id).map(|t| t.align).unwrap_or_default();
+        self.set_text_styled(id, content, size, font, style, align);
+    }
+
+    /// The text data on an object, if it is text.
+    pub fn text_of(&self, id: ObjectId) -> Option<buzz_scene::TextData> {
+        self.doc
+            .scene()
+            .find_object(id)
+            .and_then(|(_, o)| o.text.clone())
+    }
+
+    /// **Re-type a text object in a chosen cut and alignment.**
+    ///
+    /// The glyphs are shaped again from every part of the choice — the words,
+    /// the size, the family, the cut, the alignment — because all five change
+    /// the outlines, and the outlines *are* the artwork. One undo step across a
+    /// typing burst, as [`Self::set_text`].
+    pub fn set_text_styled(
+        &mut self,
+        id: ObjectId,
+        content: String,
+        size: f64,
+        font: Option<String>,
+        style: buzz_scene::FontStyle,
+        align: buzz_scene::TextAlign,
+    ) {
+        let path = buzz_text::outline_styled(&content, size, font.as_deref(), style, align)
+            .unwrap_or_default();
         self.doc.edit("Edit Text", |scene| {
             scene.update_object_across(0, u32::MAX, id, |o| {
                 if let ObjectKind::Shape(shape) = &mut o.kind {
@@ -1630,6 +1679,8 @@ impl Editor {
                     content: content.clone(),
                     size,
                     font: font.clone(),
+                    style,
+                    align,
                 });
             });
         });
@@ -2925,6 +2976,10 @@ impl Editor {
             }
             SetReverse => self.set_reverse(),
             ClearReverse => self.clear_reverse(),
+            AddProfileRight => self.add_turnaround_view(90.0),
+            AddProfileLeft => self.add_turnaround_view(-90.0),
+            AddThreeQuarterRight => self.add_turnaround_view(45.0),
+            AddThreeQuarterLeft => self.add_turnaround_view(-45.0),
             TogglePanel(panel) => {
                 self.workspace.toggle(panel);
                 self.workspace.save();
@@ -4396,6 +4451,20 @@ impl Editor {
     /// shown when the front is turned to face away. The back is anchored to the
     /// front (stored relative to it) so it travels with it.
     fn set_reverse(&mut self) {
+        self.set_turnaround_view(std::f64::consts::PI, "Set Reverse");
+    }
+
+    /// **Make one object the view of another from a given way round.**
+    ///
+    /// The same gesture as a back view, at any angle: select the front and the
+    /// drawing, and that drawing becomes what is shown once the front has turned
+    /// far enough to be nearer this angle than any other. A profile goes in at
+    /// ninety degrees, a three-quarter at forty-five.
+    pub fn add_turnaround_view(&mut self, degrees: f64) {
+        self.set_turnaround_view(degrees.to_radians(), "Add View");
+    }
+
+    fn set_turnaround_view(&mut self, angle: f64, label: &'static str) {
         if self.selection.len() != 2 {
             self.status =
                 Some("Select two: the front (drawn first) and its back (drawn second)".into());
@@ -4403,7 +4472,7 @@ impl Editor {
         }
         let ids = self.selection.ids();
         let (front, back) = (ids[0], ids[1]);
-        self.doc.edit("Set Reverse", |scene| {
+        self.doc.edit(label, |scene| {
             let front_transform = scene.find_object(front).map(|(_, o)| o.transform);
             if let (Some(front_transform), Some(mut back_obj)) =
                 (front_transform, scene.remove_object(back))
@@ -4414,32 +4483,48 @@ impl Editor {
                     .unwrap_or(Affine::IDENTITY)
                     * back_obj.transform;
                 std::sync::Arc::make_mut(&mut back_obj).transform = relative;
-                scene.update_object(front, |o| o.reverse = Some(back_obj));
+                scene.update_object(front, |o| {
+                    o.turnaround.set(angle, back_obj.clone());
+                });
             }
         });
         self.doc.end_gesture();
         self.selection.select_one(front);
-        self.status = Some("Reverse drawing set \u{2014} turn the object to see its back".into());
+        self.status = Some(format!(
+            "View at {:.0}° set \u{2014} turn the object to see it",
+            angle.to_degrees()
+        ));
     }
 
     /// Remove the selected object's reverse (back) drawing.
     fn clear_reverse(&mut self) {
         let target = {
             let scene = self.doc.scene();
-            self.selection
-                .iter()
-                .find(|id| scene.find_object(*id).is_some_and(|(_, o)| o.reverse.is_some()))
+            self.selection.iter().find(|id| {
+                scene
+                    .find_object(*id)
+                    .is_some_and(|(_, o)| !o.turnaround.is_empty())
+            })
         };
         match target {
             Some(id) => {
                 self.doc.edit("Clear Reverse", |scene| {
-                    scene.update_object(id, |o| o.reverse = None);
+                    scene.update_object(id, |o| o.turnaround = Default::default());
                 });
                 self.doc.end_gesture();
-                self.status = Some("Reverse drawing removed".into());
+                self.status = Some("Turnaround removed".into());
             }
-            None => self.status = Some("The selection has no reverse drawing".into()),
+            None => self.status = Some("The selection has no other views".into()),
         }
+    }
+
+    /// **How many views the selected object has**, beyond its own front.
+    pub fn selected_turnaround(&self) -> Option<Vec<f64>> {
+        let scene = self.doc.scene();
+        let id = self.selection.iter().next()?;
+        let (_, object) = scene.find_object(id)?;
+        (!object.turnaround.is_empty())
+            .then(|| object.turnaround.views().iter().map(|v| v.angle).collect())
     }
 
     /// **Fill the selected shapes with a procedural texture.** The texture is
@@ -4448,6 +4533,100 @@ impl Editor {
     /// tiling image fill on every selected shape. One undo step; a no-op with
     /// nothing (or nothing shaped) selected.
     pub fn apply_texture(&mut self, kind: buzz_scene::TextureKind) {
+        let recipe =
+            buzz_scene::TextureRecipe::new(kind, self.style.fill_color, self.style.stroke_color);
+        self.apply_texture_recipe(recipe, None);
+    }
+
+    /// **Keep the draw style's texture tile in step with its recipe.**
+    ///
+    /// A style cannot hold an image on its own — an image has to live in the
+    /// document's library or it would not survive being saved — so the tile is
+    /// baked here, put in the library, and handed back to the style. An asset
+    /// already baked from the same recipe is reused, so choosing Texture, going
+    /// away and coming back does not leave a trail of identical tiles.
+    ///
+    /// Cheap and idempotent: it returns immediately unless the recipe has
+    /// actually changed, which is what lets the panel call it every frame.
+    pub fn ensure_fill_texture(&mut self) {
+        if self.style.fill_kind != buzz_ui::FillKind::Texture {
+            return;
+        }
+        let recipe = self.style.fill_texture;
+        let current = self
+            .style
+            .fill_texture_asset
+            .as_ref()
+            .and_then(|a| a.recipe);
+        if current == Some(recipe) {
+            return;
+        }
+        if let Some(existing) = self.doc.scene().images().find_by_recipe(&recipe) {
+            self.style.fill_texture_asset = Some(existing);
+            return;
+        }
+        let mut made = None;
+        self.doc.edit("Texture", |scene| {
+            let name = scene.images().unique_name(recipe.kind.label());
+            let id = scene.next_image_id();
+            let asset = buzz_scene::ImageAsset::from_recipe(id, name, recipe, 256);
+            made = Some(scene.images_mut().insert(asset));
+        });
+        self.doc.end_gesture();
+        self.style.fill_texture_asset = made;
+    }
+
+    /// **The texture on the selection, if they all wear the same one.**
+    ///
+    /// What the panel shows: the recipe to put in its controls, the tile size
+    /// and the angle. `None` when nothing selected is textured, or when the
+    /// selection wears two different textures — there is no one answer then, and
+    /// showing either shape's would silently apply it to the other on the first
+    /// nudge of a slider.
+    pub fn selected_texture(&self) -> Option<(buzz_scene::TextureRecipe, f64, f64)> {
+        let scene = self.doc.scene();
+        let mut found: Option<(buzz_scene::TextureRecipe, f64, f64)> = None;
+        for id in self.selection.iter() {
+            let Some((_, object)) = scene.find_object(id) else {
+                continue;
+            };
+            let ObjectKind::Shape(shape) = &object.kind else {
+                continue;
+            };
+            let this = shape
+                .fill
+                .as_ref()
+                .and_then(|f| f.paint.image())
+                .and_then(|img| img.asset.recipe.map(|r| (r, img.cell(), img.rotation())))?;
+            match found {
+                None => found = Some(this),
+                Some(existing) if existing.0 == this.0 => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
+    /// **Re-tune the texture on the selection.** The panel's sliders come here:
+    /// the tile is re-baked from `recipe` and worn by every selected shape, so
+    /// changing a colour or coarsening a wall is a live edit rather than an
+    /// undo and a re-apply.
+    pub fn retexture(&mut self, recipe: buzz_scene::TextureRecipe, placement: Option<(f64, f64)>) {
+        self.apply_texture_recipe(recipe, placement);
+    }
+
+    /// Fill the selected shapes from a recipe.
+    ///
+    /// `placement` is the tile size and angle to wear it at; `None` fits a few
+    /// repeats across each shape, which is what applying a texture for the first
+    /// time should do. An asset already baked from this exact recipe is reused
+    /// rather than baked again, so a document that puts one texture on twenty
+    /// shapes holds one tile and uploads it once.
+    fn apply_texture_recipe(
+        &mut self,
+        recipe: buzz_scene::TextureRecipe,
+        placement: Option<(f64, f64)>,
+    ) {
         // Gather the shapes and a per-shape tile size (a few repeats across the
         // smaller side) under an immutable borrow, before the edit takes a
         // mutable one.
@@ -4471,17 +4650,27 @@ impl Editor {
             self.status = Some("Select a shape to apply a texture to".into());
             return;
         }
-        let fg = self.style.fill_color;
-        let bg = self.style.stroke_color;
-        let pixels = std::sync::Arc::new(buzz_scene::texture::tile(kind, 256, fg, bg));
+        let label = recipe.kind.label();
         self.doc.edit("Apply Texture", |scene| {
-            let name = scene.images().unique_name(kind.label());
-            let id = scene.next_image_id();
-            let asset =
-                buzz_scene::ImageAsset::from_pixels(id, name, 256, 256, std::sync::Arc::clone(&pixels));
-            let asset = scene.images_mut().insert(asset);
-            for &(id, cell) in &targets {
-                let fill = buzz_scene::ImageFill::tiled(std::sync::Arc::clone(&asset), cell);
+            // The same recipe means the same tile: reuse it rather than filling
+            // the library with copies.
+            let asset = match scene.images().find_by_recipe(&recipe) {
+                Some(existing) => existing,
+                None => {
+                    let name = scene.images().unique_name(label);
+                    let id = scene.next_image_id();
+                    let asset = buzz_scene::ImageAsset::from_recipe(id, name, recipe, 256);
+                    scene.images_mut().insert(asset)
+                }
+            };
+            for &(id, fitted) in &targets {
+                let fill = match placement {
+                    Some((cell, rotation)) => {
+                        buzz_scene::ImageFill::tiled(std::sync::Arc::clone(&asset), cell)
+                            .with_cell_rotation(cell, rotation)
+                    }
+                    None => buzz_scene::ImageFill::tiled(std::sync::Arc::clone(&asset), fitted),
+                };
                 scene.update_object_across(0, u32::MAX, id, |o| {
                     if let ObjectKind::Shape(s) = &mut o.kind {
                         s.fill = Some(buzz_scene::FillSpec::image(fill.clone()));
@@ -4490,7 +4679,7 @@ impl Editor {
             }
         });
         self.doc.end_gesture();
-        self.status = Some(format!("{} texture applied", kind.label()));
+        self.status = Some(format!("{label} texture applied"));
     }
 
     /// **Fill the selected shapes with an image file.** Decodes it, adds it to

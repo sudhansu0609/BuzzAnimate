@@ -13,6 +13,7 @@
 //! arrives in Phase 4. Rotation interpolates by shortest angular path, so a
 //! camera turning from 350° to 10° goes forward 20° rather than backwards 340°.
 
+use crate::time::AtTime;
 use buzz_geom::{Affine, Point, Projection, Size};
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +84,20 @@ impl CameraKey {
 /// camera as the stage and therefore renders at half size.
 pub const DEFAULT_FOCAL_DISTANCE: f64 = 1000.0;
 
+/// Instants across an open shutter, when a document asks for motion blur but
+/// does not say how many.
+///
+/// Eight is enough for the speeds hand-drawn animation actually moves at, and
+/// is eight times the cost of a clean frame — which is the honest price of the
+/// effect, and the reason it is not on by default.
+pub const DEFAULT_BLUR_SAMPLES: u32 = 8;
+
+/// Most instants worth sampling across one shutter.
+///
+/// Past this the picture stops changing and the export merely takes longer;
+/// bounded here so a hand-edited file cannot ask for a thousand.
+pub const MAX_BLUR_SAMPLES: u32 = 64;
+
 /// Nearest a layer may come to the camera before it is treated as behind it.
 ///
 /// At the camera plane the perspective divide blows up; a hair in front of it
@@ -120,6 +135,26 @@ pub struct NamedAngle {
     pub state: CameraKey,
 }
 
+/// **The lens at one keyframe** — where it is focused, and how wide it is open.
+///
+/// A focus *pull* is the shot's most quietly expressive move: the background
+/// softens away and the eye is carried to the face in front of it, without a
+/// cut and without anything on the stage moving. That needs focus to be a thing
+/// that changes over time, so it is keyed, like every other camera value.
+///
+/// Aperture rides along in the same key rather than in one of its own. The two
+/// are pulled together in practice — opening up is how a pull is made visible
+/// at all — and a second track of keys to keep in step would buy nothing but
+/// the chance for them to disagree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FocusKey {
+    pub frame: u32,
+    /// The layer depth that is sharp at this frame.
+    pub focus_depth: f64,
+    /// Depth-of-field strength at this frame. Zero is a pinhole: all sharp.
+    pub aperture: f64,
+}
+
 /// The camera's keyframes over the whole timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CameraTrack {
@@ -140,11 +175,38 @@ pub struct CameraTrack {
     pub aperture: f64,
     /// The layer depth that is in focus. Zero is the focal plane.
     pub focus_depth: f64,
+    /// **How long the shutter is open**, as a fraction of a frame. Zero — the
+    /// default — is an infinitely fast shutter: every frame is a clean instant,
+    /// which is how this program has always drawn.
+    ///
+    /// A film camera's shutter is open for part of each frame and records
+    /// everything that happens while it is, which is why fast motion on film is
+    /// a smear rather than a crisp displaced copy. Half a frame is the
+    /// hundred-and-eighty-degree shutter almost all cinema is shot at, and is
+    /// what "normal" motion blur looks like.
+    pub shutter: f64,
+    /// How many instants the open shutter is sampled at.
+    ///
+    /// The smear is built by drawing the frame this many times across the
+    /// shutter and adding the results up, so this is a direct multiplier on the
+    /// cost of an export — and, past a point, invisible: too few samples read
+    /// as a row of ghosts rather than a smear, and the number that fixes that
+    /// depends on how far the artwork travels, not on the resolution.
+    pub blur_samples: u32,
     /// Named viewpoints of the staged scene — Wave 10b. Empty for every
     /// document that never saves one.
     pub angles: Vec<NamedAngle>,
     /// Sorted by frame.
     keys: Vec<CameraKey>,
+    /// The focus pull, sorted by frame.
+    ///
+    /// Empty in every document that never pulls focus, which is the state
+    /// `aperture` and `focus_depth` above describe on their own. That is why
+    /// this is a separate list rather than two more fields on [`CameraKey`]:
+    /// depth of field has never needed the camera track to be *enabled*, and
+    /// folding focus into the camera's own keys would have made a focus pull
+    /// require a camera move.
+    focus_keys: Vec<FocusKey>,
 }
 
 impl Default for CameraTrack {
@@ -154,8 +216,11 @@ impl Default for CameraTrack {
             focal_distance: DEFAULT_FOCAL_DISTANCE,
             aperture: 0.0,
             focus_depth: 0.0,
+            shutter: 0.0,
+            blur_samples: DEFAULT_BLUR_SAMPLES,
             angles: Vec::new(),
             keys: Vec::new(),
+            focus_keys: Vec::new(),
         }
     }
 }
@@ -219,11 +284,11 @@ impl CameraTrack {
     /// it falls out of the projection.
     ///
     /// `None` when the layer is at or behind the camera.
-    pub fn transform_at_depth(&self, frame: u32, stage: Size, depth: f64) -> Option<Affine> {
+    pub fn transform_at_depth(&self, at: impl AtTime, stage: Size, depth: f64) -> Option<Affine> {
         let scale = self.depth_scale(depth)?;
 
         let centre = buzz_geom::Vec2::new(stage.width / 2.0, stage.height / 2.0);
-        let state = self.state_at(frame);
+        let state = self.state_at(at);
 
         // With no camera keys the camera still has a position: the middle of
         // the stage, unzoomed. Depth has to work without one, or setting a
@@ -284,7 +349,7 @@ impl CameraTrack {
     /// Before the first key it holds the first value, and after the last it
     /// holds the last — the same "hold the ends" behaviour Animate has, which
     /// stops a camera snapping to the origin outside its keyed range.
-    pub fn state_at(&self, frame: u32) -> Option<CameraKey> {
+    pub fn state_at(&self, at: impl AtTime) -> Option<CameraKey> {
         if !self.enabled || self.keys.is_empty() {
             return None;
         }
@@ -292,28 +357,31 @@ impl CameraTrack {
             return Some(self.keys[0]);
         }
 
+        // Continuous, so a shutter open between two frames sees the camera part
+        // of the way between them rather than jumping on the frame boundary.
+        let time = at.as_time();
         let first = self.keys[0];
-        if frame <= first.frame {
+        if time <= first.frame as f64 {
             return Some(first);
         }
         let last = self.keys[self.keys.len() - 1];
-        if frame >= last.frame {
+        if time >= last.frame as f64 {
             return Some(last);
         }
 
-        let after = self.keys.partition_point(|k| k.frame <= frame);
+        let after = self.keys.partition_point(|k| (k.frame as f64) <= time);
         let a = self.keys[after - 1];
         let b = self.keys[after];
 
         let span = (b.frame - a.frame) as f64;
         let t = if span > 0.0 {
-            (frame - a.frame) as f64 / span
+            (time - a.frame as f64) / span
         } else {
             0.0
         };
 
         Some(CameraKey {
-            frame,
+            frame: at.frame(),
             center: Point::new(
                 lerp(a.center.x, b.center.x, t),
                 lerp(a.center.y, b.center.y, t),
@@ -335,8 +403,8 @@ impl CameraTrack {
     ///
     /// Returns identity when the camera is off, so the caller can apply it
     /// unconditionally.
-    pub fn transform_at(&self, frame: u32, stage: Size) -> Affine {
-        let Some(state) = self.state_at(frame) else {
+    pub fn transform_at(&self, at: impl AtTime, stage: Size) -> Affine {
+        let Some(state) = self.state_at(at) else {
             return Affine::IDENTITY;
         };
         let centre = buzz_geom::Vec2::new(stage.width / 2.0, stage.height / 2.0);
@@ -358,14 +426,19 @@ impl CameraTrack {
     ///
     /// `None` when the layer is at or behind the camera, or turned so far past
     /// edge-on that it would be drawn inside out.
-    pub fn projection_at_depth(&self, frame: u32, stage: Size, depth: f64) -> Option<Projection> {
-        let state = self.state_at(frame).map(CameraKey::clamped);
+    pub fn projection_at_depth(
+        &self,
+        at: impl AtTime,
+        stage: Size,
+        depth: f64,
+    ) -> Option<Projection> {
+        let state = self.state_at(at).map(CameraKey::clamped);
 
         // Flat is the common case and must stay bit-exact, so it does not go
         // near the homography at all.
         if state.is_none_or(|s| s.is_flat()) {
             return self
-                .transform_at_depth(frame, stage, depth)
+                .transform_at_depth(at, stage, depth)
                 .map(Projection::from_affine);
         }
         let state = state?;
@@ -407,17 +480,17 @@ impl CameraTrack {
     /// `None` when the object is at or behind the camera, or exactly edge-on.
     pub fn projection_for_object(
         &self,
-        frame: u32,
+        at: impl AtTime,
         stage: Size,
         depth: f64,
         pivot: Point,
         spatial: &crate::object::Spatial,
     ) -> Option<Projection> {
         if spatial.is_flat() {
-            return self.projection_at_depth(frame, stage, depth);
+            return self.projection_at_depth(at, stage, depth);
         }
 
-        let state = self.state_at(frame).map(CameraKey::clamped);
+        let state = self.state_at(at).map(CameraKey::clamped);
         let (camera_centre, zoom, rotation, pitch, yaw) = match state {
             Some(s) => (s.center, s.zoom, s.rotation, s.pitch, s.yaw),
             None => (
@@ -497,23 +570,163 @@ impl CameraTrack {
             },
             aperture: 0.0,
             focus_depth: 0.0,
+            shutter: 0.0,
+            blur_samples: DEFAULT_BLUR_SAMPLES,
             angles: Vec::new(),
             keys,
+            focus_keys: Vec::new(),
         }
     }
 
-    /// The depth-of-field blur, in document units, for a layer at `depth`.
+    /// **The lens at `frame`** — the focus pull, resolved.
     ///
-    /// `None` when the camera is a pinhole (`aperture == 0`) or the layer is in
+    /// With no focus keys this is simply the static [`focus_depth`](Self::focus_depth)
+    /// and [`aperture`](Self::aperture), so a document that never pulls focus
+    /// takes exactly the path it always did.
+    ///
+    /// Unlike [`state_at`](Self::state_at) this does **not** require the camera
+    /// to be enabled. Depth of field has always applied with the camera track
+    /// switched off — it is a property of the lens, not of a camera *move* — and
+    /// making a pull the exception would mean switching the camera on, and so
+    /// keying a shot, just to soften a background.
+    ///
+    /// Before the first key it holds the first value and after the last it holds
+    /// the last, which is what a held focus is; between them it interpolates
+    /// linearly, like the camera's own keys.
+    pub fn focus_at(&self, at: impl AtTime) -> FocusKey {
+        let time = at.as_time();
+        let frame = at.frame();
+        if self.focus_keys.is_empty() {
+            return FocusKey {
+                frame,
+                focus_depth: self.focus_depth,
+                aperture: self.aperture,
+            };
+        }
+
+        let first = self.focus_keys[0];
+        if time <= first.frame as f64 {
+            return FocusKey { frame, ..first };
+        }
+        let last = self.focus_keys[self.focus_keys.len() - 1];
+        if time >= last.frame as f64 {
+            return FocusKey { frame, ..last };
+        }
+
+        let after = self.focus_keys.partition_point(|k| (k.frame as f64) <= time);
+        let a = self.focus_keys[after - 1];
+        let b = self.focus_keys[after];
+        let span = (b.frame - a.frame) as f64;
+        let t = if span > 0.0 {
+            (time - a.frame as f64) / span
+        } else {
+            0.0
+        };
+
+        FocusKey {
+            frame,
+            focus_depth: lerp(a.focus_depth, b.focus_depth, t),
+            aperture: lerp(a.aperture, b.aperture, t),
+        }
+    }
+
+    /// The depth-of-field blur, in document units, for a layer at `depth` on
+    /// `frame`.
+    ///
+    /// `None` when the lens is a pinhole (`aperture == 0`) or the layer is in
     /// focus, so the sharp common case sets no blur at all. The blur grows with
     /// distance from the focus depth, which is the geometric approximation to a
     /// lens's circle of confusion.
-    pub fn dof_blur(&self, depth: f64) -> Option<f64> {
-        if self.aperture <= 0.0 {
+    ///
+    /// The frame is what makes a **focus pull** possible: with focus keyed, the
+    /// same layer at the same depth is sharp on one frame and soft on another.
+    pub fn dof_blur_at(&self, at: impl AtTime, depth: f64) -> Option<f64> {
+        let lens = self.focus_at(at);
+        if lens.aperture <= 0.0 {
             return None;
         }
-        let coc = self.aperture * (depth - self.focus_depth).abs();
+        let coc = lens.aperture * (depth - lens.focus_depth).abs();
         (coc > 0.05).then_some(coc)
+    }
+
+    /// **The instants one frame's shutter is open for**, as offsets in frames.
+    ///
+    /// `None` when there is no blur to draw — no shutter, or only one sample —
+    /// and that is the answer for every document that does not ask for it, so
+    /// the export takes exactly the path it always did.
+    ///
+    /// The shutter is **centred on the frame**: the offsets run from
+    /// `-shutter/2` to `+shutter/2`, sampled at the middle of each equal slice.
+    /// Centring is what keeps the smear *around* where the artwork is rather
+    /// than trailing behind it — open the shutter at the frame instead and
+    /// every moving thing sits half a shutter late, which reads as the
+    /// animation itself having slipped.
+    pub fn shutter_offsets(&self) -> Option<Vec<f64>> {
+        if !(self.shutter > 0.0) || !self.shutter.is_finite() {
+            return None;
+        }
+        let samples = self.blur_samples.clamp(1, MAX_BLUR_SAMPLES);
+        if samples < 2 {
+            return None;
+        }
+        let n = samples as f64;
+        Some(
+            (0..samples)
+                .map(|i| self.shutter * ((i as f64 + 0.5) / n - 0.5))
+                .collect(),
+        )
+    }
+
+    /// The focus keys, sorted by frame. Empty unless the shot pulls focus.
+    pub fn focus_keys(&self) -> &[FocusKey] {
+        &self.focus_keys
+    }
+
+    /// Is the focus keyed exactly on this frame?
+    pub fn has_focus_key_at(&self, frame: u32) -> bool {
+        self.focus_keys.iter().any(|k| k.frame == frame)
+    }
+
+    /// Highest focus-keyed frame, so a shot whose only animation is a focus
+    /// pull is still as long as the pull.
+    pub fn focus_last_frame(&self) -> u32 {
+        self.focus_keys.last().map(|k| k.frame).unwrap_or(0)
+    }
+
+    /// Add or replace the focus key at `key.frame`.
+    pub fn set_focus_key(&mut self, key: FocusKey) {
+        match self.focus_keys.iter().position(|k| k.frame == key.frame) {
+            Some(index) => self.focus_keys[index] = key,
+            None => {
+                let at = self.focus_keys.partition_point(|k| k.frame < key.frame);
+                self.focus_keys.insert(at, key);
+            }
+        }
+    }
+
+    pub fn remove_focus_key(&mut self, frame: u32) -> bool {
+        let before = self.focus_keys.len();
+        self.focus_keys.retain(|k| k.frame != frame);
+        self.focus_keys.len() != before
+    }
+
+    /// Drop the pull, leaving whatever the static aperture and focus say.
+    pub fn clear_focus_keys(&mut self) {
+        self.focus_keys.clear();
+    }
+
+    /// Replace the whole pull, as the loader does.
+    ///
+    /// Sorted and de-duplicated on the way in, and a negative aperture is
+    /// clamped away: a hand-edited or corrupt file must not be able to produce
+    /// keys the lookup would read out of order.
+    pub fn set_focus_keys(&mut self, mut keys: Vec<FocusKey>) {
+        keys.sort_by_key(|k| k.frame);
+        keys.dedup_by_key(|k| k.frame);
+        for key in &mut keys {
+            key.aperture = key.aperture.max(0.0);
+        }
+        self.focus_keys = keys;
     }
 
     /// Save the camera's state at `frame` under `name`, replacing any angle of
@@ -576,10 +789,96 @@ mod tests {
     }
 
     #[test]
+    fn a_camera_with_no_shutter_has_no_motion_blur() {
+        let track = CameraTrack::new();
+        assert_eq!(track.shutter, 0.0, "off by default");
+        assert!(
+            track.shutter_offsets().is_none(),
+            "no shutter, no instants to add up"
+        );
+    }
+
+    #[test]
+    fn one_sample_is_not_a_smear() {
+        let mut track = CameraTrack::new();
+        track.shutter = 0.5;
+        track.blur_samples = 1;
+        assert!(
+            track.shutter_offsets().is_none(),
+            "a single instant is the clean frame, and should take the clean path"
+        );
+    }
+
+    /// The offsets straddle the frame evenly, so the smear sits around the
+    /// artwork rather than trailing it.
+    #[test]
+    fn the_shutter_is_centred_on_the_frame() {
+        let mut track = CameraTrack::new();
+        track.shutter = 0.5;
+        track.blur_samples = 8;
+        let offsets = track.shutter_offsets().expect("a shutter");
+
+        assert_eq!(offsets.len(), 8);
+        let mean: f64 = offsets.iter().sum::<f64>() / offsets.len() as f64;
+        assert!(mean.abs() < 1e-9, "the instants average to the frame: {mean}");
+
+        let first = offsets[0];
+        let last = offsets[offsets.len() - 1];
+        assert!(first < 0.0 && last > 0.0, "they straddle it: {first}..{last}");
+        assert!(
+            first > -0.25 && last < 0.25,
+            "and stay inside the open shutter: {first}..{last}"
+        );
+
+        // Evenly spaced, so no instant is weighted more than another.
+        let step = offsets[1] - offsets[0];
+        for pair in offsets.windows(2) {
+            assert!((pair[1] - pair[0] - step).abs() < 1e-9, "even spacing");
+        }
+    }
+
+    #[test]
+    fn a_wider_shutter_reaches_further_either_way() {
+        let mut narrow = CameraTrack::new();
+        narrow.shutter = 0.25;
+        let mut wide = CameraTrack::new();
+        wide.shutter = 1.0;
+
+        let n = narrow.shutter_offsets().expect("narrow");
+        let w = wide.shutter_offsets().expect("wide");
+        assert!(
+            w[0] < n[0] && *w.last().unwrap() > *n.last().unwrap(),
+            "a longer exposure sees more of the move"
+        );
+    }
+
+    #[test]
+    fn a_nonsense_shutter_asks_for_nothing() {
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut track = CameraTrack::new();
+            track.shutter = bad;
+            assert!(track.shutter_offsets().is_none(), "for {bad}");
+        }
+    }
+
+    #[test]
+    fn the_sample_count_is_bounded() {
+        let mut track = CameraTrack::new();
+        track.shutter = 0.5;
+        track.blur_samples = 100_000;
+        let offsets = track.shutter_offsets().expect("a shutter");
+        assert_eq!(
+            offsets.len(),
+            MAX_BLUR_SAMPLES as usize,
+            "a hand-edited file cannot ask for a thousand instants"
+        );
+    }
+
+    #[test]
     fn a_pinhole_camera_has_no_depth_of_field() {
         let track = CameraTrack::new();
         assert_eq!(track.aperture, 0.0);
-        assert_eq!(track.dof_blur(500.0), None, "no aperture, no blur");
+        assert_eq!(track.dof_blur_at(0, 500.0), None, "no aperture, no blur");
     }
 
     #[test]
@@ -587,10 +886,116 @@ mod tests {
         let mut track = CameraTrack::new();
         track.aperture = 0.02;
         track.focus_depth = 0.0;
-        assert_eq!(track.dof_blur(0.0), None, "the focus plane is sharp");
-        let near = track.dof_blur(200.0).expect("out of focus");
-        let far = track.dof_blur(800.0).expect("further out of focus");
+        assert_eq!(track.dof_blur_at(0, 0.0), None, "the focus plane is sharp");
+        let near = track.dof_blur_at(0, 200.0).expect("out of focus");
+        let far = track.dof_blur_at(0, 800.0).expect("further out of focus");
         assert!(far > near, "further from focus should blur more: {near} vs {far}");
+    }
+
+    /// The whole point of the static fields staying: a document that never
+    /// keys focus behaves exactly as it did before there was a pull at all,
+    /// on every frame.
+    #[test]
+    fn without_focus_keys_the_lens_never_changes() {
+        let mut track = CameraTrack::new();
+        track.aperture = 0.02;
+        track.focus_depth = 300.0;
+        for frame in [0, 1, 50, 10_000] {
+            let lens = track.focus_at(frame);
+            assert_eq!(lens.aperture, 0.02, "frame {frame}");
+            assert_eq!(lens.focus_depth, 300.0, "frame {frame}");
+        }
+    }
+
+    /// A focus pull: the lens starts focused on the background and travels to
+    /// the foreground, so the *same layer at the same depth* goes from sharp to
+    /// soft without anything on the stage moving.
+    #[test]
+    fn a_focus_pull_moves_the_sharp_plane_over_time() {
+        let mut track = CameraTrack::new();
+        track.set_focus_key(FocusKey {
+            frame: 0,
+            focus_depth: 600.0,
+            aperture: 0.05,
+        });
+        track.set_focus_key(FocusKey {
+            frame: 24,
+            focus_depth: 0.0,
+            aperture: 0.05,
+        });
+
+        // The layer sitting at depth 600: in focus at the start, out of it by
+        // the end.
+        assert_eq!(track.dof_blur_at(0, 600.0), None, "sharp where the focus is");
+        let pulled = track
+            .dof_blur_at(24, 600.0)
+            .expect("the focus has left this layer behind");
+        assert!(pulled > 1.0, "a full pull should be a real blur, got {pulled}");
+
+        // And the foreground it travelled to does the reverse.
+        assert!(track.dof_blur_at(0, 0.0).is_some(), "foreground starts soft");
+        assert_eq!(track.dof_blur_at(24, 0.0), None, "and ends sharp");
+    }
+
+    #[test]
+    fn focus_holds_before_the_first_key_and_after_the_last() {
+        let mut track = CameraTrack::new();
+        track.set_focus_key(FocusKey {
+            frame: 10,
+            focus_depth: 100.0,
+            aperture: 0.01,
+        });
+        track.set_focus_key(FocusKey {
+            frame: 20,
+            focus_depth: 200.0,
+            aperture: 0.02,
+        });
+
+        assert_eq!(track.focus_at(0).focus_depth, 100.0, "held before the first");
+        assert_eq!(track.focus_at(99).focus_depth, 200.0, "held after the last");
+        let middle = track.focus_at(15);
+        assert!(
+            (middle.focus_depth - 150.0).abs() < 1e-9,
+            "halfway is halfway: {}",
+            middle.focus_depth
+        );
+        assert!(
+            (middle.aperture - 0.015).abs() < 1e-9,
+            "the aperture rides along: {}",
+            middle.aperture
+        );
+    }
+
+    /// Focus keys arrive from a file, where nothing guarantees their order.
+    #[test]
+    fn loaded_focus_keys_are_sorted_and_sane() {
+        let mut track = CameraTrack::new();
+        track.set_focus_keys(vec![
+            FocusKey { frame: 20, focus_depth: 200.0, aperture: 0.02 },
+            FocusKey { frame: 0, focus_depth: 0.0, aperture: -1.0 },
+            FocusKey { frame: 20, focus_depth: 999.0, aperture: 0.5 },
+        ]);
+        let frames: Vec<u32> = track.focus_keys().iter().map(|k| k.frame).collect();
+        assert_eq!(frames, vec![0, 20], "sorted, one key per frame");
+        assert_eq!(
+            track.focus_keys()[0].aperture,
+            0.0,
+            "a negative aperture is clamped away"
+        );
+    }
+
+    #[test]
+    fn a_focus_key_can_be_replaced_and_removed() {
+        let mut track = CameraTrack::new();
+        let key = FocusKey { frame: 5, focus_depth: 1.0, aperture: 0.1 };
+        track.set_focus_key(key);
+        track.set_focus_key(FocusKey { focus_depth: 2.0, ..key });
+        assert_eq!(track.focus_keys().len(), 1, "re-keying replaces");
+        assert_eq!(track.focus_keys()[0].focus_depth, 2.0);
+        assert!(track.has_focus_key_at(5));
+        assert!(track.remove_focus_key(5));
+        assert!(!track.remove_focus_key(5), "removing twice is not a change");
+        assert!(track.focus_keys().is_empty());
     }
 
     #[test]
@@ -954,7 +1359,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// **The bound the controls stop at must be a depth that still draws.**
     ///
     /// `nearest_depth` and `depth_scale` are two expressions of the same fact —

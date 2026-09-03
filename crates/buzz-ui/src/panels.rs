@@ -346,6 +346,10 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 item(ui, Command::ClearModifiers, has_selection, &mut raised);
                 ui.separator();
                 item(ui, Command::SetReverse, has_selection, &mut raised);
+                item(ui, Command::AddThreeQuarterRight, has_selection, &mut raised);
+                item(ui, Command::AddProfileRight, has_selection, &mut raised);
+                item(ui, Command::AddThreeQuarterLeft, has_selection, &mut raised);
+                item(ui, Command::AddProfileLeft, has_selection, &mut raised);
                 item(ui, Command::ClearReverse, has_selection, &mut raised);
             });
         });
@@ -1515,11 +1519,22 @@ fn effects_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
     changed
 }
 
-/// Depth-of-field controls: a camera aperture and the depth in focus. Writes
-/// back only on change, so an untouched panel never dirties the document.
-fn depth_of_field_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
-    let mut aperture = scene.camera().aperture;
-    let mut focus = scene.camera().focus_depth;
+/// Depth-of-field controls: a camera aperture, the depth in focus, and the
+/// **focus pull** that moves it during a shot. Writes back only on change, so an
+/// untouched panel never dirties the document.
+///
+/// Two modes, and the panel never asks which one you are in. With no focus keys
+/// the two controls edit the camera's standing focus, exactly as they always
+/// did. Once the focus is keyed they edit *the key at the playhead*, keying it
+/// if there is not one yet — which is what every other keyed control in the
+/// program does, and what makes a pull something you scrub to and adjust rather
+/// than something you type.
+fn depth_of_field_properties(ui: &mut Ui, scene: &mut Scene, frame: u32) -> bool {
+    let lens = scene.camera().focus_at(frame);
+    let pulling = !scene.camera().focus_keys().is_empty();
+    let keyed_here = scene.camera().has_focus_key_at(frame);
+    let mut aperture = lens.aperture;
+    let mut focus = lens.focus_depth;
     let mut changed = false;
 
     egui::CollapsingHeader::new(RichText::new("Depth of Field").strong())
@@ -1529,28 +1544,163 @@ fn depth_of_field_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
             egui::Grid::new("dof-grid").num_columns(2).show(ui, |ui| {
                 ui.label("Aperture")
                     .on_hover_text("0 is a pinhole — everything sharp");
-                if ui
+                let aperture_changed = ui
                     .add(egui::Slider::new(&mut aperture, 0.0..=0.2).step_by(0.001))
-                    .changed()
-                {
-                    scene.camera_mut().aperture = aperture;
-                    changed = true;
-                }
+                    .changed();
                 ui.end_row();
 
                 ui.label("Focus depth")
                     .on_hover_text("The layer depth that stays sharp");
-                if ui
+                let focus_changed = ui
                     .add(egui::DragValue::new(&mut focus).speed(1.0))
-                    .changed()
-                {
-                    scene.camera_mut().focus_depth = focus;
+                    .changed();
+                ui.end_row();
+
+                if aperture_changed || focus_changed {
+                    write_lens(scene, frame, pulling, focus, aperture);
                     changed = true;
                 }
-                ui.end_row();
             });
+
+            // The pull itself. One button while the focus is standing still —
+            // pressing it is what starts a pull — and the full set once there
+            // are keys to move between.
+            //
+            // Wrapped: three buttons do not fit the narrowest dock column side
+            // by side, and a row that does not fit loses its last button rather
+            // than scrolling.
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .small_button(if keyed_here { "Re-key Focus" } else { "Key Focus" })
+                    .on_hover_text(
+                        "Pin the focus at the playhead. Key it twice, at two                          depths, and the focus pulls between them.",
+                    )
+                    .clicked()
+                {
+                    scene.camera_mut().set_focus_key(buzz_scene::FocusKey {
+                        frame,
+                        focus_depth: focus,
+                        aperture,
+                    });
+                    changed = true;
+                }
+                if ui
+                    .add_enabled(keyed_here, egui::Button::new("Remove").small())
+                    .on_hover_text("Drop the focus key at the playhead")
+                    .clicked()
+                {
+                    scene.camera_mut().remove_focus_key(frame);
+                    changed = true;
+                }
+                if ui
+                    .add_enabled(pulling, egui::Button::new("Clear Pull").small())
+                    .on_hover_text("Stop the focus moving, holding where it is now")
+                    .clicked()
+                {
+                    // Hold what the pull had reached, so clearing it does not
+                    // snap the picture to some older standing value.
+                    let camera = scene.camera_mut();
+                    camera.focus_depth = focus;
+                    camera.aperture = aperture;
+                    camera.clear_focus_keys();
+                    changed = true;
+                }
+            });
+
+            if pulling {
+                let count = scene.camera().focus_keys().len();
+                ui.label(
+                    RichText::new(format!(
+                        "Pulling focus over {count} key{}",
+                        if count == 1 { "" } else { "s" }
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
         });
     changed
+}
+
+/// Motion-blur controls: how long the shutter stays open, and how finely the
+/// open shutter is sampled.
+///
+/// **An export-time effect, and the panel says so.** Drawing the frame eight
+/// times over is exactly what the stage cannot afford while you are drawing on
+/// it, so the smear appears in the film and not under the pencil. That is a
+/// real departure from this program's preview-is-the-picture rule, and hiding
+/// it would be worse than admitting it.
+fn motion_blur_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
+    let mut shutter = scene.camera().shutter;
+    let mut samples = scene.camera().blur_samples;
+    let mut changed = false;
+
+    egui::CollapsingHeader::new(RichText::new("Motion Blur").strong())
+        .id_salt("motion-blur-section")
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::Grid::new("motion-blur-grid")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Shutter").on_hover_text(
+                        "How long the shutter stays open, in frames. 0 is off;                          0.5 is the 180° shutter most film is shot at.",
+                    );
+                    if ui
+                        .add(egui::Slider::new(&mut shutter, 0.0..=1.0).step_by(0.01))
+                        .changed()
+                    {
+                        scene.camera_mut().shutter = shutter;
+                        changed = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Samples").on_hover_text(
+                        "How many instants across the shutter are added up. More                          is smoother and costs proportionally more to export.",
+                    );
+                    let enabled = shutter > 0.0;
+                    if ui
+                        .add_enabled(
+                            enabled,
+                            egui::Slider::new(
+                                &mut samples,
+                                2..=buzz_scene::camera_track::MAX_BLUR_SAMPLES,
+                            ),
+                        )
+                        .changed()
+                    {
+                        scene.camera_mut().blur_samples = samples;
+                        changed = true;
+                    }
+                    ui.end_row();
+                });
+
+            if shutter > 0.0 {
+                ui.label(
+                    RichText::new(format!(
+                        "Each exported frame is drawn {samples} times. The stage                          shows clean frames."
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+        });
+    changed
+}
+
+/// Put an edited lens where it belongs: on the key at the playhead while the
+/// focus is being pulled, and on the camera's standing focus while it is not.
+fn write_lens(scene: &mut Scene, frame: u32, pulling: bool, focus: f64, aperture: f64) {
+    let camera = scene.camera_mut();
+    if pulling {
+        camera.set_focus_key(buzz_scene::FocusKey {
+            frame,
+            focus_depth: focus,
+            aperture,
+        });
+    } else {
+        camera.focus_depth = focus;
+        camera.aperture = aperture;
+    }
 }
 
 fn bloom_controls(ui: &mut Ui, b: &mut buzz_scene::BloomSettings) -> bool {
@@ -1768,7 +1918,11 @@ pub fn properties_panel(
 
         // Depth of field: a document-level camera setting, so it sits with the
         // document rather than in the timeline.
-        changed |= depth_of_field_properties(ui, scene);
+        changed |= depth_of_field_properties(ui, scene, at.frame);
+
+        // The shutter, next to the aperture: the other half of what a camera
+        // does to time and light.
+        changed |= motion_blur_properties(ui, scene);
 
         // The full-frame look. Its own section because it is a different kind of
         // thing from the stage's size — the colour and mood of the finished
@@ -1940,7 +2094,7 @@ pub fn color_panel(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
             .selected_text(style.fill_kind.label())
             .width(140.0)
             .show_ui(ui, |ui| {
-                for kind in [FillKind::Solid, FillKind::Linear, FillKind::Radial] {
+                for kind in FillKind::ALL {
                     ui.selectable_value(&mut style.fill_kind, kind, kind.label());
                 }
             });

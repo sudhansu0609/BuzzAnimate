@@ -28,6 +28,7 @@
 pub mod art;
 pub mod bucket;
 pub mod camera_track;
+pub mod time;
 pub mod effect_brush;
 pub mod gradient;
 pub mod image;
@@ -66,8 +67,9 @@ pub use art::ArtPiece;
 pub use bucket::{Boundary, GapSize, fill_region};
 pub use effect_brush::{EffectKind, EffectStroke, effect_artwork};
 pub use stamp::{BrushStamp, StampedArt};
+pub use time::AtTime;
 pub use camera_track::{
-    CameraKey, CameraTrack, DEFAULT_FOCAL_DISTANCE, MAX_TILT, NamedAngle,
+    CameraKey, CameraTrack, DEFAULT_FOCAL_DISTANCE, FocusKey, MAX_TILT, NamedAngle,
 };
 pub use gradient::{
     Gradient, GradientHandles, GradientKind, GradientSpread, GradientStop, MAX_STOPS, lerp_color,
@@ -81,12 +83,19 @@ pub use modifier::Modifier;
 pub use object::{
     FillSpec, Object, ObjectId, ObjectKind, Paint, PaintBlend, ShapeData, Spatial, StrokeSpec,
     TextData,
+    Turnaround,
+    TurnaroundView,
 };
 pub use post::{
     BloomSettings, GradeSettings, GrainSettings, HalftoneSettings, HatchingSettings,
     PosteriseSettings, PostSettings, VignetteSettings,
 };
-pub use texture::TextureKind;
+pub use texture::{TextureKind, TextureRecipe};
+// A text object records which cut of a family it is set in and how its lines
+// line up. The types belong to `buzz-text`, which is what honours them; they are
+// re-exported here so a document can name them without depending on the font
+// machinery itself.
+pub use buzz_text::{FontStyle, TextAlign};
 pub use raster::{Canvas, SoftBrush};
 pub use rig::{ArmatureData, NamedPose, RigBinding, RigPart, WarpData};
 pub use sound::{SoundAsset, SoundCue, SoundId, SoundLibrary, SoundRef, SoundSync};
@@ -1420,6 +1429,9 @@ impl Scene {
         self.layers()
             .frame_count()
             .max(self.camera().last_frame() + 1)
+            // A shot whose only animation is a focus pull is still as long as
+            // the pull: without this the film ended before the focus arrived.
+            .max(self.camera().focus_last_frame() + 1)
             .max(1)
     }
 
@@ -1434,17 +1446,21 @@ impl Scene {
     }
 
     /// The camera transform for `frame`, or identity when the camera is off.
-    pub fn camera_transform(&self, frame: u32) -> Affine {
-        self.camera().transform_at(frame, self.stage().size)
+    pub fn camera_transform(&self, at: impl crate::time::AtTime) -> Affine {
+        self.camera().transform_at(at, self.stage().size)
     }
 
     /// The camera transform for artwork on a layer at `depth`.
     ///
     /// `None` when the layer sits at or behind the camera and should not be
     /// drawn at all.
-    pub fn camera_transform_at_depth(&self, frame: u32, depth: f64) -> Option<Affine> {
+    pub fn camera_transform_at_depth(
+        &self,
+        at: impl crate::time::AtTime,
+        depth: f64,
+    ) -> Option<Affine> {
         self.camera()
-            .transform_at_depth(frame, self.stage().size, depth)
+            .transform_at_depth(at, self.stage().size, depth)
     }
 
     /// How a layer at `depth` is projected onto the frame.
@@ -1457,11 +1473,11 @@ impl Scene {
     /// `None` when the layer is at or behind the camera.
     pub fn camera_projection_at_depth(
         &self,
-        frame: u32,
+        at: impl crate::time::AtTime,
         depth: f64,
     ) -> Option<buzz_geom::Projection> {
         self.camera()
-            .projection_at_depth(frame, self.stage().size, depth)
+            .projection_at_depth(at, self.stage().size, depth)
     }
 
     /// Does the shot tilt at all?

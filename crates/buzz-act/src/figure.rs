@@ -329,7 +329,7 @@ pub fn build(spec: &FigureSpec, id: ObjectId, mut next_id: impl FnMut() -> Objec
         pivot: None,
         modifiers: Vec::new(),
         text: None,
-        reverse: None,
+        turnaround: Default::default(),
     }
 }
 

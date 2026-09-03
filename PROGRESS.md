@@ -4138,6 +4138,40 @@ and repetition detection that offers to make a redrawn prop a symbol.
 
 ---
 
+### ✅ Inbetweening, one level down: the strokes inside a drawing
+
+`match_drawings` pairs the *pieces* of two keyframes. This is the same problem
+one level below it, and the half that was left open: a single piece of artwork is
+very often several contours — an outline and the holes in it, or a dozen pen
+strokes merged into one shape — and resampling the whole path as one run of
+points pairs sample 40 of one drawing with sample 40 of the other, whatever they
+happen to belong to. Two contours drawn in a different order, or a drawing that
+gains one, and a stroke runs across the drawing to become an unrelated stroke.
+
+A path is now split into its own contours and they are paired the way pieces
+are: cost every pair by where it sits, how big it is, whether it closes and
+**which way round it is wound**; take the best first; let whatever is left over
+shrink away about its own middle or grow in.
+
+**Winding is in the cost because a hole must be paired with a hole.** Pairing a
+hole with a solid outline fills it in halfway through the tween, and that is the
+one artefact a viewer reads as a fault in the drawing rather than in the
+tweener — so it is weighted heavily rather than left to chance.
+
+**One contour on each side takes the path it always did.** That is the
+overwhelmingly common case and every existing shape tween in every existing
+document depends on it, so the test pins it as byte-identical rather than merely
+equivalent. There is a GPU test as well: two keyframes of a two-stroke drawing
+with the strokes drawn in opposite orders, and the frame halfway between them
+must have ink on both sides and none stranded in the middle.
+
+**What is still not done here.** This pairs contours, not the *points along*
+them — two strokes of very different lengths still resample against each other
+evenly rather than by feature. And nothing looks at what a stroke means: a
+tapered brush stroke and a construction line are the same to it.
+
+---
+
 ## 5. Current metrics
 
 | Measure | Value |
@@ -4148,7 +4182,7 @@ and repetition detection that offers to make a redrawn prop a symbol.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 2 289 passing across 110 binaries, clippy clean |
+| Tests | 2 298 passing across 111 binaries, clippy clean |
 | Rust source | ~154 000 lines |
 | Crates built | 19 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |

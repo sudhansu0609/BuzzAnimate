@@ -663,6 +663,26 @@ pub fn interpolate_path(from: &BezPath, to: &BezPath, t: f64) -> BezPath {
         return to.clone();
     }
 
+    // **A drawing is made of strokes, and they have to be paired too.**
+    //
+    // `match_drawings` pairs the *pieces* of two keyframes; this is the same
+    // problem one level down. A single piece of artwork is very often several
+    // contours — an outline and the holes in it, or a dozen pen strokes merged
+    // into one shape — and resampling the whole path as one run of points pairs
+    // sample 40 of one drawing with sample 40 of the other whatever they happen
+    // to belong to. Two contours drawn in a different order, or a drawing that
+    // gains one, and the morph runs a stroke across the drawing to become an
+    // unrelated stroke.
+    //
+    // One contour on each side is the overwhelmingly common case and takes the
+    // path below unchanged, so this costs nothing where there is nothing to
+    // pair.
+    let from_parts = subpaths(from);
+    let to_parts = subpaths(to);
+    if from_parts.len() > 1 || to_parts.len() > 1 {
+        return interpolate_strokes(&from_parts, &to_parts, t);
+    }
+
     let a = resample(from, SHAPE_SAMPLES);
     let mut b = resample(to, SHAPE_SAMPLES);
     if a.is_empty() || b.is_empty() {
@@ -700,6 +720,197 @@ pub fn interpolate_path(from: &BezPath, to: &BezPath, t: f64) -> BezPath {
         path.close_path();
     }
     path
+}
+
+/// **The separate contours a path is made of** — its strokes.
+///
+/// A `move_to` starts one; everything up to the next `move_to` belongs to it.
+/// Empty subpaths are dropped: a stray `move_to` with nothing after it is not a
+/// stroke, and pairing against it would waste a partner.
+fn subpaths(path: &BezPath) -> Vec<BezPath> {
+    let mut out: Vec<BezPath> = Vec::new();
+    let mut current = BezPath::new();
+    for element in path.elements() {
+        if matches!(element, buzz_geom::PathEl::MoveTo(_)) && !current.elements().is_empty() {
+            if current.elements().len() > 1 {
+                out.push(std::mem::take(&mut current));
+            } else {
+                current = BezPath::new();
+            }
+        }
+        current.push(*element);
+    }
+    if current.elements().len() > 1 {
+        out.push(current);
+    }
+    out
+}
+
+/// **Morph two drawings stroke by stroke**, pairing the contours by what they
+/// are rather than by the order they were drawn in.
+///
+/// The same three ideas as [`match_drawings`], one level down: cost every pair,
+/// take the best first, and let whatever is left over shrink away or grow in
+/// rather than sit there and pop. Winding is part of the cost, so a hole is
+/// paired with a hole — matching a hole to a solid outline would fill it in
+/// halfway through the tween, which is the one artefact that would be blamed on
+/// the drawing rather than on the tweener.
+fn interpolate_strokes(from: &[BezPath], to: &[BezPath], t: f64) -> BezPath {
+    let span = stroke_span(from).max(stroke_span(to)).max(1.0);
+
+    let traits_from: Vec<StrokeTrait> = from.iter().map(StrokeTrait::of).collect();
+    let traits_to: Vec<StrokeTrait> = to.iter().map(StrokeTrait::of).collect();
+
+    let mut costs: Vec<(f64, usize, usize)> = Vec::new();
+    for (i, a) in traits_from.iter().enumerate() {
+        for (j, b) in traits_to.iter().enumerate() {
+            costs.push((a.cost(b, span), i, j));
+        }
+    }
+    costs.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut pairing: Vec<Option<usize>> = vec![None; from.len()];
+    let mut taken = vec![false; to.len()];
+    for (cost, i, j) in costs {
+        if pairing[i].is_some() || taken[j] {
+            continue;
+        }
+        if cost > MAX_STROKE_COST {
+            break;
+        }
+        pairing[i] = Some(j);
+        taken[j] = true;
+    }
+
+    let mut out = BezPath::new();
+    for (i, stroke) in from.iter().enumerate() {
+        match pairing[i] {
+            Some(j) => extend(&mut out, &interpolate_contour(stroke, &to[j], t)),
+            // Nothing on the far drawing is this stroke: it goes.
+            None => extend(&mut out, &shrunk(stroke, 1.0 - t)),
+        }
+    }
+    for (j, stroke) in to.iter().enumerate() {
+        if !taken[j] {
+            extend(&mut out, &shrunk(stroke, t));
+        }
+    }
+    out
+}
+
+/// How unlike two strokes may be and still be the same stroke.
+///
+/// In the units [`StrokeTrait::cost`] returns, whose distance term is measured
+/// against the whole drawing. Tighter than the one pieces are paired by: within
+/// a single drawing the strokes are close together and there are more of them,
+/// so a loose threshold pairs a sleeve with a collar.
+const MAX_STROKE_COST: f64 = 0.7;
+
+/// What one contour is, for pairing.
+struct StrokeTrait {
+    centre: Point,
+    size: f64,
+    /// Sign of the enclosed area: which way round it is drawn, and therefore
+    /// whether it is a hole.
+    winding: f64,
+    closed: bool,
+}
+
+impl StrokeTrait {
+    fn of(path: &BezPath) -> StrokeTrait {
+        use buzz_geom::Shape as _;
+        let box_ = path.bounding_box();
+        let points = resample(path, 24);
+        StrokeTrait {
+            centre: box_.center(),
+            size: (box_.width().max(0.0) * box_.height().max(0.0))
+                .sqrt()
+                .max(1e-6),
+            winding: signed_area(&points).signum(),
+            closed: is_closed(path),
+        }
+    }
+
+    fn cost(&self, other: &StrokeTrait, span: f64) -> f64 {
+        let moved = self.centre.distance(other.centre) / span;
+        let grew = (self.size / other.size).ln().abs() / 2.0;
+        let shape = if self.closed == other.closed { 0.0 } else { 0.3 };
+        // A hole and an outline are not the same stroke. Heavy, because filling
+        // a hole in halfway through a tween is the artefact nobody would read
+        // as the tweener's fault.
+        let inside_out = if self.winding == other.winding { 0.0 } else { 0.5 };
+        moved + grew + shape + inside_out
+    }
+}
+
+/// The size of a whole drawing, for judging how far a stroke has moved.
+fn stroke_span(strokes: &[BezPath]) -> f64 {
+    use buzz_geom::Shape as _;
+    let mut bounds: Option<buzz_geom::Rect> = None;
+    for stroke in strokes {
+        let box_ = stroke.bounding_box();
+        bounds = Some(match bounds {
+            Some(b) => b.union(box_),
+            None => box_,
+        });
+    }
+    bounds
+        .map(|b| b.width().hypot(b.height()))
+        .unwrap_or(1.0)
+        .max(1.0)
+}
+
+/// Morph one contour into another — the single-outline case, which is what
+/// [`interpolate_path`] did for a whole path before strokes were paired.
+fn interpolate_contour(from: &BezPath, to: &BezPath, t: f64) -> BezPath {
+    let a = resample(from, SHAPE_SAMPLES);
+    let mut b = resample(to, SHAPE_SAMPLES);
+    if a.is_empty() || b.is_empty() {
+        return from.clone();
+    }
+    let closed = is_closed(from) && is_closed(to);
+    if closed {
+        if signed_area(&a) * signed_area(&b) < 0.0 {
+            b.reverse();
+        }
+        let offset = best_alignment(&a, &b);
+        b.rotate_left(offset);
+    }
+
+    let mut path = BezPath::new();
+    for i in 0..SHAPE_SAMPLES {
+        let pa = a[i % a.len()];
+        let pb = b[i % b.len()];
+        let p = Point::new(pa.x + (pb.x - pa.x) * t, pa.y + (pb.y - pa.y) * t);
+        if i == 0 {
+            path.move_to(p);
+        } else {
+            path.line_to(p);
+        }
+    }
+    if closed {
+        path.close_path();
+    }
+    path
+}
+
+/// A stroke drawn at `scale` of its size, about its own middle: what a stroke
+/// with no partner does on its way out, or on its way in.
+fn shrunk(path: &BezPath, scale: f64) -> BezPath {
+    use buzz_geom::Shape as _;
+    let centre = path.bounding_box().center();
+    let scale = scale.clamp(0.0, 1.0).max(1e-4);
+    Affine::translate(centre.to_vec2())
+        * Affine::scale(scale)
+        * Affine::translate(-centre.to_vec2())
+        * path.clone()
+}
+
+/// Append one path's elements to another.
+fn extend(into: &mut BezPath, from: &BezPath) {
+    for element in from.elements() {
+        into.push(*element);
+    }
 }
 
 /// Twice the signed area of a closed polygon; the sign gives the winding.
@@ -805,6 +1016,185 @@ fn resample(path: &BezPath, count: usize) -> Vec<Point> {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod stroke_tests {
+    use super::*;
+    use buzz_geom::Shape as _;
+
+    /// A square contour, as one subpath.
+    fn ring(cx: f64, cy: f64, size: f64) -> BezPath {
+        let r = size / 2.0;
+        buzz_geom::Rect::new(cx - r, cy - r, cx + r, cy + r).to_path(1e-9)
+    }
+
+    /// A hole: the same square wound the other way.
+    fn hole(cx: f64, cy: f64, size: f64) -> BezPath {
+        let mut points: Vec<Point> = resample(&ring(cx, cy, size), 16);
+        points.reverse();
+        let mut path = BezPath::new();
+        for (i, p) in points.iter().enumerate() {
+            if i == 0 {
+                path.move_to(*p);
+            } else {
+                path.line_to(*p);
+            }
+        }
+        path.close_path();
+        path
+    }
+
+    fn joined(parts: &[BezPath]) -> BezPath {
+        let mut out = BezPath::new();
+        for part in parts {
+            for element in part.elements() {
+                out.push(*element);
+            }
+        }
+        out
+    }
+
+    /// The centres of a path's contours, so a test can say where each stroke
+    /// ended up.
+    fn centres(path: &BezPath) -> Vec<Point> {
+        subpaths(path)
+            .iter()
+            .map(|s| s.bounding_box().center())
+            .collect()
+    }
+
+    #[test]
+    fn a_path_splits_into_its_own_strokes() {
+        let drawing = joined(&[ring(0.0, 0.0, 20.0), ring(100.0, 0.0, 20.0)]);
+        assert_eq!(subpaths(&drawing).len(), 2);
+    }
+
+    /// **The defect this exists to fix**, one level below the piece matcher: two
+    /// drawings of the same two strokes, drawn in opposite orders. Paired by
+    /// sample index, a stroke crosses the drawing to become the other one.
+    #[test]
+    fn strokes_pair_by_what_they_are_not_by_draw_order() {
+        let a = joined(&[ring(0.0, 0.0, 20.0), ring(200.0, 0.0, 40.0)]);
+        // The same two, barely moved, drawn the other way round.
+        let b = joined(&[ring(205.0, 0.0, 40.0), ring(4.0, 0.0, 20.0)]);
+
+        let middle = interpolate_path(&a, &b, 0.5);
+        let mut got = centres(&middle);
+        got.sort_by(|p, q| p.x.partial_cmp(&q.x).unwrap());
+
+        assert_eq!(got.len(), 2, "both strokes are still there");
+        assert!(
+            got[0].x.abs() < 20.0,
+            "the small stroke stayed where it was, at {:?}",
+            got[0]
+        );
+        assert!(
+            (got[1].x - 202.5).abs() < 20.0,
+            "and the large one stayed where it was, at {:?}",
+            got[1]
+        );
+    }
+
+    /// One contour on each side is the common case and must take the path it
+    /// always did — bit for bit, because that is what every existing shape
+    /// tween in every existing document relies on.
+    #[test]
+    fn a_single_contour_morphs_exactly_as_it_always_did() {
+        let a = ring(0.0, 0.0, 20.0);
+        let b = ring(100.0, 0.0, 20.0);
+
+        let through_the_new_path = interpolate_path(&a, &b, 0.5);
+        let through_the_old_path = interpolate_contour(&a, &b, 0.5);
+        assert_eq!(
+            through_the_new_path.to_svg(),
+            through_the_old_path.to_svg(),
+            "a single-contour morph is unchanged"
+        );
+    }
+
+    /// **A hole stays a hole.** Pairing it with a solid outline would fill it in
+    /// halfway through the tween, which reads as a fault in the drawing rather
+    /// than in the tweener.
+    #[test]
+    fn a_hole_is_paired_with_a_hole() {
+        let a = joined(&[ring(0.0, 0.0, 100.0), hole(0.0, 0.0, 40.0)]);
+        let b = joined(&[ring(6.0, 0.0, 100.0), hole(6.0, 0.0, 40.0)]);
+
+        let middle = interpolate_path(&a, &b, 0.5);
+        let parts = subpaths(&middle);
+        assert_eq!(parts.len(), 2, "the outline and its hole");
+
+        let windings: Vec<f64> = parts
+            .iter()
+            .map(|p| signed_area(&resample(p, 24)).signum())
+            .collect();
+        assert!(
+            windings[0] != windings[1],
+            "one is still wound the other way — it is still a hole: {windings:?}"
+        );
+    }
+
+    /// A stroke with no partner leaves, rather than sitting there and popping
+    /// out of existence on the last frame.
+    #[test]
+    fn a_stroke_with_no_partner_shrinks_away() {
+        let a = joined(&[ring(0.0, 0.0, 40.0), ring(300.0, 300.0, 40.0)]);
+        let b = ring(4.0, 0.0, 40.0);
+
+        let width_of_the_leaver = |t: f64| {
+            let drawn = interpolate_path(&a, &b, t);
+            subpaths(&drawn)
+                .into_iter()
+                .map(|s| s.bounding_box())
+                .find(|box_| box_.center().x > 100.0)
+                .map(|box_| box_.width())
+                .unwrap_or(0.0)
+        };
+        let early = width_of_the_leaver(0.25);
+        let late = width_of_the_leaver(0.75);
+        assert!(
+            late < early && early > 0.0,
+            "the unpartnered stroke is on its way out: {early} then {late}"
+        );
+    }
+
+    /// And one that arrives grows in, rather than appearing whole at the end.
+    #[test]
+    fn a_stroke_that_arrives_grows_in() {
+        let a = ring(0.0, 0.0, 40.0);
+        let b = joined(&[ring(4.0, 0.0, 40.0), ring(300.0, 300.0, 40.0)]);
+
+        let middle = interpolate_path(&a, &b, 0.5);
+        let arriving = subpaths(&middle)
+            .into_iter()
+            .map(|s| s.bounding_box())
+            .find(|box_| box_.center().x > 100.0)
+            .expect("the arriving stroke is drawn while arriving");
+        assert!(
+            arriving.width() > 4.0 && arriving.width() < 30.0,
+            "halfway in it is about half size, got {}",
+            arriving.width()
+        );
+    }
+
+    /// Strokes at opposite ends of a drawing are not each other.
+    #[test]
+    fn strokes_far_apart_are_not_paired() {
+        let a = joined(&[ring(0.0, 0.0, 20.0), ring(1000.0, 0.0, 20.0)]);
+        let b = ring(2.0, 0.0, 20.0);
+        let middle = interpolate_path(&a, &b, 0.5);
+        // The near one morphs; the far one shrinks away rather than being
+        // dragged a thousand units to meet it.
+        let far = subpaths(&middle)
+            .into_iter()
+            .map(|s| s.bounding_box())
+            .find(|box_| box_.center().x > 500.0);
+        assert!(
+            far.is_some(),
+            "the far stroke stayed where it was while it left"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -2196,6 +2196,50 @@ impl Editor {
         let frame = self.current_frame;
         let auto = self.auto_keyframe;
         let area = canvas.area();
+
+        // **Paint fuses with paint.** In Merge Shape mode — Animate's default,
+        // and what every other drawing tool here already honours — a stroke laid
+        // over paint of the same colour becomes part of it rather than a second
+        // object stacked on top. See `fusable_paint`.
+        let fuse = (self.style.drawing_mode == buzz_ui::DrawingMode::MergeShape)
+            .then(|| self.fusable_paint(layer, frame, canvas, brush))
+            .flatten();
+
+        if let Some((target, merged)) = fuse {
+            let blend = self.style.brush.blend();
+            let mut fused = None;
+            self.doc.edit("Brush", |scene| {
+                let id = scene.next_image_id();
+                let name = scene.images().unique_name("Paint");
+                let mut asset = buzz_scene::ImageAsset::from_pixels(
+                    id,
+                    name,
+                    merged.width,
+                    merged.height,
+                    std::sync::Arc::new(merged.pixels.clone()),
+                );
+                asset.painted = true;
+                let asset = scene.images_mut().insert(asset);
+
+                let area = merged.area();
+                let mut fill = buzz_scene::ImageFill::new(asset, area);
+                fill.smooth = false;
+                scene.update_object_at(frame, target, |o| {
+                    if let ObjectKind::Shape(shape) = &mut o.kind {
+                        shape.path = buzz_geom::Shape::to_path(&area, 1e-9);
+                        shape.fill = Some(buzz_scene::FillSpec::image(fill.clone()));
+                        shape.blend = blend;
+                    }
+                });
+                fused = Some(target);
+            });
+            self.doc.end_gesture();
+            if let Some(id) = fused {
+                self.selection.set([id]);
+            }
+            return;
+        }
+
         let mut painted = None;
         self.doc.edit("Brush", |scene| {
             if auto {
@@ -2226,6 +2270,92 @@ impl Editor {
             Some(id) => self.selection.set([id]),
             None => self.status = Some("Could not paint on this frame".into()),
         }
+    }
+
+    /// **The paint this stroke should join**, and the bitmap they make together.
+    ///
+    /// `None` — meaning the stroke becomes its own shape, as it always did —
+    /// unless every one of these holds:
+    ///
+    /// * a shape on this layer and frame carries **painted** pixels (an
+    ///   imported photograph is not paint and merges with nothing);
+    /// * it is in the **same colour**, because that is what Animate's merge
+    ///   model fuses; a different colour is a different thing on top;
+    /// * it uses the **same blend**, or fusing would change how the result sits
+    ///   against what is under it;
+    /// * their areas actually **overlap** — paint at the other end of the stage
+    ///   is not the same stroke of paint, and one bitmap spanning both would be
+    ///   mostly empty;
+    /// * and the existing paint is still **square to the axes at its own pixel
+    ///   scale**. A stroke that has since been rotated or scaled would have to
+    ///   be resampled to merge, and resampling paint to fuse it would lose more
+    ///   than the fusing gains.
+    ///
+    /// The newest such shape wins, which is the one the eye reads as "what I am
+    /// painting on".
+    fn fusable_paint(
+        &self,
+        layer: LayerId,
+        frame: u32,
+        canvas: &buzz_scene::Canvas,
+        brush: &buzz_scene::SoftBrush,
+    ) -> Option<(ObjectId, buzz_scene::MergedPaint)> {
+        let scene = self.doc.scene();
+        let blend = self.style.brush.blend();
+        let ink = brush.color.to_rgba8().to_u8_array();
+
+        // Newest first: the top of the stack is the paint the eye reads as the
+        // one being painted on.
+        let resolved = scene.layers().get(layer)?.frames.resolved_at(frame);
+        let objects: Vec<_> = resolved.iter().collect();
+        for object in objects.into_iter().rev() {
+            let ObjectKind::Shape(shape) = &object.kind else {
+                continue;
+            };
+            if shape.blend != blend {
+                continue;
+            }
+            let Some(fill) = shape.fill.as_ref().and_then(|f| f.paint.image()) else {
+                continue;
+            };
+            if !fill.asset.painted {
+                continue;
+            }
+
+            // Same colour, or it is a different thing sitting on top.
+            let Some(under_ink) = buzz_scene::painted_ink(&fill.asset) else {
+                continue;
+            };
+            let under = under_ink.to_rgba8().to_u8_array();
+            if under[0..3] != ink[0..3] {
+                continue;
+            }
+
+            // Still one pixel to one document unit, square to the axes, and
+            // where its own transform says: no resampling, no guessing.
+            let placement = object.transform * fill.transform;
+            let c = placement.as_coeffs();
+            let square = c[1].abs() < 1e-6 && c[2].abs() < 1e-6;
+            let unit = (c[0] - f64::from(fill.asset.width)).abs() < 1e-6
+                && (c[3] - f64::from(fill.asset.height)).abs() < 1e-6;
+            if !square || !unit {
+                continue;
+            }
+            let under_origin = buzz_geom::Point::new(c[4], c[5]);
+            let under_area = buzz_geom::Rect::new(
+                under_origin.x,
+                under_origin.y,
+                under_origin.x + f64::from(fill.asset.width),
+                under_origin.y + f64::from(fill.asset.height),
+            );
+            if !under_area.overlaps(canvas.area()) {
+                continue;
+            }
+
+            let merged = buzz_scene::merge_over(&fill.asset, under_origin, canvas, brush)?;
+            return Some((object.id, merged));
+        }
+        None
     }
 
     /// Place an effect stroke's artwork: vector shapes and painted bitmaps
@@ -3054,7 +3184,7 @@ impl Editor {
                 debug_assert!(false, "{command:?} must be dispatched by the shell");
             }
 
-            ImportSound | ImportImage | LipSync => {
+            ImportSound | ImportImage | LipSync | ImportVideoReference => {
                 // The shell owns the file dialog and the modal window, as with
                 // Open and Export.
                 debug_assert!(false, "{command:?} must be dispatched by the shell");
@@ -4680,6 +4810,136 @@ impl Editor {
         });
         self.doc.end_gesture();
         self.status = Some(format!("{label} texture applied"));
+    }
+
+    /// **Import a video to trace over**, one frame of it per frame of the film.
+    ///
+    /// # Why the frames are pulled apart rather than played
+    ///
+    /// A rotoscope reference has to be *scrubbable*: dragging the playhead back
+    /// and forth over six frames while drawing is the whole activity, and no
+    /// video decoder is good at that. Frames are pulled out once, up front, and
+    /// become ordinary keyframed artwork on a guide layer — which means the
+    /// reference scrubs at the speed of everything else, survives being saved,
+    /// and needs no decoder at all in the drawing path.
+    ///
+    /// # What it costs, and what is done about it
+    ///
+    /// One picture per frame is a lot of pictures, so each is scaled to fit the
+    /// stage — a reference is looked at, not exported, and there is no point
+    /// keeping detail finer than the film — and the count is capped. The layer
+    /// is a **guide**: drawn while working, never in the film.
+    ///
+    /// Frames are taken at the *document's* rate, so frame 1 of the film is the
+    /// video a frame in, whatever rate the file was shot at.
+    pub fn import_video_reference(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        /// As many frames as a reference layer will take. Twenty seconds at
+        /// twenty-four is a long shot to rotoscope in one go, and ten times
+        /// this would be a document nobody could open.
+        const MAX_FRAMES: u32 = 480;
+
+        let info = buzz_export::video::probe(path)?;
+        let stage = self.doc.scene().stage().size;
+        let fps = self.doc.scene().stage().frame_rate.max(1.0);
+
+        let scratch = anyhow::Context::context(tempfile::tempdir(), "making somewhere to put the frames")?;
+        let files = buzz_export::video::extract_frames(
+            path,
+            fps,
+            (
+                stage.width.round().max(2.0) as u32,
+                stage.height.round().max(2.0) as u32,
+            ),
+            MAX_FRAMES,
+            scratch.path(),
+        )?;
+
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Video".to_string());
+
+        // Decoded outside the edit: reading and decoding hundreds of PNGs is
+        // not something to do while holding the document.
+        let mut decoded = Vec::with_capacity(files.len());
+        for (index, file) in files.iter().enumerate() {
+            let bytes = anyhow::Context::with_context(std::fs::read(file), || {
+                format!("reading frame {}", index + 1)
+            })?;
+            decoded.push(bytes);
+        }
+
+        let layer = self.doc_add_layer(&name, LayerKind::Guide);
+        let count = decoded.len() as u32;
+        let mut placed = 0u32;
+        self.doc.edit("Import Video Reference", |scene| {
+            // The layer has to be as long as the footage before there are
+            // frames to key on.
+            scene.update_layer(layer, |l| {
+                while l.frames.length() < count {
+                    l.frames.insert_frame(l.frames.length());
+                }
+            });
+
+            for (index, bytes) in decoded.iter().enumerate() {
+                let frame = index as u32;
+                let id = scene.next_image_id();
+                let Ok(asset) = buzz_scene::ImageAsset::decode(id, format!("{name} {}", frame + 1), bytes)
+                else {
+                    continue;
+                };
+                let asset = scene.images_mut().insert(asset);
+
+                // Centred on the stage at its own size — the scale ffmpeg was
+                // asked for already fits it.
+                let (w, h) = (f64::from(asset.width), f64::from(asset.height));
+                let rect = buzz_geom::Rect::new(
+                    (stage.width - w) / 2.0,
+                    (stage.height - h) / 2.0,
+                    (stage.width + w) / 2.0,
+                    (stage.height + h) / 2.0,
+                );
+                let fill = buzz_scene::ImageFill::new(asset, rect);
+
+                // A **blank** keyframe, not an ordinary one: an ordinary
+                // keyframe carries the previous frame's artwork forward, so
+                // every frame of the clip would arrive stacked on top of every
+                // frame before it. Each frame of a video replaces the last.
+                scene.update_layer(layer, |l| {
+                    l.frames.insert_blank_keyframe(frame);
+                });
+                if scene
+                    .add_shape_at(
+                        layer,
+                        frame,
+                        ShapeData {
+                            path: buzz_geom::Shape::to_path(&rect, 1e-9),
+                            fill: Some(buzz_scene::FillSpec::image(fill)),
+                            stroke: None,
+                            blend: buzz_scene::PaintBlend::Normal,
+                        },
+                    )
+                    .is_some()
+                {
+                    placed += 1;
+                }
+            }
+        });
+        self.doc.end_gesture();
+        self.selection.set_active_layer(Some(layer));
+
+        let capped = if count >= MAX_FRAMES {
+            format!(
+                " (the first {MAX_FRAMES} of {:.0})",
+                info.seconds * info.fps
+            )
+        } else {
+            String::new()
+        };
+        self.status = Some(format!(
+            "{placed} frames of {name} on a reference layer{capped} — draw over it"
+        ));
+        Ok(())
     }
 
     /// **Fill the selected shapes with an image file.** Decodes it, adds it to

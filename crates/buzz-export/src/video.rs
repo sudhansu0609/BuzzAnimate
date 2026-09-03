@@ -191,6 +191,137 @@ pub fn ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
+/// **What a video file contains**, as ffmpeg reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoInfo {
+    pub width: u32,
+    pub height: u32,
+    /// Frames per second, as the file declares them.
+    pub fps: f64,
+    /// Length in seconds. Zero if ffmpeg would not say.
+    pub seconds: f64,
+}
+
+/// Ask ffmpeg what is in a video file.
+///
+/// # Why this lives in the *export* crate
+///
+/// Because this is where ffmpeg lives, and there should be one place that
+/// knows how to drive it. Reading a video is not exporting, but the alternative
+/// is a second module that finds ffmpeg, spawns it and interprets its output —
+/// two copies of the awkward part, to keep a tidy name.
+pub fn probe(path: &std::path::Path) -> Result<VideoInfo> {
+    // `ffprobe` ships with ffmpeg but is a separate binary and is missing from
+    // some minimal builds, so this asks ffmpeg itself and reads what it says
+    // about the input on the way to doing nothing with it.
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-i"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .context("running ffmpeg to read the video")?;
+    // ffmpeg exits non-zero when given no output file; what matters is what it
+    // printed about the input first.
+    let text = String::from_utf8_lossy(&out.stderr);
+
+    let stream = text
+        .lines()
+        .find(|l| l.contains("Stream #") && l.contains("Video:"))
+        .ok_or_else(|| anyhow::anyhow!("no video stream in {}", path.display()))?;
+
+    // "1920x1080" somewhere in the stream line.
+    let size = stream
+        .split(|c: char| c == ',' || c == ' ')
+        .filter_map(|token| {
+            let (w, h) = token.split_once('x')?;
+            // A trailing "[SAR ...]" and the like come off with the split.
+            Some((w.parse::<u32>().ok()?, h.trim_end().parse::<u32>().ok()?))
+        })
+        .find(|(w, h)| *w > 0 && *h > 0)
+        .ok_or_else(|| anyhow::anyhow!("could not read the size of {}", path.display()))?;
+
+    // "24 fps" or "23.98 fps".
+    let fps = stream
+        .split(", ")
+        .find_map(|part| part.strip_suffix(" fps")?.trim().parse::<f64>().ok())
+        .filter(|f| *f > 0.0)
+        .unwrap_or(24.0);
+
+    // "Duration: 00:00:12.34,"
+    let seconds = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Duration: "))
+        .and_then(|d| {
+            let clock = d.split(',').next()?;
+            let mut parts = clock.split(':');
+            let h: f64 = parts.next()?.trim().parse().ok()?;
+            let m: f64 = parts.next()?.parse().ok()?;
+            let sec: f64 = parts.next()?.parse().ok()?;
+            Some(h * 3600.0 + m * 60.0 + sec)
+        })
+        .unwrap_or(0.0);
+
+    Ok(VideoInfo {
+        width: size.0,
+        height: size.1,
+        fps,
+        seconds,
+    })
+}
+
+/// **Pull a video apart into one PNG per frame**, at `fps`, no wider or taller
+/// than `fit`, into `dir`. Returns the files written, in order.
+///
+/// `limit` caps how many frames are written: a reference layer is something to
+/// draw over, and a document is not the place for ten minutes of somebody's
+/// footage.
+pub fn extract_frames(
+    path: &std::path::Path,
+    fps: f64,
+    fit: (u32, u32),
+    limit: u32,
+    dir: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>> {
+    if !ffmpeg_available() {
+        bail!("ffmpeg is not on this machine, so a video cannot be read");
+    }
+    std::fs::create_dir_all(dir).context("making somewhere to put the frames")?;
+
+    let pattern = dir.join("frame-%05d.png");
+    // `decrease` never enlarges: a video smaller than the stage is left alone
+    // rather than blown up into a blurry reference. The `-2`s keep the scaler
+    // on even dimensions, which some filters insist on.
+    let scale = format!(
+        "scale='min({},iw)':'min({},ih)':force_original_aspect_ratio=decrease",
+        fit.0.max(2),
+        fit.1.max(2)
+    );
+    let status = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(path)
+        .args(["-vf", &format!("fps={fps},{scale}")])
+        .args(["-frames:v", &limit.max(1).to_string()])
+        .arg(&pattern)
+        .stdin(Stdio::null())
+        .status()
+        .context("running ffmpeg to pull the video apart")?;
+    if !status.success() {
+        bail!("ffmpeg could not read {}", path.display());
+    }
+
+    let mut frames: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .context("reading the frames back")?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
+        .collect();
+    frames.sort();
+    if frames.is_empty() {
+        bail!("{} yielded no frames", path.display());
+    }
+    Ok(frames)
+}
+
 /// The encoders this machine's ffmpeg can actually use.
 ///
 /// `ffmpeg -encoders` lists what was *compiled in*, which is not the same as

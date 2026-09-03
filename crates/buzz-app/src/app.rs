@@ -366,6 +366,8 @@ pub enum Pick {
     ImportImage,
     /// An image to lay into the selected shapes as a fill.
     FillWithImage,
+    /// A video to pull apart onto a reference layer, a frame at a time.
+    VideoReference,
     ImportSound,
     /// File ▸ Import, into the stage or into the library.
     ImportInto(buzz_scene::ImportTarget),
@@ -4534,6 +4536,7 @@ impl App {
     fn dispatch(&mut self, command: Command) {
         match command {
             Command::ImportSound => self.import_sound_dialog(),
+            Command::ImportVideoReference => self.video_reference_dialog(),
             Command::ImportImage => self.import_image_dialog(),
             Command::LipSync => self.open_lip_sync(),
             Command::ExportFla => self.export_fla_dialog(),
@@ -4841,6 +4844,7 @@ impl App {
             Pick::SaveAs => self.save_to(path),
             Pick::ImportImage => self.import_image_from(path),
             Pick::FillWithImage => self.fill_with_image_from(path),
+            Pick::VideoReference => self.video_reference_from(path),
             Pick::ImportSound => self.import_sound_from(path),
             Pick::ImportInto(target) => self.import_file(target, path),
             Pick::AnimateAssets => self.import_animate_assets_from(path),
@@ -5736,6 +5740,26 @@ impl App {
         match self.editor.fill_selection_with_image(&path, false) {
             Ok(()) => self.editor.status = Some("Filled the selection with the image".into()),
             Err(e) => self.editor.status = Some(format!("Could not fill with that image: {e:#}")),
+        }
+    }
+
+    /// Pick a video to rotoscope over.
+    fn video_reference_dialog(&mut self) {
+        self.ask_for_path(
+            crate::dialogs::Request::open_file().filter(
+                "Video",
+                &["mp4", "mov", "m4v", "avi", "mkv", "webm", "gif"],
+            ),
+            Pick::VideoReference,
+        );
+    }
+
+    fn video_reference_from(&mut self, path: std::path::PathBuf) {
+        // Pulling a video apart takes seconds, not milliseconds; saying so
+        // before it starts is the difference between "working" and "hung".
+        self.editor.status = Some("Reading the video\u{2026}".into());
+        if let Err(e) = self.editor.import_video_reference(&path) {
+            self.editor.status = Some(format!("Could not read that video: {e:#}"));
         }
     }
 

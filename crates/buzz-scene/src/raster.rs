@@ -264,14 +264,154 @@ impl Canvas {
         }
         // Painted, not read from a file: the pixels *are* the original, so
         // there is nothing to keep beside them. Saving encodes a PNG.
-        ImageAsset::from_pixels(
+        let mut asset = ImageAsset::from_pixels(
             id,
             name,
             self.width,
             self.height,
             std::sync::Arc::new(pixels),
+        );
+        asset.painted = true;
+        asset
+    }
+}
+
+/// One bitmap covering two, and where it sits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergedPaint {
+    /// Document position of the top-left corner of pixel `(0, 0)`.
+    pub origin: Point,
+    pub width: u32,
+    pub height: u32,
+    /// Straight-alpha RGBA8, `width * height * 4` long.
+    pub pixels: Vec<u8>,
+}
+
+impl MergedPaint {
+    /// Where this sits in document space.
+    pub fn area(&self) -> Rect {
+        Rect::new(
+            self.origin.x,
+            self.origin.y,
+            self.origin.x + f64::from(self.width),
+            self.origin.y + f64::from(self.height),
         )
     }
+}
+
+/// **Paint a stroke into paint already there**, giving one bitmap covering both.
+///
+/// # Why this exists
+///
+/// Animate's merge drawing model is that paint of one colour is *one thing*:
+/// draw over what you drew and there is one shape afterwards, not two stacked.
+/// A soft brush had no such rule — every stroke became its own bitmap on its own
+/// shape — so a face built out of forty strokes was forty objects, and selecting
+/// "the paint" meant selecting forty things and hoping.
+///
+/// # It must not change the picture
+///
+/// The two are composited **source-over**, which is exactly what stacking the
+/// two shapes already showed. Fusing therefore collapses the object count and
+/// leaves the frame identical, which is the only way it can be safe to do
+/// without asking. (Within a single stroke coverage is *raised* rather than
+/// composited — see [`Canvas::stamp`] — because that is one pass of one brush;
+/// two strokes really are two passes, and a second pass over a soft edge does
+/// darken it.)
+///
+/// `under_origin` is where the existing bitmap's first pixel sits in document
+/// space; the caller is responsible for having checked that it is still one
+/// pixel to one document unit and square to the axes, because this does no
+/// resampling. `None` if the union would be larger than a canvas may be.
+pub fn merge_over(
+    under: &ImageAsset,
+    under_origin: Point,
+    canvas: &Canvas,
+    brush: &SoftBrush,
+) -> Option<MergedPaint> {
+    let under_area = Rect::new(
+        under_origin.x,
+        under_origin.y,
+        under_origin.x + f64::from(under.width),
+        under_origin.y + f64::from(under.height),
+    );
+    let area = under_area.union(canvas.area());
+
+    let origin = Point::new(area.x0.floor(), area.y0.floor());
+    let width = (area.x1.ceil() - origin.x).max(1.0) as u64;
+    let height = (area.y1.ceil() - origin.y).max(1.0) as u64;
+    if width * height > MAX_CANVAS_PIXELS {
+        return None;
+    }
+    let (width, height) = (width as u32, height as u32);
+
+    let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
+
+    // The existing paint, moved into the union's frame. Both are pixel-aligned,
+    // so this is a copy rather than a resample.
+    let under_dx = (under_origin.x - origin.x).round() as i64;
+    let under_dy = (under_origin.y - origin.y).round() as i64;
+    for y in 0..under.height as i64 {
+        for x in 0..under.width as i64 {
+            let (dx, dy) = (x + under_dx, y + under_dy);
+            if dx < 0 || dy < 0 || dx >= i64::from(width) || dy >= i64::from(height) {
+                continue;
+            }
+            let from = ((y * i64::from(under.width) + x) * 4) as usize;
+            let to = ((dy * i64::from(width) + dx) * 4) as usize;
+            pixels[to..to + 4].copy_from_slice(&under.pixels[from..from + 4]);
+        }
+    }
+
+    // Then the new stroke over it.
+    let ink = brush.color.to_rgba8().to_u8_array();
+    let flow = brush.flow.clamp(0.0, 1.0) * f64::from(ink[3]) / 255.0;
+    let canvas_dx = (canvas.area().x0 - origin.x).round() as i64;
+    let canvas_dy = (canvas.area().y0 - origin.y).round() as i64;
+    for y in 0..canvas.height() as i64 {
+        for x in 0..canvas.width() as i64 {
+            let coverage = canvas.coverage_at(x, y);
+            if coverage == 0 {
+                continue;
+            }
+            let (dx, dy) = (x + canvas_dx, y + canvas_dy);
+            if dx < 0 || dy < 0 || dx >= i64::from(width) || dy >= i64::from(height) {
+                continue;
+            }
+            let alpha = f64::from(coverage) * flow / 255.0;
+            let to = ((dy * i64::from(width) + dx) * 4) as usize;
+            let below = f64::from(pixels[to + 3]) / 255.0;
+            // Straight alpha, source-over. The colours are the same, so only
+            // the alpha has anywhere to go — but it is written in full rather
+            // than assumed, so a later merge of two inks is a change of one
+            // line here rather than a rewrite.
+            let out = alpha + below * (1.0 - alpha);
+            pixels[to] = ink[0];
+            pixels[to + 1] = ink[1];
+            pixels[to + 2] = ink[2];
+            pixels[to + 3] = (out * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    Some(MergedPaint {
+        origin,
+        width,
+        height,
+        pixels,
+    })
+}
+
+/// **The one colour a painted bitmap is in**, if it has any paint at all.
+///
+/// Every pixel of a painted bitmap carries the brush's colour and differs only
+/// in coverage, so the first pixel that is not fully transparent answers for all
+/// of them. `None` for a bitmap with nothing on it.
+pub fn painted_ink(asset: &ImageAsset) -> Option<Color> {
+    asset
+        .pixels
+        .chunks_exact(4)
+        .find(|px| px[3] > 0)
+        .map(|px| Color::from_rgba8(px[0], px[1], px[2], 255))
 }
 
 /// Keep a canvas within the pixel limit, shrinking the larger side first.

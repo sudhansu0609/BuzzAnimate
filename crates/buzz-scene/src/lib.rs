@@ -96,7 +96,7 @@ pub use texture::{TextureKind, TextureRecipe};
 // re-exported here so a document can name them without depending on the font
 // machinery itself.
 pub use buzz_text::{FontStyle, TextAlign};
-pub use raster::{Canvas, SoftBrush};
+pub use raster::{MergedPaint, merge_over, painted_ink,Canvas, SoftBrush};
 pub use rig::{ArmatureData, NamedPose, RigBinding, RigPart, WarpData};
 pub use sound::{SoundAsset, SoundCue, SoundId, SoundLibrary, SoundRef, SoundSync};
 pub use swatch::{Swatch, SwatchId, Swatches, default_palette, default_swatches};

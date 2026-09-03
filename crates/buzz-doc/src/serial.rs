@@ -138,6 +138,11 @@ use serde::{Deserialize, Serialize};
 ///   fraction of a frame, and how many instants across it an export adds up.
 ///   Zero — absent — is the infinitely fast shutter every older file has, so a
 ///   document without motion blur is written exactly as version 34 wrote it.
+/// * **39** — a bitmap records whether it was **painted** with the brush. That
+///   is what lets a stroke fuse into the paint under it after the document has
+///   been reopened; an imported picture is not paint and merges with nothing.
+///   Absent for every image in every older file, which is the honest reading —
+///   nothing before this could fuse.
 /// * **38** — an object may carry a whole **turnaround**: drawings of itself
 ///   seen from other angles, each against the yaw it is the view of. A plain
 ///   back view still writes as `reverse`, exactly as version 29 introduced it,
@@ -154,7 +159,7 @@ use serde::{Deserialize, Serialize};
 ///   document with no procedural texture in it is written exactly as version 35
 ///   wrote it. A file written *with* one and opened by an older build loses that
 ///   image, which is what the bump is for.
-pub const FORMAT_VERSION: u32 = 38;
+pub const FORMAT_VERSION: u32 = 39;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -1813,6 +1818,10 @@ pub struct ImageAssetDto {
     pub format: String,
     pub width: u32,
     pub height: u32,
+    /// Painted with the brush rather than imported. Version 39; absent for
+    /// every imported picture, which is what an older file's images all are.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub painted: bool,
     /// **How to make this image, rather than the image.** Version 36.
     ///
     /// Present only for a procedural texture, and when it is present the
@@ -2243,6 +2252,7 @@ impl DocumentDto {
                         format: image.format.clone(),
                         width: image.width,
                         height: image.height,
+                        painted: image.painted,
                         recipe: image.recipe.as_ref().map(TextureRecipeDto::from_recipe),
                     }
                 })

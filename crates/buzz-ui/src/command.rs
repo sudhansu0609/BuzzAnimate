@@ -107,6 +107,9 @@ pub enum Command {
     /// A guide layer for reference art (rotoscoping): shown faded, never
     /// exported. Import an image onto it to trace over.
     NewReferenceLayer,
+    /// **Import a video to trace over**: one frame of it per frame of the film,
+    /// on a guide layer.
+    ImportVideoReference,
     DeleteLayer,
 
     // Symbols and library
@@ -360,6 +363,7 @@ impl Command {
             NewLayer => "New Layer",
             NewLayerFolder => "New Folder",
             NewReferenceLayer => "New Reference Layer",
+            ImportVideoReference => "Import Video Reference\u{2026}",
             DeleteLayer => "Delete Layer",
 
             ConvertToSymbol => "Convert to Symbol…",
@@ -554,7 +558,7 @@ impl Command {
             SaveSnapshot | Snapshots => None,
             ShortcutEditor => None,
             DetectBeats => None,
-            NewReferenceLayer => None,
+            NewReferenceLayer | ImportVideoReference => None,
 
             AddSun | AddSky | AddLamp | AddGloom | AddFire => None,
             // No Animate binding to follow, and these open dialogs rather than

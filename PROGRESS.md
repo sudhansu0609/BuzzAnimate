@@ -3895,6 +3895,105 @@ a name that collides with a built-in is refused rather than shadowing it.
 
 ---
 
+### ✅ Waves 6–15 — the effort gap, closed wave by wave
+
+> **Written late, and said so.** The checkpoint log stopped at Wave 5 while the
+> work did not, and by this file's own rule — not written here is not finished —
+> that left a great deal of finished work unfinished. This entry is the catch-up.
+> It is one entry rather than twenty because it was written after the fact from
+> the commits and the code, and an entry per wave written that way would imply a
+> record kept as the work happened. It was not.
+
+**Wave 6 — the compositor (`buzz-render/src/compositor.rs`).** A raw-wgpu
+post-process chain over the finished frame: bright-pass, a half-resolution Kawase
+ping-pong for bloom, then one composite pass carrying grade, vignette and grain.
+The stage and the exporter call the *same* `Compositor::run` on their two
+different devices, which is the parity guarantee `document.rs` gives for artwork.
+With every effect off, the composite pass reads the source with `textureLoad` at
+integer coordinates and returns it byte-for-byte — which is what lets the window
+skip the whole chain and blit instead.
+
+**Wave 9 — 2.5D.** Layers carry a `depth`; the camera carries a focal distance
+and turns depth into size by straight pinhole projection, so a layer at twice the
+focal distance draws at half size and slides half as far under a pan. Lights gain
+a `LightTrack`, so a sun can swing through a shot. The camera also gains an
+**aperture** and a **focus depth**: a layer off the focus plane is blurred in
+proportion to how far out of focus it is, reusing the per-shape blur the filter
+path already draws rather than adding a pipeline. Recorded plainly: that is the
+*geometric* half of depth of field, and a per-pixel sliced version is still a
+later upgrade.
+
+**Wave 10 — the film.** A document holds several scenes and exports as one film.
+**Wave 10b — camera angles**: a camera state saved under a name and cut back to
+at the playhead, so a set is staged once and shot from several viewpoints.
+
+**Wave 12 — the modifier stack.** Live modifiers on an object — Wiggle, Spring,
+LookAt, AutoSquashStretch — evaluated at draw time in the one place the window,
+the exporter and the headless tests all pass through, so what is drawn is what is
+exported. **Bake-down** turns any of them into ordinary keyframes when they need
+to become editable, which is the escape hatch that makes procedural motion safe
+to use at all.
+
+**Part I §6 — the beautiful half.** The **Motion Editor** (closes §7 item 18):
+a tween's easing shaped as a curve, with orient-to-path beside it. The **Text
+tool** (closes §7 item 9): click-to-place, editable vector type, glyph *outlines*
+rather than rasterised glyphs, so text scales and exports like anything else
+drawn — and with `harfrust` shaping behind it, real Devanagari, where matras
+reorder and consonants form conjuncts. Faces are enumerated from the system, so a
+Hindi or calligraphy family is one click away; each is offered in the cuts it
+actually has, because a bold button on a family with no bold changes nothing.
+
+**True turnaround.** An object turned to face away shows a *different drawing*
+rather than the front mirrored. Since generalised: drawings against the angle
+each is the view of, chosen by the object's yaw **less the camera's** — so
+swinging the shot round shows the other side without the character turning — and
+only the turn left over after choosing a view foreshortens it. That last part is
+what makes a profile possible at all: at ninety degrees the object's own plane is
+edge-on and has no width to draw in.
+
+**Wave 13 — drawing delight.** Symmetry (mirror and radial), a pull-string
+stabiliser that reaches the pencil, perspective guides, a duotone gradient-map
+filter, and **textures**: seamless procedural tiles, and any image as a shape
+fill. A texture keeps the **recipe** that made it, so it is re-tuned in place
+rather than undone and re-applied — and a saved document keeps the recipe rather
+than the tile, so a wall of brick costs about ninety bytes instead of an embedded
+PNG.
+
+**Wave 11 — animation feel.** Motion trails and arcs on the stage, audio
+scrubbing under the playhead, beat markers detected from the soundtrack, and
+reference layers for rotoscoping — a still to trace over, and now a whole video.
+Frames are pulled out with ffmpeg once, up front, and become ordinary keyframed
+artwork on a guide layer, because a rotoscope reference has to be *scrubbable*:
+dragging the playhead back and forth over six frames is the activity, and it is
+the thing no video decoder is good at.
+
+**Wave 14 — pro output.** Alpha video (ProRes 4444, a real alpha channel),
+render region, posterise, halftone and hatching in the compositor, and **object
+motion blur**. The blur was the architecturally hardest thing here: a shutter is
+open for part of a frame and records the artwork at instants *between* frames,
+and the model is `u32`-framed throughout. `AtTime` — implemented for `u32` and
+`f64` — is the way through, because a frame *is* a time, the one at its own
+start. Every existing caller compiles unchanged, and there is no second code path
+to drift.
+
+**Wave 15 — command and control.** A command palette on Ctrl+K, named version
+snapshots, saved commands, and a keyboard-shortcut editor whose overrides live on
+the workspace rather than inside any document.
+
+**Paint fuses with paint** (closes §7 item 26 for the soft brush). A stroke laid
+over paint of the same colour becomes part of it, in Merge Shape mode, as every
+other drawing tool here already honoured. The two are composited source-over —
+exactly what stacking the two shapes already showed — so fusing collapses the
+object count and leaves the frame identical, which is the only way it could be
+safe to do without asking first.
+
+**Format version 19 → 39.** Every step backward-compatible, and every one written
+so that a document not using the new thing is written byte-for-byte as the
+previous version wrote it. The bumps are listed, each with that reasoning, on
+`FORMAT_VERSION` in `buzz-doc/src/serial.rs`.
+
+---
+
 ## 5. Current metrics
 
 | Measure | Value |
@@ -3905,16 +4004,16 @@ a name that collides with a built-in is refused rather than shadowing it.
 | CPU encode time | ~0.10 ms, flat across all zooms |
 | Threads in use | 20 interactive + 6 background |
 | Items drawn at 2e14% | 61 of 224, identical output (70 before clipping, 213 before the overlap fix) |
-| Tests | 1 516 passing, clippy clean |
-| Rust source | ~48 000 lines |
-| Crates built | 16 of 17 |
+| Tests | 2 226 passing across 105 binaries, clippy clean |
+| Rust source | ~154 000 lines |
+| Crates built | 19 |
 | Phases done | 0, 1, 2, 3, 4, **5**, **7** (gaps in §7), plus CP-6.1 and CP-8.1 |
-| Format version | 19 — adds named poses on a rig |
+| Format version | 39 — adds whether a bitmap was painted, so a stroke still fuses after reopening |
 | Formats heard | `.wav`, `.mp3`, `.ogg`, `.flac`, `.m4a`, `.aac` |
 | IK budget | 50 six-bone rigs solved in parallel, well inside one frame |
 | Formats read | `.buzz`, `.fla`, `.xfl`, `.swf`, `.pdf`, `.ai` |
 | Brush preview frame | 0.57 ms at 6 000 samples and 0.5 spacing |
-| Lights | Sun, Sky, Lamp; shading, highlights and cast shadows as vector geometry |
+| Lights | Sun, Sky, Lamp, Gloom; shading, highlights, cast shadows, rim and flicker, all keyable |
 
 ---
 
@@ -4069,13 +4168,13 @@ down here has not been finished.
 |---|---|---|
 | 1 | ~~**Oversized paths culled, not clipped.**~~ | ✅ **Resolved in CP-1.1** by `RenderClip` |
 | 8 | ~~**Gradients not implemented.**~~ | ✅ **Resolved** — linear and radial gradients on fills and strokes, a working Gradient Transform tool, format version 16 |
-| 9 | **Text tool not implemented.** Needs font loading, shaping and a text-editing caret — a subsystem in its own right. | Phase 2 follow-up |
+| 9 | ~~**Text tool not implemented.**~~ | ✅ **Resolved** — click-to-place editable vector type, glyph outlines through `skrifa`, `harfrust` shaping for Devanagari, and a system font picker with real bold/italic cuts and alignment (§4) |
 | 10 | ~~**Lasso tool not implemented.**~~ | ✅ **Resolved** — freehand region that *cuts* the artwork it crosses, plus a Magic Wand beside it |
 | 11 | **Pen tool draws line segments, not Bézier curves.** Click-drag handle authoring is not there yet; anchors can be edited afterwards with Subselection. | Phase 2 follow-up |
 | 12 | **Multiple Scenes not implemented.** One scene per document. | Deferred |
 | 15 | ~~**Tweening not implemented.**~~ | ✅ **Resolved in CP-4.3** — classic, motion and shape tweens interpolate in the render path |
 | 17 | ~~**Library has no previews.**~~ | ✅ **Resolved in Wave 1** — every symbol draws a picture of itself, on the window's own device with no readback, keyed by the symbol's `Arc` address (§4) |
-| 18 | **No Motion Editor, motion paths or shape hints.** Easing exists in the model (strength and cubic Bézier) and interpolates correctly, but nothing in the UI edits a curve, and a motion tween cannot yet follow a drawn path. | Phase 4 follow-up |
+| 18 | ~~**No Motion Editor or motion paths.**~~ | ✅ **Resolved** — a curve-editing surface for a tween's easing, with orient-to-path beside it (§4). **Shape hints are still not implemented** |
 | 19 | ~~**Import commands are not wired.**~~ | ✅ **Resolved in CP-5.1b** — `Scene::merge` remaps every id; all three formats are on the File menu |
 | 20 | ~~**The XFL importer does not restore folder nesting.**~~ | ✅ **Resolved in CP-5.1c**, along with two fidelity bugs it exposed |
 | 21 | **No importer has been checked against a real file from Adobe.** Every fixture is one we wrote, so the importers are verified against the *specifications* and against files whose content we chose — not against what Animate, Illustrator and the Flash compilers actually emit, which is where the awkward cases live. This is the largest single risk in Phase 5. | Needs a licensed Animate/Illustrator and real-world files |
@@ -4091,7 +4190,7 @@ down here has not been finished.
 | 29 | **Depth does not blur.** Animate's camera has a depth-of-field effect; layers off the focal plane are sharp here however far away they are. Needs a blur in the render path. | Follow-up |
 | 27 | **Build-up paint is a deliberate deviation from Animate**, which has no such mode: its shapes always composite source-over. It is off by default, so a document that does not ask for it behaves exactly as Animate would. Added because overlapping translucent strokes that deepen is what a brush *should* do, and because the request was explicit. | By design |
 | 25 | **Pen pressure is plumbed through but never supplied.** The brush reads `StrokeSample::pressure` and the setting is in the panel, but winit 0.30 gives no tablet pressure on Windows, so every sample arrives at 1.0 and the pressure option paints a constant width. Speed is the default response for exactly this reason. Needs a platform tablet backend (Windows Ink / Wintab). | Brush follow-up |
-| 26 | **Brush strokes do not merge with what is under them.** Each stroke is its own shape even in Merge Shape mode; Animate would fuse same-coloured overlapping paint. The booleans exist (CP-1.1b) — this is a matter of routing brush output through them, which was left out because a boolean per stroke would undo the responsiveness work unless it is done off the interactive thread. | Brush follow-up |
+| 26 | ~~**Soft-brush strokes do not merge with what is under them.**~~ | ✅ **Resolved for painted strokes** — paint of one colour fuses into one bitmap, source-over, so the object count falls and the picture does not change (§4). **Still open for vector brush strokes**, which need the booleans off the interactive thread exactly as this entry always said |
 | 24 | **PDF clipping paths are ignored.** `W`/`W*` are recorded in the report but not applied, so artwork that a real file clips away arrives whole. Needs a clip concept in the scene model, which nothing else has wanted yet. | Phase 5 follow-up |
 | 38 | **Sound has no Properties panel.** Attaching a sound puts the newest import on the current keyframe with Animate's Stream sync; there is no picker, no per-sound volume or effect, and no way to choose Event/Start/Stop from the interface. The model carries all four sync modes and a volume — nothing edits them yet. | Sound follow-up |
 | 39 | **Only Stream sync actually differs.** Event, Start and Stop are stored, saved and reported, but the player treats every cue as timeline-positioned. An Event sound that should carry on past its keyframe stops with the playhead. | Sound follow-up |
@@ -4429,5 +4528,9 @@ Closest to the drawing and depth work before it:
 - **Tablet pressure** (§7 item 25). The brush already reads pressure; nothing
   supplies it.
 
-Then: library previews (§7 item 17), the Motion Editor (§7 item 18), text
-(§7 item 9), and checking the importers against real Adobe files (§7 item 21).
+Then: checking the importers against real Adobe files (§7 item 21), and the
+bitmaps they still do not bring across (§7 item 158).
+
+*Library previews (§7 item 17), the Motion Editor (§7 item 18) and text
+(§7 item 9) were listed here as next, and have since shipped — see the
+Waves 6–15 entry in §4.*

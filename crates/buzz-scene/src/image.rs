@@ -54,6 +54,14 @@ pub struct ImageAsset {
     /// or a half-transparent red and an opaque dark red become the same
     /// number and the wand selects across an edge that is plainly there.
     pub pixels: Arc<Vec<u8>>,
+    /// **Painted with the brush**, rather than imported or generated.
+    ///
+    /// What lets one stroke fuse into another: paint merges with paint, and a
+    /// photograph does not merge with anything. It is not a guess from the
+    /// pixels — an imported picture can be one flat colour too — so it is
+    /// recorded, and it survives being saved, because painting over yesterday's
+    /// stroke should fuse exactly as painting over this morning's did.
+    pub painted: bool,
     /// **The recipe that made these pixels**, when they were generated rather
     /// than imported.
     ///
@@ -162,6 +170,7 @@ impl ImageAsset {
             width,
             height,
             pixels: Arc::new(rgba.into_raw()),
+            painted: false,
             recipe: None,
             identity: next_identity(),
         })
@@ -179,6 +188,7 @@ impl ImageAsset {
             width,
             height,
             pixels: Arc::new(vec![0; (width as usize) * (height as usize) * 4]),
+            painted: false,
             recipe: None,
             identity: next_identity(),
         }
@@ -242,6 +252,7 @@ impl ImageAsset {
             width,
             height,
             pixels,
+            painted: false,
             recipe: None,
             identity: next_identity(),
         }

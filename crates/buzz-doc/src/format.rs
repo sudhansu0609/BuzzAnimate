@@ -298,7 +298,11 @@ fn read_scene<R: Read + Seek>(
             entry.name.clone(),
             &bytes,
         ) {
-            Ok(asset) => {
+            Ok(mut asset) => {
+                // Whether it was painted is in the document, not in the PNG:
+                // the decoder cannot know, and a stroke has to still be paint
+                // when the file is reopened or it would stop fusing.
+                asset.painted = entry.painted;
                 images.insert(asset);
             }
             Err(e) => tracing::warn!("{name} could not be decoded: {e}"),

@@ -26,6 +26,44 @@ struct Harness {
     readback: wgpu::Buffer,
 }
 
+/// **One GPU for the whole binary.**
+///
+/// # The crash this fixes
+///
+/// Every test used to build its own [`GpuContext`], and the test harness runs
+/// them in parallel — so on a machine with twenty-eight threads this was up to
+/// twenty-eight D3D12 devices being created, driven and destroyed at once on
+/// one adapter. It crashed intermittently *inside the graphics driver*
+/// (`STATUS_ACCESS_VIOLATION`, or a bare abnormal exit), which is exactly what
+/// that pattern produces and is precisely why it never reproduced when the test
+/// was run on its own: one device at a time is fine, and forty-five in flight
+/// is not.
+///
+/// One device, one 512-square target, shared behind a mutex. The tests
+/// serialise around the render — which they were effectively doing anyway,
+/// contending for a single adapter — and the binary stops spending most of its
+/// life creating and tearing down devices.
+///
+/// # Why sharing the target is safe
+///
+/// [`Harness::present`] clears to `BACKGROUND` and copies the whole 512 square
+/// back every time, so no test can see a pixel another one left behind. If a
+/// test ever needed a different size it would need its own target, and this is
+/// the note that says so.
+fn harness() -> Option<std::sync::MutexGuard<'static, Harness>> {
+    static GPU: std::sync::OnceLock<Option<std::sync::Mutex<Harness>>> =
+        std::sync::OnceLock::new();
+
+    let shared = GPU.get_or_init(|| Harness::new().map(std::sync::Mutex::new));
+    // **A poisoned lock is recovered rather than propagated.** One test that
+    // panics mid-render would otherwise turn every test after it into a lock
+    // error instead of its own failure, which hides the thing that actually
+    // broke behind forty-three that did not.
+    shared
+        .as_ref()
+        .map(|m| m.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+}
+
 impl Harness {
     fn new() -> Option<Self> {
         let gpu = match GpuContext::new_blocking(&GpuPreference::Automatic) {
@@ -191,7 +229,7 @@ fn warmth(pixels: &[u8]) -> f64 {
 /// The report: switch a sun on and the stage must change.
 #[test]
 fn a_sun_changes_the_stage() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
 
@@ -210,7 +248,7 @@ fn a_sun_changes_the_stage() {
 /// The report: change the light's colour and the artwork must change colour.
 #[test]
 fn the_lights_colour_reaches_the_stage() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
     editor.add_light(LightKind::sun());
@@ -238,7 +276,7 @@ fn the_lights_colour_reaches_the_stage() {
 /// The report: a lamp's height must change what is seen.
 #[test]
 fn a_lamps_height_changes_the_stage() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
     editor.add_light(LightKind::Lamp {
@@ -281,7 +319,7 @@ fn a_lamps_height_changes_the_stage() {
 #[test]
 #[ignore = "diagnostic"]
 fn dump_stage_pictures() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let out = std::path::Path::new(&std::env::var("BUZZ_DUMP").unwrap_or_default()).to_path_buf();
     if out.as_os_str().is_empty() {
         return;
@@ -385,7 +423,7 @@ fn bitmap_document() -> Editor {
 /// lights a drawn shape.
 #[test]
 fn a_sun_lights_bitmap_artwork() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = bitmap_document();
 
@@ -404,7 +442,7 @@ fn a_sun_lights_bitmap_artwork() {
 /// **The report, on bitmap artwork.** The light's colour must reach it.
 #[test]
 fn the_lights_colour_reaches_bitmap_artwork() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = bitmap_document();
     editor.add_light(LightKind::sun());
@@ -477,7 +515,7 @@ fn symbol_document() -> Editor {
 /// stopped at the instance boundary nothing an animator lights would light.
 #[test]
 fn the_lights_colour_reaches_a_symbol() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = symbol_document();
     editor.add_light(LightKind::sun());
@@ -559,7 +597,7 @@ fn cutout_document() -> Editor {
 /// compositing look pasted on.
 #[test]
 fn a_cutouts_transparent_corners_stay_transparent() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = cutout_document();
 
@@ -598,7 +636,7 @@ fn a_cutouts_transparent_corners_stay_transparent() {
 /// sun, must come out the same picture.
 #[test]
 fn a_bitmap_lights_like_the_colour_it_is_made_of() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
 
     let mut vector = document();
     vector.add_light(LightKind::sun());
@@ -685,7 +723,7 @@ fn lights_survive_a_save_and_a_reopen() {
 /// after they are built.
 #[test]
 fn lighting_survives_a_warm_cache() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
 
     for (what, mut editor) in [
         ("loose artwork", document()),
@@ -752,7 +790,7 @@ fn imported_document(stroked: bool) -> Editor {
 /// **Grouped artwork, and line work, must light too.**
 #[test]
 fn the_lights_colour_reaches_grouped_and_stroked_artwork() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
 
     for stroked in [false, true] {
         let what = if stroked { "line work" } else { "a group" };
@@ -871,7 +909,7 @@ fn diagnose_a_real_document() {
     eprintln!("{tally:#?}");
 
     // Now: does a light change the picture?
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = Editor::new(Document::new(scene));
     editor.camera.viewport = Size::new(W as f64, H as f64);
     let stage = editor.scene().stage().size;
@@ -916,7 +954,11 @@ fn diagnose_a_real_document() {
         sum(&unlit), sum(&lit), sum(&absurd), sum(&green)
     );
     // A harness built from scratch, in case the first one is holding stale
-    // pixels rather than the renderer producing them.
+    // pixels rather than the renderer producing them. **Deliberately a second
+    // device**, not the shared one — ruling that out is the whole point of the
+    // line — and safe here because it is built directly rather than through
+    // `harness()`, so it takes no lock and this diagnostic cannot deadlock
+    // against the guard it is already holding.
     if let Some(mut fresh) = Harness::new() {
         let mut cold = DrawCache::default();
         let again = fresh.stage(&editor, &mut cold);
@@ -1001,7 +1043,7 @@ fn save_a_real_document_lit() {
 /// side and the shaded one.
 #[test]
 fn a_default_sun_lights_rather_than_dims() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
 
@@ -1154,7 +1196,7 @@ const FACE_Y: u32 = ((220.0 - 210.0) * 0.85 + 256.0) as u32;
 /// which is the one thing a lamp is for.
 #[test]
 fn a_lamp_brought_closer_lights_the_near_face() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = two_faces();
     bare_lamp(&mut editor, Point::new(-500.0, 220.0));
 
@@ -1175,7 +1217,7 @@ fn a_lamp_brought_closer_lights_the_near_face() {
 /// read as a lamp.
 #[test]
 fn a_lamp_lights_the_near_face_more_than_the_far_one() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = two_faces();
     bare_lamp(&mut editor, Point::new(20.0, 220.0));
 
@@ -1194,7 +1236,7 @@ fn a_lamp_lights_the_near_face_more_than_the_far_one() {
 /// **A lamp's colour must land on what it lights**, and not only in its glint.
 #[test]
 fn a_lamps_colour_reaches_the_artwork() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = two_faces();
     bare_lamp(&mut editor, Point::new(20.0, 220.0));
 
@@ -1228,7 +1270,7 @@ fn a_lamps_colour_reaches_the_artwork() {
 /// it arrived at the character.
 #[test]
 fn a_lamp_added_to_a_film_sized_stage_lights_it() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
 
     let mut scene = Scene::default();
     scene.stage_mut().background = Color::WHITE;
@@ -1381,7 +1423,7 @@ fn away_from(pixels: &[u8], from_x: f64) -> Vec<f64> {
 /// of a lamp, which a flat per-shape tint passes.
 #[test]
 fn a_lamp_lights_one_side_of_a_shape_and_darkens_the_other() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = wall(Color::from_rgb8(0xE8, 0xE4, 0xDC));
     lamp_on(&mut editor, Point::new(70.0, 200.0));
 
@@ -1407,7 +1449,7 @@ fn a_lamp_lights_one_side_of_a_shape_and_darkens_the_other() {
 /// straight across the picture that reads as a join rather than as shading.
 #[test]
 fn a_lamps_falloff_is_a_gradient_rather_than_a_cliff() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = wall(Color::from_rgb8(0xE8, 0xE4, 0xDC));
     lamp_on(&mut editor, Point::new(70.0, 200.0));
 
@@ -1442,7 +1484,7 @@ fn a_lamps_falloff_is_a_gradient_rather_than_a_cliff() {
 /// lamp is nearest.
 #[test]
 fn a_lamps_colour_is_strongest_where_it_is_nearest() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let set = |editor: &mut Editor, c: Color| {
         editor.doc.edit("Lamp Colour", |scene| {
             let id = scene.lights().lights[0].id;
@@ -1489,7 +1531,7 @@ fn a_lamps_colour_is_strongest_where_it_is_nearest() {
 /// what the control is for and what it now measures.
 #[test]
 fn a_lamps_strength_reads_across_its_range() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = wall(Color::from_rgb8(0x60, 0x60, 0x64));
     lamp_on(&mut editor, Point::new(70.0, 200.0));
 
@@ -1519,7 +1561,7 @@ fn a_lamps_strength_reads_across_its_range() {
 /// **Moving a lamp moves the light**, across a single shape.
 #[test]
 fn carrying_a_lamp_across_a_wall_carries_the_bright_side_with_it() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = wall(Color::from_rgb8(0xE8, 0xE4, 0xDC));
     lamp_on(&mut editor, Point::new(70.0, 200.0));
 
@@ -1570,7 +1612,7 @@ fn delete_first_light(editor: &mut Editor) {
 /// **The report: use a light once, cancel it, and the next one does nothing.**
 #[test]
 fn a_light_added_after_the_last_one_was_deleted_still_lights() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
 
@@ -1602,7 +1644,7 @@ fn a_light_added_after_the_last_one_was_deleted_still_lights() {
 /// The same report, for a lamp — which is the light an animator reaches for.
 #[test]
 fn a_lamp_added_after_the_last_one_was_deleted_still_lights() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
     let unlit = h.stage(&editor, &mut cache);
@@ -1626,7 +1668,7 @@ fn a_lamp_added_after_the_last_one_was_deleted_still_lights() {
 /// **The report: the darkness does not come back either.**
 #[test]
 fn a_gloom_added_after_the_last_one_was_deleted_still_darkens() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
 
@@ -1674,7 +1716,7 @@ fn a_gloom_added_after_the_last_one_was_deleted_still_darkens() {
 /// as a sun's.
 #[test]
 fn changing_a_lamps_colour_reaches_the_stage() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
     editor.add_light(LightKind::lamp(Point::new(275.0, 200.0)));
@@ -1703,7 +1745,7 @@ fn changing_a_lamps_colour_reaches_the_stage() {
 /// document over and over into a cache that is warm.
 #[test]
 fn a_gloom_survives_a_warm_cache() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
     editor.add_light(LightKind::lamp(Point::new(430.0, 110.0)));
@@ -1733,7 +1775,7 @@ fn a_gloom_survives_a_warm_cache() {
 /// forty units on a stage five hundred and fifty across.
 #[test]
 fn a_light_added_with_no_stage_area_still_lights_the_stage() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
     let unlit = h.stage(&editor, &mut cache);
@@ -1760,7 +1802,7 @@ fn a_light_added_with_no_stage_area_still_lights_the_stage() {
 /// and one and a half wide.
 #[test]
 fn a_gloom_added_with_no_stage_area_still_darkens_the_stage() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
     editor.add_light(LightKind::lamp(Point::new(430.0, 110.0)));
@@ -1799,7 +1841,7 @@ fn switch(editor: &mut Editor, on: bool) {
 /// at the result actually does.
 #[test]
 fn a_lamp_switched_off_and_on_again_lights_the_same_way() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
     let unlit = h.stage(&editor, &mut cache);
@@ -1836,7 +1878,7 @@ fn a_lamp_switched_off_and_on_again_lights_the_same_way() {
 /// exactly as it was.
 #[test]
 fn a_gloom_switched_off_and_on_again_darkens_the_same_way() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
     editor.add_light(LightKind::lamp(Point::new(430.0, 110.0)));
@@ -1873,7 +1915,7 @@ fn a_gloom_switched_off_and_on_again_darkens_the_same_way() {
 /// and on again.
 #[test]
 fn the_rig_switched_off_and_on_again_lights_the_same_way() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut cache = DrawCache::default();
     let mut editor = document();
     editor.add_light(LightKind::lamp(Point::ORIGIN));
@@ -2070,7 +2112,7 @@ impl WindowSim {
 /// does neither.
 #[test]
 fn a_lamp_switched_off_and_on_again_reaches_the_window() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = document();
     editor.add_light(LightKind::lamp(Point::ORIGIN));
     let mut window = WindowSim::new(editor);
@@ -2102,7 +2144,7 @@ fn a_lamp_switched_off_and_on_again_reaches_the_window() {
 /// the deferred machinery is keeping the window awake on its behalf.
 #[test]
 fn a_gloom_switched_off_and_on_again_reaches_the_window() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = document();
     editor.add_light(LightKind::lamp(Point::new(430.0, 110.0)));
     editor.add_light(LightKind::gloom(Point::ORIGIN));
@@ -2143,7 +2185,7 @@ fn a_gloom_switched_off_and_on_again_reaches_the_window() {
 /// does the window ever show the new colour?
 #[test]
 fn recolouring_a_lamp_reaches_the_window() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = document();
     editor.add_light(LightKind::lamp(Point::new(275.0, 200.0)));
     let mut window = WindowSim::new(editor);
@@ -2186,7 +2228,7 @@ fn recolouring_a_lamp_reaches_the_window() {
 /// lighting is fine and no artwork was drawn at all.
 #[test]
 fn an_unmeasured_stage_area_still_draws_the_artwork() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = document();
     editor.add_light(LightKind::lamp(Point::ORIGIN));
 
@@ -2223,7 +2265,7 @@ fn an_unmeasured_stage_area_still_draws_the_artwork() {
 /// the light's colour cannot be changed any more.
 #[test]
 fn a_lamp_recolours_after_the_rig_has_been_switched_off_and_on() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = document();
     editor.add_light(LightKind::lamp(Point::new(275.0, 200.0)));
     let mut window = WindowSim::new(editor);
@@ -2341,7 +2383,7 @@ fn dense_document(shapes: usize, segments: usize) -> Editor {
 /// measuring a blank frame and passing for the wrong reason.
 #[test]
 fn a_dense_document_still_renders() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = dense_document(500, 400);
     let mut cache = DrawCache::default();
     let blank = {
@@ -2466,7 +2508,7 @@ fn an_ordinary_document_gives_up_nothing() {
 /// change its own lighting level between the frame before and the frame after.
 #[test]
 fn a_trimmed_document_lights_the_same_after_a_switch_off_and_on() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = dense_document(500, 400);
     editor.add_light(LightKind::sun());
     let mut cache = DrawCache::default();
@@ -2527,7 +2569,7 @@ fn a_trimmed_document_lights_the_same_after_a_switch_off_and_on() {
 fn shadows_come_back_after_their_switch_on_a_trimmed_document() {
     use buzz_render::document::LightDetail;
 
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let mut editor = document();
     editor.add_light(LightKind::sun());
     editor.doc.edit("A low sun", |scene| {
@@ -2577,7 +2619,7 @@ fn shadows_come_back_after_their_switch_on_a_trimmed_document() {
 fn a_trimmed_frame_still_takes_the_lights_colour() {
     use buzz_render::document::LightDetail;
 
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     for detail in [LightDetail::NoModelling, LightDetail::Flat] {
         let mut cache = DrawCache::default();
         cache.pin_detail(Some(detail));
@@ -2617,7 +2659,7 @@ fn a_trimmed_frame_still_takes_the_lights_colour() {
 /// A shadow is the silhouette of what casts it, at one tone.
 #[test]
 fn overlapping_shapes_cast_one_shadow_at_one_tone() {
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
 
     // Two squares that overlap down the middle, well clear of the shadow they
     // will throw so the measurement is of the shadow alone.
@@ -2720,7 +2762,7 @@ fn diagnose_a_saved_document() {
         }
     }
 
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     editor.camera.viewport = Size::new(W as f64, H as f64);
     let stage = editor.scene().stage().size;
     editor.camera.center = Point::new(stage.width / 2.0, stage.height / 2.0);
@@ -3071,7 +3113,7 @@ fn diagnose_the_switch_through_the_window() {
     let Ok(path) = std::env::var("BUZZ_DOC") else {
         return;
     };
-    let Some(mut h) = Harness::new() else { return };
+    let Some(mut h) = harness() else { return };
     let doc = Document::open(std::path::Path::new(&path)).expect("open");
     let mut editor = Editor::new(doc);
     editor.camera.viewport = Size::new(W as f64, H as f64);

@@ -12,7 +12,7 @@ use peniko::Color;
 
 use crate::command::{Command, shortcut_text};
 use crate::selection::Selection;
-use crate::style::{DrawStyle, DrawingMode, FillKind, StrokeKind};
+use crate::style::{DrawStyle, DrawingMode, FillKind, StrokeKind, SymmetryMode};
 use crate::theme::{Metrics, Palette};
 use crate::tools::{TOOL_GROUPS, ToolId, ToolStatus};
 use crate::view::ViewSettings;
@@ -317,6 +317,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                     Command::AddLamp,
                     Command::AddGloom,
                     Command::AddFire,
+                    Command::AddStorm,
                 ] {
                     item(ui, c, true, &mut raised);
                 }
@@ -1056,6 +1057,50 @@ fn bucket_properties(ui: &mut Ui, style: &mut DrawStyle) {
             );
         ui.end_row();
     });
+}
+
+/// Symmetry: the mirror every drawing tool draws through.
+///
+/// Buttons rather than a dropdown, because this is a mode you turn on and off
+/// mid-drawing — flip to the mirror, lay in the other eye, flip back — and a
+/// combo box makes that three clicks and a menu each way. The glyphs say which
+/// way the reflection goes: ↔ mirrors left to right, ↕ top to bottom.
+///
+/// It lives on the draw style rather than on any one tool, so the brush, the
+/// pencil, the pen and the eraser all share the setting and the axis: switching
+/// tools mid-drawing does not silently drop the mirror.
+fn symmetry_properties(ui: &mut Ui, style: &mut DrawStyle) {
+    let sym = &mut style.symmetry;
+    ui.horizontal_wrapped(|ui| {
+        for mode in SymmetryMode::ALL {
+            if ui
+                .selectable_label(sym.mode == mode, mode.label())
+                .on_hover_text(mode.description())
+                .clicked()
+            {
+                sym.mode = mode;
+            }
+        }
+    });
+
+    if sym.mode == SymmetryMode::Radial {
+        ui.add(
+            egui::Slider::new(&mut sym.radial_count, 2..=24)
+                .text("copies")
+                .integer(),
+        )
+        .on_hover_text("How many times around the centre the stroke is repeated");
+    }
+
+    if sym.is_on() {
+        ui.label(
+            RichText::new(
+                "The axes are drawn on the stage, through the centre. Every copy is                  laid down as the stroke is committed, so it can be moved or                  recoloured on its own afterwards.",
+            )
+            .small()
+            .weak(),
+        );
+    }
 }
 
 /// Brush settings, with a live preview of the pattern being stamped.
@@ -1981,6 +2026,14 @@ pub fn properties_panel(
         .id_salt("brush-section")
         .default_open(false)
         .show(ui, |ui| brush_properties(ui, style));
+    // Open by default, unlike the tool sections above it. It is four buttons
+    // rather than a screenful of sliders, and it is a mode you need to be able
+    // to *see* the state of: a mirror you have forgotten is on is a drawing
+    // that comes out wrong twice.
+    egui::CollapsingHeader::new(RichText::new("Symmetry").strong())
+        .id_salt("symmetry-section")
+        .default_open(true)
+        .show(ui, |ui| symmetry_properties(ui, style));
     egui::CollapsingHeader::new(RichText::new("Eraser").strong())
         .id_salt("eraser-section")
         .default_open(false)

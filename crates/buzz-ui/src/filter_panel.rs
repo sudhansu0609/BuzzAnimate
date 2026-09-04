@@ -132,13 +132,62 @@ pub fn filter_panel(
                     out.add_modifier = Some(Modifier::AutoSquashStretch { amount: 0.01 });
                     ui.close();
                 }
+                // A resting adult: fourteen breaths a minute, at the depth the
+                // modifier calls one. See `Modifier::Breathe`.
+                if ui
+                    .button("Breathe")
+                    .on_hover_text(
+                        "The chest rises and falls on every held pose, so a character \
+                         standing still reads as alive rather than as a picture.",
+                    )
+                    .clicked()
+                {
+                    out.add_modifier = Some(Modifier::Breathe {
+                        rate: 14.0,
+                        depth: 1.0,
+                    });
+                    ui.close();
+                }
+                // A breeze through a mid-stiff tree: leans an eighth of its own
+                // height at a full gust, a gust every five seconds or so.
+                if ui
+                    .button("Sway")
+                    .on_hover_text(
+                        "Wind: the drawing bends downwind from its base in gusts. Trees, \
+                         grass, banners, hanging signs.",
+                    )
+                    .clicked()
+                {
+                    out.add_modifier = Some(Modifier::Sway {
+                        amount: 0.12,
+                        rate: 0.2,
+                    });
+                    ui.close();
+                }
+                if ui
+                    .button("Drift")
+                    .on_hover_text(
+                        "A steady move that loops: clouds crossing the sky, the surface of \
+                         a river, a street behind a window. Set the wrap to how far it must \
+                         travel before it may start again.",
+                    )
+                    .clicked()
+                {
+                    out.add_modifier = Some(Modifier::Drift {
+                        dx: 12.0,
+                        dy: 0.0,
+                        span: 0.0,
+                        phase: 0.0,
+                    });
+                    ui.close();
+                }
             });
         });
         if modifiers.is_empty() {
             ui.label(
                 RichText::new(
-                    "Springs and wiggles are added from the Scene menu; look-at and \
-                     squash & stretch, here.",
+                    "Springs and wiggles are added from the Scene menu; look-at, \
+                     squash & stretch, breathing and sway, here.",
                 )
                 .small()
                 .weak(),
@@ -173,6 +222,81 @@ pub fn filter_panel(
                     Modifier::AutoSquashStretch { amount } => {
                         changed |= ui
                             .add(egui::DragValue::new(amount).prefix("amount ").speed(0.001))
+                            .changed();
+                    }
+                    Modifier::Breathe { rate, depth } => {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(rate)
+                                    .prefix("bpm ")
+                                    .speed(0.5)
+                                    .range(0.5..=120.0),
+                            )
+                            .on_hover_text("Breaths per minute: 14 at rest, 30 after running")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(depth)
+                                    .prefix("depth ")
+                                    .speed(0.05)
+                                    .range(0.0..=4.0),
+                            )
+                            .changed();
+                    }
+                    Modifier::Drift {
+                        dx,
+                        dy,
+                        span,
+                        phase,
+                    } => {
+                        changed |= ui
+                            .add(egui::DragValue::new(dx).prefix("dx ").speed(0.5))
+                            .on_hover_text("Document units per second, across")
+                            .changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(dy).prefix("dy ").speed(0.5))
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(span)
+                                    .prefix("wrap ")
+                                    .speed(2.0)
+                                    .range(0.0..=1.0e6),
+                            )
+                            .on_hover_text("How far it travels before it loops. 0 never loops.")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(phase)
+                                    .prefix("start ")
+                                    .speed(0.01)
+                                    .range(0.0..=1.0),
+                            )
+                            .on_hover_text(
+                                "How far into the loop it already is. Give several objects \
+                                 different values and they scatter instead of crossing in \
+                                 formation.",
+                            )
+                            .changed();
+                    }
+                    Modifier::Sway { amount, rate } => {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(amount)
+                                    .prefix("lean ")
+                                    .speed(0.01)
+                                    .range(0.0..=2.0),
+                            )
+                            .on_hover_text("How far the top leans, as a share of its own height")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(rate)
+                                    .prefix("Hz ")
+                                    .speed(0.01)
+                                    .range(0.01..=20.0),
+                            )
+                            .on_hover_text("Gusts per second")
                             .changed();
                     }
                 }

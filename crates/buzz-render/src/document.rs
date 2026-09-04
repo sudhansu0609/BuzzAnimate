@@ -1143,7 +1143,15 @@ fn draw_layers(
     // light falls on; a lamp creeping a hundredth of a frame is not something
     // a viewer can see, and sweeping it would clone the whole rig per sample
     // to prove it.
-    let lights = Arc::new(scene.lights().resolved_at(frame).into_owned());
+    // The stage's own frame rate, not a nominal one: a strike's envelope is
+    // measured in seconds, and a storm must run at the same speed in a 60 fps
+    // document as in a 24 fps one. See `LightRig::resolved_at_rate`.
+    let lights = Arc::new(
+        scene
+            .lights()
+            .resolved_at_rate(frame, scene.stage().frame_rate.max(1.0))
+            .into_owned(),
+    );
 
     // Depth ordering is opt-in on the stage. The masked run stays contiguous
     // either way, so the mask machinery below is untouched; only the order the
@@ -2970,18 +2978,43 @@ fn draw_shape(
                 }
                 if let Some(highlight) = &geometry.highlight {
                     let drawn = ctx.project(highlight, builder.tolerance());
+                    // **How hard this light catches an edge.** At full the band
+                    // is a wet, polished sheen; a drawing is usually matte, and
+                    // laying the full glint on all of it was half of why a lit
+                    // figure read as having a second, whiter drawing pasted
+                    // over one side. See `buzz_light::Light::glint`.
+                    let strength = modelling * key.glint();
+                    let band = highlight.bounding_box();
                     match (&field, &fill.paint) {
                         (Some(f), buzz_scene::Paint::Solid(c))
                             if let Some((ramp, disc)) =
-                                lamp_lit(f, *c, |i, c| i.highlight(c, key.color, modelling)) =>
+                                lamp_lit(f, *c, |i, c| i.highlight(c, key.color, strength)) =>
                         {
                             builder.fill_shape_paint(&drawn, &ramp, ctx.brush_projection(disc));
                         }
+                        // **Feathered where the fill is one colour**, which is
+                        // most artwork: the glint at the outer edge, fading to
+                        // the lit colour the picture underneath already is, so
+                        // the band ends in nothing rather than on a line. Both
+                        // ends are opaque, so the brightest part of the band is
+                        // exactly the colour the flat one was.
+                        (_, buzz_scene::Paint::Solid(c))
+                            if let Some(ramp) = glint_ramp(
+                                light.highlight(*c, key.color, strength),
+                                light.apply(*c),
+                                band,
+                                towards,
+                            ) =>
+                        {
+                            builder.fill_shape_paint(&drawn, &ramp, ctx.brush_projection(band));
+                        }
+                        // A fill made of a ramp or of pixels has no single pair
+                        // of colours to run between, so it keeps the flat band.
                         _ => {
                             let glint = ctx.paint(
                                 &fill
                                     .paint
-                                    .map_colors(|c| light.highlight(c, key.color, modelling)),
+                                    .map_colors(|c| light.highlight(c, key.color, strength)),
                             );
                             builder.fill_shape_paint(&drawn, &glint, brush_to_doc);
                         }
@@ -3274,18 +3307,122 @@ fn draw_lit_composited(
             ),
         }
     }
-    if let (Some(drawn), Some((key, _, _))) = (&highlight, &geometry) {
-        let strength = buzz_light::Illumination::highlight_strength(modelling);
-        builder.fill_shape_atop(
-            drawn,
-            key.color.multiply_alpha(strength),
-            buzz_fx::Blend::Normal,
-        );
+    if let (Some(drawn), Some((key, towards, built))) = (&highlight, &geometry) {
+        let strength = buzz_light::Illumination::highlight_strength(modelling * key.glint());
+        let glint = key.color.multiply_alpha(strength);
+        // Feathered exactly as the vector path's is — see `glint_ramp`. Here
+        // the fade is in the *alpha*, because a bitmap has no fill colour to
+        // fade towards: the ramp goes from the glint to the same glint at
+        // nothing, which is the picture underneath, untouched.
+        let ramp = built.highlight.as_ref().and_then(|h| {
+            let band = h.bounding_box();
+            glint_ramp(glint, glint.multiply_alpha(0.0), band, *towards).map(|paint| (paint, band))
+        });
+        match ramp {
+            Some((paint, band)) => builder.fill_shape_atop_paint(
+                drawn,
+                &paint,
+                ctx.brush_projection(band),
+                buzz_fx::Blend::Normal,
+            ),
+            None => builder.fill_shape_atop(drawn, glint, buzz_fx::Blend::Normal),
+        }
     }
 
     if isolate {
         builder.pop_isolation();
     }
+}
+
+/// **How much of the highlight stays at the full glint** before it starts to
+/// fall away, as a fraction of the way across the lit side of the shape.
+///
+/// Not zero. A ramp that starts at the very outer edge has its brightest value
+/// on one line of pixels, so the glint reads dimmer than the number asks for
+/// and turning the slider up only widens the fade. A quarter at full, then a
+/// fall across the rest, keeps the glint where it was and puts the softness
+/// where the flat stripe used to be.
+const GLINT_HOLD: f64 = 0.26;
+
+/// **The glint, falling off around the form instead of stopping flat.**
+///
+/// # What was wrong with the flat band
+///
+/// The highlight crescent is the artwork's outline minus a copy of itself
+/// shifted towards the light, and it was filled with **one tone, edge to
+/// edge**. A real highlight is not like that: it is brightest where the
+/// surface faces the light and dies away around the curve. Filled flat, the
+/// band is a stripe of even brightness ending on a hard line, and on a face or
+/// a limb it reads as a whiter drawing pasted over one side of the artwork
+/// rather than as light falling on it. That is the report this comes from.
+///
+/// So the band is filled with a **ramp along the light's own direction**: full
+/// where the shape faces the light, held for [`GLINT_HOLD`] of the way across,
+/// then falling to `inner` at the far side. `inner` is whatever the picture
+/// underneath already is, so the band dies into it rather than stopping.
+///
+/// **The same one fill**, with a gradient in it — no extra layer, no extra
+/// path, no second boolean. The crescents are the most expensive thing the
+/// renderer builds, and softening a light must not cost another one.
+///
+/// # Why it runs across the shape rather than across the band
+///
+/// The first version ramped over the band's own thickness, from the outline in
+/// to the terminator. It is the more obvious reading of "feather the edge" and
+/// it does not work: the band curls around the lit side of the shape, so its
+/// outer edge is a *curve*, and a linear ramp anchored to the far corner of
+/// its bounding box misses the band nearly everywhere — leaving the whole
+/// highlight filled with the colour it was meant to fade to, which measures as
+/// a light that has stopped putting any colour on the picture at all. A band
+/// that wraps cannot be feathered along its own normal by a linear gradient.
+/// It can be dimmed along its length by one, and that is the falloff the eye
+/// is actually looking for.
+///
+/// `towards` points from the artwork towards the light and `band` is the
+/// crescent's bounds in document space. `None` when there is no direction to
+/// ramp along or no extent to ramp over; the caller then draws the flat band,
+/// which is what it always drew.
+fn glint_ramp(
+    outer: Color,
+    inner: Color,
+    band: buzz_geom::Rect,
+    towards: buzz_geom::Vec2,
+) -> Option<buzz_scene::Paint> {
+    let length = towards.hypot();
+    if !length.is_finite() || length < 1e-9 {
+        return None;
+    }
+    let dir = towards / length;
+
+    // How far the band reaches from its own centre towards the light: the
+    // support of its bounding box in that direction. The box rather than the
+    // outline, because the support of a rectangle is two multiplications and
+    // the support of a bezier outline is not — and the two agree where it
+    // matters, which is the extreme.
+    let centre = band.center();
+    let support = (band.width() * dir.x).abs() * 0.5 + (band.height() * dir.y).abs() * 0.5;
+    if !support.is_finite() || support <= 1e-6 {
+        return None;
+    }
+
+    // Unit space runs from (-1, 0) to (1, 0), so the ramp's axis points *away*
+    // from the light: offset 0 is the side facing it, offset 1 the far side.
+    let axis = -dir;
+    let half = support;
+    let mid = centre;
+
+    let mut gradient = buzz_scene::Gradient::new(
+        buzz_scene::GradientKind::Linear,
+        vec![
+            buzz_scene::GradientStop::new(0.0, outer),
+            buzz_scene::GradientStop::new(GLINT_HOLD, outer),
+            buzz_scene::GradientStop::new(1.0, inner),
+        ],
+    );
+    gradient.transform = Affine::translate(mid.to_vec2())
+        * Affine::rotate(axis.y.atan2(axis.x))
+        * Affine::scale_non_uniform(half, half);
+    Some(buzz_scene::Paint::Gradient(Arc::new(gradient)))
 }
 
 /// The light across a lamp's reach, as a radial gradient in document space.

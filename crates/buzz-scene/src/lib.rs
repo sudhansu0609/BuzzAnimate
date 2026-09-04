@@ -62,7 +62,7 @@ use peniko::Color;
 use serde::{Deserialize, Serialize};
 
 pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, GradientMap, Quality};
-pub use buzz_light::{Light, LightId, LightKey, LightKind, LightRig, LightTrack};
+pub use buzz_light::{DEFAULT_GLINT, Light, LightId, LightKey, LightKind, LightRig, LightTrack};
 pub use art::ArtPiece;
 pub use bucket::{Boundary, GapSize, fill_region};
 pub use effect_brush::{EffectKind, EffectStroke, effect_artwork};

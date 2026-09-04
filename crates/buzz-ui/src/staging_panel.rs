@@ -20,14 +20,16 @@ pub enum SettingChoice {
     Sunset,
     Night,
     Interior,
+    Storm,
 }
 
 impl SettingChoice {
-    pub const ALL: [SettingChoice; 4] = [
+    pub const ALL: [SettingChoice; 5] = [
         SettingChoice::Daylight,
         SettingChoice::Sunset,
         SettingChoice::Night,
         SettingChoice::Interior,
+        SettingChoice::Storm,
     ];
 
     pub fn label(self) -> &'static str {
@@ -36,6 +38,7 @@ impl SettingChoice {
             SettingChoice::Sunset => "Sunset",
             SettingChoice::Night => "Night",
             SettingChoice::Interior => "Interior",
+            SettingChoice::Storm => "Storm",
         }
     }
 
@@ -45,6 +48,7 @@ impl SettingChoice {
             SettingChoice::Sunset => "A low sun, a warm sky, and shadows running long",
             SettingChoice::Night => "A dark sky and one warm lamp doing the work",
             SettingChoice::Interior => "A wall, a floor, and a practical lamp",
+            SettingChoice::Storm => "A black sky that strikes, and cloud running over it",
         }
     }
 }
@@ -121,6 +125,10 @@ pub struct StagingState {
     /// How tall the nearest figure is, as a fraction of the stage height.
     pub figure_scale: f64,
     pub lit: bool,
+    /// Put cloud in the sky and set it drifting. See `buzz_act::SceneRecipe`.
+    pub clouds: bool,
+    /// Put water across the near ground and set it running.
+    pub water: bool,
     /// How long the shot is, in frames.
     pub frames: u32,
 
@@ -190,6 +198,8 @@ impl Default for StagingState {
             horizon: 0.66,
             figure_scale: 0.62,
             lit: true,
+            clouds: false,
+            water: false,
             frames: 48,
             action: ActionChoice::Talk,
             from_frame: 0,
@@ -418,6 +428,23 @@ fn scene_view(ui: &mut Ui, state: &mut StagingState, response: &mut StagingRespo
         "A key, a fill, and an edge glow around the cast. Without it the scene is flat \
          colour, and the cast sits on the background rather than in it.",
     );
+
+    // **The two things that move on their own.** Both are live motion rather
+    // than keyframes, so neither of them needs re-doing when the shot is
+    // re-timed and neither costs a key per frame — see
+    // `buzz_scene::Modifier::Drift`.
+    ui.checkbox(&mut state.clouds, "Cloud in the sky")
+        .on_hover_text(
+            "Cumulus above the horizon, drifting across and looping, each at its own \
+             speed and height. It keeps moving with no keyframes at all \u{2014} scrub the \
+             timeline to see it. Nothing to add for an interior, which has a wall.",
+        );
+    ui.checkbox(&mut state.water, "Water in front")
+        .on_hover_text(
+            "A river across the near ground, with the light on its surface sliding past \
+             at several speeds at once \u{2014} which is the whole trick to water: nothing \
+             is drawn moving, the highlights just slide over each other.",
+        );
 
     ui.add_space(8.0);
     ui.separator();

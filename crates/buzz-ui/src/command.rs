@@ -180,6 +180,8 @@ pub enum Command {
     AddGloom,
     /// Add a fire: a lamp that gutters, in the colour of a hearth.
     AddFire,
+    /// Add a storm: a dark sky that strikes, every few seconds, for ever.
+    AddStorm,
     /// Show or hide the light handles on the stage.
     ToggleLightGizmos,
 
@@ -418,6 +420,7 @@ impl Command {
             AddLamp => "Lamp",
             AddGloom => "Gloom",
             AddFire => "Fire",
+            AddStorm => "Storm",
             ToggleLightGizmos => "Light Handles",
 
             SetScene => "Set the Scene\u{2026}",
@@ -589,7 +592,7 @@ impl Command {
             | ExposeOnTwos | ExposeOnThrees | PaintThrough | ImportSequenceFolder
             | RetargetPerformance | SwapSymbol => None,
 
-            AddSun | AddSky | AddLamp | AddGloom | AddFire => None,
+            AddSun | AddSky | AddLamp | AddGloom | AddFire | AddStorm => None,
             // No Animate binding to follow, and these open dialogs rather than
             // acting straight away, so a key would only save the menu.
             SetScene | DirectScene | AddScene | DuplicateScene | AddPerson | Perform
@@ -800,6 +803,7 @@ pub fn palette_commands() -> Vec<Command> {
         AddLamp,
         AddGloom,
         AddFire,
+        AddStorm,
         ToggleLightGizmos,
         SetScene,
         DirectScene,
@@ -964,6 +968,7 @@ mod tests {
             AddLamp,
             AddGloom,
             AddFire,
+            AddStorm,
             ToggleLightGizmos,
             SetScene,
             DirectScene,

@@ -33,6 +33,11 @@ pub struct LightResponse {
     /// because a fire is a lamp plus a handful of settings rather than a kind
     /// of its own; see [`buzz_scene::Light::make_fire`].
     pub add_fire: bool,
+    /// Add a sky and set it striking. A preset for the same reason a fire is —
+    /// see [`buzz_scene::Light::make_storm`] — and a sky rather than a sun
+    /// because a sheet of lightning has no direction: it lights the whole stage
+    /// at once, which is the thing an animator is after.
+    pub add_storm: bool,
     pub remove: Option<LightId>,
     pub select: Option<LightId>,
     /// A light was edited; this is the whole light, as it now is.
@@ -170,6 +175,17 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
             .clicked()
         {
             out.add_fire = true;
+        }
+        if ui
+            .small_button("\u{26A1} Storm")
+            .on_hover_text(
+                "A dark sky that strikes: a leader, a beat of nothing, then the whole stage \
+                 white for a few frames and gone. Every few seconds, never twice the same, \
+                 with no keyframes at all \u{2014} scrub the timeline to see it.",
+            )
+            .clicked()
+        {
+            out.add_storm = true;
         }
     });
 
@@ -520,6 +536,55 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
                     .on_hover_text("How wide the shaded edge is. Narrow reads as a hard light.")
                     .changed();
             });
+
+            // **How hard the lit edge lands**, which is the other half of the
+            // pair above: softness says how *wide* the modelling is, this says
+            // how *strong* the bright side of it is. The band is feathered
+            // either way, so turning this down softens rather than shrinks.
+            ui.horizontal(|ui| {
+                ui.label("Edge highlight");
+                changed |= ui
+                    .add(egui::Slider::new(&mut edited.glint, 0.0..=1.0).fixed_decimals(2))
+                    .on_hover_text(
+                        "How brightly the light catches the near side of a shape. Full is a \
+                         wet, polished sheen; a drawing is usually matte, so the default sits \
+                         near half. Zero leaves the lit side its own colour, with only the \
+                         shaded side to model it.",
+                    )
+                    .changed();
+            });
+
+            // **Lightning.** The counterpart of the flicker above: one is a
+            // light that never quite holds still, the other a light that holds
+            // still and then does not. See `buzz_scene::Light::storm`.
+            ui.horizontal(|ui| {
+                ui.label("Lightning");
+                changed |= ui
+                    .add(egui::Slider::new(&mut edited.storm, 0.0..=1.0).fixed_decimals(2))
+                    .on_hover_text(
+                        "How hard and how often it strikes. A tenth is a storm on the \
+                         horizon, flickering every few seconds; full is overhead and the \
+                         frame goes white. Turn the light itself right down first \u{2014} a \
+                         flash only reads against the dark. Zero is off.",
+                    )
+                    .changed();
+            });
+            if edited.storm > 0.0 {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("\u{26A1} Make it a storm")
+                        .on_hover_text(
+                            "A cold spark colour, the light turned down to night, and an \
+                             edge glow so figures are rimmed by the flash.",
+                        )
+                        .clicked()
+                    {
+                        edited.make_storm();
+                        changed = true;
+                    }
+                    ui.label(RichText::new("scrub to see it strike").small().weak());
+                });
+            }
 
             // **The one thing lighting does that leaves the silhouette
             // bright.** Everything else \u{2014} the tint, the terminator, the

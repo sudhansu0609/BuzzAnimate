@@ -1039,8 +1039,20 @@ fn a_default_sun_lights_rather_than_dims() {
     // And it must leave its colour behind, not merely scale the brightness: a
     // warm sun that lights everything by an equal factor on all three channels
     // is a dimmer switch, and reads as one.
+    //
+    // **Three, not four.** This is an average over every mid-tone pixel of the
+    // artwork, and the light's colour reaches most of them through the
+    // highlight band — so the number moves with the band's *average* strength,
+    // not with its peak. Since the band was given a falloff and a default
+    // glint (`buzz_light::Light::glint`, `buzz_render`'s `glint_ramp`) it is
+    // brightest where the shape faces the light and dies away around the form,
+    // which is what a highlight does and is the whole point of the change; its
+    // mean is lower for it while its peak is not. Measured: 4.2 with the old
+    // flat band, 3.9 with the falloff alone, 3.6 at the default glint. Three
+    // still fails on the defaults this test was written to catch — those gave
+    // a flat zero — and it is not a threshold the falloff can drift under.
     assert!(
-        warmth(&lit) > warmth(&unlit) + 4.0,
+        warmth(&lit) > warmth(&unlit) + 3.0,
         "the sun left no colour behind: warmth {:.1} lit against {:.1} unlit",
         warmth(&lit),
         warmth(&unlit)

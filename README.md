@@ -17,6 +17,16 @@ AVM2/ABC), ISO standards (PDF), or plain XML (XFL).
 
 ---
 
+## 📚 Documentation & User Guides
+
+New to BuzzAnimate or migrating from Adobe Animate? Explore the complete documentation suite:
+
+- 📖 [**Complete User Guide & Feature Reference Manual**](USER_GUIDE.md) — Comprehensive guide with snapshots, tool catalog, lighting, rigging, lip sync, and an exhaustive A–Z index.
+- 🚀 [**5-Minute Quickstart Tutorial**](docs/QUICKSTART.md) — Fast-track tutorial to draw, keyframe, tween, light, and export your first animated shot.
+- ⌨️ [**Keyboard & Mouse Shortcuts Cheatsheet**](docs/SHORTCUTS.md) — Instant lookup for all 23 single-key tools, timeline hotkeys, navigation chords, and symbols.
+
+---
+
 ## Status: Phases 0–5 and 7 complete
 
 BuzzAnimate is now a working editor. It opens on an Animate-shaped window —

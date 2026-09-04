@@ -132,6 +132,10 @@ struct Event {
 #[derive(Debug, Clone, PartialEq)]
 struct Story {
     setting: Setting,
+    /// The writer mentioned cloud, or a sky worth looking at.
+    clouds: bool,
+    /// The writer put water in the shot: a river, a lake, a shore.
+    water: bool,
     names: Vec<String>,
     events: Vec<Event>,
     ignored: Vec<String>,
@@ -181,6 +185,12 @@ fn setting_of(sentences: &[String]) -> Setting {
     for sentence in sentences {
         let s = sentence.to_lowercase();
         let has = |words: &[&str]| words.iter().any(|w| s.contains(w));
+        // **A storm before a night**, because a storm *is* a night and the
+        // word that matters is the more specific one: "a stormy night" is a
+        // storm, and matching "night" first would take the lightning out of it.
+        if has(&["storm", "stormy", "thunder", "lightning", "tempest", "downpour"]) {
+            return Setting::Storm;
+        }
         // Night before day: "one night, in broad daylight, he dreamed" is a
         // story about a night.
         if has(&["night", "midnight", "moonlit", "moonlight", "dark"]) {
@@ -240,6 +250,22 @@ fn has_stem(words_lower: &[String], stems: &[&str]) -> bool {
 fn parse(story: &str) -> Story {
     let sentences = split_sentences(story);
     let setting = setting_of(&sentences);
+    // **What is in the shot besides the people.** Both of these are one live
+    // modifier per object rather than any keyframes, so a story that mentions
+    // a river gets a moving river at no cost to the schedule below — see
+    // `staging::water`.
+    //
+    // A storm arrives with cloud whether the writer said so or not, but that
+    // rule lives in `staging::build` rather than here: it has to hold however
+    // the scene is made, and a copy of it in each caller is a copy that gets
+    // out of step.
+    let scenery = sentences.join(" ").to_lowercase();
+    let mentions = |words: &[&str]| words.iter().any(|w| scenery.contains(w));
+    let clouds = mentions(&["cloud", "overcast", "clouded", "sky above", "clear sky"]);
+    let water = mentions(&[
+        "river", "stream", "creek", "canal", "lake", "sea", "ocean", "shore", "beach",
+        "riverbank", "water",
+    ]);
 
     let mut names: Vec<String> = Vec::new();
     let mut anonymous: Vec<(String, usize)> = Vec::new();
@@ -391,6 +417,8 @@ fn parse(story: &str) -> Story {
 
     Story {
         setting,
+        clouds,
+        water,
         names,
         events,
         ignored,
@@ -721,6 +749,10 @@ pub fn direct(scene: &mut Scene, story: &str) -> Result<DirectedScene, DirectErr
         // Provisional: every layer is stretched to the real total at the end,
         // once the schedule has decided what the total is.
         frames: 48,
+        // What the writer put in the shot besides the people. Both are live
+        // motion, so neither of them is on the schedule below.
+        clouds: parsed.clouds,
+        water: parsed.water,
         ..SceneRecipe::default()
     };
     let staged = staging::build(scene, &recipe);

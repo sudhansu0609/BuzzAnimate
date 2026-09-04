@@ -207,6 +207,28 @@ impl SymmetryMode {
             SymmetryMode::Radial => "Radial",
         }
     }
+
+    /// What the mode does, for the tooltip on its button.
+    pub fn description(self) -> &'static str {
+        match self {
+            SymmetryMode::Off => "Draw once. No mirroring.",
+            SymmetryMode::MirrorX => {
+                "Mirror left to right, across the vertical centre line. \
+                 For faces, and anything with a left and a right."
+            }
+            SymmetryMode::MirrorY => {
+                "Mirror top to bottom, across the horizontal centre line. \
+                 For reflections in water, and for wings seen edge on."
+            }
+            SymmetryMode::Both => {
+                "Mirror across both axes at once \u{2014} four copies of every stroke."
+            }
+            SymmetryMode::Radial => {
+                "Repeat the stroke around the centre, evenly spaced. \
+                 For mandalas, snowflakes and flowers."
+            }
+        }
+    }
 }
 
 /// Symmetry mode plus how many copies a radial symmetry makes.

@@ -207,6 +207,13 @@ fn encode(
     // left. Every other preview already went through `to_screen_art` in the
     // chrome; this is the one that did not.
     let onto_stage = editor.edit_to_stage();
+    // **Symmetry is previewed, not sprung.** The mirror copies are laid down by
+    // the commit, and a copy that only appears when the pointer lifts is the
+    // drawing changing after the fact — the same fault a preview that differs
+    // from its commit has, and the reason this loops over the identity and the
+    // mirrors together rather than drawing the stroke alone.
+    let placements =
+        || std::iter::once(buzz_geom::Affine::IDENTITY).chain(editor.symmetry_mirrors());
     match editor.preview() {
         // The stroke exactly as the release will commit it: same shapes, same
         // paints, same blends. Drawn through the flat approximation of the
@@ -216,25 +223,29 @@ fn encode(
             let to_doc = onto_stage
                 .as_affine()
                 .unwrap_or(buzz_geom::Affine::IDENTITY);
-            for shape in &shapes {
-                let path = to_doc * shape.path.clone();
-                if let Some(fill) = &shape.fill {
-                    if shape.blend.is_additive() {
-                        builder.fill_shape_paint_additive(&path, &fill.paint, to_doc);
-                    } else {
-                        // **Sealed, exactly as the committed artwork is.**
-                        // Opaque fills are drawn with a sub-pixel stroke of
-                        // their own paint to close rasteriser seams, which
-                        // grows the silhouette by half a pixel a side. Drawing
-                        // the preview unsealed made every stroke *expand* the
-                        // moment the pointer lifted — the geometry was already
-                        // identical, and this was the last half pixel of
-                        // difference. See `fill_shape_paint_sealed`.
-                        builder.fill_shape_paint_sealed(&path, &fill.paint, to_doc);
+            for mirror in placements() {
+                let to_doc = to_doc * mirror;
+                for shape in &shapes {
+                    let path = to_doc * shape.path.clone();
+                    if let Some(fill) = &shape.fill {
+                        if shape.blend.is_additive() {
+                            builder.fill_shape_paint_additive(&path, &fill.paint, to_doc);
+                        } else {
+                            // **Sealed, exactly as the committed artwork is.**
+                            // Opaque fills are drawn with a sub-pixel stroke of
+                            // their own paint to close rasteriser seams, which
+                            // grows the silhouette by half a pixel a side.
+                            // Drawing the preview unsealed made every stroke
+                            // *expand* the moment the pointer lifted — the
+                            // geometry was already identical, and this was the
+                            // last half pixel of difference. See
+                            // `fill_shape_paint_sealed`.
+                            builder.fill_shape_paint_sealed(&path, &fill.paint, to_doc);
+                        }
                     }
-                }
-                if let Some(stroke) = &shape.stroke {
-                    builder.stroke_shape_paint(&path, &stroke.paint, stroke.width, to_doc);
+                    if let Some(stroke) = &shape.stroke {
+                        builder.stroke_shape_paint(&path, &stroke.paint, stroke.width, to_doc);
+                    }
                 }
             }
         }
@@ -252,11 +263,16 @@ fn encode(
             let to_doc = onto_stage
                 .as_affine()
                 .unwrap_or(buzz_geom::Affine::IDENTITY);
-            builder.fill_shape_paint(
-                &(to_doc * buzz_geom::Shape::to_path(&area, 1e-9)),
-                &paint,
-                to_doc,
-            );
+            let rect = buzz_geom::Shape::to_path(&area, 1e-9);
+            for mirror in placements() {
+                // The paint travels with the same affine the rectangle does —
+                // a bitmap reflected in place but sampled unreflected is not
+                // the same paint. Carrying the mirror in `to_doc` rather than
+                // baking it into the paint is what `mirror_shape` does at
+                // commit, one composition later.
+                let to_doc = to_doc * mirror;
+                builder.fill_shape_paint(&(to_doc * rect.clone()), &paint, to_doc);
+            }
         }
         _ => {}
     }
@@ -332,6 +348,11 @@ pub fn draw_chrome(ui: &mut Ui, editor: &Editor, area: egui::Rect) -> ChromeResp
     if view.perspective.show {
         draw_perspective(&painter, area, view, to_screen);
     }
+
+    // Where the mirror is. Without it symmetry is a mode you can only find out
+    // you are in by drawing, and the axis is a line you have to infer from
+    // where the copies came out.
+    draw_symmetry(&painter, editor, to_screen_art);
 
     // Where the pointer is, so the rotate mark can appear on the corner it is
     // actually near rather than on all four at once.
@@ -507,6 +528,64 @@ fn draw_perspective(
         for i in 0..RAYS {
             let edge = border_point(area, i as f32 / RAYS as f32);
             painter.line_segment([v, edge], ray);
+        }
+    }
+}
+
+/// The axes a symmetry setting mirrors about, drawn where the copies actually
+/// land.
+///
+/// Through `to_screen_art` rather than the view transform, because the mirror
+/// is applied in the space the *tool* draws in: inside a symbol opened in
+/// place, an axis drawn through the view would sit where the artwork is not.
+/// Each axis is sampled rather than drawn end to end, so a tilted camera bends
+/// it the way it bends everything else on the stage.
+fn draw_symmetry(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point) -> egui::Pos2) {
+    let sym = editor.style.symmetry;
+    if !sym.is_on() {
+        return;
+    }
+    let size = editor.scene().stage().size;
+    let centre = Point::new(size.width / 2.0, size.height / 2.0);
+    // Long enough to leave the stage on any axis, so a spoke at 30° still
+    // reaches the corner it points at.
+    let reach = size.width.hypot(size.height);
+    let stroke = Stroke::new(1.0, Palette::guide().gamma_multiply(0.7));
+
+    let spoke = |angle: f64| {
+        const STEPS: usize = 24;
+        let dir = buzz_geom::Vec2::new(angle.cos(), angle.sin());
+        let points: Vec<egui::Pos2> = (0..=STEPS)
+            .map(|i| {
+                let t = (i as f64 / STEPS as f64) * 2.0 - 1.0;
+                to_screen(centre + dir * (t * reach))
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, stroke));
+    };
+
+    use std::f64::consts::{PI, TAU};
+    match sym.mode {
+        buzz_ui::SymmetryMode::Off => {}
+        // The axis a left↔right mirror reflects about is the *vertical* line,
+        // which is the one place this naming reliably trips people up.
+        buzz_ui::SymmetryMode::MirrorX => spoke(PI / 2.0),
+        buzz_ui::SymmetryMode::MirrorY => spoke(0.0),
+        buzz_ui::SymmetryMode::Both => {
+            spoke(PI / 2.0);
+            spoke(0.0);
+        }
+        // One spoke per wedge, so the count in the options is something you can
+        // see rather than a number to guess at.
+        buzz_ui::SymmetryMode::Radial => {
+            let n = sym.radial_count.clamp(2, 24);
+            // A spoke is a full line, so it stands for two wedge boundaries:
+            // an even count needs half as many drawn, or every other one would
+            // be laid down twice and come out darker than its neighbours.
+            let lines = if n % 2 == 0 { n / 2 } else { n };
+            for k in 0..lines {
+                spoke(TAU * k as f64 / n as f64);
+            }
         }
     }
 }
@@ -1092,13 +1171,21 @@ fn draw_preview(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poi
             // Flattened for display only; the committed geometry keeps its
             // curves.
             let tolerance = 0.25 / editor.camera.zoom.max(f64::MIN_POSITIVE);
-            let mut points: Vec<egui::Pos2> = Vec::new();
-            kurbo::flatten(path.iter(), tolerance, |el| match el {
-                kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => points.push(to_screen(p)),
-                _ => {}
-            });
-            if points.len() >= 2 {
-                painter.add(egui::Shape::line(points, stroke));
+            // The mirror copies are outlined alongside it, because with
+            // symmetry on they are as much a part of what the release will
+            // commit as the line under the pointer is.
+            let mirrors = editor.symmetry_mirrors();
+            for placement in std::iter::once(buzz_geom::Affine::IDENTITY).chain(mirrors) {
+                let mut points: Vec<egui::Pos2> = Vec::new();
+                kurbo::flatten(path.iter(), tolerance, |el| match el {
+                    kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => {
+                        points.push(to_screen(placement * p));
+                    }
+                    _ => {}
+                });
+                if points.len() >= 2 {
+                    painter.add(egui::Shape::line(points, stroke));
+                }
             }
         }
     }

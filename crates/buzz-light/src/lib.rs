@@ -268,6 +268,73 @@ pub struct Light {
     /// [`Light::rim_glow`].
     #[serde(default)]
     pub rim: f32,
+    /// **How hard the light catches an edge**, `0.0..=1.0`. Zero draws no
+    /// highlight at all; one is the full glint.
+    ///
+    /// # What it fixes
+    ///
+    /// The highlight is the band on the side of a shape the light is on, laid
+    /// on at [`Illumination::highlight`]'s mix. Until this existed it was laid
+    /// on *flat and at full*: one tone, edge to edge, stopping dead at the
+    /// terminator. On a face or a limb that is a bright stripe with a hard line
+    /// down the inside of it — the artwork looks as though a second, whiter
+    /// drawing has been pasted over one side of it, which is the report this
+    /// number comes from.
+    ///
+    /// Two things were wrong and this is one of them. The other is the hard
+    /// line, and that is not a number: the band is **feathered** now, ramping
+    /// from the glint at the outer edge to nothing at the terminator, so there
+    /// is no seam to soften. See `buzz_render::document`'s `glint_ramp`.
+    ///
+    /// # Why the default is not one
+    ///
+    /// Because a highlight at full is a *specular* highlight, and most artwork
+    /// is not wet, polished or metal. Just over half reads as light on a matte
+    /// surface, which is what a drawing usually is; the slider goes to one for
+    /// the shots that want a sheen. Turning it up costs nothing — it is the
+    /// same one fill either way — so the default is free to be the quiet one.
+    ///
+    /// Files written before this existed load at the default rather than at
+    /// full, deliberately: what they carry is "the highlight of the day", and
+    /// the honest reading of that is the highlight, not a request for the
+    /// hardest one available.
+    #[serde(default = "soft_glint")]
+    pub glint: f32,
+    /// **How hard and how often this light strikes**, `0.0..=1.0`. Zero is a
+    /// light that does not, which is every light until this existed.
+    ///
+    /// # What it is
+    ///
+    /// Lightning. The light sits at whatever the night is set to, and every few
+    /// seconds it **strikes**: a leader flash, a beat of nothing, then the
+    /// return stroke, six or seven times the light, dying away over a third of
+    /// a second. Then the dark again, for a random count, and again.
+    ///
+    /// # Why it is a number and not a track
+    ///
+    /// For the reason [`Light::flicker`] is. Keyed by hand a storm is forty
+    /// keyframes for ten seconds of film, it is wrong on the first attempt, and
+    /// it comes out looking mechanical however carefully it is placed — because
+    /// what makes lightning read as lightning is that you cannot predict the
+    /// next one. Here it is deterministic noise on the frame, seeded from the
+    /// light's own id: the same storm on every machine and in every export,
+    /// never twice the same strike, and no keys to re-time.
+    ///
+    /// Higher is both **more often** and **harder**: at a tenth it is a distant
+    /// storm on the horizon, a flicker every ten seconds; at full it is
+    /// overhead and the frame goes white.
+    ///
+    /// # What to put it on
+    ///
+    /// Usually a **sky**, because a sky has no direction and lights the whole
+    /// stage at once, which is what a sheet of lightning does. On a sun it
+    /// flashes with a direction, so the shading and the shadows snap with it —
+    /// worth having for a close shot, too strong for a wide one.
+    ///
+    /// It composes with `flicker`: a torch carried through a storm gutters and
+    /// is lit by the sky at the same time.
+    #[serde(default)]
+    pub storm: f32,
     /// The light's animation, if it has one. `None` is a static light — every
     /// document until Wave 9a, and most since. See [`LightTrack`], and
     /// [`LightRig::resolved_at`] for how the renderer reads it.
@@ -284,6 +351,18 @@ pub struct Light {
 /// a lamp at full strength.
 fn full() -> f32 {
     1.0
+}
+
+/// **The glint a light has unless it is told otherwise**, and what a file
+/// written before the control existed loads at.
+///
+/// A matte highlight, which is what a drawing usually wants. See
+/// [`Light::glint`] for why it is not one.
+pub const DEFAULT_GLINT: f32 = 0.7;
+
+/// The serde default for [`Light::glint`].
+fn soft_glint() -> f32 {
+    DEFAULT_GLINT
 }
 
 impl Light {
@@ -348,6 +427,15 @@ impl Light {
             // added a lamp would change finished films. It also costs a
             // silhouette per lit layer, which nothing should pay for unasked.
             rim: 0.0,
+            // **A matte glint, not a wet one.** See the field: at full the
+            // highlight band reads as a second, whiter drawing pasted over one
+            // side of the artwork, and almost nothing in a drawing is polished
+            // enough to deserve that.
+            glint: soft_glint(),
+            // **Off by default**, for the reason a rim is: a storm is a
+            // deliberate look, and switching one on for every document that
+            // ever added a sky would put lightning in finished films.
+            storm: 0.0,
             track: None,
         };
 
@@ -443,10 +531,89 @@ impl Light {
         // steadier than its brightness, and a pool that pumped in and out at
         // full depth reads as a lamp on a dimmer.
         out.glow = (self.glow * (0.75 + 0.25 * factor as f32)).clamp(0.0, 1.0);
+        // **The shadow gutters too.**
+        //
+        // It did not, and that was the tell: a fire that moved every frame threw
+        // a shadow that sat perfectly still underneath it. Half the reason a
+        // hearth reads as a hearth is that the shadows on the wall behind you
+        // jump with the flame, and a steady shadow under a moving light says
+        // "filter" as loudly as a flat tint does.
+        //
+        // The *shape* is deliberately left alone: a shadow's geometry follows
+        // the light's position, and moving that would rebuild every boolean in
+        // the shot on every frame — which is exactly why the gutter moves
+        // brightness and colour and never position (see the note on `flicker`).
+        // What moves is how dark it is, which is free.
+        //
+        // Less than the brightness moves, and never to nothing: a shadow that
+        // vanished on a bright frame would flash the floor white.
+        out.shadow_strength =
+            (self.shadow_strength * (0.55 + 0.45 * factor as f32)).clamp(0.0, 1.0);
         // Redder as it drops, which is what a flame actually does: the dim part
         // of a fire is the ember colour, not a dimmer version of the flame.
         let towards_ember = ((1.0 - factor).max(0.0) * amount as f64).min(1.0);
         out.color = mix(self.color, EMBER, towards_ember as f32);
+        out
+    }
+
+    /// **This light as a storm**: a cold sky that strikes.
+    ///
+    /// A preset rather than a kind of light, exactly as [`make_fire`] is. What
+    /// makes lightning is not a new sort of source — it is an ordinary light
+    /// with a violent envelope on it and the colour of a spark.
+    ///
+    /// [`make_fire`]: Self::make_fire
+    pub fn make_storm(&mut self) {
+        // Cold and blue-white: what a spark actually is, and the opposite end
+        // of the scale from the hearth `make_fire` reaches for.
+        self.color = Color::from_rgb8(0xD6, 0xE4, 0xFF);
+        self.storm = self.storm.max(0.5);
+        // **The night it strikes into.** A flash only reads as a flash against
+        // dark, so the light itself is turned right down: what the audience
+        // sees is the difference between the strike and this, and a storm set
+        // over a daylit stage is a light going slightly brighter now and then.
+        self.intensity = self.intensity.min(0.35);
+        // A sheet of lightning rims everything it catches — it is behind the
+        // clouds and the figures are in front of it, which is the one
+        // arrangement where an edge really does come up brighter than the
+        // picture. It comes and goes with the strike, because a rim follows the
+        // light's own intensity.
+        self.rim = self.rim.max(0.6);
+    }
+
+    /// **This light as it stands at `frame`, once the storm is applied.**
+    ///
+    /// A light with no storm is returned unchanged, so nothing pays for this
+    /// that has not asked for it — the same contract [`flickered`] keeps.
+    ///
+    /// [`flickered`]: Self::flickered
+    pub fn struck(&self, frame: u32, fps: f64) -> Light {
+        let storm = self.storm.clamp(0.0, 1.0) as f64;
+        if storm <= 0.0 {
+            return self.clone();
+        }
+        let flash = strike_at(self.id.0, storm, frame, fps);
+        if flash <= 1e-4 {
+            return self.clone();
+        }
+
+        let mut out = self.clone();
+        // **Six times, not one and a half.** A strike has to overexpose. The
+        // whole read is that the frame goes white and comes back, and the tint
+        // is clamped with a soft shoulder (`Illumination::tint`), so anything
+        // that only doubles the light lands as "a bit brighter" rather than as
+        // lightning. The shoulder is what makes this safe to ask for: past full
+        // it bleaches smoothly instead of posterising.
+        out.intensity = self.intensity * (1.0 + flash as f32 * STRIKE_GAIN);
+        // Towards the spark's own colour, so a strike over a warm night reads
+        // as cold light arriving rather than as the night getting brighter.
+        out.color = mix(self.color, STRIKE, (flash * 0.85) as f32);
+        // The air lights up with it — a sheet of lightning is *in* the sky,
+        // which is the one time a pool is the honest thing to draw.
+        out.glow = (self.glow + flash as f32 * 0.5).clamp(0.0, 1.0);
+        // And the shadows snap hard on the strike, as they do under any light
+        // that suddenly gets six times stronger.
+        out.shadow_strength = (self.shadow_strength * (1.0 + flash as f32 * 0.6)).clamp(0.0, 1.0);
         out
     }
 
@@ -499,6 +666,8 @@ impl Light {
         self.glow.to_bits().hash(hasher);
         self.flicker.to_bits().hash(hasher);
         self.rim.to_bits().hash(hasher);
+        self.glint.to_bits().hash(hasher);
+        self.storm.to_bits().hash(hasher);
         match &self.kind {
             LightKind::Sun { azimuth, elevation } => {
                 0u8.hash(hasher);
@@ -650,6 +819,23 @@ impl Light {
     }
 }
 
+impl Light {
+    /// [`Light::glint`], bounded — what the renderer actually multiplies the
+    /// highlight's strength by.
+    ///
+    /// A file, a script or an importer can put anything in the field; a
+    /// negative glint would subtract the light's colour from the artwork and a
+    /// huge one would clip it to white, and neither is a thing a highlight can
+    /// be. Read through here and neither can happen.
+    pub fn glint(&self) -> f32 {
+        if self.glint.is_finite() {
+            self.glint.clamp(0.0, 1.0)
+        } else {
+            soft_glint()
+        }
+    }
+}
+
 /// **How far a highlight is pushed towards the light's own colour.**
 ///
 /// Raised with the same change that narrowed [`crate::HIGHLIGHT_SHARE`], and
@@ -660,9 +846,90 @@ impl Light {
 /// the wash smaller.
 const RIM_MIX: f32 = 0.78;
 
+/// **How far past its own brightness a strike takes a light.**
+///
+/// Large on purpose. `Illumination::tint` has a soft shoulder above full, so a
+/// light this far past it bleaches the picture towards white smoothly rather
+/// than clipping it — and bleaching towards white is what the audience is
+/// looking for. A gentler number lands as "the sky got a bit brighter", which
+/// is not lightning.
+const STRIKE_GAIN: f32 = 6.0;
+
+/// The colour a strike pushes a light towards: a cold blue-white spark.
+const STRIKE: Color = Color::from_rgb8(0xE8, 0xF0, 0xFF);
+
+/// **The strike envelope at one frame**, in `0..=1`.
+///
+/// # The shape of a strike
+///
+/// Real lightning is not one flash. A stepped leader lights the cloud faintly,
+/// there is a beat of nothing, and then the return stroke arrives several times
+/// brighter and dies away over a few tenths of a second — often flickering
+/// once or twice on the way down as further strokes follow the same channel.
+/// Animating a single ramp gives a camera flash; this gives lightning.
+///
+/// # How it stays deterministic
+///
+/// Time is cut into slots. Each slot holds at most one strike, at an offset
+/// drawn from a hash of the slot number and the light's id — so the *interval*
+/// wanders while the *rate* is what `storm` asks for, which is the difference
+/// between a storm and a metronome. Nothing carries between frames, so the
+/// frame an exporter renders on one machine is the frame the window shows on
+/// another; the same requirement, and the same answer, as the flame's gutter.
+fn strike_at(seed: u64, storm: f64, frame: u32, fps: f64) -> f64 {
+    let t = f64::from(frame) / fps.max(1.0);
+
+    // How long a slot is. A distant storm strikes every eight seconds or so; an
+    // overhead one barely stops. The strike itself is under half a second, so
+    // even the shortest slot is mostly dark.
+    let period = 8.0 - 6.4 * storm;
+    let slot = (t / period).floor();
+    let local = t - slot * period;
+
+    // Where in the slot it strikes, and how hard. Both from the slot number, so
+    // scrubbing back and forth shows the same storm.
+    let when = hash01(seed ^ ((slot as i64 as u64).wrapping_mul(0x9E37_79B9))) * (period - 0.6);
+    let u = local - when;
+    if !(0.0..=0.55).contains(&u) {
+        return 0.0;
+    }
+
+    // Not every strike is a big one — the far ones are faint, and a storm where
+    // every flash is identical reads as a fault in the lamp.
+    let power = 0.35 + 0.65 * hash01(seed ^ ((slot as i64 as u64).wrapping_mul(0x2545_F491)));
+
+    // The leader: brief, faint, and gone before the eye has settled.
+    let leader = if u < 0.07 {
+        (1.0 - u / 0.07) * 0.35
+    } else {
+        0.0
+    };
+
+    // The return stroke: up in two frames, then an exponential decay with a
+    // flicker riding on it for the strokes that follow the same channel.
+    let main = if u >= 0.13 {
+        let v = u - 0.13;
+        let rise = (v / 0.03).min(1.0);
+        let decay = (-v * 9.0).exp();
+        let restrike = 1.0 + 0.35 * (v * 42.0).sin() * (-v * 4.0).exp();
+        rise * decay * restrike
+    } else {
+        0.0
+    };
+
+    ((leader + main) * power * (0.55 + 0.45 * storm)).clamp(0.0, 1.0)
+}
+
 /// What a guttering flame drops towards: the colour of the ember rather than a
 /// dimmer copy of the flame.
 const EMBER: Color = Color::from_rgb8(0xC2, 0x3A, 0x10);
+
+/// **What a frame is worth when nobody says.**
+///
+/// The rate a strike's envelope is measured against for any caller that has no
+/// stage to ask — a script, a test, a thumbnail. Film's own rate, and the one
+/// this program's documents default to.
+pub const NOMINAL_FPS: f64 = 24.0;
 
 /// A hash with no state and no crate behind it, for turning a light's id and a
 /// frame number into the same number every time.
@@ -866,9 +1133,9 @@ impl LightRig {
     /// have to be resolved again for the frame being drawn, or is what is on the
     /// `LightRig` already the answer?
     pub fn animates(&self) -> bool {
-        self.lights
-            .iter()
-            .any(|l| l.flicker > 0.0 || l.track.as_ref().is_some_and(|t| t.animates()))
+        self.lights.iter().any(|l| {
+            l.flicker > 0.0 || l.storm > 0.0 || l.track.as_ref().is_some_and(|t| t.animates())
+        })
     }
 
     /// The rig with every animated light resolved to its state at `frame`.
@@ -880,6 +1147,22 @@ impl LightRig {
     /// static light in an animated rig keeps its identical fingerprint frame to
     /// frame, so it stays cached; see [`crate::track`].
     pub fn resolved_at(&self, frame: u32) -> Cow<'_, LightRig> {
+        self.resolved_at_rate(frame, NOMINAL_FPS)
+    }
+
+    /// [`resolved_at`](Self::resolved_at), told what a frame is worth in
+    /// seconds.
+    ///
+    /// **Only the storm needs this.** A flame's gutter is a wander with no
+    /// particular period, so counting it in frames is as good as counting it in
+    /// seconds; a strike is not. Its leader, its beat of dark and its decay are
+    /// specific fractions of a second, and measuring them in frames would make
+    /// the same storm two and a half times faster in a 60 fps document than in
+    /// a 24 fps one — the flash would be gone before the eye had it.
+    ///
+    /// The renderer knows the stage's frame rate and passes it. `resolved_at`
+    /// stands in the nominal rate for everything that does not.
+    pub fn resolved_at_rate(&self, frame: u32, fps: f64) -> Cow<'_, LightRig> {
         if !self.animates() {
             return Cow::Borrowed(self);
         }
@@ -895,6 +1178,12 @@ impl LightRig {
             // happens around that.
             if light.flicker > 0.0 {
                 *light = light.flickered(frame);
+            }
+            // The storm goes last, over the gutter as well as over the keys: a
+            // torch carried through one is lit by the sky whatever its own
+            // flame is doing on that frame.
+            if light.storm > 0.0 {
+                *light = light.struck(frame, fps);
             }
         }
         Cow::Owned(rig)
@@ -1842,6 +2131,132 @@ mod tests {
 
     /// Two fires in one shot must not flicker in step, or they read as one
     /// light with two pools.
+    /// **A storm strikes, and is dark in between.**
+    ///
+    /// The two halves of what lightning is. A light that were bright all the
+    /// time would be a lamp; one that never got bright would be off.
+    #[test]
+    fn a_storm_strikes_and_is_dark_between_strikes() {
+        let mut sky = Light::new(LightId(7), "Sky", LightKind::sky());
+        sky.make_storm();
+        let base = sky.intensity;
+
+        // Ten seconds of film at film's rate.
+        let brightness: Vec<f32> = (0..240)
+            .map(|f| sky.struck(f, NOMINAL_FPS).intensity)
+            .collect();
+
+        let peak = brightness.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            peak > base * 3.0,
+            "a strike has to overexpose: peaked at {peak} against a base of {base}"
+        );
+
+        // And most of the shot is the night it strikes into. A storm that were
+        // lit half the time would read as a flickering bulb.
+        let dark = brightness.iter().filter(|b| **b <= base * 1.05).count();
+        assert!(
+            dark > brightness.len() * 3 / 4,
+            "only {dark} of {} frames were dark; a storm is mostly night",
+            brightness.len()
+        );
+
+        // It struck more than once in ten seconds.
+        let strikes = brightness
+            .windows(2)
+            .filter(|w| w[0] <= base * 1.05 && w[1] > base * 1.5)
+            .count();
+        assert!(strikes >= 2, "only {strikes} strikes in ten seconds");
+    }
+
+    /// **A strike is the same strike at any frame rate.**
+    ///
+    /// Its leader, its beat of dark and its decay are fractions of a *second*,
+    /// so counting them in frames would run the same storm two and a half times
+    /// faster in a 60 fps document than in a 24 fps one — and the flash would
+    /// be gone before the eye had it. See `LightRig::resolved_at_rate`.
+    #[test]
+    fn a_storm_keeps_its_timing_at_any_frame_rate() {
+        let mut sky = Light::new(LightId(3), "Sky", LightKind::sky());
+        sky.make_storm();
+
+        // **Counted in seconds, not compared frame by frame.** The two rates
+        // land on different instants inside an envelope whose edges are
+        // hundredths of a second wide, so the individual samples differ and are
+        // meant to. What must not differ is how much film a storm covers: the
+        // same number of strikes over the same ten seconds, each lasting about
+        // as long.
+        let count = |fps: f64| {
+            let frames = (10.0 * fps) as u32;
+            let bright: Vec<bool> = (0..frames)
+                .map(|f| sky.struck(f, fps).intensity > sky.intensity * 1.5)
+                .collect();
+            // **Clustered, not counted as rising edges.** A strike is a
+            // leader, a beat of dark and a return stroke, so it crosses the
+            // threshold twice — and at 60 fps the beat between them is three
+            // frames wide while at 24 fps it can fall between two samples. That
+            // is the envelope being sampled, not the storm running at a
+            // different speed. Anything brightening within six tenths of a
+            // second of the last bright frame is the same strike.
+            let gap = (0.6 * fps) as usize;
+            let mut strikes = 0;
+            let mut since = usize::MAX;
+            for (i, lit) in bright.iter().enumerate() {
+                if *lit {
+                    if since == usize::MAX || i - since > gap {
+                        strikes += 1;
+                    }
+                    since = i;
+                }
+            }
+            let lit = bright.iter().filter(|b| **b).count() as f64 / fps;
+            (strikes, lit)
+        };
+
+        let (slow_strikes, slow_seconds) = count(24.0);
+        let (fast_strikes, fast_seconds) = count(60.0);
+        assert_eq!(
+            slow_strikes, fast_strikes,
+            "the same ten seconds gave {slow_strikes} strikes at 24 fps and \
+             {fast_strikes} at 60"
+        );
+        assert!(
+            (slow_seconds - fast_seconds).abs() < 0.15,
+            "the strikes lasted {slow_seconds:.2}s at 24 fps and {fast_seconds:.2}s at 60"
+        );
+        assert!(slow_strikes >= 2, "only {slow_strikes} strikes in ten seconds");
+    }
+
+    /// **A fire's shadow gutters with it.**
+    ///
+    /// Half of why a hearth reads as a hearth is that the shadows on the wall
+    /// jump with the flame. A steady shadow under a moving light says "filter"
+    /// as loudly as a flat tint does.
+    #[test]
+    fn a_fires_shadow_moves_with_the_flame() {
+        let mut fire = Light::new(LightId(9), "Fire", LightKind::lamp(Point::new(0.0, 0.0)));
+        fire.make_fire();
+
+        let shadows: Vec<f32> = (0..120).map(|f| fire.flickered(f).shadow_strength).collect();
+        let lo = shadows.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = shadows.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            hi > lo + 0.02,
+            "the shadow held still under a guttering flame: {lo}..{hi}"
+        );
+        // But never away entirely: a shadow that vanished on a bright frame
+        // would flash the floor.
+        assert!(lo > 0.0, "the shadow went out completely");
+
+        // A steady lamp's shadow does not move, so nothing pays for this that
+        // has not asked for it.
+        let steady = Light::new(LightId(10), "Lamp", LightKind::lamp(Point::new(0.0, 0.0)));
+        assert_eq!(
+            steady.flickered(0).shadow_strength,
+            steady.flickered(37).shadow_strength
+        );
+    }
+
     #[test]
     fn two_fires_gutter_differently() {
         let mut a = fire();

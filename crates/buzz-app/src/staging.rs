@@ -17,6 +17,7 @@ pub fn setting_of(choice: buzz_ui::SettingChoice) -> Setting {
         buzz_ui::SettingChoice::Sunset => Setting::Sunset,
         buzz_ui::SettingChoice::Night => Setting::Night,
         buzz_ui::SettingChoice::Interior => Setting::Interior,
+        buzz_ui::SettingChoice::Storm => Setting::Storm,
     }
 }
 
@@ -44,6 +45,8 @@ impl Editor {
             figure_scale: state.figure_scale,
             lit: state.lit,
             frames: state.frames,
+            clouds: state.clouds,
+            water: state.water,
         };
 
         let mut message = String::new();

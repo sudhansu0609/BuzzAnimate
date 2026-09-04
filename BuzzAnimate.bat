@@ -14,6 +14,13 @@ rem
 rem  It builds first when the sources have changed, which is a no-op once the
 rem  build is warm: a launcher that quietly ran last week's binary would be a
 rem  very confusing thing to own.
+rem
+rem  RUN FROM THE DESKTOP SHORTCUT THERE IS NO CONSOLE AT ALL. The shortcut
+rem  points at BuzzAnimate.vbs, which runs this file hidden and puts anything
+rem  that goes wrong in a dialog box - so the editor opens on its own, with no
+rem  black window beside it. Double-clicking this .bat, or running it from a
+rem  terminal, still shows the build as it happens, which is what you want when
+rem  you are the one changing the sources.
 rem ===========================================================================
 
 setlocal EnableDelayedExpansion
@@ -42,8 +49,7 @@ if errorlevel 1 (
     echo   Rust is not installed, or cargo is not on the PATH.
     echo   Install it from https://rustup.rs and run this again.
     echo.
-    pause
-    exit /b 1
+    goto :halt
 )
 
 rem --- refuse to build over a copy that is already running -------------------
@@ -64,8 +70,7 @@ if not errorlevel 1 (
     echo.
     echo   Close BuzzAnimate and run this again.
     echo.
-    pause
-    exit /b 1
+    goto :halt
 )
 
 echo Building BuzzAnimate ^(%PROFILE%^)...
@@ -80,8 +85,7 @@ if errorlevel 1 (
     echo   target\%PROFILE_DIR%\ is whatever was there before, and is NOT what
     echo   the sources say. Fix the build before running it.
     echo.
-    pause
-    exit /b 1
+    goto :halt
 )
 
 set "EXE=target\%PROFILE_DIR%\buzzanimate.exe"
@@ -89,8 +93,7 @@ if not exist "%EXE%" (
     echo.
     echo   Built, but %EXE% is not there. Has the binary been renamed?
     echo.
-    pause
-    exit /b 1
+    goto :halt
 )
 
 echo Starting BuzzAnimate...
@@ -105,16 +108,44 @@ rem  requires before a quoted path - without it the path IS taken as the title
 rem  and nothing launches.
 rem
 rem  A previous attempt at `start` opened BuzzAnimate minimised off-screen. The
-rem  cause was the desktop shortcut, which is created minimised (WindowStyle 7)
-rem  so its console does not flash: `start` passed that state to a *console*
-rem  binary. A GUI binary creates its own window and is unaffected.
+rem  cause was the desktop shortcut, which used to be created minimised
+rem  (WindowStyle 7) so its console would not flash: `start` passed that state
+rem  on to a *console* binary. There is no console to hide now - the shortcut
+rem  goes through BuzzAnimate.vbs - so it is created normal, and a GUI binary
+rem  makes its own window and is unaffected either way.
 rem
 rem  Debug stays in the console on purpose. `--dev` is how you ask for the
 rem  adapter table, the tracing output and a panic's backtrace, and all of that
 rem  goes to this window - so this window has to stay.
+rem
+rem  Unless there is no window. Started hidden through the .vbs, `--dev` would
+rem  run the console build with its output going to a log nobody is watching
+rem  and the launcher waiting on it forever, which looks exactly like the app
+rem  failing to open. So in that one case it is handed over with `start`, which
+rem  gives the debug build a console of its own.
 if "%PROFILE%"=="release" (
+    start "" "%EXE%" %ARGS%
+) else if defined BUZZ_SILENT (
     start "" "%EXE%" %ARGS%
 ) else (
     "%EXE%" %ARGS%
 )
 endlocal
+exit /b 0
+
+rem ===========================================================================
+rem  Every failure ends here.
+rem
+rem  **`pause` is not always available.** The desktop shortcut starts this
+rem  through BuzzAnimate.vbs, which runs it with no console at all so the black
+rem  window never appears - see the note there. In that state a `pause` waits
+rem  for a keypress nobody can give: the launcher would hang forever, invisibly,
+rem  and the only sign of it would be that BuzzAnimate never opened. So the
+rem  prompt happens only when there is a window to read it in; when there is
+rem  not, BuzzAnimate.vbs shows the message in a dialog instead, which is why
+rem  everything above is written to the console rather than swallowed.
+rem ===========================================================================
+:halt
+if not defined BUZZ_SILENT pause
+endlocal
+exit /b 1

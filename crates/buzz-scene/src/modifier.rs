@@ -44,6 +44,81 @@ pub enum Modifier {
     /// by `amount` per unit of speed. Volume-preserving: a fast move thins and
     /// lengthens the drawing, the oldest trick for selling weight and speed.
     AutoSquashStretch { amount: f64 },
+    /// **Breathing.** The chest rises and falls: the drawing grows a little
+    /// taller and wider about its own feet, in and out, forever.
+    ///
+    /// # Why a character needs one
+    ///
+    /// A held pose in animation is never *still*. A drawing that does not move
+    /// between two keys reads as a picture of a character rather than as a
+    /// character standing there, and the cheapest thing that fixes it — the
+    /// thing every animator draws by hand on a hold — is a breath. It is two
+    /// per cent of scale and nobody ever notices it consciously; they notice
+    /// its absence immediately.
+    ///
+    /// `rate` is in **breaths per minute** — twelve to sixteen at rest, thirty
+    /// and up after running — and `depth` scales the whole thing, `1.0` being
+    /// a comfortable resting breath.
+    ///
+    /// Anchored at the bottom of the drawing, so the feet stay on the ground
+    /// and the motion goes into the chest, which is where a breath belongs.
+    /// The phase is seeded from the object's id, so a crowd does not breathe
+    /// in unison — which is the one thing that would make it visible.
+    Breathe { rate: f64, depth: f64 },
+    /// **Wind.** The drawing bends downwind from its base, in gusts.
+    ///
+    /// A shear rather than a rotation: the bottom stays planted and the lean
+    /// grows with height, which is what a trunk does and what a rotation does
+    /// not — a rotated tree pivots its roots out of the ground.
+    ///
+    /// `amount` is how far the top leans at a full gust, as a fraction of the
+    /// drawing's own height (`0.1` is a stiff pine, `0.35` a willow); `rate` is
+    /// the gust frequency in hertz, around `0.2` for a breeze.
+    ///
+    /// The gust is **biased downwind** rather than centred, because wind is:
+    /// it lulls back towards upright and gusts one way, instead of waving the
+    /// tree evenly to both sides like a metronome. Seeded from the object's id,
+    /// so a row of trees planted from the same drawing does not sway as one
+    /// object — which is exactly what gives a painted background away.
+    Sway { amount: f64, rate: f64 },
+    /// **A steady drift, wrapping.** The object travels at `(dx, dy)` document
+    /// units per second, and every `span` units of travel it is back where it
+    /// started.
+    ///
+    /// # What it is for
+    ///
+    /// Everything in a background that goes past rather than moves about:
+    /// clouds crossing the sky, the surface of a river, a streetscape behind a
+    /// window, snow across a shot. All of it is one velocity and a loop, and
+    /// all of it used to be two keyframes per object per shot — which is fine
+    /// until the shot is re-timed, and then it is wrong everywhere at once.
+    ///
+    /// # Why the wrap is a distance and not a rectangle
+    ///
+    /// A wrap needs to know how far to go before starting again, and the honest
+    /// answer depends on the *drawing*: a cloud has to be all the way off the
+    /// stage before it can come back on, or it pops in mid-frame. That is a
+    /// number the thing placing the cloud knows and the modifier does not, so
+    /// it is passed in. `span` of zero never wraps, which is what a one-way
+    /// move across a single shot wants.
+    ///
+    /// The distance is measured **along the drift**, not per axis, so a
+    /// diagonal drift loops once rather than beating between two periods.
+    ///
+    /// `phase` is how far into that loop the object already is, `0..1`, and it
+    /// is the field that makes a *field* of drifting things possible. Without
+    /// it five clouds on one loop are five clouds in a queue: they all start at
+    /// the left edge together and cross in formation. Offsetting where each one
+    /// is *placed* does not fix it — the wrap then sends the ones placed
+    /// further along off the far side and holds them there for most of the
+    /// loop, which is exactly what it looked like. The phase has to be inside
+    /// the modulo, so it lives here.
+    Drift {
+        dx: f64,
+        dy: f64,
+        span: f64,
+        phase: f64,
+    },
 }
 
 impl Modifier {
@@ -54,6 +129,9 @@ impl Modifier {
             Modifier::Spring { .. } => "Spring",
             Modifier::LookAt { .. } => "Look At",
             Modifier::AutoSquashStretch { .. } => "Squash & Stretch",
+            Modifier::Breathe { .. } => "Breathe",
+            Modifier::Sway { .. } => "Sway",
+            Modifier::Drift { .. } => "Drift",
         }
     }
 
@@ -71,6 +149,54 @@ use buzz_geom::Affine;
 use buzz_physics::{Spring, Wiggle, wiggle_at};
 
 use crate::{LayerId, Object, ObjectId, ObjectKind, Scene};
+
+/// **One breath, in `-1..=1`.**
+///
+/// Not a sine. A breath is not symmetric: the chest fills quickly and empties
+/// slowly, and a pure sine reads as a machine — which is the difference
+/// between a character breathing and a drawing pulsing. A second harmonic at a
+/// third of the amplitude sharpens the rise and lengthens the fall, which is
+/// the shape of the real thing and costs one more `sin`.
+///
+/// `rate` is in breaths per minute; `seed` is the object's id, and only moves
+/// the phase, so a crowd breathes at the same rate without breathing together.
+fn breath_at(seed: u64, rate: f64, t_seconds: f64) -> f64 {
+    use std::f64::consts::TAU;
+    let per_second = rate.clamp(0.5, 120.0) / 60.0;
+    // A stable phase per object, from the same hash the wiggle uses.
+    let phase = ((splitmix64(seed ^ 0xB2EA_7115) as f64) / u64::MAX as f64) * TAU;
+    let a = TAU * per_second * t_seconds + phase;
+    (a.sin() + 0.33 * (2.0 * a).sin()) / 1.33
+}
+
+/// **One gust of wind, in about `-0.3..=1.0`.**
+///
+/// Biased downwind, because wind is: it lulls back towards upright and pushes
+/// one way, rather than waving a tree evenly to both sides. The wander itself
+/// is the wiggle's own fractal sum of sines — three octaves, so the branch has
+/// a flutter on top of the gust rather than a single frequency, which is what
+/// stops a row of trees looking like windscreen wipers.
+fn gust_at(seed: u64, rate: f64, t_seconds: f64) -> f64 {
+    let wander = buzz_physics::wiggle_at(
+        buzz_physics::Wiggle {
+            amplitude: 1.0,
+            frequency: rate.clamp(0.01, 20.0),
+        },
+        seed ^ 0x5EED_1A15,
+        t_seconds,
+    );
+    0.35 + 0.65 * wander.dx
+}
+
+/// SplitMix64's finalizer, for a stable phase per object. The same mixer
+/// `buzz_physics` seeds its wiggles with, so two procedural motions on one
+/// object do not share a phase by accident.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
 
 /// The spring cache's table: a full modified pose sequence per `(object, chain
 /// root)`, all built for one document revision.
@@ -196,6 +322,82 @@ impl Scene {
                         prepend = Affine::translate(here)
                             * squash
                             * Affine::translate(-here)
+                            * prepend;
+                    }
+                }
+                Modifier::Breathe { rate, depth } => {
+                    // Continuous in time, like the wiggle and for the same
+                    // reason: a breath is slow, and sampling it per frame
+                    // rather than per shutter would step it.
+                    let bounds = object.bounds();
+                    if bounds.width() > 0.0 && bounds.height() > 0.0 {
+                        let s = breath_at(object.id.0, rate, time / fps);
+                        let depth = depth.clamp(0.0, 4.0);
+                        // **Two per cent, and taller than it is wider.** A
+                        // breath you can measure is a breath the audience can
+                        // see, and a character that visibly inflates reads as a
+                        // balloon. The chest fills, so both axes grow; it fills
+                        // upwards more than outwards, so y grows about twice as
+                        // much as x.
+                        let sy = 1.0 + depth * 0.022 * s;
+                        let sx = 1.0 + depth * 0.010 * s;
+                        // The feet, not the middle: a breath must not lift the
+                        // character off the ground.
+                        let feet = buzz_geom::Point::new(bounds.center().x, bounds.y1);
+                        prepend = Affine::translate(feet.to_vec2())
+                            * Affine::scale_non_uniform(sx, sy)
+                            * Affine::translate(-feet.to_vec2())
+                            * prepend;
+                    }
+                }
+                Modifier::Drift {
+                    dx,
+                    dy,
+                    span,
+                    phase,
+                } => {
+                    // Continuous in time, like the wiggle: a drift is smooth,
+                    // and sampling it per frame rather than per shutter would
+                    // step a slow one visibly.
+                    let seconds = time / fps;
+                    let speed = (dx * dx + dy * dy).sqrt();
+                    if speed > 1e-9 {
+                        // Wrapped along the drift, so a background loops — and
+                        // the head start goes *inside* the wrap, so a cloud
+                        // that begins three quarters of the way along still
+                        // spends the same share of its loop on screen as one
+                        // that begins at the edge.
+                        let travelled = if span > 1e-9 {
+                            (speed * seconds + phase * span).rem_euclid(span)
+                        } else {
+                            speed * seconds
+                        };
+                        let step = travelled / speed;
+                        prepend = Affine::translate((dx * step, dy * step)) * prepend;
+                    }
+                }
+                Modifier::Sway { amount, rate } => {
+                    let bounds = object.bounds();
+                    if bounds.width() > 0.0 && bounds.height() > 0.0 {
+                        let gust = gust_at(object.id.0, rate, time / fps);
+                        // How far the *top* of the drawing leans, in document
+                        // units: a fraction of its own height, so one setting
+                        // suits a sapling and a full-grown oak.
+                        let lean = amount.clamp(-2.0, 2.0) * gust * bounds.height();
+                        // Shear: the displacement grows with height above the
+                        // base, so the base itself does not move. `k` is that
+                        // displacement per unit of height.
+                        let k = lean / bounds.height();
+                        let base = bounds.y1;
+                        // A bend shortens what it bends — the top of a leaning
+                        // trunk is nearer the ground than the top of an upright
+                        // one. Without it the crown swings along an arc that is
+                        // visibly wrong at the extremes, and the tree looks
+                        // rubbery rather than woody.
+                        let shorten = 1.0 / (1.0 + k * k).sqrt();
+                        prepend = Affine::translate((0.0, base))
+                            * Affine::new([1.0, 0.0, -k, shorten, 0.0, 0.0])
+                            * Affine::translate((0.0, -base))
                             * prepend;
                     }
                 }
@@ -439,6 +641,154 @@ mod tests {
             };
             assert_eq!(live, expected[frame as usize], "frame {frame} differs from the solver");
         }
+    }
+
+    /// A square standing on the ground, for the three modifiers that measure
+    /// themselves against the drawing's own feet.
+    fn standing_square(scene: &mut Scene, id: u64) -> (LayerId, ObjectId) {
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let object = Object::shape(
+            ObjectId(id),
+            // Top at y = 0, base at y = 100, a hundred wide.
+            ShapeData::filled(Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9), Color::WHITE),
+        );
+        let placed = scene.add_object(layer, object).unwrap();
+        scene.update_layer(layer, |l| {
+            if l.frames.length() <= 60 {
+                l.frames.insert_frame(60);
+            }
+        });
+        (layer, placed)
+    }
+
+    /// **Breathing moves the chest and leaves the feet alone.**
+    ///
+    /// Both halves matter. A breath that lifted the whole drawing would be a
+    /// character bobbing off the floor, which is worse than not breathing.
+    #[test]
+    fn breathing_raises_the_chest_and_keeps_the_feet_down() {
+        let mut scene = Scene::empty();
+        let (layer, id) = standing_square(&mut scene, 11);
+        scene.update_object_across(0, 60, id, |o| {
+            o.modifiers.push(Modifier::Breathe {
+                rate: 14.0,
+                depth: 1.0,
+            });
+        });
+
+        let mut tops = Vec::new();
+        for frame in 0..60u32 {
+            let obj = resolved(&scene, layer, id, frame);
+            let eval = scene.modified_object_at(layer, &obj, frame).unwrap();
+            let feet = eval.prepend * buzz_geom::Point::new(50.0, 100.0);
+            assert!(
+                (feet.y - 100.0).abs() < 1e-9,
+                "frame {frame}: the feet moved to {}",
+                feet.y
+            );
+            tops.push((eval.prepend * buzz_geom::Point::new(50.0, 0.0)).y);
+        }
+
+        let lo = tops.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = tops.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            hi - lo > 1.0,
+            "the chest barely moved over two and a half seconds: {lo}..{hi}"
+        );
+        // And not by so much that it reads as a balloon.
+        assert!(hi - lo < 12.0, "that is not breathing, it is inflating: {lo}..{hi}");
+    }
+
+    /// **Sway bends the top and plants the base.** A tree that pivoted about
+    /// its middle would lift its roots out of the ground, which is the reason
+    /// this is a shear rather than a rotation.
+    #[test]
+    fn sway_leans_the_top_and_plants_the_base() {
+        let mut scene = Scene::empty();
+        let (layer, id) = standing_square(&mut scene, 12);
+        scene.update_object_across(0, 60, id, |o| {
+            o.modifiers.push(Modifier::Sway {
+                amount: 0.3,
+                rate: 0.5,
+            });
+        });
+
+        let mut leans = Vec::new();
+        for frame in 0..60u32 {
+            let obj = resolved(&scene, layer, id, frame);
+            let eval = scene.modified_object_at(layer, &obj, frame).unwrap();
+            let base = eval.prepend * buzz_geom::Point::new(50.0, 100.0);
+            assert!(
+                (base - buzz_geom::Point::new(50.0, 100.0)).hypot() < 1e-9,
+                "frame {frame}: the base moved to {base:?}"
+            );
+            leans.push((eval.prepend * buzz_geom::Point::new(50.0, 0.0)).x);
+        }
+        let lo = leans.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = leans.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(hi - lo > 2.0, "the top hardly moved: {lo}..{hi}");
+    }
+
+    /// **A drift loops, and its phase says where in the loop it starts.**
+    ///
+    /// The phase is what makes a *field* of drifting things possible: without
+    /// it every cloud on one loop crosses the sky in formation.
+    #[test]
+    fn a_drift_wraps_and_its_phase_offsets_it() {
+        let mut scene = Scene::empty();
+        let (layer, id) = standing_square(&mut scene, 13);
+        scene.update_object_across(0, 60, id, |o| {
+            o.modifiers.push(Modifier::Drift {
+                dx: 100.0,
+                dy: 0.0,
+                span: 200.0,
+                phase: 0.0,
+            });
+        });
+        let fps = scene.stage().frame_rate.max(1.0);
+        let at = |frame: u32| {
+            let obj = resolved(&scene, layer, id, frame);
+            scene
+                .modified_object_at(layer, &obj, frame)
+                .unwrap()
+                .prepend
+                .translation()
+                .x
+        };
+
+        // A hundred units a second, wrapping every two hundred: back to the
+        // start after exactly two seconds.
+        assert!(at(0).abs() < 1e-9);
+        let two_seconds = (2.0 * fps) as u32;
+        assert!(
+            at(two_seconds).abs() < 1e-6,
+            "it did not come back: {}",
+            at(two_seconds)
+        );
+        assert!(at(fps as u32) > 90.0, "it barely moved in a second");
+
+        // And a half phase starts it half way along.
+        let mut other = Scene::empty();
+        let (layer2, id2) = standing_square(&mut other, 14);
+        other.update_object_across(0, 60, id2, |o| {
+            o.modifiers.push(Modifier::Drift {
+                dx: 100.0,
+                dy: 0.0,
+                span: 200.0,
+                phase: 0.5,
+            });
+        });
+        let obj = resolved(&other, layer2, id2, 0);
+        let offset = other
+            .modified_object_at(layer2, &obj, 0)
+            .unwrap()
+            .prepend
+            .translation()
+            .x;
+        assert!(
+            (offset - 100.0).abs() < 1e-6,
+            "a half phase should start it half way along, got {offset}"
+        );
     }
 
     #[test]

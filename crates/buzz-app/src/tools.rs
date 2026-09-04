@@ -500,8 +500,9 @@ impl ToolMachine {
 
     /// Which part of the gizmo a press at `at` grabbed, if any.
     ///
-    /// **The whole gizmo, from every tool that shows it.** Corners scale,
-    /// edges skew and the ring outside a corner turns — for the selection
+    /// **The whole gizmo, from every tool that shows it.** Corners scale, the
+    /// mid-edge handles squeeze one dimension, the edges either side of them
+    /// skew and the ring outside a corner turns — for the selection
     /// tools as well as Free Transform, because the handles are drawn for all
     /// of them and a handle you can see and cannot use is worse than none.
     ///
@@ -524,7 +525,10 @@ impl ToolMachine {
         let zone = transform_zone(bounds, pivot, at, grab);
         matches!(
             zone,
-            TransformZone::Rotate | TransformZone::Corner | TransformZone::Edge(_)
+            TransformZone::Rotate
+                | TransformZone::Corner
+                | TransformZone::Edge(_)
+                | TransformZone::Side(_)
         )
         .then_some(Transforming {
             zone,
@@ -883,6 +887,13 @@ impl ToolMachine {
                                 scale_about_corner(bounds, *origin, *current, mods.shift)
                             })
                         }
+                        Some((pivot, bounds, TransformZone::Side(horizontal)))
+                            if self.tool == ToolId::FreeTransform =>
+                        {
+                            Preview::Transform(scale_about_side(
+                                pivot, bounds, *origin, *current, horizontal, *mods,
+                            ))
+                        }
                         Some((pivot, bounds, TransformZone::Edge(horizontal)))
                             if self.tool == ToolId::FreeTransform =>
                         {
@@ -1148,7 +1159,10 @@ impl ToolMachine {
                     // artwork, and picking whatever happens to lie under a
                     // corner would take the selection away from the very thing
                     // the user was lining up to transform.
-                    TransformZone::Corner | TransformZone::Rotate | TransformZone::Edge(_)
+                    TransformZone::Corner
+                    | TransformZone::Rotate
+                    | TransformZone::Edge(_)
+                    | TransformZone::Side(_)
                         if was_click =>
                     {
                         ToolAction::None
@@ -1177,6 +1191,9 @@ impl ToolMachine {
                     },
                     TransformZone::Rotate => ToolAction::TransformSelection {
                         transform: rotate_about(pivot, origin, end, mods.shift),
+                    },
+                    TransformZone::Side(horizontal) => ToolAction::TransformSelection {
+                        transform: scale_about_side(pivot, bounds, origin, end, horizontal, mods),
                     },
                     TransformZone::Edge(horizontal) => ToolAction::TransformSelection {
                         transform: skew_about(pivot, bounds, origin, end, horizontal),
@@ -1666,6 +1683,14 @@ enum TransformZone {
     Corner,
     /// Just outside a corner: rotate.
     Rotate,
+    /// A mid-edge handle: **squeeze or stretch in one axis**. `true` for a
+    /// handle on a horizontal edge — the top or the bottom — which scales in y.
+    ///
+    /// The square drawn at the middle of each edge, and the answer to "press
+    /// it down from the top". Dragging the edge *line* still skews; this is
+    /// the handle sitting on it, and it is the only part of the gizmo that
+    /// changes one dimension without touching the other.
+    Side(bool),
     /// An edge: skew. `true` for a horizontal edge, which shears in x.
     Edge(bool),
     /// Anywhere else within the selection: move it.
@@ -1729,6 +1754,9 @@ fn transform_for(t: &Transforming, origin: Point, end: Point, mods: Mods) -> Aff
                 scale_about_corner(t.bounds, origin, end, mods.shift)
             }
         }
+        TransformZone::Side(horizontal) => {
+            scale_about_side(t.pivot, t.bounds, origin, end, horizontal, mods)
+        }
         TransformZone::Edge(horizontal) => skew_about(t.pivot, t.bounds, origin, end, horizontal),
         TransformZone::Pivot | TransformZone::Inside => Affine::IDENTITY,
     }
@@ -1760,6 +1788,23 @@ fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> Transform
     // into the rotation cursor.
     if nearest <= grab * 3.0 && !contains(bounds, at) {
         return TransformZone::Rotate;
+    }
+
+    // **The mid-edge handles**, which are drawn as squares exactly here — see
+    // `stage::draw_selection_chrome`. Tested before the edge lines they sit
+    // on, so the handle wins over the skew zone it overlaps: a square you can
+    // see is a promise that grabbing it does one thing, and the line either
+    // side of it is where the other one lives.
+    let mid = bounds.center();
+    for (p, horizontal) in [
+        (Point::new(mid.x, bounds.y0), true),
+        (Point::new(mid.x, bounds.y1), true),
+        (Point::new(bounds.x0, mid.y), false),
+        (Point::new(bounds.x1, mid.y), false),
+    ] {
+        if (p - at).hypot() <= grab {
+            return TransformZone::Side(horizontal);
+        }
     }
 
     // An edge, but not near a corner: skew along it.
@@ -1841,6 +1886,102 @@ fn scale_about(pivot: Point, bounds: Rect, origin: Point, end: Point, uniform: b
     Affine::translate(pivot.to_vec2())
         * Affine::scale_non_uniform(sx, sy)
         * Affine::translate(-pivot.to_vec2())
+}
+
+/// **Squeeze or stretch in one axis**, by dragging the handle at the middle of
+/// an edge, held at the opposite edge.
+///
+/// # Why this is not a skew
+///
+/// Every edge of the gizmo used to skew and nothing else, so the top handle
+/// sheared in x and a drag straight *down* it — press this flat — moved
+/// nothing at all. The pointer said as much: it turned into the horizontal
+/// resize arrow over the top edge, because horizontal was the only thing on
+/// offer there. Squashing and stretching one dimension is the most ordinary
+/// thing an animator asks of a selection, and it had no gesture.
+///
+/// So the **handle** scales and the **line either side of it** still skews.
+/// Both are reachable, both are drawn, and neither had to be given up: see
+/// [`TransformZone::Side`] for the order they are tested in.
+///
+/// `horizontal` is true for the handle on a horizontal edge — the top or the
+/// bottom — which is the one that scales in **y**.
+///
+/// Shift keeps the proportions, taking the other axis along with the dragged
+/// one; Alt holds the transformation point instead of the opposite edge, which
+/// is what Alt does at a corner as well.
+fn scale_about_side(
+    pivot: Point,
+    bounds: Rect,
+    origin: Point,
+    end: Point,
+    horizontal: bool,
+    mods: Mods,
+) -> Affine {
+    // What is held still while the grabbed edge moves. The opposite edge, so
+    // pressing the top down leaves the bottom on the ground rather than
+    // shrinking the artwork towards its middle — which is what "squash it"
+    // means and what a corner drag already does.
+    //
+    // The anchor's *other* coordinate is the pivot's, so the axis that is not
+    // being scaled is untouched by where the anchor sits.
+    let anchor = if mods.alt {
+        pivot
+    } else if horizontal {
+        let far = if (origin.y - bounds.y0).abs() < (origin.y - bounds.y1).abs() {
+            bounds.y1
+        } else {
+            bounds.y0
+        };
+        Point::new(pivot.x, far)
+    } else {
+        let far = if (origin.x - bounds.x0).abs() < (origin.x - bounds.x1).abs() {
+            bounds.x1
+        } else {
+            bounds.x0
+        };
+        Point::new(far, pivot.y)
+    };
+
+    let (before, after, extent) = if horizontal {
+        (origin.y - anchor.y, end.y - anchor.y, bounds.height())
+    } else {
+        (origin.x - anchor.x, end.x - anchor.x, bounds.width())
+    };
+    // Dragging a handle that is *on* the anchor's own row has no ratio to
+    // take; the selection's own size stands in, so the drag still does
+    // something predictable rather than nothing. Same fallback as
+    // `scale_about`, and for the same reason.
+    let s = if before.abs() > 1e-9 {
+        after / before
+    } else if extent.abs() > 1e-9 {
+        1.0 + after / extent
+    } else {
+        1.0
+    };
+
+    let (sx, sy) = if mods.shift {
+        (s, s)
+    } else if horizontal {
+        (1.0, s)
+    } else {
+        (s, 1.0)
+    };
+
+    // A zero scale is a singular matrix: the artwork collapses to a line and
+    // no drag back can recover it, because there is nothing left to scale.
+    const MIN: f64 = 1e-4;
+    let floor = |v: f64| {
+        if v.abs() < MIN {
+            MIN * if v < 0.0 { -1.0 } else { 1.0 }
+        } else {
+            v
+        }
+    };
+
+    Affine::translate(anchor.to_vec2())
+        * Affine::scale_non_uniform(floor(sx), floor(sy))
+        * Affine::translate(-anchor.to_vec2())
 }
 
 /// Skew about a point: dragging a horizontal edge shears in x, a vertical one
@@ -1973,9 +2114,99 @@ mod tests {
             TransformZone::Rotate,
             "just outside a corner"
         );
-        assert_eq!(zone(50.0, 0.0), TransformZone::Edge(true), "a top edge");
-        assert_eq!(zone(0.0, 50.0), TransformZone::Edge(false), "a left edge");
+        assert_eq!(
+            zone(50.0, 0.0),
+            TransformZone::Side(true),
+            "the handle on the top edge"
+        );
+        assert_eq!(
+            zone(0.0, 50.0),
+            TransformZone::Side(false),
+            "the handle on the left edge"
+        );
+        // The line either side of a handle still skews, which is what keeps
+        // both gestures reachable on one edge.
+        assert_eq!(zone(75.0, 0.0), TransformZone::Edge(true), "a top edge");
+        assert_eq!(zone(0.0, 75.0), TransformZone::Edge(false), "a left edge");
         assert_eq!(zone(30.0, 30.0), TransformZone::Inside, "the middle");
+    }
+
+    /// **Pressing the top handle down squashes the box and holds the bottom.**
+    ///
+    /// The gesture the gizmo had no answer for: every edge sheared, so a drag
+    /// straight down a horizontal edge — which shears in x — moved nothing.
+    #[test]
+    fn the_side_handle_squeezes_one_axis_and_holds_the_far_edge() {
+        let bounds = box_10();
+        let pivot = bounds.center();
+        let squashed = scale_about_side(
+            pivot,
+            bounds,
+            Point::new(50.0, 0.0),
+            Point::new(50.0, 50.0),
+            true,
+            Mods::default(),
+        );
+
+        // Half as tall...
+        let top = squashed * Point::new(50.0, 0.0);
+        assert!(
+            (top - Point::new(50.0, 50.0)).hypot() < 1e-9,
+            "the grabbed edge follows the pointer, got {top:?}"
+        );
+        // ...held at the bottom...
+        let bottom = squashed * Point::new(50.0, 100.0);
+        assert!(
+            (bottom - Point::new(50.0, 100.0)).hypot() < 1e-9,
+            "the far edge is the anchor, got {bottom:?}"
+        );
+        // ...and no narrower.
+        let side = squashed * Point::new(0.0, 100.0);
+        assert!(
+            (side.x - 0.0).abs() < 1e-9,
+            "one axis only: x moved to {}",
+            side.x
+        );
+
+        // A vertical edge is the other way about.
+        let pinched = scale_about_side(
+            pivot,
+            bounds,
+            Point::new(0.0, 50.0),
+            Point::new(50.0, 50.0),
+            false,
+            Mods::default(),
+        );
+        let left = pinched * Point::new(0.0, 50.0);
+        assert!((left.x - 50.0).abs() < 1e-9, "got {left:?}");
+        assert!((left.y - 50.0).abs() < 1e-9, "y is untouched, got {left:?}");
+    }
+
+    /// Alt holds the transformation point instead of the far edge — the same
+    /// thing Alt does at a corner, so one modifier means one thing.
+    #[test]
+    fn alt_squeezes_about_the_transformation_point() {
+        let bounds = box_10();
+        let pivot = bounds.center();
+        let mods = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        let squashed = scale_about_side(
+            pivot,
+            bounds,
+            Point::new(50.0, 0.0),
+            Point::new(50.0, 25.0),
+            true,
+            mods,
+        );
+        let top = squashed * Point::new(50.0, 0.0);
+        let bottom = squashed * Point::new(50.0, 100.0);
+        assert!((top.y - 25.0).abs() < 1e-9, "got {top:?}");
+        assert!(
+            (bottom.y - 75.0).abs() < 1e-9,
+            "the far edge comes in by as much, got {bottom:?}"
+        );
     }
 
     /// The circle wins over everything under it: a transformation point parked

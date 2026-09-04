@@ -310,6 +310,18 @@ pub struct LightDto {
     /// older files and in every light that does not rim, which is the default.
     #[serde(default, skip_serializing_if = "is_unrimmed")]
     pub rim: f32,
+    /// How hard this light catches an edge. Version 26.
+    ///
+    /// Absent in older files, which read as the **default** rather than as the
+    /// full glint they were rendered with. Deliberate: what those files carry
+    /// is "a highlight", and the hard one they got is the thing this control
+    /// exists to fix. See `buzz_light::Light::glint`.
+    #[serde(default = "soft_glint")]
+    pub glint: f32,
+    /// How hard and how often this light strikes. Version 26. Absent in older
+    /// files and in every light that is not a storm, which is nearly all.
+    #[serde(default, skip_serializing_if = "is_calm")]
+    pub storm: f32,
     /// Sun: the compass bearing and how high it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azimuth: Option<f64>,
@@ -395,6 +407,10 @@ fn is_steady(flicker: &f32) -> bool {
 }
 
 /// A light that lays no rim writes no `rim`, for the same reason.
+fn is_calm(storm: &f32) -> bool {
+    *storm <= 0.0
+}
+
 fn is_unrimmed(rim: &f32) -> bool {
     *rim == 0.0
 }
@@ -1381,6 +1397,37 @@ impl ModifierDto {
                 amount: Some(amount),
                 ..base
             },
+            // Version 26. `frequency` carries the rate for both — breaths per
+            // minute for one, gusts per second for the other — rather than
+            // adding a field the older kinds would never write.
+            Modifier::Breathe { rate, depth } => Self {
+                kind: "breathe".to_string(),
+                frequency: Some(rate),
+                amount: Some(depth),
+                ..base
+            },
+            Modifier::Sway { amount, rate } => Self {
+                kind: "sway".to_string(),
+                frequency: Some(rate),
+                amount: Some(amount),
+                ..base
+            },
+            // `x`/`y` are the velocity and `amount` the wrap distance — the
+            // same three fields the older kinds already carry, used for what
+            // they say rather than a new pair nothing else would ever write.
+            Modifier::Drift {
+                dx,
+                dy,
+                span,
+                phase,
+            } => Self {
+                kind: "drift".to_string(),
+                x: Some(dx),
+                y: Some(dy),
+                amount: Some(span),
+                frequency: Some(phase),
+                ..base
+            },
         }
     }
 
@@ -1405,6 +1452,20 @@ impl ModifierDto {
             }),
             "squashstretch" => Some(Modifier::AutoSquashStretch {
                 amount: self.amount.unwrap_or(0.0),
+            }),
+            "breathe" => Some(Modifier::Breathe {
+                rate: self.frequency.unwrap_or(14.0),
+                depth: self.amount.unwrap_or(1.0),
+            }),
+            "sway" => Some(Modifier::Sway {
+                amount: self.amount.unwrap_or(0.12),
+                rate: self.frequency.unwrap_or(0.2),
+            }),
+            "drift" => Some(Modifier::Drift {
+                dx: self.x.unwrap_or(0.0),
+                dy: self.y.unwrap_or(0.0),
+                span: self.amount.unwrap_or(0.0),
+                phase: self.frequency.unwrap_or(0.0),
             }),
             _ => None,
         }
@@ -1517,6 +1578,12 @@ fn yes() -> bool {
 /// The default for a lamp's glow in a file written before there was one.
 fn full_glow() -> f32 {
     1.0
+}
+
+/// The default for a light's glint in a file written before there was one.
+/// The one constant, so the format and the renderer cannot drift apart on it.
+fn soft_glint() -> f32 {
+    buzz_scene::DEFAULT_GLINT
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1899,6 +1966,20 @@ fn texture_kind_name(kind: buzz_scene::TextureKind) -> &'static str {
         K::Bricks => "bricks",
         K::Wood => "wood",
         K::Hatch => "hatch",
+        // Ground cover. Version 26. Prefixed by family, so the name says what
+        // it is without the button beside it: "lawn" alone could be anything.
+        K::GrassLawn => "grass-lawn",
+        K::GrassBlades => "grass-blades",
+        K::GrassMeadow => "grass-meadow",
+        K::GrassDry => "grass-dry",
+        K::GrassMoss => "grass-moss",
+        K::GrassClover => "grass-clover",
+        K::DirtSoil => "dirt-soil",
+        K::DirtGravel => "dirt-gravel",
+        K::DirtSand => "dirt-sand",
+        K::DirtCracked => "dirt-cracked",
+        K::DirtPebbles => "dirt-pebbles",
+        K::DirtMud => "dirt-mud",
     }
 }
 
@@ -2304,6 +2385,8 @@ impl DocumentDto {
                             glow: light.glow,
                             flicker: light.flicker,
                             rim: light.rim,
+                            glint: light.glint,
+                            storm: light.storm,
                             azimuth: None,
                             elevation: None,
                             horizon: None,
@@ -2581,6 +2664,8 @@ impl DocumentDto {
                     glow: dto.glow,
                     flicker: dto.flicker,
                     rim: dto.rim,
+                    glint: dto.glint,
+                    storm: dto.storm,
                     track: dto.track.as_ref().map(LightTrackDto::to_track).transpose()?,
                 });
             }

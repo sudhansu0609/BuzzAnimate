@@ -1994,13 +1994,21 @@ impl App {
                 ui.label("Texture");
                 let has_shape = self.editor.selection.iter().next().is_some();
                 ui.add_enabled_ui(has_shape, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for kind in buzz_scene::TextureKind::ALL {
-                            if ui.button(kind.label()).clicked() {
-                                self.editor.apply_texture(kind);
+                    // **Under family headings, not in one wrapped wall.** There
+                    // are twenty-one of these now, and "Lawn" sitting next to
+                    // "Checker" tells you nothing about which of them is
+                    // ground cover. The heading is what turns the list into
+                    // something you scan rather than read.
+                    for (family, kinds) in buzz_scene::TextureKind::GROUPS {
+                        ui.label(egui::RichText::new(family).small().weak());
+                        ui.horizontal_wrapped(|ui| {
+                            for kind in kinds {
+                                if ui.button(kind.label()).clicked() {
+                                    self.editor.apply_texture(*kind);
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                     if ui.button("Image as fill\u{2026}").clicked() {
                         self.fill_with_image_dialog();
                     }
@@ -2053,21 +2061,24 @@ impl App {
                             ui.add(egui::Slider::new(&mut recipe.contrast, 0.0..=4.0).step_by(0.05));
                             ui.end_row();
                         });
-                    ui.horizontal_wrapped(|ui| {
-                        for kind in buzz_scene::TextureKind::ALL {
-                            if ui
-                                .add(
-                                    egui::Button::new(kind.label())
-                                        .small()
-                                        .selected(kind == recipe.kind),
-                                )
-                                .clicked()
-                            {
-                                recipe.kind = kind;
-                                recipe.detail = kind.default_detail();
+                    for (family, kinds) in buzz_scene::TextureKind::GROUPS {
+                        ui.label(egui::RichText::new(family).small().weak());
+                        ui.horizontal_wrapped(|ui| {
+                            for kind in kinds {
+                                if ui
+                                    .add(
+                                        egui::Button::new(kind.label())
+                                            .small()
+                                            .selected(*kind == recipe.kind),
+                                    )
+                                    .clicked()
+                                {
+                                    recipe.kind = *kind;
+                                    recipe.detail = kind.default_detail();
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                     self.editor.ensure_fill_texture();
                 }
 
@@ -2139,49 +2150,31 @@ impl App {
                         ui.end_row();
                     });
 
-                    ui.horizontal_wrapped(|ui| {
-                        for kind in buzz_scene::TextureKind::ALL {
-                            if ui
-                                .add(
-                                    egui::Button::new(kind.label())
-                                        .small()
-                                        .selected(kind == recipe.kind),
-                                )
-                                .clicked()
-                            {
-                                edited.kind = kind;
-                                // The new pattern's own detail, since what suits
-                                // a weave does not suit a wall.
-                                edited.detail = kind.default_detail();
-                                changed = true;
+                    for (family, kinds) in buzz_scene::TextureKind::GROUPS {
+                        ui.label(egui::RichText::new(family).small().weak());
+                        ui.horizontal_wrapped(|ui| {
+                            for kind in kinds {
+                                if ui
+                                    .add(
+                                        egui::Button::new(kind.label())
+                                            .small()
+                                            .selected(*kind == recipe.kind),
+                                    )
+                                    .clicked()
+                                {
+                                    edited.kind = *kind;
+                                    // The new pattern's own detail, since what
+                                    // suits a weave does not suit a wall.
+                                    edited.detail = kind.default_detail();
+                                    changed = true;
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
 
                     if changed {
                         self.editor.retexture(edited, Some(placement));
                     }
-                }
-
-                // Symmetry drawing: everything drawn is mirrored across the
-                // stage centre. Lives on the draw style, so it applies to every
-                // drawing tool.
-                ui.separator();
-                ui.label("Symmetry");
-                let sym = &mut self.editor.style.symmetry;
-                egui::ComboBox::from_id_salt("symmetry-mode")
-                    .selected_text(sym.mode.label())
-                    .show_ui(ui, |ui| {
-                        for mode in buzz_ui::SymmetryMode::ALL {
-                            ui.selectable_value(&mut sym.mode, mode, mode.label());
-                        }
-                    });
-                if sym.mode == buzz_ui::SymmetryMode::Radial {
-                    ui.add(
-                        egui::DragValue::new(&mut sym.radial_count)
-                            .range(2..=24)
-                            .prefix("copies "),
-                    );
                 }
 
                 // Perspective guides: a horizon + rays to 1–3 vanishing points.
@@ -2753,6 +2746,10 @@ impl App {
 
         if response.add_fire {
             editor.run(Command::AddFire);
+        }
+
+        if response.add_storm {
+            editor.run(Command::AddStorm);
         }
 
         if let Some(id) = response.remove {
@@ -3738,8 +3735,9 @@ impl App {
     /// promise a gesture the release will not make.
     /// The cursor for whatever part of the transform gizmo the pointer is on.
     ///
-    /// **Three transforms live within a few pixels of each other** — a corner
-    /// resizes, the ring just outside it turns, an edge skews — and with one
+    /// **Four transforms live within a few pixels of each other** — a corner
+    /// resizes, the ring just outside it turns, the handle at the middle of an
+    /// edge squeezes that dimension, the edge either side of it skews — and with one
     /// arrow over all of them the only way to find out which you had grabbed
     /// was to let go and look. Reaching for a rotation and landing on a corner
     /// is how a turn ends up scaling the artwork, and the pointer never said.
@@ -3789,7 +3787,30 @@ impl App {
             return Some(egui::CursorIcon::Grab);
         }
 
-        // An edge, away from the corners: skew along it.
+        // **The handle at the middle of an edge: squeeze that dimension.**
+        // The arrow points the way the edge travels — down for the top handle,
+        // sideways for the left one — which is the difference between "this
+        // squashes" and "this shears", the two gestures that live within a few
+        // pixels of each other along one edge.
+        let mid = box_rect.center();
+        for (p, horizontal) in [
+            (egui::pos2(mid.x, box_rect.top()), true),
+            (egui::pos2(mid.x, box_rect.bottom()), true),
+            (egui::pos2(box_rect.left(), mid.y), false),
+            (egui::pos2(box_rect.right(), mid.y), false),
+        ] {
+            if p.distance(pos) <= grab {
+                return Some(if horizontal {
+                    egui::CursorIcon::ResizeVertical
+                } else {
+                    egui::CursorIcon::ResizeHorizontal
+                });
+            }
+        }
+
+        // An edge, away from the corners and away from its handle: skew along
+        // it. The arrow lies *along* the edge, because that is the way a skew
+        // moves it.
         let near_vertical = ((pos.x - box_rect.left()).abs() <= grab
             || (pos.x - box_rect.right()).abs() <= grab)
             && pos.y > box_rect.top() + grab

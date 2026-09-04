@@ -980,6 +980,17 @@ impl Editor {
         self.machine.preview(&self.tool_context())
     }
 
+    /// **The extra placements symmetry makes**, in the space a tool draws in.
+    ///
+    /// Empty when symmetry is off, so the ordinary path costs one comparison.
+    /// The same list the commit uses is what the preview is drawn through, and
+    /// that is the point of it being reachable from outside: a mirrored stroke
+    /// that only appears on release is the stroke changing under the pointer,
+    /// which is the one thing a drawing preview must never do.
+    pub fn symmetry_mirrors(&self) -> Vec<Affine> {
+        symmetry_transforms(self.style.symmetry, self.doc.scene().stage().size)
+    }
+
     /// Will [`Self::preview`] paint into the Vello scene rather than the
     /// chrome?
     ///
@@ -1558,7 +1569,7 @@ impl Editor {
         }
 
         let merge = self.style.drawing_mode == DrawingMode::MergeShape;
-        let symmetry = self.style.symmetry;
+        let mirrors = self.symmetry_mirrors();
         let frame = self.current_frame;
         let auto = self.auto_keyframe;
         let mut created: Option<ObjectId> = None;
@@ -1574,7 +1585,6 @@ impl Editor {
             // Symmetry drawing lays down the mirror copies first (so the stroke
             // the user is watching stays the selected one), each a reflection or
             // rotation of the drawn shape about the stage centre.
-            let mirrors = symmetry_transforms(symmetry, scene.stage().size);
             for t in &mirrors {
                 let copy = mirror_shape(&shape, *t);
                 if merge {
@@ -1778,6 +1788,18 @@ impl Editor {
                 .hypot(cutter.bounding_box().height()),
         );
 
+        // **Symmetry rubs where it draws.** A mirror you can draw through but
+        // not correct through is worse than no mirror: the far half of the
+        // drawing becomes read-only the moment you make a mistake on it.
+        //
+        // Each reflection cuts in its own pass rather than being merged into
+        // one cutter, because a reflection reverses a path's orientation — a
+        // stroke crossing the axis would have its two halves cancel under the
+        // nonzero rule and rub out nothing at all where it mattered most.
+        let cutters: Vec<BezPath> = std::iter::once(cutter.clone())
+            .chain(self.symmetry_mirrors().into_iter().map(|t| t * cutter.clone()))
+            .collect();
+
         let frame = self.current_frame;
         let at = self.edit_at();
         self.doc.edit("Erase", |scene| {
@@ -1800,8 +1822,15 @@ impl Editor {
                 // turning them into discs.
                 let mut pieces: Vec<buzz_geom::BezPath> = Vec::new();
                 update_shape(scene, at, id, |s| {
-                    let cut =
-                        buzz_geom::boolean(&s.path, &cutter, buzz_geom::BoolOp::Difference, opts);
+                    let mut cut = s.path.clone();
+                    for cutter in &cutters {
+                        cut = buzz_geom::boolean(
+                            &cut,
+                            cutter,
+                            buzz_geom::BoolOp::Difference,
+                            opts,
+                        );
+                    }
                     became_empty = cut.elements().is_empty();
                     let mut parts = buzz_geom::split_disjoint(&cut);
                     // The first piece stays in the object that was already
@@ -2198,7 +2227,8 @@ impl Editor {
 
         let frame = self.current_frame;
         let auto = self.auto_keyframe;
-        let area = canvas.area();
+        let blend = self.style.brush.blend();
+        let mirrors = self.symmetry_mirrors();
 
         // **Paint fuses with paint.** In Merge Shape mode — Animate's default,
         // and what every other drawing tool here already honours — a stroke laid
@@ -2209,9 +2239,19 @@ impl Editor {
             .flatten();
 
         if let Some((target, merged)) = fuse {
-            let blend = self.style.brush.blend();
             let mut fused = None;
             self.doc.edit("Brush", |scene| {
+                // A mirrored soft stroke reflects **this stroke's** pixels, not
+                // the fused result. Fusing rewrites the paint already on the
+                // layer, so reflecting that would mirror everything under the
+                // brush again with every dab, and the far side of the stage
+                // would thicken as you painted on the near one.
+                if !mirrors.is_empty() {
+                    let stroke = raster_shape(scene, canvas, brush, blend);
+                    for t in &mirrors {
+                        scene.add_shape_at(layer, frame, mirror_shape(&stroke, *t));
+                    }
+                }
                 let id = scene.next_image_id();
                 let name = scene.images().unique_name("Paint");
                 let mut asset = buzz_scene::ImageAsset::from_pixels(
@@ -2248,25 +2288,14 @@ impl Editor {
             if auto {
                 scene.ensure_keyframe(layer, frame);
             }
-            let id = scene.next_image_id();
-            let name = scene.images().unique_name("Paint");
-            let asset = scene.images_mut().insert(canvas.to_asset(id, name, brush));
-
-            let mut fill = buzz_scene::ImageFill::new(asset, area);
-            // The canvas is already at the document's own pixel scale, so it
-            // is drawn one painted pixel to one document unit. Smoothing it
-            // would blur paint against the grid it was painted on.
-            fill.smooth = false;
-            painted = scene.add_shape_at(
-                layer,
-                frame,
-                ShapeData {
-                    path: buzz_geom::Shape::to_path(&area, 1e-9),
-                    fill: Some(buzz_scene::FillSpec::image(fill)),
-                    stroke: None,
-                    blend: self.style.brush.blend(),
-                },
-            );
+            let shape = raster_shape(scene, canvas, brush, blend);
+            // The copies first, so the stroke being watched stays selected.
+            // Each reflection is carried by the fill's own transform, so the
+            // pixels are stored once however many mirrors there are.
+            for t in &mirrors {
+                scene.add_shape_at(layer, frame, mirror_shape(&shape, *t));
+            }
+            painted = scene.add_shape_at(layer, frame, shape);
         });
         self.doc.end_gesture();
         match painted {
@@ -2385,6 +2414,7 @@ impl Editor {
 
         let frame = self.current_frame;
         let auto = self.auto_keyframe;
+        let mirrors = self.symmetry_mirrors();
         let mut created: Option<ObjectId> = None;
         self.doc.edit(label, |scene| {
             if auto {
@@ -2411,20 +2441,15 @@ impl Editor {
                 adopt_textures(scene, shape);
             }
 
-            created = if shapes.len() == 1 {
-                let shape = shapes.into_iter().next().expect("checked length");
-                scene.add_shape_at(layer, frame, shape)
-            } else {
-                let children: Vec<std::sync::Arc<buzz_scene::Object>> = shapes
-                    .into_iter()
-                    .map(|shape| {
-                        let id = scene.next_object_id();
-                        std::sync::Arc::new(buzz_scene::Object::shape(id, shape))
-                    })
-                    .collect();
-                let id = scene.next_object_id();
-                scene.add_object_at(layer, frame, buzz_scene::Object::group(id, children))
-            };
+            // Symmetry copies go down first, so the stroke the user was
+            // watching stays the selected one — the rule `add_shape`
+            // follows, and the reason an effect brush under a mirror still
+            // leaves you holding the piece you drew.
+            for t in &mirrors {
+                let copies = shapes.iter().map(|s| mirror_shape(s, *t)).collect();
+                place_artwork(scene, layer, frame, copies);
+            }
+            created = place_artwork(scene, layer, frame, shapes);
         });
         self.doc.end_gesture();
         match created {
@@ -2468,6 +2493,7 @@ impl Editor {
 
         let start = self.current_frame;
         let count = frames.len() as u32;
+        let mirrors = self.symmetry_mirrors();
         let mut created: Option<ObjectId> = None;
         self.doc.edit(label, |scene| {
             // Every keyframe first. See the doc comment: this order is the
@@ -2496,20 +2522,14 @@ impl Editor {
                     adopt_textures(scene, shape);
                 }
 
-                let placed = if shapes.len() == 1 {
-                    let shape = shapes.into_iter().next().expect("checked length");
-                    scene.add_shape_at(layer, frame, shape)
-                } else {
-                    let children: Vec<std::sync::Arc<buzz_scene::Object>> = shapes
-                        .into_iter()
-                        .map(|shape| {
-                            let id = scene.next_object_id();
-                            std::sync::Arc::new(buzz_scene::Object::shape(id, shape))
-                        })
-                        .collect();
-                    let id = scene.next_object_id();
-                    scene.add_object_at(layer, frame, buzz_scene::Object::group(id, children))
-                };
+                // Every frame of the cycle is mirrored, not just the first:
+                // a wave drawn under a mirror has to loop on both sides or the
+                // two halves drift apart as it plays.
+                for t in &mirrors {
+                    let copies = shapes.iter().map(|s| mirror_shape(s, *t)).collect();
+                    place_artwork(scene, layer, frame, copies);
+                }
+                let placed = place_artwork(scene, layer, frame, shapes);
                 // The first frame's drawing is the one selected afterwards:
                 // it is the frame the user was looking at while drawing.
                 if created.is_none() {
@@ -3015,6 +3035,7 @@ impl Editor {
             // keeps every kind arriving by the same door.
             AddGloom => self.add_light(buzz_scene::LightKind::gloom(self.camera.center)),
             AddFire => self.add_fire(),
+            AddStorm => self.add_storm(),
 
             // -- staging and performance --------------------------------------
             SetScene => {
@@ -3408,6 +3429,30 @@ impl Editor {
             }
         });
         self.status = Some("Added a fire \u{2014} scrub the timeline to see it move".into());
+    }
+
+    /// **Add a sky and set it striking.**
+    ///
+    /// The counterpart of [`add_fire`](Self::add_fire), through the same door
+    /// and for the same reason: lightning is an ordinary light with a violent
+    /// envelope on it, and a preset buried in a panel is a preset nobody finds.
+    ///
+    /// A **sky**, not a sun: a sheet of lightning has no direction — it lights
+    /// the whole stage at once, which is what makes the frame go white rather
+    /// than one side of every figure. `make_storm` then turns the light itself
+    /// right down, because a flash only reads against the dark.
+    fn add_storm(&mut self) {
+        self.add_light(buzz_scene::LightKind::sky());
+        let Some(id) = self.light_panel.selected else {
+            return;
+        };
+        self.doc.edit("Storm", |scene| {
+            if let Some(light) = scene.lights_mut().get_mut(id) {
+                light.make_storm();
+            }
+        });
+        self.status =
+            Some("Added a storm \u{2014} scrub the timeline to see it strike".into());
     }
 
     /// Start a light drag, if a handle is under the pointer.
@@ -7005,6 +7050,63 @@ fn symmetry_transforms(sym: SymmetrySettings, stage: buzz_geom::Size) -> Vec<Aff
     }
 }
 
+/// This stroke's painted pixels as a shape, with its canvas registered in the
+/// document's image library. See [`Editor::paint_raster`] for why a stroke is
+/// its own bitmap rather than a corner of a layer-sized one.
+fn raster_shape(
+    scene: &mut Scene,
+    canvas: &buzz_scene::Canvas,
+    brush: &buzz_scene::SoftBrush,
+    blend: buzz_scene::PaintBlend,
+) -> ShapeData {
+    let id = scene.next_image_id();
+    let name = scene.images().unique_name("Paint");
+    let asset = scene.images_mut().insert(canvas.to_asset(id, name, brush));
+    let area = canvas.area();
+    let mut fill = buzz_scene::ImageFill::new(asset, area);
+    // The canvas is already at the document's own pixel scale, so it is drawn
+    // one painted pixel to one document unit. Smoothing it would blur paint
+    // against the grid it was painted on.
+    fill.smooth = false;
+    ShapeData {
+        path: buzz_geom::Shape::to_path(&area, 1e-9),
+        fill: Some(buzz_scene::FillSpec::image(fill)),
+        stroke: None,
+        blend,
+    }
+}
+
+/// Lay a finished set of brush shapes down as **one thing**.
+///
+/// A single shape stays a shape; several become a group, so a stroke that
+/// happens to be built from twenty pieces is still one click to select and one
+/// step to undo. Shared by the still and the animated commit, and by the
+/// symmetry copies of both, which is what keeps a mirrored effect stroke
+/// grouped the same way the original is.
+fn place_artwork(
+    scene: &mut Scene,
+    layer: LayerId,
+    frame: u32,
+    shapes: Vec<ShapeData>,
+) -> Option<ObjectId> {
+    if shapes.is_empty() {
+        return None;
+    }
+    if shapes.len() == 1 {
+        let shape = shapes.into_iter().next().expect("checked length");
+        return scene.add_shape_at(layer, frame, shape);
+    }
+    let children: Vec<Arc<Object>> = shapes
+        .into_iter()
+        .map(|shape| {
+            let id = scene.next_object_id();
+            Arc::new(Object::shape(id, shape))
+        })
+        .collect();
+    let id = scene.next_object_id();
+    scene.add_object_at(layer, frame, Object::group(id, children))
+}
+
 /// One symmetry copy of a shape: its path and any gradient/image paint carried
 /// through the mirror transform, so the copy is a true reflection, fill and all.
 fn mirror_shape(shape: &ShapeData, t: Affine) -> ShapeData {
@@ -7489,6 +7591,146 @@ mod tests {
         let p = t * Point::new(170.0, 120.0); // centre x = 200
         assert!((p.x - 230.0).abs() < 1e-9, "x should mirror to 230, got {}", p.x);
         assert!((p.y - 120.0).abs() < 1e-9, "y should be unchanged, got {}", p.y);
+    }
+
+    /// Mirroring is a property of *drawing*, not of one tool. The vector
+    /// brush honoured it because it commits through `add_shape`; the soft
+    /// brush, the effect brushes and the wave brush each commit their own way
+    /// and quietly drew one copy.
+    #[test]
+    fn every_brush_kind_mirrors_its_stroke() {
+        for kind in [
+            buzz_ui::BrushKind::Fluid,
+            buzz_ui::BrushKind::Raster,
+            buzz_ui::BrushKind::Effect,
+        ] {
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::ObjectDrawing;
+            e.style.brush.kind = kind;
+            e.set_tool(ToolId::Brush);
+
+            let count = |e: &Editor| {
+                e.scene()
+                    .layers()
+                    .iter()
+                    .map(|l| l.objects_at(0).len())
+                    .sum::<usize>()
+            };
+
+            // The same stroke twice: once plain, once mirrored left to right.
+            let drag = |e: &mut Editor| {
+                let points: Vec<Point> = (0..12)
+                    .map(|i| Point::new(60.0 + f64::from(i) * 8.0, 120.0))
+                    .collect();
+                e.pointer_down(points[0], Mods::default());
+                for p in &points[1..] {
+                    e.pointer_move(*p, Mods::default());
+                }
+                e.pointer_up(*points.last().expect("points"));
+            };
+
+            drag(&mut e);
+            let plain = count(&e);
+            assert!(plain > 0, "{kind:?} drew nothing at all");
+
+            e.style.symmetry.mode = SymmetryMode::MirrorX;
+            drag(&mut e);
+            let mirrored = count(&e) - plain;
+
+            assert_eq!(
+                mirrored,
+                plain * 2,
+                "{kind:?} under a left-right mirror should lay down twice what it \
+                 lays down plain, got {mirrored} against {plain}"
+            );
+        }
+    }
+
+    /// And the copy is really on the other side, rather than a second stroke
+    /// stacked on the first.
+    #[test]
+    fn a_mirrored_brush_stroke_lands_on_the_far_side() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        e.style.brush.kind = buzz_ui::BrushKind::Fluid;
+        e.style.symmetry.mode = SymmetryMode::MirrorX;
+        e.set_tool(ToolId::Brush);
+
+        let centre = e.scene().stage().size.width / 2.0;
+        let points: Vec<Point> = (0..12)
+            .map(|i| Point::new(20.0 + f64::from(i) * 6.0, 120.0))
+            .collect();
+        assert!(
+            points.iter().all(|p| p.x < centre),
+            "the test stroke has to start on one side to have a far side"
+        );
+        e.pointer_down(points[0], Mods::default());
+        for p in &points[1..] {
+            e.pointer_move(*p, Mods::default());
+        }
+        e.pointer_up(*points.last().expect("points"));
+
+        let mut left = 0;
+        let mut right = 0;
+        for layer in e.scene().layers().iter() {
+            for object in layer.objects_at(0).iter() {
+                let Some(quad) = e.object_quad(object.id) else {
+                    continue;
+                };
+                let x = quad.iter().map(|p| p.x).sum::<f64>() / 4.0;
+                if x < centre {
+                    left += 1;
+                } else {
+                    right += 1;
+                }
+            }
+        }
+        assert_eq!((left, right), (1, 1), "one stroke each side of the mirror");
+    }
+
+    /// The mirror is drawn through as well as drawn with. Rubbing out on one
+    /// side rubs out on the other, or the far half of a symmetric drawing
+    /// becomes read-only the moment you make a mistake on it.
+    #[test]
+    fn the_eraser_rubs_through_the_mirror() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+
+        // Two bars, one each side of the vertical centre line, mirror images.
+        let centre = e.scene().stage().size.width / 2.0;
+        for x in [centre - 90.0, centre + 50.0] {
+            e.apply(ToolAction::AddShape {
+                shape: ShapeData::filled(square(x, 100.0, 40.0), Color::BLACK),
+                label: "Draw",
+            });
+        }
+        let before = e
+            .scene()
+            .layers()
+            .iter()
+            .map(|l| l.objects_at(0).len())
+            .sum::<usize>();
+        assert_eq!(before, 2, "two bars to rub at");
+
+        // A narrow rub straight down through the middle of the left bar only,
+        // under a left-right mirror.
+        e.style.symmetry.mode = SymmetryMode::MirrorX;
+        let mut path = BezPath::new();
+        path.move_to(Point::new(centre - 70.0, 90.0));
+        path.line_to(Point::new(centre - 70.0, 150.0));
+        e.apply(ToolAction::Erase { path, width: 8.0 });
+
+        // Both bars are cut in two: four pieces where there were two shapes.
+        let after = e
+            .scene()
+            .layers()
+            .iter()
+            .map(|l| l.objects_at(0).len())
+            .sum::<usize>();
+        assert_eq!(
+            after, 4,
+            "the rub should have cut both bars, not only the one under the pointer"
+        );
     }
 
     fn editor() -> Editor {
@@ -9717,7 +9959,7 @@ mod tests {
         }
     }
 
-    /// **Resize and skew are reachable, from either tool, and live.**
+    /// **Resize, squeeze and skew are reachable, from either tool, and live.**
     ///
     /// The handles are drawn for the selection tools as well as Free
     /// Transform, so they have to work from both — a handle you can see and
@@ -9752,6 +9994,45 @@ mod tests {
                 "[{tool:?}] a resize must not shear: {c:?}"
             );
 
+            // -- the top handle squeezes vertically -----------------------
+            //
+            // The gesture the gizmo used to have no answer for: press the top
+            // down and the artwork gets shorter, with the bottom left where it
+            // stands. Dragging straight down the top edge used to move nothing
+            // at all, because every edge sheared and a horizontal edge shears
+            // in x alone.
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::ObjectDrawing;
+            let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+            e.selection.select_one(id);
+            e.set_tool(tool);
+
+            let before = e.scene().find_object(id).expect("there").1.bounds();
+            // The handle at the middle of the top edge, pressed halfway down.
+            e.pointer_down(screen(Point::new(150.0, 100.0)), Mods::default());
+            e.pointer_move(screen(Point::new(150.0, 150.0)), Mods::default());
+            let during = e.scene().find_object(id).expect("there").1.bounds();
+            assert!(
+                during.height() < before.height() - 1.0,
+                "[{tool:?}] pressing the top handle down should squash it as the pointer moves"
+            );
+            e.pointer_up(screen(Point::new(150.0, 150.0)));
+
+            let after = e.scene().find_object(id).expect("there").1.bounds();
+            assert!(
+                (after.width() - before.width()).abs() < 1.0,
+                "[{tool:?}] a vertical squeeze must not change the width: {after:?}"
+            );
+            assert!(
+                (after.y1 - before.y1).abs() < 1.0,
+                "[{tool:?}] the far edge is the anchor and must not move: {after:?}"
+            );
+            let c = e.scene().find_object(id).expect("there").1.transform.as_coeffs();
+            assert!(
+                c[1].abs() < 1e-9 && c[2].abs() < 1e-9,
+                "[{tool:?}] a squeeze must not shear: {c:?}"
+            );
+
             // -- an edge skews --------------------------------------------
             let mut e = editor();
             e.style.drawing_mode = DrawingMode::ObjectDrawing;
@@ -9759,10 +10040,10 @@ mod tests {
             e.selection.select_one(id);
             e.set_tool(tool);
 
-            // The middle of the top edge, well clear of both corners.
-            e.pointer_down(screen(Point::new(150.0, 100.0)), Mods::default());
-            e.pointer_move(screen(Point::new(190.0, 100.0)), Mods::default());
-            e.pointer_up(screen(Point::new(190.0, 100.0)));
+            // The top edge *between* its handle and the corner, clear of both.
+            e.pointer_down(screen(Point::new(175.0, 100.0)), Mods::default());
+            e.pointer_move(screen(Point::new(215.0, 100.0)), Mods::default());
+            e.pointer_up(screen(Point::new(215.0, 100.0)));
 
             let c = e.scene().find_object(id).expect("there").1.transform.as_coeffs();
             assert!(

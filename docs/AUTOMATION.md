@@ -145,10 +145,14 @@ have nothing that stands in for a chair.
 
 ### 2.5 Nothing does a timing pass
 
-**The gap.** `perform` and `direct` write poses on evenly spaced keys. Nothing
-applies easing, nothing puts a generated performance on twos, and nothing
-retimes a cut to land on a detected beat. There is a Motion Editor and an ease
-model for tweens; generated work never touches them.
+**Partly shipped.** A **travelling** beat now accelerates out of a standstill
+and settles into its destination, with the stride rate riding on the same
+progress as the ground speed so the feet do not slip. Generated work is already
+written on twos with a tween between.
+
+**What is left**: nothing retimes a cut to land on a detected beat, and the
+*camera* keys the director plans still carry no ease of their own (the named
+moves do; `frame_the_shot` does not use them).
 
 **Worse for the camera.** `CameraKey` has **no easing field at all**, and
 `CameraTrack::state_at` interpolates position and rotation on a linear `t`
@@ -311,11 +315,11 @@ For this animator, in this order:
    first, because that is the direction carrying information the document did
    not have.
 
-The queue is now led by **a timing pass on generated poses** (§2.5) — every
-performance is still written on evenly spaced linear keys, which is the most
-reliable tell that a shot was generated — and then the **script/CLI reach**
-(§2.1) that would let a whole brief run unattended, which is the last thing
-standing between this and an overnight render.
+The queue is now led by the **script/CLI reach** (§2.1) — the last thing
+standing between this and handing over a brief at midnight and reading the mp4
+at breakfast. After that, the two halves of §2.5 still outstanding: the
+director's own camera keys carry no ease, and nothing snaps a cut to a
+detected beat.
 
 Also shipped since this audit was written, from the requests side rather than
 this list: the **`Turn` modifier** (a face turns from one drawing, §2.6), and

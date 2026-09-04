@@ -590,6 +590,62 @@ fn hold(u: f64, rise: f64, fall: f64) -> f64 {
     }
 }
 
+/// **How far through a travelling beat the figure is**, given how far through
+/// its frames it is.
+///
+/// # Why this is not just `u`
+///
+/// A walk written on a linear progress leaves standing still at full stride and
+/// arrives at full stride and stops dead. Nobody does that. It is the same tell
+/// the camera had before its keys carried an ease, and on a body it is louder:
+/// there is no acceleration anywhere in the shot, so the character reads as
+/// being *slid* rather than as walking.
+///
+/// # A trapezoid, not a smoothstep
+///
+/// Easing the whole move would make a long cross sluggish in the middle, which
+/// is not what walking is either. What a person does is get up to speed over
+/// about a stride, hold it, and slow over about a stride — a trapezoidal speed
+/// profile — and this is that profile integrated into a position.
+///
+/// # The phase rides on the same number
+///
+/// This is the part that matters. The returned value drives **both** the travel
+/// and the point in the walk cycle, so the stride rate and the ground speed
+/// change together. Easing only the travel would leave the legs cycling at a
+/// constant rate under a body that was speeding up, which is foot slip — a
+/// worse artefact than the one being fixed.
+///
+/// `ramp` is the share of the beat spent accelerating at each end, clamped to a
+/// half so the two ramps cannot overlap.
+fn eased_progress(u: f64, ramp: f64) -> f64 {
+    let r = ramp.clamp(0.0, 0.5);
+    let u = u.clamp(0.0, 1.0);
+    if r <= 1e-9 {
+        return u;
+    }
+    // The area under the speed profile: two half-ramps and a flat middle.
+    let total = 1.0 - r;
+    let travelled = if u < r {
+        u * u / (2.0 * r)
+    } else if u <= 1.0 - r {
+        r / 2.0 + (u - r)
+    } else {
+        let left = 1.0 - u;
+        total - left * left / (2.0 * r)
+    };
+    (travelled / total).clamp(0.0, 1.0)
+}
+
+/// How much of a travelling beat is spent getting up to speed.
+///
+/// **About half a stride**, which is what it takes, and never more than a
+/// quarter of the beat — on a two-step crossing there is no room for a long
+/// acceleration and pretending otherwise would make the whole thing sluggish.
+fn ramp_for(cycles: f64) -> f64 {
+    (0.5 / cycles.max(1.0)).min(0.25)
+}
+
 /// How far a knee is folded at phase `t`.
 ///
 /// `0.0` at the moment the foot is planted and rising to `1.0` as the leg
@@ -715,7 +771,20 @@ pub fn apply_from(
         // How far through the whole performance this frame is, and therefore
         // where in the cycle. Measured against the range rather than the clock
         // so that retiming the range restretches the motion.
-        let progress = (frame - performance.frames.start) as f64 / span;
+        let linear = (frame - performance.frames.start) as f64 / span;
+        // **Travelling beats accelerate and settle; everything else does not.**
+        //
+        // A walk and a run start from a standstill and arrive at one, and a
+        // linear progress is what makes a generated one read as sliding. A
+        // talk and an idle are ambient — they have no beginning to leave and no
+        // end to arrive at, and easing them would only make them listless at
+        // both ends. The one-shots already carry their own pacing inside
+        // `pose_at`, and easing them here would apply it twice.
+        let progress = if performance.action.travels() {
+            eased_progress(linear, ramp_for(cycles))
+        } else {
+            linear
+        };
         let beat = pose_at(performance.action, progress * cycles, performance.amount);
 
         scene.ensure_keyframe(layer, frame);

@@ -849,6 +849,8 @@ Four actions, written onto the timeline as poses on the selected rig:
 - **Standing up is the sit read backwards**, not a second set of numbers. Two hand-authored versions of one move drift apart the first time either is adjusted.
 - **Only Sit leaves the body somewhere else.** It ends sat and stays sat, because that is what sitting down is — so follow it with **Stand Up**. Anything else written over the same character starts from the standing rest pose and snaps them upright, which is the honest consequence of a pose library that has no idea what a chair is.
 
+**A walk gets up to speed rather than starting at it.** A travelling beat accelerates out of a standstill over about half a stride, holds, and settles into its destination — a trapezoidal speed profile, which is what walking is. The *stride rate rides on the same number as the ground speed*, so the legs cycle slower while the body is accelerating and the feet stay planted; easing only the travel would give you foot slip, which is a worse artefact than the one being fixed. Standing actions are left evenly paced, because a talk has no beginning to leave and no end to arrive at.
+
 **The mouth is never touched.** Lip sync is a fact about the soundtrack (§16); a performance is a choice about the body. They run independently on the same character, which is what lets you re-record the dialogue without re-animating the gestures.
 
 **Retarget Performance (`Insert ▸ Scene ▸ Retarget Performance`)** copies one rig's poses onto another with the same skeleton — one walk drives a whole cast.

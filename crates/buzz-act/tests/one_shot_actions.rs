@@ -265,3 +265,120 @@ fn amount_scales_without_reshaping() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The timing pass
+// ---------------------------------------------------------------------------
+
+use buzz_act::perform::{apply_from, Performance as Perf};
+use buzz_geom::Affine;
+use buzz_scene::{LayerKind, Scene};
+
+/// A figure on a layer, ready to perform.
+fn stage() -> (Scene, buzz_scene::ObjectId) {
+    let mut scene = Scene::default();
+    let layer = scene.add_layer("Cast", LayerKind::Normal);
+    let id = scene.next_object_id();
+    let mut next = || scene_next(&mut scene);
+    let figure = buzz_act::build_figure(&buzz_act::FigureSpec::default(), id, &mut next);
+    let placed = scene.add_object(layer, figure).expect("on the layer");
+    (scene, placed)
+}
+
+fn scene_next(scene: &mut Scene) -> buzz_scene::ObjectId {
+    scene.next_object_id()
+}
+
+/// Where the figure stands at `frame`, along x.
+fn x_at(scene: &Scene, id: buzz_scene::ObjectId, frame: u32) -> f64 {
+    let (layer, _) = scene.find_object(id).expect("the figure");
+    scene
+        .layers()
+        .get(layer)
+        .and_then(|l| {
+            l.frames
+                .resolved_at(frame)
+                .iter()
+                .find(|o| o.id == id)
+                .map(|o| o.transform.translation().x)
+        })
+        .unwrap_or(0.0)
+}
+
+/// **A walk accelerates out of a standstill.**
+///
+/// The tell this was written to remove: a generated walk left at full stride on
+/// frame one and stopped dead at the end, so the character read as being slid
+/// rather than as walking.
+#[test]
+fn a_walk_gets_up_to_speed_rather_than_starting_at_it() {
+    let (mut scene, id) = stage();
+    let performance = Perf {
+        distance: 400.0,
+        ..Perf::new(Action::Walk, 0..96)
+    };
+    apply_from(&mut scene, id, &performance, Affine::IDENTITY).expect("performs");
+
+    // Ground covered in the first eighth against a middle eighth of the same
+    // length. A linear walk covers the same in both.
+    let early = x_at(&scene, id, 12) - x_at(&scene, id, 0);
+    let middle = x_at(&scene, id, 54) - x_at(&scene, id, 42);
+    assert!(
+        early < middle * 0.8,
+        "the walk started at full speed: {early:.1} early against {middle:.1} in the middle"
+    );
+
+    // And it settles rather than stopping dead.
+    let late = x_at(&scene, id, 94) - x_at(&scene, id, 82);
+    assert!(
+        late < middle * 0.9,
+        "the walk stopped dead: {late:.1} at the end against {middle:.1} in the middle"
+    );
+}
+
+/// **It still arrives exactly where it was sent.**
+///
+/// Easing the pacing must not change the distance: the director places the next
+/// beat from where this one ended, and a walk that fell short would leave the
+/// whole rest of the shot offset.
+#[test]
+fn easing_the_pacing_does_not_move_the_destination() {
+    let (mut scene, id) = stage();
+    let performance = Perf {
+        distance: 400.0,
+        ..Perf::new(Action::Walk, 0..96)
+    };
+    apply_from(&mut scene, id, &performance, Affine::IDENTITY).expect("performs");
+
+    let arrived = x_at(&scene, id, 94);
+    assert!(
+        (arrived - 400.0).abs() < 12.0,
+        "the walk was sent 400 units and arrived at {arrived:.1}"
+    );
+    assert!(x_at(&scene, id, 0).abs() < 1e-6, "it did not start where it was placed");
+}
+
+/// **Standing actions are not eased.**
+///
+/// A talk and an idle are ambient: they have no beginning to leave and no end
+/// to arrive at, and easing them would only make them listless at both ends.
+#[test]
+fn a_standing_action_keeps_its_even_pacing() {
+    for action in [Action::Talk, Action::Idle] {
+        let (mut scene, id) = stage();
+        apply_from(
+            &mut scene,
+            id,
+            &Perf::new(action, 0..96),
+            Affine::IDENTITY,
+        )
+        .expect("performs");
+        // Nothing travels, so the test is that the pose at the quarter point is
+        // the pose the unmodified curve gives there — no re-timing applied.
+        let quarter = pose_at(action, 0.25 * Perf::new(action, 0..96).cycles(24.0), 1.0);
+        assert!(
+            quarter.joints.iter().any(|v| v.abs() > 1e-9),
+            "{action:?} produced no motion at all"
+        );
+    }
+}

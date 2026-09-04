@@ -250,7 +250,12 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             // here, at the bottom, because that is what a shortcut can do.
             let current = crate::theme::theme();
             ui.menu_button("Theme", |ui| {
-                for theme in crate::theme::Theme::ALL {
+                for (i, theme) in crate::theme::Theme::ALL.into_iter().enumerate() {
+                    // The program's own themes, then the palettes people
+                    // arrive already knowing. Ten in one flat list is a wall.
+                    if i == crate::theme::Theme::HOUSE {
+                        ui.separator();
+                    }
                     let mark = if theme == current { "\u{2714} " } else { "   " };
                     if ui
                         .button(format!("{mark}{}", theme.label()))

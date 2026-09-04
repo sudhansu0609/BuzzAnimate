@@ -53,19 +53,44 @@ pub enum Theme {
     /// vision, for a projector, and for a bright room a normal light theme
     /// cannot cope with.
     Contrast,
+
+    // The four below are the well-known editor palettes rather than this
+    // program's own. People arrive already knowing whether they like them, and
+    // an animator who has spent a decade in a Dracula editor should not have to
+    // leave it behind to draw. Their published colours are used as published;
+    // where one is adjusted it is for a job the original palette never had —
+    // see `FOREST` and the note on `active`.
+    /// Deep green-black, with moss and leaf for the accents.
+    Forest,
+    /// The Dracula palette: charcoal violet, with purple and pink.
+    Dracula,
+    /// Ethan Schoonover's Solarized, dark. Blue-green base, low saturation,
+    /// tuned so no colour shouts over another.
+    SolarizedDark,
+    /// Nord: the Arctic palette. Polar-night greys under frost blue.
+    Nord,
 }
 
 impl Theme {
     /// Every theme, in the order the menu offers them: the two originals
     /// first, then the other darks, then the other lights.
-    pub const ALL: [Theme; 6] = [
+    pub const ALL: [Theme; 10] = [
         Theme::Dark,
         Theme::Light,
         Theme::Midnight,
         Theme::Slate,
         Theme::Sepia,
         Theme::Contrast,
+        Theme::Forest,
+        Theme::Dracula,
+        Theme::SolarizedDark,
+        Theme::Nord,
     ];
+
+    /// How many of [`Self::ALL`] are this program's own, before the well-known
+    /// palettes begin. The menu draws a separator here: ten in a flat list is
+    /// a wall, and the two groups are chosen for different reasons.
+    pub const HOUSE: usize = 6;
 
     pub fn label(self) -> &'static str {
         match self {
@@ -75,6 +100,10 @@ impl Theme {
             Theme::Slate => "Slate",
             Theme::Sepia => "Sepia",
             Theme::Contrast => "High Contrast",
+            Theme::Forest => "Forest",
+            Theme::Dracula => "Dracula",
+            Theme::SolarizedDark => "Solarized Dark",
+            Theme::Nord => "Nord",
         }
     }
 
@@ -91,6 +120,12 @@ impl Theme {
             Theme::Contrast => {
                 "Black behind white, with vivid guides. Built for legibility."
             }
+            Theme::Forest => "Deep green-black, with moss and leaf for the accents.",
+            Theme::Dracula => "The Dracula palette: charcoal violet, purple and pink.",
+            Theme::SolarizedDark => {
+                "Solarized, dark. Low saturation, so no colour shouts over another."
+            }
+            Theme::Nord => "The Arctic palette: polar-night greys under frost blue.",
         }
     }
 
@@ -120,6 +155,10 @@ impl Theme {
             Theme::Slate => SLATE,
             Theme::Sepia => SEPIA,
             Theme::Contrast => CONTRAST,
+            Theme::Forest => FOREST,
+            Theme::Dracula => DRACULA,
+            Theme::SolarizedDark => SOLARIZED_DARK,
+            Theme::Nord => NORD,
         }
     }
 }
@@ -190,10 +229,19 @@ palette!(
     raised,
     /// Hovered control.
     hover,
-    /// Active or selected control. The application's accent: it stays in the
-    /// blue family in every theme, because an accent that changes with the
-    /// interface stops being one. Only its weight moves, so that it can be
-    /// picked out against a near-black panel and against warm paper alike.
+    /// Active or selected control.
+    ///
+    /// This program's own themes keep it in the blue family, because an accent
+    /// that changes with the interface stops being one. The well-known
+    /// palettes do not: Dracula's identity *is* its purple and Forest's is its
+    /// green, and holding them to a house rule would leave four themes that
+    /// were only nominally the thing they are named after.
+    ///
+    /// **Dark enough for white text, whatever the family.** It is a fill with
+    /// `Color32::WHITE` written on it — see `build_visuals` — so the bright
+    /// half of a palette cannot be used here. Nord's accent is nord10 rather
+    /// than the frost blue everyone pictures for exactly this reason, and
+    /// `the_accent_can_be_written_on` holds every theme to it.
     active,
     /// Separators and panel edges.
     border,
@@ -379,6 +427,117 @@ const CONTRAST: Colors = Colors {
     handle_fill: rgb(0xFFFFFF),
     handle_stroke: rgb(0x000000),
     snap: rgb(0xFF2D95),
+};
+
+/// Deep green-black. Not a recognised palette but the one most often asked
+/// for alongside them, and the accents are picked from what a forest actually
+/// offers: moss, new leaf, and the orange of a fallen one for the snap mark.
+const FOREST: Colors = Colors {
+    chrome: rgb(0x0B1410),
+    panel: rgb(0x101B15),
+    raised: rgb(0x17271E),
+    hover: rgb(0x21362A),
+    active: rgb(0x2F7D53),
+    border: rgb(0x060D0A),
+    text: rgb(0xD3E3D8),
+    text_dim: rgb(0x8AA394),
+    pasteboard: rgb(0x33463C),
+    stage_border: rgb(0x040907),
+    ruler_bg: rgb(0x132018),
+    ruler_tick: rgb(0x7C9687),
+    ruler_text: rgb(0xA6BFB0),
+    guide: rgb(0x3FD9A0),
+    guide_locked: rgb(0x7E8A5E),
+    grid: rgba(0x4A5F52, 0x60),
+    selection: rgb(0x5BD98E),
+    handle_fill: rgb(0xFFFFFF),
+    handle_stroke: rgb(0x08110C),
+    snap: rgb(0xFF7A59),
+};
+
+/// Dracula, from its published palette: background `#282A36`, foreground
+/// `#F8F8F2`, and the six brights.
+///
+/// The accent is a deeper purple than the palette's `#BD93F9`, because that one
+/// is meant to be written *with* rather than written *on* — see `active`. The
+/// comment colour `#6272A4` is likewise lifted for the dimmed text, which in an
+/// interface has to stay readable rather than recede.
+const DRACULA: Colors = Colors {
+    chrome: rgb(0x21222C),
+    panel: rgb(0x282A36),
+    raised: rgb(0x343746),
+    hover: rgb(0x44475A),
+    active: rgb(0x7E52C9),
+    border: rgb(0x191A21),
+    text: rgb(0xF8F8F2),
+    text_dim: rgb(0x9BA3C9),
+    pasteboard: rgb(0x4A4D63),
+    stage_border: rgb(0x14151B),
+    ruler_bg: rgb(0x2D2F3D),
+    ruler_tick: rgb(0x8B93B8),
+    ruler_text: rgb(0xBDC3E0),
+    guide: rgb(0x8BE9FD),
+    guide_locked: rgb(0xF1FA8C),
+    grid: rgba(0x6272A4, 0x60),
+    selection: rgb(0xFF79C6),
+    handle_fill: rgb(0xFFFFFF),
+    handle_stroke: rgb(0x21222C),
+    snap: rgb(0xFF5555),
+};
+
+/// Solarized Dark, on its own base tones: `base03` behind, `base02` raised,
+/// `base1` for text and `base00` for what recedes.
+///
+/// The palette is built around a fixed lightness relationship rather than
+/// around contrast, which is why its text sits closer to its background than
+/// any other theme here. That is the point of it, and it still clears AA.
+const SOLARIZED_DARK: Colors = Colors {
+    chrome: rgb(0x00212B),
+    panel: rgb(0x002B36),
+    raised: rgb(0x073642),
+    hover: rgb(0x0F4B5C),
+    active: rgb(0x268BD2),
+    border: rgb(0x00161C),
+    text: rgb(0x93A1A1),
+    text_dim: rgb(0x657B83),
+    pasteboard: rgb(0x3E5B63),
+    stage_border: rgb(0x001015),
+    ruler_bg: rgb(0x052F3A),
+    ruler_tick: rgb(0x587B85),
+    ruler_text: rgb(0x93A1A1),
+    guide: rgb(0x2AA198),
+    guide_locked: rgb(0xB58900),
+    grid: rgba(0x586E75, 0x60),
+    selection: rgb(0x268BD2),
+    handle_fill: rgb(0xFDF6E3),
+    handle_stroke: rgb(0x00212B),
+    snap: rgb(0xDC322F),
+};
+
+/// Nord, by its own numbering: the Polar Night greys `nord0`-`nord3` for the
+/// chrome, Snow Storm for the text, Frost for the accents and Aurora for the
+/// marks that have to be noticed.
+const NORD: Colors = Colors {
+    chrome: rgb(0x2E3440),
+    panel: rgb(0x3B4252),
+    raised: rgb(0x434C5E),
+    hover: rgb(0x4C566A),
+    active: rgb(0x5E81AC),
+    border: rgb(0x242933),
+    text: rgb(0xECEFF4),
+    text_dim: rgb(0xA3AEC2),
+    pasteboard: rgb(0x616E85),
+    stage_border: rgb(0x21262F),
+    ruler_bg: rgb(0x39404F),
+    ruler_tick: rgb(0x92A0B5),
+    ruler_text: rgb(0xC3CCDA),
+    guide: rgb(0x8FBCBB),
+    guide_locked: rgb(0xEBCB8B),
+    grid: rgba(0x616E85, 0x60),
+    selection: rgb(0x88C0D0),
+    handle_fill: rgb(0xECEFF4),
+    handle_stroke: rgb(0x2E3440),
+    snap: rgb(0xBF616A),
 };
 
 /// The brand's three colours, in order along the frame.
@@ -818,6 +977,27 @@ mod tests {
                     t.label()
                 );
             }
+        });
+    }
+
+    /// **White is written on the accent**, so the accent cannot be one of a
+    /// palette's bright colours.
+    ///
+    /// `build_visuals` fills an active control with `Palette::active` and puts
+    /// `Color32::WHITE` on top. Dracula's `#BD93F9` and Nord's frost blue are
+    /// the obvious accents to reach for and both fail this: the label goes
+    /// nearly invisible the moment a control is pressed. 3.0 is WCAG AA for
+    /// text at this weight.
+    #[test]
+    fn the_accent_can_be_written_on() {
+        in_each_theme(|t| {
+            let ratio = contrast(Color32::WHITE, Palette::active());
+            assert!(
+                ratio >= 3.0,
+                "{}: white on the accent is {ratio:.2}:1, so a pressed control \
+                 cannot be read",
+                t.label()
+            );
         });
     }
 

@@ -26,7 +26,7 @@
 14. [Vector Filters & Blend Modes](#14-vector-filters--blend-modes)
 15. [Spatial 3D Camera & Layer Parallax](#15-spatial-3d-camera--layer-parallax)
 16. [Soundtrack, Waveforms & Automated Lip Sync](#16-soundtrack-waveforms--automated-lip-sync)
-17. [Production Staging, Directing & Physics Modifiers](#17-production-staging-directing--physics-modifiers)
+17. [Production Staging, Directing & Motion That Runs Itself](#17-production-staging-directing--motion-that-runs-itself)
 18. [Import & Export Pipelines](#18-import--export-pipelines)
 19. [JavaScript Automation (JSFL API)](#19-javascript-automation-jsfl-api)
 20. [Workspace Customization & Layouts](#20-workspace-customization--layouts)
@@ -251,6 +251,49 @@ The Brush tool (`B`) includes 7 specialized brush models selectable in the Prope
 └─────────────┴─────────────────────────────────────────────────────────────┘
 ```
 
+### The 15 Effect Brush Kinds (Brush ▸ Effect)
+
+One drag lays down vector silhouettes, gradient glows and painted pixels together — the whole point of a mixed raster-and-vector layer. Pick the kind in the Tool Options panel:
+
+| Kind | What one stroke paints | What the fill colour does |
+|---|---|---|
+| **Snow** | Drifting flakes scattered along the stroke | Flake colour |
+| **Rain** | Slanted streaks of rain | Streak colour |
+| **Stars** | A star field: dots and four-point sparkles | Star colour |
+| **Fireflies** | Warm glowing points scattered along the stroke | The fill colour is the light |
+| **Bokeh** | Soft out-of-focus discs of light | The fill colour is the light |
+| **Clouds** | Soft cumulus along the stroke | Cloud colour |
+| **Diffused Light** | A soft wash of added light — an airbrush of glow | The fill colour is the light |
+| **Light Rays** | Beams fanning from the stroke's start toward its end | The fill colour is the light |
+| **Moonlight** | A glowing moon placed where the stroke ends | The fill colour is the light |
+| **String Lights** | Fairy lights hanging from the stroke | Bulbs cycle a festive palette; the wire is dark |
+| **Lamps** | Street lamps standing on the stroke, pools of light below | The fill colour is the light |
+| **Buildings** | A lit city skyline standing on the stroke | Silhouette in the fill colour; windows glow warm |
+| **Pine Trees** | A treeline of pines standing on the stroke | Silhouette in the fill colour |
+| **Leafy Trees** | Round-crowned trees standing on the stroke | Silhouette in the fill colour |
+| **Grass** | Blades of grass growing up from the stroke | Silhouette in the fill colour |
+
+> **Pair them with Live Motion (§17.5).** Paint a treeline, then give it **Sway**; paint cloud, then give it **Drift**. That is a background that moves for two settings and no keyframes.
+
+### Re-weighting Outlines (`[` and `]`)
+
+**`Modify ▸ Shape ▸ Thicken Lines` / `Thin Lines`**, or the bracket keys — the same gesture every paint program binds for brush size, aimed at a drawing that is already down.
+
+- Touches **only the outline**. The path is untouched, the fill is untouched, and a shape with no stroke is left exactly as it was.
+- **Multiplies rather than adds**, so one press means the same thing on a hairline and on a heavy outline — and a drawing keeps its internal weighting instead of having it flattened.
+- A **hairline** has no width to scale, so thickening one makes it a real line first; thinning one leaves it alone.
+- One press is **one undo step**, however many lines it moved.
+
+**One press either way**, on a drawing with a heavy contour and fine interior lines:
+
+| `[` Thinner | As drawn | `]` Thicker |
+|---|---|---|
+| ![The same drawing one press thinner](docs/images/line_weight_thin.png) | ![The drawing as it was made](docs/images/line_weight_as_drawn.png) | ![The same drawing one press thicker](docs/images/line_weight_thick.png) |
+
+*The heavy contour and the fine lines keep their eight-to-one relationship through both presses. That is what the multiply is for: adding a fixed amount would have flattened the weighting the animator was looking at.*
+
+> **Brush strokes are fills, not outlines.** A stroke painted with the Brush tool is a filled path in this program (that is the Flash drawing model), so the bracket keys will not touch it and will say so. Widening a *fill* is `Modify ▸ Shape ▸ Expand Fill`, which is a different operation with a different failure mode.
+
 ### Custom Pattern Brush from Selection
 1. Draw any vector shape on the stage (e.g., a custom stitch, leaf, or emblem).
 2. Select it using the Selection tool (`V`).
@@ -294,7 +337,10 @@ Frame:                  1    5    10   15   20   25   30
 - **First / Last Frame**: Press `Home` / `End`.
 - **Onion Skinning (`Alt + Shift + O`)**: Displays ghosted silhouettes of preceding and succeeding frames. Drag the green and blue range markers in the frame ruler to broaden or narrow the preview window.
 - **Edit Multiple Frames**: Select and transform shapes across dozens of keyframes simultaneously!
-- **Animate on Twos (`Modify ▸ On Twos`)**: Automatically holds every keyframe for 2 frames across the selected span, instantly achieving traditional cinematic 12fps cadence in a 24fps project.
+- **On Twos / On Threes (`Control ▸ On Twos` / `On Threes`)**: Holds every drawing for 2 (or 3) frames across the selected span — the traditional 12fps cadence inside a 24fps project, and half or a third of the drawings a shot needs.
+- **Paint Through (`Control ▸ Paint Through`)**: **Ink and paint.** Carries this frame's bucket fills onto every keyframe after it, seeded from a point inside each region, flooded through the same gap-aware bucket you would have clicked with. Colouring is half the labour of drawn animation and almost none of the craft; this is the single largest saving in the program. Regions it could not match are reported rather than silently left blank.
+- **Reverse Frames (`Control ▸ Reverse Frames`)**: Plays the layer's keyframes back to front.
+- **Select Same Colour (`Edit ▸ Select Same Colour`)**: Everything on this frame painted the colour the selection is painted — recolour a whole character in one go.
 
 ---
 
@@ -497,6 +543,71 @@ Select the **Camera tool (`C`)** to activate the cinematic stage camera.
 - **Roll (Rotate)**: Drag the rotation wheel in the camera stage chrome to tilt the camera.
 - **Pitch & Yaw (Spatial 3D)**: Rotate the stage in genuine 3D perspective. The camera renders the stage trapezoidally, and vector cards rotate in depth.
 - **Camera Keyframing**: The timeline includes a dedicated **Camera Track**. Insert keyframes (`F6`) on the camera track to execute sweeping cinematic dollies, tracking shots, and dramatic zooms.
+- **Easing**: every camera key carries an ease governing the move that *leaves* it — the same curve model the artwork tweens use. It matters more here than anywhere else: the camera is the audience's head, and a head does not start at full speed and stop dead. A linear pan is the single most reliable tell that a shot was assembled rather than filmed.
+
+### Named Camera Moves (`Camera ▸ Move`)
+
+A push in is two keyframes and a number. So is a pan, and so is a reveal — and an animator making a story a week keys the same four of them hundreds of times. None of it is a decision; all of it is typing. Pick one and it is written from the playhead to the end of the scene, **already eased**:
+
+| Move | What it writes |
+|---|---|
+| **Push In** | Closes in on the middle of frame |
+| **Pull Out** | Gives the shot its air back |
+| **Pan Left / Right** | Tracks a quarter of the stage sideways, magnification unchanged |
+| **Reveal** | Opens close and pulls back to the framing you set up — the one move defined by where it *ends*, so the opening key is the derived one |
+| **Drift** | A slow diagonal creep under the whole shot: what a documentary does to a photograph, and the cheapest way to stop a held drawing reading as a still |
+
+```
+Camera ▾
+ ├ ✔ Camera
+ ├ ────────────────
+ ├ Add Camera Keyframe
+ ├ Remove Camera Keyframe
+ ├ Reset Camera
+ ├ ────────────────
+ ├ Move  ▸ ┌──────────────┐
+ │         │ Push In      │
+ │         │ Pull Out     │
+ │         │ Pan Left     │
+ │         │ Pan Right    │
+ │         │ Reveal       │
+ │         │ Drift        │
+ └ 2 keyframes └──────────┘
+```
+
+1. Put the playhead where the move should **start**.
+2. **Camera ▸ Move ▸** pick one.
+3. It is written to the end of the scene and the camera is switched on for you. Drag the second key in to shorten it.
+
+**What each one does to the framing** — all six from the same opening wide:
+
+| Opening frame | Push In | Pull Out |
+|---|---|---|
+| ![The wide every move starts from](docs/images/camera_move_start.png) | ![The same shot after a push in](docs/images/camera_move_push_in.png) | ![The same shot after a pull out](docs/images/camera_move_pull_out.png) |
+
+| Pan Left | Pan Right | Drift |
+|---|---|---|
+| ![Tracked left](docs/images/camera_move_pan_left.png) | ![Tracked right](docs/images/camera_move_pan_right.png) | ![A slow diagonal creep](docs/images/camera_move_drift.png) |
+
+**Reveal** is the odd one out, shown here by its *opening* frame — it is the only move defined by where it ends, so the close framing is the derived key and the wide is the one you set up:
+
+![A reveal opening close before pulling back](docs/images/camera_move_reveal_open.png)
+
+**And what the easing is for** — the same pan, a fifth of the way in:
+
+| Linear | Eased |
+|---|---|
+| ![A linear camera, already at full speed](docs/images/camera_ease_linear.png) | ![An eased camera, still getting under way](docs/images/camera_ease_smooth.png) |
+
+*A fifth of the way through an identical move. The linear camera is already at full speed and will stop dead at the other end; the eased one is still getting under way. This is the difference between a shot that was filmed and one that was assembled.*
+
+Each move starts from **the framing already in force**, so pushing in twice pushes in twice, and turning the camera on is part of the command.
+
+What comes out is **two ordinary camera keys**. Shortening the move is dragging the second one; nothing is live and nothing re-runs.
+
+> **Why the drift is not eased.** Every other move slows away and slows into place. A drift is meant to run underneath a shot without being seen, and easing one gives it a beginning and an end — which is exactly the thing the audience would then notice. It is left linear on purpose.
+
+> **Why a move runs to the end of the scene** rather than for a fixed two seconds: because that is what a camera move in a shot nearly always does. A push, a drift and a reveal are the length of the shot they are in — they are not events inside it.
 
 ---
 
@@ -509,6 +620,31 @@ BuzzAnimate features an integrated audio playback and phonetic lip-sync analysis
 - Supported audio formats: **`.wav`, `.mp3`, `.ogg`, `.flac`, `.m4a`, `.aac`**.
 - The soundtrack renders its full audio waveform directly on the timeline layer.
 - **Detect Musical Beats**: Choose **`Control ▸ Detect Beats`** to mark rhythmic percussion beats with vertical ticks on the frame ruler.
+
+### Fitting the Timeline to a Narration (`File ▸ Fit to Narration`)
+
+A narrated film is timed by audio that already exists and cannot move. Every shot length and every cut is fitted to it — and fitting them by dragging keyframes against a waveform by eye is the single largest block of time in a week of that work. The soundtrack already says where the lines are.
+
+1. Import the narration (`File ▸ Import Sound…`).
+2. Select the layer you are going to draw on.
+3. **`File ▸ Fit to Narration`**.
+
+You come back to a timeline that is **the right length**, with a **blank keyframe at the start of every line**, and the lines **marked on the ruler**. Then you draw.
+
+**How it hears the lines.** Not with the beat detector — that looks for *attacks*, which is where a drum is, and a narration run through it comes back as a beat per plosive. What matters in a voice-over is the opposite thing: the **silences**, because that is where the sentences end. So it thresholds rather than differentiates:
+
+| Behaviour | Why |
+|---|---|
+| The threshold is a **fraction of the track's own speaking level** | A narration recorded ten decibels down is still a narration; a fixed threshold would hear nothing in it |
+| The reference is the **75th percentile**, not the peak | One door slam would otherwise set the level for the whole take and deafen it to the actual voice |
+| Gaps shorter than **a quarter second** do not break a line | Every stop consonant is a short silence; breaking on those would give you a keyframe per syllable |
+| Anything shorter than **0.2s** is not a line | That is a cough, a click, or the microphone being knocked |
+
+**Run it again after a re-record.** A keyframe is only inserted where the layer does not already have one, so re-running adds the lines that moved and leaves everything you drew against the lines that did not.
+
+> **Why keyframes and not a scene per line.** A scene per line would be tidier to look at and wrong to work with: the soundtrack is cued on one scene, so cutting the film into thirty of them would leave twenty-nine with no audio under them. The narration stays whole; the timeline is divided instead.
+
+---
 
 ### Automated Lip Sync in 3 Steps
 1. Choose **`File ▸ New Mouth Symbol`**. BuzzAnimate creates a Graphic Symbol pre-populated with 10 labeled viseme mouth shapes:
@@ -527,28 +663,212 @@ Frame 4: U      (Pursed vowel)      Frame 9: Etc   (Consonants: D,T,S,K)
 
 ---
 
-## 17. Production Staging, Directing & Physics Modifiers
+## 17. Production Staging, Directing & Motion That Runs Itself
 
-The **`buzz-act`** subsystem accelerates scene layout and automated character acting (`Modify ▸ Staging`):
+The **`buzz-act`** subsystem does the parts of a shot that are *arithmetic rather than drawing*: arranging a set, standing a cast in it, walking them about, and keeping everything alive between the keys. It lives under **`Insert ▸ Scene`**, and every one of these commands leaves behind **ordinary layers, shapes, keyframes and poses** — one `Ctrl + Z` takes any of it back, and the first thing you are meant to do with the result is change it.
 
-### 1. Set the Scene (`Modify ▸ Staging ▸ Set the Scene…`)
-Quickly builds a staged environment complete with ground plane, backdrop, and multi-point lighting.
-- **Daylight**: High sun, blue ambient sky, short crisp shadows.
-- **Sunset**: Low warm sun, amber horizon sky, elongated dramatic shadows.
-- **Night**: Midnight sky with a focused practical warm lamp.
-- **Interior**: Floor, wall plane, and interior ceiling luminaire.
+> **In depth:** [`SCENES_AND_THE_DIRECTOR.md`](docs/SCENES_AND_THE_DIRECTOR.md) explains the arithmetic behind each of these — the framing rules, the breath curve, the wind bias — and is the reference to read when a result surprises you.
 
-### 2. Direct a Story (`Modify ▸ Staging ▸ Direct a Story…`)
-Input a text script or narrative beat list. BuzzAnimate generates timed blocking and character placement directly on the timeline.
+### 17.1 Set the Scene (`Insert ▸ Scene ▸ Set the Scene…`)
 
-### 3. Procedural Physics Modifiers
-- **Add Follow-Through (`Modify ▸ Add Follow-Through…`)**: Applies a damped-spring physics model to hair, antennae, tails, and loose clothing. When the character moves, secondary motion responds automatically!
-- **Add Wiggle (`Modify ▸ Add Wiggle…`)**: Generates deterministic organic jitter for handheld camera shake, wind gusts, or breathing idle sway.
-- **Bake Modifiers (`Modify ▸ Bake Modifiers`)**: Converts live physics calculations into editable keyframes.
+Builds a staged environment: ground plane, backdrop, a light rig that agrees with itself, and a cast standing on the floor at plausible sizes and distances. **Five settings**, each a complete rig rather than a colour swap:
+
+| Setting | The rig it builds |
+|---|---|
+| **Daylight** | A high sun, a blue ambient sky, short hard-edged shadows |
+| **Sunset** | A low sun near the horizon, a warm sky, shadows running long |
+| **Night** | A dark sky, a cold ambient fill, and one warm practical lamp doing the work |
+| **Interior** | No sky at all — a wall, a floor, and a practical luminaire |
+| **Storm** | A near-black sky that **strikes**: the stage goes white for a few frames every few seconds, for ever, with no keyframes anywhere. Colder fill, and it arrives with cloud |
+
+Each member of the staged cast is handed a live **Breathe** (§17.5) as it is placed, so a set scene is alive the moment it appears rather than a row of held drawings.
+
+- **Add Person (`Insert ▸ Scene ▸ Add Person`)** puts one more rigged figure on the stage, on a layer of its own.
+- **Add Scene / Duplicate Scene (`Insert ▸ Scene ▸ …`)** start the next shot of the film, or a complete copy of this one — which is what the next beat of a conversation starts from.
+
+### 17.2 Direct a Story (`Insert ▸ Scene ▸ Direct a Story…`)
+
+A few lines of ordinary prose in; a staged, cast, blocked and framed shot out.
+
+```
+Night. Ana walks in from the left.
+Ana talks to Ben. Ben listens.
+Ben walks off right.
+```
+
+**What it does with that:**
+1. **Reads the setting** from the slug line and sets the scene (§17.1), including cloud and water if the prose mentions a sky or a river.
+2. **Casts** every capitalised word it has no other explanation for, in order of first appearance.
+3. **Schedules the beats.** Sentences run in story order; each actor has a clock, and a sentence starts when everyone in it is free. **"Meanwhile"** starts a sentence alongside the previous one instead. An explicit *"for three seconds"* is honoured.
+4. **Writes the performance** as ordinary pose keyframes — walking on and off from either wing, walking toward another actor and stopping at conversational distance, walking across, running, talking, waiting.
+5. **Frames the shot.** The camera opens wide, **cuts** to whoever is speaking (close, centred, the zoom worked out from that actor's own height so a head is never cropped) and **pans** with anybody walking. An idle holds whatever framing it inherited.
+6. **Keeps everyone alive.** Somebody spoken *to* listens rather than freezing, and everyone left standing when their part ends idles quietly to the end of the shot.
+
+**Multiple shots.** A blank line, or a new slug line, cuts the brief into shots — and a whole brief becomes **one scene per shot**, each named from its own first words. A shot that does not restate the time of day stays in the one before it.
+
+**It fails loudly, not cleverly.** There is no language model here: the parser is a keyword grammar over the setting words, a few dozen verbs, the direction words and the names. Every sentence it could not read is listed back to you verbatim, because a director who silently skips a line of the script is worse than one who asks.
+
+### 17.3 Animate the Selection (`Insert ▸ Scene ▸ Perform…`)
+
+Four actions, written onto the timeline as poses on the selected rig:
+
+| Action | What is written | Cycle |
+|---|---|---|
+| **Walk** | Legs and arms in opposition, the body rising and falling twice a stride, travelling forward | ~1.0 s |
+| **Run** | A longer stride, a deeper body drop, arms bent and driving | ~0.6 s |
+| **Talk** | A weight shift, head movement on the stresses, hands coming up — and deliberately **no mouth** | ~3.2 s |
+| **Idle** | Standing and breathing: the difference between a held drawing and a dead one | ~4.0 s |
+
+**The mouth is never touched.** Lip sync is a fact about the soundtrack (§16); a performance is a choice about the body. They run independently on the same character, which is what lets you re-record the dialogue without re-animating the gestures.
+
+**Retarget Performance (`Insert ▸ Scene ▸ Retarget Performance`)** copies one rig's poses onto another with the same skeleton — one walk drives a whole cast.
+
+### 17.4 Turnarounds (`Insert ▸ Scene ▸ …`)
+
+Give a drawing the other views of itself, and it turns as it moves instead of sliding about facing forward.
+
+- **Set Reverse Drawing** — the second selected object becomes the first's back view.
+- **Add Profile Right / Left** — the drawing shown at a quarter turn.
+- **Add Three-Quarter Right / Left** — the view part way between front and profile, which is where most acting happens.
+- **Clear Reverse Drawing** — removes the whole turnaround.
+
+### 17.5 Live Motion — the modifiers (**Filters panel ▸ Live Motion ▸ +**)
+
+Rules evaluated **when a frame is drawn**, not baked into keys. Seven of them:
+
+| Modifier | What it does | Reach for it when |
+|---|---|---|
+| **Breathe** | The chest rises and falls about the drawing's own feet | Any character on a held pose |
+| **Blink** | The lid falls and lifts every few seconds | The eye artwork on any character |
+| **Turn** | Carries a face's features round a cylinder so it turns | A grouped head, without drawing another view |
+| **Sway** | The drawing bends downwind from its base, in gusts | Trees, grass, banners, hanging signs |
+| **Drift** | A steady move that loops | Clouds, water, a street behind a window |
+| **Wiggle** | A deterministic wander | Idle sway, a breeze, a handheld camera shake |
+| **Spring** | Damped follow-through on a bone chain | Hair, tails, coats |
+| **Look At** | Turns the object to face a point on the stage | Eyes and heads that track |
+| **Squash & Stretch** | Stretches along the direction of motion and squashes across, preserving volume | Selling weight and speed |
+
+Look At, Squash & Stretch, Breathe, Blink, Turn, Sway and Drift are added from the **Filters** panel; **Spring** and **Wiggle** come from `Insert ▸ Scene ▸ Add Follow-Through…` and `Add Wiggle…`, which can *also* bake instead of running live.
+
+**Breathe** deserves its own note, because it is the one everybody needs and nobody thinks of. A held pose in animation is never *still* — a drawing that does not move between two keys reads as a picture of a character rather than as a character standing there. Breathe fixes it with about **two per cent of scale**, anchored at the bottom of the drawing so the feet stay planted and the motion goes into the chest.
+
+- **Rate** is in breaths per minute — **14 at rest**, 30 and up after running.
+- **Depth** scales it; `1.0` is a comfortable resting breath.
+- The curve is **not a sine** (a breath fills quickly and empties slowly; a pure sine reads as a machine), and the phase is **seeded from the object**, so a crowd does not breathe in unison — which is the one thing that would make it visible.
+
+**Blink** is the other half of the same job, and on a face it is the larger half. An audience does not consciously see a blink either — but a character who holds a stare for eight seconds while talking is unnerving in a way nobody can name, and that is exactly the trap a puppet built for limited animation falls into, because its eyes are one drawing that nothing ever touches.
+
+- Put it on the **eye artwork**, not on the whole character. Like Sway on a tree, the lid falls on whatever drawing you give it; on a whole figure the whole figure ducks.
+- **Rate** is in blinks per minute — **12 is at rest**, and much past 20 starts to read as nerves, which is a choice rather than a default.
+- **Duration** is how long one blink takes. `0.16s` is a real one, and four frames at 24fps — which is also what an animator would draw.
+- The lid **falls faster than it lifts**, the bottom edge is held so the eye closes downward the way a real lid does (pinching it shut about the middle reads as a wince), the interval is **jittered** so the eye is not a ticking clock, and roughly one blink in six comes as a **double**. Like the breath, the phase is seeded from the object, so a cast never blinks in unison.
+
+**How to put one on** — the Filters panel, with the eye artwork selected:
+
+```
+┌─ Filters ───────────────────────────────┐
+│  Blend  [ Normal        ▾]              │
+│ ─────────────────────────────────────── │
+│  Live Motion  1                    [ + ]│   ← the + opens the list
+│                                    ├──────────────────┐
+│  ✕ Blink  [bpm 12.0] [s 0.16]      │ Look At          │
+│                                    │ Squash & Stretch │
+│                                    │ Breathe          │
+│                                    │ Blink        ◀── │
+│                                    │ Sway             │
+│                                    │ Drift            │
+└────────────────────────────────────└──────────────────┘
+```
+
+1. Select the eyes. **Group them first** (`Ctrl + G`) — see the warning below.
+2. **Filters ▸ Live Motion ▸ + ▸ Blink**.
+3. Leave it at 12 bpm. Play the shot; you should not be able to catch it.
+
+| Open | Shut |
+|---|---|
+| ![A character with the eyes open](docs/images/modifier_blink_open.png) | ![The same character four frames later, mid-blink](docs/images/modifier_blink_shut.png) |
+
+*The same character four frames apart. The lid falls to the bottom edge of the eye rather than pinching it shut about the middle, which is what a real lid does — and why the closed frame reads as a blink rather than as a wince.*
+
+> ⚠️ **Group both eyes into one object before adding the modifier.** The phase is seeded from the *object*, which is what stops a whole cast blinking in unison — and it means two eyes left as two separate objects will blink **independently**. A character who winks at random is a worse problem than one who never blinks. One modifier, on the thing that closes together.
+
+### Turning a Face Without Drawing Another One
+
+A drawing has no information about its own sides. Rotate a flat card in space and you get a *card* turning — the face foreshortens evenly to nothing and looks like a photograph on a swivel, because that is exactly what it is.
+
+**Turn** does what every 2D puppet on television has done for forty years: it does not rotate the drawing, it moves what is on it. A head is roughly a cylinder, so a feature some distance from the centre line sits at a known angle around it. Turn the cylinder and every feature's new position falls out — the near ones sweep across quickly, the far ones crowd toward the edge and go round the back, and each narrows by exactly the foreshortening its own angle earns. Nothing is invented and no drawing is asked for that does not exist.
+
+**Five angles off one drawing**, nothing drawn twice:
+
+| ← Turned left | Three-quarter | Front | Three-quarter | Turned right → |
+|---|---|---|---|---|
+| ![Turned to the left](docs/images/head_turn_left.png) | ![A three-quarter to the left](docs/images/head_turn_left_quarter.png) | ![The drawing as it was made](docs/images/head_turn_front.png) | ![A three-quarter to the right](docs/images/head_turn_right_quarter.png) | ![Turned to the right](docs/images/head_turn_right.png) |
+
+*Only the middle picture was drawn. Watch the far eye: it narrows and crowds toward the silhouette, which is what a real one does and what a rotated card cannot.*
+
+**How to set one up:**
+
+1. **Group the head** (`Ctrl + G`) with the parts in painting order — the head shape first, then hair, eyes, nose, mouth on top of it. **The backmost child is taken as the head form; everything painted over it is a feature.** That is the order a face is drawn in anyway, so there is nothing to name and no slots to fill.
+2. **Filters ▸ Live Motion ▸ + ▸ Turn.**
+3. **Key the head's 3D yaw** the way you would key anything — the angle comes from the object's own `rotationY`, not from a setting on the modifier, so the tween interpolates it and the head turns *through* the move instead of popping between poses.
+
+| Setting | What it means |
+|---|---|
+| **round** | How much of a cylinder the drawing is. `1.0` for a head; lower for something flatter; `0` for a signboard that should only slide, never foreshorten |
+
+**Three things it gets right that are easy to get wrong:**
+
+- **Wide parts are masses, not marks.** Hair, a hat, a beard — anything spanning most of the head — moves with the *form* rather than sweeping like a nose. Move hair like a feature and it slides off the skull and bares the forehead. (The figure above is what caught that.)
+- **A feature that goes round the back is dropped**, not squashed onto the silhouette. Features piling up on the edge is the single most obvious way a puppet turn gives itself away.
+- **A drawn view always wins.** If the character carries a turnaround (§17.4) whose view is nearer to the current angle than the front is, Turn stands aside and lets that drawing be used. A profile somebody drew beats any arithmetic. What this covers is the angles *between* the drawings — which, on a puppet with none, is all of them.
+
+> **A face drawn as one shape** still turns — the outline itself is warped — but only so far. Separate the features into a group when that is not far enough.
+
+**Why live rather than baked:**
+- **Re-time the animation and it re-follows.** Nothing to re-bake.
+- **Cost does not grow with the length of the film.** One setting per object, whether the shot is two seconds or two minutes.
+- **Same maths as the bakers.** The live spring and wiggle are the *same* solvers Add Follow-Through and Add Wiggle use — "live" and "bake to keyframes" are two deliveries of one calculation.
+
+### 17.6 Baking
+
+- **Add Follow-Through (`Insert ▸ Scene ▸ Add Follow-Through…`)** — bakes a damped-spring response of a chosen bone chain (hair, a tail) to the rig's keyed motion.
+- **Add Wiggle (`Insert ▸ Scene ▸ Add Wiggle…`)** — bakes deterministic organic jitter onto the selected object: handheld camera shake, a wind gust, an idle sway.
+- **Bake Modifiers (`Insert ▸ Scene ▸ Bake Modifiers`)** — evaluates the selection's live modifiers across the whole film into keyframes and then removes them. Live becomes editable.
+- **Clear Modifiers (`Insert ▸ Scene ▸ Clear Modifiers`)** — removes every live modifier from the selection.
 
 ---
 
 ## 18. Import & Export Pipelines
+
+### Tracing a Picture into Artwork (`Modify ▸ Bitmap`)
+
+Pixels are the one thing in this program you cannot bucket-fill, reshape, tween or recolour. **Trace Bitmap** turns an imported picture into ordinary shapes — paths with fills, on a layer, exactly like something drawn with the brush.
+
+| Command | What it is for |
+|---|---|
+| **Trace Bitmap** | A photo or a flat illustration. Six colours, the background kept |
+| **Trace as Line Art** | A scan of a drawing. Ink and paper, **the paper thrown away**, so what is left is outlines you can paint inside |
+
+1. Select the imported picture.
+2. **`Modify ▸ Bitmap ▸ Trace as Line Art`** (or **Trace Bitmap** for colour).
+3. The picture is **replaced** by the artwork it became. Bucket-fill inside the outlines as you would any drawing.
+
+| The picture | Traced as line art | Traced in colour |
+|---|---|---|
+| ![A grainy, soft-edged scan of a doodle](docs/images/trace_before.png) | ![The same doodle as closed vector outlines, recoloured to prove they are shapes](docs/images/trace_line_art.png) | ![The same doodle traced to six colours](docs/images/trace_colour.png) |
+
+*A deliberately grainy, anti-aliased raster on the left — a clean synthetic shape would prove nothing about a real scan. The middle is what came out, recoloured blue so it is visibly **shapes** rather than a picture of the original: closed outlines, the mouth's hole intact, the paper gone.*
+
+**What it does and does not do:**
+
+- It finds **areas** and outlines them; it does not follow a pencil stroke and hand you a stroked path down its middle. A traced line comes back as a long thin filled shape — which is exactly what a brush stroke already is here, so it behaves like one.
+- **Holes stay holes.** A traced ring is a ring, not a disc.
+- **Specks are dropped.** A quantised photograph produces thousands of one-pixel islands along every edge; they are dither, not artwork, and left in they make a document nothing can open quickly. The status line says how many went.
+- **Transparency is not traced**, so a cut-out arrives as a cut-out rather than a rectangle with the shape knocked out of it.
+- **The picture is replaced, and one `Ctrl + Z` puts it back.** Leaving the photograph underneath would mean aiming every later selection and fill past it.
+- **The same picture traces the same way every time**, so re-tracing after nudging a setting does not reshuffle the result.
+
+---
 
 ### 18.1 File Import Support
 - **Adobe Animate Projects**: Reads uncompressed `.xfl` and modern `.fla` archives.
@@ -735,12 +1055,15 @@ fl.trace("Created 10 vector circles successfully!");
 - [Autosave & Crash Recovery](#22-troubleshooting--pro-tips)
 
 ### B
-- [Bake Modifiers](#17-production-staging-directing--physics-modifiers)
+- [Bake Modifiers](#17-production-staging-directing--motion-that-runs-itself)
+- [Breathe (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
 - [Beat Detection](#16-soundtrack-waveforms--automated-lip-sync)
 - [Bevel Filter](#14-vector-filters--blend-modes)
 - [Blank Keyframes (`F7`)](#8-timeline-mastery--frame-by-frame-animation)
 - [Blend Modes (Multiply, Screen, Add...)](#14-vector-filters--blend-modes)
+- [Blink (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
 - [Blur Filter](#14-vector-filters--blend-modes)
+- [Bitmap Tracing](#18-import--export-pipelines)
 - [Bone Tool (`M`)](#12-rigging-fabrik-inverse-kinematics--warping)
 - [Break Apart (`Ctrl + B`)](#5-the-vector-drawing-engine-merge-shapes-vs-object-drawing)
 - [Brush Tool (`B`) & Types](#7-advanced-brushes-patterns--gradients)
@@ -748,6 +1071,7 @@ fl.trace("Created 10 vector circles successfully!");
 
 ### C
 - [Camera 3D Perspective](#15-spatial-3d-camera--layer-parallax)
+- [Camera Moves (Push In, Reveal, Drift)](#15-spatial-3d-camera--layer-parallax)
 - [Camera Tool (`C`)](#15-spatial-3d-camera--layer-parallax)
 - [Cast Shadows (Vector Calculations)](#13-studio-vector-lighting--shadow-engine)
 - [Classic Tweens](#10-tweens--the-motion-editor)
@@ -756,8 +1080,9 @@ fl.trace("Created 10 vector circles successfully!");
 - [Custom Pattern Brushes](#7-advanced-brushes-patterns--gradients)
 
 ### D
-- [Daylight Staging](#17-production-staging-directing--physics-modifiers)
-- [Direct a Story](#17-production-staging-directing--physics-modifiers)
+- [Daylight Staging](#17-production-staging-directing--motion-that-runs-itself)
+- [Direct a Story](#17-production-staging-directing--motion-that-runs-itself)
+- [Drift (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
 - [Dockable Panels](#20-workspace-customization--layouts)
 - [Drop Shadow Filter](#14-vector-filters--blend-modes)
 
@@ -765,6 +1090,8 @@ fl.trace("Created 10 vector circles successfully!");
 - [Edit in Place (`Ctrl + E`)](#11-symbols-instances--the-library)
 - [Edit Multiple Frames](#8-timeline-mastery--frame-by-frame-animation)
 - [Effect (Scenery) Brush](#7-advanced-brushes-patterns--gradients)
+- [Effect Brush — the 15 Kinds](#7-advanced-brushes-patterns--gradients)
+- [Easing on Camera Keys](#15-spatial-3d-camera--layer-parallax)
 - [Eraser Tool (`E`)](#6-comprehensive-23-tool-catalogue)
 - [Export Formats (PNG, MP4, GIF, WebP, ProRes)](#18-import--export-pipelines)
 - [Eyedropper Tool (`I`)](#6-comprehensive-23-tool-catalogue)
@@ -773,9 +1100,11 @@ fl.trace("Created 10 vector circles successfully!");
 - [FABRIK Inverse Kinematics](#12-rigging-fabrik-inverse-kinematics--warping)
 - [Filters Panel](#14-vector-filters--blend-modes)
 - [Fire Light](#13-studio-vector-lighting--shadow-engine)
+- [Face Turning Without Redrawing](#17-production-staging-directing--motion-that-runs-itself)
+- [Fit to Narration](#16-soundtrack-waveforms--automated-lip-sync)
 - [Fluid Brush](#7-advanced-brushes-patterns--gradients)
 - [Folder Layers](#9-the-7-layer-kinds--layer-hierarchy)
-- [Follow-Through Physics](#17-production-staging-directing--physics-modifiers)
+- [Follow-Through Physics](#17-production-staging-directing--motion-that-runs-itself)
 - [Free Transform Tool (`Q`)](#6-comprehensive-23-tool-catalogue)
 
 ### G
@@ -787,11 +1116,13 @@ fl.trace("Created 10 vector circles successfully!");
 - [Guide Layers (Rotoscoping)](#9-the-7-layer-kinds--layer-hierarchy)
 
 ### H
+- [Head Turn (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
 - [Hand Tool (`H`) / Spacebar Pan](#4-canvas-navigation--unbounded-zoom)
 - [HUD Telemetry Display](#4-canvas-navigation--unbounded-zoom)
 
 ### I
 - [Importing .fla, .xfl, .swf, .pdf, .ai](#18-import--export-pipelines)
+- [Ink & Paint (Paint Through)](#8-timeline-mastery--frame-by-frame-animation)
 - [Ink Bottle Tool (`S`)](#6-comprehensive-23-tool-catalogue)
 - [Inverse Mask Layers (Exclusive)](#9-the-7-layer-kinds--layer-hierarchy)
 
@@ -808,10 +1139,14 @@ fl.trace("Created 10 vector circles successfully!");
 - [Lasso Tool (`L`)](#6-comprehensive-23-tool-catalogue)
 - [Layer Depth (2.5D Parallax)](#9-the-7-layer-kinds--layer-hierarchy)
 - [Layer Parenting](#9-the-7-layer-kinds--layer-hierarchy)
+- [Line Art Tracing](#18-import--export-pipelines)
 - [Library & Live Thumbnails](#11-symbols-instances--the-library)
 - [Light Gizmos (`Ctrl + Shift + L`)](#13-studio-vector-lighting--shadow-engine)
 - [Line Tool (`N`)](#6-comprehensive-23-tool-catalogue)
 - [Lip Sync Dialog & Visemes](#16-soundtrack-waveforms--automated-lip-sync)
+- [Live Motion Modifiers](#17-production-staging-directing--motion-that-runs-itself)
+- [Look At (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
+- [Line Weight (`[` and `]`)](#7-advanced-brushes-patterns--gradients)
 - [Looping Timeline Sections](#8-timeline-mastery--frame-by-frame-animation)
 
 ### M
@@ -828,6 +1163,7 @@ fl.trace("Created 10 vector circles successfully!");
 ### N
 - [Normal Brush](#7-advanced-brushes-patterns--gradients)
 - [Normal Layers](#9-the-7-layer-kinds--layer-hierarchy)
+- [Narration-Driven Timing](#16-soundtrack-waveforms--automated-lip-sync)
 - [Nudge Selection (`Arrow Keys`)](#21-complete-keyboard-shortcuts-reference)
 - [NVENC GPU Video Encoding](#18-import--export-pipelines)
 
@@ -838,11 +1174,14 @@ fl.trace("Created 10 vector circles successfully!");
 
 ### P
 - [Paint Bucket Tool (`K`)](#6-comprehensive-23-tool-catalogue)
+- [Paint Through (Ink & Paint)](#8-timeline-mastery--frame-by-frame-animation)
+- [Phrase Detection (Voice-Over)](#16-soundtrack-waveforms--automated-lip-sync)
 - [Pasteboard Canvas](#3-visual-tour-of-the-workspace)
 - [Pattern Brush & Shapes](#7-advanced-brushes-patterns--gradients)
 - [Pencil Tool (`Y`)](#6-comprehensive-23-tool-catalogue)
 - [Pen Tool (`P`)](#6-comprehensive-23-tool-catalogue)
-- [Perform (Automated Walks/Talks)](#17-production-staging-directing--physics-modifiers)
+- [Perform (Automated Walks/Talks)](#17-production-staging-directing--motion-that-runs-itself)
+- [Profile & Three-Quarter Views](#17-production-staging-directing--motion-that-runs-itself)
 - [PolyStar Tool (`☆`)](#6-comprehensive-23-tool-catalogue)
 - [Pose Library & Keying](#12-rigging-fabrik-inverse-kinematics--warping)
 - [ProRes 4444 with Alpha](#18-import--export-pipelines)
@@ -854,14 +1193,21 @@ fl.trace("Created 10 vector circles successfully!");
 - [Raster (Soft) Brush](#7-advanced-brushes-patterns--gradients)
 - [Recognise Shape (`Modify ▸ Shape`)](#4-canvas-navigation--unbounded-zoom)
 - [Rectangle Tool (`R`)](#6-comprehensive-23-tool-catalogue)
+- [Retarget Performance](#17-production-staging-directing--motion-that-runs-itself)
+- [Reverse Drawing (Turnarounds)](#17-production-staging-directing--motion-that-runs-itself)
+- [Reverse Frames](#8-timeline-mastery--frame-by-frame-animation)
 - [Reset Workspace](#20-workspace-customization--layouts)
 - [Rigging Panel](#12-rigging-fabrik-inverse-kinematics--warping)
 
 ### S
 - [Selection Tool (`V`)](#6-comprehensive-23-tool-catalogue)
-- [Set the Scene](#17-production-staging-directing--physics-modifiers)
+- [Set the Scene](#17-production-staging-directing--motion-that-runs-itself)
 - [Shape Tweens](#10-tweens--the-motion-editor)
 - [Sky (Ambient Light)](#13-studio-vector-lighting--shadow-engine)
+- [Squash & Stretch (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
+- [Storm Staging](#17-production-staging-directing--motion-that-runs-itself)
+- [Sway (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
+- [Silence Detection](#16-soundtrack-waveforms--automated-lip-sync)
 - [Subselection Tool (`A`)](#6-comprehensive-23-tool-catalogue)
 - [Sun (Directional Light)](#13-studio-vector-lighting--shadow-engine)
 - [Swap Symbol](#11-symbols-instances--the-library)
@@ -869,8 +1215,14 @@ fl.trace("Created 10 vector circles successfully!");
 
 ### T
 - [Tasks Panel (Background Exports)](#18-import--export-pipelines)
+- [Talk / Idle / Walk / Run Actions](#17-production-staging-directing--motion-that-runs-itself)
 - [Text Tool (`T`)](#6-comprehensive-23-tool-catalogue)
 - [Themes (Studio Dark / Paper Light)](#20-workspace-customization--layouts)
+- [Three-Quarter Views](#17-production-staging-directing--motion-that-runs-itself)
+- [Turnarounds](#17-production-staging-directing--motion-that-runs-itself)
+- [Thicken / Thin Lines (`[` `]`)](#7-advanced-brushes-patterns--gradients)
+- [Turn (Head Turn Without Redrawing)](#17-production-staging-directing--motion-that-runs-itself)
+- [Trace Bitmap / Trace as Line Art](#18-import--export-pipelines)
 - [Timeline Spans & Cells](#8-timeline-mastery--frame-by-frame-animation)
 
 ### U
@@ -885,7 +1237,7 @@ fl.trace("Created 10 vector circles successfully!");
 ### W
 - [Wave Brush (Animated Flow)](#7-advanced-brushes-patterns--gradients)
 - [Waveform Display](#16-soundtrack-waveforms--automated-lip-sync)
-- [Wiggle Physics Modifier](#17-production-staging-directing--physics-modifiers)
+- [Wiggle Physics Modifier](#17-production-staging-directing--motion-that-runs-itself)
 - [Workspace Lock (`Ctrl + Alt + L`)](#20-workspace-customization--layouts)
 
 ### Z

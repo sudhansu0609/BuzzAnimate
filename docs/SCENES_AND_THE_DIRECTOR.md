@@ -225,11 +225,13 @@ A later shot that does not restate the setting keeps the one in force.
 Everything in Parts 1 and 2 that keeps moving does so through **live
 modifiers**: rules evaluated when a frame is drawn rather than baked into keys.
 
-**Object panel ▸ Live Motion ▸ +**
+**Filters panel ▸ Live Motion ▸ +**
 
 | Modifier | What it does | Reach for it when |
 |---|---|---|
 | **Breathe** | The chest rises and falls about the drawing's own feet | Any character on a held pose |
+| **Blink** | The lid falls and lifts every few seconds | The eye artwork on any character |
+| **Turn** | Carries a face's features round a cylinder so it turns | A grouped head, with no other view drawn |
 | **Sway** | The drawing bends downwind from its base, in gusts | Trees, grass, banners, hanging signs |
 | **Drift** | A steady move that loops | Clouds, water, a street behind a window |
 | **Wiggle** | A deterministic wander | Idle sway, a breeze, a handheld shake |
@@ -267,6 +269,34 @@ the one thing that would make it visible.
 
 The curve is not a sine. A breath fills quickly and empties slowly; a pure sine
 reads as a machine.
+
+### Blink
+
+The other half of the job Breathe does, and on a face the larger half. Nobody
+consciously sees a blink either — but a character who holds a stare for eight
+seconds while talking is unnerving in a way nobody can name, and that is the
+trap a puppet built for limited animation falls into: its eyes are one drawing
+that nothing ever touches.
+
+Applied to the **eye artwork**, not to the character — like Sway on a tree, the
+lid falls on whatever drawing it is given.
+
+- **Rate** is in blinks per minute: 12 at rest, and much past 20 reads as nerves.
+- **Duration** is how long one blink takes; 0.16s is a real one, four frames at 24.
+
+The lid **falls faster than it lifts** — about a third of the blink is the close
+and two thirds the open — which is what a real eyelid does and what separates a
+blink from a pulse. The bottom edge is held so the eye closes downward; pinching
+it shut about the middle reads as a wince.
+
+The interval is **jittered inside a slot** rather than fixed, because a blink on
+a metronome is worse than no blink at all: the eye becomes a ticking clock in
+the corner of the shot. And roughly one in six comes as a **double**, because a
+blink that is always single is a regularity an audience reads as mechanical
+without being able to say why.
+
+Like everything else here it is deterministic in (object, frame), so a re-timed
+shot blinks identically — and seeded per object, so a cast never blinks together.
 
 ### Sway
 

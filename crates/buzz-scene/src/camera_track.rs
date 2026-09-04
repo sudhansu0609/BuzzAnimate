@@ -8,13 +8,26 @@
 //! # Interpolation
 //!
 //! A camera whose value only changed on keyframes would jump, which would make
-//! the tool useless, so camera keys interpolate linearly. That is a small,
-//! self-contained piece of tweening; the general tween system for artwork
-//! arrives in Phase 4. Rotation interpolates by shortest angular path, so a
-//! camera turning from 350° to 10° goes forward 20° rather than backwards 340°.
+//! the tool useless, so camera keys interpolate between each other. Rotation
+//! interpolates by shortest angular path, so a camera turning from 350° to 10°
+//! goes forward 20° rather than backwards 340°.
+//!
+//! # Easing, and why the camera needed it more than anything else does
+//!
+//! Every key carries an [`Easing`] governing the span that *leaves* it — the
+//! same field and the same curve the artwork tweens use, so there is one easing
+//! model in the program rather than two.
+//!
+//! It matters more here than it does on a drawing. A camera is the audience's
+//! head, and a head does not begin moving at full speed and stop dead: a linear
+//! pan is the single most reliable tell that a shot was assembled rather than
+//! filmed. Every move [`CameraMove`] writes is eased for that reason, and the
+//! one that is not — the drift — is left linear deliberately, which is
+//! explained where it is defined.
 
 use crate::time::AtTime;
-use buzz_geom::{Affine, Point, Projection, Size};
+use crate::tween::Easing;
+use buzz_geom::{Affine, Point, Projection, Rect, Size};
 use serde::{Deserialize, Serialize};
 
 /// The camera's state at one keyframe.
@@ -38,6 +51,142 @@ pub struct CameraKey {
     pub pitch: f64,
     /// Turn left and right, in radians.
     pub yaw: f64,
+
+    /// **How the move *away from* this key is paced.**
+    ///
+    /// A keyframe's ease governs the span that starts at it, which is the
+    /// convention Animate uses for artwork and the one an animator already has
+    /// in their hands. The last key's ease is therefore never read, and that is
+    /// correct rather than an oversight: there is no span after it.
+    ///
+    /// Defaulted on load, so every document written before this existed opens
+    /// as the linear camera it was authored against. Version 41.
+    #[serde(default)]
+    pub ease: Easing,
+}
+
+/// **A camera move worth a name.**
+///
+/// # Why these are here rather than left to the animator
+///
+/// A push in is two keyframes and a number, and so is a pan, and so is a
+/// reveal — and an animator making a story a week keys the same four of them
+/// several hundred times a year. None of it is a decision; all of it is typing.
+/// The arithmetic is a fraction of the stage's own size, which the caller knows
+/// and this does not, so it is passed in.
+///
+/// What comes out is **two ordinary camera keys**. Nothing is live and nothing
+/// re-runs: the move can be dragged, re-timed, re-eased or deleted like any
+/// other pair of keys, which is the same promise every other generator in this
+/// program makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CameraMove {
+    /// Move in on what is already in the middle of frame.
+    PushIn,
+    /// The reverse: give the shot its air back.
+    PullOut,
+    /// Track left across the stage.
+    PanLeft,
+    /// Track right across the stage.
+    PanRight,
+    /// **Open close and pull back to the wide.** The one move that writes a
+    /// *start* different from where the camera is: a reveal is defined by
+    /// where it ends, so the end is the framing you set up and the beginning
+    /// is derived from it.
+    Reveal,
+    /// **A slow diagonal creep that runs under the whole shot.**
+    ///
+    /// What a documentary does to a photograph, and the cheapest way to stop a
+    /// held drawing reading as a still. Deliberately small: if the audience can
+    /// see it happening it is too fast.
+    Drift,
+}
+
+/// **The ease every deliberate camera move gets**: slow away, slow into place.
+///
+/// CSS's `ease-in-out`, expressed in the same cubic-Bézier the artwork tweens
+/// already carry. [`Easing::Strength`] cannot say this — its slider eases one
+/// end or the other, and a camera needs both, because a head that starts at
+/// full speed and stops dead is the thing this is here to avoid.
+pub const SMOOTH: Easing = Easing::CubicBezier {
+    x1: 0.42,
+    y1: 0.0,
+    x2: 0.58,
+    y2: 1.0,
+};
+
+/// How far a push or a pull changes the magnification.
+///
+/// A third is the smallest move that still reads as one. Less looks like a
+/// mistake in the render; much more and a shot composed for the wide has
+/// nothing left in frame at the end of it.
+const PUSH: f64 = 1.35;
+
+/// How far a pan travels, as a share of the stage's width. A quarter moves the
+/// subject clear across the frame without leaving the pasteboard.
+const PAN: f64 = 0.25;
+
+impl CameraMove {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PushIn => "Push In",
+            Self::PullOut => "Pull Out",
+            Self::PanLeft => "Pan Left",
+            Self::PanRight => "Pan Right",
+            Self::Reveal => "Reveal",
+            Self::Drift => "Drift",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::PushIn => "Closes in on the middle of frame, eased at both ends",
+            Self::PullOut => "Gives the shot its air back",
+            Self::PanLeft => "Tracks left across the stage",
+            Self::PanRight => "Tracks right across the stage",
+            Self::Reveal => "Opens close and pulls back to the framing you set",
+            Self::Drift => "A slow diagonal creep, too small to notice and enough to feel",
+        }
+    }
+
+    /// The ease the opening key carries.
+    ///
+    /// Every move is eased at both ends **except the drift**, which is left
+    /// linear on purpose: a drift is meant to run underneath a shot without
+    /// being seen, and easing one gives it a beginning and an end — which is
+    /// exactly the thing the audience would then notice.
+    pub fn ease(self) -> Easing {
+        match self {
+            Self::Drift => Easing::Linear,
+            _ => SMOOTH,
+        }
+    }
+}
+
+impl CameraKey {
+    /// This key with a named move applied to it, `stage` being the document's
+    /// own rectangle — what a "quarter of the way across" is measured against.
+    fn moved(self, movement: CameraMove, stage: Rect) -> Self {
+        let mut out = self;
+        match movement {
+            CameraMove::PushIn => out.zoom = (self.zoom * PUSH).clamp(0.01, 1000.0),
+            CameraMove::PullOut | CameraMove::Reveal => {
+                out.zoom = (self.zoom / PUSH).clamp(0.01, 1000.0);
+            }
+            CameraMove::PanLeft => out.center.x -= stage.width() * PAN,
+            CameraMove::PanRight => out.center.x += stage.width() * PAN,
+            CameraMove::Drift => {
+                // A twelfth of a magnification and a fortieth of the frame,
+                // across a whole shot. Both together, because a push alone
+                // reads as a zoom and a slide alone reads as a pan; it is the
+                // pair of them that reads as a camera that happens to be there.
+                out.zoom = (self.zoom * 1.08).clamp(0.01, 1000.0);
+                out.center.x += stage.width() * 0.025;
+                out.center.y -= stage.height() * 0.015;
+            }
+        }
+        out
+    }
 }
 
 /// How far the camera may tilt.
@@ -57,6 +206,7 @@ impl CameraKey {
             rotation: 0.0,
             pitch: 0.0,
             yaw: 0.0,
+            ease: Easing::Linear,
         }
     }
 
@@ -379,6 +529,11 @@ impl CameraTrack {
         } else {
             0.0
         };
+        // **The key you are leaving decides the pacing.** Animate's convention
+        // for artwork, applied here so an animator does not have to hold two
+        // rules. Every channel below is eased together — a pan whose position
+        // eased while its zoom did not would drift off its own subject.
+        let t = a.ease.apply(t);
 
         Some(CameraKey {
             frame: at.frame(),
@@ -396,7 +551,68 @@ impl CameraTrack {
             // does not take the long route through the back of the scene.
             pitch: lerp_angle(a.pitch, b.pitch, t),
             yaw: lerp_angle(a.yaw, b.yaw, t),
+            // Carried from the span this sample came out of, so a state read
+            // back and re-keyed — which is what every camera edit does — keeps
+            // the pacing it was already moving with instead of snapping linear.
+            ease: a.ease,
         })
+    }
+
+    /// **Write a named camera move across a span**, as two ordinary keys.
+    ///
+    /// The move starts from wherever the camera already is at `from` — so a
+    /// push in pushes in on the framing you have set up, rather than on some
+    /// remembered default — except for [`CameraMove::Reveal`], which is defined
+    /// by where it *ends* and therefore derives its opening key instead.
+    ///
+    /// `stage` is the document's rectangle: a pan travels a quarter of it, and
+    /// the camera does not know how big the film is.
+    ///
+    /// Returns `false` and writes nothing for an empty or backwards span, which
+    /// is the one case where two keys would land on the same frame and the
+    /// second would silently replace the first.
+    pub fn add_move(
+        &mut self,
+        movement: CameraMove,
+        from: u32,
+        to: u32,
+        stage: Rect,
+    ) -> bool {
+        if to <= from {
+            return false;
+        }
+        let here = self
+            .state_at(from)
+            .unwrap_or_else(|| CameraKey::new(from, stage.center()));
+
+        let (mut start, mut end) = match movement {
+            // A reveal ends where you framed it and starts closer in, so the
+            // move is applied backwards: the *opening* key is the derived one.
+            CameraMove::Reveal => {
+                let mut opening = here.moved(CameraMove::PushIn, stage);
+                opening.frame = from;
+                let mut settled = here;
+                settled.frame = to;
+                (opening, settled)
+            }
+            _ => {
+                let mut opening = here;
+                opening.frame = from;
+                let mut arrived = here.moved(movement, stage);
+                arrived.frame = to;
+                (opening, arrived)
+            }
+        };
+
+        start.ease = movement.ease();
+        // The arriving key ends the move. Its own ease governs whatever comes
+        // *after* it, and a move should not impose a shape on a span somebody
+        // else will write, so it is left alone at linear.
+        end.ease = Easing::Linear;
+
+        self.set_key(start);
+        self.set_key(end);
+        true
     }
 
     /// Transform mapping document space into camera space at `frame`.
@@ -788,6 +1004,151 @@ mod tests {
         t
     }
 
+    /// The stage a named move measures its distances against. Named apart from
+    /// the `stage()` in the projection tests below, which is a `Size`.
+    fn move_stage() -> Rect {
+        Rect::new(0.0, 0.0, 1920.0, 1080.0)
+    }
+
+    /// **A move is two keys and nothing else.** The whole promise: what comes
+    /// out is ordinary keyframes an animator can drag, re-time or delete.
+    #[test]
+    fn a_named_move_writes_two_ordinary_keys() {
+        let mut t = track();
+        assert!(t.add_move(CameraMove::PushIn, 0, 48, move_stage()));
+        assert_eq!(t.keys().len(), 2);
+        assert_eq!(t.keys()[0].frame, 0);
+        assert_eq!(t.keys()[1].frame, 48);
+    }
+
+    /// **A push in ends closer than it began, and a pull out further away.**
+    #[test]
+    fn a_push_closes_in_and_a_pull_opens_out() {
+        let mut t = track();
+        t.add_move(CameraMove::PushIn, 0, 48, move_stage());
+        let (a, b) = (t.keys()[0].zoom, t.keys()[1].zoom);
+        assert!(b > a, "the push in did not close in: {a} to {b}");
+
+        let mut t = track();
+        t.add_move(CameraMove::PullOut, 0, 48, move_stage());
+        let (a, b) = (t.keys()[0].zoom, t.keys()[1].zoom);
+        assert!(b < a, "the pull out did not open out: {a} to {b}");
+    }
+
+    /// **A reveal ends where you framed it.** It is the one move defined by its
+    /// destination, so the opening key is the derived one — get this backwards
+    /// and the shot ends somewhere the animator never chose.
+    #[test]
+    fn a_reveal_ends_on_the_framing_it_was_given() {
+        let mut t = track();
+        t.set_key(CameraKey {
+            zoom: 1.0,
+            ..CameraKey::new(0, Point::new(960.0, 540.0))
+        });
+        t.add_move(CameraMove::Reveal, 0, 60, move_stage());
+
+        let end = t.keys().last().copied().expect("an end key");
+        assert!(
+            (end.zoom - 1.0).abs() < 1e-9,
+            "the reveal did not settle on the framing it was given: {}",
+            end.zoom
+        );
+        assert!(
+            t.keys()[0].zoom > end.zoom,
+            "the reveal did not open closer in than it ends"
+        );
+    }
+
+    /// **A pan travels sideways and does not change magnification.**
+    #[test]
+    fn a_pan_travels_and_does_not_zoom() {
+        let mut t = track();
+        t.add_move(CameraMove::PanRight, 0, 48, move_stage());
+        let (a, b) = (t.keys()[0], t.keys()[1]);
+        assert!(b.center.x > a.center.x, "the pan did not go right");
+        assert_eq!(a.zoom, b.zoom, "a pan is not a zoom");
+
+        let mut t = track();
+        t.add_move(CameraMove::PanLeft, 0, 48, move_stage());
+        assert!(t.keys()[1].center.x < t.keys()[0].center.x, "the pan did not go left");
+    }
+
+    /// **A deliberate move is eased at both ends; a drift is not.**
+    ///
+    /// The drift is the exception on purpose — see [`CameraMove::ease`] — and
+    /// this is the test that stops somebody "fixing" it into consistency.
+    #[test]
+    fn moves_are_eased_and_the_drift_is_deliberately_not() {
+        let mut t = track();
+        t.add_move(CameraMove::PushIn, 0, 48, move_stage());
+        assert_eq!(t.keys()[0].ease, SMOOTH, "a push in should be eased");
+
+        let mut t = track();
+        t.add_move(CameraMove::Drift, 0, 48, move_stage());
+        assert_eq!(
+            t.keys()[0].ease,
+            Easing::Linear,
+            "a drift is meant to run under the shot unnoticed, which easing undoes"
+        );
+    }
+
+    /// **An eased move is behind a linear one at the start and ahead of it in
+    /// the middle.** This is the thing the whole feature exists for: a camera
+    /// that leaves slowly rather than at full speed.
+    #[test]
+    fn easing_changes_where_the_camera_is_mid_move() {
+        let a = CameraKey::new(0, Point::new(0.0, 0.0));
+        let mut eased = a;
+        eased.ease = SMOOTH;
+        let b = CameraKey::new(100, Point::new(1000.0, 0.0));
+
+        let mut linear_track = track();
+        linear_track.set_key(a);
+        linear_track.set_key(b);
+        let mut eased_track = track();
+        eased_track.set_key(eased);
+        eased_track.set_key(b);
+
+        let at = |t: &CameraTrack, f: u32| t.state_at(f).expect("a state").center.x;
+
+        assert!(
+            at(&eased_track, 10) < at(&linear_track, 10) - 20.0,
+            "the eased camera should still be getting under way at a tenth in"
+        );
+        assert!(
+            at(&eased_track, 90) > at(&linear_track, 90) + 20.0,
+            "and should be settling rather than still at full speed near the end"
+        );
+        // Both arrive, which is the property an ease must never break.
+        assert!((at(&eased_track, 100) - 1000.0).abs() < 1e-6);
+        assert!((at(&eased_track, 0) - 0.0).abs() < 1e-6);
+    }
+
+    /// **A backwards or empty span writes nothing.** Two keys on one frame is
+    /// the second silently replacing the first, which would look like the
+    /// command doing nothing for no stated reason.
+    #[test]
+    fn a_move_with_no_room_writes_nothing() {
+        let mut t = track();
+        assert!(!t.add_move(CameraMove::PushIn, 40, 40, move_stage()));
+        assert!(!t.add_move(CameraMove::PushIn, 40, 10, move_stage()));
+        assert!(t.keys().is_empty());
+    }
+
+    /// **A move starts from the framing already in force**, rather than from a
+    /// remembered default — so pushing in twice pushes in twice.
+    #[test]
+    fn a_move_starts_from_where_the_camera_already_is() {
+        let mut t = track();
+        t.set_key(CameraKey {
+            zoom: 2.0,
+            ..CameraKey::new(0, Point::new(300.0, 200.0))
+        });
+        t.add_move(CameraMove::PushIn, 0, 48, move_stage());
+        assert_eq!(t.keys()[0].center, Point::new(300.0, 200.0));
+        assert!(t.keys()[1].zoom > 2.0, "it did not start from the 2x it was on");
+    }
+
     #[test]
     fn a_camera_with_no_shutter_has_no_motion_blur() {
         let track = CameraTrack::new();
@@ -1008,6 +1369,7 @@ mod tests {
             rotation: 0.3,
             pitch: 0.0,
             yaw: 0.0,
+            ease: Easing::Linear,
         });
         track.save_angle("Wide", 0);
         let angle = track.angle("Wide").expect("saved");
@@ -1063,6 +1425,7 @@ mod tests {
             rotation: 0.0,
             pitch: 0.0,
             yaw: 0.0,
+            ease: Easing::Linear,
         });
         t.set_key(CameraKey {
             frame: 10,
@@ -1071,6 +1434,7 @@ mod tests {
             rotation: 0.0,
             pitch: 0.0,
             yaw: 0.0,
+            ease: Easing::Linear,
         });
 
         let mid = t.state_at(5).unwrap();
@@ -1093,6 +1457,7 @@ mod tests {
             rotation: deg(350.0),
             pitch: 0.0,
             yaw: 0.0,
+            ease: Easing::Linear,
         });
         t.set_key(CameraKey {
             frame: 10,
@@ -1101,6 +1466,7 @@ mod tests {
             rotation: deg(10.0),
             pitch: 0.0,
             yaw: 0.0,
+            ease: Easing::Linear,
         });
 
         let mid = t.state_at(5).unwrap().rotation.to_degrees();
@@ -1175,6 +1541,7 @@ mod tests {
             rotation: 0.0,
             pitch: 0.0,
             yaw: 0.0,
+            ease: Easing::Linear,
         });
 
         let transform = t.transform_at(0, stage);
@@ -1198,6 +1565,7 @@ mod tests {
                 rotation: 0.0,
                 pitch: 0.0,
                 yaw: 0.0,
+                ease: Easing::Linear,
             });
             let coeffs = t.transform_at(0, Size::new(550.0, 400.0)).as_coeffs();
             // NaN in, NaN out is acceptable for the value itself, but the
@@ -1413,6 +1781,7 @@ mod tests {
             rotation: 0.0,
             pitch,
             yaw,
+            ease: Easing::Linear,
         });
         track
     }
@@ -1522,6 +1891,7 @@ mod tests {
             rotation: 0.0,
             pitch: 99.0,
             yaw: -99.0,
+            ease: Easing::Linear,
         }
         .clamped();
         assert!(key.pitch <= MAX_TILT && key.yaw >= -MAX_TILT);

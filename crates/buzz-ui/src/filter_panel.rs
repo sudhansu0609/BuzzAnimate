@@ -148,6 +148,39 @@ pub fn filter_panel(
                     });
                     ui.close();
                 }
+                // A resting rate: one blink about every five seconds, each one
+                // four frames long at twenty-four. See `Modifier::Blink`.
+                if ui
+                    .button("Blink")
+                    .on_hover_text(
+                        "The eye shuts and opens every few seconds. Put it on the eye \
+                         artwork, not the whole character \u{2014} the lid falls on \
+                         whatever drawing you give it.",
+                    )
+                    .clicked()
+                {
+                    out.add_modifier = Some(Modifier::Blink {
+                        rate: 12.0,
+                        duration: 0.16,
+                    });
+                    ui.close();
+                }
+                // A head is very nearly a cylinder, so the default is the
+                // whole of one. See `Modifier::Turn`.
+                if ui
+                    .button("Turn")
+                    .on_hover_text(
+                        "Turns a face by carrying its features round a cylinder \
+                         instead of rotating the drawing. Group the head first: \
+                         the backmost part is the form, the rest are features. \
+                         The angle is the object's own 3D yaw, keyed like anything \
+                         else.",
+                    )
+                    .clicked()
+                {
+                    out.add_modifier = Some(Modifier::Turn { round: 1.0 });
+                    ui.close();
+                }
                 // A breeze through a mid-stiff tree: leans an eighth of its own
                 // height at a full gust, a gust every five seconds or so.
                 if ui
@@ -187,7 +220,7 @@ pub fn filter_panel(
             ui.label(
                 RichText::new(
                     "Springs and wiggles are added from the Scene menu; look-at, \
-                     squash & stretch, breathing and sway, here.",
+                     squash & stretch, breathing, blinking, turning and sway, here.",
                 )
                 .small()
                 .weak(),
@@ -240,6 +273,47 @@ pub fn filter_panel(
                                     .prefix("depth ")
                                     .speed(0.05)
                                     .range(0.0..=4.0),
+                            )
+                            .changed();
+                    }
+                    Modifier::Blink { rate, duration } => {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(rate)
+                                    .prefix("bpm ")
+                                    .speed(0.5)
+                                    .range(0.5..=240.0),
+                            )
+                            .on_hover_text(
+                                "Blinks per minute: 12 is at rest, and much past 20 \
+                                 starts to read as nerves",
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(duration)
+                                    .prefix("s ")
+                                    .speed(0.01)
+                                    .range(0.02..=4.0),
+                            )
+                            .on_hover_text(
+                                "How long one blink takes. 0.16s is a real one \u{2014} \
+                                 four frames at 24fps.",
+                            )
+                            .changed();
+                    }
+                    Modifier::Turn { round } => {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(round)
+                                    .prefix("round ")
+                                    .speed(0.02)
+                                    .range(0.0..=1.0),
+                            )
+                            .on_hover_text(
+                                "How much of a cylinder the drawing is: 1.0 for a \
+                                 head, lower for something flatter, 0 for a board \
+                                 that only slides",
                             )
                             .changed();
                     }

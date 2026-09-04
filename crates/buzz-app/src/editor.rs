@@ -177,7 +177,15 @@ pub struct Editor {
     scrub_until: Option<std::time::Instant>,
     /// Beat frames detected from the soundtrack, shown as ticks on the ruler.
     /// View state, not saved — a guide the animator keys action to.
-    pub beat_markers: Vec<u32>,
+    /// **Frames marked on the timeline ruler.**
+    ///
+    /// Written by `Detect Beats` (where the music hits) and by
+    /// `Fit to Narration` (where each line of the voice-over starts). One set
+    /// of marks rather than two, because they are answers to the same question
+    /// — *where in this soundtrack does something happen* — and two rows of
+    /// ticks on one ruler would be unreadable. The last command run wins, and
+    /// its status line says which.
+    pub ruler_marks: Vec<u32>,
     /// The Lip Sync dialog.
     pub lip_sync: buzz_ui::LipSyncState,
     /// Whether the last sound import also landed on the timeline. See
@@ -324,7 +332,7 @@ impl Editor {
             light_gesture: None,
             sound: crate::sound::SoundBank::new(stage_fps),
             scrub_until: None,
-            beat_markers: Vec::new(),
+            ruler_marks: Vec::new(),
             lip_sync: buzz_ui::LipSyncState::default(),
             sound_placed: false,
             staging: buzz_ui::StagingState::default(),
@@ -655,15 +663,105 @@ impl Editor {
         let fps = scene.stage().frame_rate.max(1.0);
         match self.sound.stage_track(scene) {
             Some((_, _, clip)) => {
-                self.beat_markers = buzz_audio::detect_beats(clip.as_ref(), fps);
-                let n = self.beat_markers.len();
+                self.ruler_marks = buzz_audio::detect_beats(clip.as_ref(), fps);
+                let n = self.ruler_marks.len();
                 self.status = Some(format!("Found {n} beats — marked on the ruler"));
             }
             None => {
-                self.beat_markers.clear();
+                self.ruler_marks.clear();
                 self.status = Some("There is no soundtrack to find beats in".into());
             }
         }
+    }
+
+    /// **Lay the timeline out to the narration.**
+    ///
+    /// # The job this is
+    ///
+    /// A narrated film is timed by audio that already exists and cannot move.
+    /// Every shot length and every cut is fitted to it, and fitting them by
+    /// dragging keyframes against a waveform by eye is the single largest block
+    /// of time in a week of that work. The soundtrack already says where the
+    /// lines are; nothing was reading it.
+    ///
+    /// So: find the phrases ([`buzz_audio::detect_phrases`]), stretch the film
+    /// to cover the narration, and put a **blank keyframe at the start of every
+    /// line** on the active layer. What comes out is an ordinary timeline with
+    /// ordinary keyframes, already the right length and already divided where
+    /// the sentences are, waiting to be drawn on.
+    ///
+    /// # Why blank keyframes and not scenes
+    ///
+    /// A scene per line would be tidier to look at and wrong to work with: the
+    /// soundtrack is cued on one scene, and cutting the film into thirty of
+    /// them would leave twenty-nine with no audio under them. The narration
+    /// stays whole and the timeline is divided instead.
+    ///
+    /// # Why the existing drawing is not disturbed
+    ///
+    /// A keyframe is only inserted where the layer does not already have one.
+    /// Running this a second time — after a re-record, which is the usual
+    /// reason — re-marks the ruler and adds the lines that moved, without
+    /// throwing away anything drawn against the lines that did not.
+    pub fn fit_to_narration(&mut self) {
+        let scene = self.doc.scene();
+        let fps = scene.stage().frame_rate.max(1.0);
+        let Some((_, _, clip)) = self.sound.stage_track(scene) else {
+            self.status = Some(
+                "There is no soundtrack to fit to \u{2014} import the narration first".into(),
+            );
+            return;
+        };
+
+        let options = buzz_audio::PhraseOptions::default();
+        let phrases = buzz_audio::detect_phrases(clip.as_ref(), fps, &options);
+        if phrases.is_empty() {
+            self.status =
+                Some("Nothing in that soundtrack sounded like speech".into());
+            return;
+        }
+
+        // The film has to be at least as long as the narration, or the lines
+        // past the end are marked on a ruler that does not reach them.
+        let needed = clip.duration_frames(fps).max(
+            phrases.last().map(|p| p.end).unwrap_or(0),
+        );
+        let Some(layer) = self.active_layer() else {
+            self.status = Some("There is no layer to lay the narration out on".into());
+            return;
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return;
+        }
+
+        let starts: Vec<u32> = phrases.iter().map(|p| p.start).collect();
+        let mut added = 0usize;
+        self.doc.edit("Fit to Narration", |scene| {
+            scene.update_layer(layer, |l| {
+                while l.frames.length() < needed {
+                    l.frames.insert_frame(l.frames.length());
+                }
+                for &start in &starts {
+                    // Only where there is not one already: a second run after a
+                    // re-record must not discard what was drawn to the lines
+                    // that did not move.
+                    if !l.frames.is_keyframe(start) {
+                        l.frames.insert_blank_keyframe(start);
+                        added += 1;
+                    }
+                }
+            });
+        });
+
+        // The ruler shows where the lines are, the way it shows beats.
+        self.ruler_marks = starts;
+        let lines = phrases.len();
+        let seconds = needed as f64 / fps;
+        self.status = Some(format!(
+            "{lines} lines over {seconds:.1}s \u{2014} {added} keyframes added, \
+             and the lines marked on the ruler"
+        ));
     }
 
     /// Stop the scrub burst once the drag has paused. Call once per frame.
@@ -2964,6 +3062,10 @@ impl Editor {
 
             ConvertLinesToFills => self.convert_lines_to_fills(),
             ExpandFill => self.expand_selection(2.0),
+            ThickenStroke => self.scale_selected_strokes(1.25),
+            ThinStroke => self.scale_selected_strokes(0.8),
+            TraceBitmap => self.trace_selection(buzz_scene::TraceOptions::default()),
+            TraceLineArt => self.trace_selection(buzz_scene::TraceOptions::line_art()),
             SmoothSelection => self.reshape_selection(Reshape::Smooth),
             StraightenSelection => self.reshape_selection(Reshape::Straighten),
             RecogniseShape => self.recognise_selection(),
@@ -3032,6 +3134,7 @@ impl Editor {
                     scene.camera_mut().clear();
                 });
             }
+            AddCameraMove(movement) => self.add_camera_move(movement),
 
             // -- lights ------------------------------------------------------
             AddLightKeyframe => self.add_light_key(),
@@ -3243,6 +3346,7 @@ impl Editor {
                 self.lip_sync.mouth = Some(symbol.0);
             }
             DetectBeats => self.detect_beats(),
+            FitToNarration => self.fit_to_narration(),
 
             ToggleActionsPanel => {
                 self.workspace.toggle(buzz_ui::PanelId::Actions);
@@ -5958,6 +6062,49 @@ impl Editor {
         });
     }
 
+    /// **Write a named camera move from the playhead to the end of the scene.**
+    ///
+    /// # Why it runs to the end and not for a fixed two seconds
+    ///
+    /// Because that is what a camera move in a shot nearly always does. A push
+    /// in, a drift and a reveal are all the length of the shot they are in —
+    /// they are not events inside it — and a fixed duration would be wrong
+    /// every time the shot was not that long, in both directions. What comes
+    /// out is two ordinary keys, so shortening the move is dragging the second
+    /// one, which is a thing an animator can see and do; guessing a length they
+    /// then have to *find* and correct is not.
+    fn add_camera_move(&mut self, movement: buzz_scene::CameraMove) {
+        let from = self.current_frame;
+        let last = self.doc.scene().frame_count().saturating_sub(1);
+        let stage = self.doc.scene().stage().stage_rect();
+
+        if last <= from {
+            self.status = Some(format!(
+                "{} needs frames to move across \u{2014} the playhead is at the end of the scene",
+                movement.label()
+            ));
+            return;
+        }
+
+        let mut wrote = false;
+        self.doc.edit(movement.label(), |scene| {
+            // Turning the camera on is part of the command: a move written to a
+            // camera nobody has enabled would do nothing and say nothing.
+            scene.camera_mut().enabled = true;
+            wrote = scene.camera_mut().add_move(movement, from, last, stage);
+        });
+
+        self.status = Some(if wrote {
+            format!(
+                "{} over {} frames \u{2014} drag the second camera key to re-time it",
+                movement.label(),
+                last - from
+            )
+        } else {
+            format!("Could not write a {}", movement.label())
+        });
+    }
+
     /// Key the selected light's current state at the playhead.
     fn add_light_key(&mut self) {
         let frame = self.current_frame;
@@ -6609,6 +6756,178 @@ impl Editor {
             [] => "Nothing here is a recognisable shape".to_string(),
             [one] => format!("Recognised {}", one.label()),
             many => format!("Recognised {} shapes", many.len()),
+        });
+    }
+
+    /// **Turn the selected bitmaps into artwork** — Animate's Trace Bitmap.
+    ///
+    /// # Why the picture is replaced rather than traced alongside
+    ///
+    /// Because the point of tracing is to stop having a bitmap. Leaving the
+    /// photograph underneath means every later selection, bucket fill and
+    /// nudge has to be aimed past it, and the document carries the pixels for
+    /// ever. Animate replaces it, and one `Ctrl + Z` puts it back — which is
+    /// the honest version of "you can always get it back".
+    ///
+    /// # Where the artwork lands
+    ///
+    /// [`buzz_scene::trace`] works in the picture's own pixels and knows
+    /// nothing about the stage, so the paths come back at pixel scale. Getting
+    /// them onto the stage is the composition of what the editor already knows:
+    /// the unit square to the image's own space (the fill's transform), and
+    /// that space to the layer (the object's).
+    fn trace_selection(&mut self, options: buzz_scene::TraceOptions) {
+        let ids = self.selection.ids();
+        if ids.is_empty() {
+            self.status = Some("Select a picture to trace first".into());
+            return;
+        }
+        let at = self.edit_at();
+
+        // Everything needed is read before the document is touched, so a
+        // picture that turns out not to be traceable leaves no half-edit.
+        let mut jobs: Vec<(LayerId, ObjectId, Affine, buzz_scene::TraceReport)> = Vec::new();
+        let mut not_pictures = 0usize;
+        for id in &ids {
+            let Some((layer, object)) = self.doc.scene().find_object(*id) else {
+                continue;
+            };
+            let ObjectKind::Shape(shape) = &object.kind else {
+                not_pictures += 1;
+                continue;
+            };
+            let Some(buzz_scene::Paint::Image(fill)) = shape.fill.as_ref().map(|f| &f.paint) else {
+                not_pictures += 1;
+                continue;
+            };
+            let asset = &fill.asset;
+            if asset.width == 0 || asset.height == 0 {
+                not_pictures += 1;
+                continue;
+            }
+            let report = buzz_scene::trace(asset.width, asset.height, &asset.pixels, &options);
+            if report.shapes.is_empty() {
+                self.status = Some(report.message);
+                return;
+            }
+            // Pixels → the unit square → the image's own space → the layer.
+            let place = object.transform
+                * fill.transform
+                * Affine::scale_non_uniform(
+                    1.0 / asset.width as f64,
+                    1.0 / asset.height as f64,
+                );
+            jobs.push((layer, *id, place, report));
+        }
+
+        if jobs.is_empty() {
+            self.status = Some(if not_pictures > 0 {
+                "Nothing selected is a picture \u{2014} tracing turns an imported bitmap \
+                 into shapes"
+                    .to_string()
+            } else {
+                "Nothing there to trace".to_string()
+            });
+            return;
+        }
+
+        let mut made = 0usize;
+        let mut specks = 0usize;
+        let mut colours_note = String::new();
+        let mut fresh: Vec<ObjectId> = Vec::new();
+        self.doc.edit("Trace Bitmap", |scene| {
+            for (layer, id, place, report) in &jobs {
+                specks += report.specks;
+                colours_note = report.message.clone();
+                for shape in &report.shapes {
+                    let mut shape = shape.clone();
+                    shape.path = *place * shape.path.clone();
+                    if let Some(new) = scene.add_shape_at(*layer, at.frame, shape) {
+                        fresh.push(new);
+                        made += 1;
+                    }
+                }
+                // The picture goes last, so the artwork it became is already
+                // standing in for it and nothing flickers through an empty
+                // frame in between.
+                scene.remove_object(*id);
+            }
+        });
+
+        self.selection.clear();
+        for id in fresh {
+            self.selection.toggle(id);
+        }
+        self.status = Some(if specks > 0 {
+            format!("{colours_note} \u{2014} {made} shapes on the stage")
+        } else {
+            format!("Traced {made} shapes")
+        });
+    }
+
+    /// **Re-weight the outlines of everything selected**, and nothing else.
+    ///
+    /// # What it touches, and what it deliberately does not
+    ///
+    /// Only a shape's **stroke**. The path is untouched, the fill is untouched,
+    /// and a shape with no stroke — which includes every brush stroke in this
+    /// program, whose "line" is a filled outline rather than a stroked one — is
+    /// left exactly as it was. Dilating a *fill* is a different operation with
+    /// a different failure mode, and it already has a command of its own:
+    /// `Modify ▸ Shape ▸ Expand Fill`.
+    ///
+    /// # Why multiply rather than add
+    ///
+    /// So one press means the same thing everywhere. Adding half a unit is
+    /// invisible on a six-unit outline and doubles a half-unit one, which makes
+    /// the command behave differently on different parts of the same drawing —
+    /// exactly when an animator is pressing it repeatedly to match them.
+    ///
+    /// # Hairlines
+    ///
+    /// A hairline is one screen pixel at any zoom, so it has no width to
+    /// scale. Thickening one therefore **makes it a real line first** at the
+    /// width a hairline reads as, and then scales that; thinning one leaves it
+    /// alone, because there is nothing thinner to become.
+    fn scale_selected_strokes(&mut self, factor: f64) {
+        let ids = self.selection.ids();
+        if ids.is_empty() {
+            self.status = Some("Select something with an outline first".into());
+            return;
+        }
+        let at = self.edit_at();
+        let label = if factor >= 1.0 { "Thicken Lines" } else { "Thin Lines" };
+
+        let mut touched = 0usize;
+        self.doc.edit(label, |scene| {
+            for id in ids {
+                update_shape(scene, at, id, |s| {
+                    let Some(stroke) = s.stroke.as_mut() else {
+                        return;
+                    };
+                    if stroke.hairline {
+                        if factor < 1.0 {
+                            // Already the thinnest a line can be drawn.
+                            return;
+                        }
+                        stroke.hairline = false;
+                        stroke.width = 1.0;
+                    }
+                    // Bounded at both ends: a width of zero is an invisible
+                    // line that cannot be thickened back, and one the size of
+                    // the stage is a fill nobody asked for.
+                    stroke.width = (stroke.width * factor).clamp(0.05, 400.0);
+                    touched += 1;
+                });
+            }
+        });
+
+        self.status = Some(match touched {
+            0 => "Nothing in the selection has an outline \u{2014} brush strokes are fills, \
+                  and Modify \u{25b8} Shape \u{25b8} Expand Fill is what widens those"
+                .to_string(),
+            1 => format!("{label}: one outline"),
+            n => format!("{label}: {n} outlines"),
         });
     }
 

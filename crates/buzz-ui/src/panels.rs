@@ -459,6 +459,32 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 item(ui, c, on, &mut raised);
             }
             ui.separator();
+            // The named moves. Left enabled with the camera off, because
+            // turning the camera on is what the command does first: an item
+            // greyed out until you have found an unrelated toggle teaches
+            // nobody anything.
+            ui.menu_button("Move", |ui| {
+                for m in [
+                    buzz_scene::CameraMove::PushIn,
+                    buzz_scene::CameraMove::PullOut,
+                    buzz_scene::CameraMove::PanLeft,
+                    buzz_scene::CameraMove::PanRight,
+                    buzz_scene::CameraMove::Reveal,
+                    buzz_scene::CameraMove::Drift,
+                ] {
+                    if ui
+                        .button(m.label())
+                        .on_hover_text(m.description())
+                        .clicked()
+                    {
+                        raised.push(Command::AddCameraMove(m));
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Two eased camera keys, from the playhead. Edit them like any other.");
+            ui.separator();
             ui.label(
                 RichText::new(format!("{} keyframes", scene.camera().keys().len()))
                     .small()
@@ -473,6 +499,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::LipSync, true, &mut raised);
             item(ui, Command::NewMouthSymbol, true, &mut raised);
             item(ui, Command::DetectBeats, true, &mut raised);
+            item(ui, Command::FitToNarration, true, &mut raised);
             ui.separator();
             item(ui, Command::ToggleActionsPanel, true, &mut raised);
             ui.separator();
@@ -573,8 +600,15 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             ui.separator();
             item(ui, Command::BrushFromSelection, has_selection, &mut raised);
             ui.separator();
+            ui.label(RichText::new("Bitmap").small().weak());
+            for c in [Command::TraceBitmap, Command::TraceLineArt] {
+                item(ui, c, has_selection, &mut raised);
+            }
+            ui.separator();
             ui.label(RichText::new("Shape").small().weak());
             for c in [
+                Command::ThickenStroke,
+                Command::ThinStroke,
                 Command::ConvertLinesToFills,
                 Command::ExpandFill,
                 Command::SmoothSelection,

@@ -65,6 +65,96 @@ pub enum Modifier {
     /// The phase is seeded from the object's id, so a crowd does not breathe
     /// in unison — which is the one thing that would make it visible.
     Breathe { rate: f64, depth: f64 },
+    /// **Blinking.** The eye shuts and opens again, every few seconds, for ever.
+    ///
+    /// # Why a character needs one
+    ///
+    /// [`Self::Breathe`] is the first thing that stops a held drawing reading
+    /// as a picture; a blink is the second, and on a face it is the larger of
+    /// the two. An audience does not consciously see a blink either, but a
+    /// character who holds a stare for eight seconds while talking is
+    /// unnerving in a way nobody can name — which is exactly the failure a
+    /// puppet built for limited animation falls into, because its eyes are one
+    /// drawing that nothing ever touches.
+    ///
+    /// # What it is applied to
+    ///
+    /// **The eye artwork, not the character.** Like [`Self::Sway`] on a tree,
+    /// this squashes the drawing it is given: select the eyes — one object, or
+    /// the layer they live on — and the lid falls on those. Put it on a whole
+    /// figure and the whole figure ducks.
+    ///
+    /// # The lower lid barely moves
+    ///
+    /// So the bottom of the drawing is held and the top travels down to meet
+    /// it, which is what an eyelid does. Anchoring at the middle would pinch
+    /// the eye shut from both sides at once, which reads as a wince rather
+    /// than a blink.
+    ///
+    /// `rate` is in **blinks per minute** — twelve is a comfortable resting
+    /// rate, and going much above twenty starts to read as nervousness, which
+    /// is a choice rather than a default. `duration` is how long one blink
+    /// takes in **seconds**; `0.16` is a real one, and at twenty-four frames a
+    /// second that is four frames, which is also what an animator would draw.
+    ///
+    /// The interval is jittered and the phase is seeded from the object's id,
+    /// so a cast does not blink in unison and no single character blinks to a
+    /// metronome — see [`blink_at`], where both of those live.
+    Blink { rate: f64, duration: f64 },
+    /// **Turn a face without drawing another one.**
+    ///
+    /// # The problem this solves
+    ///
+    /// A drawing has no information about its own sides. Rotate a flat card in
+    /// space and you get a *card* turning — the face foreshortens evenly to
+    /// nothing and looks like a photograph on a swivel, because that is
+    /// precisely what it is. The honest answers have always been to draw the
+    /// other views ([`crate::Turnaround`]) or to accept the character never
+    /// turning.
+    ///
+    /// There is a third answer, and it is the one every 2D puppet in
+    /// television has used for forty years: **do not rotate the drawing, move
+    /// what is on it.** A head is roughly a cylinder, so a feature at some
+    /// distance from the centre line sits at a known angle around it. Turn the
+    /// cylinder and every feature's new position falls out — the near ones
+    /// sweep across quickly, the far ones crowd toward the edge and go round
+    /// the back, and each one narrows by exactly the foreshortening its own
+    /// angle earns. Nothing is invented, nothing is guessed, and no drawing is
+    /// asked for that does not exist.
+    ///
+    /// # Where the angle comes from
+    ///
+    /// **The object's own [`crate::Spatial::rotation_y`]** — not a field here.
+    /// That is the yaw an animator already keys, the tween already
+    /// interpolates, and the renderer already reads to pick a turnaround view.
+    /// Putting the angle on the modifier instead would have made it the one
+    /// procedural motion in the program that cannot be animated, since a
+    /// modifier's own settings do not tween.
+    ///
+    /// The modifier then **consumes** that yaw: the copy it hands back is
+    /// flat. Otherwise the renderer would project the result a second time and
+    /// the turn would be foreshortened twice.
+    ///
+    /// # A drawn view always wins
+    ///
+    /// If the object carries a [`crate::Turnaround`] view nearer to the
+    /// current angle than its own front is, this does **nothing** and lets the
+    /// renderer swap that drawing in. A profile somebody drew is better than
+    /// any arithmetic, every time. What this covers is the angles between the
+    /// drawings — which, on a puppet with no drawings at all, is all of them.
+    ///
+    /// # What it needs from the artwork
+    ///
+    /// **A group.** The backmost child is taken as the head form and the ones
+    /// painted over it as its features, which is the order they are already in
+    /// if they were drawn in the order a face is drawn. Applied to a lone
+    /// shape it warps that shape's own outline instead, which turns a
+    /// one-piece drawing as far as a one-piece drawing can honestly go.
+    ///
+    /// `round` is how much of a cylinder the drawing is treated as: `1.0` for
+    /// a head, lower for something flatter, `0.0` for a signboard that should
+    /// only slide.
+    Turn { round: f64 },
     /// **Wind.** The drawing bends downwind from its base, in gusts.
     ///
     /// A shear rather than a rotation: the bottom stays planted and the lean
@@ -130,6 +220,8 @@ impl Modifier {
             Modifier::LookAt { .. } => "Look At",
             Modifier::AutoSquashStretch { .. } => "Squash & Stretch",
             Modifier::Breathe { .. } => "Breathe",
+            Modifier::Blink { .. } => "Blink",
+            Modifier::Turn { .. } => "Turn",
             Modifier::Sway { .. } => "Sway",
             Modifier::Drift { .. } => "Drift",
         }
@@ -138,14 +230,14 @@ impl Modifier {
     /// Does this modifier change the object's pose/geometry (and so needs an
     /// owned, re-posed copy), rather than only prepending a transform?
     pub fn changes_pose(&self) -> bool {
-        matches!(self, Modifier::Spring { .. })
+        matches!(self, Modifier::Spring { .. } | Modifier::Turn { .. })
     }
 }
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use buzz_geom::Affine;
+use buzz_geom::{Affine, Point};
 use buzz_physics::{Spring, Wiggle, wiggle_at};
 
 use crate::{LayerId, Object, ObjectId, ObjectKind, Scene};
@@ -168,6 +260,270 @@ fn breath_at(seed: u64, rate: f64, t_seconds: f64) -> f64 {
     let a = TAU * per_second * t_seconds + phase;
     (a.sin() + 0.33 * (2.0 * a).sin()) / 1.33
 }
+
+/// **How open an eye is: `1.0` open, `0.0` shut.**
+///
+/// Unlike the breath and the gust this is not a wave. A blink is a rare, fast
+/// event on an eye that is otherwise simply open, so this returns exactly
+/// `1.0` for the great majority of every second and dips for a fraction of one
+/// every few seconds.
+///
+/// # Why the interval is jittered rather than fixed
+///
+/// A blink on a metronome is worse than no blink at all: the eye becomes a
+/// ticking clock in the corner of the shot. Real blinking is irregular, so
+/// time is cut into slots one period long and each blink is placed at a
+/// pseudo-random offset **within its own slot**, seeded from the object and
+/// the slot number.
+///
+/// That keeps two properties that matter. It stays **deterministic in
+/// `(object, frame)`** — the promise every modifier here makes, and what lets
+/// a re-timed shot blink identically. And because a blink never starts so late
+/// in its slot that it would run past the end of it, no slot has to know about
+/// its neighbours: the whole thing is a closed-form function of the time, with
+/// nothing to integrate and no state to carry.
+///
+/// # The shape of one blink
+///
+/// The lid falls faster than it lifts — about a third of the blink is the
+/// close and two thirds the open, which is what a real eyelid does and what
+/// separates a blink from a pulse. The triangle is then smoothed, because a
+/// lid that reverses direction instantaneously at the bottom reads as a
+/// flicker rather than as something with weight.
+///
+/// # Sometimes twice
+///
+/// People blink in pairs perhaps one time in six. A blink that is *always*
+/// single is a regularity an audience reads as mechanical without being able
+/// to say why, so roughly a sixth of them — chosen from the same seed, so it
+/// is as reproducible as the rest — come as two with a short gap.
+fn blink_at(seed: u64, rate: f64, duration: f64, t_seconds: f64) -> f64 {
+    // Blinks per second, and the slot each one lives in.
+    let per_second = rate.clamp(0.5, 240.0) / 60.0;
+    let period = 1.0 / per_second;
+    // A blink cannot be longer than the gap between blinks; clamping here
+    // rather than at the call site means a nonsense setting degrades to a
+    // permanently half-shut eye instead of dividing by something negative.
+    let duration = duration.clamp(0.02, 4.0).min(period * 0.4);
+
+    let slot = (t_seconds / period).floor();
+    let slot_seed = splitmix64(seed ^ 0x51EE_D0FF ^ (slot as i64 as u64));
+    let offset = (slot_seed as f64) / (u64::MAX as f64);
+    let double = (splitmix64(slot_seed) as f64) / (u64::MAX as f64) < 0.17;
+
+    // How much of the slot this blink occupies, one or two lids' worth.
+    let gap = duration * 0.6;
+    let span = if double {
+        duration * 2.0 + gap
+    } else {
+        duration
+    };
+    let span = span.min(period);
+    // Placed so it always finishes inside its own slot — see the note above.
+    let start = offset * (period - span).max(0.0);
+
+    let mut local = t_seconds - slot * period - start;
+    if local < 0.0 || local >= span {
+        return 1.0;
+    }
+    if double && local >= duration {
+        // The gap between the pair, and then the second lid.
+        if local < duration + gap {
+            return 1.0;
+        }
+        local -= duration + gap;
+    }
+    if local >= duration {
+        return 1.0;
+    }
+
+    // A triangle through the blink: down in the first third, up over the rest.
+    const CLOSING: f64 = 0.35;
+    let u = local / duration;
+    let shut = if u < CLOSING {
+        u / CLOSING
+    } else {
+        1.0 - (u - CLOSING) / (1.0 - CLOSING)
+    };
+    // Smoothstep, so the lid arrives and leaves rather than snapping.
+    let shut = shut * shut * (3.0 - 2.0 * shut);
+    1.0 - shut.clamp(0.0, 1.0)
+}
+
+/// **The cylinder map: where a point at `u` ends up when the head turns.**
+///
+/// `u` is how far across the face the point sits, `-1` at the left edge and
+/// `+1` at the right. The face is treated as the front half of a cylinder seen
+/// end-on, so `u = sin(angle around it)`; adding the yaw and taking the sine
+/// again is the whole of the arithmetic.
+///
+/// Returns the new `u`, and the **local foreshortening** — how much narrower
+/// the drawing is at that point, which is what stops a nose sliding across a
+/// face at a constant width like a sticker.
+///
+/// `None` means the point has gone round the side and should not be drawn.
+///
+/// # The clamp on `u`
+///
+/// A feature sitting exactly on the silhouette edge is at ninety degrees,
+/// where the foreshortening ratio divides by zero. Real artwork never quite
+/// gets there, but a rounding error can, so the angle is held just inside the
+/// edge; the visible consequence is nothing at all.
+fn turn_at(u: f64, yaw: f64, round: f64) -> Option<(f64, f64)> {
+    use std::f64::consts::FRAC_PI_2;
+    /// Just inside the silhouette, where the arithmetic is still finite.
+    const EDGE: f64 = 0.995;
+
+    let round = round.clamp(0.0, 1.0);
+    // `round` of zero is a flat board: it slides and never foreshortens, which
+    // is the right answer for a signpost and a useless one for a head.
+    let u = (u.clamp(-1.0, 1.0) * round).clamp(-EDGE, EDGE);
+    let theta = u.asin();
+    let turned = theta + yaw;
+    if turned.abs() >= FRAC_PI_2 * EDGE {
+        // Round the back of the head. Hidden rather than clamped to the edge:
+        // features piling up on the silhouette is the single most obvious way
+        // a puppet turn gives itself away.
+        return None;
+    }
+    // The ratio of the two cosines is the derivative of the map — how much the
+    // drawing is compressed *here*, as against uniformly.
+    let squeeze = turned.cos() / theta.cos().max(1.0 - EDGE * EDGE);
+    Some((turned.sin(), squeeze.clamp(0.05, 4.0)))
+}
+
+/// **Turn `object` in place**, consuming its yaw.
+///
+/// The copy handed back is flat: the yaw has been spent moving the artwork, and
+/// leaving it on would have the renderer project the result a second time.
+fn turn_object(object: &mut Object, yaw: f64, round: f64) {
+    let extent = object.local_bounds();
+    if extent.width() <= 0.0 {
+        return;
+    }
+    let cx = extent.center().x;
+    let r = extent.width() * 0.5;
+
+    match &mut object.kind {
+        // **A group is a face with its parts separated**, which is what makes a
+        // real turn possible: each feature is carried round the cylinder on its
+        // own, rather than the whole picture being squeezed as one.
+        ObjectKind::Group(children) => {
+            let form_shift = r * yaw.sin() * FORM_TRAVEL;
+            // A skull does narrow a little as it comes round; much less than a
+            // flat card would, which is the whole complaint against rotating
+            // the drawing.
+            let form_narrow = 1.0 - 0.12 * (1.0 - yaw.cos());
+
+            let mut kept: Vec<Arc<Object>> = Vec::with_capacity(children.len());
+            for (index, child) in children.iter().enumerate() {
+                let here = child.bounds().center();
+
+                // **The backmost child is the head, the rest are on it.** That
+                // is the order a face is drawn in and the order the Layers
+                // panel already holds, so it needs no naming, no slots and no
+                // setup — see `Modifier::Turn`.
+                if index == 0 {
+                    let mut form = (**child).clone();
+                    form.transform = Affine::translate((cx + form_shift, 0.0))
+                        * Affine::scale_non_uniform(form_narrow, 1.0)
+                        * Affine::translate((-cx, 0.0))
+                        * form.transform;
+                    kept.push(Arc::new(form));
+                    continue;
+                }
+
+                let Some((u, squeeze)) = turn_at((here.x - cx) / r, yaw, round) else {
+                    // Round the back of the head: dropped rather than drawn at
+                    // the edge. This is the far eye going out of sight.
+                    continue;
+                };
+
+                // **How much of the head does this part cover?**
+                //
+                // An eye or a nose is a mark *on* the surface and travels the
+                // full way round it. Hair, a hat, a helmet, a beard is a mass
+                // *wrapping* the form, and moving one of those like a nose
+                // slides it off the skull and bares the forehead — which is
+                // exactly what the first version of this did, and what the
+                // figure in the guide caught.
+                //
+                // The tell is width: nothing that spans most of the head is a
+                // point on it. Squared, so that only the genuinely wide parts
+                // are affected and an eye at a quarter of the width is left
+                // very nearly alone.
+                let span = (child.bounds().width() / extent.width()).clamp(0.0, 1.0);
+                let mass = span * span;
+
+                let as_feature = cx + r * u;
+                let as_form = here.x + form_shift;
+                let moved = as_feature * (1.0 - mass) + as_form * mass;
+                let squeeze = squeeze * (1.0 - mass) + form_narrow * mass;
+
+                let mut feature = (**child).clone();
+                // Narrowed about its own middle and then carried to where the
+                // turn puts it. Only across: a yaw moves nothing vertically.
+                feature.transform = Affine::translate((moved, 0.0))
+                    * Affine::scale_non_uniform(squeeze, 1.0)
+                    * Affine::translate((-here.x, 0.0))
+                    * feature.transform;
+                kept.push(Arc::new(feature));
+            }
+            *children = kept;
+        }
+        // **One drawing, no parts.** There is nothing to carry round
+        // separately, so the outline itself is warped: the drawing turns as far
+        // as a single drawing honestly can, and the guide says to separate the
+        // features when that is not far enough.
+        ObjectKind::Shape(shape) => {
+            let map = |p: Point| {
+                turn_at((p.x - cx) / r, yaw, round)
+                    .map(|(u, _)| Point::new(cx + r * u, p.y))
+                    // A point that has gone round the side has nowhere to be on
+                    // a path that must stay closed, so it is held at the
+                    // silhouette. Dropping it would tear the outline open.
+                    .unwrap_or_else(|| {
+                        Point::new(cx + r * yaw.signum() * 0.995, p.y)
+                    })
+            };
+            shape.path = map_path(&shape.path, map);
+        }
+        // A rig or an instance has no artwork here to move: its parts live
+        // behind an armature or in the library, and guessing at either from
+        // this side would be worse than doing nothing.
+        _ => return,
+    }
+
+    object.spatial.rotation_y = 0.0;
+}
+
+/// Rebuild a path with every point put through `f`.
+///
+/// Control points go through the same map as the ends, which is what keeps a
+/// curve a curve: mapping only the on-curve points would straighten every
+/// bulge in the drawing.
+fn map_path(path: &buzz_geom::BezPath, f: impl Fn(Point) -> Point) -> buzz_geom::BezPath {
+    use buzz_geom::PathEl;
+    let mut out = buzz_geom::BezPath::new();
+    for el in path.elements() {
+        out.push(match *el {
+            PathEl::MoveTo(p) => PathEl::MoveTo(f(p)),
+            PathEl::LineTo(p) => PathEl::LineTo(f(p)),
+            PathEl::QuadTo(a, p) => PathEl::QuadTo(f(a), f(p)),
+            PathEl::CurveTo(a, b, p) => PathEl::CurveTo(f(a), f(b), f(p)),
+            PathEl::ClosePath => PathEl::ClosePath,
+        });
+    }
+    out
+}
+
+/// How much of the features' travel the head form itself takes up.
+///
+/// A face whose features slide across a silhouette that never moves reads as a
+/// mask with things sliding on it. Giving the form a fraction of the same
+/// movement reads as a head turning as one mass. It is deliberately small: at
+/// a half the two would move together and nothing would look turned at all.
+const FORM_TRAVEL: f64 = 0.15;
 
 /// **One gust of wind, in about `-0.3..=1.0`.**
 ///
@@ -349,6 +705,46 @@ impl Scene {
                             * Affine::translate(-feet.to_vec2())
                             * prepend;
                     }
+                }
+                Modifier::Blink { rate, duration } => {
+                    // Continuous in time, like the breath, and for a sharper
+                    // version of the same reason: a blink lasts three or four
+                    // frames, and holding it across an open shutter is what
+                    // lets a motion-blurred exposure catch the lid in mid-fall
+                    // rather than either fully open or fully shut.
+                    let bounds = object.bounds();
+                    if bounds.width() > 0.0 && bounds.height() > 0.0 {
+                        let open = blink_at(object.id.0, rate, duration, time / fps);
+                        // **Never quite to nothing.** A drawing scaled to zero
+                        // height has no area to rasterise: it would vanish and
+                        // pop back rather than close. A twentieth of the eye
+                        // left is a shut eye with a lid still drawn across it.
+                        let sy = 0.05 + 0.95 * open.clamp(0.0, 1.0);
+                        // The lower lid barely moves, so the bottom edge is
+                        // held and the top travels down to meet it.
+                        let lid = bounds.y1;
+                        prepend = Affine::translate((0.0, lid))
+                            * Affine::scale_non_uniform(1.0, sy)
+                            * Affine::translate((0.0, -lid))
+                            * prepend;
+                    }
+                }
+                Modifier::Turn { round } => {
+                    // The angle is the object's own keyed yaw, not a setting
+                    // here — see `Modifier::Turn`. A head that is not turned
+                    // costs nothing and is left exactly alone.
+                    let yaw = object.spatial.rotation_y;
+                    if yaw.abs() < 1e-6 {
+                        continue;
+                    }
+                    // **A drawing somebody made beats one worked out.** If a
+                    // turnaround view is nearer to this angle than the front
+                    // is, stand aside and let the renderer swap it in.
+                    if object.turnaround.view_at(yaw).is_some() {
+                        continue;
+                    }
+                    let target = posed.get_or_insert_with(|| object.clone());
+                    turn_object(target, yaw, round);
                 }
                 Modifier::Drift {
                     dx,
@@ -697,6 +1093,399 @@ mod tests {
         );
         // And not by so much that it reads as a balloon.
         assert!(hi - lo < 12.0, "that is not breathing, it is inflating: {lo}..{hi}");
+    }
+
+    /// Openness sampled finely over `seconds`, for the blink tests. A blink is
+    /// four frames long, so anything sampled per frame would step straight over
+    /// most of one.
+    fn blink_samples(seed: u64, rate: f64, duration: f64, seconds: f64) -> Vec<f64> {
+        let step = 1.0 / 240.0;
+        let n = (seconds / step) as usize;
+        (0..n)
+            .map(|i| blink_at(seed, rate, duration, i as f64 * step))
+            .collect()
+    }
+
+    /// **An eye is open almost all of the time.**
+    ///
+    /// This is the property that separates a blink from every other modifier
+    /// here: the breath and the gust are always moving, and a blink is a flat
+    /// line with rare notches in it. Get this wrong and the character is
+    /// squinting through the whole shot.
+    #[test]
+    fn an_eye_is_open_almost_all_of_the_time() {
+        let s = blink_samples(7, 12.0, 0.16, 60.0);
+        let open = s.iter().filter(|v| **v > 0.99).count() as f64 / s.len() as f64;
+        assert!(
+            open > 0.9,
+            "the eye is only fully open {:.0}% of the time",
+            open * 100.0
+        );
+    }
+
+    /// **And it does shut.** An eye that only ever half-closes reads as a
+    /// twitch; the lid has to arrive.
+    #[test]
+    fn a_blink_closes_the_eye_and_opens_it_again() {
+        let s = blink_samples(7, 12.0, 0.16, 60.0);
+        let shut = s.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(shut < 0.05, "the lid never arrived: the closest it came was {shut}");
+        assert!(
+            s.first().copied().unwrap() > 0.99 && s.last().copied().unwrap() > 0.99,
+            "the eye did not come back open"
+        );
+    }
+
+    /// **Twelve a minute means about twelve a minute.** The interval is
+    /// jittered, so this checks the count rather than the spacing.
+    #[test]
+    fn the_rate_is_blinks_per_minute() {
+        let s = blink_samples(3, 12.0, 0.16, 60.0);
+        // Count falling edges: each blink shuts once, and a double blink shuts
+        // twice, so the honest range is twelve to about fourteen.
+        let closes = s.windows(2).filter(|w| w[0] > 0.5 && w[1] <= 0.5).count();
+        assert!(
+            (10..=16).contains(&closes),
+            "twelve a minute produced {closes} in a minute"
+        );
+    }
+
+    /// **A cast does not blink in unison.** The one thing that would make the
+    /// whole effect visible, and the reason the phase is seeded per object.
+    #[test]
+    fn two_characters_do_not_blink_together() {
+        let a = blink_samples(11, 12.0, 0.16, 60.0);
+        let b = blink_samples(12, 12.0, 0.16, 60.0);
+        let together = a
+            .iter()
+            .zip(&b)
+            .filter(|(x, y)| **x < 0.5 && **y < 0.5)
+            .count();
+        let each = a.iter().filter(|v| **v < 0.5).count();
+        assert!(each > 0, "the first eye never blinked");
+        assert!(
+            (together as f64) < 0.2 * each as f64,
+            "two objects blinked together {together} samples out of {each}"
+        );
+    }
+
+    /// **Nor to a metronome.** Evenly spaced blinks turn the eye into a
+    /// ticking clock in the corner of the shot.
+    #[test]
+    fn blinks_are_not_evenly_spaced() {
+        let s = blink_samples(5, 12.0, 0.16, 180.0);
+        let starts: Vec<usize> = s
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| w[0] > 0.5 && w[1] <= 0.5)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(starts.len() > 8, "not enough blinks to judge: {}", starts.len());
+        let gaps: Vec<f64> = starts.windows(2).map(|w| (w[1] - w[0]) as f64).collect();
+        let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
+        let spread = gaps
+            .iter()
+            .map(|g| (g - mean).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            spread > 0.15 * mean,
+            "the gaps between blinks are all but identical: mean {mean:.0}, spread {spread:.0}"
+        );
+    }
+
+    /// **The same object blinks the same way twice.** Determinism in
+    /// `(object, frame)` is what lets a shot be re-timed, re-rendered and
+    /// re-exported without the eyes changing.
+    #[test]
+    fn blinking_is_reproducible() {
+        assert_eq!(
+            blink_samples(9, 12.0, 0.16, 30.0),
+            blink_samples(9, 12.0, 0.16, 30.0)
+        );
+    }
+
+    /// **The lid falls; the eye does not shrink.** The bottom edge is held, so
+    /// the drawing closes downward the way an eyelid does rather than pinching
+    /// shut about its middle, which reads as a wince.
+    #[test]
+    fn the_lid_falls_and_the_lower_lid_stays_put() {
+        let mut scene = Scene::empty();
+        let (layer, id) = standing_square(&mut scene, 21);
+        scene.update_object_across(0, 60, id, |o| {
+            o.modifiers.push(Modifier::Blink {
+                rate: 120.0,
+                duration: 0.16,
+            });
+        });
+
+        // Sampled between frames, not on them: a blink is four frames long and
+        // a per-frame sample steps over most of one.
+        let mut tops = Vec::new();
+        for step in 0..1200 {
+            let time = step as f64 * 0.05;
+            let obj = resolved(&scene, layer, id, time as u32);
+            let eval = scene.modified_object_at(layer, &obj, time).unwrap();
+            let bottom = eval.prepend * buzz_geom::Point::new(50.0, 100.0);
+            assert!(
+                (bottom.y - 100.0).abs() < 1e-9,
+                "at {time}: the lower lid moved to {}",
+                bottom.y
+            );
+            tops.push((eval.prepend * buzz_geom::Point::new(50.0, 0.0)).y);
+        }
+
+        let hi = tops.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            hi > 90.0,
+            "the top never came down to meet the bottom: it reached {hi} of 100"
+        );
+        // And it spends most of the shot open, at the top of the drawing.
+        let open = tops.iter().filter(|y| **y < 1.0).count();
+        assert!(
+            open * 2 > tops.len(),
+            "the eye was shut or half-shut for most of the shot"
+        );
+    }
+
+    // -- the head turn ------------------------------------------------------
+
+    /// A face as a group: the form first (backmost), then a left eye, a nose on
+    /// the centre line, and a right eye. Returns the layer and the object.
+    fn face(scene: &mut Scene, id: u64) -> (LayerId, ObjectId) {
+        let layer = scene.add_layer("Head", LayerKind::Normal);
+        let part = |n: u64, x0: f64, x1: f64| {
+            Arc::new(Object::shape(
+                ObjectId(n),
+                ShapeData::filled(
+                    Rect::new(x0, 40.0, x1, 60.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            ))
+        };
+        let children = vec![
+            // The form: the whole head, 0..100.
+            Arc::new(Object::shape(
+                ObjectId(id * 10),
+                ShapeData::filled(Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9), Color::WHITE),
+            )),
+            part(id * 10 + 1, 20.0, 30.0),  // left eye,  centre 25
+            part(id * 10 + 2, 47.0, 53.0),  // nose,      centre 50
+            part(id * 10 + 3, 70.0, 80.0),  // right eye, centre 75
+        ];
+        let placed = scene
+            .add_object(layer, Object::group(ObjectId(id), children))
+            .expect("a face");
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(30);
+        });
+        (layer, placed)
+    }
+
+    /// The centres of a turned face's parts, form first.
+    fn part_centres(scene: &Scene, layer: LayerId, id: ObjectId) -> Vec<f64> {
+        let object = resolved(scene, layer, id, 0);
+        let eval = scene
+            .modified_object_at(layer, &object, 0u32)
+            .expect("a modifier");
+        let drawn = eval.object.expect("the turn re-poses, so it owns a copy");
+        match &drawn.kind {
+            ObjectKind::Group(children) => {
+                children.iter().map(|c| c.bounds().center().x).collect()
+            }
+            _ => unreachable!("the fixture is a group"),
+        }
+    }
+
+    fn turned_face(yaw: f64) -> (Scene, LayerId, ObjectId) {
+        let mut scene = Scene::empty();
+        let (layer, id) = face(&mut scene, 3);
+        scene.update_object_across(0, 30, id, |o| {
+            o.spatial.rotation_y = yaw;
+            o.modifiers.push(Modifier::Turn { round: 1.0 });
+        });
+        (scene, layer, id)
+    }
+
+    /// **A face that is not turned is not touched.** The overwhelmingly common
+    /// case, and one where any movement at all would be a bug you would find in
+    /// every frame of every shot.
+    #[test]
+    fn a_head_at_rest_is_left_exactly_alone() {
+        let (scene, layer, id) = turned_face(0.0);
+        let object = resolved(&scene, layer, id, 0);
+        let eval = scene.modified_object_at(layer, &object, 0u32).expect("evaluated");
+        assert!(
+            eval.object.is_none(),
+            "an unturned head should not even be copied"
+        );
+        assert_eq!(eval.prepend, Affine::IDENTITY);
+    }
+
+    /// **Turning moves the features across the face**, and the middle one moves
+    /// furthest. That ordering is the whole of the cylinder: a feature on the
+    /// centre line is travelling straight at the viewer and sweeps fastest,
+    /// while one near the silhouette is already going away and barely shifts.
+    #[test]
+    fn features_sweep_across_and_the_centre_one_moves_most() {
+        let rest = {
+            let mut scene = Scene::empty();
+            let (layer, id) = face(&mut scene, 3);
+            let object = resolved(&scene, layer, id, 0);
+            assert!(scene.modified_object_at(layer, &object, 0u32).is_none());
+            match &object.kind {
+                ObjectKind::Group(c) => {
+                    c.iter().map(|c| c.bounds().center().x).collect::<Vec<_>>()
+                }
+                _ => unreachable!(),
+            }
+        };
+
+        let (scene, layer, id) = turned_face(0.5);
+        let now = part_centres(&scene, layer, id);
+        assert_eq!(now.len(), rest.len(), "nothing should have gone round the back yet");
+
+        // Every feature moved the same way as the turn.
+        for i in 1..now.len() {
+            assert!(
+                now[i] > rest[i],
+                "feature {i} went the wrong way: {} to {}",
+                rest[i],
+                now[i]
+            );
+        }
+        // The nose (index 2, on the centre line) outruns both eyes.
+        let travel: Vec<f64> = (1..now.len()).map(|i| now[i] - rest[i]).collect();
+        assert!(
+            travel[1] > travel[0] && travel[1] > travel[2],
+            "the centre feature should sweep furthest; travels were {travel:?}"
+        );
+    }
+
+    /// **The form moves, but far less than the features.** A silhouette that
+    /// never moved would read as a mask with things sliding on it; one that
+    /// moved as much as the features would not read as turned at all.
+    #[test]
+    fn the_head_form_carries_a_fraction_of_the_turn() {
+        let (scene, layer, id) = turned_face(0.5);
+        let now = part_centres(&scene, layer, id);
+        let form_travel = now[0] - 50.0;
+        let nose_travel = now[2] - 50.0;
+        assert!(form_travel > 0.0, "the form did not move at all");
+        assert!(
+            form_travel < nose_travel * 0.5,
+            "the form moved {form_travel:.1} against the nose's {nose_travel:.1}, \
+             which is too much to read as a turn"
+        );
+    }
+
+    /// **Features narrow as they turn away.** Sliding a nose across a face at a
+    /// constant width is the thing that makes a cheap puppet look like a
+    /// sticker on a balloon.
+    #[test]
+    fn a_feature_foreshortens_as_it_goes_round() {
+        let (scene, layer, id) = turned_face(0.6);
+        let object = resolved(&scene, layer, id, 0);
+        let drawn = scene
+            .modified_object_at(layer, &object, 0u32)
+            .expect("a modifier")
+            .object
+            .expect("an owned copy");
+        let widths: Vec<f64> = match &drawn.kind {
+            ObjectKind::Group(c) => c.iter().map(|c| c.bounds().width()).collect(),
+            _ => unreachable!(),
+        };
+        // The nose started six units wide and is turning away from straight-on.
+        assert!(
+            widths[2] < 6.0,
+            "the nose did not foreshorten: it is still {:.2} wide",
+            widths[2]
+        );
+        assert!(widths[2] > 0.0, "the nose vanished rather than narrowing");
+    }
+
+    /// **A feature that goes round the back is dropped, not squashed onto the
+    /// edge.** Features piling up on the silhouette is the single most obvious
+    /// way a puppet turn gives itself away.
+    #[test]
+    fn a_far_feature_goes_out_of_sight() {
+        let (scene, layer, id) = turned_face(1.2);
+        let now = part_centres(&scene, layer, id);
+        assert!(
+            now.len() < 4,
+            "at a heavy turn something should have gone round the back; {} parts remain",
+            now.len()
+        );
+        assert!(now.len() >= 2, "the whole face disappeared");
+    }
+
+    /// **The yaw is consumed.** The renderer projects anything still carrying
+    /// one, so leaving it on would foreshorten the turn a second time.
+    #[test]
+    fn the_turn_spends_the_yaw_it_used() {
+        let (scene, layer, id) = turned_face(0.5);
+        let object = resolved(&scene, layer, id, 0);
+        assert_eq!(object.spatial.rotation_y, 0.5, "the source still carries it");
+        let drawn = scene
+            .modified_object_at(layer, &object, 0u32)
+            .expect("a modifier")
+            .object
+            .expect("an owned copy");
+        assert_eq!(
+            drawn.spatial.rotation_y, 0.0,
+            "the drawn copy must be flat or the renderer turns it twice"
+        );
+    }
+
+    /// **A drawn view beats a calculated one.** If the animator has drawn the
+    /// profile, the renderer swaps it in and this must stand aside — otherwise
+    /// their drawing would be turned on top of already being the turn.
+    #[test]
+    fn a_drawn_turnaround_view_wins() {
+        let mut scene = Scene::empty();
+        let (layer, id) = face(&mut scene, 4);
+        let profile = Arc::new(Object::shape(
+            ObjectId(999),
+            ShapeData::filled(Rect::new(0.0, 0.0, 60.0, 100.0).to_path(1e-9), Color::WHITE),
+        ));
+        scene.update_object_across(0, 30, id, |o| {
+            o.spatial.rotation_y = 1.4;
+            o.turnaround.set(std::f64::consts::FRAC_PI_2, profile.clone());
+            o.modifiers.push(Modifier::Turn { round: 1.0 });
+        });
+
+        let object = resolved(&scene, layer, id, 0);
+        let eval = scene.modified_object_at(layer, &object, 0u32).expect("evaluated");
+        assert!(
+            eval.object.is_none(),
+            "the drawn profile was nearer, so the turn should have done nothing"
+        );
+    }
+
+    /// **The map is symmetric.** Turning left and turning right are the same
+    /// arithmetic mirrored, and a face that turns better one way than the other
+    /// is a bug nobody would think to look for.
+    #[test]
+    fn turning_the_other_way_mirrors_it() {
+        for u in [-0.8, -0.3, 0.0, 0.3, 0.8] {
+            let a = turn_at(u, 0.4, 1.0).expect("visible");
+            let b = turn_at(-u, -0.4, 1.0).expect("visible");
+            assert!(
+                (a.0 + b.0).abs() < 1e-9,
+                "u={u}: {} against mirrored {}",
+                a.0,
+                b.0
+            );
+            assert!((a.1 - b.1).abs() < 1e-9, "u={u}: foreshortening differs");
+        }
+    }
+
+    /// **Zero roundness is a flat board.** It slides and never foreshortens,
+    /// which is the right answer for a signpost.
+    #[test]
+    fn a_flat_board_slides_without_foreshortening() {
+        let (u, squeeze) = turn_at(0.7, 0.5, 0.0).expect("visible");
+        assert!((u - 0.5_f64.sin()).abs() < 1e-9, "a board should just slide");
+        assert!((squeeze - 0.5_f64.cos()).abs() < 1e-9);
     }
 
     /// **Sway bends the top and plants the base.** A tree that pivoted about

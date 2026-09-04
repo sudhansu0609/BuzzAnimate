@@ -230,6 +230,149 @@ pub fn beats_from_levels(levels: &[f32], fps: f64) -> Vec<u32> {
     beats
 }
 
+// ---------------------------------------------------------------------------
+// Phrases: where the narration speaks and where it breathes
+// ---------------------------------------------------------------------------
+
+/// **One stretch of speech**, in frames, with the silence either side of it cut
+/// away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Phrase {
+    /// First frame of the phrase.
+    pub start: u32,
+    /// One past the last frame — a half-open range, like everything else here.
+    pub end: u32,
+}
+
+impl Phrase {
+    pub fn len(&self) -> u32 {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// How hard to listen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhraseOptions {
+    /// **What counts as silence**, as a fraction of the track's own speaking
+    /// level.
+    ///
+    /// A fraction rather than an absolute, because a narration recorded quietly
+    /// is still a narration and a fixed threshold would hear nothing in it.
+    pub floor: f32,
+    /// **How long a gap has to be to end a phrase**, in seconds.
+    ///
+    /// Speech is full of tiny gaps — every stop consonant is one — and a
+    /// detector that broke on those would return a phrase per syllable. A
+    /// quarter of a second is longer than any gap inside a word and shorter
+    /// than the pause anyone leaves between sentences.
+    pub gap: f64,
+    /// **The shortest thing worth calling a phrase**, in seconds. Below this it
+    /// is a cough, a click, or the microphone being knocked.
+    pub shortest: f64,
+}
+
+impl Default for PhraseOptions {
+    fn default() -> Self {
+        Self {
+            floor: 0.12,
+            gap: 0.25,
+            shortest: 0.2,
+        }
+    }
+}
+
+/// **Find the phrases in a narration** — where it speaks, and where it breathes.
+///
+/// # Why this is not the beat detector
+///
+/// [`detect_beats`] looks for *attacks*: the moment loudness jumps, which is
+/// where a drum is. Speech has no attacks worth the name, and a narration run
+/// through the beat detector comes back as a beat per plosive. What matters in
+/// a voice-over is the opposite thing — the **silences** — because that is
+/// where the sentences end, and the sentences are what the shots are cut to.
+///
+/// So this thresholds rather than differentiates: loud enough is speech, quiet
+/// enough for long enough is a break, and everything in between is smoothed
+/// over rather than allowed to chop a word in half.
+///
+/// # What it is for
+///
+/// A narrated film is timed by audio that already exists and cannot move. Every
+/// shot length, every cut, every mouth is fitted to it, and fitting them by
+/// dragging keyframes against a waveform by eye is the single largest block of
+/// time in the week. This is the measurement that makes that automatic.
+pub fn detect_phrases(clip: &Clip, fps: f64, options: &PhraseOptions) -> Vec<Phrase> {
+    if fps <= 0.0 || clip.is_empty() {
+        return Vec::new();
+    }
+    phrases_from_levels(&clip.frame_levels(fps), fps, options)
+}
+
+/// The phrase finder, over a per-frame loudness envelope. Split out so it can
+/// be tested against a synthetic envelope without decoding audio — the same
+/// arrangement [`beats_from_levels`] has, and for the same reason.
+pub fn phrases_from_levels(levels: &[f32], fps: f64, options: &PhraseOptions) -> Vec<Phrase> {
+    if levels.is_empty() || fps <= 0.0 {
+        return Vec::new();
+    }
+
+    // **The speaking level, from the track itself.**
+    //
+    // The loudest frame is the wrong reference: one door slam sets it for the
+    // whole take and the narration then sits below the threshold. The
+    // seventy-fifth percentile of the frames that have anything in them is a
+    // level the voice actually spends time at.
+    let mut voiced: Vec<f32> = levels.iter().copied().filter(|v| *v > 1e-4).collect();
+    if voiced.is_empty() {
+        return Vec::new();
+    }
+    voiced.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let speech = voiced[voiced.len() * 3 / 4];
+    let threshold = speech * options.floor.clamp(0.001, 1.0);
+
+    let loud: Vec<bool> = levels.iter().map(|v| *v > threshold).collect();
+    let gap_frames = ((options.gap.max(0.0) * fps).round() as usize).max(1);
+    let shortest = ((options.shortest.max(0.0) * fps).round() as u32).max(1);
+
+    // Runs of speech, with the short gaps inside them closed up.
+    let mut phrases: Vec<Phrase> = Vec::new();
+    let mut at = 0usize;
+    while at < loud.len() {
+        if !loud[at] {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        let mut end = at;
+        let mut quiet = 0usize;
+        while at < loud.len() {
+            if loud[at] {
+                end = at;
+                quiet = 0;
+            } else {
+                quiet += 1;
+                // A gap this long is the speaker stopping, not a consonant.
+                if quiet >= gap_frames {
+                    break;
+                }
+            }
+            at += 1;
+        }
+        let phrase = Phrase {
+            start: start as u32,
+            end: end as u32 + 1,
+        };
+        if phrase.len() >= shortest {
+            phrases.push(phrase);
+        }
+    }
+    phrases
+}
+
 /// Work out a mouth shape for every frame of `clip`.
 pub fn analyse_visemes(clip: &Clip, fps: f64, options: &LipSyncOptions) -> VisemeTrack {
     if fps <= 0.0 || clip.is_empty() {
@@ -771,5 +914,119 @@ mod tests {
     fn the_fft_leaves_silence_silent() {
         let spectrum = spectrum(&vec![0.0; 256]);
         assert!(spectrum.iter().all(|m| *m < 1e-6));
+    }
+
+    // -- phrases ------------------------------------------------------------
+
+    /// A synthetic narration: `spec` is a list of (loud?, seconds) at 24fps.
+    fn envelope(spec: &[(bool, f64)]) -> Vec<f32> {
+        let mut out = Vec::new();
+        for &(loud, seconds) in spec {
+            let n = (seconds * 24.0).round() as usize;
+            out.extend(std::iter::repeat_n(if loud { 0.4 } else { 0.0 }, n));
+        }
+        out
+    }
+
+    /// **Two sentences with a breath between them come back as two phrases.**
+    /// The whole feature in one assertion.
+    #[test]
+    fn a_pause_between_sentences_ends_a_phrase() {
+        let levels = envelope(&[
+            (false, 0.5),
+            (true, 2.0),
+            (false, 0.6),
+            (true, 1.5),
+            (false, 0.5),
+        ]);
+        let phrases = phrases_from_levels(&levels, 24.0, &PhraseOptions::default());
+        assert_eq!(phrases.len(), 2, "{phrases:?}");
+        assert!((phrases[0].len() as f64 / 24.0 - 2.0).abs() < 0.2);
+        assert!((phrases[1].len() as f64 / 24.0 - 1.5).abs() < 0.2);
+        assert!(phrases[0].start >= 11, "the leading silence was kept");
+    }
+
+    /// **The gaps inside speech do not break it.** Every stop consonant is a
+    /// short silence; a detector that broke on those would return a phrase per
+    /// syllable, which is the failure that makes this kind of thing useless.
+    #[test]
+    fn a_consonant_gap_does_not_split_a_sentence() {
+        let levels = envelope(&[
+            (true, 0.6),
+            (false, 0.08),
+            (true, 0.6),
+            (false, 0.06),
+            (true, 0.6),
+        ]);
+        let phrases = phrases_from_levels(&levels, 24.0, &PhraseOptions::default());
+        assert_eq!(phrases.len(), 1, "the sentence was chopped up: {phrases:?}");
+    }
+
+    /// **A quiet recording is still a recording.** The threshold is a fraction
+    /// of the track's own speaking level, so a narration recorded ten decibels
+    /// down is heard exactly the same way.
+    #[test]
+    fn a_quietly_recorded_narration_is_still_heard() {
+        let loud = envelope(&[(false, 0.4), (true, 1.5), (false, 0.6), (true, 1.0)]);
+        let quiet: Vec<f32> = loud.iter().map(|v| v * 0.05).collect();
+        let o = PhraseOptions::default();
+        assert_eq!(
+            phrases_from_levels(&loud, 24.0, &o),
+            phrases_from_levels(&quiet, 24.0, &o),
+            "the same performance at a lower level found different phrases"
+        );
+    }
+
+    /// **One loud bang does not set the threshold for the take.** Using the
+    /// peak as the reference is the obvious implementation and it deafens the
+    /// detector to the actual narration.
+    #[test]
+    fn a_door_slam_does_not_deafen_it() {
+        let mut levels = envelope(&[(false, 0.3), (true, 2.0), (false, 0.6), (true, 1.5)]);
+        levels[3] = 1.0; // a slam, in the silence before the first line
+        let phrases = phrases_from_levels(&levels, 24.0, &PhraseOptions::default());
+        assert!(
+            phrases.len() >= 2,
+            "the narration was lost under one loud frame: {phrases:?}"
+        );
+    }
+
+    /// **A click is not a phrase.** Below the shortest length it is the
+    /// microphone being knocked.
+    #[test]
+    fn a_click_is_not_a_phrase() {
+        let levels = envelope(&[(false, 0.5), (true, 0.04), (false, 0.6), (true, 1.2)]);
+        let phrases = phrases_from_levels(&levels, 24.0, &PhraseOptions::default());
+        assert_eq!(phrases.len(), 1, "the click was counted: {phrases:?}");
+    }
+
+    /// **Silence is silence.** No phrases, rather than one long one.
+    #[test]
+    fn a_silent_track_has_no_phrases() {
+        assert!(phrases_from_levels(&vec![0.0; 240], 24.0, &PhraseOptions::default()).is_empty());
+        assert!(phrases_from_levels(&[], 24.0, &PhraseOptions::default()).is_empty());
+    }
+
+    /// **Phrases are in order and do not overlap**, which everything
+    /// downstream assumes.
+    #[test]
+    fn phrases_come_back_in_order() {
+        let levels = envelope(&[
+            (true, 1.0),
+            (false, 0.5),
+            (true, 0.8),
+            (false, 0.4),
+            (true, 1.2),
+        ]);
+        let phrases = phrases_from_levels(&levels, 24.0, &PhraseOptions::default());
+        assert!(phrases.len() >= 2);
+        for pair in phrases.windows(2) {
+            assert!(
+                pair[0].end <= pair[1].start,
+                "phrases overlap: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }

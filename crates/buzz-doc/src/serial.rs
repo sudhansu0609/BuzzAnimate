@@ -165,7 +165,13 @@ use serde::{Deserialize, Serialize};
 ///   document with no procedural texture in it is written exactly as version 35
 ///   wrote it. A file written *with* one and opened by an older build loses that
 ///   image, which is what the bump is for.
-pub const FORMAT_VERSION: u32 = 40;
+/// * **41** — the **blink** and **turn** modifiers, and an **ease on every
+///   camera key**. All
+///   are additive and both degrade quietly in an older build: an unknown
+///   modifier kind is dropped on load, and a camera key with no ease reads as
+///   the linear one every camera had before this. A document that uses neither
+///   is written exactly as version 40 wrote it.
+pub const FORMAT_VERSION: u32 = 41;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -1270,6 +1276,7 @@ fn camera_key_to_dto(k: &buzz_scene::CameraKey) -> CameraKeyDto {
         rotation: k.rotation,
         pitch: k.pitch,
         yaw: k.yaw,
+        ease: k.ease,
     }
 }
 
@@ -1281,6 +1288,7 @@ fn camera_key_from_dto(dto: &CameraKeyDto) -> buzz_scene::CameraKey {
         rotation: dto.rotation,
         pitch: dto.pitch,
         yaw: dto.yaw,
+        ease: dto.ease,
     }
 }
 
@@ -1302,6 +1310,14 @@ pub struct CameraKeyDto {
     /// Turn left and right, in radians. Version 10.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub yaw: f64,
+    /// How the move *leaving* this key is paced. Version 41; absent is linear,
+    /// which is what every camera written before this one did.
+    #[serde(default, skip_serializing_if = "is_linear")]
+    pub ease: buzz_scene::Easing,
+}
+
+fn is_linear(easing: &buzz_scene::Easing) -> bool {
+    *easing == buzz_scene::Easing::Linear
 }
 
 /// One focus keyframe — the lens at a frame. Version 34.
@@ -1412,6 +1428,24 @@ impl ModifierDto {
                 amount: Some(amount),
                 ..base
             },
+            // The same two fields again: `frequency` is blinks per minute and
+            // `amount` how long one takes in seconds. An older reader drops the
+            // kind it does not know, which is the right outcome — a document
+            // that loses its blinks still opens.
+            Modifier::Blink { rate, duration } => Self {
+                kind: "blink".to_string(),
+                frequency: Some(rate),
+                amount: Some(duration),
+                ..base
+            },
+            // The turn's *angle* is not here: it lives on the object's own
+            // spatial yaw, which the format already carries and the tween
+            // already interpolates. Only the roundness is the modifier's.
+            Modifier::Turn { round } => Self {
+                kind: "turn".to_string(),
+                amount: Some(round),
+                ..base
+            },
             // `x`/`y` are the velocity and `amount` the wrap distance — the
             // same three fields the older kinds already carry, used for what
             // they say rather than a new pair nothing else would ever write.
@@ -1460,6 +1494,13 @@ impl ModifierDto {
             "sway" => Some(Modifier::Sway {
                 amount: self.amount.unwrap_or(0.12),
                 rate: self.frequency.unwrap_or(0.2),
+            }),
+            "blink" => Some(Modifier::Blink {
+                rate: self.frequency.unwrap_or(12.0),
+                duration: self.amount.unwrap_or(0.16),
+            }),
+            "turn" => Some(Modifier::Turn {
+                round: self.amount.unwrap_or(1.0),
             }),
             "drift" => Some(Modifier::Drift {
                 dx: self.x.unwrap_or(0.0),
@@ -3266,6 +3307,25 @@ mod tests {
             o.modifiers.push(buzz_scene::Modifier::LookAt { x: 12.5, y: -30.0 });
             o.modifiers
                 .push(buzz_scene::Modifier::AutoSquashStretch { amount: 0.015 });
+            o.modifiers.push(buzz_scene::Modifier::Breathe {
+                rate: 14.0,
+                depth: 1.25,
+            });
+            o.modifiers.push(buzz_scene::Modifier::Blink {
+                rate: 12.0,
+                duration: 0.16,
+            });
+            o.modifiers.push(buzz_scene::Modifier::Turn { round: 0.85 });
+            o.modifiers.push(buzz_scene::Modifier::Sway {
+                amount: 0.3,
+                rate: 0.25,
+            });
+            o.modifiers.push(buzz_scene::Modifier::Drift {
+                dx: 12.0,
+                dy: -1.5,
+                span: 600.0,
+                phase: 0.4,
+            });
         });
 
         let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
@@ -3285,6 +3345,25 @@ mod tests {
                 },
                 buzz_scene::Modifier::LookAt { x: 12.5, y: -30.0 },
                 buzz_scene::Modifier::AutoSquashStretch { amount: 0.015 },
+                buzz_scene::Modifier::Breathe {
+                    rate: 14.0,
+                    depth: 1.25
+                },
+                buzz_scene::Modifier::Blink {
+                    rate: 12.0,
+                    duration: 0.16
+                },
+                buzz_scene::Modifier::Turn { round: 0.85 },
+                buzz_scene::Modifier::Sway {
+                    amount: 0.3,
+                    rate: 0.25
+                },
+                buzz_scene::Modifier::Drift {
+                    dx: 12.0,
+                    dy: -1.5,
+                    span: 600.0,
+                    phase: 0.4
+                },
             ]
         );
     }

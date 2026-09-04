@@ -47,6 +47,7 @@ pub mod swatch;
 pub mod symbol;
 pub mod texture;
 pub mod timeline;
+pub mod trace;
 pub mod tween;
 pub mod wand;
 pub mod wave;
@@ -69,7 +70,7 @@ pub use effect_brush::{EffectKind, EffectStroke, effect_artwork};
 pub use stamp::{BrushStamp, StampedArt};
 pub use time::AtTime;
 pub use camera_track::{
-    CameraKey, CameraTrack, DEFAULT_FOCAL_DISTANCE, FocusKey, MAX_TILT, NamedAngle,
+    CameraKey, CameraMove, CameraTrack, DEFAULT_FOCAL_DISTANCE, FocusKey, MAX_TILT, NamedAngle,
 };
 pub use gradient::{
     Gradient, GradientHandles, GradientKind, GradientSpread, GradientStop, MAX_STOPS, lerp_color,
@@ -104,6 +105,7 @@ pub use symbol::{
     ColorEffect, ColorTransform, Library, LoopMode, Symbol, SymbolId, SymbolInstance, SymbolKind,
 };
 pub use timeline::{FrameKind, Keyframe, LayerTimeline, ResolvedFrame, TweenSpan};
+pub use trace::{TraceOptions, TraceReport, trace, quantise};
 pub use tween::{Easing, Tween, TweenKind};
 pub use wand::{WandOptions, region_at as wand_region};
 pub use wave::{WaveKind, WaveSettings, WaveStroke, wave_artwork, wave_bounds, wave_loop};

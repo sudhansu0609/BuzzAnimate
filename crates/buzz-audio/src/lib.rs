@@ -28,7 +28,8 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context, Result, bail};
 
 pub use analysis::{
-    LipSyncOptions, Viseme, VisemeTrack, analyse_visemes, beats_from_levels, detect_beats,
+    LipSyncOptions, Phrase, PhraseOptions, Viseme, VisemeTrack, analyse_visemes,
+    beats_from_levels, detect_beats, detect_phrases, phrases_from_levels,
 };
 pub use player::{Player, PlayerState};
 

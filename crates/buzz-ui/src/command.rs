@@ -53,6 +53,10 @@ pub enum Command {
     NewMouthSymbol,
     /// Mark the soundtrack's beats on the timeline ruler.
     DetectBeats,
+    /// **Lay the timeline out to the narration**: find where the voice-over
+    /// speaks and where it breathes, stretch the film to cover it, and put a
+    /// keyframe at the start of every line. See `buzz_audio::detect_phrases`.
+    FitToNarration,
 
     // Edit
     Undo,
@@ -102,6 +106,24 @@ pub enum Command {
     /// **Select same colour**: everything on this frame painted the colour the
     /// selection is painted.
     SelectSameColour,
+    /// **Thicken the outlines** of everything selected, leaving the fills and
+    /// the shapes themselves alone.
+    ///
+    /// A step rather than a number, because weighting a drawing is something an
+    /// animator does *by eye against the rest of the drawing* — press it until
+    /// it looks right — and stopping to type a width in a box breaks exactly
+    /// the comparison being made. Multiplicative rather than additive, so one
+    /// press means the same thing on a hairline and on a heavy outline.
+    ThickenStroke,
+    /// The same, thinner.
+    ThinStroke,
+    /// **Trace a bitmap into shapes** — Animate's Modify ▸ Bitmap ▸ Trace
+    /// Bitmap. The picture is replaced by the artwork it becomes, so one undo
+    /// puts the photograph back. See `buzz_scene::trace`.
+    TraceBitmap,
+    /// The same, tuned for **a scan of a drawing**: ink and paper, and the
+    /// paper thrown away, so what is left is outlines you can paint inside.
+    TraceLineArt,
     ConvertLinesToFills,
     ExpandFill,
     SmoothSelection,
@@ -278,6 +300,15 @@ pub enum Command {
     AddCameraKeyframe,
     RemoveCameraKeyframe,
     ResetCamera,
+    /// **Write a named camera move** from the playhead: a push in, a pan, a
+    /// reveal, a drift. Two ordinary eased camera keys, which is what the
+    /// animator would have typed. See `buzz_scene::CameraMove`.
+    ///
+    /// The move is carried on the command rather than read from a panel,
+    /// for the same reason `Align` carries `to_stage`: which move it is *is*
+    /// the operation, and a command that did a different thing depending on
+    /// hidden state is a command you cannot predict.
+    AddCameraMove(buzz_scene::CameraMove),
 
     // Lights
     /// Key the selected light's current state at the playhead.
@@ -346,6 +377,7 @@ impl Command {
             LipSync => "Lip Sync…",
             NewMouthSymbol => "New Mouth Symbol",
             DetectBeats => "Detect Beats",
+            FitToNarration => "Fit to Narration",
 
             Undo => "Undo",
             Redo => "Redo",
@@ -381,6 +413,10 @@ impl Command {
             ExposeOnTwos => "On Twos",
             ExposeOnThrees => "On Threes",
             SelectSameColour => "Select Same Colour",
+            ThickenStroke => "Thicken Lines",
+            ThinStroke => "Thin Lines",
+            TraceBitmap => "Trace Bitmap",
+            TraceLineArt => "Trace as Line Art",
             ConvertLinesToFills => "Convert Lines to Fills",
             ExpandFill => "Expand Fill…",
             SmoothSelection => "Smooth",
@@ -478,6 +514,9 @@ impl Command {
             AddLightKeyframe => "Add Light Keyframe",
             RemoveLightKeyframe => "Remove Light Keyframe",
             ResetCamera => "Reset Camera",
+            // The move names itself; a second label here would be a
+            // second place to keep the wording in step.
+            AddCameraMove(m) => m.label(),
 
             SelectTool(_) => "Tool",
             Nudge { .. } => "Nudge",
@@ -553,6 +592,13 @@ impl Command {
             SendBackward => sc(ctrl, Key::ArrowDown),
             SendToBack => sc(ctrl_shift, Key::ArrowDown),
             ExpandFill => None,
+            // **The bracket keys**, as every paint program binds them for the
+            // brush size. This is the same gesture aimed at a drawing that is
+            // already down: press until the line weight looks right against
+            // the rest of the picture. Animate binds neither.
+            ThickenStroke => sc(Modifiers::NONE, Key::CloseBracket),
+            ThinStroke => sc(Modifiers::NONE, Key::OpenBracket),
+            TraceBitmap | TraceLineArt => None,
             ConvertLinesToFills => None,
             SmoothSelection => None,
             RecogniseShape => None,
@@ -593,6 +639,7 @@ impl Command {
             SaveSnapshot | Snapshots => None,
             ShortcutEditor => None,
             DetectBeats => None,
+            FitToNarration => None,
             NewReferenceLayer | ImportVideoReference | SelectSameColour
             | ExposeOnTwos | ExposeOnThrees | PaintThrough | ImportSequenceFolder
             | RetargetPerformance | SwapSymbol => None,
@@ -646,6 +693,7 @@ impl Command {
             AddLightKeyframe => None,
             RemoveLightKeyframe => None,
             ResetCamera => None,
+            AddCameraMove(_) => None,
 
             SelectTool(_) => None,
             // The arrow keys, read directly: four directions times two step
@@ -751,6 +799,10 @@ pub fn palette_commands() -> Vec<Command> {
         BringForward,
         SendBackward,
         SendToBack,
+        ThickenStroke,
+        ThinStroke,
+        TraceBitmap,
+        TraceLineArt,
         ConvertLinesToFills,
         ExpandFill,
         SmoothSelection,
@@ -844,6 +896,7 @@ pub fn palette_commands() -> Vec<Command> {
         LipSync,
         NewMouthSymbol,
         DetectBeats,
+        FitToNarration,
     ]
 }
 
@@ -917,6 +970,10 @@ mod tests {
             BringForward,
             SendBackward,
             SendToBack,
+            ThickenStroke,
+            ThinStroke,
+            TraceBitmap,
+            TraceLineArt,
             ConvertLinesToFills,
             ExpandFill,
             SmoothSelection,
@@ -1005,6 +1062,8 @@ mod tests {
             RemoveSound,
             LipSync,
             NewMouthSymbol,
+            DetectBeats,
+            FitToNarration,
         ]
     }
 

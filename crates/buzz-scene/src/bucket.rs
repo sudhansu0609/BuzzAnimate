@@ -256,14 +256,14 @@ pub const FILL_RULE: FillMode = FillMode::EvenOdd;
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct Grid {
-    w: usize,
-    h: usize,
+pub(crate) struct Grid {
+    pub(crate) w: usize,
+    pub(crate) h: usize,
     bits: Vec<bool>,
 }
 
 impl Grid {
-    fn new(w: usize, h: usize) -> Self {
+    pub(crate) fn new(w: usize, h: usize) -> Self {
         Self {
             w,
             h,
@@ -272,13 +272,20 @@ impl Grid {
     }
 
     #[inline]
-    fn get(&self, x: usize, y: usize) -> bool {
+    pub(crate) fn get(&self, x: usize, y: usize) -> bool {
         self.bits[y * self.w + x]
     }
 
     #[inline]
-    fn set(&mut self, x: usize, y: usize) {
+    pub(crate) fn set(&mut self, x: usize, y: usize) {
         self.bits[y * self.w + x] = true;
+    }
+
+    /// Unset one pixel, so a scratch grid can be reused across many regions
+    /// without reallocating one the size of the picture for each.
+    #[inline]
+    pub(crate) fn unset(&mut self, x: usize, y: usize) {
+        self.bits[y * self.w + x] = false;
     }
 
     /// Everything within `r` pixels of a set pixel, by `r` passes of a 4-neighbour
@@ -419,7 +426,7 @@ fn rasterise_fill(path: &BezPath, grid: &mut Grid, area: Rect, ppu: f64) {
 /// Directed boundary edges are collected — each set pixel contributes an edge
 /// on every side where its neighbour is unset — and chained end-to-end into
 /// loops. Interior holes fall out as their own loops.
-fn trace_contours(grid: &Grid) -> Vec<Vec<(usize, usize)>> {
+pub(crate) fn trace_contours(grid: &Grid) -> Vec<Vec<(usize, usize)>> {
     // A directed edge from one grid corner to the next, walking the fill so the
     // interior is on a consistent side.
     let mut next: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
@@ -450,8 +457,24 @@ fn trace_contours(grid: &Grid) -> Vec<Vec<(usize, usize)>> {
         }
     }
 
+    // **Loops are started in raster order, not in whatever order the map
+    // happens to hand back.**
+    //
+    // `HashMap` iteration is seeded per instance, so taking the first entry
+    // made the *same* picture trace differently between two runs: the loops
+    // came out rotated to a different starting corner, and Douglas–Peucker
+    // then kept a slightly different set of points. Nothing was visibly wrong
+    // either time, which is what made it worth pinning down — a bucket fill,
+    // and now a trace, has to be reproducible or the same document saved twice
+    // is two different documents.
+    let mut starts: Vec<(usize, usize)> = next.keys().copied().collect();
+    starts.sort_unstable_by_key(|&(x, y)| (y, x));
+
     let mut loops = Vec::new();
-    while let Some((&start, _)) = next.iter().next() {
+    for start in starts {
+        if !next.contains_key(&start) {
+            continue;
+        }
         let mut loop_pts = Vec::new();
         let mut p = start;
         loop {
@@ -472,7 +495,7 @@ fn trace_contours(grid: &Grid) -> Vec<Vec<(usize, usize)>> {
 
 /// Drop collinear points, then Douglas–Peucker to smooth the staircase the
 /// pixel grid produces, with `epsilon` in grid pixels.
-fn simplify(points: &[(usize, usize)], epsilon: f64) -> Vec<(usize, usize)> {
+pub(crate) fn simplify(points: &[(usize, usize)], epsilon: f64) -> Vec<(usize, usize)> {
     if points.len() < 3 {
         return points.to_vec();
     }

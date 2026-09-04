@@ -1211,6 +1211,10 @@ fn script_samples() -> Vec<buzz_ui::SampleEntry> {
 /// nothing when pressed — which is exactly what had happened to F8 and
 /// Ctrl+E. `every_shortcut_is_reachable_from_the_keyboard` guards it now.
 const KEYBOARD_COMMANDS: &[Command] = &[
+    // The bracket keys re-weight the selected outlines, which is a thing done
+    // repeatedly and by eye and so wants a key rather than a menu.
+    Command::ThickenStroke,
+    Command::ThinStroke,
     Command::New,
     Command::Open,
     Command::Save,
@@ -2302,7 +2306,7 @@ impl App {
                     focal_distance: self.editor.scene().camera().focal_distance,
                     nearest_depth: self.editor.scene().camera().nearest_depth(),
                     waveforms: self.editor.waveforms(),
-                    beats: self.editor.beat_markers.clone(),
+                    beats: self.editor.ruler_marks.clone(),
                 };
                 let response = buzz_ui::timeline_panel(ui, self.editor.scene(), &state);
                 self.apply_timeline(response, commands);

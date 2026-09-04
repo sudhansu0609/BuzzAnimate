@@ -642,3 +642,78 @@ fn figure_captions() {
         write(&f, "captions_on_the_picture.png");
     });
 }
+
+// ---------------------------------------------------------------------------
+// The one-shot actions
+// ---------------------------------------------------------------------------
+
+/// **A strip of poses from each new action.**
+///
+/// Five moments across one performance, side by side, so a sit can be seen to
+/// be a sit. A pose table compiles whatever numbers are in it; this is the only
+/// way to find out whether the numbers are an animation.
+#[test]
+#[ignore = "writes into docs/images; run explicitly"]
+fn figure_one_shot_actions() {
+    use buzz_act::perform::{Action, pose_at};
+    use buzz_act::{FigureSpec, build_figure};
+
+    with_exporter(|exporter| {
+        for (action, name) in [
+            (Action::Sit, "action_sit.png"),
+            (Action::Point, "action_point.png"),
+            (Action::React, "action_react.png"),
+            (Action::Turn, "action_turn.png"),
+        ] {
+            let mut scene = Scene::default();
+            scene.stage_mut().background = Color::from_rgb8(0xE8, 0xEC, 0xF2);
+            let stage = scene.stage().stage_rect();
+            let layer = scene.add_layer("Poses", LayerKind::Normal);
+
+            // Five moments, evenly across the move, left to right.
+            const SHOTS: usize = 5;
+            let spec = FigureSpec {
+                height: stage.height() * 0.55,
+                ..FigureSpec::default()
+            };
+            let mut next = 1000u64;
+            for i in 0..SHOTS {
+                let u = i as f64 / (SHOTS - 1) as f64;
+                let beat = pose_at(action, u, 1.0);
+
+                let mut id = || {
+                    next += 1;
+                    ObjectId(next)
+                };
+                let root = id();
+                let mut figure = build_figure(&spec, root, &mut id);
+
+                if let buzz_scene::ObjectKind::Armature(rig) = &mut figure.kind {
+                    // The pose is *added* to the rest, exactly as `perform`
+                    // writes it onto the timeline.
+                    let rest = rig.armature.at_rest().pose();
+                    let posed: Vec<f64> = rest
+                        .iter()
+                        .zip(&beat.joints)
+                        .map(|(r, d)| r + d)
+                        .collect();
+                    rig.armature.set_pose(&posed);
+                }
+                // Spread across the stage, standing on a common ground line —
+                // and displaced by whatever the beat says, which is how a sit
+                // gets lower than the figures either side of it.
+                let x = stage.width() * (0.12 + 0.19 * i as f64);
+                let ground = stage.height() * 0.86;
+                figure.transform = Affine::translate((
+                    x + beat.offset.x,
+                    ground + beat.offset.y,
+                ));
+                scene.add_object(layer, figure).expect("a figure");
+            }
+            scene.update_layer(layer, |l| { l.frames.insert_frame(2); });
+
+            let f = render(exporter, &scene, 0);
+            write(&f, name);
+        }
+    });
+}

@@ -551,6 +551,12 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 "run" => buzz_act::perform::Action::Run,
                 "talk" => buzz_act::perform::Action::Talk,
                 "idle" => buzz_act::perform::Action::Idle,
+                "sit" => buzz_act::perform::Action::Sit,
+                "stand" => buzz_act::perform::Action::Stand,
+                "turn" => buzz_act::perform::Action::Turn,
+                "point" => buzz_act::perform::Action::Point,
+                "reach" => buzz_act::perform::Action::Reach,
+                "react" => buzz_act::perform::Action::React,
                 other => {
                     return Err(throw(&format!(
                         "unknown action {other:?}; expected walk, run, talk or idle"

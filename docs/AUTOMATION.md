@@ -108,11 +108,15 @@ dialogue-to-*performance* path is not.
 *sits*, *stands up*, *turns*, *points*, *picks it up*, *falls*, *waves*,
 *reacts* — lands in `ignored` and is handed back to the writer to rephrase.
 
-**Why this is the cheapest win on the list.** `perform::pose_at` is a readable
-table of curves, written to be read and extended. Each new action is one more
-arm of that match, and each one directly multiplies how much of a brief lands
-without a person. Six more actions — **sit, stand, turn, point, reach, react** —
-would cover most of what people actually write in a brief.
+**Shipped.** All six — **sit, stand up, turn, point, reach, react** — are in
+`pose_at` and in the director's vocabulary, with the forms a writer would
+actually use. An ordinary paragraph of blocking now lands with nothing handed
+back.
+
+What is left of §2.3 is that the vocabulary is still a *list*: a verb outside it
+is still reported rather than guessed at, and a noun that happens to be a verb
+elsewhere in the list still wins as a verb ("perches on the step" reads as a
+walk). Both are properties of a keyword grammar rather than bugs in it.
 
 **The honest constraint.** These are hand-authored curves, not a solver. Adding
 one costs an animator's judgement, not an algorithm. That is a feature, but it
@@ -307,10 +311,11 @@ For this animator, in this order:
    first, because that is the direction carrying information the document did
    not have.
 
-The queue is now led by **the director's four verbs** (§2.3) — the cheapest
-remaining win by a wide margin, since `perform::pose_at` is a readable table of
-curves written to be extended, and every beat a writer types that is not walk,
-run, talk or wait is currently handed back to them to rephrase.
+The queue is now led by **scenery** (§2.4) — after the director runs, the
+largest remaining *drawing* task is the background, and the fifteen effect
+brushes that would paint it already exist and are never reached for. After that,
+**a timing pass on generated poses** (§2.5) and the **script/CLI reach** that
+would let a brief run unattended (§2.1).
 
 Also shipped since this audit was written, from the requests side rather than
 this list: the **`Turn` modifier** (a face turns from one drawing, §2.6), and

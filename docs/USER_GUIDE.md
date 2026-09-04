@@ -779,6 +779,12 @@ Ben walks off right.
 
 **Multiple shots.** A blank line, or a new slug line, cuts the brief into shots — and a whole brief becomes **one scene per shot**, each named from its own first words. A shot that does not restate the time of day stays in the one before it.
 
+**The verbs it knows.** Walk, run, talk and wait, and now also **sit, stand up, turn, point, reach and react** — each with the forms a writer would actually use (*sat*, *slumps*, *rises*, *gets up*, *spins*, *whirls*, *gestures*, *beckons*, *grabs*, *picks up*, *recoils*, *flinches*, *gasps*).
+
+Where a sentence says more than one thing, **travelling wins, then talking, then a gesture, then waiting**: "Ana walks over and points" is a walk with a point in it, because the walk is the beat that moves the story. "Ben stands up" is a stand and "Ben stands" is a wait, which is the one ordering that has to be right or the sentence means its opposite.
+
+> **A noun that is also a verb still reads as a verb.** "Ana perches on the step" comes out as a *walk*, because `step` is in the travelling vocabulary and a keyword grammar cannot tell that it is a noun here. Rephrase it. This is written down rather than papered over, because knowing it is worth more than pretending it does not happen.
+
 **It fails loudly, not cleverly.** There is no language model here: the parser is a keyword grammar over the setting words, a few dozen verbs, the direction words and the names. Every sentence it could not read is listed back to you verbatim, because a director who silently skips a line of the script is worse than one who asks.
 
 ### 17.3 Animate the Selection (`Insert ▸ Scene ▸ Perform…`)
@@ -791,6 +797,31 @@ Four actions, written onto the timeline as poses on the selected rig:
 | **Run** | A longer stride, a deeper body drop, arms bent and driving | ~0.6 s |
 | **Talk** | A weight shift, head movement on the stresses, hands coming up — and deliberately **no mouth** | ~3.2 s |
 | **Idle** | Standing and breathing: the difference between a held drawing and a dead one | ~4.0 s |
+
+**And six that happen once.** Everything above is a **cycle** — a longer beat is more strides of the same thing. These are **one-shots**: a body going from one state to another, and a longer beat is the same move taken more slowly.
+
+| Action | What is written | Takes about |
+|---|---|---|
+| **Sit** | Thighs to the horizontal, knees folded under, the body down onto a seat — with the forward tip and settle that sells the weight | ~1.2 s |
+| **Stand Up** | The sit read backwards, to the frame | ~1.0 s |
+| **Turn** | The head leads, the shoulders follow, the hips come last | ~0.8 s |
+| **Point** | The arm up and out, the head looking along it, held, then down | ~1.3 s |
+| **Reach** | A point with the whole body behind it — the chest leaning after the arm, the far arm counterbalancing | ~1.5 s |
+| **React** | A sharp recoil and a settle: a flinch, a start, being taken aback | ~0.7 s |
+
+![Five moments across a sit](images/action_sit.png)
+
+*One performance, five moments. The thighs come to the horizontal, the knees fold under and the body comes down and a little back — because a chair is behind you.*
+
+![Five moments across a point](images/action_point.png)
+
+*A point **holds**. An arm that goes up and comes straight back down is a wave nobody can follow; the hold through the middle is what makes it readable, and the elbow straightens **into** the point so the end of the move reads as an arrival.*
+
+**Three things these get right that are easy to get wrong:**
+
+- **A one-shot happens once, however long the beat is.** Sitting down twice because you gave it three seconds is not a slower sit, it is a person bobbing.
+- **Standing up is the sit read backwards**, not a second set of numbers. Two hand-authored versions of one move drift apart the first time either is adjusted.
+- **Only Sit leaves the body somewhere else.** It ends sat and stays sat, because that is what sitting down is — so follow it with **Stand Up**. Anything else written over the same character starts from the standing rest pose and snaps them upright, which is the honest consequence of a pose library that has no idea what a chair is.
 
 **The mouth is never touched.** Lip sync is a fact about the soundtrack (§16); a performance is a choice about the body. They run independently on the same character, which is what lets you re-record the dialogue without re-animating the gestures.
 
@@ -1135,6 +1166,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Blank Keyframes (`F7`)](#8-timeline-mastery--frame-by-frame-animation)
 - [Blend Modes (Multiply, Screen, Add...)](#14-vector-filters--blend-modes)
 - [Blink (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
+- [Body Actions (Sit, Point, React…)](#17-production-staging-directing--motion-that-runs-itself)
 - [Blur Filter](#14-vector-filters--blend-modes)
 - [Bitmap Tracing](#18-import--export-pipelines)
 - [Captions (SRT Import / Export)](#16-soundtrack-waveforms--automated-lip-sync)
@@ -1200,6 +1232,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Importing .fla, .xfl, .swf, .pdf, .ai](#18-import--export-pipelines)
 - [Ink & Paint (Paint Through)](#8-timeline-mastery--frame-by-frame-animation)
 - [Import Captions](#16-soundtrack-waveforms--automated-lip-sync)
+- [Idle / Sit / Stand / Turn](#17-production-staging-directing--motion-that-runs-itself)
 - [Ink Bottle Tool (`S`)](#6-comprehensive-23-tool-catalogue)
 - [Inverse Mask Layers (Exclusive)](#9-the-7-layer-kinds--layer-hierarchy)
 
@@ -1261,6 +1294,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Pen Tool (`P`)](#6-comprehensive-23-tool-catalogue)
 - [Perform (Automated Walks/Talks)](#17-production-staging-directing--motion-that-runs-itself)
 - [Profile & Three-Quarter Views](#17-production-staging-directing--motion-that-runs-itself)
+- [Point and Reach](#17-production-staging-directing--motion-that-runs-itself)
 - [PolyStar Tool (`☆`)](#6-comprehensive-23-tool-catalogue)
 - [Pose Library & Keying](#12-rigging-fabrik-inverse-kinematics--warping)
 - [ProRes 4444 with Alpha](#18-import--export-pipelines)
@@ -1275,6 +1309,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Retarget Performance](#17-production-staging-directing--motion-that-runs-itself)
 - [Reverse Drawing (Turnarounds)](#17-production-staging-directing--motion-that-runs-itself)
 - [Reverse Frames](#8-timeline-mastery--frame-by-frame-animation)
+- [React (Recoil)](#17-production-staging-directing--motion-that-runs-itself)
 - [Reset Workspace](#20-workspace-customization--layouts)
 - [Rigging Panel](#12-rigging-fabrik-inverse-kinematics--warping)
 
@@ -1288,6 +1323,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Sway (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
 - [Silence Detection](#16-soundtrack-waveforms--automated-lip-sync)
 - [SRT Subtitles](#16-soundtrack-waveforms--automated-lip-sync)
+- [Sit and Stand Up](#17-production-staging-directing--motion-that-runs-itself)
 - [Subselection Tool (`A`)](#6-comprehensive-23-tool-catalogue)
 - [Sun (Directional Light)](#13-studio-vector-lighting--shadow-engine)
 - [Swap Symbol](#11-symbols-instances--the-library)

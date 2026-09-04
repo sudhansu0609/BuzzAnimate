@@ -60,14 +60,28 @@ pub enum ActionChoice {
     Run,
     Talk,
     Idle,
+    Sit,
+    Stand,
+    Turn,
+    Point,
+    Reach,
+    React,
 }
 
 impl ActionChoice {
-    pub const ALL: [ActionChoice; 4] = [
+    pub const ALL: [ActionChoice; 10] = [
         ActionChoice::Walk,
         ActionChoice::Run,
         ActionChoice::Talk,
         ActionChoice::Idle,
+        // The one-shots, after the cycles: a different kind of thing, and the
+        // order says so without needing a heading.
+        ActionChoice::Sit,
+        ActionChoice::Stand,
+        ActionChoice::Turn,
+        ActionChoice::Point,
+        ActionChoice::Reach,
+        ActionChoice::React,
     ];
 
     pub fn label(self) -> &'static str {
@@ -76,6 +90,12 @@ impl ActionChoice {
             ActionChoice::Run => "Run",
             ActionChoice::Talk => "Talk",
             ActionChoice::Idle => "Idle",
+            ActionChoice::Sit => "Sit",
+            ActionChoice::Stand => "Stand Up",
+            ActionChoice::Turn => "Turn",
+            ActionChoice::Point => "Point",
+            ActionChoice::Reach => "Reach",
+            ActionChoice::React => "React",
         }
     }
 
@@ -85,6 +105,12 @@ impl ActionChoice {
             ActionChoice::Run => "A longer stride, a deeper drop, and arms bent and driving",
             ActionChoice::Talk => "A weight shift, head movement on the stresses, hands coming up",
             ActionChoice::Idle => "Standing and breathing, so a held drawing is not a dead one",
+            ActionChoice::Sit => "Down onto a seat, with the forward tip and settle that sells the weight",
+            ActionChoice::Stand => "Back up again \u{2014} the sit read backwards, so the two cannot drift apart",
+            ActionChoice::Turn => "The head leads, the shoulders follow, the hips come last",
+            ActionChoice::Point => "The arm comes up and out, the head looks along it, then it comes down",
+            ActionChoice::Reach => "A point with the whole body behind it, the chest leaning after the arm",
+            ActionChoice::React => "A sharp recoil and a settle \u{2014} a flinch, a start, being taken aback",
         }
     }
 

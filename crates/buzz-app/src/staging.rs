@@ -28,6 +28,12 @@ pub fn action_of(choice: buzz_ui::ActionChoice) -> Action {
         buzz_ui::ActionChoice::Run => Action::Run,
         buzz_ui::ActionChoice::Talk => Action::Talk,
         buzz_ui::ActionChoice::Idle => Action::Idle,
+        buzz_ui::ActionChoice::Sit => Action::Sit,
+        buzz_ui::ActionChoice::Stand => Action::Stand,
+        buzz_ui::ActionChoice::Turn => Action::Turn,
+        buzz_ui::ActionChoice::Point => Action::Point,
+        buzz_ui::ActionChoice::Reach => Action::Reach,
+        buzz_ui::ActionChoice::React => Action::React,
     }
 }
 

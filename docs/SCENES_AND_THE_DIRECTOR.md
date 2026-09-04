@@ -156,7 +156,12 @@ keyword grammar. It knows:
   *day, morning, noon, sunny* → Daylight; and **storm, thunder, lightning,
   tempest, downpour** → Storm, which is checked first because a "stormy night"
   is a storm and matching *night* first would take the lightning out of it.
-- a few dozen **verbs** sorted into four actions: walk, run, talk, wait.
+- a few dozen **verbs** sorted into ten actions: walk, run, talk and wait,
+  which repeat for as long as the beat lasts; and sit, stand up, turn, point,
+  reach and react, which happen once. Where a sentence says more than one
+  thing, travelling wins, then talking, then a gesture, then waiting — so
+  “Ana walks over and points” is a walk with a point in it, and “Ben stands
+  up” is a stand where “Ben stands” is a wait.
 - the **direction words** — "in from the left", "off right", "to Ben",
   "across".
 - **durations** — "for 3 seconds".

@@ -117,6 +117,10 @@ enum EventKind {
     Travel { running: bool, movement: Move },
     Talk { listener: Option<usize> },
     Idle,
+    /// One of the **one-shot** actions — sitting, standing, turning, pointing,
+    /// reaching, reacting. All scheduled the same way: in place, once, over a
+    /// beat as long as the action naturally takes.
+    Gesture(Action),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -356,11 +360,49 @@ fn parse(story: &str) -> Story {
             ],
         );
 
+        // **The one-shots.**
+        //
+        // Checked *before* idling and after travelling, which is the order they
+        // have to be in: "Ben stands up" contains the idling stem "stand" and
+        // means the opposite of standing about, while "Ana walks over and
+        // points" is a walk with a point in it and the walk is the beat that
+        // moves the story. Getting the order wrong is not a crash, it is a
+        // character who idles where they should have stood up — which is much
+        // harder to notice.
+        let getting_up = has_stem(&words_lower, &["rise", "rose", "risen"])
+            || (has_stem(&words_lower, &["stand", "get", "got", "clamber", "haul"])
+                && lower.contains(" up"));
+        let sitting = has_stem(&words_lower, &["sit", "sat", "seat", "perch", "slump"])
+            && !getting_up;
+        let turning = has_stem(&words_lower, &["turn", "spin", "spun", "whirl", "swivel", "wheel"]);
+        let pointing = has_stem(&words_lower, &["point", "gestur", "indicat", "beckon", "wave"]);
+        let reaching = has_stem(&words_lower, &[
+            "reach", "grab", "grasp", "seiz", "snatch", "lift", "pluck",
+        ]) || (has_stem(&words_lower, &["pick", "take", "took", "picks"]) && lower.contains(" up"));
+        let reacting = has_stem(&words_lower, &[
+            "react", "recoil", "flinch", "startl", "jump", "gasp", "wince", "jolt", "shrink",
+        ]);
+        let gesture = if sitting {
+            Some(Action::Sit)
+        } else if getting_up {
+            Some(Action::Stand)
+        } else if reacting {
+            Some(Action::React)
+        } else if reaching {
+            Some(Action::Reach)
+        } else if pointing {
+            Some(Action::Point)
+        } else if turning {
+            Some(Action::Turn)
+        } else {
+            None
+        };
+
         let actor = mentioned.first().copied().or(last_actor);
         let Some(actor) = actor else {
             // A sentence about nobody: scenery ("Night."), or noise. Setting
             // sentences are not worth reporting as failures.
-            if !(running || walking || talking || idling) {
+            if !(running || walking || talking || idling || gesture.is_some()) {
                 continue;
             }
             ignored.push(sentence.clone());
@@ -394,6 +436,8 @@ fn parse(story: &str) -> Story {
             EventKind::Talk {
                 listener: mentioned.iter().find(|i| **i != actor).copied(),
             }
+        } else if let Some(action) = gesture {
+            EventKind::Gesture(action)
         } else if idling {
             EventKind::Idle
         } else {
@@ -570,8 +614,30 @@ pub fn frame_the_shot(scene: &mut Scene, directed: &DirectedScene) -> usize {
                     push(&mut keys, beat.frames.end - 1, to, zoom_for(height, WIDE_FILL));
                 }
             }
-            // Standing still is not a reason to move the camera.
-            Action::Idle => {}
+            // **A gesture is worth cutting in for.** A point, a reach or a
+            // reaction is the beat of the shot while it happens, for the same
+            // reason a line of dialogue is — something is being *done*, and
+            // the wide that was right for a walk is too far away to read a
+            // hand. Sitting and standing are staging rather than performance,
+            // and turning is on the way to something else, so those hold
+            // whatever framing they inherited.
+            Action::Point | Action::Reach | Action::React => {
+                let Some((at, height)) = look_at(scene, beat.actor, beat.frames.start) else {
+                    continue;
+                };
+                // Not as close as a line of dialogue: a gesture needs the arm
+                // in frame, and a face-sized shot cuts it off at the elbow.
+                let zoom = zoom_for(height, (CLOSE_FILL + WIDE_FILL) * 0.5);
+                if beat.frames.start > 0
+                    && let Some(previous) = keys.last().copied()
+                {
+                    push(&mut keys, beat.frames.start - 1, previous.center, previous.zoom);
+                }
+                push(&mut keys, beat.frames.start, at, zoom);
+            }
+            // Standing still is not a reason to move the camera, and neither
+            // is sitting down in the middle of the shot you are already in.
+            Action::Idle | Action::Sit | Action::Stand | Action::Turn => {}
         }
     }
 
@@ -976,6 +1042,36 @@ pub fn direct(scene: &mut Scene, story: &str) -> Result<DirectedScene, DirectErr
                         travel: 0.0,
                     });
                 }
+            }
+
+            EventKind::Gesture(action) => {
+                let actor = event.actor;
+                // **As long as the action naturally takes**, unless the writer
+                // said otherwise. A director asked for "Ana sits" has been told
+                // what, not how long, and the answer to how long is a fact
+                // about people rather than a choice about the shot.
+                let seconds = event.seconds.unwrap_or(action.cycle_seconds());
+                let frames = ((seconds * fps).round() as u32).max(4);
+                let range = start..start + frames;
+
+                let performance = Performance {
+                    action: *action,
+                    frames: range.clone(),
+                    amount: 1.0,
+                    tempo: 1.0,
+                    distance: 0.0,
+                    step: 2,
+                };
+                if let Some((_, id)) = staged.cast.get(actor) {
+                    let _ = perform::apply_from(scene, *id, &performance, actors[actor].placed);
+                }
+                actors[actor].cursor = range.end;
+                beats.push(PlannedBeat {
+                    actor,
+                    action: *action,
+                    frames: range,
+                    travel: 0.0,
+                });
             }
 
             EventKind::Idle => {

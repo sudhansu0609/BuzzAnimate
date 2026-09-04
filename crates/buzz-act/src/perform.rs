@@ -52,6 +52,53 @@ pub enum Action {
     /// Standing still, breathing. What a character does between the lines, and
     /// the difference between a held drawing and a dead one.
     Idle,
+
+    // -- one-shots ----------------------------------------------------------
+    //
+    // Everything above is a **cycle**: it loops, and a longer beat is more
+    // strides of the same thing. Everything below happens **once** — a body
+    // going from one state to another — and a longer beat is the same move
+    // taken more slowly. See [`Action::loops`], which is what tells the two
+    // apart everywhere it matters.
+
+    /// **Sitting down.** Thighs to the horizontal, knees folded under, the
+    /// body lowered onto a seat, with the small forward tip and settle that
+    /// stops it reading as a lift descending.
+    ///
+    /// The one action here that **leaves the body somewhere else**: it ends
+    /// seated and stays seated, because that is what sitting down is. Follow
+    /// it with [`Action::Stand`] to get back up; anything else written over
+    /// the same character will start from the standing rest pose and snap them
+    /// upright, which is the honest consequence of a pose library that has no
+    /// idea what a chair is.
+    Sit,
+    /// **Getting up.** [`Action::Sit`] backwards, to the frame — one curve
+    /// read in reverse rather than a second set of numbers that would drift
+    /// out of step with the first.
+    Stand,
+    /// **Turning on the spot.** The head leads, the shoulders follow it and
+    /// the hips come last, which is the order a body actually turns in and the
+    /// reason a turn animated as one rigid block reads as a statue on a
+    /// turntable.
+    ///
+    /// The *facing* — which way the drawing points — is the caller's, not
+    /// this: see `direct::ActorState::face`. What is here is the body's part
+    /// of it, and it ends back at rest.
+    Turn,
+    /// **Pointing at something.** The arm comes up and out, the head turns to
+    /// look along it, and it holds — then comes down at the end, so the beat
+    /// composes with whatever follows instead of leaving an arm in the air.
+    Point,
+    /// **Reaching for something.** A point with the whole body behind it: the
+    /// chest leans after the arm, the far arm counterbalances, and the near
+    /// heel would come up if this rig had one.
+    Reach,
+    /// **A reaction.** A recoil away, sharply, and then a settle back — the
+    /// beat a writer means by *flinches*, *starts*, or *is taken aback*.
+    ///
+    /// Deliberately short and deliberately overshooting: a reaction that eases
+    /// politely into place is not a reaction.
+    React,
 }
 
 impl Action {
@@ -61,6 +108,12 @@ impl Action {
             Action::Run => "Run",
             Action::Talk => "Talk",
             Action::Idle => "Idle",
+            Action::Sit => "Sit",
+            Action::Stand => "Stand Up",
+            Action::Turn => "Turn",
+            Action::Point => "Point",
+            Action::Reach => "Reach",
+            Action::React => "React",
         }
     }
 
@@ -71,6 +124,12 @@ impl Action {
             Action::Run => "Run Cycle",
             Action::Talk => "Talking",
             Action::Idle => "Idle",
+            Action::Sit => "Sitting Down",
+            Action::Stand => "Standing Up",
+            Action::Turn => "Turning",
+            Action::Point => "Pointing",
+            Action::Reach => "Reaching",
+            Action::React => "Reacting",
         }
     }
 
@@ -80,6 +139,12 @@ impl Action {
             Action::Run => "A longer stride, a deeper drop, and arms bent and driving",
             Action::Talk => "A weight shift, head movement on the stresses, hands coming up",
             Action::Idle => "Standing and breathing, so a held drawing is not a dead one",
+            Action::Sit => "Down onto a seat, with the forward tip and settle that sells the weight",
+            Action::Stand => "Back up again — the sit read backwards, so the two cannot drift apart",
+            Action::Turn => "The head leads, the shoulders follow, the hips come last",
+            Action::Point => "The arm comes up and out, the head looks along it, then it comes down",
+            Action::Reach => "A point with the whole body behind it, the chest leaning after the arm",
+            Action::React => "A sharp recoil and a settle — a flinch, a start, being taken aback",
         }
     }
 
@@ -96,12 +161,36 @@ impl Action {
             Action::Run => 0.6,
             Action::Talk => 3.2,
             Action::Idle => 4.0,
+            // A one-shot's "cycle" is how long the move takes when nobody says
+            // otherwise: how long it takes a person to do the thing. These are
+            // the numbers a director uses to size a beat, not a tempo.
+            Action::Sit => 1.2,
+            Action::Stand => 1.0,
+            Action::Turn => 0.8,
+            Action::Point => 1.3,
+            Action::Reach => 1.5,
+            Action::React => 0.7,
         }
     }
 
     /// Does the figure travel while doing this?
     pub fn travels(self) -> bool {
         matches!(self, Action::Walk | Action::Run)
+    }
+
+    /// **Does this repeat, or happen once?**
+    ///
+    /// The distinction runs through everything: a longer beat of a cycle is
+    /// *more strides of the same thing*, and a longer beat of a one-shot is
+    /// *the same move taken more slowly*. It also decides whether the phase
+    /// wraps — a cycle's does, and a one-shot's must not, or the last frame of
+    /// a sit would be the first frame of it and the character would spring
+    /// back up on the very keyframe that was meant to hold them down.
+    pub fn loops(self) -> bool {
+        matches!(
+            self,
+            Action::Walk | Action::Run | Action::Talk | Action::Idle
+        )
     }
 }
 
@@ -150,6 +239,12 @@ impl Performance {
     /// generated walk announces itself. Stretching the tempo slightly to fit
     /// the frames is invisible; not doing it is not.
     pub fn cycles(&self, fps: f64) -> f64 {
+        // **A one-shot happens once, however long the beat is.** Sitting down
+        // twice because the animator gave it three seconds is not a slower sit,
+        // it is a person bobbing.
+        if !self.action.loops() {
+            return 1.0;
+        }
         let seconds = self.frames.len() as f64 / fps.max(1e-6);
         let wanted = seconds / self.action.cycle_seconds() * self.tempo.max(0.05);
         wanted.round().max(1.0)
@@ -195,7 +290,15 @@ const TURN: f64 = std::f64::consts::TAU;
 pub fn pose_at(action: Action, phase: f64, amount: f64) -> Beat {
     let mut beat = Beat::rest(Joint::ALL.len());
     let a = amount.clamp(0.0, 3.0);
-    let t = phase.rem_euclid(1.0) * TURN;
+    // **A cycle wraps; a one-shot does not.** Running a sit past its end would
+    // otherwise land back at its beginning, springing the character upright on
+    // the very keyframe meant to hold them down. See `Action::loops`.
+    let u = if action.loops() {
+        phase.rem_euclid(1.0)
+    } else {
+        phase.clamp(0.0, 1.0)
+    };
+    let t = u * TURN;
 
     match action {
         Action::Walk | Action::Run => {
@@ -311,9 +414,180 @@ pub fn pose_at(action: Action, phase: f64, amount: f64) -> Beat {
             beat.set(Joint::Hips, 0.022 * a * (0.6 * t + 1.1).sin());
             beat.offset.y = -1.2 * a * breath;
         }
+
+        // -- the one-shots --------------------------------------------------
+
+        Action::Sit => sit_into(&mut beat, ease(u), a),
+
+        // **Read backwards, not written twice.** Two hand-authored sets of
+        // numbers for the same move in opposite directions drift apart the
+        // first time either is adjusted; one curve read from the far end
+        // cannot.
+        Action::Stand => sit_into(&mut beat, ease(1.0 - u), a),
+
+        Action::Turn => {
+            // **The head leads and the hips come last.** A quarter of the move
+            // apart, which is what makes a turn read as a body deciding to
+            // turn rather than a statue on a turntable. Each part swings out
+            // and comes back: the *facing* is the caller's mirror, and what is
+            // animated here is the body's part of getting there.
+            let swing = |lag: f64| {
+                let p = ((u - lag) / (1.0 - lag)).clamp(0.0, 1.0);
+                (p * std::f64::consts::PI).sin()
+            };
+            beat.set(Joint::Head, 0.45 * a * swing(0.0));
+            beat.set(Joint::Chest, 0.30 * a * swing(0.12));
+            beat.set(Joint::Hips, 0.18 * a * swing(0.25));
+
+            // The arms trail the shoulders they hang from, and the weight dips
+            // through the middle of the turn — a person turning drops a little
+            // as they change which foot carries them.
+            beat.set(Joint::ShoulderL, -0.25 * a * swing(0.18));
+            beat.set(Joint::ShoulderR, 0.25 * a * swing(0.18));
+            beat.set(Joint::KneeL, -0.10 * a * swing(0.20));
+            beat.set(Joint::KneeR, -0.10 * a * swing(0.20));
+            beat.offset.y = 2.0 * a * swing(0.20);
+        }
+
+        Action::Point | Action::Reach => {
+            let reaching = action == Action::Reach;
+            // Out over the first third, held through the middle, down over the
+            // last quarter. Holding is what makes it a point rather than a
+            // wave: an arm that goes up and immediately comes down is a
+            // gesture nobody can follow.
+            let out = hold(u, 0.30, 0.75);
+            let extent = if reaching { 1.0 } else { 0.8 };
+
+            // **The near arm.** Up to near horizontal.
+            beat.set(Joint::ShoulderR, -1.25 * a * extent * out);
+
+            // **The elbow bends on the way up and straightens into the point.**
+            //
+            // `bend` peaks during the rise and the fall and is zero across the
+            // hold, so the arm folds as it lifts, opens out for the point
+            // itself, and folds again as it comes down — which is what makes
+            // the arrival read as an arrival rather than as a barrier arm.
+            //
+            // Every term is a multiple of `out`, and that is not incidental: a
+            // constant here left the character standing with a permanently
+            // bent arm before and after the gesture, which is what the test
+            // `a_one_shot_leaves_the_body_where_it_found_it` was written to
+            // catch and did.
+            let bend = (out * (1.0 - out) * 4.0).clamp(0.0, 1.0);
+            beat.set(Joint::ElbowR, (-0.55 * bend - 0.10 * out) * a * extent);
+
+            // **The head looks along the arm**, slightly ahead of it: the eyes
+            // get there first, always.
+            beat.set(Joint::Head, 0.22 * a * hold(u, 0.22, 0.78));
+
+            if reaching {
+                // The whole body commits: the chest leans after the arm, the
+                // far arm swings back as a counterweight, and the knees give.
+                // Without the counterweight a reach reads as a character being
+                // pulled by the wrist.
+                beat.set(Joint::Chest, 0.22 * a * out);
+                beat.set(Joint::Hips, 0.12 * a * out);
+                beat.set(Joint::ShoulderL, 0.40 * a * out);
+                beat.set(Joint::ElbowL, -0.30 * a * out);
+                beat.set(Joint::KneeL, -0.18 * a * out);
+                beat.set(Joint::KneeR, -0.10 * a * out);
+                beat.offset.x = 4.0 * a * out;
+            } else {
+                // A point is the arm and almost nothing else; a little of the
+                // chest so the shoulder is not working alone.
+                beat.set(Joint::Chest, 0.08 * a * out);
+                beat.set(Joint::ShoulderL, 0.10 * a * out);
+            }
+        }
+
+        Action::React => {
+            // **Away sharply, then back past rest, then settle.** A damped
+            // swing rather than a curve out and back: a reaction that eases
+            // politely into place is not a reaction, and the overshoot is the
+            // whole of what makes it read as being *startled* rather than
+            // deciding to lean.
+            let swing = (-4.0 * u).exp() * (u * TURN * 1.35).sin();
+            let recoil = swing * a;
+
+            beat.set(Joint::Chest, -0.42 * recoil);
+            beat.set(Joint::Head, -0.55 * recoil);
+            beat.set(Joint::Hips, -0.18 * recoil);
+            // The arms come up between the character and whatever it was.
+            beat.set(Joint::ShoulderL, -0.50 * recoil);
+            beat.set(Joint::ShoulderR, -0.44 * recoil);
+            beat.set(Joint::ElbowL, -0.70 * recoil);
+            beat.set(Joint::ElbowR, -0.62 * recoil);
+            // Weight back onto the heels, and a small drop as the knees give.
+            beat.set(Joint::KneeL, -0.22 * recoil.abs());
+            beat.set(Joint::KneeR, -0.16 * recoil.abs());
+            beat.offset.x = -7.0 * recoil;
+            beat.offset.y = 2.5 * a * recoil.abs();
+        }
     }
 
     beat
+}
+
+/// **Sitting down, at `p` of the way through it.**
+///
+/// `0.0` is standing and `1.0` is sat. Written once and read forwards for
+/// [`Action::Sit`] and backwards for [`Action::Stand`], because two sets of
+/// numbers for one move drift apart the first time either is touched.
+///
+/// The order matters more than the angles do: the hips go back *before* the
+/// knees fold, which is how a person finds a chair they cannot see, and the
+/// body tips forward on the way down and comes upright at the bottom. Lowering
+/// straight down with a level back is what a lift does.
+fn sit_into(beat: &mut Beat, p: f64, a: f64) {
+    let p = p.clamp(0.0, 1.0);
+    // The hips lead: this is at its strongest halfway down and is gone by the
+    // time the character is seated.
+    let seek = (p * std::f64::consts::PI).sin();
+
+    // Thighs to the horizontal, knees folded under. Nearly the whole of the
+    // shape; everything else is the flavour.
+    beat.set(Joint::ThighL, 1.35 * a * p);
+    beat.set(Joint::ThighR, 1.30 * a * p);
+    beat.set(Joint::KneeL, -1.45 * a * p);
+    beat.set(Joint::KneeR, -1.40 * a * p);
+
+    // Forward through the descent, upright once seated.
+    beat.set(Joint::Hips, 0.30 * a * seek + 0.10 * a * p);
+    beat.set(Joint::Chest, -0.18 * a * seek);
+    beat.set(Joint::Head, 0.12 * a * seek);
+
+    // The arms swing forward for balance on the way down and settle to the lap.
+    beat.set(Joint::ShoulderL, -0.35 * a * seek - 0.12 * a * p);
+    beat.set(Joint::ShoulderR, -0.32 * a * seek - 0.12 * a * p);
+    beat.set(Joint::ElbowL, -0.30 * a * p);
+    beat.set(Joint::ElbowR, -0.28 * a * p);
+
+    // Down by about a third of the figure's height, which is where a seat is.
+    beat.offset.y = 26.0 * a * p;
+    // And a little back, because a chair is behind you.
+    beat.offset.x = -6.0 * a * p;
+}
+
+/// Smooth in and out, `0..1`. The pacing a body has and a machine does not.
+fn ease(u: f64) -> f64 {
+    let u = u.clamp(0.0, 1.0);
+    u * u * (3.0 - 2.0 * u)
+}
+
+/// **Out by `rise`, held, and back by `fall`** — `0..1`.
+///
+/// The shape of every gesture that has to be *read*: it arrives, it stays long
+/// enough to be seen, and it leaves. Both edges are eased, so the hand does not
+/// start and stop dead.
+fn hold(u: f64, rise: f64, fall: f64) -> f64 {
+    let u = u.clamp(0.0, 1.0);
+    if u < rise {
+        ease(u / rise.max(1e-6))
+    } else if u < fall {
+        1.0
+    } else {
+        ease((1.0 - u) / (1.0 - fall).max(1e-6))
+    }
 }
 
 /// How far a knee is folded at phase `t`.

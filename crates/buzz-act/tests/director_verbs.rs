@@ -239,3 +239,39 @@ fn the_original_four_are_unchanged() {
     assert_eq!(first("Ana waits."), Some(Action::Idle));
     assert_eq!(first("Ana listens."), Some(Action::Idle));
 }
+
+/// **A brief that names a place gets one.**
+///
+/// The writer has already said what the shot looks like; asking them to say it
+/// again in a dialog is the kind of thing that makes a tool feel like
+/// paperwork. This is the join between the prose and the fifteen effect
+/// brushes that had been sitting there unreachable.
+#[test]
+fn a_brief_that_names_a_place_is_given_one() {
+    let bare = {
+        let mut scene = Scene::default();
+        buzz_act::direct(&mut scene, "Day. Ana waits.").expect("directs");
+        scene.layers().len()
+    };
+    let wooded = {
+        let mut scene = Scene::default();
+        buzz_act::direct(&mut scene, "Day. A forest. Ana waits.").expect("directs");
+        scene.layers().len()
+    };
+    assert!(
+        wooded > bare,
+        "a forest added no layers: {wooded} against {bare}"
+    );
+}
+
+/// **A storm brings its own rain**, the way it already brings its own cloud.
+#[test]
+fn a_storm_arrives_wet() {
+    let mut scene = Scene::default();
+    buzz_act::direct(&mut scene, "A storm. Ana waits.").expect("directs");
+    assert!(
+        scene.layers().iter().any(|l| l.name == "Rain"),
+        "a storm with no rain in it: {:?}",
+        scene.layers().iter().map(|l| l.name.clone()).collect::<Vec<_>>()
+    );
+}

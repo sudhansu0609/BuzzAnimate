@@ -1287,6 +1287,28 @@ impl Scene {
         id
     }
 
+    /// **Move a stage layer to another row**, as dragging it in the timeline
+    /// would.
+    ///
+    /// [`Self::add_stage_layer`] always adds at the *front*, which is right for
+    /// something the animator just made and wrong for something being placed
+    /// into an arrangement that already exists — a treeline belongs behind the
+    /// cast, and adding it in front and leaving it there paints a forest over
+    /// the actors. The layer stack has always been able to do this; nothing
+    /// had needed it.
+    pub fn reorder_stage_layer(&mut self, id: LayerId, to_index: usize) -> bool {
+        let moved = self.layers.reorder(id, to_index);
+        if moved {
+            self.bump();
+        }
+        moved
+    }
+
+    /// Where a stage layer sits in paint order, front first.
+    pub fn stage_layer_index(&self, id: LayerId) -> Option<usize> {
+        self.stage_layers().iter().position(|l| l.id == id)
+    }
+
     /// Edit a layer on the document's own timeline, whatever is open for
     /// editing. The companion to [`Self::add_stage_layer`], and there for the
     /// same reason.

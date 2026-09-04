@@ -756,6 +756,30 @@ Builds a staged environment: ground plane, backdrop, a light rig that agrees wit
 
 Each member of the staged cast is handed a live **Breathe** (§17.5) as it is placed, so a set scene is alive the moment it appears rather than a row of held drawings.
 
+**And the set is filled in.** Until now, staging built the *arrangement* — ground, sky, lights, cast — and left the largest remaining job in the shot, drawing the background, entirely to you. The fifteen effect brushes that would paint one had been sitting there the whole time, reachable only by hand.
+
+| Scenery | What is laid |
+|---|---|
+| **Forest** | A treeline of pines along the horizon, grass at the front |
+| **City** | A lit skyline, and street lamps down the path |
+| **Meadow** | Open ground: grass near, a thin line of trees far off |
+| **Waterside** | A shore, with the bank in front of it |
+| **Bare** | Ground and sky, and nothing between them |
+
+A **storm** also brings its own rain, the way it already brings its own cloud.
+
+| Bare | Forest | City |
+|---|---|---|
+| ![A staged set with nothing between ground and sky](images/scenery_bare.png) | ![The same brief with a forest](images/scenery_forest.png) | ![The same brief as a city street](images/scenery_city.png) |
+
+*The same prose three ways. `Sunset. Ana waits.` against `Sunset. A forest. Ana waits.` — the writer already said what the shot looks like.*
+
+**Every piece of it is one effect-brush stroke** — the same call the Brush tool makes, laid down as ordinary grouped artwork. Select it, move it, delete it, draw over it, or extend it with the very brush that made it. Nothing here is live and nothing re-runs.
+
+- **Far scenery goes behind the cast, near scenery in front.** A treeline belongs at the horizon and grass belongs at your feet; the layers land accordingly.
+- **They sit at their own depths**, so the parallax the depth system already gives comes for free.
+- **The same brief lays the same set twice**, so re-directing does not reshuffle your background.
+
 - **Add Person (`Insert ▸ Scene ▸ Add Person`)** puts one more rigged figure on the stage, on a layer of its own.
 - **Add Scene / Duplicate Scene (`Insert ▸ Scene ▸ …`)** start the next shot of the film, or a complete copy of this one — which is what the next beat of a conversation starts from.
 
@@ -778,6 +802,8 @@ Ben walks off right.
 6. **Keeps everyone alive.** Somebody spoken *to* listens rather than freezing, and everyone left standing when their part ends idles quietly to the end of the shot.
 
 **Multiple shots.** A blank line, or a new slug line, cuts the brief into shots — and a whole brief becomes **one scene per shot**, each named from its own first words. A shot that does not restate the time of day stays in the one before it.
+
+**It reads the place from the prose.** *forest*, *wood*, *pines*; *city*, *street*, *rooftop*; *river*, *shore*, *beach*; *meadow*, *field*, *hill* — the same kind of trigger as the cloud and water it already read, and for the same reason: a writer who says *forest* should not have to say it again in a dialog. Where a brief says both, the more specific wins — a city street lined with trees is a city.
 
 **The verbs it knows.** Walk, run, talk and wait, and now also **sit, stand up, turn, point, reach and react** — each with the forms a writer would actually use (*sat*, *slumps*, *rises*, *gets up*, *spins*, *whirls*, *gestures*, *beckons*, *grabs*, *picks up*, *recoils*, *flinches*, *gasps*).
 
@@ -1170,6 +1196,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Blur Filter](#14-vector-filters--blend-modes)
 - [Bitmap Tracing](#18-import--export-pipelines)
 - [Captions (SRT Import / Export)](#16-soundtrack-waveforms--automated-lip-sync)
+- [Backgrounds from a Brief](#17-production-staging-directing--motion-that-runs-itself)
 - [Bone Tool (`M`)](#12-rigging-fabrik-inverse-kinematics--warping)
 - [Break Apart (`Ctrl + B`)](#5-the-vector-drawing-engine-merge-shapes-vs-object-drawing)
 - [Brush Tool (`B`) & Types](#7-advanced-brushes-patterns--gradients)
@@ -1178,6 +1205,7 @@ fl.trace("Created 10 vector circles successfully!");
 ### C
 - [Camera 3D Perspective](#15-spatial-3d-camera--layer-parallax)
 - [Camera Moves (Push In, Reveal, Drift)](#15-spatial-3d-camera--layer-parallax)
+- [City / Forest / Meadow Scenery](#17-production-staging-directing--motion-that-runs-itself)
 - [Camera Tool (`C`)](#15-spatial-3d-camera--layer-parallax)
 - [Cast Shadows (Vector Calculations)](#13-studio-vector-lighting--shadow-engine)
 - [Classic Tweens](#10-tweens--the-motion-editor)
@@ -1310,6 +1338,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Reverse Drawing (Turnarounds)](#17-production-staging-directing--motion-that-runs-itself)
 - [Reverse Frames](#8-timeline-mastery--frame-by-frame-animation)
 - [React (Recoil)](#17-production-staging-directing--motion-that-runs-itself)
+- [Rain from a Storm](#17-production-staging-directing--motion-that-runs-itself)
 - [Reset Workspace](#20-workspace-customization--layouts)
 - [Rigging Panel](#12-rigging-fabrik-inverse-kinematics--warping)
 
@@ -1324,6 +1353,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Silence Detection](#16-soundtrack-waveforms--automated-lip-sync)
 - [SRT Subtitles](#16-soundtrack-waveforms--automated-lip-sync)
 - [Sit and Stand Up](#17-production-staging-directing--motion-that-runs-itself)
+- [Scenery (Set Filling)](#17-production-staging-directing--motion-that-runs-itself)
 - [Subselection Tool (`A`)](#6-comprehensive-23-tool-catalogue)
 - [Sun (Directional Light)](#13-studio-vector-lighting--shadow-engine)
 - [Swap Symbol](#11-symbols-instances--the-library)
@@ -1339,6 +1369,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Thicken / Thin Lines (`[` `]`)](#7-advanced-brushes-patterns--gradients)
 - [Turn (Head Turn Without Redrawing)](#17-production-staging-directing--motion-that-runs-itself)
 - [Trace Bitmap / Trace as Line Art](#18-import--export-pipelines)
+- [Treeline and Skyline](#17-production-staging-directing--motion-that-runs-itself)
 - [Timeline Spans & Cells](#8-timeline-mastery--frame-by-frame-animation)
 
 ### U

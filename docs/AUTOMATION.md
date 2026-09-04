@@ -131,15 +131,15 @@ effect brushes that would fill it — pine trees, leafy trees, grass, buildings,
 street lamps, string lights, rain, snow, stars, cloud — are **hand-drawn only**.
 `buzz-act` never references `effect_brush`.
 
-**What it needs.** Setting-aware scenery in the staging recipe: a `Night`
-exterior lays a treeline or a skyline along the horizon and a lamp strip along
-the path; a storm lays rain; a daylight exterior lays grass. Plus prose triggers
-in the director — *forest*, *city*, *street*, *rain* — matching the existing
-`clouds` / `water` mechanism, which is already exactly this pattern and already
-works.
+**Shipped.** `buzz_act::scenery` lays a treeline, a skyline, grass or a bank as
+**effect-brush strokes** — the same call the Brush tool makes — behind the cast
+or in front of it as the distance demands, and a storm brings its own rain. The
+director reads the place out of the prose (*forest*, *city*, *river*, *field*)
+with the same kind of trigger it already used for cloud and water.
 
-**Why it is worth it.** After the director runs, the largest remaining *drawing*
-task is the background, and the brushes that would paint it already exist.
+**What is left of it** is the interior: `Setting::Interior` still gets a bare
+wall, because a room is furniture rather than a treeline and the effect brushes
+have nothing that stands in for a chair.
 
 ---
 
@@ -311,11 +311,11 @@ For this animator, in this order:
    first, because that is the direction carrying information the document did
    not have.
 
-The queue is now led by **scenery** (§2.4) — after the director runs, the
-largest remaining *drawing* task is the background, and the fifteen effect
-brushes that would paint it already exist and are never reached for. After that,
-**a timing pass on generated poses** (§2.5) and the **script/CLI reach** that
-would let a brief run unattended (§2.1).
+The queue is now led by **a timing pass on generated poses** (§2.5) — every
+performance is still written on evenly spaced linear keys, which is the most
+reliable tell that a shot was generated — and then the **script/CLI reach**
+(§2.1) that would let a whole brief run unattended, which is the last thing
+standing between this and an overnight render.
 
 Also shipped since this audit was written, from the requests side rather than
 this list: the **`Turn` modifier** (a face turns from one drawing, §2.6), and

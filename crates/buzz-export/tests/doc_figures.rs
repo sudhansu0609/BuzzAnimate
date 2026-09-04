@@ -717,3 +717,24 @@ fn figure_one_shot_actions() {
         }
     });
 }
+
+/// **A brief, directed, with the set filled in.**
+///
+/// The whole point of the scenery join in one picture: the same prose, staged
+/// bare and staged with the place it names.
+#[test]
+#[ignore = "writes into docs/images; run explicitly"]
+fn figure_scenery() {
+    with_exporter(|exporter| {
+        for (story, name) in [
+            ("Sunset. Ana waits.", "scenery_bare.png"),
+            ("Sunset. A forest. Ana waits.", "scenery_forest.png"),
+            ("Night. A city street. Ana waits.", "scenery_city.png"),
+        ] {
+            let mut scene = Scene::default();
+            buzz_act::direct(&mut scene, story).expect("the brief directs");
+            let f = render(exporter, &scene, 0);
+            write(&f, name);
+        }
+    });
+}

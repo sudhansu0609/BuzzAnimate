@@ -140,6 +140,11 @@ struct Story {
     clouds: bool,
     /// The writer put water in the shot: a river, a lake, a shore.
     water: bool,
+    /// **What the shot looks like** — a forest, a street, a field. Read from
+    /// the same prose by the same kind of trigger as `clouds` and `water`,
+    /// because a writer who says *forest* has already said it and should not
+    /// have to say it again in a dialog.
+    scenery: crate::scenery::Scenery,
     names: Vec<String>,
     events: Vec<Event>,
     ignored: Vec<String>,
@@ -263,8 +268,9 @@ fn parse(story: &str) -> Story {
     // rule lives in `staging::build` rather than here: it has to hold however
     // the scene is made, and a copy of it in each caller is a copy that gets
     // out of step.
-    let scenery = sentences.join(" ").to_lowercase();
-    let mentions = |words: &[&str]| words.iter().any(|w| scenery.contains(w));
+    let scenery_text = sentences.join(" ").to_lowercase();
+    let mentions = |words: &[&str]| words.iter().any(|w| scenery_text.contains(w));
+    let scenery = crate::scenery::Scenery::from_prose(&scenery_text);
     let clouds = mentions(&["cloud", "overcast", "clouded", "sky above", "clear sky"]);
     let water = mentions(&[
         "river", "stream", "creek", "canal", "lake", "sea", "ocean", "shore", "beach",
@@ -465,6 +471,7 @@ fn parse(story: &str) -> Story {
         water,
         names,
         events,
+        scenery,
         ignored,
     }
 }
@@ -822,6 +829,24 @@ pub fn direct(scene: &mut Scene, story: &str) -> Result<DirectedScene, DirectErr
         ..SceneRecipe::default()
     };
     let staged = staging::build(scene, &recipe);
+
+    // **Fill the set.** After the arrangement, the largest remaining task in a
+    // shot was drawing the background — and the brushes that paint one have
+    // been sitting there the whole time. Laid *before* the cast is named, so
+    // the scenery layers land behind the actors rather than over them, and
+    // laid as ordinary grouped artwork the animator can extend with the same
+    // brush that made it.
+    let horizon_y = {
+        let stage = scene.stage().stage_rect();
+        stage.y0 + stage.height() * recipe.horizon.clamp(0.15, 0.95)
+    };
+    crate::scenery::lay(scene, parsed.scenery, horizon_y, staged.backdrop);
+    // A storm arrives with rain the way it already arrives with cloud: it is
+    // what a storm is, and the rule lives in one place so it cannot get out of
+    // step with the setting that needs it.
+    if let Some(weather) = crate::scenery::weather_for(parsed.setting) {
+        crate::scenery::lay_weather(scene, weather);
+    }
 
     // Name the cast what the story called them, on the layer and the object
     // both: a timeline that says "Ana" is a timeline the writer can read.

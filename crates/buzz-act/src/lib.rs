@@ -44,6 +44,7 @@ pub mod figure;
 pub mod motion_path;
 pub mod perform;
 pub mod physics;
+pub mod scenery;
 pub mod staging;
 
 pub use autorig::assemble;
@@ -51,6 +52,7 @@ pub use buzz_physics::{Spring, Wiggle};
 pub use direct::{DirectError, DirectedScene, PlannedBeat, PlannedShot, direct, split_shots};
 pub use figure::{FigureSpec, Joint, Palette, build as build_figure, is_figure, rest_pose};
 pub use motion_path::{MotionError, MotionPathOptions, MotionReport, follow as follow_path};
+pub use scenery::{Scenery, SceneryReport, lay as lay_scenery, lay_weather, weather_for};
 pub use physics::{PhysicsError, PhysicsReport, bake as follow_through_bake, wiggle as wiggle_bake};
 pub use perform::{
     Action, Beat, PerformError, PerformReport, Performance, apply as perform,

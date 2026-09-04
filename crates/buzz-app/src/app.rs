@@ -379,6 +379,10 @@ pub enum Pick {
     Export(buzz_ui::ExportKind),
     /// Where to write the document as an Animate `.fla`.
     ExportFla,
+    /// A subtitle file to read onto the timeline.
+    ImportCaptions,
+    /// Where to write the caption layer as `.srt`.
+    ExportCaptions,
 }
 
 /// A compact UTC timestamp, `YYYY-MM-DD HHhMM`, for naming a snapshot. Built
@@ -4572,6 +4576,16 @@ impl App {
     fn dispatch(&mut self, command: Command) {
         match command {
             Command::ImportSound => self.import_sound_dialog(),
+            Command::ImportCaptions => self.ask_for_path(
+                crate::dialogs::Request::open_file().filter("Subtitles", &["srt", "vtt"]),
+                Pick::ImportCaptions,
+            ),
+            Command::ExportCaptions => self.ask_for_path(
+                crate::dialogs::Request::save_file()
+                    .filter("Subtitles", &["srt"])
+                    .file_name("captions.srt"),
+                Pick::ExportCaptions,
+            ),
             Command::ImportVideoReference => self.video_reference_dialog(),
             Command::ImportSequenceFolder => self.sequence_folder_dialog(),
             Command::ImportImage => self.import_image_dialog(),
@@ -4884,6 +4898,15 @@ impl App {
             Pick::VideoReference => self.video_reference_from(path),
             Pick::SequenceFolder => self.sequence_folder_from(path),
             Pick::ImportSound => self.import_sound_from(path),
+            Pick::ImportCaptions => match self.editor.import_captions(&path) {
+                Ok(_) => {}
+                Err(e) => self.editor.status = Some(format!("Could not read those captions: {e}")),
+            },
+            Pick::ExportCaptions => {
+                if let Err(e) = self.editor.export_captions(&path) {
+                    self.editor.status = Some(format!("Could not write those captions: {e}"));
+                }
+            }
             Pick::ImportInto(target) => self.import_file(target, path),
             Pick::AnimateAssets => self.import_animate_assets_from(path),
             Pick::Export(kind) => self.start_export(kind, path),

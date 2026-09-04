@@ -57,6 +57,12 @@ pub enum Command {
     /// speaks and where it breathes, stretch the film to cover it, and put a
     /// keyframe at the start of every line. See `buzz_audio::detect_phrases`.
     FitToNarration,
+    /// **Read a subtitle file onto the timeline**: a caption layer with the
+    /// words keyed to their own timecodes. See `buzz_doc::srt`.
+    ImportCaptions,
+    /// **Write the caption layer back out as `.srt`**, to upload beside the
+    /// film.
+    ExportCaptions,
 
     // Edit
     Undo,
@@ -378,6 +384,8 @@ impl Command {
             NewMouthSymbol => "New Mouth Symbol",
             DetectBeats => "Detect Beats",
             FitToNarration => "Fit to Narration",
+            ImportCaptions => "Import Captions (.srt)\u{2026}",
+            ExportCaptions => "Export Captions (.srt)\u{2026}",
 
             Undo => "Undo",
             Redo => "Redo",
@@ -640,6 +648,7 @@ impl Command {
             ShortcutEditor => None,
             DetectBeats => None,
             FitToNarration => None,
+            ImportCaptions | ExportCaptions => None,
             NewReferenceLayer | ImportVideoReference | SelectSameColour
             | ExposeOnTwos | ExposeOnThrees | PaintThrough | ImportSequenceFolder
             | RetargetPerformance | SwapSymbol => None,
@@ -897,6 +906,8 @@ pub fn palette_commands() -> Vec<Command> {
         NewMouthSymbol,
         DetectBeats,
         FitToNarration,
+        ImportCaptions,
+        ExportCaptions,
     ]
 }
 
@@ -1064,6 +1075,8 @@ mod tests {
             NewMouthSymbol,
             DetectBeats,
             FitToNarration,
+            ImportCaptions,
+            ExportCaptions,
         ]
     }
 

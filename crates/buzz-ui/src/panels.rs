@@ -500,6 +500,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::NewMouthSymbol, true, &mut raised);
             item(ui, Command::DetectBeats, true, &mut raised);
             item(ui, Command::FitToNarration, true, &mut raised);
+            item(ui, Command::ImportCaptions, true, &mut raised);
+            item(ui, Command::ExportCaptions, true, &mut raised);
             ui.separator();
             item(ui, Command::ToggleActionsPanel, true, &mut raised);
             ui.separator();

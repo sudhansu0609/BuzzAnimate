@@ -764,6 +764,192 @@ impl Editor {
         ));
     }
 
+    /// **Read a subtitle file onto the timeline** as a caption layer.
+    ///
+    /// # Why this is the direction that matters
+    ///
+    /// The program can already hear *where* a narration speaks
+    /// ([`Self::fit_to_narration`]) and cannot hear a word of *what* it says. A
+    /// subtitle file is the one place both sit together, and nobody has to type
+    /// it: every transcription tool writes this format, and so does YouTube.
+    ///
+    /// So this is the import that gives the document something it has never
+    /// had — the words, on the frame they are spoken. Captions on the picture
+    /// are the immediate use; handing a named character their own lines is the
+    /// one worth having.
+    ///
+    /// # A layer of its own
+    ///
+    /// Captions are not artwork and do not want to be mixed in with it: they
+    /// are re-imported wholesale every time the narration is re-cut, and
+    /// throwing away a layer is a great deal safer than picking text objects
+    /// out of a drawing. So a fresh **Captions** layer each time, and the old
+    /// one is left alone rather than merged into.
+    pub fn import_captions(&mut self, path: &std::path::Path) -> anyhow::Result<usize> {
+        let text = std::fs::read_to_string(path)
+            .or_else(|_| std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()))?;
+        let caps = buzz_doc::srt::parse(&text);
+        if caps.is_empty() {
+            anyhow::bail!("nothing in that file looked like subtitles");
+        }
+
+        let fps = self.doc.scene().stage().frame_rate.max(1.0);
+        let stage = self.doc.scene().stage().stage_rect();
+        // Down where a subtitle goes, and sized to the picture rather than to a
+        // number: the same file on a 4K stage should not arrive as a speck.
+        let size = (stage.height() / 20.0).max(8.0);
+        let baseline = stage.y1 - stage.height() * 0.12;
+        let colour = self.style.fill_color;
+
+        // The words are shaped before the document is touched, so a font that
+        // cannot be found leaves no half-made layer behind.
+        let mut drawn: Vec<(std::ops::Range<u32>, buzz_geom::BezPath, buzz_scene::TextData, f64)> =
+            Vec::new();
+        for cue in &caps.cues {
+            let data = buzz_scene::TextData {
+                content: cue.text.clone(),
+                size,
+                font: None,
+                style: buzz_text::FontStyle::REGULAR,
+                align: buzz_text::TextAlign::Centre,
+            };
+            let Some(path) = buzz_text::outline_styled(
+                &cue.text,
+                size,
+                None,
+                data.style,
+                data.align,
+            ) else {
+                continue;
+            };
+            let (width, _) = buzz_text::measure_styled(&cue.text, size, None, data.style);
+            drawn.push((cue.frames(fps), path, data, width));
+        }
+        if drawn.is_empty() {
+            anyhow::bail!("no font available to draw those captions with");
+        }
+
+        let last = drawn.iter().map(|(r, ..)| r.end).max().unwrap_or(1);
+        let mut layer = LayerId(0);
+        self.doc.edit("Import Captions", |scene| {
+            layer = scene.add_layer("Captions", LayerKind::Normal);
+            scene.update_layer(layer, |l| {
+                while l.frames.length() < last {
+                    l.frames.insert_frame(l.frames.length());
+                }
+            });
+            for (range, path, data, width) in &drawn {
+                scene.update_layer(layer, |l| {
+                    l.frames.insert_blank_keyframe(range.start);
+                    // **And a blank one where it ends**, or the last caption of
+                    // a scene hangs on the screen to the end of the film. Only
+                    // where the next one does not already start there.
+                    if !l.frames.is_keyframe(range.end) && range.end < l.frames.length() {
+                        l.frames.insert_blank_keyframe(range.end);
+                    }
+                });
+                if let Some(id) = scene.add_shape_at(
+                    layer,
+                    range.start,
+                    ShapeData::filled(path.clone(), colour),
+                ) {
+                    scene.update_object_at(range.start, id, |o| {
+                        // **Centred by measurement, not by the align setting.**
+                        //
+                        // `TextAlign::Centre` lines the *rows of a block* up
+                        // with each other; it does not put the block on a
+                        // point. Trusting it to did exactly what you would
+                        // expect: every caption started at the middle of the
+                        // stage and ran off the right-hand edge. The figure in
+                        // the guide is what showed it.
+                        o.transform = Affine::translate((
+                            stage.center().x - width / 2.0,
+                            baseline,
+                        ));
+                        o.text = Some(data.clone());
+                    });
+                }
+            }
+        });
+        self.doc.end_gesture();
+
+        self.select_layer(layer);
+        let n = caps.cues.len();
+        let cast = caps.speakers();
+        self.status = Some(match (caps.skipped, cast.len()) {
+            (0, 0) => format!("{n} captions on their own layer"),
+            (0, _) => format!("{n} captions, spoken by {}", cast.join(", ")),
+            (s, 0) => format!("{n} captions \u{2014} {s} blocks could not be read"),
+            (s, _) => format!(
+                "{n} captions spoken by {} \u{2014} {s} blocks could not be read",
+                cast.join(", ")
+            ),
+        });
+        Ok(n)
+    }
+
+    /// **Write the active layer's captions back out as `.srt`.**
+    ///
+    /// # Why the active layer and not every piece of text in the film
+    ///
+    /// Because a title card is text and a logo is text, and neither is a
+    /// caption. There is no property that separates them — only which layer the
+    /// animator put them on — so the rule is the one the animator can see and
+    /// control. [`Self::import_captions`] leaves its own layer selected, so the
+    /// round trip needs no thought.
+    ///
+    /// A cue runs from its keyframe to the next keyframe on that layer, which
+    /// is exactly how the import laid it down and exactly what the timeline
+    /// shows.
+    pub fn export_captions(&mut self, path: &std::path::Path) -> anyhow::Result<usize> {
+        let Some(layer) = self.active_layer() else {
+            anyhow::bail!("there is no layer to take captions from");
+        };
+        let scene = self.doc.scene();
+        let fps = scene.stage().frame_rate.max(1.0);
+        let Some(l) = scene.layers().get(layer) else {
+            anyhow::bail!("there is no layer to take captions from");
+        };
+
+        // Every keyframe that holds text, and where the next keyframe is.
+        let starts: Vec<u32> = l.frames.keyframes().iter().map(|k| k.start).collect();
+        let length = l.frames.length();
+        let mut cues: Vec<buzz_doc::srt::Cue> = Vec::new();
+        for (i, &start) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).copied().unwrap_or(length);
+            // A keyframe may hold several text objects; they are one caption,
+            // in the order they are painted, which is how a two-line subtitle
+            // built by hand would read.
+            let lines: Vec<String> = l
+                .frames
+                .resolved_at(start)
+                .iter()
+                .filter_map(|o| o.text.as_ref().map(|t| t.content.clone()))
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            if lines.is_empty() {
+                continue;
+            }
+            let to_ms = |frame: u32| ((frame as f64 / fps) * 1000.0).round() as u64;
+            cues.push(buzz_doc::srt::Cue {
+                start_ms: to_ms(start),
+                end_ms: to_ms(end.max(start + 1)),
+                text: lines.join("\n"),
+                speaker: None,
+            });
+        }
+
+        if cues.is_empty() {
+            anyhow::bail!(
+                "there is no text on the active layer \u{2014} select the caption layer first"
+            );
+        }
+        std::fs::write(path, buzz_doc::srt::write(&cues))?;
+        let n = cues.len();
+        self.status = Some(format!("Wrote {n} captions to {}", path.display()));
+        Ok(n)
+    }
+
     /// Stop the scrub burst once the drag has paused. Call once per frame.
     pub fn tick_scrub(&mut self) {
         if self.playback.playing {
@@ -3347,6 +3533,9 @@ impl Editor {
             }
             DetectBeats => self.detect_beats(),
             FitToNarration => self.fit_to_narration(),
+            // The dialogs belong to the shell, which raises these back with a
+            // path — the same route Import Sound and every export take.
+            ImportCaptions | ExportCaptions => {}
 
             ToggleActionsPanel => {
                 self.workspace.toggle(buzz_ui::PanelId::Actions);

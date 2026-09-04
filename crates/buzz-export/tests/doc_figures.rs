@@ -595,3 +595,50 @@ fn encode_png(w: u32, h: u32, pixels: &[u8]) -> Vec<u8> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Captions
+// ---------------------------------------------------------------------------
+
+/// **A caption, on the picture, from a subtitle file.**
+///
+/// Rendered through the same text path the editor's importer uses, so the
+/// figure shows where a line actually lands rather than where it was meant to.
+#[test]
+#[ignore = "writes into docs/images; run explicitly"]
+fn figure_captions() {
+    with_exporter(|exporter| {
+        let mut scene = framing_scene();
+        let layer = scene.add_layer("Captions", LayerKind::Normal);
+        let stage = scene.stage().stage_rect();
+        let size = (stage.height() / 20.0).max(8.0);
+        let line = "We should go before it gets dark.";
+
+        let path = buzz_text::outline_styled(
+            line,
+            size,
+            None,
+            buzz_text::FontStyle::REGULAR,
+            buzz_text::TextAlign::Centre,
+        )
+        .expect("a font to draw with");
+
+        let mut object = Object::shape(
+            ObjectId(900),
+            ShapeData::filled(path, Color::from_rgb8(0xF6, 0xF6, 0xFA)),
+        );
+        // Centred by measurement, exactly as the importer does it: the align
+        // setting lines rows up with each other and does not place the block.
+        let (width, _) =
+            buzz_text::measure_styled(line, size, None, buzz_text::FontStyle::REGULAR);
+        object.transform = Affine::translate((
+            stage.center().x - width / 2.0,
+            stage.y1 - stage.height() * 0.12,
+        ));
+        scene.add_object(layer, object).expect("a caption");
+        scene.update_layer(layer, |l| { l.frames.insert_frame(4); });
+
+        let f = render(exporter, &scene, 0);
+        write(&f, "captions_on_the_picture.png");
+    });
+}

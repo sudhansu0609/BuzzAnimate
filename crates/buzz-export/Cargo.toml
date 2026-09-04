@@ -27,6 +27,8 @@ png = "0.18"
 [dev-dependencies]
 tempfile = "3"
 png = "0.18"
+# For the caption figure: text is shaped the same way the editor shapes it.
+buzz-text.workspace = true
 serde_json.workspace = true
 # For the motion-path headless test: bake an object along a curve, then render.
 buzz-act.workspace = true

@@ -89,6 +89,12 @@ no notion of a quoted line of dialogue at all.
 second of it is hand-wired. The frame ranges the automation would need are
 already computed and thrown away.
 
+**Half the input now exists.** An imported SRT (3.2 §3) carries the words, the
+timings and — where the file names one — the speaker. What is still missing is
+the join: nothing routes a named cue to that character's mouth symbol and runs
+`analyse_visemes` over the span. **That is now the largest remaining item in
+this document.**
+
 ---
 
 ### 2.3 The director understands four verbs
@@ -253,12 +259,17 @@ that a drawing is alive, and there is no blink anywhere in the codebase.~~
 a lid that falls faster than it lifts, one blink in six a double, seeded per
 object. Filters panel ▸ Live Motion ▸ Blink.
 
-**3. No captions, in or out.** Every channel in this genre burns in text, ships
-an `.srt`, or both. There is no SRT import to text layers and no SRT export —
-despite the program already time-aligning the narration to build visemes, and
-now knowing exactly where every line starts and ends (`detect_phrases`). The
-timings exist; nothing writes them out. **This is now the cheapest large win
-left.**
+**3. No captions, in or out.** ~~There is no SRT import to text layers and no
+SRT export.~~ **Shipped** — `buzz_doc::srt` reads and writes SubRip, and
+`File ▸ Import/Export Captions` puts the words on a Captions layer keyed to
+their own timecodes and takes them back off again.
+
+**Note the direction was wrong when this was written.** "SRT out, then in" is
+backwards: the program knows the *timings* and not the *words*, so an export
+built from what it had would have produced perfectly-timed empty cues. Import
+is what carries information the document did not already have — and it is what
+makes §2 possible, because a cue that says `Ana:` is dialogue attached to a
+name.
 
 **4. Camera moves are manual and interpolate linearly.** **Shipped** — every
 `CameraKey` now carries an `Easing`, applied in `state_at`, and `Camera ▸ Move`
@@ -287,9 +298,14 @@ For this animator, in this order:
 1. ~~**Auto-blink**~~ — **shipped**.
 2. ~~**Narration-driven timing**~~ — **shipped** as `Fit to Narration`.
 3. ~~**Named camera moves, eased**~~ — **shipped**.
-4. **SRT out** (then in) — the alignment already happens and the line
-   boundaries are now measured; this is plumbing, and it is table stakes for
-   the platform. **The next thing to build.**
+4. ~~**SRT out** (then in)~~ — **shipped**, and in the right order: import
+   first, because that is the direction carrying information the document did
+   not have.
+
+The queue is now led by **dialogue routed to a character** (§2.2): an imported
+cue that names a speaker, matched to that character's mouth, with
+`analyse_visemes` run over the cue's own frames. Every piece of it exists
+separately.
 
 Also shipped since this audit was written, from the requests side rather than
 this list: the **`Turn` modifier** (a face turns from one drawing, §2.6), and
@@ -317,10 +333,11 @@ Ordered by hours-saved per hour-spent building it, the queue is:
 5. **Scenery from the effect brushes** (2.4)
 6. Turnarounds, crowds, batch export (2.6–2.8)
 
-And from the animator's side of the desk (Part 3): **captions in and out**
-(3.2 §3) is now the cheapest large win left. Auto-blink, eased named camera
-moves and narration-driven timing have all shipped since this audit was
-written, along with the head turn and bitmap tracing.
+And from the animator's side of the desk (Part 3): **dialogue routed from an
+imported caption to a character's mouth** is now the largest win left — every
+piece of it exists and nothing joins them. Auto-blink, eased named camera moves,
+narration-driven timing and captions in and out have all shipped since this
+audit was written, along with the head turn and bitmap tracing.
 
 ---
 

@@ -438,6 +438,7 @@ dependencies = [
  "buzz-import-xfl",
  "buzz-render",
  "buzz-scene",
+ "buzz-text",
  "kurbo",
  "peniko",
  "png",

@@ -621,6 +621,51 @@ BuzzAnimate features an integrated audio playback and phonetic lip-sync analysis
 - The soundtrack renders its full audio waveform directly on the timeline layer.
 - **Detect Musical Beats**: Choose **`Control ▸ Detect Beats`** to mark rhythmic percussion beats with vertical ticks on the frame ruler.
 
+### Captions In and Out (`File ▸ Import/Export Captions (.srt)`)
+
+An **SRT** is the subtitle format — plain text, and about as simple as a format gets:
+
+```
+1
+00:00:01,000 --> 00:00:04,200
+Ana: We should go before it gets dark.
+
+2
+00:00:05,100 --> 00:00:07,800
+Ben said nothing.
+```
+
+A number, a timecode pair, the line, a blank line. Every transcription tool writes it, and so does YouTube — which means **you never have to type any of it**.
+
+![A caption on the picture](images/captions_on_the_picture.png)
+
+**Import is the direction that matters.** The program can already hear *where* a narration speaks (Fit to Narration, above) and not a word of *what* it says. A subtitle file is the one place both sit together, so importing one gives the document something it has never had: the words, on the frame they are spoken.
+
+1. Transcribe your voice-over with whatever you like — Whisper, Descript, or YouTube's own auto-caption download.
+2. **`File ▸ Import Captions (.srt)…`**
+3. You get a **Captions layer**, each line keyed to its own timecode, centred near the bottom of the stage, and gone again when the line ends.
+
+**Export** writes the **active layer's** text back out. That rule is deliberate: a title card is text and a logo is text, and neither is a caption — the only thing that separates them is which layer you put them on. The import leaves its own layer selected, so a round trip needs no thought.
+
+**What it forgives**, because real subtitle files are written by a hundred programs and plenty are careless:
+
+| | |
+|---|---|
+| A **byte-order mark** | Windows tools add one, and it lands right on the first cue |
+| **`,` or `.`** before the milliseconds | SRT says comma, WebVTT says stop, tools emit both |
+| **No index lines** | Plenty of files have none |
+| **Numbers out of order** | Cues are sorted by their timecodes, not by what they claim |
+| **Markup** — `<i>`, `<font …>`, `{\an8}` | Stripped: the text becomes *artwork*, and a literal `<i>` drawn on the picture is worse than a line that is not italic |
+| **One mangled block** | Skipped and counted, not fatal. The status line says how many |
+
+A file with *nothing* readable in it is refused outright — that means the wrong file was picked, and an empty layer would send you looking in the wrong place.
+
+**Who says what.** A line like `Ana: We should go.` names a speaker, and the status line lists the cast it found. But `Meanwhile: the door opened.` is exactly as name-shaped and is not a character — so the decision is made across the **whole file**, not line by line: a prefix counts as a speaker if it **comes back on another line**, or is written in **capitals** (`ANA:`, the broadcast convention). Anything else is left in the text, because the safe direction to be wrong in is keeping a word you can delete rather than silently deleting one and casting somebody called Meanwhile.
+
+> **What this unlocks next.** Knowing who speaks and when is the missing half of routing a line to a character's mouth and running lip sync on that actor automatically — see `docs/AUTOMATION.md`.
+
+---
+
 ### Fitting the Timeline to a Narration (`File ▸ Fit to Narration`)
 
 A narrated film is timed by audio that already exists and cannot move. Every shot length and every cut is fitted to it — and fitting them by dragging keyframes against a waveform by eye is the single largest block of time in a week of that work. The soundtrack already says where the lines are.
@@ -1064,6 +1109,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Blink (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
 - [Blur Filter](#14-vector-filters--blend-modes)
 - [Bitmap Tracing](#18-import--export-pipelines)
+- [Captions (SRT Import / Export)](#16-soundtrack-waveforms--automated-lip-sync)
 - [Bone Tool (`M`)](#12-rigging-fabrik-inverse-kinematics--warping)
 - [Break Apart (`Ctrl + B`)](#5-the-vector-drawing-engine-merge-shapes-vs-object-drawing)
 - [Brush Tool (`B`) & Types](#7-advanced-brushes-patterns--gradients)
@@ -1093,6 +1139,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Effect Brush — the 15 Kinds](#7-advanced-brushes-patterns--gradients)
 - [Easing on Camera Keys](#15-spatial-3d-camera--layer-parallax)
 - [Eraser Tool (`E`)](#6-comprehensive-23-tool-catalogue)
+- [Export Captions (.srt)](#16-soundtrack-waveforms--automated-lip-sync)
 - [Export Formats (PNG, MP4, GIF, WebP, ProRes)](#18-import--export-pipelines)
 - [Eyedropper Tool (`I`)](#6-comprehensive-23-tool-catalogue)
 
@@ -1123,6 +1170,7 @@ fl.trace("Created 10 vector circles successfully!");
 ### I
 - [Importing .fla, .xfl, .swf, .pdf, .ai](#18-import--export-pipelines)
 - [Ink & Paint (Paint Through)](#8-timeline-mastery--frame-by-frame-animation)
+- [Import Captions](#16-soundtrack-waveforms--automated-lip-sync)
 - [Ink Bottle Tool (`S`)](#6-comprehensive-23-tool-catalogue)
 - [Inverse Mask Layers (Exclusive)](#9-the-7-layer-kinds--layer-hierarchy)
 
@@ -1208,6 +1256,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Storm Staging](#17-production-staging-directing--motion-that-runs-itself)
 - [Sway (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
 - [Silence Detection](#16-soundtrack-waveforms--automated-lip-sync)
+- [SRT Subtitles](#16-soundtrack-waveforms--automated-lip-sync)
 - [Subselection Tool (`A`)](#6-comprehensive-23-tool-catalogue)
 - [Sun (Directional Light)](#13-studio-vector-lighting--shadow-engine)
 - [Swap Symbol](#11-symbols-instances--the-library)

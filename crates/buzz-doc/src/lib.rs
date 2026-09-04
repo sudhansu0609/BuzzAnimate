@@ -14,6 +14,7 @@ pub mod history;
 pub mod project;
 pub mod serial;
 pub mod snapshots;
+pub mod srt;
 pub mod templates;
 
 use std::path::{Path, PathBuf};

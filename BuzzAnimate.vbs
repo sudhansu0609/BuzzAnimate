@@ -26,7 +26,7 @@
 
 Option Explicit
 
-Dim shell, fso, here, bat, logFile, cmd, args, i, code, message
+Dim shell, fso, here, bat, logFile, doneFile, splash, icon, cmd, args, i, code, message
 
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
@@ -56,13 +56,52 @@ Next
 ' a key in, so a prompt would hang the launcher forever with nothing on screen.
 shell.Environment("PROCESS")("BUZZ_SILENT") = "1"
 
+' --- something on screen while the build runs -----------------------------
+'
+'  Hiding the console fixed the black window nobody wanted and created a worse
+'  problem: when the sources have changed, the build takes minutes, and with
+'  nothing on screen at all - no window, no taskbar button - opening the
+'  program looks exactly like opening a program that is broken. That is what
+'  it was reported as.
+'
+'  tools\build-splash.ps1 is the answer. It shows a small window with a sweeping
+'  bar and the crate cargo is on, read from the same log the failure dialog
+'  below uses. It is started for *every* launch and draws nothing for the first
+'  stretch, so the warm case - which is nearly every launch - still puts the
+'  editor on screen and nothing else.
+'
+'  The done-file is how it is told to close. The splash is started hidden and
+'  non-blocking, which leaves no handle to terminate, and a file both sides can
+'  see needs no handle.
+doneFile = logFile & ".done"
+On Error Resume Next
+If fso.FileExists(doneFile) Then fso.DeleteFile doneFile, True
+On Error GoTo 0
+
+splash = fso.BuildPath(here, "tools\build-splash.ps1")
+icon = fso.BuildPath(here, "assets\buzzanimate.ico")
+If fso.FileExists(splash) Then
+    ' -WindowStyle Hidden and a window style of 0 between them keep
+    ' PowerShell's own console off the screen; the form it draws is the only
+    ' thing that appears. False = do not wait, or the build would never start.
+    shell.Run "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden" & _
+              " -File """ & splash & """ -Log """ & logFile & """" & _
+              " -Done """ & doneFile & """ -Icon """ & icon & """", 0, False
+End If
+
 ' cmd /c "" ... "" is the quoting cmd.exe wants when the command itself is
 ' quoted: the outer pair is stripped, the inner ones do the work.
 cmd = "cmd /c """"" & bat & """" & args & " > """ & logFile & """ 2>&1"""
 
-' 0 = no window, True = wait. The wait is short: once the build is warm the
+' 0 = no window, True = wait. The wait is short once the build is warm: the
 ' batch hands the editor over with `start` and returns immediately.
 code = shell.Run(cmd, 0, True)
+
+' The build is over, whether it worked or not. Told before the failure dialog
+' below, so the splash is never left sweeping behind a message box.
+On Error Resume Next
+fso.CreateTextFile(doneFile, True).WriteLine "done"
+On Error GoTo 0
 
 If code <> 0 Then
     message = ""

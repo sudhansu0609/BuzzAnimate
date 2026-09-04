@@ -10,38 +10,80 @@ rem      BuzzAnimate.bat --gpu NVIDIA        pick a graphics adapter by name
 rem      BuzzAnimate.bat --script tidy.js    run a script at startup
 rem      BuzzAnimate.bat --dev               use the debug build (faster to
 rem                                          compile, slower to draw)
+rem      BuzzAnimate.bat --console           watch a release build go past
 rem
 rem  It builds first when the sources have changed, which is a no-op once the
 rem  build is warm: a launcher that quietly ran last week's binary would be a
 rem  very confusing thing to own.
 rem
-rem  RUN FROM THE DESKTOP SHORTCUT THERE IS NO CONSOLE AT ALL. The shortcut
-rem  points at BuzzAnimate.vbs, which runs this file hidden and puts anything
-rem  that goes wrong in a dialog box - so the editor opens on its own, with no
-rem  black window beside it. Double-clicking this .bat, or running it from a
-rem  terminal, still shows the build as it happens, which is what you want when
-rem  you are the one changing the sources.
+rem  THERE IS NO CONSOLE UNLESS YOU ASK FOR ONE. Opening the editor should put
+rem  the editor on screen and nothing else, so by default this hands itself to
+rem  BuzzAnimate.vbs, which runs it hidden and puts anything that goes wrong in
+rem  a dialog box. That holds however it is started: the desktop shortcut, a
+rem  double-click on this file, or a terminal.
+rem
+rem  `--dev` and `--console` keep the window, because that is where the adapter
+rem  table, the tracing output, a panic's backtrace and the build itself go -
+rem  which is what you want when you are the one changing the sources.
 rem ===========================================================================
 
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
+rem  This folder, captured before anything else touches the arguments.
+rem  `shift` in the parse loop below shifts %0 along with the rest, so after it
+rem  `%~dp0` is the directory of whatever argument ended up there - open a
+rem  document with this launcher and it became the document's folder, and the
+rem  hand-off below went looking for BuzzAnimate.vbs beside the .buzz file.
+set "HERE=%~dp0"
+
 set "PROFILE=release"
 set "PROFILE_DIR=release"
 set "ARGS="
 
-rem --- pull `--dev` out of the arguments; pass everything else through ------
+rem --- pull `--dev` and `--console` out; pass everything else through -------
 :parse
 if "%~1"=="" goto parsed
 if /I "%~1"=="--dev" (
     set "PROFILE=dev"
     set "PROFILE_DIR=debug"
+) else if /I "%~1"=="--console" (
+    set "WANT_CONSOLE=1"
 ) else (
     set "ARGS=!ARGS! "%~1""
 )
 shift
 goto parse
 :parsed
+
+rem --- no console unless one was actually asked for --------------------------
+rem
+rem  Opening the editor should put the editor on screen and nothing else. But
+rem  Windows hands a batch file a console before a single line of it has run,
+rem  so double-clicking this one always showed a black window beside the
+rem  editor for as long as the build took. It cannot be prevented from in here
+rem  - it can only be handed off: BuzzAnimate.vbs runs a fresh copy of this
+rem  file with no console at all, so what is left is a flash rather than a
+rem  window that sits there. The desktop shortcut goes straight to the .vbs
+rem  and does not flash either; this is the safety net for anyone who opens
+rem  the folder and double-clicks the launcher instead.
+rem
+rem  **Asked for, not guessed at.** The obvious trick is to sniff
+rem  `%cmdcmdline%` for this file's name and call that a double-click. It is
+rem  wrong: PowerShell runs a .bat as `cmd /c "<path>"` too, so running it
+rem  from a terminal looked exactly like a double-click and the build output
+rem  a developer had just asked for went to a log nobody was watching. So the
+rem  console is kept when it is *requested* - `--dev`, which exists for the
+rem  adapter table and the backtraces, or `--console` for watching a release
+rem  build go past - and not otherwise. BUZZ_SILENT means the .vbs is already
+rem  the caller, and handing back to it would be a loop.
+if defined BUZZ_SILENT goto :keep_console
+if defined WANT_CONSOLE goto :keep_console
+if "%PROFILE%"=="dev" goto :keep_console
+if not exist "%HERE%BuzzAnimate.vbs" goto :keep_console
+start "" wscript.exe "%HERE%BuzzAnimate.vbs" %*
+exit /b 0
+:keep_console
 
 where cargo >nul 2>&1
 if errorlevel 1 (

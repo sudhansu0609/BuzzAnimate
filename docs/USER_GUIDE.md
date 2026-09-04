@@ -1002,6 +1002,39 @@ Pixels are the one thing in this program you cannot bucket-fill, reshape, tween 
 
 ---
 
+### Rendering Without Opening the Program (`--brief`, `--render`)
+
+Everything needed to make a film without a person was already built — the director, the staging, the scenery, the performances, the reel, the encoders — and none of it could be reached without opening a window and clicking. That is the difference between a program that *helps you animate* and one you can hand a brief to and walk away from.
+
+```
+buzzanimate --brief story.txt --render film.mp4 --height 1080
+buzzanimate project.buzz --render film.mov
+buzzanimate project.buzz --brief extra-shots.txt --render film.mp4
+```
+
+| Flag | What it does |
+|---|---|
+| `--brief <file>` | Prose to direct into a film. One scene per shot, exactly as `Direct a Story` does |
+| `--render <file>` | Render and **exit**, opening no window. The extension picks the format |
+| `--height <px>` | Target height; the width follows the document's aspect, rounded even |
+| `--gpu <name or index>` | Force an adapter, as it always did |
+
+Give both a document and a brief and the brief is directed **into** the document — which is how a scripted pipeline adds shots to a set somebody built by hand.
+
+**Formats** follow the file name: `.mp4`, `.mov`, `.gif`, `.webp`, and `.png` for a still of the first frame. An extension nothing renders to is refused before any work is done.
+
+**It is the same export the Tasks panel runs.** One `ExportRequest`, one encoder path, one set of settings — so what comes out of an overnight render is what would have come out of the dialog.
+
+**And it exits non-zero when it fails**, with the reason on stderr, so whatever scheduled it can tell. A brief nothing could be read out of names the file *and* carries the director's own complaint:
+
+```
+Render failed: nothing in story.txt could be directed — Could not direct that
+brief — shot 1: no line of that story named someone doing something — try
+"Ana walks in from the left. Ana talks to Ben."
+```
+
+---
+
 ### 18.1 File Import Support
 - **Adobe Animate Projects**: Reads uncompressed `.xfl` and modern `.fla` archives.
 - **Adobe Flash SWF**: Extracts vector shapes, morphs, and symbol definitions from `.swf`.
@@ -1195,10 +1228,12 @@ fl.trace("Created 10 vector circles successfully!");
 - [Blend Modes (Multiply, Screen, Add...)](#14-vector-filters--blend-modes)
 - [Blink (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
 - [Body Actions (Sit, Point, React…)](#17-production-staging-directing--motion-that-runs-itself)
+- [Brief to Film (`--brief`)](#18-import--export-pipelines)
 - [Blur Filter](#14-vector-filters--blend-modes)
 - [Bitmap Tracing](#18-import--export-pipelines)
 - [Captions (SRT Import / Export)](#16-soundtrack-waveforms--automated-lip-sync)
 - [Backgrounds from a Brief](#17-production-staging-directing--motion-that-runs-itself)
+- [Command-Line Rendering](#18-import--export-pipelines)
 - [Bone Tool (`M`)](#12-rigging-fabrik-inverse-kinematics--warping)
 - [Break Apart (`Ctrl + B`)](#5-the-vector-drawing-engine-merge-shapes-vs-object-drawing)
 - [Brush Tool (`B`) & Types](#7-advanced-brushes-patterns--gradients)
@@ -1341,6 +1376,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Reverse Frames](#8-timeline-mastery--frame-by-frame-animation)
 - [React (Recoil)](#17-production-staging-directing--motion-that-runs-itself)
 - [Rain from a Storm](#17-production-staging-directing--motion-that-runs-itself)
+- [Rendering Headlessly (`--render`)](#18-import--export-pipelines)
 - [Reset Workspace](#20-workspace-customization--layouts)
 - [Rigging Panel](#12-rigging-fabrik-inverse-kinematics--warping)
 
@@ -1356,6 +1392,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [SRT Subtitles](#16-soundtrack-waveforms--automated-lip-sync)
 - [Sit and Stand Up](#17-production-staging-directing--motion-that-runs-itself)
 - [Scenery (Set Filling)](#17-production-staging-directing--motion-that-runs-itself)
+- [Scheduled / Overnight Renders](#18-import--export-pipelines)
 - [Subselection Tool (`A`)](#6-comprehensive-23-tool-catalogue)
 - [Sun (Directional Light)](#13-studio-vector-lighting--shadow-engine)
 - [Swap Symbol](#11-symbols-instances--the-library)

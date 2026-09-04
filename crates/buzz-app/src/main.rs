@@ -43,8 +43,37 @@ fn main() -> Result<()> {
         .init();
 
     // `--gpu <substring>` forces a specific adapter; `--script <file>` runs a
-    // script over the document once it is open.
+    // script over the document once it is open; `--brief <file>` and
+    // `--render <file>` make a film without opening one at all.
     let args = Args::parse(std::env::args().skip(1));
+
+    // **`--render` never opens a window.**
+    //
+    // This is the whole of the unattended path: a brief or a document in, a
+    // film out, and an exit code whatever scheduled it can read. It has to come
+    // before the event loop is built — an overnight render on a machine nobody
+    // is sitting at must not be waiting on one — and it exits rather than
+    // falling through, because a render that then opened the editor would be a
+    // render nobody could run from a batch file.
+    if let Some(output) = args.render.clone() {
+        let job = buzz_app::headless::RenderJob {
+            document: args.document.clone(),
+            brief: args.brief.clone(),
+            output,
+            height: args.height,
+            gpu: args.gpu.clone(),
+        };
+        return match buzz_app::headless::render(&job) {
+            Ok(message) => {
+                eprintln!("{message}");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("Render failed: {e:#}");
+                std::process::exit(1);
+            }
+        };
+    }
 
     // A user-event loop so egui (and background installs) can wake it from an
     // idle wait; `ControlFlow::Wait` is the default, and the app raises it to
@@ -113,6 +142,13 @@ struct Args {
     document: Option<std::path::PathBuf>,
     /// A script to run once the document is open.
     script: Option<std::path::PathBuf>,
+    /// **Render and exit**, opening no window. The path's extension chooses the
+    /// format.
+    render: Option<std::path::PathBuf>,
+    /// A file of prose to direct into a film before rendering it.
+    brief: Option<std::path::PathBuf>,
+    /// Target height in pixels for a render; the width follows the aspect.
+    height: Option<u32>,
 }
 
 impl Args {
@@ -127,6 +163,9 @@ impl Args {
             gpu: GpuPreference::Automatic,
             document: None,
             script: None,
+            render: None,
+            brief: None,
+            height: None,
         };
 
         let mut i = 0;
@@ -145,6 +184,24 @@ impl Args {
                 "--script" => {
                     if let Some(v) = value {
                         out.script = Some(std::path::PathBuf::from(v));
+                        i += 1;
+                    }
+                }
+                "--render" => {
+                    if let Some(v) = value {
+                        out.render = Some(std::path::PathBuf::from(v));
+                        i += 1;
+                    }
+                }
+                "--brief" => {
+                    if let Some(v) = value {
+                        out.brief = Some(std::path::PathBuf::from(v));
+                        i += 1;
+                    }
+                }
+                "--height" => {
+                    if let Some(v) = value {
+                        out.height = v.parse().ok();
                         i += 1;
                     }
                 }

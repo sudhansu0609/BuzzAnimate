@@ -149,10 +149,11 @@ pub fn lay(
         return out;
     }
     let stage = scene.stage().stage_rect();
-    // Wider than the stage, for the same reason the backdrop is: a camera that
-    // pans must not run off the end of the treeline.
-    let x0 = stage.x0 - stage.width() * 0.5;
-    let x1 = stage.x1 + stage.width() * 0.5;
+    // Wider than the stage, and by the same margin the backdrop uses: a camera
+    // following somebody into the wings must not run off the end of the
+    // treeline any more than it may run off the end of the sky.
+    let x0 = stage.x0 - stage.width();
+    let x1 = stage.x1 + stage.width();
 
     // (name, kind, y, size, colour, depth) — back to front.
     //
@@ -331,7 +332,7 @@ pub fn weather_for(setting: Setting) -> Option<EffectKind> {
 pub fn lay_weather(scene: &mut Scene, kind: EffectKind) -> SceneryReport {
     let mut out = SceneryReport::default();
     let stage = scene.stage().stage_rect();
-    let wide = stage.inflate(stage.width() * 0.5, stage.height() * 0.5);
+    let wide = stage.inflate(stage.width(), stage.height());
 
     // Weather fills the frame rather than standing on a line, so the stroke is
     // drawn down the shot rather than across it.

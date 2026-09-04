@@ -137,6 +137,22 @@ pub enum TaskOutcome {
 pub struct ProgressSink(Arc<Mutex<TaskProgress>>);
 
 impl ProgressSink {
+    /// **A sink attached to nothing**, for work running outside the registry.
+    ///
+    /// A headless render has no Tasks panel to draw a bar in and no window to
+    /// draw it on, but `run_export` reports through one regardless — so it gets
+    /// somewhere to report that nobody reads. Cheaper and far less invasive
+    /// than threading an `Option` through every task that already works.
+    pub fn detached() -> Self {
+        Self(Arc::new(Mutex::new(TaskProgress::default())))
+    }
+
+    /// What has been reported so far, for a caller polling it themselves.
+    pub fn read(&self) -> (u64, u64) {
+        let p = lock(&self.0);
+        (p.done, p.total)
+    }
+
     pub fn set(&self, done: u64, total: u64) {
         let mut p = lock(&self.0);
         p.done = done;

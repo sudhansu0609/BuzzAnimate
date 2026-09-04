@@ -62,10 +62,15 @@ choice; neither is reachable from a script.
 you animate" and "you hand it a brief at midnight and read the mp4 at
 breakfast".
 
-**What it needs.** Roughly six host calls — `directSequence`, `setScene`,
-`addLight`, `lipSync`, `exportWith(preset)`, `saveAs` — plus a
-`--render <preset>` flag on the binary. Everything underneath them exists and
-is tested; this is wiring, not new machinery.
+**Shipped, and by the other route.** `--brief <file> --render <file>` makes a
+film with no window, no event loop and an exit code, reusing the same
+`run_export` the Tasks panel calls.
+
+**The scripting half was the wrong design.** Six host calls would have had to
+reach export and file IO from inside a sandboxed QuickJS that deliberately
+cannot touch either — the interpreter that must be *least* able to break the
+program is the wrong place to put the encoder. The CLI needed none of that and
+gets the same result.
 
 ---
 
@@ -315,11 +320,13 @@ For this animator, in this order:
    first, because that is the direction carrying information the document did
    not have.
 
-The queue is now led by the **script/CLI reach** (§2.1) — the last thing
-standing between this and handing over a brief at midnight and reading the mp4
-at breakfast. After that, the two halves of §2.5 still outstanding: the
-director's own camera keys carry no ease, and nothing snaps a cut to a
-detected beat.
+**The end-to-end path is closed**: a brief at midnight is an mp4 at breakfast.
+
+What is left is refinement rather than reach. The director's own camera keys
+carry no ease (§2.5); nothing snaps a cut to a detected beat; the interior
+setting still gets a bare wall (§2.4); and the scripting API is still
+scene-only, which is right for what it is and worth saying out loud rather than
+leaving as an apparent gap.
 
 Also shipped since this audit was written, from the requests side rather than
 this list: the **`Turn` modifier** (a face turns from one drawing, §2.6), and

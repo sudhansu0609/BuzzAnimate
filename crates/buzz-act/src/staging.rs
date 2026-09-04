@@ -316,7 +316,13 @@ pub fn build(scene: &mut Scene, recipe: &SceneRecipe) -> StagedScene {
     // sky — and a background that stops exactly at the stage rectangle is the
     // commonest way that happens. Half a stage of margin all round is cheap:
     // it is two rectangles.
-    let wide = stage.inflate(stage.width() * 0.5, stage.height() * 0.5);
+    // **A whole stage of margin, not half.** Half was enough for a camera that
+    // stayed put and not for one that follows somebody into the wings: the
+    // director sends an entrance to 0.16 stages off-stage and then frames it
+    // wide, and at any zoom under about 1.5 the near edge of the shot ran off
+    // the end of the sky — a grey band down the side of the picture, which is
+    // what the first unattended render came back with.
+    let wide = stage.inflate(stage.width(), stage.height());
 
     let (sky_top, sky_bottom) = recipe.setting.backdrop();
     let backdrop = scene.add_stage_layer("Sky", LayerKind::Normal);

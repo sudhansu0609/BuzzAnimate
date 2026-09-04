@@ -63,6 +63,9 @@ pub enum Command {
     /// **Write the caption layer back out as `.srt`**, to upload beside the
     /// film.
     ExportCaptions,
+    /// **Lip-sync every character from the caption layer**, each over their own
+    /// lines and nobody else's. See `Editor::lip_sync_from_captions`.
+    LipSyncFromCaptions,
 
     // Edit
     Undo,
@@ -386,6 +389,7 @@ impl Command {
             FitToNarration => "Fit to Narration",
             ImportCaptions => "Import Captions (.srt)\u{2026}",
             ExportCaptions => "Export Captions (.srt)\u{2026}",
+            LipSyncFromCaptions => "Lip Sync from Captions",
 
             Undo => "Undo",
             Redo => "Redo",
@@ -648,7 +652,7 @@ impl Command {
             ShortcutEditor => None,
             DetectBeats => None,
             FitToNarration => None,
-            ImportCaptions | ExportCaptions => None,
+            ImportCaptions | ExportCaptions | LipSyncFromCaptions => None,
             NewReferenceLayer | ImportVideoReference | SelectSameColour
             | ExposeOnTwos | ExposeOnThrees | PaintThrough | ImportSequenceFolder
             | RetargetPerformance | SwapSymbol => None,
@@ -908,6 +912,7 @@ pub fn palette_commands() -> Vec<Command> {
         FitToNarration,
         ImportCaptions,
         ExportCaptions,
+        LipSyncFromCaptions,
     ]
 }
 
@@ -1077,6 +1082,7 @@ mod tests {
             FitToNarration,
             ImportCaptions,
             ExportCaptions,
+            LipSyncFromCaptions,
         ]
     }
 

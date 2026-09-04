@@ -803,8 +803,13 @@ impl Editor {
 
         // The words are shaped before the document is touched, so a font that
         // cannot be found leaves no half-made layer behind.
-        let mut drawn: Vec<(std::ops::Range<u32>, buzz_geom::BezPath, buzz_scene::TextData, f64)> =
-            Vec::new();
+        let mut drawn: Vec<(
+            std::ops::Range<u32>,
+            buzz_geom::BezPath,
+            buzz_scene::TextData,
+            f64,
+            Option<String>,
+        )> = Vec::new();
         for cue in &caps.cues {
             let data = buzz_scene::TextData {
                 content: cue.text.clone(),
@@ -823,7 +828,7 @@ impl Editor {
                 continue;
             };
             let (width, _) = buzz_text::measure_styled(&cue.text, size, None, data.style);
-            drawn.push((cue.frames(fps), path, data, width));
+            drawn.push((cue.frames(fps), path, data, width, cue.speaker.clone()));
         }
         if drawn.is_empty() {
             anyhow::bail!("no font available to draw those captions with");
@@ -838,7 +843,7 @@ impl Editor {
                     l.frames.insert_frame(l.frames.length());
                 }
             });
-            for (range, path, data, width) in &drawn {
+            for (range, path, data, width, speaker) in &drawn {
                 scene.update_layer(layer, |l| {
                     l.frames.insert_blank_keyframe(range.start);
                     // **And a blank one where it ends**, or the last caption of
@@ -846,6 +851,18 @@ impl Editor {
                     // where the next one does not already start there.
                     if !l.frames.is_keyframe(range.end) && range.end < l.frames.length() {
                         l.frames.insert_blank_keyframe(range.end);
+                    }
+                    // **The speaker goes on the keyframe's label.**
+                    //
+                    // Which is a frame label — Animate's own idea — and so it
+                    // is visible in the timeline, editable by hand when the
+                    // detection got somebody wrong, and saved with the
+                    // document without a new field. It is also what
+                    // `Lip Sync from Captions` reads to know whose line this
+                    // is; a name buried in a struct nobody can see would have
+                    // meant a mis-detected speaker was unfixable.
+                    if let Some(who) = speaker {
+                        l.frames.set_label(range.start, Some(who.clone()));
                     }
                 });
                 if let Some(id) = scene.add_shape_at(
@@ -886,6 +903,210 @@ impl Editor {
             ),
         });
         Ok(n)
+    }
+
+    /// **Lip-sync every character from the caption layer**, each over their own
+    /// lines and nobody else's.
+    ///
+    /// # The gap this closes
+    ///
+    /// Lip sync could already turn a soundtrack into mouth shapes, but only
+    /// *one mouth against the whole track*: run it on Ana and she mouths Ben's
+    /// lines too. That is fine for a monologue and useless for a conversation,
+    /// which is most of what a story is.
+    ///
+    /// What was missing was never the analysis. It was knowing **who is
+    /// speaking and when** — and an imported subtitle file says exactly that.
+    /// So this reads the caption layer's frame labels for the cast, slices the
+    /// viseme track to each line's own frames, and writes each slice onto that
+    /// character's own layer. Two people talking, each animated only while they
+    /// are talking.
+    ///
+    /// # How a speaker is matched to a mouth
+    ///
+    /// **By name.** A speaker called `Ana` drives the library symbol whose name
+    /// matches `Ana` — exactly, or as a word inside it, so `Ana Mouth` and
+    /// `Ana_mouth` both work — and the keyframes go on a layer of that name,
+    /// made if there is not one.
+    ///
+    /// Matching by name rather than asking is what makes this worth running: a
+    /// dialog with a row per speaker is the same work as doing it by hand once
+    /// there are more than about three of them. A speaker with no matching
+    /// symbol is reported by name rather than skipped in silence, because the
+    /// fix — rename the symbol — is one the message can state outright.
+    ///
+    /// # The mouth closes at the end of every line
+    ///
+    /// A rest shape is appended to each slice. Without it the last shape of a
+    /// line holds until the character's next line, which leaves them frozen
+    /// mid-vowel through everybody else's dialogue.
+    pub fn lip_sync_from_captions(&mut self) -> anyhow::Result<usize> {
+        let Some(captions) = self.active_layer() else {
+            anyhow::bail!("there is no layer to take captions from");
+        };
+        let scene = self.doc.scene();
+        let fps = scene.stage().frame_rate.max(1.0);
+
+        let Some((_, sound_start, clip)) = self.sound.stage_track(scene) else {
+            anyhow::bail!("there is no soundtrack to sync to");
+        };
+
+        // The lines, from the caption layer: a labelled keyframe that holds
+        // text is somebody's line, and it runs to the next keyframe.
+        let Some(layer) = scene.layers().get(captions) else {
+            anyhow::bail!("there is no layer to take captions from");
+        };
+        let starts: Vec<u32> = layer.frames.keyframes().iter().map(|k| k.start).collect();
+        let length = layer.frames.length();
+        let mut lines: Vec<(String, std::ops::Range<u32>)> = Vec::new();
+        for (i, key) in layer.frames.keyframes().iter().enumerate() {
+            let Some(who) = key.label.clone() else { continue };
+            let has_text = layer
+                .frames
+                .resolved_at(key.start)
+                .iter()
+                .any(|o| o.text.is_some());
+            if !has_text {
+                continue;
+            }
+            let end = starts.get(i + 1).copied().unwrap_or(length);
+            lines.push((who, key.start..end.max(key.start + 1)));
+        }
+        if lines.is_empty() {
+            anyhow::bail!(
+                "no line on this layer names a speaker \u{2014} import captions that say \
+                 who is talking, or label the keyframes yourself"
+            );
+        }
+
+        // The whole track once, then sliced per line. Analysing per line would
+        // re-window the audio at every cue boundary and give a different answer
+        // at the seams than a single pass does.
+        let track = buzz_audio::analyse_visemes(
+            clip.as_ref(),
+            fps,
+            &buzz_audio::LipSyncOptions::default(),
+        );
+        if track.is_empty() {
+            anyhow::bail!("that soundtrack analysed to nothing");
+        }
+
+        // Each speaker's mouth symbol, matched by name.
+        let needed = buzz_audio::Viseme::COUNT;
+        let mut cast: Vec<String> = Vec::new();
+        for (who, _) in &lines {
+            if !cast.iter().any(|c| c.eq_ignore_ascii_case(who)) {
+                cast.push(who.clone());
+            }
+        }
+        let mouth_for = |who: &str| -> Option<buzz_scene::SymbolId> {
+            scene
+                .library()
+                .iter()
+                .filter(|s| s.length() >= needed && name_mentions(&s.name, who))
+                // The closest match wins, so `Ana` beats `Ana and Ben` when
+                // both exist.
+                .min_by_key(|s| s.name.chars().count())
+                .map(|s| s.id)
+        };
+
+        let mut jobs: Vec<(String, buzz_scene::SymbolId, Vec<std::ops::Range<u32>>)> = Vec::new();
+        let mut unmatched: Vec<String> = Vec::new();
+        for who in &cast {
+            match mouth_for(who) {
+                Some(mouth) => {
+                    let spans = lines
+                        .iter()
+                        .filter(|(w, _)| w.eq_ignore_ascii_case(who))
+                        .map(|(_, r)| r.clone())
+                        .collect();
+                    jobs.push((who.clone(), mouth, spans));
+                }
+                None => unmatched.push(who.clone()),
+            }
+        }
+        if jobs.is_empty() {
+            anyhow::bail!(
+                "no mouth symbol matches {} \u{2014} name a symbol after the speaker \
+                 (at least {needed} frames, one per shape)",
+                unmatched.join(" or ")
+            );
+        }
+
+        // Where a mouth sits, if the character's layer already has one; the
+        // middle of the stage otherwise, to be dragged into place.
+        let stage_centre = scene.stage().stage_rect().center();
+
+        let mut written = 0usize;
+        let mut done: Vec<String> = Vec::new();
+        self.doc.edit("Lip Sync from Captions", |scene| {
+            for (who, mouth, spans) in &jobs {
+                let existing = scene
+                    .layers()
+                    .iter()
+                    .find(|l| l.name.eq_ignore_ascii_case(who))
+                    .map(|l| l.id);
+                let target = match existing {
+                    Some(id) => id,
+                    None => scene.add_layer(who.clone(), LayerKind::Normal),
+                };
+
+                // Keep whatever placement the character's mouth already has, so
+                // running this twice does not move it back to the middle.
+                let placement = scene
+                    .layers()
+                    .get(target)
+                    .and_then(|l| {
+                        let frames: Vec<u32> =
+                            l.frames.keyframes().iter().map(|k| k.start).collect();
+                        frames.into_iter().find_map(|at| {
+                            l.frames
+                                .resolved_at(at)
+                                .iter()
+                                .find(|o| matches!(o.kind, ObjectKind::Instance(_)))
+                                .map(|o| o.transform)
+                        })
+                    })
+                    .unwrap_or_else(|| Affine::translate(stage_centre.to_vec2()));
+
+                for span in spans {
+                    // The line's own frames, in the track's own numbering.
+                    let from = span.start.saturating_sub(sound_start) as usize;
+                    let to = (span.end.saturating_sub(sound_start) as usize).min(track.len());
+                    if from >= to {
+                        continue;
+                    }
+                    let mut frames = track.frames[from..to].to_vec();
+                    // **Closed at the end of the line.** Without it the last
+                    // shape holds until this character speaks again, leaving
+                    // them frozen mid-vowel through everybody else's dialogue.
+                    frames.push(buzz_audio::Viseme::Rest);
+                    let slice = buzz_audio::VisemeTrack { frames, fps };
+
+                    let report = crate::lipsync::write_track(
+                        scene,
+                        &slice,
+                        span.start,
+                        target,
+                        *mouth,
+                        placement,
+                    );
+                    written += report.keyframes as usize;
+                }
+                done.push(who.clone());
+            }
+        });
+        self.doc.end_gesture();
+
+        self.status = Some(match unmatched.is_empty() {
+            true => format!("Lip sync: {written} keyframes for {}", done.join(", ")),
+            false => format!(
+                "Lip sync: {written} keyframes for {} \u{2014} no mouth symbol named {}",
+                done.join(", "),
+                unmatched.join(" or ")
+            ),
+        });
+        Ok(written)
     }
 
     /// **Write the active layer's captions back out as `.srt`.**
@@ -3536,6 +3757,11 @@ impl Editor {
             // The dialogs belong to the shell, which raises these back with a
             // path — the same route Import Sound and every export take.
             ImportCaptions | ExportCaptions => {}
+            LipSyncFromCaptions => {
+                if let Err(e) = self.lip_sync_from_captions() {
+                    self.status = Some(format!("{e}"));
+                }
+            }
 
             ToggleActionsPanel => {
                 self.workspace.toggle(buzz_ui::PanelId::Actions);
@@ -7221,6 +7447,21 @@ fn update_object(scene: &mut Scene, at: EditAt, id: ObjectId, f: impl FnMut(&mut
 }
 
 /// Edit a shape in place, ignoring groups.
+/// **Does `name` name `who`** — exactly, or as a word inside it?
+///
+/// `Ana` matches `Ana`, `Ana Mouth` and `Ana_mouth`, and does not match
+/// `Anabel` or `Banana`. Word-bounded rather than a substring search, because
+/// a substring match would have `Ana` driving `Anabel`'s mouth and the animator
+/// would spend an hour looking for the reason.
+fn name_mentions(name: &str, who: &str) -> bool {
+    if name.eq_ignore_ascii_case(who) {
+        return true;
+    }
+    let boundary = |c: char| !c.is_alphanumeric();
+    name.split(boundary)
+        .any(|word| word.eq_ignore_ascii_case(who))
+}
+
 fn update_shape(scene: &mut Scene, at: EditAt, id: ObjectId, mut f: impl FnMut(&mut ShapeData)) {
     update_object(scene, at, id, |o| {
         if let ObjectKind::Shape(shape) = &mut o.kind {

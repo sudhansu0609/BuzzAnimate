@@ -140,7 +140,7 @@ pub fn parse(text: &str) -> Captions {
     // Blocks are separated by blank lines. Carriage returns are stripped per
     // line rather than up front, so a file with mixed endings still splits.
     let mut block: Vec<&str> = Vec::new();
-    let mut flush = |block: &mut Vec<&str>, cues: &mut Vec<Cue>, skipped: &mut usize| {
+    let flush = |block: &mut Vec<&str>, cues: &mut Vec<Cue>, skipped: &mut usize| {
         if block.is_empty() {
             return;
         }

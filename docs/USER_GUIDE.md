@@ -666,6 +666,34 @@ A file with *nothing* readable in it is refused outright — that means the wron
 
 ---
 
+### Lip Sync from Captions (`File ▸ Lip Sync from Captions`)
+
+Lip sync on its own drives **one mouth against the whole soundtrack** — run it on Ana and she mouths Ben's lines too. Fine for a monologue, useless for a conversation, which is most of what a story is.
+
+What was missing was never the analysis. It was knowing **who is speaking and when** — and an imported subtitle file says exactly that. So:
+
+1. **Import the dialogue** (`File ▸ Import Sound…`).
+2. **Import captions that name the speakers** — `Ana: We should go.` (§ above).
+3. Give each character a **mouth symbol named after them**: `Ana`, or `Ana Mouth`, or `Ana_mouth`. At least 10 frames, one per shape — `File ▸ New Mouth Symbol` makes one to draw over.
+4. With the caption layer selected, **`File ▸ Lip Sync from Captions`**.
+
+Each character gets mouth keyframes **over their own lines and nobody else's**, on a layer of their own name (made if there is not one).
+
+| The rule | Why |
+|---|---|
+| A speaker is matched to a symbol **by name**, exactly or as a word inside it | A dialog with a row per speaker is the same work as doing it by hand once there are more than about three of them |
+| Word-bounded, so `Ana` does not match `Anabel` | A substring match would have Ana driving Anabel's mouth, and you would spend an hour looking for the reason |
+| The closest name wins | So `Ana` beats `Ana and Ben` when both exist |
+| A speaker with **no matching symbol is named** in the status line | The fix is to rename the symbol, and the message can say so outright |
+| **The mouth closes at the end of every line** | Otherwise the last shape holds until that character speaks again, leaving them frozen mid-vowel through everybody else's dialogue |
+| An existing mouth's **placement is kept** | Running it twice does not drag the mouth back to the middle of the stage |
+
+**Who is speaking is stored on the caption keyframe's label** — a frame label, Animate's own idea. That means it is **visible in the timeline and editable by hand**: if the import got somebody wrong, retype the label and run this again. A name buried where you could not see it would have made a mis-detected speaker unfixable.
+
+> The whole track is analysed **once** and then sliced per line. Analysing each line separately would re-window the audio at every cue boundary and give a different answer at the seams than a single pass does.
+
+---
+
 ### Fitting the Timeline to a Narration (`File ▸ Fit to Narration`)
 
 A narrated film is timed by audio that already exists and cannot move. Every shot length and every cut is fitted to it — and fitting them by dragging keyframes against a waveform by eye is the single largest block of time in a week of that work. The soundtrack already says where the lines are.
@@ -1129,6 +1157,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Daylight Staging](#17-production-staging-directing--motion-that-runs-itself)
 - [Direct a Story](#17-production-staging-directing--motion-that-runs-itself)
 - [Drift (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
+- [Dialogue Routed to a Character](#16-soundtrack-waveforms--automated-lip-sync)
 - [Dockable Panels](#20-workspace-customization--layouts)
 - [Drop Shadow Filter](#14-vector-filters--blend-modes)
 
@@ -1195,6 +1224,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Live Motion Modifiers](#17-production-staging-directing--motion-that-runs-itself)
 - [Look At (Live Motion)](#17-production-staging-directing--motion-that-runs-itself)
 - [Line Weight (`[` and `]`)](#7-advanced-brushes-patterns--gradients)
+- [Lip Sync from Captions](#16-soundtrack-waveforms--automated-lip-sync)
 - [Looping Timeline Sections](#8-timeline-mastery--frame-by-frame-animation)
 
 ### M
@@ -1205,6 +1235,7 @@ fl.trace("Created 10 vector circles successfully!");
 - [Motion Editor & Easing](#10-tweens--the-motion-editor)
 - [Motion Path Tool (`J`)](#10-tweens--the-motion-editor)
 - [Motion Tweens](#10-tweens--the-motion-editor)
+- [Multi-Character Lip Sync](#16-soundtrack-waveforms--automated-lip-sync)
 - [Mouth Symbols (10 Visemes)](#16-soundtrack-waveforms--automated-lip-sync)
 - [MovieClip Symbols](#11-symbols-instances--the-library)
 

@@ -89,11 +89,16 @@ no notion of a quoted line of dialogue at all.
 second of it is hand-wired. The frame ranges the automation would need are
 already computed and thrown away.
 
-**Half the input now exists.** An imported SRT (3.2 §3) carries the words, the
-timings and — where the file names one — the speaker. What is still missing is
-the join: nothing routes a named cue to that character's mouth symbol and runs
-`analyse_visemes` over the span. **That is now the largest remaining item in
-this document.**
+**Shipped.** `File ▸ Lip Sync from Captions` reads the caption layer's frame
+labels for the cast, matches each speaker to a mouth symbol of that name,
+slices the viseme track to each line's own frames and writes it onto that
+character's layer — closing the mouth at the end of every line. Two people
+talking, each animated only while they are talking.
+
+**What remains of §2.2** is the other half: the *director* still does not write
+`Talk` beats fitted to a real line's length, and nothing creates the mouth
+symbols or places them on a character. The dialogue-to-mouth path is done; the
+dialogue-to-*performance* path is not.
 
 ---
 
@@ -302,10 +307,10 @@ For this animator, in this order:
    first, because that is the direction carrying information the document did
    not have.
 
-The queue is now led by **dialogue routed to a character** (§2.2): an imported
-cue that names a speaker, matched to that character's mouth, with
-`analyse_visemes` run over the cue's own frames. Every piece of it exists
-separately.
+The queue is now led by **the director's four verbs** (§2.3) — the cheapest
+remaining win by a wide margin, since `perform::pose_at` is a readable table of
+curves written to be extended, and every beat a writer types that is not walk,
+run, talk or wait is currently handed back to them to rephrase.
 
 Also shipped since this audit was written, from the requests side rather than
 this list: the **`Turn` modifier** (a face turns from one drawing, §2.6), and
@@ -333,11 +338,12 @@ Ordered by hours-saved per hour-spent building it, the queue is:
 5. **Scenery from the effect brushes** (2.4)
 6. Turnarounds, crowds, batch export (2.6–2.8)
 
-And from the animator's side of the desk (Part 3): **dialogue routed from an
-imported caption to a character's mouth** is now the largest win left — every
-piece of it exists and nothing joins them. Auto-blink, eased named camera moves,
-narration-driven timing and captions in and out have all shipped since this
-audit was written, along with the head turn and bitmap tracing.
+And from the animator's side of the desk (Part 3), what is left is mostly
+**scenery** (2.4), **a timing pass on generated poses** (2.5) and the
+**script/CLI reach** that would let a brief run unattended (2.1). Auto-blink,
+eased named camera moves, narration-driven timing, captions in and out, and
+dialogue routed to each character's mouth have all shipped since this audit was
+written, along with the head turn and bitmap tracing.
 
 ---
 

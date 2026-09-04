@@ -207,7 +207,7 @@ pub fn trace(width: u32, height: u32, pixels: &[u8], options: &TraceOptions) -> 
         while let Some(at) = stack.pop() {
             cells.push(at);
             let (x, y) = (at % w, at / w);
-            let mut push = |nx: usize, ny: usize, stack: &mut Vec<usize>, seen: &mut Vec<bool>| {
+            let push = |nx: usize, ny: usize, stack: &mut Vec<usize>, seen: &mut Vec<bool>| {
                 let n = ny * w + nx;
                 if !seen[n] && index[n] == Some(colour) {
                     seen[n] = true;

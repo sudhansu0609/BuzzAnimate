@@ -1608,6 +1608,21 @@ impl Editor {
         }
     }
 
+    /// **Use this interface theme**, and remember it.
+    ///
+    /// Both ways in land here — the Window menu picking one by name, and the
+    /// shortcut stepping to the next — so the theme is stored, persisted and
+    /// reported in one place rather than in each of them.
+    fn set_theme(&mut self, theme: buzz_ui::theme::Theme) {
+        buzz_ui::theme::set_theme(theme);
+        self.workspace.theme = theme;
+        self.workspace.save();
+        // The context is restyled by the shell, which owns it; this records
+        // what the chrome should now be.
+        self.restyle = true;
+        self.status = Some(format!("{} interface", theme.label()));
+    }
+
     /// **Place a text object** at `at`. The glyph outlines are shaped here (the
     /// editor holds the font) and stored as an ordinary filled shape; the string
     /// rides along on `Object::text` so it stays editable.
@@ -3165,16 +3180,8 @@ impl Editor {
                 );
                 self.workspace.save();
             }
-            ToggleTheme => {
-                let next = buzz_ui::theme::theme().other();
-                buzz_ui::theme::set_theme(next);
-                self.workspace.theme = next;
-                self.workspace.save();
-                // The context is restyled by the shell, which owns it; this
-                // records what the chrome should now be.
-                self.restyle = true;
-                self.status = Some(format!("{} interface", next.label()));
-            }
+            ToggleTheme => self.set_theme(buzz_ui::theme::theme().next()),
+            SetTheme(theme) => self.set_theme(theme),
             About => self.about.open = true,
             ResetWorkspace => {
                 // The layout, and only the layout: the theme, the new-document

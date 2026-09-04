@@ -908,9 +908,13 @@ impl App {
         let attrs = Window::default_attributes()
             .with_title("BuzzAnimate")
             .with_window_icon(window_icon())
-            .with_theme(Some(match scheme {
-                buzz_ui::theme::Theme::Dark => winit::window::Theme::Dark,
-                buzz_ui::theme::Theme::Light => winit::window::Theme::Light,
+            // The system titlebar has two states, not six: what it needs to
+            // know is whether the window it is framing is dark, so that its
+            // own buttons are drawn to contrast with it.
+            .with_theme(Some(if scheme.is_dark() {
+                winit::window::Theme::Dark
+            } else {
+                winit::window::Theme::Light
             }))
             // **Hidden until there is something in it.**
             //

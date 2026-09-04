@@ -155,8 +155,11 @@ pub enum Command {
     TogglePanel(super::workspace::PanelId),
     /// Stop the layout being rearranged by accident.
     ToggleLayoutLock,
-    /// Switch between the dark and the light interface.
+    /// Step to the next interface theme, wrapping. The keyboard's way in;
+    /// the Window menu offers them by name instead.
     ToggleTheme,
+    /// Use this interface theme.
+    SetTheme(super::theme::Theme),
     /// Help ▸ About BuzzAnimate.
     About,
     /// Put every panel back where it started.
@@ -408,7 +411,8 @@ impl Command {
 
             TogglePanel(_) => "Panel",
             ToggleLayoutLock => "Lock Layout",
-            ToggleTheme => "Light Interface",
+            ToggleTheme => "Next Theme",
+            SetTheme(_) => "Theme",
             About => "About BuzzAnimate",
             ResetWorkspace => "Reset Layout",
             SaveSnapshot => "Save Snapshot",
@@ -584,6 +588,7 @@ impl Command {
             // action, and Ctrl+Alt+L is free here.
             ToggleLayoutLock => sc(ctrl.plus(Modifiers::ALT), Key::L),
             ToggleTheme => None,
+            SetTheme(_) => None,
             About => None,
             SaveSnapshot | Snapshots => None,
             ShortcutEditor => None,

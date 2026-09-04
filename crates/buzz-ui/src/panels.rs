@@ -242,15 +242,39 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             // The interface theme. Animate keeps this in Preferences; there
             // is no Preferences dialog here, and the Window menu is where the
             // rest of the chrome's own settings already live.
-            let lit = crate::theme::theme() == crate::theme::Theme::Light;
-            let mark = if lit { "\u{2714} " } else { "   " };
-            if ui
-                .button(format!("{mark}{}", Command::ToggleTheme.label()))
-                .clicked()
-            {
-                raised.push(Command::ToggleTheme);
-                ui.close();
-            }
+            //
+            // **By name, not as a toggle.** It was a single "Light Interface"
+            // item with a tick, which is the right control for a pair and the
+            // wrong one for six: it showed nothing of what was on offer and
+            // gave no way to reach any of it in one step. The cycle is still
+            // here, at the bottom, because that is what a shortcut can do.
+            let current = crate::theme::theme();
+            ui.menu_button("Theme", |ui| {
+                for theme in crate::theme::Theme::ALL {
+                    let mark = if theme == current { "\u{2714} " } else { "   " };
+                    if ui
+                        .button(format!("{mark}{}", theme.label()))
+                        .on_hover_text(theme.description())
+                        .clicked()
+                    {
+                        raised.push(Command::SetTheme(theme));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                let shortcut = shortcut_text(ui.ctx(), Command::ToggleTheme);
+                if ui
+                    .add(
+                        egui::Button::new(format!("   {}", Command::ToggleTheme.label()))
+                            .shortcut_text(shortcut),
+                    )
+                    .on_hover_text("Step to the next theme in the list")
+                    .clicked()
+                {
+                    raised.push(Command::ToggleTheme);
+                    ui.close();
+                }
+            });
             ui.separator();
 
             let mark = if workspace.locked { "\u{2714} " } else { "   " };

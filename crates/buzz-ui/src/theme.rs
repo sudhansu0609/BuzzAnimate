@@ -25,27 +25,101 @@ use egui::{Color32, CornerRadius, Stroke, Visuals};
 use serde::{Deserialize, Serialize};
 
 /// Which interface theme is in use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+///
+/// # Why this is a list rather than a switch
+///
+/// There were two, and every colour was a two-armed macro: one dark value, one
+/// light one, chosen by a `match`. Adding a third would have meant editing
+/// twenty of those arms and getting all twenty right. A theme is a *table* of
+/// colours now — see [`Colors`] — so adding one is adding a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Theme {
     /// Animate's own default, and this program's.
     #[default]
     Dark,
     /// For bright rooms, and for anybody who simply prefers it.
     Light,
+    /// Near-black and cool. For working in the dark, and for the OLED panels
+    /// where an almost-black grey is the only thing still drawing power.
+    Midnight,
+    /// A softer dark: blue-grey, a little lighter than [`Theme::Dark`]. The
+    /// contrast between chrome and artwork is lower, which is easier on the
+    /// eyes over a long session and worse for picking out fine detail.
+    Slate,
+    /// Warm paper. The light-table feel, for anyone who finds a grey interface
+    /// cold to draw on all day.
+    Sepia,
+    /// Maximum legibility: black behind white, and vivid guides. For low
+    /// vision, for a projector, and for a bright room a normal light theme
+    /// cannot cope with.
+    Contrast,
 }
 
 impl Theme {
+    /// Every theme, in the order the menu offers them: the two originals
+    /// first, then the other darks, then the other lights.
+    pub const ALL: [Theme; 6] = [
+        Theme::Dark,
+        Theme::Light,
+        Theme::Midnight,
+        Theme::Slate,
+        Theme::Sepia,
+        Theme::Contrast,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Theme::Dark => "Dark",
             Theme::Light => "Light",
+            Theme::Midnight => "Midnight",
+            Theme::Slate => "Slate",
+            Theme::Sepia => "Sepia",
+            Theme::Contrast => "High Contrast",
         }
     }
 
-    pub fn other(self) -> Theme {
+    /// What the theme is for, for the tooltip beside its name.
+    pub fn description(self) -> &'static str {
         match self {
-            Theme::Dark => Theme::Light,
-            Theme::Light => Theme::Dark,
+            Theme::Dark => {
+                "The default. Neutral grey, so the artwork's own colours read true."
+            }
+            Theme::Light => "A light interface for a bright room.",
+            Theme::Midnight => "Near-black and cool, for working in the dark.",
+            Theme::Slate => "A softer blue-grey dark, easier over a long session.",
+            Theme::Sepia => "Warm paper, for the light-table feel.",
+            Theme::Contrast => {
+                "Black behind white, with vivid guides. Built for legibility."
+            }
+        }
+    }
+
+    /// Whether egui should start from its dark base rather than its light one.
+    ///
+    /// Every colour that matters is overridden in [`build_visuals`], but the
+    /// base decides the handful that are not — shadows, and the tint of a
+    /// disabled widget — and starting a dark theme from the light base leaves
+    /// those looking washed out against everything around them.
+    pub fn is_dark(self) -> bool {
+        !matches!(self, Theme::Light | Theme::Sepia)
+    }
+
+    /// The next theme along, wrapping. What the Window menu's cycle command
+    /// steps through, and what the keyboard shortcut does.
+    pub fn next(self) -> Theme {
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// The colours this theme answers with.
+    pub fn colors(self) -> Colors {
+        match self {
+            Theme::Dark => DARK,
+            Theme::Light => LIGHT,
+            Theme::Midnight => MIDNIGHT,
+            Theme::Slate => SLATE,
+            Theme::Sepia => SEPIA,
+            Theme::Contrast => CONTRAST,
         }
     }
 }
@@ -54,177 +128,258 @@ static CURRENT: AtomicU8 = AtomicU8::new(0);
 
 /// The theme every colour below is answering for.
 pub fn theme() -> Theme {
-    match CURRENT.load(Ordering::Relaxed) {
-        0 => Theme::Dark,
-        _ => Theme::Light,
-    }
+    let i = CURRENT.load(Ordering::Relaxed) as usize;
+    // Clamped rather than wrapped: a preferences file written by a build that
+    // had more themes should land on *a* theme, not on an arbitrary one.
+    Theme::ALL[i.min(Theme::ALL.len() - 1)]
 }
 
 /// Switch themes. Call [`apply`] afterwards to restyle an egui context.
 pub fn set_theme(value: Theme) {
-    CURRENT.store(
-        match value {
-            Theme::Dark => 0,
-            Theme::Light => 1,
-        },
-        Ordering::Relaxed,
-    );
+    let i = Theme::ALL.iter().position(|t| *t == value).unwrap_or(0);
+    CURRENT.store(i as u8, Ordering::Relaxed);
+}
+
+/// The current theme's colours.
+fn colors() -> Colors {
+    theme().colors()
 }
 
 /// Panel and chrome colours.
 pub struct Palette;
 
-/// Pick between the dark and the light value of one colour.
-macro_rules! themed {
-    ($(#[$doc:meta])* $name:ident, $dark:expr, $light:expr) => {
-        $(#[$doc])*
-        pub fn $name() -> Color32 {
-            match theme() {
-                Theme::Dark => $dark,
-                Theme::Light => $light,
-            }
+/// A hex literal as an opaque colour, so a palette reads as a list of colours
+/// rather than a column of byte triples.
+const fn rgb(hex: u32) -> Color32 {
+    Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
+
+/// The same, premultiplied against an alpha. Only the grid needs it: it is
+/// drawn *over* the pasteboard rather than instead of it.
+const fn rgba(hex: u32, a: u8) -> Color32 {
+    Color32::from_rgba_premultiplied((hex >> 16) as u8, (hex >> 8) as u8, hex as u8, a)
+}
+
+/// Declare the colours a theme is made of, once.
+///
+/// This writes both the [`Colors`] field list and the `Palette::name()`
+/// accessor that reads it, so the two cannot drift apart — and so the many
+/// places that ask for `Palette::panel()` did not have to change when a theme
+/// stopped being one of a pair.
+macro_rules! palette {
+    ($($(#[$doc:meta])* $name:ident),+ $(,)?) => {
+        /// Every colour the chrome asks for, as one table. One of these *is* a
+        /// theme.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct Colors {
+            $($(#[$doc])* pub $name: Color32,)+
+        }
+
+        impl Palette {
+            $($(#[$doc])* pub fn $name() -> Color32 { colors().$name })+
         }
     };
 }
 
-impl Palette {
-    themed!(
-        /// Window chrome behind the panels.
-        chrome,
-        Color32::from_rgb(0x26, 0x26, 0x26),
-        Color32::from_rgb(0xD6, 0xD6, 0xD6)
-    );
-    themed!(
-        /// Panel interiors.
-        panel,
-        Color32::from_rgb(0x2F, 0x2F, 0x2F),
-        Color32::from_rgb(0xEE, 0xEE, 0xEE)
-    );
-    themed!(
-        /// Slightly raised surfaces: toolbar buttons, headers.
-        raised,
-        Color32::from_rgb(0x3A, 0x3A, 0x3A),
-        Color32::from_rgb(0xDD, 0xDD, 0xDD)
-    );
-    themed!(
-        /// Hovered control.
-        hover,
-        Color32::from_rgb(0x4A, 0x4A, 0x4A),
-        Color32::from_rgb(0xC8, 0xC8, 0xC8)
-    );
-    themed!(
-        /// Active or selected control. The same blue in both themes: it is the
-        /// application's accent, and an accent that changes with the theme
-        /// stops being one.
-        active,
-        Color32::from_rgb(0x2D, 0x6C, 0xB5),
-        Color32::from_rgb(0x2D, 0x6C, 0xB5)
-    );
-    themed!(
-        /// Separators and panel edges.
-        border,
-        Color32::from_rgb(0x1C, 0x1C, 0x1C),
-        Color32::from_rgb(0xB4, 0xB4, 0xB4)
-    );
+palette!(
+    /// Window chrome behind the panels.
+    chrome,
+    /// Panel interiors.
+    panel,
+    /// Slightly raised surfaces: toolbar buttons, headers.
+    raised,
+    /// Hovered control.
+    hover,
+    /// Active or selected control. The application's accent: it stays in the
+    /// blue family in every theme, because an accent that changes with the
+    /// interface stops being one. Only its weight moves, so that it can be
+    /// picked out against a near-black panel and against warm paper alike.
+    active,
+    /// Separators and panel edges.
+    border,
+    /// Ordinary text.
+    text,
+    /// Secondary text.
+    text_dim,
+    /// The work area surrounding the stage. Objects here are editable but do
+    /// not appear in published output.
+    ///
+    /// **Never the tone of the stage**, in any theme. The pasteboard's job is
+    /// to be clearly not the stage, and a white document on a white surround
+    /// loses the edge of the frame — which is the one boundary an animator has
+    /// to see at all times. Animate keeps it grey in its light theme for the
+    /// same reason, and so does every theme here.
+    pasteboard,
+    /// Edge of the stage rectangle.
+    stage_border,
+    /// Ruler background.
+    ruler_bg,
+    /// Ruler markings.
+    ruler_tick,
+    /// Ruler numbers.
+    ruler_text,
+    /// Guides dragged off the rulers. Animate uses cyan-green.
+    guide,
+    /// A guide that cannot be moved.
+    guide_locked,
+    /// The drawing grid.
+    grid,
+    /// Selection marquee and outlines.
+    selection,
+    /// Transform handles and the transformation point.
+    handle_fill,
+    /// Their outline.
+    handle_stroke,
+    /// A snap indicator, shown while a drag is snapping to something.
+    snap,
+);
 
-    themed!(
-        /// Ordinary text.
-        text,
-        Color32::from_rgb(0xD8, 0xD8, 0xD8),
-        Color32::from_rgb(0x1E, 0x1E, 0x1E)
-    );
-    themed!(
-        /// Secondary text.
-        text_dim,
-        Color32::from_rgb(0x9A, 0x9A, 0x9A),
-        Color32::from_rgb(0x5A, 0x5A, 0x5A)
-    );
+/// The default. Neutral grey, so the artwork's own colours read true.
+const DARK: Colors = Colors {
+    chrome: rgb(0x262626),
+    panel: rgb(0x2F2F2F),
+    raised: rgb(0x3A3A3A),
+    hover: rgb(0x4A4A4A),
+    active: rgb(0x2D6CB5),
+    border: rgb(0x1C1C1C),
+    text: rgb(0xD8D8D8),
+    text_dim: rgb(0x9A9A9A),
+    pasteboard: rgb(0x535353),
+    stage_border: rgb(0x1A1A1A),
+    ruler_bg: rgb(0x333333),
+    ruler_tick: rgb(0x888888),
+    ruler_text: rgb(0xAAAAAA),
+    guide: rgb(0x00D0C8),
+    guide_locked: rgb(0x8A8A60),
+    grid: rgba(0x606060, 0x60),
+    selection: rgb(0x00A8FF),
+    handle_fill: rgb(0xFFFFFF),
+    handle_stroke: rgb(0x202020),
+    snap: rgb(0xFF4080),
+};
 
-    themed!(
-        /// The work area surrounding the stage. Objects here are editable but
-        /// do not appear in published output.
-        ///
-        /// Mid-grey in **both** themes, and deliberately: the pasteboard's job
-        /// is to be clearly not the stage, and a white document on a white
-        /// surround loses the edge of the frame — which is the one boundary an
-        /// animator has to see at all times. Animate keeps it grey in its
-        /// light theme for the same reason.
-        pasteboard,
-        Color32::from_rgb(0x53, 0x53, 0x53),
-        Color32::from_rgb(0x8E, 0x8E, 0x8E)
-    );
-    themed!(
-        /// Edge of the stage rectangle.
-        stage_border,
-        Color32::from_rgb(0x1A, 0x1A, 0x1A),
-        Color32::from_rgb(0x33, 0x33, 0x33)
-    );
+/// For bright rooms.
+const LIGHT: Colors = Colors {
+    chrome: rgb(0xD6D6D6),
+    panel: rgb(0xEEEEEE),
+    raised: rgb(0xDDDDDD),
+    hover: rgb(0xC8C8C8),
+    active: rgb(0x2D6CB5),
+    border: rgb(0xB4B4B4),
+    text: rgb(0x1E1E1E),
+    text_dim: rgb(0x5A5A5A),
+    pasteboard: rgb(0x8E8E8E),
+    stage_border: rgb(0x333333),
+    ruler_bg: rgb(0xE4E4E4),
+    ruler_tick: rgb(0x707070),
+    ruler_text: rgb(0x444444),
+    guide: rgb(0x009A94),
+    guide_locked: rgb(0x8A8A40),
+    grid: rgba(0x404040, 0x40),
+    selection: rgb(0x0078D4),
+    handle_fill: rgb(0xFFFFFF),
+    handle_stroke: rgb(0x202020),
+    snap: rgb(0xD00050),
+};
 
-    themed!(
-        /// Ruler background.
-        ruler_bg,
-        Color32::from_rgb(0x33, 0x33, 0x33),
-        Color32::from_rgb(0xE4, 0xE4, 0xE4)
-    );
-    themed!(
-        /// Ruler markings.
-        ruler_tick,
-        Color32::from_rgb(0x88, 0x88, 0x88),
-        Color32::from_rgb(0x70, 0x70, 0x70)
-    );
-    themed!(
-        /// Ruler numbers.
-        ruler_text,
-        Color32::from_rgb(0xAA, 0xAA, 0xAA),
-        Color32::from_rgb(0x44, 0x44, 0x44)
-    );
+/// Near-black, cool. The panel is not pure black: a true black behind a dark
+/// drawing makes the drawing read as a hole rather than as artwork.
+const MIDNIGHT: Colors = Colors {
+    chrome: rgb(0x0E1116),
+    panel: rgb(0x141922),
+    raised: rgb(0x1E2530),
+    hover: rgb(0x2A3340),
+    active: rgb(0x3B82F6),
+    border: rgb(0x080A0E),
+    text: rgb(0xD5DCE6),
+    text_dim: rgb(0x8B95A5),
+    pasteboard: rgb(0x39414F),
+    stage_border: rgb(0x05070A),
+    ruler_bg: rgb(0x171D27),
+    ruler_tick: rgb(0x7C879A),
+    ruler_text: rgb(0xA3AEBF),
+    guide: rgb(0x22D3EE),
+    guide_locked: rgb(0x6B7280),
+    grid: rgba(0x46505F, 0x60),
+    selection: rgb(0x38BDF8),
+    handle_fill: rgb(0xFFFFFF),
+    handle_stroke: rgb(0x0B0E13),
+    snap: rgb(0xFB7185),
+};
 
-    themed!(
-        /// Guides dragged off the rulers. Animate uses cyan-green.
-        guide,
-        Color32::from_rgb(0x00, 0xD0, 0xC8),
-        Color32::from_rgb(0x00, 0x9A, 0x94)
-    );
-    themed!(
-        /// A guide that cannot be moved.
-        guide_locked,
-        Color32::from_rgb(0x8A, 0x8A, 0x60),
-        Color32::from_rgb(0x8A, 0x8A, 0x40)
-    );
-    themed!(
-        /// The drawing grid.
-        grid,
-        Color32::from_rgba_premultiplied(0x60, 0x60, 0x60, 0x60),
-        Color32::from_rgba_premultiplied(0x40, 0x40, 0x40, 0x40)
-    );
+/// A softer dark: blue-grey, and a step lighter than [`DARK`].
+const SLATE: Colors = Colors {
+    chrome: rgb(0x2B313B),
+    panel: rgb(0x353C48),
+    raised: rgb(0x424A58),
+    hover: rgb(0x515B6B),
+    active: rgb(0x4C86C6),
+    border: rgb(0x21262E),
+    text: rgb(0xDCE1E8),
+    text_dim: rgb(0xA2ABB8),
+    pasteboard: rgb(0x5C6675),
+    stage_border: rgb(0x1B1F26),
+    ruler_bg: rgb(0x3A424F),
+    ruler_tick: rgb(0x939DAC),
+    ruler_text: rgb(0xB4BDC9),
+    guide: rgb(0x2FD4C8),
+    guide_locked: rgb(0x8A8A60),
+    grid: rgba(0x6E7887, 0x60),
+    selection: rgb(0x5AB0F5),
+    handle_fill: rgb(0xFFFFFF),
+    handle_stroke: rgb(0x232830),
+    snap: rgb(0xFF6088),
+};
 
-    themed!(
-        /// Selection marquee and outlines. The same blue in both themes, for
-        /// the same reason as [`Palette::active`].
-        selection,
-        Color32::from_rgb(0x00, 0xA8, 0xFF),
-        Color32::from_rgb(0x00, 0x78, 0xD4)
-    );
-    themed!(
-        /// Transform handles and the transformation point.
-        handle_fill,
-        Color32::from_rgb(0xFF, 0xFF, 0xFF),
-        Color32::from_rgb(0xFF, 0xFF, 0xFF)
-    );
-    themed!(
-        /// Their outline.
-        handle_stroke,
-        Color32::from_rgb(0x20, 0x20, 0x20),
-        Color32::from_rgb(0x20, 0x20, 0x20)
-    );
+/// Warm paper. The pasteboard is a deeper tan than the panels, so the stage
+/// still reads as a lit sheet lying on a desk.
+const SEPIA: Colors = Colors {
+    chrome: rgb(0xD8CCB3),
+    panel: rgb(0xF2E9D8),
+    raised: rgb(0xE6DAC3),
+    hover: rgb(0xD3C5A8),
+    active: rgb(0x2D6CB5),
+    border: rgb(0xBCAE92),
+    text: rgb(0x2A2116),
+    text_dim: rgb(0x6B5B45),
+    pasteboard: rgb(0x9C907A),
+    stage_border: rgb(0x3A2E1E),
+    ruler_bg: rgb(0xEADFC9),
+    ruler_tick: rgb(0x8A7B60),
+    ruler_text: rgb(0x4A3E2C),
+    guide: rgb(0x00857E),
+    guide_locked: rgb(0x8A7A40),
+    grid: rgba(0x463C2D, 0x40),
+    selection: rgb(0x0078D4),
+    handle_fill: rgb(0xFFFFFF),
+    handle_stroke: rgb(0x2A2116),
+    snap: rgb(0xC02050),
+};
 
-    themed!(
-        /// A snap indicator, shown while a drag is snapping to something.
-        snap,
-        Color32::from_rgb(0xFF, 0x40, 0x80),
-        Color32::from_rgb(0xD0, 0x00, 0x50)
-    );
-}
+/// Built for legibility rather than for comfort: black behind white, a visible
+/// border on every edge, and guides at full saturation.
+const CONTRAST: Colors = Colors {
+    chrome: rgb(0x000000),
+    panel: rgb(0x000000),
+    raised: rgb(0x141414),
+    hover: rgb(0x2E2E2E),
+    active: rgb(0x0A84FF),
+    border: rgb(0xFFFFFF),
+    text: rgb(0xFFFFFF),
+    text_dim: rgb(0xD0D0D0),
+    pasteboard: rgb(0x3A3A3A),
+    stage_border: rgb(0xFFFFFF),
+    ruler_bg: rgb(0x000000),
+    ruler_tick: rgb(0xFFFFFF),
+    ruler_text: rgb(0xFFFFFF),
+    guide: rgb(0x00FFFF),
+    guide_locked: rgb(0xFFFF00),
+    grid: rgba(0x969696, 0x90),
+    selection: rgb(0x00E5FF),
+    handle_fill: rgb(0xFFFFFF),
+    handle_stroke: rgb(0x000000),
+    snap: rgb(0xFF2D95),
+};
 
 /// The brand's three colours, in order along the frame.
 ///
@@ -358,9 +513,10 @@ const SCROLL_BAR: f32 = 9.0;
 
 /// Apply the theme to an egui context.
 ///
-/// The same dark palette is installed for *both* egui theme slots. BuzzAnimate
-/// is a dark-only application, and leaving the light slot untouched would give
-/// a half-styled window to anyone whose system theme is light.
+/// The chosen palette is installed into *both* egui theme slots. Which theme
+/// is in use is BuzzAnimate's own setting, not the system's, and leaving the
+/// other slot untouched would give a half-styled window to anyone whose system
+/// theme disagreed with the one they picked here.
 pub fn apply(ctx: &egui::Context) {
     let visuals = build_visuals();
     ctx.set_visuals_of(egui::Theme::Dark, visuals.clone());
@@ -388,9 +544,10 @@ pub fn apply(ctx: &egui::Context) {
 }
 
 fn build_visuals() -> Visuals {
-    let mut visuals = match theme() {
-        Theme::Dark => Visuals::dark(),
-        Theme::Light => Visuals::light(),
+    let mut visuals = if theme().is_dark() {
+        Visuals::dark()
+    } else {
+        Visuals::light()
     };
 
     visuals.panel_fill = Palette::panel();
@@ -443,13 +600,36 @@ mod tests {
         0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
     }
 
+    /// WCAG relative luminance: gamma-corrected, and weighted for the eye.
+    /// Not the same thing as `lum` above, which is a quick perceptual
+    /// brightness used for comparing two greys.
+    fn relative_luminance(c: Color32) -> f32 {
+        let channel = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+    }
+
+    /// WCAG contrast ratio between two colours, 1.0 (identical) to 21.0
+    /// (black against white).
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (x, y) = (relative_luminance(a), relative_luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
     /// Run something in each theme, and leave the theme as it was found.
     ///
     /// The current theme is process-wide, so a test that changed it and walked
     /// away would make its neighbours fail depending on the order they ran in.
     fn in_each_theme(mut body: impl FnMut(Theme)) {
         let was = theme();
-        for t in [Theme::Dark, Theme::Light] {
+        for t in Theme::ALL {
             set_theme(t);
             body(t);
         }
@@ -583,16 +763,77 @@ mod tests {
         });
     }
 
-    /// Switching is a toggle, and it comes back.
+    /// Every theme can be set, and reads back as itself.
+    ///
+    /// The theme is a process-wide index rather than the value, so a variant
+    /// added in the middle of `ALL` without its storage being updated would
+    /// come back as its neighbour. That is exactly the sort of thing that
+    /// shows up as one panel in the wrong colours much later.
     #[test]
-    fn the_theme_switches_and_returns() {
+    fn every_theme_sets_and_reads_back() {
         let was = theme();
-        set_theme(Theme::Light);
-        assert_eq!(theme(), Theme::Light);
-        assert_eq!(Theme::Light.other(), Theme::Dark);
-        set_theme(Theme::Dark);
-        assert_eq!(theme(), Theme::Dark);
+        for t in Theme::ALL {
+            set_theme(t);
+            assert_eq!(theme(), t, "{} did not read back", t.label());
+        }
         set_theme(was);
+    }
+
+    /// Stepping lands on every theme and comes back to where it started, so
+    /// the cycle cannot strand anyone on a subset of the list.
+    #[test]
+    fn stepping_visits_every_theme_and_returns() {
+        let mut seen = Vec::new();
+        let mut t = Theme::Dark;
+        for _ in 0..Theme::ALL.len() {
+            seen.push(t);
+            t = t.next();
+        }
+        assert_eq!(t, Theme::Dark, "the cycle should return to its start");
+        for expected in Theme::ALL {
+            assert!(seen.contains(&expected), "{} is not on the cycle", expected.label());
+        }
+    }
+
+    /// **Every theme has to be legible**, not just the two that were here
+    /// first. Four hand-tuned palettes are four chances to leave dim text on
+    /// a panel it cannot be read against, and that is not something a compiler
+    /// can catch.
+    ///
+    /// The ratio is WCAG's, and 4.5 is its AA threshold for body text. Dimmed
+    /// text is held to 3.0 — it is secondary by design, and holding it to the
+    /// body-text bar would just make it a second body text.
+    #[test]
+    fn every_theme_is_legible() {
+        in_each_theme(|t| {
+            let panel = Palette::panel();
+            for (name, fg, floor) in [
+                ("text", Palette::text(), 4.5),
+                ("text_dim", Palette::text_dim(), 3.0),
+            ] {
+                let ratio = contrast(fg, panel);
+                assert!(
+                    ratio >= floor,
+                    "{}: {name} on the panel is {ratio:.2}:1, below {floor}:1",
+                    t.label()
+                );
+            }
+        });
+    }
+
+    /// The pasteboard must never be the tone of the stage, or the edge of the
+    /// frame disappears — see the note on `Palette::pasteboard`. The stage is
+    /// the document's own colour, and white is the one everybody starts with.
+    #[test]
+    fn the_pasteboard_is_never_mistaken_for_the_stage() {
+        in_each_theme(|t| {
+            let ratio = contrast(Palette::pasteboard(), Color32::WHITE);
+            assert!(
+                ratio >= 1.6,
+                "{}: the pasteboard is {ratio:.2}:1 against a white stage,                  which loses the edge of the frame",
+                t.label()
+            );
+        });
     }
 }
 

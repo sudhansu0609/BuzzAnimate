@@ -1830,6 +1830,11 @@ impl App {
                 }
             }
 
+            ToolOptions => {
+                let tool = self.editor.tool();
+                panels::tool_options_panel(ui, tool, &mut self.editor.style);
+            }
+
             Layers => {
                 let editor = &mut self.editor;
                 let selection = &mut editor.selection;

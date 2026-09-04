@@ -1088,6 +1088,89 @@ fn bucket_properties(ui: &mut Ui, style: &mut DrawStyle) {
     });
 }
 
+/// **Settings for the tool in hand**, and nothing else.
+///
+/// # Why this is its own panel
+///
+/// These were collapsing sections inside Properties: one for the Brush, one
+/// for the Eraser, one for the Magic Wand, one for the Paint Bucket, all four
+/// present whatever was selected and all four closed by default. So the Brush
+/// size — the single most-adjusted number in a drawing program — sat behind a
+/// header that looked identical whether or not the Brush was even in hand,
+/// under two other sections, in a panel that was already showing the document
+/// and the selection. Animate puts the tool's options in a strip under the
+/// toolbar precisely because this is the thing reached for most often.
+///
+/// One tool's settings are shown, and it is the one whose button is lit. There
+/// is nothing to open, nothing to scroll past, and no way to be looking at the
+/// Eraser's size while holding the Brush.
+pub fn tool_options_panel(ui: &mut Ui, tool: ToolId, style: &mut DrawStyle) {
+    // The tool's own symbol beside its name, the same drawing the lit button
+    // in the toolbar carries. Two places showing the same mark is how the
+    // panel says which button it is talking about.
+    ui.horizontal(|ui| {
+        let size = egui::vec2(18.0, 18.0);
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        crate::icons::tool_icon(ui.painter(), rect, tool, Palette::text());
+        ui.heading(tool.name());
+    });
+    ui.separator();
+
+    let mut anything = true;
+    match tool {
+        ToolId::Brush => brush_properties(ui, style),
+        ToolId::Eraser => eraser_properties(ui, style),
+        ToolId::MagicWand => wand_properties(ui, style),
+        ToolId::PaintBucket => bucket_properties(ui, style),
+        _ => anything = false,
+    }
+
+    // Symmetry belongs to *drawing*, not to any one tool, so it follows
+    // whichever of them is in hand rather than living in a section of its own
+    // that has to be found separately.
+    if draws_through_symmetry(tool) {
+        if anything {
+            ui.add_space(6.0);
+        }
+        ui.label(RichText::new("Symmetry").strong());
+        symmetry_properties(ui, style);
+        anything = true;
+    }
+
+    if !anything {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(match tool.status() {
+                ToolStatus::Planned(when) => format!("{} arrives in {when}.", tool.name()),
+                ToolStatus::Ready => format!("{} has no settings.", tool.name()),
+            })
+            .small()
+            .weak(),
+        );
+    }
+}
+
+/// Whether a tool lays down artwork the symmetry mirror should copy.
+///
+/// The Eraser is on the list because it rubs through the mirror too — a mirror
+/// you can draw through but not correct through leaves the far half of a
+/// drawing read-only the moment you slip. The Paint Bucket and the Ink Bottle
+/// are not: they recolour what is already there, and what is already there was
+/// mirrored when it was drawn.
+fn draws_through_symmetry(tool: ToolId) -> bool {
+    matches!(
+        tool,
+        ToolId::Brush
+            | ToolId::Pencil
+            | ToolId::Pen
+            | ToolId::Line
+            | ToolId::Rectangle
+            | ToolId::Oval
+            | ToolId::PolyStar
+            | ToolId::Eraser
+    )
+}
+
 /// Symmetry: the mirror every drawing tool draws through.
 ///
 /// Buttons rather than a dropdown, because this is a mode you turn on and off
@@ -2044,37 +2127,14 @@ pub fn properties_panel(
         changed |= spatial_properties(ui, scene, id, at);
     }
 
-    // **Rolled up, not gone.**
+    // The Brush, Eraser, Magic Wand, Paint Bucket and Symmetry sections used
+    // to be here, rolled up. They are the Tool Options panel now — see
+    // `tool_options_panel` for why one tool's settings, shown for the tool in
+    // hand, beat five headers that are always present and always closed.
     //
-    // These two are settings for one tool each, and open they took six hundred
-    // points of a panel that also has to show the document and the selection —
-    // enough to push the Colour panel below it clean off the window. Closed by
-    // default and remembered once opened, which is what every other long
-    // section of settings does.
-    egui::CollapsingHeader::new(RichText::new("Brush").strong())
-        .id_salt("brush-section")
-        .default_open(false)
-        .show(ui, |ui| brush_properties(ui, style));
-    // Open by default, unlike the tool sections above it. It is four buttons
-    // rather than a screenful of sliders, and it is a mode you need to be able
-    // to *see* the state of: a mirror you have forgotten is on is a drawing
-    // that comes out wrong twice.
-    egui::CollapsingHeader::new(RichText::new("Symmetry").strong())
-        .id_salt("symmetry-section")
-        .default_open(true)
-        .show(ui, |ui| symmetry_properties(ui, style));
-    egui::CollapsingHeader::new(RichText::new("Eraser").strong())
-        .id_salt("eraser-section")
-        .default_open(false)
-        .show(ui, |ui| eraser_properties(ui, style));
-    egui::CollapsingHeader::new(RichText::new("Magic Wand").strong())
-        .id_salt("wand-section")
-        .default_open(false)
-        .show(ui, |ui| wand_properties(ui, style));
-    egui::CollapsingHeader::new(RichText::new("Paint Bucket").strong())
-        .id_salt("bucket-section")
-        .default_open(false)
-        .show(ui, |ui| bucket_properties(ui, style));
+    // Stroke and Fill stays: it is the *style* new artwork takes and what a
+    // selection can be recoloured to, which belongs with the document and the
+    // selection rather than with whichever tool happens to be held.
 
     ui.add_space(8.0);
     ui.label(RichText::new("Stroke and Fill").strong());

@@ -30,6 +30,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PanelId {
     Tools,
+    /// Settings for the tool currently in hand, and nothing else.
+    ///
+    /// Animate keeps these in a strip under the toolbar. They were collapsing
+    /// sections inside Properties here — one per tool, all of them present at
+    /// once, all closed by default — which meant the Brush's size lived three
+    /// clicks deep behind a header that looked the same whether the Brush was
+    /// in hand or not. A panel that shows the tool you are actually holding is
+    /// the thing being reached for.
+    ToolOptions,
     Layers,
     Properties,
     Color,
@@ -56,6 +65,7 @@ impl PanelId {
     pub fn title(self) -> &'static str {
         match self {
             Self::Tools => "Tools",
+            Self::ToolOptions => "Tool Options",
             Self::Layers => "Layers",
             Self::Properties => "Properties",
             Self::Color => "Color",
@@ -87,6 +97,7 @@ impl PanelId {
             Self::Rig => "Rig",
             Self::Lighting => "Light",
             Self::Properties => "Props",
+            Self::ToolOptions => "Tool",
             other => other.title(),
         }
     }
@@ -100,8 +111,9 @@ impl PanelId {
         !matches!(self, Self::Tools | Self::Timeline)
     }
 
-    pub const ALL: [PanelId; 16] = [
+    pub const ALL: [PanelId; 17] = [
         PanelId::Tools,
+        PanelId::ToolOptions,
         PanelId::Layers,
         PanelId::Properties,
         PanelId::Color,
@@ -140,6 +152,15 @@ pub enum Dock {
 }
 
 impl Dock {
+    /// The docks that are actually columns of stacked panels, where a slot's
+    /// `order` is its place on screen.
+    ///
+    /// `Float` and `Hidden` are not here on purpose. A panel in either still
+    /// carries an `order`, but it describes the place it will take in its
+    /// `home` dock when it comes back — renumbering those by their position in
+    /// the hidden pile would quietly rearrange where closed panels reopen.
+    pub const COLUMNS: [Dock; 4] = [Dock::Left, Dock::Right, Dock::RightOuter, Dock::Bottom];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Left => "Dock Left",
@@ -432,6 +453,14 @@ pub const BOTTOM_HEIGHT_RANGE: std::ops::RangeInclusive<f32> = 80.0..=900.0;
 /// Numbered above any `order` so they cannot collide with the one-panel
 /// sections, which take their group from their position.
 const GROUP_UTILITY: GroupId = 100;
+/// The tool's own settings, in a section of their own.
+///
+/// A number of its own rather than the `order`-derived one every ungrouped
+/// panel gets, and that is what makes it safe to add to a layout somebody has
+/// already arranged: a saved file has no slot with this group, so the panel
+/// arrives in its own section instead of tabbing itself in front of whatever
+/// already held that number. See `Workspace::fill_gaps`.
+const GROUP_TOOL_OPTIONS: GroupId = 102;
 const GROUP_ASSETS: GroupId = 101;
 
 /// Bring a size back inside its range — including a NaN out of a damaged file,
@@ -563,30 +592,34 @@ impl Workspace {
             slots: vec![
                 slot(PanelId::Tools, Dock::Left, 0, Dock::Left),
                 slot(PanelId::Layers, Dock::Right, 0, Dock::Right),
-                slot(PanelId::Properties, Dock::Right, 1, Dock::Right),
-                slot(PanelId::Color, Dock::Right, 2, Dock::Right),
+                // Above Properties, because it answers the question asked
+                // most often and most urgently — "how big is this brush" —
+                // and because the two read as a pair: what you are holding,
+                // then what you have selected.
+                tab(
+                    PanelId::ToolOptions,
+                    Dock::Right,
+                    1,
+                    Dock::Right,
+                    GROUP_TOOL_OPTIONS,
+                    true,
+                ),
+                slot(PanelId::Properties, Dock::Right, 2, Dock::Right),
+                slot(PanelId::Color, Dock::Right, 3, Dock::Right),
                 // Beside the colour controls, which is where a palette is
                 // reached for. Animate docks Swatches with Color for the same
                 // reason.
-                slot(PanelId::Swatches, Dock::Right, 3, Dock::Right),
+                slot(PanelId::Swatches, Dock::Right, 4, Dock::Right),
                 // **One section, five tabs.** Each of these is reached for now
                 // and then rather than all day. Rolled up they were five title
                 // bars taking five rows and showing nothing; as tabs they take
                 // one row and always show one of them. That is what the
                 // grouping is *for*, and the default arrangement should
                 // demonstrate it rather than leave it as something to discover.
-                tab(PanelId::Depth, Dock::Right, 4, Dock::Right, GROUP_UTILITY, true),
-                tab(PanelId::Rig, Dock::Right, 5, Dock::Right, GROUP_UTILITY, false),
+                tab(PanelId::Depth, Dock::Right, 5, Dock::Right, GROUP_UTILITY, true),
+                tab(PanelId::Rig, Dock::Right, 6, Dock::Right, GROUP_UTILITY, false),
                 tab(
                     PanelId::Filters,
-                    Dock::Right,
-                    6,
-                    Dock::Right,
-                    GROUP_UTILITY,
-                    false,
-                ),
-                tab(
-                    PanelId::Lighting,
                     Dock::Right,
                     7,
                     Dock::Right,
@@ -594,9 +627,17 @@ impl Workspace {
                     false,
                 ),
                 tab(
-                    PanelId::Sound,
+                    PanelId::Lighting,
                     Dock::Right,
                     8,
+                    Dock::Right,
+                    GROUP_UTILITY,
+                    false,
+                ),
+                tab(
+                    PanelId::Sound,
+                    Dock::Right,
+                    9,
                     Dock::Right,
                     GROUP_UTILITY,
                     false,
@@ -1066,12 +1107,62 @@ impl Workspace {
             if self.slot(id).is_none()
                 && let Some(slot) = defaults.slot(id)
             {
+                // **Room is made at the position the default gives it**, not
+                // left to the end of the column.
+                //
+                // Sections are sorted by `order`, and that sort is stable, so a
+                // new slot appended with an order it *ties* on lands after the
+                // panel it was meant to sit above — below the fold, in a column
+                // the user then has to scroll to discover a panel they were
+                // never told about. Tool Options ties with Properties, sits
+                // under a tall panel, and was invisible on a real layout
+                // despite being present, open and correct in the file.
+                //
+                // Pushing the rest of the dock down by one preserves every
+                // relative position the user arranged and costs nothing to the
+                // groups, which are keyed by `group` rather than by `order`.
+                for existing in &mut self.slots {
+                    if existing.dock == slot.dock && existing.order >= slot.order {
+                        existing.order += 1;
+                    }
+                }
                 self.slots.push(*slot);
             }
         }
         // And drop anything unrecognised, which is what a *newer* build's
         // layout looks like from here.
         self.slots.retain(|s| PanelId::ALL.contains(&s.id));
+
+        // **Every column is renumbered so no two panels share a place.**
+        //
+        // `sections` sorts by `order`, and that sort is stable, so two panels
+        // holding the same number come out in whatever order the *file* happens
+        // to list them — which is not a decision anybody made. Tool Options tied
+        // with Properties on a real layout, lost the tie to file order, and was
+        // drawn below a panel tall enough to push it off the bottom of the
+        // column: present, open, correct in the file, and invisible.
+        //
+        // Ties break towards the default arrangement, so the answer is the one
+        // the layout was designed with rather than an accident of which line
+        // came first. Everything else keeps the order the user put it in, and
+        // the numbers come out contiguous, which is what `reorder` assumes.
+        for dock in Dock::COLUMNS {
+            let mut here: Vec<usize> = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.dock == dock)
+                .map(|(i, _)| i)
+                .collect();
+            here.sort_by_key(|&i| {
+                let slot = &self.slots[i];
+                let designed = defaults.slot(slot.id).map_or(u32::MAX, |d| d.order);
+                (slot.order, designed)
+            });
+            for (place, i) in here.into_iter().enumerate() {
+                self.slots[i].order = place as u32;
+            }
+        }
 
         // A hand-edited or half-migrated file must still show a panel in every
         // section rather than an empty body under a tab strip.
@@ -1371,16 +1462,30 @@ mod tests {
         assert!(PanelId::Library.draws_own_title());
     }
 
+    /// Moving a panel up swaps it with the one above, wherever in the column
+    /// the two happen to be.
+    ///
+    /// Written against the panel's *found* position rather than a literal
+    /// index. It used to assert that Properties ended up first, which was only
+    /// true while Properties happened to be second — so adding a panel above it
+    /// failed a test about reordering for reasons that had nothing to do with
+    /// reordering.
     #[test]
     fn reordering_moves_a_panel_within_its_side() {
         let mut workspace = Workspace::animate();
         let before = workspace.on(Dock::Right);
+        let at = before
+            .iter()
+            .position(|id| *id == PanelId::Properties)
+            .expect("Properties is on the right");
+        assert!(at > 0, "it needs something above it to swap with");
+
         workspace.reorder(PanelId::Properties, -1);
         let after = workspace.on(Dock::Right);
 
-        assert_eq!(after[0], PanelId::Properties);
-        assert_eq!(after[1], before[0]);
-        assert_eq!(after.len(), before.len());
+        assert_eq!(after.len(), before.len(), "no panel was gained or lost");
+        assert_eq!(after[at - 1], PanelId::Properties, "it moved up one");
+        assert_eq!(after[at], before[at - 1], "and the one above came down");
     }
 
     #[test]
@@ -1729,6 +1834,62 @@ mod migration_tests {
         );
     }
 
+    /// **A panel added in a later build arrives in a section of its own.**
+    ///
+    /// This is the trap `GROUP_TOOL_OPTIONS` exists to avoid. Every ungrouped
+    /// panel in the default layout takes its `order` as its group id, so a new
+    /// panel numbered like its neighbours would land in *their* section — as a
+    /// tab, at the front, hiding whatever the user was looking at. Tool Options
+    /// sits above Properties in a fresh layout, so it is exactly the panel that
+    /// would have swallowed it.
+    #[test]
+    fn a_panel_from_a_later_build_does_not_tab_itself_over_an_existing_one() {
+        // A layout saved before Tool Options existed.
+        let mut saved = Workspace::animate();
+        saved.slots.retain(|s| s.id != PanelId::ToolOptions);
+        assert!(saved.slot(PanelId::ToolOptions).is_none(), "it starts absent");
+
+        saved.fill_gaps();
+
+        let added = saved.slot(PanelId::ToolOptions).expect("it was added back");
+        let properties = saved.slot(PanelId::Properties).expect("Properties is there");
+        assert_ne!(
+            added.group, properties.group,
+            "Tool Options tabbed itself into the Properties section"
+        );
+        for section in saved.sections(added.dock) {
+            if section.panels.contains(&PanelId::ToolOptions) {
+                assert_eq!(
+                    section.panels.len(),
+                    1,
+                    "it should arrive alone, not sharing: {:?}",
+                    section.panels
+                );
+            }
+        }
+        assert!(
+            saved.is_open(PanelId::ToolOptions),
+            "a panel nobody can see is a panel that does not exist"
+        );
+
+        // **And it lands where the default puts it**, above Properties, rather
+        // than at the bottom of the column. Present-but-below-the-fold is the
+        // same as absent to anyone who does not already know to scroll for it.
+        let column = saved.on(Dock::Right);
+        let tool = column
+            .iter()
+            .position(|id| *id == PanelId::ToolOptions)
+            .expect("Tool Options is in the column");
+        let props = column
+            .iter()
+            .position(|id| *id == PanelId::Properties)
+            .expect("Properties is in the column");
+        assert!(
+            tool < props,
+            "Tool Options should sit above Properties, got {column:?}"
+        );
+    }
+
     /// A panel the user had moved somewhere of its own is not swept into a
     /// group by the migration — it kept its place before, so it keeps it now.
     #[test]
@@ -1834,8 +1995,10 @@ mod group_tests {
             "a tabbed section that starts rolled up shows nothing at all"
         );
 
-        // Five panels, one section: the right column is five sections, not nine.
-        assert_eq!(workspace.sections(Dock::Right).len(), 5);
+        // Five panels, one section. The right column holds ten panels — Layers,
+        // Tool Options, Properties, Color, Swatches and these five — and the
+        // grouping makes that six sections rather than ten.
+        assert_eq!(workspace.sections(Dock::Right).len(), 6);
     }
 
     /// **Every section has exactly one front tab, always.**

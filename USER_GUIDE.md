@@ -621,7 +621,7 @@ BuzzAnimate features an integrated audio playback and phonetic lip-sync analysis
 - The soundtrack renders its full audio waveform directly on the timeline layer.
 - **Detect Musical Beats**: Choose **`Control ▸ Detect Beats`** to mark rhythmic percussion beats with vertical ticks on the frame ruler.
 
-### Captions In and Out (`File ▸ Import/Export Captions (.srt)`)
+### Captions In and Out (`Commands ▸ Import/Export Captions (.srt)`)
 
 An **SRT** is the subtitle format — plain text, and about as simple as a format gets:
 
@@ -642,7 +642,7 @@ A number, a timecode pair, the line, a blank line. Every transcription tool writ
 **Import is the direction that matters.** The program can already hear *where* a narration speaks (Fit to Narration, above) and not a word of *what* it says. A subtitle file is the one place both sit together, so importing one gives the document something it has never had: the words, on the frame they are spoken.
 
 1. Transcribe your voice-over with whatever you like — Whisper, Descript, or YouTube's own auto-caption download.
-2. **`File ▸ Import Captions (.srt)…`**
+2. **`Commands ▸ Import Captions (.srt)…`**
 3. You get a **Captions layer**, each line keyed to its own timecode, centred near the bottom of the stage, and gone again when the line ends.
 
 **Export** writes the **active layer's** text back out. That rule is deliberate: a title card is text and a logo is text, and neither is a caption — the only thing that separates them is which layer you put them on. The import leaves its own layer selected, so a round trip needs no thought.
@@ -666,7 +666,7 @@ A file with *nothing* readable in it is refused outright — that means the wron
 
 ---
 
-### Lip Sync from Captions (`File ▸ Lip Sync from Captions`)
+### Lip Sync from Captions (`Commands ▸ Lip Sync from Captions`)
 
 Lip sync on its own drives **one mouth against the whole soundtrack** — run it on Ana and she mouths Ben's lines too. Fine for a monologue, useless for a conversation, which is most of what a story is.
 
@@ -674,8 +674,8 @@ What was missing was never the analysis. It was knowing **who is speaking and wh
 
 1. **Import the dialogue** (`File ▸ Import Sound…`).
 2. **Import captions that name the speakers** — `Ana: We should go.` (§ above).
-3. Give each character a **mouth symbol named after them**: `Ana`, or `Ana Mouth`, or `Ana_mouth`. At least 10 frames, one per shape — `File ▸ New Mouth Symbol` makes one to draw over.
-4. With the caption layer selected, **`File ▸ Lip Sync from Captions`**.
+3. Give each character a **mouth symbol named after them**: `Ana`, or `Ana Mouth`, or `Ana_mouth`. At least 10 frames, one per shape — `Commands ▸ New Mouth Symbol` makes one to draw over.
+4. With the caption layer selected, **`Commands ▸ Lip Sync from Captions`**.
 
 Each character gets mouth keyframes **over their own lines and nobody else's**, on a layer of their own name (made if there is not one).
 
@@ -694,13 +694,13 @@ Each character gets mouth keyframes **over their own lines and nobody else's**, 
 
 ---
 
-### Fitting the Timeline to a Narration (`File ▸ Fit to Narration`)
+### Fitting the Timeline to a Narration (`Commands ▸ Fit to Narration`)
 
 A narrated film is timed by audio that already exists and cannot move. Every shot length and every cut is fitted to it — and fitting them by dragging keyframes against a waveform by eye is the single largest block of time in a week of that work. The soundtrack already says where the lines are.
 
 1. Import the narration (`File ▸ Import Sound…`).
 2. Select the layer you are going to draw on.
-3. **`File ▸ Fit to Narration`**.
+3. **`Commands ▸ Fit to Narration`**.
 
 You come back to a timeline that is **the right length**, with a **blank keyframe at the start of every line**, and the lines **marked on the ruler**. Then you draw.
 
@@ -720,7 +720,7 @@ You come back to a timeline that is **the right length**, with a **blank keyfram
 ---
 
 ### Automated Lip Sync in 3 Steps
-1. Choose **`File ▸ New Mouth Symbol`**. BuzzAnimate creates a Graphic Symbol pre-populated with 10 labeled viseme mouth shapes:
+1. Choose **`Commands ▸ New Mouth Symbol`**. BuzzAnimate creates a Graphic Symbol pre-populated with 10 labeled viseme mouth shapes:
 
 ```
 Frame 0: Rest   (Closed/Relaxed)    Frame 5: L     (Tongue up)
@@ -730,7 +730,7 @@ Frame 3: O      (Round open)        Frame 8: FV    (Teeth on lip)
 Frame 4: U      (Pursed vowel)      Frame 9: Etc   (Consonants: D,T,S,K)
 ```
 
-2. Select **`File ▸ Lip Sync…`** (`Window ▸ Lip Sync`).
+2. Select **`Commands ▸ Lip Sync…`**.
 3. Select your dialogue audio track, choose the mouth symbol, and pick the destination character layer. Click **Confirm**.
 4. BuzzAnimate analyzes the audio frequencies and automatically assigns corresponding mouth keyframes across the timeline!
 

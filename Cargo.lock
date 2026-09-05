@@ -342,6 +342,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 name = "buzz-act"
 version = "0.1.0"
 dependencies = [
+ "buzz-audio",
  "buzz-geom",
  "buzz-light",
  "buzz-physics",
@@ -349,6 +350,7 @@ dependencies = [
  "buzz-scene",
  "kurbo",
  "peniko",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -592,12 +594,15 @@ name = "buzz-script"
 version = "0.1.0"
 dependencies = [
  "buzz-act",
+ "buzz-audio",
+ "buzz-doc",
  "buzz-geom",
  "buzz-scene",
  "buzz-text",
  "kurbo",
  "peniko",
  "rquickjs",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",

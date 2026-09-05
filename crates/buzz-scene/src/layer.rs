@@ -153,6 +153,22 @@ pub struct Layer {
     /// apart for exactly that reason.
     pub follows: Option<LayerId>,
 
+    /// **Which bone of the followed layer's rig this one follows**, if it
+    /// follows a bone rather than the whole drawing.
+    ///
+    /// Layer parenting on its own inherits the *object's* motion — where the
+    /// character is standing. That is the right answer for a prop in a hand and
+    /// the wrong one for a face: a walk carries most of its motion in the
+    /// bones, so a head parented to the body arrives in the right place and
+    /// then sits still while the skull under it nods and leans away from it.
+    /// At a wide framing nobody sees it; open on somebody running and the face
+    /// slides off the head.
+    ///
+    /// With a bone named, the link inherits the object's motion **and** that
+    /// bone's — which is what parenting a head to a head means. `None` is the
+    /// plain link, which is what every document written before this had.
+    pub follows_bone: Option<usize>,
+
     /// This layer's own transform **at the moment it became a rig parent**.
     ///
     /// Layer parenting propagates a parent's motion *away from its rest pose*,
@@ -254,6 +270,7 @@ impl Layer {
             kind,
             parent: None,
             follows: None,
+            follows_bone: None,
             rest_pose: None,
             visible: true,
             locked: false,
@@ -483,24 +500,27 @@ impl LayerStack {
     /// the body's absolute transform would fling it across the stage as soon as
     /// the link was made, which is not what parenting means to an animator.
     pub fn inherited_transform(&self, id: LayerId, at: impl crate::time::AtTime) -> Affine {
-        let mut chain = Vec::new();
-        let mut current = self.get(id).and_then(|l| l.follows);
+        // Each step carries the layer it follows **and which bone of it**, so
+        // a face can follow a head while the arm it is standing next to follows
+        // the whole body.
+        let mut chain: Vec<(LayerId, Option<usize>)> = Vec::new();
+        let mut current = self.get(id).map(|l| (l.follows, l.follows_bone));
         // Bounded by the layer count: a corrupt file can hold a follow cycle,
         // and this must terminate rather than hang the renderer.
         for _ in 0..self.layers.len() {
-            let Some(next) = current else { break };
-            if chain.contains(&next) {
+            let Some((Some(next), bone)) = current else { break };
+            if chain.iter().any(|(seen, _)| *seen == next) {
                 break;
             }
-            chain.push(next);
-            current = self.get(next).and_then(|l| l.follows);
+            chain.push((next, bone));
+            current = self.get(next).map(|l| (l.follows, l.follows_bone));
         }
 
         // Outermost first: the grandparent's motion applies to the parent's,
         // and both apply to this layer.
         let mut out = Affine::IDENTITY;
-        for followed in chain.iter().rev() {
-            out *= self.motion_of(*followed, at.as_time());
+        for (followed, bone) in chain.iter().rev() {
+            out *= self.motion_of_bone(*followed, at.as_time(), *bone);
         }
         out
     }
@@ -519,8 +539,31 @@ impl LayerStack {
     /// Recorded as a deviation rather than hidden: Animate tracks a
     /// transformation for the layer itself.
     pub fn motion_of(&self, id: LayerId, at: impl crate::time::AtTime) -> Affine {
+        self.motion_of_bone(id, at, None)
+    }
+
+    /// [`Self::motion_of`], optionally through one bone of the layer's rig.
+    ///
+    /// See [`Layer::follows_bone`] for why a link would want that. `None` for
+    /// the bone is exactly the plain motion, so the two share every line.
+    pub fn motion_of_bone(
+        &self,
+        id: LayerId,
+        at: impl crate::time::AtTime,
+        bone: Option<usize>,
+    ) -> Affine {
         let Some(layer) = self.get(id) else {
             return Affine::IDENTITY;
+        };
+        // The bone's own contribution: how far it has turned from the pose the
+        // artwork was drawn in, about its own head. `pose_transform` is the
+        // identity at rest, which is what makes this compose with the plain
+        // motion below rather than replacing it.
+        let through = |object: &crate::Object| match (bone, &object.kind) {
+            (Some(index), crate::ObjectKind::Armature(rig)) if index < rig.armature.len() => {
+                rig.armature.pose_transform(index)
+            }
+            _ => Affine::IDENTITY,
         };
         let anchor = |at: f64| {
             layer
@@ -528,7 +571,7 @@ impl LayerStack {
                 .resolved_at(at)
                 .iter()
                 .next()
-                .map(|object| object.transform)
+                .map(|object| object.transform * through(object))
         };
         let Some(now) = anchor(at.as_time()) else {
             return Affine::IDENTITY;

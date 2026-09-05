@@ -264,6 +264,9 @@ impl Exporter {
             settings,
             &document::FrameOptions {
                 lit: true,
+                // Reference geometry is for the person drawing, not for the
+                // audience. See `FrameOptions::guides`.
+                guides: false,
                 ..document::FrameOptions::default()
             },
         )

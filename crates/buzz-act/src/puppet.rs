@@ -209,6 +209,17 @@ pub fn build(scene: &mut Scene, spec: &PuppetSpec) -> Puppet {
     // own and never needs any: the body walks, and the face goes along.
     scene.set_follows(face_layer, Some(body_layer), 0);
     scene.set_follows(mouth_layer, Some(body_layer), 0);
+    // **To the head bone, not to the whole body.**
+    //
+    // Most of a walk's motion is in the bones, and a face linked to the body
+    // alone arrives in the right place and then holds still while the skull
+    // under it nods and leans out from behind it. At a wide framing nobody
+    // notices; open on somebody running and the face slides off the head.
+    for layer in [face_layer, mouth_layer] {
+        scene.update_stage_layer(layer, |l| {
+            l.follows_bone = Some(figure::Joint::Head.index());
+        });
+    }
 
     Puppet {
         body_layer,
@@ -440,6 +451,44 @@ mod tests {
         assert_eq!(scene.library().len(), before, "the library grew");
         assert_eq!(second.eyes_symbol, first.eyes_symbol);
         assert_eq!(second.mouth_symbol, first.mouth_symbol);
+    }
+
+    /// **The face follows the head bone, not just the body.**
+    ///
+    /// Most of a walk's motion is in the bones. A face linked to the body alone
+    /// arrives where the character arrives and then holds still while the skull
+    /// under it nods away from it — which nobody sees at a wide framing and
+    /// everybody sees the moment the camera comes in on somebody running.
+    #[test]
+    fn the_face_moves_when_the_head_bone_does() {
+        let (mut scene, puppet) = built();
+        let face = scene
+            .layers()
+            .get(puppet.face_layer)
+            .expect("a face layer");
+        assert_eq!(
+            face.follows_bone,
+            Some(figure::Joint::Head.index()),
+            "the face is not linked to the head bone"
+        );
+
+        let still = scene.layers().inherited_transform(puppet.face_layer, 0u32);
+
+        // Turn the head bone, and nothing else.
+        scene.update_object_at(0, puppet.body, |object| {
+            if let ObjectKind::Armature(rig) = &mut object.kind {
+                let mut pose = rig.armature.pose();
+                pose[figure::Joint::Head.index()] += 0.35;
+                rig.armature.set_pose(&pose);
+            }
+        });
+
+        let after = scene.layers().inherited_transform(puppet.face_layer, 0u32);
+        assert_ne!(
+            still.as_coeffs(),
+            after.as_coeffs(),
+            "the head turned and the face stayed where it was"
+        );
     }
 
     /// **The face lands on the head**, not near it: the skull is drawn at this

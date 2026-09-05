@@ -1135,6 +1135,12 @@ pub struct LayerDto {
     /// absent means it follows nothing, which is every older document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follows: Option<u64>,
+    /// Which bone of the followed layer's rig this one follows, when it follows
+    /// a bone rather than the whole drawing — a face parented to a head. Absent
+    /// means the plain link, which is every older document and almost every
+    /// layer of a newer one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follows_bone: Option<usize>,
     /// The pose a rig parent was linked at. Version 10; absent on older
     /// documents, which fall back to their first keyframe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2172,6 +2178,7 @@ impl LayerDto {
             kind: layer.kind,
             parent: layer.parent.map(|p| p.0),
             follows: layer.follows.map(|p| p.0),
+            follows_bone: layer.follows_bone,
             rest_pose: layer.rest_pose.map(|m| m.as_coeffs()),
             visible: layer.visible,
             locked: layer.locked,
@@ -2212,6 +2219,7 @@ impl LayerDto {
         let mut layer = Layer::new(LayerId(self.id), self.name.clone(), self.kind);
         layer.parent = self.parent.map(LayerId);
         layer.follows = self.follows.map(LayerId);
+        layer.follows_bone = self.follows_bone;
         layer.rest_pose = self.rest_pose.map(buzz_geom::Affine::new);
         layer.visible = self.visible;
         layer.locked = self.locked;
@@ -3269,12 +3277,23 @@ mod tests {
         let body = scene.add_layer("Body", LayerKind::Normal);
         let head = scene.add_layer("Head", LayerKind::Normal);
         let hat = scene.add_layer("Hat", LayerKind::Normal);
-        scene.update_layer(head, |l| l.follows = Some(body));
+        scene.update_layer(head, |l| {
+            l.follows = Some(body);
+            // And to one *bone* of it, which is what parenting a face to a head
+            // means and is its own thing to lose.
+            l.follows_bone = Some(2);
+        });
         scene.update_layer(hat, |l| l.follows = Some(head));
 
         let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
         assert_eq!(back.layers().get(head).unwrap().follows, Some(body));
+        assert_eq!(back.layers().get(head).unwrap().follows_bone, Some(2));
         assert_eq!(back.layers().get(hat).unwrap().follows, Some(head));
+        assert_eq!(
+            back.layers().get(hat).unwrap().follows_bone,
+            None,
+            "a plain link must not gain a bone on the way through"
+        );
         assert_eq!(
             back.layers().get(body).unwrap().follows,
             None,

@@ -307,6 +307,13 @@
       return host.direct(String(story === undefined ? "" : story));
     };
 
+    // The same, answering with who it cast and when it planned them talking --
+    // so a script can lip-sync the people the director just staged, over the
+    // frames the director itself chose.
+    this.directScene = function (story) {
+      return JSON.parse(host.directScene(String(story === undefined ? '' : story)));
+    };
+
     // ---- the film ---------------------------------------------------------
     //
     // Everything above edits *a* scene. A film is several, and until these
@@ -335,7 +342,11 @@
       name: function (index) { return host.sceneName(Number(index)); },
       rename: function (index, name) { host.setSceneName(Number(index), String(name)); },
       // How long this shot runs. Every layer is stretched to reach it.
-      setLength: function (frames) { host.setSceneFrames(Number(frames)); },
+      // Set the shot's length, and answer with what it actually came out as.
+      // Trimming a directed shot means trimming its camera too: the scene is
+      // as long as its longest layer *or* its last camera key, so leaving the
+      // keys behind would leave the shot the length it was.
+      setLength: function (frames) { return host.setSceneFrames(Number(frames)); },
     };
 
     // Ground, backdrop, a light rig, and optionally cloud and water:
@@ -384,6 +395,11 @@
     this.parentLayer = function (child, parent, frame) {
       return host.parentLayer(Number(child), Number(parent) || 0, Number(frame) || 0);
     };
+    // A new layer, and its id back -- which JSFL's addNewLayer does not give,
+    // because in Animate you go and look at the timeline instead.
+    this.newLayer = function (name, kind, depth) {
+      return host.newLayer(String(name || ""), String(kind || "normal"), Number(depth) || 0);
+    };
     this.setLayerKind = function (layer, kind) {
       host.setLayerKindOf(Number(layer), String(kind));
     };
@@ -405,6 +421,11 @@
       var r = readRect(rect);
       return host.addRectangleOn(Number(layer), Number(frame) || 0,
                                  r[0], r[1], r[2], r[3], String(fill));
+    };
+    this.addOvalOn = function (layer, frame, rect, fill) {
+      var r = readRect(rect);
+      return host.addOvalOn(Number(layer), Number(frame) || 0,
+                            r[0], r[1], r[2], r[3], String(fill));
     };
     // A seamless procedural texture on a shape.
     this.textureObject = function (objectId, options) {

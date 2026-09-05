@@ -221,12 +221,14 @@ pub fn lay(
                 true,
             ),
         ],
-        // **A village is three passes, not one.** Trees along the horizon put
-        // the houses *in* somewhere rather than on a blank field; the houses
-        // themselves are the Buildings brush at a third of the size a skyline
-        // uses, which turns a tower block into a cottage; and the string lights
-        // over the near ground are what makes a lane read as inhabited.
-        // The grass comes last so it grows in front of the doors.
+        // **A village is trees, then houses, then the ground they stand on.**
+        //
+        // The trees go along the horizon first, so the houses are *in* somewhere
+        // rather than on a blank field. The houses are their own brush and not
+        // the skyline shrunk: that was the first attempt and it came back as a
+        // row of small tower blocks, because what makes a skyline read as one is
+        // its shape and not its size. The verge is laid last so the grass grows
+        // in front of the doors rather than behind them.
         Scenery::Village => vec![
             (
                 "Village Trees",
@@ -239,20 +241,11 @@ pub fn lay(
             ),
             (
                 "Houses",
-                EffectKind::Buildings,
-                horizon_y + stage.height() * 0.02,
-                stage.height() * 0.052,
-                Color::from_rgb8(0x4A, 0x38, 0x2E),
+                EffectKind::Houses,
+                horizon_y + stage.height() * 0.015,
+                stage.height() * 0.055,
+                Color::from_rgb8(0xB9, 0x9E, 0x7E),
                 0.6,
-                true,
-            ),
-            (
-                "Lane Lights",
-                EffectKind::StringLights,
-                horizon_y + stage.height() * 0.11,
-                stage.height() * 0.05,
-                Color::from_rgb8(0xFF, 0xD2, 0x8A),
-                0.15,
                 true,
             ),
             (
@@ -366,6 +359,23 @@ pub fn lay(
         }
         out.layers.push(layer);
     }
+
+    // **As long as the shot, not one frame long.**
+    //
+    // `add_stage_layer` makes a layer a single frame long, and every caller
+    // inside `staging::build` is followed by a pass that stretches the lot to
+    // the recipe's length. Scenery is laid *after* that pass, so a treeline was
+    // drawn on frame 0 and had disappeared by frame 1: an unattended render
+    // came back with a forest in the first frame and a bare field for the rest
+    // of the shot, which is not the kind of bug you notice in a still.
+    let last = scene.frame_count().saturating_sub(1);
+    for layer in &out.layers {
+        scene.update_stage_layer(*layer, |l| {
+            if l.frames.length() <= last {
+                l.frames.insert_frame(last);
+            }
+        });
+    }
     out
 }
 
@@ -435,6 +445,14 @@ pub fn lay_weather(scene: &mut Scene, kind: EffectKind) -> SceneryReport {
         }
     }
     out.layers.push(layer);
+    // As long as the shot, for the same reason as [`lay`] above: a rainstorm
+    // that stops after one frame is not weather.
+    let last = scene.frame_count().saturating_sub(1);
+    scene.update_stage_layer(layer, |l| {
+        if l.frames.length() <= last {
+            l.frames.insert_frame(last);
+        }
+    });
     out
 }
 

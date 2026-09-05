@@ -166,6 +166,37 @@ impl Default for FigureSpec {
     }
 }
 
+impl Palette {
+    /// **One of a rota of ways to dress somebody.**
+    ///
+    /// A cast of six in one palette is six copies of one person, and a random
+    /// palette is a scene that comes out differently every time it is set. So
+    /// it is a list, indexed by where in the cast somebody stands, and it wraps.
+    ///
+    /// Skins vary too, and by less than the clothes: skin is what a face is
+    /// made of and a wide spread there reads as a species rather than a cast.
+    pub fn nth(index: usize) -> Self {
+        // (skin, shirt, trousers)
+        const ROTA: [(u32, u32, u32); 6] = [
+            (0xE8B692, 0x3E6BA8, 0x33394A),
+            (0xC98A5E, 0x8A4230, 0x2C3040),
+            (0xD69A6A, 0xC0577F, 0x6B2A44),
+            (0xA9713F, 0x3F7A5E, 0x2A3340),
+            (0xEFC4A2, 0x6A5AA0, 0x3A3550),
+            (0xB77F52, 0xC9903A, 0x4A3A2C),
+        ];
+        let (skin, shirt, trousers) = ROTA[index % ROTA.len()];
+        let rgb = |v: u32| {
+            Color::from_rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
+        };
+        Self {
+            skin: rgb(skin),
+            shirt: rgb(shirt),
+            trousers: rgb(trousers),
+        }
+    }
+}
+
 impl FigureSpec {
     /// A child: shorter, and with the larger head that is most of what says so.
     pub fn child() -> Self {

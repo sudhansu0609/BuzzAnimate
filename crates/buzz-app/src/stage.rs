@@ -169,6 +169,8 @@ fn encode(
             // A dimmed layer is dimmed in its ghosts too, or a layer faded
             // right down still shows solidly in every ghost around it.
             layer_alpha: true,
+            // The stage is where a guide is for. See `FrameOptions::guides`.
+            guides: true,
             // The stage draws whole frames: motion blur is an export pass, so
             // scrubbing never pays for it.
             subframe: 0.0,

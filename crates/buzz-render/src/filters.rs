@@ -194,9 +194,22 @@ pub fn draw_ops(builder: &mut SceneBuilder<'_>, ops: &[Op], projection: &Project
                     .as_affine()
                     .map(|a| a * *transform)
                     .unwrap_or(*transform);
-                let placed = projection.map_path(&(*transform * path.clone()), tolerance);
+                // **The placed path, not the path.**
+                //
+                // `stroke_transformed` takes the geometry where it actually
+                // lands and uses its second argument to shape the *pen* only —
+                // it cancels the transform out of the geometry internally, so
+                // handing it `pen.inverse() * placed` cancelled it twice and
+                // drew the stroke back at the path's own coordinates.
+                //
+                // With no camera and a round pen that is the identity twice
+                // over and nothing showed. Switch a camera on and every rim a
+                // light lays turned up as a second, hollow copy of the artwork
+                // sitting where the artwork would be if the camera were not
+                // there — which is every scene the director makes, because the
+                // director always frames its shot.
                 builder.stroke_transformed(
-                    &(pen.inverse() * placed),
+                    &placed_stroke(projection, *transform, path, tolerance),
                     fade(*color, alpha),
                     *width,
                     pen,
@@ -218,6 +231,21 @@ pub fn draw_ops(builder: &mut SceneBuilder<'_>, ops: &[Op], projection: &Project
     for _ in 0..open {
         builder.pop_isolation();
     }
+}
+
+/// Where a filter's stroke lands: its own transform, then the lens.
+///
+/// Split out so the order is stated once. A stroke inside a filter is authored
+/// in the artwork's coordinates and carries a transform of its own — the squash
+/// that turns a round pen into the ellipse a blur wants — and the projection
+/// goes on the outside of that, as the last thing that happens to anything.
+fn placed_stroke(
+    projection: &Projection,
+    transform: buzz_geom::Affine,
+    path: &buzz_geom::BezPath,
+    tolerance: f64,
+) -> buzz_geom::BezPath {
+    projection.map_path(&(transform * path.clone()), tolerance)
 }
 
 /// A filter's colour, faded by the authoring overlays (onion skin, guides).

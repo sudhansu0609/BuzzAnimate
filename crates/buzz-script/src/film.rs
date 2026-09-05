@@ -156,8 +156,40 @@ fn scenes<'js>(
     host_fn!(ctx, host, state, "setSceneFrames", |state, frames: u32| {
         let mut s = state.borrow_mut();
         let frames = frames.max(1);
-        s.scene_mut().set_frame_count(frames);
         let last = frames - 1;
+
+        // **The camera first, because it can hold a shot open on its own.**
+        //
+        // `Scene::frame_count` is the longest layer *or* the last camera key,
+        // whichever is further out -- which is right, since a shot must not end
+        // before its focus pull arrives. It also means trimming the layers and
+        // stopping there leaves the scene exactly as long as it was, and the
+        // call silently does nothing. That is what a directed shot clamped to
+        // five seconds ran into: every layer came back to 120 and the shot
+        // stayed 151, because the director had keyed the camera at 150.
+        let camera = s.scene_mut().camera_mut();
+        let beyond: Vec<u32> = camera
+            .keys()
+            .iter()
+            .map(|k| k.frame)
+            .filter(|f| *f > last)
+            .collect();
+        for frame in beyond {
+            camera.remove_key(frame);
+        }
+        let beyond: Vec<u32> = camera
+            .focus_keys()
+            .iter()
+            .map(|k| k.frame)
+            .filter(|f| *f > last)
+            .collect();
+        for frame in beyond {
+            camera.remove_focus_key(frame);
+        }
+
+        s.scene_mut().set_frame_count(frames);
+
+        // And every layer reaches the end, so nothing vanishes mid-shot.
         let layers: Vec<LayerId> = s.scene().layers().iter().map(|l| l.id).collect();
         for layer in layers {
             s.scene_mut().update_layer(layer, |l| {
@@ -166,7 +198,7 @@ fn scenes<'js>(
                 }
             });
         }
-        Ok(())
+        Ok(s.scene().frame_count() as i32)
     });
     Ok(())
 }
@@ -358,8 +390,62 @@ fn cast<'js>(
         Ok(puppet_json(&puppet).to_string())
     });
 
-    // A performance, with the two controls the short form leaves out: how big
-    // it is, and how far it travels.
+    // **Direct a whole shot, and be told who it cast and when they speak.**
+    //
+    // `document.direct` has always staged, cast, blocked and framed a scene
+    // from prose, and then handed back only how long it came out -- so a script
+    // that wanted to lip-sync the people the director had just cast had no way
+    // to find out who they were, or which frames the director had planned them
+    // talking over. Both were computed and thrown away.
+    //
+    // That is the gap `AUTOMATION.md` calls the dialogue-to-*performance* half
+    // of 2.2. This closes it from the script's side: the answer carries the
+    // cast with every id a mouth needs, and the talk beats with their frames.
+    host_fn!(ctx, host, state, "directScene", |state, story: String| {
+        let mut s = state.borrow_mut();
+        let directed = buzz_act::direct(s.scene_mut(), &story)
+            .map_err(|e| throw(&format!("{e}")))?;
+
+        let cast: Vec<Value> = directed
+            .staged
+            .puppets
+            .iter()
+            .enumerate()
+            .map(|(i, puppet)| {
+                let mut entry = puppet_json(puppet);
+                if let Some(name) = directed.names.get(i) {
+                    entry["name"] = json!(name);
+                }
+                entry["actor"] = json!(i);
+                entry
+            })
+            .collect();
+
+        let talking: Vec<Value> = directed
+            .beats
+            .iter()
+            .filter(|beat| beat.action == buzz_act::perform::Action::Talk)
+            .map(|beat| {
+                json!({
+                    "actor": beat.actor,
+                    "from": beat.frames.start,
+                    "to": beat.frames.end,
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "frames": directed.frames,
+            "cast": cast,
+            "talking": talking,
+            "ignored": directed.ignored,
+            "message": directed.message,
+        })
+        .to_string())
+    });
+
+    // A performance with its size and its travel, where `perform` takes the
+    // defaults: how big it is, and how far it moves.
     host_fn!(
         ctx,
         host,
@@ -488,6 +574,39 @@ fn rigging<'js>(
         }
     );
 
+    // **A new layer, and its id back.**
+    //
+    // JSFL's `addNewLayer` answers with nothing, because in Animate you go and
+    // look at the timeline afterwards. A script has no timeline to look at, and
+    // the layer it just made is the one it is about to draw a mask on.
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "newLayer",
+        |state, name: String, kind: String, depth: f64| {
+            let kind = layer_kind_named(&kind)?;
+            let mut s = state.borrow_mut();
+            let name = if name.is_empty() {
+                format!("Layer_{}", s.scene().layers().len() + 1)
+            } else {
+                name
+            };
+            let id = s.scene_mut().add_stage_layer(name, kind);
+            if depth != 0.0 && depth.is_finite() {
+                s.scene_mut().update_layer(id, |l| l.depth = depth);
+            }
+            // As long as the shot already is, so anything drawn on it lasts.
+            let last = s.scene().frame_count().saturating_sub(1);
+            s.scene_mut().update_layer(id, |l| {
+                if l.frames.length() <= last {
+                    l.frames.insert_frame(last);
+                }
+            });
+            Ok(id.0)
+        }
+    );
+
     // A layer's kind: `normal`, `mask`, `masked`, `inverseMask`, `folder`,
     // `guide` or `guided`. A mask clips the run of masked layers under it.
     host_fn!(
@@ -561,6 +680,31 @@ fn rigging<'js>(
             let mut s = state.borrow_mut();
             use buzz_geom::Shape as _;
             let shape = buzz_scene::ShapeData::filled(rect.to_path(1e-9), colour);
+            s.scene_mut()
+                .add_shape_at(LayerId(layer), frame, shape)
+                .map(|id| id.0)
+                .ok_or_else(|| throw(&format!("could not draw on layer {layer}")))
+        }
+    );
+
+    // The same, as an oval. Two calls rather than one with a flag, because
+    // rquickjs binds seven parameters to a native function and a shape on a
+    // named layer at a named frame has used every one of them.
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "addOvalOn",
+        |state, layer: u64, frame: u32, l: f64, t: f64, r: f64, b: f64, fill: String| {
+            let colour = parse_color(&fill)?;
+            let rect = buzz_geom::Rect::new(l.min(r), t.min(b), l.max(r), t.max(b));
+            if rect.width() <= 0.0 || rect.height() <= 0.0 {
+                return Err(throw("a shape needs a non-zero width and height"));
+            }
+            let mut s = state.borrow_mut();
+            use buzz_geom::Shape as _;
+            let path = kurbo::Ellipse::from_rect(rect).to_path(1e-3);
+            let shape = buzz_scene::ShapeData::filled(path, colour);
             s.scene_mut()
                 .add_shape_at(LayerId(layer), frame, shape)
                 .map(|id| id.0)

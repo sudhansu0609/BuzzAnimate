@@ -67,6 +67,14 @@ pub enum EffectKind {
     Lamps,
     /// A city skyline standing on the stroke, windows lit.
     Buildings,
+    /// **A row of low houses**: pitched roofs, a lit window, a chimney.
+    ///
+    /// Not [`Self::Buildings`] at a smaller size. A skyline reads as a skyline
+    /// because of its *shape* — tall, flat-topped, repeated — and shrinking one
+    /// gives a row of sheds rather than a village. What says dwelling is the
+    /// pitched roof and the single warm window, and neither is something a
+    /// scaled-down tower block grows.
+    Houses,
     /// A row of pines standing on the stroke.
     PineTrees,
     /// Round-crowned trees standing on the stroke.
@@ -76,7 +84,7 @@ pub enum EffectKind {
 }
 
 impl EffectKind {
-    pub const ALL: [EffectKind; 15] = [
+    pub const ALL: [EffectKind; 16] = [
         Self::Snow,
         Self::Rain,
         Self::Stars,
@@ -89,6 +97,7 @@ impl EffectKind {
         Self::StringLights,
         Self::Lamps,
         Self::Buildings,
+        Self::Houses,
         Self::PineTrees,
         Self::LeafyTrees,
         Self::Grass,
@@ -108,6 +117,7 @@ impl EffectKind {
             Self::StringLights => "String Lights",
             Self::Lamps => "Lamps",
             Self::Buildings => "Buildings",
+            Self::Houses => "Houses",
             Self::PineTrees => "Pine Trees",
             Self::LeafyTrees => "Leafy Trees",
             Self::Grass => "Grass",
@@ -128,6 +138,7 @@ impl EffectKind {
             Self::StringLights => "Fairy lights hanging from the stroke",
             Self::Lamps => "Street lamps standing on the stroke, pools of light below",
             Self::Buildings => "A lit city skyline standing on the stroke",
+            Self::Houses => "A row of low houses with pitched roofs and lit windows",
             Self::PineTrees => "A treeline of pines standing on the stroke",
             Self::LeafyTrees => "Round-crowned trees standing on the stroke",
             Self::Grass => "Blades of grass growing up from the stroke",
@@ -146,7 +157,7 @@ impl EffectKind {
             | Self::Moonlight
             | Self::Lamps => "The fill colour is the light",
             Self::StringLights => "Bulbs cycle a festive palette; the wire is dark",
-            Self::Buildings => "Silhouette in the fill colour; windows glow warm",
+            Self::Buildings | Self::Houses => "Silhouette in the fill colour; windows glow warm",
             Self::PineTrees | Self::LeafyTrees => "Silhouette in the fill colour",
         }
     }
@@ -229,6 +240,7 @@ pub fn effect_artwork(kind: EffectKind, stroke: &EffectStroke<'_>) -> Vec<ArtPie
         EffectKind::StringLights => string_lights(&ctx),
         EffectKind::Lamps => lamps(&ctx),
         EffectKind::Buildings => buildings(&ctx),
+        EffectKind::Houses => houses(&ctx),
         EffectKind::PineTrees => pine_trees(&ctx),
         EffectKind::LeafyTrees => leafy_trees(&ctx),
         EffectKind::Grass => grass(&ctx),
@@ -1051,6 +1063,110 @@ fn buildings(fx: &Fx<'_>) -> Vec<ArtPiece> {
     out
 }
 
+/// **A row of low houses standing on the stroke.**
+///
+/// Three things separate this from [`buildings`] scaled down, and they are the
+/// three things that make a shape read as somewhere people live:
+///
+/// * **A pitched roof.** A flat top is a warehouse. The gable is drawn as its
+///   own triangle so the roof can take a darker tone than the wall, which is
+///   what stops a house reading as one flat blob at a distance.
+/// * **One warm window, not a grid.** A grid of lit windows is a block of
+///   flats however small you draw it; a single square of light per house is a
+///   room with somebody in it.
+/// * **A chimney on most of them**, off-centre. It is four points of geometry
+///   and it is most of the silhouette's character.
+///
+/// Wider than they are tall, unlike a tower: the proportion is doing as much
+/// work here as the roof.
+fn houses(fx: &Fx<'_>) -> Vec<ArtPiece> {
+    let step = (fx.size * 0.25).max(1.0);
+    let stamps = walk(fx.spine, step, caps::PARTICLES * 2);
+    if stamps.is_empty() {
+        return Vec::new();
+    }
+
+    let mut walls = BezPath::new();
+    let mut roofs = BezPath::new();
+    let mut windows = BezPath::new();
+    let mut cursor = 0usize;
+    let mut b = 0usize;
+
+    while cursor < stamps.len() && b < caps::STRUCTURES {
+        let base = stamps[cursor].pos;
+        // Wider than tall. A house is a box you can see the whole of.
+        let w = fx.size * (1.3 + 0.9 * fx.rng(b, 0xB0E1));
+        let wall = fx.size * (0.55 + 0.45 * fx.rng(b, 0xB0E2));
+        let roof = fx.size * (0.42 + 0.30 * fx.rng(b, 0xB0E3));
+        let body = Rect::new(base.x - w / 2.0, base.y - wall, base.x + w / 2.0, base.y);
+
+        if walls.elements().len() < caps::ELEMENTS {
+            add_rect(&mut walls, body);
+        }
+
+        // The gable, overhanging the wall a little at the eaves, as a roof does.
+        if roofs.elements().len() < caps::ELEMENTS {
+            let eaves = w * 0.10;
+            let mut gable = BezPath::new();
+            gable.move_to(Point::new(body.x0 - eaves, body.y0));
+            gable.line_to(Point::new(body.x1 + eaves, body.y0));
+            gable.line_to(Point::new(base.x, body.y0 - roof));
+            gable.close_path();
+            roofs.extend(gable.iter());
+
+            // A chimney on most of them, off to one side.
+            if fx.rng(b, 0xB0E4) < 0.65 {
+                let side = if fx.rng(b, 0xB0E5) < 0.5 { -1.0 } else { 1.0 };
+                let cx = base.x + side * w * 0.26;
+                let stack = fx.size * 0.10;
+                add_rect(
+                    &mut roofs,
+                    Rect::new(
+                        cx - stack * 0.5,
+                        body.y0 - roof * 0.95,
+                        cx + stack * 0.5,
+                        body.y0,
+                    ),
+                );
+            }
+        }
+
+        // One window, warm. Two on the wider houses, and no more than that.
+        let pane = (fx.size * 0.24).min(wall * 0.45);
+        let lights = if w > fx.size * 1.9 { 2 } else { 1 };
+        for n in 0..lights {
+            if windows.elements().len() >= caps::ELEMENTS {
+                break;
+            }
+            let spread = if lights == 1 {
+                0.0
+            } else {
+                (n as f64 - 0.5) * w * 0.42
+            };
+            let wx = base.x + spread - pane * 0.5;
+            let wy = body.y0 + wall * 0.30;
+            add_rect(&mut windows, Rect::new(wx, wy, wx + pane, wy + pane));
+        }
+
+        // The next one, with a lane between.
+        let advance = ((w + fx.size * 0.55) / step).ceil() as usize;
+        cursor += advance.max(1);
+        b += 1;
+    }
+
+    let mut out = Vec::new();
+    push_solid(&mut out, walls, fx.color);
+    // The roof is the fill colour taken down towards black, so one chosen
+    // colour still gives two tones and the row does not read as a silhouette.
+    push_solid(&mut out, roofs, darken(fx.color, 0.55));
+    push_solid(
+        &mut out,
+        windows,
+        Color::from_rgba8(0xFF, 0xC9, 0x6B, 0xEA),
+    );
+    out
+}
+
 fn pine_trees(fx: &Fx<'_>) -> Vec<ArtPiece> {
     let stamps = walk(fx.spine, (fx.size * 1.3).max(4.0), caps::STRUCTURES);
     let mut wood = BezPath::new();
@@ -1326,6 +1442,7 @@ mod tests {
         let samples = drag(Point::new(0.0, 200.0), Point::new(600.0, 200.0), 60);
         for kind in [
             EffectKind::Buildings,
+            EffectKind::Houses,
             EffectKind::PineTrees,
             EffectKind::LeafyTrees,
             EffectKind::Grass,

@@ -427,6 +427,19 @@ pub fn build(scene: &mut Scene, recipe: &SceneRecipe) -> StagedScene {
 
         let spec = FigureSpec {
             height: stage.height() * recipe.figure_scale * shrink,
+            // **Nobody is dressed the same.**
+            //
+            // The cast used to take the default palette to a person, so three
+            // characters came back as three copies of one man in a blue shirt.
+            // Depth and facing were already varied for exactly this reason --
+            // two people in a shot who read as the same person are a mistake
+            // the eye catches instantly -- and clothes are the cheapest of the
+            // three to vary and the most visible.
+            //
+            // A fixed rota rather than a random one, so a scene set twice is
+            // set the same way both times, and so a writer who does not like
+            // the second character's coat knows where it came from.
+            palette: crate::figure::Palette::nth(i),
             // They face each other: the first from the left looking right, the
             // rest looking back at it. Two people in a shot who both face the
             // camera are two people in a photograph.

@@ -77,6 +77,21 @@ pub struct FrameOptions {
     /// camera, the tweens and the wiggles on to where they are part-way through
     /// the frame. See [`FrameOptions::at`].
     pub subframe: f64,
+    /// **Draw guide layers.**
+    ///
+    /// A guide is reference geometry — a motion path, a perspective grid, a
+    /// photograph to trace over. `LayerKind::paints_to_output` has said since
+    /// it was written that a guide does not reach the film, and until this
+    /// existed nothing read it: the render walk asked `paints_on_stage`, which
+    /// is the *authoring* question, so a guide was drawn faded into the export
+    /// as well as onto the stage.
+    ///
+    /// Faded, so it survived review as "a bit of the background" rather than as
+    /// a bug — and a traced photograph delivered at 35% over the drawing is
+    /// exactly the outcome the layer kind exists to prevent.
+    ///
+    /// On by default, which is the stage. The exporter turns it off.
+    pub guides: bool,
     /// The visible rectangle in **document space**, for culling.
     ///
     /// **Display-only.** The window passes the viewport rect so artwork far off
@@ -101,6 +116,7 @@ impl Default for FrameOptions {
             // pools without having to say so twice.
             pools: true,
             layer_alpha: false,
+            guides: true,
             place: Affine::IDENTITY,
             subframe: 0.0,
             cull: None,
@@ -1541,6 +1557,9 @@ fn draw_layer(
         };
 
         // Guides are authoring aids: visible on stage, never exported.
+        if layer.kind == LayerKind::Guide && !options.guides {
+            return;
+        }
         let outline = layer.outline || (options.ghost.is_some() && options.ghost_outlines);
         let tint = outline.then_some(layer.color);
         let faded = layer.kind == LayerKind::Guide;

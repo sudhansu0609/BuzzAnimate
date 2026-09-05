@@ -293,9 +293,11 @@ for (var i = 0; i < directed.ignored.length; i++) {
   fl.trace("  the director could not read: " + directed.ignored[i]);
 }
 
-// The village goes in behind what the director staged, at the horizon it used.
+// **The director laid the village itself.** It reads the place out of the prose
+// -- *village* is one of its scenery words -- so asking for one here as well
+// got the trees and the houses twice, in two stacks, at the same horizon. The
+// weather is still ours: the director has no drifting sky.
 var villageSky = doc.layerNamed("Sky");
-doc.layScenery("village", GROUND_Y, villageSky);
 movingSky(villageSky, {
   texture: "Noise", top: "#FFFFFF20", bottom: "#FFF6E018",
   bg: "#FFFFFF00",
@@ -362,13 +364,16 @@ doc.addLight("lamp", {
   color: "#FFD9A0", intensity: 0.75,
 });
 
-// The moon, back out of the asset library rather than drawn again.
+// The moon, back out of the asset library rather than drawn again. The merge
+// brings its own layer with the instance already on it, so the only thing left
+// to do is put that layer in the sky -- placing a *second* instance, which is
+// what this did at first, hangs two moons in the same patch of sky.
 var recalled = doc.assets.place("Moon", "Three Roads");
-var moonSymbol = doc.findSymbol("Moon");
-if (moonSymbol) {
-  var skyMoon = doc.newLayer("Moon", "normal", 980);
-  inFrontOf(skyMoon, city.backdrop);
-  doc.placeSymbol(moonSymbol, skyMoon, 0, { x: 0, y: 0, scale: 1.25 });
+if (recalled.layers && recalled.layers.length > 0) {
+  for (var m = 0; m < recalled.layers.length; m++) {
+    doc.setLayerKind(recalled.layers[m], "normal");
+    inFrontOf(recalled.layers[m], city.backdrop);
+  }
   fl.trace("  recalled the moon from the asset library");
 } else {
   fl.trace("  the moon was not in the asset library; the sky keeps its stars");

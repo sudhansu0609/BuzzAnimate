@@ -1075,10 +1075,30 @@ fn library<'js>(
                 .cloned()
                 .ok_or_else(|| throw(&format!("there is no asset called {name:?}")))?;
             let mut s = state.borrow_mut();
+            // **Which layers arrived**, not just how many.
+            //
+            // A merge lands the asset's own layers wherever the stack happens
+            // to put them, and a script that has just fetched a moon wants it
+            // *in the sky*. Counting them is enough for a status bar and no use
+            // at all to a caller, so the ids are taken before and after and the
+            // difference handed back.
+            let before: Vec<u64> = s.scene().layers().iter().map(|l| l.id.0).collect();
             let report = library
                 .place(&asset, s.scene_mut())
                 .map_err(|e| throw(&format!("{e}")))?;
-            Ok(json!({"layers": report.layers, "symbols": report.symbols}).to_string())
+            let arrived: Vec<u64> = s
+                .scene()
+                .layers()
+                .iter()
+                .map(|l| l.id.0)
+                .filter(|id| !before.contains(id))
+                .collect();
+            Ok(json!({
+                "layers": arrived,
+                "symbols": report.symbols,
+                "objects": report.objects,
+            })
+            .to_string())
         }
     );
 

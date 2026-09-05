@@ -76,8 +76,8 @@ fn conversation() -> (Editor, tempfile::TempDir) {
     // A mouth for each character, named after them — which is how they are
     // matched, and the whole of the setup this feature asks for.
     editor.doc.edit("Mouths", |scene| {
-        buzz_app::lipsync::placeholder_mouth(scene, "Ana");
-        buzz_app::lipsync::placeholder_mouth(scene, "Ben");
+        buzz_act::lipsync::placeholder_mouth(scene, "Ana");
+        buzz_act::lipsync::placeholder_mouth(scene, "Ben");
     });
 
     editor.import_captions(&srt).expect("the captions import");
@@ -207,7 +207,7 @@ fn a_speaker_with_no_mouth_symbol_is_named() {
     editor.import_sound(&wav).expect("imports");
     // Only Ana has a mouth.
     editor.doc.edit("Mouths", |scene| {
-        buzz_app::lipsync::placeholder_mouth(scene, "Ana");
+        buzz_act::lipsync::placeholder_mouth(scene, "Ana");
     });
     editor.import_captions(&srt).expect("imports");
 

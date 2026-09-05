@@ -5042,6 +5042,10 @@ impl App {
             selection: self.editor.selection.ids(),
             active_layer: self.editor.selection.active_layer(),
                     config_dir: buzz_script::default_config_dir(),
+            // The Assets panel's own folder. A script filing a cast there
+            // is filing it where the panel will show it, which is the
+            // whole point of an asset outliving its document.
+            asset_root: buzz_doc::AssetLibrary::user().root().map(|p| p.to_path_buf()),
         };
         let mut working = self.editor.doc.scene().clone();
 

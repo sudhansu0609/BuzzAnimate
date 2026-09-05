@@ -182,18 +182,29 @@ pub fn write_track(
 /// nothing to show — so this makes a symbol of the right length with a labelled
 /// placeholder on each frame, which can then be drawn over shape by shape.
 pub fn placeholder_mouth(scene: &mut Scene, name: &str) -> SymbolId {
+    let symbol = scene.add_symbol(name, buzz_scene::SymbolKind::Graphic, None);
+    fill_placeholder_mouth(scene, symbol);
+    symbol
+}
+
+/// The same shapes, drawn into a symbol that already exists.
+///
+/// Split out for [`crate::puppet`], which wants the mouth filed in the Cast
+/// folder beside the eyes and the brows rather than at the root of the library
+/// -- and, more to the point, wants to make it *once* for a whole cast. A
+/// symbol is made by whoever is going to name and file it; this only draws.
+pub fn fill_placeholder_mouth(scene: &mut Scene, symbol: SymbolId) {
     use buzz_geom::Shape as _;
     use buzz_scene::ShapeData;
     use peniko::Color;
 
-    let symbol = scene.add_symbol(name, buzz_scene::SymbolKind::Graphic, None);
     let Some(layer) = scene
         .library()
         .get(symbol)
         .and_then(|s| s.layers.iter().next())
         .map(|l| l.id)
     else {
-        return symbol;
+        return;
     };
 
     // Openness stands in for the shape: a closed line for the closed mouths, a
@@ -248,8 +259,6 @@ pub fn placeholder_mouth(scene: &mut Scene, name: &str) -> SymbolId {
             }
         });
     });
-
-    symbol
 }
 
 #[cfg(test)]

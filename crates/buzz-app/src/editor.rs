@@ -1093,7 +1093,7 @@ impl Editor {
                     frames.push(buzz_audio::Viseme::Rest);
                     let slice = buzz_audio::VisemeTrack { frames, fps };
 
-                    let report = crate::lipsync::write_track(
+                    let report = buzz_act::lipsync::write_track(
                         scene,
                         &slice,
                         span.start,
@@ -4510,7 +4510,7 @@ impl Editor {
     pub fn new_mouth_symbol(&mut self) -> buzz_scene::SymbolId {
         let mut made = None;
         self.doc.edit("New Mouth Symbol", |scene| {
-            made = Some(crate::lipsync::placeholder_mouth(scene, "Mouth"));
+            made = Some(buzz_act::lipsync::placeholder_mouth(scene, "Mouth"));
         });
         self.doc.end_gesture();
         self.status = Some("Made a mouth symbol - draw each shape on its own frame".into());
@@ -4607,7 +4607,7 @@ impl Editor {
 
         let mut outcome = None;
         self.doc.edit("Lip Sync", |scene| {
-            outcome = Some(crate::lipsync::apply(
+            outcome = Some(buzz_act::lipsync::apply(
                 scene,
                 &clip,
                 start,
@@ -4670,6 +4670,10 @@ impl Editor {
             selection: self.selection.ids(),
             active_layer: self.selection.active_layer(),
                     config_dir: buzz_script::default_config_dir(),
+            // The Assets panel's own folder. A script filing a cast there
+            // is filing it where the panel will show it, which is the
+            // whole point of an asset outliving its document.
+            asset_root: buzz_doc::AssetLibrary::user().root().map(|p| p.to_path_buf()),
         };
 
         let mut working = self.doc.scene().clone();

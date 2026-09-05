@@ -28,7 +28,7 @@ use buzz_geom::{Point, Rect, Shape as _};
 use buzz_scene::{LayerId, LayerKind, ObjectId, Scene, ShapeData};
 use peniko::Color;
 
-use crate::figure::{self, FigureSpec};
+use crate::figure::FigureSpec;
 
 /// Where the scene is, which decides the palette and the light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +287,13 @@ pub struct StagedScene {
     /// performances can be timed independently, which is the whole reason two
     /// people in a shot are two layers.
     pub cast: Vec<(LayerId, ObjectId)>,
+    /// **The whole rig for each of them**, in the same order as [`Self::cast`].
+    ///
+    /// `cast` is the *body* — the thing a performance is written on — and used
+    /// to be all a staged character had. A staged character now also has a
+    /// face, and anything that wants to talk to it needs to know which layer
+    /// that is on and where the mouth belongs. See [`crate::puppet`].
+    pub puppets: Vec<crate::puppet::Puppet>,
     pub message: String,
 }
 
@@ -427,41 +434,38 @@ pub fn build(scene: &mut Scene, recipe: &SceneRecipe) -> StagedScene {
             ..FigureSpec::default()
         };
 
-        let layer = scene.add_stage_layer(&format!("Person {}", i + 1), LayerKind::Normal);
-        let id = scene.next_object_id();
-        let mut person = figure::build(&spec, id, || scene.next_object_id());
-        person.name = Some(format!("Person {}", i + 1));
-        person.transform = buzz_geom::Affine::translate((
-            stage.x0 + stage.width() * across,
-            stands_on,
-        )) * person.transform;
-
-        if let Some(placed) = scene.add_object(layer, person) {
-            // **Everybody breathes.**
-            //
-            // A staged scene is a held pose until somebody animates it, and a
-            // held pose that does not move is a picture of a character rather
-            // than a character standing there. A breath is the cheapest thing
-            // that fixes it and the thing an animator draws by hand on every
-            // hold; two per cent of scale, nobody notices it consciously, and
-            // everybody notices its absence.
-            //
-            // Live, so it costs no keyframes and cannot be knocked out by a
-            // re-time — and so a performance written over it walks *and*
-            // breathes rather than choosing. Seeded per object, so a cast of
-            // six does not inhale together.
-            //
-            // A resting rate, and slightly quicker for the ones further back:
-            // an even rate across the cast is the one thing that would make it
-            // visible as a mechanism.
-            scene.update_object_across(0, u32::MAX, placed, |o| {
-                o.modifiers.push(buzz_scene::Modifier::Breathe {
-                    rate: 13.0 + 3.0 * depth,
-                    depth: 1.0,
-                });
-            });
-            out.cast.push((layer, placed));
-        }
+        // **A whole puppet, not a body.**
+        //
+        // This used to be `figure::build` — thirteen bones and no face — and
+        // that meant every automatic character in the program was somebody seen
+        // from far enough away that their face did not matter. Nothing staged
+        // could blink, and nothing staged could be lip-synced without an
+        // animator first drawing a mouth and parenting it by hand, once per
+        // character, per shot. See [`crate::puppet`] for the two rigs it gets
+        // instead: bones for the limbs, layer parenting for the face.
+        //
+        // **Everybody still breathes.** A staged scene is a held pose until
+        // somebody animates it, and a held pose that does not move is a picture
+        // of a character rather than a character standing there. Live, so it
+        // costs no keyframes, cannot be knocked out by a re-time, and composes
+        // with a walk written over it rather than losing to one. A resting
+        // rate, and slightly quicker for the ones further back: an even rate
+        // across the cast is the one thing that would make it visible as a
+        // mechanism. The blink is seeded the same way and for the same reason.
+        let puppet = crate::puppet::build(
+            scene,
+            &crate::puppet::PuppetSpec {
+                name: format!("Person {}", i + 1),
+                figure: spec,
+                at: buzz_geom::Point::new(stage.x0 + stage.width() * across, stands_on),
+                blink_rate: 11.0 + 3.0 * depth,
+                breathe_rate: 13.0 + 3.0 * depth,
+                eyes: peniko::Color::from_rgb8(0x2A, 0x1C, 0x12),
+                frames: recipe.frames,
+            },
+        );
+        out.cast.push((puppet.body_layer, puppet.body));
+        out.puppets.push(puppet);
     }
 
     // Every layer as long as the shot, so a performance written next has frames
@@ -915,7 +919,7 @@ mod tests {
         for id in built.actors() {
             let (_, object) = scene.find_object(id).expect("the person is on a layer");
             assert!(
-                figure::is_figure(object),
+                crate::figure::is_figure(object),
                 "and is rigged, or nothing can be performed on it"
             );
         }

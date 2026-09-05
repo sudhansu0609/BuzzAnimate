@@ -12,7 +12,29 @@
 //! ```text
 //! buzzanimate --brief story.txt --render out.mp4
 //! buzzanimate film.buzz --render out.mp4 --height 1080
+//! buzzanimate --script film.js --audio line.mp3 --from 12 --for 15 \
+//!             --save film.buzz --render film.mp4
 //! ```
+//!
+//! # The script runs here too, and it is the reason this grew
+//!
+//! `--script` used to need the window: the editor built the interpreter, so a
+//! script could only run against a document somebody had open. That put the
+//! most capable half of the automation on the wrong side of the very door this
+//! module exists to open -- a brief can say *"Ana walks in from the left"*, and
+//! nothing a brief can say will rig a face, mask a sky or lip-sync a take.
+//!
+//! So a render job can carry a script, and the script is handed the **whole
+//! film** rather than one scene (see [`buzz_script::run_film`]). It can add
+//! shots, switch between them, cast, rig and lip-sync, and what it leaves is an
+//! ordinary document -- which `--save` writes and `--render` encodes.
+//!
+//! # Sound comes in through the host, not through the script
+//!
+//! A script cannot open a file, and that stays true. `--audio` opens one here,
+//! `--from` and `--for` take the slice that is actually wanted out of it, and
+//! the decoded clip is handed to the script by index. A four-minute take and a
+//! fifteen-second film is the ordinary case, not the exotic one.
 //!
 //! # It opens no window, and it says so on the way
 //!
@@ -53,12 +75,38 @@ pub struct RenderJob {
     /// which is how a scripted pipeline adds shots to a set somebody built by
     /// hand.
     pub brief: Option<PathBuf>,
+    /// **A script to run over the whole film**, after the brief is directed
+    /// and before anything is written.
+    ///
+    /// Last, because it is the most specific: a brief stages a shot in broad
+    /// strokes and a script edits what the brief produced. Reversing them would
+    /// have the director paint over the script's work.
+    pub script: Option<PathBuf>,
+    /// **Dialogue and music**, decoded before the run and handed to the script
+    /// by index. Each may carry a slice of the file rather than all of it.
+    pub audio: Vec<AudioIn>,
+    /// Where to write the `.buzz` document, if it is wanted.
+    ///
+    /// Separate from the render, and either may be given alone: a document with
+    /// no film is a set-up to open and carry on with, and a film with no
+    /// document is the ordinary overnight job.
+    pub save: Option<PathBuf>,
     /// Where the film goes. The extension chooses the format.
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
     /// Target height in pixels; the width follows the document's aspect.
     /// `None` keeps the stage's own size.
     pub height: Option<u32>,
     pub gpu: GpuPreference,
+}
+
+/// One sound to open on the way in, and how much of it is wanted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioIn {
+    pub path: PathBuf,
+    /// Where the wanted part starts, in seconds. `None` is the beginning.
+    pub from: Option<f64>,
+    /// How much of it is wanted, in seconds. `None` is the rest of the file.
+    pub length: Option<f64>,
 }
 
 /// **Run a render job to completion**, with no window and no event loop.
@@ -67,6 +115,84 @@ pub struct RenderJob {
 /// that mean there is no film to make at all — a missing brief, an
 /// unrecognisable output format — rather than for a frame that came out wrong.
 pub fn render(job: &RenderJob) -> Result<String> {
+    // **The output format is checked before any work is done.** Directing a
+    // brief and running a script take real time, and finding out afterwards
+    // that nothing encodes a `.psd` is the worst possible moment.
+    let format = job.output.as_deref().map(format_for).transpose()?;
+
+    let mut report = Vec::new();
+    let mut doc = build(job, &mut report)?;
+
+    if let Some(path) = &job.save {
+        doc.save_as(path)
+            .with_context(|| format!("saving {}", path.display()))?;
+        report.push(format!("Saved {}", path.display()));
+    }
+
+    let Some(output) = job.output.clone() else {
+        // A job that only builds a document is a complete job. Refusing it
+        // because no film was asked for would make `--save` useless on its own.
+        return Ok(report.join(" "));
+    };
+
+    // Every scene, in the order they play -- the same snapshots the Tasks panel
+    // would have taken.
+    let scenes: Vec<buzz_scene::Scene> = doc.film();
+    let Some(lead) = scenes.first() else {
+        bail!("that document has no scenes in it");
+    };
+    let frames = buzz_export::Reel::of(scenes.iter()).frames();
+    if frames == 0 {
+        bail!("that film is zero frames long");
+    }
+
+    let format = format.expect("checked at the top, and the output is still there");
+    let settings = sized(lead, job.height);
+    let target = target_for(format, &output)?;
+
+    let label = output
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "film".to_string());
+
+    eprintln!(
+        "Rendering {} scene(s), {frames} frames, {}x{} \u{2192} {}",
+        scenes.len(),
+        settings.width,
+        settings.height,
+        output.display()
+    );
+
+    let ctx = TaskCtx {
+        cancel: CancelToken::new(),
+        progress: ProgressSink::detached(),
+    };
+    let request = ExportRequest {
+        scenes,
+        settings,
+        range: 0..frames,
+        target,
+        gpu: job.gpu.clone(),
+        label,
+    };
+
+    match run_export(request, &ctx) {
+        TaskOutcome::Finished(message) => {
+            report.push(message);
+            Ok(report.join(" "))
+        }
+        TaskOutcome::Failed(why) => bail!("{why}"),
+        TaskOutcome::Cancelled => bail!("the render was cancelled"),
+    }
+}
+
+/// **Everything up to the document being finished**: open it, direct the brief
+/// into it, run the script over it.
+///
+/// Split out from [`render`] because a job that only saves does exactly this
+/// and stops, and because the order of the three is the part worth being able
+/// to read in one place.
+fn build(job: &RenderJob, report: &mut Vec<String>) -> Result<Document> {
     let mut doc = match &job.document {
         Some(path) => {
             let (scenes, _) = buzz_doc::format::load_scenes(path)
@@ -102,64 +228,129 @@ pub fn render(job: &RenderJob) -> Result<String> {
         doc = editor.doc;
     }
 
-    if job.document.is_none() && job.brief.is_none() {
-        bail!("nothing to render: give a document, a brief, or both");
+    if job.document.is_none() && job.brief.is_none() && job.script.is_none() {
+        bail!("nothing to do: give a document, a brief, a script, or any of them together");
     }
 
-    // Every scene, in the order they play — the same snapshots the Tasks panel
-    // would have taken.
-    let scenes: Vec<buzz_scene::Scene> = doc.film();
-    let Some(lead) = scenes.first() else {
-        bail!("that document has no scenes in it");
-    };
-    let frames = buzz_export::Reel::of(scenes.iter()).frames();
-    if frames == 0 {
-        bail!("that film is zero frames long");
+    match directed {
+        0 => {}
+        1 => report.push("Directed one shot.".to_string()),
+        n => report.push(format!("Directed {n} shots.")),
     }
 
-    let format = format_for(&job.output)?;
-    let settings = sized(lead, job.height);
-    let target = target_for(format, &job.output)?;
+    // **The script, over the whole film.** See the note at the top of the file
+    // on why it is handed every scene rather than one.
+    if let Some(path) = &job.script {
+        let source = std::fs::read_to_string(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let sounds = decode_all(&job.audio)?;
+        for clip in &sounds {
+            eprintln!(
+                "Sound: {} ({:.2}s, {} Hz, {} channel(s))",
+                clip.name,
+                clip.duration_seconds(),
+                clip.sample_rate,
+                clip.channels
+            );
+        }
 
-    let label = job
-        .output
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "film".to_string());
-
-    eprintln!(
-        "Rendering {} scene(s), {frames} frames, {}x{} \u{2192} {}",
-        scenes.len(),
-        settings.width,
-        settings.height,
-        job.output.display()
-    );
-
-    // The same call the Tasks panel makes. A cancel token nobody will cancel,
-    // and a progress sink that prints instead of drawing a bar.
-    let ctx = TaskCtx {
-        cancel: CancelToken::new(),
-        progress: ProgressSink::detached(),
-    };
-    let request = ExportRequest {
-        scenes,
-        settings,
-        range: 0..frames,
-        target,
-        gpu: job.gpu.clone(),
-        label,
-    };
-
-    match run_export(request, &ctx) {
-        TaskOutcome::Finished(message) => Ok(match directed {
-            0 => message,
-            1 => format!("Directed one shot. {message}"),
-            n => format!("Directed {n} shots. {message}"),
-        }),
-        TaskOutcome::Failed(why) => bail!("{why}"),
-        TaskOutcome::Cancelled => bail!("the render was cancelled"),
+        let named = doc.scene_names();
+        let mut film = buzz_script::Film {
+            scenes: doc.film(),
+            names: named,
+            current: 0,
+            sounds,
+        };
+        let context = buzz_script::ScriptContext {
+            current_frame: 0,
+            selection: Vec::new(),
+            active_layer: None,
+            config_dir: buzz_script::default_config_dir(),
+            asset_root: buzz_doc::AssetLibrary::user().root().map(|p| p.to_path_buf()),
+        };
+        // **A generous budget, because nobody is waiting on it.** The five
+        // seconds a script gets in the editor is right there -- a mistake must
+        // be an annoyance rather than a hang -- and wrong here, where the script
+        // is the film and the person who started it has gone to bed.
+        let limits = buzz_script::Limits {
+            time: std::time::Duration::from_secs(600),
+            memory: 512 * 1024 * 1024,
+            ..buzz_script::Limits::default()
+        };
+        let outcome = buzz_script::run_film(&mut film, context, &source, &limits, None);
+        for line in &outcome.trace {
+            eprintln!("{line}");
+        }
+        for line in &outcome.alerts {
+            eprintln!("(asked) {line}");
+        }
+        if let Some(error) = &outcome.error {
+            bail!("{}: {error}", path.display());
+        }
+        if film.scenes.is_empty() {
+            bail!("{} left the film with no scenes in it", path.display());
+        }
+        let scenes: Vec<(String, buzz_scene::Scene)> = film
+            .names
+            .iter()
+            .cloned()
+            .zip(film.scenes.iter().cloned())
+            .collect();
+        doc = Document::from_scenes(scenes);
+        report.push(format!(
+            "Ran {} over {} scene(s).",
+            path.display(),
+            doc.scene_names().len()
+        ));
     }
+
+    Ok(doc)
 }
+
+/// Open every `--audio`, taking the slice each one asked for.
+fn decode_all(wanted: &[AudioIn]) -> Result<Vec<buzz_audio::Clip>> {
+    wanted
+        .iter()
+        .map(|want| {
+            let clip = buzz_audio::Clip::open(&want.path)
+                .with_context(|| format!("opening {}", want.path.display()))?;
+            Ok(slice(&clip, want.from, want.length))
+        })
+        .collect()
+}
+
+/// **A part of a clip**, cut on whole sample frames.
+///
+/// A dialogue take is minutes long and a shot is seconds long, so the useful
+/// unit is almost never the file. Cut on a frame boundary rather than on a raw
+/// sample index: cutting a stereo file mid-frame swaps the channels for the
+/// rest of the clip, which is audible and baffling.
+fn slice(clip: &buzz_audio::Clip, from: Option<f64>, length: Option<f64>) -> buzz_audio::Clip {
+    if from.is_none() && length.is_none() {
+        return clip.clone();
+    }
+    let channels = clip.channels.max(1) as usize;
+    let rate = clip.sample_rate.max(1) as f64;
+    let frames = clip.len();
+
+    let start = ((from.unwrap_or(0.0).max(0.0) * rate).round() as usize).min(frames);
+    let end = match length {
+        Some(seconds) if seconds > 0.0 => {
+            (start + (seconds * rate).round() as usize).min(frames)
+        }
+        _ => frames,
+    };
+    if end <= start {
+        return clip.clone();
+    }
+
+    let samples = clip.samples[start * channels..end * channels].to_vec();
+    let name = format!("{} {:.1}s", clip.name, (end - start) as f64 / rate);
+    buzz_audio::Clip::new(&name, clip.sample_rate, clip.channels, samples)
+        .unwrap_or_else(|_| clip.clone())
+}
+
+
 
 /// The format an output path asks for, by its extension.
 ///
@@ -280,12 +471,15 @@ mod tests {
         let job = RenderJob {
             document: None,
             brief: None,
-            output: PathBuf::from("out.mp4"),
+            script: None,
+            audio: Vec::new(),
+            save: None,
+            output: Some(PathBuf::from("out.mp4")),
             height: None,
             gpu: GpuPreference::Automatic,
         };
-        let err = render(&job).expect_err("nothing to render");
-        assert!(err.to_string().contains("nothing to render"), "{err}");
+        let err = render(&job).expect_err("nothing to do");
+        assert!(err.to_string().contains("nothing to do"), "{err}");
     }
 
     /// **An empty brief says so**, rather than rendering a blank film.
@@ -297,7 +491,10 @@ mod tests {
         let job = RenderJob {
             document: None,
             brief: Some(brief),
-            output: dir.path().join("out.mp4"),
+            script: None,
+            audio: Vec::new(),
+            save: None,
+            output: Some(dir.path().join("out.mp4")),
             height: None,
             gpu: GpuPreference::Automatic,
         };

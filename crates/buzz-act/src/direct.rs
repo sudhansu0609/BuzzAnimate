@@ -852,8 +852,16 @@ pub fn direct(scene: &mut Scene, story: &str) -> Result<DirectedScene, DirectErr
     // both: a timeline that says "Ana" is a timeline the writer can read.
     for (i, (layer, id)) in staged.cast.iter().enumerate() {
         if let Some(name) = parsed.names.get(i) {
-            scene.update_stage_layer(*layer, |l| l.name = name.clone());
+            scene.update_stage_layer(*layer, |l| l.name = format!("{name} Body"));
             scene.update_object_at(0, *id, |o| o.name = Some(name.clone()));
+            // **The face and the mouth take the name too.** A character is
+            // three layers now, and a timeline reading "Ana Body / Person 2
+            // Face / Person 2 Mouth" is worse than the one it replaced: the
+            // rig is right there and it does not look like one rig.
+            if let Some(puppet) = staged.puppets.get(i) {
+                scene.update_stage_layer(puppet.face_layer, |l| l.name = format!("{name} Face"));
+                scene.update_stage_layer(puppet.mouth_layer, |l| l.name = format!("{name} Mouth"));
+            }
         }
     }
 

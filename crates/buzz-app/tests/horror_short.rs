@@ -738,11 +738,11 @@ fn five_minutes_of_dialogue_can_be_analysed_and_lip_synced() {
     );
 
     // A mouth symbol with one frame per shape, and a layer to put it on.
-    let mouth = buzz_app::lipsync::placeholder_mouth(&mut scene, "Mouth shapes");
+    let mouth = buzz_act::lipsync::placeholder_mouth(&mut scene, "Mouth shapes");
     let layer = scene.add_layer("Lip sync", LayerKind::Normal);
 
     stage("write the mouth keyframes", Duration::from_secs(20), || {
-        buzz_app::lipsync::write_track(
+        buzz_act::lipsync::write_track(
             &mut scene,
             &track,
             0,

@@ -307,6 +307,191 @@
       return host.direct(String(story === undefined ? "" : story));
     };
 
+    // ---- the film ---------------------------------------------------------
+    //
+    // Everything above edits *a* scene. A film is several, and until these
+    // existed a script could build the first shot and had no way to reach the
+    // second -- so an unattended run could automate a shot and never a film.
+    //
+    // The wide calls take and return plain objects; JSON is only how they cross
+    // into Rust, and no caller should ever see it.
+
+    function fromJson(text) {
+      return text === undefined || text === "" ? {} : JSON.parse(text);
+    }
+    function toJson(value) {
+      return JSON.stringify(value || {});
+    }
+
+    this.scenes = {
+      get count() { return host.sceneCount(); },
+      get index() { return host.sceneIndex(); },
+      // Switch to a shot. The selection and the playhead belong to the scene
+      // they were in, so they are cleared rather than carried across.
+      go: function (index) { host.setSceneIndex(Number(index)); },
+      // Add a shot and switch to it. It inherits the stage size and the frame
+      // rate, which are properties of the film, and nothing else.
+      add: function (name) { return host.addScene(String(name || "")); },
+      name: function (index) { return host.sceneName(Number(index)); },
+      rename: function (index, name) { host.setSceneName(Number(index), String(name)); },
+      // How long this shot runs. Every layer is stretched to reach it.
+      setLength: function (frames) { host.setSceneFrames(Number(frames)); },
+    };
+
+    // Ground, backdrop, a light rig, and optionally cloud and water:
+    //
+    //   var set = document.setTheScene({setting: "night", clouds: true});
+    //   document.layScenery("city", set.horizonY, set.backdrop);
+    this.setTheScene = function (options) {
+      return fromJson(host.setTheScene(toJson(options)));
+    };
+    // Trees, houses, a skyline, grass -- laid as effect-brush strokes, which is
+    // the same call the Brush tool makes.
+    this.layScenery = function (kind, horizonY, backdropLayer) {
+      return fromJson(host.layScenery(String(kind), Number(horizonY) || 0,
+                                      Number(backdropLayer) || 0));
+    };
+    // Rain, snow, stars, fireflies -- across the whole stage.
+    this.layWeather = function (kind) { return host.layWeather(String(kind)); };
+    this.addLight = function (kind, options) {
+      return host.addLight(String(kind), toJson(options));
+    };
+
+    // Cast somebody: a bone-rigged body, a face parented to it, a blink and a
+    // breath. Answers with every id the rest of the script will need.
+    this.addCharacter = function (options) {
+      return fromJson(host.addCharacter(toJson(options)));
+    };
+    // A performance with its size and its travel, where `perform` takes the
+    // defaults.
+    this.performFully = function (objectId, action, from, to, options) {
+      var o = options || {};
+      return host.performFully(
+        Number(objectId), String(action), Number(from) || 0, Number(to),
+        o.amount === undefined ? 0 : Number(o.amount),
+        o.distance === undefined ? 0 : Number(o.distance)
+      );
+    };
+    // A live modifier on one object, named rather than selected.
+    this.addModifier = function (objectId, kind, options) {
+      host.addModifierTo(Number(objectId), String(kind), toJson(options));
+    };
+
+    // ---- rigging ----------------------------------------------------------
+    //
+    // Layer parenting: the half of a puppet rig that is not bones. Pass 0 to
+    // unlink.
+    this.parentLayer = function (child, parent, frame) {
+      return host.parentLayer(Number(child), Number(parent) || 0, Number(frame) || 0);
+    };
+    this.setLayerKind = function (layer, kind) {
+      host.setLayerKindOf(Number(layer), String(kind));
+    };
+    // Every layer, front first, with its id, name and what it follows.
+    this.layers = function () { return JSON.parse(host.layerIds()); };
+    this.layerNamed = function (name) {
+      var all = this.layers();
+      for (var i = 0; i < all.length; i++) if (all[i].name === name) return all[i].id;
+      return 0;
+    };
+    this.moveLayerTo = function (layer, row) {
+      return host.moveLayerTo(Number(layer), Number(row));
+    };
+    this.layerRow = function (layer) { return host.layerRow(Number(layer)); };
+    // Draw on a named layer at a named frame. The JSFL addNewRectangle draws
+    // wherever the editor is pointing, which a script building three scenes
+    // has no way to say.
+    this.addRectangleOn = function (layer, frame, rect, fill) {
+      var r = readRect(rect);
+      return host.addRectangleOn(Number(layer), Number(frame) || 0,
+                                 r[0], r[1], r[2], r[3], String(fill));
+    };
+    // A seamless procedural texture on a shape.
+    this.textureObject = function (objectId, options) {
+      var o = options || {};
+      host.textureObject(
+        Number(objectId), String(o.kind || "Noise"),
+        String(o.fg || "#FFFFFF"), String(o.bg || "#000000"),
+        o.detail === undefined ? 4 : Number(o.detail),
+        o.cell === undefined ? 0 : Number(o.cell)
+      );
+    };
+
+    // ---- dialogue ---------------------------------------------------------
+    //
+    // The host opens the file; a script is handed what came out of it. See the
+    // note in film.rs on why the boundary is where it is.
+    this.sounds = {
+      get count() { return host.soundCount(); },
+      info: function (index) { return fromJson(host.soundInfo(Number(index))); },
+      // Put one on the timeline, on a sound layer of its own.
+      attach: function (index, options) {
+        var o = options || {};
+        return fromJson(host.attachSound(
+          Number(index), String(o.name || ""),
+          Number(o.frame) || 0,
+          o.volume === undefined ? 1 : Number(o.volume)
+        ));
+      },
+      // Where the voice speaks and where it breathes.
+      phrases: function (index) { return JSON.parse(host.phrasesIn(Number(index))); },
+    };
+    // Analyse a track into visemes and write a keyframe per mouth shape onto
+    // one character's own mouth layer:
+    //
+    //   document.lipSync({sound: 0, layer: ana.mouthLayer, mouth: ana.mouthSymbol,
+    //                     x: ana.mouthX, y: ana.mouthY, scale: ana.mouthScale});
+    this.lipSync = function (options) {
+      return fromJson(host.lipSync(toJson(options)));
+    };
+
+    // ---- the library and the assets --------------------------------------
+    this.findSymbol = function (name) { return host.findSymbol(String(name)); };
+    // Place an instance. frameOfSymbol shows one drawing and holds there --
+    // a mouth shape, a turnaround view -- and is left off for one that plays.
+    this.placeSymbol = function (symbol, layer, frame, options) {
+      var o = options || {};
+      return host.placeSymbol(
+        Number(symbol), Number(layer), Number(frame) || 0,
+        Number(o.x) || 0, Number(o.y) || 0,
+        o.scale === undefined ? 1 : Number(o.scale),
+        o.frameOfSymbol === undefined ? -1 : Number(o.frameOfSymbol)
+      );
+    };
+    this.symbolFromObjects = function (name, kind, ids, layer, frame) {
+      return fromJson(host.symbolFromObjects(
+        String(name), String(kind || "graphic"), JSON.stringify(ids || []),
+        Number(layer), Number(frame) || 0
+      ));
+    };
+    // The library on disk, outside any one document.
+    this.assets = {
+      list: function () { return JSON.parse(host.assetNames()); },
+      save: function (symbol, name, folder) {
+        return fromJson(host.saveAsset(Number(symbol), String(name), String(folder || "")));
+      },
+      place: function (name, folder) {
+        return fromJson(host.placeAsset(String(name), String(folder || "")));
+      },
+    };
+
+    // ---- the camera, moving ----------------------------------------------
+    //
+    // These sit beside camera.setKey above rather than replacing it: that one
+    // writes a framing, and these write a *move*, already eased at both ends.
+    this.camera.move = function (kind, from, to) {
+      return host.cameraMove(String(kind), Number(from) || 0, Number(to));
+    };
+    this.camera.setEasedKey = function (frame, shot) {
+      var s = shot || {};
+      host.setEasedCameraKey(
+        Number(frame), Number(s.x) || 0, Number(s.y) || 0,
+        s.zoom === undefined ? 1 : Number(s.zoom),
+        Number(s.rotation) || 0,
+        String(s.ease || "smooth")
+      );
+    };
+
     this.getTimeline = function () { return new Timeline(); };
   }
 

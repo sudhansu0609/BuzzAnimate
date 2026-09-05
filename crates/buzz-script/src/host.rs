@@ -56,6 +56,12 @@ macro_rules! host_fn {
     }};
 }
 
+// Shared with `film`, which installs the calls that build a whole film onto the
+// same `__host` object. Split by subject rather than by mechanism: the two use
+// the same macro, the same state and the same error helper, and what separates
+// them is that one automates a *document* and the other automates a *shot*.
+pub(crate) use host_fn;
+
 /// Bind every primitive onto a `__host` global.
 pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()> {
     let host = Object::new(ctx.clone())?;
@@ -130,14 +136,14 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
 
     // -- document properties ------------------------------------------------
     host_fn!(ctx, host, state, "docWidth", |state| {
-        Ok(state.borrow().scene.stage().size.width)
+        Ok(state.borrow().scene().stage().size.width)
     });
     host_fn!(ctx, host, state, "docHeight", |state| {
-        Ok(state.borrow().scene.stage().size.height)
+        Ok(state.borrow().scene().stage().size.height)
     });
     host_fn!(ctx, host, state, "setDocSize", |state, w: f64, h: f64| {
         let mut s = state.borrow_mut();
-        let size = &mut s.scene.stage_mut().size;
+        let size = &mut s.scene_mut().stage_mut().size;
         if w > 0.0 {
             size.width = w;
         }
@@ -147,16 +153,16 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         Ok(())
     });
     host_fn!(ctx, host, state, "frameRate", |state| {
-        Ok(state.borrow().scene.stage().frame_rate)
+        Ok(state.borrow().scene().stage().frame_rate)
     });
     host_fn!(ctx, host, state, "setFrameRate", |state, rate: f64| {
         if rate > 0.0 {
-            state.borrow_mut().scene.stage_mut().frame_rate = rate;
+            state.borrow_mut().scene_mut().stage_mut().frame_rate = rate;
         }
         Ok(())
     });
     host_fn!(ctx, host, state, "backgroundColor", |state| {
-        Ok(to_hex(state.borrow().scene.stage().background))
+        Ok(to_hex(state.borrow().scene().stage().background))
     });
     host_fn!(
         ctx,
@@ -165,14 +171,14 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         "setBackgroundColor",
         |state, hex: String| {
             let color = parse_color(&hex)?;
-            state.borrow_mut().scene.stage_mut().background = color;
+            state.borrow_mut().scene_mut().stage_mut().background = color;
             Ok(())
         }
     );
 
     // -- layers -------------------------------------------------------------
     host_fn!(ctx, host, state, "layerCount", |state| {
-        Ok(state.borrow().scene.layers().len() as i32)
+        Ok(state.borrow().scene().layers().len() as i32)
     });
     host_fn!(ctx, host, state, "layerName", |state, index: i32| {
         let s = state.borrow();
@@ -185,7 +191,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         "setLayerName",
         |state, index: i32, name: String| {
             let id = layer_id(&state.borrow(), index)?;
-            state.borrow_mut().scene.update_layer(id, |l| l.name = name);
+            state.borrow_mut().scene_mut().update_layer(id, |l| l.name = name);
             Ok(())
         }
     );
@@ -202,7 +208,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             let id = layer_id(&state.borrow(), index)?;
             state
                 .borrow_mut()
-                .scene
+                .scene_mut()
                 .update_layer(id, |l| l.visible = on);
             Ok(())
         }
@@ -218,7 +224,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         "setLayerLocked",
         |state, index: i32, on: bool| {
             let id = layer_id(&state.borrow(), index)?;
-            state.borrow_mut().scene.update_layer(id, |l| l.locked = on);
+            state.borrow_mut().scene_mut().update_layer(id, |l| l.locked = on);
             Ok(())
         }
     );
@@ -238,7 +244,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             let id = layer_id(&state.borrow(), index)?;
             state
                 .borrow_mut()
-                .scene
+                .scene_mut()
                 .update_layer(id, |l| l.depth = depth);
             Ok(())
         }
@@ -246,11 +252,11 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
     host_fn!(ctx, host, state, "addNewLayer", |state, name: String| {
         let mut s = state.borrow_mut();
         let name = if name.is_empty() {
-            format!("Layer_{}", s.scene.layers().len() + 1)
+            format!("Layer_{}", s.scene().layers().len() + 1)
         } else {
             name
         };
-        s.scene.add_layer(name, LayerKind::Normal);
+        s.scene_mut().add_layer(name, LayerKind::Normal);
         Ok(())
     });
     host_fn!(ctx, host, state, "deleteLayer", |state, index: i32| {
@@ -258,16 +264,16 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         let mut s = state.borrow_mut();
         // Animate refuses to remove the last layer: a document with none has
         // nowhere to draw.
-        if s.scene.layers().len() <= 1 {
+        if s.scene().layers().len() <= 1 {
             return Err(throw("a document must keep at least one layer"));
         }
-        s.scene.remove_layer(id);
+        s.scene_mut().remove_layer(id);
         Ok(())
     });
 
     // -- frames -------------------------------------------------------------
     host_fn!(ctx, host, state, "frameCount", |state| {
-        Ok(state.borrow().scene.frame_count() as i32)
+        Ok(state.borrow().scene().frame_count() as i32)
     });
     host_fn!(ctx, host, state, "currentFrame", |state| {
         Ok(state.borrow().context.current_frame as i32)
@@ -283,7 +289,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         let (id, frame) = target(&state.borrow())?;
         let mut s = state.borrow_mut();
         for _ in 0..count.max(0) {
-            s.scene.update_layer(id, |l| {
+            s.scene_mut().update_layer(id, |l| {
                 l.frames.insert_frame(frame);
             });
         }
@@ -291,14 +297,14 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
     });
     host_fn!(ctx, host, state, "insertKeyframe", |state| {
         let (id, frame) = target(&state.borrow())?;
-        state.borrow_mut().scene.update_layer(id, |l| {
+        state.borrow_mut().scene_mut().update_layer(id, |l| {
             l.frames.insert_keyframe(frame);
         });
         Ok(())
     });
     host_fn!(ctx, host, state, "insertBlankKeyframe", |state| {
         let (id, frame) = target(&state.borrow())?;
-        state.borrow_mut().scene.update_layer(id, |l| {
+        state.borrow_mut().scene_mut().update_layer(id, |l| {
             l.frames.insert_blank_keyframe(frame);
         });
         Ok(())
@@ -358,7 +364,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 }
             };
             let mut set = false;
-            s.scene.update_layer(id, |l| {
+            s.scene_mut().update_layer(id, |l| {
                 set = l.frames.set_tween(frame, tween);
             });
             if !set {
@@ -379,7 +385,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             let mut s = state.borrow_mut();
             let id = layer_id(&s, layer)?;
             let mut set = false;
-            s.scene.update_layer(id, |l| {
+            s.scene_mut().update_layer(id, |l| {
                 let mut tween = l.frames.tween_at(frame);
                 if !tween.is_active() {
                     return;
@@ -399,7 +405,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
 
     // -- the camera ---------------------------------------------------------
     host_fn!(ctx, host, state, "setCameraEnabled", |state, on: bool| {
-        state.borrow_mut().scene.camera_mut().enabled = on;
+        state.borrow_mut().scene_mut().camera_mut().enabled = on;
         Ok(())
     });
 
@@ -410,7 +416,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         "setCameraKey",
         |state, frame: u32, x: f64, y: f64, zoom: f64, rotation: f64| {
             let mut s = state.borrow_mut();
-            let camera = s.scene.camera_mut();
+            let camera = s.scene_mut().camera_mut();
             camera.enabled = true;
             let mut key = buzz_scene::CameraKey::new(frame, buzz_geom::Point::new(x, y));
             key.zoom = if zoom > 0.0 { zoom } else { 1.0 };
@@ -421,7 +427,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
     );
 
     host_fn!(ctx, host, state, "removeCameraKey", |state, frame: u32| {
-        Ok(state.borrow_mut().scene.camera_mut().remove_key(frame))
+        Ok(state.borrow_mut().scene_mut().camera_mut().remove_key(frame))
     });
 
     host_fn!(
@@ -431,7 +437,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         "setFocusKey",
         |state, frame: u32, depth: f64, aperture: f64| {
             let mut s = state.borrow_mut();
-            s.scene.camera_mut().set_focus_key(buzz_scene::FocusKey {
+            s.scene_mut().camera_mut().set_focus_key(buzz_scene::FocusKey {
                 frame,
                 focus_depth: depth,
                 aperture: aperture.max(0.0),
@@ -447,7 +453,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         "setShutter",
         |state, shutter: f64, samples: i32| {
             let mut s = state.borrow_mut();
-            let camera = s.scene.camera_mut();
+            let camera = s.scene_mut().camera_mut();
             camera.shutter = shutter.max(0.0);
             if samples > 0 {
                 camera.blur_samples = samples as u32;
@@ -494,7 +500,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             return Err(throw("nothing is selected to clear modifiers from"));
         }
         for id in ids {
-            s.scene.update_object_across(0, u32::MAX, id, |o| {
+            s.scene_mut().update_object_across(0, u32::MAX, id, |o| {
                 o.modifiers.clear();
             });
         }
@@ -512,7 +518,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             let layer = s
                 .context
                 .active_layer
-                .or_else(|| s.scene.layers().iter().next().map(|l| l.id))
+                .or_else(|| s.scene().layers().iter().next().map(|l| l.id))
                 .ok_or_else(|| throw("the document has no layer to put text on"))?;
             let frame = s.context.current_frame;
             let family = (!font.is_empty()).then(|| font.clone());
@@ -521,10 +527,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 .ok_or_else(|| throw("there is no font available to draw text with"))?;
             let colour = Color::BLACK;
             let id = s
-                .scene
+                .scene_mut()
                 .add_shape_at(layer, frame, ShapeData::filled(path, colour))
                 .ok_or_else(|| throw("could not put text on that frame"))?;
-            s.scene.update_object_at(frame, id, |o| {
+            s.scene_mut().update_object_at(frame, id, |o| {
                 o.transform = Affine::translate((x, y));
                 o.text = Some(buzz_scene::TextData::new(&content, size, family.clone()));
             });
@@ -567,7 +573,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 return Err(throw("a performance needs at least one frame"));
             }
             let performance = buzz_act::perform::Performance::new(action, from..to);
-            buzz_act::perform::apply(&mut s.scene, ObjectId(object), &performance)
+            buzz_act::perform::apply(s.scene_mut(), ObjectId(object), &performance)
                 .map(|report| report.keyframes as i32)
                 .map_err(|e| throw(&format!("{e}")))
         }
@@ -575,7 +581,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
 
     host_fn!(ctx, host, state, "direct", |state, story: String| {
         let mut s = state.borrow_mut();
-        buzz_act::direct(&mut s.scene, &story)
+        buzz_act::direct(s.scene_mut(), &story)
             .map(|scene| scene.frames as i32)
             .map_err(|e| throw(&format!("{e}")))
     });
@@ -588,7 +594,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         let mut s = state.borrow_mut();
         let frame = s.context.current_frame;
         let ids: Vec<ObjectId> = s
-            .scene
+            .scene()
             .layers()
             .selectable()
             .flat_map(|l| l.objects_at(frame).iter())
@@ -614,7 +620,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             let ids = state.borrow().context.selection.clone();
             let mut s = state.borrow_mut();
             for id in ids {
-                s.scene.update_object(id, |o| {
+                s.scene_mut().update_object(id, |o| {
                     o.transform = Affine::translate((dx, dy)) * o.transform;
                 });
             }
@@ -625,7 +631,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         let ids = state.borrow().context.selection.clone();
         let mut s = state.borrow_mut();
         for id in ids {
-            s.scene.remove_object(id);
+            s.scene_mut().remove_object(id);
         }
         s.context.selection.clear();
         Ok(())
@@ -633,11 +639,11 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
 
     // -- library and symbols ------------------------------------------------
     host_fn!(ctx, host, state, "libraryItemCount", |state| {
-        Ok(state.borrow().scene.library().len() as i32)
+        Ok(state.borrow().scene().library().len() as i32)
     });
     host_fn!(ctx, host, state, "libraryItemName", |state, index: i32| {
         let s = state.borrow();
-        let names: Vec<String> = s.scene.library().iter().map(|x| x.name.clone()).collect();
+        let names: Vec<String> = s.scene().library().iter().map(|x| x.name.clone()).collect();
         names
             .get(index.max(0) as usize)
             .cloned()
@@ -674,9 +680,9 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             } else {
                 name
             };
-            let symbol = s.scene.add_symbol(name, kind, None);
+            let symbol = s.scene_mut().add_symbol(name, kind, None);
             let Some(inner) = s
-                .scene
+                .scene()
                 .library()
                 .get(symbol)
                 .and_then(|x| x.layers.iter().next())
@@ -687,23 +693,27 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
 
             let mut lifted = Vec::new();
             for id in &ids {
-                if let Some(object) = s.scene.remove_object(*id) {
+                if let Some(object) = s.scene_mut().remove_object(*id) {
                     lifted.push(object);
                 }
             }
-            s.scene.library_mut().update(symbol, |sym| {
+            s.scene_mut().library_mut().update(symbol, |sym| {
                 sym.layers.update(inner, |l| {
                     l.frames.set_objects(0, lifted);
                 });
             });
 
             let placed = s
-                .scene
+                .scene_mut()
                 .add_instance_at(layer, frame, symbol, Affine::IDENTITY);
             s.context.selection = placed.into_iter().collect();
             Ok(())
         }
     );
+
+    // The film-making half: scenes, staging, casting, rigging, dialogue and the
+    // camera. See `crate::film`.
+    crate::film::install(ctx, &host, state)?;
 
     ctx.globals().set("__host", host)?;
     Ok(())
@@ -761,7 +771,7 @@ fn add_shape(
 
     let (id, frame) = target(&state.borrow())?;
     let mut s = state.borrow_mut();
-    match s.scene.add_shape_at(id, frame, shape) {
+    match s.scene_mut().add_shape_at(id, frame, shape) {
         Some(_) => Ok(()),
         None => Err(throw("could not draw on that layer; it may be locked")),
     }
@@ -818,14 +828,14 @@ fn add_modifier(
         return Err(throw("nothing is selected to put a modifier on"));
     }
     for id in ids {
-        s.scene.update_object_across(0, u32::MAX, id, |o| {
+        s.scene_mut().update_object_across(0, u32::MAX, id, |o| {
             o.modifiers.push(modifier);
         });
     }
     Ok(())
 }
 
-fn throw(message: &str) -> rquickjs::Error {
+pub(crate) fn throw(message: &str) -> rquickjs::Error {
     // The engine turns this into a thrown `Error` at the call site, which is
     // what lets a script `try`/`catch` a bad index.
     rquickjs::Error::new_from_js_message("host", "error", message)
@@ -837,7 +847,7 @@ fn layer_at(state: &State, index: i32) -> JsResult<&buzz_scene::Layer> {
         return Err(throw("a layer index cannot be negative"));
     }
     state
-        .scene
+        .scene()
         .layers()
         .iter()
         .nth(index as usize)
@@ -845,23 +855,23 @@ fn layer_at(state: &State, index: i32) -> JsResult<&buzz_scene::Layer> {
         .ok_or_else(|| {
             throw(&format!(
                 "there is no layer {index}; the document has {}",
-                state.scene.layers().len()
+                state.scene().layers().len()
             ))
         })
 }
 
-fn layer_id(state: &State, index: i32) -> JsResult<LayerId> {
+pub(crate) fn layer_id(state: &State, index: i32) -> JsResult<LayerId> {
     layer_at(state, index).map(|l| l.id)
 }
 
 /// Where a drawing or frame operation lands: the active layer, or the front
 /// one if the editor has not nominated a layer.
-fn target(state: &State) -> JsResult<(LayerId, u32)> {
+pub(crate) fn target(state: &State) -> JsResult<(LayerId, u32)> {
     let layer = state
         .context
         .active_layer
-        .filter(|id| state.scene.layers().get(*id).is_some())
-        .or_else(|| state.scene.layers().iter().next().map(|l| l.id))
+        .filter(|id| state.scene().layers().get(*id).is_some())
+        .or_else(|| state.scene().layers().iter().next().map(|l| l.id))
         .ok_or_else(|| throw("the document has no layer to work on"))?;
     Ok((layer, state.context.current_frame))
 }
@@ -872,7 +882,7 @@ fn to_hex(color: Color) -> String {
 }
 
 /// Parse `#RRGGBB` or `#RRGGBBAA`, as JSFL colour strings are written.
-fn parse_color(text: &str) -> JsResult<Color> {
+pub(crate) fn parse_color(text: &str) -> JsResult<Color> {
     let hex = text.trim().trim_start_matches('#');
     let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
 

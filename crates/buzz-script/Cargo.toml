@@ -16,8 +16,19 @@ buzz-scene.workspace = true
 buzz-act.workspace = true
 # For the glyph outlines a text object is made of.
 buzz-text.workspace = true
+# Dialogue: the clips the host decoded, and the viseme analysis a script runs
+# against them. No file IO comes with it — the host opens the file, and the
+# script is handed what came out.
+buzz-audio.workspace = true
+# The asset library on disk -- the one directory a script may write to. See
+# `ScriptContext::asset_root`.
+buzz-doc.workspace = true
 
 kurbo.workspace = true
+# Several of the film-making calls take more arguments than rquickjs will bind
+# to a native function (seven), so those take one JSON object instead. It is
+# also how they answer with more than one number.
+serde_json.workspace = true
 peniko.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

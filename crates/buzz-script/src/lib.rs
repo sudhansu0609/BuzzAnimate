@@ -36,6 +36,7 @@
 //! script does. One undo step, which is what the queue was for, is achieved by
 //! committing the working copy in a single edit.
 
+mod film;
 mod host;
 mod samples;
 
@@ -97,6 +98,15 @@ pub struct ScriptContext {
     /// a script may read the scripts that live beside it and nothing else.
     /// `None` disables reading altogether.
     pub config_dir: Option<std::path::PathBuf>,
+
+    /// **Where the asset library lives**, and the only place a script may
+    /// write to.
+    ///
+    /// The same reasoning as `config_dir` above, one door further: assets are a
+    /// cast and a set that outlive the document, so an unattended film that
+    /// builds a cast has to be able to file it and a later one has to be able
+    /// to fetch it. Confined to this directory, and `None` turns it off.
+    pub asset_root: Option<std::path::PathBuf>,
 }
 
 /// Where a shelf of JSFL commands lives on this machine.
@@ -204,11 +214,56 @@ impl ScriptOutcome {
 }
 
 /// Everything the host functions read and write during a run.
+///
+/// # Why this holds the whole film rather than one scene
+///
+/// A script used to be handed a single [`Scene`], which is right for the thing
+/// scripting was first for — a repetitive edit inside the shot you are looking
+/// at. It is the wrong shape for the thing scripting turned out to be needed
+/// for: a **film** is several scenes, and a script that can build one shot and
+/// then has no way to reach the second is a script that cannot make a film.
+///
+/// So the state carries every scene and an index saying which one the calls
+/// operate on, exactly as the editor carries a scene list and a current scene.
+/// A one-scene run is the same thing with a list of one, which is why
+/// [`run`] is unchanged for every caller that had one.
 pub(crate) struct State {
-    pub scene: Scene,
+    /// Every scene in the document, in the order they play.
+    pub scenes: Vec<Scene>,
+    /// Their names, one per scene. A name belongs to the *document*, not to the
+    /// scene -- which is where `buzz_doc` keeps it -- so it is carried
+    /// alongside rather than fetched from the scene, and the two lists are kept
+    /// the same length by every call that adds to either.
+    pub names: Vec<String>,
+    /// Which one the document calls act on.
+    pub current: usize,
     pub context: ScriptContext,
     pub trace: Vec<String>,
     pub alerts: Vec<String>,
+    /// Sounds the host decoded before the run, offered to the script by index.
+    ///
+    /// A script cannot open a file — that is the sandbox, and it stays. What
+    /// the *host* opened on its way in is a different thing, and a dialogue
+    /// track a script can attach and lip-sync against is most of what an
+    /// unattended film needs that a scene alone does not carry.
+    pub sounds: Vec<buzz_audio::Clip>,
+}
+
+impl State {
+    /// The scene the script is working on.
+    ///
+    /// Clamped rather than panicking: `current` is only ever set through
+    /// `setSceneIndex`, which range-checks, but a scene removed underneath it
+    /// must not take the run down.
+    pub(crate) fn scene(&self) -> &Scene {
+        let i = self.current.min(self.scenes.len().saturating_sub(1));
+        &self.scenes[i]
+    }
+
+    pub(crate) fn scene_mut(&mut self) -> &mut Scene {
+        let i = self.current.min(self.scenes.len().saturating_sub(1));
+        &mut self.scenes[i]
+    }
 }
 
 /// Run `source` against `scene`.
@@ -239,16 +294,70 @@ pub fn run_until(
     limits: &Limits,
     stop: Option<StopSignal>,
 ) -> ScriptOutcome {
+    let mut film = Film {
+        scenes: vec![scene.clone()],
+        names: vec!["Scene 1".to_string()],
+        current: 0,
+        sounds: Vec::new(),
+    };
+    let outcome = run_film(&mut film, context, source, limits, stop);
+    // A one-scene caller gets its one scene back. If the script added scenes it
+    // had nowhere to put them, which is why `run_film` exists and this does not
+    // silently drop them without saying so — see `Film::scenes`.
+    if let Some(first) = film.scenes.into_iter().next() {
+        *scene = first;
+    }
+    outcome
+}
+
+/// **Every scene a script can reach, and the sounds it was handed.**
+///
+/// The unit a film-making script operates on. A caller that has only one scene
+/// keeps using [`run`]; a caller that has a document uses this, and the script
+/// can then add shots, switch between them and lip-sync a track across them.
+#[derive(Default)]
+pub struct Film {
+    /// The scenes, in the order they play.
+    pub scenes: Vec<Scene>,
+    /// Their names, in the same order.
+    pub names: Vec<String>,
+    /// Which one the script starts on.
+    pub current: usize,
+    /// Tracks the host decoded before the run. A script attaches these by
+    /// index; it still cannot open a file of its own.
+    pub sounds: Vec<buzz_audio::Clip>,
+}
+
+/// **Run `source` against a whole film.**
+///
+/// The scenes are modified in place — added to, reordered, switched between —
+/// so the caller commits the lot in one edit exactly as it committed one scene.
+pub fn run_film(
+    film: &mut Film,
+    context: ScriptContext,
+    source: &str,
+    limits: &Limits,
+    stop: Option<StopSignal>,
+) -> ScriptOutcome {
     let started = Instant::now();
-    let revision_before = scene.revision();
+    if film.scenes.is_empty() {
+        film.scenes.push(Scene::default());
+    }
+    while film.names.len() < film.scenes.len() {
+        film.names.push(format!("Scene {}", film.names.len() + 1));
+    }
+    let before: Vec<u64> = film.scenes.iter().map(|s| s.revision()).collect();
 
     let state = Rc::new(RefCell::new(State {
-        // Cheap: the scene is copy-on-write, so this shares its artwork until
+        // Cheap: a scene is copy-on-write, so this shares its artwork until
         // the script actually changes something.
-        scene: scene.clone(),
+        scenes: film.scenes.clone(),
+        names: film.names.clone(),
+        current: film.current.min(film.scenes.len() - 1),
         context,
         trace: Vec::new(),
         alerts: Vec::new(),
+        sounds: film.sounds.clone(),
     }));
 
     let (error, stopped) = evaluate(&state, source, limits, stop);
@@ -259,8 +368,11 @@ pub fn run_until(
         .unwrap_or_else(|rc| RefCell::new(rc.borrow().clone_state()))
         .into_inner();
 
-    let changed = finished.scene.revision() != revision_before;
-    *scene = finished.scene;
+    let after: Vec<u64> = finished.scenes.iter().map(|s| s.revision()).collect();
+    let changed = after != before;
+    film.scenes = finished.scenes;
+    film.names = finished.names;
+    film.current = finished.current.min(film.scenes.len().saturating_sub(1));
 
     ScriptOutcome {
         trace: finished.trace,
@@ -277,7 +389,10 @@ impl State {
     /// Used only if a reference escaped into a closure the engine still holds.
     fn clone_state(&self) -> Self {
         Self {
-            scene: self.scene.clone(),
+            scenes: self.scenes.clone(),
+            names: self.names.clone(),
+            current: self.current,
+            sounds: self.sounds.clone(),
             context: self.context.clone(),
             trace: self.trace.clone(),
             alerts: self.alerts.clone(),

@@ -41,8 +41,10 @@
 pub mod autorig;
 pub mod direct;
 pub mod figure;
+pub mod lipsync;
 pub mod motion_path;
 pub mod perform;
+pub mod puppet;
 pub mod physics;
 pub mod scenery;
 pub mod staging;

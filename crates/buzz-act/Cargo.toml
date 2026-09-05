@@ -13,6 +13,11 @@ buzz-rig.workspace = true
 buzz-scene.workspace = true
 buzz-light.workspace = true
 buzz-physics.workspace = true
+# Dialogue. The mouth track is a performance like any other -- a shape chosen
+# per frame from a sound -- so it belongs beside the walk cycle rather than in
+# the application, where nothing below the window could reach it.
+buzz-audio.workspace = true
 
+thiserror.workspace = true
 kurbo.workspace = true
 peniko.workspace = true

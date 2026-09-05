@@ -845,7 +845,15 @@ impl Scene {
                     // frames, and holding it across an open shutter is what
                     // lets a motion-blurred exposure catch the lid in mid-fall
                     // rather than either fully open or fully shut.
-                    let bounds = object.bounds();
+                    // **Resolved through the library, not measured locally.**
+                    // `Object::bounds` cannot reach the library, so an
+                    // *instance* measures as the 2x2 placeholder it returns --
+                    // and a lid held at the bottom of a 2-unit box is a lid
+                    // through the middle of the eye, which reads as a wince
+                    // rather than a blink. A puppet's eyes are almost always an
+                    // instance, so this is the common case rather than the
+                    // exotic one.
+                    let bounds = self.resolved_bounds(object);
                     if bounds.width() > 0.0 && bounds.height() > 0.0 {
                         let open = blink_at(object.id.0, rate, duration, time / fps);
                         // **Never quite to nothing.** A drawing scaled to zero
@@ -906,7 +914,10 @@ impl Scene {
                     }
                 }
                 Modifier::Sway { amount, rate } => {
-                    let bounds = object.bounds();
+                    // Resolved, for the same reason as the blink above: a tree
+                    // placed as a symbol would otherwise lean about a point two
+                    // units under its origin instead of its own base.
+                    let bounds = self.resolved_bounds(object);
                     if bounds.width() > 0.0 && bounds.height() > 0.0 {
                         let gust = gust_at(object.id.0, rate, time / fps);
                         // How far the *top* of the drawing leans, in document

@@ -55,11 +55,14 @@ fn main() -> Result<()> {
     // is sitting at must not be waiting on one — and it exits rather than
     // falling through, because a render that then opened the editor would be a
     // render nobody could run from a batch file.
-    if let Some(output) = args.render.clone() {
+    if args.render.is_some() || args.save.is_some() {
         let job = buzz_app::headless::RenderJob {
             document: args.document.clone(),
             brief: args.brief.clone(),
-            output,
+            script: args.script.clone(),
+            audio: args.audio.clone(),
+            save: args.save.clone(),
+            output: args.render.clone(),
             height: args.height,
             gpu: args.gpu.clone(),
         };
@@ -69,7 +72,7 @@ fn main() -> Result<()> {
                 Ok(())
             }
             Err(e) => {
-                eprintln!("Render failed: {e:#}");
+                eprintln!("Failed: {e:#}");
                 std::process::exit(1);
             }
         };
@@ -147,6 +150,13 @@ struct Args {
     render: Option<std::path::PathBuf>,
     /// A file of prose to direct into a film before rendering it.
     brief: Option<std::path::PathBuf>,
+    /// **Where to save the document.** Given on its own, the run builds a
+    /// `.buzz` and opens no window and encodes nothing -- which is what a
+    /// script that sets up a film for somebody to carry on with wants.
+    save: Option<std::path::PathBuf>,
+    /// Sounds to open and hand to the script, in the order they were given.
+    /// `--from` and `--for` after one take a slice of it.
+    audio: Vec<buzz_app::headless::AudioIn>,
     /// Target height in pixels for a render; the width follows the aspect.
     height: Option<u32>,
 }
@@ -165,6 +175,8 @@ impl Args {
             script: None,
             render: None,
             brief: None,
+            save: None,
+            audio: Vec::new(),
             height: None,
         };
 
@@ -196,6 +208,42 @@ impl Args {
                 "--brief" => {
                     if let Some(v) = value {
                         out.brief = Some(std::path::PathBuf::from(v));
+                        i += 1;
+                    }
+                }
+                "--save" => {
+                    if let Some(v) = value {
+                        out.save = Some(std::path::PathBuf::from(v));
+                        i += 1;
+                    }
+                }
+                "--audio" => {
+                    if let Some(v) = value {
+                        out.audio.push(buzz_app::headless::AudioIn {
+                            path: std::path::PathBuf::from(v),
+                            from: None,
+                            length: None,
+                        });
+                        i += 1;
+                    }
+                }
+                // **These attach to the `--audio` before them**, which is how
+                // a command line says "this bit of that file" without inventing
+                // a punctuation for it. Given before any audio they are a
+                // mistake worth ignoring rather than guessing at.
+                "--from" => {
+                    if let Some(v) = value {
+                        if let Some(last) = out.audio.last_mut() {
+                            last.from = v.parse().ok();
+                        }
+                        i += 1;
+                    }
+                }
+                "--for" => {
+                    if let Some(v) = value {
+                        if let Some(last) = out.audio.last_mut() {
+                            last.length = v.parse().ok();
+                        }
                         i += 1;
                     }
                 }

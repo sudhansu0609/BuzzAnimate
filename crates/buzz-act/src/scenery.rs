@@ -53,6 +53,14 @@ pub enum Scenery {
     Forest,
     /// A lit skyline along the horizon, and street lamps on the path.
     City,
+    /// **A handful of low houses**, trees behind them, grass in front.
+    ///
+    /// Not a small city. A city reads as a city because of its *skyline* --
+    /// tall, flat-topped, repeated -- and shrinking one gives you a row of
+    /// sheds, not a village. What says village is the mixture: roofs at two
+    /// heights among trees, warm windows rather than a lit grid, and ground
+    /// coming right up to the door.
+    Village,
     /// Open ground: grass near, and a thin line of trees far off.
     Meadow,
     /// A shore: water at the horizon, grass on the bank.
@@ -65,6 +73,7 @@ impl Scenery {
             Self::Bare => "Bare",
             Self::Forest => "Forest",
             Self::City => "City",
+            Self::Village => "Village",
             Self::Meadow => "Meadow",
             Self::Waterside => "Waterside",
         }
@@ -75,6 +84,7 @@ impl Scenery {
             Self::Bare => "Ground and sky, and nothing between them",
             Self::Forest => "A treeline along the horizon, grass at the front",
             Self::City => "A lit skyline, and street lamps down the path",
+            Self::Village => "Low houses among trees, with the ground up to the door",
             Self::Meadow => "Open ground: grass near, a thin line of trees far off",
             Self::Waterside => "A shore, with the bank in front of it",
         }
@@ -95,6 +105,12 @@ impl Scenery {
         let has = |words: &[&str]| words.iter().any(|w| lower.contains(w));
 
         if has(&[
+            "village", "hamlet", "cottage", "cottages", "farmstead", "settlement",
+        ]) {
+            // Checked before the city, because "the village street" is a
+            // village and matching *street* first would put a skyline on it.
+            Self::Village
+        } else if has(&[
             "city", "street", "town", "rooftop", "skyline", "alley", "downtown",
             "pavement", "sidewalk",
         ]) {
@@ -203,6 +219,50 @@ pub fn lay(
                 Color::from_rgb8(0xFF, 0xD9, 0x9E),
                 0.2,
                 true,
+            ),
+        ],
+        // **A village is three passes, not one.** Trees along the horizon put
+        // the houses *in* somewhere rather than on a blank field; the houses
+        // themselves are the Buildings brush at a third of the size a skyline
+        // uses, which turns a tower block into a cottage; and the string lights
+        // over the near ground are what makes a lane read as inhabited.
+        // The grass comes last so it grows in front of the doors.
+        Scenery::Village => vec![
+            (
+                "Village Trees",
+                EffectKind::LeafyTrees,
+                horizon_y - stage.height() * 0.01,
+                stage.height() * 0.085,
+                Color::from_rgb8(0x2A, 0x3E, 0x2C),
+                0.85,
+                true,
+            ),
+            (
+                "Houses",
+                EffectKind::Buildings,
+                horizon_y + stage.height() * 0.02,
+                stage.height() * 0.052,
+                Color::from_rgb8(0x4A, 0x38, 0x2E),
+                0.6,
+                true,
+            ),
+            (
+                "Lane Lights",
+                EffectKind::StringLights,
+                horizon_y + stage.height() * 0.11,
+                stage.height() * 0.05,
+                Color::from_rgb8(0xFF, 0xD2, 0x8A),
+                0.15,
+                true,
+            ),
+            (
+                "Verge",
+                stage_grass(),
+                stage.y1 - stage.height() * 0.05,
+                stage.height() * 0.045,
+                Color::from_rgb8(0x35, 0x4E, 0x33),
+                -0.3,
+                false,
             ),
         ],
         Scenery::Meadow => vec![

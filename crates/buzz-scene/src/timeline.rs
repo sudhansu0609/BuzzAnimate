@@ -420,15 +420,29 @@ impl LayerTimeline {
         true
     }
 
-    /// **Shift+F6** — remove the keyframe at `frame`.
+    /// **Shift+F6** — remove the keyframe **governing** `frame`.
     ///
     /// Its frames merge into the preceding keyframe's span. Frame 0's keyframe
     /// cannot be removed; a layer must always start with one.
+    ///
+    /// # Governing, not standing exactly on
+    ///
+    /// This used to require the playhead to be on the keyframe's own first
+    /// frame and did nothing otherwise. A keyframe running from 5 to 12 is one
+    /// drawing, and the animator standing on frame 8 is standing on it — every
+    /// other frame operation here agrees, which is why drawing on frame 8
+    /// edits frame 5's artwork (see [`Self::keyframe_at_mut`]). Clear Keyframe
+    /// was the one that did not, so pressing Shift+F6 anywhere but the first
+    /// frame of a span silently did nothing at all. That is the "clear keyframe
+    /// is not working" report.
     pub fn clear_keyframe(&mut self, frame: u32) -> bool {
-        if frame == 0 || !self.is_keyframe(frame) {
+        let Some(start) = self.keyframe_start(frame) else {
+            return false;
+        };
+        if start == 0 {
             return false;
         }
-        self.keyframes.retain(|k| k.start != frame);
+        self.keyframes.retain(|k| k.start != start);
         true
     }
 
@@ -828,6 +842,46 @@ mod tests {
             1,
             "frame 5 should now show the earlier keyframe"
         );
+    }
+
+    /// **The report: Clear Keyframe did nothing.**
+    ///
+    /// It worked only from the keyframe's own first frame. A keyframe running
+    /// from 5 to 12 is one drawing, and an animator standing on frame 8 is
+    /// standing on it — every other frame operation here already agrees, which
+    /// is why drawing on 8 edits 5's artwork. Shift+F6 was the one that made
+    /// you find the start of the span first, and silently did nothing if you
+    /// had not.
+    #[test]
+    fn shift_f6_works_from_anywhere_inside_the_span() {
+        for standing_on in [5, 6, 9, 12] {
+            let mut t = LayerTimeline::new();
+            t.push_object(0, object(1));
+            t.insert_frame(15);
+            t.insert_blank_keyframe(5);
+            assert!(t.is_keyframe(5), "the span under test does not begin at 5");
+
+            assert!(
+                t.clear_keyframe(standing_on),
+                "Shift+F6 on frame {standing_on} of a span beginning at 5 did nothing"
+            );
+            assert!(!t.is_keyframe(5), "the keyframe is still there");
+            assert_eq!(
+                t.objects_at(standing_on).len(),
+                1,
+                "frame {standing_on} should now show the earlier keyframe"
+            );
+        }
+    }
+
+    /// And it still refuses when there is nothing to clear: the frames past the
+    /// end of the layer belong to no keyframe at all.
+    #[test]
+    fn shift_f6_past_the_end_does_nothing() {
+        let mut t = LayerTimeline::new();
+        t.push_object(0, object(1));
+        t.insert_frame(9);
+        assert!(!t.clear_keyframe(400), "cleared a keyframe that is not there");
     }
 
     /// A layer must always start with a keyframe, or early frames would have

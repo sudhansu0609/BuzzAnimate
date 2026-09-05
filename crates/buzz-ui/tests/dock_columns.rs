@@ -453,3 +453,92 @@ fn a_layer_that_is_not_selected_costs_one_row() {
         used / 10.0
     );
 }
+
+
+
+
+
+/// **A row's controls must still work when the row can be dragged.**
+///
+/// # The defect this exists for
+///
+/// `dnd_drag_source` interacts over everything it wraps. Wrapping a whole
+/// library row in one put a drag widget over the row's own name button, and the
+/// click never reached it — so no symbol could be selected, so Place, Duplicate
+/// and Delete stayed permanently greyed out and deleting a symbol from the
+/// library was impossible. The Assets panel acquired the identical defect the
+/// day its rows became draggable, and there it took Rename and Delete with it.
+///
+/// The fix in both is the same: the *thumbnail* is the handle, not the row.
+/// This drives a real pointer over a real panel, because the whole failure was
+/// invisible to any test that only called the functions.
+#[test]
+fn clicking_a_library_row_selects_it_even_though_it_can_be_dragged() {
+    let ctx = egui::Context::default();
+    buzz_ui::theme::apply(&ctx);
+    let mut scene = Scene::default();
+    scene.add_symbol("Oak", buzz_scene::SymbolKind::Graphic, None);
+    let usage = std::collections::BTreeMap::new();
+
+    let mut draw = |state: &mut buzz_ui::LibraryState, input: egui::RawInput| {
+        let _ = ctx.run_ui(input, |ui| {
+            egui::Panel::right("dock")
+                .resizable(false)
+                .exact_size(260.0)
+                .show(ui, |ui| {
+                    let _ = buzz_ui::library_panel(ui, &mut scene, state, &usage, &mut |_| None);
+                });
+        });
+    };
+
+    // Sweep the panel with a click and record where a symbol became selected.
+    // A sweep rather than a computed position: the row's place depends on the
+    // header, the search box and the separators above it, and hard-coding that
+    // would make this a test of the layout rather than of the click.
+    let mut selected_anywhere = false;
+    for step in 0..(70 * 10) {
+        let y = 20.0 + (step / 10) as f32 * 6.0;
+        let x = 1668.0 + 30.0 + (step % 10) as f32 * 20.0;
+        let at = egui::pos2(x, y);
+
+        let mut state = buzz_ui::LibraryState::default();
+        draw(&mut state, screen());
+        draw(
+            &mut state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+                ..screen()
+            },
+        );
+        draw(
+            &mut state,
+            egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+                ..screen()
+            },
+        );
+        if state.selected.is_some() {
+            selected_anywhere = true;
+            break;
+        }
+    }
+
+    assert!(
+        selected_anywhere,
+        "no click anywhere in the Library selected the symbol \u{2014} so Place, \
+         Duplicate and Delete can never become enabled"
+    );
+}

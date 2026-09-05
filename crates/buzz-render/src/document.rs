@@ -1577,7 +1577,7 @@ fn draw_layer(
         let shadow = (lit && cache.detail().casts())
             .then(|| rig.key())
             .flatten()
-            .and_then(|key| buzz_light::shadow_transform(key, scene.shadow_height(layer.depth, key)));
+            .and_then(|key| buzz_light::shadow_throw(key, scene.shadow_height(layer.depth, key)));
 
         // Culling is safe only where document-space bounds compare directly to
         // the viewport and nothing off-screen can reach into it: a flat camera,
@@ -1612,13 +1612,32 @@ fn draw_layer(
                 // frame of a document larger than the window, is most of what
                 // made switching lighting on feel like switching responsiveness
                 // off.
-                match shadow {
-                    Some(shadow) => rect.union(shadow.inverse().transform_rect_bbox(rect)),
+                match &shadow {
+                    // A shadow on a **wall** is one affine for the whole
+                    // layer, so the casters that matter are exactly those in
+                    // its inverse image and nothing has to be guessed.
+                    Some(buzz_light::ShadowThrow::Wall(shadow)) => {
+                        rect.union(shadow.inverse().transform_rect_bbox(rect))
+                    }
+                    // A shadow on the **ground** is worked out per caster, so
+                    // there is no one inverse to take. What bounds it instead
+                    // is how far any caster on this layer could throw one:
+                    // nothing here is taller than the layer's own artwork.
+                    Some(throw) => {
+                        let tall = layer
+                            .bounds_at(frame)
+                            .map(|b| b.height())
+                            .unwrap_or(0.0);
+                        let reach = throw.reach(tall);
+                        rect.inflate(reach, reach)
+                    }
                     None => rect,
                 }
             });
 
         let ctx = DrawCtx {
+            // Set per object, where the layer's modifiers are evaluated.
+            breath: None,
             scene,
             cull,
             lights: lights.clone(),
@@ -1641,6 +1660,10 @@ fn draw_layer(
             stage_size: scene.stage().size,
             depth: 0,
             lighting,
+            // Per object below, where whether this artwork is its own figure
+            // can be answered. This is the rig's answer for artwork that never
+            // reaches that decision.
+            shape_edges: lights.shape_edges(),
             layer_depth: layer.depth,
             projection,
         };
@@ -1667,7 +1690,7 @@ fn draw_layer(
         // made it. See `SceneBuilder::push_alpha_group`.
         if let Some(shadow) = shadow
             && let Some(key) = rig.key()
-            && let Some(cast) = shadow_group_bounds(&resolved, shadow, &ctx)
+            && let Some(cast) = shadow_group_bounds(&resolved, &shadow, &ctx)
         {
             // The group carries everything that would have dimmed the fill:
             // the light's own shadow strength, a guide layer's fade, and a
@@ -1681,7 +1704,16 @@ fn draw_layer(
             }
             builder.push_alpha_group(cast, alpha);
             for object in resolved.iter() {
-                cast_shadows(builder, object, Affine::IDENTITY, key, shadow, &ctx);
+                // **Per caster**, because a shadow on the ground is anchored at
+                // the feet of the thing that casts it — see
+                // [`buzz_light::ShadowThrow`]. A wall shadow answers the same
+                // affine whatever it is asked about, so this costs it nothing.
+                //
+                // Resolved bounds, so a character symbol is measured through
+                // the library rather than by its placeholder box; the memo
+                // makes it a lookup.
+                let thrown = shadow.at(ctx.scene.resolved_bounds(object));
+                cast_shadows(builder, object, Affine::IDENTITY, thrown, &ctx);
             }
             builder.pop_isolation();
         }
@@ -1804,27 +1836,127 @@ fn draw_layer(
         let dof_blur = scene.camera().dof_blur_at(time, layer.depth);
 
         if !layer_fx.as_ref().is_some_and(|fx| fx.hide_subject) {
-            for (object, owner) in resolved.iter_owned() {
-                let mut object_ctx = layer_ctx.clone();
-                // A layer blur applies to every shape on the layer, and depth of
-                // field adds to it — the wider of the two wins, so a blurred
-                // background layer thrown out of focus is not blurred twice.
-                object_ctx.blur = combine_blur(layer_fx.as_ref().and_then(|fx| fx.blur), dof_blur);
+            // A layer blur applies to every shape on the layer, and depth of
+            // field adds to it — the wider of the two wins, so a blurred
+            // background layer thrown out of focus is not blurred twice. The
+            // same for every object here, so it is worked out once.
+            let blur = combine_blur(layer_fx.as_ref().and_then(|fx| fx.blur), dof_blur);
 
-                // Live modifiers (a spring, a wiggle) are evaluated here — the one
-                // place the window, the exporter and the headless tests all pass
-                // through, so what is drawn is what is exported. Almost every
-                // object has none and takes the cheap `None` path unchanged.
-                match scene.modified_object_at(layer.id, object, time) {
-                    None => draw_object(builder, object, owner, Affine::IDENTITY, &object_ctx, cache),
-                    Some(eval) => {
-                        // A spring re-poses the rig into an owned copy (no `Arc`
-                        // identity); a wiggle only prepends a transform and keeps
-                        // the original, so its symbol/bounds caches still hit.
-                        let drawn = eval.object.as_ref().unwrap_or(object);
-                        let owner = if eval.object.is_some() { None } else { owner };
-                        draw_object(builder, drawn, owner, eval.prepend, &object_ctx, cache);
-                    }
+            // **Everything placed before anything is drawn.**
+            //
+            // A figure may be several of the layer's objects — see
+            // [`figure_groups`] — and which ones cannot be known until they
+            // have all been placed and measured.
+            let mut placed: Vec<Placed<'_>> = Vec::new();
+            for (object, owner) in resolved.iter_owned() {
+                // Live modifiers (a spring, a wiggle) are evaluated here — the
+                // one place the window, the exporter and the headless tests all
+                // pass through, so what is drawn is what is exported. Almost
+                // every object has none and takes the cheap `None` path
+                // unchanged.
+                //
+                // A spring re-poses the rig into an owned copy (no `Arc`
+                // identity); a wiggle only prepends a transform and keeps the
+                // original, so its symbol/bounds caches still hit.
+                let (held, owner, prepend, breath) =
+                    match scene.modified_object_at(layer.id, object, time) {
+                        None => (None, owner, Affine::IDENTITY, None),
+                        Some(eval) => {
+                            let owner = if eval.object.is_some() { None } else { owner };
+                            (eval.object, owner, eval.prepend, eval.breath)
+                        }
+                    };
+                // Resolved through the library, because a character is usually
+                // an instance and an instance's own bounds are a placeholder.
+                let bounds = match owner {
+                    Some(owner) => cache.bounds.resolved(owner, ctx.scene),
+                    None => ctx.scene.resolved_bounds(held.as_ref().unwrap_or(object)),
+                };
+                placed.push(Placed {
+                    held,
+                    stored: object,
+                    owner,
+                    prepend,
+                    breath,
+                    region: buzz_scene::object::transform_rect(prepend, bounds),
+                });
+            }
+
+            let groups = match layer_ctx.lights.edges {
+                // Only the figure mode has any grouping to do; the others read
+                // each object on its own and must not pay to find out that they
+                // overlap.
+                buzz_scene::EdgeMode::Figure => figure_groups(&placed, &layer_ctx),
+                _ => (0..placed.len()).map(|i| vec![i]).collect(),
+            };
+
+            for group in groups {
+                let members: Vec<&Placed<'_>> = group.iter().map(|i| &placed[*i]).collect();
+
+                // **Is this object its own figure already?**
+                //
+                // A lone shape's silhouette *is* its outline, so the two modes
+                // agree on the picture — and the shape path draws the bands the
+                // cheap way, recoloured into the fill, where the figure pass
+                // must composite them over artwork whose colours it cannot
+                // know. So a layer of four hundred props keeps the encode it
+                // always had, and only artwork actually made of pieces pays for
+                // being treated as one.
+                //
+                // A shape that overlaps another one is *not* alone, whatever it
+                // is made of: the two of them are one body, and one body takes
+                // one set of bands.
+                let alone = members.len() == 1
+                    && matches!(
+                        members[0].object().kind,
+                        ObjectKind::Shape(_) | ObjectKind::Warp(_)
+                    );
+
+                let mut object_ctx = layer_ctx.clone();
+                object_ctx.blur = blur;
+                object_ctx.shape_edges = match object_ctx.lights.edges {
+                    buzz_scene::EdgeMode::Off => 0.0,
+                    buzz_scene::EdgeMode::Shapes => object_ctx.lights.shape_edges(),
+                    buzz_scene::EdgeMode::Figure if alone => object_ctx.lights.figure_edges(),
+                    buzz_scene::EdgeMode::Figure => 0.0,
+                };
+
+                // **The light on the figure**, when the rig models figures
+                // rather than shapes: the bands are measured against the
+                // silhouette of everything the figure draws, so they go round
+                // the character rather than round each piece of it. Opened
+                // before the draw because the silhouette is gathered *from* the
+                // draw, and closed after, because the bands lie over it. See
+                // [`FigurePass`].
+                //
+                // Here, at the layer's own objects, rather than inside
+                // `draw_object`: this is exactly the set of things that are one
+                // figure. Everything below is a part of one.
+                let figure = (!alone)
+                    .then(|| FigurePass::open_over(&object_ctx, cache, &members))
+                    .flatten();
+                for member in &members {
+                    // A breath belongs to the one object that breathes, so it
+                    // is set here and not on the group: two characters in one
+                    // figure breathe at their own rates, as they should.
+                    let member_ctx = match member.breath {
+                        None => object_ctx.clone(),
+                        breath => DrawCtx {
+                            breath,
+                            ..object_ctx.clone()
+                        },
+                    };
+                    draw_object(
+                        builder,
+                        member.object(),
+                        member.owner,
+                        member.prepend,
+                        &member_ctx,
+                        cache,
+                    );
+                }
+                if let Some(figure) = figure {
+                    figure.close(builder, &object_ctx, cache);
                 }
             }
         }
@@ -1954,6 +2086,26 @@ struct DrawCtx<'a> {
     /// symbols, so a shape inside a character inside a scene is lit by the
     /// same sun as everything else.
     lighting: Option<(f64, f64)>,
+    /// **How strongly this artwork models its own edges**, which is the rig's
+    /// modelling strength where the light draws shape by shape and zero where a
+    /// [`FigurePass`] around the object is going to draw them instead.
+    ///
+    /// Set per object by [`draw_layer`], because the answer is a property of
+    /// the object rather than of the rig: under [`buzz_scene::EdgeMode::Figure`]
+    /// an object that *is* one shape is its own figure, and drawing its bands
+    /// here — recoloured into the fill, one pass — is both the same picture and
+    /// cheaper than compositing them over it afterwards.
+    shape_edges: f32,
+    /// **The breath deforming the artwork being drawn**, if it breathes.
+    ///
+    /// Carried on the context rather than folded into a transform because a
+    /// breath is not one: the legs do not move, the ribs swell and the head
+    /// rides on them, which is three behaviours over three bands of the body.
+    /// See [`buzz_scene::Breath`].
+    ///
+    /// Here rather than in the modifier because the artwork a breath has to
+    /// reach is usually inside a symbol, and the renderer is what expands one.
+    breath: Option<buzz_scene::Breath>,
     /// The depth of the layer being drawn, which sets how far a lamp is from
     /// it and how long its shadow runs.
     layer_depth: f64,
@@ -1998,6 +2150,17 @@ impl DrawCtx<'_> {
         self.projection.map_path(path, tolerance)
     }
 
+    /// The path with this object's breath in it, if it breathes.
+    ///
+    /// A no-op — and no copy — for everything that does not, which is every
+    /// object in almost every document.
+    fn breathe(&self, path: buzz_geom::BezPath) -> buzz_geom::BezPath {
+        match &self.breath {
+            Some(breath) => breath.path(&path),
+            None => path,
+        }
+    }
+
     /// Apply only the authoring overlays.
     ///
     /// Outline view draws in the layer's identifying colour, which is chrome
@@ -2038,6 +2201,498 @@ impl DrawCtx<'_> {
     }
 }
 
+/// **The light on a whole figure**, rather than on each shape it is drawn from.
+///
+/// # What this fixes
+///
+/// A crescent is artwork minus a copy of itself shifted towards the light, and
+/// until this existed the artwork in that sentence was always *one shape*. On a
+/// drawing made of one shape that is exactly right. On a character — a group, a
+/// rig, a symbol, a hundred shapes — it is a hundred separate figures: every
+/// interior patch of shading picks up its own lit side and its own terminator,
+/// so the drawing reads as a pile of separately outlined pieces instead of one
+/// body turned towards the lamp, and stops looking like itself. That is the
+/// report this comes from, and [`buzz_scene::EdgeMode`] is the choice it left
+/// behind.
+///
+/// Here the bands are measured against the silhouette of **everything the
+/// object draws**, taken from the draw itself: the pass switches the cache's
+/// collector on, every filled path that goes by lands in it, and the crescents
+/// are built from the lot. Nothing has to walk the object a second time, and
+/// nothing can disagree with what was actually drawn — a posed rig, a tween, a
+/// symbol on its own playhead, all of it arrives the same way.
+///
+/// # Cheaper, not dearer
+///
+/// One pair of booleans for a character instead of one pair per shape. The
+/// silhouette itself is *concatenated*, not unioned — filled non-zero,
+/// overlapping subpaths merge, which is what the booleans downstream read it as
+/// anyway — so gathering it costs a path copy per shape and no boolean at all,
+/// and only on the frames where something is actually built.
+///
+/// # No isolation group
+///
+/// The bands compose `SrcAtop`, which needs the backdrop under them to be the
+/// figure. Every band is a crescent *inside* the silhouette, and the silhouette
+/// is where the figure's own artwork is, so the backdrop there is that artwork —
+/// no group required, which is the difference between one render target per lit
+/// character per frame and none. Where a figure is semi-transparent the band
+/// modulates what shows through it as well; that is the same trade the shape
+/// path makes for an opaque fill, and it is worth a great deal more than it
+/// costs.
+struct FigurePass<'a> {
+    owner: Option<&'a Arc<Object>>,
+    /// What the artwork is made of, when the object's address does not say —
+    /// see [`LightCache::ready`].
+    content: u64,
+    /// The object's placement, which is what the cache is keyed on.
+    doc: Affine,
+    /// Where the figure stands, in document space.
+    ///
+    /// The light over it is worked out from this at [`close`](Self::close) and
+    /// not before: on a stage of four hundred props most figures have no band
+    /// to draw on any one frame — the geometry is still being built — and
+    /// measuring a lamp's falloff across each of them anyway was most of what
+    /// the pass cost.
+    region: buzz_geom::Rect,
+    /// What the layer's lighting says about depth and the stage's height, kept
+    /// for that measurement.
+    lighting: (f64, f64),
+    /// The key light and the direction it lies in, when it models at all.
+    key: Option<(&'a buzz_light::Light, buzz_geom::Vec2)>,
+    /// The deepest gloom reaching the figure, the way its darkness arrives, and
+    /// how deep it is here.
+    gloom: Option<(&'a buzz_light::Light, buzz_geom::Vec2, f32)>,
+    /// Geometry already in the cache, if it was there before the draw. When it
+    /// is, no silhouette is collected at all.
+    key_built: Option<Arc<buzz_light::ShadeGeometry>>,
+    gloom_built: Option<Arc<buzz_light::ShadeGeometry>>,
+    modelling: f32,
+}
+
+/// One top-level object of a layer, placed and measured, waiting to be drawn.
+///
+/// The layer's objects are all resolved before any of them is drawn, because a
+/// figure may be several of them and which ones cannot be known until they have
+/// all been placed. See [`figure_groups`].
+struct Placed<'a> {
+    /// A live modifier's re-posed copy, kept alive for as long as it is drawn
+    /// from. `None` when the object was drawn as it is stored.
+    held: Option<Object>,
+    stored: &'a Object,
+    owner: Option<&'a Arc<Object>>,
+    prepend: Affine,
+    /// The breath deforming this object's artwork, if it breathes.
+    breath: Option<buzz_scene::Breath>,
+    /// Where it lands in document space, resolved through the library.
+    region: buzz_geom::Rect,
+}
+
+impl<'a> Placed<'a> {
+    /// The object as it is actually drawn — the modifier's copy if there is one.
+    fn object(&self) -> &Object {
+        self.held.as_ref().unwrap_or(self.stored)
+    }
+
+    /// Its placement, which is what the crescent cache is keyed on.
+    fn doc(&self) -> Affine {
+        self.prepend * self.object().transform
+    }
+
+    /// Is this thing the size of the stage? A backdrop is not part of the
+    /// figure standing in front of it, however much of it that figure covers.
+    /// The same test [`FigurePass::open_over`] uses to refuse it an edge, and
+    /// for the same reason.
+    fn is_backdrop(&self, ctx: &DrawCtx<'_>) -> bool {
+        let stage = ctx.scene.stage().stage_rect();
+        self.region.width() >= stage.width() && self.region.height() >= stage.height()
+    }
+}
+
+/// **Which of a layer's objects are one figure**, as groups of indices into
+/// `placed`, in paint order.
+///
+/// # Why a layer is not simply one figure, nor one figure per object
+///
+/// `EdgeMode::Figure` measures a light's bands against the silhouette of the
+/// figure so they go round the body rather than round each piece of it. It did
+/// that per top-level object — which is right for a character drawn as a group,
+/// a rig or a symbol, and wrong for one drawn as a limb per object on a layer.
+/// There each limb was its own figure, so every place two limbs overlapped fell
+/// between two sets of bands and came out as a pale seam across the joint.
+///
+/// A layer is not one figure either: that is a layer of separate props, which
+/// is exactly the case the per-object rule got right and which the `Shapes`
+/// mode is kept for.
+///
+/// **Objects that overlap are one figure.** A body's pieces touch — that is
+/// what makes them a body — and props standing apart on a stage do not. A
+/// backdrop is excluded however much it covers, because a figure in front of a
+/// wall is not part of the wall.
+///
+/// # Cost
+///
+/// A sweep along x with an active list, not every pair against every other: a
+/// layer of four hundred props is a stated case here, and it must not become
+/// eighty thousand rectangle tests a frame. Objects are compared only while
+/// their x ranges are still open, so a spread-out layer costs a sort and a walk.
+///
+/// And a figure rebuilds as a **unit** — move one of its pieces and its whole
+/// silhouette is gathered again — so a group that swallowed a layer would put
+/// that layer's entire geometry on every frame of a drag. See
+/// [`MOST_PIECES_IN_A_FIGURE`].
+fn figure_groups(placed: &[Placed<'_>], ctx: &DrawCtx<'_>) -> Vec<Vec<usize>> {
+    let n = placed.len();
+    if n <= 1 {
+        return (0..n).map(|i| vec![i]).collect();
+    }
+
+    // Union-find over the objects, joined when two of them overlap.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+
+    let joinable: Vec<bool> = placed
+        .iter()
+        .map(|p| {
+            p.region.width() > 0.0 && p.region.height() > 0.0 && !p.is_backdrop(ctx)
+        })
+        .collect();
+
+    let mut order: Vec<usize> = (0..n).filter(|i| joinable[*i]).collect();
+    order.sort_by(|a, b| placed[*a].region.x0.total_cmp(&placed[*b].region.x0));
+
+    let mut active: Vec<usize> = Vec::new();
+    for i in order {
+        let region = placed[i].region;
+        // Anything whose right edge is behind this one's left edge cannot meet
+        // it, nor anything further right, so it leaves the sweep for good.
+        active.retain(|j| placed[*j].region.x1 >= region.x0);
+        for &j in &active {
+            let other = placed[j].region;
+            if region.y0 <= other.y1 && other.y0 <= region.y1 {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                if a != b {
+                    parent[a] = b;
+                }
+            }
+        }
+        active.push(i);
+    }
+
+    // Back into paint order: a figure is drawn where its first member was, and
+    // its members in the order the layer stacks them.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut seen: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        match seen.get(&root) {
+            Some(at) => groups[*at].push(i),
+            None => {
+                seen.insert(root, groups.len());
+                groups.push(vec![i]);
+            }
+        }
+    }
+
+    // A run of pieces too long to be a body is a layer, and a layer is not a
+    // figure. Broken back into one figure each, which is what it was before any
+    // of this and what the per-object rule already got right.
+    if groups.iter().any(|g| g.len() > MOST_PIECES_IN_A_FIGURE) {
+        return groups
+            .into_iter()
+            .flat_map(|group| {
+                if group.len() > MOST_PIECES_IN_A_FIGURE {
+                    group.into_iter().map(|i| vec![i]).collect::<Vec<_>>()
+                } else {
+                    vec![group]
+                }
+            })
+            .collect();
+    }
+    groups
+}
+
+/// **How many overlapping objects still read as one body.**
+///
+/// A figure is gathered and rebuilt as a unit: move one of its pieces and the
+/// whole silhouette is collected again. That is the right trade for a character
+/// — a body is a body, and it is a couple of dozen pieces — and the wrong one
+/// for a layer of artwork that merely happens to touch. Six hundred blobs
+/// scattered over a stage overlap their neighbours by chance, and joined into
+/// one figure they put every path on the layer into every frame of a drag:
+/// measured at 364 ms against a 12 ms warm frame, which is the hang this
+/// number exists to prevent.
+///
+/// Two dozen with room to spare. A rigged biped is eleven parts; a generous
+/// cut-out character with hair, hands and a prop or two is under twenty. Past
+/// that, the pieces are a layer and get a figure each, exactly as they did
+/// before overlapping meant anything — and artwork that really is one body in
+/// more pieces than this can say so by being a group, which is one figure at
+/// any size.
+const MOST_PIECES_IN_A_FIGURE: usize = 32;
+
+impl<'a> FigurePass<'a> {
+    /// Decide whether this object is lit as a figure, and set up for it.
+    ///
+    /// `prepend` is whatever the caller is about to draw the object through —
+    /// a live modifier's transform, or the identity — and the object's own
+    /// transform is applied on top of it here, so the key moves when the figure
+    /// moves.
+    /// `members` is the figure: one object usually, and several where a layer's
+    /// objects overlap and are therefore one body. See [`figure_groups`].
+    ///
+    /// The pass is keyed on the **first** member — its `Arc`, its placement —
+    /// with every member's content and placement folded into the content hash,
+    /// so a figure whose pieces move, or gains or loses one, rebuilds and one
+    /// that is standing still does not.
+    fn open_over(
+        ctx: &'a DrawCtx<'a>,
+        cache: &mut DrawCache,
+        members: &[&Placed<'a>],
+    ) -> Option<FigurePass<'a>> {
+        let modelling = ctx.lights.figure_edges();
+        let lead = *members.first()?;
+        if modelling <= 0.01
+            || !cache.detail().models()
+            || !members.iter().any(|m| m.object().visible)
+        {
+            return None;
+        }
+        let (stage_height, depth) = ctx.lighting?;
+
+        // Where the figure stands, and how much light is on it — everything it
+        // is made of, taken together.
+        let region = members
+            .iter()
+            .map(|m| m.region)
+            .reduce(|a, b| a.union(b))
+            .unwrap_or(lead.region);
+        if !(region.width() > 0.0 && region.height() > 0.0) {
+            return None;
+        }
+        let owner = lead.owner;
+
+        let here = region.center();
+        let key = ctx.lights.key().and_then(|key| {
+            buzz_light::crescent_direction(key, here, depth, modelling).map(|towards| (key, towards))
+        });
+
+        // **No edge on a backdrop**, for the reason `draw_gloom_edge` gives: a
+        // shape that runs past the sides of the frame has no edge in shot.
+        let stage = ctx.scene.stage().stage_rect();
+        let backdrop = region.width() >= stage.width() && region.height() >= stage.height();
+        let gloom = (!backdrop)
+            .then(|| {
+                ctx.lights
+                    .lights
+                    .iter()
+                    .filter_map(|light| buzz_light::gloom_at(light, here).map(|got| (light, got)))
+                    .max_by(|a, b| a.1.1.total_cmp(&b.1.1))
+            })
+            .flatten()
+            .map(|(light, (facing, deep))| (light, facing, deep));
+
+        if key.is_none() && gloom.is_none() {
+            return None;
+        }
+
+        let doc = lead.doc();
+        // Every member's content **and** its placement: the cache is keyed on
+        // the first of them, so anything that moves a later one has to move the
+        // key too or the figure would keep the crescents of a pose it has left.
+        let content = members.iter().fold(members.len() as u64, |acc, member| {
+            let mut hash = acc
+                .rotate_left(11)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ figure_content(member.object(), ctx);
+            for coefficient in member.doc().as_coeffs() {
+                hash = hash.rotate_left(7) ^ (coefficient.to_bits() as u64);
+            }
+            hash
+        });
+
+        // What is already built. Only when *something* is missing does the
+        // silhouette have to be gathered, which is what keeps a settled frame
+        // from copying every path in the document.
+        let key_built = key.and_then(|(light, towards)| {
+            cache.lights.ready(
+                owner,
+                LightCache::FIGURE,
+                content,
+                doc,
+                towards,
+                light.softness,
+            )
+        });
+        let gloom_built = gloom.and_then(|(light, facing, _)| {
+            cache.lights.ready(
+                owner,
+                LightCache::FIGURE,
+                content,
+                doc,
+                -facing,
+                light.softness,
+            )
+        });
+        if key.is_some() && key_built.is_none()
+            || gloom.is_some() && gloom_built.is_none()
+            // Tweened and posed artwork has no identity to cache against, so it
+            // is gathered and built every frame — as its shapes' crescents were.
+            || owner.is_none()
+        {
+            cache.lights.collect_silhouette();
+        }
+
+        Some(FigurePass {
+            owner,
+            content,
+            doc,
+            region,
+            lighting: (stage_height, depth),
+            key,
+            gloom,
+            key_built,
+            gloom_built,
+            modelling,
+        })
+    }
+
+    /// Lay the bands over the figure that has just been drawn.
+    fn close(self, builder: &mut SceneBuilder<'_>, ctx: &DrawCtx<'_>, cache: &mut DrawCache) {
+        let silhouette = cache.lights.take_silhouette();
+
+        // Whatever was cached, else built from the silhouette this draw
+        // gathered, else nothing at all — which is the ordinary answer while a
+        // light is being dragged and the geometry is still on its way.
+        let build = |cache: &mut DrawCache,
+                     had: Option<Arc<buzz_light::ShadeGeometry>>,
+                     towards: buzz_geom::Vec2,
+                     softness: f64| {
+            had.or_else(|| {
+                silhouette.as_ref().map(|path| {
+                    cache
+                        .lights
+                        .figure(self.owner, self.content, path, self.doc, towards, softness)
+                })
+            })
+            .filter(|geometry| !geometry.is_empty())
+        };
+
+        let key = self.key.and_then(|(key, towards)| {
+            build(cache, self.key_built.clone(), towards, key.softness)
+                .map(|geometry| (key, towards, geometry))
+        });
+        let gloom = self.gloom.and_then(|(gloom, facing, deep)| {
+            let alpha = (deep * self.modelling * 0.75).clamp(0.0, 1.0);
+            (alpha > 0.02)
+                .then(|| build(cache, self.gloom_built.clone(), -facing, gloom.softness))
+                .flatten()
+                .map(|geometry| (gloom, alpha, geometry))
+        });
+        if key.is_none() && gloom.is_none() {
+            return;
+        }
+
+        // Only now is the light itself worked out. A lamp falling off across
+        // the figure keeps its ramp, so the bands darken along the body as the
+        // lamp does.
+        let (stage_height, depth) = self.lighting;
+        let field = ctx.lights.field(self.region, depth, stage_height);
+        if field.is_neutral() {
+            return;
+        }
+        let light = field.uniform();
+        let lamp = field
+            .disc()
+            .map(|(centre, reach)| cache.lamp_paints(&field, centre, reach));
+
+        if let Some((key, towards, geometry)) = key {
+            let shade = geometry
+                .shade
+                .as_ref()
+                .map(|s| ctx.project(s, builder.tolerance()));
+            let highlight = geometry.highlight.as_ref().map(|h| {
+                // The band's bounds in **document** space: the ramp runs along
+                // the light's own direction, which is a fact about the scene
+                // rather than about the lens.
+                (ctx.project(h, builder.tolerance()), h.bounding_box())
+            });
+            lay_bands(
+                builder,
+                ctx,
+                Bands {
+                    shade: shade.as_ref(),
+                    highlight: highlight.as_ref().map(|(path, band)| (path, *band)),
+                    towards: Some(towards),
+                    key: Some(key),
+                    lamp: lamp.as_deref(),
+                    light: &light,
+                    modelling: self.modelling,
+                },
+            );
+        }
+
+        // The dark edge the deepest wall of gloom leaves, which is the other
+        // half of what makes light read as light: the tint says how much light
+        // there is, an edge says which way it is coming from. Its own aim, so
+        // it shares nothing with the key light's entry.
+        if let Some((gloom, alpha, geometry)) = gloom
+            && let Some(edge) = &geometry.highlight
+        {
+            let drawn = ctx.project(edge, builder.tolerance());
+            builder.fill_shape_atop(
+                &drawn,
+                gloom.color.multiply_alpha(alpha),
+                buzz_fx::Blend::Multiply,
+            );
+        }
+    }
+}
+
+/// **What a figure's artwork is made of**, beyond the object's own address.
+///
+/// An object's `Arc` is a complete answer for artwork that lives under it:
+/// copy-on-write gives an edited group a new address, and the cache keys on
+/// that. An **instance** does not — its artwork lives in the library and runs
+/// on its own playhead, so a symbol being edited, or its next keyframe coming
+/// round, changes the silhouette while the instance's address and placement sit
+/// perfectly still.
+///
+/// So an object with an instance anywhere inside it folds in the library's
+/// identity and the frame it is playing. Everything else answers zero and keys
+/// on its address alone, which is every shape, every group of shapes and every
+/// rig — and is what keeps a settled document hitting the cache frame after
+/// frame.
+fn figure_content(object: &Object, ctx: &DrawCtx<'_>) -> u64 {
+    fn has_instance(object: &Object, depth: usize) -> bool {
+        if depth >= MAX_SYMBOL_DEPTH {
+            return true;
+        }
+        match &object.kind {
+            ObjectKind::Instance(_) => true,
+            ObjectKind::Group(children) => children.iter().any(|c| has_instance(c, depth + 1)),
+            ObjectKind::Armature(rig) => {
+                rig.parts.iter().any(|p| has_instance(&p.artwork, depth + 1))
+            }
+            ObjectKind::Shape(_) | ObjectKind::Warp(_) => false,
+        }
+    }
+
+    if !has_instance(object, 0) {
+        return 0;
+    }
+    // The library's identity moves on any edit to any symbol, and `elapsed` is
+    // what a graphic instance plays against. Neither is free to change without
+    // the silhouette being allowed to.
+    (ctx.scene.library().content_id() as u64) ^ ((ctx.elapsed as u64 + 1) << 40)
+}
+
 /// **The dark edge one wall of dark leaves on one shape.**
 ///
 /// The counterpart of the highlight: where the terminator says which side of a
@@ -2075,7 +2730,7 @@ fn draw_gloom_edge(
     if !cache.detail().models() {
         return;
     }
-    let modelling = ctx.lights.modelling;
+    let modelling = ctx.shape_edges;
     if modelling <= 0.01 {
         return;
     }
@@ -2562,6 +3217,12 @@ fn try_stamp_symbol(
         || ctx.gradient_map.is_some()
         || ctx.blur.is_some()
         || ctx.lighting.is_some()
+        // **A breath is a deformation of the artwork**, so a cached encoding of
+        // that artwork is the wrong shape — and it changes every frame, so
+        // there is nothing here worth keeping anyway. Without this the symbol
+        // would be stamped from the first frame's encoding and the character
+        // would simply stop breathing.
+        || ctx.breath.is_some()
         || !inner_ctx.effect.is_identity()
     {
         return false;
@@ -2694,6 +3355,13 @@ fn stamp_scene(
 /// boolean per object per frame for a result nobody would be able to tell
 /// apart. Strokes are left out for the same reason a mask ignores them: a
 /// silhouette is a region, and a stroke is a line.
+///
+/// Each path is wound forward as it goes in ([`buzz_geom::turns_backwards`]):
+/// merging under the non-zero rule only holds while they all turn the same way,
+/// and drawn artwork's do not. Two wound opposite ways cancel where they
+/// overlap, so without it a figure drawn in pieces comes back holed at every
+/// joint — a filter with the joins missing, or a rim glow that traces the
+/// insides of the figure as well as its outline.
 fn append_silhouette(object: &Object, transform: Affine, out: &mut buzz_geom::BezPath) {
     let mut flat = Vec::new();
     object.flatten(transform, &mut flat);
@@ -2701,7 +3369,10 @@ fn append_silhouette(object: &Object, transform: Affine, out: &mut buzz_geom::Be
         if shape.fill.is_none() {
             continue;
         }
-        for element in (place * shape.path).elements() {
+        // Wound one way, so paths that overlap merge under the non-zero rule
+        // instead of cancelling into a hole where they meet. Per path, so a
+        // path's own holes survive — see [`buzz_geom::turns_backwards`].
+        for element in buzz_geom::wound_forward(&(place * shape.path)).elements() {
             out.push(*element);
         }
     }
@@ -2725,7 +3396,12 @@ fn draw_shape(
     // Everything drawn below goes through the second; everything *measured* —
     // lighting, which is a property of the scene rather than of the view — uses
     // the first.
-    let placed = doc * shape.path.clone();
+    //
+    // **Breathed first**, so everything downstream — the light on it, its
+    // silhouette, its shadow — is measured against the shape as it is actually
+    // drawn. A breath is a deformation of the artwork rather than a placement
+    // of it, so it lands here on the document-space path and not on `doc`.
+    let placed = ctx.breathe(doc * shape.path.clone());
     let path = ctx.project(&placed, builder.tolerance());
 
     // Outline view: draw the silhouette in the layer colour instead of the
@@ -2756,6 +3432,18 @@ fn draw_shape(
     // shape's own coordinates, so `doc` puts it in the document, and the
     // projection puts it on the frame — the same two steps the path took above.
     let brush_to_doc = ctx.brush_projection(placed.bounding_box()) * doc;
+
+    // **The figure this shape is part of**, if one is being gathered.
+    //
+    // A figure's crescents are measured against the silhouette of everything it
+    // draws, and this is where that silhouette comes from: the draw itself.
+    // Fills only — a silhouette is a region, and a stroke is a line — and in
+    // *document* space, which is the space the light is measured in and the
+    // space the crescent cache is keyed on. Costs nothing at all unless a
+    // figure is being collected, which is only while one is being built.
+    if shape.fill.is_some() && cache.lights.collecting() {
+        cache.lights.add_silhouette(&placed);
+    }
 
     if let Some(fill) = &shape.fill {
         // **A bitmap takes the light as a blend, not as a colour.**
@@ -2921,7 +3609,7 @@ fn draw_shape(
                 && let Some(light) = &light
                 && let Some(key) = ctx.lights.key()
                 && let Some(towards) =
-                    buzz_light::crescent_direction(key, here, ctx.layer_depth, ctx.lights.modelling)
+                    buzz_light::crescent_direction(key, here, ctx.layer_depth, ctx.shape_edges)
             {
                 // `towards` above is which way the light lies from here — all a
                 // crescent takes from a light, and `None` when it draws none:
@@ -2933,7 +3621,7 @@ fn draw_shape(
                 // second time inside the cache was a whole path copy per shape per
                 // frame, paid on every *hit*, which is most of what lighting used
                 // to cost once the geometry itself had settled.
-                let modelling = ctx.lights.modelling;
+                let modelling = ctx.shape_edges;
                 let geometry = cache
                     .lights
                     .crescents(owner, index, &placed, doc, towards, key.softness);
@@ -2962,12 +3650,38 @@ fn draw_shape(
                 // value for the whole of it.
                 if let Some(shade) = &geometry.shade {
                     let drawn = ctx.project(shade, builder.tolerance());
+                    // **How sharply the shade arrives.** A hard light's
+                    // terminator is a line: one step from lit to shaded, no
+                    // ramp. A soft one arrives over the width of the band. At a
+                    // softness of zero this is zero and the flat fill below is
+                    // taken, which is exactly the hard edge asked for.
+                    let feather = buzz_light::shade_feather(key.softness);
+                    let band = shade.bounding_box();
                     match (&field, &fill.paint) {
                         (Some(f), buzz_scene::Paint::Solid(c))
                             if let Some((ramp, disc)) =
                                 lamp_lit(f, *c, |i, c| i.apply_shaded(c)) =>
                         {
                             builder.fill_shape_paint(&drawn, &ramp, ctx.brush_projection(disc));
+                        }
+                        // **Feathered where the fill is one colour**, which is
+                        // most artwork: full shade held across the band's outer
+                        // part and falling to the lit colour the picture
+                        // already is at the terminator, so the band ends in
+                        // nothing rather than on a line. The ramp runs *away*
+                        // from the light, which is the direction the band was
+                        // built in.
+                        (_, buzz_scene::Paint::Solid(c))
+                            if feather > 1e-3
+                                && let Some(ramp) = banded_ramp(
+                                    light.apply_shaded(*c),
+                                    light.apply(*c),
+                                    band,
+                                    -towards,
+                                    1.0 - feather,
+                                ) =>
+                        {
+                            builder.fill_shape_paint(&drawn, &ramp, ctx.brush_projection(band));
                         }
                         _ => {
                             let shaded =
@@ -3192,7 +3906,7 @@ fn draw_lit_composited(
     // The crescents are worked out **before** anything is drawn, because the
     // group opened below has to be big enough to hold them: a crescent is the
     // artwork's own outline offset, so it can reach a little outside the shape.
-    let modelling = ctx.lights.modelling;
+    let modelling = ctx.shape_edges;
     let key = ctx.lights.key();
     let geometry = key
         .and_then(|key| {
@@ -3296,10 +4010,98 @@ fn draw_lit_composited(
     // already lit, and multiplication composes, so it lands on the ambient
     // colour exactly — and takes it as a ramp of the light field rather than as
     // one colour, so a band lying across a lamp's falloff darkens with it.
-    if let Some(drawn) = &shade {
-        match &lamp {
-            None => builder.fill_shape_atop(drawn, light.shade_filter(), buzz_fx::Blend::Multiply),
-            Some(lamp) => builder.fill_shape_atop_paint(
+    lay_bands(
+        builder,
+        ctx,
+        Bands {
+            shade: shade.as_ref(),
+            highlight: highlight.as_ref().zip(
+                geometry
+                    .as_ref()
+                    .and_then(|(_, _, g)| g.highlight.as_ref())
+                    .map(|h| h.bounding_box()),
+            ),
+            towards: geometry.as_ref().map(|(_, t, _)| *t),
+            key: geometry.as_ref().map(|(k, _, _)| *k),
+            lamp: lamp.as_deref(),
+            light: &light,
+            modelling,
+        },
+    );
+
+    if isolate {
+        builder.pop_isolation();
+    }
+}
+
+/// The two bands a key light lays over artwork **that is already drawn**, and
+/// everything needed to colour them.
+struct Bands<'a> {
+    /// The shaded crescent, projected. `None` where there is none to draw.
+    shade: Option<&'a buzz_geom::BezPath>,
+    /// The glint, projected, with its **document-space** bounds — which is the
+    /// space the ramp along the light's direction is built in.
+    highlight: Option<(&'a buzz_geom::BezPath, buzz_geom::Rect)>,
+    /// Which way the light lies, for the ramp.
+    towards: Option<buzz_geom::Vec2>,
+    key: Option<&'a buzz_light::Light>,
+    /// The lamp's gradients, when one falls off across this artwork.
+    lamp: Option<&'a LampPaints>,
+    /// The light over the artwork as one value, for everything the ramp does
+    /// not answer.
+    light: &'a buzz_light::Illumination,
+    modelling: f32,
+}
+
+/// **Lay the shaded side and the glint over artwork already on the frame.**
+///
+/// Shared by the two things that light by compositing rather than by
+/// recolouring — a bitmap or a lamp-lit shape ([`draw_lit_composited`]) and a
+/// whole figure ([`FigurePass`]) — so the two cannot drift into drawing the
+/// same light two different ways.
+///
+/// The shaded band carries only the **ratio** from lit to ambient: the picture
+/// beneath it is already lit and multiplication composes, so it lands on the
+/// ambient colour exactly. The glint is **screened**, not laid over: light
+/// falling on the artwork adds to the colour that is there rather than
+/// replacing it, so a red coat catching a warm lamp stays red. See
+/// [`buzz_light::Illumination::highlight_strength`], which the vector path
+/// mixes with to the same place.
+fn lay_bands(builder: &mut SceneBuilder<'_>, ctx: &DrawCtx<'_>, it: Bands<'_>) {
+    if let Some(drawn) = it.shade {
+        // The same feather the vector path lays, for the same reason: a hard
+        // light's terminator is a line and a soft one's is a gradient, and the
+        // two routes must not disagree about which. Multiplying by white is
+        // multiplying by nothing, so the ramp runs from the shade filter at the
+        // band's outer edge to white at the terminator.
+        let feather = it.key.map(|k| buzz_light::shade_feather(k.softness));
+        match (it.lamp, feather, it.towards) {
+            (None, Some(feather), Some(towards)) if feather > 1e-3 => {
+                let band = drawn.bounding_box();
+                match banded_ramp(
+                    it.light.shade_filter(),
+                    Color::WHITE,
+                    band,
+                    -towards,
+                    1.0 - feather,
+                ) {
+                    Some(paint) => builder.fill_shape_atop_paint(
+                        drawn,
+                        &paint,
+                        ctx.brush_projection(band),
+                        buzz_fx::Blend::Multiply,
+                    ),
+                    None => builder.fill_shape_atop(
+                        drawn,
+                        it.light.shade_filter(),
+                        buzz_fx::Blend::Multiply,
+                    ),
+                }
+            }
+            (None, _, _) => {
+                builder.fill_shape_atop(drawn, it.light.shade_filter(), buzz_fx::Blend::Multiply)
+            }
+            (Some(lamp), _, _) => builder.fill_shape_atop_paint(
                 drawn,
                 &lamp.shade,
                 ctx.brush_projection(lamp.disc),
@@ -3307,30 +4109,23 @@ fn draw_lit_composited(
             ),
         }
     }
-    if let (Some(drawn), Some((key, towards, built))) = (&highlight, &geometry) {
-        let strength = buzz_light::Illumination::highlight_strength(modelling * key.glint());
+    if let (Some((drawn, band)), Some(key), Some(towards)) = (it.highlight, it.key, it.towards) {
+        let strength = buzz_light::Illumination::highlight_strength(it.modelling * key.glint());
         let glint = key.color.multiply_alpha(strength);
         // Feathered exactly as the vector path's is — see `glint_ramp`. Here
-        // the fade is in the *alpha*, because a bitmap has no fill colour to
-        // fade towards: the ramp goes from the glint to the same glint at
+        // the fade is in the *alpha*, because a photograph has no fill colour
+        // to fade towards: the ramp goes from the glint to the same glint at
         // nothing, which is the picture underneath, untouched.
-        let ramp = built.highlight.as_ref().and_then(|h| {
-            let band = h.bounding_box();
-            glint_ramp(glint, glint.multiply_alpha(0.0), band, *towards).map(|paint| (paint, band))
-        });
+        let ramp = glint_ramp(glint, glint.multiply_alpha(0.0), band, towards);
         match ramp {
-            Some((paint, band)) => builder.fill_shape_atop_paint(
+            Some(paint) => builder.fill_shape_atop_paint(
                 drawn,
                 &paint,
                 ctx.brush_projection(band),
-                buzz_fx::Blend::Normal,
+                buzz_fx::Blend::Screen,
             ),
-            None => builder.fill_shape_atop(drawn, glint, buzz_fx::Blend::Normal),
+            None => builder.fill_shape_atop(drawn, glint, buzz_fx::Blend::Screen),
         }
-    }
-
-    if isolate {
-        builder.pop_isolation();
     }
 }
 
@@ -3388,6 +4183,23 @@ fn glint_ramp(
     band: buzz_geom::Rect,
     towards: buzz_geom::Vec2,
 ) -> Option<buzz_scene::Paint> {
+    banded_ramp(outer, inner, band, towards, GLINT_HOLD)
+}
+
+/// [`glint_ramp`], with the length of the flat part named by the caller.
+///
+/// `hold` is how much of the band stays at `outer` before it starts to fall
+/// away, as a fraction of the band. The glint's is fixed; the shaded side's
+/// comes from the light's softness, and at a softness of zero it is **1.0** —
+/// the whole band at full tone, which is a terminator with no ramp in it at
+/// all. That is what a hard light is. See [`buzz_light::shade_feather`].
+fn banded_ramp(
+    outer: Color,
+    inner: Color,
+    band: buzz_geom::Rect,
+    towards: buzz_geom::Vec2,
+    hold: f64,
+) -> Option<buzz_scene::Paint> {
     let length = towards.hypot();
     if !length.is_finite() || length < 1e-9 {
         return None;
@@ -3415,7 +4227,7 @@ fn glint_ramp(
         buzz_scene::GradientKind::Linear,
         vec![
             buzz_scene::GradientStop::new(0.0, outer),
-            buzz_scene::GradientStop::new(GLINT_HOLD, outer),
+            buzz_scene::GradientStop::new(hold.clamp(0.0, 1.0), outer),
             buzz_scene::GradientStop::new(1.0, inner),
         ],
     );
@@ -3533,17 +4345,18 @@ fn cast_shadows(
     builder: &mut SceneBuilder<'_>,
     object: &Object,
     doc: Affine,
-    key: &buzz_light::Light,
     shadow: Affine,
     ctx: &DrawCtx<'_>,
 ) {
-    cast_shadows_within(builder, object, doc, key, shadow, ctx, 0);
+    let mut caster = Caster::default();
+    cast_shadows_within(builder, &mut caster, object, doc, shadow, ctx, 0);
+    caster.draw(builder);
 }
 
 /// **Where a layer's shadows land**, as the group they are drawn inside.
 ///
-/// The union of what the layer actually draws, thrown by the shadow affine, and
-/// then through the lens. Every group is a render target, so it is trimmed to
+/// The union of what the layer actually draws, each caster thrown the way the
+/// light throws *it*, and then through the lens. Every group is a render target, so it is trimmed to
 /// what can be seen: a caster whose shadow falls right off the side of the
 /// frame should not buy a buffer the size of the throw.
 ///
@@ -3556,18 +4369,23 @@ fn cast_shadows(
 /// `None` when the layer draws nothing, or nothing whose shadow can be seen.
 fn shadow_group_bounds(
     resolved: &buzz_scene::ResolvedFrame<'_>,
-    shadow: Affine,
+    shadow: &buzz_light::ShadowThrow,
     ctx: &DrawCtx<'_>,
 ) -> Option<buzz_geom::Rect> {
     let mut area: Option<buzz_geom::Rect> = None;
     for object in resolved.iter() {
+        // Each caster thrown by **its own** affine, and the union of those: a
+        // ground shadow is anchored at the feet of the figure that casts it, so
+        // one box thrown once would be the shadow of the whole layer treated as
+        // a single enormous caster.
         let b = ctx.scene.resolved_bounds(object);
+        let thrown = shadow.at(b).transform_rect_bbox(b);
         area = Some(match area {
-            Some(a) => a.union(b),
-            None => b,
+            Some(a) => a.union(thrown),
+            None => thrown,
         });
     }
-    let mut area = shadow.transform_rect_bbox(area?);
+    let mut area = area?;
     if let Some(cull) = ctx.cull {
         area = area.intersect(cull);
     }
@@ -3577,26 +4395,121 @@ fn shadow_group_bounds(
     ctx.projection.map_rect_bounds(area)
 }
 
-/// One shape's shadow: its outline, put where the light throws it.
+/// **Everything one caster blocks the light with**, gathered before any of it
+/// is drawn.
 ///
-/// The projection is folded into the placement rather than applied after it, so
-/// the path is copied once. `shadow * doc` is the same thing as shadowing the
-/// already-placed path — the shadow is taken in document space — for one path
-/// transform instead of two.
-fn draw_shadow(
-    builder: &mut SceneBuilder<'_>,
-    path: &buzz_geom::BezPath,
-    doc: Affine,
-    _key: &buzz_light::Light,
-    shadow: Affine,
-    ctx: &DrawCtx<'_>,
-) {
-    // **Opaque.** The tone is on the group this is drawn inside, so that shapes
-    // overlapping within one caster make a silhouette rather than a darker
-    // patch. See the shadow pass in `draw_layer`.
-    let cast = (shadow * doc) * path.clone();
-    let drawn = ctx.project(&cast, builder.tolerance());
-    builder.fill_shape(&drawn, Color::BLACK);
+/// # Why the shadow is one path and not one path per shape
+///
+/// A shadow used to be a black fill per shape of the caster. Every one of those
+/// is antialiased on its own, so wherever two regions of the artwork share a
+/// boundary — which on imported artwork is *every* boundary, Flash having
+/// scan-converted a shape as a soup of edges in one pass — each covered about
+/// half of every pixel along it, and half composited over half is three
+/// quarters, not one. The missing quarter was the ground, and it traced every
+/// internal border in the figure across its shadow as a pale line. That is the
+/// "the shadows have inner outlines" report, and it is the conflation artifact:
+/// a property of compositing paths separately rather than a bug in any of them.
+///
+/// Sealing each fill the way the artwork is sealed would work and would cost a
+/// stroke per shape — it measurably doubled what a cast shadow encodes, which
+/// on a dense document was enough to spend the whole lighting budget and trim
+/// the shadows away altogether.
+///
+/// So the fills are concatenated and filled **once**. There are then no
+/// internal boundaries to conflate, because the rasteriser scan-converts the
+/// whole silhouette in one pass — which is what Flash did, and why its artwork
+/// has no seams in it. It is also *cheaper* than what it replaces: one path per
+/// caster instead of one per shape.
+#[derive(Default)]
+struct Caster {
+    /// Every filled outline, thrown and projected, as one path.
+    fills: buzz_geom::BezPath,
+    /// The outlines, which cannot be folded into a fill. Each with the pen it
+    /// is to be drawn with, already carried through the throw.
+    strokes: Vec<(buzz_geom::BezPath, f64)>,
+    /// Hairlines, which are a pixel wide at every zoom and so carry no width.
+    hairlines: Vec<buzz_geom::BezPath>,
+}
+
+impl Caster {
+    /// Add one shape's contribution.
+    fn add(
+        &mut self,
+        builder: &SceneBuilder<'_>,
+        shape: &buzz_scene::ShapeData,
+        doc: Affine,
+        shadow: Affine,
+        ctx: &DrawCtx<'_>,
+    ) {
+        // Breathed where the artwork is and *then* thrown: a breathing
+        // character's shadow breathes with it, which is what makes the shadow
+        // read as its own.
+        let cast = shadow * ctx.breathe(doc * shape.path.clone());
+        let drawn = ctx.project(&cast, builder.tolerance());
+
+        if shape.fill.is_some() {
+            // **Wound forward**, because concatenating only unions under the
+            // non-zero rule while every path turns the same way — two wound
+            // opposite ways cancel where they overlap and leave a hole at the
+            // join, which is the same defect this exists to remove. A path's
+            // own holes survive; see [`buzz_geom::turns_backwards`].
+            for element in buzz_geom::wound_forward(&drawn).elements() {
+                self.fills.push(*element);
+            }
+        }
+
+        // **And the outline, because a silhouette has no seams in it.**
+        //
+        // A shadow used to be the fills alone. In artwork drawn the way artwork
+        // is actually drawn — a fill for each region with a line between them —
+        // every one of those lines was a gap the ground showed through. It also
+        // gives an unfilled outline — a rope, a wire, a stray line — the shadow
+        // it should always have had, which filling its path could never do.
+        let Some(stroke) = &shape.stroke else {
+            return;
+        };
+        if stroke.hairline {
+            // A hairline is a pixel wide however far away it is, and its shadow
+            // is the same hairline: a seam, not a rope.
+            self.hairlines.push(drawn);
+            return;
+        }
+        // **The pen is thrown too.**
+        //
+        // The path is stroked after it has been projected, the way the
+        // artwork's own strokes are — but a shadow's path has been through the
+        // throw as well, and the throw scales. A ground shadow under a low
+        // light stretches away from its caster, so the gap between two thrown
+        // fills is wider than the gap between the fills themselves and a pen of
+        // the drawn width no longer covers it: measured, the seam went from
+        // bare ground to half-dark rather than closing.
+        //
+        // The *largest* scale the throw applies, not the average: a throw
+        // squashes one axis and stretches the other, one pen cannot follow
+        // both, and a seam sealed a little wide disappears inside the
+        // silhouette while a seam sealed a little narrow is the light thread
+        // this exists to remove.
+        let [a, b, c, d, _, _] = shadow.as_coeffs();
+        let spread = a.hypot(b).max(c.hypot(d)).max(1.0);
+        self.strokes.push((drawn, stroke.width * spread));
+    }
+
+    /// Draw what was gathered.
+    ///
+    /// **Opaque.** The tone is on the group this is drawn inside, so that
+    /// everything overlapping within one caster makes a silhouette rather than
+    /// a darker patch. See the shadow pass in `draw_layer`.
+    fn draw(self, builder: &mut SceneBuilder<'_>) {
+        if !self.fills.elements().is_empty() {
+            builder.fill_shape(&self.fills, Color::BLACK);
+        }
+        for (path, width) in &self.strokes {
+            builder.stroke_transformed(path, Color::BLACK, *width, Affine::IDENTITY);
+        }
+        for path in &self.hairlines {
+            builder.stroke_hairline(path, Color::BLACK, 1.0);
+        }
+    }
 }
 
 /// [`cast_shadows`], carrying how deep into nested symbols it has gone.
@@ -3605,10 +4518,10 @@ fn draw_shadow(
 /// which is the layer's distance from the camera. A symbol containing an
 /// instance of itself would otherwise recurse until the stack ran out.
 fn cast_shadows_within(
-    builder: &mut SceneBuilder<'_>,
+    builder: &SceneBuilder<'_>,
+    caster: &mut Caster,
     object: &Object,
     doc: Affine,
-    key: &buzz_light::Light,
     shadow: Affine,
     ctx: &DrawCtx<'_>,
     depth_limit: usize,
@@ -3620,28 +4533,28 @@ fn cast_shadows_within(
 
     match &object.kind {
         ObjectKind::Shape(shape) => {
-            if shape.fill.is_none() {
-                // An unfilled outline has nothing to block the light with.
+            if shape.fill.is_none() && shape.stroke.is_none() {
+                // Nothing drawn is nothing to block the light with.
                 return;
             }
-            draw_shadow(builder, &shape.path, doc, key, shadow, ctx);
+            caster.add(builder, shape, doc, shadow, ctx);
         }
         ObjectKind::Group(children) => {
             for child in children {
-                cast_shadows_within(builder, child, doc, key, shadow, ctx, depth_limit);
+                cast_shadows_within(builder, caster, child, doc, shadow, ctx, depth_limit);
             }
         }
         ObjectKind::Armature(rig) => {
             for part in rig.posed() {
-                cast_shadows_within(builder, &part, doc, key, shadow, ctx, depth_limit);
+                cast_shadows_within(builder, caster, &part, doc, shadow, ctx, depth_limit);
             }
         }
         ObjectKind::Warp(warp) => {
             let warped = warp.warped();
-            if warped.fill.is_none() {
+            if warped.fill.is_none() && warped.stroke.is_none() {
                 return;
             }
-            draw_shadow(builder, &warped.path, doc, key, shadow, ctx);
+            caster.add(builder, &warped, doc, shadow, ctx);
         }
         // **A symbol's shadow is the shadow of what it contains.**
         //
@@ -3675,7 +4588,7 @@ fn cast_shadows_within(
                     continue;
                 }
                 for child in layer.objects_at(inner) {
-                    cast_shadows_within(builder, child, doc, key, shadow, ctx, depth_limit + 1);
+                    cast_shadows_within(builder, caster, child, doc, shadow, ctx, depth_limit + 1);
                 }
             }
         }
@@ -4494,3 +5407,4 @@ mod symbol_scene {
         assert_ineligible(&scene, &wide_camera(), &FrameOptions::default());
     }
 }
+

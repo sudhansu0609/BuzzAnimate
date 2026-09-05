@@ -251,6 +251,51 @@ impl AssetLibrary {
         Ok(())
     }
 
+    /// **Move an asset into a folder**, keeping its name.
+    ///
+    /// The folder is a path relative to the library root, `/`-separated, and
+    /// empty means the root — the same convention [`Asset::folder`] uses. It is
+    /// made if it is not there, because dropping something into a folder that
+    /// has just been named should not fail on a technicality.
+    ///
+    /// A name already taken in the destination is stepped past rather than
+    /// overwritten: these are files, and there is no undo out here.
+    pub fn move_to_folder(&mut self, asset: &Asset, folder: &str) -> Result<(), DocError> {
+        let Some(root) = self.root.clone() else {
+            return Ok(());
+        };
+        let folder = folder.trim_matches('/');
+        if folder == asset.folder {
+            return Ok(());
+        }
+        // Built and checked the way `delete_folder` builds and checks it: a
+        // `..` arriving from anywhere must not reach outside the library.
+        let dir = if folder.is_empty() {
+            root.clone()
+        } else {
+            root.join(folder.replace('/', std::path::MAIN_SEPARATOR_STR))
+        };
+        let inside = dir
+            .canonicalize()
+            .ok()
+            .zip(root.canonicalize().ok())
+            .map(|(d, r)| d.starts_with(&r))
+            .unwrap_or_else(|| !folder.contains(".."));
+        if !inside {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&dir).map_err(DocError::Io)?;
+
+        let name = self.unique_name(&asset.name, folder);
+        let target = dir.join(format!("{name}.{}", format::EXTENSION));
+        if target == asset.path {
+            return Ok(());
+        }
+        std::fs::rename(&asset.path, &target).map_err(DocError::Io)?;
+        self.rescan();
+        Ok(())
+    }
+
     /// Make a folder, including its parents.
     pub fn create_folder(&mut self, folder: &str) -> Result<(), DocError> {
         let Some(root) = self.root.clone() else {
@@ -344,6 +389,80 @@ fn sanitise(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// **Filing an asset by dragging it onto a folder.**
+    ///
+    /// An asset could be made and renamed but never moved: the folder it landed
+    /// in was whichever happened to be selected when it was kept, and putting it
+    /// somewhere else meant deleting it and adding it again from the document
+    /// it came from.
+    #[test]
+    fn an_asset_moves_between_folders() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut library = AssetLibrary::at(dir.path());
+        library
+            .save("Oak", "Trees", &buzz_scene::Scene::default())
+            .expect("save");
+
+        let oak = library.assets().iter().next().cloned().expect("the oak");
+        assert_eq!(oak.folder, "Trees");
+
+        library.move_to_folder(&oak, "Props").expect("moved");
+        let moved = library.assets().iter().next().cloned().expect("still there");
+        assert_eq!(moved.folder, "Props", "it did not land in the new folder");
+        assert_eq!(moved.name, "Oak", "it lost its name on the way");
+        assert!(moved.path.exists(), "the file did not follow");
+        assert!(!oak.path.exists(), "the old file was left behind");
+    }
+
+    /// The root is a destination like any other, and moving somewhere it
+    /// already is does nothing rather than failing.
+    #[test]
+    fn an_asset_moves_to_the_root_and_nowhere_twice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut library = AssetLibrary::at(dir.path());
+        library
+            .save("Oak", "Trees", &buzz_scene::Scene::default())
+            .expect("save");
+        let oak = library.assets().iter().next().cloned().expect("the oak");
+
+        library.move_to_folder(&oak, "").expect("moved to the root");
+        let moved = library.assets().iter().next().cloned().expect("still there");
+        assert_eq!(moved.folder, "");
+
+        library.move_to_folder(&moved, "").expect("moved nowhere");
+        assert_eq!(library.len(), 1, "moving it onto itself duplicated it");
+    }
+
+    /// A name already taken where it is going is stepped past, not overwritten:
+    /// these are files, and there is no undo out here.
+    #[test]
+    fn filing_an_asset_never_overwrites_one_that_is_there() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut library = AssetLibrary::at(dir.path());
+        library
+            .save("Oak", "Trees", &buzz_scene::Scene::default())
+            .expect("save");
+        library
+            .save("Oak", "Props", &buzz_scene::Scene::default())
+            .expect("save");
+        let from_trees = library
+            .assets()
+            .iter()
+            .find(|a| a.folder == "Trees")
+            .cloned()
+            .expect("the one in Trees");
+
+        library
+            .move_to_folder(&from_trees, "Props")
+            .expect("moved");
+        assert_eq!(library.len(), 2, "one of them was overwritten");
+        assert_eq!(
+            library.assets().iter().filter(|a| a.folder == "Props").count(),
+            2,
+            "they are not both in Props"
+        );
+    }
+
     use super::*;
 
     /// Deleting a folder takes what is in it, and **cannot** take the library.

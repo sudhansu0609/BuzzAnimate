@@ -448,6 +448,22 @@ pub const LEFT_WIDTH_RANGE: std::ops::RangeInclusive<f32> =
 /// The timeline, which needs a couple of layer rows to be worth having.
 pub const BOTTOM_HEIGHT_RANGE: std::ops::RangeInclusive<f32> = 80.0..=900.0;
 
+/// The narrowest the artwork may be squeezed to by the columns either side.
+///
+/// # Why the columns are not simply allowed to take the window
+///
+/// `egui` gives each side to whichever panel asks first and clamps it to what
+/// is left, so on a window that cannot hold every column at the width it was
+/// dragged to, the last one asked was placed *on top of* its neighbour — the
+/// Properties column drawn over the far-right column, and the stage between
+/// them a forty-point sliver. That is the "the left edge drags over the
+/// property panel" report: nothing was overlapping the stage, the panels were
+/// overlapping each other because there was no room left to share.
+///
+/// So the columns are fitted to the window *before* they are drawn, and this
+/// is the artwork's share that they may not eat into.
+pub const MIN_STAGE_WIDTH: f32 = 200.0;
+
 /// The two sections the default arrangement ships grouped.
 ///
 /// Numbered above any `order` so they cannot collide with the one-panel
@@ -462,6 +478,166 @@ const GROUP_UTILITY: GroupId = 100;
 /// already held that number. See `Workspace::fill_gaps`.
 const GROUP_TOOL_OPTIONS: GroupId = 102;
 const GROUP_ASSETS: GroupId = 101;
+
+/// What the three dock columns are actually drawn at this frame.
+///
+/// The workspace's own `left_width` / `right_width` / `right_outer_width` are
+/// what the user dragged them to and what gets saved; these are those numbers
+/// after the window has had its say. A column absent from the layout is zero.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColumnWidths {
+    pub left: f32,
+    pub right: f32,
+    pub right_outer: f32,
+}
+
+impl ColumnWidths {
+    /// Everything the columns take together.
+    pub fn total(&self) -> f32 {
+        self.left + self.right + self.right_outer
+    }
+}
+
+/// Squeeze the columns into the width there actually is.
+///
+/// `wanted` is what each column was dragged to, `floor` the narrowest each may
+/// be drawn at, and a zero in `wanted` means that column is not in the layout
+/// at all. Nothing is widened — a window with room to spare gets the widths it
+/// was given back unchanged.
+///
+/// # How the shortfall is shared
+///
+/// Off the widest column first, down to the width of the next widest, and then
+/// off both together — the shape a window manager uses, and the one that keeps
+/// a 240-point column whole while a 900-point one gives up the space it was
+/// not using. Only when every column is at its floor does the stage start
+/// losing its own minimum, and only when *that* is gone are the floors
+/// themselves scaled down, because a column drawn narrow is still better than
+/// two columns drawn on top of each other.
+pub fn fit_columns(available: f32, wanted: ColumnWidths, floor: ColumnWidths) -> ColumnWidths {
+    fit_columns_keeping(available, wanted, floor, None)
+}
+
+/// [`fit_columns`], with one column held at the width it asked for.
+///
+/// `keep` is the column whose boundary the user has hold of. Without it, a
+/// drag outwards is shared out over every column including the one being
+/// dragged, and the boundary crawls away from the pointer instead of following
+/// it. With it, the columns beyond give up their space first and the dragged
+/// one only starts losing width when they have none left to give.
+pub fn fit_columns_keeping(
+    available: f32,
+    wanted: ColumnWidths,
+    floor: ColumnWidths,
+    keep: Option<Dock>,
+) -> ColumnWidths {
+    let room = if available.is_nan() {
+        0.0
+    } else {
+        available.max(0.0)
+    };
+    // A column that is not in the layout has no width and no floor.
+    let floor = ColumnWidths {
+        left: if wanted.left > 0.0 { floor.left } else { 0.0 },
+        right: if wanted.right > 0.0 { floor.right } else { 0.0 },
+        right_outer: if wanted.right_outer > 0.0 {
+            floor.right_outer
+        } else {
+            0.0
+        },
+    };
+    let wanted = ColumnWidths {
+        left: wanted.left.max(floor.left),
+        right: wanted.right.max(floor.right),
+        right_outer: wanted.right_outer.max(floor.right_outer),
+    };
+    if wanted.total() + MIN_STAGE_WIDTH <= room {
+        return wanted;
+    }
+
+    let target = (room - MIN_STAGE_WIDTH).max(0.0);
+    if floor.total() > target {
+        // Not even the floors and a stage fit. The stage gives up what it has
+        // left before any column is drawn narrower than its contents.
+        if floor.total() <= room {
+            return floor;
+        }
+        // And a window narrower than the floors themselves gets them scaled,
+        // because the one thing that must not happen is a column placed over
+        // its neighbour.
+        let scale = if floor.total() > 0.0 {
+            room / floor.total()
+        } else {
+            0.0
+        };
+        return ColumnWidths {
+            left: floor.left * scale,
+            right: floor.right * scale,
+            right_outer: floor.right_outer * scale,
+        };
+    }
+
+    // (wanted, floor, is this the one the user has hold of?)
+    let mut columns = [
+        (wanted.left, floor.left, keep == Some(Dock::Left)),
+        (wanted.right, floor.right, keep == Some(Dock::Right)),
+        (
+            wanted.right_outer,
+            floor.right_outer,
+            keep == Some(Dock::RightOuter),
+        ),
+    ];
+
+    // The columns beyond the boundary being dragged go first; only if they run
+    // out does the second pass take the dragged one down with them.
+    for protect_the_dragged in [true, false] {
+        let spare: f32 = columns
+            .iter()
+            .filter(|(_, _, held)| protect_the_dragged && *held)
+            .map(|(w, _, _)| *w)
+            .sum();
+        let share = target - spare;
+        let movable: Vec<&(f32, f32, bool)> = columns
+            .iter()
+            .filter(|(_, _, held)| !(protect_the_dragged && *held))
+            .collect();
+        let lowest: f32 = movable.iter().map(|(_, f, _)| *f).sum();
+        if lowest > share {
+            // These alone cannot get under it; try again with everything.
+            continue;
+        }
+        // The widest cap under which they fit. Anything already narrower than
+        // the cap keeps its width; anything wider is cut back to it.
+        let under = |cap: f32| -> f32 {
+            movable
+                .iter()
+                .map(|(w, f, _)| w.min(cap).max(*f))
+                .sum::<f32>()
+        };
+        let (mut low, mut high) = (0.0f32, wanted.total().max(1.0));
+        for _ in 0..40 {
+            let mid = (low + high) * 0.5;
+            if under(mid) <= share {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        for (w, f, held) in &mut columns {
+            if protect_the_dragged && *held {
+                continue;
+            }
+            *w = w.min(low).max(*f);
+        }
+        break;
+    }
+
+    ColumnWidths {
+        left: columns[0].0,
+        right: columns[1].0,
+        right_outer: columns[2].0,
+    }
+}
 
 /// Bring a size back inside its range — including a NaN out of a damaged file,
 /// which `f32::clamp` panics on rather than fixing.
@@ -741,6 +917,125 @@ impl Workspace {
                 .is_some_and(|slot| slot.collapsed);
         }
         sections
+    }
+
+    /// Is there anything docked on this side at all?
+    fn occupied(&self, dock: Dock) -> bool {
+        self.slots.iter().any(|slot| slot.dock == dock)
+    }
+
+    /// What each column asks for, before the window has had its say. A side
+    /// with nothing docked on it asks for nothing.
+    fn wanted_widths(&self) -> ColumnWidths {
+        ColumnWidths {
+            left: if self.occupied(Dock::Left) {
+                self.left_width
+            } else {
+                0.0
+            },
+            right: if self.occupied(Dock::Right) {
+                self.right_width
+            } else {
+                0.0
+            },
+            right_outer: if self.occupied(Dock::RightOuter) {
+                self.right_outer_width
+            } else {
+                0.0
+            },
+        }
+    }
+
+    /// The narrowest each column may be drawn.
+    fn floor_widths() -> ColumnWidths {
+        ColumnWidths {
+            left: *LEFT_WIDTH_RANGE.start(),
+            right: *COLUMN_WIDTH_RANGE.start(),
+            right_outer: *COLUMN_WIDTH_RANGE.start(),
+        }
+    }
+
+    /// The widths to lay the columns out at in `available` points of window.
+    ///
+    /// Call this rather than reading `left_width` and friends directly: those
+    /// are what the user dragged to, and on a window too narrow to hold them
+    /// all, drawing them at those widths puts one column on top of another.
+    /// See [`fit_columns`].
+    pub fn column_widths(&self, available: f32) -> ColumnWidths {
+        self.column_widths_dragging(available, None)
+    }
+
+    /// [`column_widths`](Self::column_widths), told which boundary the user
+    /// currently has hold of so that column keeps the width it was dragged to.
+    pub fn column_widths_dragging(&self, available: f32, dragging: Option<Dock>) -> ColumnWidths {
+        fit_columns_keeping(
+            available,
+            self.wanted_widths(),
+            Self::floor_widths(),
+            dragging,
+        )
+    }
+
+    /// Take the widths the window forced and make them the layout's own.
+    ///
+    /// Called when a boundary is let go. During the drag the columns beyond it
+    /// are squeezed for the display only, and the numbers behind them still say
+    /// what they were before — which is fine until the drag ends and the fit is
+    /// recomputed without a column to favour, at which point the space is
+    /// shared out afresh and the boundary springs away from where it was
+    /// dropped. Writing the fit back is what makes a drag *land*.
+    pub fn commit_column_widths(&mut self, available: f32, dragged: Option<Dock>) {
+        let fitted = self.column_widths_dragging(available, dragged);
+        if self.occupied(Dock::Left) {
+            self.left_width = clamp_to(fitted.left, LEFT_WIDTH_RANGE);
+        }
+        if self.occupied(Dock::Right) {
+            self.right_width = clamp_to(fitted.right, COLUMN_WIDTH_RANGE);
+        }
+        if self.occupied(Dock::RightOuter) {
+            self.right_outer_width = clamp_to(fitted.right_outer, COLUMN_WIDTH_RANGE);
+        }
+    }
+
+    /// The widest one column may be dragged to and still leave its neighbours
+    /// their minimum and the stage its own.
+    ///
+    /// Dragging a boundary squeezes the columns beyond it — that is what
+    /// [`column_widths`](Self::column_widths) is for — but once they are at
+    /// their floors the drag has to stop, or the stored width runs away past
+    /// anything the window can show and dragging back does nothing until it
+    /// has caught up.
+    pub fn column_cap(&self, dock: Dock, available: f32) -> f32 {
+        let wanted = self.wanted_widths();
+        let floor = Self::floor_widths();
+        let others = match dock {
+            Dock::Left => {
+                (if wanted.right > 0.0 { floor.right } else { 0.0 })
+                    + (if wanted.right_outer > 0.0 {
+                        floor.right_outer
+                    } else {
+                        0.0
+                    })
+            }
+            Dock::Right => {
+                (if wanted.left > 0.0 { floor.left } else { 0.0 })
+                    + (if wanted.right_outer > 0.0 {
+                        floor.right_outer
+                    } else {
+                        0.0
+                    })
+            }
+            Dock::RightOuter => {
+                (if wanted.left > 0.0 { floor.left } else { 0.0 })
+                    + (if wanted.right > 0.0 { floor.right } else { 0.0 })
+            }
+            _ => 0.0,
+        };
+        let own_floor = match dock {
+            Dock::Left => floor.left,
+            _ => floor.right,
+        };
+        (available - MIN_STAGE_WIDTH - others).max(own_floor)
     }
 
     /// The section a panel belongs to, if it is on screen.
@@ -1355,6 +1650,206 @@ mod tests {
         let back: Workspace = serde_json::from_str(&json).unwrap();
         assert_eq!(back.shortcut_for(Command::Save), ws.shortcut_for(Command::Save));
         assert_eq!(back.shortcut_for(Command::PlayPause), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Fitting the columns to the window
+    // -----------------------------------------------------------------
+    //
+    // The report: dragging the stage's left boundary ran the left column's
+    // edge over the Properties column on the right instead of shrinking it.
+    // One fact underneath it — `egui` gives each side to whichever panel asks
+    // first and clamps it to what is left, so three columns wanting more than
+    // the window has are placed on top of one another. These measure that the
+    // columns are fitted to the window before anybody draws.
+
+    fn floors() -> ColumnWidths {
+        ColumnWidths {
+            left: *LEFT_WIDTH_RANGE.start(),
+            right: *COLUMN_WIDTH_RANGE.start(),
+            right_outer: *COLUMN_WIDTH_RANGE.start(),
+        }
+    }
+
+    #[test]
+    fn a_window_with_room_to_spare_leaves_the_columns_alone() {
+        let wanted = ColumnWidths {
+            left: 60.0,
+            right: 300.0,
+            right_outer: 240.0,
+        };
+        assert_eq!(fit_columns(1920.0, wanted, floors()), wanted);
+    }
+
+    /// The defect itself, as a number: the three columns at the widths they
+    /// may be dragged to are wider than a 1080p window, and drawn at those
+    /// widths two of them share the same points.
+    #[test]
+    fn columns_wider_than_the_window_are_squeezed_rather_than_stacked() {
+        let wanted = ColumnWidths {
+            left: *LEFT_WIDTH_RANGE.end(),
+            right: *COLUMN_WIDTH_RANGE.end(),
+            right_outer: *COLUMN_WIDTH_RANGE.end(),
+        };
+        assert!(
+            wanted.total() > 1920.0,
+            "the ranges no longer describe a layout that cannot fit;              this test has nothing to catch"
+        );
+
+        let fitted = fit_columns(1920.0, wanted, floors());
+        assert!(
+            fitted.total() <= 1920.0 - MIN_STAGE_WIDTH + 0.5,
+            "the columns took {:.0} of a 1920-point window and left the              stage {:.0}",
+            fitted.total(),
+            1920.0 - fitted.total()
+        );
+        // Nothing was widened on the way.
+        assert!(fitted.left <= wanted.left && fitted.right <= wanted.right);
+    }
+
+    /// A column that is not in the layout is not owed any width — hiding the
+    /// far-right column has to give its points to the others.
+    #[test]
+    fn an_empty_side_takes_nothing() {
+        let wanted = ColumnWidths {
+            left: 60.0,
+            right: 900.0,
+            right_outer: 0.0,
+        };
+        let fitted = fit_columns(1000.0, wanted, floors());
+        assert_eq!(fitted.right_outer, 0.0);
+        assert_eq!(
+            fitted.right,
+            1000.0 - MIN_STAGE_WIDTH - 60.0,
+            "the hidden column's points were reserved anyway"
+        );
+    }
+
+    /// The shortfall comes off the widest column first. A narrow column beside
+    /// a very wide one should not be trimmed at all.
+    #[test]
+    fn the_widest_column_gives_up_the_space() {
+        let wanted = ColumnWidths {
+            left: 60.0,
+            right: 800.0,
+            right_outer: 240.0,
+        };
+        let fitted = fit_columns(1200.0, wanted, floors());
+        assert_eq!(fitted.left, 60.0, "the tool strip was trimmed");
+        assert_eq!(fitted.right_outer, 240.0, "the narrow column was trimmed");
+        assert!(fitted.right < 800.0);
+        assert!((fitted.total() - (1200.0 - MIN_STAGE_WIDTH)).abs() < 1.0);
+    }
+
+    /// While a boundary is being dragged, the column behind it keeps what the
+    /// pointer asked for and the ones beyond give way. Without this the
+    /// shortfall is shared with the column being dragged and its edge crawls
+    /// away from the pointer.
+    #[test]
+    fn the_column_being_dragged_keeps_its_width() {
+        let wanted = ColumnWidths {
+            left: 380.0,
+            right: 300.0,
+            right_outer: 240.0,
+        };
+        let free = fit_columns(1100.0, wanted, floors());
+        assert!(free.left < 380.0, "nothing was over-subscribed to begin with");
+
+        let dragged = fit_columns_keeping(1100.0, wanted, floors(), Some(Dock::Left));
+        assert_eq!(dragged.left, 380.0, "the dragged column did not follow the pointer");
+        assert!(dragged.right < 300.0, "the property column did not shrink");
+        assert!(dragged.total() <= 1100.0 - MIN_STAGE_WIDTH + 0.5);
+    }
+
+    /// Squeezed past every floor, the stage gives up its own minimum before a
+    /// column is drawn narrower than its contents — and even then the columns
+    /// never add up to more than the window.
+    #[test]
+    fn a_window_too_narrow_for_the_floors_still_never_overlaps() {
+        for room in [900.0, 600.0, 400.0, 200.0, 40.0, 0.0] {
+            let wanted = ColumnWidths {
+                left: 400.0,
+                right: 300.0,
+                right_outer: 240.0,
+            };
+            let fitted = fit_columns(room, wanted, floors());
+            assert!(
+                fitted.total() <= room + 0.5,
+                "in {room} points the columns took {:.0}",
+                fitted.total()
+            );
+            assert!(fitted.left >= 0.0 && fitted.right >= 0.0 && fitted.right_outer >= 0.0);
+        }
+    }
+
+    /// A damaged layout file reaches this with a NaN in it; the columns must
+    /// still come out as numbers.
+    #[test]
+    fn a_nonsense_window_produces_numbers() {
+        let wanted = ColumnWidths {
+            left: 60.0,
+            right: 300.0,
+            right_outer: 240.0,
+        };
+        let fitted = fit_columns(f32::NAN, wanted, floors());
+        assert!(fitted.left.is_finite() && fitted.right.is_finite());
+        assert!(fitted.total() <= 0.5);
+    }
+
+    /// The cap the splitters clamp a drag to: wide enough to squeeze the
+    /// neighbours flat, and not one point wider.
+    #[test]
+    fn a_boundary_stops_where_its_neighbours_run_out() {
+        let workspace = Workspace::animate();
+        let cap = workspace.column_cap(Dock::Left, 1200.0);
+        let neighbours = *COLUMN_WIDTH_RANGE.start() * 2.0;
+        assert!((cap - (1200.0 - MIN_STAGE_WIDTH - neighbours)).abs() < 0.5);
+
+        // And a drag to the cap leaves a layout that fits.
+        let mut dragged = workspace.clone();
+        dragged.left_width = cap;
+        let fitted = dragged.column_widths_dragging(1200.0, Some(Dock::Left));
+        assert_eq!(fitted.left, cap);
+        assert!(fitted.total() <= 1200.0 - MIN_STAGE_WIDTH + 0.5);
+    }
+
+    /// Letting go of a boundary must not move it.
+    ///
+    /// While the drag is live the dragged column is favoured; once it is over
+    /// nothing is, and if the squeeze were left to the display only the space
+    /// would be shared out afresh and the boundary would jump. The fit is
+    /// written back instead.
+    #[test]
+    fn a_dragged_boundary_stays_where_it_was_dropped() {
+        const ROOM: f32 = 1200.0;
+        let mut workspace = Workspace::animate();
+        workspace.right_width = 300.0;
+        workspace.right_outer_width = 240.0;
+
+        // The Properties column dragged as wide as this window allows, which
+        // is what the splitter clamps the drag to.
+        let dropped = clamp_to(
+            workspace.column_cap(Dock::Right, ROOM),
+            COLUMN_WIDTH_RANGE,
+        );
+        assert!(dropped > 300.0, "this window had no squeezing to do");
+        workspace.right_width = dropped;
+
+        let live = workspace.column_widths_dragging(ROOM, Some(Dock::Right));
+        assert_eq!(live.right, dropped, "the edge left the pointer mid-drag");
+        assert!(
+            live.right_outer < 240.0,
+            "the far-right column did not give way"
+        );
+
+        workspace.commit_column_widths(ROOM, Some(Dock::Right));
+        let settled = workspace.column_widths(ROOM);
+        assert!(
+            (settled.right - dropped).abs() < 1.0,
+            "the boundary was dropped at {dropped:.0} and settled at {:.0}",
+            settled.right
+        );
+        assert!(settled.total() <= ROOM - MIN_STAGE_WIDTH + 0.5);
     }
 
     #[test]

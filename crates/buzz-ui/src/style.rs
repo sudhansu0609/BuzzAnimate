@@ -151,6 +151,9 @@ pub struct DrawStyle {
     /// four units across however large the brush was and nothing in the tool
     /// options said so.
     pub eraser_size: f64,
+    /// **What the eraser is allowed to take** — Animate's Erase Normal, Erase
+    /// Fills, Erase Lines and Erase Selected Fills.
+    pub eraser_mode: EraserMode,
     /// Animate's hairline: always one pixel, whatever the zoom.
     pub hairline: bool,
     pub stroke_kind: StrokeKind,
@@ -171,6 +174,70 @@ pub struct DrawStyle {
     pub symmetry: SymmetrySettings,
     /// Recently used colours, most recent first.
     pub swatches: Vec<Color>,
+}
+
+/// **What the eraser is allowed to take.**
+///
+/// Animate's eraser modes. The eraser cuts through everything on the layer,
+/// which is right most of the time and exactly wrong when you are tidying line
+/// art over a flat colour: one slip takes the colour with the line. Restricting
+/// it is how that is worked around, and it is a mode changed several times a
+/// minute, so it belongs in the tool's own options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EraserMode {
+    /// Everything under the rub, lines and colour alike.
+    #[default]
+    Normal,
+    /// Only shapes that carry a fill — the flat colour, leaving the linework.
+    Fills,
+    /// Only shapes that are a line and nothing else, leaving the colour.
+    Lines,
+    /// Only the fills of shapes that are **selected**, so the rub cannot stray
+    /// onto the drawing beside the one being worked on.
+    SelectedFills,
+}
+
+impl EraserMode {
+    pub const ALL: [EraserMode; 4] = [
+        Self::Normal,
+        Self::Fills,
+        Self::Lines,
+        Self::SelectedFills,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Fills => "Fills",
+            Self::Lines => "Lines",
+            Self::SelectedFills => "Selected fills",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Normal => "Rub through everything on the layer.",
+            Self::Fills => "Rub through filled shapes only, leaving the linework alone.",
+            Self::Lines => "Rub through lines only \u{2014} shapes with a stroke and no fill.",
+            Self::SelectedFills => {
+                "Rub through the fills of selected shapes only, so the rub cannot \
+                 stray onto the drawing beside the one being worked on."
+            }
+        }
+    }
+
+    /// Does a shape with this fill and stroke fall to this eraser?
+    ///
+    /// The one place the rule lives, so the tool options and the eraser itself
+    /// cannot describe two different behaviours.
+    pub fn takes(self, has_fill: bool, has_stroke: bool, selected: bool) -> bool {
+        match self {
+            Self::Normal => true,
+            Self::Fills => has_fill,
+            Self::Lines => has_stroke && !has_fill,
+            Self::SelectedFills => selected && has_fill,
+        }
+    }
 }
 
 /// How new strokes are mirrored as they are drawn — a mandala/character-symmetry
@@ -295,6 +362,7 @@ impl Default for DrawStyle {
             stroke_width: 1.0,
             // A little wider than the default brush, as a rubber is.
             eraser_size: 16.0,
+            eraser_mode: EraserMode::default(),
             hairline: false,
             stroke_kind: StrokeKind::Solid,
             drawing_mode: DrawingMode::default(),

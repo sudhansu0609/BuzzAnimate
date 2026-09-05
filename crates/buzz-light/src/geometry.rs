@@ -50,14 +50,56 @@ impl ShadeGeometry {
 ///
 /// Proportional to the shape's *smaller* side, so a long thin limb gets a
 /// crescent along its length rather than one that swallows it whole.
-pub fn crescent_offset(bounds: Rect, direction: Vec2, softness: f64) -> Vec2 {
+pub fn crescent_offset(bounds: Rect, direction: Vec2, width: f64) -> Vec2 {
     let extent = bounds.width().min(bounds.height()).max(1e-6);
-    let reach = extent * softness.clamp(0.02, 0.9);
+    let reach = extent * width.clamp(0.0, 0.9);
     let length = direction.hypot();
     if length <= f64::EPSILON {
         return Vec2::ZERO;
     }
     direction * (reach / length)
+}
+
+/// **How much of the form the light leaves in shade**, from a light's softness.
+///
+/// # Why this is not just the softness
+///
+/// Softness used to *be* the width: the band was `softness` of the shape across,
+/// so turning it down turned the shading down with it. At the bottom of the
+/// slider a character had a two-per-cent rim of dark along one edge and nothing
+/// else, which is not a hard light — it is no light modelling at all. The
+/// complaint it produced was that the softness slider did not work.
+///
+/// A hard light does not shade *less*. It shades exactly as much and gets there
+/// in one step: the terminator is a line rather than a gradient. So the width
+/// has a floor, and below it softness stops changing how much of the form is
+/// dark and changes only how sharply the dark begins — see [`shade_feather`].
+///
+/// Above the floor a softer light does also wrap further round the form, which
+/// is true of real ones: a big source lights round a curve that a small one
+/// leaves black.
+pub fn shade_width(softness: f64) -> f64 {
+    softness.clamp(0.0, 1.0).max(HARD_SHADE_WIDTH).min(0.9)
+}
+
+/// **The narrowest a shaded side gets**, as a fraction of the form.
+///
+/// What a hard light leaves dark. Not a sliver: the point of a hard light is a
+/// crisp terminator across a properly shaded form, and a form with a hairline
+/// of dark down one edge reads as unlit artwork with a defect.
+const HARD_SHADE_WIDTH: f64 = 0.3;
+
+/// **How gradually the shade arrives**, as the fraction of the band the
+/// terminator ramps over.
+///
+/// Zero at a softness of zero, which is the whole point: no ramp, one step from
+/// lit to shaded, an exact boundary. A small source — the sun through a gap, a
+/// bare bulb, anything far away or tiny — throws a terminator you could cut
+/// yourself on, and that is what the bottom of the slider now means.
+///
+/// At the top the ramp spans the band, which is a window on an overcast day.
+pub fn shade_feather(softness: f64) -> f64 {
+    softness.clamp(0.0, 1.0)
 }
 
 /// The shaded crescent on the side away from the light.
@@ -71,7 +113,7 @@ pub fn shade_crescent(path: &BezPath, towards: Vec2, softness: f64) -> Option<Be
     if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
         return None;
     }
-    let offset = crescent_offset(bounds, towards, softness);
+    let offset = crescent_offset(bounds, towards, shade_width(softness));
     if offset.hypot() < 1e-6 {
         return None;
     }
@@ -89,16 +131,19 @@ pub fn shade_crescent(path: &BezPath, towards: Vec2, softness: f64) -> Option<Be
 /// band across exactly the width it was built with, and guessing the number
 /// twice is how the two drift apart.
 ///
-/// **A third narrower than it was, and much more saturated with it.** At 0.45
-/// the highlight was a broad band down one side of every shape: it lit the
-/// figure, but what it read as was the artwork having been painted in two
-/// tones, not as light catching an edge. The complaint it produced was that a
-/// lamp changes the overall colour of a drawing and nothing else — which is
-/// exactly right, because a wash and a broad band are both washes.
+/// **A third narrower than it was.** At 0.45 the highlight was a broad band
+/// down one side of every shape: it lit the figure, but what it read as was the
+/// artwork having been painted in two tones, not as light catching an edge. The
+/// complaint it produced was that a lamp changes the overall colour of a
+/// drawing and nothing else — which is exactly right, because a wash and a
+/// broad band are both washes.
 ///
-/// The pair matters. Narrowing alone only makes the wash smaller, so
-/// `Illumination::highlight`'s mix went up with it: a *narrow* band at a lot of
-/// the light's colour is what an edge catching the light looks like.
+/// The width is half of it. The other half is what the band is *filled* with,
+/// and that has since stopped being a mix towards the light's colour and become
+/// a screen of it — see `Illumination::highlight` and `GLINT_LIGHT`. A narrow
+/// band that adds the light to what the artwork already is, is what an edge
+/// catching the light looks like; a broad one that replaces it is a second
+/// drawing.
 ///
 /// **Not narrower than this.** Below about a quarter the band stops carrying
 /// enough of the light's colour for the frame as a whole to read as lit at all;
@@ -113,12 +158,12 @@ pub const HIGHLIGHT_SHARE: f64 = 0.30;
 /// a feathered terminator has to ramp over. Measured from the same offset the
 /// geometry is built from, so the ramp and the shape it fills always agree.
 pub fn shade_reach(bounds: Rect, towards: Vec2, softness: f64) -> f64 {
-    crescent_offset(bounds, towards, softness).hypot()
+    crescent_offset(bounds, towards, shade_width(softness)).hypot()
 }
 
 /// [`shade_reach`], for the narrower highlight band.
 pub fn highlight_reach(bounds: Rect, towards: Vec2, softness: f64) -> f64 {
-    crescent_offset(bounds, -towards, softness * HIGHLIGHT_SHARE).hypot()
+    crescent_offset(bounds, -towards, shade_width(softness) * HIGHLIGHT_SHARE).hypot()
 }
 
 /// The lit crescent on the side towards the light.
@@ -127,7 +172,7 @@ pub fn highlight_crescent(path: &BezPath, towards: Vec2, softness: f64) -> Optio
     if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
         return None;
     }
-    let offset = crescent_offset(bounds, -towards, softness * HIGHLIGHT_SHARE);
+    let offset = crescent_offset(bounds, -towards, shade_width(softness) * HIGHLIGHT_SHARE);
     if offset.hypot() < 1e-6 {
         return None;
     }
@@ -188,6 +233,10 @@ pub fn shadow_transform(light: &Light, height: f64) -> Option<Affine> {
             // produce a shadow kilometres long, which is arithmetically right
             // and useless — and very slow to rasterise.
             let length = length.min(height * MAX_SHADOW_RATIO);
+            // And then what the animator asked for. Applied after the bound, so
+            // the setting means the same thing at every elevation instead of
+            // doing nothing wherever the geometry was already clamped.
+            let length = length * light.shadow_length.max(0.0) as f64;
             let (sin_a, cos_a) = azimuth.sin_cos();
             let away = Vec2::new(-cos_a, -sin_a) * length;
             Some(Affine::translate(away))
@@ -210,11 +259,236 @@ pub fn shadow_transform(light: &Light, height: f64) -> Option<Affine> {
                 return None;
             }
             let scale = (lamp_height / gap).clamp(1.0, MAX_LAMP_SCALE);
+            // The multiplier scales how far the shadow is pushed out from under
+            // the lamp, not the lamp's arithmetic: at 1 this is the similar
+            // triangles above, at 0 the shadow sits under its caster.
+            let scale = 1.0 + (scale - 1.0) * light.shadow_length.max(0.0) as f64;
             Some(
                 Affine::translate(position.to_vec2())
                     * Affine::scale(scale)
                     * Affine::translate(-position.to_vec2()),
             )
+        }
+    }
+}
+
+/// **How a light throws this layer's shadows**, ready to be asked for one
+/// caster at a time.
+///
+/// A shadow on a **wall** is the same affine for everything on the layer: the
+/// surface is parallel to the picture plane, so a translation (a sun) or a
+/// scale about the lamp (a lamp) puts every caster's silhouette where it
+/// belongs, and the layer can work it out once.
+///
+/// A shadow on the **ground** cannot be. It is anchored at the caster's own
+/// feet — that is what makes it read as a shadow rather than as a copy — so it
+/// depends on where the caster stands and how tall it is. Hence a value that
+/// carries what the *light* contributes and is asked, per caster, for the rest.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShadowThrow {
+    /// One affine for the whole layer.
+    Wall(Affine),
+    /// Worked out per caster; see [`ShadowThrow::at`].
+    Ground {
+        /// A sun's fixed bearing, or `None` for a lamp, whose bearing is
+        /// wherever the caster happens to stand relative to it.
+        away: Option<Vec2>,
+        /// Shadow length per unit of caster height — `1 / tan(elevation)` —
+        /// for a sun. `None` for a lamp, whose elevation is different from
+        /// every point of the stage.
+        stretch: Option<f64>,
+        /// The lamp, as its position in the plane and its height above the
+        /// floor.
+        lamp: Option<(Point, f64)>,
+    },
+}
+
+/// **The least rake a floor is drawn at**, as a fraction of the shadow's own
+/// length.
+///
+/// A shadow lying on the ground is the caster laid flat along it, so its depth
+/// on the screen is however much of the floor the picture shows. Taken
+/// literally from the light's bearing, a light exactly to the side lays the
+/// shadow along a line across the frame with no depth at all — arithmetically
+/// right for a floor seen exactly edge-on, and useless, because a line is not a
+/// shadow.
+///
+/// Every 2D stage is drawn from a little above its floor, and this is that
+/// little: a shadow always keeps at least this much of its length as depth on
+/// the screen, leaning towards the viewer when the light says nothing either
+/// way. It scales *with* the length, so a light straight overhead still puts a
+/// puddle underfoot rather than a wedge.
+const MIN_GROUND_RAKE: f64 = 0.34;
+
+/// **How a light throws shadows onto whatever catches them.**
+///
+/// `height` is what a wall shadow needs — how far the artwork stands in front
+/// of the surface behind it — and is ignored by a ground shadow, which is
+/// anchored at the feet and cares only about how high the light is.
+///
+/// `None` when this light throws nothing: a sky, a gloom, shadows switched off,
+/// a light below the horizon, or (on a wall) artwork lying flat on the surface
+/// itself.
+pub fn shadow_throw(light: &Light, height: f64) -> Option<ShadowThrow> {
+    if !light.shadows {
+        return None;
+    }
+    if light.fall == crate::ShadowFall::Wall {
+        return shadow_transform(light, height).map(ShadowThrow::Wall);
+    }
+
+    match light.kind {
+        LightKind::Sky { .. } | LightKind::Gloom { .. } => None,
+        LightKind::Sun { azimuth, elevation } => {
+            if elevation <= 0.02 {
+                return None;
+            }
+            let (sin_a, cos_a) = azimuth.sin_cos();
+            Some(ShadowThrow::Ground {
+                away: Some(Vec2::new(-cos_a, -sin_a)),
+                // A caster of height `h` under a light at `elevation` throws a
+                // shadow `h / tan(elevation)` long. Bounded for the same reason
+                // a wall shadow is: a light on the horizon means a shadow
+                // kilometres long, which is right and useless.
+                // Bounded first, then scaled by what the animator asked for,
+                // so the setting means the same thing at every elevation.
+                stretch: Some(
+                    (1.0 / elevation.tan()).min(MAX_SHADOW_RATIO)
+                        * light.shadow_length.max(0.0) as f64,
+                ),
+                lamp: None,
+            })
+        }
+        LightKind::Lamp {
+            position, height, ..
+        } => Some(ShadowThrow::Ground {
+            away: None,
+            stretch: Some(light.shadow_length.max(0.0) as f64),
+            lamp: Some((position, height.max(1.0))),
+        }),
+    }
+}
+
+impl ShadowThrow {
+    /// The affine that throws the shadow of a caster standing in `caster`.
+    ///
+    /// # What the ground projection is
+    ///
+    /// The caster is flat artwork standing upright on the floor, so the bottom
+    /// of its box is where it meets the ground and the rest of it is height
+    /// above that. The shadow lays that height down along the floor, away from
+    /// the light:
+    ///
+    /// * the feet stay exactly where they are — that is the whole point, and it
+    ///   is what stops a shadow drifting off its owner;
+    /// * a point `h` above them lands `h · stretch` away along the light's
+    ///   bearing;
+    /// * `stretch` is `1 / tan(elevation)`, so a light overhead gives a puddle
+    ///   and a low one a long throw.
+    ///
+    /// For a lamp the elevation is not one number for the stage — it is how
+    /// high the lamp is *seen from this caster* — so it is worked out here,
+    /// from the lamp's height and how far away it stands. That is what makes a
+    /// figure walking away from a lamp grow a longer shadow as it goes.
+    pub fn at(&self, caster: Rect) -> Affine {
+        match *self {
+            Self::Wall(affine) => affine,
+            Self::Ground {
+                away,
+                stretch,
+                lamp,
+            } => {
+                // Where the caster meets the floor: the bottom of its box, and
+                // its middle across.
+                let base = Point::new((caster.x0 + caster.x1) * 0.5, caster.y1);
+
+                let (away, stretch) = match (away, stretch, lamp) {
+                    (Some(away), Some(stretch), _) => (away, stretch),
+                    (_, wanted, Some((position, lamp_height))) => {
+                        // A lamp has no one elevation for the stage, so its
+                        // stretch is worked out per caster here — and the
+                        // light's own length setting arrives as `stretch` with
+                        // no bearing beside it, to be applied to the result.
+                        let asked = wanted.unwrap_or(1.0);
+                        let out = base - position;
+                        let distance = out.hypot();
+                        if distance < 1e-6 {
+                            // Directly underneath: no bearing, and no shadow to
+                            // speak of either.
+                            (Vec2::new(0.0, 1.0), 0.0)
+                        } else {
+                            // The lamp's elevation from here is
+                            // `atan(lamp_height / distance)`, so the stretch —
+                            // its cotangent — is `distance / lamp_height`.
+                            (
+                                out / distance,
+                                (distance / lamp_height).min(MAX_SHADOW_RATIO) * asked,
+                            )
+                        }
+                    }
+                    // Neither a bearing nor a lamp: nothing to throw along.
+                    _ => (Vec2::new(0.0, 1.0), 0.0),
+                };
+
+                // The floor is seen from a little above, never exactly
+                // edge-on — see `MIN_GROUND_RAKE`. Towards the viewer when the
+                // light gives no preference, which is where a floor is.
+                //
+                // **Towards the viewer on a tie**, and the tie is generous: a
+                // light exactly across the stage has a bearing whose vertical
+                // part is a rounding error, and taking its sign would decide
+                // between a shadow in front of the figure and one hidden behind
+                // it on the strength of `sin(pi)`.
+                let rake = if away.y > 1e-6 {
+                    away.y.max(MIN_GROUND_RAKE)
+                } else if away.y < -1e-6 {
+                    away.y.min(-MIN_GROUND_RAKE)
+                } else {
+                    MIN_GROUND_RAKE
+                };
+
+                // `h = base.y − y` is height above the floor, so
+                //   x' = x + away.x · stretch · h
+                //   y' = base.y + rake · stretch · h
+                // which is linear in (x, y): one affine, and the same one for
+                // every shape of this caster.
+                let sx = away.x * stretch;
+                let sy = rake * stretch;
+                Affine::new([
+                    1.0,
+                    0.0,
+                    -sx,
+                    -sy,
+                    sx * base.y,
+                    base.y * (1.0 + sy),
+                ])
+            }
+        }
+    }
+
+    /// **The furthest a shadow can reach from its caster**, for a caster no
+    /// taller than `height`. What the renderer grows its culling rectangle by,
+    /// so a figure just off the frame whose shadow falls into it is still
+    /// drawn.
+    pub fn reach(&self, height: f64) -> f64 {
+        match *self {
+            Self::Wall(affine) => {
+                let c = affine.as_coeffs();
+                c[4].hypot(c[5])
+            }
+            Self::Ground { stretch, lamp, .. } => {
+                let stretch = stretch.unwrap_or(MAX_SHADOW_RATIO);
+                // A lamp's stretch is per caster and is not known here, so the
+                // worst case stands in for it — times the light's own length
+                // setting, which for a lamp is all `stretch` carries. A reach
+                // that under-reports is a shadow culled away at the edge of the
+                // frame.
+                let stretch = match lamp {
+                    Some(_) => MAX_SHADOW_RATIO * stretch,
+                    None => stretch,
+                };
+                height * stretch
+            }
         }
     }
 }
@@ -283,8 +557,11 @@ pub fn crescent_direction(light: &Light, at: Point, depth: f64, modelling: f32) 
     if modelling <= 0.01 {
         return None;
     }
-    let (towards, _) = light.towards(at, depth)?;
-    let planar = towards.planar();
+    // **Across the picture, not across the floor.** See
+    // [`Light::screen_towards`]: a sun's bearing is measured on the ground and
+    // its height is the part that has to become "up" on the screen, or raising
+    // the sun moves nothing but the shadow.
+    let planar = light.screen_towards(at, depth)?;
     // A light directly in front has no direction *in the plane*, so it
     // produces no crescents — only fill. Trying to build them from a
     // zero-length vector is where a stray NaN would come from.
@@ -1058,15 +1335,58 @@ mod tests {
 
     #[test]
     fn a_softer_light_makes_a_wider_terminator() {
-        let hard = shade_crescent(&square(), Vec2::new(1.0, 0.0), 0.1).expect("hard");
-        let soft = shade_crescent(&square(), Vec2::new(1.0, 0.0), 0.6).expect("soft");
+        // Above the floor, where softness still widens the band. Below it a
+        // softer light sharpens the terminator instead — see
+        // `a_hard_light_shades_the_form_and_does_not_merely_stop_shading_it`.
+        let hard = shade_crescent(&square(), Vec2::new(1.0, 0.0), 0.3).expect("hard");
+        let soft = shade_crescent(&square(), Vec2::new(1.0, 0.0), 0.9).expect("soft");
 
         assert!(
-            soft.bounding_box().width() > hard.bounding_box().width() * 3.0,
+            soft.bounding_box().width() > hard.bounding_box().width() * 2.5,
             "soft {:?} should be much wider than hard {:?}",
             soft.bounding_box(),
             hard.bounding_box()
         );
+    }
+
+    /// **The report: the softness slider did not work.**
+    ///
+    /// Softness used to *be* the band's width, so turning it down turned the
+    /// shading down with it — at the bottom of the slider a figure had a
+    /// two-per-cent rim of dark along one edge and nothing else. That is not a
+    /// hard light, it is no modelling at all.
+    ///
+    /// A hard light shades exactly as much and gets there in one step. So the
+    /// width has a floor, and below it softness stops changing how much of the
+    /// form is dark and changes only how sharply the dark begins.
+    #[test]
+    fn a_hard_light_shades_the_form_and_does_not_merely_stop_shading_it() {
+        let form = square().bounding_box();
+        let extent = form.width().min(form.height());
+
+        for softness in [0.0, 0.05, 0.2] {
+            let shade = shade_crescent(&square(), Vec2::new(1.0, 0.0), softness)
+                .unwrap_or_else(|| panic!("no shade at all at a softness of {softness}"));
+            let width = shade.bounding_box().width();
+            assert!(
+                width >= extent * HARD_SHADE_WIDTH - 1.0,
+                "a softness of {softness} left {width:.0} of a {extent:.0} form in                  shade, which is a rim rather than a shaded side"
+            );
+        }
+    }
+
+    /// And what softness *does* change down there: how sharply the shade
+    /// arrives. Zero is one step — an exact boundary, which is what a hard
+    /// light has.
+    #[test]
+    fn a_hard_light_has_no_ramp_in_its_terminator() {
+        assert_eq!(shade_feather(0.0), 0.0, "a hard light must not feather");
+        assert!(shade_feather(0.5) > 0.0);
+        assert!(shade_feather(1.0) > shade_feather(0.5));
+        // And the width stops changing below the floor, so the two settings
+        // are genuinely independent down there.
+        assert_eq!(shade_width(0.0), shade_width(0.2));
+        assert!(shade_width(0.9) > shade_width(0.3));
     }
 
     /// The crescent is the artwork's own outline, not a rectangle: that is
@@ -1100,6 +1420,134 @@ mod tests {
             low.bounding_box(),
             high.bounding_box()
         );
+    }
+
+    /// **A shadow on the ground starts at the feet.**
+    ///
+    /// The whole difference between a shadow and a second copy of the drawing:
+    /// wherever the light is, the contact line does not move.
+    #[test]
+    fn a_ground_shadow_is_anchored_at_the_casters_feet() {
+        let caster = Rect::new(100.0, 100.0, 200.0, 300.0);
+        for elevation in [0.3, 0.7, 1.2] {
+            let throw = shadow_throw(&sun(0.6, elevation), 50.0).expect("a throw");
+            let feet = Point::new(150.0, caster.y1);
+            let landed = throw.at(caster) * feet;
+            assert!(
+                (landed - feet).hypot() < 1e-9,
+                "the feet moved to {landed:?} at elevation {elevation}"
+            );
+        }
+    }
+
+    /// A light overhead puts a puddle underfoot; a low one throws a long
+    /// shadow. The complaint this comes from is a shadow that did neither —
+    /// it was the caster's own silhouette, full size, hung in the air behind
+    /// it, because it was being projected onto the *wall* rather than the
+    /// floor.
+    #[test]
+    fn a_higher_light_gives_a_shorter_ground_shadow() {
+        let caster = Rect::new(100.0, 100.0, 200.0, 300.0);
+        let reach = |elevation: f64| {
+            let throw = shadow_throw(&sun(0.0, elevation), 50.0).expect("a throw");
+            let head = Point::new(150.0, caster.y0);
+            (throw.at(caster) * head - Point::new(150.0, caster.y1)).hypot()
+        };
+
+        let overhead = reach(1.5);
+        let middling = reach(0.8);
+        let low = reach(0.3);
+        assert!(
+            overhead < middling && middling < low,
+            "a lower light must throw further: {overhead:.0}, {middling:.0}, {low:.0}"
+        );
+        assert!(
+            overhead < caster.height() * 0.5,
+            "a light nearly overhead should leave a puddle, not a shadow \
+             {overhead:.0} long"
+        );
+    }
+
+    /// It lies away from the light, as a shadow does.
+    #[test]
+    fn a_ground_shadow_lies_away_from_the_light() {
+        let caster = Rect::new(100.0, 100.0, 200.0, 300.0);
+        let head = Point::new(150.0, caster.y0);
+
+        // A sun towards +x throws along -x.
+        let east = shadow_throw(&sun(0.0, 0.5), 50.0)
+            .expect("a throw")
+            .at(caster)
+            * head;
+        assert!(east.x < 100.0, "a sun at 0 casts along -x: {east:?}");
+
+        // And a lamp throws outwards from wherever it stands.
+        let mut lamp = Light::new(
+            LightId(3),
+            "Lamp",
+            LightKind::Lamp {
+                position: Point::new(0.0, 0.0),
+                height: 200.0,
+                radius: 600.0,
+            },
+        );
+        lamp.shadows = true;
+        let thrown = shadow_throw(&lamp, 50.0).expect("a throw").at(caster) * head;
+        assert!(
+            thrown.x > 150.0 && thrown.y > caster.y1,
+            "a lamp up and to the left should throw down and right: {thrown:?}"
+        );
+    }
+
+    /// **Walking away from a lamp lengthens the shadow**, because the lamp is
+    /// lower in the sky the further off you stand. A sun cannot do this and a
+    /// wall shadow does the opposite — it grows because the *projection*
+    /// enlarges, not because the light is low.
+    #[test]
+    fn a_caster_further_from_a_lamp_throws_a_longer_ground_shadow() {
+        let mut lamp = Light::new(
+            LightId(4),
+            "Lamp",
+            LightKind::Lamp {
+                position: Point::new(0.0, 0.0),
+                height: 200.0,
+                radius: 900.0,
+            },
+        );
+        lamp.shadows = true;
+        let throw = shadow_throw(&lamp, 50.0).expect("a throw");
+
+        let length = |x: f64| {
+            let caster = Rect::new(x, 100.0, x + 100.0, 300.0);
+            let head = Point::new(x + 50.0, caster.y0);
+            (throw.at(caster) * head - Point::new(x + 50.0, caster.y1)).hypot()
+        };
+
+        assert!(
+            length(600.0) > length(200.0),
+            "further from the lamp should mean a longer shadow: {:.0} against {:.0}",
+            length(600.0),
+            length(200.0)
+        );
+    }
+
+    /// The wall projection is still there, and still what it was: the caster's
+    /// own silhouette, moved.
+    #[test]
+    fn a_wall_shadow_still_translates_the_whole_caster() {
+        let mut light = sun(0.0, 0.5);
+        light.fall = crate::ShadowFall::Wall;
+        let throw = shadow_throw(&light, 60.0).expect("a throw");
+        assert!(matches!(throw, ShadowThrow::Wall(_)));
+
+        let caster = Rect::new(100.0, 100.0, 200.0, 300.0);
+        let moved = throw.at(caster).transform_rect_bbox(caster);
+        assert!(
+            (moved.width() - caster.width()).abs() < 1e-6
+                && (moved.height() - caster.height()).abs() < 1e-6,
+            "a sun's wall shadow is a translation: {moved:?}"
+        );
+        assert!(moved.x0 < caster.x0, "and it moves away from the light");
     }
 
     #[test]
@@ -1245,16 +1693,59 @@ mod tests {
         );
     }
 
-    /// A light straight in front produces fill and nothing else — a shape lit
-    /// head-on has no terminator, which is why noon looks flat.
+    /// **A sun overhead lights from overhead**, and the shade goes underneath.
+    ///
+    /// This used to assert the opposite — that a sun at ninety degrees produced
+    /// no crescents at all, "which is why noon looks flat". That was true of
+    /// the arithmetic and false of the picture: artwork here stands *upright*,
+    /// so a light above it is not a light behind it. What actually happened was
+    /// that the shading direction was read off the light's compass bearing,
+    /// which shrinks to nothing as the sun rises and hits exactly zero at the
+    /// top — so the modelling switched itself off at the one setting an
+    /// animator reaches for when they want strong top light.
+    ///
+    /// See [`Light::screen_towards`].
     #[test]
-    fn a_light_directly_in_front_makes_no_crescents() {
+    fn a_sun_overhead_shades_from_underneath() {
         let overhead = sun(0.0, std::f64::consts::FRAC_PI_2);
         let geometry = shade_for(&square(), &overhead, Point::ZERO, 0.0, 50.0, 1.0);
 
-        assert!(geometry.shade.is_none(), "no terminator when lit head-on");
-        assert!(geometry.highlight.is_none());
-        assert!(geometry.cast.is_some(), "but it still casts, straight down");
+        let shade = geometry.shade.expect("a terminator under an overhead sun");
+        let highlight = geometry.highlight.expect("and a lit top");
+        assert!(geometry.cast.is_some(), "and it still casts, straight down");
+
+        // `square()` is the artwork; the shade must sit below its middle and
+        // the glint above it, because the light is above.
+        let form = square().bounding_box();
+        assert!(
+            shade.bounding_box().center().y > form.center().y,
+            "the shade is not underneath: {:?} in a form of {form:?}",
+            shade.bounding_box()
+        );
+        assert!(
+            highlight.bounding_box().center().y < form.center().y,
+            "the glint is not on top: {:?}",
+            highlight.bounding_box()
+        );
+    }
+
+    /// **Raising the sun turns the light on the figure**, rather than only
+    /// changing the length of its shadow.
+    #[test]
+    fn raising_the_sun_lifts_the_light_up_the_picture() {
+        let low = crescent_direction(&sun(0.0, 0.15), Point::ZERO, 0.0, 1.0).expect("low");
+        let high = crescent_direction(&sun(0.0, 1.4), Point::ZERO, 0.0, 1.0).expect("high");
+
+        // Screen y grows downwards, so "up the picture" is more negative.
+        let tilt = |v: buzz_geom::Vec2| -v.y / v.hypot();
+        assert!(
+            tilt(low) < 0.2,
+            "a sun on the horizon should light from the side, not from above: {low:?}"
+        );
+        assert!(
+            tilt(high) > 0.9,
+            "a sun overhead should light from above: {high:?}"
+        );
     }
 
     #[test]
@@ -1373,4 +1864,100 @@ mod tests {
         assert!(rim_glow(&light, Point::ZERO, 0.0).is_none());
     }
 
+}
+
+#[cfg(test)]
+mod shadow_length_tests {
+    use super::*;
+    use crate::{Light, LightId, LightKind, ShadowFall};
+
+    fn sun(elevation: f64) -> Light {
+        let mut light = Light::new(LightId(1), "Sun", LightKind::Sun { azimuth: 0.0, elevation });
+        light.shadows = true;
+        light
+    }
+
+    /// A caster 100 tall, and how far its shadow reaches along the ground.
+    fn ground_reach(light: &Light) -> f64 {
+        let caster = Rect::new(0.0, 0.0, 20.0, 100.0);
+        let throw = shadow_throw(light, 70.0).expect("a throw");
+        let top = throw.at(caster) * Point::new(10.0, 0.0);
+        (top - Point::new(10.0, 100.0)).hypot()
+    }
+
+    /// **The report: the shadow's length could not be controlled.**
+    ///
+    /// It could, but only by moving the light — and where the light is is also
+    /// what decides the shading on every figure on the stage, so an animator who
+    /// wants a shorter shadow and this light has nowhere to go. The multiplier
+    /// is that place.
+    #[test]
+    fn the_length_setting_shortens_and_lengthens_the_throw() {
+        let mut light = sun(0.6);
+        let honest = ground_reach(&light);
+        assert!(honest > 1.0, "the fixture throws nothing to measure");
+
+        light.shadow_length = 0.5;
+        let half = ground_reach(&light);
+        assert!(
+            (half / honest - 0.5).abs() < 0.02,
+            "half length threw {half:.1} against {honest:.1}"
+        );
+
+        light.shadow_length = 2.0;
+        let double = ground_reach(&light);
+        assert!(
+            (double / honest - 2.0).abs() < 0.05,
+            "double length threw {double:.1} against {honest:.1}"
+        );
+    }
+
+    /// Zero puts the shadow under its caster rather than throwing none: a
+    /// silhouette underfoot is a real staging choice, and "no shadow" is what
+    /// the Shadows switch is for.
+    #[test]
+    fn zero_length_lands_the_shadow_underfoot() {
+        let mut light = sun(0.6);
+        light.shadow_length = 0.0;
+        assert!(ground_reach(&light) < 0.5);
+    }
+
+    /// **The bound is on the geometry, not on the animator.** The clamp exists
+    /// so a sun on the horizon does not ask for a shadow kilometres long; it
+    /// must not also stop a deliberate setting from doing anything, which is
+    /// what applying it after the multiplier would do.
+    #[test]
+    fn the_setting_still_works_where_the_geometry_is_clamped() {
+        // Low enough that `1 / tan` is past `MAX_SHADOW_RATIO` and clamped.
+        let mut light = sun(0.05);
+        let clamped = ground_reach(&light);
+        light.shadow_length = 0.25;
+        let asked = ground_reach(&light);
+        assert!(
+            (asked / clamped - 0.25).abs() < 0.02,
+            "the clamp swallowed the setting: {asked:.1} against {clamped:.1}"
+        );
+    }
+
+    /// And a wall shadow, which is a different projection entirely.
+    #[test]
+    fn a_wall_shadow_takes_the_same_setting() {
+        let mut light = sun(0.6);
+        light.fall = ShadowFall::Wall;
+        let offset = |light: &Light| {
+            let affine = shadow_transform(light, 70.0).expect("a throw");
+            let c = affine.as_coeffs();
+            c[4].hypot(c[5])
+        };
+        let honest = offset(&light);
+        light.shadow_length = 0.5;
+        assert!((offset(&light) / honest - 0.5).abs() < 0.02);
+    }
+
+    /// A file written before the setting existed means "as long as the geometry
+    /// says", and the default has to be exactly that.
+    #[test]
+    fn the_default_changes_nothing() {
+        assert_eq!(sun(0.6).shadow_length, 1.0);
+    }
 }

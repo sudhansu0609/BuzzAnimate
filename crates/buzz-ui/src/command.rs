@@ -175,6 +175,8 @@ pub enum Command {
     /// Place an instance of the library selection on the stage.
     PlaceInstance,
     DuplicateSymbol,
+    /// Keep the selected library symbol in the Assets library.
+    SymbolToAsset,
     DeleteSymbol,
     NewLibraryFolder,
 
@@ -452,6 +454,7 @@ impl Command {
             EditDocument => "Edit Document",
             PlaceInstance => "Place on Stage",
             DuplicateSymbol => "Duplicate Symbol",
+            SymbolToAsset => "Keep Symbol as Asset",
             DeleteSymbol => "Delete Symbol",
             NewLibraryFolder => "New Library Folder",
 
@@ -632,7 +635,7 @@ impl Command {
             EditSymbol => sc(ctrl, Key::E),
             EditDocument => sc(ctrl, Key::F4),
             PlaceInstance => None,
-            DuplicateSymbol => None,
+            DuplicateSymbol | SymbolToAsset => None,
             DeleteSymbol => None,
             NewLibraryFolder => None,
 
@@ -861,6 +864,7 @@ pub fn palette_commands() -> Vec<Command> {
         EditDocument,
         PlaceInstance,
         DuplicateSymbol,
+        SymbolToAsset,
         DeleteSymbol,
         NewLibraryFolder,
         CreateClassicTween,
@@ -1034,6 +1038,7 @@ mod tests {
             EditDocument,
             PlaceInstance,
             DuplicateSymbol,
+            SymbolToAsset,
             DeleteSymbol,
             NewLibraryFolder,
             CreateClassicTween,

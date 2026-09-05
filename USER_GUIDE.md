@@ -488,10 +488,22 @@ BuzzAnimate features a specialized studio vector lighting system (`Window ▸ Li
 ### Working with Light Gizmos
 - Press **`Ctrl + Shift + L`** to show/hide stage light gizmos.
 - Drag a lamp's central handle to move it. Drag the outer radius ring to adjust falloff range.
-- **Cast Shadows**: Check *Cast Shadows* on any lamp or sun. Shadow polygons are computed directly against vector artwork contours:
+- **Cast Shadows**: Check *Shadows* on any lamp or sun. Shadow polygons are computed directly against vector artwork contours:
 
 ![Vector Cast Shadows](docs/images/vector_shadow_geometry.png)
 
+- **Depth** (the slider beside *Shadows*): how dark the shadow lands. 0 leaves the ground untouched; 1 is a solid silhouette.
+- **Length**: how far the shadow runs, against what the light's height says it should. 1 is that answer exactly, 0 puts the shadow under its caster, and up to 3 runs it long. How long a shadow is *is* a consequence of how high the light is — but the light's height is also what decides the shading on every figure on the stage, so "shorter shadow" and "keep this light where it is" are two wishes the geometry will not grant at once. This is where you settle it. The **direction** still comes from the light: a shadow pointing somewhere its light cannot explain is the one thing an audience notices.
+- **Falls on** (next to *Shadows*): what the shadow lands on.
+  - **Ground** (default) — the floor the figure stands on. The shadow starts at its feet and lies away from the light, short when the light is high and long when it is low; a figure walking away from a lamp grows a longer shadow as it goes.
+  - **Wall** — the surface behind it. The shadow is the figure's own silhouette, upright and full size, offset away from the light and enlarged by a lamp's divergence. Right for a figure standing close in front of a wall. *Stands off* sets how far in front, and only appears in this mode.
+
+- **Edges** (bottom of the panel, before *Modelling*): what the shaded side and the highlight are measured around. Three buttons:
+  - **Figure** (default) — one shaded side and one highlight per figure, taken from the silhouette of the whole object: a group, a rig, a character symbol and everything inside it. This is what a light does to a body, and it is *cheaper* than Shapes on a character, because the whole figure costs one pair of outlines instead of one pair per shape.
+  - **Shapes** — a shaded side and a highlight on every shape, each measured against its own outline. Right for a layer of separate props. On a character it outlines every piece of the drawing separately, interior shading included.
+  - **Off** — no bands at all. The light still tints what it reaches, and a lamp keeps its glow, its falloff, its rim and its shadows. For artwork already drawn with its own shading in it.
+  - *Modelling* sets how strongly the bands are drawn and is kept when you switch modes, so Off and back gives you the strength you had.
+- **The highlight adds light, it does not replace colour.** A lit edge is the artwork's own colour with the light screened over it, so a red coat under a warm lamp goes a brighter, warmer red rather than the same pale tone as everything else in the shot. Turn *Glint* up on the light for a wet, polished sheen.
 - **Keyframed Lighting**: Click **Add Light Keyframe** in the Lighting panel to animate light position, color, and intensity along the timeline (e.g., a flashlight sweeping across a room or a flickering torch).
 
 ---

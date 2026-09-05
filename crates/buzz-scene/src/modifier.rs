@@ -60,8 +60,14 @@ pub enum Modifier {
     /// and up after running — and `depth` scales the whole thing, `1.0` being
     /// a comfortable resting breath.
     ///
-    /// Anchored at the bottom of the drawing, so the feet stay on the ground
-    /// and the motion goes into the chest, which is where a breath belongs.
+    /// **The legs do not move.** This was a scale of the whole drawing about
+    /// its feet, which kept the feet on the floor and moved everything else in
+    /// proportion to its height — so the knees rose a third of the way and the
+    /// character's legs grew and shrank as it breathed. Below the pelvis
+    /// nothing moves now; the ribs swell; the head and shoulders ride on the
+    /// chest rather than stretching with it. See [`Breath`], which is what this
+    /// resolves to.
+    ///
     /// The phase is seeded from the object's id, so a crowd does not breathe
     /// in unison — which is the one thing that would make it visible.
     Breathe { rate: f64, depth: f64 },
@@ -558,6 +564,107 @@ fn splitmix64(mut x: u64) -> u64 {
 /// root)`, all built for one document revision.
 pub(crate) type SpringTable = HashMap<(ObjectId, usize), Arc<Vec<Vec<f64>>>>;
 
+/// **Where the top of the pelvis is**, up a standing figure from the floor.
+///
+/// Human proportions, roughly: the hip joint sits a shade under halfway up an
+/// adult and the iliac crest a little above that. Everything below this is legs,
+/// and legs do not breathe.
+const HIPS_UP_THE_BODY: f64 = 0.47;
+/// **Where the shoulders are**, up a standing figure from the floor. Above this
+/// the drawing rides on the chest instead of stretching with it.
+const SHOULDERS_UP_THE_BODY: f64 = 0.78;
+
+/// **A breath, as the deformation it actually is.**
+///
+/// # Why this is not a transform
+///
+/// A breath used to be a scale of the whole drawing about its feet. The feet
+/// stayed down, which was the half of it anybody had checked — but a scale
+/// about the feet moves *every* point above them in proportion to its height,
+/// so the knees rose by a third of the motion, the hips by a half, and the
+/// character's legs visibly grew and shrank. That is not breathing; it is the
+/// drawing inflating.
+///
+/// Breathing is the chest. The pelvis and the legs do not move at all, the ribs
+/// swell, and everything above the shoulders — head, hair, the top of the arms —
+/// rides on the chest rather than stretching with it. That is three different
+/// behaviours over three bands of the body, which no single affine can be.
+///
+/// So it is a deformation with a falloff up the body, applied to the artwork
+/// where it is drawn. Three numbers say where the bands are, in document space,
+/// and the rest is the size of the breath.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Breath {
+    /// Document-space `y` below which nothing moves at all — the top of the
+    /// pelvis. Everything below is legs, and legs do not breathe.
+    pub hips: f64,
+    /// Document-space `y` above which the drawing moves **rigidly**, carried by
+    /// the chest under it rather than stretched any further.
+    pub shoulders: f64,
+    /// The `x` the ribs widen about.
+    pub centre: f64,
+    /// How far the top of the chest rises, in document units. Signed: a breath
+    /// out is negative.
+    pub rise: f64,
+    /// How much wider the ribs get, as a fraction of their width.
+    pub widen: f64,
+}
+
+impl Breath {
+    /// How much of the breath reaches a point at height `y`.
+    ///
+    /// Zero at the hips, one at the shoulders, and a smooth ramp between so the
+    /// ribs do not develop a crease where the band ends. `y` grows downwards, so
+    /// the hips are the *larger* number.
+    fn reach(&self, y: f64) -> f64 {
+        let span = self.hips - self.shoulders;
+        if span <= 1e-9 {
+            return if y <= self.shoulders { 1.0 } else { 0.0 };
+        }
+        let t = ((self.hips - y) / span).clamp(0.0, 1.0);
+        // Smoothstep: zero slope at both ends, so the deformation meets the
+        // still legs and the rigid shoulders without a kink in the outline.
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// Where a point of the artwork goes.
+    pub fn at(&self, p: Point) -> Point {
+        let t = self.reach(p.y);
+        if t <= 0.0 {
+            return p;
+        }
+        Point::new(
+            self.centre + (p.x - self.centre) * (1.0 + self.widen * t),
+            p.y - self.rise * t,
+        )
+    }
+
+    /// The path, breathed.
+    pub fn path(&self, path: &buzz_geom::BezPath) -> buzz_geom::BezPath {
+        let mut moved = buzz_geom::BezPath::new();
+        for element in path.elements() {
+            moved.push(match *element {
+                buzz_geom::PathEl::MoveTo(p) => buzz_geom::PathEl::MoveTo(self.at(p)),
+                buzz_geom::PathEl::LineTo(p) => buzz_geom::PathEl::LineTo(self.at(p)),
+                buzz_geom::PathEl::QuadTo(a, b) => {
+                    buzz_geom::PathEl::QuadTo(self.at(a), self.at(b))
+                }
+                buzz_geom::PathEl::CurveTo(a, b, c) => {
+                    buzz_geom::PathEl::CurveTo(self.at(a), self.at(b), self.at(c))
+                }
+                buzz_geom::PathEl::ClosePath => buzz_geom::PathEl::ClosePath,
+            });
+        }
+        moved
+    }
+
+    /// Is there anything to do? A breath at the top or bottom of its cycle
+    /// moves nothing, and the renderer should not pay for it.
+    pub fn is_still(&self) -> bool {
+        self.rise.abs() < 1e-6 && self.widen.abs() < 1e-6
+    }
+}
+
 /// The result of evaluating an object's modifiers at a frame.
 ///
 /// `prepend` is composed onto the object's own transform in stage space (a
@@ -568,6 +675,10 @@ pub(crate) type SpringTable = HashMap<(ObjectId, usize), Arc<Vec<Vec<f64>>>>;
 pub struct ModifierEval {
     pub prepend: Affine,
     pub object: Option<Object>,
+    /// The breath to deform this object's artwork by, if it breathes. Applied
+    /// by the renderer, because the renderer is what expands a symbol into the
+    /// artwork a breath has to reach. See [`Breath`].
+    pub breath: Option<Breath>,
 }
 
 impl Scene {
@@ -595,6 +706,7 @@ impl Scene {
         let fps = self.stage().frame_rate.max(1.0);
         let mut prepend = Affine::IDENTITY;
         let mut posed: Option<Object> = None;
+        let mut breath: Option<Breath> = None;
 
         for modifier in &object.modifiers {
             match *modifier {
@@ -685,25 +797,46 @@ impl Scene {
                     // Continuous in time, like the wiggle and for the same
                     // reason: a breath is slow, and sampling it per frame
                     // rather than per shutter would step it.
-                    let bounds = object.bounds();
+                    //
+                    // **Resolved bounds**, because a character is usually a
+                    // symbol instance and an instance's own bounds are a
+                    // placeholder a few units across — measured that way, the
+                    // bands below would all land in the same place and the
+                    // breath would do nothing at all.
+                    let bounds = crate::object::transform_rect(prepend, self.resolved_bounds(object));
                     if bounds.width() > 0.0 && bounds.height() > 0.0 {
                         let s = breath_at(object.id.0, rate, time / fps);
                         let depth = depth.clamp(0.0, 4.0);
+                        let height = bounds.height();
+                        // **Where the body's three bands are.** Human
+                        // proportions, roughly and deliberately: the top of the
+                        // pelvis is a little under halfway up a standing figure
+                        // and the shoulders a little under a quarter down from
+                        // the crown. Everything below the hips is legs and does
+                        // not move; everything above the shoulders is carried.
+                        //
+                        // `y` grows downwards, so `y1` is the feet.
+                        let hips = bounds.y1 - height * HIPS_UP_THE_BODY;
+                        let shoulders = bounds.y1 - height * SHOULDERS_UP_THE_BODY;
                         // **Two per cent, and taller than it is wider.** A
                         // breath you can measure is a breath the audience can
                         // see, and a character that visibly inflates reads as a
-                        // balloon. The chest fills, so both axes grow; it fills
-                        // upwards more than outwards, so y grows about twice as
-                        // much as x.
-                        let sy = 1.0 + depth * 0.022 * s;
-                        let sx = 1.0 + depth * 0.010 * s;
-                        // The feet, not the middle: a breath must not lift the
-                        // character off the ground.
-                        let feet = buzz_geom::Point::new(bounds.center().x, bounds.y1);
-                        prepend = Affine::translate(feet.to_vec2())
-                            * Affine::scale_non_uniform(sx, sy)
-                            * Affine::translate(-feet.to_vec2())
-                            * prepend;
+                        // balloon. The chest fills, so it grows both ways; it
+                        // fills upwards more than outwards.
+                        //
+                        // Measured against the **chest**, not the whole figure:
+                        // it is the ribs that swell, and a tall character does
+                        // not breathe more deeply than a short one because it
+                        // has longer legs.
+                        let chest = (hips - shoulders).max(1e-6);
+                        breath = Some(Breath {
+                            hips,
+                            shoulders,
+                            centre: bounds.center().x,
+                            rise: depth * 0.022 * s * chest,
+                            widen: depth * 0.010 * s,
+                        })
+                        .filter(|b| !b.is_still());
                     }
                 }
                 Modifier::Blink { rate, duration } => {
@@ -803,6 +936,7 @@ impl Scene {
         Some(ModifierEval {
             prepend,
             object: posed,
+            breath,
         })
     }
 
@@ -1072,27 +1206,149 @@ mod tests {
             });
         });
 
-        let mut tops = Vec::new();
-        for frame in 0..60u32 {
+        // A standing figure a hundred units tall: feet at y = 100, crown at 0.
+        let sample = |frame: u32, y: f64| {
             let obj = resolved(&scene, layer, id, frame);
             let eval = scene.modified_object_at(layer, &obj, frame).unwrap();
-            let feet = eval.prepend * buzz_geom::Point::new(50.0, 100.0);
+            let breath = eval.breath.expect("a breath");
+            breath.at(buzz_geom::Point::new(50.0, y)).y
+        };
+
+        let mut chest = Vec::new();
+        for frame in 0..60u32 {
+            // **The feet stay on the floor**, which is the half of this that
+            // was always true.
             assert!(
-                (feet.y - 100.0).abs() < 1e-9,
-                "frame {frame}: the feet moved to {}",
-                feet.y
+                (sample(frame, 100.0) - 100.0).abs() < 1e-9,
+                "frame {frame}: the feet left the floor"
             );
-            tops.push((eval.prepend * buzz_geom::Point::new(50.0, 0.0)).y);
+            chest.push(sample(frame, 25.0));
         }
 
-        let lo = tops.iter().copied().fold(f64::INFINITY, f64::min);
-        let hi = tops.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let lo = chest.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = chest.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         assert!(
-            hi - lo > 1.0,
+            hi - lo > 0.4,
             "the chest barely moved over two and a half seconds: {lo}..{hi}"
         );
         // And not by so much that it reads as a balloon.
-        assert!(hi - lo < 12.0, "that is not breathing, it is inflating: {lo}..{hi}");
+        assert!(
+            hi - lo < 12.0,
+            "that is not breathing, it is inflating: {lo}..{hi}"
+        );
+    }
+
+    /// **The report: a breathing character's legs went up and down with it.**
+    ///
+    /// The breath used to be a scale of the whole drawing about its feet. The
+    /// feet stayed down — which is the only thing anybody had checked — but a
+    /// scale about the feet moves *every* point above them in proportion to its
+    /// height, so the ankles rose a tenth of the motion, the knees a third and
+    /// the hips a half. The legs visibly grew and shrank. That is not a
+    /// character breathing, it is a drawing inflating.
+    ///
+    /// Breathing is the chest: below the pelvis nothing moves at all.
+    #[test]
+    fn breathing_does_not_move_the_legs() {
+        let mut scene = Scene::empty();
+        let (layer, id) = standing_square(&mut scene, 11);
+        scene.update_object_across(0, 60, id, |o| {
+            o.modifiers.push(Modifier::Breathe {
+                rate: 14.0,
+                depth: 4.0,
+            });
+        });
+
+        // Ankles, shins, knees, thighs — every one of them below the hips on a
+        // hundred-unit figure whose feet are at y = 100.
+        let legs = [98.0, 90.0, 75.0, 62.0, 54.0];
+        let mut chest_moved: f64 = 0.0;
+        for frame in 0..60u32 {
+            let obj = resolved(&scene, layer, id, frame);
+            let eval = scene.modified_object_at(layer, &obj, frame).unwrap();
+            let breath = eval.breath.expect("a breath");
+            for y in legs {
+                let p = buzz_geom::Point::new(30.0, y);
+                let moved = breath.at(p);
+                assert!(
+                    (moved.y - p.y).abs() < 1e-9 && (moved.x - p.x).abs() < 1e-9,
+                    "frame {frame}: a leg at y={y} moved to {moved:?} — the                      whole body is supposed to stand still and only the torso                      move"
+                );
+            }
+            let chest = buzz_geom::Point::new(50.0, 30.0);
+            chest_moved = chest_moved.max((breath.at(chest).y - chest.y).abs());
+        }
+        assert!(
+            chest_moved > 0.4,
+            "nothing moved at all, so this test is not measuring anything"
+        );
+    }
+
+    /// **Above the shoulders the drawing rides, it does not stretch.**
+    ///
+    /// A head carried on a filling chest rises with it. A head that kept
+    /// stretching would grow taller every time the character breathed in, which
+    /// is the same defect as the legs at the other end of the body.
+    #[test]
+    fn breathing_carries_the_head_without_stretching_it() {
+        let mut scene = Scene::empty();
+        let (layer, id) = standing_square(&mut scene, 11);
+        scene.update_object_across(0, 60, id, |o| {
+            o.modifiers.push(Modifier::Breathe {
+                rate: 14.0,
+                depth: 4.0,
+            });
+        });
+
+        for frame in [3u32, 9, 17, 26, 38] {
+            let obj = resolved(&scene, layer, id, frame);
+            let eval = scene.modified_object_at(layer, &obj, frame).unwrap();
+            let breath = eval.breath.expect("a breath");
+            // The chin and the crown are both above the shoulders, so the
+            // distance between them must not change.
+            let (chin, crown) = (
+                buzz_geom::Point::new(50.0, 18.0),
+                buzz_geom::Point::new(50.0, 2.0),
+            );
+            let before = chin.y - crown.y;
+            let after = breath.at(chin).y - breath.at(crown).y;
+            assert!(
+                (after - before).abs() < 1e-9,
+                "frame {frame}: the head stretched from {before} to {after}"
+            );
+        }
+    }
+
+    /// A breath must reach a **symbol instance**, which is what a character
+    /// usually is — and an instance's own bounds are a placeholder a few units
+    /// across, so measuring the body's bands off them would put all three in
+    /// the same place and the breath would do nothing at all.
+    #[test]
+    fn a_breath_measures_a_symbol_by_what_it_resolves_to() {
+        let mut scene = Scene::empty();
+        let (layer, id) = standing_square(&mut scene, 11);
+        let resolved_obj = resolved(&scene, layer, id, 0);
+        let tall = scene.resolved_bounds(&resolved_obj);
+        assert!(tall.height() > 50.0, "the fixture is not a standing figure");
+
+        scene.update_object_across(0, 60, id, |o| {
+            o.modifiers.push(Modifier::Breathe {
+                rate: 14.0,
+                depth: 1.0,
+            });
+        });
+        let obj = resolved(&scene, layer, id, 7);
+        let breath = scene
+            .modified_object_at(layer, &obj, 7u32)
+            .unwrap()
+            .breath
+            .expect("a breath");
+        assert!(
+            breath.hips - breath.shoulders > 10.0,
+            "the body's bands collapsed onto each other: hips {} shoulders {}",
+            breath.hips,
+            breath.shoulders
+        );
     }
 
     /// Openness sampled finely over `seconds`, for the blink tests. A blink is

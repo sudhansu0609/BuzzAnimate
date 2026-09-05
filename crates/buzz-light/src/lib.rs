@@ -45,10 +45,11 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
 pub use geometry::{
-    HIGHLIGHT_SHARE, RIM_REACH, crescent_offset, highlight_reach, shade_reach,
-    GloomBand, LightPool, RimGlow, ShadeGeometry, cast_shadow, crescent_direction, crescents,
-    gloom_at, gloom_band, highlight_crescent, light_pool, rim_glow, shade_crescent,
-    shadow_transform,
+    GloomBand, HIGHLIGHT_SHARE, LightPool, RIM_REACH, RimGlow, ShadeGeometry, ShadowThrow,
+    cast_shadow, crescent_direction, crescent_offset, crescents, gloom_at, gloom_band,
+    highlight_crescent, highlight_reach, light_pool, rim_glow, shade_crescent, shade_feather,
+    shade_reach, shade_width,
+    shadow_throw, shadow_transform,
 };
 pub use track::{LightKey, LightTrack};
 
@@ -193,8 +194,35 @@ pub struct Light {
     pub enabled: bool,
     /// Does this light cast shadows, and how dark are they?
     pub shadows: bool,
+    /// **What its shadows land on** — the floor the artwork stands on, or the
+    /// surface behind it. See [`ShadowFall`].
+    #[serde(default)]
+    pub fall: ShadowFall,
     /// `0.0..=1.0`.
     pub shadow_strength: f32,
+    /// **How long its shadows run**, as a multiple of what the geometry says.
+    ///
+    /// # Why a light has this at all
+    ///
+    /// A shadow's length is the honest consequence of how high the light is:
+    /// `1 / tan(elevation)` times the caster's own height, and moving the sun
+    /// is how you change it. That is right, and it is not enough — the sun's
+    /// height is also what decides where the terminator sits on every figure
+    /// and how the whole stage is lit, so "I want a shorter shadow" and "I want
+    /// this light where it is" are two wishes that the physics will not grant
+    /// at once.
+    ///
+    /// Animators settle that the way they always have, by drawing the shadow
+    /// they want. This is that: one multiplier over the length the geometry
+    /// worked out, so the light stays where it was put and the shadow lands
+    /// where the shot needs it. `1.0` is the honest answer and the default;
+    /// `0.0` puts the shadow directly under its caster.
+    ///
+    /// Length only. The *direction* still comes from the light, because a
+    /// shadow pointing somewhere its light cannot explain is the one thing an
+    /// audience does notice.
+    #[serde(default = "default_shadow_length")]
+    pub shadow_length: f32,
     /// How far off the background flat artwork is assumed to stand, in
     /// document units. Layer depth is added to it.
     pub standing_height: f64,
@@ -274,8 +302,8 @@ pub struct Light {
     /// # What it fixes
     ///
     /// The highlight is the band on the side of a shape the light is on, laid
-    /// on at [`Illumination::highlight`]'s mix. Until this existed it was laid
-    /// on *flat and at full*: one tone, edge to edge, stopping dead at the
+    /// on at [`Illumination::highlight`]'s strength. Until this existed it was
+    /// laid on *flat and at full*: one tone, edge to edge, stopping dead at the
     /// terminator. On a face or a limb that is a bright stripe with a hard line
     /// down the inside of it — the artwork looks as though a second, whiter
     /// drawing has been pasted over one side of it, which is the report this
@@ -397,6 +425,8 @@ impl Light {
             intensity: 1.3,
             enabled: true,
             shadows: true,
+            shadow_length: 1.0,
+            fall: ShadowFall::default(),
             shadow_strength: 0.45,
             // **How a flat drawing gets a shadow at all**, so the default has to
             // be one that produces a visible one. Forty put the whole shadow
@@ -660,7 +690,9 @@ impl Light {
         self.intensity.to_bits().hash(hasher);
         self.enabled.hash(hasher);
         self.shadows.hash(hasher);
+        self.fall.hash(hasher);
         self.shadow_strength.to_bits().hash(hasher);
+        self.shadow_length.to_bits().hash(hasher);
         f(hasher, self.standing_height);
         f(hasher, self.softness);
         self.glow.to_bits().hash(hasher);
@@ -746,6 +778,44 @@ impl Light {
                 let falloff = 1.0 / (1.0 + (distance / radius.max(1.0)).powi(2));
                 Some((to_light.unit(), self.intensity * falloff as f32))
             }
+        }
+    }
+
+    /// **Which way the light lies across the picture**, for a piece of flat
+    /// artwork standing upright at `point`.
+    ///
+    /// # Why this is not just `towards().planar()`
+    ///
+    /// It was, and that dropped the light's height on the floor. A sun's
+    /// direction is a compass bearing tilted up out of the *ground*: its `x`
+    /// and `y` are the bearing and its `z` is the height. Artwork is not lying
+    /// on the ground — the whole shadow model has it "flat artwork standing
+    /// upright on the floor" — so the plane the light has to be projected onto
+    /// is the screen: across is `x`, and up is `z`.
+    ///
+    /// Taking `(x, y)` instead used the bearing's *depth* component as though
+    /// it were screen-vertical, and scaled the whole thing by `cos(elevation)`
+    /// — which normalises away. So raising the sun changed the length of its
+    /// shadow and **nothing about the light on the figure**: the terminator sat
+    /// in the same place at dawn and at noon, and at noon exactly the vector
+    /// collapsed to zero and the modelling switched off altogether. That is the
+    /// "the sun seems to be at a lower level however high I put it" report.
+    ///
+    /// Now elevation tilts the light up the picture, as it should: on the
+    /// horizon it comes from the side, overhead it comes from straight above
+    /// and the shadow is underneath. Screen `y` grows downwards, so up is
+    /// negative.
+    ///
+    /// A **lamp** is different and is left alone: it is placed *on the stage*,
+    /// so its `x` and `y` are already screen coordinates and its `z` is how far
+    /// it stands in front of the artwork. Its planar part is the answer.
+    pub fn screen_towards(&self, point: Point, depth: f64) -> Option<Vec2> {
+        match self.kind {
+            LightKind::Sun { azimuth, elevation } => {
+                let (sin_e, cos_e) = elevation.sin_cos();
+                Some(Vec2::new(azimuth.cos() * cos_e, -sin_e))
+            }
+            _ => self.towards(point, depth).map(|(towards, _)| towards.planar()),
         }
     }
 
@@ -836,15 +906,30 @@ impl Light {
     }
 }
 
-/// **How far a highlight is pushed towards the light's own colour.**
+/// **How much of the light's own colour a glint adds.**
 ///
-/// Raised with the same change that narrowed [`crate::HIGHLIGHT_SHARE`], and
-/// for the same reason: the two are one decision. A broad band at a little of
-/// the light's colour reads as the artwork having been painted in two tones; a
-/// narrow band at a lot of it reads as an edge catching the light, which is
-/// what a highlight is for. Narrowing without brightening would only have made
-/// the wash smaller.
-const RIM_MIX: f32 = 0.78;
+/// # Added, not mixed
+///
+/// This used to be the `t` of a *lerp towards the light's colour*, at 0.78 —
+/// so a lit edge was 78% the lamp and 22% the drawing, and under a warm lamp a
+/// red coat came out the same pale peach as the grey wall beside it. That is
+/// the report this number comes from: the light did not fall on the artwork,
+/// it replaced it.
+///
+/// A **screen** instead: `lit + light·k·(1 − lit)`. It can only ever add light,
+/// so nothing under it loses its own colour — the red coat goes bright warm red
+/// and stays red, and two differently painted things catching the same light
+/// stay different. It is also what light physically does, which is why it looks
+/// like light rather than like paint.
+///
+/// # Why not higher
+///
+/// A screen at one is white, and the band would be back to being a second
+/// drawing over the first. Something under a half keeps the artwork's own
+/// colour plainly readable through the brightest part of the band, which is the
+/// whole point; the [`Light::glint`] slider is there for a shot that wants a
+/// wet, polished sheen and multiplies this.
+const GLINT_LIGHT: f32 = 0.45;
 
 /// **How far past its own brightness a strike takes a light.**
 ///
@@ -1021,6 +1106,128 @@ pub struct LightRig {
     /// decision: the same lighting can be rendered as a soft gradient or as
     /// hard cel shading, and animators disagree about which they want.
     pub modelling: f32,
+    /// **What the light lays its shaded side and its glint along.** See
+    /// [`EdgeMode`].
+    ///
+    /// A mode rather than `modelling = 0.0` so that changing it and changing
+    /// back gives the strength that was set, instead of asking for it to be
+    /// dialled in a second time.
+    #[serde(default)]
+    pub edges: EdgeMode,
+}
+
+/// **What a light draws its edges around.**
+///
+/// The shaded side, the glint and the dark edge a gloom leaves are crescents:
+/// artwork minus a copy of itself shifted towards the light. The question this
+/// answers is *whose* outline that is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeMode {
+    /// **No edgework at all.** The light still lights: the tint it lays on the
+    /// artwork, a lamp's pool and its falloff, the rim, the cast shadows. Only
+    /// the bands go.
+    ///
+    /// For artwork already drawn with its own shading in it, which is most
+    /// hand-drawn artwork — there the light is being asked for the *quality* of
+    /// the light in the room and nothing else.
+    Off,
+    /// **One set of bands per shape.**
+    ///
+    /// Every shape gets its own lit side and its own terminator, measured
+    /// against its own outline. On a drawing made of one shape that is exactly
+    /// right and is what [`Figure`](Self::Figure) does too. On a character
+    /// drawn as a hundred shapes it is a hundred separate figures: each patch
+    /// of interior shading picks up its own rim, the pieces stop reading as one
+    /// body, and the drawing stops looking like itself.
+    ///
+    /// Kept because it is the right answer for a *layer of separate props* —
+    /// and because it is what every document drawn before the choice existed
+    /// was made against.
+    Shapes,
+    /// **One set of bands per figure**, measured against the whole silhouette
+    /// of the object as it is drawn — a group, a rig, a character symbol and
+    /// everything inside it.
+    ///
+    /// This is what a light does to a body: one lit side, one terminator,
+    /// running around the outside of the figure and across nothing inside it.
+    /// It is also *cheaper* than [`Shapes`](Self::Shapes) on the artwork it
+    /// matters for, because a character costs one pair of booleans instead of
+    /// one pair per shape.
+    ///
+    /// The default, and the same picture as `Shapes` for any object that is a
+    /// single shape.
+    #[default]
+    Figure,
+}
+
+/// A shadow as long as the geometry says, which is what a light did before it
+/// could be told otherwise — and what every saved file means by saying nothing.
+fn default_shadow_length() -> f32 {
+    1.0
+}
+
+/// The range [`Light::shadow_length`] may be set over.
+///
+/// Up to three, because "longer than physics" is a real staging choice — a long
+/// raking shadow from a light that has to stay where it is — and past three the
+/// shadow is off any stage. Down to zero, which puts it under its caster.
+pub const SHADOW_LENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=3.0;
+
+/// **What a light's shadows land on.**
+///
+/// # Why there is a choice at all
+///
+/// A shadow is the caster's outline projected onto whatever catches it, and in
+/// a flat drawing there are two candidates. Which one is meant is a staging
+/// decision, not a calculation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShadowFall {
+    /// **The floor the artwork stands on.** The shadow is anchored at the
+    /// caster's feet and lies away from the light along the ground, foreshortened
+    /// by how high the light is: overhead, a puddle underfoot; low, a long
+    /// shadow stretching away.
+    ///
+    /// This is what an animator means by "the shadow of a character", and it is
+    /// the one that reads as the figure *standing somewhere* rather than being
+    /// pasted on.
+    #[default]
+    Ground,
+    /// **The surface behind it** — the backdrop, a wall, whatever the furthest
+    /// layer is. The shadow is the caster's own silhouette, upright and
+    /// full-size, offset away from the light and enlarged by a lamp's
+    /// divergence.
+    ///
+    /// Right for a figure standing close in front of a wall, which is exactly
+    /// the shot it was written for, and wrong everywhere else: on an open stage
+    /// it puts a second copy of the character in the air behind them.
+    Wall,
+}
+
+impl ShadowFall {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ground => "Ground",
+            Self::Wall => "Wall",
+        }
+    }
+
+    pub const ALL: [ShadowFall; 2] = [ShadowFall::Ground, ShadowFall::Wall];
+}
+
+impl EdgeMode {
+    /// The label an animator picks this by.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Shapes => "Shapes",
+            Self::Figure => "Figure",
+        }
+    }
+
+    /// Every mode, in the order they are offered.
+    pub const ALL: [EdgeMode; 3] = [EdgeMode::Off, EdgeMode::Shapes, EdgeMode::Figure];
 }
 
 impl LightRig {
@@ -1060,6 +1267,7 @@ impl LightRig {
         self.enabled.hash(&mut hasher);
         colour(&mut hasher, self.base);
         self.modelling.to_bits().hash(&mut hasher);
+        self.edges.hash(&mut hasher);
         self.lights.len().hash(&mut hasher);
 
         // Each light hashes itself, through the same routine `Light::fingerprint`
@@ -1081,6 +1289,7 @@ impl Default for LightRig {
             // document that switches lighting on should not go dark.
             base: Color::from_rgb8(0x6E, 0x74, 0x82),
             modelling: 0.8,
+            edges: EdgeMode::default(),
         }
     }
 }
@@ -1100,6 +1309,7 @@ impl LightRig {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.modelling.to_bits().hash(&mut hasher);
+        self.edges.hash(&mut hasher);
         for light in self.lights.iter().filter(|l| l.enabled && l.is_directional()) {
             light.id.0.hash(&mut hasher);
             light.softness.to_bits().hash(&mut hasher);
@@ -1119,6 +1329,33 @@ impl LightRig {
             }
         }
         hasher.finish()
+    }
+
+    /// **How strongly a single shape's own crescents are drawn** — the
+    /// modelling strength in [`EdgeMode::Shapes`], and zero in every other
+    /// mode.
+    ///
+    /// Everything generated from one shape's outline goes through this rather
+    /// than reading `modelling` directly, so there is one answer to "does this
+    /// shape draw edges" and no path that quietly disagrees with the mode: the
+    /// terminator, the glint and the dark edge of a gloom all stop together,
+    /// and the cache keyed on [`aim`](Self::aim) is dropped when they do.
+    pub fn shape_edges(&self) -> f32 {
+        if self.edges == EdgeMode::Shapes {
+            self.modelling
+        } else {
+            0.0
+        }
+    }
+
+    /// [`shape_edges`](Self::shape_edges) for the whole figure's silhouette:
+    /// the modelling strength in [`EdgeMode::Figure`], zero elsewhere.
+    pub fn figure_edges(&self) -> f32 {
+        if self.edges == EdgeMode::Figure {
+            self.modelling
+        } else {
+            0.0
+        }
     }
 
     /// Is there anything that would change how the document looks?
@@ -1567,18 +1804,35 @@ impl Illumination {
         from_linear(out, base.to_rgba8().to_u8_array()[3])
     }
 
-    /// The colour a highlight is drawn in: the artwork, pushed towards the
-    /// light's own colour.
+    /// The colour a highlight is drawn in: the artwork as it is already lit,
+    /// **with the light's colour added on top of it** — a screen, not a mix.
+    ///
+    /// Adding is what keeps a highlight reading as light falling on the
+    /// drawing. A mix towards the light's colour takes the artwork's own colour
+    /// away with it, so every lit edge in the shot comes out the same colour
+    /// whatever it is painted; see [`GLINT_LIGHT`].
     pub fn highlight(&self, base: Color, light: Color, strength: f32) -> Color {
-        mix(self.apply(base), light, strength.clamp(0.0, 1.0) * RIM_MIX)
+        let k = Self::highlight_strength(strength);
+        let lit = to_linear(self.apply(base));
+        let add = to_linear(light);
+        let mut out = [0.0f32; 3];
+        for i in 0..3 {
+            // Screen: `a + b(1 − a)`. Never above one, never below `lit`, and
+            // the ratios between the artwork's own channels survive it.
+            out[i] = lit[i] + add[i] * k * (1.0 - lit[i]);
+        }
+        from_linear(out, base.to_rgba8().to_u8_array()[3])
     }
 
-    /// How far a highlight over **artwork that cannot be recoloured** is
-    /// pushed towards the light. The `t` of [`highlight`](Self::highlight), for
-    /// a caller that must lay the light's colour over the picture at an alpha
-    /// rather than mix it into one.
+    /// How much of the light's colour a highlight adds over **artwork that
+    /// cannot be recoloured**.
+    ///
+    /// The same `k` [`highlight`](Self::highlight) screens with, for a caller
+    /// that must lay the light over the picture as a pass rather than fold it
+    /// into a colour. Laid on at this alpha **with a screen blend**, the
+    /// compositor arrives at the same place: `dst + k·src·(1 − dst)`.
     pub fn highlight_strength(strength: f32) -> f32 {
-        strength.clamp(0.0, 1.0) * RIM_MIX
+        strength.clamp(0.0, 1.0) * GLINT_LIGHT
     }
 
     /// The light itself, **as colours to composite with**.
@@ -2529,6 +2783,44 @@ mod tests {
             warmth(lit) > warmth(shaded) * 1.2,
             "the lit side should be warmer than the shade: lit {lit:?}, shaded {shaded:?}"
         );
+    }
+
+    /// **Changing what the edges are drawn around must reach the cache as well
+    /// as the picture.**
+    ///
+    /// The crescents are cached, and the cache is thrown away on the numbers
+    /// below. A switch the fingerprints could not see would leave the bands on
+    /// the screen until something else happened to move — the light being
+    /// switched off, in effect, and nothing changing.
+    #[test]
+    fn switching_the_edges_off_stops_the_modelling_and_moves_the_fingerprints() {
+        // Both the mode and the strength reach the fingerprints, and a mode
+        // that draws nothing draws nothing on either path.
+        let rig = LightRig {
+            lights: vec![sun(0.0, 1.0)],
+            enabled: true,
+            ..LightRig::default()
+        };
+        let mut off = rig.clone();
+        off.edges = EdgeMode::Off;
+
+        assert_eq!(
+            rig.shape_edges(),
+            0.0,
+            "the default models figures, not shapes"
+        );
+        assert_eq!(rig.figure_edges(), rig.modelling);
+        assert_eq!(off.shape_edges(), 0.0);
+        assert_eq!(off.figure_edges(), 0.0);
+        // The strength itself is untouched, so the bands come back at it.
+        assert_eq!(off.modelling, rig.modelling);
+
+        assert_ne!(
+            rig.fingerprint(),
+            off.fingerprint(),
+            "the switch must repaint"
+        );
+        assert_ne!(rig.aim(), off.aim(), "the switch must drop the crescents");
     }
 
     /// The key light is the one shadows follow, and it should be the one an

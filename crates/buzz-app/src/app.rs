@@ -726,6 +726,12 @@ pub struct App {
     /// were born with. Recording the rects as they are laid out is the only
     /// way to be right about this that does not repeat the layout arithmetic.
     dock_rects: Vec<(buzz_ui::Dock, egui::Rect)>,
+    /// How much width the columns and the stage had to share this frame.
+    ///
+    /// Recorded where the columns are laid out, and read by the splitters, so
+    /// a boundary cannot be dragged past the point where its neighbours are
+    /// already as narrow as they go.
+    dock_room: f32,
     /// The opening scene, drawn over the interface for the first second or so
     /// of a session and then dissolved. See [`buzz_ui::splash`].
     splash: buzz_ui::SplashState,
@@ -801,6 +807,7 @@ impl App {
             picker: crate::dialogs::Pending::default(),
             tasks: crate::tasks::TaskRegistry::default(),
             dock_rects: Vec::new(),
+            dock_room: 0.0,
             splash: buzz_ui::SplashState::default(),
         };
         app.recovery = app.find_recoveries();
@@ -1479,8 +1486,30 @@ impl App {
                 }
             }
 
-            for (dock, id_name, width) in [(buzz_ui::Dock::Left, "dock-left", workspace.left_width)]
-            {
+            // **How wide the columns may actually be drawn.**
+            //
+            // `egui` hands each side to whichever panel asks first and clamps
+            // it to whatever is left, so three columns that together want more
+            // than the window has end up placed over one another — which is
+            // what "the left edge drags over the property panel" is. Fitting
+            // them to the window first means a column that has to give up
+            // space shrinks instead, and gets it back when there is room.
+            let room = ui.available_rect_before_wrap().width();
+            // The boundary under the pointer, if one is being dragged: that
+            // column keeps what it was dragged to and the others give way, so
+            // the edge follows the pointer instead of creeping away from it.
+            let dragging = [
+                (buzz_ui::Dock::Left, "split-left"),
+                (buzz_ui::Dock::Right, "split-right"),
+                (buzz_ui::Dock::RightOuter, "split-right-outer"),
+            ]
+            .into_iter()
+            .find(|(_, id)| ui.ctx().is_being_dragged(egui::Id::new(*id)))
+            .map(|(dock, _)| dock);
+            let columns = workspace.column_widths_dragging(room, dragging);
+            self.dock_room = room;
+
+            for (dock, id_name, width) in [(buzz_ui::Dock::Left, "dock-left", columns.left)] {
                 let sections = workspace.sections(dock);
                 if sections.is_empty() {
                     continue;
@@ -1506,9 +1535,9 @@ impl App {
                 (
                     buzz_ui::Dock::RightOuter,
                     "dock-right-outer",
-                    workspace.right_outer_width,
+                    columns.right_outer,
                 ),
-                (buzz_ui::Dock::Right, "dock-right", workspace.right_width),
+                (buzz_ui::Dock::Right, "dock-right", columns.right),
             ] {
                 let sections = workspace.sections(dock);
                 if sections.is_empty() {
@@ -1803,7 +1832,20 @@ impl App {
         requests: &mut DockRequests,
         commands: &mut Vec<Command>,
     ) {
-        egui::ScrollArea::vertical()
+        // **Both axes, and the horizontal one is not decoration.**
+        //
+        // A row wider than the column used to be drawn straight past the edge —
+        // and `egui` does not simply clip it. A panel's reported rectangle is
+        // its *contents'*, so a right-hand column whose rows overflow by 170
+        // points reports itself 170 points further right than it was drawn, and
+        // the stage is then laid out through that gap: its ruler, its scroll
+        // bars and its zoom pill painted across the panel, which is exactly
+        // what "the stage's scrollbar overlaps the property panel" is.
+        //
+        // Scrolling the width instead keeps the column's rectangle honest — the
+        // stage stops where the panel starts — and gives the cut-off end of a
+        // row somewhere to be reached from, rather than nowhere.
+        egui::ScrollArea::both()
             .id_salt(("column", sections.first().map(|s| s.front)))
             .show(ui, |ui| {
                 for (index, section) in sections.iter().enumerate() {
@@ -1840,7 +1882,8 @@ impl App {
 
             ToolOptions => {
                 let tool = self.editor.tool();
-                panels::tool_options_panel(ui, tool, &mut self.editor.style);
+                let editor = &mut self.editor;
+                panels::tool_options_panel(ui, tool, editor.doc.scene(), &mut editor.style);
             }
 
             Layers => {
@@ -2803,6 +2846,12 @@ impl App {
                 scene.lights_mut().modelling = modelling;
             });
         }
+
+        if let Some(edges) = response.set_edges {
+            editor.doc.edit("Light Edges", |scene| {
+                scene.lights_mut().edges = edges;
+            });
+        }
     }
 
     /// The Armature panel, and the edits it raises.
@@ -3605,22 +3654,30 @@ impl App {
                 use buzz_ui::workspace::{
                     BOTTOM_HEIGHT_RANGE, COLUMN_WIDTH_RANGE, LEFT_WIDTH_RANGE, clamp_to,
                 };
+                let room = self.dock_room;
                 let workspace = &mut self.editor.workspace;
                 // The same ranges the workspace clamps a loaded layout to, so a
                 // column cannot be dragged to a width that the next launch
-                // would silently undo.
+                // would silently undo — and, on top of those, what this window
+                // has room for. A boundary dragged outwards squeezes the
+                // columns beyond it and then stops, rather than storing a width
+                // nothing can show and going dead on the way back.
                 match name {
                     "split-left" => {
+                        let cap = workspace.column_cap(buzz_ui::Dock::Left, room);
                         workspace.left_width =
-                            clamp_to(workspace.left_width + moved, LEFT_WIDTH_RANGE);
+                            clamp_to(workspace.left_width + moved, LEFT_WIDTH_RANGE).min(cap);
                     }
                     "split-right" => {
+                        let cap = workspace.column_cap(buzz_ui::Dock::Right, room);
                         workspace.right_width =
-                            clamp_to(workspace.right_width + moved, COLUMN_WIDTH_RANGE);
+                            clamp_to(workspace.right_width + moved, COLUMN_WIDTH_RANGE).min(cap);
                     }
                     "split-right-outer" => {
+                        let cap = workspace.column_cap(buzz_ui::Dock::RightOuter, room);
                         workspace.right_outer_width =
-                            clamp_to(workspace.right_outer_width + moved, COLUMN_WIDTH_RANGE);
+                            clamp_to(workspace.right_outer_width + moved, COLUMN_WIDTH_RANGE)
+                                .min(cap);
                     }
                     _ => {
                         workspace.bottom_height =
@@ -3630,6 +3687,20 @@ impl App {
                 changed = true;
             }
             if response.drag_stopped() {
+                // What the window forced becomes the layout's own, so the
+                // boundary stays where it was dropped instead of springing
+                // back when the fit is recomputed without a column to favour.
+                let dragged = match name {
+                    "split-left" => Some(buzz_ui::Dock::Left),
+                    "split-right" => Some(buzz_ui::Dock::Right),
+                    "split-right-outer" => Some(buzz_ui::Dock::RightOuter),
+                    _ => None,
+                };
+                if dragged.is_some() {
+                    self.editor
+                        .workspace
+                        .commit_column_widths(self.dock_room, dragged);
+                }
                 // Saved when the drag ends rather than on every pixel of it.
                 self.editor.workspace.save();
             }
@@ -4737,7 +4808,19 @@ impl App {
                 let name = self.editor.assets.unique_name("Asset", &folder);
                 match self.editor.assets.save(&name, &folder, &asset) {
                     Ok(saved) => {
-                        self.editor.status = Some(format!("Kept {} in Assets", saved.label()));
+                        // **Named as part of keeping it.** It used to become
+                        // "Asset", then "Asset 2", with the only way to say
+                        // otherwise being to find it afterwards and rename it —
+                        // and an asset library outlives the document, so a
+                        // shelf of "Asset 7"s is worse than a library of
+                        // "Symbol 7"s. The name is a focused field the moment
+                        // it lands: type over it, or press Enter and keep it.
+                        self.editor
+                            .assets_panel
+                            .start_naming(saved.path.clone(), saved.name.clone());
+                        self.editor.workspace.select_tab(buzz_ui::PanelId::Assets);
+                        self.editor.status =
+                            Some(format!("Kept {} in Assets \u{2014} type its name", saved.label()));
                     }
                     Err(e) => self.editor.status = Some(format!("Could not save the asset: {e}")),
                 }
@@ -4762,6 +4845,23 @@ impl App {
             Rename { asset, name } => {
                 if let Err(e) = self.editor.assets.rename(&asset, &name) {
                     self.editor.status = Some(format!("Could not rename: {e}"));
+                }
+            }
+
+            MoveToFolder { asset, folder } => {
+                let name = asset.name.clone();
+                match self.editor.assets.move_to_folder(&asset, &folder) {
+                    Ok(()) => {
+                        let where_to = if folder.is_empty() {
+                            "the top level".to_string()
+                        } else {
+                            folder.clone()
+                        };
+                        self.editor.status = Some(format!("Filed {name} in {where_to}"));
+                    }
+                    Err(e) => {
+                        self.editor.status = Some(format!("Could not move {name}: {e}"));
+                    }
                 }
             }
 
@@ -7575,6 +7675,185 @@ const OPEN: &str = "\u{23f7}";
 mod dock_geometry_tests {
     use super::*;
 
+    /// **Three columns and a stage must add up to the window.**
+    ///
+    /// The sequel to the test below, and the same shape of defect from the
+    /// other end. Every column reports itself honestly now — but `egui` gives
+    /// each side to whichever panel asks first and clamps it to what is left,
+    /// so when the three of them together want more than the window has, the
+    /// last one asked is placed *over* its neighbour. Dragging the stage's
+    /// left boundary outwards is the quickest way to arrange that: the left
+    /// column grows, the stage is squeezed to a sliver, and then the
+    /// Properties column is drawn across the far-right one.
+    ///
+    /// So the widths are fitted to the window before anything is drawn, and
+    /// this lays the panels out exactly as `docks` does — bottom, left, far
+    /// right, right — and measures that no two of them share a point.
+    #[test]
+    fn the_columns_never_overlap_however_wide_they_are_dragged() {
+        // A wide window, a laptop, and a window too narrow for the columns'
+        // own minimums — with the boundaries dragged to their extremes.
+        for room in [1920.0f32, 1280.0, 1000.0, 700.0, 420.0] {
+            for (left, right, outer) in [
+                (
+                    *buzz_ui::workspace::LEFT_WIDTH_RANGE.end(),
+                    *buzz_ui::workspace::COLUMN_WIDTH_RANGE.end(),
+                    *buzz_ui::workspace::COLUMN_WIDTH_RANGE.end(),
+                ),
+                (60.0, 300.0, 240.0),
+                (*buzz_ui::workspace::LEFT_WIDTH_RANGE.end(), 300.0, 240.0),
+            ] {
+                let mut workspace = buzz_ui::Workspace::animate();
+                workspace.left_width = left;
+                workspace.right_width = right;
+                workspace.right_outer_width = outer;
+
+                let ctx = egui::Context::default();
+                buzz_ui::theme::apply(&ctx);
+                let mut edges: Vec<(&str, egui::Rangef)> = Vec::new();
+
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(room, 1040.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let available = ui.available_rect_before_wrap().width();
+                        let columns = workspace.column_widths(available);
+                        // The order in `docks`: left first, then the far-right
+                        // column, then the one beside the stage.
+                        let left = egui::Panel::left("left")
+                            .resizable(false)
+                            .exact_size(columns.left)
+                            .show(ui, |ui| {
+                                ui.label("tools");
+                            });
+                        let outer = egui::Panel::right("outer")
+                            .resizable(false)
+                            .exact_size(columns.right_outer)
+                            .show(ui, |ui| {
+                                ui.label("library");
+                            });
+                        let right = egui::Panel::right("right")
+                            .resizable(false)
+                            .exact_size(columns.right)
+                            .show(ui, |ui| {
+                                ui.label("properties");
+                            });
+                        let stage = ui.available_rect_before_wrap();
+                        edges.push(("left column", left.response.rect.x_range()));
+                        edges.push(("stage", stage.x_range()));
+                        edges.push(("right column", right.response.rect.x_range()));
+                        edges.push(("far-right column", outer.response.rect.x_range()));
+                    },
+                );
+
+                // Laid out left to right, each one starts where the last ended.
+                for pair in edges.windows(2) {
+                    let (before, after) = (&pair[0], &pair[1]);
+                    assert!(
+                        after.1.min >= before.1.max - 1.0,
+                        "in a {room}-point window with columns dragged to                          {left}/{right}/{outer}, the {} ({:?}) is drawn over                          the {} ({:?})",
+                        after.0,
+                        after.1,
+                        before.0,
+                        before.1,
+                    );
+                }
+                // And nothing hangs off the end of the window.
+                let last = edges.last().expect("panels were laid out");
+                assert!(
+                    last.1.max <= room + 1.0,
+                    "the {} runs {:.0} points past the edge of a {room}-point                      window",
+                    last.0,
+                    last.1.max - room
+                );
+            }
+        }
+    }
+
+    /// **The stage must stop where the panels start.**
+    ///
+    /// The report was that the stage's scrollbar was drawn across the
+    /// Properties panel, and that the panel would not shrink. Both are one
+    /// fact, and it is a subtle one: a panel's *reported* rectangle in `egui`
+    /// is its **contents'**, not the box it was placed in. A right-hand column
+    /// whose rows are wider than the column does not simply overflow — `egui`
+    /// trims the reported rect back to the panel's width from the **right**,
+    /// so the rect slides bodily rightwards by however much the contents
+    /// overran. The parent then hands the central panel everything left of
+    /// that slid edge, and the stage is laid out *through* the column: ruler,
+    /// scroll bars and zoom pill painted over the panel, the artwork ending
+    /// 170 points short of where the stage says it ends.
+    ///
+    /// Measured against the whole application rather than a stand-in, at the
+    /// narrowest a column can be dragged to, because the defect only appears
+    /// once something real in the column does not fit.
+    #[test]
+    fn the_stage_never_reaches_into_a_dock_column() {
+        let mut app = App::new(GpuPreference::default());
+        // Every panel there is, in the one column — which is a layout a user
+        // can arrange, and the one that asks the most of its width.
+        for id in buzz_ui::PanelId::ALL {
+            if id != buzz_ui::PanelId::Timeline {
+                app.editor.workspace.move_to(id, buzz_ui::Dock::Right);
+            }
+        }
+        // The narrowest the splitters allow, which is where a row is most
+        // likely not to fit.
+        app.editor.workspace.right_width = *buzz_ui::workspace::COLUMN_WIDTH_RANGE.start();
+        app.editor.workspace.right_outer_width = *buzz_ui::workspace::COLUMN_WIDTH_RANGE.start();
+
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+
+        // Twice: the first frame has no scroll state and the second does, and
+        // it was the settled frame that drifted.
+        for _ in 0..2 {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(1226.0, 1002.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let stage = app.build_ui(ui);
+                    for (dock, rect) in &app.dock_rects {
+                        match dock {
+                            buzz_ui::Dock::Right | buzz_ui::Dock::RightOuter => assert!(
+                                stage.right() <= rect.left() + 1.0,
+                                "the stage runs to {:.0} but the {dock:?} column                                  starts at {:.0} — {:.0} points of stage drawn                                  over the panel",
+                                stage.right(),
+                                rect.left(),
+                                stage.right() - rect.left(),
+                            ),
+                            buzz_ui::Dock::Left => assert!(
+                                stage.left() >= rect.right() - 1.0,
+                                "the stage starts at {:.0} but the left column                                  runs to {:.0}",
+                                stage.left(),
+                                rect.right(),
+                            ),
+                            _ => {}
+                        }
+                    }
+                    // And the columns still do not reach past the window.
+                    for (_, rect) in &app.dock_rects {
+                        assert!(
+                            rect.right() <= 1227.0,
+                            "a column runs {:.0} points off the right of the window",
+                            rect.right() - 1226.0
+                        );
+                    }
+                },
+            );
+        }
+    }
+
     /// **A dock column must report the rectangle it was given.**
     ///
     /// This is the invariant that failed, and everything the user saw followed
@@ -8122,3 +8401,4 @@ mod shell_tests {
         assert!(thumb.width().is_finite());
     }
 }
+

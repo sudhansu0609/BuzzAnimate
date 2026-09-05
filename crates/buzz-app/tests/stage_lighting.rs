@@ -11,7 +11,7 @@ use buzz_doc::Document;
 use buzz_geom::{Point, Rect, Shape as _, Size};
 use buzz_render::document::DrawCache;
 use buzz_render::{GpuContext, GpuPreference, wgpu};
-use buzz_scene::{LayerKind, LightKind, Scene, ShapeData};
+use buzz_scene::{EdgeMode, LayerKind, LightKind, Scene, ShapeData};
 use peniko::Color;
 
 const W: u32 = 512;
@@ -1082,23 +1082,395 @@ fn a_default_sun_lights_rather_than_dims() {
     // warm sun that lights everything by an equal factor on all three channels
     // is a dimmer switch, and reads as one.
     //
-    // **Three, not four.** This is an average over every mid-tone pixel of the
-    // artwork, and the light's colour reaches most of them through the
-    // highlight band — so the number moves with the band's *average* strength,
-    // not with its peak. Since the band was given a falloff and a default
-    // glint (`buzz_light::Light::glint`, `buzz_render`'s `glint_ramp`) it is
-    // brightest where the shape faces the light and dies away around the form,
-    // which is what a highlight does and is the whole point of the change; its
-    // mean is lower for it while its peak is not. Measured: 4.2 with the old
-    // flat band, 3.9 with the falloff alone, 3.6 at the default glint. Three
-    // still fails on the defaults this test was written to catch — those gave
-    // a flat zero — and it is not a threshold the falloff can drift under.
+    // **One and a half, not four.** This is an average over every mid-tone
+    // pixel of the artwork, and the light's colour reaches most of them through
+    // the highlight band — so the number moves with the band's *average*
+    // strength, not with its peak, and every softening of the band has taken it
+    // down. Measured: 4.2 with the old flat band, 3.9 with the falloff alone,
+    // 3.6 at the default glint, and 1.9 now the glint is **screened** rather
+    // than mixed.
+    //
+    // That last drop is the point of that change rather than a regression in
+    // it. A mix pushed the band most of the way to the light's own colour, so
+    // it read as a second, differently-coloured drawing laid over one side of
+    // the artwork — the report `buzz_light::GLINT_LIGHT` records. A screen can
+    // only *add* light, so the artwork keeps its own colour underneath and the
+    // average warmth of the frame is lower by construction.
+    //
+    // The threshold still does its job: the defaults this test was written to
+    // catch gave a flat **zero**, because they scaled all three channels alike.
+    // Anything that leaves colour behind at all clears one and a half.
     assert!(
-        warmth(&lit) > warmth(&unlit) + 3.0,
+        warmth(&lit) > warmth(&unlit) + 1.5,
         "the sun left no colour behind: warmth {:.1} lit against {:.1} unlit",
         warmth(&lit),
         warmth(&unlit)
     );
+}
+
+
+/// **Switching the edges off must leave the light and take only the bands.**
+///
+/// The report: a light was put on a character and every edge in the drawing lit
+/// up — not the figure's outline alone but each interior patch of shading,
+/// because the crescents are built from every *shape*'s own outline. The
+/// drawing stopped looking like itself.
+///
+/// `LightRig::edges` is the switch that says no. What it must do is exact: the
+/// same picture the modelling strength at zero gives — the tint, a lamp's pool
+/// and its falloff all still there — while leaving the strength itself alone,
+/// so the bands come back at the setting they had.
+#[test]
+fn edges_off_drops_the_bands_and_keeps_the_light() {
+    let Some(mut h) = harness() else { return };
+    let mut cache = DrawCache::default();
+    let mut editor = document();
+
+    let unlit = h.stage(&editor, &mut cache);
+    editor.add_light(LightKind::sun());
+    let banded = h.stage(&editor, &mut cache);
+
+    // The switch, with the strength left where it was.
+    editor
+        .doc
+        .edit("Edges", |scene| scene.lights_mut().edges = EdgeMode::Off);
+    let plain = h.stage(&editor, &mut cache);
+    assert_eq!(
+        editor.scene().lights().modelling,
+        buzz_scene::LightRig::default().modelling,
+        "switching the edges off must not spend the modelling strength"
+    );
+
+    // The bands were doing something, and they are gone.
+    assert!(
+        difference(&banded, &plain) > 0.01,
+        "the edges made no difference to switch off"
+    );
+
+    // And what is left is precisely the modelling turned down to nothing —
+    // not some third rendering of its own.
+    editor.doc.edit("Edges", |scene| {
+        let rig = scene.lights_mut();
+        rig.edges = EdgeMode::Figure;
+        rig.modelling = 0.0;
+    });
+    let at_zero = h.stage(&editor, &mut cache);
+    assert!(
+        difference(&plain, &at_zero) < 0.001,
+        "edges off drew a different picture from modelling at zero: {:.4} of \
+         the frame differs",
+        difference(&plain, &at_zero)
+    );
+
+    // The light itself is untouched: the sun still lands on the artwork, and
+    // still leaves its colour there.
+    // Measured: 9.1% of the frame moves, which is most of the artwork and the
+    // lit stage behind it. The bands account for 3% of their own.
+    assert!(
+        difference(&unlit, &plain) > 0.05,
+        "with the edges off the sun stopped lighting the artwork: only {:.4}          of the frame moved",
+        difference(&unlit, &plain)
+    );
+    // Three, for the reason spelled out on `a_default_sun_lights_rather_than_dims`
+    // — and comfortably clear of it here at 10.4, because with no shaded band
+    // taking half the artwork down the tint is all there is to measure.
+    assert!(
+        warmth(&plain) > warmth(&unlit) + 3.0,
+        "with the edges off the sun left no colour behind: warmth {:.1} lit \
+         against {:.1} unlit",
+        warmth(&plain),
+        warmth(&unlit)
+    );
+}
+
+
+/// **A figure drawn as many shapes, and the same figure drawn as one.**
+///
+/// Nine touching squares laid out as one big square, in a group — which is what
+/// a character is: a body drawn as a heap of pieces that read as one shape.
+fn tiled_figure() -> Editor {
+    let mut scene = Scene::default();
+    scene.stage_mut().background = Color::WHITE;
+    scene.stage_mut().size = Size::new(550.0, 400.0);
+    let layer = scene.add_layer("Art", LayerKind::Normal);
+
+    let mut pieces = Vec::new();
+    let mut id = 5000;
+    for row in 0..3 {
+        for col in 0..3 {
+            let x = 200.0 + col as f64 * 50.0;
+            let y = 150.0 + row as f64 * 50.0;
+            pieces.push(std::sync::Arc::new(buzz_scene::Object::shape(
+                buzz_scene::ObjectId(id),
+                ShapeData::filled(Rect::new(x, y, x + 50.0, y + 50.0).to_path(1e-9), ART),
+            )));
+            id += 1;
+        }
+    }
+    scene.add_object(
+        layer,
+        buzz_scene::Object {
+            kind: buzz_scene::ObjectKind::Group(pieces),
+            ..buzz_scene::Object::shape(
+                buzz_scene::ObjectId(4999),
+                ShapeData::filled(Rect::ZERO.to_path(1e-9), ART),
+            )
+        },
+    );
+
+    let mut editor = Editor::new(Document::new(scene));
+    editor.camera.viewport = Size::new(W as f64, H as f64);
+    editor.camera.center = Point::new(275.0, 200.0);
+    editor.camera.zoom = 0.8;
+    editor
+}
+
+/// **A character is one figure, not a hundred.**
+///
+/// This is the report the whole choice comes from: put a light on a character
+/// and every edge in the drawing lit up, the interior shading included, because
+/// the crescents were built from each *shape*'s own outline. Nine touching
+/// squares stand in for a body drawn as many pieces.
+///
+/// In [`EdgeMode::Figure`] the bands go round the outside and the inside of the
+/// figure is left alone, so the middle of it is exactly what an unmodelled
+/// light leaves. In [`EdgeMode::Shapes`] it is not: every seam inside the
+/// figure carries its own terminator and its own glint.
+#[test]
+fn a_figure_is_lit_as_one_body_and_not_as_its_pieces() {
+    let Some(mut h) = harness() else { return };
+    let mut cache = DrawCache::default();
+    let mut editor = tiled_figure();
+    editor.add_light(LightKind::sun());
+
+    let mode = |editor: &mut Editor, mode| {
+        editor
+            .doc
+            .edit("Edges", |scene| scene.lights_mut().edges = mode);
+    };
+
+    mode(&mut editor, EdgeMode::Off);
+    let plain = h.stage(&editor, &mut cache);
+    mode(&mut editor, EdgeMode::Figure);
+    let figure = h.stage(&editor, &mut cache);
+    mode(&mut editor, EdgeMode::Shapes);
+    let shapes = h.stage(&editor, &mut cache);
+
+    // The middle of the middle tile: as far inside the figure as it is possible
+    // to be, and nowhere near the outside edge any mode draws on.
+    let inside = |px: &[u8]| patch_luma(px, W / 2, H / 2 - 6, 10);
+
+    assert!(
+        (inside(&figure) - inside(&plain)).abs() < 1.0,
+        "the figure's own middle was shaded: {:.1} against {:.1} with no \
+         modelling at all",
+        inside(&figure),
+        inside(&plain)
+    );
+    assert!(
+        (inside(&shapes) - inside(&plain)).abs() > 4.0,
+        "the per-shape mode left the interior alone, so this test is no longer \
+         measuring anything: {:.1} against {:.1}",
+        inside(&shapes),
+        inside(&plain)
+    );
+
+    // And the figure is modelled — the bands are on it, they are just on the
+    // outside of it.
+    assert!(
+        difference(&figure, &plain) > 0.01,
+        "the figure was not modelled at all"
+    );
+}
+
+/// **The same figure, whether it is drawn as one shape or as nine.**
+///
+/// The point of measuring against the silhouette: a body's light must not
+/// depend on how many pieces the artist happened to draw it in.
+#[test]
+fn a_figure_is_lit_the_same_however_many_pieces_it_is_drawn_in() {
+    let Some(mut h) = harness() else { return };
+    let mut cache = DrawCache::default();
+
+    let mut tiled = tiled_figure();
+    tiled.add_light(LightKind::sun());
+    let many = h.stage(&tiled, &mut cache);
+
+    // `document` is the same 150-unit square in the same place, as one shape.
+    let mut solid = document();
+    solid.add_light(LightKind::sun());
+    let one = h.stage(&solid, &mut cache);
+
+    assert!(
+        difference(&many, &one) < 0.01,
+        "a figure drawn in nine pieces was lit differently from the same figure \
+         drawn in one: {:.4} of the frame differs",
+        difference(&many, &one)
+    );
+}
+
+/// **A lit edge is light on the drawing, not a new colour over it.**
+///
+/// The highlight used to be a lerp 78% of the way towards the light's own
+/// colour, so a red coat and a grey wall came out of the same lamp the same
+/// pale peach — the light replaced the artwork rather than falling on it. It is
+/// a screen now: it can only add.
+#[test]
+fn a_highlight_keeps_the_colour_it_falls_on() {
+    let Some(mut h) = harness() else { return };
+    let mut cache = DrawCache::default();
+
+    // A strongly coloured drawing under a strongly coloured light: the case
+    // that shows a mix up for what it is.
+    let red = Color::from_rgb8(0xC0, 0x20, 0x18);
+    let mut scene = Scene::default();
+    scene.stage_mut().background = Color::WHITE;
+    scene.stage_mut().size = Size::new(550.0, 400.0);
+    let layer = scene.add_layer("Art", LayerKind::Normal);
+    scene.add_shape(
+        layer,
+        ShapeData::filled(Rect::new(200.0, 150.0, 350.0, 300.0).to_path(1e-9), red),
+    );
+    let mut editor = Editor::new(Document::new(scene));
+    editor.camera.viewport = Size::new(W as f64, H as f64);
+    editor.camera.center = Point::new(275.0, 200.0);
+    editor.camera.zoom = 0.8;
+
+    editor.add_light(LightKind::sun());
+    editor.doc.edit("Cool key", |scene| {
+        let id = scene.lights().lights[0].id;
+        let light = scene.lights_mut().get_mut(id).expect("the sun");
+        // A cold light, so a band that took the light's colour would go blue.
+        light.color = Color::from_rgb8(0x60, 0xA0, 0xFF);
+        light.intensity = 1.6;
+        light.glint = 1.0;
+    });
+    let lit = h.stage(&editor, &mut cache);
+
+    // The brightest pixels of the artwork are the glint, which is the band
+    // under test. Red must still be leading blue there: light fell on a red
+    // coat and it is a brighter red, not a blue one.
+    let mut brightest = (0.0, [0u8; 3]);
+    for px in lit.chunks_exact(4) {
+        let luma = 0.2126 * px[0] as f64 + 0.7152 * px[1] as f64 + 0.0722 * px[2] as f64;
+        // Artwork only: not the white stage, not the dark pasteboard.
+        if luma < 235.0 && luma > brightest.0 {
+            brightest = (luma, [px[0], px[1], px[2]]);
+        }
+    }
+    let [r, _, b] = brightest.1;
+    assert!(
+        r > b,
+        "the glint took the light's colour instead of adding to the artwork's: \
+         the brightest lit pixel is {:?}",
+        brightest.1
+    );
+}
+
+
+/// Not an assertion: the three edge modes on one figure, side by side, so the
+/// choice can be judged by eye. `BUZZ_DUMP=<dir> cargo test -p buzz-app --test
+/// stage_lighting dump_edge_modes -- --ignored`.
+#[test]
+#[ignore = "diagnostic"]
+fn dump_edge_modes() {
+    let Some(mut h) = harness() else { return };
+    let out = std::path::Path::new(&std::env::var("BUZZ_DUMP").unwrap_or_default()).to_path_buf();
+    if out.as_os_str().is_empty() {
+        return;
+    }
+    std::fs::create_dir_all(&out).expect("dump dir");
+    let write = |name: &str, pixels: &[u8]| {
+        let file = std::fs::File::create(out.join(name)).expect("create");
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), W, H);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()
+            .expect("header")
+            .write_image_data(pixels)
+            .expect("data");
+    };
+
+    // A figure drawn the way a character is: a stack of pieces, in one group,
+    // each its own shape, some of them the interior shading a light used to
+    // outline separately.
+    let mut scene = Scene::default();
+    scene.stage_mut().background = Color::from_rgb8(0xF2, 0xEE, 0xE6);
+    scene.stage_mut().size = Size::new(550.0, 400.0);
+    let layer = scene.add_layer("Art", LayerKind::Normal);
+    let skin = Color::from_rgb8(0xD8, 0xA0, 0x78);
+    let coat = Color::from_rgb8(0xB8, 0x32, 0x28);
+    let dark = Color::from_rgb8(0x8A, 0x22, 0x1C);
+    let mut id = 7000;
+    let mut piece = |path: buzz_geom::BezPath, colour: Color| {
+        id += 1;
+        std::sync::Arc::new(buzz_scene::Object::shape(
+            buzz_scene::ObjectId(id),
+            ShapeData::filled(path, colour),
+        ))
+    };
+    let ellipse = |cx: f64, cy: f64, rx: f64, ry: f64| {
+        // Scaled from a unit circle: `buzz_geom` re-exports `Circle`, not
+        // `Ellipse`, and an ellipse is a circle that has been stretched.
+        buzz_geom::Affine::translate((cx, cy))
+            * buzz_geom::Affine::scale_non_uniform(rx, ry)
+            * buzz_geom::Circle::new(Point::ZERO, 1.0).to_path(0.001)
+    };
+    let pieces = vec![
+        // Body, then arms, then the head — and two panels of interior shading
+        // on the coat, which is what a per-shape light outlines separately.
+        piece(ellipse(275.0, 250.0, 62.0, 78.0), coat),
+        piece(ellipse(216.0, 246.0, 20.0, 58.0), coat),
+        piece(ellipse(334.0, 246.0, 20.0, 58.0), coat),
+        piece(ellipse(252.0, 258.0, 22.0, 52.0), dark),
+        piece(ellipse(298.0, 262.0, 18.0, 44.0), dark),
+        piece(ellipse(275.0, 150.0, 44.0, 48.0), skin),
+    ];
+    scene.add_object(
+        layer,
+        buzz_scene::Object {
+            kind: buzz_scene::ObjectKind::Group(pieces),
+            ..buzz_scene::Object::shape(
+                buzz_scene::ObjectId(6999),
+                ShapeData::filled(Rect::ZERO.to_path(1e-9), coat),
+            )
+        },
+    );
+
+    let mut editor = Editor::new(Document::new(scene));
+    editor.camera.viewport = Size::new(W as f64, H as f64);
+    editor.camera.center = Point::new(275.0, 210.0);
+    editor.camera.zoom = 1.1;
+
+    let mut cache = DrawCache::default();
+    write("0-unlit.png", &h.stage(&editor, &mut cache));
+
+    editor.add_light(LightKind::Lamp {
+        position: Point::new(120.0, 90.0),
+        height: 180.0,
+        radius: 520.0,
+    });
+    editor.doc.edit("Lamp", |scene| {
+        let id = scene.lights().lights[0].id;
+        let light = scene.lights_mut().get_mut(id).expect("the lamp");
+        light.color = Color::from_rgb8(0xFF, 0xE0, 0xB0);
+        light.intensity = 1.8;
+        scene.lights_mut().base = Color::from_rgb8(0x50, 0x58, 0x70);
+    });
+
+    for (name, mode) in [
+        ("1-shapes.png", EdgeMode::Shapes),
+        ("2-figure.png", EdgeMode::Figure),
+        ("3-off.png", EdgeMode::Off),
+    ] {
+        editor
+            .doc
+            .edit("Edges", |scene| scene.lights_mut().edges = mode);
+        // Twice: the first lit frame is the one that builds the geometry.
+        h.stage(&editor, &mut cache);
+        write(name, &h.stage(&editor, &mut cache));
+    }
+    eprintln!("wrote {}", out.display());
 }
 
 
@@ -2428,7 +2800,14 @@ fn encode_stage(editor: &Editor, cache: &mut DrawCache) -> u32 {
 fn a_frame_too_big_to_rasterise_trims_its_lighting_rather_than_vanishing() {
     use buzz_render::document::{LightDetail, segment_ceiling};
 
-    let mut editor = dense_document(700, 600);
+    // **Calibrated to straddle the ceiling**: it must fit unlit and not fit
+    // lit, or it is measuring nothing. That makes it sensitive to anything that
+    // changes what lighting costs — it has had to grow once already, when the
+    // shading direction started following the light's height and the crescents
+    // came out simpler. If this fails on the first assertion the fixture is too
+    // big for the ceiling; if it fails on the second, lighting got cheaper and
+    // the fixture needs to grow again. Neither is the trimming being broken.
+    let mut editor = dense_document(900, 600);
     let mut cache = DrawCache::default();
 
     // Unlit, this document is already most of what can be encoded, and nothing
@@ -3172,5 +3551,444 @@ fn diagnose_the_switch_through_the_window() {
     eprintln!(
         "  undo of the switch differs from the first lit frame by {:.2}%",
         difference(&lit, &undone) * 100.0
+    );
+}
+
+
+/// **A rigged character is one body to the light, joints included.**
+///
+/// The report, with a picture: a lit figure had a pale band across the elbow
+/// and another across the wrist — the places where one rig part overlaps the
+/// next. Measured off the screenshot the arm read (115, 86, 28) and the band
+/// (174, 119, 28), which is not shading, it is shading *missing*: the bands
+/// were being measured against each part's own outline, so every part's hidden
+/// cap edge carried a terminator of its own and the overlap fell between two
+/// of them.
+///
+/// A figure's light must not know how many bones the animator used. Two
+/// overlapping parts on one armature, and the seam must read the same as the
+/// solid middle of the limb.
+#[test]
+fn a_rigged_figure_has_no_seam_at_its_joints() {
+    let Some(mut h) = harness() else { return };
+    let mut cache = DrawCache::default();
+
+    // An upper arm and a forearm, overlapping the way rig parts do: the second
+    // starts well inside the first, so the joint is a real overlap and not two
+    // shapes meeting at a line.
+    let mut scene = Scene::default();
+    scene.stage_mut().background = Color::WHITE;
+    scene.stage_mut().size = Size::new(550.0, 400.0);
+    let layer = scene.add_layer("Art", LayerKind::Normal);
+
+    let mut armature = buzz_rig::Armature::default();
+    armature.push_dragged("upper", None, Point::new(275.0, 130.0), Point::new(275.0, 200.0));
+    armature.push_dragged("fore", Some(0), Point::new(275.0, 200.0), Point::new(275.0, 270.0));
+
+    let limb = |id: u64, y0: f64, y1: f64, bone: usize| buzz_scene::rig::RigPart {
+        artwork: std::sync::Arc::new(buzz_scene::Object::shape(
+            buzz_scene::ObjectId(id),
+            ShapeData::filled(Rect::new(240.0, y0, 310.0, y1).to_path(1e-9), ART),
+        )),
+        binding: buzz_scene::rig::RigBinding::Rigid(bone),
+    };
+
+    let mut data = buzz_scene::rig::ArmatureData::new(armature);
+    data.parts.push(limb(6001, 130.0, 210.0, 0));
+    // Overlapping the one above by twenty units — the joint.
+    data.parts.push(limb(6002, 190.0, 270.0, 1));
+
+    scene.add_object(
+        layer,
+        buzz_scene::Object {
+            kind: buzz_scene::ObjectKind::Armature(data),
+            ..buzz_scene::Object::shape(
+                buzz_scene::ObjectId(6000),
+                ShapeData::filled(Rect::ZERO.to_path(1e-9), ART),
+            )
+        },
+    );
+
+    let mut editor = Editor::new(Document::new(scene));
+    editor.camera.viewport = Size::new(W as f64, H as f64);
+    editor.camera.center = Point::new(275.0, 200.0);
+    editor.camera.zoom = 0.8;
+    editor.add_light(LightKind::sun());
+    editor
+        .doc
+        .edit("Edges", |scene| scene.lights_mut().edges = EdgeMode::Figure);
+
+    let px = h.stage(&editor, &mut cache);
+
+    // Straight down the middle of the limb: above the joint, across it, below.
+    // The centre of the frame is document (275, 200), which is the joint.
+    let at = |dy: i32| patch_luma(&px, W / 2, (H as i32 / 2 + dy) as u32, 3);
+    let above = at(-30);
+    let seam = at(-5);
+    let below = at(30);
+
+    assert!(
+        (seam - above).abs() < 4.0 && (seam - below).abs() < 4.0,
+        "the joint is a band: the limb reads {above:.1} above it and \
+         {below:.1} below it, and {seam:.1} across it"
+    );
+}
+
+
+/// **The same two limbs, drawn as separate objects rather than bound to one
+/// armature** — which is how cut-out artwork arrives from an import, and how a
+/// character is drawn before anybody rigs it.
+///
+/// A body is a body whether or not its pieces have bones in them, so this must
+/// read exactly like [`a_rigged_figure_has_no_seam_at_its_joints`]. It does
+/// not: measured down the middle of the limb the overlap comes out at 195
+/// against 185 either side of it, because [`EdgeMode::Figure`] takes each
+/// **top-level object** as one figure, so the upper edge of the overlapping
+/// piece — an edge buried inside the limb — carries a glint of its own.
+///
+/// Fixed by grouping a layer's overlapping objects into one figure before the
+/// pass is opened — see `figure_groups`. A body's pieces touch, and props
+/// standing apart on a stage do not, so overlapping is the question that
+/// separates the two.
+#[test]
+fn overlapping_pieces_on_a_layer_are_lit_as_one_figure() {
+    let Some(mut h) = harness() else { return };
+    let mut cache = DrawCache::default();
+    let mut scene = Scene::default();
+    scene.stage_mut().background = Color::WHITE;
+    scene.stage_mut().size = Size::new(550.0, 400.0);
+    let layer = scene.add_layer("Art", LayerKind::Normal);
+    for (id, y0, y1) in [(7001u64, 130.0, 210.0), (7002, 190.0, 270.0)] {
+        scene.add_object(
+            layer,
+            buzz_scene::Object::shape(
+                buzz_scene::ObjectId(id),
+                ShapeData::filled(Rect::new(240.0, y0, 310.0, y1).to_path(1e-9), ART),
+            ),
+        );
+    }
+    let mut editor = Editor::new(Document::new(scene));
+    editor.camera.viewport = Size::new(W as f64, H as f64);
+    editor.camera.center = Point::new(275.0, 200.0);
+    editor.camera.zoom = 0.8;
+    editor.add_light(LightKind::sun());
+    editor
+        .doc
+        .edit("Edges", |scene| scene.lights_mut().edges = EdgeMode::Figure);
+
+    let px = h.stage(&editor, &mut cache);
+    let at = |dy: i32| patch_luma(&px, W / 2, (H as i32 / 2 + dy) as u32, 3);
+    // The joint, and the solid limb either side of it.
+    let (above, seam, below) = (at(-30), at(-5), at(30));
+    assert!(
+        (seam - above).abs() < 4.0 && (seam - below).abs() < 4.0,
+        "the joint is a band: the limb reads {above:.1} above it and          {below:.1} below it, and {seam:.1} across it"
+    );
+}
+
+/// **A cast shadow is a silhouette, and a silhouette has no seams in it.**
+///
+/// The report came with a picture: the figure's shadow on the ground had the
+/// figure's own linework traced across it in light — the fold lines of a sari
+/// showing as pale threads inside the dark. They are not lines drawn into the
+/// shadow. They are the shadow *missing*: it was cast from the fills alone, so
+/// wherever the artwork put a stroke between two filled regions the ground
+/// showed straight through the gap.
+///
+/// Two filled regions with a stroked line along the join, and the shadow across
+/// that join must be as dark as the shadow either side of it.
+#[test]
+fn a_cast_shadow_has_no_gap_where_the_artwork_has_a_line() {
+    let Some(mut h) = harness() else { return };
+    let mut cache = DrawCache::default();
+
+    let mut scene = Scene::default();
+    scene.stage_mut().background = Color::WHITE;
+    scene.stage_mut().size = Size::new(550.0, 400.0);
+    let layer = scene.add_layer("Art", LayerKind::Normal);
+
+    // Two panels meeting at y = 200, and the line the artist drew along the
+    // join — which is exactly the arrangement that left a thread of light.
+    // Side by side, so the join runs **along** the throw and the gap is not
+    // squashed away by the projection — the way a garment's fold lines run
+    // down a figure and straight down its shadow. One drawing, not three
+    // objects: a ground shadow is anchored per caster, so pieces of one figure
+    // have to be one caster or they throw from different places.
+    let piece = |id: u64, x0: f64, x1: f64| {
+        std::sync::Arc::new(buzz_scene::Object::shape(
+            buzz_scene::ObjectId(id),
+            ShapeData::filled(Rect::new(x0, 120.0, x1, 280.0).to_path(1e-9), ART),
+        ))
+    };
+    let mut join = buzz_geom::BezPath::new();
+    join.move_to((275.0, 120.0));
+    join.line_to((275.0, 280.0));
+    let line = std::sync::Arc::new(buzz_scene::Object::shape(
+        buzz_scene::ObjectId(8003),
+        ShapeData::stroked(join, Color::BLACK, 16.0),
+    ));
+
+    // **Inside a symbol, a piece to a layer** — which is how a character is
+    // actually built, and the arrangement the report came from. The shadow pass
+    // has to reach the line art through the instance and the symbol's own layer
+    // stack, not only through a group on the stage.
+    let symbol = scene.add_symbol("Figure", buzz_scene::SymbolKind::Graphic, None);
+    scene.library_mut().update(symbol, |symbol| {
+        for (i, (name, art)) in [
+            ("left", piece(8001, 200.0, 268.0)),
+            ("right", piece(8002, 282.0, 350.0)),
+            ("lines", line.clone()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut inner =
+                buzz_scene::Layer::new(buzz_scene::LayerId(8100 + i as u64), name, LayerKind::Normal);
+            inner.frames.set_objects(0, vec![art]);
+            symbol.layers.push_front(inner);
+        }
+    });
+    scene.add_object(
+        layer,
+        buzz_scene::Object {
+            kind: buzz_scene::ObjectKind::Instance(buzz_scene::SymbolInstance::new(symbol)),
+            ..buzz_scene::Object::shape(
+                buzz_scene::ObjectId(8000),
+                ShapeData::filled(Rect::ZERO.to_path(1e-9), ART),
+            )
+        },
+    );
+
+    let mut editor = Editor::new(Document::new(scene));
+    editor.camera.viewport = Size::new(W as f64, H as f64);
+    editor.camera.center = Point::new(275.0, 200.0);
+    editor.camera.zoom = 0.8;
+    editor.add_light(LightKind::sun());
+    editor.doc.edit("Shadows", |scene| {
+        let rig = scene.lights_mut();
+        rig.edges = EdgeMode::Off;
+        for light in rig.lights.iter_mut() {
+            light.shadows = true;
+            light.shadow_strength = 1.0;
+        }
+    });
+
+    let px = h.stage(&editor, &mut cache);
+
+    // Straight across the middle of the shadow, over where the line is. Every
+    // sample is inside the silhouette, so every sample must be shadow: before
+    // this was fixed the middle of this run came back at 255 — bare, fully lit
+    // ground — with the dark either side of it.
+    let across: Vec<f64> = (W / 2 - 36..W / 2 + 36)
+        .step_by(2)
+        .map(|x| patch_luma(&px, x, 340, 2))
+        .collect();
+    let lightest = across.iter().cloned().fold(f64::MIN, f64::max);
+    assert!(
+        lightest < 12.0,
+        "the artwork's own line is a gap in its shadow: the silhouette runs to          {lightest:.0} where it should be solid ({across:?})"
+    );
+}
+
+/// **A figure's light must not depend on which way its outlines were drawn.**
+///
+/// This is the "the intersections glow" report, and the mechanism is a good
+/// deal less obvious than the picture. A figure's bands are measured against
+/// the silhouette of everything it draws, and that silhouette is *concatenated*
+/// rather than unioned — filled non-zero, overlapping contours merge, for a
+/// fraction of the cost of a real boolean. That holds only while every contour
+/// turns the same way. Two wound opposite ways **cancel** where they overlap,
+/// so the silhouette comes back with a hole punched in it exactly at the
+/// intersection — and a hole in the silhouette is a gap in the shading, which
+/// on a shaded figure reads as a patch of light.
+///
+/// Nothing about a path says which way round it should go and an importer emits
+/// whatever the source file had, so a character with a limb to a layer lit up
+/// along every joint. Measured here: with the second limb reversed, the twenty
+/// units of overlap came back at 87 against 185 for the same limb either side
+/// of it.
+#[test]
+fn a_figure_is_lit_the_same_whichever_way_its_outlines_are_wound() {
+    let Some(mut h) = harness() else { return };
+    let mut cache = DrawCache::default();
+
+    // The same rectangle, drawn clockwise and anticlockwise.
+    let wound = |x0: f64, y0: f64, x1: f64, y1: f64, forward: bool| {
+        let mut p = buzz_geom::BezPath::new();
+        let pts = if forward {
+            [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        } else {
+            [(x0, y0), (x0, y1), (x1, y1), (x1, y0)]
+        };
+        p.move_to(pts[0]);
+        for q in &pts[1..] {
+            p.line_to(*q);
+        }
+        p.close_path();
+        p
+    };
+
+    // An upper arm and a forearm overlapping at the elbow, as one drawing.
+    let limb = |forward: bool| {
+        let mut scene = Scene::default();
+        scene.stage_mut().background = Color::WHITE;
+        scene.stage_mut().size = Size::new(550.0, 400.0);
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let part = |id: u64, y0: f64, y1: f64, fwd: bool| {
+            std::sync::Arc::new(buzz_scene::Object::shape(
+                buzz_scene::ObjectId(id),
+                ShapeData::filled(wound(240.0, y0, 310.0, y1, fwd), ART),
+            ))
+        };
+        scene.add_object(
+            layer,
+            buzz_scene::Object {
+                kind: buzz_scene::ObjectKind::Group(vec![
+                    part(9001, 130.0, 210.0, true),
+                    part(9002, 190.0, 270.0, forward),
+                ]),
+                ..buzz_scene::Object::shape(
+                    buzz_scene::ObjectId(9000),
+                    ShapeData::filled(Rect::ZERO.to_path(1e-9), ART),
+                )
+            },
+        );
+        let mut editor = Editor::new(Document::new(scene));
+        editor.camera.viewport = Size::new(W as f64, H as f64);
+        editor.camera.center = Point::new(275.0, 200.0);
+        editor.camera.zoom = 0.8;
+        editor.add_light(LightKind::sun());
+        editor
+            .doc
+            .edit("Edges", |scene| scene.lights_mut().edges = EdgeMode::Figure);
+        editor
+    };
+
+    let agreeing = h.stage(&limb(true), &mut cache);
+    let opposed = h.stage(&limb(false), &mut cache);
+
+    // Down the middle of the limb, through the joint and well past it either
+    // side. The two must agree everywhere: the winding is not a lighting
+    // decision.
+    for dy in (-40..=40).step_by(5) {
+        let y = (H as i32 / 2 + dy) as u32;
+        let (a, b) = (
+            patch_luma(&agreeing, W / 2, y, 3),
+            patch_luma(&opposed, W / 2, y, 3),
+        );
+        assert!(
+            (a - b).abs() < 2.0,
+            "reversing an outline changed the light on the figure: {a:.0}              against {b:.0}, {dy} points from the joint"
+        );
+    }
+}
+
+/// **A shadow of artwork drawn in touching regions is one tone.**
+///
+/// The second half of the "inner outlines in the shadow" report, and a
+/// different mechanism from the first. The first was gaps: a shadow cast from
+/// the fills alone left a hole wherever the artist had drawn a *line* between
+/// two regions. This is the case where there is no gap at all — the regions
+/// share their boundary exactly, which is how imported artwork is drawn, Flash
+/// having scan-converted a shape as a soup of edges in one pass.
+///
+/// A shadow is one black fill per shape of the caster, and every one of them is
+/// antialiased on its own. Along a shared boundary each covers about half of
+/// every pixel, and half composited over half is three quarters, not one. The
+/// missing quarter is the ground, and it traces every internal border in the
+/// figure as a pale line across its shadow. It is the conflation artifact, the
+/// artwork has been sealed against it for exactly this reason, and its shadow
+/// had not been.
+///
+/// Six touching strips, and the shadow across all five joins must be as dark in
+/// the middle as it is anywhere.
+#[test]
+fn a_shadow_of_touching_regions_has_no_seams_in_it() {
+    let Some(mut h) = harness() else { return };
+    let mut cache = DrawCache::default();
+
+    let mut scene = Scene::default();
+    scene.stage_mut().background = Color::WHITE;
+    scene.stage_mut().size = Size::new(550.0, 400.0);
+    let layer = scene.add_layer("Art", LayerKind::Normal);
+
+    // A symbol with a strip to a layer, sharing every boundary exactly — the
+    // arrangement a character imported from Animate arrives in.
+    let symbol = scene.add_symbol("Figure", buzz_scene::SymbolKind::Graphic, None);
+    scene.library_mut().update(symbol, |symbol| {
+        for i in 0..6u64 {
+            let x0 = 200.0 + i as f64 * 25.0;
+            let art = std::sync::Arc::new(buzz_scene::Object::shape(
+                buzz_scene::ObjectId(9001 + i),
+                ShapeData::filled(Rect::new(x0, 120.0, x0 + 25.0, 280.0).to_path(1e-9), ART),
+            ));
+            let mut inner = buzz_scene::Layer::new(
+                buzz_scene::LayerId(9200 + i),
+                format!("strip {i}"),
+                LayerKind::Normal,
+            );
+            inner.frames.set_objects(0, vec![art]);
+            symbol.layers.push_front(inner);
+        }
+    });
+    scene.add_object(
+        layer,
+        buzz_scene::Object {
+            kind: buzz_scene::ObjectKind::Instance(buzz_scene::SymbolInstance::new(symbol)),
+            ..buzz_scene::Object::shape(
+                buzz_scene::ObjectId(9100),
+                ShapeData::filled(Rect::ZERO.to_path(1e-9), ART),
+            )
+        },
+    );
+
+    let mut editor = Editor::new(Document::new(scene));
+    editor.camera.viewport = Size::new(W as f64, H as f64);
+    editor.camera.center = Point::new(275.0, 250.0);
+    editor.camera.zoom = 0.5;
+    editor.add_light(LightKind::Sun {
+        azimuth: 0.0,
+        elevation: 0.6,
+    });
+    editor.doc.edit("Shadows", |scene| {
+        let rig = scene.lights_mut();
+        rig.edges = EdgeMode::Off;
+        for light in rig.lights.iter_mut() {
+            light.shadows = true;
+            light.shadow_strength = 1.0;
+        }
+    });
+
+    let px = h.stage(&editor, &mut cache);
+    let luma = |x: u32, y: u32| {
+        let i = ((y * W + x) * 4) as usize;
+        0.2126 * px[i] as f64 + 0.7152 * px[i + 1] as f64 + 0.0722 * px[i + 2] as f64
+    };
+
+    // The row with the most shadow in it, and then across the shadow itself.
+    let row = (140..320)
+        .max_by_key(|y| (130..390).filter(|x| luma(*x, *y) < 60.0).count())
+        .expect("a row");
+    let across: Vec<f64> = (130..390).map(|x| luma(x, row)).collect();
+    let inside: Vec<usize> = across
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v < 60.0)
+        .map(|(i, _)| i)
+        .collect();
+    // Strictly inside: the shadow's own outer edge is antialiased against the
+    // ground and is supposed to be, so the last few samples either end are the
+    // silhouette rather than a seam in it.
+    const EDGE: usize = 4;
+    let (first, last) = (
+        *inside.first().expect("some shadow") + EDGE,
+        *inside.last().expect("some shadow") - EDGE,
+    );
+    assert!(last > first + 20, "too little shadow to measure across");
+    let middle = &across[first..=last];
+    let worst = middle.iter().cloned().fold(f64::MIN, f64::max);
+    assert!(
+        worst < 30.0,
+        "the shadow is seamed where the artwork's regions touch: it runs to          {worst:.0} inside its own silhouette (row {row}, {middle:?})"
     );
 }

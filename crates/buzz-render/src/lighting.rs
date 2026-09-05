@@ -70,6 +70,16 @@ struct Place {
     /// as a translation does — which the old key, a quantised centre point,
     /// could not see.
     doc: [i64; 6],
+    /// **What the artwork is made of**, when the object's own address does not
+    /// say. Zero for a shape, whose address is the whole answer.
+    ///
+    /// A *figure* is measured against everything it draws, and an instance
+    /// draws artwork that lives in the library rather than under its own
+    /// pointer: editing the symbol, or the symbol's playhead reaching the next
+    /// keyframe, changes the silhouette without changing anything else in this
+    /// key. The renderer folds the library's identity and the frame into this
+    /// so those cannot go unnoticed. See `document`'s figure pass.
+    content: u64,
 }
 
 /// A light direction and softness, rounded to the step the cache works in.
@@ -209,6 +219,20 @@ pub struct LightCache {
     /// Whether anything this frame was drawn with geometry that is not the
     /// geometry it asked for. See [`LightCache::is_stale`].
     stale: bool,
+    /// **The figure being drawn right now, as its own outline accumulates.**
+    ///
+    /// A figure's crescents are measured against the silhouette of everything
+    /// it draws — a group, a rig, a character symbol and its whole subtree —
+    /// and the honest way to get that is to take it from the draw itself:
+    /// whatever was drawn is what the light is on. So the renderer switches
+    /// this on around one object, every filled path it draws lands here, and
+    /// the crescents are built from the lot.
+    ///
+    /// `None` between figures, and — deliberately — `None` while a figure whose
+    /// geometry is already cached is drawn, because collecting copies every
+    /// path in it and on a hit there is nothing to build from them. See
+    /// [`LightCache::ready`].
+    collecting: Option<BezPath>,
     /// The "nothing" handed back when there is not even stale geometry to show.
     empty: Arc<ShadeGeometry>,
 }
@@ -232,6 +256,7 @@ impl Default for LightCache {
             misses: Vec::new(),
             queued: HashSet::new(),
             stale: false,
+            collecting: None,
             empty: Arc::default(),
         }
     }
@@ -291,6 +316,7 @@ impl LightCache {
         self.misses.clear();
         self.queued.clear();
         self.stale = false;
+        self.collecting = None;
         self.inline_spent = std::time::Duration::ZERO;
     }
 
@@ -389,6 +415,99 @@ impl LightCache {
         }
     }
 
+    /// **The shape index a whole figure's crescents are keyed under.**
+    ///
+    /// A figure's silhouette is not any one of its shapes, so it needs a slot
+    /// of its own in the same placement. Reserved at the top of the range,
+    /// where no real shape index can reach: a group with sixty-five thousand
+    /// children has other problems.
+    pub const FIGURE: u16 = u16::MAX;
+
+    /// **The crescents already built for this placement and aim**, if any.
+    ///
+    /// A cheap look before the work: it tells the renderer whether it has to
+    /// collect a figure's silhouette at all. Collecting copies every path the
+    /// figure draws, and on a hit — which is nearly every frame of nearly every
+    /// document — there would be nothing to build from them.
+    ///
+    /// Marks the placement used, exactly as a hit through
+    /// [`crescents`](Self::crescents) does, so looking is enough to keep it
+    /// alive.
+    pub fn ready(
+        &mut self,
+        owner: Option<&Arc<Object>>,
+        shape_index: u16,
+        content: u64,
+        doc: Affine,
+        towards: Vec2,
+        softness: f64,
+    ) -> Option<Arc<ShadeGeometry>> {
+        let place = Self::place(owner?, shape_index, content, doc);
+        let slot = self.places.get_mut(&place)?;
+        slot.used = self.frame;
+        slot.built.get(&Aim::of(towards, softness)).map(Arc::clone)
+    }
+
+    /// The key one piece of artwork is cached under.
+    fn place(owner: &Arc<Object>, shape_index: u16, content: u64, doc: Affine) -> Place {
+        Place {
+            object: Arc::as_ptr(owner) as usize,
+            shape: shape_index,
+            doc: quantise(doc),
+            content,
+        }
+    }
+
+    /// Start gathering the outline of the figure about to be drawn.
+    ///
+    /// Everything [`add_silhouette`](Self::add_silhouette) is given until
+    /// [`take_silhouette`](Self::take_silhouette) becomes one path.
+    pub fn collect_silhouette(&mut self) {
+        self.collecting = Some(BezPath::new());
+    }
+
+    /// Is a figure being gathered? Read by the shape path, which is on the hot
+    /// route and must not pay for a figure nobody is collecting.
+    pub fn collecting(&self) -> bool {
+        self.collecting.is_some()
+    }
+
+    /// Add one drawn path to the figure being gathered.
+    ///
+    /// **Concatenated, not unioned.** Filled non-zero, overlapping subpaths
+    /// merge — which is what a silhouette means, and what the booleans that
+    /// build the crescents read it as (`buzz_geom::FillMode::NonZero`). A union
+    /// would be a boolean per shape per figure to arrive at a path nobody could
+    /// tell apart. The same choice, for the same reason, as the silhouette a
+    /// filter is built from.
+    /// **Wound one way as it goes in.** Concatenating only merges under the
+    /// non-zero rule while every path turns the same way; two wound opposite
+    /// ways cancel where they overlap, and the figure's silhouette comes back
+    /// with a hole in it exactly at the intersection. On a character drawn a
+    /// limb to a layer that is a hole at every joint — a gap in the shading,
+    /// which on a shaded figure reads as a patch of light.
+    ///
+    /// Per path rather than per contour, so a path's own holes survive: see
+    /// [`buzz_geom::turns_backwards`]. A path already the right way round is
+    /// not copied.
+    pub fn add_silhouette(&mut self, placed: &BezPath) {
+        if let Some(out) = &mut self.collecting {
+            for element in buzz_geom::wound_forward(placed).elements() {
+                out.push(*element);
+            }
+        }
+    }
+
+    /// Finish gathering, and hand back what was drawn.
+    ///
+    /// `None` when nothing was collected — an object that drew no filled
+    /// artwork has no silhouette and no light on it.
+    pub fn take_silhouette(&mut self) -> Option<BezPath> {
+        self.collecting
+            .take()
+            .filter(|path| !path.elements().is_empty())
+    }
+
     /// The crescents for one shape, building them only if they are not here.
     ///
     /// `placed` is the path already in document space — the caller has it, from
@@ -411,17 +530,56 @@ impl LightCache {
         towards: Vec2,
         softness: f64,
     ) -> Arc<ShadeGeometry> {
+        self.geometry(owner, shape_index, 0, placed, doc, towards, softness)
+    }
+
+    /// The crescents for **a whole figure**, from the silhouette it drew.
+    ///
+    /// The same cache and the same deferral as one shape's, under the figure's
+    /// reserved index ([`FIGURE`](Self::FIGURE)) and with `content` standing in
+    /// for everything about the artwork that the object's own address does not
+    /// carry — see [`Place::content`].
+    pub fn figure(
+        &mut self,
+        owner: Option<&Arc<Object>>,
+        content: u64,
+        silhouette: &BezPath,
+        doc: Affine,
+        towards: Vec2,
+        softness: f64,
+    ) -> Arc<ShadeGeometry> {
+        self.geometry(
+            owner,
+            Self::FIGURE,
+            content,
+            silhouette,
+            doc,
+            towards,
+            softness,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the cache key, spelled out; a struct would only move it"
+    )]
+    fn geometry(
+        &mut self,
+        owner: Option<&Arc<Object>>,
+        shape_index: u16,
+        content: u64,
+        placed: &BezPath,
+        doc: Affine,
+        towards: Vec2,
+        softness: f64,
+    ) -> Arc<ShadeGeometry> {
         let aim = Aim::of(towards, softness);
 
         let Some(owner) = owner else {
             return Arc::new(buzz_light::crescents(placed, aim.towards(), aim.softness()));
         };
 
-        let place = Place {
-            object: Arc::as_ptr(owner) as usize,
-            shape: shape_index,
-            doc: quantise(doc),
-        };
+        let place = Self::place(owner, shape_index, content, doc);
 
         // The common path: one hash lookup, no geometry touched at all.
         if let Some(slot) = self.places.get_mut(&place) {
@@ -580,20 +738,34 @@ mod tests {
         cache.set_defer(false);
         let before = ask(&mut cache, &object, &light);
 
-        // Brighter, warmer, higher, no longer casting: the picture changes, the
-        // terminator does not move.
+        // Brighter, warmer, standing higher off the background, no longer
+        // casting: the picture changes, the terminator does not move.
+        //
+        // **Elevation is not on this list.** It used to be — the shading
+        // direction was read off the light's compass bearing, and raising the
+        // sun only shortened its shadow. It now tilts the light up the picture,
+        // so it moves the terminator like any other aim and must rebuild like
+        // one. See `Light::screen_towards`.
         let mut same_aim = light.clone();
         same_aim.intensity = 3.0;
         same_aim.color = Color::from_rgb8(0x00, 0x40, 0xFF);
         same_aim.standing_height = 400.0;
         same_aim.shadows = false;
-        if let LightKind::Sun { elevation, .. } = &mut same_aim.kind {
-            *elevation = 1.4;
-        }
         let after = ask(&mut cache, &object, &same_aim);
         assert!(
             Arc::ptr_eq(&before, &after),
             "nothing that leaves the terminator where it is may rebuild it"
+        );
+
+        // Raise it, and it must rebuild: the light is coming from somewhere
+        // else on the picture now.
+        let mut raised = light.clone();
+        if let LightKind::Sun { elevation, .. } = &mut raised.kind {
+            *elevation = 1.4;
+        }
+        assert!(
+            !Arc::ptr_eq(&before, &ask(&mut cache, &object, &raised)),
+            "raising the sun left the terminator where it was"
         );
 
         // Swing it round, and it must rebuild.

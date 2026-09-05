@@ -46,6 +46,11 @@ pub enum AssetAction {
     DeleteFolder {
         folder: String,
     },
+    /// **Move an asset into a folder**, which is what dropping it on one means.
+    MoveToFolder {
+        asset: Asset,
+        folder: String,
+    },
     /// Read the directory again.
     Rescan,
     /// Bring an entire Animate asset library across.
@@ -128,6 +133,15 @@ pub struct AssetPanelState {
     renaming: Option<(std::path::PathBuf, String)>,
     expanded: std::collections::BTreeSet<String>,
 }
+
+/// **An asset being dragged**, as the payload a folder can catch.
+///
+/// Its own type rather than the asset alone, for the reason
+/// `library_panel::DraggedSymbol` is: two things being dragged around the same
+/// window must be distinguishable, or a folder would swallow a symbol and the
+/// stage would place a folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraggedAsset(pub Asset);
 
 impl AssetPanelState {
     fn is_expanded(&self, path: &str) -> bool {
@@ -312,9 +326,26 @@ fn draw_folder(
             }
             ui.label(RichText::new("F").small().weak())
                 .on_hover_text("Folder");
-            let label = ui
-                .selectable_label(selected, &leaf)
-                .on_hover_text("Click makes this the folder new assets go into");
+            // **A folder catches an asset dropped on it.** The label is the
+            // target rather than the whole row, so the drop lands on the thing
+            // that is named — dropping on the Delete button at the far end
+            // would be a filing gesture that reads as a destructive one.
+            let dropped = ui.dnd_drop_zone::<DraggedAsset, egui::Response>(
+                egui::Frame::NONE,
+                |ui| {
+                    ui.selectable_label(selected, &leaf).on_hover_text(
+                        "Click makes this the folder new assets go into \u{b7} drop \
+                         an asset here to file it",
+                    )
+                },
+            );
+            let label = dropped.0.inner;
+            if let Some(payload) = dropped.1 {
+                *action = Some(AssetAction::MoveToFolder {
+                    asset: payload.0.clone(),
+                    folder: folder.clone(),
+                });
+            }
             if label.clicked() {
                 state.selected_folder = if selected {
                     String::new()
@@ -469,6 +500,23 @@ fn shorten(name: &str, max: usize) -> String {
     format!("{kept}\u{2026}")
 }
 
+impl AssetPanelState {
+    /// **Start naming an asset**, as though its name had been double-clicked.
+    ///
+    /// Called the moment one is kept. See
+    /// [`LibraryState::start_naming`](crate::LibraryState::start_naming): the
+    /// asset had the same defect, and "Asset", "Asset 2" is a worse library
+    /// than "Symbol", "Symbol 2" because assets outlive the document.
+    pub fn start_naming(&mut self, path: std::path::PathBuf, name: impl Into<String>) {
+        self.renaming = Some((path, name.into()));
+    }
+
+    /// The asset whose name is being typed, if one is.
+    pub fn naming(&self) -> Option<&std::path::Path> {
+        self.renaming.as_ref().map(|(path, _)| path.as_path())
+    }
+}
+
 /// Place, rename and delete — the three things a row and a cell both offer.
 fn asset_menu(
     ui: &mut Ui,
@@ -499,15 +547,33 @@ fn asset_row(
     action: &mut Option<AssetAction>,
     thumbnail: AssetThumbnailSource<'_>,
 ) {
+    // **Draggable, so it can be filed.** An asset could be made and renamed but
+    // never moved: the folder it landed in was the folder that happened to be
+    // selected when it was kept, and putting it somewhere else meant deleting
+    // it and adding it again from the document it came from. Dragging it onto a
+    // folder is what every library in every program offers, and it is the only
+    // gesture that does not need the asset to still exist somewhere else.
+    let drag_id = ui.id().with(("asset-drag", &asset.path));
     ui.horizontal(|ui| {
         ui.add_space(indent);
 
         // **The picture, before the name.** Choosing an asset meant reading a
         // list of names and opening the ones you could not remember, which is
         // the slowest possible way to answer "which of these is the oak".
+        //
+        // **And the picture is the drag handle**, not the whole row.
+        // `dnd_drag_source` interacts over everything it wraps, and a drag
+        // widget laid over a row swallows the clicks meant for what is in it —
+        // wrapping the row took Rename, Delete and Place with it. The Library
+        // had the same defect for the same reason; see `draw_symbol_row`.
         let edge = state.thumbnail_size.edge();
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(edge, edge), egui::Sense::hover());
-        draw_thumbnail(ui, rect, asset, thumbnail);
+        let dragged = ui.dnd_drag_source(drag_id, DraggedAsset(asset.clone()), |ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(edge, edge), egui::Sense::hover());
+            draw_thumbnail(ui, rect, asset, thumbnail);
+        });
+        dragged
+            .response
+            .on_hover_text("Drag onto a folder to file it there");
         ui.add_space(4.0);
 
         let renaming = state

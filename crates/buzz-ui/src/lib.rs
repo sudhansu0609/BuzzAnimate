@@ -69,7 +69,9 @@ pub use staging_panel::{
     ActionChoice, SettingChoice, StagingDialog, StagingResponse, StagingState, staging_dialog,
 };
 pub use font_preview::FontPreviews;
-pub use style::{DrawStyle, DrawingMode, FillKind, StrokeKind, SymmetryMode, SymmetrySettings};
+pub use style::{
+    DrawStyle, DrawingMode, EraserMode, FillKind, StrokeKind, SymmetryMode, SymmetrySettings,
+};
 pub use swatch_panel::{SwatchState, swatch_panel};
 pub use tasks_panel::{FinishedRow, TaskAction, TaskRow, TasksView, tasks_panel};
 pub use theme::{Metrics, Palette};

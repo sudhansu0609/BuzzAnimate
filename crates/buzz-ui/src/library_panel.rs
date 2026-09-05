@@ -112,6 +112,28 @@ pub type ThumbnailSource<'a> = &'a mut dyn FnMut(SymbolId) -> Option<egui::Textu
 
 /// Draw the Library panel.
 ///
+impl LibraryState {
+    /// **Start naming a symbol**, as though its name had been double-clicked.
+    ///
+    /// Called the moment one is made. Convert to Symbol used to name it
+    /// "Symbol" and leave it at that: Animate asks for the name as part of the
+    /// gesture, and here there was nowhere to say it — the artwork became
+    /// "Symbol", then "Symbol 2", and a library of them had to be renamed
+    /// afterwards one at a time, if you remembered which was which.
+    ///
+    /// A field with the name in it, focused, is the same offer without a modal
+    /// in the way: type over it, or press Enter and keep the default.
+    pub fn start_naming(&mut self, id: SymbolId, name: impl Into<String>) {
+        self.renaming = Some((id, name.into()));
+    }
+
+    /// The symbol whose name is being typed, if one is. For tests and for
+    /// anything that needs to know a field has the keyboard.
+    pub fn naming(&self) -> Option<SymbolId> {
+        self.renaming.as_ref().map(|(id, _)| *id)
+    }
+}
+
 /// Takes the scene mutably because renaming a symbol and moving it between
 /// folders are edits in their own right; the caller wraps the call in an undo
 /// step, and a frame where nothing changed records nothing.
@@ -337,7 +359,6 @@ fn draw_symbol_row(
     // and it is what every library in every drawing program does. The stage
     // picks the payload up; see `App::handle_stage_input`.
     let drag_id = ui.id().with(("library-drag", id.0));
-    ui.dnd_drag_source(drag_id, DraggedSymbol(id), |ui| {
     ui.horizontal(|ui| {
         ui.add_space(indent + 18.0);
 
@@ -347,22 +368,45 @@ fn draw_symbol_row(
         // out what they are. The space is always claimed, whether or not the
         // picture has been drawn yet, so a library does not jiggle as its
         // thumbnails arrive over the next few frames.
-        let (slot, _) = ui.allocate_exact_size(
-            egui::vec2(THUMBNAIL, THUMBNAIL),
-            egui::Sense::hover(),
-        );
-        match thumbnail(id) {
-            Some(texture) => {
-                egui::Image::new((texture, egui::vec2(THUMBNAIL, THUMBNAIL)))
-                    .paint_at(ui, slot);
+        //
+        // **And the picture is the handle**, not the whole row.
+        //
+        // `dnd_drag_source` interacts over everything it wraps, and a drag
+        // widget laid over a row swallows the clicks meant for what is in it:
+        // wrapping the row made its name unselectable, so nothing could ever
+        // become the selected symbol — which is why Place, Duplicate and Delete
+        // sat permanently greyed out and deleting a symbol looked impossible.
+        // Measured: with the row wrapped, no click anywhere in the panel
+        // selected a symbol; with only the thumbnail wrapped, every click on
+        // the name does.
+        //
+        // Grabbing the picture is also what a library is expected to offer.
+        let dragged = ui.dnd_drag_source(drag_id, DraggedSymbol(id), |ui| {
+            let (slot, _) = ui.allocate_exact_size(
+                egui::vec2(THUMBNAIL, THUMBNAIL),
+                egui::Sense::hover(),
+            );
+            match thumbnail(id) {
+                Some(texture) => {
+                    egui::Image::new((texture, egui::vec2(THUMBNAIL, THUMBNAIL)))
+                        .paint_at(ui, slot);
+                }
+                // Not drawn yet: a quiet frame, so the row reads as a row
+                // rather than as a gap.
+                None => {
+                    ui.painter().rect_stroke(
+                        slot,
+                        2.0,
+                        egui::Stroke::new(1.0, Palette::border()),
+                        egui::StrokeKind::Inside,
+                    );
+                }
             }
-            // Not drawn yet: a quiet frame, so the row reads as a row rather
-            // than as a gap.
-            None => {
-                ui.painter()
-                    .rect_stroke(slot, 2.0, egui::Stroke::new(1.0, Palette::border()), egui::StrokeKind::Inside);
-            }
-        }
+            slot
+        });
+        dragged
+            .response
+            .on_hover_text("Drag onto the stage to place an instance");
 
         // A one-letter kind marker, as Animate's icon column does.
         let mark = match kind {
@@ -422,6 +466,7 @@ fn draw_symbol_row(
                 Command::EditSymbol,
                 Command::PlaceInstance,
                 Command::DuplicateSymbol,
+                Command::SymbolToAsset,
                 Command::DeleteSymbol,
             ] {
                 if ui.button(c.label()).clicked() {
@@ -447,7 +492,6 @@ fn draw_symbol_row(
                 format!("Used {uses} time(s), including inside other symbols")
             });
         });
-    });
     });
 }
 
@@ -511,6 +555,17 @@ fn draw_footer(
             .clicked()
         {
             *command = Some(Command::DuplicateSymbol);
+        }
+        // **Out of the document and onto the shelf.** A symbol could be kept as
+        // an asset only by placing an instance of it, selecting that, keeping
+        // it, and deleting the instance again. The Library is where symbols
+        // are, so it is where "keep this one" is asked.
+        if ui
+            .add_enabled(selected.is_some(), egui::Button::new("Asset").small())
+            .on_hover_text("Keep this symbol in the Assets library, to reuse in any document")
+            .clicked()
+        {
+            *command = Some(Command::SymbolToAsset);
         }
         if ui
             .add_enabled(selected.is_some(), egui::Button::new("🗑").small())

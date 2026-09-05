@@ -74,6 +74,30 @@ pub fn nearest_on_path(path: &BezPath, point: Point, accuracy: f64) -> Option<Ne
     best
 }
 
+/// **Is the point inside the fill, or close enough to its edge to count?**
+///
+/// # Why a fill needs slack at all
+///
+/// `fill_contains` is exact: the point is inside the path or it is not. That is
+/// right for asking what colour is under the pointer and wrong for asking what
+/// the user meant to click. Line art is very often drawn as *filled* paths
+/// rather than stroked ones — every brush stroke here becomes one, and imported
+/// artwork is nothing else — and a filled path a pixel or two wide has almost
+/// no interior to land in. Selecting a line meant hitting it exactly, which is
+/// the "selecting lines is tedious" report.
+///
+/// A stroke already had this slack. This is the same slack for a fill: inside
+/// counts, and so does within `tolerance` of the outline. On a thin sliver that
+/// is the difference between a target a pixel wide and one the width of the
+/// pick radius; on a large shape it adds an imperceptible halo and changes
+/// nothing about clicking in the middle of it.
+pub fn fill_contains_near(path: &BezPath, point: Point, fill: FillMode, tolerance: f64) -> bool {
+    fill_contains(path, point, fill)
+        // Zero width: the reach is the tolerance alone, measured from the
+        // outline, which is exactly "near the edge".
+        || (tolerance > 0.0 && stroke_contains(path, point, 0.0, tolerance))
+}
+
 /// Did the user click on the stroke of `path`?
 ///
 /// `stroke_width` is the drawn width; `tolerance` is the extra slack in
@@ -166,7 +190,7 @@ fn test_one(
     {
         return Some(HitPart::Stroke);
     }
-    if target.filled && fill_contains(target.path, point, fill) {
+    if target.filled && fill_contains_near(target.path, point, fill, tolerance) {
         return Some(HitPart::Fill);
     }
     None
@@ -289,6 +313,48 @@ mod tests {
             !fill_contains(&path, inside_inner, FillMode::EvenOdd),
             "even-odd should punch a hole"
         );
+    }
+
+    /// **The report: selecting lines was tedious.**
+    ///
+    /// A stroke has always had a few pixels of slack. A *fill* had none — the
+    /// point was inside the path or it was not. Line art is very often drawn as
+    /// filled paths rather than stroked ones: every brush stroke here becomes
+    /// one, and imported artwork is nothing else. A filled path two units wide
+    /// therefore had a two-unit target, and had to be clicked dead on.
+    #[test]
+    fn a_thin_filled_line_is_clickable_from_beside_it() {
+        // A line drawn as a filled sliver two units wide, as a brush stroke is.
+        let sliver = Rect::new(0.0, 49.0, 100.0, 51.0).to_path(1e-9);
+        let beside = Point::new(50.0, 53.0);
+
+        assert!(
+            !fill_contains(&sliver, beside, FillMode::NonZero),
+            "the fixture is not thin enough to be testing anything"
+        );
+        assert!(
+            !fill_contains_near(&sliver, beside, FillMode::NonZero, 0.0),
+            "with no tolerance a miss is still a miss"
+        );
+        assert!(
+            fill_contains_near(&sliver, beside, FillMode::NonZero, 6.0),
+            "three units from a filled line, with six of slack, should select it"
+        );
+    }
+
+    /// The slack is slack, not a free-for-all: well clear of the shape is still
+    /// a miss, and the inside of a shape is unaffected.
+    #[test]
+    fn the_fill_slack_does_not_reach_across_the_stage() {
+        let square = Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9);
+        assert!(fill_contains_near(&square, Point::new(50.0, 50.0), FillMode::NonZero, 6.0));
+        assert!(fill_contains_near(&square, Point::new(103.0, 50.0), FillMode::NonZero, 6.0));
+        assert!(!fill_contains_near(
+            &square,
+            Point::new(140.0, 50.0),
+            FillMode::NonZero,
+            6.0
+        ));
     }
 
     #[test]

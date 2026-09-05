@@ -21,8 +21,18 @@ use peniko::Color;
 
 use crate::tools::{Mods, Preview, ToolAction, ToolContext, ToolMachine};
 
-/// How close a click must come to count as hitting a stroke, in screen pixels.
-const PICK_TOLERANCE_PX: f64 = 4.0;
+/// **How close a click must come to count as hitting artwork**, in screen
+/// pixels.
+///
+/// Screen pixels, not document units, so the slack is the same at every zoom —
+/// what it is really describing is how accurately a hand with a mouse can be
+/// expected to land, and that does not change when the drawing is scaled.
+///
+/// Six rather than four. Four is about the width of the pointer's own tip, so
+/// a line had to be hit dead on; every drawing application allows a few pixels
+/// more than that, and the complaint that selecting lines was tedious was
+/// partly this and mostly that a *filled* path was tested with no slack at all.
+const PICK_TOLERANCE_PX: f64 = 6.0;
 
 /// Upper bound on the playhead. Roughly 11 hours at 24 fps — far past anything
 /// real, but finite so a stray value cannot produce an absurd timeline.
@@ -853,7 +863,7 @@ impl Editor {
                         l.frames.insert_blank_keyframe(range.end);
                     }
                     // **The speaker goes on the keyframe's label.**
-                    //
+                    self.workspace.select_tab(buzz_ui::PanelId::ToolOptions);
                     // Which is a frame label — Animate's own idea — and so it
                     // is visible in the timeline, editable by hand when the
                     // detection got somebody wrong, and saved with the
@@ -1328,7 +1338,19 @@ impl Editor {
 
     pub fn set_tool(&mut self, tool: ToolId) {
         if tool.is_ready() {
+            let changed = self.machine.tool() != tool;
             self.machine.set_tool(tool);
+            // **Bring the tool's settings to the front.**
+            //
+            // The Tool Options panel shows whichever tool is in hand, which is
+            // no use at all while it is the tab *behind* Properties: picking up
+            // the Paint Bucket changed a panel nobody could see. Choosing a
+            // tool is exactly the moment its settings become the thing being
+            // looked at, so the panel comes forward the way clicking its tab
+            // would — no layout moves, and a section rolled up stays rolled up.
+            if changed {
+                self.workspace.select_tab(buzz_ui::PanelId::ToolOptions);
+            }
             // Free Transform needs something to put handles on. Picking it up
             // with nothing selected takes the active layer's artwork, so the
             // tool is usable the moment it is chosen — which is what going into
@@ -2322,11 +2344,33 @@ impl Editor {
 
         let frame = self.current_frame;
         let at = self.edit_at();
+        // **What this eraser is allowed to take.** Animate's eraser modes: the
+        // rub cuts everything by default, which is wrong exactly when you are
+        // tidying line art over flat colour and one slip costs the colour too.
+        // The rule itself lives on the mode so the tool options and the eraser
+        // cannot describe two different behaviours.
+        let mode = self.style.eraser_mode;
+        let selected: Vec<ObjectId> = self.selection.iter().collect();
         self.doc.edit("Erase", |scene| {
             let ids: Vec<ObjectId> = scene
                 .layers()
                 .get(layer)
-                .map(|l| l.objects_at(frame).iter().map(|o| o.id).collect())
+                .map(|l| {
+                    l.objects_at(frame)
+                        .iter()
+                        .filter(|o| match &o.kind {
+                            ObjectKind::Shape(shape) => mode.takes(
+                                shape.fill.is_some(),
+                                shape.stroke.is_some(),
+                                selected.contains(&o.id),
+                            ),
+                            // A group, a symbol or a rig is not a fill or a
+                            // line, so only the unrestricted eraser touches it.
+                            _ => mode == buzz_ui::EraserMode::Normal,
+                        })
+                        .map(|o| o.id)
+                        .collect()
+                })
                 .unwrap_or_default();
 
             for id in ids {
@@ -3718,6 +3762,7 @@ impl Editor {
             PlaceInstance => self.place_library_instance(),
             DuplicateSymbol => self.duplicate_library_symbol(),
             DeleteSymbol => self.delete_library_symbol(),
+            SymbolToAsset => self.keep_symbol_as_asset(),
             NewLibraryFolder => self.new_library_folder(),
 
             // -- tweens ------------------------------------------------------
@@ -4853,8 +4898,10 @@ impl Editor {
             .unwrap_or(Point::ZERO);
 
         let mut placed = None;
+        let mut made = None;
         self.doc.edit("Convert to Symbol", |scene| {
             let symbol = scene.add_symbol("Symbol", kind, folder.as_deref());
+            made = Some(symbol);
             let Some(inner_layer) = scene
                 .library()
                 .get(symbol)
@@ -4895,7 +4942,29 @@ impl Editor {
         match placed {
             Some(id) => {
                 self.selection.set([id]);
-                self.status = Some("Converted to symbol".into());
+                // **Named as part of the gesture.**
+                //
+                // Animate asks for the name in the Convert to Symbol dialog.
+                // Here there was nowhere to say it: the artwork became
+                // "Symbol", then "Symbol 2", and a library of them had to be
+                // renamed afterwards one at a time — assuming you could still
+                // tell which was which. The new symbol is selected in the
+                // Library, the panel is brought forward, and its name is a
+                // focused field: type over it, or press Enter and keep the
+                // default.
+                if let Some(symbol) = made {
+                    self.library.selected = Some(symbol);
+                    let name = self
+                        .doc
+                        .scene()
+                        .library()
+                        .get(symbol)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| "Symbol".into());
+                    self.library.start_naming(symbol, name);
+                    self.workspace.select_tab(buzz_ui::PanelId::Library);
+                }
+                self.status = Some("Converted to symbol \u{2014} type its name".into());
             }
             None => self.status = Some("Nothing was converted".into()),
         }
@@ -4911,6 +4980,15 @@ impl Editor {
         });
         if let Some(id) = created {
             self.library.selected = Some(id);
+            let name = self
+                .doc
+                .scene()
+                .library()
+                .get(id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| "Symbol".into());
+            // The same offer Convert to Symbol makes, for the same reason.
+            self.library.start_naming(id, name);
             self.doc.edit_view(|scene| {
                 scene.enter_symbol(id);
             });
@@ -5071,6 +5149,50 @@ impl Editor {
         });
         if let Some(new_id) = created {
             self.library.selected = Some(new_id);
+        }
+    }
+
+    /// **Keep the selected library symbol in the Assets library.**
+    ///
+    /// A symbol could be shelved only by placing an instance of it on the
+    /// stage, selecting that, keeping *it*, and deleting the instance again —
+    /// four steps and a mess to tidy, for the one operation that moves work
+    /// between documents. The Library is where symbols are, so it is where
+    /// "keep this one" is asked.
+    ///
+    /// The asset carries the symbol and everything it uses; see
+    /// [`Scene::extract_symbol`]. It lands with its name ready to type, as
+    /// anything newly made here does.
+    fn keep_symbol_as_asset(&mut self) {
+        let Some(id) = self.library.selected else {
+            self.status = Some("Select a symbol in the Library first".into());
+            return;
+        };
+        let Some(scene) = self.doc.scene().extract_symbol(id) else {
+            self.status = Some("That symbol is no longer in the library".into());
+            return;
+        };
+        let name = self
+            .doc
+            .scene()
+            .library()
+            .get(id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "Symbol".into());
+
+        let folder = self.assets_panel.selected_folder.clone();
+        let unique = self.assets.unique_name(&name, &folder);
+        match self.assets.save(&unique, &folder, &scene) {
+            Ok(saved) => {
+                self.assets_panel
+                    .start_naming(saved.path.clone(), saved.name.clone());
+                self.workspace.select_tab(buzz_ui::PanelId::Assets);
+                self.status = Some(format!(
+                    "Kept {} in Assets \u{2014} type its name",
+                    saved.label()
+                ));
+            }
+            Err(e) => self.status = Some(format!("Could not save the asset: {e}")),
         }
     }
 
@@ -6617,6 +6739,21 @@ impl Editor {
         if baked.is_empty() {
             return;
         }
+        // Whether anything is being left live, for what the status bar says.
+        let kept_breath = self
+            .doc
+            .scene()
+            .layers()
+            .get(layer)
+            .map(|l| l.frames.resolved_at(0))
+            .into_iter()
+            .flat_map(|resolved| resolved.iter().cloned().collect::<Vec<_>>())
+            .any(|o| {
+                o.id == id
+                    && o.modifiers
+                        .iter()
+                        .any(|m| matches!(m, buzz_scene::Modifier::Breathe { .. }))
+            });
 
         // Phase 2: write the keyframes and drop the modifiers, so the baked
         // motion is not then applied a second time on top of itself.
@@ -6640,10 +6777,26 @@ impl Editor {
                     });
                 }
             }
-            scene.update_object_across(0, u32::MAX, id, |o| o.modifiers.clear());
+            // **A breath is not baked, and is not dropped either.**
+            //
+            // Every other modifier here resolves to a placement or a pose, and
+            // a keyframe holds both. A breath resolves to neither: it deforms
+            // the artwork, with the legs still, the ribs swelling and the head
+            // riding on them, and there is nothing in a transform keyframe that
+            // can say so. Clearing it with the rest would quietly delete the
+            // character's breathing, which is worse than not baking it.
+            scene.update_object_across(0, u32::MAX, id, |o| {
+                o.modifiers
+                    .retain(|m| matches!(m, buzz_scene::Modifier::Breathe { .. }));
+            });
         });
         self.doc.end_gesture();
-        self.status = Some("Baked the live modifiers into keyframes".into());
+        self.status = Some(if kept_breath {
+            "Baked the live modifiers into keyframes. The breath is a              deformation, not a placement, so it stays live."
+                .into()
+        } else {
+            "Baked the live modifiers into keyframes".into()
+        });
     }
 
     /// Move the camera at the playhead, keying it if needed.
@@ -7626,8 +7779,18 @@ fn object_contains(
 
     match &object.kind {
         ObjectKind::Shape(shape) => {
+            // **With the same slack a stroke gets.** Line art is very often
+            // drawn as filled paths rather than stroked ones — every brush
+            // stroke here becomes one — and an exact test on a sliver two
+            // pixels wide is a target two pixels wide. See
+            // `buzz_geom::hit::fill_contains_near`.
             if shape.fill.is_some()
-                && buzz_geom::hit::fill_contains(&shape.path, local, buzz_geom::FillMode::NonZero)
+                && buzz_geom::hit::fill_contains_near(
+                    &shape.path,
+                    local,
+                    buzz_geom::FillMode::NonZero,
+                    tolerance,
+                )
             {
                 return true;
             }
@@ -8487,6 +8650,65 @@ mod tests {
             after, 4,
             "the rub should have cut both bars, not only the one under the pointer"
         );
+    }
+
+    /// **The report: selecting a line was tedious.**
+    ///
+    /// Brush strokes and imported line art are *filled* paths, and a fill was
+    /// hit-tested exactly — the point was inside or it was not. A line two
+    /// units wide was a two-unit target however far you were zoomed out. It now
+    /// gets the same few pixels of slack a stroke always had, measured through
+    /// the whole trip a real click takes: stage space to screen and back.
+    #[test]
+    fn a_click_beside_a_thin_line_selects_it() {
+        let mut e = editor();
+        let layer = e.active_layer().expect("a layer");
+        let mut id = None;
+        e.doc.edit("Line", |scene| {
+            let object = scene.next_object_id();
+            id = Some(object);
+            // A filled sliver, as a brush stroke becomes.
+            let line = Object::shape(
+                object,
+                ShapeData::filled(
+                    buzz_geom::Rect::new(100.0, 99.0, 300.0, 101.0).to_path(1e-9),
+                    Color::BLACK,
+                ),
+            );
+            scene
+                .edit_layers()
+                .update(layer, |l| {
+                    l.frames.set_objects(0, vec![Arc::new(line)]);
+                });
+        });
+        let id = id.expect("the line");
+
+        // Dead on it, which always worked.
+        let on = e.camera.doc_to_screen(buzz_geom::Point::new(200.0, 100.0));
+        assert_eq!(
+            e.object_at(e.screen_to_edit(on), e.pick_tolerance()),
+            Some(id),
+            "a click on the line itself missed it"
+        );
+
+        // And a couple of pixels off it, which is what a hand actually does.
+        for away in [-3.0, 3.0] {
+            let near = e
+                .camera
+                .doc_to_screen(buzz_geom::Point::new(200.0, 100.0 + away));
+            assert_eq!(
+                e.object_at(e.screen_to_edit(near), e.pick_tolerance()),
+                Some(id),
+                "a click {away} units from the line missed it"
+            );
+        }
+
+        // Well clear of it is still empty stage: the slack is slack, not a
+        // magnet.
+        let far = e
+            .camera
+            .doc_to_screen(buzz_geom::Point::new(200.0, 160.0));
+        assert_eq!(e.object_at(e.screen_to_edit(far), e.pick_tolerance()), None);
     }
 
     fn editor() -> Editor {
@@ -13237,6 +13459,203 @@ mod tests {
         assert!(
             e.selection.is_empty(),
             "the Selection tool selected the layer"
+        );
+    }
+
+    /// **Animate's eraser modes.** Rubbing over line art laid on flat colour
+    /// takes both, which is the one time an eraser that cuts everything is
+    /// exactly wrong.
+    #[test]
+    fn the_eraser_takes_only_what_its_mode_allows() {
+        use buzz_ui::EraserMode;
+
+        // A filled patch and a bare line, overlapping, with the rub crossing
+        // both of them.
+        let build = |mode: EraserMode| {
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::ObjectDrawing;
+            e.style.eraser_mode = mode;
+            let layer = e.active_layer().expect("a layer");
+            let (mut fill_id, mut line_id) = (ObjectId(0), ObjectId(0));
+            e.doc.edit("Art", |scene| {
+                let a = scene.next_object_id();
+                fill_id = a;
+                let patch = Object::shape(
+                    a,
+                    ShapeData::filled(
+                        buzz_geom::Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9),
+                        Color::WHITE,
+                    ),
+                );
+                let b = scene.next_object_id();
+                line_id = b;
+                let mut line = buzz_geom::BezPath::new();
+                line.move_to((0.0, 50.0));
+                line.line_to((100.0, 50.0));
+                let line = Object::shape(b, ShapeData::stroked(line, Color::BLACK, 4.0));
+                scene.edit_layers().update(layer, |l| {
+                    l.frames.set_objects(0, vec![Arc::new(patch), Arc::new(line)]);
+                });
+            });
+            (e, fill_id, line_id)
+        };
+
+        // A rub straight down the middle, wide enough to bite both.
+        let rub = || {
+            let mut p = buzz_geom::BezPath::new();
+            p.move_to((50.0, -20.0));
+            p.line_to((50.0, 120.0));
+            p
+        };
+        let survives = |e: &Editor, id: ObjectId| e.scene().find_object(id).is_some();
+        let whole = |e: &Editor, id: ObjectId| {
+            e.scene()
+                .find_object(id)
+                .map(|(_, o)| o.bounds().width() > 90.0)
+                .unwrap_or(false)
+        };
+
+        // Normal takes both.
+        let (mut e, fill, line) = build(EraserMode::Normal);
+        e.apply(ToolAction::Erase { path: rub(), width: 10.0 });
+        assert!(!whole(&e, fill), "Normal left the fill untouched");
+        assert!(!whole(&e, line), "Normal left the line untouched");
+
+        // Fills takes the colour and leaves the linework.
+        let (mut e, fill, line) = build(EraserMode::Fills);
+        e.apply(ToolAction::Erase { path: rub(), width: 10.0 });
+        assert!(!whole(&e, fill), "Fills did not take the fill");
+        assert!(whole(&e, line), "Fills took the line as well");
+
+        // Lines takes the linework and leaves the colour.
+        let (mut e, fill, line) = build(EraserMode::Lines);
+        e.apply(ToolAction::Erase { path: rub(), width: 10.0 });
+        assert!(whole(&e, fill), "Lines took the fill as well");
+        assert!(!whole(&e, line), "Lines did not take the line");
+
+        // Selected fills takes nothing while nothing is selected.
+        let (mut e, fill, line) = build(EraserMode::SelectedFills);
+        e.selection.clear();
+        e.apply(ToolAction::Erase { path: rub(), width: 10.0 });
+        assert!(whole(&e, fill), "Selected fills rubbed an unselected fill");
+        assert!(whole(&e, line), "Selected fills rubbed a line");
+        assert!(survives(&e, fill) && survives(&e, line));
+
+        // And takes it once it is selected.
+        let (mut e, fill, _line) = build(EraserMode::SelectedFills);
+        e.selection.set([fill]);
+        e.apply(ToolAction::Erase { path: rub(), width: 10.0 });
+        assert!(!whole(&e, fill), "Selected fills did not rub the selected fill");
+    }
+
+    /// **The report: a symbol could not be kept as an asset from the Library.**
+    ///
+    /// The only route was to place an instance, select it, keep that, and
+    /// delete the instance again — four steps and a mess to tidy, for the one
+    /// operation that moves work between documents.
+    #[test]
+    fn a_library_symbol_can_be_kept_as_an_asset() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut e = editor();
+        e.assets = buzz_doc::AssetLibrary::at(dir.path());
+
+        // A symbol with something in it, so the asset is not an empty shell.
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let art = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a square");
+        e.selection.set([art]);
+        e.run(Command::ConvertToSymbol);
+        let symbol = e.library.selected.expect("the symbol");
+        e.doc.edit("Name", |scene| {
+            scene.library_mut().update(symbol, |s| s.name = "Oak".into());
+        });
+
+        e.run(Command::SymbolToAsset);
+
+        let kept: Vec<String> = e.assets.assets().iter().map(|a| a.name.clone()).collect();
+        assert_eq!(kept, vec!["Oak".to_string()], "the symbol was not shelved");
+
+        // And what was shelved can be placed back: it carries the symbol, not
+        // a reference to one the receiving document has never heard of.
+        let asset = e.assets.assets().first().cloned().expect("the asset");
+        let mut fresh = editor();
+        let library = fresh.assets.clone();
+        let mut placed = None;
+        fresh.doc.edit("Place", |scene| {
+            placed = Some(library.place(&asset, scene));
+        });
+        let _ = placed;
+        let reopened = buzz_doc::AssetLibrary::at(dir.path());
+        assert_eq!(reopened.len(), 1, "the asset did not survive on disk");
+    }
+
+    /// **The report: a symbol could not be named when it was made.**
+    ///
+    /// Animate asks for the name in the Convert to Symbol dialog. Here the
+    /// artwork became "Symbol", then "Symbol 2", and there was nowhere in the
+    /// gesture to say otherwise — a library of them had to be renamed
+    /// afterwards, one at a time, assuming you could still tell which was
+    /// which.
+    #[test]
+    fn converting_to_a_symbol_offers_its_name_for_typing() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a square");
+        e.selection.set([id]);
+
+        e.run(Command::ConvertToSymbol);
+
+        let symbol = e.library.selected.expect("the new symbol is selected");
+        assert_eq!(
+            e.library.naming(),
+            Some(symbol),
+            "the new symbol's name is not waiting to be typed"
+        );
+        // And the panel holding that field is the one at the front, or the
+        // field is behind a tab and the offer is invisible.
+        assert!(
+            e.workspace
+                .slot(buzz_ui::PanelId::Library)
+                .is_some_and(|slot| slot.selected),
+            "the Library is not the tab at the front"
+        );
+    }
+
+    /// A brand new empty symbol makes the same offer, for the same reason.
+    #[test]
+    fn a_new_symbol_offers_its_name_for_typing() {
+        let mut e = editor();
+        e.run(Command::NewSymbol);
+        let symbol = e.library.selected.expect("the new symbol is selected");
+        assert_eq!(e.library.naming(), Some(symbol));
+    }
+
+    /// **Picking up a tool brings its settings to the front.**
+    ///
+    /// The Tool Options panel has always shown whichever tool is in hand, which
+    /// is no use while it is the tab *behind* Properties: choosing the Paint
+    /// Bucket changed a panel nobody could see.
+    #[test]
+    fn choosing_a_tool_brings_its_options_forward() {
+        let mut e = editor();
+        // Tab another panel in with it and bring *that* one to the front, which
+        // is the arrangement the report is about: the tool's settings are one
+        // tab back, so choosing a tool changes a panel nobody can see.
+        e.workspace
+            .group_with(buzz_ui::PanelId::Properties, buzz_ui::PanelId::ToolOptions);
+        e.workspace.select_tab(buzz_ui::PanelId::Properties);
+        assert!(
+            !e.workspace
+                .slot(buzz_ui::PanelId::ToolOptions)
+                .is_some_and(|slot| slot.selected),
+            "the fixture did not manage to put the tool options behind a tab"
+        );
+
+        e.set_tool(ToolId::PaintBucket);
+        assert!(
+            e.workspace
+                .slot(buzz_ui::PanelId::ToolOptions)
+                .is_some_and(|slot| slot.selected),
+            "the tool's own settings did not come forward"
         );
     }
 

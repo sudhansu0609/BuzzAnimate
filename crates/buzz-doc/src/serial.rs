@@ -202,6 +202,12 @@ fn color_to_hex(c: Color) -> String {
     }
 }
 
+/// A shadow as long as the light's height says: what every file written before
+/// the setting existed meant, and what it must keep meaning.
+fn full_shadow_length() -> f32 {
+    1.0
+}
+
 fn color_from_hex(s: &str) -> Result<Color, SerialError> {
     let hex = s.strip_prefix('#').unwrap_or(s);
     let byte = |i: usize| {
@@ -287,6 +293,11 @@ pub struct LightRigDto {
     pub enabled: bool,
     pub base: String,
     pub modelling: f32,
+    /// What the rig draws its crescents around: "off", "shapes" or "figure".
+    /// An absent field — every file written before the choice existed — loads
+    /// as the default, which is by figure. See [`buzz_scene::EdgeMode`].
+    #[serde(default)]
+    pub edges: buzz_scene::EdgeMode,
     pub lights: Vec<LightDto>,
 }
 
@@ -300,7 +311,17 @@ pub struct LightDto {
     pub intensity: f32,
     pub enabled: bool,
     pub shadows: bool,
+    /// What this light's shadows land on: "ground" or "wall". An absent field —
+    /// every file written before the choice existed — loads as the default,
+    /// which is the ground. See [`buzz_scene::ShadowFall`].
+    #[serde(default)]
+    pub fall: buzz_scene::ShadowFall,
     pub shadow_strength: f32,
+    /// How long this light's shadows run, against what its height says they
+    /// should. An absent field — every file written before the setting existed —
+    /// loads as 1.0, which is exactly what those files drew.
+    #[serde(default = "full_shadow_length")]
+    pub shadow_length: f32,
     pub standing_height: f64,
     pub softness: f64,
     /// How much of a lamp's light is drawn as a pool. Version 22. Absent in
@@ -2406,6 +2427,7 @@ impl DocumentDto {
                 enabled: scene.lights().enabled,
                 base: color_to_hex(scene.lights().base),
                 modelling: scene.lights().modelling,
+                edges: scene.lights().edges,
                 lights: scene
                     .lights()
                     .lights
@@ -2420,7 +2442,9 @@ impl DocumentDto {
                             intensity: light.intensity,
                             enabled: light.enabled,
                             shadows: light.shadows,
+                            fall: light.fall,
                             shadow_strength: light.shadow_strength,
+                            shadow_length: light.shadow_length,
                             standing_height: light.standing_height,
                             softness: light.softness,
                             glow: light.glow,
@@ -2654,6 +2678,7 @@ impl DocumentDto {
             lights.enabled = rig.enabled;
             lights.base = color_from_hex(&rig.base)?;
             lights.modelling = rig.modelling;
+            lights.edges = rig.edges;
 
             for dto in &rig.lights {
                 // An unknown kind loads as a sky rather than being dropped: a
@@ -2699,7 +2724,9 @@ impl DocumentDto {
                     intensity: dto.intensity,
                     enabled: dto.enabled,
                     shadows: dto.shadows,
+                    fall: dto.fall,
                     shadow_strength: dto.shadow_strength,
+                    shadow_length: dto.shadow_length,
                     standing_height: dto.standing_height,
                     softness: dto.softness,
                     glow: dto.glow,
@@ -4878,6 +4905,87 @@ mod layer_alpha_tests {
         assert!(
             back.lights().lights[0].track.is_none(),
             "a light with no track recorded must open static"
+        );
+    }
+
+    /// What a light's shadows land on saves too, and a file from before the
+    /// choice opens with them on the ground — which is what "the shadow of a
+    /// character" has always meant, whatever the renderer used to draw.
+    #[test]
+    fn where_a_shadow_falls_survives_the_round_trip_and_defaults_to_the_ground() {
+        let mut scene = Scene::default();
+        scene.lights_mut().enabled = true;
+        let mut sun = buzz_scene::Light::new(
+            buzz_scene::LightId(1),
+            "Key",
+            buzz_scene::LightKind::sun(),
+        );
+        sun.fall = buzz_scene::ShadowFall::Wall;
+        scene.lights_mut().lights.push(sun);
+
+        let back = DocumentDto::from_scene(&scene)
+            .to_scene()
+            .expect("round trip");
+        assert_eq!(back.lights().lights[0].fall, buzz_scene::ShadowFall::Wall);
+
+        let mut json = serde_json::to_value(DocumentDto::from_scene(&scene)).expect("serialise");
+        assert_eq!(
+            json["lights"]["lights"][0]["fall"],
+            serde_json::json!("wall")
+        );
+        for light in json["lights"]["lights"].as_array_mut().expect("lights") {
+            light.as_object_mut().expect("a light").remove("fall");
+        }
+        let older: DocumentDto = serde_json::from_value(json).expect("read back");
+        assert_eq!(
+            older.to_scene().expect("to scene").lights().lights[0].fall,
+            buzz_scene::ShadowFall::Ground,
+            "a file from before the choice must open casting onto the ground"
+        );
+    }
+
+    /// The edge mode saves, and a file written before it existed opens on the
+    /// default — one set of bands round the figure.
+    #[test]
+    fn the_edge_mode_survives_the_round_trip_and_defaults_to_figure() {
+        let mut scene = Scene::default();
+        scene.lights_mut().enabled = true;
+        scene.lights_mut().lights.push(buzz_scene::Light::new(
+            buzz_scene::LightId(1),
+            "Key",
+            buzz_scene::LightKind::sun(),
+        ));
+        scene.lights_mut().edges = buzz_scene::EdgeMode::Off;
+
+        let back = DocumentDto::from_scene(&scene)
+            .to_scene()
+            .expect("round trip");
+        assert_eq!(
+            back.lights().edges,
+            buzz_scene::EdgeMode::Off,
+            "the edges came back on across a save"
+        );
+        assert_eq!(
+            back.lights().modelling,
+            scene.lights().modelling,
+            "the modelling strength changed across a save"
+        );
+
+        // Written by name, so the file says what it means and a mode added
+        // later cannot renumber the ones already saved.
+        let mut json = serde_json::to_value(DocumentDto::from_scene(&scene)).expect("serialise");
+        assert_eq!(json["lights"]["edges"], serde_json::json!("off"));
+
+        // A file from before the choice has no `edges` at all.
+        json["lights"]
+            .as_object_mut()
+            .expect("the rig")
+            .remove("edges");
+        let older: DocumentDto = serde_json::from_value(json).expect("read back");
+        assert_eq!(
+            older.to_scene().expect("to scene").lights().edges,
+            buzz_scene::EdgeMode::Figure,
+            "a file from before the choice must open modelling its figures"
         );
     }
 

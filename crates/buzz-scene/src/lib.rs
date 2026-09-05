@@ -63,7 +63,10 @@ use peniko::Color;
 use serde::{Deserialize, Serialize};
 
 pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, GradientMap, Quality};
-pub use buzz_light::{DEFAULT_GLINT, Light, LightId, LightKey, LightKind, LightRig, LightTrack};
+pub use buzz_light::{
+    DEFAULT_GLINT, EdgeMode, Light, LightId, LightKey, LightKind, LightRig, LightTrack,
+    SHADOW_LENGTH_RANGE, ShadowFall,
+};
 pub use art::ArtPiece;
 pub use bucket::{Boundary, GapSize, fill_region};
 pub use effect_brush::{EffectKind, EffectStroke, effect_artwork};
@@ -80,7 +83,7 @@ pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
 pub use looping::{LoopRegion, MAX_REPEATS};
 pub use merge::{ImportTarget, MergeReport};
-pub use modifier::Modifier;
+pub use modifier::{Breath, Modifier};
 pub use object::{
     FillSpec, Object, ObjectId, ObjectKind, Paint, PaintBlend, ShapeData, Spatial, StrokeSpec,
     TextData,
@@ -1847,6 +1850,59 @@ impl Scene {
             out.ids.reserve_above(id.0);
         }
         out
+    }
+
+    /// **One symbol, as a document of its own** — the Library's counterpart of
+    /// [`extract`](Self::extract).
+    ///
+    /// A symbol could be kept as an asset only by placing an instance of it on
+    /// the stage, selecting that, keeping it, and deleting the instance again.
+    /// The Library is where symbols are, and it is where "keep this one" should
+    /// be asked.
+    ///
+    /// The asset holds one instance of the symbol at the origin, and the symbol
+    /// itself along with everything it uses — the same closure `extract` takes,
+    /// for the same reason: an asset that references a symbol the receiving
+    /// document has never heard of is an asset that cannot be placed.
+    ///
+    /// `None` if there is no such symbol.
+    pub fn extract_symbol(&self, symbol: SymbolId) -> Option<Scene> {
+        let source = self.library.get(symbol)?;
+        let mut out = Scene::empty();
+        let layer = out.add_layer("Asset", LayerKind::Normal);
+
+        // Everything the symbol needs, itself included, depth-first and never
+        // twice — a symbol that contains an instance of itself through an
+        // import must not send this round for ever.
+        let mut wanted = vec![symbol];
+        let mut seen: Vec<SymbolId> = Vec::new();
+        while let Some(id) = wanted.pop() {
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            let Some(symbol) = self.library.get(id) else {
+                continue;
+            };
+            for inner in symbol.layers.iter().flat_map(|l| l.frames.keyframes()) {
+                for object in inner.objects.iter() {
+                    collect_symbols(object, &mut wanted);
+                }
+            }
+            out.library.insert((**symbol).clone());
+            out.ids.reserve_above(id.0);
+        }
+
+        // And an instance of it to be placed, named for the symbol so the
+        // asset arrives saying what it is.
+        let id = out.next_object_id();
+        let mut object = Object {
+            kind: ObjectKind::Instance(crate::symbol::SymbolInstance::new(symbol)),
+            ..Object::shape(id, ShapeData::filled(buzz_geom::BezPath::new(), Color::WHITE))
+        };
+        object.name = Some(source.name.clone());
+        out.add_object_at(layer, 0, object);
+        Some(out)
     }
 
     pub fn find_object(&self, id: ObjectId) -> Option<(LayerId, &Arc<Object>)> {

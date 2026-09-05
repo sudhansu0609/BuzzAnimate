@@ -732,6 +732,52 @@ pub fn split_disjoint(path: &BezPath) -> Vec<BezPath> {
     pieces
 }
 
+/// **Does this path run the wrong way round?**
+///
+/// # The bug this exists for
+///
+/// A silhouette here is built by *concatenating* the paths that were drawn and
+/// filling the result non-zero. That merges overlapping paths for a fraction of
+/// the cost of a real union — but only while they all turn the same way. Two
+/// wound in opposite directions cancel where they overlap under the non-zero
+/// rule, and the union comes out with a **hole punched in it exactly at the
+/// intersection**.
+///
+/// Drawn artwork is full of opposite windings: nothing about a path says which
+/// way round it should go, and an importer emits whatever the source file had.
+/// A character with a limb per layer therefore lit up along every joint — the
+/// shading had a gap at each overlap, and a gap in the shading is a highlight.
+///
+/// # Why this is asked of a whole path and not of each contour
+///
+/// A hole is a contour deliberately wound *against* the one that contains it —
+/// the inside of a letter O, the gap between an arm and a body. Turning every
+/// contour the same way would seal every one of those. The sign of the path's
+/// **total** area follows its outer contour, so reversing the whole path when
+/// it is negative — with [`BezPath::reverse_subpaths`], which flips all of them
+/// together — leaves the holes exactly as deep as they were and only changes
+/// which way the outside runs. Ask this per drawn path, then concatenate.
+///
+/// Costs a walk over the segments and nothing else; a path that is already the
+/// right way round is never copied.
+pub fn turns_backwards(path: &BezPath) -> bool {
+    use kurbo::ParamCurveArea as _;
+    let area: f64 = kurbo::segments(path.elements().iter().copied())
+        .map(|segment| segment.signed_area())
+        .sum();
+    area < 0.0
+}
+
+/// The path, wound so it merges with anything else [`turns_backwards`] has been
+/// asked about. Holes kept. See that function for why this exists.
+pub fn wound_forward(path: &BezPath) -> std::borrow::Cow<'_, BezPath> {
+    if turns_backwards(path) {
+        std::borrow::Cow::Owned(path.reverse_subpaths())
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
 /// The subpaths of a path, each as a path of its own.
 fn subpaths(path: &BezPath) -> Vec<BezPath> {
     let mut out: Vec<BezPath> = Vec::new();
@@ -876,5 +922,105 @@ mod split_tests {
         assert_eq!(pieces[0].bounding_box(), solid.bounding_box());
 
         assert!(split_disjoint(&BezPath::new()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod winding_tests {
+    use super::*;
+    use kurbo::Shape as _;
+
+    fn box_path(x0: f64, y0: f64, x1: f64, y1: f64, forward: bool) -> BezPath {
+        let pts = if forward {
+            [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        } else {
+            [(x0, y0), (x0, y1), (x1, y1), (x1, y0)]
+        };
+        let mut path = BezPath::new();
+        path.move_to(pts[0]);
+        for p in &pts[1..] {
+            path.line_to(*p);
+        }
+        path.close_path();
+        path
+    }
+
+    /// Concatenating two paths of the same winding is a union; concatenating
+    /// two of opposite winding is a union with a hole in the overlap.
+    fn concatenated(a: &BezPath, b: &BezPath) -> BezPath {
+        let mut out = BezPath::new();
+        for path in [a, b] {
+            for element in wound_forward(path).elements() {
+                out.push(*element);
+            }
+        }
+        out
+    }
+
+    /// **The bug, as a winding number.** Two overlapping paths wound opposite
+    /// ways cancel under the non-zero rule, so the point in the middle of the
+    /// overlap is *outside* the concatenation — a hole exactly where they meet.
+    /// That hole is the gap in a figure's shading at its joints.
+    #[test]
+    fn opposed_paths_cancel_where_they_overlap() {
+        let (left, right) = (
+            box_path(0.0, 0.0, 100.0, 100.0, true),
+            box_path(50.0, 0.0, 150.0, 100.0, false),
+        );
+        let overlap = Point::new(75.0, 50.0);
+
+        let mut naive = left.clone();
+        naive.extend(right.iter());
+        assert_eq!(
+            naive.winding(overlap),
+            0,
+            "this no longer cancels, so the test has nothing to catch"
+        );
+
+        let wound = concatenated(&left, &right);
+        assert_ne!(wound.winding(overlap), 0, "the overlap is still a hole");
+        for point in [Point::new(25.0, 50.0), Point::new(125.0, 50.0)] {
+            assert_ne!(wound.winding(point), 0, "{point:?} fell out of the union");
+        }
+        assert_eq!(wound.winding(Point::new(-10.0, 50.0)), 0, "grew outwards");
+    }
+
+    /// **A path's own holes are not touched.**
+    ///
+    /// A hole is a contour deliberately wound against the one containing it —
+    /// the inside of a letter O, the gap between an arm and a body. Winding
+    /// every *contour* the same way would seal every one of them, which is why
+    /// this is asked of a whole path: reversing it flips all its contours
+    /// together and leaves their relative winding alone.
+    #[test]
+    fn a_hole_survives_being_wound_forward() {
+        for outer_forward in [true, false] {
+            let mut ring = box_path(0.0, 0.0, 100.0, 100.0, outer_forward);
+            ring.extend(box_path(25.0, 25.0, 75.0, 75.0, !outer_forward).iter());
+            assert_eq!(ring.winding(Point::new(50.0, 50.0)), 0, "no hole to keep");
+
+            let wound = wound_forward(&ring);
+            assert_eq!(
+                wound.winding(Point::new(50.0, 50.0)),
+                0,
+                "the hole was filled in"
+            );
+            assert_ne!(wound.winding(Point::new(10.0, 50.0)), 0, "the ring went");
+            assert!(!turns_backwards(&wound), "it still runs the wrong way");
+        }
+    }
+
+    /// A path already the right way round is handed straight back, uncopied.
+    #[test]
+    fn a_path_that_already_agrees_is_left_alone() {
+        let path = box_path(0.0, 0.0, 100.0, 100.0, true);
+        assert!(!turns_backwards(&path));
+        assert!(matches!(wound_forward(&path), std::borrow::Cow::Borrowed(_)));
+    }
+
+    /// An empty path has no direction and must not be called backwards.
+    #[test]
+    fn an_empty_path_is_not_backwards() {
+        assert!(!turns_backwards(&BezPath::new()));
     }
 }

@@ -13,7 +13,7 @@
 //!   sun is, and the shadow runs the other way.
 
 use buzz_geom::Point;
-use buzz_scene::{Light, LightId, LightKind, LightRig};
+use buzz_scene::{EdgeMode, Light, LightId, LightKind, LightRig, SHADOW_LENGTH_RANGE, ShadowFall};
 use egui::{Color32, RichText, Ui};
 use peniko::Color;
 
@@ -48,6 +48,9 @@ pub struct LightResponse {
     pub set_base: Option<Color>,
     /// How strongly shading and highlights are drawn.
     pub set_modelling: Option<f32>,
+    /// What the light draws its bands around: nothing, each shape, or the
+    /// whole figure.
+    pub set_edges: Option<EdgeMode>,
     /// The keyframe button was pressed: `true` to key the selected light at the
     /// playhead, `false` to remove the key there.
     pub key: Option<bool>,
@@ -313,11 +316,16 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
                     ui.label("Height");
                     if ui
                         .add(
-                            egui::Slider::new(&mut height, 2.0..=90.0)
+                            egui::Slider::new(&mut height, 0.0..=90.0)
                                 .suffix("\u{b0}")
                                 .fixed_decimals(0),
                         )
-                        .on_hover_text("How high it stands. Low is long shadows.")
+                        .on_hover_text(
+                            "How high the sun stands. 0 is on the horizon, lighting \
+                             from the side with a long shadow; 90 is straight \
+                             overhead, lighting the tops of things with the shadow \
+                             underneath them.",
+                        )
                         .changed()
                     {
                         *elevation = height.to_radians();
@@ -505,35 +513,110 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
             ui.horizontal(|ui| {
                 changed |= ui
                     .checkbox(&mut edited.shadows, "Shadows")
-                    .on_hover_text("Cast a shadow of the artwork onto what is behind it")
+                    .on_hover_text("Cast a shadow of the artwork")
                     .changed();
                 if edited.shadows {
+                    // **Named, because an unlabelled slider beside a checkbox
+                    // is not a setting anybody can find.** It was already the
+                    // shadow's darkness and it was already adjustable; what it
+                    // did not say anywhere was that it was. `Depth` rather than
+                    // `Strength`: what the number moves is how dark the shadow
+                    // lands, from the ground barely dimmed to black.
                     changed |= ui
                         .add(
                             egui::Slider::new(&mut edited.shadow_strength, 0.0..=1.0)
-                                .fixed_decimals(2),
+                                .fixed_decimals(2)
+                                .text("Depth"),
+                        )
+                        .on_hover_text(
+                            "How dark the cast shadow lands. 0 leaves the ground                              untouched; 1 is a solid silhouette.",
                         )
                         .changed();
                 }
             });
 
-            ui.horizontal(|ui| {
-                ui.label("Stands off");
+            // **Length, separately from the light's height.**
+            //
+            // How long a shadow runs is the honest consequence of how high the
+            // light is — and the light's height is also what decides where the
+            // terminator sits on every figure on the stage. So "shorter shadow"
+            // and "keep this light where it is" are two wishes the geometry
+            // will not grant at once, and an animator settles that the way they
+            // always have: by drawing the shadow the shot needs.
+            if edited.shadows {
                 changed |= ui
-                    .add(egui::Slider::new(&mut edited.standing_height, 0.0..=400.0).suffix(" px"))
+                    .add(
+                        egui::Slider::new(
+                            &mut edited.shadow_length,
+                            SHADOW_LENGTH_RANGE,
+                        )
+                        .fixed_decimals(2)
+                        .text("Length"),
+                    )
                     .on_hover_text(
-                        "How far the artwork is assumed to stand off the background. Flat \
-                         drawings have no thickness, so this is what gives them a shadow at \
-                         all \u{2014} layer depth adds to it.",
+                        "How far the shadow runs, against what the light's height                          says it should. 1 is that answer exactly; 0 puts the                          shadow under its caster. The direction still comes from                          the light.",
                     )
                     .changed();
-            });
+            }
+
+            // **What the shadow lands on.** Two different pictures, not two
+            // settings of one: on the ground it is anchored at the figure's
+            // feet and lies away from the light; on a wall it is the figure's
+            // own silhouette offset behind it. See `buzz_scene::ShadowFall`.
+            if edited.shadows {
+                ui.horizontal(|ui| {
+                    ui.label("Falls on");
+                    for fall in ShadowFall::ALL {
+                        changed |= ui
+                            .selectable_value(&mut edited.fall, fall, fall.label())
+                            .on_hover_text(match fall {
+                                ShadowFall::Ground => {
+                                    "The floor the artwork stands on. The shadow starts at the \
+                                     figure's feet and lies away from the light, short when the \
+                                     light is high and long when it is low."
+                                }
+                                ShadowFall::Wall => {
+                                    "The surface behind it. The shadow is the figure's own \
+                                     silhouette, upright and full size, offset away from the \
+                                     light \u{2014} for a figure standing close in front of a \
+                                     wall."
+                                }
+                            })
+                            .changed();
+                    }
+                });
+            }
+
+            // Only a wall shadow asks how far the artwork stands in front of
+            // it; a shadow on the floor starts at the feet, and the height that
+            // matters there is the light's.
+            if edited.fall == ShadowFall::Wall {
+                ui.horizontal(|ui| {
+                    ui.label("Stands off");
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut edited.standing_height, 0.0..=400.0)
+                                .suffix(" px"),
+                        )
+                        .on_hover_text(
+                            "How far the artwork is assumed to stand off the background. Flat \
+                             drawings have no thickness, so this is what gives them a shadow on \
+                             the wall at all \u{2014} layer depth adds to it.",
+                        )
+                        .changed();
+                });
+            }
 
             ui.horizontal(|ui| {
                 ui.label("Softness");
                 changed |= ui
-                    .add(egui::Slider::new(&mut edited.softness, 0.02..=0.9).fixed_decimals(2))
-                    .on_hover_text("How wide the shaded edge is. Narrow reads as a hard light.")
+                    .add(egui::Slider::new(&mut edited.softness, 0.0..=1.0).fixed_decimals(2))
+                    .on_hover_text(
+                        "How gradually the shaded side arrives. 0 is a hard light: \
+                         one step from lit to shaded, an exact boundary. Turning it \
+                         up feathers the terminator and wraps it further round the \
+                         form, the way a bigger source does.",
+                    )
                     .changed();
             });
 
@@ -643,10 +726,50 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
             out.set_base = Some(from_egui(base));
         }
 
+        // **Edges before strength**, because it is the bigger decision. See
+        // `buzz_scene::EdgeMode`: what the shaded side and the glint are
+        // measured against decides whether a lit character reads as one body or
+        // as a pile of separately outlined pieces.
+        ui.label("Edges");
+        let mut edges = rig.edges;
+        for mode in EdgeMode::ALL {
+            if ui
+                .selectable_value(&mut edges, mode, mode.label())
+                .on_hover_text(match mode {
+                    EdgeMode::Off => {
+                        "No shaded side and no highlight. The light still tints \
+                         what it reaches, and a lamp keeps its glow, its falloff \
+                         and its shadows \u{2014} for artwork already drawn with \
+                         its own shading in it."
+                    }
+                    EdgeMode::Shapes => {
+                        "A shaded side and a highlight on every shape, each \
+                         measured against its own outline. Right for a layer of \
+                         separate props; on a character it outlines every piece \
+                         of the drawing separately."
+                    }
+                    EdgeMode::Figure => {
+                        "One shaded side and one highlight per figure, measured \
+                         around the whole character \u{2014} group, rig, symbol \
+                         and all. What a light does to a body, and cheaper than \
+                         Shapes on artwork made of many pieces."
+                    }
+                })
+                .changed()
+            {
+                out.set_edges = Some(edges);
+            }
+        }
+
+        // Greyed out rather than hidden when nothing is being modelled: the
+        // strength is still set, and the edges come back at it.
         ui.label("Modelling");
         let mut modelling = rig.modelling;
         if ui
-            .add(egui::Slider::new(&mut modelling, 0.0..=1.0).fixed_decimals(2))
+            .add_enabled(
+                rig.edges != EdgeMode::Off,
+                egui::Slider::new(&mut modelling, 0.0..=1.0).fixed_decimals(2),
+            )
             .on_hover_text("How strongly the shaded side and the highlight are drawn")
             .changed()
         {
@@ -664,48 +787,76 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
 /// dark spoke opposite is where the shadow will fall, drawn because that —
 /// not the angle — is what the animator is actually choosing.
 ///
+/// # Why it is this big, and why the middle behaves specially
+///
+/// It was thirty-four points across, with the whole range from horizon to
+/// overhead squeezed into that radius and **overhead at the exact centre** — a
+/// single point. Worse, a guard skipped any drag within a point of the middle,
+/// so ninety degrees was not merely hard to hit, it was unreachable: the
+/// closest the dial could get was about eighty-seven. And near the centre a
+/// pointer movement of one pixel swings the bearing right round, so the sun
+/// jitters through every azimuth on the way up.
+///
+/// That is the "the sun only goes in a small circle" report, and the "I cannot
+/// get it high enough" one before it. The dial is now big enough to aim, the
+/// middle of it is a **target rather than a point** — anywhere inside it means
+/// straight overhead, and the bearing is left alone there because a sun
+/// directly above has no bearing worth reading — and the rings are drawn where
+/// the angles actually are.
+///
 /// Returns whether the drag changed anything.
 fn sun_dial(ui: &mut Ui, azimuth: &mut f64, elevation: &mut f64) -> bool {
-    const RADIUS: f32 = 34.0;
-
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), RADIUS * 2.0 + 10.0),
+        egui::vec2(ui.available_width(), SUN_DIAL_RADIUS * 2.0 + 10.0),
         egui::Sense::click_and_drag(),
     );
     let painter = ui.painter_at(rect);
-    let centre = egui::pos2(rect.left() + RADIUS + 6.0, rect.center().y);
+    let centre = egui::pos2(rect.left() + SUN_DIAL_RADIUS + 6.0, rect.center().y);
+    let quarter = std::f64::consts::FRAC_PI_2;
 
-    painter.circle_filled(centre, RADIUS, Palette::panel());
-    painter.circle_stroke(centre, RADIUS, egui::Stroke::new(1.0, Palette::border()));
-    // The horizon ring: the sun on it is level with the stage, at the middle
-    // it is straight overhead.
+    painter.circle_filled(centre, SUN_DIAL_RADIUS, Palette::panel());
     painter.circle_stroke(
         centre,
-        RADIUS * 0.5,
-        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 20)),
+        SUN_DIAL_RADIUS,
+        egui::Stroke::new(1.0, Palette::border()),
     );
+    // Where the angles are: the rim is the horizon and the middle is overhead,
+    // the way a fisheye photograph of the sky maps it, so these sit at thirty
+    // and sixty degrees up. They used to be one ring at half the radius,
+    // described in a comment as the horizon — which is the rim — and an
+    // animator who read it as the edge of the dial never took the sun above
+    // forty-five.
+    for up in [30.0f64, 60.0] {
+        let t = 1.0 - up.to_radians() / quarter;
+        painter.circle_stroke(
+            centre,
+            SUN_DIAL_OVERHEAD + (SUN_DIAL_RADIUS - SUN_DIAL_OVERHEAD) * t as f32,
+            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 18)),
+        );
+    }
 
     let mut changed = false;
-    // Dead centre has no direction to read, so a click there leaves the sun
-    // where it is rather than snapping it to an arbitrary bearing.
     if let Some(pos) = (response.dragged() || response.clicked())
         .then(|| ui.ctx().input(|i| i.pointer.interact_pos()))
         .flatten()
-        && (pos - centre).length() > 1.0
     {
         let offset = pos - centre;
-        *azimuth = (offset.y as f64).atan2(offset.x as f64);
-        // Distance from the middle is the sun's height, the way a fisheye
-        // photograph of the sky maps it: the rim is the horizon.
-        let t = (offset.length() / RADIUS).clamp(0.0, 1.0) as f64;
-        *elevation = ((1.0 - t) * std::f64::consts::FRAC_PI_2).clamp(0.03, 1.55);
+        // The bearing is left exactly as it was at the top: a sun directly
+        // above has no direction across the picture to read, and taking one
+        // from a two-pixel offset is how the old dial span the azimuth wildly
+        // on the way up.
+        if offset.length() > SUN_DIAL_OVERHEAD {
+            *azimuth = (offset.y as f64).atan2(offset.x as f64);
+        }
+        *elevation = sun_dial_elevation(offset.length());
         changed = true;
     }
 
     // Where the sun sits on the dial, and where its shadow runs.
-    let t = 1.0 - (*elevation / std::f64::consts::FRAC_PI_2).clamp(0.0, 1.0);
+    let t = 1.0 - (*elevation / quarter).clamp(0.0, 1.0);
     let (sin_a, cos_a) = azimuth.sin_cos();
-    let arm = egui::vec2(cos_a as f32, sin_a as f32) * (RADIUS * t as f32);
+    let reach = SUN_DIAL_OVERHEAD + (SUN_DIAL_RADIUS - SUN_DIAL_OVERHEAD) * t as f32;
+    let arm = egui::vec2(cos_a as f32, sin_a as f32) * reach;
 
     painter.line_segment(
         [centre, centre - arm],
@@ -715,17 +866,17 @@ fn sun_dial(ui: &mut Ui, azimuth: &mut f64, elevation: &mut f64) -> bool {
         [centre, centre + arm],
         egui::Stroke::new(1.5, Palette::border()),
     );
-    painter.circle_filled(centre + arm, 5.0, Color32::from_rgb(0xFF, 0xD9, 0x6A));
+    painter.circle_filled(centre + arm, 6.0, Color32::from_rgb(0xFF, 0xD9, 0x6A));
 
     painter.text(
-        egui::pos2(centre.x + RADIUS + 12.0, rect.center().y - 8.0),
+        egui::pos2(centre.x + SUN_DIAL_RADIUS + 12.0, rect.center().y - 8.0),
         egui::Align2::LEFT_CENTER,
         format!("{:.0}\u{b0}", azimuth.to_degrees()),
         egui::FontId::proportional(11.0),
         Palette::text(),
     );
     painter.text(
-        egui::pos2(centre.x + RADIUS + 12.0, rect.center().y + 8.0),
+        egui::pos2(centre.x + SUN_DIAL_RADIUS + 12.0, rect.center().y + 8.0),
         egui::Align2::LEFT_CENTER,
         format!("{:.0}\u{b0} up", elevation.to_degrees()),
         egui::FontId::proportional(11.0),
@@ -735,9 +886,97 @@ fn sun_dial(ui: &mut Ui, azimuth: &mut f64, elevation: &mut f64) -> bool {
     changed
 }
 
+/// The dial's rim, which is the horizon.
+pub const SUN_DIAL_RADIUS: f32 = 56.0;
+/// Anywhere within this of the middle of the dial is straight overhead.
+///
+/// A target rather than a point. Ninety degrees used to live at the exact
+/// centre, which no pointer lands on, behind a guard that ignored the middle
+/// entirely — so the top of the sun's range could not be reached by dragging at
+/// all.
+pub const SUN_DIAL_OVERHEAD: f32 = 5.0;
+
+/// **Where the sun dial puts a pointer**, as the elevation it means.
+///
+/// `from_centre` is how far the pointer is from the middle of the dial, in
+/// points; the answer is in radians, from zero on the rim to a quarter turn
+/// inside the overhead target.
+pub fn sun_dial_elevation(from_centre: f32) -> f64 {
+    let quarter = std::f64::consts::FRAC_PI_2;
+    if from_centre <= SUN_DIAL_OVERHEAD {
+        return quarter;
+    }
+    let span = (SUN_DIAL_RADIUS - SUN_DIAL_OVERHEAD).max(1.0);
+    let t = ((from_centre - SUN_DIAL_OVERHEAD) / span).clamp(0.0, 1.0) as f64;
+    ((1.0 - t) * quarter).clamp(0.0, quarter)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The report: the sun only went round in a small circle, and would not
+    /// go high.**
+    ///
+    /// The dial mapped horizon-to-overhead across its radius with overhead at
+    /// the exact centre — a single point — and then refused any drag within a
+    /// point of that centre. So the top of the range was not merely fiddly, it
+    /// was unreachable: the closest the dial could be dragged was about
+    /// eighty-seven degrees, on a disc thirty-four points across.
+    #[test]
+    fn the_sun_dial_reaches_straight_overhead() {
+        let quarter = std::f64::consts::FRAC_PI_2;
+
+        // Dead centre, and anywhere in the target around it, is overhead.
+        for from_centre in [0.0, 1.0, SUN_DIAL_OVERHEAD] {
+            assert_eq!(
+                sun_dial_elevation(from_centre),
+                quarter,
+                "{from_centre} points from the middle should be straight overhead"
+            );
+        }
+        // The rim is the horizon, and past it stays there.
+        assert_eq!(sun_dial_elevation(SUN_DIAL_RADIUS), 0.0);
+        assert_eq!(sun_dial_elevation(SUN_DIAL_RADIUS * 3.0), 0.0);
+    }
+
+    /// The range in between is spread over the dial, and runs the right way
+    /// round: further out is lower.
+    #[test]
+    fn the_sun_dial_falls_from_overhead_at_the_middle_to_the_horizon_at_the_rim() {
+        let mut last = f64::INFINITY;
+        for step in 0..=20 {
+            let at = SUN_DIAL_RADIUS * step as f32 / 20.0;
+            let elevation = sun_dial_elevation(at);
+            assert!(
+                elevation <= last + 1e-9,
+                "the sun rose on the way out at {at}: {elevation} after {last}"
+            );
+            last = elevation;
+        }
+
+        // And the middle of the dial is somewhere near the middle of the range,
+        // so the useful angles are not all crowded into a few pixels.
+        let middle = sun_dial_elevation(SUN_DIAL_RADIUS / 2.0).to_degrees();
+        assert!(
+            (35.0..=55.0).contains(&middle),
+            "half way out is {middle} degrees up, which is not half the range"
+        );
+    }
+
+    /// It also has to be big enough to aim at. Thirty-four points across put
+    /// ninety degrees of elevation into seventeen pixels.
+    #[test]
+    fn the_sun_dial_is_big_enough_to_aim() {
+        assert!(
+            SUN_DIAL_RADIUS >= 48.0,
+            "the dial is {SUN_DIAL_RADIUS} points across the radius"
+        );
+        assert!(
+            SUN_DIAL_OVERHEAD >= 3.0,
+            "the overhead target is {SUN_DIAL_OVERHEAD} points and a pointer will miss it"
+        );
+    }
 
     fn rig(lights: Vec<Light>) -> LightRig {
         LightRig {

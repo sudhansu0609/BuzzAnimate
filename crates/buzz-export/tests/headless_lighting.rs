@@ -52,6 +52,32 @@ fn luma(pixel: [u8; 4]) -> f32 {
     0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32
 }
 
+/// **How much of the white stage a shadow has darkened**, inside a rectangle of
+/// the frame, as a count of pixels.
+///
+/// Counting rather than sampling one pixel, because a shadow on the **ground**
+/// is not where a shadow on a wall was: it leaves the caster's feet rather than
+/// its middle, and it leans towards the viewer as well as away from the light
+/// (`buzz_light::ShadowFall`). A single point is a guess about geometry; a
+/// region asks the question the test is actually about — did the light darken
+/// the floor over *there*.
+fn darkened(frame: &Frame, x: std::ops::Range<u32>, y: std::ops::Range<u32>) -> usize {
+    let mut n = 0;
+    for py in y {
+        for px in x.clone() {
+            if luma(frame.pixel(px, py)) < 230.0 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The square `document` draws, and the floor under it: the artwork runs from
+/// x 200 to 350 and stands on y 300, so this is the band of stage below its
+/// feet, which is where a shadow on the ground lands.
+const FLOOR: std::ops::Range<u32> = 302..398;
+
 /// The promise every existing document depends on: no lights, no change.
 #[test]
 fn a_document_without_lights_renders_exactly_as_before() {
@@ -151,12 +177,14 @@ fn the_cast_shadow_falls_away_from_the_sun_and_swings_with_it() {
             sun.shadow_strength = 0.8;
         }
 
+        // The floor either side of the square's feet.
         let cast_left = render(exporter, &scene);
-        let left_of = luma(cast_left.pixel(170, 225));
-        let right_of = luma(cast_left.pixel(380, 225));
+        let left_of = darkened(&cast_left, 40..200, FLOOR);
+        let right_of = darkened(&cast_left, 350..510, FLOOR);
         assert!(
-            left_of < right_of - 20.0,
-            "the shadow should darken the background to the left: {left_of} vs {right_of}"
+            left_of > right_of + 200,
+            "the shadow should darken the floor to the left: {left_of} pixels \
+             against {right_of} on the right"
         );
 
         // Turn the sun around: the shadow must move to the other side.
@@ -165,11 +193,60 @@ fn the_cast_shadow_falls_away_from_the_sun_and_swings_with_it() {
             elevation: 0.45,
         };
         let cast_right = render(exporter, &scene);
-        let left_of = luma(cast_right.pixel(170, 225));
-        let right_of = luma(cast_right.pixel(380, 225));
+        let left_of = darkened(&cast_right, 40..200, FLOOR);
+        let right_of = darkened(&cast_right, 350..510, FLOOR);
         assert!(
-            right_of < left_of - 20.0,
-            "the shadow should have swung to the right: {left_of} vs {right_of}"
+            right_of > left_of + 200,
+            "the shadow should have swung to the right: {left_of} pixels on the \
+             left against {right_of}"
+        );
+    });
+}
+
+/// **A shadow falls on the floor, not into the air beside the figure.**
+///
+/// The report: put a light above a character and the shadow came out level with
+/// the character, off to one side, at the character's own size — because it was
+/// being projected onto the surface *behind* the artwork, as though every stage
+/// were a figure standing against a wall. On an open stage what that reads as
+/// is a second copy of the drawing floating in the air.
+///
+/// On the ground it leaves the feet and lies away along the floor. Both are
+/// real shadows and the choice is the animator's — [`buzz_scene::ShadowFall`] —
+/// so this pins each of them where it belongs.
+#[test]
+fn a_shadow_lands_on_the_floor_rather_than_beside_the_figure() {
+    with_exporter(|exporter| {
+        let mut scene = document();
+        let id = scene.add_light(LightKind::Sun {
+            azimuth: 0.0,
+            elevation: 0.6,
+        });
+        {
+            let sun = scene.lights_mut().get_mut(id).expect("the sun");
+            sun.standing_height = 60.0;
+            sun.shadow_strength = 0.8;
+        }
+
+        // The square runs from y 150 to 300, so this is the air beside it, at
+        // its own height — where a shadow on a wall lands.
+        const BESIDE: std::ops::Range<u32> = 160..290;
+
+        let ground = render(exporter, &scene);
+        assert!(
+            darkened(&ground, 40..195, FLOOR) > 500,
+            "a shadow on the ground must darken the floor at the figure's feet"
+        );
+        assert!(
+            darkened(&ground, 40..195, BESIDE) < 200,
+            "a shadow on the ground must not hang in the air beside the figure"
+        );
+
+        scene.lights_mut().get_mut(id).expect("the sun").fall = buzz_scene::ShadowFall::Wall;
+        let wall = render(exporter, &scene);
+        assert!(
+            darkened(&wall, 40..195, BESIDE) > 500,
+            "a shadow on the wall is the figure's silhouette at its own height"
         );
     });
 }
@@ -192,12 +269,13 @@ fn a_lower_sun_throws_a_longer_shadow() {
             }
             let frame = render(exporter, &scene);
 
-            // How far left of the square the darkening *reaches*: scan
-            // inwards from the stage edge and stop at the first dark pixel.
-            // Scanning outwards from the square instead measures where the
-            // shadow starts, which is the same for every elevation.
+            // How far left of the square the darkening *reaches*: the first
+            // column of the floor, scanning in from the stage edge, that the
+            // shadow has darkened anywhere. Scanning outwards from the square
+            // instead measures where the shadow starts, which is the same for
+            // every elevation — it starts at the caster's feet.
             (0..200u32)
-                .find(|x| luma(frame.pixel(*x, 225)) < 200.0)
+                .find(|x| darkened(&frame, *x..*x + 1, FLOOR) > 0)
                 .unwrap_or(200)
         };
 
@@ -361,12 +439,12 @@ fn a_symbol_instance_casts_a_shadow_like_loose_artwork() {
         }
 
         let frame = render(exporter, &scene);
-        let left_of = luma(frame.pixel(170, 225));
-        let right_of = luma(frame.pixel(380, 225));
+        let left_of = darkened(&frame, 40..200, FLOOR);
+        let right_of = darkened(&frame, 350..510, FLOOR);
         assert!(
-            left_of < right_of - 20.0,
+            left_of > right_of + 200,
             "an instance should cast a shadow to the left just as loose artwork \
-             does: {left_of} vs {right_of}"
+             does: {left_of} pixels against {right_of} on the right"
         );
     });
 }

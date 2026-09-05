@@ -1082,6 +1082,22 @@ fn wand_properties(ui: &mut Ui, style: &mut DrawStyle) {
 /// across whatever the brush was set to, with nothing in the options saying so.
 fn eraser_properties(ui: &mut Ui, style: &mut DrawStyle) {
     egui::Grid::new("eraser-props").num_columns(2).show(ui, |ui| {
+        // **What it is allowed to take.** Animate's eraser modes, and the
+        // reason they exist: tidying line art over flat colour with an eraser
+        // that takes everything means one slip costs the colour too.
+        ui.label("Mode");
+        egui::ComboBox::from_id_salt("eraser-mode")
+            .selected_text(style.eraser_mode.label())
+            .show_ui(ui, |ui| {
+                for mode in crate::EraserMode::ALL {
+                    ui.selectable_value(&mut style.eraser_mode, mode, mode.label())
+                        .on_hover_text(mode.description());
+                }
+            })
+            .response
+            .on_hover_text(style.eraser_mode.description());
+        ui.end_row();
+
         ui.label("Size");
         ui.add(
             egui::Slider::new(&mut style.eraser_size, 1.0..=200.0)
@@ -1105,7 +1121,18 @@ fn eraser_properties(ui: &mut Ui, style: &mut DrawStyle) {
 }
 
 /// Paint Bucket settings: the gap size the fill will bridge.
-fn bucket_properties(ui: &mut Ui, style: &mut DrawStyle) {
+fn bucket_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
+    // **What it paints with, where the tool is.**
+    //
+    // Animate puts the fill colour in the tool options strip beside Gap Size,
+    // because choosing a colour and choosing how far the bucket leaks are one
+    // decision made at one moment. Here they were in different panels: the
+    // bucket's only setting was the gap, and the colour it was about to lay
+    // down lived in Colour, which might not even be open.
+    fill_paint_properties(ui, scene, style, "bucket");
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Gaps").strong());
     egui::Grid::new("bucket-props").num_columns(2).show(ui, |ui| {
         ui.label("Gap size");
         egui::ComboBox::from_id_salt("bucket-gap")
@@ -1125,6 +1152,56 @@ fn bucket_properties(ui: &mut Ui, style: &mut DrawStyle) {
     });
 }
 
+/// Ink Bottle settings: the line it is about to lay on whatever is clicked.
+fn ink_bottle_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
+    stroke_paint_properties(ui, scene, style, "ink");
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Click a shape to give it this outline. A shape that already has one \
+             takes this instead.",
+        )
+        .small()
+        .weak(),
+    );
+}
+
+/// Eyedropper settings — which is to say, where what it picks up will land.
+///
+/// Animate's Eyedropper has no options, and inventing some would be worse than
+/// none. What it can usefully show is the pair of swatches it is about to
+/// overwrite, so the tool that sets the colour and the place the colour is set
+/// are the same place. Picking from a stroke fills the stroke swatch and
+/// picking from a fill fills the fill one; this is where you see that it
+/// worked.
+fn eyedropper_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
+    ui.label(
+        RichText::new(
+            "Click artwork to take its colour. A line fills the stroke swatch, a \
+             fill fills the fill one.",
+        )
+        .small()
+        .weak(),
+    );
+    ui.add_space(6.0);
+    ui.label(RichText::new("Stroke").strong());
+    let mut stroke = style.stroke_color;
+    if color_row(ui, "dropper-stroke", &mut stroke) {
+        style.stroke_color = stroke;
+        style.stroke_enabled = true;
+        style.remember(stroke);
+    }
+    ui.add_space(4.0);
+    ui.label(RichText::new("Fill").strong());
+    let mut fill = style.fill_color;
+    if color_row(ui, "dropper-fill", &mut fill) {
+        style.fill_color = fill;
+        style.fill_enabled = true;
+        style.remember(fill);
+    }
+    swatch_strips(ui, scene, style);
+}
+
 /// **Settings for the tool in hand**, and nothing else.
 ///
 /// # Why this is its own panel
@@ -1141,24 +1218,52 @@ fn bucket_properties(ui: &mut Ui, style: &mut DrawStyle) {
 /// One tool's settings are shown, and it is the one whose button is lit. There
 /// is nothing to open, nothing to scroll past, and no way to be looking at the
 /// Eraser's size while holding the Brush.
-pub fn tool_options_panel(ui: &mut Ui, tool: ToolId, style: &mut DrawStyle) {
-    // The tool's own symbol beside its name, the same drawing the lit button
-    // in the toolbar carries. Two places showing the same mark is how the
-    // panel says which button it is talking about.
+pub fn tool_options_panel(ui: &mut Ui, tool: ToolId, scene: &Scene, style: &mut DrawStyle) {
+    // **Lit, the way the tool's own button is.**
+    //
+    // The panel showed the tool in hand and always had, in the same grey as
+    // everything else — so on a screen of panels there was nothing to say that
+    // this one had just changed under you when you picked up a different tool.
+    // The toolbar answers that by lighting the button; this is the same answer
+    // in the same colour, and the accent rule under it carries the eye down
+    // into the settings that changed.
+    let accent = Palette::active();
     ui.horizontal(|ui| {
         let size = egui::vec2(18.0, 18.0);
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-        crate::icons::tool_icon(ui.painter(), rect, tool, Palette::text());
-        ui.heading(tool.name());
+        crate::icons::tool_icon(ui.painter(), rect, tool, accent);
+        ui.heading(RichText::new(tool.name()).color(accent));
     });
-    ui.separator();
+    // A rule in the accent colour rather than the frame's own separator, for
+    // the same reason: this is the live section.
+    let rule = ui.available_width();
+    let (line, _) = ui.allocate_exact_size(egui::vec2(rule, 3.0), egui::Sense::hover());
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(line.min, egui::vec2(rule, 2.0)),
+        1.0,
+        accent,
+    );
+    ui.add_space(2.0);
 
     let mut anything = true;
     match tool {
-        ToolId::Brush => brush_properties(ui, style),
+        ToolId::Brush => brush_properties(ui, scene, style),
         ToolId::Eraser => eraser_properties(ui, style),
         ToolId::MagicWand => wand_properties(ui, style),
-        ToolId::PaintBucket => bucket_properties(ui, style),
+        ToolId::PaintBucket => bucket_properties(ui, scene, style),
+        ToolId::InkBottle => ink_bottle_properties(ui, scene, style),
+        ToolId::Eyedropper => eyedropper_properties(ui, scene, style),
+        // A line and a pencil lay a stroke, so they ask the same question the
+        // Ink Bottle does.
+        ToolId::Line | ToolId::Pencil | ToolId::Pen => {
+            stroke_paint_properties(ui, scene, style, "line");
+        }
+        // **Everything that lays a fill gets to choose it here.** A shape tool
+        // is about to draw a filled shape; asking what colour in another panel
+        // is the same detour the bucket had.
+        ToolId::Rectangle | ToolId::Oval | ToolId::PolyStar => {
+            fill_paint_properties(ui, scene, style, "shape");
+        }
         _ => anything = false,
     }
 
@@ -1258,9 +1363,17 @@ fn symmetry_properties(ui: &mut Ui, style: &mut DrawStyle) {
 /// here in Properties because that is where this application's contextual
 /// settings already live, and splitting them across two places would be worse
 /// than the deviation.
-fn brush_properties(ui: &mut Ui, style: &mut DrawStyle) {
+fn brush_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
     use crate::brush::{BrushKind, PatternShape};
 
+    // **What it paints with, first.** A brush lays a fill, and which colour is
+    // the question asked most often while drawing — Animate puts it in the tool
+    // options strip for that reason. It used to be in the Colour panel, which
+    // might not be open.
+    fill_paint_properties(ui, scene, style, "brush");
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Brush").strong());
     egui::Grid::new("brush-props").num_columns(2).show(ui, |ui| {
         ui.label("Type");
         egui::ComboBox::from_id_salt("brush-kind")
@@ -2263,6 +2376,227 @@ pub fn properties_panel(
 /// Swatches panel. Recent colours are what this session has been using, which
 /// is worth a row while sketching and worthless tomorrow. Animate has only the
 /// first; the second was here before the palette existed and earns its keep.
+/// **What a stroke is drawn with**, as a block any tool that lays one can show.
+///
+/// The counterpart of [`fill_paint_properties`]. The Ink Bottle exists to put a
+/// stroke on something and had no settings at all — the colour, the width and
+/// the style it was about to apply were three panels away, and two of them were
+/// under a heading called "Stroke and Fill" that reads as being about the
+/// selection.
+pub fn stroke_paint_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle, id: &str) {
+    ui.horizontal(|ui| {
+        ui.label("Stroke");
+        // Animate's crossed swatch: the tool stays the tool and lays no line.
+        if ui
+            .selectable_label(!style.stroke_enabled, "\u{2298} None")
+            .on_hover_text("Lay no stroke at all")
+            .clicked()
+        {
+            style.stroke_enabled = !style.stroke_enabled;
+        }
+    });
+
+    if !style.stroke_enabled {
+        ui.label(
+            RichText::new("Nothing will be laid down until a stroke is chosen.")
+                .small()
+                .weak(),
+        );
+        return;
+    }
+
+    let mut c = style.stroke_color;
+    if color_row(ui, &format!("{id}-stroke"), &mut c) {
+        style.stroke_color = c;
+        style.remember(c);
+    }
+    if let Some(swatch) = scene.swatches().find_color(style.stroke_color) {
+        ui.label(RichText::new(&swatch.name).small().weak());
+    }
+
+    let mut alpha = f64::from(style.stroke_color.components[3]) * 100.0;
+    if ui
+        .add(
+            egui::Slider::new(&mut alpha, 0.0..=100.0)
+                .text("Alpha")
+                .suffix(" %")
+                .fixed_decimals(0),
+        )
+        .on_hover_text("How much of what is underneath shows through the line")
+        .changed()
+    {
+        style.stroke_color.components[3] = (alpha / 100.0) as f32;
+    }
+
+    egui::Grid::new(("stroke-props", id))
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("Width");
+            ui.add_enabled(
+                !style.hairline,
+                egui::DragValue::new(&mut style.stroke_width)
+                    .range(0.0..=200.0)
+                    .speed(0.1),
+            )
+            .on_hover_text("In document units. A hairline ignores this.");
+            ui.end_row();
+
+            ui.label("Hairline");
+            ui.checkbox(&mut style.hairline, "")
+                .on_hover_text("One pixel wide at every zoom, as Animate's hairline is");
+            ui.end_row();
+
+            ui.label("Style");
+            egui::ComboBox::from_id_salt(("stroke-kind", id))
+                .selected_text(style.stroke_kind.label())
+                .show_ui(ui, |ui| {
+                    for kind in [StrokeKind::Solid, StrokeKind::Dashed, StrokeKind::Dotted] {
+                        ui.selectable_value(&mut style.stroke_kind, kind, kind.label());
+                    }
+                });
+            ui.end_row();
+        });
+
+    swatch_strips(ui, scene, style);
+}
+
+/// **What a fill is painted with**, as a block any tool that lays one can show.
+///
+/// The Paint Bucket, the shape tools and the Brush all put down a fill, and
+/// what that fill *is* — no fill at all, a solid colour, its opacity, a
+/// gradient, a texture — is the same set of questions for all of them. It used
+/// to be answerable only in the Colour panel, so the bucket's own options had
+/// one setting in them (the gap size) and the colour it was about to lay down
+/// was somewhere else, possibly behind a tab. Animate puts the colour in the
+/// tool options strip for exactly this reason.
+///
+/// `id` keeps two of these on screen at once from sharing widget state — the
+/// Colour panel's and a tool's.
+pub fn fill_paint_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle, id: &str) {
+    ui.horizontal(|ui| {
+        ui.label("Fill");
+        // **No fill is a mode, not a colour.** Animate's swatch with the red
+        // stroke through it: the tool is still the tool, it simply lays nothing
+        // down. A toggle beside the kind rather than an entry in the list,
+        // because it is the thing you flick on and off while working.
+        if ui
+            .selectable_label(!style.fill_enabled, "\u{2298} None")
+            .on_hover_text("Lay no fill at all")
+            .clicked()
+        {
+            style.fill_enabled = !style.fill_enabled;
+        }
+        egui::ComboBox::from_id_salt(("fill kind", id))
+            .selected_text(style.fill_kind.label())
+            .width(120.0)
+            .show_ui(ui, |ui| {
+                for kind in FillKind::ALL {
+                    ui.selectable_value(&mut style.fill_kind, kind, kind.label());
+                }
+            });
+    });
+
+    if !style.fill_enabled {
+        ui.label(
+            RichText::new("Nothing will be laid down until a fill is chosen.")
+                .small()
+                .weak(),
+        );
+        return;
+    }
+
+    if style.fill_kind == FillKind::Solid {
+        let mut c = style.fill_color;
+        if color_row(ui, &format!("{id}-fill"), &mut c) {
+            style.fill_color = c;
+            style.remember(c);
+        }
+        if let Some(swatch) = scene.swatches().find_color(style.fill_color) {
+            ui.label(RichText::new(&swatch.name).small().weak());
+        }
+
+        // **Alpha on its own slider.** It is in the picker too, on the tab
+        // behind the hue wheel, which is a poor place for the one property of
+        // a colour an animator adjusts by number. Shown as a percentage,
+        // because "fifty per cent alpha" is how it is said.
+        let mut alpha = f64::from(style.fill_color.components[3]) * 100.0;
+        if ui
+            .add(
+                egui::Slider::new(&mut alpha, 0.0..=100.0)
+                    .text("Alpha")
+                    .suffix(" %")
+                    .fixed_decimals(0),
+            )
+            .on_hover_text("How much of what is underneath shows through the fill")
+            .changed()
+        {
+            style.fill_color.components[3] = (alpha / 100.0) as f32;
+        }
+    } else {
+        gradient_editor(ui, &mut style.fill_gradient);
+    }
+
+    swatch_strips(ui, scene, style);
+}
+
+/// The document's swatches and the recently used ones, as two strips of chips.
+///
+/// Shared by the Colour panel and the tool options for the same reason the fill
+/// block is: picking a colour is picking a colour wherever it is being done.
+/// Shift-click sends the colour to the stroke instead of the fill, which is
+/// what the Colour panel has always done.
+fn swatch_strips(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
+    let mut picked: Option<(Color, bool)> = None;
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Swatches").small().weak());
+    let palette: Vec<(String, Color)> = scene
+        .swatches()
+        .iter()
+        .map(|s| (s.path(), s.color))
+        .collect();
+    ui.horizontal_wrapped(|ui| {
+        if palette.is_empty() {
+            ui.label(
+                RichText::new("none \u{2014} add colours in the Swatches panel")
+                    .small()
+                    .weak()
+                    .italics(),
+            );
+        }
+        for (name, color) in &palette {
+            if swatch_chip(ui, *color, name) {
+                picked = Some((*color, ui.input(|i| i.modifiers.shift)));
+            }
+        }
+    });
+
+    ui.add_space(4.0);
+    ui.label(RichText::new("Recent").small().weak());
+    let recent = style.swatches.clone();
+    ui.horizontal_wrapped(|ui| {
+        if recent.is_empty() {
+            ui.label(RichText::new("none yet").small().weak().italics());
+        }
+        for color in &recent {
+            if swatch_chip(ui, *color, "Recently used") {
+                picked = Some((*color, ui.input(|i| i.modifiers.shift)));
+            }
+        }
+    });
+
+    if let Some((color, to_stroke)) = picked {
+        if to_stroke {
+            style.stroke_color = color;
+            style.stroke_enabled = true;
+        } else {
+            style.fill_color = color;
+            style.fill_enabled = true;
+        }
+        style.remember(color);
+    }
+}
+
 pub fn color_panel(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
     ui.heading("Color");
     ui.separator();

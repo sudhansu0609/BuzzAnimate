@@ -230,6 +230,9 @@ pub enum Command {
     /// **Direct a story**: a few lines of prose in, a staged scene with the
     /// walks and talks already on the timeline. See `buzz_act::direct`.
     DirectScene,
+    /// The scenery half of the Story panel: what is in the shot, and whose
+    /// drawings it is made of.
+    SceneryFor,
     /// A new, empty scene after this one — the next shot of the film.
     AddScene,
     /// A complete copy of this scene, opened for editing. What the next beat
@@ -480,6 +483,7 @@ impl Command {
 
             SetScene => "Set the Scene\u{2026}",
             DirectScene => "Direct a Story\u{2026}",
+            SceneryFor => "Scenery\u{2026}",
             AddScene => "Add Scene",
             DuplicateScene => "Duplicate Scene",
             AddPerson => "Add Person",
@@ -663,7 +667,8 @@ impl Command {
             AddSun | AddSky | AddLamp | AddGloom | AddFire | AddStorm => None,
             // No Animate binding to follow, and these open dialogs rather than
             // acting straight away, so a key would only save the menu.
-            SetScene | DirectScene | AddScene | DuplicateScene | AddPerson | Perform
+            SetScene | DirectScene | SceneryFor | AddScene | DuplicateScene | AddPerson
+            | Perform
             | AddFollowThrough | AddWiggle | ClearModifiers | BakeModifiers | SetReverse
             | ClearReverse | AddProfileRight | AddProfileLeft | AddThreeQuarterRight
             | AddThreeQuarterLeft => None,

@@ -85,6 +85,11 @@ pub struct RenderJob {
     /// **Dialogue and music**, decoded before the run and handed to the script
     /// by index. Each may carry a slice of the file rather than all of it.
     pub audio: Vec<AudioIn>,
+    /// **Where to write a contact sheet**, if one is wanted.
+    ///
+    /// A test render: frames spread across the film, tiled into one PNG. See
+    /// [`contact_sheet`].
+    pub preview: Option<PathBuf>,
     /// Where to write the `.buzz` document, if it is wanted.
     ///
     /// Separate from the render, and either may be given alone: a document with
@@ -127,6 +132,21 @@ pub fn render(job: &RenderJob) -> Result<String> {
         doc.save_as(path)
             .with_context(|| format!("saving {}", path.display()))?;
         report.push(format!("Saved {}", path.display()));
+    }
+
+    if let Some(path) = &job.preview {
+        let scenes = doc.film();
+        let sheet = contact_sheet(&scenes, job.height, &job.gpu)
+            .with_context(|| format!("previewing into {}", path.display()))?;
+        sheet
+            .write_png(path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        report.push(format!(
+            "Preview: {}x{} \u{2192} {}",
+            sheet.width,
+            sheet.height,
+            path.display()
+        ));
     }
 
     let Some(output) = job.output.clone() else {
@@ -305,6 +325,93 @@ fn build(job: &RenderJob, report: &mut Vec<String>) -> Result<Document> {
     }
 
     Ok(doc)
+}
+
+/// How many frames a contact sheet holds, and how they are laid out.
+///
+/// Three across and two down: enough to cross a three-shot film and see a
+/// camera move, and small enough that the sheet is a picture rather than a
+/// wall.
+const SHEET: (u32, u32) = (3, 2);
+
+/// **A test render: frames from across the film, tiled into one picture.**
+///
+/// # Why this exists next to `--render`
+///
+/// Rendering a film to find out whether it is right costs the whole film, and
+/// the mistakes it catches are the cheap ones — the wrong range, a light left
+/// off, a guide layer somebody forgot to hide. Six frames cost a second and
+/// catch every one of them. `--render out.png` already gives the *first* frame,
+/// which is the least informative part of a film: the camera has not moved,
+/// nobody has walked anywhere, and no cut has happened.
+///
+/// Rendered through the exporter, so what the sheet shows is what the file
+/// would hold rather than what the stage would draw.
+pub fn contact_sheet(
+    scenes: &[buzz_scene::Scene],
+    height: Option<u32>,
+    gpu: &GpuPreference,
+) -> Result<buzz_export::Frame> {
+    let reel = buzz_export::Reel::of(scenes.iter());
+    let total = reel.frames();
+    let Some(lead) = reel.lead() else {
+        bail!("that document has no scenes in it");
+    };
+    if total == 0 {
+        bail!("that film is zero frames long");
+    }
+
+    // A cell of the sheet, at the film's own aspect. Deliberately small: this
+    // is a check, not a delivery.
+    let settings = sized(lead, Some(height.unwrap_or(1080).min(2160) / SHEET.1.max(1)));
+    let mut exporter = buzz_export::Exporter::new(gpu)?;
+
+    let (cols, rows) = SHEET;
+    let cells = cols * rows;
+    let (cw, ch) = (settings.width, settings.height);
+    let mut sheet = buzz_export::Frame {
+        width: cw * cols,
+        height: ch * rows,
+        pixels: vec![0u8; (cw * cols * ch * rows * 4) as usize],
+    };
+
+    let last = total - 1;
+    for i in 0..cells {
+        // Spread across the whole film, ends included: the first frame and the
+        // last are the two most worth looking at.
+        let at = if cells <= 1 {
+            0
+        } else {
+            (last as u64 * i as u64 / (cells as u64 - 1)) as u32
+        };
+        let Some((scene, local)) = reel.at_clamped(at) else {
+            continue;
+        };
+        let frame = exporter.render(scene, local, &settings)?;
+        blit(&mut sheet, &frame, (i % cols) * cw, (i / cols) * ch);
+    }
+    Ok(sheet)
+}
+
+/// Copy `from` into `into` with its top-left corner at `(x, y)`.
+///
+/// Row by row rather than pixel by pixel: the rows are contiguous in both, so
+/// this is six memcpys per row and not a million bounds checks.
+fn blit(into: &mut buzz_export::Frame, from: &buzz_export::Frame, x: u32, y: u32) {
+    for row in 0..from.height {
+        let dst_y = y + row;
+        if dst_y >= into.height {
+            break;
+        }
+        let width = from.width.min(into.width.saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        let src = (row * from.width * 4) as usize;
+        let dst = ((dst_y * into.width + x) * 4) as usize;
+        let bytes = (width * 4) as usize;
+        into.pixels[dst..dst + bytes].copy_from_slice(&from.pixels[src..src + bytes]);
+    }
 }
 
 /// Open every `--audio`, taking the slice each one asked for.

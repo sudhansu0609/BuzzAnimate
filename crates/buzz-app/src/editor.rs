@@ -185,6 +185,14 @@ pub struct Editor {
     /// While scrubbing the playhead with sound, the moment the short burst of
     /// audio should stop if the drag has paused. `None` when not scrubbing.
     scrub_until: Option<std::time::Instant>,
+    /// The frame the scrub has already been told about.
+    ///
+    /// A pointer moves far more often than the playhead changes frame — sixty
+    /// times a second over a timeline running at twenty-four — and repositioning
+    /// the audio on every one of those replays the same few milliseconds over
+    /// and over. A run of restarts at a steady rate is a *tone*, which is the
+    /// hum that used to sit under the sound while dragging.
+    scrub_frame: Option<u32>,
     /// Beat frames detected from the soundtrack, shown as ticks on the ruler.
     /// View state, not saved — a guide the animator keys action to.
     /// **Frames marked on the timeline ruler.**
@@ -203,6 +211,8 @@ pub struct Editor {
     sound_placed: bool,
     /// The Set the Scene and Animate Selection dialogs. See `crate::staging`.
     pub staging: buzz_ui::StagingState,
+    /// The Story panel's own state: the draft, the set and the scenery.
+    pub story: buzz_ui::StoryState,
     /// A motion path just drawn, waiting on the dialog: the curve and the object
     /// it will send along it, captured at draw time so a later change of
     /// selection cannot send the wrong thing. See `crate::staging`.
@@ -342,10 +352,12 @@ impl Editor {
             light_gesture: None,
             sound: crate::sound::SoundBank::new(stage_fps),
             scrub_until: None,
+            scrub_frame: None,
             ruler_marks: Vec::new(),
             lip_sync: buzz_ui::LipSyncState::default(),
             sound_placed: false,
             staging: buzz_ui::StagingState::default(),
+            story: buzz_ui::StoryState::default(),
             pending_motion_path: None,
             import_summary: None,
             should_quit: false,
@@ -656,11 +668,18 @@ impl Editor {
         if self.sound.stage_track(scene).is_none() {
             return;
         }
+        // **Only when the frame has actually changed.** See `scrub_frame`: the
+        // deadline is still pushed out below, so holding the pointer still on
+        // one frame keeps the sound alive without restarting it.
+        let moved = self.scrub_frame != Some(frame);
         if self.scrub_until.is_some() && self.sound.playing_frame().is_some() {
-            self.sound.seek(frame);
+            if moved {
+                self.sound.seek(frame);
+            }
         } else {
             self.sound.play(scene, frame);
         }
+        self.scrub_frame = Some(frame);
         self.scrub_until =
             Some(std::time::Instant::now() + std::time::Duration::from_millis(140));
     }
@@ -1185,12 +1204,14 @@ impl Editor {
     pub fn tick_scrub(&mut self) {
         if self.playback.playing {
             self.scrub_until = None;
+            self.scrub_frame = None;
             return;
         }
         if let Some(deadline) = self.scrub_until {
             if std::time::Instant::now() >= deadline {
                 self.sound.stop();
                 self.scrub_until = None;
+                self.scrub_frame = None;
             }
         }
     }
@@ -3607,11 +3628,26 @@ impl Editor {
             AddStorm => self.add_storm(),
 
             // -- staging and performance --------------------------------------
-            SetScene => {
-                let frames = self.doc.scene().frame_count();
-                self.staging.open_scene(frames);
+            // **All three raise the Story panel now.**
+            //
+            // The first two were modal dialogs, and a modal is the wrong shape
+            // for either: setting a shot up is written and rewritten, and a box
+            // covering the stage while you type is a box you cannot see the
+            // result through. See `buzz_ui::story_panel`.
+            SetScene | DirectScene | SceneryFor => {
+                self.story.frames = self.doc.scene().frame_count();
+                let brief = self.doc.scene().brief().to_string();
+                let at = self.doc.active_scene();
+                // The shot's own words, unless something is already being
+                // typed: losing a draft to a menu item is worse than showing
+                // the wrong one.
+                if self.story.draft.trim().is_empty() && !brief.is_empty() {
+                    self.story.load(at, &brief);
+                }
+                self.story.show_set = matches!(command, SetScene);
+                self.story.show_scenery = matches!(command, SceneryFor);
+                self.raise_story_panel();
             }
-            DirectScene => self.staging.open_direct(),
             AddScene => {
                 self.add_scene();
                 let n = self.doc.active_scene() + 1;
@@ -4718,7 +4754,19 @@ impl Editor {
     /// The symbol's timeline is a different length and holds different
     /// objects, so a playhead and a selection from the old context would both
     /// be meaningless.
-    fn after_context_change(&mut self) {
+    /// Put the Story panel in front, opening it if it is away.
+    ///
+    /// A closed panel cannot be brought to the front of anything, which is why
+    /// this is two steps — the same as the Layer Depth view.
+    pub fn raise_story_panel(&mut self) {
+        let workspace = &mut self.workspace;
+        if !workspace.is_open(buzz_ui::PanelId::Story) {
+            workspace.move_to(buzz_ui::PanelId::Story, buzz_ui::Dock::Right);
+        }
+        workspace.select_tab(buzz_ui::PanelId::Story);
+    }
+
+    pub(crate) fn after_context_change(&mut self) {
         self.selection.clear();
         self.selection.set_active_layer(None);
         self.selection.ensure_active_layer(self.doc.scene());

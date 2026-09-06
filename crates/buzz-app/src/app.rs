@@ -665,6 +665,8 @@ pub struct App {
     /// because an asset is a file on disk rather than a symbol in the open
     /// document, so it is keyed and invalidated differently.
     asset_thumbnails: crate::thumbnails::AssetThumbnails,
+    /// The Export dialog's test render. See [`crate::preview`].
+    preview: crate::preview::Preview,
     /// Shading geometry being built off the UI thread, if any.
     ///
     /// The first lit frame of a heavy scene used to cost a third of a second,
@@ -797,6 +799,7 @@ impl App {
             stage_area_min: egui::Pos2::ZERO,
             thumbnails: crate::thumbnails::Thumbnails::default(),
             asset_thumbnails: crate::thumbnails::AssetThumbnails::default(),
+            preview: crate::preview::Preview::default(),
             shade_build: None,
             shade_aim: 0,
             stage_stale: false,
@@ -1763,6 +1766,54 @@ impl App {
     /// Each change is its own undo step with its own label, so pushing a layer
     /// back and then flattening everything are two separate things to undo
     /// rather than one indivisible "depth" blob.
+    /// **The Story panel**: the brief, the set, and the scenery.
+    ///
+    /// The state is taken out of the editor for the duration, because the panel
+    /// wants `&mut` on it while the actions want `&mut` on the whole editor —
+    /// the same trick every dialog here uses.
+    fn story_panel(&mut self, ui: &mut egui::Ui) {
+        let shots = self.editor.shot_summaries();
+        let symbols = self.editor.library_choices();
+        let current = self.editor.doc.active_scene();
+
+        let mut state = std::mem::take(&mut self.editor.story);
+        let response = buzz_ui::story_panel(ui, &mut state, &shots, current, &symbols);
+
+        if let Some(index) = response.go_to {
+            self.editor.switch_scene(index);
+            // **The words come with the shot.** Unless something is being
+            // typed: replacing a draft somebody is halfway through is how a
+            // paragraph gets lost, so the panel offers it instead.
+            let untouched = state.draft.trim().is_empty()
+                || shots
+                    .get(state.draft_from.unwrap_or(usize::MAX))
+                    .is_some_and(|s| s.brief == state.draft);
+            if untouched {
+                let brief = shots.get(index).map(|s| s.brief.clone()).unwrap_or_default();
+                state.load(index, &brief);
+            }
+        }
+        if response.direct {
+            self.editor.story_direct(&mut state);
+        }
+        if response.direct_sequence {
+            let story = state.draft.clone();
+            let directed = self.editor.direct_sequence(&story);
+            state.report = self.editor.status.clone();
+            state.ignored.clear();
+            if directed > 0 {
+                state.draft_from = Some(self.editor.doc.active_scene());
+            }
+        }
+        if response.set_scene {
+            self.editor.story_set_scene(&state);
+        }
+        if response.lay_scenery {
+            self.editor.story_lay_scenery(&state);
+        }
+        self.editor.story = state;
+    }
+
     fn depth_panel(&mut self, ui: &mut egui::Ui) {
         let active = self.editor.selection.active_layer();
         let response = buzz_ui::depth_panel(ui, self.editor.doc.scene(), active);
@@ -2293,6 +2344,7 @@ impl App {
                     buzz_ui::swatch_panel(ui, scene, state, style);
                 });
             }
+            Story => self.story_panel(ui),
             Depth => self.depth_panel(ui),
             Rig => self.rig_panel(ui),
             Filters => self.filter_panel(ui),
@@ -5631,10 +5683,54 @@ impl App {
         self.editor.staging = state;
     }
 
+    /// **Ask for a test render** at whatever the Export dialog currently says.
+    ///
+    /// The same scenes, the same range and the same size the export itself
+    /// would use — reading them from anywhere else would be a preview of a
+    /// different film.
+    fn request_preview(&mut self) {
+        let scenes = self.editor.doc.film();
+        if scenes.is_empty() {
+            return;
+        }
+        self.preview.request(crate::preview::Request {
+            range: self.editor.export.range(),
+            width: self.editor.export.width,
+            height: self.editor.export.height,
+            scenes,
+        });
+    }
+
     /// Draw the Export dialog and act on what the user chose.
     fn export_dialog(&mut self, ctx: &egui::Context) {
         let names = self.presets.names();
-        let response = buzz_ui::export_dialog(ctx, &mut self.editor.export, &names);
+        let shots: Vec<buzz_ui::PreviewShot> = self
+            .preview
+            .shots()
+            .iter()
+            .map(|shot| buzz_ui::PreviewShot {
+                frame: shot.frame,
+                texture: shot.id,
+                size: shot.size(),
+            })
+            .collect();
+        let message = self.preview.message.clone();
+        let response = buzz_ui::export_dialog(
+            ctx,
+            &mut self.editor.export,
+            &names,
+            &shots,
+            message.as_deref(),
+        );
+
+        if response.preview {
+            self.request_preview();
+        }
+        // A dialog that has been closed has nothing to show, and its textures
+        // are a megabyte nobody is looking at.
+        if response.cancelled || response.confirmed {
+            self.preview.clear();
+        }
 
         if let Some(i) = response.apply_preset
             && let Some(preset) = self.presets.all().into_iter().nth(i)
@@ -7126,6 +7222,22 @@ impl App {
             );
             // Ask for another frame so the rest arrive without the pointer
             // having to move.
+            active.window.request_redraw();
+        }
+
+        // **The Export dialog's test render**, here for the same reason: this
+        // is the only place the device, Vello and egui's renderer meet. The
+        // whole strip in one go — six small pictures is a few milliseconds,
+        // and a strip filling in one frame at a time would flicker its way
+        // into existence while the user watched.
+        if self.preview.pending() {
+            let mut scratch = buzz_render::vello::Scene::new();
+            self.preview.fulfil(
+                &mut active.gpu,
+                &mut active.egui_renderer,
+                &mut scratch,
+                &mut self.lights,
+            );
             active.window.request_redraw();
         }
 

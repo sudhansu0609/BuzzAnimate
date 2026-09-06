@@ -371,6 +371,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 ui.separator();
                 item(ui, Command::SetScene, true, &mut raised);
                 item(ui, Command::DirectScene, true, &mut raised);
+                item(ui, Command::SceneryFor, true, &mut raised);
                 item(ui, Command::AddPerson, true, &mut raised);
                 ui.separator();
                 // Left enabled whatever is selected: the dialog is where the

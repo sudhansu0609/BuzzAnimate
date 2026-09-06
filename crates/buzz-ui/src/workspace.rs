@@ -52,6 +52,12 @@ pub enum PanelId {
     Assets,
     Timeline,
     Actions,
+    /// **The brief, the set and the scenery.**
+    ///
+    /// What used to be two modal dialogs. Directing is written and rewritten
+    /// rather than answered once, and a box covering the stage while you type
+    /// is a box you cannot see the result through. See [`crate::story_panel`].
+    Story,
     /// The easing-curve editor for the tween under the playhead. Hidden until
     /// asked for, from the Window menu.
     MotionEditor,
@@ -79,6 +85,7 @@ impl PanelId {
             Self::Assets => "Assets",
             Self::Timeline => "Timeline",
             Self::Actions => "Actions",
+            Self::Story => "Story",
             Self::MotionEditor => "Motion Editor",
             Self::Tasks => "Tasks",
         }
@@ -111,7 +118,7 @@ impl PanelId {
         !matches!(self, Self::Tools | Self::Timeline)
     }
 
-    pub const ALL: [PanelId; 17] = [
+    pub const ALL: [PanelId; 18] = [
         PanelId::Tools,
         PanelId::ToolOptions,
         PanelId::Layers,
@@ -127,6 +134,7 @@ impl PanelId {
         PanelId::Assets,
         PanelId::Timeline,
         PanelId::Actions,
+        PanelId::Story,
         PanelId::MotionEditor,
         PanelId::Tasks,
     ];
@@ -786,24 +794,28 @@ impl Workspace {
                 // reached for. Animate docks Swatches with Color for the same
                 // reason.
                 slot(PanelId::Swatches, Dock::Right, 4, Dock::Right),
-                // **One section, five tabs.** Each of these is reached for now
-                // and then rather than all day. Rolled up they were five title
-                // bars taking five rows and showing nothing; as tabs they take
+                // **One section, six tabs.** Each of these is reached for now
+                // and then rather than all day. Rolled up they were six title
+                // bars taking six rows and showing nothing; as tabs they take
                 // one row and always show one of them. That is what the
                 // grouping is *for*, and the default arrangement should
                 // demonstrate it rather than leave it as something to discover.
-                tab(PanelId::Depth, Dock::Right, 5, Dock::Right, GROUP_UTILITY, true),
-                tab(PanelId::Rig, Dock::Right, 6, Dock::Right, GROUP_UTILITY, false),
+                //
+                // **Story is the one at the front.** Setting a shot up is what
+                // an animator does before anything else in it, and it is the
+                // panel that replaced two menu items nobody would find.
+                tab(PanelId::Story, Dock::Right, 5, Dock::Right, GROUP_UTILITY, true),
                 tab(
-                    PanelId::Filters,
+                    PanelId::Depth,
                     Dock::Right,
-                    7,
+                    6,
                     Dock::Right,
                     GROUP_UTILITY,
                     false,
                 ),
+                tab(PanelId::Rig, Dock::Right, 7, Dock::Right, GROUP_UTILITY, false),
                 tab(
-                    PanelId::Lighting,
+                    PanelId::Filters,
                     Dock::Right,
                     8,
                     Dock::Right,
@@ -811,9 +823,17 @@ impl Workspace {
                     false,
                 ),
                 tab(
-                    PanelId::Sound,
+                    PanelId::Lighting,
                     Dock::Right,
                     9,
+                    Dock::Right,
+                    GROUP_UTILITY,
+                    false,
+                ),
+                tab(
+                    PanelId::Sound,
+                    Dock::Right,
+                    10,
                     Dock::Right,
                     GROUP_UTILITY,
                     false,
@@ -2280,7 +2300,9 @@ mod migration_tests {
             .expect("the Depth panel is on the right");
         assert!(utility.panels.contains(&PanelId::Sound));
         assert!(utility.is_tabbed());
-        assert_eq!(utility.front, PanelId::Depth);
+        // Story is the tab at the front: setting a shot up comes before
+        // anything else done in it.
+        assert_eq!(utility.front, PanelId::Story);
 
         for id in [PanelId::Layers, PanelId::Properties] {
             let section = right
@@ -2465,8 +2487,8 @@ mod migration_tests {
 mod group_tests {
     use super::*;
 
-    /// The default arrangement puts the five occasional panels in one section,
-    /// which is what turns a column of nine into a column of five.
+    /// The default arrangement puts the six occasional panels in one section,
+    /// which is what turns a column of ten into a column of five.
     #[test]
     fn the_occasional_panels_share_one_section() {
         let workspace = Workspace::animate();
@@ -2475,6 +2497,7 @@ mod group_tests {
             .expect("Layer Depth is on screen");
 
         for id in [
+            PanelId::Story,
             PanelId::Depth,
             PanelId::Rig,
             PanelId::Filters,
@@ -2484,7 +2507,7 @@ mod group_tests {
             assert!(section.panels.contains(&id), "{id:?} is not in the section");
         }
         assert!(section.is_tabbed());
-        assert_eq!(section.front, PanelId::Depth, "no tab is at the front");
+        assert_eq!(section.front, PanelId::Story, "no tab is at the front");
         assert!(
             !section.collapsed,
             "a tabbed section that starts rolled up shows nothing at all"

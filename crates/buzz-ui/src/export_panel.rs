@@ -360,6 +360,20 @@ pub struct ExportResponse {
     pub apply_preset: Option<usize>,
     /// Save the current settings as a preset under `preset_name`.
     pub save_preset: bool,
+    /// **Render a test strip** at these settings, without writing anything.
+    pub preview: bool,
+}
+
+/// One frame of a test render, ready to draw.
+///
+/// The shell renders these — it is the only part that has a GPU — and hands
+/// them over as textures. See `buzz_app::preview`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreviewShot {
+    /// Which frame of the film it is, for the caption.
+    pub frame: u32,
+    pub texture: egui::TextureId,
+    pub size: egui::Vec2,
 }
 
 /// Draw the dialog. Returns what the user chose.
@@ -370,6 +384,8 @@ pub fn export_dialog(
     ctx: &egui::Context,
     state: &mut ExportState,
     presets: &[String],
+    preview: &[PreviewShot],
+    preview_message: Option<&str>,
 ) -> ExportResponse {
     let mut response = ExportResponse::default();
     let Some(kind) = state.open else {
@@ -400,6 +416,7 @@ pub fn export_dialog(
             if state.fingerprint() != before {
                 state.selected_preset = None;
             }
+            preview_view(ui, preview, preview_message, &mut response);
         });
 
     // The window's own close button counts as cancelling.
@@ -410,6 +427,64 @@ pub fn export_dialog(
         state.close();
     }
     response
+}
+
+/// **The test render**: a strip of frames from across the range, at these
+/// settings, before anything is written.
+///
+/// Every setting above changes what comes out, and the only way to find out
+/// what used to be to export it — so the cheap mistakes (the wrong range, the
+/// wrong size, a light left off) were all found *after* the encode. Six frames
+/// take a moment and catch every one of them.
+fn preview_view(
+    ui: &mut Ui,
+    shots: &[PreviewShot],
+    message: Option<&str>,
+    response: &mut ExportResponse,
+) {
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui
+            .button("Test render")
+            .on_hover_text("Render a few frames at these settings, without writing a file")
+            .clicked()
+        {
+            response.preview = true;
+        }
+        if let Some(message) = message {
+            ui.label(RichText::new(message).small().weak());
+        }
+    });
+
+    if shots.is_empty() {
+        return;
+    }
+
+    // One row, scrolling: the frames are in order and reading them left to
+    // right is reading the film.
+    egui::ScrollArea::horizontal()
+        .max_height(140.0)
+        .id_salt("export-preview")
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for shot in shots {
+                    ui.vertical(|ui| {
+                        // Scaled to a common height so a strip of frames is a
+                        // strip rather than a staircase.
+                        let scale = 100.0 / shot.size.y.max(1.0);
+                        ui.add(
+                            egui::Image::new((shot.texture, shot.size * scale))
+                                .corner_radius(2.0),
+                        );
+                        ui.label(
+                            RichText::new(format!("{}", shot.frame))
+                                .small()
+                                .weak(),
+                        );
+                    });
+                }
+            });
+        });
 }
 
 /// The preset row at the top of the dialog: pick one to fill the settings, or

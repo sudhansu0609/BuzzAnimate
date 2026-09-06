@@ -55,13 +55,14 @@ fn main() -> Result<()> {
     // is sitting at must not be waiting on one — and it exits rather than
     // falling through, because a render that then opened the editor would be a
     // render nobody could run from a batch file.
-    if args.render.is_some() || args.save.is_some() {
+    if args.render.is_some() || args.save.is_some() || args.preview.is_some() {
         let job = buzz_app::headless::RenderJob {
             document: args.document.clone(),
             brief: args.brief.clone(),
             script: args.script.clone(),
             audio: args.audio.clone(),
             save: args.save.clone(),
+            preview: args.preview.clone(),
             output: args.render.clone(),
             height: args.height,
             gpu: args.gpu.clone(),
@@ -154,6 +155,9 @@ struct Args {
     /// `.buzz` and opens no window and encodes nothing -- which is what a
     /// script that sets up a film for somebody to carry on with wants.
     save: Option<std::path::PathBuf>,
+    /// **A contact sheet to write**: frames from across the film, tiled into
+    /// one PNG. A test render, before committing to the encode.
+    preview: Option<std::path::PathBuf>,
     /// Sounds to open and hand to the script, in the order they were given.
     /// `--from` and `--for` after one take a slice of it.
     audio: Vec<buzz_app::headless::AudioIn>,
@@ -176,6 +180,7 @@ impl Args {
             render: None,
             brief: None,
             save: None,
+            preview: None,
             audio: Vec::new(),
             height: None,
         };
@@ -214,6 +219,12 @@ impl Args {
                 "--save" => {
                     if let Some(v) = value {
                         out.save = Some(std::path::PathBuf::from(v));
+                        i += 1;
+                    }
+                }
+                "--preview" => {
+                    if let Some(v) = value {
+                        out.preview = Some(std::path::PathBuf::from(v));
                         i += 1;
                     }
                 }

@@ -31,6 +31,7 @@ pub mod selection;
 pub mod sound_panel;
 pub mod splash;
 pub mod staging_panel;
+pub mod story_panel;
 pub mod style;
 pub mod swatch_panel;
 pub mod tasks_panel;
@@ -51,6 +52,7 @@ pub use command_palette::{command_palette, CommandPaletteState};
 pub use shortcut_editor::{shortcut_editor, ShortcutEditorState};
 pub use depth_panel::{DepthResponse, depth_panel};
 pub use export_panel::{
+    PreviewShot,
     ContainerChoice, DitherChoice, ExportKind, ExportResponse, ExportState, GifOptions,
     VideoChoice, VideoOptions, WebpOptions, export_dialog,
 };
@@ -65,6 +67,9 @@ pub use rig_panel::{DraggedPart, LoosePart, RigPanelState, RigResponse, rig_pane
 pub use selection::Selection;
 pub use sound_panel::{SoundChoice, SoundResponse, sound_panel};
 pub use splash::{SplashState, opening_scene};
+pub use story_panel::{
+    SceneryChoice, SceneryPartChoice, ShotSummary, StoryResponse, StoryState, story_panel,
+};
 pub use staging_panel::{
     ActionChoice, SettingChoice, StagingDialog, StagingResponse, StagingState, staging_dialog,
 };

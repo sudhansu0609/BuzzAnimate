@@ -238,6 +238,18 @@ pub struct Scene {
     /// The document's named colours. Private for the same reason.
     swatches: Swatches,
     layers: LayerStack,
+    /// **The prose this scene was built from**, when it was built from prose.
+    ///
+    /// The director reads a paragraph and lays out a whole shot from it, and
+    /// until this existed that paragraph was thrown away the moment the scene
+    /// appeared: the animator was left with sixty layers and no record of the
+    /// sentence that made them, and no way to change a word and try again
+    /// without retyping the lot.
+    ///
+    /// Kept on the *scene* rather than beside it, so it travels wherever the
+    /// scene does -- into a saved document, into a script's film, into an
+    /// asset. Empty for every scene made by hand, which is most of them.
+    brief: String,
     ids: IdAllocator,
     revision: u64,
     /// Symbols currently open for editing, outermost first.
@@ -293,6 +305,7 @@ impl Clone for Scene {
             looping: self.looping,
             swatches: self.swatches.clone(),
             layers: self.layers.clone(),
+            brief: self.brief.clone(),
             ids: self.ids,
             revision: self.revision,
             editing: self.editing.clone(),
@@ -349,6 +362,7 @@ impl PartialEq for Scene {
             && self.looping == other.looping
             && self.swatches == other.swatches
             && self.layers == other.layers
+            && self.brief == other.brief
             && self.ids == other.ids
             && self.revision == other.revision
     }
@@ -367,6 +381,7 @@ impl Default for Scene {
             // A new document opens with Animate's default palette, named.
             swatches: swatch::default_swatches(),
             layers: LayerStack::new(),
+            brief: String::new(),
             ids: IdAllocator::default(),
             revision: 0,
             editing: Vec::new(),
@@ -381,6 +396,23 @@ impl Default for Scene {
 }
 
 impl Scene {
+    /// **The prose this scene was directed from**, or empty.
+    ///
+    /// See [`Self::brief`]. Shown in the Story panel, where it can be edited
+    /// and re-directed.
+    pub fn brief(&self) -> &str {
+        &self.brief
+    }
+
+    /// Record the prose a scene was built from.
+    ///
+    /// Bumps the revision like any other edit: it is part of the document and
+    /// a document that changed it is a document to save.
+    pub fn set_brief(&mut self, brief: impl Into<String>) {
+        self.brief = brief.into();
+        self.bump();
+    }
+
     /// An empty document with no layers at all.
     ///
     /// Importers want this; the editor wants [`Scene::default`].
@@ -397,6 +429,7 @@ impl Scene {
             // palette it carries comes from the file rather than from here.
             swatches: Swatches::default(),
             layers: LayerStack::new(),
+            brief: String::new(),
             ids: IdAllocator::default(),
             revision: 0,
             editing: Vec::new(),

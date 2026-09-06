@@ -262,6 +262,10 @@ pub struct DocumentDto {
     /// Imported bitmaps. Version 17. The files live in `media/`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageAssetDto>,
+    /// **The prose the scene was directed from.** Absent in every older file
+    /// and in every scene built by hand, which is most of them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub brief: String,
 }
 
 /// A named colour.
@@ -2335,6 +2339,7 @@ impl DocumentDto {
         };
 
         Self {
+            brief: scene.brief().to_string(),
             format_version: FORMAT_VERSION,
             stage: StageDto {
                 width: scene.stage().size.width,
@@ -2555,6 +2560,9 @@ impl DocumentDto {
             }
         }
         *scene.images_mut() = images.clone();
+        if !self.brief.is_empty() {
+            scene.set_brief(self.brief.clone());
+        }
         let images = &images;
         *scene.stage_mut() = StageProperties {
             size: Size::new(self.stage.width, self.stage.height),

@@ -92,6 +92,30 @@ struct Mixer {
     position: u64,
     playing: bool,
     volume: f32,
+    /// **Output gain, ramped rather than switched.**
+    ///
+    /// Every abrupt change to what is being mixed is a step in the waveform,
+    /// and a step is a click. There are three of them — starting, stopping, and
+    /// moving the playhead — and the third is the one that hurts: dragging the
+    /// playhead repositions the audio many times a second, and a run of clicks
+    /// at a steady rate is not a series of clicks, it is a **tone**. That is the
+    /// hum heard under the audio while scrubbing.
+    ///
+    /// One envelope fixes all three. It travels towards [`Self::target`] at a
+    /// fixed rate — see `RAMP_SECONDS` — so nothing the mixer does ever arrives
+    /// as a step.
+    gain: f32,
+    /// What [`Self::gain`] is travelling towards: one while playing, zero while
+    /// stopped or while a reposition is waiting to happen.
+    target: f32,
+    /// **A move the mixer has not made yet.**
+    ///
+    /// A seek does not take effect where it is asked for. It sets this, the
+    /// gain falls to zero over a few milliseconds, and *then* the position
+    /// jumps and fades back in — so the join is a short dip rather than a step.
+    /// Silent for the ear, and about ten milliseconds, which is a third of a
+    /// frame at 24fps.
+    pending_seek: Option<u64>,
     /// A clock that only ever goes forwards, in output sample frames.
     ///
     /// **Distinct from `position`, and that is the whole of honest Event
@@ -135,7 +159,20 @@ fn sample_at(clip: &Clip, position: f64, channel: usize, clip_channels: usize) -
     a + (b - a) * t
 }
 
+/// How long the output takes to travel between silence and full.
+///
+/// Long enough to be inaudible as a click, short enough to be inaudible as a
+/// fade: five milliseconds is about a tenth of a frame at 24fps, and it is the
+/// figure every editor's declicker lands on.
+const RAMP_SECONDS: f32 = 0.005;
+
 impl Mixer {
+    /// How far the gain moves per output sample frame.
+    fn ramp_step(&self) -> f32 {
+        let samples = self.sample_rate.max(1) as f32 * RAMP_SECONDS;
+        if samples <= 1.0 { 1.0 } else { 1.0 / samples }
+    }
+
     /// Fill `output` with whatever the cues have at the current position.
     fn render(&mut self, output: &mut [f32]) {
         output.fill(0.0);
@@ -145,11 +182,29 @@ impl Mixer {
             return;
         }
 
+        // Where the envelope is heading. A waiting reposition takes priority
+        // over playing: the gain has to reach zero before the jump can happen.
+        self.target = if self.pending_seek.is_some() {
+            0.0
+        } else if self.playing {
+            1.0
+        } else {
+            0.0
+        };
+
         // **Event voices are rendered even when the playhead is stopped.**
         // That is what makes them events rather than positions: pressing stop
         // ends the film, not the door slam that was already sounding.
-        if !self.playing && self.voices.is_empty() {
+        //
+        // The gain has to have arrived, too: cutting the tail of a fade-out to
+        // take the cheap path would put back the click the fade is there to
+        // remove.
+        if !self.playing && self.voices.is_empty() && self.gain <= 0.0 {
+            self.gain = 0.0;
             self.clock += frames as u64;
+            if let Some(to) = self.pending_seek.take() {
+                self.position = to;
+            }
             return;
         }
 
@@ -216,16 +271,37 @@ impl Mixer {
             alive
         });
 
-        // Sum without clipping to a hard edge: two loud cues together would
-        // otherwise square off into audible distortion.
-        for sample in output.iter_mut() {
-            *sample = sample.clamp(-1.0, 1.0);
+        // **The envelope, and the clamp, in one pass over the buffer.**
+        //
+        // The gain is per sample *frame* rather than per sample, so the
+        // channels of a stereo pair are scaled together and the image does not
+        // wander during a ramp.
+        let step = self.ramp_step();
+        for i in 0..frames {
+            if self.gain < self.target {
+                self.gain = (self.gain + step).min(self.target);
+            } else if self.gain > self.target {
+                self.gain = (self.gain - step).max(self.target);
+            }
+            for c in 0..channels {
+                let at = i * channels + c;
+                // Summed without clipping to a hard edge: two loud cues
+                // together would otherwise square off into audible distortion.
+                output[at] = (output[at] * self.gain).clamp(-1.0, 1.0);
+            }
         }
 
         if self.playing {
             self.position += frames as u64;
         }
         self.clock += frames as u64;
+
+        // The join, once the gain is out of the way.
+        if self.gain <= 0.0
+            && let Some(to) = self.pending_seek.take()
+        {
+            self.position = to;
+        }
     }
 
     /// Start any Event or Start cue the playhead crosses in this buffer.
@@ -393,15 +469,34 @@ impl Player {
         }
     }
 
-    /// Move to a frame. Takes effect on the next buffer, playing or not.
+    /// **Move to a frame**, without a click.
+    ///
+    /// The jump does not happen here. It is handed to the mixer, which fades
+    /// out, moves, and fades back in over about ten milliseconds — see
+    /// [`Mixer::pending_seek`]. A seek that lands where the audio already is
+    /// does nothing at all, so holding the playhead still while dragging
+    /// something else does not stutter the sound.
     pub fn seek(&mut self, frame: u32) {
         if let Ok(mut mixer) = self.mixer.lock() {
             let rate = mixer.sample_rate.max(1) as f64;
-            mixer.position = if mixer.fps > 0.0 {
+            let to = if mixer.fps > 0.0 {
                 (frame as f64 / mixer.fps * rate) as u64
             } else {
                 0
             };
+            // Already there, or already on the way there.
+            if mixer.pending_seek == Some(to)
+                || (mixer.pending_seek.is_none() && mixer.position == to)
+            {
+                return;
+            }
+            // Nothing is sounding yet, so there is nothing to fade out of.
+            if mixer.gain <= 0.0 && !mixer.playing {
+                mixer.position = to;
+                mixer.pending_seek = None;
+                return;
+            }
+            mixer.pending_seek = Some(to);
         }
     }
 
@@ -498,6 +593,22 @@ mod tests {
             fps,
             volume: 1.0,
             ..Mixer::default()
+        }
+    }
+
+    /// A mixer already playing, with its output envelope **settled**.
+    ///
+    /// Everything below that is about the *mix* wants the steady state. The
+    /// first few milliseconds of any playback are a ramp up from silence -- see
+    /// `Mixer::gain` -- and a test that rendered one short buffer from a cold
+    /// start would be measuring the declicker rather than the mixer. The
+    /// envelope has tests of its own.
+    fn rolling(fps: f64) -> Mixer {
+        Mixer {
+            playing: true,
+            gain: 1.0,
+            target: 1.0,
+            ..mixer(fps)
         }
     }
 
@@ -680,8 +791,7 @@ mod tests {
 
     #[test]
     fn nothing_queued_renders_silence() {
-        let mut mixer = mixer(24.0);
-        mixer.playing = true;
+        let mut mixer = rolling(24.0);
         let mut out = vec![0.5f32; 256];
         mixer.render(&mut out);
         assert!(out.iter().all(|s| *s == 0.0));
@@ -705,8 +815,7 @@ mod tests {
 
     #[test]
     fn a_cue_is_heard_once_playback_reaches_it() {
-        let mut mixer = mixer(24.0);
-        mixer.playing = true;
+        let mut mixer = rolling(24.0);
         mixer.cues = vec![Cue {
             clip: clip(1.0, 0.5),
             start_frame: 0,
@@ -727,8 +836,7 @@ mod tests {
     /// the whole point of putting sound on a timeline.
     #[test]
     fn a_cue_starting_later_is_silent_until_its_frame() {
-        let mut mixer = mixer(24.0);
-        mixer.playing = true;
+        let mut mixer = rolling(24.0);
         mixer.cues = vec![Cue {
             clip: clip(1.0, 0.5),
             start_frame: 12,
@@ -752,8 +860,7 @@ mod tests {
 
     #[test]
     fn two_cues_sum_and_stay_within_range() {
-        let mut mixer = mixer(24.0);
-        mixer.playing = true;
+        let mut mixer = rolling(24.0);
         mixer.cues = vec![
             Cue {
                 clip: clip(1.0, 0.7),
@@ -780,8 +887,7 @@ mod tests {
 
     #[test]
     fn volume_scales_what_is_heard() {
-        let mut mixer = mixer(24.0);
-        mixer.playing = true;
+        let mut mixer = rolling(24.0);
         mixer.volume = 0.5;
         mixer.cues = vec![Cue {
             clip: clip(1.0, 0.8),
@@ -803,8 +909,7 @@ mod tests {
     /// normal case, not the exception.
     #[test]
     fn a_clip_at_another_sample_rate_still_plays_for_its_whole_length() {
-        let mut mixer = mixer(24.0);
-        mixer.playing = true;
+        let mut mixer = rolling(24.0);
         let clip = Arc::new(Clip::new("x", 44_100, 1, vec![0.5; 44_100]).expect("a clip"));
         mixer.cues = vec![Cue {
             clip,
@@ -825,12 +930,118 @@ mod tests {
         assert!(out.iter().all(|s| *s == 0.0), "the clip should have ended");
     }
 
+    /// **Nothing the mixer does arrives as a step.**
+    ///
+    /// A step in the waveform is a click, and the three places one could come
+    /// from are starting, stopping, and moving the playhead. The third is the
+    /// one that hurts: dragging the playhead repositions the audio many times a
+    /// second, and a run of clicks at a steady rate is not a series of clicks,
+    /// it is a tone -- the hum that used to sit under the sound while scrubbing.
+    #[test]
+    fn playback_fades_in_rather_than_starting_on_a_step() {
+        let mut mixer = mixer(24.0);
+        mixer.playing = true;
+        mixer.cues = vec![Cue {
+            clip: clip(1.0, 0.5),
+            start_frame: 0,
+            volume: 1.0,
+            sync: CueSync::Stream,
+        }];
+
+        let mut out = vec![0.0f32; 512];
+        mixer.render(&mut out);
+        assert!(
+            out[0].abs() < 0.02,
+            "playback started on a step of {}",
+            out[0]
+        );
+        assert!(
+            (out[out.len() - 1] - 0.5).abs() < 1e-6,
+            "the ramp should be over well inside one buffer, ended at {}",
+            out[out.len() - 1]
+        );
+    }
+
+    /// **A seek fades out, moves, and fades back in.**
+    ///
+    /// The move deliberately does not happen where it is asked for: the gain
+    /// has to reach zero first, or the join is exactly the step this is here to
+    /// avoid.
+    #[test]
+    fn a_seek_does_not_land_on_a_step() {
+        let mut mixer = rolling(24.0);
+        mixer.cues = vec![Cue {
+            clip: clip(4.0, 0.5),
+            start_frame: 0,
+            volume: 1.0,
+            sync: CueSync::Stream,
+        }];
+
+        // Settled, and loud.
+        let mut out = vec![0.0f32; 512];
+        mixer.render(&mut out);
+        assert!((out[0] - 0.5).abs() < 1e-6);
+
+        // Ask to move a long way. The position must not have moved yet.
+        mixer.pending_seek = Some(96_000);
+        let before = mixer.position;
+        mixer.render(&mut out);
+        assert!(
+            out[out.len() - 1].abs() < 1e-6,
+            "the buffer carrying a seek should end in silence, ended at {}",
+            out[out.len() - 1]
+        );
+        assert_ne!(before, mixer.position, "the mixer stopped dead");
+        assert_eq!(
+            mixer.position, 96_000,
+            "the move should have happened once the gain reached zero"
+        );
+        assert_eq!(mixer.pending_seek, None, "the move is done with");
+
+        // And it comes back up rather than snapping on.
+        mixer.render(&mut out);
+        assert!(out[0].abs() < 0.02, "the new position came in on a step");
+    }
+
+    /// A seek that lands where the audio already is does nothing, so holding
+    /// the playhead still while dragging something else cannot stutter it.
+    #[test]
+    fn a_seek_to_where_it_already_is_is_ignored() {
+        let mut player = Player::new(24.0);
+        {
+            let mut mixer = player.mixer.lock().expect("the mixer");
+            mixer.sample_rate = 48_000;
+            mixer.channels = 2;
+            mixer.playing = true;
+            mixer.gain = 1.0;
+            // Somewhere else entirely, so the first seek has work to do.
+            mixer.position = 500;
+        }
+        player.seek(1);
+        assert_eq!(
+            player.mixer.lock().expect("the mixer").pending_seek,
+            Some(2_000)
+        );
+
+        // Asked for the same frame again: still the one move, not a second.
+        {
+            let mut mixer = player.mixer.lock().expect("the mixer");
+            mixer.pending_seek = None;
+            mixer.position = 2_000;
+        }
+        player.seek(1);
+        assert_eq!(
+            player.mixer.lock().expect("the mixer").pending_seek,
+            None,
+            "a seek to where it already is should do nothing at all"
+        );
+    }
+
     /// Every sample's source is computed from its absolute position, so
     /// playback cannot accumulate drift however many buffers go by.
     #[test]
     fn playback_does_not_drift_over_many_buffers() {
-        let mut mixer = mixer(24.0);
-        mixer.playing = true;
+        let mut mixer = rolling(24.0);
         mixer.cues = vec![Cue {
             clip: clip(10.0, 0.5),
             start_frame: 0,

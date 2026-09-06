@@ -1205,6 +1205,15 @@ pub fn direct(scene: &mut Scene, story: &str) -> Result<DirectedScene, DirectErr
         ));
     }
 
+    // **The scene keeps the words it was made from.**
+    //
+    // Until it did, the paragraph was thrown away the moment the shot appeared:
+    // the animator was left with sixty layers and no record of the sentence
+    // behind them, and no way to change a word and try again without retyping
+    // the lot. Recorded here rather than in each caller, so the editor, the
+    // script host and an overnight render all keep it.
+    scene.set_brief(story);
+
     let directed = DirectedScene {
         staged,
         names: parsed.names,

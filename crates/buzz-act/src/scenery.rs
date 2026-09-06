@@ -129,6 +129,87 @@ impl Scenery {
     }
 }
 
+/// **Which part of a set a piece of artwork stands in for.**
+///
+/// The effect brushes draw a treeline, a verge and a skyline convincingly and
+/// generically, and generic is the point of them: they fill a shot in one
+/// stroke. What they cannot be is *your* trees. An animator with a drawn oak
+/// wants the oak, and until this existed the only way to get it was to lay the
+/// brush strokes and then delete them.
+///
+/// So every entry in a scenery plan names the part it is playing, and a
+/// [`SceneryArt`] can put a library symbol in that part instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SceneryPart {
+    /// Anything standing along the horizon: pines, leafy trees, a far treeline.
+    Trees,
+    /// Ground cover at the front of the shot: grass, a verge, a bank.
+    Grass,
+    /// Dwellings and towers: a skyline, a row of houses.
+    Buildings,
+    /// Practicals standing on the ground: street lamps, lane lights.
+    Lamps,
+}
+
+impl SceneryPart {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Trees => "Trees",
+            Self::Grass => "Grass",
+            Self::Buildings => "Buildings",
+            Self::Lamps => "Lamps",
+        }
+    }
+
+    pub const ALL: [SceneryPart; 4] = [
+        Self::Trees,
+        Self::Grass,
+        Self::Buildings,
+        Self::Lamps,
+    ];
+}
+
+/// **Your own drawings, in place of the brushes.**
+///
+/// A symbol per part. Where one is given, the scenery scatters instances of it
+/// along the same line the brush would have painted, at the same size and with
+/// the same jitter — so a hand-drawn oak lands in a treeline that reads as a
+/// treeline rather than as a row of identical stamps.
+///
+/// Everything left `None` is drawn by the brush, so this composes: your trees
+/// with the generated grass is a perfectly ordinary thing to want.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SceneryArt {
+    pub trees: Option<buzz_scene::SymbolId>,
+    pub grass: Option<buzz_scene::SymbolId>,
+    pub buildings: Option<buzz_scene::SymbolId>,
+    pub lamps: Option<buzz_scene::SymbolId>,
+}
+
+impl SceneryArt {
+    pub fn get(&self, part: SceneryPart) -> Option<buzz_scene::SymbolId> {
+        match part {
+            SceneryPart::Trees => self.trees,
+            SceneryPart::Grass => self.grass,
+            SceneryPart::Buildings => self.buildings,
+            SceneryPart::Lamps => self.lamps,
+        }
+    }
+
+    pub fn set(&mut self, part: SceneryPart, symbol: Option<buzz_scene::SymbolId>) {
+        match part {
+            SceneryPart::Trees => self.trees = symbol,
+            SceneryPart::Grass => self.grass = symbol,
+            SceneryPart::Buildings => self.buildings = symbol,
+            SceneryPart::Lamps => self.lamps = symbol,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        SceneryPart::ALL.iter().all(|p| self.get(*p).is_none())
+    }
+}
+
 /// What was laid down.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SceneryReport {
@@ -160,6 +241,20 @@ pub fn lay(
     horizon_y: f64,
     backdrop: Option<buzz_scene::LayerId>,
 ) -> SceneryReport {
+    lay_with(scene, what, horizon_y, backdrop, &SceneryArt::default())
+}
+
+/// [`lay`], with your own drawings in whichever parts you have them for.
+///
+/// See [`SceneryArt`]. An empty one is exactly [`lay`], which is why the two
+/// share every line below rather than being two arrangements to keep in step.
+pub fn lay_with(
+    scene: &mut Scene,
+    what: Scenery,
+    horizon_y: f64,
+    backdrop: Option<buzz_scene::LayerId>,
+    art: &SceneryArt,
+) -> SceneryReport {
     let mut out = SceneryReport::default();
     if what == Scenery::Bare {
         return out;
@@ -179,12 +274,13 @@ pub fn lay(
     // treeline that filled the frame and dwarfed the cast. The figure in the
     // guide is what showed it; these are what came back.
     // The last field is **far**: does this go behind the cast, or in front?
-    let plan: Vec<(&str, EffectKind, f64, f64, Color, f64, bool)> = match what {
+    let plan: Vec<(&str, EffectKind, SceneryPart, f64, f64, Color, f64, bool)> = match what {
         Scenery::Bare => Vec::new(),
         Scenery::Forest => vec![
             (
                 "Treeline",
                 EffectKind::PineTrees,
+                SceneryPart::Trees,
                 horizon_y,
                 stage.height() * 0.11,
                 Color::from_rgb8(0x1E, 0x2E, 0x24),
@@ -194,6 +290,7 @@ pub fn lay(
             (
                 "Grass",
                 stage_grass(),
+                SceneryPart::Grass,
                 stage.y1 - stage.height() * 0.04,
                 stage.height() * 0.045,
                 Color::from_rgb8(0x2C, 0x44, 0x2E),
@@ -205,6 +302,7 @@ pub fn lay(
             (
                 "Skyline",
                 EffectKind::Buildings,
+                SceneryPart::Buildings,
                 horizon_y,
                 stage.height() * 0.15,
                 Color::from_rgb8(0x18, 0x1C, 0x2A),
@@ -214,6 +312,7 @@ pub fn lay(
             (
                 "Street Lamps",
                 EffectKind::Lamps,
+                SceneryPart::Lamps,
                 horizon_y + stage.height() * 0.10,
                 stage.height() * 0.09,
                 Color::from_rgb8(0xFF, 0xD9, 0x9E),
@@ -233,6 +332,7 @@ pub fn lay(
             (
                 "Village Trees",
                 EffectKind::LeafyTrees,
+                SceneryPart::Trees,
                 horizon_y - stage.height() * 0.01,
                 stage.height() * 0.085,
                 Color::from_rgb8(0x2A, 0x3E, 0x2C),
@@ -242,6 +342,7 @@ pub fn lay(
             (
                 "Houses",
                 EffectKind::Houses,
+                SceneryPart::Buildings,
                 horizon_y + stage.height() * 0.015,
                 stage.height() * 0.055,
                 Color::from_rgb8(0xB9, 0x9E, 0x7E),
@@ -251,6 +352,7 @@ pub fn lay(
             (
                 "Verge",
                 stage_grass(),
+                SceneryPart::Grass,
                 stage.y1 - stage.height() * 0.05,
                 stage.height() * 0.045,
                 Color::from_rgb8(0x35, 0x4E, 0x33),
@@ -262,6 +364,7 @@ pub fn lay(
             (
                 "Far Trees",
                 EffectKind::LeafyTrees,
+                SceneryPart::Trees,
                 horizon_y,
                 stage.height() * 0.07,
                 Color::from_rgb8(0x33, 0x46, 0x38),
@@ -271,6 +374,7 @@ pub fn lay(
             (
                 "Grass",
                 stage_grass(),
+                SceneryPart::Grass,
                 stage.y1 - stage.height() * 0.06,
                 stage.height() * 0.05,
                 Color::from_rgb8(0x3A, 0x54, 0x36),
@@ -282,6 +386,7 @@ pub fn lay(
             (
                 "Far Trees",
                 EffectKind::LeafyTrees,
+                SceneryPart::Trees,
                 horizon_y,
                 stage.height() * 0.06,
                 Color::from_rgb8(0x2A, 0x3C, 0x33),
@@ -291,6 +396,7 @@ pub fn lay(
             (
                 "Bank",
                 stage_grass(),
+                SceneryPart::Grass,
                 stage.y1 - stage.height() * 0.05,
                 stage.height() * 0.045,
                 Color::from_rgb8(0x35, 0x4C, 0x33),
@@ -300,7 +406,19 @@ pub fn lay(
         ],
     };
 
-    for (name, kind, y, size, colour, depth, far) in plan {
+    for (name, kind, part, y, size, colour, depth, far) in plan {
+        // **Your drawing, if you gave one for this part.** Laid on its own
+        // layer at the same depth and in the same place in the stack, so
+        // everything downstream cannot tell which route the artwork took.
+        if let Some(symbol) = art.get(part) {
+            let layer = scene.add_stage_layer(name, LayerKind::Normal);
+            scene.update_layer(layer, |l| l.depth = depth);
+            out.pieces += scatter(scene, layer, symbol, x0, x1, y, size, part);
+            place_behind(scene, layer, backdrop, far);
+            out.layers.push(layer);
+            continue;
+        }
+
         // **A straight stroke across the shot.** The effect brushes scatter
         // along their own spine, so a level line is not a level result — it is
         // a treeline of varying heights standing on level ground, which is what
@@ -343,20 +461,7 @@ pub fn lay(
                 out.pieces += 1;
             }
         }
-        // **Far scenery goes behind the cast.** Moved to sit directly in front
-        // of the backdrop, which is where a horizon belongs; near scenery is
-        // left at the front, which is where a foreground belongs.
-        if far
-            && let Some(sky) = backdrop
-            && let Some(at) = scene.stage_layer_index(sky)
-            && at > 0
-        {
-            // **One less than the sky's index**, because the move takes this
-            // layer out of the front first and everything behind it shifts up
-            // by one. Reordering to `at` lands it *behind* the sky, where
-            // nobody can see it — which is what the first attempt did.
-            scene.reorder_stage_layer(layer, at - 1);
-        }
+        place_behind(scene, layer, backdrop, far);
         out.layers.push(layer);
     }
 
@@ -377,6 +482,98 @@ pub fn lay(
         });
     }
     out
+}
+
+/// **Far scenery goes behind the cast.** Moved to sit directly in front of the
+/// backdrop, which is where a horizon belongs; near scenery is left at the
+/// front, which is where a foreground belongs.
+fn place_behind(
+    scene: &mut Scene,
+    layer: buzz_scene::LayerId,
+    backdrop: Option<buzz_scene::LayerId>,
+    far: bool,
+) {
+    if far
+        && let Some(sky) = backdrop
+        && let Some(at) = scene.stage_layer_index(sky)
+        && at > 0
+    {
+        // **One less than the sky's index**, because the move takes this layer
+        // out of the front first and everything behind it shifts up by one.
+        // Reordering to `at` lands it *behind* the sky, where nobody can see
+        // it — which is what the first attempt did.
+        scene.reorder_stage_layer(layer, at - 1);
+    }
+}
+
+/// **Stand copies of `symbol` along the line**, the way the brush would have.
+///
+/// Three things make a row of stamps read as a treeline rather than as
+/// wallpaper, and all three are here: the spacing is jittered, the size is
+/// jittered, and each copy stands *on* the line rather than being centred on
+/// it. Deterministic — seeded from the position — so a scene laid twice is laid
+/// the same way, which is the same promise the effect brushes make.
+///
+/// Returns how many were placed.
+fn scatter(
+    scene: &mut Scene,
+    layer: buzz_scene::LayerId,
+    symbol: buzz_scene::SymbolId,
+    x0: f64,
+    x1: f64,
+    y: f64,
+    size: f64,
+    part: SceneryPart,
+) -> usize {
+    let Some(bounds) = scene.symbol_bounds(symbol).filter(|b| b.height() > 1e-6) else {
+        return 0;
+    };
+
+    // How tall a piece stands, as a multiple of the brush size. The brushes
+    // themselves work in these proportions — a pine is about twice its size,
+    // a blade of grass about one — so a drawing dropped into the same part
+    // lands at the same scale as the artwork it is replacing.
+    let (tall, spacing, jitter) = match part {
+        SceneryPart::Trees => (2.0, 1.05, 0.45),
+        SceneryPart::Buildings => (2.2, 1.15, 0.25),
+        SceneryPart::Lamps => (1.8, 3.0, 0.15),
+        // Grass is a mat rather than a row: pieces overlap, and a gap in it
+        // reads as a bald patch.
+        SceneryPart::Grass => (1.0, 0.55, 0.20),
+    };
+
+    let mut placed = 0usize;
+    let mut x = x0;
+    let mut i = 0u64;
+    // A hard ceiling, because the line is three stages wide and a small drawing
+    // would otherwise fill the document with instances.
+    while x < x1 && placed < 400 {
+        // Deterministic hash of the index: the same line gives the same row.
+        let noise = |salt: u64| {
+            let mut h = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt;
+            h ^= h >> 29;
+            h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            h ^= h >> 32;
+            (h % 10_000) as f64 / 10_000.0
+        };
+
+        let vary = 1.0 + (noise(0xA1) - 0.5) * 2.0 * jitter;
+        let height = size * tall * vary;
+        let scale = height / bounds.height();
+        let width = bounds.width() * scale;
+
+        // Its feet on the line: the symbol's own bottom edge goes to `y`.
+        let at = buzz_geom::Affine::translate((x - bounds.x0 * scale, y - bounds.y1 * scale))
+            * buzz_geom::Affine::scale(scale);
+        if scene.add_instance_at(layer, 0, symbol, at).is_some() {
+            placed += 1;
+        }
+
+        let gap = width * spacing * (1.0 + (noise(0xB2) - 0.5) * 2.0 * jitter);
+        x += gap.max(size * 0.1);
+        i += 1;
+    }
+    placed
 }
 
 /// Grass, named apart so the two places that want it cannot disagree about

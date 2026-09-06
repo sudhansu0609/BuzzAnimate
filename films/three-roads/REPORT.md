@@ -228,11 +228,79 @@ Named rather than hidden:
 
 ---
 
-## 6. Verification
+## 6. Second pass — what the film's own workflow was missing
 
-- `cargo test --workspace` — **2528 passed, 0 failed**.
-- Both new regression tests were checked *failing* before their fix and passing
-  after; the rim test reports the exact channel difference it saw.
+Six things asked for after the first cut, and one bug found while doing them.
+
+### 6.1 The bone rig came off the character — ~35 min
+
+**Symptom.** Drag a bone on a rigged figure and the artwork jumps away from the
+skeleton.
+
+**Cause.** Dragging from a bone's *tip* extends the chain, and extending called
+`Armature::set_rest_here` — which adopts the pose the bones are in **now** as
+the pose they were drawn in. On a rig being built that is right and invisible.
+On a finished, posed rig it is a catastrophe: every rigidly bound part is drawn
+through `pose_transform`, which measures a bone against its rest, so re-resting
+a posed skeleton makes all of those the identity. The drawing snaps back to
+where it was drawn while the bones stay where the animator put them.
+
+**Why it was so easy to hit.** *The end of a bone is what you reach for to move
+a limb* — the end of a forearm is the hand. The tip is exactly what extended the
+chain.
+
+**Fixed** in three parts, because it was three problems wearing one coat:
+
+- `add_bone` leaves the rest pose alone. A bone from `push_dragged` already
+  rests at the angle it was dragged at, so nothing needed re-resting.
+- **Dragging a bone poses it** unless the Bone tool is set to Builds. Building a
+  skeleton and animating one are opposite jobs that want the same gesture.
+- **Show bones** takes the skeleton off the stage *and* out of the pointer's
+  way, so the artwork underneath can be worked on.
+
+Two regression tests, both checked failing before the fix — the artwork jumped
+29 units.
+
+### 6.2 The scrub hummed — ~20 min
+
+Dragging the playhead repositioned the audio on **every pointer move**: sixty
+times a second over a timeline running at twenty-four, so the same few
+milliseconds restarted over and over. A run of restarts at a steady rate is not
+a series of clicks, it is a *tone* — which is the hum that sat under the audio.
+
+Two halves, and both were needed. The mixer now travels between silence and full
+over five milliseconds and **defers a seek until the gain has reached zero**, so
+nothing it does arrives as a step; and the editor only repositions when the
+frame has actually changed.
+
+### 6.3 The rest, as asked
+
+| Asked for | What it is |
+|---|---|
+| **See the render before writing it** | `Test render` in the Export dialog draws six frames from across the range through the export's own pipeline. `--preview sheet.png` writes the same six as a contact sheet — 2.6 s for this film. |
+| **Panels for the director, scenery and scene setup** | The **Story** panel. *Direct a Story* and *Set the Scene* were modal dialogs, which is the wrong shape for something written and rewritten: a box covering the stage while you type is a box you cannot see the result through. |
+| **Your own trees, grass and ground** | Every part of a set — trees, grass, buildings, lamps — takes a library symbol instead of the effect brush, scattered along the same line at the same size with the same jitter. |
+| **See the words the director used** | `Scene::brief` keeps the prose a shot was directed from, saved with the document and shown in the Story panel, where it can be edited and re-directed. It used to be thrown away the moment the shot appeared. |
+| **Show and hide the bone rig** | Tool Options, with the Bone tool in hand. Hidden means hidden from the pointer too. |
+| **How to move a limb** | User guide §12, rewritten. It had promised "grab the hand and drag" for a behaviour that did the opposite. |
+
+### 6.4 What this round cost
+
+About **three hours**, of which roughly 55 minutes on the two bugs, 80 on the
+Story panel and the custom scenery, 35 on the test render, and the rest on tests
+and documentation.
+
+The pattern from §4 held: both bugs were found by *using* the thing, not by
+reading it. The hum was found by scrubbing the film's own soundtrack; the rig
+came apart the first time somebody grabbed a hand.
+
+---
+
+## 7. Verification
+
+- `cargo test --workspace` — **2540 passed, 0 failed**.
+- Every regression test here was checked *failing* before its fix and passing
+  after; each reports the number it actually measured.
 - The saved `.buzz` was re-opened and re-rendered on its own — 360 frames,
   15.000 s, three sounds — so the document is complete rather than a by-product
   of the run that made it.

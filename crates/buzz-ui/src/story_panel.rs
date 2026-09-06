@@ -187,6 +187,14 @@ pub struct StoryState {
     /// idea. This forces the state for one frame and then clears itself, which
     /// leaves the section under the user's control from then on.
     pub reveal: bool,
+    /// **Put the caret in the brief box**, once.
+    ///
+    /// The modal this replaced opened with the cursor in the text field, which
+    /// is the whole of what "…" on a menu item promises: you asked to write a
+    /// story, so you are now writing one. A panel that merely *appears* leaves
+    /// the user to find a text box among six tabs in a narrow column and click
+    /// it before they can type a word.
+    pub focus_draft: bool,
 }
 
 impl Default for StoryState {
@@ -209,6 +217,7 @@ impl Default for StoryState {
             show_set: true,
             show_scenery: true,
             reveal: false,
+            focus_draft: false,
         }
     }
 }
@@ -348,8 +357,10 @@ fn the_words(
         .max_height(150.0)
         .id_salt("story-draft")
         .show(ui, |ui| {
-            ui.add(
+            let box_id = ui.make_persistent_id("story-brief");
+            let field = ui.add(
                 egui::TextEdit::multiline(&mut state.draft)
+                    .id(box_id)
                     .desired_width(f32::INFINITY)
                     .desired_rows(6)
                     .hint_text(
@@ -358,6 +369,12 @@ fn the_words(
                          Ana talks to Ben for 3 seconds. Ben listens.",
                     ),
             );
+            // Asked for by the menu item that opened the panel. Once: taking
+            // focus every frame would make the box impossible to leave.
+            if state.focus_draft {
+                field.request_focus();
+                state.focus_draft = false;
+            }
         });
 
     let has_words = !state.draft.trim().is_empty();

@@ -3660,7 +3660,20 @@ impl Editor {
                 // The menu item names a section, so that section opens. See
                 // `StoryState::reveal`.
                 self.story.reveal = true;
+                // Directing is typing, so the caret goes where the typing goes.
+                self.story.focus_draft = matches!(command, DirectScene);
                 self.raise_story_panel();
+                self.status = Some(match command {
+                    SetScene => "Set the scene: choose where it is, then press \
+                                 Set the scene"
+                        .to_string(),
+                    SceneryFor => "Scenery: choose what is in the shot, and whose \
+                                   drawings it is made of"
+                        .to_string(),
+                    _ => "Write the shot \u{2014} \u{201c}Night. Ana walks in from \
+                          the left.\u{201d} \u{2014} then press Direct"
+                        .to_string(),
+                });
             }
             AddScene => {
                 self.add_scene();

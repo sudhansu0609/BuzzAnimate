@@ -107,3 +107,46 @@ fn each_menu_item_opens_the_part_it_names() {
         );
     }
 }
+
+/// **Directing puts the caret where the writing goes.**
+///
+/// The modal this replaced opened with the cursor in the text field, which is
+/// the whole of what an ellipsis on a menu item promises: you asked to write a
+/// story, so you are writing one. A panel that merely appears leaves you to
+/// find a text box among six tabs in a narrow column first.
+#[test]
+fn directing_a_story_puts_the_caret_in_the_brief() {
+    let mut directing = app();
+    directing.run(Command::DirectScene);
+    assert!(directing.story.focus_draft, "the brief box was not asked for");
+
+    // The other two are about the panel's other sections, and stealing the
+    // keyboard from somebody adjusting a slider would be a nuisance.
+    for command in [Command::SetScene, Command::SceneryFor] {
+        let mut app = app();
+        app.run(command);
+        assert!(
+            !app.story.focus_draft,
+            "{command:?} took the keyboard for the brief"
+        );
+    }
+}
+
+/// **And it says what to do.** A panel appearing in a column is not an
+/// instruction; the status bar is where this program tells you one.
+#[test]
+fn each_menu_item_says_what_to_do_next() {
+    for (command, wants) in [
+        (Command::DirectScene, "Direct"),
+        (Command::SetScene, "Set the scene"),
+        (Command::SceneryFor, "Scenery"),
+    ] {
+        let mut app = app();
+        app.run(command);
+        let said = app.status.clone().unwrap_or_default();
+        assert!(
+            said.contains(wants),
+            "{command:?} said {said:?}, which does not mention {wants:?}"
+        );
+    }
+}

@@ -1207,6 +1207,7 @@ fn draw_layers(
             close_mask(builder, open.take());
             if let Some(mask_id) = wanted
                 && let Some(path) = mask_geometry(
+                    scene,
                     layers,
                     mask_id,
                     time,
@@ -1451,7 +1452,18 @@ fn active_masks(
 /// layer's *shapes*, ignoring their colour, and a mask made of three separate
 /// blobs shows through all three. Strokes are ignored for the same reason
 /// Animate ignores them: a mask is a region, and a stroke is a line.
+///
+/// # Symbols count
+///
+/// A mask layer holding a symbol instance is the ordinary case, not the odd
+/// one: every Animate character on this machine masks its eyeballs with an
+/// instance of the eye-white symbol, because the eye white *is* a symbol and
+/// the animator dragged it onto the mask layer. `Object::flatten` skips
+/// instances — it has no library to resolve them with — so those masks came
+/// out empty, no clip was opened, and the eyeballs were drawn whole over the
+/// face. [`mask_shapes`] goes through the library.
 fn mask_geometry(
+    scene: &Scene,
     layers: &buzz_scene::LayerStack,
     mask: buzz_scene::LayerId,
     at: impl buzz_scene::AtTime,
@@ -1465,17 +1477,19 @@ fn mask_geometry(
     // on a tilted layer has to be foreshortened by exactly the same lens as the
     // artwork it clips, or it would clip the wrong region.
     let place = place * layers.inherited_transform(mask, at);
+    let frame = at.frame();
+    let elapsed = elapsed_on(layer, frame);
 
+    let mut flat = Vec::new();
     for object in layer.frames.resolved_at(at).iter() {
-        let mut flat = Vec::new();
-        object.flatten(place, &mut flat);
-        for (transform, shape) in flat {
-            if shape.fill.is_none() {
-                continue;
-            }
-            for element in (transform * shape.path).elements() {
-                combined.push(*element);
-            }
+        mask_shapes(scene, object, elapsed, place, 0, &mut flat);
+    }
+    for (transform, shape) in flat {
+        if shape.fill.is_none() {
+            continue;
+        }
+        for element in (transform * shape.path).elements() {
+            combined.push(*element);
         }
     }
 
@@ -1484,6 +1498,67 @@ fn mask_geometry(
     }
     let mapped = projection.map_path(&combined, tolerance);
     (!mapped.elements().is_empty()).then_some(mapped)
+}
+
+/// How long the keyframe governing `frame` has been on screen — what a graphic
+/// instance on the layer counts its own playhead from.
+fn elapsed_on(layer: &buzz_scene::Layer, frame: u32) -> u32 {
+    frame
+        - layer
+            .frames
+            .keyframe_at(frame)
+            .map(|k| k.start)
+            .unwrap_or(0)
+            .min(frame)
+}
+
+/// Every filled shape an object on a mask layer stands for, **instances
+/// included** — the one difference from `Object::flatten`.
+///
+/// An instance is opened at the frame it would be drawn at, and each layer
+/// inside it contributes its artwork where that layer's own parenting puts it.
+/// A mask layer *inside* the instance is a stencil there and not a region here,
+/// and a guide is never drawn anywhere, so both are passed over.
+fn mask_shapes(
+    scene: &Scene,
+    object: &Object,
+    elapsed: u32,
+    parent: Affine,
+    depth: usize,
+    out: &mut Vec<(Affine, buzz_scene::ShapeData)>,
+) {
+    if !object.visible {
+        return;
+    }
+    let world = parent * object.transform;
+    match &object.kind {
+        ObjectKind::Group(children) => {
+            for child in children {
+                mask_shapes(scene, child, elapsed, world, depth, out);
+            }
+        }
+        ObjectKind::Instance(instance) => {
+            if depth >= MAX_SYMBOL_DEPTH {
+                return;
+            }
+            let Some(symbol) = scene.library().get(instance.symbol) else {
+                return;
+            };
+            let inner = instance.resolve_frame(symbol.kind, elapsed, symbol.length());
+            for layer in symbol.layers.drawable_at(inner) {
+                if layer.kind.is_mask() || layer.kind == LayerKind::Guide {
+                    continue;
+                }
+                let follows = symbol.layers.inherited_transform(layer.id, inner);
+                let inner_elapsed = elapsed_on(layer, inner);
+                for child in layer.frames.resolved_at(inner).iter() {
+                    mask_shapes(scene, child, inner_elapsed, world * follows, depth + 1, out);
+                }
+            }
+        }
+        // Shapes, warps and posed rigs flatten as they always did.
+        _ => object.flatten(parent, out),
+    }
 }
 
 /// Draw one layer's artwork.
@@ -3151,6 +3226,7 @@ fn draw_symbol_contents(
             close_mask(builder, open.take());
             if let Some(mask_id) = wanted
                 && let Some(path) = mask_geometry(
+                    inner_ctx.scene,
                     &symbol.layers,
                     mask_id,
                     inner,

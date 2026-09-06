@@ -112,12 +112,27 @@ impl Remapper<'_> {
             // A parent outside this stack cannot be honoured, so the layer
             // becomes top-level rather than pointing at a foreign document.
             copy.parent = layer.parent.and_then(|p| layer_ids.get(&p).copied());
+            // **Layer Parenting comes across too**, renumbered the same way.
+            //
+            // It did not, and every rigged character placed from the asset
+            // library arrived as a pile of parts that had forgotten which
+            // followed which: the importer read Animate's parent links and
+            // baked the rest poses, the file kept them, and this copy — the
+            // one step between the library and the stage — dropped them on
+            // the floor. The rest pose is what the link measures motion
+            // from, so it travels with the link.
+            copy.follows = layer.follows.and_then(|f| layer_ids.get(&f).copied());
+            copy.follows_bone = copy.follows.and(layer.follows_bone);
+            copy.rest_pose = layer.rest_pose;
             copy.visible = layer.visible;
             copy.locked = layer.locked;
             copy.outline = layer.outline;
+            copy.alpha = layer.alpha;
             copy.color = layer.color;
             copy.height = layer.height;
+            copy.depth = layer.depth;
             copy.collapsed = layer.collapsed;
+            copy.filters = layer.filters.clone();
             copy.frames = self.timeline(&layer.frames);
             out.insert(index, copy);
         }
@@ -382,6 +397,82 @@ mod tests {
 
         scene.add_instance_at(layer, 0, outer, Affine::IDENTITY);
         scene
+    }
+
+    /// **Layer Parenting survives a merge**, renumbered along with the layers.
+    ///
+    /// Every rigged character in the asset library is a symbol whose layers
+    /// follow each other — head follows body, wrist follows arm — and placing
+    /// one goes through here. The links, the bone each follows, and the rest
+    /// pose the motion is measured from were all being dropped, so a character
+    /// arrived on the stage as parts that no longer moved together.
+    #[test]
+    fn layer_parenting_comes_across_renumbered() {
+        let mut guest = document("Guest", 5.0);
+        let rest = Affine::translate((7.0, 11.0));
+        // On the stage: a head that follows a body.
+        let body = guest.add_layer("Body", crate::layer::LayerKind::Normal);
+        let head = guest.add_layer("Head", crate::layer::LayerKind::Normal);
+        guest.edit_layers().update(head, |l| {
+            l.follows = Some(body);
+            l.follows_bone = Some(2);
+        });
+        guest.edit_layers().update(body, |l| l.rest_pose = Some(rest));
+        // And inside a symbol, which is where a character keeps its rig.
+        let outer = guest.library().iter().find(|s| s.name == "Guest Outer").unwrap().id;
+        guest.library_mut().update(outer, |s| {
+            let torso = s.layers.iter().next().unwrap().id;
+            let mut arm = Layer::normal(LayerId(9_999), "Arm");
+            arm.follows = Some(torso);
+            s.layers.insert(0, arm);
+        });
+
+        let mut host = document("Host", 10.0);
+        host.merge(&guest, ImportTarget::Stage);
+
+        let find = |name: &str| {
+            host.stage_layers()
+                .iter()
+                .find(|l| l.name == name)
+                .unwrap_or_else(|| panic!("no layer {name}"))
+                .clone()
+        };
+        let (body, head) = (find("Body"), find("Head"));
+        assert_eq!(head.follows, Some(body.id), "the head no longer follows the body");
+        assert_eq!(head.follows_bone, Some(2), "and lost which bone it followed");
+        assert_eq!(body.rest_pose, Some(rest), "the rest pose was dropped");
+        assert_ne!(body.id, LayerId(9_999), "ids were not renumbered");
+
+        let outer = host
+            .library()
+            .iter()
+            .find(|s| s.name == "Guest Outer")
+            .expect("the guest's outer symbol");
+        let arm = outer.layers.iter().find(|l| l.name == "Arm").expect("the arm");
+        let torso = outer.layers.iter().find(|l| l.name != "Arm").expect("the torso");
+        assert_eq!(arm.follows, Some(torso.id), "inside the symbol, the arm let go");
+    }
+
+    /// A link to a layer that did not come across cannot be honoured, and a
+    /// stale bone index on a layer that follows nothing is a lie.
+    #[test]
+    fn a_link_to_a_missing_layer_is_dropped_whole() {
+        let mut guest = document("Guest", 5.0);
+        let head = guest.add_layer("Head", crate::layer::LayerKind::Normal);
+        guest.edit_layers().update(head, |l| {
+            l.follows = Some(LayerId(424_242));
+            l.follows_bone = Some(1);
+        });
+        let mut host = document("Host", 10.0);
+        host.merge(&guest, ImportTarget::Stage);
+        let head = host
+            .stage_layers()
+            .iter()
+            .find(|l| l.name == "Head")
+            .unwrap()
+            .clone();
+        assert_eq!(head.follows, None);
+        assert_eq!(head.follows_bone, None);
     }
 
     /// The defect the whole module exists to prevent: both documents number

@@ -258,6 +258,20 @@ impl SoundBank {
         }
     }
 
+    /// **Jog one frame of sound**, from `frame`, and stop.
+    ///
+    /// What dragging the playhead does. Distinct from [`Self::play`] because a
+    /// scrub is *bounded*: see `buzz_audio::Player::scrub`.
+    pub fn scrub(&mut self, scene: &Scene, frame: u32) {
+        self.refresh(scene);
+        if !self.player.has_sound() {
+            return;
+        }
+        if let Err(e) = self.player.scrub(frame) {
+            tracing::warn!("could not scrub audio: {e:#}");
+        }
+    }
+
     pub fn stop(&mut self) {
         self.player.pause();
     }

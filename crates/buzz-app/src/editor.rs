@@ -668,18 +668,20 @@ impl Editor {
         if self.sound.stage_track(scene).is_none() {
             return;
         }
-        // **Only when the frame has actually changed.** See `scrub_frame`: the
-        // deadline is still pushed out below, so holding the pointer still on
-        // one frame keeps the sound alive without restarting it.
-        let moved = self.scrub_frame != Some(frame);
-        if self.scrub_until.is_some() && self.sound.playing_frame().is_some() {
-            if moved {
-                self.sound.seek(frame);
-            }
-        } else {
-            self.sound.play(scene, frame);
+        // **Only when the frame has actually changed.** See `scrub_frame`: a
+        // pointer moves far more often than the playhead changes frame, and
+        // re-triggering on every one of those is what a machine gun sounds
+        // like.
+        if self.scrub_frame != Some(frame) {
+            // **One frame of sound, then silence** -- a jog wheel rather than
+            // playback. Repositioning and letting it *run*, which is what this
+            // used to do, means the audio races ahead of a pointer that is
+            // moving slower than real time and gets yanked back on the next
+            // move: the same fragment, over and over, and worse still when
+            // scrubbing back and forth over a few frames.
+            self.sound.scrub(scene, frame);
+            self.scrub_frame = Some(frame);
         }
-        self.scrub_frame = Some(frame);
         self.scrub_until =
             Some(std::time::Instant::now() + std::time::Duration::from_millis(140));
     }

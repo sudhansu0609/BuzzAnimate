@@ -116,6 +116,29 @@ struct Mixer {
     /// Silent for the ear, and about ten milliseconds, which is a third of a
     /// frame at 24fps.
     pending_seek: Option<u64>,
+    /// **How much of a scrub window is left to play**, in output sample frames.
+    ///
+    /// `None` is ordinary playback, which runs until it is stopped. `Some` is a
+    /// scrub, and it is bounded — which is the whole difference between the
+    /// two.
+    ///
+    /// # Why a scrub is bounded and playback is not
+    ///
+    /// A scrub used to reposition the audio and then let it *run*. Drag the
+    /// playhead slower than real time — which is what dragging is — and the
+    /// audio races ahead of the pointer, gets yanked back to the frame on the
+    /// next move, and races ahead again: the same fragment over and over.
+    /// Dragging back and forth over a few frames made it worse, because every
+    /// pass replayed the same overlapping pieces.
+    ///
+    /// A jog wheel does not do that. Each frame the playhead crosses is played
+    /// **once**, for as long as that frame lasts, and then it stops until the
+    /// playhead moves again. Drag at real speed and the windows meet and it
+    /// sounds continuous; drag slowly and you hear each frame once with a gap
+    /// after it, which is what "finding the beat by ear" actually is.
+    scrub_left: Option<u64>,
+    /// How long one scrub window is, in output sample frames.
+    scrub_window: u64,
     /// A clock that only ever goes forwards, in output sample frames.
     ///
     /// **Distinct from `position`, and that is the whole of honest Event
@@ -184,7 +207,9 @@ impl Mixer {
 
         // Where the envelope is heading. A waiting reposition takes priority
         // over playing: the gain has to reach zero before the jump can happen.
-        self.target = if self.pending_seek.is_some() {
+        // A spent scrub window is silent for the same reason it is bounded.
+        let spent = self.scrub_left == Some(0);
+        self.target = if self.pending_seek.is_some() || spent {
             0.0
         } else if self.playing {
             1.0
@@ -199,11 +224,15 @@ impl Mixer {
         // The gain has to have arrived, too: cutting the tail of a fade-out to
         // take the cheap path would put back the click the fade is there to
         // remove.
-        if !self.playing && self.voices.is_empty() && self.gain <= 0.0 {
+        if (!self.playing || spent) && self.voices.is_empty() && self.gain <= 0.0 {
             self.gain = 0.0;
             self.clock += frames as u64;
             if let Some(to) = self.pending_seek.take() {
                 self.position = to;
+                // A fresh window at the new frame: the move *is* the scrub.
+                if self.scrub_left.is_some() {
+                    self.scrub_left = Some(self.scrub_window);
+                }
             }
             return;
         }
@@ -295,12 +324,19 @@ impl Mixer {
             self.position += frames as u64;
         }
         self.clock += frames as u64;
+        // A scrub window is spent as it plays, and stops when it runs out.
+        if let Some(left) = &mut self.scrub_left {
+            *left = left.saturating_sub(frames as u64);
+        }
 
         // The join, once the gain is out of the way.
         if self.gain <= 0.0
             && let Some(to) = self.pending_seek.take()
         {
             self.position = to;
+            if self.scrub_left.is_some() {
+                self.scrub_left = Some(self.scrub_window);
+            }
         }
     }
 
@@ -451,6 +487,8 @@ impl Player {
         self.seek(frame);
         if let Ok(mut mixer) = self.mixer.lock() {
             mixer.playing = true;
+            // Playback is unbounded; only a scrub is a window.
+            mixer.scrub_left = None;
         }
         if let Some(stream) = &self.stream {
             stream.play().context("starting the audio stream")?;
@@ -463,6 +501,7 @@ impl Player {
     pub fn pause(&mut self) {
         if let Ok(mut mixer) = self.mixer.lock() {
             mixer.playing = false;
+            mixer.scrub_left = None;
         }
         if self.state == PlayerState::Playing {
             self.state = PlayerState::Paused;
@@ -498,6 +537,51 @@ impl Player {
             }
             mixer.pending_seek = Some(to);
         }
+    }
+
+    /// **Play one frame's worth of sound, from `frame`, and stop.**
+    ///
+    /// A jog wheel rather than playback: see [`Mixer::scrub_left`]. Repeated
+    /// calls on the *same* frame do nothing at all, so a pointer jittering
+    /// inside one frame does not machine-gun it.
+    ///
+    /// `fps` is the film's, so one window is one frame however the document is
+    /// timed. A window shorter than the ramp would be all ramp, so it is held
+    /// off a floor.
+    pub fn scrub(&mut self, frame: u32) -> Result<()> {
+        if self.stream.is_none() {
+            match self.open() {
+                Ok(()) => {}
+                Err(e) => {
+                    let message = format!("{e:#}");
+                    tracing::warn!("no audio output: {message}");
+                    self.unavailable = Some(message);
+                    return Ok(());
+                }
+            }
+        }
+
+        let fresh = if let Ok(mut mixer) = self.mixer.lock() {
+            let rate = mixer.sample_rate.max(1) as f64;
+            let seconds = if mixer.fps > 0.0 { 1.0 / mixer.fps } else { 0.04 };
+            // Two ramps and something to hear between them.
+            mixer.scrub_window = (seconds.max(RAMP_SECONDS as f64 * 4.0) * rate) as u64;
+            let was_scrubbing = mixer.scrub_left.is_some();
+            mixer.scrub_left = Some(mixer.scrub_window);
+            mixer.playing = true;
+            !was_scrubbing
+        } else {
+            false
+        };
+
+        // `seek` is what moves it, click-free. On the first scrub of a drag
+        // there is nothing sounding to fade out of, so it lands immediately.
+        self.seek(frame);
+        if fresh && let Some(stream) = &self.stream {
+            stream.play().context("starting the audio stream")?;
+        }
+        self.state = PlayerState::Playing;
+        Ok(())
     }
 
     /// Where the sound has actually reached, as an animation frame.
@@ -1034,6 +1118,116 @@ mod tests {
             player.mixer.lock().expect("the mixer").pending_seek,
             None,
             "a seek to where it already is should do nothing at all"
+        );
+    }
+
+    /// **A scrub plays one frame and stops.**
+    ///
+    /// The bounded window is the whole difference between a jog wheel and
+    /// playback. Without it a scrub repositions the audio and lets it *run*:
+    /// drag slower than real time — which is what dragging is — and the sound
+    /// races ahead of the pointer, is yanked back on the next move, and races
+    /// ahead again. The same fragment over and over, and worse still scrubbing
+    /// back and forth, because every pass replays the same overlapping pieces.
+    #[test]
+    fn a_scrub_window_runs_out_and_goes_quiet() {
+        let mut mixer = rolling(24.0);
+        mixer.cues = vec![Cue {
+            clip: clip(4.0, 0.5),
+            start_frame: 0,
+            volume: 1.0,
+            sync: CueSync::Stream,
+        }];
+        // One frame at 24fps: 2000 output frames at 48kHz.
+        mixer.scrub_window = 2_000;
+        mixer.scrub_left = Some(2_000);
+
+        // Well inside the window: loud.
+        let mut out = vec![0.0f32; 1_024];
+        mixer.render(&mut out);
+        assert!(
+            (out[out.len() - 1] - 0.5).abs() < 1e-6,
+            "the window should still be sounding, got {}",
+            out[out.len() - 1]
+        );
+
+        // Past it: spent, and silent. Six buffers is three thousand output
+        // frames against a two-thousand-frame window, with room for the ramp
+        // down at the end of it.
+        for _ in 0..6 {
+            mixer.render(&mut out);
+        }
+        assert_eq!(mixer.scrub_left, Some(0), "the window did not run out");
+        assert!(
+            out.iter().all(|s| s.abs() < 1e-6),
+            "a spent window is still sounding: {:?}",
+            &out[..4]
+        );
+    }
+
+    /// **A new frame opens a new window**, so dragging on keeps making sound.
+    #[test]
+    fn moving_to_another_frame_opens_a_fresh_window() {
+        let mut mixer = rolling(24.0);
+        mixer.cues = vec![Cue {
+            clip: clip(4.0, 0.5),
+            start_frame: 0,
+            volume: 1.0,
+            sync: CueSync::Stream,
+        }];
+        mixer.scrub_window = 2_000;
+        mixer.scrub_left = Some(0);
+
+        // Spent: render once so the gain is down where a seek expects it.
+        let mut out = vec![0.0f32; 512];
+        for _ in 0..3 {
+            mixer.render(&mut out);
+        }
+        assert!(out.iter().all(|s| s.abs() < 1e-6));
+
+        // The playhead moves.
+        mixer.pending_seek = Some(4_000);
+        mixer.render(&mut out);
+        assert_eq!(mixer.pending_seek, None, "the move did not happen");
+        assert_eq!(
+            mixer.position, 4_000,
+            "it should have landed on the new frame"
+        );
+        assert_eq!(
+            mixer.scrub_left,
+            Some(2_000),
+            "a new frame should have opened a fresh window"
+        );
+
+        // And it makes sound again, which is the point.
+        for _ in 0..2 {
+            mixer.render(&mut out);
+        }
+        assert!(
+            out.iter().any(|s| s.abs() > 0.1),
+            "the new window is silent"
+        );
+    }
+
+    /// **Playback is not a window.** Pressing play after a scrub must run to
+    /// the end of the film rather than for a fortieth of a second.
+    #[test]
+    fn playing_clears_the_scrub_window() {
+        let mut player = Player::new(24.0);
+        {
+            let mut mixer = player.mixer.lock().expect("the mixer");
+            mixer.sample_rate = 48_000;
+            mixer.channels = 2;
+            mixer.scrub_left = Some(10);
+            mixer.scrub_window = 2_000;
+        }
+        // No device in a test: `play` reports the failure and carries on, and
+        // the state it sets before reaching for one is what matters here.
+        let _ = player.play(0);
+        let mixer = player.mixer.lock().expect("the mixer");
+        assert_eq!(
+            mixer.scrub_left, None,
+            "playback inherited the scrub's window"
         );
     }
 

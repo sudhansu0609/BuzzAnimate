@@ -399,6 +399,19 @@ pub struct Workspace {
     /// here because a keymap belongs to the person, not to any one film.
     #[serde(default)]
     pub keymap: std::collections::BTreeMap<String, Option<KeyChord>>,
+    /// **A panel its column should scroll to**, once.
+    ///
+    /// The fourth way a panel can be out of sight, and the one none of the
+    /// others covers: open, at the front of its section, unrolled — and below
+    /// the bottom of a column that scrolls. The Story panel sits sixth in the
+    /// right-hand column, under Layers, Tool Options, Properties, Color and
+    /// Swatches, and on a 1080-pixel screen that is below the fold. Every
+    /// measure in this struct said it was showing.
+    ///
+    /// Set by [`Self::reveal`], taken by whichever column draws the panel. Not
+    /// saved: it is a request about the next frame, not part of the layout.
+    #[serde(skip)]
+    pub scroll_to: Option<PanelId>,
 }
 
 /// A serialisable keyboard chord — the modifiers and the key, stored by name so
@@ -820,6 +833,7 @@ impl Workspace {
         Self {
             version: LAYOUT_VERSION,
             name: "Animator".into(),
+            scroll_to: None,
             slots: vec![
                 slot(PanelId::Tools, Dock::Left, 0, Dock::Left),
                 slot(PanelId::Layers, Dock::Right, 0, Dock::Right),
@@ -1333,7 +1347,7 @@ impl Workspace {
     /// **Show a panel**: open it where it belongs, bring its tab to the front,
     /// and unroll the section it is in.
     ///
-    /// What a menu item naming a panel owes the user. Each of the three steps
+    /// What a menu item naming a panel owes the user. Each of the four steps
     /// covers a way the panel can be out of sight, and a command that skips any
     /// of them can leave the user looking at an unchanged screen.
     pub fn reveal(&mut self, id: PanelId) {
@@ -1345,6 +1359,10 @@ impl Workspace {
         // right for clicking a tab, wrong for a menu item, which has no other
         // way to show you anything.
         self.set_collapsed(id, false);
+        // And a column that scrolls is scrolled to it. Open, fronted and
+        // unrolled below the fold is what "I clicked it and nothing happened"
+        // looks like from the inside. See `scroll_to`.
+        self.scroll_to = Some(id);
     }
 
     /// Move a panel to a side, putting it at the end of whatever is there.
@@ -2690,6 +2708,27 @@ mod group_tests {
             mine < last,
             "the panel came back at the bottom of the column (row {mine} of {last})"
         );
+    }
+
+    /// **Revealing a panel asks its column to scroll to it.**
+    ///
+    /// Open, fronted and unrolled are not enough on a column taller than the
+    /// screen — and the Story panel sits under five others in the right-hand
+    /// column, which on a 1080-pixel screen is exactly that. This was the
+    /// second time "Direct a Story" was reported as doing nothing.
+    #[test]
+    fn revealing_a_panel_asks_its_column_to_scroll_to_it() {
+        let mut workspace = Workspace::animate();
+        assert_eq!(workspace.scroll_to, None, "nothing has been asked for yet");
+
+        workspace.reveal(PanelId::Story);
+        assert_eq!(workspace.scroll_to, Some(PanelId::Story));
+
+        // A request, not a layout: it does not survive a save.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("layout.json");
+        workspace.save_to(&path);
+        assert_eq!(Workspace::load_from(&path).scroll_to, None);
     }
 
     /// The default arrangement puts the six occasional panels in one section,

@@ -1812,6 +1812,15 @@ impl App {
         if response.lay_scenery {
             self.editor.story_lay_scenery(&state);
         }
+        // **The panel stays where you can see it.** Directing a shot selects
+        // what it built, and the Properties panel above this one grows to
+        // describe it — which, in a column that keeps its scroll offset in
+        // pixels, pushes the panel you just pressed a button in off the bottom
+        // of the screen. See `Workspace::scroll_to`.
+        if response.direct || response.direct_sequence || response.set_scene || response.lay_scenery
+        {
+            self.editor.workspace.scroll_to = Some(buzz_ui::PanelId::Story);
+        }
         self.editor.story = state;
     }
 
@@ -1897,6 +1906,15 @@ impl App {
         // Scrolling the width instead keeps the column's rectangle honest — the
         // stage stops where the panel starts — and gives the cut-off end of a
         // row somewhere to be reached from, rather than nowhere.
+        //
+        // **And scrolled to a panel somebody asked for.** A column of ten
+        // panels is taller than the screen, and a panel opened, fronted and
+        // unrolled at row six of it is below the fold — which is what "Direct
+        // a Story does nothing" turned out to mean, twice. The request comes
+        // from `Workspace::reveal`, and is spent by the column that finds the
+        // panel, so a panel floating or docked elsewhere leaves it standing for
+        // the frame it is docked on.
+        let wanted = self.editor.workspace.scroll_to;
         egui::ScrollArea::both()
             .id_salt(("column", sections.first().map(|s| s.front)))
             .show(ui, |ui| {
@@ -1904,6 +1922,7 @@ impl App {
                     if index > 0 {
                         ui.separator();
                     }
+                    let top = ui.cursor().top();
                     // Rolled up, the header carries the name whatever the panel
                     // would normally do, or the column becomes a stack of
                     // anonymous strips. A tabbed section always shows its tabs,
@@ -1912,6 +1931,17 @@ impl App {
                     section_header(ui, section, neighbours, locked, named, true, requests);
                     if !section.collapsed {
                         self.draw_panel(ui, section.front, commands);
+                    }
+                    if wanted.is_some_and(|id| section.panels.contains(&id)) {
+                        // The section's top to the top of the view: a panel
+                        // taller than the column is shown from its title, not
+                        // from wherever its bottom lands.
+                        let rect = egui::Rect::from_min_max(
+                            egui::pos2(ui.min_rect().left(), top),
+                            egui::pos2(ui.min_rect().right(), ui.cursor().top()),
+                        );
+                        ui.scroll_to_rect(rect, Some(egui::Align::Min));
+                        self.editor.workspace.scroll_to = None;
                     }
                 }
             });

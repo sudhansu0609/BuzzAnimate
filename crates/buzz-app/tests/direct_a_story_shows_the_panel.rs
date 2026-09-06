@@ -14,10 +14,14 @@
 //! 3. **The section is rolled up.** Selecting a tab deliberately does *not*
 //!    unroll a section — that is right for clicking a tab and wrong for a menu
 //!    item, which has no other way to show you anything.
+//! 4. **It is below the fold.** Open, fronted, unrolled — and sixth in a
+//!    right-hand column that is taller than the screen. The column scrolls,
+//!    and nothing scrolled it.
 //!
-//! The third is the one that reads as "I clicked it and nothing happened",
-//! because something *did* happen: the right tab was selected, behind a rolled
-//! up title bar.
+//! The third and fourth are the ones that read as "I clicked it and nothing
+//! happened", because something *did* happen: the right tab was selected,
+//! behind a rolled-up title bar or off the bottom of the window. The fourth
+//! was found on this machine, with a layout every other measure called fine.
 
 use buzz_app::editor::Editor;
 use buzz_ui::{Command, Dock, PanelId};
@@ -72,6 +76,11 @@ fn directing_a_story_brings_the_panel_to_the_front() {
         assert!(
             !workspace.is_collapsed(PanelId::Story),
             "{name}: the section is rolled up, so the panel shows nothing"
+        );
+        assert_eq!(
+            workspace.scroll_to,
+            Some(PanelId::Story),
+            "{name}: the column was not asked to scroll to it"
         );
     }
 }

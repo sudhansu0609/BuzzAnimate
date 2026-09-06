@@ -728,6 +728,18 @@ pub struct App {
     /// were born with. Recording the rects as they are laid out is the only
     /// way to be right about this that does not repeat the layout arithmetic.
     dock_rects: Vec<(buzz_ui::Dock, egui::Rect)>,
+    /// Every section on screen this frame, for a dragged panel to be dropped
+    /// on. Filled as the sections are drawn, like `dock_rects`.
+    drop_zones: Vec<DropZone>,
+    /// The panel being lit up and how brightly, resolved once per frame from
+    /// `Workspace::highlight` and the clock.
+    highlight_frame: Option<(buzz_ui::PanelId, f32)>,
+    /// When the current highlight began.
+    highlight_since: Option<(buzz_ui::PanelId, f64)>,
+    /// Floating windows to put at a point on the next frame — the point a
+    /// panel was dropped at. egui remembers a window's position itself, so a
+    /// new position has to be pressed on it once.
+    place_floats: Vec<(buzz_ui::workspace::GroupId, egui::Pos2)>,
     /// How much width the columns and the stage had to share this frame.
     ///
     /// Recorded where the columns are laid out, and read by the splitters, so
@@ -810,6 +822,10 @@ impl App {
             picker: crate::dialogs::Pending::default(),
             tasks: crate::tasks::TaskRegistry::default(),
             dock_rects: Vec::new(),
+            drop_zones: Vec::new(),
+            highlight_frame: None,
+            highlight_since: None,
+            place_floats: Vec::new(),
             dock_room: 0.0,
             splash: buzz_ui::SplashState::default(),
         };
@@ -1453,6 +1469,30 @@ impl App {
             let workspace = self.editor.workspace.clone();
             let locked = workspace.locked;
             self.dock_rects.clear();
+            self.drop_zones.clear();
+
+            // **The highlight fades.** A revealed panel's header is drawn in
+            // the accent for a couple of seconds and then left alone; the
+            // clock is read once here so every section agrees.
+            self.highlight_frame = None;
+            if let Some(panel) = self.editor.workspace.highlight {
+                let now = ui.input(|i| i.time);
+                let since = match self.highlight_since {
+                    Some((p, t)) if p == panel => t,
+                    _ => {
+                        self.highlight_since = Some((panel, now));
+                        now
+                    }
+                };
+                let strength = 1.0 - ((now - since) / HIGHLIGHT_SECONDS) as f32;
+                if strength <= 0.0 {
+                    self.editor.workspace.highlight = None;
+                    self.highlight_since = None;
+                } else {
+                    self.highlight_frame = Some((panel, strength));
+                    ui.ctx().request_repaint();
+                }
+            }
 
             // Bottom first: `egui` gives each side to whichever panel asks
             // first, so the order here is the order down the window.
@@ -1463,6 +1503,7 @@ impl App {
                 } else {
                     240.0
                 };
+                let emphasis = self.emphasis_for(&section);
                 let response = egui::Panel::bottom(egui::Id::new(("dock-bottom", section.group)))
                     // **Exact, not default.** egui keeps a size of its own per
                     // panel, and a `default_size` is only consulted when it has
@@ -1480,6 +1521,7 @@ impl App {
                             locked,
                             !section.front.draws_own_title(),
                             false,
+                            emphasis,
                             &mut requests,
                         );
                         self.draw_panel(ui, section.front, &mut commands);
@@ -1488,6 +1530,12 @@ impl App {
                     self.dock_rects
                         .push((buzz_ui::Dock::Bottom, response.response.rect));
                 }
+                self.drop_zones.push(DropZone {
+                    dock: buzz_ui::Dock::Bottom,
+                    group: section.group,
+                    front: section.front,
+                    rect: response.response.rect,
+                });
             }
 
             // **How wide the columns may actually be drawn.**
@@ -1525,6 +1573,7 @@ impl App {
                     .show(ui, |ui| {
                         self.draw_column(
                             ui,
+                            dock,
                             &sections,
                             &neighbours,
                             locked,
@@ -1554,6 +1603,7 @@ impl App {
                     .show(ui, |ui| {
                         self.draw_column(
                             ui,
+                            dock,
                             &sections,
                             &neighbours,
                             locked,
@@ -1585,14 +1635,26 @@ impl App {
                 } else {
                     section.front.title().to_string()
                 };
-                let response = egui::Window::new(title)
+                let emphasis = self.emphasis_for(&section);
+                let mut window = egui::Window::new(title)
                     .id(egui::Id::new(("float", section.group)))
                     .open(&mut open)
                     .movable(!locked)
                     .resizable(!locked)
                     .default_pos(slot.map(|s| s.float_pos).unwrap_or((320.0, 140.0)))
-                    .default_size(slot.map(|s| s.float_size).unwrap_or((300.0, 380.0)))
-                    .show(ui.ctx(), |ui| {
+                    .default_size(slot.map(|s| s.float_size).unwrap_or((300.0, 380.0)));
+                // Dropped somewhere: put the window there, once. egui keeps
+                // its own idea of where a window is, and `default_pos` is
+                // only consulted when it has none.
+                if let Some(at) = self
+                    .place_floats
+                    .iter()
+                    .position(|(group, _)| *group == section.group)
+                {
+                    let (_, pos) = self.place_floats.remove(at);
+                    window = window.current_pos(pos);
+                }
+                let response = window.show(ui.ctx(), |ui| {
                         // A lone floating panel is not named here: the window
                         // frame already carries the title, and the panel below
                         // may carry it again. A tabbed one still needs its tabs.
@@ -1603,6 +1665,7 @@ impl App {
                             locked,
                             false,
                             false,
+                            emphasis,
                             &mut requests,
                         );
                         egui::ScrollArea::vertical()
@@ -1619,6 +1682,14 @@ impl App {
                             slot.float_size = (rect.width(), rect.height());
                         }
                     }
+                    // A window is somewhere to drop a panel too: it becomes a
+                    // tab of that window.
+                    self.drop_zones.push(DropZone {
+                        dock: buzz_ui::Dock::Float,
+                        group: section.group,
+                        front: section.front,
+                        rect,
+                    });
                 }
                 if !open {
                     // Closing a floating group closes the whole group: the
@@ -1630,7 +1701,22 @@ impl App {
                 }
             }
 
+            // **Drag-and-drop docking.** A panel picked up by its grip or its
+            // tab is carried until the pointer is released, and where it lands
+            // decides what happens: on a section, it becomes a tab there; in
+            // the gap between two sections of a column, it docks there in a
+            // section of its own; anywhere else, it floats at that point.
+            // The target is outlined while the drag is in progress, so the
+            // drop is never a guess.
+            self.drag_docking(ui.ctx(), &mut requests);
+
+            let floated: Vec<(buzz_ui::PanelId, (f32, f32))> = requests.floats.clone();
             requests.apply(&mut self.editor.workspace);
+            for (id, (x, y)) in floated {
+                if let Some(slot) = self.editor.workspace.slot(id) {
+                    self.place_floats.push((slot.group, egui::pos2(x, y)));
+                }
+            }
 
             // The edit-path breadcrumb. Animate keeps this strip directly above
             // the stage, and it is the only way back out of a symbol.
@@ -1887,6 +1973,7 @@ impl App {
     fn draw_column(
         &mut self,
         ui: &mut egui::Ui,
+        dock: buzz_ui::Dock,
         sections: &[buzz_ui::Section],
         neighbours: &[buzz_ui::PanelId],
         locked: bool,
@@ -1928,18 +2015,28 @@ impl App {
                     // anonymous strips. A tabbed section always shows its tabs,
                     // so it never needs this.
                     let named = section.collapsed || !section.front.draws_own_title();
-                    section_header(ui, section, neighbours, locked, named, true, requests);
+                    let emphasis = self.emphasis_for(section);
+                    section_header(
+                        ui, section, neighbours, locked, named, true, emphasis, requests,
+                    );
                     if !section.collapsed {
                         self.draw_panel(ui, section.front, commands);
                     }
+                    // The section's top to the top of the view: what a scroll
+                    // aims at, and what a dragged panel can be dropped on.
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(ui.min_rect().left(), top),
+                        egui::pos2(ui.min_rect().right(), ui.cursor().top()),
+                    );
+                    self.drop_zones.push(DropZone {
+                        dock,
+                        group: section.group,
+                        front: section.front,
+                        rect: rect.intersect(ui.clip_rect()),
+                    });
                     if wanted.is_some_and(|id| section.panels.contains(&id)) {
-                        // The section's top to the top of the view: a panel
-                        // taller than the column is shown from its title, not
-                        // from wherever its bottom lands.
-                        let rect = egui::Rect::from_min_max(
-                            egui::pos2(ui.min_rect().left(), top),
-                            egui::pos2(ui.min_rect().right(), ui.cursor().top()),
-                        );
+                        // A panel taller than the column is shown from its
+                        // title, not from wherever its bottom lands.
                         ui.scroll_to_rect(rect, Some(egui::Align::Min));
                         self.editor.workspace.scroll_to = None;
                     }
@@ -7559,6 +7656,161 @@ struct DockRequests {
     ungroups: Vec<buzz_ui::PanelId>,
     /// Roll a section up to its tabs, or open it.
     collapses: Vec<(buzz_ui::PanelId, bool)>,
+    /// Dock a panel in a column above the section named, or at the bottom.
+    docks: Vec<(buzz_ui::PanelId, buzz_ui::Dock, Option<buzz_ui::workspace::GroupId>)>,
+    /// Float a panel at a point on the screen.
+    floats: Vec<(buzz_ui::PanelId, (f32, f32))>,
+}
+
+/// What is being carried during a drag: the panels of a section picked up by
+/// its grip, or the one panel of a tab.
+struct DraggedPanels(Vec<buzz_ui::PanelId>);
+
+/// A section as it was drawn this frame, for a dragged panel to land on.
+#[derive(Debug, Clone, Copy)]
+struct DropZone {
+    dock: buzz_ui::Dock,
+    group: buzz_ui::workspace::GroupId,
+    front: buzz_ui::PanelId,
+    rect: egui::Rect,
+}
+
+/// Where a dragged panel would land if released now.
+enum DropTarget {
+    /// As a tab of this section.
+    Section { front: buzz_ui::PanelId, rect: egui::Rect },
+    /// In a section of its own in this column, above the section named.
+    Column {
+        dock: buzz_ui::Dock,
+        before: Option<buzz_ui::workspace::GroupId>,
+        line: egui::Rect,
+    },
+    /// In a window of its own, here.
+    Float(egui::Pos2),
+}
+
+/// How long a revealed panel's header stays lit.
+const HIGHLIGHT_SECONDS: f64 = 2.5;
+
+impl App {
+    /// How brightly this section's header is lit this frame, if at all.
+    fn emphasis_for(&self, section: &buzz_ui::Section) -> Option<f32> {
+        self.highlight_frame
+            .filter(|(panel, _)| section.panels.contains(panel))
+            .map(|(_, strength)| strength)
+    }
+
+    /// Where the pointer is over, in drop terms.
+    ///
+    /// Sections are checked last-drawn first, because that is what is on top:
+    /// a floating window over a column is the thing under the pointer, not
+    /// the column behind it. A panel dropped on its own section goes nowhere.
+    fn drop_target(&self, pointer: egui::Pos2, dragged: &[buzz_ui::PanelId]) -> Option<DropTarget> {
+        if let Some(zone) = self.drop_zones.iter().rev().find(|z| z.rect.contains(pointer)) {
+            if dragged.contains(&zone.front) {
+                return None;
+            }
+            return Some(DropTarget::Section {
+                front: zone.front,
+                rect: zone.rect,
+            });
+        }
+        if let Some((dock, rect)) = self.dock_rects.iter().find(|(_, r)| r.contains(pointer)) {
+            let mut zones: Vec<&DropZone> =
+                self.drop_zones.iter().filter(|z| z.dock == *dock).collect();
+            zones.sort_by(|a, b| a.rect.top().total_cmp(&b.rect.top()));
+            let before = zones.iter().find(|z| z.rect.center().y > pointer.y);
+            let y = before
+                .map(|z| z.rect.top())
+                .or_else(|| zones.last().map(|z| z.rect.bottom()))
+                .unwrap_or(rect.top());
+            let line = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), y - 2.0),
+                egui::pos2(rect.right(), y + 2.0),
+            );
+            return Some(DropTarget::Column {
+                dock: *dock,
+                before: before.map(|z| z.group),
+                line,
+            });
+        }
+        Some(DropTarget::Float(pointer))
+    }
+
+    /// Carry a dragged panel, show where it would land, and land it.
+    fn drag_docking(&self, ctx: &egui::Context, requests: &mut DockRequests) {
+        let Some(dragged) = egui::DragAndDrop::payload::<DraggedPanels>(ctx) else {
+            return;
+        };
+        let accent = Palette::selection();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("dock-drop"),
+        ));
+        let pointer = ctx.pointer_latest_pos();
+
+        // The name travels with the pointer, so what is being carried is
+        // never in doubt.
+        if let Some(p) = pointer {
+            let names = dragged
+                .0
+                .iter()
+                .map(|id| id.tab_title())
+                .collect::<Vec<_>>()
+                .join(" \u{b7} ");
+            egui::Area::new(egui::Id::new("dock-drag-label"))
+                .order(egui::Order::Tooltip)
+                .fixed_pos(p + egui::vec2(14.0, 14.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.label(egui::RichText::new(names).small());
+                    });
+                });
+        }
+
+        let target = pointer.and_then(|p| self.drop_target(p, &dragged.0));
+        match &target {
+            Some(DropTarget::Section { rect, .. }) => {
+                painter.rect_filled(*rect, 3.0, accent.gamma_multiply(0.18));
+                painter.rect_stroke(
+                    *rect,
+                    3.0,
+                    egui::Stroke::new(2.0, accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            Some(DropTarget::Column { line, .. }) => {
+                painter.rect_filled(*line, 1.0, accent);
+            }
+            Some(DropTarget::Float(_)) | None => {}
+        }
+        ctx.request_repaint();
+
+        if ctx.input(|i| i.pointer.any_released()) {
+            egui::DragAndDrop::clear_payload(ctx);
+            match target {
+                Some(DropTarget::Section { front, .. }) => {
+                    for id in &dragged.0 {
+                        if *id != front {
+                            requests.groups.push((*id, front));
+                        }
+                    }
+                }
+                Some(DropTarget::Column { dock, before, .. }) => {
+                    for id in &dragged.0 {
+                        requests.docks.push((*id, dock, before));
+                    }
+                }
+                Some(DropTarget::Float(pos)) => {
+                    for id in &dragged.0 {
+                        requests.floats.push((*id, (pos.x, pos.y)));
+                    }
+                }
+                None => {}
+            }
+        }
+    }
 }
 
 impl DockRequests {
@@ -7573,7 +7825,9 @@ impl DockRequests {
             || !self.selects.is_empty()
             || !self.groups.is_empty()
             || !self.ungroups.is_empty()
-            || !self.collapses.is_empty();
+            || !self.collapses.is_empty()
+            || !self.docks.is_empty()
+            || !self.floats.is_empty();
 
         for id in self.selects {
             workspace.select_tab(id);
@@ -7586,6 +7840,12 @@ impl DockRequests {
         }
         for id in self.ungroups {
             workspace.ungroup(id);
+        }
+        for (id, dock, before) in self.docks {
+            workspace.dock_at(id, dock, before);
+        }
+        for (id, pos) in self.floats {
+            workspace.float_at(id, pos);
         }
         for (id, dock) in self.moves {
             workspace.move_to(id, dock);
@@ -7630,6 +7890,8 @@ fn section_header(
     locked: bool,
     named: bool,
     collapsible: bool,
+    // How brightly the header is lit, for a panel that has just been revealed.
+    emphasis: Option<f32>,
     out: &mut DockRequests,
 ) {
     // **A header that looks like a header.**
@@ -7639,10 +7901,21 @@ fn section_header(
     // Library "looked obscure" and the Assets panel below it was reported
     // missing rather than merely out of sight. A filled strip the width of the
     // panel says plainly where one panel stops and the next begins.
-    let frame = egui::Frame::new()
-        .fill(Palette::raised())
+    // **Lit, when the panel has just been asked for.** The accent washes the
+    // strip and outlines it, and fades as `emphasis` falls, so the eye is
+    // taken to the panel that arrived and then left alone.
+    let accent = Palette::selection();
+    let fill = match emphasis {
+        Some(strength) => Palette::raised().lerp_to_gamma(accent, 0.35 * strength),
+        None => Palette::raised(),
+    };
+    let mut frame = egui::Frame::new()
+        .fill(fill)
         .inner_margin(egui::Margin::symmetric(4, 2))
         .corner_radius(3);
+    if let Some(strength) = emphasis {
+        frame = frame.stroke(egui::Stroke::new(2.0, accent.gamma_multiply(strength)));
+    }
 
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
@@ -7736,12 +8009,65 @@ fn section_header(
                 // Whatever the menu left over holds the roll-up triangle and
                 // the tabs.
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    // **The grip.** Drag it to carry the whole section — onto
+                    // another panel to tab with it, into a column to dock
+                    // there, or onto the stage to float it. A drag rather
+                    // than the menu, because it is the gesture everyone
+                    // tries first, and because where the pointer lands says
+                    // where the panel goes without a list to read.
+                    //
+                    // **Only where there is room.** The tools column is 55
+                    // points at its narrowest, and the menu, the triangle and
+                    // a tab strip have to share that with the frame's margins;
+                    // a grip on top of them left a truncated tab overrunning
+                    // the column by two points, and an overrun is a column
+                    // that reports itself wider than it was drawn (see
+                    // `dock_geometry_tests`). A narrow column keeps its handle
+                    // anyway: the roll-up triangle below drags too. A floating
+                    // window has no triangle and plenty of width, so it always
+                    // gets the grip.
+                    let roomy = ui.available_width() >= 120.0;
+                    if !collapsible || roomy {
+                        let grip = ui
+                            .scope(|ui| {
+                                ui.spacing_mut().button_padding = egui::vec2(1.0, 1.0);
+                                ui.add(
+                                    egui::Button::new(egui::RichText::new(GRIP).small().weak())
+                                        .frame(false)
+                                        .sense(egui::Sense::drag()),
+                                )
+                            })
+                            .inner
+                            .on_hover_text(if locked {
+                                "The layout is locked"
+                            } else {
+                                "Drag to move this section: drop it on a panel to \
+                                 tab with it, between panels to dock there, or on \
+                                 the stage to float it"
+                            });
+                        if !locked {
+                            grip.dnd_set_drag_payload(DraggedPanels(section.panels.clone()));
+                        }
+                        // Where the grip was drawn, for the tests that drive a
+                        // drag through the real window: a guess at where a
+                        // twelve-point button landed is how a test tests the
+                        // guess rather than the drag.
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(egui::Id::new(("grip", section.front)), grip.rect);
+                        });
+                    }
+
                     // The roll-up triangle, where every collapsible thing keeps
                     // one. Only docked sections get it: a floating window
                     // already has a close button, and rolling one up would
                     // leave a title bar adrift over the stage.
-                    if collapsible
-                        && ui
+                    if collapsible {
+                        // Clicked, it rolls the section up or opens it.
+                        // Dragged, it carries the section, which is the whole
+                        // of the drag handle a column too narrow for the grip
+                        // has. egui tells the two apart by whether the pointer
+                        // moved.
+                        let triangle = ui
                             .add(
                                 egui::Button::new(
                                     egui::RichText::new(if section.collapsed {
@@ -7751,16 +8077,20 @@ fn section_header(
                                     })
                                     .small(),
                                 )
-                                .frame(false),
+                                .frame(false)
+                                .sense(egui::Sense::click_and_drag()),
                             )
                             .on_hover_text(if section.collapsed {
-                                "Rolled up \u{2014} click to open"
+                                "Rolled up \u{2014} click to open, or drag to move"
                             } else {
-                                "Roll up, and keep the tabs"
-                            })
-                            .clicked()
-                    {
-                        out.collapses.push((section.front, !section.collapsed));
+                                "Roll up, and keep the tabs \u{2014} or drag to move"
+                            });
+                        if triangle.clicked() {
+                            out.collapses.push((section.front, !section.collapsed));
+                        }
+                        if !locked {
+                            triangle.dnd_set_drag_payload(DraggedPanels(section.panels.clone()));
+                        }
                     }
 
                     if section.is_tabbed() {
@@ -7772,12 +8102,20 @@ fn section_header(
                                 let front = *id == section.front;
                                 let label = egui::RichText::new(id.tab_title()).small();
                                 let label = if front { label } else { label.weak() };
-                                if ui
-                                    .add(egui::Button::selectable(front, label).truncate())
-                                    .on_hover_text(id.title())
-                                    .clicked()
-                                {
+                                // A tab can be dragged out on its own, which
+                                // is how one panel leaves a group.
+                                let tab = ui
+                                    .add(
+                                        egui::Button::selectable(front, label)
+                                            .truncate()
+                                            .sense(egui::Sense::click_and_drag()),
+                                    )
+                                    .on_hover_text(id.title());
+                                if tab.clicked() {
                                     out.selects.push(*id);
+                                }
+                                if !locked {
+                                    tab.dnd_set_drag_payload(DraggedPanels(vec![*id]));
                                 }
                             }
                         });
@@ -7813,6 +8151,10 @@ fn section_header(
 /// empty box. `theme::font_has` said so before it reached a screenshot,
 /// which is the whole reason that check exists.
 const PANEL_MENU: &str = "...";
+
+/// The drag handle on every section header. Two colons: in the bundled font
+/// beyond doubt, and it reads as a grip.
+const GRIP: &str = "::";
 
 /// The roll-up triangle on a docked panel's header.
 ///
@@ -8078,6 +8420,7 @@ mod dock_geometry_tests {
                                         false,
                                         true,
                                         true,
+                                        None,
                                         &mut requests,
                                     );
                                 }
@@ -8100,6 +8443,7 @@ mod dock_geometry_tests {
                                     false,
                                     true,
                                     true,
+                                    None,
                                     &mut requests,
                                 );
                             });
@@ -8324,6 +8668,211 @@ mod idle_tests {
         drive(&mut app, vec![]);
 
         assert!(opened, "right-clicking the stage should raise its menu");
+    }
+
+    /// **Panels can be dragged where they should go.**
+    ///
+    /// Driven through the real `build_ui` with pointer events, because the
+    /// question is never whether `dock_at` works — the workspace tests cover
+    /// that — but whether picking a section up by its grip, carrying it and
+    /// letting go lands it where the pointer is: a section becomes a tab
+    /// there, a gap in a column docks there, the stage floats it.
+    mod dock_drag_tests {
+        use super::*;
+
+        struct Drive {
+            app: App,
+            ctx: egui::Context,
+            screen: egui::Rect,
+        }
+
+        impl Drive {
+            fn new() -> Self {
+                let mut app = App::new(GpuPreference::Automatic);
+                app.recovery.found.clear();
+                let ctx = egui::Context::default();
+                buzz_ui::theme::apply(&ctx);
+                let screen =
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+                let mut drive = Self { app, ctx, screen };
+                // Two frames to lay the window out and settle its scroll state.
+                drive.frame(vec![]);
+                drive.frame(vec![]);
+                drive
+            }
+
+            fn frame(&mut self, events: Vec<egui::Event>) {
+                let input = egui::RawInput {
+                    events,
+                    screen_rect: Some(self.screen),
+                    ..Default::default()
+                };
+                let app = &mut self.app;
+                let _ = self.ctx.run_ui(input, |ui| {
+                    app.build_ui(ui);
+                });
+            }
+
+            /// Where a section was drawn on the last frame.
+            fn zone(&self, front: buzz_ui::PanelId) -> egui::Rect {
+                self.app
+                    .drop_zones
+                    .iter()
+                    .find(|z| z.front == front)
+                    .unwrap_or_else(|| panic!("{front:?} was not drawn"))
+                    .rect
+            }
+
+            /// The grip of a section, where the header drew it.
+            fn grip(&self, front: buzz_ui::PanelId) -> egui::Pos2 {
+                self.ctx
+                    .data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("grip", front))))
+                    .unwrap_or_else(|| panic!("{front:?} has no grip on screen"))
+                    .center()
+            }
+
+            /// Press at `from`, carry to `to`, let go.
+            fn drag(&mut self, from: egui::Pos2, to: egui::Pos2) {
+                let mods = egui::Modifiers::default();
+                self.frame(vec![egui::Event::PointerMoved(from)]);
+                self.frame(vec![egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: mods,
+                }]);
+                // In steps, as a hand moves, so the drag threshold is crossed
+                // and the target has frames to be found in.
+                for step in 1..=6 {
+                    let t = step as f32 / 6.0;
+                    self.frame(vec![egui::Event::PointerMoved(from + (to - from) * t)]);
+                }
+                assert!(
+                    egui::DragAndDrop::has_payload_of_type::<DraggedPanels>(&self.ctx),
+                    "nothing was picked up"
+                );
+                self.frame(vec![egui::Event::PointerButton {
+                    pos: to,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: mods,
+                }]);
+                self.frame(vec![]);
+            }
+        }
+
+        /// Dropped on a section: a tab of it.
+        #[test]
+        fn dropping_a_section_on_another_makes_it_a_tab_there() {
+            let mut d = Drive::new();
+            let from = d.grip(buzz_ui::PanelId::Layers);
+            let to = d.zone(buzz_ui::PanelId::Properties).center();
+
+            d.drag(from, to);
+
+            let section = d
+                .app
+                .editor
+                .workspace
+                .section_of(buzz_ui::PanelId::Layers)
+                .expect("still on screen");
+            assert!(
+                section.panels.contains(&buzz_ui::PanelId::Properties),
+                "Layers did not join Properties: {:?}",
+                section.panels
+            );
+            assert_eq!(section.front, buzz_ui::PanelId::Layers, "the dropped tab comes to the front");
+        }
+
+        /// Dropped in the gap between two sections: docked there, alone.
+        #[test]
+        fn dropping_a_section_between_two_others_docks_it_there() {
+            let mut d = Drive::new();
+            // The Library section, from the far-right column, carried into
+            // the right-hand one: just above the Properties section, in the
+            // gap between it and what is above.
+            let from = d.grip(buzz_ui::PanelId::Library);
+            let target = d.zone(buzz_ui::PanelId::Properties);
+            let to = egui::pos2(target.center().x, target.top() - 1.0);
+
+            d.drag(from, to);
+
+            let workspace = &d.app.editor.workspace;
+            assert_eq!(workspace.dock_of(buzz_ui::PanelId::Library), buzz_ui::Dock::Right);
+            let side = workspace.on(buzz_ui::Dock::Right);
+            let library = side
+                .iter()
+                .position(|p| *p == buzz_ui::PanelId::Library)
+                .expect("in the right column");
+            let properties = side
+                .iter()
+                .position(|p| *p == buzz_ui::PanelId::Properties)
+                .expect("Properties is still there");
+            assert!(
+                library < properties && properties - library <= 2,
+                "not just above Properties: {side:?}"
+            );
+            assert_eq!(
+                workspace.section_of(buzz_ui::PanelId::Library).unwrap().panels,
+                vec![buzz_ui::PanelId::Library],
+                "a section of its own"
+            );
+        }
+
+        /// Dropped on the stage: a window of its own, there.
+        #[test]
+        fn dropping_a_section_on_the_stage_floats_it_there() {
+            let mut d = Drive::new();
+            let from = d.grip(buzz_ui::PanelId::Layers);
+            let to = egui::pos2(700.0, 450.0);
+
+            d.drag(from, to);
+
+            let workspace = &d.app.editor.workspace;
+            assert_eq!(workspace.dock_of(buzz_ui::PanelId::Layers), buzz_ui::Dock::Float);
+            assert_eq!(
+                workspace.slot(buzz_ui::PanelId::Layers).unwrap().float_pos,
+                (700.0, 450.0)
+            );
+            // And the window is drawn where it was dropped, not where egui
+            // last remembered one.
+            d.frame(vec![]);
+            let rect = d.zone(buzz_ui::PanelId::Layers);
+            assert!(
+                (rect.left() - 700.0).abs() < 2.0 && (rect.top() - 450.0).abs() < 2.0,
+                "the window was drawn at {:?}",
+                rect.min
+            );
+        }
+
+        /// A locked layout picks nothing up.
+        #[test]
+        fn a_locked_layout_cannot_be_dragged() {
+            let mut d = Drive::new();
+            d.app.editor.workspace.locked = true;
+            d.frame(vec![]);
+            let before = d.app.editor.workspace.clone();
+            let from = d.grip(buzz_ui::PanelId::Layers);
+            let to = d.zone(buzz_ui::PanelId::Properties).center();
+            let mods = egui::Modifiers::default();
+            d.frame(vec![egui::Event::PointerMoved(from)]);
+            d.frame(vec![egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: mods,
+            }]);
+            d.frame(vec![egui::Event::PointerMoved(to)]);
+            assert!(!egui::DragAndDrop::has_payload_of_type::<DraggedPanels>(&d.ctx));
+            d.frame(vec![egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: mods,
+            }]);
+            d.frame(vec![]);
+            assert_eq!(d.app.editor.workspace.slots, before.slots);
+        }
     }
 
     /// **Turning on the depth view shows the picture.**

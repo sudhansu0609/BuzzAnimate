@@ -3782,7 +3782,20 @@ impl Editor {
             AddThreeQuarterRight => self.add_turnaround_view(45.0),
             AddThreeQuarterLeft => self.add_turnaround_view(-45.0),
             TogglePanel(panel) => {
-                self.workspace.toggle(panel);
+                // Opening a panel from the Window menu shows it the way every
+                // other menu item does: at the top of its column, on screen,
+                // lit. Closing is closing. A locked layout cannot be
+                // rearranged, so there the panel comes back where it was and
+                // is pointed at rather than moved.
+                if self.workspace.is_open(panel) {
+                    self.workspace.toggle(panel);
+                } else if self.workspace.locked {
+                    self.workspace.toggle(panel);
+                    self.workspace.scroll_to = Some(panel);
+                    self.workspace.highlight = Some(panel);
+                } else {
+                    self.workspace.reveal(panel);
+                }
                 self.workspace.save();
             }
             ToggleLayoutLock => {

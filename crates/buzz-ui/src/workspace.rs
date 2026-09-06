@@ -412,6 +412,13 @@ pub struct Workspace {
     /// saved: it is a request about the next frame, not part of the layout.
     #[serde(skip)]
     pub scroll_to: Option<PanelId>,
+    /// **A panel to light up**, so the eye lands on it.
+    ///
+    /// Set by [`Self::reveal`] beside `scroll_to`; the window draws the
+    /// section's header in the accent colour and fades it over a couple of
+    /// seconds, then clears this. Not saved, for the same reason.
+    #[serde(skip)]
+    pub highlight: Option<PanelId>,
 }
 
 /// A serialisable keyboard chord — the modifiers and the key, stored by name so
@@ -834,6 +841,7 @@ impl Workspace {
             version: LAYOUT_VERSION,
             name: "Animator".into(),
             scroll_to: None,
+            highlight: None,
             slots: vec![
                 slot(PanelId::Tools, Dock::Left, 0, Dock::Left),
                 slot(PanelId::Layers, Dock::Right, 0, Dock::Right),
@@ -1359,10 +1367,84 @@ impl Workspace {
         // right for clicking a tab, wrong for a menu item, which has no other
         // way to show you anything.
         self.set_collapsed(id, false);
-        // And a column that scrolls is scrolled to it. Open, fronted and
-        // unrolled below the fold is what "I clicked it and nothing happened"
-        // looks like from the inside. See `scroll_to`.
+        // **And it goes to the top of its column**, lit up. Asked for in as
+        // many words: whatever is chosen from a menu should be the first thing
+        // in the column and obviously the thing that just arrived, rather
+        // than somewhere down a scroll with nothing to mark it out.
+        self.raise_to_top(id);
         self.scroll_to = Some(id);
+        self.highlight = Some(id);
+    }
+
+    /// **Put a panel's section at the top of its column.**
+    ///
+    /// The whole section moves, tabs and all, and everything else on that side
+    /// keeps its order below it. A floating or hidden panel has no column to
+    /// be top of, and a locked layout is left as it is.
+    pub fn raise_to_top(&mut self, id: PanelId) {
+        if self.locked {
+            return;
+        }
+        let Some(slot) = self.slot(id).copied() else {
+            return;
+        };
+        if !slot.dock.is_docked() {
+            return;
+        }
+        let (mine, rest): (Vec<PanelId>, Vec<PanelId>) = self
+            .on(slot.dock)
+            .into_iter()
+            .partition(|p| self.slot(*p).is_some_and(|s| s.group == slot.group));
+        for (order, panel) in mine.into_iter().chain(rest).enumerate() {
+            if let Some(s) = self.slot_mut(panel) {
+                s.order = order as u32;
+            }
+        }
+    }
+
+    /// **Dock a panel in a column at a chosen place** — in a section of its
+    /// own, directly above the section `before`, or at the bottom when there
+    /// is none.
+    ///
+    /// What dropping a dragged panel into the gap between two sections means.
+    /// [`Self::move_to`] alone appends to the end of the column, which is the
+    /// right answer for a menu item and the wrong one for a pointer that was
+    /// released at a particular place.
+    pub fn dock_at(&mut self, id: PanelId, dock: Dock, before: Option<GroupId>) {
+        if self.locked || !dock.is_docked() {
+            return;
+        }
+        self.move_to(id, dock);
+        let Some(before) = before else {
+            return;
+        };
+        let mut side = self.on(dock);
+        side.retain(|p| *p != id);
+        let at = side
+            .iter()
+            .position(|p| self.slot(*p).is_some_and(|s| s.group == before))
+            .unwrap_or(side.len());
+        side.insert(at, id);
+        for (order, panel) in side.into_iter().enumerate() {
+            if let Some(s) = self.slot_mut(panel) {
+                s.order = order as u32;
+            }
+        }
+    }
+
+    /// **Float a panel at a point on the screen** — where it was dropped.
+    ///
+    /// A panel already floating stays in its window, which moves there.
+    pub fn float_at(&mut self, id: PanelId, pos: (f32, f32)) {
+        if self.locked {
+            return;
+        }
+        if self.dock_of(id) != Dock::Float {
+            self.move_to(id, Dock::Float);
+        }
+        if let Some(slot) = self.slot_mut(id) {
+            slot.float_pos = pos;
+        }
     }
 
     /// Move a panel to a side, putting it at the end of whatever is there.
@@ -2708,6 +2790,74 @@ mod group_tests {
             mine < last,
             "the panel came back at the bottom of the column (row {mine} of {last})"
         );
+    }
+
+    /// **Revealing a panel puts its section at the top of the column, lit.**
+    ///
+    /// Asked for in as many words: a panel chosen off a menu should be the
+    /// first thing in its column and obviously the thing that just arrived.
+    /// The whole section goes, so the tabs it shares stay together.
+    #[test]
+    fn revealing_a_panel_raises_its_section_and_lights_it_up() {
+        let mut workspace = Workspace::animate();
+        let was_first = workspace.sections(Dock::Right)[0].front;
+        assert_ne!(was_first, PanelId::Story, "Story already starts at the top");
+
+        workspace.reveal(PanelId::Story);
+
+        let top = &workspace.sections(Dock::Right)[0];
+        assert_eq!(top.front, PanelId::Story, "not at the top of the column");
+        assert!(
+            top.panels.contains(&PanelId::Depth),
+            "the section came apart on the way up: {:?}",
+            top.panels
+        );
+        assert_eq!(workspace.highlight, Some(PanelId::Story));
+        // What was first is now second, and nothing else changed order.
+        assert_eq!(workspace.sections(Dock::Right)[1].front, was_first);
+
+        // A locked layout is not rearranged, but the panel is still pointed at.
+        let mut locked = Workspace::animate();
+        locked.locked = true;
+        locked.reveal(PanelId::Story);
+        assert_eq!(locked.sections(Dock::Right)[0].front, was_first);
+        assert_eq!(locked.highlight, Some(PanelId::Story));
+    }
+
+    /// **Dropping a panel between two sections docks it there.**
+    #[test]
+    fn dock_at_puts_a_panel_above_the_section_it_was_dropped_on() {
+        let mut workspace = Workspace::animate();
+        let properties = workspace.slot(PanelId::Properties).unwrap().group;
+
+        workspace.dock_at(PanelId::Library, Dock::Right, Some(properties));
+
+        let side = workspace.on(Dock::Right);
+        let at = side.iter().position(|p| *p == PanelId::Library).expect("docked right");
+        assert_eq!(side[at + 1], PanelId::Properties, "not directly above Properties: {side:?}");
+        assert_eq!(
+            workspace.section_of(PanelId::Library).unwrap().panels,
+            vec![PanelId::Library],
+            "it should be a section of its own"
+        );
+
+        // No section named: the bottom of the column.
+        workspace.dock_at(PanelId::Assets, Dock::Right, None);
+        assert_eq!(workspace.on(Dock::Right).last(), Some(&PanelId::Assets));
+    }
+
+    /// **Dropping a panel on the stage floats it there.**
+    #[test]
+    fn float_at_places_the_window_where_it_was_dropped() {
+        let mut workspace = Workspace::animate();
+        workspace.float_at(PanelId::Library, (100.0, 200.0));
+        assert_eq!(workspace.dock_of(PanelId::Library), Dock::Float);
+        assert_eq!(workspace.slot(PanelId::Library).unwrap().float_pos, (100.0, 200.0));
+        // Already floating: the window moves rather than being re-made.
+        let group = workspace.slot(PanelId::Library).unwrap().group;
+        workspace.float_at(PanelId::Library, (10.0, 20.0));
+        assert_eq!(workspace.slot(PanelId::Library).unwrap().group, group);
+        assert_eq!(workspace.slot(PanelId::Library).unwrap().float_pos, (10.0, 20.0));
     }
 
     /// **Revealing a panel asks its column to scroll to it.**

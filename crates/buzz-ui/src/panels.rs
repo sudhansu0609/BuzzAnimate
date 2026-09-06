@@ -648,6 +648,20 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         ui.menu_button("Help", |ui| {
             item(ui, Command::About, true, &mut raised);
         });
+
+        // **Reset Layout, in plain sight.** It is on the Window menu too, but
+        // the moment somebody wants it is the moment the layout has gone
+        // wrong on them, and a button at the end of the menu bar is there
+        // whatever state the panels are in.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button("Reset Layout")
+                .on_hover_text("Put every panel back where it started")
+                .clicked()
+            {
+                raised.push(Command::ResetWorkspace);
+            }
+        });
     });
 
     raised

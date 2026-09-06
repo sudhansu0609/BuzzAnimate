@@ -82,6 +82,18 @@ fn directing_a_story_brings_the_panel_to_the_front() {
             Some(PanelId::Story),
             "{name}: the column was not asked to scroll to it"
         );
+        // And it is the first thing in its column, lit.
+        let dock = workspace.dock_of(PanelId::Story);
+        assert_eq!(
+            workspace.sections(dock).first().map(|s| s.front),
+            Some(PanelId::Story),
+            "{name}: the panel is not at the top of its column"
+        );
+        assert_eq!(
+            workspace.highlight,
+            Some(PanelId::Story),
+            "{name}: nothing marks the panel out as the one that just arrived"
+        );
     }
 }
 

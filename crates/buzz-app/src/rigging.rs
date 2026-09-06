@@ -102,6 +102,22 @@ pub enum RigTarget {
 /// building a chain would be impossible — every attempt to extend a bone would
 /// pose it instead.
 pub fn target_at(scene: &Scene, frame: u32, point: Point, tolerance: f64) -> RigTarget {
+    target_at_visible(scene, frame, point, tolerance, true)
+}
+
+/// [`target_at`], with the bones out of the way when they are hidden.
+///
+/// **A rig you cannot see must not be a rig you can grab.** Hiding the bones is
+/// how an animator gets at the artwork underneath them — the skeleton of a
+/// figure covers most of it — and a hidden bone that still swallowed the click
+/// would make the toggle worse than useless.
+pub fn target_at_visible(
+    scene: &Scene,
+    frame: u32,
+    point: Point,
+    tolerance: f64,
+    bones_shown: bool,
+) -> RigTarget {
     let mut artwork = None;
 
     for layer in scene.layers().selectable() {
@@ -115,7 +131,7 @@ pub fn target_at(scene: &Scene, frame: u32, point: Point, tolerance: f64) -> Rig
             let local = inverse * point;
 
             match &object.kind {
-                ObjectKind::Armature(rig) => {
+                ObjectKind::Armature(rig) if bones_shown => {
                     for (index, (_, tip)) in rig.segments().iter().enumerate() {
                         if (local - *tip).hypot() <= tolerance {
                             return RigTarget::BoneTip(object.id, index);
@@ -134,6 +150,12 @@ pub fn target_at(scene: &Scene, frame: u32, point: Point, tolerance: f64) -> Rig
                         return RigTarget::Handle(object.id, index);
                     }
                 }
+                // **A hidden rig offers nothing at all**, rather than
+                // offering its artwork. Falling through to the arm below would
+                // hand an already-rigged object to the Bone tool as bare
+                // artwork, and the tool would rig it a second time -- throwing
+                // away the skeleton the animator hid.
+                ObjectKind::Armature(_) => continue,
                 _ => {
                     if artwork.is_none() && object.bounds().contains(point) {
                         artwork = Some(object.id);
@@ -222,9 +244,26 @@ pub fn add_bone(
         let name = format!("Bone {}", rig.armature.len() + 1);
         rig.armature
             .push_dragged(name, parent, inverse * head, inverse * tip);
-        // Weights are relative to the skeleton, so a new bone means new
-        // weights: without this the artwork would ignore the bone just added.
-        rig.armature.set_rest_here();
+
+        // **The rest pose is left alone.**
+        //
+        // This used to call `set_rest_here`, which adopts the pose the bones
+        // are in *now* as the pose they were drawn in. On a rig being built
+        // that is right and invisible: the first bones are laid on artwork that
+        // is not going anywhere, and a bone from `push_dragged` already rests
+        // at the angle it was dragged at.
+        //
+        // On a rig that is finished and **posed** it takes the character apart.
+        // Every rigidly bound part is drawn through `pose_transform`, which
+        // measures a bone against its rest — so re-resting a posed skeleton
+        // makes all of those the identity and the artwork snaps back to where
+        // it was drawn while the bones stay where the animator put them.
+        //
+        // Easy to hit, too: grabbing the end of a bone is the natural way to
+        // move a limb, and the end of a bone is what extends the chain.
+        //
+        // Weights are still relative to the skeleton, so skinned parts are
+        // re-bound against it — that part was never the problem.
         rig.rebind();
     });
 }

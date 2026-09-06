@@ -834,6 +834,14 @@ fn draw_gradient_handles(
 /// Bones are drawn as Animate draws them: a tapered quadrilateral, widest a
 /// quarter of the way along, so which end is the head can be read at a glance.
 fn draw_rigs(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point) -> egui::Pos2) {
+    // **Hidden means hidden.** A figure's skeleton covers most of its artwork,
+    // and there is no way to draw on what is underneath while it is in the way.
+    // The pointer is taken off them at the same time — see
+    // `rigging::target_at_visible` — because a rig you cannot see and can still
+    // grab by accident is worse than one you can see.
+    if !editor.workspace.rig.show_bones {
+        return;
+    }
     let frame = editor.current_frame;
     let scene = editor.scene();
     let selected = |id: buzz_scene::ObjectId| editor.selection.contains(id);

@@ -87,4 +87,5 @@ pub use tools::{ToolId, ToolStatus, all_tools, tool_for_key};
 pub use view::{
     Guide, Orientation, PerspectiveGuides, SnapSettings, SnapTarget, Snapped, ViewSettings,
 };
-pub use workspace::{command_id, Dock, GroupId, KeyChord, PanelId, Section, Slot, Workspace};
+pub use workspace::{
+    RigOptions,command_id, Dock, GroupId, KeyChord, PanelId, Section, Slot, Workspace};

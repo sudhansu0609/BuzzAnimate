@@ -1081,6 +1081,51 @@ fn wand_properties(ui: &mut Ui, style: &mut DrawStyle) {
 /// Its own size, rather than four times the stroke-width slider — which is a
 /// number about outlines, defaults to one, and left the eraser four units
 /// across whatever the brush was set to, with nothing in the options saying so.
+/// **What the Bone tool does, and whether you can see it doing it.**
+///
+/// Both of these answer complaints about working with a rig that already
+/// exists rather than one being built, which is nearly all of the time an
+/// animator spends near one. See [`crate::workspace::RigOptions`].
+fn bone_properties(ui: &mut Ui, rig: &mut crate::workspace::RigOptions) {
+    ui.checkbox(&mut rig.show_bones, "Show bones")
+        .on_hover_text(
+            "Draw the skeleton over the artwork. Hidden, it is also out of the \
+             pointer's way, so you can draw on what is underneath.",
+        );
+
+    ui.add_space(4.0);
+    ui.label(RichText::new("Dragging a bone").small().weak());
+    // A pair rather than a checkbox: these are two things the tool does, and
+    // "Build bones: off" is a worse way to say "this poses".
+    ui.horizontal(|ui| {
+        if ui
+            .selectable_label(!rig.build, "Poses")
+            .on_hover_text("Drag any part of a bone, including its end, to move the limb")
+            .clicked()
+        {
+            rig.build = false;
+        }
+        if ui
+            .selectable_label(rig.build, "Builds")
+            .on_hover_text("Drag from a bone's end to add a child bone to the chain")
+            .clicked()
+        {
+            rig.build = true;
+        }
+    });
+    ui.label(
+        RichText::new(if rig.build {
+            "Drag from the end of a bone to extend the chain. Drag across bare \
+             artwork to start a new one."
+        } else {
+            "Drag a bone to move the limb. Everything above it in the chain \
+             follows; everything below is carried along."
+        })
+        .small()
+        .weak(),
+    );
+}
+
 fn eraser_properties(ui: &mut Ui, style: &mut DrawStyle) {
     egui::Grid::new("eraser-props").num_columns(2).show(ui, |ui| {
         // **What it is allowed to take.** Animate's eraser modes, and the
@@ -1219,7 +1264,13 @@ fn eyedropper_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
 /// One tool's settings are shown, and it is the one whose button is lit. There
 /// is nothing to open, nothing to scroll past, and no way to be looking at the
 /// Eraser's size while holding the Brush.
-pub fn tool_options_panel(ui: &mut Ui, tool: ToolId, scene: &Scene, style: &mut DrawStyle) {
+pub fn tool_options_panel(
+    ui: &mut Ui,
+    tool: ToolId,
+    scene: &Scene,
+    style: &mut DrawStyle,
+    rig: &mut crate::workspace::RigOptions,
+) {
     // **Lit, the way the tool's own button is.**
     //
     // The panel showed the tool in hand and always had, in the same grey as
@@ -1265,6 +1316,7 @@ pub fn tool_options_panel(ui: &mut Ui, tool: ToolId, scene: &Scene, style: &mut 
         ToolId::Rectangle | ToolId::Oval | ToolId::PolyStar => {
             fill_paint_properties(ui, scene, style, "shape");
         }
+        ToolId::Bone => bone_properties(ui, rig),
         _ => anything = false,
     }
 

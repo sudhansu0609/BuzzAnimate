@@ -140,6 +140,47 @@ impl PanelId {
     ];
 }
 
+/// **How the Bone tool behaves, and whether the skeleton is on screen.**
+///
+/// Two settings, and they answer the two things that make an existing rig hard
+/// to work with.
+///
+/// **Showing.** A figure's skeleton covers most of its artwork, and there is no
+/// way to draw on what is underneath while it is in the way. Hiding it takes it
+/// out of the *pointer's* way too — see `rigging::target_at_visible` — because
+/// a rig you cannot see and can still grab by accident is worse than one you
+/// can see.
+///
+/// **Building.** Dragging from a bone's tip extends the chain, which is how a
+/// skeleton is built and is *not* what an animator wants ninety-nine times out
+/// of a hundred: the tip is the end of the limb, and the end of the limb is
+/// what you reach for to move it. So building is a mode you turn on, and
+/// posing — dragging any part of a bone, including its tip — is what the tool
+/// does the rest of the time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RigOptions {
+    /// Draw the bones over the artwork, and let the pointer find them.
+    #[serde(default = "yes")]
+    pub show_bones: bool,
+    /// Dragging from a bone's tip **extends the chain** rather than posing it.
+    #[serde(default)]
+    pub build: bool,
+}
+
+impl Default for RigOptions {
+    fn default() -> Self {
+        Self {
+            show_bones: true,
+            build: false,
+        }
+    }
+}
+
+/// `true`, for a serde default that has to be a function.
+fn yes() -> bool {
+    true
+}
+
 /// Where a panel lives.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
@@ -345,6 +386,12 @@ pub struct Workspace {
     /// Mutually exclusive with the parenting view: one column, one question.
     #[serde(default)]
     pub depth_view: bool,
+    /// How the Bone tool behaves, and whether the skeleton is on screen.
+    ///
+    /// A way of looking at the film and a way of working on it, so it lives
+    /// here with the other preferences and survives a restart.
+    #[serde(default)]
+    pub rig: RigOptions,
     /// The user's keyboard-shortcut overrides, keyed by a stable command id.
     ///
     /// `Some(chord)` rebinds a command; `None` explicitly unbinds one that has a
@@ -884,6 +931,7 @@ impl Workspace {
             row_scale: default_row_scale(),
             parenting_view: false,
             depth_view: false,
+            rig: RigOptions::default(),
             asset_thumbnail_size: crate::assets_panel::ThumbnailSize::default(),
             keymap: std::collections::BTreeMap::new(),
         }

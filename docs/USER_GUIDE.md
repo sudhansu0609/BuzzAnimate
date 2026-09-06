@@ -437,12 +437,52 @@ BuzzAnimate includes a built-in character rigging and deformation suite (`Window
 
 ![Character Rigging and Stage Lighting](images/character_with_lamp.png)
 
-### Skeletons with the Bone Tool (`M`)
-1. Place character limbs on consecutive layers or convert them to symbols.
-2. Select the **Bone Tool (`M`)**.
-3. Drag from the pelvis to the chest, shoulder to elbow, and elbow to wrist to build a kinematic chain.
-4. **FABRIK IK Solver**: Grab the hand or foot and drag. The entire limb flexes and reaches naturally!
-5. **Joint Limits & Pins**: In the Rigging panel, set rotation constraints (e.g. elbow limited to 0°–145°) and pin foot bones to prevent floor sliding.
+### The Bone tool does two things, and you choose which
+
+Pick up the **Bone tool (`M`)** and the **Tool Options** panel shows two settings.
+They matter, because building a skeleton and animating one are opposite jobs
+that want the same drag.
+
+| Setting | What it does |
+|---|---|
+| **Dragging a bone: Poses** | *(the default)* Drag any part of a bone — including its far end — and the limb moves. |
+| **Dragging a bone: Builds** | Drag from a bone's far end to add the next bone in the chain. Drag across bare artwork to start a skeleton. |
+| **Show bones** | Draws the skeleton over the artwork. Turn it **off** and the bones are out of the pointer's way as well as out of sight, so you can draw on the artwork underneath without grabbing the rig by accident. |
+
+### Moving a limb
+
+This is the ordinary, everyday thing, and it needs no setting-up:
+
+1. Pick up the **Bone tool (`M`)**. Leave it on **Poses**.
+2. **Drag the bone.** Anywhere along it — the middle, or the end. The end is
+   usually what you want: the end of a forearm is the hand.
+3. The whole chain **above** the bone bends to follow (FABRIK inverse
+   kinematics), and everything **below** it is carried along — which is what
+   keeps a hand attached to a wrist.
+4. The base stays put. Dragging a hand reaches the arm out; it does not slide
+   the character across the stage.
+5. It is **one undo step** per drag, however many times the pointer moved.
+
+Key the pose as you would any other change: the rig's angles live on the
+keyframe, so two keyed poses tween into each other.
+
+> **If the artwork used to come away from the skeleton:** that was extending the
+> chain by accident. Grabbing the end of a bone built a new bone, and building
+> one re-set what the rig thought its drawn pose was — so the drawing snapped
+> back to where it started while the bones stayed where you put them. Posing is
+> now what a drag does unless you ask for **Builds**.
+
+### Building a skeleton
+
+1. Place the character's limbs on consecutive layers, or convert them to symbols.
+2. Pick up the **Bone tool (`M`)** and set **Dragging a bone: Builds**.
+3. Drag across the artwork to lay the first bone — pelvis to chest.
+4. Drag from that bone's **far end** to add the next: chest to shoulder,
+   shoulder to elbow, elbow to wrist.
+5. Set **Poses** again when the skeleton is finished. You will not want to
+   extend it often, and leaving it on Builds is how a limb becomes a spur.
+6. **Joint limits and pins**: in the Rigging panel, constrain a joint (an elbow
+   to 0°–145°, say) and pin the feet so they do not slide along the floor.
 
 ### The Pose Library
 - Click **Save Pose** in the Rigging panel to save character stances (e.g., "Idle", "Contact", "Recoil", "Jump").

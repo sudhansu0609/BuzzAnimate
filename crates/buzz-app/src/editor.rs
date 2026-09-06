@@ -4108,20 +4108,42 @@ impl Editor {
         }
 
         let tolerance = crate::rigging::GRAB_PX / self.camera.zoom.max(f64::MIN_POSITIVE);
-        let target =
-            crate::rigging::target_at(self.doc.scene(), self.current_frame, doc, tolerance);
+        let rig = self.workspace.rig;
+        let target = crate::rigging::target_at_visible(
+            self.doc.scene(),
+            self.current_frame,
+            doc,
+            tolerance,
+            rig.show_bones,
+        );
         // Rigging is the one gesture whose outcome depends on what was under
         // the pointer, so what it found is worth being able to see.
         tracing::debug!(?tool, ?doc, tolerance, ?target, "rig gesture");
 
         self.rig_gesture = match (tool, target) {
             // -- the Bone tool ---------------------------------------------
-            (ToolId::Bone, RigTarget::BoneTip(object, bone)) => Some(RigGesture::Building {
-                object: Some(object),
-                parent: Some(bone),
-                head: doc,
-                current: doc,
-            }),
+            //
+            // **A tip poses unless the tool is set to build.** The tip is the
+            // end of the limb, and the end of the limb is what a person reaches
+            // for to move it — so extending the chain from there, which is what
+            // this always used to do, was the wrong answer almost every time
+            // somebody touched a finished rig. See `buzz_ui::RigOptions`.
+            (ToolId::Bone, RigTarget::BoneTip(object, bone)) if rig.build => {
+                Some(RigGesture::Building {
+                    object: Some(object),
+                    parent: Some(bone),
+                    head: doc,
+                    current: doc,
+                })
+            }
+            (ToolId::Bone, RigTarget::BoneTip(object, bone)) => {
+                self.selection.set([object]);
+                Some(RigGesture::Posing {
+                    object,
+                    bone,
+                    current: doc,
+                })
+            }
             (ToolId::Bone, RigTarget::Bone(object, bone)) => {
                 self.selection.set([object]);
                 Some(RigGesture::Posing {
@@ -4137,7 +4159,11 @@ impl Editor {
                 current: doc,
             }),
             (ToolId::Bone, RigTarget::Handle(..) | RigTarget::Nothing) => {
-                self.status = Some("Draw a bone across some artwork to rig it".into());
+                self.status = Some(if rig.show_bones {
+                    "Drag a bone to move the limb, or drag across artwork to rig it".into()
+                } else {
+                    "The bones are hidden \u{2014} turn them on in Tool Options".to_string()
+                });
                 None
             }
 
@@ -14275,10 +14301,16 @@ mod tests {
     }
 
     /// Building a chain: each drag from the previous bone's tip adds the next.
+    ///
+    /// **In Build mode**, which is not the default. A tip is the end of a limb
+    /// and the end of a limb is what a person grabs to *move* it, so extending
+    /// from there is something the tool is put into rather than something it
+    /// does to anyone who touches a finished rig. See `buzz_ui::RigOptions`.
     #[test]
     fn dragging_from_a_bone_tip_adds_a_child_bone() {
         let (mut e, id) = editor_with_limb();
         e.set_tool(ToolId::Bone);
+        e.workspace.rig.build = true;
 
         drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
         drag(&mut e, Point::new(100.0, 100.0), Point::new(200.0, 100.0));
@@ -14297,8 +14329,10 @@ mod tests {
     fn dragging_a_bone_poses_the_rig_and_moves_the_artwork() {
         let (mut e, id) = editor_with_limb();
         e.set_tool(ToolId::Bone);
+        e.workspace.rig.build = true;
         drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
         drag(&mut e, Point::new(100.0, 100.0), Point::new(200.0, 100.0));
+        e.workspace.rig.build = false;
 
         let before = e.scene().find_object(id).expect("there").1.bounds();
         // Grab the second bone in the middle and pull it downwards.
@@ -14311,13 +14345,64 @@ mod tests {
         );
     }
 
+    /// **The end of a bone moves the limb**, which is what a person reaching
+    /// for the end of a limb means by it.
+    ///
+    /// This is the behaviour that used to be unreachable: a tip grab always
+    /// extended the chain, and extending re-rested the skeleton, so the artwork
+    /// came off the bones. The rig has one bone here, so the tip is the hand.
+    #[test]
+    fn the_end_of_a_bone_poses_it_rather_than_extending_the_chain() {
+        let (mut e, id) = editor_with_limb();
+        e.set_tool(ToolId::Bone);
+        drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
+        assert_eq!(armature_of(&e, id).len(), 1);
+
+        let before = e.scene().find_object(id).expect("there").1.bounds();
+        // Straight at the tip, and downwards.
+        drag(&mut e, Point::new(100.0, 100.0), Point::new(60.0, 190.0));
+
+        assert_eq!(
+            armature_of(&e, id).len(),
+            1,
+            "grabbing the end of a bone added one instead of moving the limb"
+        );
+        let after = e.scene().find_object(id).expect("there").1.bounds();
+        assert!(
+            after.y1 > before.y1 + 20.0,
+            "the limb did not move: {before:?} then {after:?}"
+        );
+    }
+
+    /// **Hidden bones are out of the pointer's way**, not just out of the
+    /// picture: a rig you cannot see and can still grab by accident is worse
+    /// than one you can see.
+    #[test]
+    fn hiding_the_bones_lets_the_pointer_reach_the_artwork() {
+        let (mut e, id) = editor_with_limb();
+        e.set_tool(ToolId::Bone);
+        drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
+        let posed = armature_of(&e, id).pose();
+
+        e.workspace.rig.show_bones = false;
+        drag(&mut e, Point::new(50.0, 100.0), Point::new(60.0, 190.0));
+
+        assert_eq!(
+            armature_of(&e, id).pose(),
+            posed,
+            "a hidden bone was posed by a drag that should not have found it"
+        );
+    }
+
     /// A whole posing drag is one undo step, like every other drag.
     #[test]
     fn a_posing_drag_is_a_single_undo_step() {
         let (mut e, id) = editor_with_limb();
         e.set_tool(ToolId::Bone);
+        e.workspace.rig.build = true;
         drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
         drag(&mut e, Point::new(100.0, 100.0), Point::new(200.0, 100.0));
+        e.workspace.rig.build = false;
 
         let posed_from = armature_of(&e, id).pose();
 

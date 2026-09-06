@@ -1934,7 +1934,13 @@ impl App {
             ToolOptions => {
                 let tool = self.editor.tool();
                 let editor = &mut self.editor;
-                panels::tool_options_panel(ui, tool, editor.doc.scene(), &mut editor.style);
+                panels::tool_options_panel(
+                    ui,
+                    tool,
+                    editor.doc.scene(),
+                    &mut editor.style,
+                    &mut editor.workspace.rig,
+                );
             }
 
             Layers => {

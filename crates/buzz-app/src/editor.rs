@@ -3657,6 +3657,9 @@ impl Editor {
                 }
                 self.story.show_set = matches!(command, SetScene);
                 self.story.show_scenery = matches!(command, SceneryFor);
+                // The menu item names a section, so that section opens. See
+                // `StoryState::reveal`.
+                self.story.reveal = true;
                 self.raise_story_panel();
             }
             AddScene => {
@@ -4797,10 +4800,17 @@ impl Editor {
     /// this is two steps — the same as the Layer Depth view.
     pub fn raise_story_panel(&mut self) {
         let workspace = &mut self.workspace;
+        // Three things can hide it, and a menu item has to beat all three.
         if !workspace.is_open(buzz_ui::PanelId::Story) {
             workspace.move_to(buzz_ui::PanelId::Story, buzz_ui::Dock::Right);
         }
         workspace.select_tab(buzz_ui::PanelId::Story);
+        // **And unroll the section.** Selecting a tab deliberately leaves a
+        // rolled-up section rolled up — right for clicking a tab, and wrong
+        // here, where the whole point is to show somebody the panel. Without
+        // this the menu item selected the right tab behind a closed title bar,
+        // which reads exactly like nothing happening.
+        workspace.set_collapsed(buzz_ui::PanelId::Story, false);
     }
 
     pub(crate) fn after_context_change(&mut self) {

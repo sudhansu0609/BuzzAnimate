@@ -178,6 +178,15 @@ pub struct StoryState {
 
     pub show_set: bool,
     pub show_scenery: bool,
+    /// **Obey `show_set` and `show_scenery` on the next frame**, once.
+    ///
+    /// egui remembers whether a collapsing header is open, and `default_open`
+    /// only applies the first time it is drawn. So a menu item that names a
+    /// section — *Set the Scene…*, *Scenery…* — could set the flag and watch
+    /// nothing happen, because the header had been drawn before and had its own
+    /// idea. This forces the state for one frame and then clears itself, which
+    /// leaves the section under the user's control from then on.
+    pub reveal: bool,
 }
 
 impl Default for StoryState {
@@ -199,6 +208,7 @@ impl Default for StoryState {
             ignored: Vec::new(),
             show_set: true,
             show_scenery: true,
+            reveal: false,
         }
     }
 }
@@ -266,6 +276,9 @@ pub fn story_panel(
     the_set(ui, state, &mut response);
     ui.add_space(4.0);
     the_scenery(ui, state, symbols, &mut response);
+
+    // Spent: the sections are the user's again from here.
+    state.reveal = false;
 
     response
 }
@@ -379,9 +392,14 @@ fn the_words(
 }
 
 fn the_set(ui: &mut Ui, state: &mut StoryState, response: &mut StoryResponse) {
-    let header = egui::CollapsingHeader::new(RichText::new("The set").strong())
+    let mut header = egui::CollapsingHeader::new(RichText::new("The set").strong())
         .default_open(state.show_set)
         .id_salt("story-set");
+    if state.reveal {
+        // Forced, because `default_open` is only a *default*. See
+        // `StoryState::reveal`.
+        header = header.open(Some(state.show_set));
+    }
     header.show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label("Where");
@@ -433,9 +451,12 @@ fn the_scenery(
     symbols: &[(u64, String)],
     response: &mut StoryResponse,
 ) {
-    let header = egui::CollapsingHeader::new(RichText::new("The scenery").strong())
+    let mut header = egui::CollapsingHeader::new(RichText::new("The scenery").strong())
         .default_open(state.show_scenery)
         .id_salt("story-scenery");
+    if state.reveal {
+        header = header.open(Some(state.show_scenery));
+    }
     header.show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label("What is in it");

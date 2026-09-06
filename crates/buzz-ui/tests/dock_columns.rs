@@ -366,7 +366,7 @@ fn every_docked_panel_fits_the_narrowest_column() {
     check(
         "Armature",
         column_overflow(narrowest, |ui| {
-            let _ = rig_panel(ui, None, &[], &[], None, &mut RigPanelState::default());
+            let _ = rig_panel(ui, None, &[], &[], None, &mut RigPanelState::default(), &mut Default::default());
         }),
         &mut failures,
     );
@@ -377,7 +377,7 @@ fn every_docked_panel_fits_the_narrowest_column() {
     check(
         "Rigging",
         column_overflow(narrowest, |ui| {
-            let _ = rig_panel(ui, None, &[], &rig_parts(), None, &mut RigPanelState::default());
+            let _ = rig_panel(ui, None, &[], &rig_parts(), None, &mut RigPanelState::default(), &mut Default::default());
         }),
         &mut failures,
     );

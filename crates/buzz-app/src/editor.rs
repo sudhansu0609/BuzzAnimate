@@ -3523,6 +3523,15 @@ impl Editor {
 
             ToggleRulers => self.view.show_rulers = !self.view.show_rulers,
             ToggleGrid => self.view.show_grid = !self.view.show_grid,
+            ToggleBoneRig => {
+                let on = !self.workspace.rig.show_bones;
+                self.workspace.rig.show_bones = on;
+                self.status = Some(if on {
+                    "Bones shown \u{2014} drag one to move the limb".into()
+                } else {
+                    "Bones hidden \u{2014} the artwork under them can be worked on".to_string()
+                });
+            }
             ToggleGuides => self.view.show_guides = !self.view.show_guides,
             ToggleSnapping => self.view.snap.to_objects = !self.view.snap.to_objects,
             TogglePasteboard => self.view.show_pasteboard = !self.view.show_pasteboard,

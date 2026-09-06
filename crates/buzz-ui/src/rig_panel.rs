@@ -194,8 +194,41 @@ pub fn rig_panel(
     parts: &[LoosePart],
     bound: Option<(&str, &[(usize, String)])>,
     state: &mut RigPanelState,
+    rig: &mut crate::workspace::RigOptions,
 ) -> RigResponse {
     let mut response = RigResponse::default();
+
+    // **How the rig behaves, at the top of the rig's own panel.**
+    //
+    // These live in the Bone tool's options too, which is where somebody
+    // holding that tool looks. It is the wrong place for the one person who
+    // most wants them: an animator drawing over a character is holding a
+    // *drawing* tool, and the skeleton is in the way of both the pen and the
+    // pointer.
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(&mut rig.show_bones, "Show bones")
+            .on_hover_text(
+                "Hidden, the bones are out of the pointer's way as well as out \
+                 of sight, so the artwork under them can be worked on",
+            );
+        ui.separator();
+        ui.label(RichText::new("Drag:").small().weak());
+        if ui
+            .selectable_label(!rig.build, "poses")
+            .on_hover_text("Drag any part of a bone, including its end, to move the limb")
+            .clicked()
+        {
+            rig.build = false;
+        }
+        if ui
+            .selectable_label(rig.build, "builds")
+            .on_hover_text("Drag from a bone's end to add the next bone in the chain")
+            .clicked()
+        {
+            rig.build = true;
+        }
+    });
+    ui.separator();
 
     match bound {
         // A rig that was assembled from a pattern: show what is in it, so a
@@ -667,9 +700,11 @@ fn armature_section(
     let Some(armature) = armature else {
         ui.label(
             RichText::new(
-                "Select a rigged object to edit its bones.\n\nWith the Bone tool (M), drag \
-                 across artwork to create an armature, then drag from a bone's tip to add \
-                 the next one.",
+                "Select a rigged object to edit its bones.\n\nTo move a limb: pick up the \
+                 Bone tool (M) and drag a bone \u{2014} anywhere along it, including its \
+                 end. The chain above bends to follow; everything below is carried along.\
+                 \n\nTo build a skeleton: set Drag to \u{201c}builds\u{201d}, drag across \
+                 artwork to lay the first bone, then drag from its end to add the next.",
             )
             .small()
             .weak(),
@@ -1103,12 +1138,12 @@ mod tests {
         let _ = ctx.run_ui(Default::default(), |ui| {
             let mut state = RigPanelState::default();
             // Nothing selected, nothing on the stage.
-            let empty = rig_panel(ui, None, &[], &[], None, &mut state);
+            let empty = rig_panel(ui, None, &[], &[], None, &mut state, &mut Default::default());
             assert_eq!(empty, RigResponse::default());
             // Parts on the stage, waiting to be sorted.
-            let _ = rig_panel(ui, None, &[], &parts, None, &mut state);
+            let _ = rig_panel(ui, None, &[], &parts, None, &mut state, &mut Default::default());
             // A rig selected, built the old way.
-            let _ = rig_panel(ui, Some(&armature), &[], &parts, None, &mut state);
+            let _ = rig_panel(ui, Some(&armature), &[], &parts, None, &mut state, &mut Default::default());
             // A rig selected that was assembled from a pattern.
             let bound = [(0usize, "L_arm".to_string())];
             let _ = rig_panel(
@@ -1118,6 +1153,7 @@ mod tests {
                 &parts,
                 Some(("Prop", &bound)),
                 &mut state,
+                &mut Default::default(),
             );
             // And one whose pattern this build has never heard of.
             let _ = rig_panel(
@@ -1127,6 +1163,7 @@ mod tests {
                 &parts,
                 Some(("Centaur", &bound)),
                 &mut state,
+                &mut Default::default(),
             );
         });
     }

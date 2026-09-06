@@ -1283,6 +1283,7 @@ const KEYBOARD_COMMANDS: &[Command] = &[
     Command::ToggleLayoutLock,
     Command::ZoomShowAll,
     Command::ToggleLightGizmos,
+    Command::ToggleBoneRig,
     // Timeline. Animators press these constantly, so they must be live.
     Command::InsertFrame,
     Command::RemoveFrame,
@@ -2966,6 +2967,7 @@ impl App {
             &parts,
             bound.as_ref().map(|(name, filled)| (name.as_str(), filled.as_slice())),
             &mut self.editor.rig_panel,
+            &mut self.editor.workspace.rig,
         );
 
         // -- assembling, which does not need anything to be selected --------

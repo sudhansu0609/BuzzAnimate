@@ -220,6 +220,13 @@ pub enum Command {
     AddStorm,
     /// Show or hide the light handles on the stage.
     ToggleLightGizmos,
+    /// **Show the bones** over the artwork, and let the pointer find them.
+    ///
+    /// Also in the Bone tool's own options, but a setting you can only reach by
+    /// picking up a particular tool is a setting nobody finds — and *hiding*
+    /// the rig is most wanted by somebody holding a drawing tool, who is not
+    /// holding the Bone tool by definition.
+    ToggleBoneRig,
 
     // Staging and performance
     /// **Set a scene**: ground, backdrop, lights and a cast standing in it.
@@ -480,6 +487,7 @@ impl Command {
             AddFire => "Fire",
             AddStorm => "Storm",
             ToggleLightGizmos => "Light Handles",
+            ToggleBoneRig => "Bones",
 
             SetScene => "Set the Scene\u{2026}",
             DirectScene => "Direct a Story\u{2026}",
@@ -673,6 +681,9 @@ impl Command {
             | ClearReverse | AddProfileRight | AddProfileLeft | AddThreeQuarterRight
             | AddThreeQuarterLeft => None,
             ToggleLightGizmos => sc(ctrl_shift, Key::L),
+            // Ctrl+Shift+B, beside the light handles it sits next to in the
+            // View menu. Animate has no equivalent; there was nothing to clash.
+            ToggleBoneRig => sc(ctrl_shift, Key::B),
 
             // F9 is Animate's own Actions panel key on Windows.
             ToggleActionsPanel => sc(Modifiers::NONE, Key::F9),
@@ -884,6 +895,7 @@ pub fn palette_commands() -> Vec<Command> {
         AddFire,
         AddStorm,
         ToggleLightGizmos,
+        ToggleBoneRig,
         SetScene,
         DirectScene,
         AddScene,
@@ -1058,6 +1070,7 @@ mod tests {
             AddFire,
             AddStorm,
             ToggleLightGizmos,
+        ToggleBoneRig,
             SetScene,
             DirectScene,
             AddScene,

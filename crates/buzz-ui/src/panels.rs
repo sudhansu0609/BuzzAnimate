@@ -222,6 +222,14 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 &mut raised,
             );
             toggle(ui, Command::ToggleLightGizmos, light_gizmos, &mut raised);
+            // Hiding the skeleton is wanted most by somebody holding a drawing
+            // tool, who cannot reach the Bone tool's own options.
+            toggle(
+                ui,
+                Command::ToggleBoneRig,
+                workspace.rig.show_bones,
+                &mut raised,
+            );
         });
 
         // Animate's Window menu: what is on screen, and where.

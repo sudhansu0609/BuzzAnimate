@@ -1,0 +1,341 @@
+{
+  "version": 2,
+  "name": "Animator",
+  "slots": [
+    {
+      "id": "Tools",
+      "dock": "Left",
+      "home": "Left",
+      "order": 0,
+      "float_pos": [
+        320.0,
+        140.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 0,
+      "selected": true
+    },
+    {
+      "id": "Layers",
+      "dock": "Right",
+      "home": "Right",
+      "order": 0,
+      "float_pos": [
+        320.0,
+        140.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 0,
+      "selected": true
+    },
+    {
+      "id": "Properties",
+      "dock": "Right",
+      "home": "Right",
+      "order": 2,
+      "float_pos": [
+        344.0,
+        164.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 1,
+      "selected": true
+    },
+    {
+      "id": "Color",
+      "dock": "Right",
+      "home": "Right",
+      "order": 3,
+      "float_pos": [
+        368.0,
+        188.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 2,
+      "selected": true
+    },
+    {
+      "id": "Swatches",
+      "dock": "Right",
+      "home": "Right",
+      "order": 4,
+      "float_pos": [
+        392.0,
+        212.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 3,
+      "selected": true
+    },
+    {
+      "id": "Depth",
+      "dock": "Right",
+      "home": "Right",
+      "order": 5,
+      "float_pos": [
+        416.0,
+        236.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 100,
+      "selected": true
+    },
+    {
+      "id": "Rig",
+      "dock": "Right",
+      "home": "Right",
+      "order": 6,
+      "float_pos": [
+        440.0,
+        260.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 100,
+      "selected": false
+    },
+    {
+      "id": "Filters",
+      "dock": "Right",
+      "home": "Right",
+      "order": 9,
+      "float_pos": [
+        464.0,
+        284.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 103,
+      "selected": true
+    },
+    {
+      "id": "Lighting",
+      "dock": "Right",
+      "home": "Right",
+      "order": 7,
+      "float_pos": [
+        488.0,
+        308.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 100,
+      "selected": false
+    },
+    {
+      "id": "Sound",
+      "dock": "Right",
+      "home": "Right",
+      "order": 8,
+      "float_pos": [
+        512.0,
+        332.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 100,
+      "selected": false
+    },
+    {
+      "id": "Library",
+      "dock": "RightOuter",
+      "home": "RightOuter",
+      "order": 0,
+      "float_pos": [
+        320.0,
+        140.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 101,
+      "selected": false
+    },
+    {
+      "id": "Assets",
+      "dock": "RightOuter",
+      "home": "RightOuter",
+      "order": 1,
+      "float_pos": [
+        344.0,
+        164.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 101,
+      "selected": true
+    },
+    {
+      "id": "Timeline",
+      "dock": "Bottom",
+      "home": "Bottom",
+      "order": 0,
+      "float_pos": [
+        320.0,
+        140.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 0,
+      "selected": true
+    },
+    {
+      "id": "Actions",
+      "dock": "Hidden",
+      "home": "Bottom",
+      "order": 1,
+      "float_pos": [
+        344.0,
+        164.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 1,
+      "selected": true
+    },
+    {
+      "id": "Tasks",
+      "dock": "Hidden",
+      "home": "Bottom",
+      "order": 2,
+      "float_pos": [
+        368.0,
+        188.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 2,
+      "selected": true
+    },
+    {
+      "id": "MotionEditor",
+      "dock": "Hidden",
+      "home": "Right",
+      "order": 3,
+      "float_pos": [
+        392.0,
+        212.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 3,
+      "selected": true
+    },
+    {
+      "id": "ToolOptions",
+      "dock": "Right",
+      "home": "Right",
+      "order": 1,
+      "float_pos": [
+        344.0,
+        164.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 102,
+      "selected": true
+    },
+    {
+      "id": "Story",
+      "dock": "Right",
+      "home": "Right",
+      "order": 10,
+      "float_pos": [
+        440.0,
+        260.0
+      ],
+      "float_size": [
+        300.0,
+        380.0
+      ],
+      "collapsed": false,
+      "group": 104,
+      "selected": true
+    }
+  ],
+  "locked": false,
+  "recovery_dirs": [
+    "B:\\youtubeProjects\\Buzzcaf_Media\\BuzzAnimate\\films\\three-roads"
+  ],
+  "new_document": {
+    "width": 1920.0,
+    "height": 1080.0,
+    "frame_rate": 24.0,
+    "background": [
+      255,
+      255,
+      255
+    ]
+  },
+  "theme": "Slate",
+  "left_width": 55.0,
+  "right_width": 298.0,
+  "right_outer_width": 216.0,
+  "bottom_height": 328.0,
+  "frame_width": 12.0,
+  "row_scale": 1.0,
+  "asset_thumbnail_size": "Medium",
+  "parenting_view": false,
+  "depth_view": false,
+  "rig": {
+    "show_bones": true,
+    "build": false
+  },
+  "keymap": {}
+}

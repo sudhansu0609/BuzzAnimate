@@ -1292,6 +1292,61 @@ impl Workspace {
         self.dock_of(id) != Dock::Hidden
     }
 
+    /// **Put a panel back where the default arrangement has it** — its dock,
+    /// its row, and its section — making room as `fill_gaps` does.
+    ///
+    /// Distinct from [`Self::move_to`], which is the call for a *user* dragging
+    /// a panel somewhere and rightly appends to the end of a column in a
+    /// section of its own. That is the wrong answer for "show me this panel":
+    /// the end of a long column is below the fold, which looks exactly like
+    /// nothing happening.
+    pub fn restore_default_place(&mut self, id: PanelId) {
+        if self.locked {
+            return;
+        }
+        let defaults = Self::animate();
+        let Some(default) = defaults.slot(id).copied() else {
+            return;
+        };
+        // Make room at the row the default gives it, exactly as `fill_gaps`
+        // does for a panel arriving for the first time.
+        for existing in &mut self.slots {
+            if existing.id != id && existing.dock == default.dock && existing.order >= default.order
+            {
+                existing.order += 1;
+            }
+        }
+        match self.slot_mut(id) {
+            Some(slot) => {
+                slot.dock = default.dock;
+                slot.home = default.home;
+                slot.order = default.order;
+                slot.group = default.group;
+                slot.collapsed = default.collapsed;
+            }
+            None => self.slots.push(default),
+        }
+        // The section it has just joined shows it.
+        self.select_tab(id);
+    }
+
+    /// **Show a panel**: open it where it belongs, bring its tab to the front,
+    /// and unroll the section it is in.
+    ///
+    /// What a menu item naming a panel owes the user. Each of the three steps
+    /// covers a way the panel can be out of sight, and a command that skips any
+    /// of them can leave the user looking at an unchanged screen.
+    pub fn reveal(&mut self, id: PanelId) {
+        if !self.is_open(id) {
+            self.restore_default_place(id);
+        }
+        self.select_tab(id);
+        // Selecting a tab deliberately leaves a rolled-up section rolled up —
+        // right for clicking a tab, wrong for a menu item, which has no other
+        // way to show you anything.
+        self.set_collapsed(id, false);
+    }
+
     /// Move a panel to a side, putting it at the end of whatever is there.
     ///
     /// Does nothing while the layout is locked — that is what locking is for,
@@ -1464,6 +1519,11 @@ impl Workspace {
                 }
             }
         }
+        // **Put the Story panel back where the arrangement has it**, once.
+        // See `VERSION_STORY_PLACED`.
+        if self.version < VERSION_STORY_PLACED {
+            self.restore_default_place(PanelId::Story);
+        }
         self.version = LAYOUT_VERSION;
 
         for id in PanelId::ALL {
@@ -1549,12 +1609,24 @@ impl Workspace {
 
 /// Bumped when the *default arrangement* changes in a way a saved layout
 /// should adopt. See [`Workspace::version`].
-pub const LAYOUT_VERSION: u32 = VERSION_TAB_GROUPS;
+pub const LAYOUT_VERSION: u32 = VERSION_STORY_PLACED;
 
 /// Panels gained the roll-up, and five of them started rolled.
 const VERSION_ROLL_UPS: u32 = 1;
 /// Panels gained tab groups, and two sections started tabbed.
 const VERSION_TAB_GROUPS: u32 = 2;
+/// **The Story panel put where it belongs.**
+///
+/// It arrived in a build whose `raise_story_panel` reached for `move_to`, which
+/// is the call for *a user dragging a panel somewhere*: it appends to the end of
+/// a column in a section of its own. So the first person to pick "Direct a
+/// Story…" off the menu got the panel opened, selected and unrolled at the
+/// bottom of a right-hand column ten panels long — below the fold, and to every
+/// appearance nothing happening at all.
+///
+/// A saved layout cannot fix itself, because `fill_gaps` only fills *gaps* and
+/// the slot is present. So this migration puts it back once.
+const VERSION_STORY_PLACED: u32 = 3;
 
 /// The home a slot takes when a saved layout predates the field.
 fn default_home() -> Dock {
@@ -2534,6 +2606,91 @@ mod migration_tests {
 #[cfg(test)]
 mod group_tests {
     use super::*;
+
+    /// **A panel stranded at the bottom of a column is put back.**
+    ///
+    /// Taken from a real layout. The Story panel arrived in a build whose
+    /// "show me this panel" reached for `move_to` — the call for a *user*
+    /// dragging a panel, which appends to the end of a column in a section of
+    /// its own. So it ended up at row ten of a right-hand column, alone,
+    /// selected, unrolled, and below the fold: open by every measure the code
+    /// had, and invisible to the person who asked for it.
+    ///
+    /// `fill_gaps` could not fix it, because it fills *gaps* and the slot was
+    /// present. Hence the migration.
+    #[test]
+    fn a_story_panel_stranded_at_the_bottom_is_put_back() {
+        let mut saved = Workspace::animate();
+        saved.version = VERSION_TAB_GROUPS;
+        // Exactly what `move_to` left behind.
+        let last = saved
+            .slots
+            .iter()
+            .filter(|s| s.dock == Dock::Right)
+            .map(|s| s.order)
+            .max()
+            .expect("a right column");
+        let lone = saved.next_group(Dock::Right);
+        if let Some(slot) = saved.slot_mut(PanelId::Story) {
+            slot.order = last + 1;
+            slot.group = lone;
+            slot.selected = true;
+        }
+
+        saved.fill_gaps();
+
+        let section = saved
+            .section_of(PanelId::Story)
+            .expect("the Story panel is on screen");
+        assert!(
+            section.panels.contains(&PanelId::Depth),
+            "the Story panel is still in a section of its own: {:?}",
+            section.panels
+        );
+        assert_eq!(
+            section.front,
+            PanelId::Story,
+            "put back, but behind another tab"
+        );
+        assert!(!section.collapsed, "put back into a rolled-up section");
+    }
+
+    /// **Revealing a hidden panel opens it where it belongs**, not at the end
+    /// of whatever column it lands in — which is where `move_to` puts it, and
+    /// which on a long column is off the bottom of the screen.
+    #[test]
+    fn revealing_a_hidden_panel_puts_it_in_its_own_section() {
+        let mut workspace = Workspace::animate();
+        workspace.move_to(PanelId::Story, Dock::Hidden);
+        assert!(!workspace.is_open(PanelId::Story));
+
+        workspace.reveal(PanelId::Story);
+
+        assert!(workspace.is_open(PanelId::Story));
+        let section = workspace
+            .section_of(PanelId::Story)
+            .expect("on screen");
+        assert!(
+            section.panels.contains(&PanelId::Depth),
+            "reveal dumped it in a section of its own: {:?}",
+            section.panels
+        );
+        assert_eq!(section.front, PanelId::Story);
+
+        // And its row is the designed one rather than the end of the column.
+        let last = workspace
+            .slots
+            .iter()
+            .filter(|s| s.dock == Dock::Right)
+            .map(|s| s.order)
+            .max()
+            .expect("a right column");
+        let mine = workspace.slot(PanelId::Story).expect("a slot").order;
+        assert!(
+            mine < last,
+            "the panel came back at the bottom of the column (row {mine} of {last})"
+        );
+    }
 
     /// The default arrangement puts the six occasional panels in one section,
     /// which is what turns a column of ten into a column of five.

@@ -4812,18 +4812,9 @@ impl Editor {
     /// A closed panel cannot be brought to the front of anything, which is why
     /// this is two steps — the same as the Layer Depth view.
     pub fn raise_story_panel(&mut self) {
-        let workspace = &mut self.workspace;
-        // Three things can hide it, and a menu item has to beat all three.
-        if !workspace.is_open(buzz_ui::PanelId::Story) {
-            workspace.move_to(buzz_ui::PanelId::Story, buzz_ui::Dock::Right);
-        }
-        workspace.select_tab(buzz_ui::PanelId::Story);
-        // **And unroll the section.** Selecting a tab deliberately leaves a
-        // rolled-up section rolled up — right for clicking a tab, and wrong
-        // here, where the whole point is to show somebody the panel. Without
-        // this the menu item selected the right tab behind a closed title bar,
-        // which reads exactly like nothing happening.
-        workspace.set_collapsed(buzz_ui::PanelId::Story, false);
+        // Opens it where it *belongs* rather than at the end of a column,
+        // fronts its tab, and unrolls the section. See `Workspace::reveal`.
+        self.workspace.reveal(buzz_ui::PanelId::Story);
     }
 
     pub(crate) fn after_context_change(&mut self) {

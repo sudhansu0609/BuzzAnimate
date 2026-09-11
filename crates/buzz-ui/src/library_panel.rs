@@ -41,6 +41,59 @@ const USE_COUNT: f32 = 26.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DraggedSymbol(pub SymbolId);
 
+/// Which items a panel is showing: everything, only what moves, or only stills.
+///
+/// The same three-way choice serves the Library and the Assets panels — an
+/// animated symbol and an animated asset are one idea at two scales — so it
+/// lives in one place and both toggles drive it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MotionFilter {
+    /// Animated and static together, each under its own heading.
+    #[default]
+    All,
+    /// Only what moves.
+    Animated,
+    /// Only stills.
+    Static,
+}
+
+impl MotionFilter {
+    pub const ALL: [Self; 3] = [Self::All, Self::Animated, Self::Static];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Animated => "Animated",
+            Self::Static => "Static",
+        }
+    }
+
+    /// Does an item with this motion pass the filter?
+    pub fn accepts(self, animated: bool) -> bool {
+        match self {
+            Self::All => true,
+            Self::Animated => animated,
+            Self::Static => !animated,
+        }
+    }
+
+    /// Draw the three-way toggle, updating `current`. Shared by both panels so
+    /// they read and behave the same.
+    pub fn toggle(ui: &mut Ui, current: &mut Self) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Show").small().weak());
+            for option in Self::ALL {
+                if ui
+                    .selectable_label(*current == option, option.label())
+                    .clicked()
+                {
+                    *current = option;
+                }
+            }
+        });
+    }
+}
+
 /// Panel state that is not part of the document.
 ///
 /// Which folders are open and what is typed in the search box are view state:
@@ -59,6 +112,8 @@ pub struct LibraryState {
     /// Animate asks in a dialog; this is the same choice, kept as a sticky
     /// setting so a run of conversions does not need one click each.
     pub new_symbol_kind: SymbolKind,
+    /// Whether the list shows every symbol, only animated ones, or only stills.
+    pub motion: MotionFilter,
     /// Folder paths the user has opened.
     expanded: BTreeSet<String>,
     /// Rename buffer, live only while a rename is in progress.
@@ -171,6 +226,10 @@ pub fn library_panel(
             state.search.clear();
         }
     });
+
+    // Animated or still. On "All" the two are shown apart, under their own
+    // headings; the other two narrow the list to one or the other.
+    MotionFilter::toggle(ui, &mut state.motion);
     ui.separator();
 
     // **A fixed height, not the room available.**
@@ -229,6 +288,9 @@ pub fn library_panel(
                         Row::Folder { path, leaf, depth } => {
                             draw_folder_row(&mut row_ui, state, path, leaf, *depth);
                         }
+                        Row::Group { label, depth } => {
+                            draw_group_row(&mut row_ui, label, *depth);
+                        }
                         Row::Symbol {
                             id,
                             name,
@@ -271,6 +333,12 @@ enum Row {
         leaf: String,
         depth: usize,
     },
+    /// An "Animated" or "Static" heading over the symbols that follow, shown
+    /// only when the filter is [`MotionFilter::All`] and that group has members.
+    Group {
+        label: &'static str,
+        depth: usize,
+    },
     Symbol {
         id: SymbolId,
         name: String,
@@ -294,8 +362,32 @@ fn flatten_rows(scene: &Scene, state: &LibraryState) -> Vec<Row> {
                 walk(scene, state, Some(&folder), depth + 1, rows);
             }
         }
+        // Split this level's symbols into moving and still, keeping only what
+        // matches the search and the motion filter.
+        let mut animated = Vec::new();
+        let mut still = Vec::new();
         for symbol in scene.library().symbols_in(parent) {
-            if state.matches(&symbol.name) {
+            if !state.matches(&symbol.name) || !state.motion.accepts(symbol.is_animated()) {
+                continue;
+            }
+            if symbol.is_animated() {
+                &mut animated
+            } else {
+                &mut still
+            }
+            .push(symbol);
+        }
+
+        let mut emit = |label: &'static str, symbols: &[&std::sync::Arc<buzz_scene::Symbol>]| {
+            if symbols.is_empty() {
+                return;
+            }
+            // A heading only earns its row when both groups are on show; asked
+            // for one alone, the list is already all of one kind.
+            if state.motion == MotionFilter::All {
+                rows.push(Row::Group { label, depth });
+            }
+            for symbol in symbols {
                 rows.push(Row::Symbol {
                     id: symbol.id,
                     name: symbol.name.clone(),
@@ -303,11 +395,22 @@ fn flatten_rows(scene: &Scene, state: &LibraryState) -> Vec<Row> {
                     depth,
                 });
             }
-        }
+        };
+        emit("Animated", &animated);
+        emit("Static", &still);
     }
     let mut rows = Vec::new();
     walk(scene, state, None, 0, &mut rows);
     rows
+}
+
+/// Draw an "Animated" / "Static" heading over the symbols beneath it.
+fn draw_group_row(ui: &mut Ui, label: &str, depth: usize) {
+    let indent = depth as f32 * 14.0;
+    ui.horizontal(|ui| {
+        ui.add_space(indent + 18.0);
+        ui.label(RichText::new(label).small().weak());
+    });
 }
 
 /// Draw one folder row of the flattened tree.
@@ -687,6 +790,67 @@ mod tests {
         for folder in ["Characters", "Characters/Hero", "Empty"] {
             assert!(state.is_expanded(folder), "{folder} should be open");
         }
+    }
+
+    /// On "All", symbols are split into an Animated group and a Static group,
+    /// each under its own heading, so a browsing eye can tell the two apart.
+    #[test]
+    fn symbols_are_grouped_into_animated_and_static() {
+        let scene = library_scene();
+        let mut state = LibraryState::default();
+        state.expand_all(&scene);
+
+        let rows = flatten_rows(&scene, &state);
+
+        // The movie clip sits at the root, under an "Animated" heading.
+        let loop_id = scene.library().find_by_name("Loop").expect("the clip").id;
+        let animated_over_loop = rows.windows(2).any(|w| {
+            matches!(w[0], Row::Group { label: "Animated", .. })
+                && matches!(&w[1], Row::Symbol { id, .. } if *id == loop_id)
+        });
+        assert!(animated_over_loop, "the movie clip is under an Animated heading");
+
+        // The graphics are stills, so there is a Static heading too.
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r, Row::Group { label: "Static", .. })),
+            "the graphics are under a Static heading"
+        );
+    }
+
+    /// Asked for one kind, the list narrows to it and drops the headings — a
+    /// list already all of one kind does not need to say so.
+    #[test]
+    fn the_motion_filter_narrows_the_list() {
+        let scene = library_scene();
+        let mut state = LibraryState {
+            motion: MotionFilter::Animated,
+            ..Default::default()
+        };
+        state.expand_all(&scene);
+
+        let names = |rows: &[Row]| {
+            let mut names: Vec<String> = rows
+                .iter()
+                .filter_map(|r| match r {
+                    Row::Symbol { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            names.sort();
+            names
+        };
+
+        let rows = flatten_rows(&scene, &state);
+        assert!(
+            !rows.iter().any(|r| matches!(r, Row::Group { .. })),
+            "no headings when only one kind is shown"
+        );
+        assert_eq!(names(&rows), ["Loop"], "only the movie clip is animated");
+
+        state.motion = MotionFilter::Static;
+        let rows = flatten_rows(&scene, &state);
+        assert_eq!(names(&rows), ["Hero Arm", "Hero Body"], "the rest are stills");
     }
 
     /// The tree the panel walks must reach every symbol exactly once, or a

@@ -12,6 +12,7 @@ pub mod align;
 pub mod assets_panel;
 pub mod brush;
 pub mod camera_panel;
+pub mod character_panel;
 pub mod command;
 pub mod command_palette;
 pub mod shortcut_editor;
@@ -47,6 +48,9 @@ pub use actions_panel::{ActionsResponse, ActionsState, SampleEntry, SavedScript,
 pub use assets_panel::{AssetAction, AssetPanelState, ThumbnailSize, assets_panel};
 pub use brush::{BrushKind, BrushSettings, PatternShape};
 pub use camera_panel::{CameraPanelState, CameraResponse, camera_hud, camera_panel};
+pub use character_panel::{
+    CAST_FOLDER, CastAction, CastPanelState, CastThumbnailSource, cast_panel,
+};
 pub use command::Command;
 pub use command_palette::{command_palette, CommandPaletteState};
 pub use shortcut_editor::{shortcut_editor, ShortcutEditorState};
@@ -58,7 +62,7 @@ pub use export_panel::{
 };
 pub use filter_panel::{FilterPanelState, FilterResponse, FilterTarget, filter_panel};
 pub use motion_editor::{MotionEditorResponse, MotionEditorState, motion_editor_panel};
-pub use library_panel::{LibraryState, library_panel};
+pub use library_panel::{LibraryState, MotionFilter, library_panel};
 pub use light_panel::{LightPanelState, LightResponse, light_panel};
 pub use lipsync_panel::{Choice, LipSyncResponse, LipSyncState, lip_sync_dialog};
 pub use new_document::{DocumentSetup, NewDocumentResponse, NewDocumentState, new_document_dialog};

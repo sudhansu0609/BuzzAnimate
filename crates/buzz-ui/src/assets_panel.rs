@@ -13,6 +13,8 @@
 use buzz_doc::{Asset, AssetLibrary};
 use egui::{RichText, Ui};
 
+use crate::MotionFilter;
+
 /// How the panel asks the shell for an asset's picture.
 ///
 /// The same arrangement the Library panel uses: the panel has no GPU and no
@@ -123,12 +125,18 @@ pub struct AssetPanelState {
     pub importing: Option<(usize, usize)>,
     /// How big the pictures are, and so how the assets are laid out.
     pub thumbnail_size: ThumbnailSize,
+    /// Whether the panel shows every asset, only animated ones, or only stills.
+    pub motion: MotionFilter,
     /// A folder whose deletion has been asked for once and not yet confirmed.
     ///
     /// Deleting a folder takes every asset under it, and an asset library has
     /// no undo — it is files on disk. So the first click says what will go and
     /// the second does it.
     pub confirm_delete: Option<String>,
+    /// An asset whose deletion has been asked for once and not yet confirmed,
+    /// by its path. Same reason as [`Self::confirm_delete`]: an asset is a file
+    /// on disk with no undo, so the first Delete arms and the second removes it.
+    pub confirm_delete_asset: Option<std::path::PathBuf>,
     /// A rename in progress.
     renaming: Option<(std::path::PathBuf, String)>,
     expanded: std::collections::BTreeSet<String>,
@@ -219,6 +227,10 @@ pub fn assets_panel(
             }
         }
     });
+
+    // Animated or still. On "All" the two are shown apart, under their own
+    // headings inside each folder; the other two narrow to one or the other.
+    MotionFilter::toggle(ui, &mut state.motion);
     ui.separator();
 
     if library.is_empty() && library.folders().is_empty() {
@@ -395,11 +407,11 @@ fn draw_folder(
     draw_assets(ui, state, &here, indent, action, thumbnail);
 }
 
-/// The assets in one folder, laid out as the chosen size asks for.
+/// The assets in one folder, separated into animated and still.
 ///
-/// Rows for Small and Medium, a wrapping grid for Large. Split here rather than
-/// inside the row so the grid can decide how many fit across, which is a
-/// question about the panel rather than about any one asset.
+/// On "All" both groups are drawn, each under its own heading; asked for one
+/// kind alone the other is left out and the heading with it, since the whole
+/// listing is then of a single kind.
 fn draw_assets(
     ui: &mut Ui,
     state: &mut AssetPanelState,
@@ -408,9 +420,49 @@ fn draw_assets(
     action: &mut Option<AssetAction>,
     thumbnail: AssetThumbnailSource<'_>,
 ) {
+    let (animated, still): (Vec<&Asset>, Vec<&Asset>) = here.iter().partition(|a| a.animated);
+    match state.motion {
+        MotionFilter::All => {
+            draw_asset_group(ui, state, "Animated", &animated, indent, action, thumbnail);
+            draw_asset_group(ui, state, "Static", &still, indent, action, thumbnail);
+        }
+        MotionFilter::Animated => {
+            draw_asset_group(ui, state, "", &animated, indent, action, thumbnail);
+        }
+        MotionFilter::Static => {
+            draw_asset_group(ui, state, "", &still, indent, action, thumbnail);
+        }
+    }
+}
+
+/// One group of assets — optionally under a heading — laid out as the chosen
+/// size asks for.
+///
+/// Rows for Small and Medium, a wrapping grid for Large. Split from the row so
+/// the grid can decide how many fit across, which is a question about the panel
+/// rather than about any one asset.
+fn draw_asset_group(
+    ui: &mut Ui,
+    state: &mut AssetPanelState,
+    heading: &str,
+    here: &[&Asset],
+    indent: f32,
+    action: &mut Option<AssetAction>,
+    thumbnail: AssetThumbnailSource<'_>,
+) {
+    if here.is_empty() {
+        return;
+    }
+    if !heading.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            ui.label(RichText::new(heading).small().weak());
+        });
+    }
+
     let size = state.thumbnail_size;
     if !size.is_grid() {
-        for asset in here {
+        for &asset in here {
             asset_row(ui, state, asset, indent, action, thumbnail);
         }
         return;
@@ -427,7 +479,7 @@ fn draw_assets(
     for chunk in here.chunks(columns) {
         ui.horizontal(|ui| {
             ui.add_space(indent);
-            for asset in chunk {
+            for &asset in chunk {
                 asset_cell(ui, state, asset, action, thumbnail);
             }
         });
@@ -532,9 +584,19 @@ fn asset_menu(
         state.renaming = Some((asset.path.clone(), asset.name.clone()));
         ui.close();
     }
-    if ui.button("Delete").clicked() {
+    // Two clicks, because there is no undo for a file on disk. The first arms
+    // the delete (the shell relabels this and says so); the second, on the now
+    // "confirm?" button, does it. Arming keeps the menu open so the second click
+    // has something to land on.
+    let armed = state.confirm_delete_asset.as_deref() == Some(asset.path.as_path());
+    if ui
+        .button(if armed { "Delete \u{2014} confirm?" } else { "Delete" })
+        .clicked()
+    {
         *action = Some(AssetAction::Delete(asset.clone()));
-        ui.close();
+        if armed {
+            ui.close();
+        }
     }
 }
 
@@ -612,9 +674,17 @@ fn asset_row(
             // which the bundled fonts do not have - the note beside it said as
             // much about another glyph and then used one anyway. It drew as an
             // empty box, so deleting an asset looked impossible.
+            //
+            // Two clicks, because a file on disk has no undo: the first arms and
+            // the button becomes "Delete?", the second confirms.
+            let armed = state.confirm_delete_asset.as_deref() == Some(asset.path.as_path());
             if ui
-                .small_button("Delete")
-                .on_hover_text("Delete this asset from the library")
+                .small_button(if armed { "Delete?" } else { "Delete" })
+                .on_hover_text(if armed {
+                    "Click again to delete this asset for good \u{2014} there is no undo"
+                } else {
+                    "Delete this asset from the library"
+                })
                 .clicked()
             {
                 *action = Some(AssetAction::Delete(asset.clone()));

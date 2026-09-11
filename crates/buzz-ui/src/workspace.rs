@@ -50,6 +50,11 @@ pub enum PanelId {
     Sound,
     Library,
     Assets,
+    /// **The cast** — the characters a film is directed from, kept where they
+    /// outlive it, with a wardrobe that re-skins every part and pose at once.
+    /// Beside the Assets panel, because a character is an asset with a face.
+    /// See [`crate::cast_panel`].
+    Cast,
     Timeline,
     Actions,
     /// **The brief, the set and the scenery.**
@@ -83,6 +88,7 @@ impl PanelId {
             Self::Sound => "Sound",
             Self::Library => "Library",
             Self::Assets => "Assets",
+            Self::Cast => "Cast",
             Self::Timeline => "Timeline",
             Self::Actions => "Actions",
             Self::Story => "Story",
@@ -118,7 +124,7 @@ impl PanelId {
         !matches!(self, Self::Tools | Self::Timeline)
     }
 
-    pub const ALL: [PanelId; 18] = [
+    pub const ALL: [PanelId; 19] = [
         PanelId::Tools,
         PanelId::ToolOptions,
         PanelId::Layers,
@@ -132,6 +138,7 @@ impl PanelId {
         PanelId::Sound,
         PanelId::Library,
         PanelId::Assets,
+        PanelId::Cast,
         PanelId::Timeline,
         PanelId::Actions,
         PanelId::Story,
@@ -923,6 +930,19 @@ impl Workspace {
                     PanelId::Assets,
                     Dock::RightOuter,
                     1,
+                    Dock::RightOuter,
+                    GROUP_ASSETS,
+                    false,
+                ),
+                // **The cast tabs in with the Library and the Assets panel.** A
+                // character is an asset with a face, and the comparison an
+                // animator makes — this film's symbols, the shelf of reusable
+                // things, the people — is the one these three tabs put side by
+                // side.
+                tab(
+                    PanelId::Cast,
+                    Dock::RightOuter,
+                    2,
                     Dock::RightOuter,
                     GROUP_ASSETS,
                     false,

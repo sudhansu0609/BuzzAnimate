@@ -1611,11 +1611,90 @@ impl Scene {
         self.repaint_links(mapping)
     }
 
-    /// The walk both of the above are: every fill and stroke in the document
-    /// that carries a swatch link the mapping answers for.
-    fn repaint_links(&mut self, mapping: &dyn Fn(SwatchId) -> Option<Color>) -> usize {
-        let mut changed = 0;
+    /// **Recolour by matching a colour** — every fill or stroke painted
+    /// exactly `from` becomes `to`, on every frame, in every symbol, across the
+    /// whole document.
+    ///
+    /// This is the palette for artwork that was never linked to a swatch: a
+    /// character drawn or imported with plain colours can still be re-skinned in
+    /// one edit — change the skin, and every part on every pose changes with it.
+    /// Matching is exact on the 8-bit colour, the same test [`Self::colours_used`]
+    /// groups by, so a colour the palette offered finds every part wearing it.
+    /// Returns how many fills and strokes were repainted.
+    pub fn recolour_matching(&mut self, from: Color, to: Color) -> usize {
+        if colours_equal(from, to) {
+            return 0;
+        }
+        let repaint = |shape: &mut crate::ShapeData, changed: &mut usize| {
+            if let Some(fill) = &mut shape.fill
+                && colours_equal(fill.paint.color(), from)
+            {
+                fill.paint = Paint::Solid(to);
+                *changed += 1;
+            }
+            if let Some(stroke) = &mut shape.stroke
+                && colours_equal(stroke.paint.color(), from)
+            {
+                stroke.paint = Paint::Solid(to);
+                *changed += 1;
+            }
+        };
+        self.repaint_shapes(&repaint)
+    }
 
+    /// **Every colour the artwork is painted with, most-used first.**
+    ///
+    /// Walks the same reach [`Self::recolour_matching`] repaints — the stage and
+    /// every symbol, on every keyframe — so what a palette view shows is exactly
+    /// what a recolour would find. Fills and strokes are counted together; the
+    /// count is how many parts wear the colour, which is what makes a
+    /// character's few real colours stand out from one-off details.
+    pub fn colours_used(&self) -> Vec<(Color, usize)> {
+        let mut counts: Vec<(Color, usize)> = Vec::new();
+        let mut tally = |c: Color| match counts.iter_mut().find(|(k, _)| colours_equal(*k, c)) {
+            Some(slot) => slot.1 += 1,
+            None => counts.push((c, 1)),
+        };
+
+        // Every object on the stage, and everything nested inside it.
+        let layers: Vec<LayerId> = self.layers().iter().map(|l| l.id).collect();
+        for layer in layers {
+            let frames: Vec<u32> = self
+                .layers()
+                .get(layer)
+                .map(|l| l.frames.keyframes().iter().map(|k| k.start).collect())
+                .unwrap_or_default();
+            for frame in frames {
+                let objects: Vec<std::sync::Arc<Object>> = self
+                    .layers()
+                    .get(layer)
+                    .map(|l| l.frames.objects_at(frame).to_vec())
+                    .unwrap_or_default();
+                for object in &objects {
+                    visit_shapes(object, &mut tally);
+                }
+            }
+        }
+
+        // And every symbol in the library, because a character is usually one.
+        for symbol in self.library().iter() {
+            for layer in symbol.layers.iter() {
+                for keyframe in layer.frames.keyframes() {
+                    for object in keyframe.objects.iter() {
+                        visit_shapes(object, &mut tally);
+                    }
+                }
+            }
+        }
+
+        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        counts
+    }
+
+    /// **Change a swatch, and everything painted with it changes** — the linked
+    /// walk. Every fill and stroke in the document that carries a swatch link
+    /// the mapping answers for.
+    fn repaint_links(&mut self, mapping: &dyn Fn(SwatchId) -> Option<Color>) -> usize {
         let repaint = |shape: &mut crate::ShapeData, changed: &mut usize| {
             if let Some(fill) = &mut shape.fill
                 && let Some(swatch) = fill.swatch
@@ -1634,6 +1713,14 @@ impl Scene {
                 *changed += 1;
             }
         };
+        self.repaint_shapes(&repaint)
+    }
+
+    /// Apply `repaint` to every shape on the stage and in every symbol, on
+    /// every keyframe, and bump the revision if anything changed. The reach
+    /// linked and matched recolouring share, so both touch the whole film.
+    fn repaint_shapes(&mut self, repaint: &dyn Fn(&mut crate::ShapeData, &mut usize)) -> usize {
+        let mut changed = 0;
 
         // Every object on the stage, and everything nested inside it.
         let layers: Vec<LayerId> = self.layers().iter().map(|l| l.id).collect();
@@ -1651,7 +1738,7 @@ impl Scene {
                     .unwrap_or_default();
                 for id in ids {
                     self.update_object_at(frame, id, |object| {
-                        repaint_object(object, &repaint, &mut changed);
+                        repaint_object(object, repaint, &mut changed);
                     });
                 }
             }
@@ -1672,7 +1759,7 @@ impl Scene {
                             for object in std::sync::Arc::make_mut(&mut keyframe.objects).iter_mut() {
                                 repaint_object(
                                     std::sync::Arc::make_mut(object),
-                                    &repaint,
+                                    repaint,
                                     &mut changed,
                                 );
                             }
@@ -1697,6 +1784,19 @@ impl Scene {
             // the pull: without this the film ended before the focus arrived.
             .max(self.camera().focus_last_frame() + 1)
             .max(1)
+    }
+
+    /// Does this document hold animation, rather than a single still frame?
+    ///
+    /// True when the main timeline moves — some layer carries a second keyframe
+    /// — when the camera moves, or when any library symbol is animated. A still
+    /// held for a length of frames is not animation. Lets the Assets and Library
+    /// panels separate animated work from static artwork; see
+    /// [`Symbol::is_animated`](crate::Symbol::is_animated).
+    pub fn is_animated(&self) -> bool {
+        self.stage_layers().iter().any(|l| l.keyframe_count() > 1)
+            || self.camera().last_frame() > 0
+            || self.library().iter().any(|s| s.is_animated())
     }
 
     /// Duration in seconds at the document's frame rate.
@@ -2338,6 +2438,47 @@ fn walk_objects(
 /// A group holds shapes, and a rig holds artwork per part; both are drawings
 /// with fills of their own, and a recolour that stopped at the top level would
 /// leave a character's own pieces untouched.
+/// Two colours are the same colour when their 8-bit channels agree — the test
+/// `select_same_colour` uses, so what the palette groups is what a recolour
+/// finds. f32 colours that differ below a step are one swatch to the eye.
+fn colours_equal(a: Color, b: Color) -> bool {
+    a.to_rgba8().to_u8_array() == b.to_rgba8().to_u8_array()
+}
+
+/// Read-only mirror of [`repaint_object`]: hand every fill and stroke colour in
+/// `object`, and everything nested inside it, to `visit`. Kept beside the
+/// repaint walk so the two do not drift over which shapes a character owns.
+fn visit_shapes(object: &Object, visit: &mut dyn FnMut(Color)) {
+    match &object.kind {
+        ObjectKind::Shape(shape) => {
+            if let Some(fill) = &shape.fill {
+                visit(fill.paint.color());
+            }
+            if let Some(stroke) = &shape.stroke {
+                visit(stroke.paint.color());
+            }
+        }
+        ObjectKind::Group(children) => {
+            for child in children.iter() {
+                visit_shapes(child, visit);
+            }
+        }
+        ObjectKind::Armature(rig) => {
+            for part in rig.parts.iter() {
+                visit_shapes(&part.artwork, visit);
+            }
+        }
+        // An instance carries no artwork of its own — the symbol it points at
+        // is walked in its own right.
+        ObjectKind::Instance(_) | ObjectKind::Warp(_) => {}
+    }
+
+    // A turnaround's other views are drawings too.
+    for view in object.turnaround.views() {
+        visit_shapes(&view.drawing, visit);
+    }
+}
+
 fn repaint_object(
     object: &mut Object,
     repaint: &dyn Fn(&mut crate::ShapeData, &mut usize),
@@ -2397,6 +2538,72 @@ mod tests {
             );
         }
         (scene, layer)
+    }
+
+    /// The palette a character offers is every colour its parts wear, the most
+    /// worn first, so a coat used all over sits above a one-off button.
+    #[test]
+    fn colours_used_counts_every_part_most_worn_first() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().unwrap().id;
+        let coat = Color::from_rgb8(0x2E, 0x7D, 0x32);
+        let button = Color::from_rgb8(0xC0, 0x30, 0x30);
+        scene.add_shape(layer, ShapeData::filled(square(0.0, 0.0, 10.0), coat));
+        scene.add_shape(layer, ShapeData::filled(square(20.0, 0.0, 10.0), coat));
+        scene.add_shape(layer, ShapeData::filled(square(40.0, 0.0, 10.0), button));
+
+        let palette = scene.colours_used();
+        assert_eq!(palette.first().map(|(c, _)| *c), Some(coat), "most worn first");
+        assert_eq!(palette[0].1, 2, "the coat is on two parts");
+        assert!(
+            palette.iter().any(|(c, n)| *c == button && *n == 1),
+            "the button is one part: {palette:?}"
+        );
+    }
+
+    /// **Re-skin by matching a colour**: change the coat once and every part
+    /// wearing it changes, while a different colour is left alone.
+    #[test]
+    fn recolour_matching_repaints_only_the_matched_colour() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().unwrap().id;
+        let coat = Color::from_rgb8(0x2E, 0x7D, 0x32);
+        let button = Color::from_rgb8(0xC0, 0x30, 0x30);
+        let new_coat = Color::from_rgb8(0x15, 0x3E, 0x8A);
+        scene.add_shape(layer, ShapeData::filled(square(0.0, 0.0, 10.0), coat));
+        scene.add_shape(layer, ShapeData::filled(square(20.0, 0.0, 10.0), coat));
+        scene.add_shape(layer, ShapeData::filled(square(40.0, 0.0, 10.0), button));
+
+        let painted = scene.recolour_matching(coat, new_coat);
+        assert_eq!(painted, 2, "both coat parts were repainted");
+
+        let palette = scene.colours_used();
+        assert!(
+            palette.iter().any(|(c, n)| *c == new_coat && *n == 2),
+            "the coat is now the new colour, on both parts: {palette:?}"
+        );
+        assert!(
+            palette.iter().all(|(c, _)| *c != coat),
+            "no part still wears the old coat: {palette:?}"
+        );
+        assert!(
+            palette.iter().any(|(c, n)| *c == button && *n == 1),
+            "the button was left alone: {palette:?}"
+        );
+    }
+
+    /// A colour nothing wears changes nothing, and repainting to the same
+    /// colour is a no-op — neither should report a phantom repaint.
+    #[test]
+    fn recolour_matching_a_missing_or_identical_colour_does_nothing() {
+        let (mut scene, _) = scene_with_shapes(3);
+        let absent = Color::from_rgb8(0x01, 0x02, 0x03);
+        assert_eq!(scene.recolour_matching(absent, Color::BLACK), 0);
+        assert_eq!(
+            scene.recolour_matching(Color::WHITE, Color::WHITE),
+            0,
+            "repainting white to white is a no-op"
+        );
     }
 
     /// **Pulling the camera in must not push a layer out of the picture.**
@@ -2884,6 +3091,30 @@ mod tests {
             fit.x1 >= scene.stage().size.width,
             "the stage should still be included"
         );
+    }
+
+    /// **A document knows whether it moves**, which is how the Assets and
+    /// Library panels tell animated work from a still. A single keyframe, however
+    /// long it is held, is a still; a second keyframe, a camera move or a movie
+    /// clip is animation.
+    #[test]
+    fn a_document_knows_when_it_moves() {
+        // A fresh document is a single still.
+        assert!(!Scene::default().is_animated());
+
+        // A second keyframe on the main timeline is movement.
+        let mut moved = Scene::default();
+        let layer = moved.layers().iter().next().unwrap().id;
+        moved.update_layer(layer, |l| {
+            l.frames.insert_frame(20);
+            l.frames.insert_keyframe(10);
+        });
+        assert!(moved.is_animated(), "a second keyframe is movement");
+
+        // A movie-clip symbol is animated even with a bare main timeline.
+        let mut clip = Scene::default();
+        clip.add_symbol("Loop", SymbolKind::MovieClip, None);
+        assert!(clip.is_animated(), "a movie clip is animated");
     }
 
     /// The Properties panel edits an instance by id, so the edit has to reach

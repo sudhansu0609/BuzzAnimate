@@ -665,6 +665,12 @@ pub struct App {
     /// because an asset is a file on disk rather than a symbol in the open
     /// document, so it is keyed and invalidated differently.
     asset_thumbnails: crate::thumbnails::AssetThumbnails,
+    /// The open character's loaded document, and the wardrobe and poses derived
+    /// from it. Held here rather than re-read from disk every frame: a
+    /// character is a whole document, and enumerating its colours or posing it
+    /// is a walk of the whole thing. Rebuilt when the open character changes or
+    /// after a recolour writes it back. See [`Self::cast_panel`].
+    cast_sheet: Option<CastSheet>,
     /// The Export dialog's test render. See [`crate::preview`].
     preview: crate::preview::Preview,
     /// Shading geometry being built off the UI thread, if any.
@@ -811,6 +817,7 @@ impl App {
             stage_area_min: egui::Pos2::ZERO,
             thumbnails: crate::thumbnails::Thumbnails::default(),
             asset_thumbnails: crate::thumbnails::AssetThumbnails::default(),
+            cast_sheet: None,
             preview: crate::preview::Preview::default(),
             shade_build: None,
             shade_aim: 0,
@@ -1910,6 +1917,205 @@ impl App {
         self.editor.story = state;
     }
 
+    /// **The Cast panel**: the characters a film is directed from, their
+    /// wardrobe and their poses.
+    ///
+    /// The characters are the assets filed under [`buzz_ui::CAST_FOLDER`]. The
+    /// wardrobe (every colour they wear) and their named poses are the open
+    /// character's own, kept in [`Self::cast_sheet`] so a whole document is not
+    /// re-read from disk every frame.
+    fn cast_panel(&mut self, ui: &mut egui::Ui) {
+        let characters: Vec<buzz_doc::Asset> = self
+            .editor
+            .assets
+            .assets()
+            .iter()
+            .filter(|a| is_cast(&a.folder))
+            .cloned()
+            .collect();
+        let can_add = !self.editor.selection.is_empty();
+
+        // Load the open character's sheet if it changed since the last frame.
+        let open = self.editor.cast_panel.open.clone();
+        self.ensure_cast_sheet(open.as_deref());
+        let (palette, poses): (&[(peniko::Color, usize)], &[String]) = match &self.cast_sheet {
+            Some(sheet) => (&sheet.palette, &sheet.poses),
+            None => (&[], &[]),
+        };
+
+        let mut state = std::mem::take(&mut self.editor.cast_panel);
+        let thumbs = &mut self.asset_thumbnails;
+        let action = buzz_ui::cast_panel(
+            ui,
+            &characters,
+            palette,
+            poses,
+            &mut state,
+            can_add,
+            &mut |path| thumbs.get(path),
+        );
+        self.editor.cast_panel = state;
+
+        if let Some(action) = action {
+            self.apply_cast_action(action);
+        }
+    }
+
+    /// Load the character at `path` into [`Self::cast_sheet`] unless it is
+    /// already the one loaded, and drop the sheet when nothing is open. Reading
+    /// a character is a whole-document load, so this runs only when the open
+    /// character actually changes.
+    fn ensure_cast_sheet(&mut self, path: Option<&std::path::Path>) {
+        let Some(path) = path else {
+            self.cast_sheet = None;
+            return;
+        };
+        if self.cast_sheet.as_ref().is_some_and(|s| s.path == path) {
+            return;
+        }
+        let asset = self
+            .editor
+            .assets
+            .assets()
+            .iter()
+            .find(|a| a.path == path)
+            .cloned();
+        let Some(asset) = asset else {
+            self.cast_sheet = None;
+            return;
+        };
+        self.cast_sheet = match self.editor.assets.load(&asset) {
+            Ok(scene) => Some(CastSheet {
+                path: asset.path.clone(),
+                palette: scene.colours_used(),
+                poses: poses_of(&scene),
+                scene,
+            }),
+            Err(_) => None,
+        };
+    }
+
+    /// Act on what the Cast panel asked for.
+    ///
+    /// Casting reuses the asset placer, so a character arrives on the stage
+    /// selected with its masks and rigging intact, exactly as any placed asset
+    /// does. The wardrobe and the add are the panel's own.
+    fn apply_cast_action(&mut self, action: buzz_ui::CastAction) {
+        use buzz_ui::CastAction::*;
+        match action {
+            // The panel already recorded which character is open in its own
+            // state; the sheet loads on the next frame.
+            Open(_) => {}
+            Cast(asset) => self.apply_asset_action(buzz_ui::AssetAction::Place(asset)),
+            AddSelection => self.add_to_cast(),
+            Rename { asset, name } => {
+                if let Err(e) = self.editor.assets.rename(&asset, &name) {
+                    self.editor.status = Some(format!("Could not rename: {e}"));
+                } else {
+                    // The file moved, so the path the sheet was keyed on is
+                    // gone; the list still shows the character under its new
+                    // name.
+                    self.editor.cast_panel.open = None;
+                    self.cast_sheet = None;
+                    self.asset_thumbnails.forget();
+                }
+            }
+            Delete(asset) => self.delete_from_cast(asset),
+            Recolour { asset, from, to } => self.recolour_character(&asset, from, to),
+            Rescan => {
+                self.editor.assets.rescan();
+                self.asset_thumbnails.forget();
+                self.cast_sheet = None;
+            }
+        }
+    }
+
+    /// Keep the selected character as a new member of the cast and open its
+    /// sheet. Filed under [`buzz_ui::CAST_FOLDER`], which is what tells a
+    /// character apart from a prop in the same library.
+    fn add_to_cast(&mut self) {
+        let ids = self.editor.selection.ids();
+        if ids.is_empty() {
+            self.editor.status = Some("Select a character to add to the cast".into());
+            return;
+        }
+        let doc = self
+            .editor
+            .doc
+            .scene()
+            .extract(self.editor.current_frame, &ids);
+        let name = self.editor.assets.unique_name("Character", buzz_ui::CAST_FOLDER);
+        match self.editor.assets.save(&name, buzz_ui::CAST_FOLDER, &doc) {
+            Ok(saved) => {
+                self.editor.cast_panel.open = Some(saved.path.clone());
+                self.cast_sheet = None;
+                self.editor.workspace.select_tab(buzz_ui::PanelId::Cast);
+                self.asset_thumbnails.forget();
+                self.editor.status = Some(format!(
+                    "Added {} to the cast \u{2014} double-click the name to rename",
+                    saved.name
+                ));
+            }
+            Err(e) => self.editor.status = Some(format!("Could not add to the cast: {e}")),
+        }
+    }
+
+    /// Remove a character from the cast, on the second click — a file on disk
+    /// has no undo, so the first click arms and the second removes.
+    fn delete_from_cast(&mut self, asset: buzz_doc::Asset) {
+        if self.editor.cast_panel.confirm_delete.as_deref() != Some(asset.path.as_path()) {
+            self.editor.cast_panel.confirm_delete = Some(asset.path.clone());
+            self.editor.status = Some(format!(
+                "Delete {} \u{2014} click Delete again to confirm",
+                asset.name
+            ));
+            return;
+        }
+        self.editor.cast_panel.confirm_delete = None;
+        match self.editor.assets.delete(&asset) {
+            Ok(()) => {
+                if self.editor.cast_panel.open.as_deref() == Some(asset.path.as_path()) {
+                    self.editor.cast_panel.open = None;
+                }
+                self.cast_sheet = None;
+                self.asset_thumbnails.forget();
+                self.editor.status = Some(format!("Removed {} from the cast", asset.name));
+            }
+            Err(e) => self.editor.status = Some(format!("Could not remove {}: {e}", asset.name)),
+        }
+    }
+
+    /// **Re-skin a character**: repaint every part painted `from` with `to`, on
+    /// every pose, and write the character back so the new skin is theirs from
+    /// now on.
+    ///
+    /// The recolour is applied to the character's loaded document, so the
+    /// wardrobe updates the moment the well changes; the file is rewritten and
+    /// its thumbnail forgotten so the list catches up too.
+    fn recolour_character(&mut self, asset: &buzz_doc::Asset, from: peniko::Color, to: peniko::Color) {
+        self.ensure_cast_sheet(Some(asset.path.as_path()));
+        let Some(sheet) = self.cast_sheet.as_mut() else {
+            self.editor.status = Some(format!("Could not read {}", asset.name));
+            return;
+        };
+        let painted = sheet.scene.recolour_matching(from, to);
+        if painted == 0 {
+            return;
+        }
+        sheet.palette = sheet.scene.colours_used();
+        let scene = sheet.scene.clone();
+        match self.editor.assets.save(&asset.name, &asset.folder, &scene) {
+            Ok(_) => {
+                self.asset_thumbnails.forget();
+                self.editor.status = Some(match painted {
+                    1 => format!("Re-skinned {} \u{2014} 1 part", asset.name),
+                    n => format!("Re-skinned {} \u{2014} {n} parts", asset.name),
+                });
+            }
+            Err(e) => self.editor.status = Some(format!("Could not save {}: {e}", asset.name)),
+        }
+    }
+
     fn depth_panel(&mut self, ui: &mut egui::Ui) {
         let active = self.editor.selection.active_layer();
         let response = buzz_ui::depth_panel(ui, self.editor.doc.scene(), active);
@@ -2466,6 +2672,8 @@ impl App {
                     self.apply_asset_action(action);
                 }
             }
+
+            Cast => self.cast_panel(ui),
 
             Swatches => {
                 // Naming a colour and moving one between folders are edits to
@@ -3359,10 +3567,12 @@ impl App {
     /// The scene name at the root of the edit-path breadcrumb, and the menu
     /// behind it — switch scene, add, rename, delete. Animate's "Edit Scene"
     /// control, folded into the crumb it sits on.
-    fn scene_crumb(&mut self, ui: &mut egui::Ui, command: &mut Option<Command>) {
-        let active = self.editor.doc.active_scene();
-        let names = self.editor.doc.scene_names();
-
+    fn scene_crumb(
+        &mut self,
+        ui: &mut egui::Ui,
+        command: &mut Option<Command>,
+        inside_symbol: bool,
+    ) {
         // Mid-rename: the crumb becomes a text field, committed on Enter or
         // when focus leaves, abandoned on Escape.
         if let Some((index, mut buffer)) = self.scene_rename.take() {
@@ -3384,82 +3594,115 @@ impl App {
             return;
         }
 
-        let current = names
+        let active = self.editor.doc.active_scene();
+        let current = self
+            .editor
+            .doc
+            .scene_names()
             .get(active)
             .cloned()
             .unwrap_or_else(|| "Scene 1".to_string());
 
-        ui.menu_button(egui::RichText::new(current).small(), |ui| {
-            for (i, name) in names.iter().enumerate() {
-                if ui
-                    .selectable_label(i == active, egui::RichText::new(name).small())
-                    .clicked()
-                {
-                    if i == active {
-                        // Already here: the click means "leave the symbol and
-                        // show this scene's main timeline".
-                        *command = Some(Command::EditDocument);
-                    } else {
-                        self.editor.switch_scene(i);
-                    }
-                    ui.close();
-                }
-            }
-
-            ui.separator();
-
-            if ui.button("Add Scene").clicked() {
-                self.editor.add_scene();
-                ui.close();
-            }
-            // **The one a conversation is built out of.** Two people in a room
-            // is the same set, cast and lighting beat after beat; only the
-            // performance changes. Duplicating gives the next shot all of that
-            // to start from, which is the alternative to copying frames onto
-            // the end of the timeline by hand.
+        // Inside a symbol the scene name is a link straight back to the main
+        // timeline — click the root to leave the symbol, however deep in you are
+        // — with the scene menu folded onto a caret beside it. At the main
+        // timeline there is nowhere further out to go, so the name *is* the menu.
+        if inside_symbol {
             if ui
-                .button("Duplicate Scene")
-                .on_hover_text(
-                    "A copy of this scene, complete \u{2014} set, cast, lights and every \
-                     keyframe \u{2014} placed after it and opened for editing. What the \
-                     next beat of a conversation starts from.",
-                )
+                .link(egui::RichText::new(&current).small())
+                .on_hover_text("Back to this scene's main timeline")
                 .clicked()
             {
-                self.editor.duplicate_scene(active);
+                *command = Some(Command::EditDocument);
+            }
+            ui.menu_button(egui::RichText::new("\u{23F7}").small(), |ui| {
+                self.scene_menu(ui, command);
+            })
+            .response
+            .on_hover_text("Switch, add, rename or delete a scene");
+        } else {
+            ui.menu_button(egui::RichText::new(&current).small(), |ui| {
+                self.scene_menu(ui, command);
+            })
+            .response
+            .on_hover_text("Switch, add, rename or delete a scene");
+        }
+    }
+
+    /// The scene menu — switch, add, duplicate, rename, reorder, delete — folded
+    /// behind the scene crumb. Split out so the crumb can present it under the
+    /// name at the main timeline and under a caret while a symbol is open.
+    fn scene_menu(&mut self, ui: &mut egui::Ui, command: &mut Option<Command>) {
+        let active = self.editor.doc.active_scene();
+        let names = self.editor.doc.scene_names();
+
+        for (i, name) in names.iter().enumerate() {
+            if ui
+                .selectable_label(i == active, egui::RichText::new(name).small())
+                .clicked()
+            {
+                if i == active {
+                    // Already here: the click means "leave the symbol and
+                    // show this scene's main timeline".
+                    *command = Some(Command::EditDocument);
+                } else {
+                    self.editor.switch_scene(i);
+                }
                 ui.close();
             }
-            if ui.button("Rename Scene\u{2026}").clicked() {
-                self.scene_rename = Some((active, names[active].clone()));
-                ui.close();
-            }
-            ui.add_enabled_ui(names.len() > 1, |ui| {
-                ui.horizontal(|ui| {
-                    // The running order is the order the film plays in, so it
-                    // has to be changeable.
-                    if ui
-                        .add_enabled(active > 0, egui::Button::new("Move Up"))
-                        .clicked()
-                    {
-                        self.editor.move_scene(active, active - 1);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(active + 1 < names.len(), egui::Button::new("Move Down"))
-                        .clicked()
-                    {
-                        self.editor.move_scene(active, active + 1);
-                        ui.close();
-                    }
-                });
-                if ui.button("Delete Scene").clicked() {
-                    self.editor.delete_scene(active);
+        }
+
+        ui.separator();
+
+        if ui.button("Add Scene").clicked() {
+            self.editor.add_scene();
+            ui.close();
+        }
+        // **The one a conversation is built out of.** Two people in a room
+        // is the same set, cast and lighting beat after beat; only the
+        // performance changes. Duplicating gives the next shot all of that
+        // to start from, which is the alternative to copying frames onto
+        // the end of the timeline by hand.
+        if ui
+            .button("Duplicate Scene")
+            .on_hover_text(
+                "A copy of this scene, complete \u{2014} set, cast, lights and every \
+                 keyframe \u{2014} placed after it and opened for editing. What the \
+                 next beat of a conversation starts from.",
+            )
+            .clicked()
+        {
+            self.editor.duplicate_scene(active);
+            ui.close();
+        }
+        if ui.button("Rename Scene\u{2026}").clicked() {
+            self.scene_rename = Some((active, names[active].clone()));
+            ui.close();
+        }
+        ui.add_enabled_ui(names.len() > 1, |ui| {
+            ui.horizontal(|ui| {
+                // The running order is the order the film plays in, so it
+                // has to be changeable.
+                if ui
+                    .add_enabled(active > 0, egui::Button::new("Move Up"))
+                    .clicked()
+                {
+                    self.editor.move_scene(active, active - 1);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(active + 1 < names.len(), egui::Button::new("Move Down"))
+                    .clicked()
+                {
+                    self.editor.move_scene(active, active + 1);
                     ui.close();
                 }
             });
-        })
-        .response
-        .on_hover_text("Switch, add, rename or delete a scene");
+            if ui.button("Delete Scene").clicked() {
+                self.editor.delete_scene(active);
+                ui.close();
+            }
+        });
     }
 
     fn breadcrumb(&mut self, ui: &mut egui::Ui) -> Option<Command> {
@@ -3467,7 +3710,7 @@ impl App {
         let path: Vec<buzz_scene::SymbolId> = self.editor.scene().edit_path().to_vec();
 
         ui.horizontal(|ui| {
-            self.scene_crumb(ui, &mut command);
+            self.scene_crumb(ui, &mut command, !path.is_empty());
 
             for (depth, id) in path.iter().enumerate() {
                 // ">" rather than a typographic chevron: egui's bundled fonts
@@ -3488,6 +3731,13 @@ impl App {
                 if last {
                     ui.label(egui::RichText::new(name).small().strong());
                 } else if ui.link(egui::RichText::new(name).small()).clicked() {
+                    // Clear the stage selection first: opening the selected
+                    // symbol prefers a chosen instance's symbol over the Library
+                    // selection (see `edit_selected_symbol`), so without this a
+                    // crumb click could open the selected instance rather than
+                    // the ancestor it names. Re-entering a symbol already on the
+                    // path steps the edit stack back out to it.
+                    self.editor.selection.clear();
                     self.editor.library.selected = Some(*id);
                     command = Some(Command::EditSymbol);
                 }
@@ -4953,6 +5203,18 @@ impl App {
         match action {
             Place(asset) => {
                 let library = self.editor.assets.clone();
+                // What the timeline being edited already holds at this frame, so
+                // that afterwards the placed artwork can be told apart from it
+                // and selected — the same before/after diff Paste uses.
+                let frame = self.editor.current_frame;
+                let before: std::collections::HashSet<buzz_scene::ObjectId> = self
+                    .editor
+                    .doc
+                    .scene()
+                    .layers()
+                    .iter()
+                    .flat_map(|l| l.objects_at(frame).iter().map(|o| o.id))
+                    .collect();
                 let mut outcome = None;
                 self.editor.doc.edit("Place Asset", |scene| {
                     outcome = Some(library.place(&asset, scene));
@@ -4960,8 +5222,19 @@ impl App {
                 match outcome {
                     Some(Ok(report)) => {
                         // The placed artwork is what the user now wants to move,
-                        // exactly as it is after an import.
-                        self.editor.selection.clear();
+                        // exactly as it is after an import — so it arrives
+                        // selected, with the Free Transform handles already on
+                        // it, rather than dropped and deselected.
+                        let arrived: Vec<buzz_scene::ObjectId> = self
+                            .editor
+                            .doc
+                            .scene()
+                            .layers()
+                            .iter()
+                            .flat_map(|l| l.objects_at(frame).iter().map(|o| o.id))
+                            .filter(|id| !before.contains(id))
+                            .collect();
+                        self.editor.selection.set(arrived);
                         self.editor
                             .selection
                             .ensure_active_layer(self.editor.doc.scene());
@@ -5053,10 +5326,27 @@ impl App {
             }
 
             Delete(asset) => {
-                if let Err(e) = self.editor.assets.delete(&asset) {
-                    self.editor.status = Some(format!("Could not delete: {e}"));
+                // **No undo out here.** An asset is a file on disk, so the first
+                // Delete arms and says so, and the second — on the "Delete?"
+                // button the panel now shows — removes it.
+                if self.editor.assets_panel.confirm_delete_asset.as_deref()
+                    != Some(asset.path.as_path())
+                {
+                    self.editor.assets_panel.confirm_delete_asset = Some(asset.path.clone());
+                    self.editor.status = Some(format!(
+                        "Delete the asset {}? It cannot be undone — click Delete again to confirm",
+                        asset.name
+                    ));
+                } else {
+                    self.editor.assets_panel.confirm_delete_asset = None;
+                    match self.editor.assets.delete(&asset) {
+                        Ok(()) => {
+                            self.editor.status = Some(format!("Deleted {}", asset.name));
+                        }
+                        Err(e) => self.editor.status = Some(format!("Could not delete: {e}")),
+                    }
+                    self.asset_thumbnails.forget();
                 }
-                self.asset_thumbnails.forget();
             }
 
             DeleteFolder { folder } => {
@@ -7692,6 +7982,14 @@ enum DropTarget {
 /// How long a revealed panel's header stays lit.
 const HIGHLIGHT_SECONDS: f64 = 2.5;
 
+/// The colour of the drop indicator while a panel is being dragged.
+///
+/// A clear green, as Animate uses, rather than the blue selection accent: it has
+/// to read as "here" on top of any theme's panels, and against a selection that
+/// may itself be on screen. Fixed rather than a palette entry so it is the same
+/// unmistakable green in every theme.
+const DROP_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x35, 0xC4, 0x6A);
+
 impl App {
     /// How brightly this section's header is lit this frame, if at all.
     fn emphasis_for(&self, section: &buzz_ui::Section) -> Option<f32> {
@@ -7706,15 +8004,45 @@ impl App {
     /// a floating window over a column is the thing under the pointer, not
     /// the column behind it. A panel dropped on its own section goes nowhere.
     fn drop_target(&self, pointer: egui::Pos2, dragged: &[buzz_ui::PanelId]) -> Option<DropTarget> {
+        // A section directly under the pointer is the first candidate, and
+        // Animate's rule decides what happens: near its top or bottom edge a new
+        // row docks above or below it (a green line); over its body it tabs in
+        // (a green box). Only a column can grow a row — a floating window has no
+        // column, so it only ever tabs in.
         if let Some(zone) = self.drop_zones.iter().rev().find(|z| z.rect.contains(pointer)) {
+            let r = zone.rect;
+            if let Some(col) = self
+                .dock_rects
+                .iter()
+                .find(|(d, _)| *d == zone.dock)
+                .map(|(_, r)| *r)
+            {
+                // A generous edge band, so the line is easy to hit, but never so
+                // wide it swallows the body of a short section.
+                let band = (r.height() * 0.30).clamp(8.0, 32.0);
+                if pointer.y < r.top() + band {
+                    return Some(DropTarget::Column {
+                        dock: zone.dock,
+                        before: Some(zone.group),
+                        line: Self::insertion_line(col, r.top()),
+                    });
+                }
+                if pointer.y > r.bottom() - band {
+                    return Some(DropTarget::Column {
+                        dock: zone.dock,
+                        before: self.section_after(zone.dock, r),
+                        line: Self::insertion_line(col, r.bottom()),
+                    });
+                }
+            }
+            // The body: tab into it, unless it is the section already being
+            // carried, where that would do nothing.
             if dragged.contains(&zone.front) {
                 return None;
             }
-            return Some(DropTarget::Section {
-                front: zone.front,
-                rect: zone.rect,
-            });
+            return Some(DropTarget::Section { front: zone.front, rect: r });
         }
+        // Over a column but in the gap past the last section: dock at the end.
         if let Some((dock, rect)) = self.dock_rects.iter().find(|(_, r)| r.contains(pointer)) {
             let mut zones: Vec<&DropZone> =
                 self.drop_zones.iter().filter(|z| z.dock == *dock).collect();
@@ -7724,17 +8052,36 @@ impl App {
                 .map(|z| z.rect.top())
                 .or_else(|| zones.last().map(|z| z.rect.bottom()))
                 .unwrap_or(rect.top());
-            let line = egui::Rect::from_min_max(
-                egui::pos2(rect.left(), y - 2.0),
-                egui::pos2(rect.right(), y + 2.0),
-            );
             return Some(DropTarget::Column {
                 dock: *dock,
                 before: before.map(|z| z.group),
-                line,
+                line: Self::insertion_line(*rect, y),
             });
         }
         Some(DropTarget::Float(pointer))
+    }
+
+    /// A horizontal insertion bar spanning a column, centred on `y`.
+    fn insertion_line(col: egui::Rect, y: f32) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(col.left() + 2.0, y - 2.0),
+            egui::pos2(col.right() - 2.0, y + 2.0),
+        )
+    }
+
+    /// The group of the section immediately below `rect` in `dock`, or `None`
+    /// when `rect` is the last — i.e. what "dock below this section" docks
+    /// before, in [`Workspace::dock_at`] terms.
+    fn section_after(
+        &self,
+        dock: buzz_ui::Dock,
+        rect: egui::Rect,
+    ) -> Option<buzz_ui::workspace::GroupId> {
+        self.drop_zones
+            .iter()
+            .filter(|z| z.dock == dock && z.rect.top() > rect.top() + 1.0)
+            .min_by(|a, b| a.rect.top().total_cmp(&b.rect.top()))
+            .map(|z| z.group)
     }
 
     /// Carry a dragged panel, show where it would land, and land it.
@@ -7742,7 +8089,7 @@ impl App {
         let Some(dragged) = egui::DragAndDrop::payload::<DraggedPanels>(ctx) else {
             return;
         };
-        let accent = Palette::selection();
+        let accent = DROP_ACCENT;
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Tooltip,
             egui::Id::new("dock-drop"),
@@ -7772,16 +8119,20 @@ impl App {
         let target = pointer.and_then(|p| self.drop_target(p, &dragged.0));
         match &target {
             Some(DropTarget::Section { rect, .. }) => {
-                painter.rect_filled(*rect, 3.0, accent.gamma_multiply(0.18));
+                // Tabbing in: a filled green wash under a clear green border, so
+                // the whole section reads as the drop.
+                painter.rect_filled(*rect, 4.0, accent.gamma_multiply(0.22));
                 painter.rect_stroke(
                     *rect,
-                    3.0,
-                    egui::Stroke::new(2.0, accent),
+                    4.0,
+                    egui::Stroke::new(2.5, accent),
                     egui::StrokeKind::Inside,
                 );
             }
             Some(DropTarget::Column { line, .. }) => {
-                painter.rect_filled(*line, 1.0, accent);
+                // Docking as a new row: a rounded green bar across the column,
+                // Animate's insertion line.
+                painter.rect_filled(*line, 2.0, accent);
             }
             Some(DropTarget::Float(_)) | None => {}
         }
@@ -8127,16 +8478,61 @@ fn section_header(
                         // Rolled up, every panel is named: the title bar is all
                         // that is left of it, and an unlabelled strip is not a
                         // panel, it is a smudge.
+                        //
+                        // **And the name drags the section**, so the title bar is
+                        // a grab handle the size of the whole strip, not just the
+                        // two-colon grip — the gesture a hand tries first.
                         let room = ui.available_width().max(1.0);
-                        ui.add_sized(
-                            egui::vec2(room, ui.spacing().interact_size.y),
-                            egui::Label::new(
-                                egui::RichText::new(section.front.title())
-                                    .small()
-                                    .color(Palette::text_dim()),
+                        let title = ui
+                            .add_sized(
+                                egui::vec2(room, ui.spacing().interact_size.y),
+                                egui::Label::new(
+                                    egui::RichText::new(section.front.title())
+                                        .small()
+                                        .color(Palette::text_dim()),
+                                )
+                                .truncate()
+                                .sense(egui::Sense::click_and_drag()),
                             )
-                            .truncate(),
-                        );
+                            .on_hover_text(if locked {
+                                "The layout is locked"
+                            } else {
+                                "Drag the title to move this section"
+                            });
+                        if !locked {
+                            title.dnd_set_drag_payload(DraggedPanels(section.panels.clone()));
+                        }
+                        // Where a title-bar drag can be started, for the tests
+                        // that drive one through the real window.
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(
+                                egui::Id::new(("header-drag", section.front)),
+                                title.rect,
+                            );
+                        });
+                    }
+
+                    // **Whatever the row leaves over drags the section too.**
+                    //
+                    // The tabs, the name and the handles rarely fill the strip;
+                    // the rest of it is empty, and in Animate that empty title
+                    // bar is itself the grab handle. Allocating exactly the space
+                    // that is left keeps the promise that nothing here overflows
+                    // the column. The menu keeps its click and each tab keeps its
+                    // own drag, because those sit on top of this.
+                    let rest = ui.available_size();
+                    if rest.x > 1.0 {
+                        let (_, drag) =
+                            ui.allocate_exact_size(rest, egui::Sense::click_and_drag());
+                        if !locked {
+                            drag.dnd_set_drag_payload(DraggedPanels(section.panels.clone()));
+                        }
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(
+                                egui::Id::new(("header-drag", section.front)),
+                                drag.rect,
+                            );
+                        });
                     }
                 });
             });
@@ -8348,6 +8744,90 @@ mod dock_geometry_tests {
                 },
             );
         }
+    }
+
+    /// **The breadcrumb renders at every depth**, including the form it takes
+    /// inside a symbol: the scene name a link back to the main timeline, the
+    /// scene menu folded onto the caret beside it, and each open ancestor its
+    /// own link. A smoke test — it catches id collisions, missing glyphs and
+    /// layout panics in the new branch, and confirms the strip raises no command
+    /// on its own.
+    #[test]
+    fn the_breadcrumb_renders_at_the_root_and_inside_nested_symbols() {
+        let mut app = App::new(GpuPreference::default());
+
+        // Two symbols, to be opened one inside the other for a two-level path.
+        let mut ids = None;
+        app.editor.doc.edit("symbols", |scene| {
+            let outer = scene.add_symbol("Outer", buzz_scene::SymbolKind::Graphic, None);
+            let inner = scene.add_symbol("Inner", buzz_scene::SymbolKind::MovieClip, None);
+            ids = Some((outer, inner));
+        });
+        let (outer, inner) = ids.expect("the symbols");
+
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1226.0, 1002.0),
+            )),
+            ..Default::default()
+        };
+
+        // At the main timeline the strip is the scene crumb alone.
+        let _ = ctx.run_ui(input(), |ui| {
+            assert!(app.editor.scene().edit_path().is_empty());
+            assert!(app.breadcrumb(ui).is_none());
+        });
+
+        // Open both symbols, deepest last.
+        app.editor.doc.edit_view(|scene| {
+            scene.enter_symbol(outer);
+            scene.enter_symbol(inner);
+        });
+        assert_eq!(
+            app.editor.scene().edit_path().to_vec(),
+            vec![outer, inner],
+            "both symbols are on the edit path, outermost first"
+        );
+
+        // The two-level strip renders without panic and raises nothing itself.
+        let _ = ctx.run_ui(input(), |ui| {
+            assert!(app.breadcrumb(ui).is_none());
+        });
+    }
+
+    /// **Deleting an asset takes two clicks**, because a file on disk has no
+    /// undo. The first arms the confirm and leaves the file; the second removes
+    /// it.
+    #[test]
+    fn deleting_an_asset_needs_a_second_click_to_confirm() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut app = App::new(GpuPreference::default());
+        app.editor.assets = buzz_doc::AssetLibrary::at(dir.path());
+        let asset = app
+            .editor
+            .assets
+            .save("Oak", "", &buzz_scene::Scene::default())
+            .expect("save");
+        assert_eq!(app.editor.assets.len(), 1);
+
+        // First click: armed, nothing deleted.
+        app.apply_asset_action(buzz_ui::AssetAction::Delete(asset.clone()));
+        assert_eq!(app.editor.assets.len(), 1, "the first click must not delete");
+        assert!(
+            app.editor.assets_panel.confirm_delete_asset.is_some(),
+            "the first click arms the confirmation"
+        );
+
+        // Second click: confirmed and gone, arming cleared.
+        app.apply_asset_action(buzz_ui::AssetAction::Delete(asset));
+        assert_eq!(app.editor.assets.len(), 0, "the second click deletes");
+        assert!(
+            app.editor.assets_panel.confirm_delete_asset.is_none(),
+            "and the arming is cleared"
+        );
     }
 
     /// **A dock column must report the rectangle it was given.**
@@ -8731,6 +9211,15 @@ mod idle_tests {
                     .center()
             }
 
+            /// A point on a section's title bar that is not the grip — the name
+            /// or the empty part of the strip, which drags the whole section too.
+            fn header(&self, front: buzz_ui::PanelId) -> egui::Pos2 {
+                self.ctx
+                    .data(|d| d.get_temp::<egui::Rect>(egui::Id::new(("header-drag", front))))
+                    .unwrap_or_else(|| panic!("{front:?} has no title-bar drag zone"))
+                    .center()
+            }
+
             /// Press at `from`, carry to `to`, let go.
             fn drag(&mut self, from: egui::Pos2, to: egui::Pos2) {
                 let mods = egui::Modifiers::default();
@@ -8816,6 +9305,72 @@ mod idle_tests {
                 workspace.section_of(buzz_ui::PanelId::Library).unwrap().panels,
                 vec![buzz_ui::PanelId::Library],
                 "a section of its own"
+            );
+        }
+
+        /// **The whole title bar re-docks, not only the `::` grip.** Dragging a
+        /// section by the empty part of its header carries it just as the grip
+        /// does — the grab handle Animate gives you.
+        #[test]
+        fn dragging_a_sections_title_bar_re_docks_it() {
+            let mut d = Drive::new();
+            let from = d.header(buzz_ui::PanelId::Layers);
+            let to = d.zone(buzz_ui::PanelId::Properties).center();
+
+            d.drag(from, to);
+
+            let section = d
+                .app
+                .editor
+                .workspace
+                .section_of(buzz_ui::PanelId::Layers)
+                .expect("still on screen");
+            assert!(
+                section.panels.contains(&buzz_ui::PanelId::Properties),
+                "dragging the title bar did not move Layers onto Properties: {:?}",
+                section.panels
+            );
+        }
+
+        /// Dropped on a section's lower edge: a new row below it, Animate's
+        /// insertion-line behaviour — not a tab inside it.
+        #[test]
+        fn dropping_on_a_sections_lower_edge_docks_a_row_below_it() {
+            let mut d = Drive::new();
+            let from = d.grip(buzz_ui::PanelId::Library);
+            let target = d.zone(buzz_ui::PanelId::Properties);
+            // Just inside the bottom edge, where the green insertion line shows.
+            let to = egui::pos2(target.center().x, target.bottom() - 2.0);
+
+            d.drag(from, to);
+
+            let workspace = &d.app.editor.workspace;
+            let section = workspace
+                .section_of(buzz_ui::PanelId::Library)
+                .expect("still on screen");
+            assert!(
+                !section.panels.contains(&buzz_ui::PanelId::Properties),
+                "Library tabbed into Properties instead of docking below it: {:?}",
+                section.panels
+            );
+            let dock = workspace.dock_of(buzz_ui::PanelId::Properties);
+            assert_eq!(
+                workspace.dock_of(buzz_ui::PanelId::Library),
+                dock,
+                "Library landed in the same column as Properties"
+            );
+            let side = workspace.on(dock);
+            let library = side
+                .iter()
+                .position(|p| *p == buzz_ui::PanelId::Library)
+                .expect("in the column");
+            let properties = side
+                .iter()
+                .position(|p| *p == buzz_ui::PanelId::Properties)
+                .expect("in the column");
+            assert!(
+                library > properties,
+                "Library must sit below Properties: {side:?}"
             );
         }
 
@@ -9102,6 +9657,61 @@ mod shell_tests {
             true,
         );
         assert!(thumb.width().is_finite());
+    }
+}
+
+/// The open character's loaded document and what the Cast panel shows of it.
+///
+/// Cached because a character is a whole document: enumerating its colours or
+/// reading its poses is a walk of the lot, and doing that every frame would
+/// make the panel lurch. Rebuilt when the open character changes, and after a
+/// recolour edits it. See [`App::cast_panel`].
+struct CastSheet {
+    /// The asset's path on disk, the key the sheet is matched against.
+    path: std::path::PathBuf,
+    /// The character's document, recoloured in place as the wardrobe changes
+    /// and written back to disk.
+    scene: buzz_scene::Scene,
+    /// Every colour the character wears, most-worn first — the wardrobe.
+    palette: Vec<(peniko::Color, usize)>,
+    /// The named poses the character carries.
+    poses: Vec<String>,
+}
+
+/// Is this asset folder the cast folder, or a folder within it?
+fn is_cast(folder: &str) -> bool {
+    folder == buzz_ui::CAST_FOLDER || folder.starts_with(&format!("{}/", buzz_ui::CAST_FOLDER))
+}
+
+/// The named poses a character carries, in the order first seen and without
+/// repeats. Poses live on the rig, so a character built from more than one
+/// rigged figure offers each of their pose libraries.
+fn poses_of(scene: &buzz_scene::Scene) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for layer in scene.layers().iter() {
+        for object in layer.objects_at(0).iter() {
+            collect_poses(object, &mut names);
+        }
+    }
+    names
+}
+
+/// Gather the pose names on `object` and anything nested inside it.
+fn collect_poses(object: &buzz_scene::Object, out: &mut Vec<String>) {
+    match &object.kind {
+        buzz_scene::ObjectKind::Armature(rig) => {
+            for pose in &rig.poses {
+                if !out.iter().any(|n| n == &pose.name) {
+                    out.push(pose.name.clone());
+                }
+            }
+        }
+        buzz_scene::ObjectKind::Group(children) => {
+            for child in children.iter() {
+                collect_poses(child, out);
+            }
+        }
+        _ => {}
     }
 }
 

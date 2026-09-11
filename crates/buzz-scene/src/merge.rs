@@ -319,11 +319,19 @@ impl Scene {
 
         // 5. Incoming layers go on top, which is where Animate puts them and
         //    where the user will look for what they just imported.
+        //
+        //    **Into the timeline being edited, not always the root.** A user
+        //    who opens a symbol and places an asset means "put it in here"; the
+        //    same is true of Import to Stage. Sending it to the root stage
+        //    instead dropped it where it could be seen faded behind the symbol
+        //    but never selected — it was on a timeline that was not the one open
+        //    for editing. `add_layer` already files new layers this way.
         if let Some(layers) = stage_layers {
             let arriving: Vec<_> = layers.iter().cloned().collect();
             report.layers = arriving.len();
+            let dest = self.active_layers_mut();
             for (index, layer) in arriving.into_iter().enumerate() {
-                self.layers.insert(index, (*layer).clone());
+                dest.insert(index, (*layer).clone());
             }
         }
 

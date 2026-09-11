@@ -317,6 +317,15 @@ impl Layer {
         self.frames.length()
     }
 
+    /// How many keyframes this layer holds.
+    ///
+    /// One is a single still, however long it is held. More than one means a
+    /// second drawing or the two ends of a tween — that is, animation. Used to
+    /// tell an animated symbol or asset from a static one.
+    pub fn keyframe_count(&self) -> usize {
+        self.frames.keyframe_count()
+    }
+
     /// Add an object to the keyframe governing `frame`.
     pub fn push_object_at(&mut self, frame: u32, object: Arc<Object>) -> bool {
         self.frames.push_object(frame, object)

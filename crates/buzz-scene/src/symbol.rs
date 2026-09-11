@@ -365,6 +365,16 @@ impl Symbol {
         self.layers.frame_count()
     }
 
+    /// Does this symbol hold animation, rather than a single still drawing?
+    ///
+    /// A movie clip runs a timeline of its own, so it counts as animated
+    /// whatever it holds. Any other symbol is animated when one of its layers
+    /// carries more than one keyframe — a second drawing, or the two ends of a
+    /// tween. A single keyframe held for a hundred frames is still a still.
+    pub fn is_animated(&self) -> bool {
+        self.kind == SymbolKind::MovieClip || self.layers.iter().any(|l| l.keyframe_count() > 1)
+    }
+
     /// Artwork shown at `frame`, in paint order.
     pub fn objects_at(&self, frame: u32) -> Vec<&Arc<Object>> {
         self.layers

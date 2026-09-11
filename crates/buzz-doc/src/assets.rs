@@ -54,6 +54,11 @@ pub struct Asset {
     pub folder: String,
     /// Where it actually is.
     pub path: PathBuf,
+    /// True when the saved document holds animation — a movie clip, a tween, a
+    /// second keyframe — rather than a single still drawing. Worked out when the
+    /// library is scanned so the panel can separate animated assets from static
+    /// ones. See [`buzz_scene::Scene::is_animated`].
+    pub animated: bool,
 }
 
 impl Asset {
@@ -77,6 +82,13 @@ pub struct AssetLibrary {
     root: Option<PathBuf>,
     assets: Vec<Asset>,
     folders: Vec<String>,
+    /// Whether each asset holds animation, kept between scans and keyed by the
+    /// file's modification time. Telling an animated asset from a static one
+    /// means reading the whole document; doing that for every file on every
+    /// rescan — and a rescan follows every save, rename, move and delete — is
+    /// the per-frame-scale cost the rest of this module is careful to avoid, so
+    /// an unchanged file is read once and remembered.
+    animation: std::collections::HashMap<PathBuf, (std::time::SystemTime, bool)>,
     /// What went wrong last time, for the panel to show. An unreadable library
     /// must not be silent — an empty panel looks like "you have no assets".
     pub last_error: Option<String>,
@@ -179,14 +191,36 @@ impl AssetLibrary {
             } else if path.extension().and_then(|e| e.to_str()) == Some(format::EXTENSION)
                 && let Some(name) = path.file_stem().and_then(|n| n.to_str())
             {
+                let name = name.to_string();
+                let animated = self.resolve_animated(&path);
                 self.assets.push(Asset {
-                    name: name.to_string(),
+                    name,
                     folder: folder.to_string(),
                     path,
+                    animated,
                 });
             }
         }
         Ok(())
+    }
+
+    /// Whether the asset at `path` holds animation, cached by the file's
+    /// modification time so an unchanged file is read once rather than on every
+    /// rescan. A file that has changed since, or that has never been seen, is
+    /// read; one that cannot be read counts as static rather than being dropped.
+    fn resolve_animated(&mut self, path: &Path) -> bool {
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if let Some(mtime) = mtime
+            && let Some((seen, animated)) = self.animation.get(path)
+            && *seen == mtime
+        {
+            return *animated;
+        }
+        let animated = format::load(path).map(|s| s.is_animated()).unwrap_or(false);
+        if let Some(mtime) = mtime {
+            self.animation.insert(path.to_path_buf(), (mtime, animated));
+        }
+        animated
     }
 
     /// Save a scene as an asset called `name` inside `folder`.
@@ -211,11 +245,13 @@ impl AssetLibrary {
         let path = dir.join(format!("{name}.{}", format::EXTENSION));
         format::save(scene, &path)?;
 
+        let animated = scene.is_animated();
         self.rescan();
         Ok(Asset {
             name,
             folder: folder.to_string(),
             path,
+            animated,
         })
     }
 
@@ -584,6 +620,39 @@ mod tests {
             target.library().get(placed_symbol).map(|s| s.name.as_str()),
             Some("Lamp Post")
         );
+    }
+
+    /// **Scanning records whether an asset moves.** The panel separates
+    /// animated work from still artwork, and that answer costs a whole document
+    /// read — so it is worked out on the scan and remembered, not on every draw.
+    #[test]
+    fn an_asset_knows_whether_it_moves() {
+        use buzz_scene::SymbolKind;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut library = AssetLibrary::at(dir.path());
+
+        // A single still.
+        let oak = library.save("Oak", "", &a_tree()).expect("save");
+        assert!(!oak.animated, "a lone drawing is static");
+
+        // A document with a movie clip in it is animated by construction.
+        let mut moving = Scene::default();
+        moving.add_symbol("Wind", SymbolKind::MovieClip, None);
+        let wind = library.save("Wind", "", &moving).expect("save");
+        assert!(wind.animated, "a movie clip makes the asset animated");
+
+        // And a fresh scan reads the same off disk, not just off the save.
+        let found = AssetLibrary::at(dir.path());
+        let scanned = |name: &str| {
+            found
+                .assets()
+                .iter()
+                .find(|a| a.name == name)
+                .map(|a| a.animated)
+        };
+        assert_eq!(scanned("Oak"), Some(false));
+        assert_eq!(scanned("Wind"), Some(true));
     }
 
     /// Two assets of the same name in one folder would be one file.

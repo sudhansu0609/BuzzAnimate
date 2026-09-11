@@ -136,6 +136,11 @@ pub struct Editor {
     /// bug for something a button can refresh.
     pub assets: buzz_doc::AssetLibrary,
     pub assets_panel: buzz_ui::AssetPanelState,
+    /// The Cast panel's view state: which character's sheet is open, and the
+    /// transient business of renaming and confirming a delete. The characters
+    /// themselves are assets on disk in [`buzz_ui::CAST_FOLDER`]; the wardrobe
+    /// and poses shown are re-derived from the open character each frame.
+    pub cast_panel: buzz_ui::CastPanelState,
     /// The Swatches panel: which folders are open, what is being renamed,
     /// what is typed in its search box. View state — the palette itself is in
     /// the document.
@@ -341,6 +346,7 @@ impl Editor {
             about: buzz_ui::AboutState::default(),
             assets: buzz_doc::AssetLibrary::user(),
             assets_panel: buzz_ui::AssetPanelState::default(),
+            cast_panel: buzz_ui::CastPanelState::default(),
             actions: ActionsState::default(),
             export: buzz_ui::ExportState::default(),
             rig_gesture: None,
@@ -9885,6 +9891,104 @@ mod tests {
             additive: false,
         });
         assert!(e.selection.is_empty());
+    }
+
+    // Build an asset scene holding a symbol instance whose artwork is a square
+    // at (0,0)-(100,100), like a placed character.
+    fn instance_asset_scene() -> Scene {
+        let mut source = editor();
+        let layer = source.active_layer().expect("a layer");
+        let mut instance_id = None;
+        source.doc.edit("Build", |scene| {
+            let symbol = scene.add_symbol("Character", buzz_scene::SymbolKind::Graphic, None);
+            let inner = scene
+                .library()
+                .get(symbol)
+                .and_then(|s| s.layers.iter().next())
+                .map(|l| l.id)
+                .expect("a layer inside the symbol");
+            let art = Object::shape(
+                scene.next_object_id(),
+                ShapeData::filled(square(0.0, 0.0, 100.0), Color::WHITE),
+            );
+            scene.library_mut().update(symbol, |s| {
+                s.layers.update(inner, |l| {
+                    l.frames.set_objects(0, vec![Arc::new(art)]);
+                });
+            });
+            instance_id = scene.add_instance_at(layer, 0, symbol, Affine::IDENTITY);
+        });
+        source
+            .doc
+            .scene()
+            .extract(0, &[instance_id.expect("the instance")])
+    }
+
+    /// A placed asset is clickable where it lands — on the main timeline, the
+    /// ordinary case.
+    #[test]
+    fn a_placed_asset_is_selectable_at_root() {
+        let asset = instance_asset_scene();
+        let mut e = editor();
+        e.doc.edit("Place Asset", |scene| {
+            scene.merge(&asset, buzz_scene::ImportTarget::Stage);
+        });
+        e.selection.clear();
+        e.apply(ToolAction::PickAt {
+            point: Point::new(50.0, 50.0),
+            additive: false,
+        });
+        assert!(
+            !e.selection.is_empty(),
+            "a placed asset must be clickable at the main timeline"
+        );
+    }
+
+    /// **A placed asset lands in the symbol you have open, not the root.**
+    ///
+    /// The regression: placing while a symbol was open for editing merged the
+    /// artwork onto the root stage, where it showed faded behind the symbol but
+    /// could never be selected — it was on a timeline that was not the one being
+    /// edited. It must arrive on the open context and be clickable there.
+    #[test]
+    fn a_placed_asset_lands_in_the_open_symbol_and_is_selectable() {
+        let asset = instance_asset_scene();
+        let mut e = editor();
+
+        // Open a symbol for editing, as when the breadcrumb shows a symbol.
+        let sym = {
+            let mut made = None;
+            e.doc.edit("New Symbol", |scene| {
+                made = Some(scene.add_symbol("Open Me", buzz_scene::SymbolKind::Graphic, None));
+            });
+            made.unwrap()
+        };
+        e.doc.edit_view(|scene| {
+            scene.enter_symbol(sym);
+        });
+        assert!(!e.scene().edit_path().is_empty(), "we are inside a symbol");
+
+        let root_before = e.scene().stage_layers().iter().count();
+        e.doc.edit("Place Asset", |scene| {
+            scene.merge(&asset, buzz_scene::ImportTarget::Stage);
+        });
+
+        // Nothing new on the root stage; the asset went into the open symbol.
+        assert_eq!(
+            e.scene().stage_layers().iter().count(),
+            root_before,
+            "the asset must not land on the root stage"
+        );
+
+        e.selection.clear();
+        e.apply(ToolAction::PickAt {
+            point: Point::new(50.0, 50.0),
+            additive: false,
+        });
+        assert!(
+            !e.selection.is_empty(),
+            "a placed asset must be selectable in the context it was placed into"
+        );
     }
 
     #[test]

@@ -1751,6 +1751,7 @@ fn draw_layer(
             gradient_map: None,
             blur: None,
             stage_frame: frame,
+            synced: false,
             stage_size: scene.stage().size,
             depth: 0,
             lighting,
@@ -2170,6 +2171,13 @@ struct DrawCtx<'a> {
     /// always read at this one; a symbol on its fourth frame must not be seen
     /// through the camera's fourth.
     stage_frame: u32,
+    /// **Inside an instance locked to the root timeline.** Set once a
+    /// [`buzz_scene::SymbolInstance::sync_to_root`] instance is entered and
+    /// stays set for everything nested below it, so the whole subtree resolves
+    /// its playhead to `stage_frame` rather than counting elapsed frames from
+    /// where each instance was placed. This is what lines a character's lip
+    /// sync up with the root dialogue at every level.
+    synced: bool,
     /// The layer's own size, for the camera's arithmetic.
     stage_size: buzz_geom::Size,
     /// Whether this layer is lit, and what the lights need to know about it:
@@ -3153,31 +3161,44 @@ fn draw_object_inner(
                 return;
             };
 
-            // A graphic follows the parent playhead — from where it was
-            // placed, not from the start of the film; a movie clip shows its
-            // first frame while authoring.
-            let inner = instance.resolve_frame(symbol.kind, ctx.elapsed, symbol.length());
+            // Locked to the root, or inside something that is: the whole
+            // subtree reads the stage's own frame. Otherwise a graphic follows
+            // the parent playhead from where it was placed, and a movie clip
+            // shows its first frame while authoring.
+            let synced = ctx.synced || instance.sync_to_root;
+            let inner = if synced {
+                instance.resolve_to_root(ctx.stage_frame, symbol.length())
+            } else {
+                instance.resolve_frame(symbol.kind, ctx.elapsed, symbol.length())
+            };
 
             let mut inner_ctx = ctx.clone();
             inner_ctx.frame = inner;
             inner_ctx.depth += 1;
+            inner_ctx.synced = synced;
             // Compose rather than replace: a tinted symbol inside a faded one
             // must show both effects.
             inner_ctx.effect = instance.color.compose(&ctx.effect);
 
             // Reuse a cached encoding of the whole symbol when it is safe to; the
             // symbol is not cloned here, so `symbol` is still borrowed from the
-            // scene, which is why the id and the reference both go in.
-            if try_stamp_symbol(
-                builder,
-                ctx,
-                &inner_ctx,
-                instance.symbol,
-                symbol,
-                inner,
-                doc,
-                cache,
-            ) {
+            // scene, which is why the id and the reference both go in. The stamp
+            // cache keys on `(symbol, inner)` and resolves the symbol's insides
+            // the ordinary elapsed way, so a root-synced instance — whose insides
+            // resolve to the stage frame instead — is drawn directly rather than
+            // from a cache that never saw the sync.
+            if !synced
+                && try_stamp_symbol(
+                    builder,
+                    ctx,
+                    &inner_ctx,
+                    instance.symbol,
+                    symbol,
+                    inner,
+                    doc,
+                    cache,
+                )
+            {
                 return;
             }
 
@@ -4672,7 +4693,22 @@ fn cast_shadows_within(
             let Some(symbol) = ctx.scene.library().get(instance.symbol) else {
                 return;
             };
-            let inner = instance.resolve_frame(symbol.kind, ctx.elapsed, symbol.length());
+            // Locked to the root, or nested inside something that is: the
+            // shadow is cast from the stage's own frame, so it agrees with the
+            // artwork drawn the same way.
+            let synced = ctx.synced || instance.sync_to_root;
+            let inner = if synced {
+                instance.resolve_to_root(ctx.stage_frame, symbol.length())
+            } else {
+                instance.resolve_frame(symbol.kind, ctx.elapsed, symbol.length())
+            };
+            let synced_ctx;
+            let ctx = if synced && !ctx.synced {
+                synced_ctx = DrawCtx { synced: true, ..ctx.clone() };
+                &synced_ctx
+            } else {
+                ctx
+            };
 
             for layer in symbol.layers.drawable_at(inner) {
                 // A mask layer is not artwork and casts nothing; the layers it

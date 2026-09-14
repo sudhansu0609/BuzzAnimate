@@ -64,6 +64,17 @@ pub struct Cue {
     pub clip: Arc<Clip>,
     /// The animation frame this sound starts on.
     pub start_frame: u32,
+    /// The frame a **streamed** sound stops on, if its span ends before the
+    /// clip does — the next keyframe on its layer, so a blank keyframe silences
+    /// it there. `None` plays to the clip's own end. Ignored for event sounds,
+    /// which run to their own end once triggered.
+    pub end_frame: Option<u32>,
+    /// **In-point**, seconds into the clip where playback begins — the clip is
+    /// entered here rather than at zero, so a trimmed lead-in is skipped.
+    pub trim_start: f32,
+    /// **Out-point**, seconds into the clip where playback stops, or `None` for
+    /// the clip's own end. Only `trim_start..trim_end` of the clip is heard.
+    pub trim_end: Option<f32>,
     pub volume: f32,
     pub sync: CueSync,
 }
@@ -255,16 +266,38 @@ impl Mixer {
             let ratio = clip.sample_rate as f64 / self.sample_rate as f64;
             let clip_channels = clip.channels.max(1) as usize;
             let gain = cue.volume * self.volume;
+            // Where the stream's frames run out — a blank keyframe on its layer,
+            // or the layer's end — in output sample frames. It falls silent
+            // there even if the clip has more to give.
+            let end = cue.end_frame.map(|f| {
+                if self.fps > 0.0 {
+                    (f as f64 / self.fps * self.sample_rate as f64) as u64
+                } else {
+                    0
+                }
+            });
+            // The trimmed section of the clip, in *clip* samples: playback
+            // enters the clip at the in-point and stops at the out-point, so
+            // only `trim_start..trim_end` is ever read.
+            let trim_start = (cue.trim_start.max(0.0) as f64) * clip.sample_rate as f64;
+            let trim_end = cue
+                .trim_end
+                .map(|s| (s as f64 * clip.sample_rate as f64).min(clip.len() as f64))
+                .unwrap_or(clip.len() as f64);
 
             for i in 0..frames {
                 let at = self.position + i as u64;
                 if at < start {
                     continue;
                 }
+                if end.is_some_and(|e| at >= e) {
+                    continue;
+                }
                 // Computed from the absolute position every time, so a stream
-                // cannot drift from the picture however long it plays.
-                let source = ((at - start) as f64) * ratio;
-                if source >= clip.len() as f64 {
+                // cannot drift from the picture however long it plays. Offset by
+                // the in-point so a trimmed clip is entered part-way through.
+                let source = ((at - start) as f64) * ratio + trim_start;
+                if source >= clip.len() as f64 || source >= trim_end {
                     continue;
                 }
                 for c in 0..channels {
@@ -700,6 +733,9 @@ mod tests {
         Cue {
             clip,
             start_frame,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 1.0,
             sync,
         }
@@ -752,6 +788,58 @@ mod tests {
         let mut out = vec![0.0f32; 512];
         mixer.render(&mut out);
         assert_eq!(loudness(&out), 0.0, "a stream is a position, not an event");
+    }
+
+    /// **In-clip trim, the in-point.** A trimmed stream enters the clip at its
+    /// in-point rather than at zero, so the lead-in is skipped and what plays is
+    /// the section the user kept.
+    #[test]
+    fn a_trimmed_stream_enters_the_clip_at_its_in_point() {
+        // A clip silent for its first second, loud for its second.
+        let rate = 48_000usize;
+        let mut samples = vec![0.0f32; rate];
+        samples.extend(std::iter::repeat(0.8f32).take(rate));
+        let clip = Arc::new(Clip::new("Trim", rate as u32, 1, samples).expect("a clip"));
+
+        // Untrimmed, from frame 0: the first buffer is the silent lead-in.
+        let mut m = rolling(24.0);
+        m.cues = vec![cue(Arc::clone(&clip), 0, CueSync::Stream)];
+        let mut out = vec![0.0f32; 512];
+        m.render(&mut out);
+        assert!(loudness(&out) < 0.01, "untrimmed, the clip opens in its silence");
+
+        // Trimmed to skip the first second: the same first buffer is loud.
+        let mut m = rolling(24.0);
+        m.cues = vec![Cue {
+            trim_start: 1.0,
+            ..cue(Arc::clone(&clip), 0, CueSync::Stream)
+        }];
+        let mut out = vec![0.0f32; 512];
+        m.render(&mut out);
+        assert!(
+            loudness(&out) > 0.4,
+            "trimmed to the in-point, it enters at the loud section"
+        );
+    }
+
+    /// **In-clip trim, the out-point.** Playback of a trimmed stream falls
+    /// silent at the out-point even though the clip has more to give.
+    #[test]
+    fn a_trimmed_stream_stops_at_its_out_point() {
+        // A clip loud throughout, two seconds long.
+        let clip = clip(2.0, 0.8);
+
+        let mut m = rolling(24.0);
+        // Out-point at 0.25s: 48k * 0.25 = 12_000 clip samples, so a buffer that
+        // starts at output sample 20_000 is past it and must be silent.
+        m.cues = vec![Cue {
+            trim_end: Some(0.25),
+            ..cue(clip, 0, CueSync::Stream)
+        }];
+        m.position = 20_000;
+        let mut out = vec![0.0f32; 512];
+        m.render(&mut out);
+        assert_eq!(loudness(&out), 0.0, "past the out-point the stream is silent");
     }
 
     /// Scrubbing moves a stream and leaves an event where it is.
@@ -887,6 +975,9 @@ mod tests {
         mixer.cues = vec![Cue {
             clip: clip(1.0, 0.5),
             start_frame: 0,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 1.0,
             sync: CueSync::Stream,
         }];
@@ -903,6 +994,9 @@ mod tests {
         mixer.cues = vec![Cue {
             clip: clip(1.0, 0.5),
             start_frame: 0,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 1.0,
             sync: CueSync::Stream,
         }];
@@ -924,6 +1018,9 @@ mod tests {
         mixer.cues = vec![Cue {
             clip: clip(1.0, 0.5),
             start_frame: 12,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 1.0,
             sync: CueSync::Stream,
         }];
@@ -949,12 +1046,18 @@ mod tests {
             Cue {
                 clip: clip(1.0, 0.7),
                 start_frame: 0,
+                end_frame: None,
+                trim_start: 0.0,
+                trim_end: None,
                 volume: 1.0,
                 sync: CueSync::Stream,
             },
             Cue {
                 clip: clip(1.0, 0.7),
                 start_frame: 0,
+                end_frame: None,
+                trim_start: 0.0,
+                trim_end: None,
                 volume: 1.0,
                 sync: CueSync::Stream,
             },
@@ -976,6 +1079,9 @@ mod tests {
         mixer.cues = vec![Cue {
             clip: clip(1.0, 0.8),
             start_frame: 0,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 0.5,
             sync: CueSync::Stream,
         }];
@@ -998,6 +1104,9 @@ mod tests {
         mixer.cues = vec![Cue {
             clip,
             start_frame: 0,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 1.0,
             sync: CueSync::Stream,
         }];
@@ -1028,6 +1137,9 @@ mod tests {
         mixer.cues = vec![Cue {
             clip: clip(1.0, 0.5),
             start_frame: 0,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 1.0,
             sync: CueSync::Stream,
         }];
@@ -1057,6 +1169,9 @@ mod tests {
         mixer.cues = vec![Cue {
             clip: clip(4.0, 0.5),
             start_frame: 0,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 1.0,
             sync: CueSync::Stream,
         }];
@@ -1135,6 +1250,9 @@ mod tests {
         mixer.cues = vec![Cue {
             clip: clip(4.0, 0.5),
             start_frame: 0,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 1.0,
             sync: CueSync::Stream,
         }];
@@ -1172,6 +1290,9 @@ mod tests {
         mixer.cues = vec![Cue {
             clip: clip(4.0, 0.5),
             start_frame: 0,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 1.0,
             sync: CueSync::Stream,
         }];
@@ -1239,6 +1360,9 @@ mod tests {
         mixer.cues = vec![Cue {
             clip: clip(10.0, 0.5),
             start_frame: 0,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 1.0,
             sync: CueSync::Stream,
         }];
@@ -1263,6 +1387,9 @@ mod tests {
         player.set_cues(vec![Cue {
             clip: clip(0.1, 0.2),
             start_frame: 0,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 1.0,
             sync: CueSync::Stream,
         }]);
@@ -1323,6 +1450,9 @@ mod device_tests {
         player.set_cues(vec![Cue {
             clip,
             start_frame: 0,
+            end_frame: None,
+            trim_start: 0.0,
+            trim_end: None,
             volume: 1.0,
             sync: CueSync::Stream,
         }]);

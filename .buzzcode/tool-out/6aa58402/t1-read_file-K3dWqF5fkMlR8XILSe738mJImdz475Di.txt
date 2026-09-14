@@ -1,0 +1,311 @@
+OVERVIEW.md (lines 1-310 of 310)
+  1	# BuzzAnimate — Overview: what it has, what it cannot do, what is next
+  2	
+  3	**Written:** 2026-08-15 · **Format version:** 19 · **Tests:** 1 516 passing, clippy clean
+  4	
+  5	One page that consolidates the three questions people actually ask about this
+  6	program. The detail behind each answer lives elsewhere and is linked:
+  7	
+  8	| File | What it is |
+  9	|---|---|
+ 10	| [`OVERVIEW.md`](OVERVIEW.md) | **This file.** The consolidated state of the tool. |
+ 11	| [`PROGRESS.md`](PROGRESS.md) | The record: what was built, what was measured, what broke on the way, and the numbered gap list (§7). |
+ 12	| [`IMPROVEMENTS.md`](IMPROVEMENTS.md) | The plan: what to build next, in what order, and why — Parts I, II and III. |
+ 13	| [`ARCHITECTURE.md`](ARCHITECTURE.md) | The design: **how** the engine waves are built, the rule that keeps the window responsive, and what each costs. |
+ 14	| [`README.md`](README.md) | The pitch and how to run it. |
+ 15	
+ 16	> **Rule this project runs on:** a change that is not written down has not been
+ 17	> finished. Every `§7-nn` below is a numbered row in `PROGRESS.md`, so anything
+ 18	> stated here can be checked against the record it was written into.
+ 19	
+ 20	---
+ 21	
+ 22	## 1. What it is
+ 23	
+ 24	GPU-accelerated vector animation — Adobe Animate's workflow rebuilt on a modern
+ 25	engine. Not a new kind of tool: an Animate user should be productive on day one.
+ 26	The improvements go **underneath** — unbounded zoom, all cores, GPU rasterisation
+ 27	— not on top, where the buttons are.
+ 28	
+ 29	**Stack:** Rust · wgpu · Vello · egui · `f64` geometry throughout via `kurbo`.
+ 30	
+ 31	| | Adobe Animate 2024 | BuzzAnimate |
+ 32	|---|---|---|
+ 33	| Maximum zoom | 2 000% | **no cap** — verified to 2×10¹⁴% |
+ 34	| CPU | effectively single-threaded | **work-stealing pool, all cores** |
+ 35	| Rasterisation | CPU | **GPU compute shaders (Vello)** |
+ 36	
+ 37	**16 crates, ~48 000 lines.**
+ 38	
+ 39	| Crate | Does |
+ 40	|---|---|
+ 41	| `buzz-geom` | `f64` geometry and the rebasing camera behind unbounded zoom |
+ 42	| `buzz-scene` | Copy-on-write document model, Animate-compatible layers, R-tree index |
+ 43	| `buzz-doc` | The `.buzz` format, undo history, autosave and crash recovery |
+ 44	| `buzz-render` | GPU device selection and Vello-backed rendering |
+ 45	| `buzz-jobs` | Work-stealing job system and utilisation metrics |
+ 46	| `buzz-ui` | Theme, menus, panels, stage chrome |
+ 47	| `buzz-app` | The application shell |
+ 48	| `buzz-rig` | Armatures, IK, skinning, mesh warping |
+ 49	| `buzz-light` | Sun, sky and lamp; shading and cast shadows |
+ 50	| `buzz-fx` | Filters and blend modes, as vector geometry |
+ 51	| `buzz-audio` | Decoding, waveforms, playback, lip-sync analysis |
+ 52	| `buzz-export` | Finished frames out: PNG images and sequences, MP4/MOV via NVENC |
+ 53	| `buzz-script` | Sandboxed JavaScript API over the document |
+ 54	| `buzz-import-xfl` · `-swf` · `-pdf` | The three importers |
+ 55	
+ 56	---
+ 57	
+ 58	## 2. What is implemented
+ 59	
+ 60	### Phases
+ 61	
+ 62	| Phase | State |
+ 63	|---|---|
+ 64	| 0 — Foundations | ✅ complete |
+ 65	| 1 — Geometry & document core | ✅ complete |
+ 66	| 2 — Stage, tools & UI shell | ✅ substantially complete |
+ 67	| 3 — Timeline & frame animation | ✅ complete |
+ 68	| 4 — Symbols, library & tweens | ✅ complete |
+ 69	| 5 — Importers | ✅ complete |
+ 70	| 6 — Export | 🟡 **PNG, MP4/MOV with sound, GIF and WebP** (CP-6.1–6.3), on a background queue with presets and a Tasks panel (Wave 5). HTML5 (CP-6.4) not built |
+ 71	| 7 — Rigging | ✅ complete |
+ 72	| 8 — Scripting & ActionScript | 🟡 **JS scripting only** (CP-8.1). No AS3 runtime or compiler |
+ 73	
+ 74	### Drawing
+ 75	
+ 76	- **23 tools** — Selection, Subselection, Lasso, Magic Wand, Free Transform,
+ 77	  Gradient Transform, Pen, Text, Line, Rectangle, Oval, PolyStar, Pencil, Brush,
+ 78	  Bone, Asset Warp, Paint Bucket, Ink Bottle, Eyedropper, Eraser, Camera, Hand,
+ 79	  Zoom — on Animate's own letters. **22 of them work; Text is inert** (§7-9), and
+ 80	  a test asserts it is the only one.
+ 81	- **4 brush kinds** — Fluid, Pattern, Art, Soft (raster) — with **7 pattern
+ 82	  shapes** including one made from a selection.
+ 83	- Gradients: linear and radial, on fills and strokes, with a working Gradient
+ 84	  Transform tool.
+ 85	- Shape recognition (circles, ovals, squares, rectangles at any angle), smoothing,
+ 86	  straightening, boolean operations, path offsetting.
+ 87	- Bitmaps as a paint; Lasso that *cuts* the artwork it crosses; Magic Wand.
+ 88	
+ 89	### Document & timeline
+ 90	
+ 91	- **7 layer kinds** — Normal, Folder, Mask, **Inverse Mask**, Masked, Guide, Guided.
+ 92	- Layer parenting, per-layer depth, colour, transparency, outline view, lock, hide.
+ 93	- **Cut, Copy and Paste** — artwork carries the symbols it needs and moves between
+ 94	  documents. **Align, Distribute and Match Size** in `Modify ▸ Align`, with or without
+ 95	  the stage as the frame. **Arrow-key nudge**, one unit and eight with Shift.
+ 96	- Timeline with Animate's frame conventions, onion skin, Edit Multiple Frames,
+ 97	  Auto Keyframe, a looping section, two zooms, and layer switches on the rows.
+ 98	- **Tweens** — classic, motion and shape, with easing in the model.
+ 99	- Symbols (Graphic, MovieClip, Button), nested timelines, a Library with folders,
+100	  search, usage counts and **a thumbnail of every symbol**.
+101	- Camera with keyframes, spatial 3D rotation, layer depth and a real projection.
+102	- Undo/redo by snapshot; autosave; crash recovery offered on launch.
+103	
+104	### Look
+105	
+106	- **5 filters** — Blur, Drop Shadow, Glow, Bevel, Colour Adjust.
+107	- **10 blend modes** — Normal, Layer, Darken, Multiply, Lighten, Screen, Overlay,
+108	  Hard Light, Add, Difference.
+109	- **Lighting** — sun, sky and lamp, with shading, highlights and cast shadows.
+110	  A deliberate addition; Animate has no lights (§7-44).
+111	- Named swatches in folders; dark and light themes.
+112	
+113	### Sound
+114	
+115	- Decodes `.wav` `.mp3` `.ogg` `.flac` `.m4a` `.aac`.
+116	- A soundtrack is audible from inside any symbol at any depth, draws its waveform
+117	  in the timeline, and drives **automatic lip sync**.
+118	
+119	### Rigging
+120	
+121	- Bone tool; armatures over shapes and symbol chains.
+122	- **FABRIK IK** with angle limits and pin constraints.
+123	- Puppet warp via Moving Least Squares; vertex weight binding; poses that tween.
+124	- **A pose library on each rig** — name a pose, apply it, mirror it, or *Key* it so
+125	  two poses tween; it travels with the character into any document. Bones can be
+126	  deleted and reparented.
+127	- Budget: 50 six-bone rigs solved in parallel, well inside one frame.
+128	
+129	### In and out
+130	
+131	| Direction | Formats |
+132	|---|---|
+133	| **Reads** | `.buzz` · `.fla` · `.xfl` · `.swf` · `.pdf` · `.ai` |
+134	| **Writes** | `.buzz` · PNG image · PNG sequence · **MP4 / MOV, with the soundtrack muxed in** |
+135	
+136	Video encodes on the GPU through NVENC (`h264_nvenc` / `hevc_nvenc` / `av1_nvenc`)
+137	with software fallbacks, driving the ffmpeg already on the machine — frames are piped
+138	as they render, so a 500-frame export never lands 4 GB of PNG on the disk.
+139	
+140	All three importers merge into an **already-open** document, remapping every id,
+141	and report what they could not bring across.
+142	
+143	### Scripting
+144	
+145	Sandboxed JavaScript through Animate's own `fl` / `document` API — rectangles,
+146	ovals, layers, frames, selection, the library and document properties.
+147	
+148	---
+149	
+150	## 3. Restrictions
+151	
+152	Four kinds, and the difference matters: some of these will never change, some are
+153	waiting on other people, some are simply not built yet, and some are choices.
+154	
+155	### 3.1 Hard limits — architectural, not going away soon
+156	
+157	| Limit | Why | Ref |
+158	|---|---|---|
+159	| **egui pinned at 0.35** | 0.36 needs wgpu 30; vello 0.9 needs wgpu 29. Two wgpu majors cannot share a device. **Blocked on vello.** | §7-2 |
+160	| **`f64` precision floor** | Sub-pixel accuracy to ~1e12%, linear decay after. By design. | §7-4 |
+161	| **Filters and lighting are geometry, not raster passes** | Vello offers no shader hook, so a shaded side is a boolean crescent and a blur is built from bands. Keeps everything editable; will not match a true raster blur. Holds for *per-shape* effects only — a **full-frame** pass is possible at the seam where Vello's output is blitted, which is what `ARCHITECTURE.md` Wave 6 builds on. | §7-46, §7-52 |
+162	| **No tablet pressure** | winit 0.30 supplies none on Windows. The brush reads pressure and the setting exists; every sample arrives at 1.0. | §7-25 |
+163	| **Legacy binary `.fla`** (CS4 and older, OLE2) | Out of scope. | §7-5 |
+164	| **No `.fla` write-back** | Import only. Not planned for v1. | §7-6 |
+165	| **egui is immediate-mode** | Chosen to reach a working app fast; acknowledged as not ideal long-term for a pro tool. | §7-3 |
+166	| **Windows-only launcher** | `BuzzAnimate.bat` is a batch file; elsewhere it is `cargo run --release -p buzz-app`. | §7-106 |
+167	
+168	### 3.2 Not built yet — the significant absences
+169	
+170	| Missing | Consequence | Ref |
+171	|---|---|---|
+172	| **Text tool** | No titles or credits without drawing them by hand or importing them. Needs font loading, shaping and an editing caret. | §7-9 |
+173	| **HTML5 export** | PNG, PNG sequence, MP4/MOV, GIF and WebP are the outputs; a self-playing HTML5 build is not. | CP-6.4 |
+174	| **Thumbnails in the Assets panel** | The Library draws a picture of every symbol; an asset is a file on disk, so a picture of one needs a background read. | §7-81 |
+175	| **Motion Editor, motion paths, shape hints** | Easing exists in the model and interpolates; nothing edits the curve, and a tween cannot follow a drawn path. | §7-18 |
+176	| **Bitmap import in all three readers** | XFL, SWF and PDF count and report their bitmaps as skipped. The pipeline they need now exists. | §7-158, §7-116 |
+177	| **Multiple scenes** | One scene per document. | §7-12 |
+178	| **AS3 runtime and compiler** | JavaScript scripting works; ActionScript does not exist. | CP-8.3–8.4 |
+179	| **Bézier pen and the Bind tool** | The Pen draws segments; skin weights cannot be painted by hand. Bones can now be deleted and reparented. | §7-11, §7-34 |
+180	| **Depth of field** | Layers off the focal plane stay perfectly sharp. | §7-29 |
+181	
+182	### 3.3 Deliberate deviations from Animate
+183	
+184	Each is off by default or additive, so a document that does not use it behaves
+185	exactly as Animate would.
+186	
+187	| Deviation | Ref |
+188	|---|---|
+189	| **Lighting** — Animate has no lights at all | §7-44 |
+190	| **Build-up paint** — Animate's shapes always composite source-over | §7-27 |
+191	| **Inverse mask** — a `.fla` cannot express one, so a document using it will not round-trip | §7-119 |
+192	| **The looping section** lives in the document and the exporter repeats it; Animate's loop is a transport setting | §7-66 |
+193	| **Auto Keyframe** — Animate has no such mode | §7-70 |
+194	| **Named swatches in folders** — Animate's panel is a flat grid of unnamed chips | §7-76 |
+195	| **The Assets panel** — Animate's ships curated content and syncs with Creative Cloud | §7-80 |
+196	| **Panels move by menu, not by dragging** — grouping into tabs now works (§7-57 resolved); dragging a panel into a dock does not | §7-56 |
+197	| **One workspace**, plus Reset — Animate saves named workspaces | §7-58 |
+198	| **Two themes, not a theme editor** | §7-89 |
+199	
+200	### 3.4 The long tail
+201	
+202	`PROGRESS.md` §7 carries **155 numbered rows, 138 of them still open.** They are
+203	the honest record of every place this program does something a reasonable person
+204	would not expect, from *"a soft brush cannot paint across strokes"* (§7-164) to
+205	*"a recovered document does not remember what it was"* (§7-102). Most are small,
+206	all are written down, and none of them is a surprise waiting to be discovered.
+207	
+208	---
+209	
+210	## 4. Suggested improvements
+211	
+212	The full argument, with sizing and what already exists to build on, is in
+213	[`IMPROVEMENTS.md`](IMPROVEMENTS.md). In brief:
+214	
+215	> **The diagnosis: the tool is built for drawing, and the work being done is
+216	> assembly** — placing characters you already own, into stages you have already
+217	> built, in poses you have already worked out. Almost none of what makes that slow
+218	> is hard. It is missing.
+219	
+220	### Wave 1 — stop retyping work already done
+221	
+222	| | Size | |
+223	|---|---|---|
+224	| **The clipboard** | M | `Scene::extract` and `Scene::merge` both already exist and are tested. Mostly wiring. |
+225	| **Thumbnails** | L | Off-thread raster into a cache keyed by symbol and revision. Turns choosing-by-name into choosing-by-sight. |
+226	| **Drag from panel, drop on stage** | S | Removes two steps from every placement. |
+227	
+228	### Wave 2 — poses become things you own
+229	
+230	**Pose Library** (M) stored on the `Symbol` so it travels with the character ·
+231	**Mirror a pose** (S) · **Pose-to-pose keying** (S), which turns a pose library
+232	into a way of *animating* · **Bone delete and reparent** (M).
+233	
+234	### Wave 3 — set the stage once
+235	
+236	**Scene templates** (M) · **Align and Distribute** (S) · **Arrow-key nudge** (S) ·
+237	**Live transform preview** (S–M).
+238	
+239	### And the beautiful half
+240	
+241	**Motion Editor and motion paths** (L, §7-18) — the single biggest available
+242	change to how motion *feels* · **Keyframed lights** (M, §7-47) · **Depth of
+243	field** (M, §7-29) · **The Text tool** (L, §7-9).
+244	
+245	### Recommended order
+246	
+247	```
+248	Clipboard  →  Thumbnails  →  Drag-to-place
+249	```
+250	
+251	All three are absences rather than hard problems; all three are repaid every time
+252	a character is placed; and thumbnails are what makes the Pose Library worth
+253	building at all — a pose you cannot see is a pose you will not reuse.
+254	
+255	### Beyond that: Parts II and III
+256	
+257	Part I above makes the tool quicker. **Part II changes what it is** — one program for
+258	vector *and* raster drawing, exporting in the background while you start the next shot,
+259	lit and composited like a 3D package, on an engine with one rule: *the window never
+260	stops responding.* Designs in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+261	
+262	| Wave | | Size |
+263	|---|---|---|
+264	| 4 | Foundations — the task registry; everything long comes off the UI thread | M |
+265	| 5 | Background export — queue, presets, Tasks panel, GIF/WebP | M |
+266	| 6 | Compositor — bloom, grain, vignette, grade; cheap depth of field | M |
+267	| 7 | **Raster layers** — paint properly, beside the vectors | **L** |
+268	| 8 | Asset pipeline — watched folders | S |
+269	| 9 | 2.5D — keyframed lights, depth sorting, real depth of field | M+S+M |
+270	| 10 | The film — `.buzzproj`, many shots into one movie | M |
+271	| 10b | **Camera angles** — stage once, shoot from anywhere | S–M |
+272	
+273	**Part III** is the delight half: motion trails and arcs, audio scrubbing, a video
+274	reference layer for rotoscoping; the **procedural modifier stack** (springs on bones =
+275	automatic follow-through); stabiliser, symmetry and perspective guides; true motion
+276	blur and alpha video at export; a command palette.
+277	
+278	---
+279	
+280	## 5. Numbers
+281	
+282	| Measure | Value |
+283	|---|---|
+284	| Zoom verified | 2×10¹⁴% (Animate: 2 000%) |
+285	| Render quality across 13 decades | constant ~4.01% ink |
+286	| GPU frame time at 1e12% | 0.9 ms |
+287	| Threads in use | 20 interactive + 6 background |
+288	| Tests | 1 516 passing, clippy clean |
+289	| Rust source | ~48 000 lines across 16 crates |
+290	| Format version | 19 |
+291	| IK budget | 50 six-bone rigs in parallel, inside one frame |
+292	| First frame of a heavy scene | 305 ms, then cached (§7-155) |
+293	| Open items in §7 | 138 of 155 |
+294	
+295	---
+296	
+297	## 6. Keeping this file true
+298	
+299	`OVERVIEW.md` is a **summary of the other files** and holds no facts of its own.
+300	When something ships:
+301	
+302	1. `PROGRESS.md` §4 gets a section saying what was built and **why it was built
+303	   that way**.
+304	2. Its `§7-nn` row is struck through and marked resolved.
+305	3. Its row in `IMPROVEMENTS.md` is struck through with a pointer to that section,
+306	   and — for a Part II or III wave — the design in `ARCHITECTURE.md` is marked
+307	   shipped, with any difference between design and build recorded in §4.
+308	4. **Then** the relevant table here is moved — out of §3 and into §2, or out of §4.
+309	
+310	If this file and `PROGRESS.md` ever disagree, `PROGRESS.md` is right.

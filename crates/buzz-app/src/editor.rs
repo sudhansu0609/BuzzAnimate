@@ -2103,9 +2103,7 @@ impl Editor {
 
         let auto = self.auto_keyframe;
         self.doc.edit("Paint Bucket", |scene| {
-            if auto {
-                scene.ensure_keyframe(layer, frame);
-            }
+            ensure_keyframe_for_drawing(scene, layer, frame, auto);
             scene.add_shape_behind_at(layer, frame, shape);
         });
     }
@@ -2135,25 +2133,15 @@ impl Editor {
             // already there: a stroke made on frame 12 of a span belongs to
             // frame 12, not to the keyframe on frame 0 where it would otherwise
             // land and appear from.
-            if auto {
-                scene.ensure_keyframe(layer, frame);
-            }
+            ensure_keyframe_for_drawing(scene, layer, frame, auto);
             // Symmetry drawing lays down the mirror copies first (so the stroke
             // the user is watching stays the selected one), each a reflection or
             // rotation of the drawn shape about the stage centre.
             for t in &mirrors {
                 let copy = mirror_shape(&shape, *t);
-                if merge {
-                    merge_shape_into_layer(scene, layer, frame, copy);
-                } else {
-                    scene.add_shape_at(layer, frame, copy);
-                }
+                lay_shape(scene, layer, frame, merge, copy);
             }
-            created = if merge {
-                merge_shape_into_layer(scene, layer, frame, shape)
-            } else {
-                scene.add_shape_at(layer, frame, shape)
-            };
+            created = lay_shape(scene, layer, frame, merge, shape);
         });
 
         // Animate leaves a freshly drawn shape selected in object-drawing mode
@@ -2203,9 +2191,7 @@ impl Editor {
         let auto = self.auto_keyframe;
         let mut created: Option<ObjectId> = None;
         self.doc.edit("Text", |scene| {
-            if auto {
-                scene.ensure_keyframe(layer, frame);
-            }
+            ensure_keyframe_for_drawing(scene, layer, frame, auto);
             created = scene.add_shape_at(layer, frame, ShapeData::filled(path.clone(), color));
             if let Some(id) = created {
                 scene.update_object_at(frame, id, |o| {
@@ -2268,6 +2254,47 @@ impl Editor {
                 });
             });
         });
+    }
+
+    /// **Change when an imported sound begins.**
+    ///
+    /// A sound plays from the keyframe it sits on, so its timing *is* that
+    /// keyframe's frame — and until now there was no way to move it once
+    /// imported. This re-homes the clip from `from` to a keyframe on `to`: the
+    /// frames before it fall silent, the layer is stretched to cover the clip
+    /// at its new place so its span still shows on the timeline, and the
+    /// playhead follows so the Sound panel keeps the moved clip in view. One
+    /// undo step.
+    pub fn set_sound_start(&mut self, layer: LayerId, from: u32, to: u32) {
+        if from == to {
+            return;
+        }
+        let scene = self.doc.scene();
+        let Some(reference) = scene.frame_sound(layer, from) else {
+            return;
+        };
+        let fps = scene.stage().frame_rate;
+        let frames = scene
+            .sounds()
+            .get(reference.sound)
+            .map(|a| a.duration_frames(fps))
+            .unwrap_or(1)
+            .max(1);
+        self.doc.edit("Move Sound", |scene| {
+            scene.set_frame_sound(layer, from, None);
+            scene.update_layer(layer, |l| {
+                // A keyframe on the new start to carry the clip, then the span
+                // stretched to cover its whole length from there.
+                l.frames.insert_blank_keyframe(to);
+                let end = to.saturating_add(frames);
+                if end > l.frames.length() {
+                    l.frames.insert_frame(end - 1);
+                }
+            });
+            scene.set_frame_sound(layer, to, Some(reference));
+        });
+        self.doc.end_gesture();
+        self.current_frame = to;
     }
 
     fn transform_selection(&mut self, transform: Affine, label: &'static str) {
@@ -2878,9 +2905,7 @@ impl Editor {
 
         let mut painted = None;
         self.doc.edit("Brush", |scene| {
-            if auto {
-                scene.ensure_keyframe(layer, frame);
-            }
+            ensure_keyframe_for_drawing(scene, layer, frame, auto);
             let shape = raster_shape(scene, canvas, brush, blend);
             // The copies first, so the stroke being watched stays selected.
             // Each reflection is carried by the fill's own transform, so the
@@ -3010,9 +3035,7 @@ impl Editor {
         let mirrors = self.symmetry_mirrors();
         let mut created: Option<ObjectId> = None;
         self.doc.edit(label, |scene| {
-            if auto {
-                scene.ensure_keyframe(layer, frame);
-            }
+            ensure_keyframe_for_drawing(scene, layer, frame, auto);
             // Painted pieces go into the document's image library, exactly as
             // a soft-brush stroke does — which is what makes their pixels
             // part of the file rather than of this session.
@@ -4599,11 +4622,19 @@ impl Editor {
                         levels
                     }
                 };
+                // The trim in-point and out-point, in clip-frames, so the strip
+                // draws only the section that plays.
+                let level_start = (f64::from(reference.trim_start.max(0.0)) * fps).round() as usize;
+                let level_end = reference
+                    .trim_end
+                    .map(|s| (f64::from(s) * fps).round() as usize);
                 map.insert(
                     layer.id,
                     buzz_ui::Waveform {
                         start_frame: keyframe.start,
                         levels,
+                        level_start,
+                        level_end,
                     },
                 );
             }
@@ -8208,11 +8239,171 @@ impl DerefVector for Affine {
 /// separate parallel lines has boxes that cross constantly and no ink in
 /// common; fusing those would make one object of a whole drawing, which is the
 /// failure the filled path documents at length just below.
+/// **Key the frame a stroke is about to land on, so it does not reach back
+/// into a blank keyframe and fill the whole hold.**
+///
+/// With Auto Keyframe on, every edit keys its own frame — the mode's point.
+/// With it off, an edit reaches back to the keyframe that owns the frame, which
+/// is right when that keyframe holds a drawing you are adding to. It is wrong
+/// when the keyframe is *blank*: a blank keyframe means "nothing from here on",
+/// so drawing several frames into its hold would fill the frames before the
+/// stroke as well as the one under the pointer. So a blank hold is split at the
+/// drawn frame — the frames before it stay blank, the drawing begins where the
+/// playhead is — while a held drawing still reaches back exactly as it did.
+fn ensure_keyframe_for_drawing(scene: &mut Scene, layer: LayerId, frame: u32, auto: bool) {
+    if auto {
+        scene.ensure_keyframe(layer, frame);
+        return;
+    }
+    let in_blank_hold = scene
+        .layers()
+        .get(layer)
+        .and_then(|l| l.frames.keyframe_at(frame))
+        .is_some_and(|k| k.is_blank() && k.start != frame);
+    if in_blank_hold {
+        scene.ensure_keyframe(layer, frame);
+    }
+}
+
+/// **Lay one drawn shape onto the layer, honouring the drawing mode.**
+///
+/// Object Drawing keeps it whole, as its own object. Merge Shape treats a fill
+/// and an outline as the separate primitives Animate does: a shape drawn with
+/// both is laid down as two — the outline (a line) and the fill — so each
+/// merges and cuts on its own terms and, crucially, each can be *selected on
+/// its own*. That is what lets you rub out the outline and keep the colour, or
+/// the colour and keep the outline. The outline goes down **first**, while its
+/// own fill is not yet on the layer, so it never cuts the fill it was drawn
+/// with — only artwork that was already there. Returns the fill's id (or the
+/// single shape's), which is what the caller may select.
+fn lay_shape(
+    scene: &mut Scene,
+    layer: LayerId,
+    frame: u32,
+    merge: bool,
+    shape: ShapeData,
+) -> Option<ObjectId> {
+    if !merge {
+        return scene.add_shape_at(layer, frame, shape);
+    }
+    if shape.fill.is_some() && shape.stroke.is_some() {
+        // The fill goes down first so it cuts and merges with the colour that
+        // was already there; the outline is laid on top of it — visible over
+        // the fill and the thing a click on the edge finds — and does not cut
+        // the fill it belongs to (`cut_fills = false`).
+        let fill = ShapeData {
+            path: shape.path.clone(),
+            fill: shape.fill,
+            stroke: None,
+            blend: shape.blend,
+        };
+        let created = merge_shape_into_layer(scene, layer, frame, fill);
+        let outline = ShapeData {
+            path: shape.path,
+            fill: None,
+            stroke: shape.stroke,
+            blend: shape.blend,
+        };
+        merge_stroke_into_layer(scene, layer, frame, outline, false);
+        created
+    } else {
+        merge_shape_into_layer(scene, layer, frame, shape)
+    }
+}
+
+/// **Cut the colour a line is drawn across.**
+///
+/// Every filled shape on this layer and frame that `cutter` — the outlined ink
+/// of a line — overlaps is cut along it with a `Difference`, and where the cut
+/// separates the colour into disjoint regions the shape is split into one per
+/// region, each keeping the paint of the shape it came from (the same way
+/// `erase` splits what a rub divides). The pieces let the paint bucket colour
+/// one side of a line without the other. A line that does not fully cross a
+/// shape leaves it in one piece, notched under the line that covers it.
+fn cut_fills_along(
+    scene: &mut Scene,
+    layer: LayerId,
+    frame: u32,
+    cutter: &BezPath,
+    opts: buzz_geom::BooleanOptions,
+) {
+    if cutter.elements().is_empty() {
+        return;
+    }
+    let cutter_bb = cutter.bounding_box();
+    let ids: Vec<ObjectId> = scene
+        .layers()
+        .get(layer)
+        .map(|l| {
+            l.objects_at(frame)
+                .iter()
+                .filter(|o| o.visible && !o.locked)
+                .filter_map(|o| match &o.kind {
+                    // Only flat, Normal-blend paint is cut. Build-up paint
+                    // layers rather than merges, so a line does not divide it;
+                    // and groups, instances and rigs sit above the merge layer
+                    // and are never divided by a stroke, exactly as in
+                    // `merge_shape_into_layer`.
+                    ObjectKind::Shape(s)
+                        if s.fill.is_some() && s.blend == buzz_scene::PaintBlend::Normal =>
+                    {
+                        s.path.bounding_box().overlaps(cutter_bb).then_some(o.id)
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for id in ids {
+        let mut emptied = false;
+        let mut pieces: Vec<BezPath> = Vec::new();
+        update_shape(scene, EditAt::exact(frame), id, |s| {
+            let cut = buzz_geom::boolean(&s.path, cutter, buzz_geom::BoolOp::Difference, opts);
+            emptied = cut.elements().is_empty();
+            let mut parts = buzz_geom::split_disjoint(&cut);
+            // The first piece stays in the object that was already there, so it
+            // keeps its id, name and stacking order; only the extra pieces are
+            // new objects.
+            s.path = if parts.is_empty() {
+                cut
+            } else {
+                parts.remove(0)
+            };
+            pieces = parts;
+        });
+        if emptied {
+            scene.remove_object(id);
+            continue;
+        }
+        let template = scene.find_object(id).and_then(|(_, o)| match &o.kind {
+            ObjectKind::Shape(s) => Some(s.clone()),
+            _ => None,
+        });
+        if let Some(template) = template {
+            for path in pieces {
+                scene.add_shape_at(layer, frame, ShapeData { path, ..template.clone() });
+            }
+        }
+    }
+}
+
+/// Fuse a line into the layer's linework, optionally cutting the colour it
+/// crosses.
+///
+/// `cut_fills` is true for a line the user draws in its own right — a Line- or
+/// Pencil-tool stroke — which divides any fill it is drawn across, the way it
+/// does in Animate. It is false for the outline half of a shape drawn with both
+/// a fill and an outline: that outline is coincident with its own fill's edge,
+/// so cutting would only shave a hairline off the colour it belongs to. The
+/// fill of such a shape has already cut whatever it was drawn over, so nothing
+/// is lost by the outline not cutting as well.
 fn merge_stroke_into_layer(
     scene: &mut Scene,
     layer: LayerId,
     frame: u32,
     incoming: ShapeData,
+    cut_fills: bool,
 ) -> Option<ObjectId> {
     let Some(new_stroke) = incoming.stroke.clone() else {
         // Neither fill nor stroke: nothing that can fuse, and nothing visible
@@ -8236,6 +8427,36 @@ fn merge_stroke_into_layer(
         (Paint::Gradient(a), Paint::Gradient(b)) => a == b,
         _ => false,
     };
+
+    // The width used both to judge that two lines meet and to cut the colour a
+    // line is drawn across. A hairline has no document width of its own, so its
+    // own length sets the scale at which "these touch" and "this divides that"
+    // are sensible questions.
+    let width = if new_stroke.hairline {
+        // A hairline is one screen pixel however far in you are, so it has no
+        // document width to outline. Its own length gives the scale at which
+        // "these meet" is a sensible question.
+        (bb.width().hypot(bb.height()) * 1e-3).max(0.05)
+    } else {
+        new_stroke.width
+    };
+
+    // **A line divides the colour it is drawn across.**
+    //
+    // In Merge Shape mode — Animate's default — a line drawn over a fill splits
+    // that fill along the line, so the paint bucket can colour one side without
+    // the other. Cutting only ever happened between *fills* before (a different
+    // colour drawn over paint), so a line drawn across a shape left the fill
+    // whole: clicking either side of the line recoloured the entire shape, and
+    // the line looked like a divider that divided nothing — the "I drew a line
+    // over it but cannot fill just one part" report. The stroke itself is left
+    // exactly as drawn and placed on top; only the paint beneath it is cut, and
+    // where the cut separates the colour into disjoint regions each region
+    // becomes its own shape. Skipped for the outline of a fill+outline shape,
+    // which is coincident with its own fill and must not shave it.
+    if cut_fills {
+        cut_fills_along(scene, layer, frame, &ink(&incoming.path, width), opts);
+    }
 
     // Lines already on the frame that share this one's ink and could touch it.
     let candidates: Vec<(ObjectId, BezPath)> = scene
@@ -8265,14 +8486,6 @@ fn merge_stroke_into_layer(
 
     let mut merged = incoming.path.clone();
     let mut absorbed = Vec::new();
-    let width = if new_stroke.hairline {
-        // A hairline is one screen pixel however far in you are, so it has no
-        // document width to outline. Its own length gives the scale at which
-        // "these meet" is a sensible question.
-        (bb.width().hypot(bb.height()) * 1e-3).max(0.05)
-    } else {
-        new_stroke.width
-    };
 
     for (id, path) in candidates {
         // Measured against everything fused so far, so a chain of three
@@ -8325,8 +8538,24 @@ fn merge_shape_into_layer(
         // pulled it out of the drawing it plainly belonged to. In Merge Shape
         // what touches is one thing, and that has to hold for the strokes as
         // well as for the paint.
-        return merge_stroke_into_layer(scene, layer, frame, incoming);
+        // A line the user drew in its own right cuts the colour it crosses.
+        return merge_stroke_into_layer(scene, layer, frame, incoming, true);
     };
+
+    // **Build-up paint layers; it does not merge.**
+    //
+    // A shape whose blend is not Normal — build-up (additive) above all — is
+    // meant to accumulate where it overlaps: alpha over alpha reads deeper, the
+    // way ink or an airbrush does, so two low-opacity strokes cross at a higher
+    // opacity than either alone. Fusing two build-up strokes of one colour into
+    // a single shape, or letting a second colour cut the first, throws that
+    // overlap away — the second stroke stops deepening the first and the whole
+    // point of build-up is lost. So special-blend paint is placed as its own
+    // shape and left to composite, exactly as it already does across layers;
+    // only Normal-blend fills take the merge model below.
+    if incoming.blend != buzz_scene::PaintBlend::Normal {
+        return scene.add_shape_at(layer, frame, incoming);
+    }
 
     let bb = incoming.path.bounding_box();
     let opts = buzz_geom::BooleanOptions::for_shape_size(bb.width().hypot(bb.height()));
@@ -8372,10 +8601,15 @@ fn merge_shape_into_layer(
                 .iter()
                 .filter(|o| o.visible && !o.locked)
                 .filter_map(|o| match &o.kind {
-                    ObjectKind::Shape(s) => s
+                    // Normal-blend fills only. Build-up (and any special blend)
+                    // paint layers rather than merges, so it is never fused
+                    // into or cut by what is drawn over it — see the guard at
+                    // the top of this function.
+                    ObjectKind::Shape(s) if s.blend == buzz_scene::PaintBlend::Normal => s
                         .fill
                         .as_ref()
                         .map(|f| (o.id, f.paint.clone(), s.path.clone())),
+                    ObjectKind::Shape(_) => None,
                     // Merge-shape rules apply to raw shapes only. Groups,
                     // symbol instances and rigged artwork are objects: in
                     // Animate they sit above the merge layer and never fuse
@@ -8419,19 +8653,59 @@ fn merge_shape_into_layer(
             merged = buzz_geom::boolean(&merged, &path, buzz_geom::BoolOp::Union, opts);
             absorbed.push(id);
         } else {
-            // Different colour: the new shape cuts into the old one.
+            // **A different colour cuts — and what the cut divides becomes
+            // separate shapes.**
+            //
+            // A line drawn clean across a fill splits it in two, exactly as an
+            // eraser rub does. A `Difference` returns one path holding both
+            // halves, though, so leaving it at that welded them into a single
+            // object: the paint bucket then recoloured *both* halves from one
+            // click and dragging one dragged the other — the line looked like
+            // it divided the colour but nothing behaved as if it had. So the
+            // pieces are separated the same way `erase` separates them, with
+            // `split_disjoint` keeping each piece's holes with it.
             let mut emptied = false;
+            let mut pieces: Vec<BezPath> = Vec::new();
             update_shape(scene, EditAt::exact(frame), id, |s| {
-                s.path = buzz_geom::boolean(
+                let cut = buzz_geom::boolean(
                     &s.path,
                     &incoming.path,
                     buzz_geom::BoolOp::Difference,
                     opts,
                 );
-                emptied = s.path.elements().is_empty();
+                emptied = cut.elements().is_empty();
+                let mut parts = buzz_geom::split_disjoint(&cut);
+                // The first piece stays in the object that was already there,
+                // so it keeps its id, its name and its place in the stacking
+                // order; only the extra pieces are new.
+                s.path = if parts.is_empty() {
+                    cut
+                } else {
+                    parts.remove(0)
+                };
+                pieces = parts;
             });
             if emptied {
                 scene.remove_object(id);
+                continue;
+            }
+            // The offcuts, as objects of their own, carrying the same paint as
+            // the shape they came from.
+            let template = scene.find_object(id).and_then(|(_, o)| match &o.kind {
+                ObjectKind::Shape(s) => Some(s.clone()),
+                _ => None,
+            });
+            if let Some(template) = template {
+                for path in pieces {
+                    scene.add_shape_at(
+                        layer,
+                        frame,
+                        ShapeData {
+                            path,
+                            ..template.clone()
+                        },
+                    );
+                }
             }
         }
     }
@@ -9775,6 +10049,129 @@ mod tests {
         );
         let bounds = e.scene().content_bounds().unwrap();
         assert!((bounds.width() - 150.0).abs() < 1.0, "got {bounds:?}");
+    }
+
+    /// **Build-up paint layers rather than merging, so its overlaps build up.**
+    ///
+    /// The report: two low-opacity colours should read *deeper* where they
+    /// cross. That only happens while the strokes stay separate to composite —
+    /// and merge-shape fused two of the same colour into one shape and let a
+    /// different colour cut the first, either way flattening the overlap away.
+    /// Additive (build-up) paint is now left to layer, the way it already does
+    /// across separate layers; only Normal-blend fills take the merge model.
+    #[test]
+    fn build_up_paint_layers_instead_of_merging() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::MergeShape;
+        let faint = Color::from_rgba8(0, 0, 0, 60);
+
+        // Two build-up bars of the same colour, crossing in the middle.
+        for rect in [
+            Rect::new(0.0, 40.0, 120.0, 60.0),
+            Rect::new(40.0, 0.0, 60.0, 120.0),
+        ] {
+            e.apply(ToolAction::AddShape {
+                shape: ShapeData::filled(rect.to_path(1e-9), faint)
+                    .with_blend(buzz_scene::PaintBlend::Additive),
+                label: "Brush",
+            });
+        }
+        assert_eq!(
+            e.scene().shape_count(),
+            2,
+            "build-up strokes must stay separate, or their overlap cannot build up"
+        );
+
+        // A different build-up colour crossing them must also stay separate.
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(
+                Rect::new(0.0, 55.0, 120.0, 75.0).to_path(1e-9),
+                Color::from_rgba8(200, 0, 0, 60),
+            )
+            .with_blend(buzz_scene::PaintBlend::Additive),
+            label: "Brush",
+        });
+        assert_eq!(e.scene().shape_count(), 3, "a build-up colour never cuts build-up paint");
+
+        // And a Normal shape drawn over build-up paint sits on top, never cuts it.
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(Rect::new(30.0, 30.0, 70.0, 70.0).to_path(1e-9), Color::WHITE),
+            label: "Draw",
+        });
+        assert_eq!(
+            e.scene().shape_count(),
+            4,
+            "a normal shape must not cut the build-up paint beneath it"
+        );
+    }
+
+    /// **The report: I want to select the lines to delete them afterwards.**
+    ///
+    /// A fill and its outline are separate things in Animate's merge model. A
+    /// shape drawn with both is laid down as two objects — a fill and a line —
+    /// so a click on the edge takes the outline and a click inside takes the
+    /// fill, and rubbing the outline out leaves the colour behind. The outline
+    /// sits on top (so it is what the edge click finds) and never cuts the fill
+    /// it was drawn with.
+    #[test]
+    fn a_fill_and_its_outline_are_separate_and_separately_selectable() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::MergeShape;
+
+        // A rectangle with both a fill and an outline, as a shape tool draws it.
+        let rect = ShapeData {
+            path: square(0.0, 0.0, 80.0),
+            fill: Some(FillSpec {
+                paint: Paint::Solid(Color::WHITE),
+                rule: buzz_geom::FillMode::NonZero,
+                swatch: None,
+            }),
+            stroke: Some(StrokeSpec {
+                paint: Paint::Solid(Color::BLACK),
+                width: 3.0,
+                hairline: false,
+                swatch: None,
+            }),
+            blend: buzz_scene::PaintBlend::default(),
+        };
+        e.apply(ToolAction::AddShape { shape: rect, label: "Draw Rectangle" });
+
+        // Two objects: a fill-only one and an outline-only one.
+        let parts: Vec<(ObjectId, bool, bool)> = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter().cloned())
+            .filter_map(|o| match &o.kind {
+                ObjectKind::Shape(s) => Some((o.id, s.fill.is_some(), s.stroke.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(parts.len(), 2, "the fill and the outline are separate objects");
+        let fill_id = parts.iter().find(|(_, f, s)| *f && !*s).map(|(id, ..)| *id);
+        let line_id = parts.iter().find(|(_, f, s)| !*f && *s).map(|(id, ..)| *id);
+        let fill_id = fill_id.expect("a fill-only object");
+        let line_id = line_id.expect("an outline-only object");
+
+        // A click on the edge finds the outline; a click inside finds the fill.
+        let hit = |p: Point| e.object_at(e.screen_to_edit(e.camera.doc_to_screen(p)), e.pick_tolerance());
+        assert_eq!(hit(Point::new(0.0, 40.0)), Some(line_id), "the edge is the outline");
+        assert_eq!(hit(Point::new(40.0, 40.0)), Some(fill_id), "the inside is the fill");
+
+        // Selecting and deleting the outline leaves the fill behind.
+        e.selection.select_one(line_id);
+        e.run(Command::Delete);
+        let left: Vec<(bool, bool)> = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter().cloned())
+            .filter_map(|o| match &o.kind {
+                ObjectKind::Shape(s) => Some((s.fill.is_some(), s.stroke.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(left, vec![(true, false)], "only the fill remains after the line is deleted");
     }
 
     /// ...and a different colour cuts.
@@ -11845,6 +12242,150 @@ mod tests {
         );
     }
 
+    /// **The report: a line drawn across a fill would not let the halves be
+    /// coloured separately.**
+    ///
+    /// In Merge Shape mode a stroke of a different colour cuts the fill under
+    /// it, and a line drawn clean across — "covering both ends" — cuts it in
+    /// two. The two halves have to become separate objects for the bucket to
+    /// colour one without the other; while they were welded into a single
+    /// multi-contour shape, clicking either half recoloured both and the
+    /// dividing line did nothing.
+    #[test]
+    fn a_line_across_a_fill_lets_each_half_be_coloured_on_its_own() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::MergeShape;
+
+        // A plain filled square, no stroke to complicate the count.
+        draw_square(&mut e, 0.0, 0.0, 60.0, Color::WHITE);
+        assert_eq!(e.scene().shape_count(), 1);
+
+        // A black bar straight across, past both edges: the merge cuts the
+        // square and the cut divides it in two.
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(
+                Rect::new(-10.0, 27.0, 70.0, 33.0).to_path(1e-9),
+                Color::BLACK,
+            ),
+            label: "Line",
+        });
+        // Two halves of the square plus the bar itself.
+        assert_eq!(
+            e.scene().shape_count(),
+            3,
+            "the line should have split the fill into two separate shapes"
+        );
+
+        // Colour the top half red.
+        e.style.fill_enabled = true;
+        e.style.fill_color = Color::from_rgb8(0xFF, 0x00, 0x00);
+        e.apply(ToolAction::BucketFill {
+            point: Point::new(30.0, 12.0),
+        });
+
+        // The two coloured halves (everything but the black bar), by where they
+        // sit and what colour they ended up.
+        let halves: Vec<(f64, [u8; 4])> = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter().cloned())
+            .filter_map(|o| match &o.kind {
+                ObjectKind::Shape(s) => s.fill.as_ref().map(|f| {
+                    let rgba = f.color().to_rgba8().to_u8_array();
+                    let mid = buzz_geom::Shape::bounding_box(&s.path).center().y;
+                    (mid, rgba)
+                }),
+                _ => None,
+            })
+            .filter(|(_, rgba)| rgba[0..3] != [0, 0, 0]) // drop the black bar
+            .collect();
+
+        assert_eq!(halves.len(), 2, "two coloured halves should remain");
+        let top = halves.iter().min_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
+        let bottom = halves.iter().max_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
+        assert_eq!(
+            top.1,
+            [0xFF, 0x00, 0x00, 0xFF],
+            "the half under the cursor should have taken the new colour"
+        );
+        assert_eq!(
+            bottom.1,
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            "the other half must be left exactly as it was"
+        );
+    }
+
+    /// **A stroke — a Line- or Pencil-tool line, which has no fill of its own —
+    /// divides the colour under it too.**
+    ///
+    /// The companion to the case above, and the one the report was really
+    /// about: a line drawn with the Line tool is a bare stroke, and stroke
+    /// merging used to fuse lines with lines and leave fills alone entirely. So
+    /// a line drawn across a filled shape stayed a separate object beside an
+    /// uncut fill, and the bucket recoloured the whole fill. The stroke now
+    /// cuts the paint beneath it, so each side fills on its own.
+    #[test]
+    fn a_bare_stroke_across_a_fill_divides_it_for_the_bucket() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::MergeShape;
+
+        draw_square(&mut e, 0.0, 0.0, 60.0, Color::WHITE);
+        assert_eq!(e.scene().shape_count(), 1);
+
+        // A bare line straight across, past both edges — no fill, just ink.
+        let mut across = BezPath::new();
+        across.move_to(Point::new(-10.0, 30.0));
+        across.line_to(Point::new(70.0, 30.0));
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData {
+                path: across,
+                fill: None,
+                stroke: Some(StrokeSpec {
+                    paint: Paint::Solid(Color::BLACK),
+                    width: 3.0,
+                    hairline: false,
+                    swatch: None,
+                }),
+                blend: buzz_scene::PaintBlend::default(),
+            },
+            label: "Line",
+        });
+        // Two halves of the fill plus the line itself.
+        assert_eq!(
+            e.scene().shape_count(),
+            3,
+            "the bare stroke should have split the fill in two"
+        );
+
+        e.style.fill_enabled = true;
+        e.style.fill_color = Color::from_rgb8(0xFF, 0x00, 0x00);
+        e.apply(ToolAction::BucketFill {
+            point: Point::new(30.0, 12.0),
+        });
+
+        let halves: Vec<(f64, [u8; 4])> = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter().cloned())
+            .filter_map(|o| match &o.kind {
+                ObjectKind::Shape(s) => s.fill.as_ref().map(|f| {
+                    let rgba = f.color().to_rgba8().to_u8_array();
+                    let mid = buzz_geom::Shape::bounding_box(&s.path).center().y;
+                    (mid, rgba)
+                }),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(halves.len(), 2, "two coloured halves should remain");
+        let top = halves.iter().min_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
+        let bottom = halves.iter().max_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
+        assert_eq!(top.1, [0xFF, 0x00, 0x00, 0xFF], "only the clicked half recoloured");
+        assert_eq!(bottom.1, [0xFF, 0xFF, 0xFF, 0xFF], "the other half is untouched");
+    }
+
     /// Clicking inside a stroke-only outline creates a new fill shape, behind
     /// the lines — the paint bucket's actual job, not just recolouring.
     #[test]
@@ -12372,6 +12913,8 @@ mod tests {
     fn drawing_lands_on_the_keyframe_that_owns_the_current_frame() {
         let mut e = editor();
         e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        // A held *drawing*: frame 0 has artwork, carried across the span.
+        draw_square(&mut e, 0.0, 0.0, 50.0, Color::WHITE);
         let layer = e.selection.active_layer().unwrap();
         e.doc.edit("Frames", |s| {
             s.update_layer(layer, |l| {
@@ -12379,16 +12922,93 @@ mod tests {
             });
         });
 
-        // Drawing on frame 7, inside the span that began at frame 0.
+        // Drawing on frame 7, inside the span that began at frame 0. The
+        // keyframe holds a drawing, so the new stroke joins it rather than
+        // keying a fresh frame.
         e.set_frame(7);
         draw_square(&mut e, 0.0, 0.0, 20.0, Color::WHITE);
 
         assert_eq!(
             e.scene().shape_count_at(0),
-            1,
-            "the edit belongs to frame 0"
+            2,
+            "the edit joined frame 0's held drawing"
         );
-        assert_eq!(e.scene().shape_count_at(7), 1);
+        assert_eq!(e.scene().shape_count_at(7), 2);
+        assert_eq!(
+            e.scene().layers().get(layer).unwrap().frames.keyframes().len(),
+            1,
+            "adding to a held drawing makes no new keyframe"
+        );
+    }
+
+    /// **The report: after a blank keyframe, the frames stay blank until I draw
+    /// on one.**
+    ///
+    /// A blank keyframe means "nothing from here on". Drawing several frames
+    /// into its hold used to reach back and fill the whole hold from the blank
+    /// keyframe's start, so the frames the animator meant to leave empty filled
+    /// in too. Now the drawn frame is keyed where the playhead is: the frames
+    /// before it stay blank, and the colour begins where it was drawn.
+    #[test]
+    fn drawing_past_a_blank_keyframe_keys_that_frame_and_leaves_the_hold_blank() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+
+        // A held drawing, then a blank keyframe part-way along.
+        draw_square(&mut e, 0.0, 0.0, 50.0, Color::WHITE);
+        e.set_frame(0);
+        for _ in 0..9 {
+            e.run(Command::InsertFrame);
+        }
+        e.set_frame(5);
+        e.run(Command::InsertBlankKeyframe);
+        assert_eq!(e.scene().shape_count_at(5), 0, "the blank keyframe empties from here");
+
+        // Draw on frame 8, inside the blank hold.
+        e.set_frame(8);
+        draw_square(&mut e, 100.0, 0.0, 20.0, Color::WHITE);
+
+        assert_eq!(e.scene().shape_count_at(0), 1, "the earlier hold is untouched");
+        assert_eq!(e.scene().shape_count_at(5), 0, "the blank frames stay blank");
+        assert_eq!(e.scene().shape_count_at(7), 0, "right up to the drawn frame");
+        assert_eq!(e.scene().shape_count_at(8), 1, "and the drawing begins where it was drawn");
+    }
+
+    /// **The report: there is no way to change when an imported clip starts.**
+    ///
+    /// A sound plays from the keyframe it sits on. An import drops it on frame
+    /// 0, and nothing moved it after. `set_sound_start` re-homes the clip to a
+    /// later frame — it now plays from there, the frames before fall silent,
+    /// and the layer stretches to cover the clip's span at its new position.
+    #[test]
+    fn an_imported_sound_can_be_moved_to_start_later() {
+        use std::sync::Arc;
+        let mut e = editor();
+        let layer = e.selection.active_layer().unwrap();
+
+        e.doc.edit("Import", |s| {
+            let id = s.add_sound("Line", Arc::new(vec![0u8; 16]), "wav", 44_100, 1, 44_100);
+            s.set_frame_sound(layer, 0, Some(buzz_scene::SoundRef::stream(id)));
+        });
+        e.doc.end_gesture();
+        let fps = e.scene().stage().frame_rate;
+        let clip_frames = (44_100.0 / 44_100.0 * fps) as u32; // one second
+
+        let cues = e.scene().stage_cues();
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].start_frame, 0, "an import starts at frame 0");
+
+        e.set_sound_start(layer, 0, 10);
+
+        let cues = e.scene().stage_cues();
+        assert_eq!(cues.len(), 1, "still one cue, just moved");
+        assert_eq!(cues[0].start_frame, 10, "it now plays from frame 10");
+        assert!(e.scene().frame_sound(layer, 0).is_none(), "frame 0 fell silent");
+        assert_eq!(e.current_frame, 10, "the playhead follows the moved clip");
+        assert!(
+            e.scene().layers().get(layer).unwrap().frames.length() >= 10 + clip_frames,
+            "the layer stretches to cover the clip at its new start"
+        );
     }
 
     /// The playhead must be able to go past the end, or the document could
@@ -14811,7 +15431,9 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(e.scene().shape_count(), 1, "and it should have drawn one");
+        // A rectangle drawn with both a fill and an outline lands as two
+        // objects in merge mode — the fill and its separately-selectable line.
+        assert_eq!(e.scene().shape_count(), 2, "and it should have drawn the rectangle");
     }
 
     /// Hiding the handles hides them from the pointer too: a hidden handle

@@ -391,9 +391,19 @@ impl DrawStyle {
     }
 
     /// Remember a colour the user picked.
+    ///
+    /// **The same colour is only ever kept once.** Deduped by RGB, ignoring
+    /// opacity: picking a hue again — even at a different alpha — moves that one
+    /// chip to the front rather than filling a second slot with a near-identical
+    /// colour, so the row keeps making room for genuinely different colours. The
+    /// chip carries the alpha of the *latest* pick.
     pub fn remember(&mut self, color: Color) {
         let key = color.to_rgba8().to_u8_array();
-        self.swatches.retain(|c| c.to_rgba8().to_u8_array() != key);
+        let rgb = [key[0], key[1], key[2]];
+        self.swatches.retain(|c| {
+            let k = c.to_rgba8().to_u8_array();
+            [k[0], k[1], k[2]] != rgb
+        });
         self.swatches.insert(0, color);
         self.swatches.truncate(24);
     }
@@ -511,6 +521,41 @@ mod tests {
         let novel = Color::from_rgb8(0x12, 0x34, 0x56);
         s.remember(novel);
         assert_eq!(s.swatches.len(), before + 1);
+    }
+
+    /// The same colour picked at a different opacity is not a second chip: it
+    /// deduplicates by RGB and the surviving chip carries the latest alpha.
+    #[test]
+    fn the_same_colour_at_a_new_opacity_replaces_rather_than_repeats() {
+        let mut s = DrawStyle::default();
+        let opaque = Color::from_rgba8(0x20, 0x80, 0xC0, 0xFF);
+        let faint = Color::from_rgba8(0x20, 0x80, 0xC0, 0x40);
+
+        s.remember(opaque);
+        let after_first = s.swatches.len();
+        s.remember(faint);
+
+        assert_eq!(
+            s.swatches.len(),
+            after_first,
+            "a second opacity of the same colour must not add a chip"
+        );
+        assert_eq!(
+            s.swatches[0].to_rgba8().to_u8_array(),
+            faint.to_rgba8().to_u8_array(),
+            "the surviving chip carries the latest opacity"
+        );
+        assert_eq!(
+            s.swatches
+                .iter()
+                .filter(|c| {
+                    let k = c.to_rgba8().to_u8_array();
+                    [k[0], k[1], k[2]] == [0x20, 0x80, 0xC0]
+                })
+                .count(),
+            1,
+            "only one chip of that colour, at any opacity"
+        );
     }
 
     #[test]

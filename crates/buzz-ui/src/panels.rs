@@ -861,6 +861,7 @@ fn instance_properties(
     let mut new_loop = instance.loop_mode;
     let mut new_color = instance.color;
     let mut new_symbol = instance.symbol;
+    let mut new_sync_to_root = instance.sync_to_root;
     let mut edited = false;
 
     // Every other symbol this instance could point at instead.
@@ -940,6 +941,23 @@ fn instance_properties(
                     });
                 ui.end_row();
             }
+
+            // **Sync to root.** Lock this instance — and everything nested in
+            // it — to the stage's own frame, so a lip sync generated against
+            // the root dialogue lines up wherever the mouth actually lives.
+            // Off leaves the instance to be keyed by hand.
+            ui.label("Sync to root");
+            if ui
+                .checkbox(&mut new_sync_to_root, "Match the stage frame")
+                .on_hover_text(
+                    "Play this instance and its contents on the root timeline's frame number, \
+                     rather than from where it was placed. Turn off for manual timing.",
+                )
+                .changed()
+            {
+                edited = true;
+            }
+            ui.end_row();
         });
 
     // -- colour effect ------------------------------------------------------
@@ -1046,6 +1064,7 @@ fn instance_properties(
                 i.first_frame = new_first_frame;
                 i.loop_mode = new_loop;
                 i.color = new_color;
+                i.sync_to_root = new_sync_to_root;
             }
         });
 

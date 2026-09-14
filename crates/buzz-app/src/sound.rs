@@ -150,6 +150,9 @@ impl SoundBank {
                 Some(buzz_audio::player::Cue {
                     clip: Arc::clone(clip),
                     start_frame: cue.start_frame,
+                    end_frame: cue.end_frame,
+                    trim_start: cue.trim_start,
+                    trim_end: cue.trim_end,
                     volume: cue.volume,
                     // Stop never reaches the player at all — `stage_cues`
                     // drops it — so the remaining three map straight across.

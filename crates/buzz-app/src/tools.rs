@@ -923,6 +923,26 @@ impl ToolMachine {
             return ToolAction::None;
         }
 
+        // **Hold Control to flip merge and build-up for the stroke in hand.**
+        //
+        // The Build-up toggle in the tool options sets the usual behaviour;
+        // Control overrides it for this one stroke — down to build up over a
+        // merging default, up to merge over a build-up default — the same way a
+        // modifier flips other tools without disturbing their setting. Only the
+        // brush honours build-up, so this is the only tool it changes; the
+        // flipped copy is made only when it is actually needed.
+        let flipped_style;
+        let style: &DrawStyle = if is_brush && mods.ctrl {
+            flipped_style = {
+                let mut s = ctx.style.clone();
+                s.brush.build_up = !s.brush.build_up;
+                s
+            };
+            &flipped_style
+        } else {
+            ctx.style
+        };
+
         match self.tool {
             ToolId::Lasso => match lasso_region(&samples) {
                 Some(region) => ToolAction::PickInRegion {
@@ -936,7 +956,7 @@ impl ToolMachine {
                 width: ctx.style.eraser_size.max(0.5),
             },
             ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Raster => {
-                match paint_soft_stroke(&samples, ctx.style) {
+                match paint_soft_stroke(&samples, style) {
                     Some((canvas, brush)) => ToolAction::PaintRaster { canvas, brush },
                     None => ToolAction::None,
                 }
@@ -989,7 +1009,7 @@ impl ToolMachine {
                 // pointer move, so what was on screen while drawing is what is
                 // committed — see `Preview::Artwork`.
                 let budget = buzz_geom::BrushBudget::default();
-                match vector_brush_shape(&samples, ctx.style, &budget) {
+                match vector_brush_shape(&samples, style, &budget) {
                     Some(shape) => ToolAction::AddShape {
                         shape,
                         label: "Brush",
@@ -2569,6 +2589,38 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    /// Holding Control while brushing flips merge and build-up for that stroke,
+    /// without changing the persistent toggle.
+    #[test]
+    fn holding_control_flips_build_up_for_one_stroke() {
+        let style = DrawStyle::default();
+        assert!(!style.brush.build_up, "the default is merge, not build-up");
+
+        let blend_of = |mods: Mods| -> buzz_scene::PaintBlend {
+            let mut m = ToolMachine::new(ToolId::Brush);
+            m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, mods, &ctx(&style));
+            for i in 1..10 {
+                let p = Point::new(i as f64 * 5.0, 0.0);
+                m.pointer_move(p, p, mods);
+            }
+            match m.pointer_up(Point::new(50.0, 0.0), Point::ORIGIN, &ctx(&style)) {
+                ToolAction::AddShape { shape, .. } => shape.blend,
+                other => panic!("got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            blend_of(Mods::default()),
+            buzz_scene::PaintBlend::Normal,
+            "a plain stroke merges"
+        );
+        assert_eq!(
+            blend_of(Mods { ctrl: true, ..Default::default() }),
+            buzz_scene::PaintBlend::Additive,
+            "Ctrl flips the merging default into build-up for the stroke"
+        );
     }
 
     /// Drive a whole stroke through the machine, with controlled timing.

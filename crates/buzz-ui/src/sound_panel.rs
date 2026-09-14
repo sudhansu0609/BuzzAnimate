@@ -32,6 +32,10 @@ use crate::theme::Palette;
 pub struct SoundResponse {
     /// Put this sound on the current keyframe, or take it off.
     pub set: Option<Option<SoundRef>>,
+    /// Move the sound on the current keyframe to start on this frame instead
+    /// (0-based). This is how the timing of an imported clip is changed: the
+    /// clip is re-homed to a keyframe at the chosen frame and plays from there.
+    pub move_to: Option<u32>,
     /// Import a sound file — the File ▸ Import Sound command.
     pub import: bool,
     /// Open the Lip Sync dialog for the sound on this keyframe.
@@ -150,13 +154,81 @@ pub fn sound_panel(
         return out;
     };
 
-    if let Some(choice) = library.iter().find(|c| c.id == r.sound) {
+    let duration = library
+        .iter()
+        .find(|c| c.id == r.sound)
+        .map(|c| c.seconds as f32)
+        .unwrap_or(0.0);
+    if duration > 0.0 {
         ui.label(
-            RichText::new(format!("{:.2} s", choice.seconds))
+            RichText::new(format!("{duration:.2} s"))
                 .small()
                 .weak(),
         );
     }
+
+    // **Trim** — which seconds of the clip actually play. The in-point cuts a
+    // lead-in, the out-point cuts a tail; only `start..end` is heard, drawn on
+    // the timeline, and exported. This is the "cut a section out of the clip"
+    // control, distinct from Start frame, which only says where on the timeline
+    // the (trimmed) clip begins.
+    if duration > 0.0 {
+        ui.horizontal(|ui| {
+            ui.label("Trim start");
+            let mut start = r.trim_start.clamp(0.0, duration);
+            let upper = r.trim_end.unwrap_or(duration);
+            if ui
+                .add(
+                    egui::DragValue::new(&mut start)
+                        .range(0.0..=upper)
+                        .speed(0.01)
+                        .fixed_decimals(2)
+                        .suffix(" s"),
+                )
+                .on_hover_text("Seconds into the clip where it starts — cuts off the lead-in")
+                .changed()
+            {
+                r.trim_start = start.clamp(0.0, upper);
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Trim end");
+            let mut end = r.trim_end.unwrap_or(duration).clamp(r.trim_start, duration);
+            if ui
+                .add(
+                    egui::DragValue::new(&mut end)
+                        .range(r.trim_start..=duration)
+                        .speed(0.01)
+                        .fixed_decimals(2)
+                        .suffix(" s"),
+                )
+                .on_hover_text("Seconds into the clip where it stops — cuts off the tail")
+                .changed()
+            {
+                // At the full length it is stored as "no out-point", so a
+                // re-decode of a longer take is not silently clipped.
+                r.trim_end = (end < duration).then_some(end.clamp(r.trim_start, duration));
+                changed = true;
+            }
+        });
+    }
+
+    // **Start frame** — when the clip begins. A sound plays from the keyframe
+    // it sits on, so changing this re-homes it to a keyframe on that frame; the
+    // editor moves the playhead there too, so this control keeps showing it.
+    // Shown 1-based, to match the timeline's frame numbers.
+    ui.horizontal(|ui| {
+        ui.label("Start frame");
+        let mut start = frame + 1;
+        if ui
+            .add(egui::DragValue::new(&mut start).range(1..=1_000_000))
+            .on_hover_text("The frame this clip begins on — its timing on the timeline")
+            .changed()
+        {
+            out.move_to = Some(start.saturating_sub(1));
+        }
+    });
 
     // Sync. The one setting whose choice actually changes what you hear, so it
     // carries a line of explanation rather than four bare words.
@@ -310,6 +382,8 @@ mod tests {
             sync: SoundSync::Event,
             volume: 0.3,
             loops: 4,
+            trim_start: 1.5,
+            trim_end: Some(3.0),
         };
         let swapped = SoundRef {
             sound: SoundId(2),
@@ -318,6 +392,8 @@ mod tests {
         assert_eq!(swapped.sync, SoundSync::Event);
         assert_eq!(swapped.volume, 0.3);
         assert_eq!(swapped.loops, 4);
+        assert_eq!(swapped.trim_start, 1.5, "the trim in-point travels with the swap");
+        assert_eq!(swapped.trim_end, Some(3.0), "and the out-point");
     }
 
     #[test]

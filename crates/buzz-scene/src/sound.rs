@@ -114,16 +114,25 @@ pub struct SoundRef {
     /// How many times to play. Zero means loop for as long as the timeline
     /// runs, which is what Animate's "loop" checkbox does.
     pub loops: u32,
+    /// **In-point**: seconds into the clip where playback begins, so the lead-in
+    /// of a take can be cut off. Zero plays from the start.
+    pub trim_start: f32,
+    /// **Out-point**: seconds into the clip where playback stops, so the tail
+    /// can be cut off. `None` plays to the clip's own end. Only the section
+    /// `trim_start..trim_end` is heard, drawn, and exported.
+    pub trim_end: Option<f32>,
 }
 
 impl SoundRef {
-    /// Dialogue: streamed, full volume, played once.
+    /// Dialogue: streamed, full volume, played once, untrimmed.
     pub fn stream(sound: SoundId) -> Self {
         Self {
             sound,
             sync: SoundSync::Stream,
             volume: 1.0,
             loops: 1,
+            trim_start: 0.0,
+            trim_end: None,
         }
     }
 
@@ -133,6 +142,8 @@ impl SoundRef {
             sync: SoundSync::Event,
             volume: 1.0,
             loops: 1,
+            trim_start: 0.0,
+            trim_end: None,
         }
     }
 }
@@ -146,6 +157,17 @@ impl SoundRef {
 pub struct SoundCue {
     pub sound: SoundId,
     pub start_frame: u32,
+    /// The frame a **streamed** sound stops on — the next keyframe on its
+    /// layer, which is how a blank keyframe cuts it short, or the layer's end.
+    /// `None` means play to the clip's own end (event sounds, which run on
+    /// their own clock, always carry `None`).
+    pub end_frame: Option<u32>,
+    /// In-point in seconds: where in the clip playback begins (see
+    /// [`SoundRef::trim_start`]).
+    pub trim_start: f32,
+    /// Out-point in seconds, or `None` for the clip's end (see
+    /// [`SoundRef::trim_end`]).
+    pub trim_end: Option<f32>,
     pub volume: f32,
     pub sync: SoundSync,
 }

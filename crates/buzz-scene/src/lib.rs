@@ -862,16 +862,31 @@ impl Scene {
             // and an animator hides layers constantly while working. Losing
             // the soundtrack because a layer was hidden would be surprising in
             // exactly the way this whole design is trying to avoid.
-            for keyframe in layer.frames.keyframes() {
+            let keyframes = layer.frames.keyframes();
+            for (i, keyframe) in keyframes.iter().enumerate() {
                 let Some(sound) = keyframe.sound else {
                     continue;
                 };
                 if sound.sync == SoundSync::Stop {
                     continue;
                 }
+                // A stream is tied to the timeline, so it lasts only as long as
+                // its frames do: it stops at the next keyframe on this layer —
+                // which is how a blank keyframe cuts it short — or at the end of
+                // the layer's span. An event or start sound runs on its own
+                // clock once triggered and ignores this.
+                let end_frame = (sound.sync == SoundSync::Stream).then(|| {
+                    keyframes
+                        .get(i + 1)
+                        .map(|next| next.start)
+                        .unwrap_or_else(|| layer.frames.length())
+                });
                 cues.push(SoundCue {
                     sound: sound.sound,
                     start_frame: keyframe.start,
+                    end_frame,
+                    trim_start: sound.trim_start,
+                    trim_end: sound.trim_end,
                     volume: sound.volume,
                     sync: sound.sync,
                 });

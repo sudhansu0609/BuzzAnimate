@@ -1187,6 +1187,10 @@ fn is_zero(value: &f64) -> bool {
     *value == 0.0
 }
 
+fn is_zero_f32(value: &f32) -> bool {
+    *value == 0.0
+}
+
 /// The default for a fraction whose absence means "all of it".
 fn full() -> f64 {
     1.0
@@ -1230,6 +1234,13 @@ pub struct SoundDto {
     pub volume: f32,
     #[serde(default = "one")]
     pub loops: u32,
+    /// In-point in seconds. Version 33; defaulted and skipped at zero, so an
+    /// untrimmed clip saves exactly as it did before.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub trim_start: f32,
+    /// Out-point in seconds, `None` for the clip's end. Version 33.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trim_end: Option<f32>,
 }
 
 /// An imported sound. The audio itself lives in the container's `media/`
@@ -1687,6 +1698,11 @@ pub enum ObjectKindDto {
         loop_mode: LoopMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         color: Option<ColorTransformDto>,
+        /// Lock the instance's playhead to the root timeline's frame. Version
+        /// 33; defaulted and skipped when off, so older files read back with
+        /// the instance playing as it always did.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        sync_to_root: bool,
     },
     /// Artwork rigged to a skeleton. Version 6.
     ///
@@ -2212,6 +2228,8 @@ impl LayerDto {
                         sync: s.sync,
                         volume: s.volume,
                         loops: s.loops,
+                        trim_start: s.trim_start,
+                        trim_end: s.trim_end,
                     }),
                 })
                 .collect(),
@@ -2279,6 +2297,8 @@ impl LayerDto {
                     sync: s.sync,
                     volume: s.volume,
                     loops: s.loops,
+                    trim_start: s.trim_start,
+                    trim_end: s.trim_end,
                 }),
             });
         }
@@ -2782,6 +2802,7 @@ impl ObjectDto {
                 symbol: i.symbol.0,
                 first_frame: i.first_frame,
                 loop_mode: i.loop_mode,
+                sync_to_root: i.sync_to_root,
                 // The identity is the common case; leaving it out keeps a
                 // document full of plain instances readable.
                 color: (!i.color.is_identity()).then_some(ColorTransformDto {
@@ -2937,10 +2958,12 @@ impl ObjectDto {
                 first_frame,
                 loop_mode,
                 color,
+                sync_to_root,
             } => ObjectKind::Instance(SymbolInstance {
                 symbol: SymbolId(*symbol),
                 first_frame: *first_frame,
                 loop_mode: *loop_mode,
+                sync_to_root: *sync_to_root,
                 color: color.map_or_else(ColorTransform::default, |c| ColorTransform {
                     multiply: c.multiply,
                     add: c.add,

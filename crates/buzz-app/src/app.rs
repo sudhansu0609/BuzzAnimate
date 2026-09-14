@@ -3119,26 +3119,52 @@ impl App {
             })
             .collect();
 
-        // The keyframe the playhead is on, and whether it is one at all. A
-        // sound lives on a keyframe, so a frame inside a span has nowhere to
-        // put one — and saying so is more use than an inert panel.
-        let (current, on_keyframe) = match layer
+        // **Which sound the panel edits, and the frame it sits on.**
+        //
+        // A sound lives on a keyframe, but requiring the playhead to sit exactly
+        // on that keyframe made the whole panel — the clip, its start frame, its
+        // volume — vanish the moment you scrubbed off it, which is why "there's
+        // no Start-frame control" was the report. So: if the keyframe under the
+        // playhead carries a sound, edit that; otherwise show the sound anywhere
+        // on the layer (an imported clip is on its own layer's frame 1), and
+        // edit it where it actually is. Only when the layer has no sound at all
+        // does the frame-under-the-playhead decide what the panel can offer.
+        let (current, sound_frame, on_keyframe) = match layer
             .and_then(|id| editor.doc.scene().stage_layers().get(id))
-            .and_then(|l| l.frames.keyframes().iter().find(|k| k.start == frame))
         {
-            Some(keyframe) => (keyframe.sound, true),
-            None => (None, false),
+            Some(l) => {
+                let kfs = l.frames.keyframes();
+                let here = kfs.iter().find(|k| k.start == frame);
+                if let Some(k) = here.filter(|k| k.sound.is_some()) {
+                    (k.sound, frame, true)
+                } else if let Some(k) = kfs.iter().find(|k| k.sound.is_some()) {
+                    (k.sound, k.start, true)
+                } else if here.is_some() {
+                    (None, frame, true)
+                } else {
+                    (None, frame, false)
+                }
+            }
+            None => (None, frame, false),
         };
 
-        let response = buzz_ui::sound_panel(ui, &library, current, on_keyframe, frame);
+        let response = buzz_ui::sound_panel(ui, &library, current, on_keyframe, sound_frame);
 
         if let Some(reference) = response.set
             && let Some(layer) = layer
         {
             editor.doc.edit("Sound Settings", |scene| {
-                scene.set_frame_sound(layer, frame, reference);
+                scene.set_frame_sound(layer, sound_frame, reference);
             });
             editor.doc.end_gesture();
+            let scene = editor.doc.scene().clone();
+            editor.sound.refresh(&scene);
+        }
+
+        if let Some(new_start) = response.move_to
+            && let Some(layer) = layer
+        {
+            editor.set_sound_start(layer, sound_frame, new_start);
             let scene = editor.doc.scene().clone();
             editor.sound.refresh(&scene);
         }

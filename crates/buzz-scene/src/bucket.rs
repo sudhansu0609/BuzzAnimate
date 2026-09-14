@@ -149,8 +149,24 @@ pub fn fill_region(boundaries: &[Boundary], seed: Point, gap: GapSize) -> Option
             rasterise_fill(&b.path, &mut walls, area, ppu);
         }
         if let Some(width) = b.stroke_width {
-            let outline = outline_stroke(&b.path, StrokeStyle::new(width), 0.25 / ppu);
-            rasterise_fill(&outline, &mut walls, area, ppu);
+            // **Each contour is stroked and rasterised on its own.**
+            //
+            // Stroking a whole path at once returns one outline holding the two
+            // ring loops of every closed contour and the band of every open
+            // one. Rasterising all of that together under the non-zero rule
+            // lets a line's band *cancel* against a ring loop where the two
+            // cross — the winding sums back to zero right at the junction and
+            // opens a one-pixel gap the flood pours straight through. It is
+            // exactly why a rectangle with a line welded into the same shape
+            // (a fused outline-plus-divider) filled edge to edge while the same
+            // two drawn as separate objects filled only the half that was
+            // clicked. A contour is an independent wall; stroked on its own and
+            // OR-ed into the grid, walls only ever add and never rub each other
+            // out.
+            for sub in subpaths(&b.path) {
+                let outline = outline_stroke(&sub, StrokeStyle::new(width), 0.25 / ppu);
+                rasterise_fill(&outline, &mut walls, area, ppu);
+            }
         }
     }
 
@@ -321,6 +337,23 @@ impl Grid {
             }
         }
     }
+}
+
+/// Split a path into its subpaths, one per `MoveTo`, so each contour can be
+/// stroked and rasterised as the independent wall it is.
+fn subpaths(path: &BezPath) -> Vec<BezPath> {
+    let mut out: Vec<BezPath> = Vec::new();
+    let mut current = BezPath::new();
+    for el in path.elements() {
+        if matches!(el, buzz_geom::PathEl::MoveTo(_)) && !current.elements().is_empty() {
+            out.push(std::mem::take(&mut current));
+        }
+        current.push(*el);
+    }
+    if !current.elements().is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 /// Scan-convert a filled path into the grid with the non-zero rule.
@@ -595,6 +628,37 @@ mod tests {
         // A large enough gap size bridges the ~30-unit opening.
         let filled = fill_region(&[boundary(&path)], Point::new(70.0, 70.0), GapSize::ExtraLarge);
         assert!(filled.is_some(), "the gap should close at Extra Large");
+    }
+
+    /// **A divider welded into the outline still blocks the flood.**
+    ///
+    /// A boundary whose path holds the closed rectangle *and* an open line
+    /// across it — as it does once an outline and a divider have merged into
+    /// one shape — must fill only the half the seed is in. Stroking the whole
+    /// path at once and rasterising it under the non-zero rule let the line's
+    /// band cancel against the rectangle ring where they cross, opening a gap
+    /// the flood escaped through into the far half; each contour is now stroked
+    /// on its own so the walls only ever add.
+    #[test]
+    fn a_divider_welded_into_the_outline_still_blocks_the_flood() {
+        let mut combined = Rect::new(100.0, 100.0, 300.0, 220.0).to_path(0.01);
+        combined.move_to(Point::new(80.0, 160.0)); // a line clean across, past both edges
+        combined.line_to(Point::new(320.0, 160.0));
+        let boundary = Boundary {
+            path: combined,
+            filled: false,
+            stroke_width: Some(1.0),
+        };
+        let region = fill_region(&[boundary], Point::new(200.0, 130.0), GapSize::None)
+            .expect("the top half is enclosed and should fill");
+        // Only the top half: the divider held the flood back from the bottom.
+        assert!(region.winding(Point::new(200.0, 130.0)) != 0, "the clicked half");
+        assert!(
+            region.winding(Point::new(200.0, 190.0)) == 0,
+            "the flood must not have leaked into the other half"
+        );
+        let bbox = region.bounding_box();
+        assert!(bbox.y1 <= 162.0, "the fill reached past the divider: {bbox:?}");
     }
 
     /// Clicking on the line itself fills nothing.

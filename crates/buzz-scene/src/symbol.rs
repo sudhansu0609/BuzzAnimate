@@ -302,6 +302,17 @@ pub struct SymbolInstance {
     pub first_frame: u32,
     pub loop_mode: LoopMode,
     pub color: ColorTransform,
+    /// **Lock this instance's playhead to the root timeline's frame number.**
+    ///
+    /// Off (the default), the instance plays as Animate's do — a graphic runs
+    /// from where it was placed, a movie clip on its own timeline. On, it and
+    /// everything nested inside it show the *root* frame the stage is on, so a
+    /// character placed on the root reads frame 42 when the stage is on frame
+    /// 42, and so does the head symbol inside it, and the mouth inside that.
+    /// That is what makes a lip sync generated against the root dialogue line
+    /// up wherever the mouth actually lives. Toggle it off to key the character
+    /// by hand instead.
+    pub sync_to_root: bool,
 }
 
 impl SymbolInstance {
@@ -311,6 +322,7 @@ impl SymbolInstance {
             first_frame: 0,
             loop_mode: LoopMode::Loop,
             color: ColorTransform::default(),
+            sync_to_root: false,
         }
     }
 
@@ -330,6 +342,21 @@ impl SymbolInstance {
             LoopMode::SingleFrame => self.first_frame.min(length - 1),
             LoopMode::Loop => (self.first_frame + elapsed) % length,
             LoopMode::PlayOnce => (self.first_frame + elapsed).min(length - 1),
+        }
+    }
+
+    /// The frame to show when locked to the root timeline — the root's own
+    /// frame number, clamped or looped into the symbol's own length. This is
+    /// what [`Self::sync_to_root`] resolves to, at every level: a character and
+    /// everything inside it read the frame the stage is on, ignoring where the
+    /// instance was placed (`first_frame` and `elapsed` do not enter into it).
+    /// `SingleFrame` still holds one frame, for a symbol used as a still.
+    pub fn resolve_to_root(&self, root_frame: u32, symbol_length: u32) -> u32 {
+        let length = symbol_length.max(1);
+        match self.loop_mode {
+            LoopMode::SingleFrame => self.first_frame.min(length - 1),
+            LoopMode::Loop => root_frame % length,
+            LoopMode::PlayOnce => root_frame.min(length - 1),
         }
     }
 }
@@ -668,6 +695,34 @@ mod tests {
         }
         // A zero-length symbol must not divide by zero.
         assert_eq!(instance.resolve_frame(SymbolKind::Graphic, 5, 0), 0);
+    }
+
+    /// **Locked to the root, an instance reads the stage's own frame.** Where
+    /// it was placed and how long it has been on stage do not enter into it —
+    /// which is what lets a character and everything inside it agree with the
+    /// dialogue on the root timeline.
+    #[test]
+    fn syncing_to_root_reads_the_stage_frame_regardless_of_placement() {
+        let instance = SymbolInstance {
+            first_frame: 7, // deliberately not zero, to prove it is ignored
+            loop_mode: LoopMode::PlayOnce,
+            ..SymbolInstance::new(SymbolId(1))
+        };
+        // Within the symbol's length, the frame *is* the root frame.
+        assert_eq!(instance.resolve_to_root(4, 30), 4);
+        assert_eq!(instance.resolve_to_root(29, 30), 29);
+        // PlayOnce holds the last frame past the end.
+        assert_eq!(instance.resolve_to_root(100, 30), 29);
+
+        // Loop wraps within its own length.
+        let looping = SymbolInstance {
+            loop_mode: LoopMode::Loop,
+            ..SymbolInstance::new(SymbolId(1))
+        };
+        assert_eq!(looping.resolve_to_root(4, 30), 4);
+        assert_eq!(looping.resolve_to_root(33, 30), 3);
+        // A zero-length symbol must not divide by zero.
+        assert_eq!(looping.resolve_to_root(5, 0), 0);
     }
 
     #[test]

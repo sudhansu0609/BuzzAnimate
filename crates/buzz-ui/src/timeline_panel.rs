@@ -205,8 +205,16 @@ pub struct TimelineState {
 pub struct Waveform {
     /// The frame the sound starts on.
     pub start_frame: u32,
-    /// Loudness per frame, `0.0..=1.0`.
+    /// Loudness per frame of the **whole clip**, `0.0..=1.0`. Shared across
+    /// layers and memoised, so it is not sliced to the trim — `level_start` and
+    /// `level_end` say which part of it to draw instead.
     pub levels: std::sync::Arc<Vec<f32>>,
+    /// First level to draw — the in-point, in clip-frames. The strip is laid
+    /// out from `start_frame`, reading `levels[level_start..]`.
+    pub level_start: usize,
+    /// One past the last level to draw — the out-point in clip-frames, or the
+    /// clip's end when `None`.
+    pub level_end: Option<usize>,
 }
 
 /// Width reserved for the layer-name column.
@@ -1252,7 +1260,7 @@ fn camera_row(
             },
         );
 
-        draw_frame_cell(&painter, cell, kind, tween, frame == state.current_frame);
+        draw_frame_cell(&painter, cell, kind, tween, false, frame == state.current_frame);
     }
 
     // The pinned "Camera" name cell, over the grid.
@@ -1340,7 +1348,7 @@ fn light_row(
             complete: true,
             arrow: false,
         });
-        draw_frame_cell(&painter, cell, kind, tween, frame == state.current_frame);
+        draw_frame_cell(&painter, cell, kind, tween, false, frame == state.current_frame);
     }
 
     let names = ui.painter_at(name_row.intersect(ui.clip_rect()));
@@ -1454,18 +1462,36 @@ fn layer_row(
         let x = grid_left + frame as f32 * cell_width;
         let cell =
             egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(cell_width, height));
+        // A frame reads as blank when the keyframe governing it holds nothing
+        // at all — no art *and* no sound — across its own cell and every frame
+        // of its span, so the hold after a blank keyframe no longer looks
+        // filled. A sound keyframe carries no art but is not blank: its cell
+        // stays occupied and shows the waveform.
+        let blank = layer
+            .frames
+            .keyframe_at(frame)
+            .is_some_and(|k| k.is_blank() && k.sound.is_none());
         draw_frame_cell(
             &grid,
             cell,
             layer.frame_kind(frame),
             tween_cell(layer, frame, length),
+            blank,
             frame == state.current_frame,
         );
     }
     // A sound layer draws its waveform across the frames the sound covers, over
     // the cells and translucently, so an animator finds the accents by looking.
+    // It stops where the sound does — at the next keyframe on the layer, so a
+    // blank keyframe cuts the waveform off just as it silences the audio.
     if let Some(waveform) = state.waveforms.get(&layer.id) {
-        draw_waveform(&grid, waveform, grid_left, rect, height, &visible, cell_width);
+        let sound_end = layer
+            .frames
+            .keyframes()
+            .iter()
+            .map(|k| k.start)
+            .find(|s| *s > waveform.start_frame);
+        draw_waveform(&grid, waveform, grid_left, rect, height, &visible, cell_width, sound_end);
     }
 
     // -- name column, pinned and drawn over the grid ----------------------
@@ -2083,13 +2109,34 @@ fn draw_waveform(
     height: f32,
     visible: &std::ops::Range<u32>,
     cell_width: f32,
+    // The frame the sound stops on — the next keyframe on the layer — past
+    // which no waveform is drawn, so a blank keyframe cuts the strip off.
+    end: Option<u32>,
 ) {
     let middle = row.center().y;
     let half = (height * 0.5 - 2.0).max(1.0);
     let colour = Color32::from_rgba_unmultiplied(120, 215, 255, 150);
 
-    for (i, level) in waveform.levels.iter().enumerate() {
-        let frame = waveform.start_frame + i as u32;
+    // Only the trimmed section of the clip is drawn, laid out from the sound's
+    // start frame: timeline frame `start_frame + i` shows clip level
+    // `level_start + i`, up to the out-point (`level_end`) or the clip's end.
+    let last_level = waveform
+        .level_end
+        .unwrap_or(waveform.levels.len())
+        .min(waveform.levels.len());
+    let mut i = 0u32;
+    loop {
+        let level_idx = waveform.level_start + i as usize;
+        if level_idx >= last_level {
+            break;
+        }
+        let frame = waveform.start_frame + i;
+        i += 1;
+        // The sound also stops at the next keyframe (a blank keyframe cuts it),
+        // so the waveform does too.
+        if end.is_some_and(|e| frame >= e) {
+            break;
+        }
         // Only the bars in view — the strip is virtualized with the cells.
         if frame >= visible.end {
             break;
@@ -2097,6 +2144,7 @@ fn draw_waveform(
         if frame < visible.start {
             continue;
         }
+        let level = waveform.levels[level_idx];
         let x = grid_left + frame as f32 * cell_width;
         let amplitude = (level.clamp(0.0, 1.0) * half).max(0.5);
         painter.rect_filled(
@@ -2116,18 +2164,22 @@ fn draw_frame_cell(
     cell: egui::Rect,
     kind: FrameKind,
     tween: Option<TweenCell>,
+    blank: bool,
     playhead: bool,
 ) {
-    // Animate's frame grid: an occupied frame is a light grey, an empty one the
-    // dark panel; a tween tints its whole span so the three kinds read apart at
-    // a glance. Sampled from Animate: occupied #909090, empty #252525.
-    let occupied = Color32::from_rgb(0x90, 0x90, 0x90);
+    // The frame grid, brightest where there is the most to see: a frame that
+    // **holds art** stands out light; a **blank** keyframe and the span it holds
+    // open are the plainer grey; a frame with **no layer** under it is the dark
+    // panel. `blank` is true for the whole span a blank keyframe governs, not
+    // just its own cell. A tween tints its whole span so it reads apart too.
+    let filled = Color32::from_rgb(0xE8, 0xE8, 0xE8);
+    let blank_fill = Color32::from_rgb(0x90, 0x90, 0x90);
     let empty = Color32::from_rgb(0x25, 0x25, 0x25);
     let background = match (kind, tween) {
         (FrameKind::Empty, _) => empty,
         (_, Some(t)) => t.tint,
-        // A blank keyframe still holds its span open, so its cell is occupied.
-        _ => occupied,
+        _ if blank => blank_fill,
+        _ => filled,
     };
     painter.rect_filled(cell, 0.0, background);
 

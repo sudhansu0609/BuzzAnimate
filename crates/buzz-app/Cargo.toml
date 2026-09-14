@@ -61,7 +61,7 @@ serde_json.workspace = true
 # that lives exactly as long as the encode does.
 tempfile = "3"
 
-[build-dependencies]
+[target.'cfg(windows)'.build-dependencies]
 # Embeds the icon into the .exe, so Explorer and the taskbar show it too.
 # The build script tolerates its absence rather than failing.
 winresource = "0.1"

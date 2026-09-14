@@ -242,10 +242,16 @@ fn encode(
         bail!("there are no frames in that range to export");
     }
     if !crate::ffmpeg_available() {
+        let install_hint = if cfg!(target_os = "windows") {
+            "on Windows, `winget install Gyan.FFmpeg`."
+        } else if cfg!(target_os = "macos") {
+            "on macOS, `brew install ffmpeg`."
+        } else {
+            "on Linux, your package manager (e.g. `sudo apt install ffmpeg`)."
+        };
         bail!(
             "no ffmpeg was found on this machine, and animated export needs one.\n\
-             Install it and make sure `ffmpeg` is on your PATH — on Windows, \
-             `winget install Gyan.FFmpeg`."
+             Install it and make sure `ffmpeg` is on your PATH — {install_hint}"
         );
     }
 
@@ -273,7 +279,7 @@ fn encode(
         std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = crate::video::ffmpeg_cmd();
     build(&mut command, width, height, fps, &temporary);
     command
         .stdin(Stdio::piped())

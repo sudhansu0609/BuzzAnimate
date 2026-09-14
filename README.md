@@ -135,6 +135,16 @@ after that. `Camera::screen_precision_px()` reports it live in the HUD.
 have changed — a no-op once the build is warm — and then starts the editor. A
 launcher that quietly ran last week's binary would be a confusing thing to own.
 
+**macOS & Linux: run `./buzzanimate.sh`** (or double-click `BuzzAnimate.command` on macOS).
+
+```sh
+# macOS / Linux
+./buzzanimate.sh                        an empty document
+./buzzanimate.sh "path/to/Scene.buzz"   open a document
+./buzzanimate.sh --gpu "Apple M"        choose a graphics adapter by name
+./buzzanimate.sh --dev                  the debug build (faster to compile)
+```
+
 ```bat
 BuzzAnimate.bat                        an empty document
 BuzzAnimate.bat "C:\work\Scene.buzz"    open a document

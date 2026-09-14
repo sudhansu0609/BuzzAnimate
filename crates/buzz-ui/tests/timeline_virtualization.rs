@@ -93,6 +93,8 @@ fn the_waveform_type_holds_its_levels_by_arc() {
     let w = Waveform {
         start_frame: 0,
         levels: std::sync::Arc::new(vec![0.1, 0.2, 0.3]),
+        level_start: 0,
+        level_end: None,
     };
     let clone = w.clone();
     assert!(std::sync::Arc::ptr_eq(&w.levels, &clone.levels));

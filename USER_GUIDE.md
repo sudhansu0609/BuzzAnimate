@@ -87,7 +87,21 @@ BuzzAnimate.bat --script setup.js      :: Runs an automated startup script
 BuzzAnimate.bat --dev                  :: Runs the debug build
 ```
 
-### 2.2 Startup Console & GPU Adapter Table
+### 2.2 Starting BuzzAnimate on macOS
+- **Double-click `BuzzAnimate.command`** in the application folder in Finder.
+- Alternatively, run `./BuzzAnimate.command` or `./buzzanimate.sh` from Terminal.
+- Automatically detects and builds the native macOS binary, ensures Cargo/Homebrew paths are loaded, and launches BuzzAnimate with Metal GPU acceleration.
+
+```sh
+# macOS / Linux Launcher Command-Line Options
+./BuzzAnimate.command                        # Opens a fresh, empty document
+./BuzzAnimate.command "path/to/Shot1.buzz"   # Opens an existing project
+./BuzzAnimate.command --gpu "Apple M"        # Specifies GPU adapter
+./BuzzAnimate.command --script setup.js      # Runs an automated startup script
+./BuzzAnimate.command --dev                  # Runs the debug build
+```
+
+### 2.3 Startup Console & GPU Adapter Table
 When BuzzAnimate launches, a companion diagnostic console window opens. It scores every graphics adapter on your system and binds to the highest-performing hardware GPU:
 
 ```

@@ -558,9 +558,10 @@ impl Command {
     /// Animate's default shortcut, if it has one.
     pub fn shortcut(self) -> Option<KeyboardShortcut> {
         use Command::*;
-        let ctrl = Modifiers::CTRL;
-        let ctrl_shift = Modifiers::CTRL.plus(Modifiers::SHIFT);
-        let ctrl_alt = Modifiers::CTRL.plus(Modifiers::ALT);
+        // Uses COMMAND so that on macOS it maps to Command (⌘) and on Windows/Linux to Ctrl.
+        let ctrl = Modifiers::COMMAND;
+        let ctrl_shift = Modifiers::COMMAND.plus(Modifiers::SHIFT);
+        let ctrl_alt = Modifiers::COMMAND.plus(Modifiers::ALT);
 
         let sc = |m: Modifiers, k: Key| Some(KeyboardShortcut::new(m, k));
 
@@ -778,7 +779,7 @@ impl Command {
 }
 
 fn ctrl_semicolon() -> Modifiers {
-    Modifiers::CTRL
+    Modifiers::COMMAND
 }
 
 /// Every command that carries a keyboard shortcut.
@@ -1167,8 +1168,8 @@ mod tests {
         };
 
         expect(Command::ConvertToSymbol, Modifiers::NONE, Key::F8);
-        expect(Command::NewSymbol, Modifiers::CTRL, Key::F8);
-        expect(Command::EditSymbol, Modifiers::CTRL, Key::E);
+        expect(Command::NewSymbol, Modifiers::COMMAND, Key::F8);
+        expect(Command::EditSymbol, Modifiers::COMMAND, Key::E);
     }
 
     #[test]
@@ -1181,12 +1182,12 @@ mod tests {
             assert_eq!(sc.logical_key, k, "{c:?} key");
         };
 
-        expect(Command::Save, Modifiers::CTRL, Key::S);
-        expect(Command::Undo, Modifiers::CTRL, Key::Z);
-        expect(Command::Copy, Modifiers::CTRL, Key::C);
-        expect(Command::Paste, Modifiers::CTRL, Key::V);
-        expect(Command::SelectAll, Modifiers::CTRL, Key::A);
-        expect(Command::GroupSelection, Modifiers::CTRL, Key::G);
+        expect(Command::Save, Modifiers::COMMAND, Key::S);
+        expect(Command::Undo, Modifiers::COMMAND, Key::Z);
+        expect(Command::Copy, Modifiers::COMMAND, Key::C);
+        expect(Command::Paste, Modifiers::COMMAND, Key::V);
+        expect(Command::SelectAll, Modifiers::COMMAND, Key::A);
+        expect(Command::GroupSelection, Modifiers::COMMAND, Key::G);
     }
 
     #[test]

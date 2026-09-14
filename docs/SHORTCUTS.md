@@ -1,6 +1,8 @@
 # ⌨️ BuzzAnimate Keyboard Shortcuts & Quick Reference
 
 > Fast lookup cheatsheet for tools, timeline controls, canvas navigation, editing, and window management.
+>
+> 🍎 **macOS Note**: On macOS, use **`Cmd (⌘)`** wherever **`Ctrl`** is listed, and **`Option (⌥)`** wherever **`Alt`** is listed (e.g. `Cmd + S` to save, `Cmd + Z` to undo). Both `Cmd + Y` and `Ctrl + Y` are accepted for Redo.
 
 ---
 

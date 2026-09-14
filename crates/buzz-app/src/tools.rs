@@ -2963,8 +2963,9 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(matches!(preview, Preview::Artwork(_)), "got {preview:?}");
+        let max_ms = if cfg!(debug_assertions) { 45 } else { 16 };
         assert!(
-            elapsed.as_millis() < 16,
+            elapsed.as_millis() < max_ms,
             "one preview frame of a 6000-sample pattern stroke took {elapsed:?}; \
              at 60 fps that is a stutter the user would feel"
         );

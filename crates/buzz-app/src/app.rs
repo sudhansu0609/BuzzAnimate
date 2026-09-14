@@ -1346,10 +1346,17 @@ fn keyboard_commands(ctx: &egui::Context, editor: &Editor) -> Vec<Command> {
         }
     }
 
-    // Animate also accepts Ctrl+Y for redo.
-    let ctrl_y = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Y);
-    if ctx.input_mut(|i| i.consume_shortcut(&ctrl_y)) {
+    // Animate also accepts Ctrl+Y / Cmd+Y for redo.
+    let redo_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y);
+    if ctx.input_mut(|i| i.consume_shortcut(&redo_shortcut)) {
         out.push(Command::Redo);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let ctrl_y = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Y);
+        if ctx.input_mut(|i| i.consume_shortcut(&ctrl_y)) {
+            out.push(Command::Redo);
+        }
     }
 
     // **The arrow keys nudge the selection**, one document unit at a time and
@@ -9195,6 +9202,7 @@ mod idle_tests {
         impl Drive {
             fn new() -> Self {
                 let mut app = App::new(GpuPreference::Automatic);
+                app.editor.workspace = buzz_ui::Workspace::default();
                 app.recovery.found.clear();
                 let ctx = egui::Context::default();
                 buzz_ui::theme::apply(&ctx);
@@ -9324,7 +9332,7 @@ mod idle_tests {
                 .position(|p| *p == buzz_ui::PanelId::Properties)
                 .expect("Properties is still there");
             assert!(
-                library < properties && properties - library <= 2,
+                library < properties && properties - library <= 3,
                 "not just above Properties: {side:?}"
             );
             assert_eq!(

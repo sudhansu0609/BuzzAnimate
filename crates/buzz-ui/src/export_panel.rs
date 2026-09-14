@@ -623,11 +623,14 @@ fn settings_view(
             egui::Color32::from_rgb(220, 120, 90),
             "No ffmpeg found on this machine.",
         );
-        ui.label(
-            RichText::new("This format needs one. On Windows: winget install Gyan.FFmpeg")
-                .small()
-                .weak(),
-        );
+        let install_hint = if cfg!(target_os = "windows") {
+            "This format needs one. On Windows: winget install Gyan.FFmpeg"
+        } else if cfg!(target_os = "macos") {
+            "This format needs one. On macOS: brew install ffmpeg"
+        } else {
+            "This format needs one. Install `ffmpeg` via your package manager."
+        };
+        ui.label(RichText::new(install_hint).small().weak());
     }
 
     if kind == ExportKind::Gif {

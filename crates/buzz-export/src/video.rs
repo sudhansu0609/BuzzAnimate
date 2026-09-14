@@ -176,12 +176,46 @@ pub struct VideoReport {
     pub audio_tracks: usize,
 }
 
+/// Resolve an `ffmpeg` command, trying `PATH` first and falling back to common
+/// macOS Homebrew and MacPorts install paths when running in environments where
+/// the user's interactive shell PATH is not inherited (such as macOS GUI apps).
+pub fn ffmpeg_cmd() -> Command {
+    // 1. Try "ffmpeg" directly on PATH.
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return Command::new("ffmpeg");
+    }
+
+    // 2. On Unix/macOS, check common installation directories.
+    #[cfg(unix)]
+    {
+        for path in [
+            "/opt/homebrew/bin/ffmpeg",  // Apple Silicon Homebrew
+            "/usr/local/bin/ffmpeg",     // Intel Mac Homebrew
+            "/opt/local/bin/ffmpeg",     // MacPorts
+        ] {
+            if std::path::Path::new(path).exists() {
+                return Command::new(path);
+            }
+        }
+    }
+
+    Command::new("ffmpeg")
+}
+
 /// Is there an ffmpeg to drive?
 ///
 /// Checked before an export starts rather than discovered when the pipe breaks,
 /// so the message can say what to do about it.
 pub fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg")
+    ffmpeg_cmd()
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -214,7 +248,7 @@ pub fn probe(path: &std::path::Path) -> Result<VideoInfo> {
     // `ffprobe` ships with ffmpeg but is a separate binary and is missing from
     // some minimal builds, so this asks ffmpeg itself and reads what it says
     // about the input on the way to doing nothing with it.
-    let out = Command::new("ffmpeg")
+    let out = ffmpeg_cmd()
         .args(["-hide_banner", "-i"])
         .arg(path)
         .stdin(Stdio::null())
@@ -296,7 +330,7 @@ pub fn extract_frames(
         fit.0.max(2),
         fit.1.max(2)
     );
-    let status = Command::new("ffmpeg")
+    let status = ffmpeg_cmd()
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(path)
         .args(["-vf", &format!("fps={fps},{scale}")])
@@ -330,7 +364,7 @@ pub fn extract_frames(
 /// the common case; a real failure is caught when the process exits and is
 /// reported with ffmpeg's own words.
 fn compiled_encoders() -> Vec<String> {
-    let Ok(out) = Command::new("ffmpeg")
+    let Ok(out) = ffmpeg_cmd()
         .args(["-hide_banner", "-encoders"])
         .stdin(Stdio::null())
         .output()
@@ -381,10 +415,16 @@ pub fn export_video(
         bail!("there are no frames in that range to export");
     }
     if !ffmpeg_available() {
+        let install_hint = if cfg!(target_os = "windows") {
+            "on Windows, `winget install Gyan.FFmpeg`."
+        } else if cfg!(target_os = "macos") {
+            "on macOS, `brew install ffmpeg`."
+        } else {
+            "on Linux, your package manager (e.g. `sudo apt install ffmpeg`)."
+        };
         bail!(
             "no ffmpeg was found on this machine, and video export needs one.\n\
-             Install it and make sure `ffmpeg` is on your PATH — on Windows, \
-             `winget install Gyan.FFmpeg`."
+             Install it and make sure `ffmpeg` is on your PATH — {install_hint}"
         );
     }
 
@@ -518,7 +558,7 @@ fn spawn_ffmpeg(
     audio: &[AudioTrack],
     output: &Path,
 ) -> Result<Child> {
-    let mut command = Command::new("ffmpeg");
+    let mut command = ffmpeg_cmd();
     command
         .arg("-hide_banner")
         // Overwrite: the caller has already decided, and a prompt on stdin

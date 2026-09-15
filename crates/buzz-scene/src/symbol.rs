@@ -158,9 +158,8 @@ impl ColorTransform {
     /// Apply to a colour.
     pub fn apply(&self, color: Color) -> Color {
         let [r, g, b, a] = color.to_rgba8().to_u8_array();
-        let ch = |v: u8, i: usize| {
-            ((v as f32 / 255.0) * self.multiply[i] + self.add[i]).clamp(0.0, 1.0)
-        };
+        let ch =
+            |v: u8, i: usize| ((v as f32 / 255.0) * self.multiply[i] + self.add[i]).clamp(0.0, 1.0);
         Color::from_rgba8(
             (ch(r, 0) * 255.0).round() as u8,
             (ch(g, 1) * 255.0).round() as u8,
@@ -212,7 +211,10 @@ pub enum ColorEffect {
     None,
     /// -1 is black, 1 is white.
     Brightness(f32),
-    Tint { color: Color, amount: f32 },
+    Tint {
+        color: Color,
+        amount: f32,
+    },
     Alpha(f32),
     /// A transform none of the named effects produces — the result of nesting,
     /// of a tween part way through, or of an imported file.
@@ -300,6 +302,17 @@ pub struct SymbolInstance {
     pub first_frame: u32,
     pub loop_mode: LoopMode,
     pub color: ColorTransform,
+    /// **Lock this instance's playhead to the root timeline's frame number.**
+    ///
+    /// Off (the default), the instance plays as Animate's do — a graphic runs
+    /// from where it was placed, a movie clip on its own timeline. On, it and
+    /// everything nested inside it show the *root* frame the stage is on, so a
+    /// character placed on the root reads frame 42 when the stage is on frame
+    /// 42, and so does the head symbol inside it, and the mouth inside that.
+    /// That is what makes a lip sync generated against the root dialogue line
+    /// up wherever the mouth actually lives. Toggle it off to key the character
+    /// by hand instead.
+    pub sync_to_root: bool,
 }
 
 impl SymbolInstance {
@@ -309,6 +322,7 @@ impl SymbolInstance {
             first_frame: 0,
             loop_mode: LoopMode::Loop,
             color: ColorTransform::default(),
+            sync_to_root: false,
         }
     }
 
@@ -328,6 +342,21 @@ impl SymbolInstance {
             LoopMode::SingleFrame => self.first_frame.min(length - 1),
             LoopMode::Loop => (self.first_frame + elapsed) % length,
             LoopMode::PlayOnce => (self.first_frame + elapsed).min(length - 1),
+        }
+    }
+
+    /// The frame to show when locked to the root timeline — the root's own
+    /// frame number, clamped or looped into the symbol's own length. This is
+    /// what [`Self::sync_to_root`] resolves to, at every level: a character and
+    /// everything inside it read the frame the stage is on, ignoring where the
+    /// instance was placed (`first_frame` and `elapsed` do not enter into it).
+    /// `SingleFrame` still holds one frame, for a symbol used as a still.
+    pub fn resolve_to_root(&self, root_frame: u32, symbol_length: u32) -> u32 {
+        let length = symbol_length.max(1);
+        match self.loop_mode {
+            LoopMode::SingleFrame => self.first_frame.min(length - 1),
+            LoopMode::Loop => root_frame % length,
+            LoopMode::PlayOnce => root_frame.min(length - 1),
         }
     }
 }
@@ -363,6 +392,16 @@ impl Symbol {
         self.layers.frame_count()
     }
 
+    /// Does this symbol hold animation, rather than a single still drawing?
+    ///
+    /// A movie clip runs a timeline of its own, so it counts as animated
+    /// whatever it holds. Any other symbol is animated when one of its layers
+    /// carries more than one keyframe — a second drawing, or the two ends of a
+    /// tween. A single keyframe held for a hundred frames is still a still.
+    pub fn is_animated(&self) -> bool {
+        self.kind == SymbolKind::MovieClip || self.layers.iter().any(|l| l.keyframe_count() > 1)
+    }
+
     /// Artwork shown at `frame`, in paint order.
     pub fn objects_at(&self, frame: u32) -> Vec<&Arc<Object>> {
         self.layers
@@ -393,10 +432,23 @@ impl Symbol {
 /// Folders are stored as paths on the symbols themselves plus an explicit
 /// folder set, so an empty folder survives — Animate lets you make a folder
 /// before putting anything in it, and losing it on save would be surprising.
+/// # Why the maps are behind `Arc`
+///
+/// Cloning a [`crate::Scene`] happens constantly — every `Document::edit`
+/// snapshots for undo, and several panels wrap their draw in an `edit` each
+/// frame. If `symbols` were an inline `BTreeMap`, each of those clones would
+/// allocate one tree node per symbol; on an imported document with thousands of
+/// symbols that is a per-frame cost large enough to freeze the window. Behind an
+/// `Arc`, cloning the `Library` is a pointer copy, and the tree is forked once —
+/// via [`Arc::make_mut`] — only when it is actually mutated, exactly as
+/// [`crate::LayerStack`] does. **Editing one symbol still changes only that
+/// symbol's `Arc` address** (the inner `Arc<Symbol>` values are pointer-copied
+/// when the map forks), so the pointer-identity caches keyed on it — thumbnails,
+/// the lighting and filter caches — stay correct.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Library {
-    symbols: BTreeMap<SymbolId, Arc<Symbol>>,
-    folders: BTreeSet<String>,
+    symbols: Arc<BTreeMap<SymbolId, Arc<Symbol>>>,
+    folders: Arc<BTreeSet<String>>,
 }
 
 impl Library {
@@ -416,6 +468,17 @@ impl Library {
         self.symbols.get(&id)
     }
 
+    /// A cheap identity for the shared symbol map: its address, which is stable
+    /// across the pointer-copy clones the document makes each frame and changes
+    /// exactly when the library is edited (via `Arc::make_mut`). Two different
+    /// documents hold different maps, so a render cache keyed partly on this
+    /// will not serve one document's symbols for another — the per-scene
+    /// `revision` counter alone cannot tell two documents apart. See
+    /// [`crate::Scene::revision`].
+    pub fn content_id(&self) -> usize {
+        Arc::as_ptr(&self.symbols) as *const () as usize
+    }
+
     /// Symbols in insertion-independent order, so listings are stable.
     pub fn iter(&self) -> impl Iterator<Item = &Arc<Symbol>> {
         self.symbols.values()
@@ -428,17 +491,17 @@ impl Library {
         {
             self.add_folder(folder);
         }
-        self.symbols.insert(id, Arc::new(symbol));
+        Arc::make_mut(&mut self.symbols).insert(id, Arc::new(symbol));
         id
     }
 
     pub fn remove(&mut self, id: SymbolId) -> Option<Arc<Symbol>> {
-        self.symbols.remove(&id)
+        Arc::make_mut(&mut self.symbols).remove(&id)
     }
 
     /// Edit a symbol in place, cloning only if another snapshot shares it.
     pub fn update(&mut self, id: SymbolId, f: impl FnOnce(&mut Symbol)) -> bool {
-        match self.symbols.get_mut(&id) {
+        match Arc::make_mut(&mut self.symbols).get_mut(&id) {
             Some(slot) => {
                 f(Arc::make_mut(slot));
                 true
@@ -454,7 +517,7 @@ impl Library {
     /// a symbol's layer stack in place of the document's, and every existing
     /// tool edits the symbol without needing to know.
     pub fn layers_mut(&mut self, id: SymbolId) -> Option<&mut LayerStack> {
-        self.symbols
+        Arc::make_mut(&mut self.symbols)
             .get_mut(&id)
             .map(|s| &mut Arc::make_mut(s).layers)
     }
@@ -493,7 +556,7 @@ impl Library {
                 accumulated.push('/');
             }
             accumulated.push_str(part);
-            self.folders.insert(accumulated.clone());
+            Arc::make_mut(&mut self.folders).insert(accumulated.clone());
         }
     }
 
@@ -503,8 +566,7 @@ impl Library {
     /// Animate keeps the contents.
     pub fn remove_folder(&mut self, path: &str) {
         let prefix = format!("{path}/");
-        self.folders
-            .retain(|f| f != path && !f.starts_with(&prefix));
+        Arc::make_mut(&mut self.folders).retain(|f| f != path && !f.starts_with(&prefix));
 
         let affected: Vec<SymbolId> = self
             .symbols
@@ -635,18 +697,52 @@ mod tests {
         assert_eq!(instance.resolve_frame(SymbolKind::Graphic, 5, 0), 0);
     }
 
+    /// **Locked to the root, an instance reads the stage's own frame.** Where
+    /// it was placed and how long it has been on stage do not enter into it —
+    /// which is what lets a character and everything inside it agree with the
+    /// dialogue on the root timeline.
+    #[test]
+    fn syncing_to_root_reads_the_stage_frame_regardless_of_placement() {
+        let instance = SymbolInstance {
+            first_frame: 7, // deliberately not zero, to prove it is ignored
+            loop_mode: LoopMode::PlayOnce,
+            ..SymbolInstance::new(SymbolId(1))
+        };
+        // Within the symbol's length, the frame *is* the root frame.
+        assert_eq!(instance.resolve_to_root(4, 30), 4);
+        assert_eq!(instance.resolve_to_root(29, 30), 29);
+        // PlayOnce holds the last frame past the end.
+        assert_eq!(instance.resolve_to_root(100, 30), 29);
+
+        // Loop wraps within its own length.
+        let looping = SymbolInstance {
+            loop_mode: LoopMode::Loop,
+            ..SymbolInstance::new(SymbolId(1))
+        };
+        assert_eq!(looping.resolve_to_root(4, 30), 4);
+        assert_eq!(looping.resolve_to_root(33, 30), 3);
+        // A zero-length symbol must not divide by zero.
+        assert_eq!(looping.resolve_to_root(5, 0), 0);
+    }
+
     #[test]
     fn colour_effects_reduce_to_multiply_and_add() {
         let identity = ColorTransform::default();
         assert!(identity.is_identity());
         assert_eq!(
-            identity.apply(Color::from_rgb8(10, 20, 30)).to_rgba8().to_u8_array(),
+            identity
+                .apply(Color::from_rgb8(10, 20, 30))
+                .to_rgba8()
+                .to_u8_array(),
             [10, 20, 30, 255]
         );
 
         // Alpha halves the alpha channel and leaves colour alone.
         let half = ColorTransform::alpha(0.5);
-        let out = half.apply(Color::from_rgb8(200, 100, 50)).to_rgba8().to_u8_array();
+        let out = half
+            .apply(Color::from_rgb8(200, 100, 50))
+            .to_rgba8()
+            .to_u8_array();
         assert_eq!(&out[..3], &[200, 100, 50]);
         assert!((out[3] as i32 - 128).abs() <= 1, "alpha was {}", out[3]);
     }
@@ -672,7 +768,11 @@ mod tests {
             .apply(Color::from_rgb8(0, 0, 255))
             .to_rgba8()
             .to_u8_array();
-        assert_eq!(&full[..3], &[255, 0, 0], "full tint should replace the colour");
+        assert_eq!(
+            &full[..3],
+            &[255, 0, 0],
+            "full tint should replace the colour"
+        );
     }
 
     /// Composing must equal applying one then the other.
@@ -711,7 +811,11 @@ mod tests {
         let a = ColorTransform::default();
         let b = ColorTransform::alpha(0.0);
         let mid = a.lerp(&b, 0.5);
-        assert!((mid.multiply[3] - 0.5).abs() < 1e-6, "got {}", mid.multiply[3]);
+        assert!(
+            (mid.multiply[3] - 0.5).abs() < 1e-6,
+            "got {}",
+            mid.multiply[3]
+        );
     }
 
     #[test]
@@ -860,8 +964,14 @@ mod tests {
                     assert!((a - b).abs() < 1e-3, "alpha {a} came back as {b}");
                 }
                 (
-                    ColorEffect::Tint { color: c1, amount: a1 },
-                    ColorEffect::Tint { color: c2, amount: a2 },
+                    ColorEffect::Tint {
+                        color: c1,
+                        amount: a1,
+                    },
+                    ColorEffect::Tint {
+                        color: c2,
+                        amount: a2,
+                    },
                 ) => {
                     assert!((a1 - a2).abs() < 1e-3, "tint amount {a1} came back as {a2}");
                     // The colour survives an 8-bit round trip through the

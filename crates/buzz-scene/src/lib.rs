@@ -25,31 +25,93 @@
 //! [`SpatialIndex`] records the revision it was built from, so a consumer can
 //! tell whether what it holds is current instead of trusting it blindly.
 
+pub mod art;
+pub mod bucket;
 pub mod camera_track;
+pub mod time;
+pub mod effect_brush;
+pub mod gradient;
+pub mod image;
 pub mod index;
 pub mod layer;
+pub mod looping;
 pub mod merge;
 pub mod object;
+pub mod post;
+pub mod modifier;
+pub mod raster;
+pub mod rig;
+pub mod sound;
+pub mod stamp;
+pub mod swatch;
 pub mod symbol;
+pub mod texture;
 pub mod timeline;
+pub mod trace;
 pub mod tween;
+pub mod wand;
+pub mod wave;
 
 use std::sync::Arc;
+
+/// A symbol's resolved extent, keyed by symbol id — every symbol's, built in
+/// one pass by [`Scene::symbol_bounds_table`].
+pub type BoundsTable = std::collections::HashMap<SymbolId, Rect>;
 
 use buzz_geom::{Affine, Point, Rect, Size};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
-pub use camera_track::{CameraKey, CameraTrack};
+pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, GradientMap, Quality};
+pub use buzz_light::{
+    DEFAULT_GLINT, EdgeMode, Light, LightId, LightKey, LightKind, LightRig, LightTrack,
+    SHADOW_LENGTH_RANGE, ShadowFall,
+};
+pub use art::ArtPiece;
+pub use bucket::{Boundary, GapSize, fill_region};
+pub use effect_brush::{EffectKind, EffectStroke, effect_artwork};
+pub use stamp::{BrushStamp, StampedArt};
+pub use time::AtTime;
+pub use camera_track::{
+    CameraKey, CameraMove, CameraTrack, DEFAULT_FOCAL_DISTANCE, FocusKey, MAX_TILT, NamedAngle,
+};
+pub use gradient::{
+    Gradient, GradientHandles, GradientKind, GradientSpread, GradientStop, MAX_STOPS, lerp_color,
+};
+pub use image::{ImageAsset, ImageFill, ImageId, ImageLibrary};
 pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
+pub use looping::{LoopRegion, MAX_REPEATS};
 pub use merge::{ImportTarget, MergeReport};
-pub use object::{FillSpec, Object, ObjectId, ObjectKind, PaintBlend, ShapeData, StrokeSpec};
+pub use modifier::{Breath, Modifier};
+pub use object::{
+    FillSpec, Object, ObjectId, ObjectKind, Paint, PaintBlend, ShapeData, Spatial, StrokeSpec,
+    TextData,
+    Turnaround,
+    TurnaroundView,
+};
+pub use post::{
+    BloomSettings, GradeSettings, GrainSettings, HalftoneSettings, HatchingSettings,
+    PosteriseSettings, PostSettings, VignetteSettings,
+};
+pub use texture::{TextureKind, TextureRecipe};
+// A text object records which cut of a family it is set in and how its lines
+// line up. The types belong to `buzz-text`, which is what honours them; they are
+// re-exported here so a document can name them without depending on the font
+// machinery itself.
+pub use buzz_text::{FontStyle, TextAlign};
+pub use raster::{MergedPaint, merge_over, painted_ink,Canvas, SoftBrush};
+pub use rig::{ArmatureData, NamedPose, RigBinding, RigPart, WarpData};
+pub use sound::{SoundAsset, SoundCue, SoundId, SoundLibrary, SoundRef, SoundSync};
+pub use swatch::{Swatch, SwatchId, Swatches, default_palette, default_swatches};
 pub use symbol::{
     ColorEffect, ColorTransform, Library, LoopMode, Symbol, SymbolId, SymbolInstance, SymbolKind,
 };
 pub use timeline::{FrameKind, Keyframe, LayerTimeline, ResolvedFrame, TweenSpan};
+pub use trace::{TraceOptions, TraceReport, trace, quantise};
 pub use tween::{Easing, Tween, TweenKind};
+pub use wand::{WandOptions, region_at as wand_region};
+pub use wave::{WaveKind, WaveSettings, WaveStroke, wave_artwork, wave_bounds, wave_loop};
 
 /// Stage setup, matching Animate's Document Properties dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -58,6 +120,19 @@ pub struct StageProperties {
     pub size: Size,
     pub background: Color,
     pub frame_rate: f64,
+    /// The full-frame look: bloom, grade, vignette and grain. Off by default,
+    /// so a stage that never opens the Effects panel behaves exactly as one did
+    /// before the compositor existed. See [`crate::PostSettings`].
+    pub post: PostSettings,
+    /// Draw layers ordered by their depth rather than by the timeline.
+    ///
+    /// **Off by default, and byte-identical to the timeline order when every
+    /// depth is equal.** Existing films rely on paint order being the timeline's,
+    /// so reordering them silently would change work already finished. When on,
+    /// layers that cross in space resolve by which is nearer the camera instead
+    /// of one always drawing wholly in front. A mask and the layers it clips move
+    /// together, or the mask would stop meaning anything.
+    pub sort_by_depth: bool,
 }
 
 impl Default for StageProperties {
@@ -66,6 +141,8 @@ impl Default for StageProperties {
             size: Size::new(550.0, 400.0),
             background: Color::WHITE,
             frame_rate: 24.0,
+            post: PostSettings::default(),
+            sort_by_depth: false,
         }
     }
 }
@@ -106,8 +183,38 @@ impl IdAllocator {
     }
 }
 
+/// Where an edit lands: the frame, and whether Auto Keyframe applies to it.
+///
+/// Carried as one value rather than two arguments so that the mode did not
+/// have to be threaded through every editing path as a bare `bool`, where it
+/// would eventually be passed in the wrong order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditAt {
+    /// The frame the playhead is on.
+    pub frame: u32,
+    /// Make a keyframe of that frame first, if it has none.
+    pub auto_key: bool,
+    /// **Edit Multiple Frames.** When set, every keyframe *beginning* inside
+    /// this inclusive range is edited, not only the one under the playhead —
+    /// which is how a whole scene is shifted across without touching each
+    /// drawing in turn.
+    pub span: Option<(u32, u32)>,
+}
+
+impl EditAt {
+    /// This frame, with no keyframe made — for edits that are on a keyframe by
+    /// construction, or that create the artwork they are editing.
+    pub fn exact(frame: u32) -> Self {
+        Self {
+            frame,
+            auto_key: false,
+            span: None,
+        }
+    }
+}
+
 /// An immutable snapshot of the document.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Scene {
     /// Private so every change goes through [`Scene::stage_mut`] and bumps the
     /// revision. As a public field it was possible to resize the stage without
@@ -119,7 +226,30 @@ pub struct Scene {
     camera: CameraTrack,
     /// Reusable symbols, organised into folders. Private for the same reason.
     library: Library,
+    /// Imported sounds. Private for the same reason as the library.
+    sounds: SoundLibrary,
+    /// Bitmaps the document holds. See [`crate::image`].
+    images: ImageLibrary,
+    /// The lights. Private for the same reason: changing one has to bump the
+    /// revision, or the renderer would keep drawing yesterday's shadows.
+    lights: LightRig,
+    /// The looping section, if there is one. Private for the same reason.
+    looping: LoopRegion,
+    /// The document's named colours. Private for the same reason.
+    swatches: Swatches,
     layers: LayerStack,
+    /// **The prose this scene was built from**, when it was built from prose.
+    ///
+    /// The director reads a paragraph and lays out a whole shot from it, and
+    /// until this existed that paragraph was thrown away the moment the scene
+    /// appeared: the animator was left with sixty layers and no record of the
+    /// sentence that made them, and no way to change a word and try again
+    /// without retyping the lot.
+    ///
+    /// Kept on the *scene* rather than beside it, so it travels wherever the
+    /// scene does -- into a saved document, into a script's film, into an
+    /// asset. Empty for every scene made by hand, which is most of them.
+    brief: String,
     ids: IdAllocator,
     revision: u64,
     /// Symbols currently open for editing, outermost first.
@@ -142,6 +272,84 @@ pub struct Scene {
     /// [`Scene::stage_layers`] reaches the document's own timeline regardless
     /// of context, and that is what saving uses.
     editing: Vec<SymbolId>,
+    /// Where each open symbol sits, one per entry in `editing`.
+    ///
+    /// Identity for a symbol opened from the Library — Animate's *Edit
+    /// Symbol* — and the instance's own transform for one opened from the
+    /// stage, which is *Edit in Place*. View state exactly as `editing` is.
+    edit_places: Vec<Affine>,
+    /// Memoised resolved-bounds table, tagged with the revision it was built
+    /// for. Rebuilding it is linear in the library, but resolving bounds is a
+    /// per-object, per-frame operation on every selection, so even a linear
+    /// rebuild every call is enough to lag a big import. Cached here so a
+    /// steady document pays for it once. Interior-mutable and never part of the
+    /// document's identity — not serialised, not compared, not undone.
+    bounds_cache: std::sync::RwLock<Option<(u64, Arc<BoundsTable>)>>,
+    /// Memoised live-spring pose sequences, tagged with the revision they were
+    /// built for. A spring modifier must be integrated forward across the whole
+    /// span, which is too costly to redo for every ghost and scrub; computed
+    /// once per `(object, chain root)` and held here. Interior-mutable and never
+    /// part of the document's identity — same rules as [`Self::bounds_cache`].
+    modifier_cache: std::sync::RwLock<Option<(u64, crate::modifier::SpringTable)>>,
+}
+
+impl Clone for Scene {
+    fn clone(&self) -> Self {
+        Self {
+            stage: self.stage,
+            camera: self.camera.clone(),
+            library: self.library.clone(),
+            sounds: self.sounds.clone(),
+            images: self.images.clone(),
+            lights: self.lights.clone(),
+            looping: self.looping,
+            swatches: self.swatches.clone(),
+            layers: self.layers.clone(),
+            brief: self.brief.clone(),
+            ids: self.ids,
+            revision: self.revision,
+            editing: self.editing.clone(),
+            edit_places: self.edit_places.clone(),
+            // A fresh, empty cache: a snapshot rebuilds its own on first use,
+            // so a clone shares no mutable state with the scene it came from.
+            bounds_cache: std::sync::RwLock::new(None),
+            modifier_cache: std::sync::RwLock::new(None),
+        }
+    }
+}
+
+/// Invert an affine, or `None` when it has collapsed and cannot be undone.
+fn invert(t: Affine) -> Option<Affine> {
+    invert_affine(t)
+}
+
+/// Invert an affine, or `None` when it has collapsed and cannot be undone.
+///
+/// Public because the shell has to undo the same transforms the renderer
+/// applies — a click inside a symbol opened in place is carried back through
+/// exactly this.
+pub fn invert_affine(t: Affine) -> Option<Affine> {
+    let c = t.as_coeffs();
+    let determinant = c[0] * c[3] - c[1] * c[2];
+    (determinant.abs() > 1e-12).then(|| t.inverse())
+}
+
+/// Every symbol an object refers to, however deeply it is wrapped.
+fn collect_symbols(object: &Object, out: &mut Vec<SymbolId>) {
+    match &object.kind {
+        ObjectKind::Instance(i) => out.push(i.symbol),
+        ObjectKind::Group(children) => {
+            for child in children {
+                collect_symbols(child, out);
+            }
+        }
+        ObjectKind::Armature(rig) => {
+            for part in &rig.parts {
+                collect_symbols(&part.artwork, out);
+            }
+        }
+        ObjectKind::Shape(_) | ObjectKind::Warp(_) => {}
+    }
 }
 
 impl PartialEq for Scene {
@@ -149,7 +357,12 @@ impl PartialEq for Scene {
         self.stage == other.stage
             && self.camera == other.camera
             && self.library == other.library
+            && self.sounds == other.sounds
+            && self.lights == other.lights
+            && self.looping == other.looping
+            && self.swatches == other.swatches
             && self.layers == other.layers
+            && self.brief == other.brief
             && self.ids == other.ids
             && self.revision == other.revision
     }
@@ -161,10 +374,20 @@ impl Default for Scene {
             stage: StageProperties::default(),
             camera: CameraTrack::new(),
             library: Library::new(),
+            sounds: SoundLibrary::default(),
+            images: ImageLibrary::default(),
+            lights: LightRig::default(),
+            looping: LoopRegion::default(),
+            // A new document opens with Animate's default palette, named.
+            swatches: swatch::default_swatches(),
             layers: LayerStack::new(),
+            brief: String::new(),
             ids: IdAllocator::default(),
             revision: 0,
             editing: Vec::new(),
+            edit_places: Vec::new(),
+            bounds_cache: std::sync::RwLock::new(None),
+            modifier_cache: std::sync::RwLock::new(None),
         };
         // Animate starts every document with one layer named "Layer_1".
         scene.add_layer("Layer_1", LayerKind::Normal);
@@ -173,6 +396,23 @@ impl Default for Scene {
 }
 
 impl Scene {
+    /// **The prose this scene was directed from**, or empty.
+    ///
+    /// See [`Self::brief`]. Shown in the Story panel, where it can be edited
+    /// and re-directed.
+    pub fn brief(&self) -> &str {
+        &self.brief
+    }
+
+    /// Record the prose a scene was built from.
+    ///
+    /// Bumps the revision like any other edit: it is part of the document and
+    /// a document that changed it is a document to save.
+    pub fn set_brief(&mut self, brief: impl Into<String>) {
+        self.brief = brief.into();
+        self.bump();
+    }
+
     /// An empty document with no layers at all.
     ///
     /// Importers want this; the editor wants [`Scene::default`].
@@ -181,10 +421,21 @@ impl Scene {
             stage: StageProperties::default(),
             camera: CameraTrack::new(),
             library: Library::new(),
+            sounds: SoundLibrary::default(),
+            images: ImageLibrary::default(),
+            lights: LightRig::default(),
+            looping: LoopRegion::default(),
+            // No palette: an importer builds the document, and whatever
+            // palette it carries comes from the file rather than from here.
+            swatches: Swatches::default(),
             layers: LayerStack::new(),
+            brief: String::new(),
             ids: IdAllocator::default(),
             revision: 0,
             editing: Vec::new(),
+            edit_places: Vec::new(),
+            bounds_cache: std::sync::RwLock::new(None),
+            modifier_cache: std::sync::RwLock::new(None),
         }
     }
 
@@ -228,11 +479,29 @@ impl Scene {
         self.editing.last().copied()
     }
 
-    /// Open a symbol for editing.
+    /// Open a symbol for editing, at the origin.
+    ///
+    /// Animate's **Edit Symbol**: the symbol is shown in its own space, in the
+    /// middle of the stage, wherever its instances happen to be. Use
+    /// [`Self::enter_symbol_in_place`] for the other one.
     ///
     /// Does not bump the revision: opening a symbol is navigation, not an
     /// edit, and marking the document dirty for it would be wrong.
     pub fn enter_symbol(&mut self, id: SymbolId) -> bool {
+        self.enter_symbol_in_place(id, Affine::IDENTITY)
+    }
+
+    /// Open a symbol **where the instance that was clicked sits**.
+    ///
+    /// Animate's *Edit in Place*, and the difference is not cosmetic: a head
+    /// drawn at the origin while its body is half a stage away cannot be
+    /// judged against anything, and every nudge has to be imagined. `place` is
+    /// the transform from this symbol's own space to the space of whatever is
+    /// open now — the instance's matrix, and its layer's parenting with it.
+    ///
+    /// The places compose down the path, so opening a hand inside an arm
+    /// inside a character lands the hand on the character's wrist.
+    pub fn enter_symbol_in_place(&mut self, id: SymbolId, place: Affine) -> bool {
         if self.library.get(id).is_none() {
             return false;
         }
@@ -240,20 +509,34 @@ impl Scene {
         // cycle forever; jump back to that level instead.
         if let Some(index) = self.editing.iter().position(|s| *s == id) {
             self.editing.truncate(index + 1);
+            self.edit_places.truncate(index + 1);
         } else {
             self.editing.push(id);
+            self.edit_places.push(place);
         }
         true
     }
 
+    /// Where the symbol being edited sits, in the document's own space.
+    ///
+    /// Identity on the main timeline, and identity for a symbol opened from
+    /// the Library rather than from the stage.
+    pub fn edit_place(&self) -> Affine {
+        self.edit_places
+            .iter()
+            .fold(Affine::IDENTITY, |acc, place| acc * *place)
+    }
+
     /// Step out one level, towards the main timeline.
     pub fn exit_symbol(&mut self) -> bool {
+        self.edit_places.pop();
         self.editing.pop().is_some()
     }
 
     /// Return all the way to the main timeline.
     pub fn edit_document(&mut self) {
         self.editing.clear();
+        self.edit_places.clear();
     }
 
     pub fn stage(&self) -> &StageProperties {
@@ -276,6 +559,44 @@ impl Scene {
         &mut self.camera
     }
 
+    /// **Move the camera nearer or further, carrying the layers with it.**
+    ///
+    /// A layer's depth is measured from the focal plane, so what counts as in
+    /// front of the lens moves when the lens does. Setting the focal distance
+    /// through the field alone left every layer where it was: pull a 6000-unit
+    /// camera in to 200 and a layer parked at −5700 is suddenly four thousand
+    /// units *behind* it, `CameraTrack::depth_scale` answers `None`, and the
+    /// layer stops being drawn — artwork vanishing off the stage with nothing
+    /// on screen having touched it.
+    ///
+    /// So this is the way to set it. Any layer nearer than
+    /// [`CameraTrack::nearest_depth`] is carried forward to that bound — the
+    /// same one every control that moves a layer already respects. Only the
+    /// near side: a layer behind the stage merely gets smaller, and clamping it
+    /// would throw away staging that was never in danger. A layer already in
+    /// front of the new bound does not move at all, which is almost all of them
+    /// almost always, and every layer on the stage.
+    pub fn set_focal_distance(&mut self, distance: f64) {
+        // A distance that is not a distance would put `nearest_depth` on top of
+        // the stage and flatten every layer against it — a destructive edit
+        // from a value no control can produce but a script can. `from_parts`
+        // refuses the same values when reading a file, for the same reason.
+        if !distance.is_finite() || distance <= 0.0 {
+            return;
+        }
+        self.camera_mut().focal_distance = distance;
+        let nearest = self.camera.nearest_depth();
+        let squeezed: Vec<LayerId> = self
+            .layers()
+            .iter()
+            .filter(|l| l.depth < nearest)
+            .map(|l| l.id)
+            .collect();
+        for id in squeezed {
+            self.update_layer(id, |l| l.depth = nearest);
+        }
+    }
+
     pub fn library(&self) -> &Library {
         &self.library
     }
@@ -284,6 +605,311 @@ impl Scene {
     pub fn library_mut(&mut self) -> &mut Library {
         self.revision += 1;
         &mut self.library
+    }
+
+    // -- lighting ------------------------------------------------------------
+
+    /// The document's named colours.
+    pub fn swatches(&self) -> &Swatches {
+        &self.swatches
+    }
+
+    /// Mutable palette. Bumps the revision, so naming a colour is undoable and
+    /// marks the document dirty — it is part of the file, not a preference.
+    pub fn swatches_mut(&mut self) -> &mut Swatches {
+        self.revision += 1;
+        &mut self.swatches
+    }
+
+    /// Add a colour to the palette.
+    pub fn add_swatch(&mut self, name: &str, color: Color, folder: Option<String>) -> SwatchId {
+        self.revision += 1;
+        self.swatches.add(name, color, folder)
+    }
+
+    /// The section of the timeline that repeats, if any.
+    pub fn looping(&self) -> &LoopRegion {
+        &self.looping
+    }
+
+    /// Mutable loop region. Bumps the revision, so setting one is undoable.
+    pub fn looping_mut(&mut self) -> &mut LoopRegion {
+        self.revision += 1;
+        &mut self.looping
+    }
+
+    /// The document frame to draw for each frame of the **finished film**.
+    ///
+    /// Without a loop region this is every frame once, and every caller that
+    /// walks it behaves exactly as it did before there was such a thing.
+    pub fn playlist(&self) -> Vec<u32> {
+        self.looping.playlist(self.frame_count())
+    }
+
+    /// How long the finished film is, in frames — which is longer than the
+    /// timeline when a section repeats.
+    pub fn rendered_frame_count(&self) -> u32 {
+        self.looping.rendered_length(self.frame_count())
+    }
+
+    /// The document's lights.
+    pub fn lights(&self) -> &LightRig {
+        &self.lights
+    }
+
+    /// Mutable lights. Bumps the revision, so moving a light is undoable and
+    /// invalidates whatever the renderer had cached.
+    pub fn lights_mut(&mut self) -> &mut LightRig {
+        self.revision += 1;
+        &mut self.lights
+    }
+
+    /// Add a light, with a fresh id and a name that is not taken.
+    pub fn add_light(&mut self, kind: LightKind) -> LightId {
+        let id = LightId(self.ids.take());
+        let base = kind.label();
+        let mut name = base.to_string();
+        for n in 2..10_000 {
+            if !self.lights.lights.iter().any(|l| l.name == name) {
+                break;
+            }
+            name = format!("{base} {n}");
+        }
+
+        let light = Light::new(id, name, kind);
+        let rig = self.lights_mut();
+        rig.lights.push(light);
+        // Adding the first light switches the rig on: an animator who asks for
+        // a sun means to see one, and a light that does nothing until a second
+        // switch is found is a bug report waiting to happen.
+        rig.enabled = true;
+        id
+    }
+
+    /// How far artwork on `layer` stands above the surface its shadow falls
+    /// on, for a given light.
+    ///
+    /// Flat artwork has no thickness, so the light's standing height is the
+    /// base; a layer pushed towards the camera really is further in front of
+    /// the background, and its shadow lengthens by exactly that much.
+    pub fn shadow_height(&self, layer_depth: f64, light: &Light) -> f64 {
+        let receiver = self.receiving_depth();
+        (light.standing_height + (receiver - layer_depth)).max(0.0)
+    }
+
+    /// The depth of the surface shadows fall on: the furthest layer back.
+    pub fn receiving_depth(&self) -> f64 {
+        self.stage_layers()
+            .iter()
+            .map(|l| l.depth)
+            .fold(0.0f64, f64::max)
+    }
+
+    // -- sound ---------------------------------------------------------------
+
+    /// Imported sounds.
+    pub fn sounds(&self) -> &SoundLibrary {
+        &self.sounds
+    }
+
+    /// The document's bitmaps.
+    pub fn images(&self) -> &ImageLibrary {
+        &self.images
+    }
+
+    /// Mutable bitmap library. Bumps the revision, so importing is undoable.
+    pub fn images_mut(&mut self) -> &mut ImageLibrary {
+        self.revision += 1;
+        &mut self.images
+    }
+
+    /// Allocate a bitmap id without putting anything in the library yet.
+    ///
+    /// For paint, which builds its own pixels rather than decoding a file.
+    pub fn next_image_id(&mut self) -> ImageId {
+        ImageId(self.ids.take())
+    }
+
+    /// Decode a bitmap file into the library, giving it a fresh id and a name
+    /// no other bitmap has.
+    ///
+    /// Decoding here rather than in the caller means a file that cannot be read
+    /// fails *before* the document is touched — the same rule sound import
+    /// follows, and for the same reason: a library entry that shows nothing is
+    /// worse than a refused import.
+    pub fn add_image(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<std::sync::Arc<ImageAsset>, crate::image::ImageError> {
+        let id = ImageId(self.ids.take());
+        let name = self.images.unique_name(name);
+        let asset = ImageAsset::decode(id, name, bytes)?;
+        Ok(self.images_mut().insert(asset))
+    }
+
+    /// Import a bitmap and place it as a shape filled with it.
+    ///
+    /// **This is Animate's Import *and* its Break Apart in one step**, and
+    /// deliberately so. A placed bitmap that is not yet artwork can only be
+    /// moved and scaled; every other thing an animator wants to do to it —
+    /// cut the sky out, rub away an edge, keep the tree — needs it broken
+    /// apart first. Arriving already broken apart skips a step nobody ever
+    /// wants to skip, and costs nothing, because the shape it makes is an
+    /// ordinary rectangle that behaves exactly as a drawn one does.
+    pub fn place_image(
+        &mut self,
+        layer: LayerId,
+        frame: u32,
+        asset: std::sync::Arc<ImageAsset>,
+        at: Point,
+    ) -> Option<ObjectId> {
+        let natural = crate::image::ImageFill::natural_rect(&asset);
+        let rect = Rect::new(at.x, at.y, at.x + natural.width(), at.y + natural.height());
+        self.place_image_in(layer, frame, asset, rect)
+    }
+
+    /// Place a bitmap filling an exact rectangle, as [`Scene::place_image`]
+    /// does at its natural size.
+    pub fn place_image_in(
+        &mut self,
+        layer: LayerId,
+        frame: u32,
+        asset: std::sync::Arc<ImageAsset>,
+        rect: Rect,
+    ) -> Option<ObjectId> {
+        let fill = crate::image::ImageFill::new(asset, rect);
+        let shape = ShapeData {
+            path: buzz_geom::Shape::to_path(&rect, 1e-9),
+            fill: Some(FillSpec::image(fill)),
+            stroke: None,
+            blend: PaintBlend::Normal,
+        };
+        self.add_shape_at(layer, frame, shape)
+    }
+
+    /// Mutable sound library. Bumps the revision, so importing is undoable.
+    pub fn sounds_mut(&mut self) -> &mut SoundLibrary {
+        self.revision += 1;
+        &mut self.sounds
+    }
+
+    /// Import a sound, giving it a unique name and a fresh id.
+    pub fn add_sound(
+        &mut self,
+        name: &str,
+        data: std::sync::Arc<Vec<u8>>,
+        format: &str,
+        sample_rate: u32,
+        channels: u16,
+        length: u64,
+    ) -> SoundId {
+        let id = SoundId(self.ids.take());
+        let name = self.sounds.unique_name(name);
+        self.sounds_mut().insert(SoundAsset {
+            id,
+            name,
+            data,
+            format: format.to_ascii_lowercase(),
+            sample_rate,
+            channels,
+            length,
+        });
+        id
+    }
+
+    /// Attach a sound to the keyframe governing `frame` on `layer`.
+    ///
+    /// Animate attaches sound to a *keyframe*, not to a layer, so one layer
+    /// can carry a whole scene's effects. Returns whether there was a keyframe
+    /// to attach it to.
+    pub fn set_frame_sound(&mut self, layer: LayerId, frame: u32, sound: Option<SoundRef>) -> bool {
+        let mut attached = false;
+        self.update_layer(layer, |l| {
+            if let Some(keyframe) = l.frames.keyframe_at_mut(frame) {
+                keyframe.sound = sound;
+                attached = true;
+            }
+        });
+        attached
+    }
+
+    /// The sound on the keyframe governing `frame`.
+    pub fn frame_sound(&self, layer: LayerId, frame: u32) -> Option<SoundRef> {
+        self.layers()
+            .get(layer)?
+            .frames
+            .keyframe_at(frame)
+            .and_then(|k| k.sound)
+    }
+
+    /// Every sound on the **document's own timeline**, with the frame it
+    /// starts on.
+    ///
+    /// # Why this reads the stage timeline, always
+    ///
+    /// This is what plays. It deliberately ignores which symbol is open for
+    /// editing, so the dialogue on the root timeline keeps sounding when you
+    /// step into a character to animate its walk — and when you step from
+    /// there into its head to animate the mouth. The sound belongs to the
+    /// document; the symbol you are inside is a view of it.
+    ///
+    /// It is the same distinction saving makes, for the same reason.
+    pub fn stage_cues(&self) -> Vec<SoundCue> {
+        let mut cues = Vec::new();
+        for layer in self.stage_layers().iter() {
+            // A hidden layer is still heard: hiding a layer hides *artwork*,
+            // and an animator hides layers constantly while working. Losing
+            // the soundtrack because a layer was hidden would be surprising in
+            // exactly the way this whole design is trying to avoid.
+            let keyframes = layer.frames.keyframes();
+            for (i, keyframe) in keyframes.iter().enumerate() {
+                let Some(sound) = keyframe.sound else {
+                    continue;
+                };
+                if sound.sync == SoundSync::Stop {
+                    continue;
+                }
+                // A stream is tied to the timeline, so it lasts only as long as
+                // its frames do: it stops at the next keyframe on this layer —
+                // which is how a blank keyframe cuts it short — or at the end of
+                // the layer's span. An event or start sound runs on its own
+                // clock once triggered and ignores this.
+                let end_frame = (sound.sync == SoundSync::Stream).then(|| {
+                    keyframes
+                        .get(i + 1)
+                        .map(|next| next.start)
+                        .unwrap_or_else(|| layer.frames.length())
+                });
+                cues.push(SoundCue {
+                    sound: sound.sound,
+                    start_frame: keyframe.start,
+                    end_frame,
+                    trim_start: sound.trim_start,
+                    trim_end: sound.trim_end,
+                    volume: sound.volume,
+                    sync: sound.sync,
+                });
+            }
+        }
+        cues.sort_by_key(|c| c.start_frame);
+        cues
+    }
+
+    /// Sounds placed anywhere, including inside symbols, for the Library
+    /// panel's use count.
+    pub fn sound_usage(&self) -> std::collections::BTreeMap<SoundId, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        let stage = self.stage_layers().iter();
+        let nested = self.library.iter().flat_map(|s| s.layers.iter());
+        for layer in stage.chain(nested) {
+            for keyframe in layer.frames.keyframes() {
+                if let Some(sound) = keyframe.sound {
+                    *counts.entry(sound.sound).or_insert(0) += 1;
+                }
+            }
+        }
+        counts
     }
 
     /// Add a symbol, giving it a unique name and a fresh id.
@@ -298,7 +924,9 @@ impl Scene {
         let mut symbol = Symbol::new(id, name, kind);
         symbol.folder = folder.map(|f| f.trim_matches('/').to_string());
         // A symbol always needs one layer, or there is nowhere to draw.
-        symbol.layers.push_front(Layer::normal(LayerId(self.ids.take()), "Layer_1"));
+        symbol
+            .layers
+            .push_front(Layer::normal(LayerId(self.ids.take()), "Layer_1"));
         self.library.insert(symbol);
         self.bump();
         id
@@ -326,26 +954,281 @@ impl Scene {
     /// the library, so it returns a placeholder; anything that needs real
     /// extents for an instance comes here.
     pub fn instance_bounds(&self, object: &Object) -> Option<Rect> {
+        self.instance_bounds_within(object, 0)
+    }
+
+    /// How deep symbol nesting is followed when measuring.
+    ///
+    /// A symbol that contains an instance of itself is a cycle, and measuring
+    /// it would recurse until the stack ran out. Animate refuses to create one;
+    /// an imported or hand-edited file can contain one anyway. The same limit
+    /// the renderer uses, for the same reason.
+    const MAX_MEASURE_DEPTH: usize = 12;
+
+    fn instance_bounds_within(&self, object: &Object, depth: usize) -> Option<Rect> {
+        if depth >= Self::MAX_MEASURE_DEPTH {
+            return None;
+        }
         let instance = object.instance()?;
         let symbol = self.library.get(instance.symbol)?;
-        let local = symbol.bounds()?;
+        let local = self.symbol_bounds_within(symbol, depth + 1)?;
         Some(object::transform_rect(object.transform, local))
     }
 
+    /// What a symbol's artwork actually covers, resolved through the library.
+    ///
+    /// # Why this cannot be `Symbol::bounds`
+    ///
+    /// [`Symbol::bounds`] measures its layers with [`Object::bounds`], and an
+    /// object has no way to reach the library — so a nested instance measures
+    /// as its placeholder, a two-unit box about the origin.
+    ///
+    /// **That is every Animate character.** A rig is a symbol whose layers hold
+    /// one part-symbol each: a head, a hand, a body. Measured without the
+    /// library, the whole character came out two units across, which made it
+    /// clickable only at a dot on its own origin — so it could not be selected,
+    /// could not be double-clicked into, drew its transform handles in a
+    /// pinpoint, and put its transformation point in the wrong place. The
+    /// symptom is "I cannot get inside my character", and the cause is here.
+    pub fn symbol_bounds(&self, symbol: SymbolId) -> Option<Rect> {
+        let symbol = self.library.get(symbol)?;
+        self.symbol_bounds_within(symbol, 0)
+    }
+
+    fn symbol_bounds_within(&self, symbol: &Symbol, depth: usize) -> Option<Rect> {
+        if depth >= Self::MAX_MEASURE_DEPTH {
+            return None;
+        }
+        // Across every frame, as `Symbol::bounds` does: a symbol's extent is
+        // what it covers over its whole timeline, not what one frame shows.
+        //
+        // **Through the symbol's own layer parenting**, which is how a
+        // character symbol is rigged inside itself — the renderer draws a part
+        // through the chain it follows (`buzz_render::document`), so measuring
+        // the parts where they were drawn at rest gives a symbol smaller than
+        // the character on screen. Everything downstream inherits that error:
+        // the cheap rejection in hit testing throws away clicks that land on a
+        // limb the rig has carried outside the measured box, so the click falls
+        // through to whatever is behind it.
+        //
+        // Per keyframe, because where a parent has taken a part depends on the
+        // frame. Memoised by `symbol_bounds_table`, so this runs once per
+        // symbol per revision rather than once per measurement.
+        symbol
+            .layers
+            .iter()
+            .flat_map(|layer| {
+                layer.frames.keyframes().iter().flat_map(move |key| {
+                    let follows = symbol.layers.inherited_transform(layer.id, key.start);
+                    key.objects.iter().map(move |o| (follows, o))
+                })
+            })
+            .map(|(follows, o)| {
+                crate::object::transform_rect(follows, self.resolved_bounds_within(o, depth))
+            })
+            .reduce(|a, b| a.union(b))
+    }
+
     /// Bounds of an object, resolving instances through the library.
+    /// The transformation point of an object, in the space it is placed in.
+    ///
+    /// The stored point when there is one; otherwise the centre of what the
+    /// object actually covers — which for an instance means asking the
+    /// library, and is why this lives on the scene rather than on the object.
+    pub fn pivot_of(&self, object: &Object) -> Point {
+        match object.pivot {
+            Some(local) => object.transform * local,
+            None => self.resolved_bounds(object).center(),
+        }
+    }
+
+    /// The same point in the object's **own** coordinates, which is how it is
+    /// stored: put on the artwork, so it travels with it.
+    pub fn pivot_local_of(&self, object: &Object) -> Point {
+        match object.pivot {
+            Some(local) => local,
+            None => match invert(object.transform) {
+                Some(back) => back * self.resolved_bounds(object).center(),
+                // A collapsed transform has no inverse and no visible artwork
+                // to turn about; the object's own origin is as good as
+                // anything and cannot produce a NaN.
+                None => Point::ORIGIN,
+            },
+        }
+    }
+
+    /// Put the transformation point at a document-space position.
+    ///
+    /// Stored in the object's own space, so it stays on the artwork.
+    pub fn set_pivot_at(&mut self, frame: u32, id: ObjectId, at: Point) -> bool {
+        let Some((_, object)) = self.find_object(id) else {
+            return false;
+        };
+        let local = match invert(object.transform) {
+            Some(back) => back * at,
+            None => return false,
+        };
+        self.update_object_at(frame, id, |o| o.pivot = Some(local))
+    }
+
     pub fn resolved_bounds(&self, object: &Object) -> Rect {
+        // Through the memoised table, not the naive recursion below: an
+        // instance nested N deep costs the recursion time exponential in N,
+        // because each level re-measures every level under it from scratch.
+        // Selecting an imported character (rigs inside rigs) then re-measured
+        // the whole tree every frame the selection chrome was drawn, and the
+        // stage froze. The table is linear in the library, and cached across
+        // calls at one revision, so a steady document resolves any object with
+        // a walk of the object plus a lookup per instance.
+        let table = self.cached_bounds_table();
+        self.resolved_bounds_with(object, &table)
+    }
+
+    /// The resolved-bounds table for the current revision, built once and
+    /// reused until an edit moves the revision on. See [`Self::bounds_cache`].
+    pub fn cached_bounds_table(&self) -> Arc<BoundsTable> {
+        // A read lock for the common case: the table is present and current.
+        if let Ok(guard) = self.bounds_cache.read()
+            && let Some((revision, table)) = guard.as_ref()
+            && *revision == self.revision
+        {
+            return Arc::clone(table);
+        }
+        // Stale or missing: build it (linear in the library) with the read lock
+        // released, then store under a write lock.
+        let table = Arc::new(self.symbol_bounds_table());
+        if let Ok(mut guard) = self.bounds_cache.write() {
+            *guard = Some((self.revision, Arc::clone(&table)));
+        }
+        table
+    }
+
+    fn resolved_bounds_within(&self, object: &Object, depth: usize) -> Rect {
         match &object.kind {
             ObjectKind::Instance(_) => self
-                .instance_bounds(object)
+                .instance_bounds_within(object, depth)
                 .unwrap_or_else(|| object.bounds()),
             ObjectKind::Group(children) => children
                 .iter()
                 .map(|c| {
-                    object::transform_rect(object.transform, self.resolved_bounds(c))
+                    object::transform_rect(object.transform, self.resolved_bounds_within(c, depth))
                 })
                 .reduce(|a, b| a.union(b))
                 .unwrap_or_else(|| object.bounds()),
-            ObjectKind::Shape(_) => object.bounds(),
+            // Rigged artwork measures itself, posed, and needs no library.
+            ObjectKind::Shape(_) | ObjectKind::Armature(_) | ObjectKind::Warp(_) => object.bounds(),
+        }
+    }
+
+    /// Every symbol's resolved extent, computed in **one memoised pass** — linear
+    /// in the library, not exponential in its nesting.
+    ///
+    /// [`Self::resolved_bounds`] re-walks a symbol's whole subtree per call, so
+    /// resolving many objects (a whole frame's worth, every frame while
+    /// scrubbing) re-measures the same rigs over and over. Build this table once
+    /// per document revision and resolve objects against it with
+    /// [`Self::resolved_bounds_with`], and the per-object cost becomes a lookup.
+    pub fn symbol_bounds_table(&self) -> std::collections::HashMap<SymbolId, Rect> {
+        let mut table = std::collections::HashMap::new();
+        let mut visiting = std::collections::HashSet::new();
+        for symbol in self.library.iter() {
+            self.symbol_bounds_memo(symbol.id, &mut table, &mut visiting);
+        }
+        table
+    }
+
+    /// One symbol's resolved extent, memoised into `table`. Cycle-safe: a
+    /// back-edge to a symbol still being measured contributes nothing, exactly
+    /// as the depth limit does for the recursive measure.
+    fn symbol_bounds_memo(
+        &self,
+        id: SymbolId,
+        table: &mut std::collections::HashMap<SymbolId, Rect>,
+        visiting: &mut std::collections::HashSet<SymbolId>,
+    ) -> Rect {
+        if let Some(&bounds) = table.get(&id) {
+            return bounds;
+        }
+        let Some(symbol) = self.library.get(id) else {
+            return Rect::ZERO;
+        };
+        if !visiting.insert(id) {
+            return Rect::ZERO;
+        }
+        let mut bounds: Option<Rect> = None;
+        for layer in symbol.layers.iter() {
+            for object in layer.all_objects() {
+                let b = self.object_bounds_memo(object, table, visiting);
+                if b != Rect::ZERO {
+                    bounds = Some(bounds.map_or(b, |acc| acc.union(b)));
+                }
+            }
+        }
+        visiting.remove(&id);
+        let resolved = bounds.unwrap_or(Rect::ZERO);
+        table.insert(id, resolved);
+        resolved
+    }
+
+    /// An object's resolved bounds in its parent's space, reading nested symbols
+    /// from the memo rather than the library.
+    fn object_bounds_memo(
+        &self,
+        object: &Object,
+        table: &mut std::collections::HashMap<SymbolId, Rect>,
+        visiting: &mut std::collections::HashSet<SymbolId>,
+    ) -> Rect {
+        match &object.kind {
+            ObjectKind::Instance(instance) => {
+                let child = self.symbol_bounds_memo(instance.symbol, table, visiting);
+                if child == Rect::ZERO {
+                    object.bounds()
+                } else {
+                    object::transform_rect(object.transform, child)
+                }
+            }
+            ObjectKind::Group(children) => children
+                .iter()
+                .map(|c| object::transform_rect(object.transform, self.object_bounds_memo(c, table, visiting)))
+                .reduce(|a, b| a.union(b))
+                .unwrap_or_else(|| object.bounds()),
+            ObjectKind::Shape(_) | ObjectKind::Armature(_) | ObjectKind::Warp(_) => object.bounds(),
+        }
+    }
+
+    /// An object's resolved bounds, reading nested symbols from a table built by
+    /// [`Self::symbol_bounds_table`] instead of re-walking the library.
+    pub fn resolved_bounds_with(
+        &self,
+        object: &Object,
+        table: &std::collections::HashMap<SymbolId, Rect>,
+    ) -> Rect {
+        match &object.kind {
+            ObjectKind::Instance(instance) => match table.get(&instance.symbol) {
+                Some(&local) if local != Rect::ZERO => {
+                    object::transform_rect(object.transform, local)
+                }
+                _ => object.bounds(),
+            },
+            ObjectKind::Group(children) => children
+                .iter()
+                .map(|c| object::transform_rect(object.transform, self.resolved_bounds_with(c, table)))
+                .reduce(|a, b| a.union(b))
+                .unwrap_or_else(|| object.bounds()),
+            ObjectKind::Shape(_) | ObjectKind::Armature(_) | ObjectKind::Warp(_) => object.bounds(),
+        }
+    }
+
+    /// The object's transformation point, resolving an instance's centre from a
+    /// bounds table rather than by re-walking the library. See [`Self::pivot_of`].
+    pub fn pivot_of_with(
+        &self,
+        object: &Object,
+        table: &std::collections::HashMap<SymbolId, Rect>,
+    ) -> Point {
+        match object.pivot {
+            Some(local) => object.transform * local,
+            None => self.resolved_bounds_with(object, table).center(),
         }
     }
 
@@ -365,7 +1248,14 @@ impl Scene {
                         walk(c, counts);
                     }
                 }
-                ObjectKind::Shape(_) => {}
+                // A symbol rigged to an armature is still in use, and deleting
+                // it would leave the rig drawing nothing.
+                ObjectKind::Armature(rig) => {
+                    for part in &rig.parts {
+                        walk(&part.artwork, counts);
+                    }
+                }
+                ObjectKind::Shape(_) | ObjectKind::Warp(_) => {}
             }
         }
 
@@ -430,15 +1320,107 @@ impl Scene {
         id
     }
 
+    /// Add a layer to the **document's own** timeline, whatever is open for
+    /// editing.
+    ///
+    /// [`Self::add_layer`] adds to whichever timeline is being edited, which is
+    /// right for artwork: a layer made while a character symbol is open belongs
+    /// inside that character. Sound is the exception. What plays and what is
+    /// exported is [`Self::stage_cues`], which reads the document's timeline and
+    /// nothing else, so a sound layer made inside a symbol would be neither
+    /// heard nor written.
+    pub fn add_stage_layer(&mut self, name: impl Into<String>, kind: LayerKind) -> LayerId {
+        let id = LayerId(self.ids.take());
+        let mut layer = Layer::new(id, name, kind);
+        layer.color = crate::layer::default_color(self.stage_layers().len());
+        self.layers.push_front(layer);
+        self.bump();
+        id
+    }
+
+    /// **Move a stage layer to another row**, as dragging it in the timeline
+    /// would.
+    ///
+    /// [`Self::add_stage_layer`] always adds at the *front*, which is right for
+    /// something the animator just made and wrong for something being placed
+    /// into an arrangement that already exists — a treeline belongs behind the
+    /// cast, and adding it in front and leaving it there paints a forest over
+    /// the actors. The layer stack has always been able to do this; nothing
+    /// had needed it.
+    pub fn reorder_stage_layer(&mut self, id: LayerId, to_index: usize) -> bool {
+        let moved = self.layers.reorder(id, to_index);
+        if moved {
+            self.bump();
+        }
+        moved
+    }
+
+    /// Where a stage layer sits in paint order, front first.
+    pub fn stage_layer_index(&self, id: LayerId) -> Option<usize> {
+        self.stage_layers().iter().position(|l| l.id == id)
+    }
+
+    /// Edit a layer on the document's own timeline, whatever is open for
+    /// editing. The companion to [`Self::add_stage_layer`], and there for the
+    /// same reason.
+    pub fn update_stage_layer(&mut self, id: LayerId, f: impl FnOnce(&mut Layer)) -> bool {
+        let changed = self.layers.update(id, f);
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
     pub fn remove_layer(&mut self, id: LayerId) -> Option<Arc<Layer>> {
         let removed = self.active_layers_mut().remove(id);
         if removed.is_some() {
+            // Anything that followed it is released rather than left pointing
+            // at a layer that is gone: a dangling link resolves to identity, so
+            // the artwork would be right, but the Parent column would show a
+            // name for a layer the user cannot find.
+            let orphans = self.layers().followers_of(id);
+            for orphan in orphans {
+                self.active_layers_mut()
+                    .update(orphan, |l| l.follows = None);
+            }
             self.bump();
         }
         removed
     }
 
     /// Edit a layer in place. Returns false if it does not exist.
+    /// **Make `child` follow `parent`** — Animate's Layer Parenting — recording
+    /// the pose the link was made at.
+    ///
+    /// The recording is the part that matters. Parenting propagates a parent's
+    /// motion away from its rest pose, so without a rest to measure from, a
+    /// character with a single keyframe has no motion to propagate and moving
+    /// a wrist leaves its palm behind. See [`Layer::rest_pose`].
+    ///
+    /// `parent` of `None` detaches. Refuses a link that would make a cycle,
+    /// because a layer that follows itself has nothing sensible to draw.
+    pub fn set_follows(&mut self, child: LayerId, parent: Option<LayerId>, frame: u32) -> bool {
+        if let Some(parent) = parent {
+            if !self.layers().can_follow(child, parent) {
+                return false;
+            }
+            // Where the parent stands right now, taken before the link exists
+            // so it is the pose the user sees when they make it.
+            let rest = self
+                .layers()
+                .get(parent)
+                .and_then(|l| l.frames.resolved_at(frame).iter().next().map(|o| o.transform));
+            self.update_layer(parent, |l| {
+                // Only if it has none: a second child must not move the rest
+                // the first one was rigged against.
+                if l.rest_pose.is_none() {
+                    l.rest_pose = rest;
+                }
+            });
+        }
+        self.update_layer(child, |l| l.follows = parent)
+    }
+
     pub fn update_layer(&mut self, id: LayerId, f: impl FnOnce(&mut Layer)) -> bool {
         let ok = self.active_layers_mut().update(id, f);
         if ok {
@@ -474,13 +1456,38 @@ impl Scene {
         self.add_shape_at(layer, 0, shape)
     }
 
+    /// Place a shape **behind** everything else on the frame — for a paint-bucket
+    /// fill, which belongs under the lines it was poured between.
+    pub fn add_shape_behind_at(
+        &mut self,
+        layer: LayerId,
+        frame: u32,
+        shape: ShapeData,
+    ) -> Option<ObjectId> {
+        let id = ObjectId(self.ids.take());
+        let object = Arc::new(Object::shape(id, shape));
+        let mut placed = false;
+        self.active_layers_mut()
+            .update(layer, |l| placed = l.frames.insert_object_behind(frame, object));
+        placed.then(|| {
+            self.bump();
+            id
+        })
+    }
+
     /// Place an already-built object on a layer at `frame`.
-    pub fn add_object_at(&mut self, layer: LayerId, frame: u32, object: Object) -> Option<ObjectId> {
+    pub fn add_object_at(
+        &mut self,
+        layer: LayerId,
+        frame: u32,
+        object: Object,
+    ) -> Option<ObjectId> {
         let id = object.id;
         self.ids.reserve_above(id.0);
         let mut placed = false;
-        self.active_layers_mut()
-            .update(layer, |l| placed = l.push_object_at(frame, Arc::new(object)));
+        self.active_layers_mut().update(layer, |l| {
+            placed = l.push_object_at(frame, Arc::new(object))
+        });
         placed.then(|| {
             self.bump();
             id
@@ -492,12 +1499,319 @@ impl Scene {
         self.add_object_at(layer, 0, object)
     }
 
+    // -- the library ----------------------------------------------------------
+
+    /// **Point every instance of one symbol at another.**
+    ///
+    /// # What this is for
+    ///
+    /// A prop, a costume, a character drawn a second way: the animation is
+    /// already right and only the drawing is to change. Without this, that means
+    /// finding every instance across every frame and every symbol that contains
+    /// one, and replacing each by hand — and the instances are the *placements*,
+    /// so each one carries a position, a scale and a colour effect that would
+    /// have to be typed back in.
+    ///
+    /// Swapping keeps all of that. Only what the instance *points at* changes,
+    /// so a character swapped for their second costume stands where they stood,
+    /// at the size they were, with the same tint.
+    ///
+    /// Returns how many instances were repointed. Swapping a symbol for itself
+    /// changes nothing and says so by returning zero.
+    pub fn swap_symbol(&mut self, from: SymbolId, to: SymbolId) -> usize {
+        if from == to || self.library().get(to).is_none() {
+            return 0;
+        }
+        let mut swapped = 0;
+
+        let repoint = |object: &mut Object, swapped: &mut usize| {
+            if let ObjectKind::Instance(instance) = &mut object.kind
+                && instance.symbol == from
+            {
+                instance.symbol = to;
+                *swapped += 1;
+            }
+        };
+
+        let layers: Vec<LayerId> = self.layers().iter().map(|l| l.id).collect();
+        for layer in layers {
+            let frames: Vec<u32> = self
+                .layers()
+                .get(layer)
+                .map(|l| l.frames.keyframes().iter().map(|k| k.start).collect())
+                .unwrap_or_default();
+            for frame in frames {
+                let ids: Vec<ObjectId> = self
+                    .layers()
+                    .get(layer)
+                    .map(|l| l.frames.objects_at(frame).iter().map(|o| o.id).collect())
+                    .unwrap_or_default();
+                for id in ids {
+                    self.update_object_at(frame, id, |object| {
+                        walk_objects(object, &repoint, &mut swapped);
+                    });
+                }
+            }
+        }
+
+        // And inside every symbol — a costume worn by a character inside another
+        // symbol is exactly the case this exists for. The symbol being swapped
+        // *to* is skipped: pointing it at itself would be a loop.
+        let symbols: Vec<SymbolId> = self.library().iter().map(|s| s.id).collect();
+        for id in symbols {
+            if id == to {
+                continue;
+            }
+            let layer_ids: Vec<LayerId> = self
+                .library()
+                .get(id)
+                .map(|s| s.layers.iter().map(|l| l.id).collect())
+                .unwrap_or_default();
+            self.library_mut().update(id, |symbol| {
+                for layer in layer_ids {
+                    symbol.layers.update(layer, |l| {
+                        for keyframe in l.frames.keyframes_mut() {
+                            for object in
+                                std::sync::Arc::make_mut(&mut keyframe.objects).iter_mut()
+                            {
+                                walk_objects(
+                                    std::sync::Arc::make_mut(object),
+                                    &repoint,
+                                    &mut swapped,
+                                );
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        if swapped > 0 {
+            self.bump();
+        }
+        swapped
+    }
+
+    // -- the palette ---------------------------------------------------------
+
+    /// **Change a swatch, and everything painted with it changes.**
+    ///
+    /// # What this is for
+    ///
+    /// Until now a palette was a picker: it handed you a colour and forgot. So
+    /// "make the coat green" meant finding every shape wearing that colour, on
+    /// every frame, inside every symbol, and repainting each one by hand — and
+    /// getting it wrong somewhere, which is how a character ends up with two
+    /// slightly different coats in one film. A fill that remembers *which
+    /// swatch* it came from turns that afternoon into one edit.
+    ///
+    /// Returns how many fills and strokes were repainted, so the caller can say
+    /// so rather than leaving the user wondering whether it worked.
+    ///
+    /// Reaches the whole document: every layer, every keyframe, and every
+    /// symbol in the library, because a character is usually a symbol and
+    /// recolouring one that stopped at the stage would be worse than useless.
+    pub fn recolour_swatch(&mut self, swatch: SwatchId, color: Color) -> usize {
+        self.swatches_mut().update(swatch, |s| s.color = color);
+        self.repaint_links(&|id| (id == swatch).then_some(color))
+    }
+
+    /// **Swap one palette for another** — the same drawing in a second set of
+    /// colours.
+    ///
+    /// `mapping` answers, for each swatch a fill is linked to, what colour it
+    /// should now be; `None` leaves that fill alone. A night version of a scene
+    /// is this with a mapping built from two palettes, and it is one undo step.
+    pub fn recolour_by(&mut self, mapping: &dyn Fn(SwatchId) -> Option<Color>) -> usize {
+        self.repaint_links(mapping)
+    }
+
+    /// **Recolour by matching a colour** — every fill or stroke painted
+    /// exactly `from` becomes `to`, on every frame, in every symbol, across the
+    /// whole document.
+    ///
+    /// This is the palette for artwork that was never linked to a swatch: a
+    /// character drawn or imported with plain colours can still be re-skinned in
+    /// one edit — change the skin, and every part on every pose changes with it.
+    /// Matching is exact on the 8-bit colour, the same test [`Self::colours_used`]
+    /// groups by, so a colour the palette offered finds every part wearing it.
+    /// Returns how many fills and strokes were repainted.
+    pub fn recolour_matching(&mut self, from: Color, to: Color) -> usize {
+        if colours_equal(from, to) {
+            return 0;
+        }
+        let repaint = |shape: &mut crate::ShapeData, changed: &mut usize| {
+            if let Some(fill) = &mut shape.fill
+                && colours_equal(fill.paint.color(), from)
+            {
+                fill.paint = Paint::Solid(to);
+                *changed += 1;
+            }
+            if let Some(stroke) = &mut shape.stroke
+                && colours_equal(stroke.paint.color(), from)
+            {
+                stroke.paint = Paint::Solid(to);
+                *changed += 1;
+            }
+        };
+        self.repaint_shapes(&repaint)
+    }
+
+    /// **Every colour the artwork is painted with, most-used first.**
+    ///
+    /// Walks the same reach [`Self::recolour_matching`] repaints — the stage and
+    /// every symbol, on every keyframe — so what a palette view shows is exactly
+    /// what a recolour would find. Fills and strokes are counted together; the
+    /// count is how many parts wear the colour, which is what makes a
+    /// character's few real colours stand out from one-off details.
+    pub fn colours_used(&self) -> Vec<(Color, usize)> {
+        let mut counts: Vec<(Color, usize)> = Vec::new();
+        let mut tally = |c: Color| match counts.iter_mut().find(|(k, _)| colours_equal(*k, c)) {
+            Some(slot) => slot.1 += 1,
+            None => counts.push((c, 1)),
+        };
+
+        // Every object on the stage, and everything nested inside it.
+        let layers: Vec<LayerId> = self.layers().iter().map(|l| l.id).collect();
+        for layer in layers {
+            let frames: Vec<u32> = self
+                .layers()
+                .get(layer)
+                .map(|l| l.frames.keyframes().iter().map(|k| k.start).collect())
+                .unwrap_or_default();
+            for frame in frames {
+                let objects: Vec<std::sync::Arc<Object>> = self
+                    .layers()
+                    .get(layer)
+                    .map(|l| l.frames.objects_at(frame).to_vec())
+                    .unwrap_or_default();
+                for object in &objects {
+                    visit_shapes(object, &mut tally);
+                }
+            }
+        }
+
+        // And every symbol in the library, because a character is usually one.
+        for symbol in self.library().iter() {
+            for layer in symbol.layers.iter() {
+                for keyframe in layer.frames.keyframes() {
+                    for object in keyframe.objects.iter() {
+                        visit_shapes(object, &mut tally);
+                    }
+                }
+            }
+        }
+
+        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        counts
+    }
+
+    /// **Change a swatch, and everything painted with it changes** — the linked
+    /// walk. Every fill and stroke in the document that carries a swatch link
+    /// the mapping answers for.
+    fn repaint_links(&mut self, mapping: &dyn Fn(SwatchId) -> Option<Color>) -> usize {
+        let repaint = |shape: &mut crate::ShapeData, changed: &mut usize| {
+            if let Some(fill) = &mut shape.fill
+                && let Some(swatch) = fill.swatch
+                && let Some(color) = mapping(swatch)
+                && fill.paint.color() != color
+            {
+                fill.paint = Paint::Solid(color);
+                *changed += 1;
+            }
+            if let Some(stroke) = &mut shape.stroke
+                && let Some(swatch) = stroke.swatch
+                && let Some(color) = mapping(swatch)
+                && stroke.paint.color() != color
+            {
+                stroke.paint = Paint::Solid(color);
+                *changed += 1;
+            }
+        };
+        self.repaint_shapes(&repaint)
+    }
+
+    /// Apply `repaint` to every shape on the stage and in every symbol, on
+    /// every keyframe, and bump the revision if anything changed. The reach
+    /// linked and matched recolouring share, so both touch the whole film.
+    fn repaint_shapes(&mut self, repaint: &dyn Fn(&mut crate::ShapeData, &mut usize)) -> usize {
+        let mut changed = 0;
+
+        // Every object on the stage, and everything nested inside it.
+        let layers: Vec<LayerId> = self.layers().iter().map(|l| l.id).collect();
+        for layer in layers {
+            let frames: Vec<u32> = self
+                .layers()
+                .get(layer)
+                .map(|l| l.frames.keyframes().iter().map(|k| k.start).collect())
+                .unwrap_or_default();
+            for frame in frames {
+                let ids: Vec<ObjectId> = self
+                    .layers()
+                    .get(layer)
+                    .map(|l| l.frames.objects_at(frame).iter().map(|o| o.id).collect())
+                    .unwrap_or_default();
+                for id in ids {
+                    self.update_object_at(frame, id, |object| {
+                        repaint_object(object, repaint, &mut changed);
+                    });
+                }
+            }
+        }
+
+        // And every symbol in the library, because a character is usually one.
+        let symbols: Vec<crate::SymbolId> = self.library().iter().map(|s| s.id).collect();
+        for id in symbols {
+            let layer_ids: Vec<LayerId> = self
+                .library()
+                .get(id)
+                .map(|s| s.layers.iter().map(|l| l.id).collect())
+                .unwrap_or_default();
+            self.library_mut().update(id, |symbol| {
+                for layer in layer_ids {
+                    symbol.layers.update(layer, |l| {
+                        for keyframe in l.frames.keyframes_mut() {
+                            for object in std::sync::Arc::make_mut(&mut keyframe.objects).iter_mut() {
+                                repaint_object(
+                                    std::sync::Arc::make_mut(object),
+                                    repaint,
+                                    &mut changed,
+                                );
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        if changed > 0 {
+            self.bump();
+        }
+        changed
+    }
+
     /// Frames in the document: the longest layer, and at least one.
     pub fn frame_count(&self) -> u32 {
         self.layers()
             .frame_count()
             .max(self.camera().last_frame() + 1)
+            // A shot whose only animation is a focus pull is still as long as
+            // the pull: without this the film ended before the focus arrived.
+            .max(self.camera().focus_last_frame() + 1)
             .max(1)
+    }
+
+    /// Does this document hold animation, rather than a single still frame?
+    ///
+    /// True when the main timeline moves — some layer carries a second keyframe
+    /// — when the camera moves, or when any library symbol is animated. A still
+    /// held for a length of frames is not animation. Lets the Assets and Library
+    /// panels separate animated work from static artwork; see
+    /// [`Symbol::is_animated`](crate::Symbol::is_animated).
+    pub fn is_animated(&self) -> bool {
+        self.stage_layers().iter().any(|l| l.keyframe_count() > 1)
+            || self.camera().last_frame() > 0
+            || self.library().iter().any(|s| s.is_animated())
     }
 
     /// Duration in seconds at the document's frame rate.
@@ -511,17 +1825,46 @@ impl Scene {
     }
 
     /// The camera transform for `frame`, or identity when the camera is off.
-    pub fn camera_transform(&self, frame: u32) -> Affine {
-        self.camera().transform_at(frame, self.stage().size)
+    pub fn camera_transform(&self, at: impl crate::time::AtTime) -> Affine {
+        self.camera().transform_at(at, self.stage().size)
     }
 
     /// The camera transform for artwork on a layer at `depth`.
     ///
     /// `None` when the layer sits at or behind the camera and should not be
     /// drawn at all.
-    pub fn camera_transform_at_depth(&self, frame: u32, depth: f64) -> Option<Affine> {
+    pub fn camera_transform_at_depth(
+        &self,
+        at: impl crate::time::AtTime,
+        depth: f64,
+    ) -> Option<Affine> {
         self.camera()
-            .transform_at_depth(frame, self.stage().size, depth)
+            .transform_at_depth(at, self.stage().size, depth)
+    }
+
+    /// How a layer at `depth` is projected onto the frame.
+    ///
+    /// A homography rather than an affine, because a tilted camera turns a
+    /// layer's rectangle into a trapezoid. With no tilt it *is* an affine —
+    /// exactly [`Self::camera_transform_at_depth`] — so the render path takes
+    /// the same route it always did for the documents that do not use this.
+    ///
+    /// `None` when the layer is at or behind the camera.
+    pub fn camera_projection_at_depth(
+        &self,
+        at: impl crate::time::AtTime,
+        depth: f64,
+    ) -> Option<buzz_geom::Projection> {
+        self.camera()
+            .projection_at_depth(at, self.stage().size, depth)
+    }
+
+    /// Does the shot tilt at all?
+    ///
+    /// Lets the renderer and the editor take the flat path when nothing in the
+    /// document has ever asked for perspective.
+    pub fn camera_has_tilt(&self) -> bool {
+        self.camera().has_tilt()
     }
 
     /// Move a point from where the user sees it into a layer's own
@@ -536,15 +1879,49 @@ impl Scene {
     /// Returns the point unchanged for a layer on the focal plane, which is
     /// every layer in a document that does not use depth.
     pub fn view_to_layer(&self, frame: u32, depth: f64, point: Point) -> Option<Point> {
-        if depth == 0.0 {
+        if depth == 0.0 && !self.camera_has_tilt() {
             return Some(point);
         }
-        let with_depth = self.camera_transform_at_depth(frame, depth)?;
-        // Relative to the depth-zero transform, because that is the space the
-        // rest of the editor already works in.
-        let base = self.camera_transform(frame);
-        let combined = base * with_depth.inverse();
-        Some(combined * point)
+
+        // Through the projection, not the affine: with the camera tilted, the
+        // artwork is not merely scaled but foreshortened, and a click has to be
+        // carried back through the same perspective it was drawn with — or
+        // tilted artwork is visible and unclickable.
+        let with_depth = self.camera_projection_at_depth(frame, depth)?;
+        // **Out through the depth-zero shot, then back in through this
+        // layer's.**
+        //
+        // `point` arrives in the space the editor works in: the focal plane,
+        // with the document camera already taken off it by
+        // `Editor::screen_to_edit`. So it goes forward through the depth-zero
+        // shot to reach the view, and back through this layer's own shot to
+        // reach its geometry.
+        //
+        // The order matters and was the other way round, which composed to the
+        // identity whenever the camera was — every document without one — and
+        // to a displacement the moment a shot was framed off centre.
+        let base = buzz_geom::Projection::from_affine(self.camera_transform(frame));
+        let combined = base.then(&with_depth.inverse()?);
+        combined.map_point(point)
+    }
+
+    /// Move a point from a layer's own coordinates back out to the space the
+    /// editor works in — the exact inverse of [`Self::view_to_layer`].
+    ///
+    /// Needed wherever the editor has geometry and wants to know where the user
+    /// will see it: the selection's handle box, and the test for whether a drag
+    /// began inside the selection.
+    ///
+    /// Returns the point unchanged for a layer on the focal plane, which is
+    /// every layer in a document that does not use depth.
+    pub fn layer_to_view(&self, frame: u32, depth: f64, point: Point) -> Option<Point> {
+        if depth == 0.0 && !self.camera_has_tilt() {
+            return Some(point);
+        }
+        let with_depth = self.camera_projection_at_depth(frame, depth)?;
+        let base = buzz_geom::Projection::from_affine(self.camera_transform(frame));
+        let combined = with_depth.then(&base.inverse()?);
+        combined.map_point(point)
     }
 
     /// Allocate an id without attaching anything to the document yet.
@@ -562,6 +1939,120 @@ impl Scene {
     }
 
     /// Find an object and the layer holding it.
+    /// A document holding just these objects — a selection lifted out.
+    ///
+    /// # Why a whole `Scene`
+    ///
+    /// This is how a selection becomes a reusable asset, and an asset is a
+    /// `.buzz` document so that it can be opened, edited and saved back with
+    /// no second format to maintain. It also means placing one is
+    /// [`Scene::merge`], which already renumbers every id it brings across.
+    ///
+    /// **Symbols come too, recursively.** An instance whose symbol was left
+    /// behind draws nothing, so the definitions the selection depends on — and
+    /// the ones *those* depend on — are copied with it. Ids are kept as they
+    /// are; `merge` reassigns them on the way in.
+    pub fn extract(&self, frame: u32, ids: &[ObjectId]) -> Scene {
+        let mut out = Scene::empty();
+        let layer = out.add_layer("Asset", LayerKind::Normal);
+
+        let mut wanted: Vec<SymbolId> = Vec::new();
+        for id in ids {
+            // As the artwork is **on this frame**. The same id appears on
+            // several keyframes with different transforms, and an asset kept
+            // while looking at frame 12 should be what frame 12 shows.
+            let object = self
+                .layers()
+                .iter()
+                .find_map(|l| l.objects_at(frame).iter().find(|o| o.id == *id))
+                .or_else(|| self.find_object(*id).map(|(_, o)| o));
+            let Some(object) = object else {
+                continue;
+            };
+            collect_symbols(object, &mut wanted);
+            out.add_object_at(layer, 0, (**object).clone());
+        }
+
+        // Depth-first through nested symbols, without revisiting one — two
+        // instances of the same symbol, or a symbol containing itself through
+        // an import, must not send this round for ever.
+        let mut seen: Vec<SymbolId> = Vec::new();
+        while let Some(id) = wanted.pop() {
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            let Some(symbol) = self.library.get(id) else {
+                continue;
+            };
+            for inner in symbol.layers.iter().flat_map(|l| l.frames.keyframes()) {
+                for object in inner.objects.iter() {
+                    collect_symbols(object, &mut wanted);
+                }
+            }
+            out.library.insert((**symbol).clone());
+            out.ids.reserve_above(id.0);
+        }
+
+        for id in ids {
+            out.ids.reserve_above(id.0);
+        }
+        out
+    }
+
+    /// **One symbol, as a document of its own** — the Library's counterpart of
+    /// [`extract`](Self::extract).
+    ///
+    /// A symbol could be kept as an asset only by placing an instance of it on
+    /// the stage, selecting that, keeping it, and deleting the instance again.
+    /// The Library is where symbols are, and it is where "keep this one" should
+    /// be asked.
+    ///
+    /// The asset holds one instance of the symbol at the origin, and the symbol
+    /// itself along with everything it uses — the same closure `extract` takes,
+    /// for the same reason: an asset that references a symbol the receiving
+    /// document has never heard of is an asset that cannot be placed.
+    ///
+    /// `None` if there is no such symbol.
+    pub fn extract_symbol(&self, symbol: SymbolId) -> Option<Scene> {
+        let source = self.library.get(symbol)?;
+        let mut out = Scene::empty();
+        let layer = out.add_layer("Asset", LayerKind::Normal);
+
+        // Everything the symbol needs, itself included, depth-first and never
+        // twice — a symbol that contains an instance of itself through an
+        // import must not send this round for ever.
+        let mut wanted = vec![symbol];
+        let mut seen: Vec<SymbolId> = Vec::new();
+        while let Some(id) = wanted.pop() {
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            let Some(symbol) = self.library.get(id) else {
+                continue;
+            };
+            for inner in symbol.layers.iter().flat_map(|l| l.frames.keyframes()) {
+                for object in inner.objects.iter() {
+                    collect_symbols(object, &mut wanted);
+                }
+            }
+            out.library.insert((**symbol).clone());
+            out.ids.reserve_above(id.0);
+        }
+
+        // And an instance of it to be placed, named for the symbol so the
+        // asset arrives saying what it is.
+        let id = out.next_object_id();
+        let mut object = Object {
+            kind: ObjectKind::Instance(crate::symbol::SymbolInstance::new(symbol)),
+            ..Object::shape(id, ShapeData::filled(buzz_geom::BezPath::new(), Color::WHITE))
+        };
+        object.name = Some(source.name.clone());
+        out.add_object_at(layer, 0, object);
+        Some(out)
+    }
+
     pub fn find_object(&self, id: ObjectId) -> Option<(LayerId, &Arc<Object>)> {
         self.layers()
             .iter()
@@ -600,10 +2091,216 @@ impl Scene {
         changed
     }
 
+    /// Edit an object where the playhead is: making a keyframe first when Auto
+    /// Keyframe is on, and across every keyframe in range under Edit Multiple
+    /// Frames.
+    pub fn update_object_where(
+        &mut self,
+        at: EditAt,
+        id: ObjectId,
+        mut f: impl FnMut(&mut Object),
+    ) -> bool {
+        if let Some((first, last)) = at.span {
+            return self.update_object_across(first, last, id, f);
+        }
+        if at.auto_key {
+            self.ensure_keyframe_for(at.frame, id);
+        }
+        self.update_object_at(at.frame, id, |o| f(o))
+    }
+
+    /// **Edit Multiple Frames** — change an object on every keyframe beginning
+    /// in `first..=last`.
+    ///
+    /// The same object id legitimately appears on several keyframes, because
+    /// F6 duplicates a keyframe by cloning the `Arc` around its objects. This
+    /// changes *each* of those copies: moving a character that was drawn on
+    /// twelve keyframes moves all twelve, which is the whole point of the mode.
+    /// Keyframes outside the range are left exactly as they are.
+    pub fn update_object_across(
+        &mut self,
+        first: u32,
+        last: u32,
+        id: ObjectId,
+        mut f: impl FnMut(&mut Object),
+    ) -> bool {
+        let Some((layer_id, _)) = self.find_object(id) else {
+            return false;
+        };
+        let mut changed = false;
+        self.active_layers_mut().update(layer_id, |layer| {
+            for keyframe in layer.frames.keyframes_mut() {
+                if keyframe.start < first || keyframe.start > last {
+                    continue;
+                }
+                let objects = Arc::make_mut(&mut keyframe.objects);
+                if let Some(object) = objects.iter_mut().find(|o| o.id == id) {
+                    f(Arc::make_mut(object));
+                    changed = true;
+                }
+            }
+        });
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
+    /// Every object visible in `first..=last`, as `(frame, id)` pairs.
+    ///
+    /// The frame is the keyframe's own start, which is where an edit to that
+    /// object has to land. Used by Edit Multiple Frames for hit testing and
+    /// for Select All, both of which have to reach artwork the playhead is not
+    /// standing on.
+    pub fn objects_across(&self, first: u32, last: u32) -> Vec<(u32, ObjectId)> {
+        let mut out = Vec::new();
+        for layer in self.layers().selectable() {
+            for keyframe in layer.frames.keyframes() {
+                if keyframe.start < first || keyframe.start > last {
+                    continue;
+                }
+                for object in keyframe.objects.iter() {
+                    if object.visible && !object.locked {
+                        out.push((keyframe.start, object.id));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Make the document `frames` long.
+    ///
+    /// # Why every layer moves together
+    ///
+    /// A document's length is the length of its longest layer \u2014 there is no
+    /// separate number to set, in Animate or here. So "make it 48 frames"
+    /// means extending every layer that is shorter and trimming every layer
+    /// that is longer, which is what an animator means when they set the
+    /// length of a shot.
+    ///
+    /// Trimming **removes frames from the end**, and with them any keyframe
+    /// that started there. Extending carries the last keyframe's artwork
+    /// onwards, exactly as F5 does.
+    pub fn set_frame_count(&mut self, frames: u32) -> bool {
+        let wanted = frames.clamp(1, 16_000);
+        if self.frame_count() == wanted {
+            return false;
+        }
+
+        let ids: Vec<LayerId> = self.layers().iter().map(|l| l.id).collect();
+        for id in ids {
+            self.update_layer(id, |layer| {
+                while layer.frames.length() < wanted {
+                    layer.frames.insert_frame(layer.frames.length());
+                }
+                while layer.frames.length() > wanted {
+                    let last = layer.frames.length() - 1;
+                    if !layer.frames.remove_frame(last) {
+                        break;
+                    }
+                }
+            });
+        }
+        true
+    }
+
+    /// **Auto Keyframe** \u2014 give `frame` a keyframe of its own, if it has none.
+    ///
+    /// Exactly what F6 does, and it exists as its own operation because
+    /// "changing something at frame 12 should change frame 12" is a mode, not
+    /// a command: without it, editing inside a span alters the keyframe that
+    /// owns the span, and the change reaches back to wherever that keyframe
+    /// starts. With it, the artwork is duplicated onto the frame first, so the
+    /// change begins where the playhead is.
+    ///
+    /// Returns whether a keyframe was made. Does nothing past the end of the
+    /// layer's span: there would be no artwork to duplicate, and a blank
+    /// keyframe is never what an edit meant to produce (§7 item 37).
+    pub fn ensure_keyframe(&mut self, layer: LayerId, frame: u32) -> bool {
+        let Some(target) = self.layers().get(layer) else {
+            return false;
+        };
+        if target.frames.is_keyframe(frame) || frame >= target.frames.length() {
+            return false;
+        }
+        let mut made = false;
+        self.update_layer(layer, |layer| {
+            made = layer.frames.insert_keyframe(frame);
+        });
+        made
+    }
+
+    /// Auto Keyframe for the layer an object lives on.
+    pub fn ensure_keyframe_for(&mut self, frame: u32, id: ObjectId) -> bool {
+        match self.find_object(id) {
+            Some((layer, _)) => self.ensure_keyframe(layer, frame),
+            None => false,
+        }
+    }
+
+    /// Edit an object **on the keyframe that owns `frame`**.
+    ///
+    /// # Why this exists next to [`Self::update_object`]
+    ///
+    /// Pressing F6 duplicates a keyframe by cloning the `Arc` around its
+    /// objects, so the *same object id* legitimately appears on several
+    /// keyframes of one layer. `update_object` edits the first one it finds,
+    /// which is the earliest — so moving artwork with the playhead on frame 12
+    /// would silently change frame 0 instead, and leave frame 12 exactly as it
+    /// was. Anything that knows where the playhead is should come here.
+    ///
+    /// Falls back to searching every keyframe when the object is not on the
+    /// one owning `frame`: an object selected on another layer, or held on a
+    /// keyframe beyond the span, should still be editable rather than
+    /// mysteriously immovable.
+    pub fn update_object_at(
+        &mut self,
+        frame: u32,
+        id: ObjectId,
+        f: impl FnOnce(&mut Object),
+    ) -> bool {
+        let Some((layer_id, _)) = self.find_object(id) else {
+            return false;
+        };
+        let mut f = Some(f);
+        let mut changed = false;
+
+        self.active_layers_mut().update(layer_id, |layer| {
+            if let Some(keyframe) = layer.frames.keyframe_at_mut(frame) {
+                let objects = Arc::make_mut(&mut keyframe.objects);
+                if let Some(object) = objects.iter_mut().find(|o| o.id == id)
+                    && let Some(f) = f.take()
+                {
+                    f(Arc::make_mut(object));
+                    changed = true;
+                    return;
+                }
+            }
+
+            for keyframe in layer.frames.keyframes_mut() {
+                let objects = Arc::make_mut(&mut keyframe.objects);
+                if let Some(object) = objects.iter_mut().find(|o| o.id == id) {
+                    if let Some(f) = f.take() {
+                        f(Arc::make_mut(object));
+                        changed = true;
+                    }
+                    break;
+                }
+            }
+        });
+
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
     pub fn remove_object(&mut self, id: ObjectId) -> Option<Arc<Object>> {
         let layer_id = self.find_object(id).map(|(l, _)| l)?;
         let mut removed = None;
-        self.active_layers_mut().update(layer_id, |l| removed = l.remove_object(id));
+        self.active_layers_mut()
+            .update(layer_id, |l| removed = l.remove_object(id));
         if removed.is_some() {
             self.bump();
         }
@@ -630,7 +2327,10 @@ impl Scene {
 
     /// Bounds of all artwork across every frame, ignoring the stage rectangle.
     pub fn content_bounds(&self) -> Option<Rect> {
-        self.layers().iter().filter_map(|l| l.bounds()).reduce(|a, b| a.union(b))
+        self.layers()
+            .iter()
+            .filter_map(|l| l.bounds())
+            .reduce(|a, b| a.union(b))
     }
 
     /// Everything the user could reasonably want framed: the stage plus any
@@ -650,6 +2350,10 @@ impl Scene {
         let mut entries = Vec::new();
         let mut depth = 0usize;
         for layer in self.layers().drawable_at(frame) {
+            // A followed layer's artwork is drawn somewhere other than where
+            // its geometry says it is, so the index has to agree — otherwise a
+            // parented limb is visible but unclickable.
+            let follows = self.layers().inherited_transform(layer.id, frame);
             for object in layer.objects_at(frame) {
                 if !object.visible {
                     continue;
@@ -657,7 +2361,7 @@ impl Scene {
                 entries.push(IndexEntry {
                     object: object.id,
                     layer: layer.id,
-                    bounds: object.bounds(),
+                    bounds: crate::object::transform_rect(follows, object.bounds()),
                     depth,
                 });
                 depth += 1;
@@ -703,6 +2407,132 @@ impl Scene {
     }
 }
 
+/// Run `f` over one object and everything nested inside it.
+///
+/// The same walk the recolour does, with the visit left to the caller: a group
+/// holds objects, a rig holds artwork per part, and a turnaround holds whole
+/// drawings of its other sides. Anything that stops at the top level misses
+/// most of a character.
+fn walk_objects(
+    object: &mut Object,
+    f: &dyn Fn(&mut Object, &mut usize),
+    count: &mut usize,
+) {
+    f(object, count);
+    match &mut object.kind {
+        ObjectKind::Group(children) => {
+            for child in children.iter_mut() {
+                walk_objects(std::sync::Arc::make_mut(child), f, count);
+            }
+        }
+        ObjectKind::Armature(rig) => {
+            for part in rig.parts.iter_mut() {
+                walk_objects(std::sync::Arc::make_mut(&mut part.artwork), f, count);
+            }
+        }
+        ObjectKind::Shape(_) | ObjectKind::Instance(_) | ObjectKind::Warp(_) => {}
+    }
+    let views: Vec<usize> = (0..object.turnaround.views().len()).collect();
+    if !views.is_empty() {
+        let mut updated = object.turnaround.clone();
+        for view in views {
+            let (angle, drawing) = {
+                let v = &updated.views()[view];
+                (v.angle, std::sync::Arc::clone(&v.drawing))
+            };
+            let mut drawing = (*drawing).clone();
+            walk_objects(&mut drawing, f, count);
+            updated.set(angle, std::sync::Arc::new(drawing));
+        }
+        object.turnaround = updated;
+    }
+}
+
+/// Repaint one object and everything drawn inside it.
+///
+/// A group holds shapes, and a rig holds artwork per part; both are drawings
+/// with fills of their own, and a recolour that stopped at the top level would
+/// leave a character's own pieces untouched.
+/// Two colours are the same colour when their 8-bit channels agree — the test
+/// `select_same_colour` uses, so what the palette groups is what a recolour
+/// finds. f32 colours that differ below a step are one swatch to the eye.
+fn colours_equal(a: Color, b: Color) -> bool {
+    a.to_rgba8().to_u8_array() == b.to_rgba8().to_u8_array()
+}
+
+/// Read-only mirror of [`repaint_object`]: hand every fill and stroke colour in
+/// `object`, and everything nested inside it, to `visit`. Kept beside the
+/// repaint walk so the two do not drift over which shapes a character owns.
+fn visit_shapes(object: &Object, visit: &mut dyn FnMut(Color)) {
+    match &object.kind {
+        ObjectKind::Shape(shape) => {
+            if let Some(fill) = &shape.fill {
+                visit(fill.paint.color());
+            }
+            if let Some(stroke) = &shape.stroke {
+                visit(stroke.paint.color());
+            }
+        }
+        ObjectKind::Group(children) => {
+            for child in children.iter() {
+                visit_shapes(child, visit);
+            }
+        }
+        ObjectKind::Armature(rig) => {
+            for part in rig.parts.iter() {
+                visit_shapes(&part.artwork, visit);
+            }
+        }
+        // An instance carries no artwork of its own — the symbol it points at
+        // is walked in its own right.
+        ObjectKind::Instance(_) | ObjectKind::Warp(_) => {}
+    }
+
+    // A turnaround's other views are drawings too.
+    for view in object.turnaround.views() {
+        visit_shapes(&view.drawing, visit);
+    }
+}
+
+fn repaint_object(
+    object: &mut Object,
+    repaint: &dyn Fn(&mut crate::ShapeData, &mut usize),
+    changed: &mut usize,
+) {
+    match &mut object.kind {
+        ObjectKind::Shape(shape) => repaint(shape, changed),
+        ObjectKind::Group(children) => {
+            for child in children.iter_mut() {
+                repaint_object(std::sync::Arc::make_mut(child), repaint, changed);
+            }
+        }
+        ObjectKind::Armature(rig) => {
+            for part in rig.parts.iter_mut() {
+                repaint_object(std::sync::Arc::make_mut(&mut part.artwork), repaint, changed);
+            }
+        }
+        // An instance carries no artwork of its own — the symbol it points at
+        // is repainted in its own right, once, however many instances there are.
+        ObjectKind::Instance(_) | ObjectKind::Warp(_) => {}
+    }
+
+    // A turnaround's other views are drawings too.
+    let views: Vec<usize> = (0..object.turnaround.views().len()).collect();
+    if !views.is_empty() {
+        let mut updated = object.turnaround.clone();
+        for view in views {
+            let (angle, drawing) = {
+                let v = &updated.views()[view];
+                (v.angle, std::sync::Arc::clone(&v.drawing))
+            };
+            let mut drawing = (*drawing).clone();
+            repaint_object(&mut drawing, repaint, changed);
+            updated.set(angle, std::sync::Arc::new(drawing));
+        }
+        object.turnaround = updated;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,6 +2555,180 @@ mod tests {
         (scene, layer)
     }
 
+    /// The palette a character offers is every colour its parts wear, the most
+    /// worn first, so a coat used all over sits above a one-off button.
+    #[test]
+    fn colours_used_counts_every_part_most_worn_first() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().unwrap().id;
+        let coat = Color::from_rgb8(0x2E, 0x7D, 0x32);
+        let button = Color::from_rgb8(0xC0, 0x30, 0x30);
+        scene.add_shape(layer, ShapeData::filled(square(0.0, 0.0, 10.0), coat));
+        scene.add_shape(layer, ShapeData::filled(square(20.0, 0.0, 10.0), coat));
+        scene.add_shape(layer, ShapeData::filled(square(40.0, 0.0, 10.0), button));
+
+        let palette = scene.colours_used();
+        assert_eq!(palette.first().map(|(c, _)| *c), Some(coat), "most worn first");
+        assert_eq!(palette[0].1, 2, "the coat is on two parts");
+        assert!(
+            palette.iter().any(|(c, n)| *c == button && *n == 1),
+            "the button is one part: {palette:?}"
+        );
+    }
+
+    /// **Re-skin by matching a colour**: change the coat once and every part
+    /// wearing it changes, while a different colour is left alone.
+    #[test]
+    fn recolour_matching_repaints_only_the_matched_colour() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().unwrap().id;
+        let coat = Color::from_rgb8(0x2E, 0x7D, 0x32);
+        let button = Color::from_rgb8(0xC0, 0x30, 0x30);
+        let new_coat = Color::from_rgb8(0x15, 0x3E, 0x8A);
+        scene.add_shape(layer, ShapeData::filled(square(0.0, 0.0, 10.0), coat));
+        scene.add_shape(layer, ShapeData::filled(square(20.0, 0.0, 10.0), coat));
+        scene.add_shape(layer, ShapeData::filled(square(40.0, 0.0, 10.0), button));
+
+        let painted = scene.recolour_matching(coat, new_coat);
+        assert_eq!(painted, 2, "both coat parts were repainted");
+
+        let palette = scene.colours_used();
+        assert!(
+            palette.iter().any(|(c, n)| *c == new_coat && *n == 2),
+            "the coat is now the new colour, on both parts: {palette:?}"
+        );
+        assert!(
+            palette.iter().all(|(c, _)| *c != coat),
+            "no part still wears the old coat: {palette:?}"
+        );
+        assert!(
+            palette.iter().any(|(c, n)| *c == button && *n == 1),
+            "the button was left alone: {palette:?}"
+        );
+    }
+
+    /// A colour nothing wears changes nothing, and repainting to the same
+    /// colour is a no-op — neither should report a phantom repaint.
+    #[test]
+    fn recolour_matching_a_missing_or_identical_colour_does_nothing() {
+        let (mut scene, _) = scene_with_shapes(3);
+        let absent = Color::from_rgb8(0x01, 0x02, 0x03);
+        assert_eq!(scene.recolour_matching(absent, Color::BLACK), 0);
+        assert_eq!(
+            scene.recolour_matching(Color::WHITE, Color::WHITE),
+            0,
+            "repainting white to white is a no-op"
+        );
+    }
+
+    /// **Pulling the camera in must not push a layer out of the picture.**
+    ///
+    /// A layer's depth is measured from the focal plane, so what counts as "in
+    /// front of the lens" moves when the lens does. Both depth controls bound a
+    /// *drag* against the focal distance of the moment — and then the camera
+    /// depth is its own slider, from 6000 down to 200, with nothing to say that
+    /// the layer parked at −5700 is now four thousand units behind the camera.
+    /// `depth_scale` answers `None` there, correctly, and the layer stops being
+    /// drawn: artwork vanishing off the stage with nothing on screen having
+    /// touched it.
+    #[test]
+    fn pulling_the_camera_in_keeps_every_layer_in_front_of_it() {
+        let mut scene = Scene::default();
+        let near = scene.add_layer("Near", LayerKind::Normal);
+        let far = scene.add_layer("Far", LayerKind::Normal);
+
+        scene.set_focal_distance(6000.0);
+        scene.update_layer(near, |l| l.depth = -5700.0);
+        scene.update_layer(far, |l| l.depth = 3000.0);
+        assert!(
+            scene.camera().depth_scale(-5700.0).is_some(),
+            "the fixture must start visible"
+        );
+
+        scene.set_focal_distance(200.0);
+
+        for layer in scene.layers().iter() {
+            assert!(
+                scene.camera().depth_scale(layer.depth).is_some(),
+                "{:?} at depth {} fell behind a 200-unit lens",
+                layer.name,
+                layer.depth
+            );
+        }
+        // The near layer is carried in rather than flattened onto the stage:
+        // it was in front, and it stays in front.
+        let depth = scene.layers().iter().find(|l| l.id == near).unwrap().depth;
+        assert!(depth < 0.0, "it must stay in front of the stage, not on it");
+        // The far layer never threatened anything and must not have moved.
+        let depth = scene.layers().iter().find(|l| l.id == far).unwrap().depth;
+        assert_eq!(depth, 3000.0, "a layer behind the stage is never in danger");
+    }
+
+    /// A focal distance that is not a distance must be refused rather than
+    /// flattening every layer onto the stage.
+    #[test]
+    fn a_nonsense_focal_distance_moves_nothing() {
+        let mut scene = Scene::default();
+        let layer = scene.add_layer("Near", LayerKind::Normal);
+        scene.set_focal_distance(4000.0);
+        scene.update_layer(layer, |l| l.depth = -3000.0);
+
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -100.0] {
+            scene.set_focal_distance(bad);
+            assert_eq!(scene.camera().focal_distance, 4000.0, "for {bad}");
+            let depth = scene.layers().iter().find(|l| l.id == layer).unwrap().depth;
+            assert_eq!(depth, -3000.0, "for {bad}");
+        }
+    }
+
+    /// Cloning a scene must be a pointer copy of the library, and editing one
+    /// symbol must change **only that symbol's** `Arc` address — the invariant
+    /// the thumbnail and lighting caches key on. This is the correctness pin for
+    /// the Arc-wrapped library maps (plan item 1.5).
+    #[test]
+    fn editing_one_symbol_leaves_the_others_pointer_identical() {
+        let mut scene = Scene::default();
+        let a = scene.add_symbol("a", SymbolKind::Graphic, None);
+        let b = scene.add_symbol("b", SymbolKind::Graphic, None);
+        let c = scene.add_symbol("c", SymbolKind::Graphic, None);
+
+        // A snapshot, exactly as Document::edit takes for undo.
+        let snapshot = scene.clone();
+        let ptr = |s: &Scene, id: SymbolId| Arc::as_ptr(s.library().get(id).unwrap());
+
+        // Edit only b.
+        scene.library_mut().update(b, |s| s.name = "renamed".into());
+
+        // b's address changed; a and c did not, in either the live scene or the
+        // snapshot — the snapshot is entirely untouched.
+        assert_ne!(ptr(&scene, b), ptr(&snapshot, b), "b should have forked");
+        assert_eq!(ptr(&scene, a), ptr(&snapshot, a), "a must not fork");
+        assert_eq!(ptr(&scene, c), ptr(&snapshot, c), "c must not fork");
+        assert_eq!(snapshot.library().get(b).unwrap().name, "b", "undo intact");
+    }
+
+    /// Cloning a big library is cheap — a handful of pointer copies, not one
+    /// allocation per symbol. Guards against a regression to inline maps.
+    #[test]
+    fn cloning_a_large_library_is_cheap() {
+        let mut scene = Scene::default();
+        for i in 0..5_000 {
+            scene.add_symbol(format!("sym{i}"), SymbolKind::Graphic, None);
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            let c = scene.clone();
+            std::hint::black_box(&c);
+        }
+        let per = start.elapsed() / 100;
+        // Generous even for a debug build: an inline BTreeMap clone of 5k
+        // symbols is milliseconds; a pointer copy is sub-microsecond.
+        assert!(
+            per < std::time::Duration::from_micros(200),
+            "cloning a 5k-symbol scene took {per:?} — the library is not pointer-shared"
+        );
+    }
+
     #[test]
     fn a_new_document_matches_animates_defaults() {
         let scene = Scene::default();
@@ -740,7 +2744,10 @@ mod tests {
         let layer = scene.layers().iter().next().unwrap().id;
 
         let r0 = scene.revision();
-        scene.add_shape(layer, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+        scene.add_shape(
+            layer,
+            ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+        );
         let r1 = scene.revision();
         assert!(r1 > r0);
 
@@ -763,7 +2770,10 @@ mod tests {
         let (mut scene, layer) = scene_with_shapes(5);
         let extra = scene.add_layer("Another", LayerKind::Normal);
         let shape = scene
-            .add_shape(extra, ShapeData::filled(square(0.0, 0.0, 5.0), Color::WHITE))
+            .add_shape(
+                extra,
+                ShapeData::filled(square(0.0, 0.0, 5.0), Color::WHITE),
+            )
             .unwrap();
 
         assert_ne!(layer.0, extra.0);
@@ -797,7 +2807,10 @@ mod tests {
         let snapshot = scene.clone();
         let before = snapshot.shape_count();
 
-        scene.add_shape(layer, ShapeData::filled(square(999.0, 0.0, 10.0), Color::WHITE));
+        scene.add_shape(
+            layer,
+            ShapeData::filled(square(999.0, 0.0, 10.0), Color::WHITE),
+        );
         scene.update_layer(layer, |l| l.name = "changed".into());
 
         assert_eq!(snapshot.shape_count(), before, "the snapshot changed");
@@ -837,7 +2850,15 @@ mod tests {
     #[test]
     fn cloning_a_scene_shares_structure_wholesale() {
         let (scene, layer) = scene_with_shapes(50);
-        let object = Arc::clone(scene.layers().get(layer).unwrap().objects_at(0).first().unwrap());
+        let object = Arc::clone(
+            scene
+                .layers()
+                .get(layer)
+                .unwrap()
+                .objects_at(0)
+                .first()
+                .unwrap(),
+        );
         let before = Arc::strong_count(&object);
 
         let clones: Vec<Scene> = (0..20).map(|_| scene.clone()).collect();
@@ -876,8 +2897,15 @@ mod tests {
     #[test]
     fn an_edit_touches_only_what_changed() {
         let (mut scene, layer) = scene_with_shapes(20);
-        let untouched_before =
-            Arc::as_ptr(scene.layers().get(layer).unwrap().objects_at(0).last().unwrap());
+        let untouched_before = Arc::as_ptr(
+            scene
+                .layers()
+                .get(layer)
+                .unwrap()
+                .objects_at(0)
+                .last()
+                .unwrap(),
+        );
 
         scene.update_layer(layer, |l| {
             let objects = l.frames.objects_at_mut(0).expect("frame 0 exists");
@@ -885,8 +2913,15 @@ mod tests {
             first.transform = Affine::translate((5.0, 5.0));
         });
 
-        let untouched_after =
-            Arc::as_ptr(scene.layers().get(layer).unwrap().objects_at(0).last().unwrap());
+        let untouched_after = Arc::as_ptr(
+            scene
+                .layers()
+                .get(layer)
+                .unwrap()
+                .objects_at(0)
+                .last()
+                .unwrap(),
+        );
         assert_eq!(
             untouched_before, untouched_after,
             "an unrelated object was reallocated"
@@ -917,9 +2952,15 @@ mod tests {
         let visible = scene.add_layer("Visible", LayerKind::Normal);
         let hidden = scene.add_layer("Hidden", LayerKind::Normal);
 
-        scene.add_shape(visible, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+        scene.add_shape(
+            visible,
+            ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+        );
         let ghost = scene
-            .add_shape(hidden, ShapeData::filled(square(50.0, 0.0, 10.0), Color::WHITE))
+            .add_shape(
+                hidden,
+                ShapeData::filled(square(50.0, 0.0, 10.0), Color::WHITE),
+            )
             .unwrap();
         scene.update_layer(hidden, |l| l.visible = false);
 
@@ -935,7 +2976,10 @@ mod tests {
         let mut scene = Scene::empty();
         let folder = scene.add_layer("Folder", LayerKind::Folder);
         // Even if something were somehow attached to a folder.
-        scene.add_shape(folder, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+        scene.add_shape(
+            folder,
+            ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+        );
         assert!(scene.flatten_for_render().is_empty());
     }
 
@@ -946,10 +2990,16 @@ mod tests {
         let front = scene.add_layer("Front", LayerKind::Normal);
 
         let back_shape = scene
-            .add_shape(back, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE))
+            .add_shape(
+                back,
+                ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+            )
             .unwrap();
         let front_shape = scene
-            .add_shape(front, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE))
+            .add_shape(
+                front,
+                ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+            )
             .unwrap();
 
         let entries = scene.index_entries();
@@ -966,7 +3016,10 @@ mod tests {
         let index = scene.build_index();
         assert!(index.is_current_for(scene.revision()));
 
-        scene.add_shape(layer, ShapeData::filled(square(0.0, 500.0, 10.0), Color::WHITE));
+        scene.add_shape(
+            layer,
+            ShapeData::filled(square(0.0, 500.0, 10.0), Color::WHITE),
+        );
         assert!(
             !index.is_current_for(scene.revision()),
             "the index should now report itself stale"
@@ -1031,7 +3084,10 @@ mod tests {
         assert!(scene.remove_object(target).is_some());
         assert!(scene.find_object(target).is_none());
         assert_eq!(scene.shape_count(), 1);
-        assert!(scene.remove_object(target).is_none(), "removing twice is a no-op");
+        assert!(
+            scene.remove_object(target).is_none(),
+            "removing twice is a no-op"
+        );
     }
 
     #[test]
@@ -1050,6 +3106,30 @@ mod tests {
             fit.x1 >= scene.stage().size.width,
             "the stage should still be included"
         );
+    }
+
+    /// **A document knows whether it moves**, which is how the Assets and
+    /// Library panels tell animated work from a still. A single keyframe, however
+    /// long it is held, is a still; a second keyframe, a camera move or a movie
+    /// clip is animation.
+    #[test]
+    fn a_document_knows_when_it_moves() {
+        // A fresh document is a single still.
+        assert!(!Scene::default().is_animated());
+
+        // A second keyframe on the main timeline is movement.
+        let mut moved = Scene::default();
+        let layer = moved.layers().iter().next().unwrap().id;
+        moved.update_layer(layer, |l| {
+            l.frames.insert_frame(20);
+            l.frames.insert_keyframe(10);
+        });
+        assert!(moved.is_animated(), "a second keyframe is movement");
+
+        // A movie-clip symbol is animated even with a bare main timeline.
+        let mut clip = Scene::default();
+        clip.add_symbol("Loop", SymbolKind::MovieClip, None);
+        assert!(clip.is_animated(), "a movie clip is animated");
     }
 
     /// The Properties panel edits an instance by id, so the edit has to reach
@@ -1131,12 +3211,507 @@ mod tests {
         assert_eq!(scene.revision(), before);
     }
 
+    /// **The defect `update_object_at` exists for.** F6 duplicates a keyframe
+    /// by cloning the `Arc` around its objects, so one id appears on several
+    /// keyframes. Editing "the object" without saying *when* changed the
+    /// earliest keyframe — so posing a rig or dragging a shape on frame 12
+    /// silently damaged frame 0 and appeared to do nothing.
+    #[test]
+    fn editing_an_object_lands_on_the_keyframe_the_playhead_is_in() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+
+        // Extend the span, then duplicate the keyframe at frame 10.
+        scene.update_layer(layer, |l| {
+            for _ in 0..10 {
+                l.frames.insert_frame(0);
+            }
+            l.frames.insert_keyframe(10);
+        });
+
+        assert!(scene.update_object_at(10, id, |o| {
+            o.transform = Affine::translate((100.0, 0.0));
+        }));
+
+        let at = |frame: u32| {
+            scene
+                .layers()
+                .iter()
+                .flat_map(|l| l.objects_at(frame).iter())
+                .find(|o| o.id == id)
+                .map(|o| o.transform.translation().x)
+                .expect("the shape")
+        };
+
+        assert_eq!(at(10), 100.0, "the edited frame did not change");
+        assert_eq!(at(0), 0.0, "frame 0 was changed instead");
+    }
+
+    /// **The length of the shot.** F5 adds a frame to one layer; this is the
+    /// document's own length, and every layer follows it.
+    #[test]
+    fn setting_the_length_extends_every_layer() {
+        let mut scene = Scene::default();
+        let a = scene.layers().iter().next().expect("a layer").id;
+        let b = scene.add_layer("Second", LayerKind::Normal);
+        scene.update_layer(b, |l| {
+            l.frames.insert_frame(29);
+        });
+        assert_eq!(scene.frame_count(), 30, "the longest layer decides");
+
+        assert!(scene.set_frame_count(48));
+
+        assert_eq!(scene.frame_count(), 48);
+        for id in [a, b] {
+            assert_eq!(
+                scene.layers().get(id).unwrap().frames.length(),
+                48,
+                "every layer should run the length of the document"
+            );
+        }
+    }
+
+    /// Trimming takes frames off the end, including of the layers that were
+    /// longer than the new length.
+    #[test]
+    fn setting_a_shorter_length_trims_every_layer() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(99);
+        });
+        assert_eq!(scene.frame_count(), 100);
+
+        assert!(scene.set_frame_count(24));
+        assert_eq!(scene.frame_count(), 24);
+        assert_eq!(scene.layers().get(layer).unwrap().frames.length(), 24);
+    }
+
+    /// Artwork on frame 0 survives being trimmed to a single frame: a document
+    /// always has one frame, and it is the drawing.
+    #[test]
+    fn trimming_to_one_frame_keeps_the_drawing() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(40);
+        });
+
+        scene.set_frame_count(1);
+
+        assert_eq!(scene.frame_count(), 1);
+        assert_eq!(scene.layers().get(layer).unwrap().objects_at(0).len(), 1);
+    }
+
+    /// Asking for the length it already has changes nothing at all \u2014 so a
+    /// drag that has not moved does not fill the undo history.
+    #[test]
+    fn setting_the_length_it_already_has_does_nothing() {
+        let mut scene = Scene::default();
+        let before = scene.revision();
+        assert!(!scene.set_frame_count(scene.frame_count()));
+        assert_eq!(scene.revision(), before);
+    }
+
+    /// Absurd numbers are brought into range rather than allocating a timeline
+    /// nobody asked for.
+    #[test]
+    fn the_length_is_bounded() {
+        let mut scene = Scene::default();
+        scene.set_frame_count(0);
+        assert_eq!(scene.frame_count(), 1, "a document has at least one frame");
+
+        scene.set_frame_count(u32::MAX);
+        assert!(scene.frame_count() <= 16_000, "{}", scene.frame_count());
+    }
+
+    /// The transformation point defaults to the centre of the artwork, which
+    /// is what everything did before there was one.
+    #[test]
+    fn an_untouched_object_turns_about_its_centre() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 100.0, 50.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+
+        let (_, object) = scene.find_object(id).expect("the object");
+        assert_eq!(scene.pivot_of(object), Point::new(50.0, 25.0));
+        assert_eq!(scene.pivot_local_of(object), Point::new(50.0, 25.0));
+    }
+
+    /// **Put on the artwork, and it stays there.** Stored in the object's own
+    /// coordinates, so moving or scaling the object carries the point with it
+    /// rather than leaving it behind in the document.
+    #[test]
+    fn a_transformation_point_travels_with_the_artwork() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 100.0, 50.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+
+        // On the left-hand edge: a hinge.
+        assert!(scene.set_pivot_at(0, id, Point::new(0.0, 25.0)));
+        scene.update_object_at(0, id, |o| {
+            o.transform = Affine::translate((200.0, 0.0)) * o.transform
+        });
+
+        let (_, object) = scene.find_object(id).expect("the object");
+        assert_eq!(
+            scene.pivot_of(object),
+            Point::new(200.0, 25.0),
+            "the hinge moved with the door"
+        );
+        assert_eq!(
+            scene.pivot_local_of(object),
+            Point::new(0.0, 25.0),
+            "and is still stored on the artwork"
+        );
+    }
+
+    /// A scaled object keeps its hinge on the same part of the drawing.
+    #[test]
+    fn a_transformation_point_scales_with_the_artwork() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 100.0, 50.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        scene.set_pivot_at(0, id, Point::new(100.0, 50.0));
+        scene.update_object_at(0, id, |o| o.transform = Affine::scale(2.0));
+
+        let (_, object) = scene.find_object(id).expect("the object");
+        assert_eq!(scene.pivot_of(object), Point::new(200.0, 100.0));
+    }
+
+    /// Clearing it goes back to the centre rather than to the origin.
+    #[test]
+    fn clearing_a_transformation_point_returns_it_to_the_centre() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 100.0, 50.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        scene.set_pivot_at(0, id, Point::new(0.0, 0.0));
+        scene.update_object_at(0, id, |o| o.pivot = None);
+
+        let (_, object) = scene.find_object(id).expect("the object");
+        assert_eq!(scene.pivot_of(object), Point::new(50.0, 25.0));
+    }
+
+    /// Lifting a selection out gives a document that draws the same artwork.
+    #[test]
+    fn extracting_a_selection_gives_a_document_of_its_own() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let keep = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        let leave = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(50.0, 50.0, 60.0, 60.0).to_path(1e-9),
+                    Color::BLACK,
+                ),
+            )
+            .expect("another shape");
+
+        let asset = scene.extract(0, &[keep]);
+
+        let ids: Vec<ObjectId> = asset
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .map(|o| o.id)
+            .collect();
+        assert_eq!(ids, vec![keep], "only the selected artwork comes across");
+        assert!(!ids.contains(&leave));
+    }
+
+    /// **The failure this guards against**: an instance whose symbol was left
+    /// behind draws nothing at all, and the asset looks empty when placed.
+    #[test]
+    fn extracting_an_instance_brings_its_symbol_and_the_nested_ones() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+
+        // A head symbol, and a body symbol that contains an instance of it.
+        let head = scene.add_symbol("Head", SymbolKind::Graphic, None);
+        let body = scene.add_symbol("Body", SymbolKind::MovieClip, None);
+        scene.library_mut().update(body, |symbol| {
+            let mut inner = Layer::new(LayerId(7_000), "Head", LayerKind::Normal);
+            let objects = Arc::make_mut(&mut inner.frames.keyframes_mut()[0].objects);
+            objects.push(Arc::new(Object::instance_of(ObjectId(9_000), head)));
+            symbol.layers.push_front(inner);
+        });
+
+        let instance = scene
+            .add_instance_at(layer, 0, body, Affine::IDENTITY)
+            .expect("an instance");
+
+        let asset = scene.extract(0, &[instance]);
+
+        assert!(
+            asset.library().get(body).is_some(),
+            "the symbol placed on the stage must come with it"
+        );
+        assert!(
+            asset.library().get(head).is_some(),
+            "and the symbol nested inside that one"
+        );
+    }
+
+    /// **The selection freeze.** `resolved_bounds` used to re-measure a
+    /// symbol's whole subtree on every call, so a chain of instances nested N
+    /// deep cost time exponential in N — and it was called for every selected
+    /// object, every frame the selection chrome was drawn. Selecting an
+    /// imported character (rigs inside rigs) locked the stage up. Through the
+    /// memoised table it is linear, so even a deep chain resolves instantly.
+    #[test]
+    fn resolving_a_deeply_nested_instance_is_not_exponential() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+
+        // A chain: sym0 contains sym1 contains sym2 … the deepest holds a
+        // shape. A naive recursive measure branches at every level.
+        const DEPTH: usize = 24;
+        let mut symbols = Vec::new();
+        for i in 0..DEPTH {
+            symbols.push(scene.add_symbol(format!("s{i}"), SymbolKind::Graphic, None));
+        }
+        for i in 0..DEPTH {
+            let this = symbols[i];
+            let child = symbols.get(i + 1).copied();
+            scene.library_mut().update(this, |symbol| {
+                let mut inner = Layer::new(LayerId(7_000 + i as u64), "L", LayerKind::Normal);
+                let objects = Arc::make_mut(&mut inner.frames.keyframes_mut()[0].objects);
+                match child {
+                    Some(child) => objects.push(Arc::new(Object::instance_of(
+                        ObjectId(9_000 + i as u64),
+                        child,
+                    ))),
+                    // The leaf carries real geometry, so the bounds are non-zero.
+                    None => objects.push(Arc::new(Object::shape(
+                        ObjectId(9_000 + i as u64),
+                        ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+                    ))),
+                }
+                symbol.layers.push_front(inner);
+            });
+        }
+
+        let instance = scene
+            .add_instance_at(layer, 0, symbols[0], Affine::IDENTITY)
+            .expect("an instance");
+        let (_, object) = scene.find_object(instance).expect("the placed instance");
+
+        let start = std::time::Instant::now();
+        let bounds = scene.resolved_bounds(object);
+        let elapsed = start.elapsed();
+
+        assert!(bounds.area() > 0.0, "the nested shape gives it real extents");
+        // Exponential in 24 would never finish; linear is microseconds. The
+        // bound is generous for a debug build under test-runner load.
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "resolving a {DEPTH}-deep instance took {elapsed:?} — the exponential \
+             measure is back"
+        );
+
+        // And it still agrees with the table it now reads from.
+        let table = scene.symbol_bounds_table();
+        assert_eq!(bounds, scene.resolved_bounds_with(object, &table));
+    }
+
+    /// A symbol that contains an instance of itself — which an import can
+    /// produce — must not send the walk round for ever.
+    #[test]
+    fn extraction_terminates_on_a_self_referential_symbol() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let loop_symbol = scene.add_symbol("Loop", SymbolKind::Graphic, None);
+        scene.library_mut().update(loop_symbol, |symbol| {
+            let mut inner = Layer::new(LayerId(7_000), "Itself", LayerKind::Normal);
+            let objects = Arc::make_mut(&mut inner.frames.keyframes_mut()[0].objects);
+            objects.push(Arc::new(Object::instance_of(ObjectId(9_100), loop_symbol)));
+            symbol.layers.push_front(inner);
+        });
+        let instance = scene
+            .add_instance_at(layer, 0, loop_symbol, Affine::IDENTITY)
+            .expect("an instance");
+
+        let asset = scene.extract(0, &[instance]);
+        assert_eq!(asset.library().len(), 1);
+    }
+
+    /// An asset taken while looking at frame 12 is what frame 12 shows.
+    #[test]
+    fn extraction_takes_the_artwork_as_it_is_on_that_frame() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(12);
+            l.frames.insert_keyframe(12);
+        });
+        scene.update_object_at(12, id, |o| o.transform = Affine::translate((300.0, 0.0)));
+
+        let asset = scene.extract(12, &[id]);
+        let x = asset
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .find(|o| o.id == id)
+            .map(|o| o.transform.translation().x)
+            .expect("the artwork");
+        assert_eq!(x, 300.0, "frame 0's copy was taken instead");
+    }
+
+    /// Auto Keyframe splits the span at the frame being edited, so the change
+    /// starts there instead of reaching back to where the keyframe began.
+    #[test]
+    fn ensure_keyframe_splits_a_span() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(9);
+        });
+
+        assert!(scene.ensure_keyframe(layer, 5), "frame 5 should be keyed");
+        assert!(scene.layers().get(layer).unwrap().frames.is_keyframe(5));
+        assert!(
+            !scene.ensure_keyframe(layer, 5),
+            "a second call should do nothing"
+        );
+
+        // The artwork is duplicated, as F6 does — an empty frame 5 would be an
+        // edit that appears to delete the drawing.
+        assert_eq!(
+            scene.layers().get(layer).unwrap().objects_at(5).len(),
+            1,
+            "the new keyframe should carry the artwork"
+        );
+    }
+
+    /// Past the end of the span there is nothing to duplicate, and a blank
+    /// keyframe is never what an edit meant to produce (§7 item 37).
+    #[test]
+    fn ensure_keyframe_does_nothing_past_the_end_of_a_span() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        assert!(!scene.ensure_keyframe(layer, 40));
+        assert_eq!(scene.layers().get(layer).unwrap().frames.length(), 1);
+    }
+
+    /// An object that is not on the keyframe owning the frame — because the
+    /// playhead is somewhere else entirely — is still editable rather than
+    /// mysteriously immovable.
+    #[test]
+    fn editing_falls_back_when_the_playhead_is_off_the_object() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+
+        // Frame 500 is far beyond the one-frame span.
+        assert!(scene.update_object_at(500, id, |o| o.visible = false));
+        assert!(
+            scene
+                .layers()
+                .iter()
+                .flat_map(|l| l.objects_at(0).iter())
+                .any(|o| o.id == id && !o.visible)
+        );
+    }
+
     /// Snapshots must not see later edits — the guarantee the whole
     /// copy-on-write model rests on.
     #[test]
     fn update_object_does_not_reach_into_an_existing_snapshot() {
         let (mut scene, _) = scene_with_shapes(3);
-        let id = scene.layers().iter().next().unwrap().all_objects().next().unwrap().id;
+        let id = scene
+            .layers()
+            .iter()
+            .next()
+            .unwrap()
+            .all_objects()
+            .next()
+            .unwrap()
+            .id;
 
         let snapshot = scene.clone();
         assert!(scene.update_object(id, |o| o.visible = false));

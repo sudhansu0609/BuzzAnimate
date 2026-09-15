@@ -6,18 +6,32 @@
 //!   workstation with virtual display drivers installed.
 //! * [`GpuContext`] — the device, queue and Vello renderer, plus the scene
 //!   building that honours the rebasing contract from `buzz-geom`.
+//! * [`document`] — the walk that turns a [`buzz_scene::Scene`] into Vello
+//!   drawing commands. It sits here rather than in the application because the
+//!   window, the exporter and the headless tests must all encode a document
+//!   the same way; an export that does not match the screen is the worst bug
+//!   an animation tool can have.
 
 pub mod adapter;
+pub mod compositor;
+pub mod document;
+pub mod filters;
+pub mod lighting;
 
 use anyhow::{Context, Result};
 use buzz_geom::{Affine, BezPath, Camera, RenderClip, RenderSplit, Shape};
+use buzz_scene::{GradientKind, GradientSpread, Paint};
 use peniko::{Color, Fill};
+use std::sync::Arc;
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 use wgpu::{Device, Instance, Queue, TextureFormat, TextureView};
 
 pub use adapter::{GpuPreference, Selection, SelectionError};
+pub use compositor::Compositor;
 // Re-export the wgpu that vello uses, so downstream crates cannot accidentally
-// link a second, incompatible copy.
+// link a second, incompatible copy. Vello itself goes with it, for the same
+// reason: the exporter builds scenes and must build *these* scenes.
+pub use vello;
 pub use vello::wgpu;
 
 /// Everything needed to rasterise a scene on the GPU.
@@ -138,6 +152,55 @@ pub const RENDER_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 /// Geometry is rebased into anchor-relative space **in `f64` on the CPU**, and
 /// only then handed to Vello along with the small-magnitude view transform.
 /// Passing document-space geometry with a fused transform would reintroduce the
+/// How Animate's blend list maps onto Vello's.
+///
+/// Nine of the ten are one of Vello's mixing modes; Add is a *compositing*
+/// operator rather than a mixing one — `Plus` sums the two, which is what
+/// Animate's Add does. Layer means "composite as a group first", which is the
+/// group itself, so it needs no equation at all.
+fn blend_mode(blend: buzz_fx::Blend) -> peniko::BlendMode {
+    use buzz_fx::Blend;
+    let (mix, compose) = match blend {
+        Blend::Normal | Blend::Layer => (peniko::Mix::Normal, peniko::Compose::SrcOver),
+        Blend::Darken => (peniko::Mix::Darken, peniko::Compose::SrcOver),
+        Blend::Multiply => (peniko::Mix::Multiply, peniko::Compose::SrcOver),
+        Blend::Lighten => (peniko::Mix::Lighten, peniko::Compose::SrcOver),
+        Blend::Screen => (peniko::Mix::Screen, peniko::Compose::SrcOver),
+        Blend::Overlay => (peniko::Mix::Overlay, peniko::Compose::SrcOver),
+        Blend::HardLight => (peniko::Mix::HardLight, peniko::Compose::SrcOver),
+        Blend::Difference => (peniko::Mix::Difference, peniko::Compose::SrcOver),
+        Blend::Add => (peniko::Mix::Normal, peniko::Compose::Plus),
+    };
+    peniko::BlendMode::new(mix, compose)
+}
+
+/// How far a filled shape is grown to close the seam against its neighbour,
+/// in **screen pixels**. See [`SceneBuilder::fill_shape_paint_sealed`].
+///
+/// A stroke is centred on the path, so this width pushes the edge out by half
+/// of itself; two neighbours therefore overlap by the whole of it. Just under a
+/// pixel of overlap is enough to bring a shared boundary to full coverage, and
+/// going wider only disturbs more of the silhouette.
+const SEAM_SEAL_PX: f64 = 0.9;
+
+
+/// Is this paint fully opaque everywhere?
+///
+/// A gradient has to be checked stop by stop: one transparent stop is enough to
+/// make sealing it draw a dark rim, and the average would hide that.
+pub(crate) fn is_opaque(paint: &Paint) -> bool {
+    match paint {
+        Paint::Solid(c) => c.components[3] >= 1.0,
+        Paint::Gradient(g) => g.stops().iter().all(|s| s.color.components[3] >= 1.0),
+        // **Never sealed.** A photograph is opaque in the middle and its
+        // interesting edges are where it is not; a cut-out is transparent over
+        // most of its own rectangle. Growing either by half a pixel would
+        // smear the border pixels outwards, which is exactly the fringe that
+        // makes a composite look pasted on.
+        Paint::Image(_) => false,
+    }
+}
+
 /// precision collapse that caps Animate at 2000%. See `buzz_geom::camera`.
 pub struct SceneBuilder<'a> {
     scene: &'a mut Scene,
@@ -187,6 +250,17 @@ impl<'a> SceneBuilder<'a> {
         self.clip.bounds()
     }
 
+    /// **How much geometry this scene has taken so far**, as Vello's own count
+    /// of encoded path segments.
+    ///
+    /// Read rather than tallied: the encoding is the thing that will be
+    /// rasterised, so its own number cannot drift from what was drawn. It is
+    /// what [`crate::document::DrawCache::reconsider`] judges a frame by; see
+    /// there for why a frame has to be judged at all.
+    pub fn encoded_segments(&self) -> u32 {
+        self.scene.encoding().n_path_segments
+    }
+
     /// Shift the rendered output by a screen-space offset.
     ///
     /// The editor draws the stage into the central area between the docked
@@ -196,8 +270,36 @@ impl<'a> SceneBuilder<'a> {
     ///
     /// Applied to the GPU transform only, which keeps it away from the
     /// precision-critical CPU stages.
+    ///
+    /// **A non-finite offset is ignored rather than applied.** The window
+    /// derives this from the rectangle egui gave the stage, and that rectangle
+    /// is `Rect::NOTHING` — infinities — until the layout has been measured
+    /// once, which is the first frame after the app opens and can be a frame
+    /// again after the window is maximised. An infinity here goes into the GPU
+    /// transform, every coordinate through it comes out NaN, and the whole
+    /// frame rasterises to nothing: a black stage, with the lighting apparently
+    /// off because *everything* is off. Drawing the frame at the origin for one
+    /// frame is wrong by a few pixels; drawing it black is wrong by the whole
+    /// picture.
     pub fn with_viewport_offset(mut self, offset: buzz_geom::Vec2) -> Self {
+        if !offset.x.is_finite() || !offset.y.is_finite() {
+            return self;
+        }
         self.split.gpu_view = Affine::translate(offset) * self.split.gpu_view;
+        self
+    }
+
+    /// Scale the rendered output by the display's device-pixel ratio.
+    ///
+    /// The camera works in **logical** points, the same space egui lays the
+    /// panels and draws the selection chrome in, so a click maps to the same
+    /// place the chrome is drawn. Vello's target is **physical** pixels, so the
+    /// finished output is scaled up by `pixels_per_point` here — on the GPU
+    /// transform only, after the precision-critical CPU split. On a 1:1 display
+    /// this is the identity. Apply **before** [`Self::with_viewport_offset`] so
+    /// the offset, already in physical pixels, is not scaled again.
+    pub fn with_output_scale(mut self, scale: f64) -> Self {
+        self.split.gpu_view = Affine::scale(scale) * self.split.gpu_view;
         self
     }
 
@@ -234,6 +336,334 @@ impl<'a> SceneBuilder<'a> {
             .fill(Fill::NonZero, self.split.gpu_view, color, None, &path);
     }
 
+    /// The affine that carries document space into render space.
+    ///
+    /// The same anchor-then-scale the geometry takes in [`Self::to_render_space`],
+    /// without the clip — a brush has no segments to bound.
+    fn doc_to_render(&self) -> Affine {
+        Affine::scale(self.split.scale) * Affine::translate(-self.split.anchor.to_vec2())
+    }
+
+    /// Turn a document paint into a Vello brush, plus the transform that puts
+    /// it where the artwork is.
+    ///
+    /// # Why the brush transform, and not gradient coordinates in render space
+    ///
+    /// The gradient is defined in unit space, so everything that positions it —
+    /// the object's placement, the camera, and the render split — is one
+    /// matrix. Handing Vello that matrix as the brush transform means the
+    /// gradient goes through *exactly* what the path went through, composed in
+    /// `f64` here rather than accumulated separately. Vello's own encoding
+    /// multiplies it by the same `gpu_view` the path is drawn with (see
+    /// `Scene::fill`), so the ramp cannot drift away from the shape it fills at
+    /// any zoom.
+    fn brush_for(&self, paint: &Paint, to_doc: Affine) -> (peniko::Brush, Option<Affine>) {
+        // A bitmap is a brush too, placed by the same chain — the object's
+        // own space, then the camera, then the render split — so a photograph
+        // stays stuck to the shape it fills at any zoom, exactly as a gradient
+        // does. Vello samples the image over the unit square, which is the
+        // space `ImageFill::transform` is defined in, so the two agree with no
+        // conversion at all.
+        if let Some(fill) = paint.image() {
+            let asset = &fill.asset;
+            let data = peniko::ImageData {
+                // The same allocation the document holds, not a copy: an
+                // `Arc<Vec<u8>>` coerces to the trait object Blob wants, so a
+                // 4K photograph is shared with the scene rather than cloned
+                // into every frame.
+                // **A stable identity, not a fresh one.** The GPU caches by
+                // this number, and `Blob::new` takes a new one from a global
+                // counter on every call — so building the brush per frame made
+                // every frame a cache miss and re-uploaded the whole
+                // photograph. `blob_id` is the asset's own id mixed with a
+                // counter that moves only when the pixels do.
+                data: peniko::Blob::from_raw_parts(
+                    Arc::clone(&asset.pixels) as Arc<dyn AsRef<[u8]> + Send + Sync>,
+                    asset.blob_id(),
+                ),
+                format: peniko::ImageFormat::Rgba8,
+                // Straight alpha, as the model stores it and as PNG does.
+                alpha_type: peniko::ImageAlphaType::Alpha,
+                width: asset.width,
+                height: asset.height,
+            };
+            let quality = if fill.smooth {
+                peniko::ImageQuality::Medium
+            } else {
+                peniko::ImageQuality::Low
+            };
+            // A tiling fill (a seamless texture) repeats across the shape; an
+            // ordinary photograph pads its last row of pixels out to the edge.
+            let extend = if fill.tile {
+                peniko::Extend::Repeat
+            } else {
+                peniko::Extend::Pad
+            };
+            let brush = peniko::ImageBrush {
+                image: data,
+                sampler: peniko::ImageSampler {
+                    x_extend: extend,
+                    y_extend: extend,
+                    quality,
+                    alpha: 1.0,
+                },
+            };
+            // Vello samples in *pixel* space, so the unit square has to be
+            // scaled up to the image's own size before the placement is
+            // applied. Getting this the wrong way round draws one pixel of the
+            // photograph across the whole shape.
+            let to_pixels = Affine::scale_non_uniform(
+                1.0 / f64::from(asset.width).max(1.0),
+                1.0 / f64::from(asset.height).max(1.0),
+            );
+            let placed = self.doc_to_render() * to_doc * fill.transform * to_pixels;
+            return (peniko::Brush::Image(brush), Some(placed));
+        }
+
+        let Some(g) = paint.gradient() else {
+            return (peniko::Brush::Solid(paint.color()), None);
+        };
+
+        let stops: Vec<peniko::ColorStop> = g
+            .stops()
+            .iter()
+            .map(|s| peniko::ColorStop::from((s.offset as f32, s.color)))
+            .collect();
+
+        let kind = match g.kind {
+            GradientKind::Linear => peniko::GradientKind::Linear(
+                peniko::LinearGradientPosition::new((-1.0, 0.0), (1.0, 0.0)),
+            ),
+            // The focal point is Animate's: the hot spot slides along the unit
+            // x axis while the outer circle stays put. A two-point radial with
+            // a zero inner radius is exactly that, and is what SWF's focal
+            // gradients mean as well.
+            GradientKind::Radial => {
+                peniko::GradientKind::Radial(peniko::RadialGradientPosition::new_two_point(
+                    (g.focal.clamp(-1.0, 1.0), 0.0),
+                    0.0,
+                    (0.0, 0.0),
+                    1.0,
+                ))
+            }
+        };
+
+        let mut brush = peniko::Gradient {
+            kind,
+            ..Default::default()
+        };
+        brush.extend = match g.spread {
+            GradientSpread::Pad => peniko::Extend::Pad,
+            GradientSpread::Reflect => peniko::Extend::Reflect,
+            GradientSpread::Repeat => peniko::Extend::Repeat,
+        };
+        brush.stops = stops.as_slice().into();
+
+        let placed = self.doc_to_render() * to_doc * g.transform;
+        (peniko::Brush::Gradient(brush), Some(placed))
+    }
+
+    /// Fill a document-space shape with a paint, which may be a gradient.
+    ///
+    /// `to_doc` maps the paint's own space — the object's — into document
+    /// space. It is the accumulated placement the caller already has, and it is
+    /// what keeps a gradient stuck to its artwork when the artwork is moved,
+    /// scaled or turned.
+    pub fn fill_shape_paint(&mut self, shape: &impl Shape, paint: &Paint, to_doc: Affine) {
+        let path = self.to_render_space(shape);
+        let (brush, brush_transform) = self.brush_for(paint, to_doc);
+        self.scene.fill(
+            Fill::NonZero,
+            self.split.gpu_view,
+            &brush,
+            brush_transform,
+            &path,
+        );
+    }
+
+    /// Fill a shape and **seal its edge**, so it does not leave a pale seam
+    /// against the shape beside it.
+    ///
+    /// # The defect this exists for
+    ///
+    /// Two filled shapes that share an edge should meet with nothing between
+    /// them. They do not. Every path is antialiased independently, so along a
+    /// shared boundary each shape covers about *half* of every pixel — and
+    /// compositing one over the other gives `0.5 + 0.5 × (1 − 0.5) = 0.75`, not
+    /// `1.0`. The remaining quarter is the stage showing through, and it reads
+    /// as a thin pale line tracing every border in the drawing. It is worst on
+    /// imported artwork, because Flash drew a shape as a *soup of edges* that
+    /// were scan-converted together in one pass, so every region in a `.fla`
+    /// shares its boundary exactly with its neighbour. This is the well-known
+    /// conflation artifact, and it is a property of compositing paths
+    /// separately rather than a bug in any one of them.
+    ///
+    /// # The fix, and why it is a stroke
+    ///
+    /// The shape is stroked with **its own paint**, a hair under a pixel wide.
+    /// That pushes its coverage half a pixel outwards, so two neighbours now
+    /// overlap across the boundary instead of meeting exactly on it, and the
+    /// pixel sums to full. Growing the geometry with a boolean would be exact
+    /// and would cost an offset per shape per frame; a stroke is one extra path
+    /// and the difference is half a pixel of silhouette.
+    ///
+    /// # When it must not happen
+    ///
+    /// **Only for opaque paint.** A translucent fill stroked with itself
+    /// composites twice around its rim, which draws a visible darker outline —
+    /// turning a subtle seam into an obvious border. Translucent artwork keeps
+    /// the seam, which is the lesser of the two.
+    pub fn fill_shape_paint_sealed(&mut self, shape: &impl Shape, paint: &Paint, to_doc: Affine) {
+        self.fill_shape_paint(shape, paint, to_doc);
+        if !is_opaque(paint) {
+            return;
+        }
+        // In screen pixels: the seam is a property of the *rasteriser*, not of
+        // the document, so it is the same width at every zoom. Slightly under a
+        // pixel — a full pixel of overlap is enough to close the gap, and less
+        // silhouette is disturbed than a wider stroke would disturb.
+        let width = SEAM_SEAL_PX / self.view_scale().max(f64::MIN_POSITIVE);
+        self.stroke_shape_paint(shape, paint, width, to_doc);
+    }
+
+    /// Stroke a document-space shape with a paint, which may be a gradient.
+    pub fn stroke_shape_paint(
+        &mut self,
+        shape: &impl Shape,
+        paint: &Paint,
+        width: f64,
+        to_doc: Affine,
+    ) {
+        let path = self.to_render_space(shape);
+        let render_width = self.split.scale_length(width).max(f64::MIN_POSITIVE);
+        let (brush, brush_transform) = self.brush_for(paint, to_doc);
+        self.scene.stroke(
+            &kurbo::Stroke::new(render_width),
+            self.split.gpu_view,
+            &brush,
+            brush_transform,
+            &path,
+        );
+    }
+
+    /// Fill additively with a paint. See [`Self::fill_shape_additive`], which
+    /// this is the gradient-capable form of.
+    pub fn fill_shape_paint_additive(&mut self, shape: &impl Shape, paint: &Paint, to_doc: Affine) {
+        let path = self.to_render_space(shape);
+        let (brush, brush_transform) = self.brush_for(paint, to_doc);
+        let blend = peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::Plus);
+        self.scene
+            .push_layer(Fill::NonZero, blend, 1.0, self.split.gpu_view, &path);
+        self.scene.fill(
+            Fill::NonZero,
+            self.split.gpu_view,
+            &brush,
+            brush_transform,
+            &path,
+        );
+        self.scene.pop_layer();
+    }
+
+    /// Fill with a paint the way **light** falls on what is already there:
+    /// everything gets brighter, nothing gets darker, and nothing goes past
+    /// white.
+    ///
+    /// Screen rather than Plus, which is the other obvious choice. Plus is what
+    /// two beams of light do to each other in a vacuum and it blows past white
+    /// the moment a lamp is anywhere near a pale surface — a cream wall under a
+    /// warm lamp turns into a white disc with an edge. Screen is
+    /// `1 − (1 − a)(1 − b)`: it approaches white and never reaches it, which is
+    /// how a photograph of a lit wall behaves and what a painter reaches for.
+    /// Over black it does nothing, which is also right — a lamp cannot light
+    /// what absorbs everything.
+    pub fn fill_shape_paint_lit(&mut self, shape: &impl Shape, paint: &Paint, to_doc: Affine) {
+        let path = self.to_render_space(shape);
+        let (brush, brush_transform) = self.brush_for(paint, to_doc);
+        let blend = peniko::BlendMode::new(peniko::Mix::Screen, peniko::Compose::SrcOver);
+        self.scene
+            .push_layer(Fill::NonZero, blend, 1.0, self.split.gpu_view, &path);
+        self.scene.fill(
+            Fill::NonZero,
+            self.split.gpu_view,
+            &brush,
+            brush_transform,
+            &path,
+        );
+        self.scene.pop_layer();
+    }
+
+    /// Lay `color` over what is already drawn inside `shape`, **and only where
+    /// something is already drawn**.
+    ///
+    /// This is how light reaches artwork whose colours cannot be rewritten one
+    /// by one — a bitmap. The light becomes a blend over the picture instead of
+    /// a change to the paint; see [`buzz_light::Illumination::as_filter`].
+    ///
+    /// # Why `SrcAtop`
+    ///
+    /// A cut-out photograph is transparent over most of its own rectangle. Laid
+    /// on with ordinary source-over, a multiply against a transparent backdrop
+    /// paints the colour straight in — so the light would fill the hole in the
+    /// cut-out with itself, and a character on a white stage would gain a
+    /// coloured rectangle around it. `SrcAtop` keeps the backdrop's alpha, so
+    /// the light lands on the picture and nowhere else.
+    ///
+    /// The caller is responsible for what "already drawn" means: called outside
+    /// an isolation group the backdrop includes the stage, and the light would
+    /// tint that too. See [`Self::push_isolation`].
+    pub fn fill_shape_atop(&mut self, shape: &impl Shape, color: Color, blend: buzz_fx::Blend) {
+        let path = self.to_render_space(shape);
+        let mix = blend_mode(blend).mix;
+        self.scene.push_layer(
+            Fill::NonZero,
+            peniko::BlendMode::new(mix, peniko::Compose::SrcAtop),
+            1.0,
+            self.split.gpu_view,
+            &path,
+        );
+        self.scene
+            .fill(Fill::NonZero, self.split.gpu_view, color, None, &path);
+        self.scene.pop_layer();
+    }
+
+    /// [`Self::fill_shape_atop`], with a paint instead of one colour.
+    ///
+    /// **This is what makes a lamp fall off across a shape.** A light laid over
+    /// artwork as a solid can only tint it evenly; the same pass with a radial
+    /// gradient — the lamp's own falloff, centred where it stands — lands the
+    /// light per pixel, so the near side of a face is brighter than the far side
+    /// of the same face. See [`buzz_light::LightRig::field`].
+    ///
+    /// `to_doc` maps the paint's own space into document space, exactly as
+    /// [`Self::fill_shape_paint`] takes it. A light's ramp is already in document
+    /// space, so what it wants is the projection alone.
+    pub fn fill_shape_atop_paint(
+        &mut self,
+        shape: &impl Shape,
+        paint: &Paint,
+        to_doc: Affine,
+        blend: buzz_fx::Blend,
+    ) {
+        let path = self.to_render_space(shape);
+        let (brush, brush_transform) = self.brush_for(paint, to_doc);
+        let mix = blend_mode(blend).mix;
+        self.scene.push_layer(
+            Fill::NonZero,
+            peniko::BlendMode::new(mix, peniko::Compose::SrcAtop),
+            1.0,
+            self.split.gpu_view,
+            &path,
+        );
+        self.scene.fill(
+            Fill::NonZero,
+            self.split.gpu_view,
+            &brush,
+            brush_transform,
+            &path,
+        );
+        self.scene.pop_layer();
+    }
+
     /// Fill a shape so that its opacity **adds** to whatever is under it.
     ///
     /// Two strokes at alpha 0.2 and 0.3 overlap at exactly 0.5, rather than the
@@ -267,6 +697,66 @@ impl<'a> SceneBuilder<'a> {
         self.scene.pop_layer();
     }
 
+    /// Fill a shape with the **even-odd** rule.
+    ///
+    /// What a ring is drawn with: an outer boundary and an inner one in the
+    /// same path, with the hole between them. Non-zero would fill the lot.
+    pub fn fill_shape_even_odd(&mut self, shape: &impl Shape, color: Color) {
+        let path = self.to_render_space(shape);
+        self.scene
+            .fill(Fill::EvenOdd, self.split.gpu_view, color, None, &path);
+    }
+
+    /// Stroke a shape with an extra transform applied to the **pen** as well as
+    /// the path.
+    ///
+    /// This is what draws an elliptical soft edge: `buzz-fx` squashes the path
+    /// so the blur is round, and the transform stretches path and pen back
+    /// together. A round pen scaled by a width would stay round.
+    ///
+    /// The transform is applied in document space, before the render split, so
+    /// it is subject to the same magnification as everything else.
+    pub fn stroke_transformed(
+        &mut self,
+        shape: &impl Shape,
+        color: Color,
+        width: f64,
+        transform: Affine,
+    ) {
+        // The path is carried into the transformed space by hand; the pen is
+        // carried by handing Vello the transform, which strokes under it.
+        let path = self.to_render_space(shape);
+        let render_width = self.split.scale_length(width).max(f64::MIN_POSITIVE);
+
+        // Render space is the document scaled about an anchor, so a transform
+        // meant for document space has to be conjugated into it: shift to the
+        // anchor, scale, apply, and undo. For the scale-only transforms this
+        // is used with, that reduces to the transform itself.
+        self.scene.stroke(
+            &kurbo::Stroke::new(render_width),
+            self.split.gpu_view * transform,
+            color,
+            None,
+            &(transform.inverse() * path),
+        );
+    }
+
+    /// Begin a group that composites with what is behind it using `blend`.
+    ///
+    /// Animate's blend modes need a backdrop to blend *with*, and without a
+    /// group that backdrop is the entire stage — so every mode but Normal is
+    /// drawn into one of these.
+    pub fn push_blend(&mut self, bounds: buzz_geom::Rect, blend: buzz_fx::Blend) {
+        let path = self.to_render_space(&bounds);
+        self.scene.push_layer(
+            Fill::NonZero,
+            blend_mode(blend),
+            1.0,
+            self.split.gpu_view,
+            &path,
+        );
+    }
+
     /// Begin a transparent group that later drawing composites into.
     ///
     /// Ordinary source-over drawing is unaffected by being inside one — an
@@ -287,9 +777,95 @@ impl<'a> SceneBuilder<'a> {
         );
     }
 
-    /// Close the group opened by [`Self::push_isolation`].
+    /// Begin a group that is composited at `alpha` when it closes.
+    ///
+    /// **What this buys over drawing at that alpha directly**: inside the
+    /// group, overlapping shapes do not compound. Two half-transparent shapes
+    /// laid one on another make three quarters; the same two drawn opaque
+    /// inside a group closed at a half make a half, everywhere, which is what
+    /// a *silhouette* means. That is exactly the difference between a shadow
+    /// and a stack of shadows — see the shadow pass in
+    /// [`crate::document`].
+    ///
+    /// `bounds` limits the group as [`Self::push_isolation`] does, and for the
+    /// same reason: a group is a render target.
+    pub fn push_alpha_group(&mut self, bounds: buzz_geom::Rect, alpha: f32) {
+        let path = self.to_render_space(&bounds);
+        self.scene.push_layer(
+            Fill::NonZero,
+            peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::SrcOver),
+            alpha.clamp(0.0, 1.0),
+            self.split.gpu_view,
+            &path,
+        );
+    }
+
+    /// Close the group opened by [`Self::push_isolation`] or
+    /// [`Self::push_alpha_group`].
     pub fn pop_isolation(&mut self) {
         self.scene.pop_layer();
+    }
+
+    /// Clip everything drawn until the next [`Self::pop_isolation`] to `shape`.
+    ///
+    /// This is what a mask layer does: the shape is the mask's own artwork, and
+    /// the layers it claims show only where that artwork covers them.
+    ///
+    /// **Non-zero fill, deliberately.** A mask drawn as several separate blobs
+    /// shows through all of them; under even-odd, two overlapping blobs would
+    /// punch a hole where they cross, which is not what anybody drawing a mask
+    /// means. The shape goes through the same document-space clipping and
+    /// rebasing as artwork, so a mask survives extreme zoom like everything
+    /// else.
+    pub fn push_clip(&mut self, shape: &impl Shape) {
+        let path = self.to_render_space(shape);
+        self.scene.push_layer(
+            Fill::NonZero,
+            peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::SrcOver),
+            1.0,
+            self.split.gpu_view,
+            &path,
+        );
+    }
+
+    /// Hide, rather than reveal: everything drawn until the matching
+    /// [`Self::pop_inverse_clip`] is kept *except* where the shape covers it.
+    ///
+    /// **Why this is not a clip.** The obvious inverse — a huge rectangle with
+    /// the mask's subpaths reversed inside it — is wrong for any mask made of
+    /// overlapping blobs: under the non-zero rule two reversed overlapping
+    /// shapes wind back to a filled region, and the overlap would show through
+    /// the hole it is supposed to be part of. So the run is drawn into a group
+    /// of its own and the mask is then *punched out* of it with `DestOut`,
+    /// which is exact whatever the geometry does.
+    ///
+    /// `bounds` must cover everything the group draws: it is the group's
+    /// render target, and artwork outside it is cut off.
+    pub fn push_inverse_clip(&mut self, bounds: buzz_geom::Rect) {
+        self.push_isolation(bounds);
+    }
+
+    /// Close the group opened by [`Self::push_inverse_clip`], punching `shape`
+    /// out of it.
+    pub fn pop_inverse_clip(&mut self, shape: &impl Shape) {
+        let path = self.to_render_space(shape);
+        let punch = peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::DestOut);
+
+        // The shape is its own clip, so the layer that composites with
+        // `DestOut` covers exactly the region to remove.
+        self.scene
+            .push_layer(Fill::NonZero, punch, 1.0, self.split.gpu_view, &path);
+        self.scene.fill(
+            Fill::NonZero,
+            self.split.gpu_view,
+            // Any opaque colour: `DestOut` reads the source's alpha only.
+            Color::BLACK,
+            None,
+            &path,
+        );
+        self.scene.pop_layer();
+
+        self.pop_isolation();
     }
 
     /// Stroke a document-space shape with a width in document units.
@@ -464,7 +1040,10 @@ mod tests {
                 (on_screen - 0.1).abs() < 1e-9,
                 "tolerance should be ~0.1 px on screen at zoom {zoom}, was {on_screen}"
             );
-            assert!(tol > 0.0 && tol.is_finite(), "bad tolerance {tol} at {zoom}");
+            assert!(
+                tol > 0.0 && tol.is_finite(),
+                "bad tolerance {tol} at {zoom}"
+            );
         }
 
         // The specific failure: at 1e12x the artwork's smallest features are

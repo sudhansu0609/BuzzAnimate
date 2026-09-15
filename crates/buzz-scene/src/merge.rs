@@ -28,13 +28,32 @@ use crate::timeline::{Keyframe, LayerTimeline};
 use crate::{IdAllocator, Scene};
 
 /// Where an imported document should land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `PartialEq` but not `Eq`: a paste carries a distance, and a distance is
+/// floating point.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ImportTarget {
     /// Animate's *Import to Library*: bring the symbols, leave the stage alone.
     Library,
     /// Animate's *Import to Stage*: bring the symbols **and** place the
     /// document's own timeline as new layers on top of the current one.
     Stage,
+    /// **Paste.** Bring the symbols, and put the incoming artwork on a layer
+    /// that already exists, at one frame.
+    ///
+    /// Distinct from [`Self::Stage`] because pasting must not invent layers.
+    /// An import arrives as a document and keeps its own structure; a paste is
+    /// artwork arriving in the middle of the drawing you are already making,
+    /// and Animate puts it on the current layer at the current frame. Three
+    /// copies of a character would otherwise be three new layers each.
+    Onto {
+        layer: LayerId,
+        frame: u32,
+        /// Moved by this much on the way in, so a paste over its own original
+        /// is visibly a second copy rather than an invisible one exactly on
+        /// top. Animate offsets a plain paste and not a Paste in Place.
+        offset: buzz_geom::Vec2,
+    },
 }
 
 /// What a merge brought across.
@@ -50,9 +69,15 @@ pub struct MergeReport {
 impl MergeReport {
     /// A sentence for the status bar.
     pub fn summary(&self) -> String {
-        let mut s = format!("{} symbols, {} layers, {} objects", self.symbols, self.layers, self.objects);
+        let mut s = format!(
+            "{} symbols, {} layers, {} objects",
+            self.symbols, self.layers, self.objects
+        );
         if !self.renamed.is_empty() {
-            s.push_str(&format!("; {} renamed to avoid a clash", self.renamed.len()));
+            s.push_str(&format!(
+                "; {} renamed to avoid a clash",
+                self.renamed.len()
+            ));
         }
         s
     }
@@ -64,6 +89,9 @@ struct Remapper<'a> {
     /// Old symbol id to new. Built before any artwork is copied, because an
     /// instance may refer to a symbol defined later in the file.
     symbols: HashMap<SymbolId, SymbolId>,
+    /// Old sound id to new, for the same reason: a keyframe's sound reference
+    /// is a number, and two documents both numbering from one would collide.
+    sounds: HashMap<crate::sound::SoundId, crate::sound::SoundId>,
     objects: usize,
 }
 
@@ -80,20 +108,31 @@ impl Remapper<'_> {
 
         let mut out = LayerStack::new();
         for (index, layer) in source.iter().enumerate() {
-            let mut copy = Layer::new(
-                layer_ids[&layer.id],
-                layer.name.clone(),
-                layer.kind,
-            );
+            let mut copy = Layer::new(layer_ids[&layer.id], layer.name.clone(), layer.kind);
             // A parent outside this stack cannot be honoured, so the layer
             // becomes top-level rather than pointing at a foreign document.
             copy.parent = layer.parent.and_then(|p| layer_ids.get(&p).copied());
+            // **Layer Parenting comes across too**, renumbered the same way.
+            //
+            // It did not, and every rigged character placed from the asset
+            // library arrived as a pile of parts that had forgotten which
+            // followed which: the importer read Animate's parent links and
+            // baked the rest poses, the file kept them, and this copy — the
+            // one step between the library and the stage — dropped them on
+            // the floor. The rest pose is what the link measures motion
+            // from, so it travels with the link.
+            copy.follows = layer.follows.and_then(|f| layer_ids.get(&f).copied());
+            copy.follows_bone = copy.follows.and(layer.follows_bone);
+            copy.rest_pose = layer.rest_pose;
             copy.visible = layer.visible;
             copy.locked = layer.locked;
             copy.outline = layer.outline;
+            copy.alpha = layer.alpha;
             copy.color = layer.color;
             copy.height = layer.height;
+            copy.depth = layer.depth;
             copy.collapsed = layer.collapsed;
+            copy.filters = layer.filters.clone();
             copy.frames = self.timeline(&layer.frames);
             out.insert(index, copy);
         }
@@ -114,6 +153,15 @@ impl Remapper<'_> {
                 ),
                 label: k.label.clone(),
                 tween: k.tween,
+                // Sound ids are remapped by the caller alongside symbol ids;
+                // a merge that kept the source's id would point at whichever
+                // local sound happened to share the number.
+                sound: k.sound.map(|mut reference| {
+                    if let Some(new) = self.sounds.get(&reference.sound) {
+                        reference.sound = *new;
+                    }
+                    reference
+                }),
             })
             .collect();
         LayerTimeline::from_parts(keyframes, source.length())
@@ -144,9 +192,27 @@ impl Remapper<'_> {
                     }
                     ObjectKind::Instance(copy)
                 }
+                // A rig's parts are objects in their own right, so they are
+                // renumbered too — otherwise an imported armature would hold
+                // artwork whose ids collide with the document's own.
+                ObjectKind::Armature(rig) => {
+                    let mut copy = rig.clone();
+                    for part in &mut copy.parts {
+                        part.artwork = std::sync::Arc::new(self.object(&part.artwork));
+                    }
+                    ObjectKind::Armature(copy)
+                }
+                ObjectKind::Warp(warp) => ObjectKind::Warp(warp.clone()),
             },
             locked: source.locked,
             visible: source.visible,
+            filters: source.filters.clone(),
+            blend: source.blend,
+            spatial: source.spatial,
+            pivot: source.pivot,
+            modifiers: source.modifiers.clone(),
+            text: source.text.clone(),
+            turnaround: source.turnaround.clone(),
         }
     }
 }
@@ -169,9 +235,27 @@ impl Scene {
             symbols.insert(symbol.id, SymbolId(self.ids.take()));
         }
 
+        // Sounds are renumbered the same way, and copied across: a document
+        // whose keyframes referred to sounds that did not come with them would
+        // play silence and give no clue why.
+        let mut sounds = HashMap::new();
+        let mut incoming_sounds = Vec::new();
+        for sound in other.sounds.iter() {
+            let id = crate::sound::SoundId(self.ids.take());
+            sounds.insert(sound.id, id);
+            let mut copy = (**sound).clone();
+            copy.id = id;
+            copy.name = self.sounds.unique_name(&copy.name);
+            incoming_sounds.push(copy);
+        }
+        for sound in incoming_sounds {
+            self.sounds.insert(sound);
+        }
+
         let mut remap = Remapper {
             ids: &mut self.ids,
             symbols,
+            sounds,
             objects: 0,
         };
 
@@ -188,11 +272,29 @@ impl Scene {
             });
         }
 
-        // 3. The document's own timeline, if this is an Import to Stage.
-        let stage_layers = match target {
-            ImportTarget::Stage => Some(remap.layer_stack(other.stage_layers())),
-            ImportTarget::Library => None,
-        };
+        // 3. The document's own timeline, if this is an Import to Stage — or
+        //    just its artwork, if this is a paste.
+        let mut stage_layers = None;
+        let mut pasted: Vec<Object> = Vec::new();
+        match target {
+            ImportTarget::Stage => stage_layers = Some(remap.layer_stack(other.stage_layers())),
+            ImportTarget::Library => {}
+            ImportTarget::Onto { frame, offset, .. } => {
+                // Everything the source shows on its own first frame. A
+                // clipboard scene built by `extract` is one layer at frame 0,
+                // but taking `objects_at` of every layer means a whole
+                // imported document can be pasted too, flattened onto one
+                // layer, which is what "paste this artwork here" means.
+                let _ = frame;
+                for layer in other.stage_layers().iter() {
+                    for object in layer.objects_at(0).iter() {
+                        let mut copy = remap.object(object);
+                        copy.transform = buzz_geom::Affine::translate(offset) * copy.transform;
+                        pasted.push(copy);
+                    }
+                }
+            }
+        }
         report.objects = remap.objects;
 
         // 4. Names are resolved against the destination one at a time, so two
@@ -217,11 +319,26 @@ impl Scene {
 
         // 5. Incoming layers go on top, which is where Animate puts them and
         //    where the user will look for what they just imported.
+        //
+        //    **Into the timeline being edited, not always the root.** A user
+        //    who opens a symbol and places an asset means "put it in here"; the
+        //    same is true of Import to Stage. Sending it to the root stage
+        //    instead dropped it where it could be seen faded behind the symbol
+        //    but never selected — it was on a timeline that was not the one open
+        //    for editing. `add_layer` already files new layers this way.
         if let Some(layers) = stage_layers {
             let arriving: Vec<_> = layers.iter().cloned().collect();
             report.layers = arriving.len();
+            let dest = self.active_layers_mut();
             for (index, layer) in arriving.into_iter().enumerate() {
-                self.layers.insert(index, (*layer).clone());
+                dest.insert(index, (*layer).clone());
+            }
+        }
+
+        // 6. Or, for a paste, onto the layer that is already there.
+        if let ImportTarget::Onto { layer, frame, .. } = target {
+            for object in pasted {
+                self.add_object_at(layer, frame, object);
             }
         }
 
@@ -253,7 +370,15 @@ mod tests {
         let outer = scene.add_symbol(format!("{name} Outer"), SymbolKind::Graphic, None);
 
         // Artwork in the inner symbol.
-        let inner_layer = scene.library().get(inner).unwrap().layers.iter().next().unwrap().id;
+        let inner_layer = scene
+            .library()
+            .get(inner)
+            .unwrap()
+            .layers
+            .iter()
+            .next()
+            .unwrap()
+            .id;
         let art = Object::shape(scene.next_object_id(), shape(size));
         scene.library_mut().update(inner, |s| {
             s.layers.update(inner_layer, |l| {
@@ -262,7 +387,15 @@ mod tests {
         });
 
         // An instance of the inner symbol, inside the outer one.
-        let outer_layer = scene.library().get(outer).unwrap().layers.iter().next().unwrap().id;
+        let outer_layer = scene
+            .library()
+            .get(outer)
+            .unwrap()
+            .layers
+            .iter()
+            .next()
+            .unwrap()
+            .id;
         let nested = Object::instance_of(scene.next_object_id(), inner);
         scene.library_mut().update(outer, |s| {
             s.layers.update(outer_layer, |l| {
@@ -272,6 +405,82 @@ mod tests {
 
         scene.add_instance_at(layer, 0, outer, Affine::IDENTITY);
         scene
+    }
+
+    /// **Layer Parenting survives a merge**, renumbered along with the layers.
+    ///
+    /// Every rigged character in the asset library is a symbol whose layers
+    /// follow each other — head follows body, wrist follows arm — and placing
+    /// one goes through here. The links, the bone each follows, and the rest
+    /// pose the motion is measured from were all being dropped, so a character
+    /// arrived on the stage as parts that no longer moved together.
+    #[test]
+    fn layer_parenting_comes_across_renumbered() {
+        let mut guest = document("Guest", 5.0);
+        let rest = Affine::translate((7.0, 11.0));
+        // On the stage: a head that follows a body.
+        let body = guest.add_layer("Body", crate::layer::LayerKind::Normal);
+        let head = guest.add_layer("Head", crate::layer::LayerKind::Normal);
+        guest.edit_layers().update(head, |l| {
+            l.follows = Some(body);
+            l.follows_bone = Some(2);
+        });
+        guest.edit_layers().update(body, |l| l.rest_pose = Some(rest));
+        // And inside a symbol, which is where a character keeps its rig.
+        let outer = guest.library().iter().find(|s| s.name == "Guest Outer").unwrap().id;
+        guest.library_mut().update(outer, |s| {
+            let torso = s.layers.iter().next().unwrap().id;
+            let mut arm = Layer::normal(LayerId(9_999), "Arm");
+            arm.follows = Some(torso);
+            s.layers.insert(0, arm);
+        });
+
+        let mut host = document("Host", 10.0);
+        host.merge(&guest, ImportTarget::Stage);
+
+        let find = |name: &str| {
+            host.stage_layers()
+                .iter()
+                .find(|l| l.name == name)
+                .unwrap_or_else(|| panic!("no layer {name}"))
+                .clone()
+        };
+        let (body, head) = (find("Body"), find("Head"));
+        assert_eq!(head.follows, Some(body.id), "the head no longer follows the body");
+        assert_eq!(head.follows_bone, Some(2), "and lost which bone it followed");
+        assert_eq!(body.rest_pose, Some(rest), "the rest pose was dropped");
+        assert_ne!(body.id, LayerId(9_999), "ids were not renumbered");
+
+        let outer = host
+            .library()
+            .iter()
+            .find(|s| s.name == "Guest Outer")
+            .expect("the guest's outer symbol");
+        let arm = outer.layers.iter().find(|l| l.name == "Arm").expect("the arm");
+        let torso = outer.layers.iter().find(|l| l.name != "Arm").expect("the torso");
+        assert_eq!(arm.follows, Some(torso.id), "inside the symbol, the arm let go");
+    }
+
+    /// A link to a layer that did not come across cannot be honoured, and a
+    /// stale bone index on a layer that follows nothing is a lie.
+    #[test]
+    fn a_link_to_a_missing_layer_is_dropped_whole() {
+        let mut guest = document("Guest", 5.0);
+        let head = guest.add_layer("Head", crate::layer::LayerKind::Normal);
+        guest.edit_layers().update(head, |l| {
+            l.follows = Some(LayerId(424_242));
+            l.follows_bone = Some(1);
+        });
+        let mut host = document("Host", 10.0);
+        host.merge(&guest, ImportTarget::Stage);
+        let head = host
+            .stage_layers()
+            .iter()
+            .find(|l| l.name == "Head")
+            .unwrap()
+            .clone();
+        assert_eq!(head.follows, None);
+        assert_eq!(head.follows_bone, None);
     }
 
     /// The defect the whole module exists to prevent: both documents number
@@ -285,7 +494,10 @@ mod tests {
         // The two documents genuinely do collide before merging.
         let host_ids: Vec<u64> = host.library().iter().map(|s| s.id.0).collect();
         let guest_ids: Vec<u64> = guest.library().iter().map(|s| s.id.0).collect();
-        assert_eq!(host_ids, guest_ids, "the id spaces must overlap for this test to mean anything");
+        assert_eq!(
+            host_ids, guest_ids,
+            "the id spaces must overlap for this test to mean anything"
+        );
 
         host.merge(&guest, ImportTarget::Stage);
 
@@ -303,11 +515,21 @@ mod tests {
             .find_map(|o| o.instance().map(|i| i.symbol))
             .expect("the nested instance came across");
 
-        let target = host.library().get(nested).expect("it points at a real symbol");
-        assert_eq!(target.name, "Guest Inner", "the nested instance was repointed");
+        let target = host
+            .library()
+            .get(nested)
+            .expect("it points at a real symbol");
+        assert_eq!(
+            target.name, "Guest Inner",
+            "the nested instance was repointed"
+        );
 
         let bounds = target.bounds().expect("the inner symbol has artwork");
-        assert_eq!(bounds.width(), 99.0, "and at the guest's artwork, not the host's");
+        assert_eq!(
+            bounds.width(),
+            99.0,
+            "and at the guest's artwork, not the host's"
+        );
     }
 
     /// The host's own artwork must be exactly as it was.
@@ -354,7 +576,11 @@ mod tests {
 
         let report = host.merge(&guest, ImportTarget::Library);
 
-        assert_eq!(host.stage_layers().len(), layers_before, "the stage must not change");
+        assert_eq!(
+            host.stage_layers().len(),
+            layers_before,
+            "the stage must not change"
+        );
         assert_eq!(report.layers, 0);
         assert_eq!(host.library().len(), symbols_before + report.symbols);
     }
@@ -370,7 +596,10 @@ mod tests {
         assert!(report.layers > 0);
 
         let top = host.stage_layers().iter().next().unwrap();
-        assert_ne!(top.name, "Host Layer", "the imported layer goes above the existing one");
+        assert_ne!(
+            top.name, "Host Layer",
+            "the imported layer goes above the existing one"
+        );
     }
 
     /// A name the user already used is theirs; the incoming one moves aside,
@@ -446,7 +675,11 @@ mod tests {
             .iter()
             .flat_map(|s| s.layers.iter().flat_map(|l| l.all_objects()));
         for object in stage.chain(nested) {
-            assert!(seen.insert(object.id.0), "object id {} appears twice", object.id.0);
+            assert!(
+                seen.insert(object.id.0),
+                "object id {} appears twice",
+                object.id.0
+            );
         }
     }
 
@@ -478,7 +711,10 @@ mod tests {
             Some(copied_folder.id),
             "the child must point at the copied folder"
         );
-        assert_ne!(copied_folder.id, folder, "and the folder must have been renumbered");
+        assert_ne!(
+            copied_folder.id, folder,
+            "and the folder must have been renumbered"
+        );
     }
 
     /// An instance whose symbol is not in the file cannot be repaired, and

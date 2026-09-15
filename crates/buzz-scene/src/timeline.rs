@@ -36,6 +36,9 @@ pub struct Keyframe {
     pub label: Option<String>,
     /// A tween running from here to the next keyframe.
     pub tween: crate::tween::Tween,
+    /// A sound starting here — Animate attaches sound to a keyframe rather
+    /// than to a layer, so one layer can carry a whole scene's effects.
+    pub sound: Option<crate::sound::SoundRef>,
 }
 
 impl Keyframe {
@@ -45,6 +48,7 @@ impl Keyframe {
             objects: Arc::new(Vec::new()),
             label: None,
             tween: crate::tween::Tween::default(),
+            sound: None,
         }
     }
 
@@ -139,6 +143,20 @@ impl ResolvedFrame<'_> {
             Self::Tweened(objects) => Box::new(objects.iter()),
         }
     }
+
+    /// Iterate, and say whether each object has a **stable identity**.
+    ///
+    /// Stored artwork is shared behind an `Arc` that survives every snapshot
+    /// it is not edited in, so anything derived from it can be cached against
+    /// that address. Tweened artwork is built fresh for the frame being drawn
+    /// and has no identity to cache against — which is correct, because it is
+    /// different geometry on every frame.
+    pub fn iter_owned(&self) -> Box<dyn Iterator<Item = (&Object, Option<&Arc<Object>>)> + '_> {
+        match self {
+            Self::Stored(objects) => Box::new(objects.iter().map(|o| (&**o, Some(o)))),
+            Self::Tweened(objects) => Box::new(objects.iter().map(|o| (o, None))),
+        }
+    }
 }
 
 /// A layer's frames.
@@ -209,8 +227,8 @@ impl LayerTimeline {
     /// Returns borrowed objects when there is no tween, so the common case
     /// allocates nothing; a tween has to build new objects because the
     /// interpolated state does not exist anywhere in the document.
-    pub fn resolved_at(&self, frame: u32) -> ResolvedFrame<'_> {
-        let Some(index) = self.index_at(frame) else {
+    pub fn resolved_at(&self, at: impl crate::time::AtTime) -> ResolvedFrame<'_> {
+        let Some(index) = self.index_at(at.frame()) else {
             return ResolvedFrame::Stored(&[]);
         };
         let keyframe = &self.keyframes[index];
@@ -229,7 +247,10 @@ impl LayerTimeline {
         if span == 0 {
             return ResolvedFrame::Stored(&keyframe.objects);
         }
-        let progress = (frame - keyframe.start) as f64 / span as f64;
+        // Continuous in time, not in frames: with the shutter open between two
+        // frames a tween is *between* them too, which is the motion the smear
+        // is made of. On a whole frame this is the same division it always was.
+        let progress = (at.as_time() - keyframe.start as f64) / span as f64;
         if progress <= 0.0 {
             return ResolvedFrame::Stored(&keyframe.objects);
         }
@@ -255,9 +276,7 @@ impl LayerTimeline {
 
     /// The tween on the keyframe governing `frame`.
     pub fn tween_at(&self, frame: u32) -> crate::tween::Tween {
-        self.keyframe_at(frame)
-            .map(|k| k.tween)
-            .unwrap_or_default()
+        self.keyframe_at(frame).map(|k| k.tween).unwrap_or_default()
     }
 
     /// The tween governing `frame`, together with the frames it runs between.
@@ -282,12 +301,19 @@ impl LayerTimeline {
     }
 
     /// What the timeline draws at `frame`.
+    ///
+    /// Binary search, not a linear scan: the timeline calls this once **per
+    /// cell**, up to thousands of columns times every layer, so a linear walk of
+    /// the layer's keyframes here is the difference between a responsive grid and
+    /// a frozen one on a long document. Keyframes are sorted by `start`
+    /// ([`Self::from_parts`] guarantees it), so an exact-start lookup is a
+    /// `binary_search`.
     pub fn frame_kind(&self, frame: u32) -> FrameKind {
         if frame >= self.length {
             return FrameKind::Empty;
         }
-        if let Some(k) = self.keyframes.iter().find(|k| k.start == frame) {
-            return if k.is_blank() {
+        if let Ok(index) = self.keyframes.binary_search_by_key(&frame, |k| k.start) {
+            return if self.keyframes[index].is_blank() {
                 FrameKind::BlankKeyframe
             } else {
                 FrameKind::Keyframe
@@ -300,9 +326,12 @@ impl LayerTimeline {
         }
     }
 
-    /// Is `frame` the start of a keyframe?
+    /// Is `frame` the start of a keyframe? Binary search, for the same reason
+    /// [`Self::frame_kind`] is.
     pub fn is_keyframe(&self, frame: u32) -> bool {
-        self.keyframes.iter().any(|k| k.start == frame)
+        self.keyframes
+            .binary_search_by_key(&frame, |k| k.start)
+            .is_ok()
     }
 
     /// Frame the keyframe governing `frame` starts on.
@@ -368,6 +397,10 @@ impl LayerTimeline {
             objects,
             label: None,
             tween: crate::tween::Tween::default(),
+            // A duplicated keyframe does *not* duplicate its sound: F6 on a
+            // dialogue layer would otherwise start the whole take again from
+            // the new frame, on top of the one already playing.
+            sound: None,
         });
         true
     }
@@ -387,19 +420,124 @@ impl LayerTimeline {
         true
     }
 
-    /// **Shift+F6** — remove the keyframe at `frame`.
+    /// **Shift+F6** — remove the keyframe **governing** `frame`.
     ///
     /// Its frames merge into the preceding keyframe's span. Frame 0's keyframe
     /// cannot be removed; a layer must always start with one.
+    ///
+    /// # Governing, not standing exactly on
+    ///
+    /// This used to require the playhead to be on the keyframe's own first
+    /// frame and did nothing otherwise. A keyframe running from 5 to 12 is one
+    /// drawing, and the animator standing on frame 8 is standing on it — every
+    /// other frame operation here agrees, which is why drawing on frame 8
+    /// edits frame 5's artwork (see [`Self::keyframe_at_mut`]). Clear Keyframe
+    /// was the one that did not, so pressing Shift+F6 anywhere but the first
+    /// frame of a span silently did nothing at all. That is the "clear keyframe
+    /// is not working" report.
     pub fn clear_keyframe(&mut self, frame: u32) -> bool {
-        if frame == 0 || !self.is_keyframe(frame) {
+        let Some(start) = self.keyframe_start(frame) else {
+            return false;
+        };
+        if start == 0 {
             return false;
         }
-        self.keyframes.retain(|k| k.start != frame);
+        self.keyframes.retain(|k| k.start != start);
         true
     }
 
     /// Set the artwork of the keyframe governing `frame`.
+    /// **Clear Frames** \u2014 empty the artwork here, keeping the frames.
+    ///
+    /// Distinct from [`Self::clear_keyframe`], which removes the keyframe
+    /// itself and hands the frames back to the one before it. This keeps the
+    /// keyframe and empties it: the span is unchanged and what was drawn is
+    /// gone, which is what Animate's Clear Frames does.
+    pub fn clear_frames(&mut self, frame: u32) -> bool {
+        match self.keyframe_at_mut(frame) {
+            Some(keyframe) if !keyframe.objects.is_empty() => {
+                keyframe.objects = Arc::new(Vec::new());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// **Re-expose this layer on `step`s** — animation "on twos", or threes.
+    ///
+    /// # What it is
+    ///
+    /// A drawing that changes every frame is animated *on ones*. Most hand-drawn
+    /// animation is *on twos*: each drawing is held for two frames, which halves
+    /// the drawings and, at twenty-four a second, is what a great deal of
+    /// animation people admire actually looks like. Threes are common for slow
+    /// or distant action.
+    ///
+    /// This keeps the keyframe at the start of the range and every `step`th one
+    /// after it, and hands the frames in between back to the drawing before them.
+    /// **Nothing is deleted that was not a keyframe**, and no artwork is thrown
+    /// away by re-exposing a range twice — the drawings that remain are the ones
+    /// that were on the kept frames.
+    ///
+    /// # Why it is destructive at all
+    ///
+    /// The dropped keyframes' artwork does go. There is no way to hold a drawing
+    /// for two frames while also keeping the one it replaced, and pretending
+    /// otherwise — a "hidden" copy — would be a second answer to what is on a
+    /// frame. Undo is the safety net, as it is for every other frame operation.
+    ///
+    /// Returns how many keyframes were dropped. `step` below two does nothing:
+    /// on ones is what the layer already is.
+    pub fn expose_on(&mut self, from: u32, to: u32, step: u32) -> usize {
+        if step < 2 || to < from {
+            return 0;
+        }
+        let doomed: Vec<u32> = self
+            .keyframes
+            .iter()
+            .map(|k| k.start)
+            .filter(|start| {
+                *start > from
+                    && *start <= to
+                    // Kept: the ones that land on the beat of the step, counted
+                    // from the start of the range rather than from frame zero,
+                    // so re-exposing a range keeps the drawing it starts with.
+                    && (*start - from) % step != 0
+            })
+            .collect();
+
+        let mut dropped = 0;
+        for frame in doomed {
+            if self.clear_keyframe(frame) {
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+
+    /// **Reverse Frames** \u2014 play this layer's keyframes back to front.
+    ///
+    /// The artwork of the first keyframe ends up on the last, and so on. The
+    /// keyframes stay where they are; it is their *contents* that swap, so the
+    /// timing an animator built is kept and only the order changes \u2014 which is
+    /// what Animate does, and what makes it useful for a cycle.
+    pub fn reverse_frames(&mut self) -> bool {
+        if self.keyframes.len() < 2 {
+            return false;
+        }
+        let contents: Vec<Arc<Vec<Arc<Object>>>> =
+            self.keyframes.iter().map(|k| k.objects.clone()).collect();
+        for (keyframe, objects) in self.keyframes.iter_mut().zip(contents.into_iter().rev()) {
+            keyframe.objects = objects;
+        }
+        true
+    }
+
+    /// The artwork on the keyframe governing `frame`, for copying.
+    pub fn frame_contents(&self, frame: u32) -> Option<Vec<Arc<Object>>> {
+        self.keyframe_at(frame).map(|k| k.objects.as_ref().clone())
+    }
+
     pub fn set_objects(&mut self, frame: u32, objects: Vec<Arc<Object>>) -> bool {
         match self.keyframe_at_mut(frame) {
             Some(k) => {
@@ -415,6 +553,21 @@ impl LayerTimeline {
         match self.keyframe_at_mut(frame) {
             Some(k) => {
                 Arc::make_mut(&mut k.objects).push(object);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Add an object **behind** everything else on the frame — first in the
+    /// stored order, so it paints first and lands at the back.
+    ///
+    /// What a paint-bucket fill wants: the colour goes under the lines it was
+    /// poured between, exactly as Animate places a fill behind its strokes.
+    pub fn insert_object_behind(&mut self, frame: u32, object: Arc<Object>) -> bool {
+        match self.keyframe_at_mut(frame) {
+            Some(k) => {
+                Arc::make_mut(&mut k.objects).insert(0, object);
                 true
             }
             None => false,
@@ -518,6 +671,60 @@ mod tests {
         assert_eq!(t.keyframe_count(), 1);
         assert_eq!(t.frame_kind(0), FrameKind::BlankKeyframe);
         assert_eq!(t.frame_kind(1), FrameKind::Empty);
+    }
+
+    /// The binary-search `frame_kind`/`is_keyframe` must agree with a plain
+    /// linear scan for every frame, on a track big enough that the linear form
+    /// was the timeline's freeze. This is the correctness pin for 1.1.
+    #[test]
+    fn frame_kind_binary_search_matches_a_linear_scan() {
+        // A long track with ~2 000 keyframes at scattered starts, alternating
+        // blank and filled so both keyframe kinds are exercised.
+        let length = 10_000u32;
+        let mut keyframes = Vec::new();
+        let mut frame = 0u32;
+        let mut i = 0u64;
+        while frame < length {
+            let mut k = Keyframe::new(frame);
+            if i % 2 == 0 {
+                k.objects = Arc::new(vec![object(i + 1)]);
+            }
+            keyframes.push(k);
+            // Irregular gaps so spans and span-ends land at varied frames.
+            frame += 1 + (i % 5) as u32;
+            i += 1;
+        }
+        let track = LayerTimeline::from_parts(keyframes.clone(), length);
+
+        // Linear reference, exactly the old implementation.
+        let starts: std::collections::HashSet<u32> = keyframes.iter().map(|k| k.start).collect();
+        let blanks: std::collections::HashSet<u32> = keyframes
+            .iter()
+            .filter(|k| k.is_blank())
+            .map(|k| k.start)
+            .collect();
+
+        for f in 0..length + 5 {
+            let expected = if f >= length {
+                FrameKind::Empty
+            } else if starts.contains(&f) {
+                if blanks.contains(&f) {
+                    FrameKind::BlankKeyframe
+                } else {
+                    FrameKind::Keyframe
+                }
+            } else if f + 1 == length {
+                FrameKind::SpanEnd
+            } else {
+                FrameKind::Span
+            };
+            assert_eq!(track.frame_kind(f), expected, "frame_kind mismatch at {f}");
+            assert_eq!(
+                track.is_keyframe(f),
+                starts.contains(&f),
+                "is_keyframe mismatch at {f}"
+            );
+        }
     }
 
     #[test]
@@ -635,6 +842,46 @@ mod tests {
             1,
             "frame 5 should now show the earlier keyframe"
         );
+    }
+
+    /// **The report: Clear Keyframe did nothing.**
+    ///
+    /// It worked only from the keyframe's own first frame. A keyframe running
+    /// from 5 to 12 is one drawing, and an animator standing on frame 8 is
+    /// standing on it — every other frame operation here already agrees, which
+    /// is why drawing on 8 edits 5's artwork. Shift+F6 was the one that made
+    /// you find the start of the span first, and silently did nothing if you
+    /// had not.
+    #[test]
+    fn shift_f6_works_from_anywhere_inside_the_span() {
+        for standing_on in [5, 6, 9, 12] {
+            let mut t = LayerTimeline::new();
+            t.push_object(0, object(1));
+            t.insert_frame(15);
+            t.insert_blank_keyframe(5);
+            assert!(t.is_keyframe(5), "the span under test does not begin at 5");
+
+            assert!(
+                t.clear_keyframe(standing_on),
+                "Shift+F6 on frame {standing_on} of a span beginning at 5 did nothing"
+            );
+            assert!(!t.is_keyframe(5), "the keyframe is still there");
+            assert_eq!(
+                t.objects_at(standing_on).len(),
+                1,
+                "frame {standing_on} should now show the earlier keyframe"
+            );
+        }
+    }
+
+    /// And it still refuses when there is nothing to clear: the frames past the
+    /// end of the layer belong to no keyframe at all.
+    #[test]
+    fn shift_f6_past_the_end_does_nothing() {
+        let mut t = LayerTimeline::new();
+        t.push_object(0, object(1));
+        t.insert_frame(9);
+        assert!(!t.clear_keyframe(400), "cleared a keyframe that is not there");
     }
 
     /// A layer must always start with a keyframe, or early frames would have
@@ -780,5 +1027,85 @@ mod tests {
             t.tween_span_at(500).is_none(),
             "a frame the layer does not reach cannot be tweened"
         );
+    }
+}
+
+#[cfg(test)]
+mod exposure_tests {
+    use super::*;
+
+    /// A layer with a drawing on every frame — animation on ones.
+    fn on_ones(frames: u32) -> LayerTimeline {
+        let mut t = LayerTimeline::default();
+        for frame in 0..frames {
+            t.insert_frame(frame);
+            t.insert_blank_keyframe(frame);
+        }
+        t
+    }
+
+    #[test]
+    fn on_twos_keeps_every_other_drawing() {
+        let mut t = on_ones(8);
+        assert_eq!(t.keyframe_count(), 8, "it starts on ones");
+
+        let dropped = t.expose_on(0, 7, 2);
+        assert_eq!(dropped, 4, "half the drawings fold into the ones they follow");
+
+        let kept: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
+        assert_eq!(kept, vec![0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn on_threes_keeps_every_third() {
+        let mut t = on_ones(9);
+        t.expose_on(0, 8, 3);
+        let kept: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
+        assert_eq!(kept, vec![0, 3, 6]);
+    }
+
+    /// The frames in between are still there, holding the drawing before them.
+    /// Re-exposing must not shorten the shot.
+    #[test]
+    fn the_shot_is_the_same_length_afterwards() {
+        let mut t = on_ones(8);
+        let before = t.length();
+        t.expose_on(0, 7, 2);
+        assert_eq!(t.length(), before, "no frames were removed, only keyframes");
+        assert!(!t.is_keyframe(1), "frame 2 is no longer a keyframe");
+        assert!(
+            t.keyframe_start(1) == Some(0),
+            "and it holds the drawing before it"
+        );
+    }
+
+    /// Counted from the start of the range, so re-exposing part of a shot keeps
+    /// the drawing that part starts on.
+    #[test]
+    fn the_range_keeps_its_own_first_drawing() {
+        let mut t = on_ones(8);
+        t.expose_on(3, 7, 2);
+        let kept: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
+        assert_eq!(kept, vec![0, 1, 2, 3, 5, 7], "outside the range is untouched");
+    }
+
+    #[test]
+    fn on_ones_is_what_it_already_is() {
+        let mut t = on_ones(6);
+        assert_eq!(t.expose_on(0, 5, 1), 0, "a step of one changes nothing");
+        assert_eq!(t.expose_on(0, 5, 0), 0);
+        assert_eq!(t.keyframe_count(), 6);
+    }
+
+    /// Doing it twice is doing it once: the second pass has nothing left to
+    /// drop, which is what stops a repeated menu click eating a shot.
+    #[test]
+    fn re_exposing_the_same_range_is_idempotent() {
+        let mut t = on_ones(8);
+        t.expose_on(0, 7, 2);
+        let after_first: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
+        assert_eq!(t.expose_on(0, 7, 2), 0, "nothing left to fold");
+        let after_second: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
+        assert_eq!(after_first, after_second);
     }
 }

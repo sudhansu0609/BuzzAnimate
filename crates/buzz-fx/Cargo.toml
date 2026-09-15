@@ -1,0 +1,15 @@
+[package]
+name = "buzz-fx"
+description = "Animate's filters — blur, drop shadow, glow, bevel and colour adjustment — as vector geometry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+buzz-geom.workspace = true
+
+kurbo.workspace = true
+peniko.workspace = true
+serde.workspace = true

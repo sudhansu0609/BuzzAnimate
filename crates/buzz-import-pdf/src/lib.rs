@@ -169,7 +169,8 @@ fn build(doc: &PdfDocument) -> Result<(Scene, ImportReport), ImportError> {
                 interp.run(&content.operations, base, *page_id, 0, &mut objects);
             }
             Err(e) => {
-                report.note_unsupported(&format!("a page whose content could not be decoded ({e})"));
+                report
+                    .note_unsupported(&format!("a page whose content could not be decoded ({e})"));
             }
         }
 
@@ -179,6 +180,8 @@ fn build(doc: &PdfDocument) -> Result<(Scene, ImportReport), ImportError> {
             objects: std::sync::Arc::new(objects),
             label: None,
             tween: buzz_scene::Tween::default(),
+            // Imported formats carry no sound yet (PROGRESS §7).
+            sound: None,
         });
     }
 
@@ -352,7 +355,9 @@ impl<'a> Interpreter<'a> {
                     1 => state.stroke = gray(n(0), state.stroke_alpha),
                     3 => state.stroke = rgb(n(0), n(1), n(2), state.stroke_alpha),
                     4 => state.stroke = cmyk(n(0), n(1), n(2), n(3), state.stroke_alpha),
-                    _ => self.report.note_unsupported("a pattern or separation stroke"),
+                    _ => self
+                        .report
+                        .note_unsupported("a pattern or separation stroke"),
                 },
 
                 // -- path construction ----------------------------------------
@@ -506,7 +511,8 @@ impl<'a> Interpreter<'a> {
         };
 
         let Some(stream_id) = self.lookup_xobject(name, resources) else {
-            self.report.note_unsupported("a form or image that could not be resolved");
+            self.report
+                .note_unsupported("a form or image that could not be resolved");
             return;
         };
 
@@ -514,7 +520,11 @@ impl<'a> Interpreter<'a> {
             return;
         };
 
-        let subtype = stream.dict.get(b"Subtype").ok().and_then(|o| o.as_name().ok());
+        let subtype = stream
+            .dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok());
         match subtype {
             Some(b"Image") => {
                 self.report.note_unsupported("an embedded image");
@@ -527,7 +537,8 @@ impl<'a> Interpreter<'a> {
         if depth >= MAX_FORM_DEPTH {
             // A form that draws itself is a cycle; a bound is the only defence
             // against a file that contains one.
-            self.report.note_unsupported("a form nested too deeply to follow");
+            self.report
+                .note_unsupported("a form nested too deeply to follow");
             return;
         }
 
@@ -541,9 +552,12 @@ impl<'a> Interpreter<'a> {
         }
 
         // `decode_content` needs the filters applied first.
-        let decoded = stream.decompressed_content().unwrap_or_else(|_| stream.content.clone());
+        let decoded = stream
+            .decompressed_content()
+            .unwrap_or_else(|_| stream.content.clone());
         let Ok(content) = lopdf::content::Content::decode(&decoded) else {
-            self.report.note_unsupported("a form whose content could not be decoded");
+            self.report
+                .note_unsupported("a form whose content could not be decoded");
             return;
         };
 
@@ -553,8 +567,16 @@ impl<'a> Interpreter<'a> {
     /// Find an XObject by name in the resource dictionary.
     fn lookup_xobject(&self, name: &[u8], resources: PdfObjectId) -> Option<PdfObjectId> {
         let dict = self.doc.get_dictionary(resources).ok()?;
-        let resources = dict.get_deref(b"Resources", self.doc).ok()?.as_dict().ok()?;
-        let xobjects = resources.get_deref(b"XObject", self.doc).ok()?.as_dict().ok()?;
+        let resources = dict
+            .get_deref(b"Resources", self.doc)
+            .ok()?
+            .as_dict()
+            .ok()?;
+        let xobjects = resources
+            .get_deref(b"XObject", self.doc)
+            .ok()?
+            .as_dict()
+            .ok()?;
         match xobjects.get(name).ok()? {
             PdfObject::Reference(id) => Some(*id),
             _ => None,
@@ -573,8 +595,16 @@ impl<'a> Interpreter<'a> {
         };
         let Some(gs) = (|| {
             let dict = self.doc.get_dictionary(resources).ok()?;
-            let resources = dict.get_deref(b"Resources", self.doc).ok()?.as_dict().ok()?;
-            let states = resources.get_deref(b"ExtGState", self.doc).ok()?.as_dict().ok()?;
+            let resources = dict
+                .get_deref(b"Resources", self.doc)
+                .ok()?
+                .as_dict()
+                .ok()?;
+            let states = resources
+                .get_deref(b"ExtGState", self.doc)
+                .ok()?
+                .as_dict()
+                .ok()?;
             states.get_deref(name, self.doc).ok()?.as_dict().ok()
         })() else {
             return;
@@ -658,7 +688,10 @@ mod tests {
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
             format!("<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox {media_box} >>"),
             "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << >> >>".to_string(),
-            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
         ];
 
         for (i, body) in objects.iter().enumerate() {
@@ -667,7 +700,10 @@ mod tests {
         }
 
         let xref = out.len();
-        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+        out.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
         for offset in &offsets {
             out.push_str(&format!("{offset:010} 00000 n \n"));
         }
@@ -702,8 +738,8 @@ mod tests {
 
         let shapes = shapes(&scene);
         assert_eq!(shapes.len(), 1);
-        let fill = shapes[0].fill.expect("it is filled");
-        assert_eq!(fill.color.to_rgba8().to_u8_array()[..3], [255, 0, 0]);
+        let fill = shapes[0].fill.as_ref().expect("it is filled");
+        assert_eq!(fill.color().to_rgba8().to_u8_array()[..3], [255, 0, 0]);
     }
 
     /// The single most common way to get an import subtly wrong: PDF measures
@@ -772,9 +808,24 @@ mod tests {
         let shapes = shapes(&scene);
         assert_eq!(shapes.len(), 2);
 
-        assert_eq!(shapes[0].fill.unwrap().color.to_rgba8().to_u8_array()[..3], [255, 0, 0]);
         assert_eq!(
-            shapes[1].fill.unwrap().color.to_rgba8().to_u8_array()[..3],
+            shapes[0]
+                .fill
+                .as_ref()
+                .unwrap()
+                .color()
+                .to_rgba8()
+                .to_u8_array()[..3],
+            [255, 0, 0]
+        );
+        assert_eq!(
+            shapes[1]
+                .fill
+                .as_ref()
+                .unwrap()
+                .color()
+                .to_rgba8()
+                .to_u8_array()[..3],
             [0, 0, 0],
             "Q must restore the colour set before q"
         );
@@ -793,11 +844,32 @@ mod tests {
 
     #[test]
     fn cmyk_black_is_black_and_cmyk_white_is_white() {
-        let pdf = pdf_with("0 0 0 1 k\n0 0 10 10 re\nf\n0 0 0 0 k\n0 0 10 10 re\nf", "[0 0 612 792]");
+        let pdf = pdf_with(
+            "0 0 0 1 k\n0 0 10 10 re\nf\n0 0 0 0 k\n0 0 10 10 re\nf",
+            "[0 0 612 792]",
+        );
         let (scene, _) = import_bytes(&pdf).unwrap();
         let shapes = shapes(&scene);
-        assert_eq!(shapes[0].fill.unwrap().color.to_rgba8().to_u8_array()[..3], [0, 0, 0]);
-        assert_eq!(shapes[1].fill.unwrap().color.to_rgba8().to_u8_array()[..3], [255, 255, 255]);
+        assert_eq!(
+            shapes[0]
+                .fill
+                .as_ref()
+                .unwrap()
+                .color()
+                .to_rgba8()
+                .to_u8_array()[..3],
+            [0, 0, 0]
+        );
+        assert_eq!(
+            shapes[1]
+                .fill
+                .as_ref()
+                .unwrap()
+                .color()
+                .to_rgba8()
+                .to_u8_array()[..3],
+            [255, 255, 255]
+        );
     }
 
     #[test]
@@ -810,7 +882,7 @@ mod tests {
 
         let shape = &shapes(&scene)[0];
         assert!(shape.fill.is_some() && shape.stroke.is_some());
-        assert_eq!(shape.stroke.unwrap().width, 5.0);
+        assert_eq!(shape.stroke.as_ref().unwrap().width, 5.0);
     }
 
     /// `n` ends a path without painting it. Emitting it anyway would fill
@@ -870,16 +942,25 @@ mod tests {
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
             "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 /MediaBox [0 0 200 200] >>".to_string(),
             "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>".to_string(),
-            format!("<< /Length {} >>\nstream\n{content_a}\nendstream", content_a.len()),
+            format!(
+                "<< /Length {} >>\nstream\n{content_a}\nendstream",
+                content_a.len()
+            ),
             "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".to_string(),
-            format!("<< /Length {} >>\nstream\n{content_b}\nendstream", content_b.len()),
+            format!(
+                "<< /Length {} >>\nstream\n{content_b}\nendstream",
+                content_b.len()
+            ),
         ];
         for (i, body) in objects.iter().enumerate() {
             offsets.push(out.len());
             out.push_str(&format!("{} 0 obj\n{body}\nendobj\n", i + 1));
         }
         let xref = out.len();
-        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+        out.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
         for offset in &offsets {
             out.push_str(&format!("{offset:010} 00000 n \n"));
         }
@@ -916,9 +997,15 @@ mod tests {
         let fresh = scene
             .add_shape(
                 layer,
-                ShapeData::filled(kurbo::Rect::new(0.0, 0.0, 1.0, 1.0).to_path(1e-9), Color::WHITE),
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 1.0, 1.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
             )
             .unwrap();
-        assert!(!used.contains(&fresh.0), "the allocator reissued an imported id");
+        assert!(
+            !used.contains(&fresh.0),
+            "the allocator reissued an imported id"
+        );
     }
 }

@@ -97,10 +97,7 @@ impl ZoomTarget {
             // and they make rotation and drift obvious if the maths is wrong.
             for i in 0..8 {
                 let a = std::f64::consts::TAU * (i as f64) / 8.0;
-                let p = Point::new(
-                    center.x + a.cos() * r * 0.62,
-                    center.y + a.sin() * r * 0.62,
-                );
+                let p = Point::new(center.x + a.cos() * r * 0.62, center.y + a.sin() * r * 0.62);
                 items.push(Item {
                     path: Circle::new(p, r * 0.05).to_path(1e-12),
                     fill: Some(color),
@@ -131,7 +128,10 @@ impl ZoomTarget {
             let rot = Affine::rotate_about(0.3 * g as f64, center);
             for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
                 let mut p = BezPath::new();
-                p.move_to(Point::new(center.x + dx * r * 0.72, center.y + dy * r * 0.72));
+                p.move_to(Point::new(
+                    center.x + dx * r * 0.72,
+                    center.y + dy * r * 0.72,
+                ));
                 p.line_to(Point::new(
                     center.x + dx * (r * 0.72 + tick),
                     center.y + dy * (r * 0.72 + tick),

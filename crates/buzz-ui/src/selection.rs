@@ -101,6 +101,14 @@ impl Selection {
         }
     }
 
+    /// Keep only the objects a caller says are still on screen.
+    ///
+    /// Edit Multiple Frames decides that against a *range* of frames rather
+    /// than one, so the rule lives with the caller and this only applies it.
+    pub fn retain(&mut self, keep: impl Fn(ObjectId) -> bool) {
+        self.objects.retain(|id| keep(*id));
+    }
+
     /// Drop anything not visible at `frame`.
     ///
     /// Moving the playhead can leave the selection pointing at artwork on a
@@ -143,15 +151,93 @@ impl Selection {
         self.active_layer
     }
 
-    /// Combined bounds of the selection, for transform handles.
+    /// Combined bounds of the selection **where the artwork is drawn**, for
+    /// transform handles.
     ///
     /// Goes through the scene rather than [`Object::bounds`] so that a
     /// selected symbol instance reports the extents of the artwork inside it.
-    pub fn bounds(&self, scene: &Scene) -> Option<Rect> {
+    ///
+    /// # Why the frame is needed
+    ///
+    /// Layer parenting draws a layer's artwork somewhere other than where its
+    /// geometry sits, and how far depends on where the parent is *on this
+    /// frame*. Without it these bounds described a rig's limb where it was
+    /// drawn at rest rather than where it is now, and everything built on them
+    /// was wrong in the same way: the transform box and its handles drew off
+    /// the artwork, the transformation point sat beside it, and — worst,
+    /// because it is silent — the "did this drag start inside the selection?"
+    /// test said no when the user pressed on their own character, so dragging
+    /// it rubber-banded a marquee instead of moving it.
+    ///
+    /// This is the same space [`crate::Selection`]'s callers hit-test in: the
+    /// artwork as drawn, before the document camera.
+    /// Combined bounds of the selection in the objects' **own** space, before
+    /// layer parenting moves the artwork.
+    ///
+    /// For edits that rebase geometry rather than measure it on screen —
+    /// Convert to Symbol lifts the objects out with their own transforms, so
+    /// the registration point it computes has to be in the space those
+    /// transforms are written in. Anything the user points at or that is drawn
+    /// as chrome wants [`Self::bounds_at`] instead.
+    pub fn local_bounds(&self, scene: &Scene) -> Option<Rect> {
         self.objects
             .iter()
             .filter_map(|id| scene.find_object(*id).map(|(_, o)| scene.resolved_bounds(o)))
             .reduce(|a, b| a.union(b))
+    }
+
+    pub fn bounds_at(&self, scene: &Scene, frame: u32) -> Option<Rect> {
+        self.objects
+            .iter()
+            .filter_map(|id| {
+                let (layer, object) = scene.find_object(*id)?;
+                let follows = scene.layers().inherited_transform(layer, frame);
+                Some(buzz_scene::object::transform_rect(
+                    follows,
+                    scene.resolved_bounds(object),
+                ))
+            })
+            .reduce(|a, b| a.union(b))
+    }
+
+    /// Make `layer` the active one **and select what is on it** at `frame`.
+    ///
+    /// This is what clicking a layer does in Animate: the layer becomes the one
+    /// new artwork goes on, and everything already on it is selected — so the
+    /// obvious next move, transforming or colouring the lot, needs no second
+    /// gesture. Before this, clicking a layer only moved the highlight, and the
+    /// artwork had to be marquee-selected afterwards.
+    ///
+    /// **Locked and hidden artwork is skipped**, and a locked or hidden *layer*
+    /// selects nothing at all — the same rule hit-testing uses. Selecting
+    /// something that cannot then be moved would be an empty promise, and
+    /// worse, a delete would take it.
+    pub fn select_layer(&mut self, scene: &Scene, layer: LayerId, frame: u32) {
+        self.active_layer = Some(layer);
+        self.objects.clear();
+
+        // `selectable` is the same rule hit-testing uses — editable, visible
+        // through its folders, and not locked through them either. Reusing it
+        // rather than re-deriving it is what keeps clicking a layer and
+        // clicking its artwork agreeing about what can be had.
+        let Some(target) = scene.layers().selectable().find(|l| l.id == layer) else {
+            return;
+        };
+        for object in target.objects_at(frame).iter() {
+            if object.visible && !object.locked {
+                self.objects.insert(object.id);
+            }
+        }
+    }
+
+    /// Select what is on the active layer, if anything is.
+    ///
+    /// Used when a tool is chosen that needs something to work on: see
+    /// `Editor::select_active_layer_contents`.
+    pub fn select_active_layer_contents(&mut self, scene: &Scene, frame: u32) {
+        if let Some(layer) = self.active_layer {
+            self.select_layer(scene, layer, frame);
+        }
     }
 
     /// Description for the Properties panel header.
@@ -170,6 +256,15 @@ impl Selection {
                                 Some(s) => format!("{} — {}", s.kind.label(), s.name),
                                 None => "Missing Symbol".to_string(),
                             }
+                        }
+                        // Animate calls rigged artwork an armature and says how
+                        // many bones it has, which is the number you need when
+                        // deciding whether you are looking at the right rig.
+                        buzz_scene::ObjectKind::Armature(rig) => {
+                            format!("Armature ({} bones)", rig.armature.len())
+                        }
+                        buzz_scene::ObjectKind::Warp(w) => {
+                            format!("Warp ({} handles)", w.handles.len())
                         }
                     },
                     None => "Shape".to_string(),
@@ -206,6 +301,110 @@ mod tests {
             })
             .collect();
         (scene, layer, ids)
+    }
+
+    /// Clicking a layer selects what is on it — the whole point of the change.
+    #[test]
+    fn selecting_a_layer_selects_its_artwork() {
+        let (scene, layer, ids) = scene_with(3);
+        let mut selection = Selection::new();
+
+        selection.select_layer(&scene, layer, 0);
+
+        assert_eq!(selection.active_layer(), Some(layer));
+        assert_eq!(selection.len(), 3);
+        for id in ids {
+            assert!(selection.contains(id), "{id:?} should have been selected");
+        }
+    }
+
+    /// It **replaces** rather than adds, so clicking one layer and then another
+    /// leaves only the second's artwork selected.
+    #[test]
+    fn selecting_another_layer_replaces_the_selection() {
+        let (mut scene, first, _) = scene_with(2);
+        let second = scene.add_layer("Second", LayerKind::Normal);
+        let other = scene
+            .add_shape(
+                second,
+                ShapeData::filled(KRect::new(0.0, 0.0, 5.0, 5.0).to_path(1e-9), Color::WHITE),
+            )
+            .unwrap();
+
+        let mut selection = Selection::new();
+        selection.select_layer(&scene, first, 0);
+        assert_eq!(selection.len(), 2);
+
+        selection.select_layer(&scene, second, 0);
+        assert_eq!(selection.ids(), vec![other]);
+        assert_eq!(selection.active_layer(), Some(second));
+    }
+
+    /// A locked layer becomes active — you can still aim at it — but nothing on
+    /// it is selected. Selecting artwork that cannot then be moved would be an
+    /// empty promise, and a delete would take it anyway.
+    #[test]
+    fn a_locked_layer_is_made_active_but_selects_nothing() {
+        let (mut scene, layer, _) = scene_with(2);
+        scene.update_layer(layer, |l| l.locked = true);
+
+        let mut selection = Selection::new();
+        selection.select_layer(&scene, layer, 0);
+
+        assert_eq!(selection.active_layer(), Some(layer));
+        assert!(selection.is_empty(), "a locked layer selected its artwork");
+    }
+
+    #[test]
+    fn a_hidden_layer_selects_nothing_either() {
+        let (mut scene, layer, _) = scene_with(2);
+        scene.update_layer(layer, |l| l.visible = false);
+
+        let mut selection = Selection::new();
+        selection.select_layer(&scene, layer, 0);
+        assert!(selection.is_empty());
+    }
+
+    /// The frame matters: a layer's artwork is different on different frames,
+    /// so clicking it while the playhead is at forty must not select frame
+    /// zero's drawing.
+    #[test]
+    fn the_artwork_selected_is_the_artwork_on_that_frame() {
+        let (mut scene, layer, ids) = scene_with(1);
+        // A second keyframe further along, with its own drawing.
+        scene.update_layer(layer, |l| {
+            l.frames.insert_blank_keyframe(10);
+        });
+        let later = scene
+            .add_shape_at(
+                layer,
+                10,
+                ShapeData::filled(KRect::new(0.0, 0.0, 5.0, 5.0).to_path(1e-9), Color::WHITE),
+            )
+            .unwrap();
+
+        let mut selection = Selection::new();
+        selection.select_layer(&scene, layer, 0);
+        assert_eq!(selection.ids(), ids);
+
+        selection.select_layer(&scene, layer, 10);
+        assert_eq!(selection.ids(), vec![later]);
+    }
+
+    /// A layer with nothing on it selects nothing, and does not keep whatever
+    /// was selected before.
+    #[test]
+    fn an_empty_layer_clears_the_selection() {
+        let (mut scene, layer, _) = scene_with(2);
+        let empty = scene.add_layer("Empty", LayerKind::Normal);
+
+        let mut selection = Selection::new();
+        selection.select_layer(&scene, layer, 0);
+        assert_eq!(selection.len(), 2);
+
+        selection.select_layer(&scene, empty, 0);
+        assert!(selection.is_empty());
+        assert_eq!(selection.active_layer(), Some(empty));
     }
 
     #[test]
@@ -311,7 +510,7 @@ mod tests {
         let mut s = Selection::new();
         s.set([ids[0], ids[2]]);
 
-        let bounds = s.bounds(&scene).unwrap();
+        let bounds = s.bounds_at(&scene, 0).unwrap();
         assert!((bounds.x0 - 0.0).abs() < 1e-9);
         assert!((bounds.x1 - 50.0).abs() < 1e-9, "got {bounds:?}");
     }
@@ -319,7 +518,7 @@ mod tests {
     #[test]
     fn an_empty_selection_has_no_bounds() {
         let (scene, _, _) = scene_with(2);
-        assert!(Selection::new().bounds(&scene).is_none());
+        assert!(Selection::new().bounds_at(&scene, 0).is_none());
     }
 
     #[test]

@@ -8,12 +8,26 @@
 //! # Interpolation
 //!
 //! A camera whose value only changed on keyframes would jump, which would make
-//! the tool useless, so camera keys interpolate linearly. That is a small,
-//! self-contained piece of tweening; the general tween system for artwork
-//! arrives in Phase 4. Rotation interpolates by shortest angular path, so a
-//! camera turning from 350° to 10° goes forward 20° rather than backwards 340°.
+//! the tool useless, so camera keys interpolate between each other. Rotation
+//! interpolates by shortest angular path, so a camera turning from 350° to 10°
+//! goes forward 20° rather than backwards 340°.
+//!
+//! # Easing, and why the camera needed it more than anything else does
+//!
+//! Every key carries an [`Easing`] governing the span that *leaves* it — the
+//! same field and the same curve the artwork tweens use, so there is one easing
+//! model in the program rather than two.
+//!
+//! It matters more here than it does on a drawing. A camera is the audience's
+//! head, and a head does not begin moving at full speed and stop dead: a linear
+//! pan is the single most reliable tell that a shot was assembled rather than
+//! filmed. Every move [`CameraMove`] writes is eased for that reason, and the
+//! one that is not — the drift — is left linear deliberately, which is
+//! explained where it is defined.
 
-use buzz_geom::{Affine, Point, Size};
+use crate::time::AtTime;
+use crate::tween::Easing;
+use buzz_geom::{Affine, Point, Projection, Rect, Size};
 use serde::{Deserialize, Serialize};
 
 /// The camera's state at one keyframe.
@@ -24,9 +38,164 @@ pub struct CameraKey {
     pub center: Point,
     /// Magnification. 1.0 shows the stage at its natural size.
     pub zoom: f64,
-    /// Rotation in radians.
+    /// Rotation in radians. Roll, in camera terms: the horizon tipping.
     pub rotation: f64,
+
+    /// Tilt up and down, in radians — the camera nodding.
+    ///
+    /// This is what makes the camera **spatial** rather than a pan-and-zoom
+    /// over a flat picture: with pitch, a layer's far edge really is further
+    /// away than its near edge, so a rectangle is drawn as a trapezoid. Zero
+    /// is looking straight at the stage, which is where every document that
+    /// does not use this stays.
+    pub pitch: f64,
+    /// Turn left and right, in radians.
+    pub yaw: f64,
+
+    /// **How the move *away from* this key is paced.**
+    ///
+    /// A keyframe's ease governs the span that starts at it, which is the
+    /// convention Animate uses for artwork and the one an animator already has
+    /// in their hands. The last key's ease is therefore never read, and that is
+    /// correct rather than an oversight: there is no span after it.
+    ///
+    /// Defaulted on load, so every document written before this existed opens
+    /// as the linear camera it was authored against. Version 41.
+    #[serde(default)]
+    pub ease: Easing,
 }
+
+/// **A camera move worth a name.**
+///
+/// # Why these are here rather than left to the animator
+///
+/// A push in is two keyframes and a number, and so is a pan, and so is a
+/// reveal — and an animator making a story a week keys the same four of them
+/// several hundred times a year. None of it is a decision; all of it is typing.
+/// The arithmetic is a fraction of the stage's own size, which the caller knows
+/// and this does not, so it is passed in.
+///
+/// What comes out is **two ordinary camera keys**. Nothing is live and nothing
+/// re-runs: the move can be dragged, re-timed, re-eased or deleted like any
+/// other pair of keys, which is the same promise every other generator in this
+/// program makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CameraMove {
+    /// Move in on what is already in the middle of frame.
+    PushIn,
+    /// The reverse: give the shot its air back.
+    PullOut,
+    /// Track left across the stage.
+    PanLeft,
+    /// Track right across the stage.
+    PanRight,
+    /// **Open close and pull back to the wide.** The one move that writes a
+    /// *start* different from where the camera is: a reveal is defined by
+    /// where it ends, so the end is the framing you set up and the beginning
+    /// is derived from it.
+    Reveal,
+    /// **A slow diagonal creep that runs under the whole shot.**
+    ///
+    /// What a documentary does to a photograph, and the cheapest way to stop a
+    /// held drawing reading as a still. Deliberately small: if the audience can
+    /// see it happening it is too fast.
+    Drift,
+}
+
+/// **The ease every deliberate camera move gets**: slow away, slow into place.
+///
+/// CSS's `ease-in-out`, expressed in the same cubic-Bézier the artwork tweens
+/// already carry. [`Easing::Strength`] cannot say this — its slider eases one
+/// end or the other, and a camera needs both, because a head that starts at
+/// full speed and stops dead is the thing this is here to avoid.
+pub const SMOOTH: Easing = Easing::CubicBezier {
+    x1: 0.42,
+    y1: 0.0,
+    x2: 0.58,
+    y2: 1.0,
+};
+
+/// How far a push or a pull changes the magnification.
+///
+/// A third is the smallest move that still reads as one. Less looks like a
+/// mistake in the render; much more and a shot composed for the wide has
+/// nothing left in frame at the end of it.
+const PUSH: f64 = 1.35;
+
+/// How far a pan travels, as a share of the stage's width. A quarter moves the
+/// subject clear across the frame without leaving the pasteboard.
+const PAN: f64 = 0.25;
+
+impl CameraMove {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PushIn => "Push In",
+            Self::PullOut => "Pull Out",
+            Self::PanLeft => "Pan Left",
+            Self::PanRight => "Pan Right",
+            Self::Reveal => "Reveal",
+            Self::Drift => "Drift",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::PushIn => "Closes in on the middle of frame, eased at both ends",
+            Self::PullOut => "Gives the shot its air back",
+            Self::PanLeft => "Tracks left across the stage",
+            Self::PanRight => "Tracks right across the stage",
+            Self::Reveal => "Opens close and pulls back to the framing you set",
+            Self::Drift => "A slow diagonal creep, too small to notice and enough to feel",
+        }
+    }
+
+    /// The ease the opening key carries.
+    ///
+    /// Every move is eased at both ends **except the drift**, which is left
+    /// linear on purpose: a drift is meant to run underneath a shot without
+    /// being seen, and easing one gives it a beginning and an end — which is
+    /// exactly the thing the audience would then notice.
+    pub fn ease(self) -> Easing {
+        match self {
+            Self::Drift => Easing::Linear,
+            _ => SMOOTH,
+        }
+    }
+}
+
+impl CameraKey {
+    /// This key with a named move applied to it, `stage` being the document's
+    /// own rectangle — what a "quarter of the way across" is measured against.
+    fn moved(self, movement: CameraMove, stage: Rect) -> Self {
+        let mut out = self;
+        match movement {
+            CameraMove::PushIn => out.zoom = (self.zoom * PUSH).clamp(0.01, 1000.0),
+            CameraMove::PullOut | CameraMove::Reveal => {
+                out.zoom = (self.zoom / PUSH).clamp(0.01, 1000.0);
+            }
+            CameraMove::PanLeft => out.center.x -= stage.width() * PAN,
+            CameraMove::PanRight => out.center.x += stage.width() * PAN,
+            CameraMove::Drift => {
+                // A twelfth of a magnification and a fortieth of the frame,
+                // across a whole shot. Both together, because a push alone
+                // reads as a zoom and a slide alone reads as a pan; it is the
+                // pair of them that reads as a camera that happens to be there.
+                out.zoom = (self.zoom * 1.08).clamp(0.01, 1000.0);
+                out.center.x += stage.width() * 0.025;
+                out.center.y -= stage.height() * 0.015;
+            }
+        }
+        out
+    }
+}
+
+/// How far the camera may tilt.
+///
+/// Past this a layer plane is nearly edge-on: it occupies a sliver of the
+/// frame, the flattening tolerance collapses, and the picture is no longer
+/// something anybody meant. Animate has no equivalent because Animate has no
+/// tilt; the bound is here because the arithmetic needs one.
+pub const MAX_TILT: f64 = 1.3;
 
 impl CameraKey {
     pub fn new(frame: u32, center: Point) -> Self {
@@ -35,7 +204,25 @@ impl CameraKey {
             center,
             zoom: 1.0,
             rotation: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            ease: Easing::Linear,
         }
+    }
+
+    /// Is the camera looking straight at the stage?
+    ///
+    /// The render path leans on this: an untilted camera is an affine, and
+    /// takes exactly the route it always did.
+    pub fn is_flat(&self) -> bool {
+        self.pitch == 0.0 && self.yaw == 0.0
+    }
+
+    /// The same key with its tilt brought into range.
+    pub fn clamped(mut self) -> Self {
+        self.pitch = self.pitch.clamp(-MAX_TILT, MAX_TILT);
+        self.yaw = self.yaw.clamp(-MAX_TILT, MAX_TILT);
+        self
     }
 }
 
@@ -47,6 +234,20 @@ impl CameraKey {
 /// camera as the stage and therefore renders at half size.
 pub const DEFAULT_FOCAL_DISTANCE: f64 = 1000.0;
 
+/// Instants across an open shutter, when a document asks for motion blur but
+/// does not say how many.
+///
+/// Eight is enough for the speeds hand-drawn animation actually moves at, and
+/// is eight times the cost of a clean frame — which is the honest price of the
+/// effect, and the reason it is not on by default.
+pub const DEFAULT_BLUR_SAMPLES: u32 = 8;
+
+/// Most instants worth sampling across one shutter.
+///
+/// Past this the picture stops changing and the export merely takes longer;
+/// bounded here so a hand-edited file cannot ask for a thousand.
+pub const MAX_BLUR_SAMPLES: u32 = 64;
+
 /// Nearest a layer may come to the camera before it is treated as behind it.
 ///
 /// At the camera plane the perspective divide blows up; a hair in front of it
@@ -54,6 +255,55 @@ pub const DEFAULT_FOCAL_DISTANCE: f64 = 1000.0;
 /// close or closer are simply not drawn, which is what Animate does and is far
 /// better than a frame filled by one runaway layer.
 const NEAR_PLANE: f64 = 1.0;
+
+/// **How near the lens a layer may be put**, as a fraction of the focal
+/// distance.
+///
+/// Not [`NEAR_PLANE`], which is where the projection actually gives up. A layer
+/// a hair in front of that is magnified by hundreds and swamps the frame, so
+/// every control that moves a layer stops well short — and so does
+/// [`Scene::set_focal_distance`](crate::Scene::set_focal_distance), which has
+/// to keep the same promise when it is the *lens* that moves rather than the
+/// layer.
+///
+/// One number, in one place, because the two controls used to disagree: the
+/// timeline's depth column bounded a drag at 0.95 of the focal distance and the
+/// Layer Depth panel at 0.9, so the same layer had two different "as near as it
+/// goes" depending on which one you reached for.
+const NEAR_LIMIT: f64 = 0.9;
+
+/// A named camera position — a "shot" of the staged scene.
+///
+/// An angle is a *camera state*, not a new scene: the stage is furniture,
+/// characters and lights, and the camera already carries everything a viewpoint
+/// needs — centre, zoom, roll, pitch, yaw. Naming one lets an animator stage a
+/// set once and shoot it from several angles, jumping between them or cutting
+/// between them on the timeline. See [`CameraTrack::angles`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedAngle {
+    pub name: String,
+    pub state: CameraKey,
+}
+
+/// **The lens at one keyframe** — where it is focused, and how wide it is open.
+///
+/// A focus *pull* is the shot's most quietly expressive move: the background
+/// softens away and the eye is carried to the face in front of it, without a
+/// cut and without anything on the stage moving. That needs focus to be a thing
+/// that changes over time, so it is keyed, like every other camera value.
+///
+/// Aperture rides along in the same key rather than in one of its own. The two
+/// are pulled together in practice — opening up is how a pull is made visible
+/// at all — and a second track of keys to keep in step would buy nothing but
+/// the chance for them to disagree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FocusKey {
+    pub frame: u32,
+    /// The layer depth that is sharp at this frame.
+    pub focus_depth: f64,
+    /// Depth-of-field strength at this frame. Zero is a pinhole: all sharp.
+    pub aperture: f64,
+}
 
 /// The camera's keyframes over the whole timeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -65,8 +315,48 @@ pub struct CameraTrack {
     /// This is what turns a layer's depth into a size: the smaller it is, the
     /// more violent the perspective, exactly as a shorter lens exaggerates it.
     pub focal_distance: f64,
+    /// Depth-of-field strength, in blur document-units per unit of depth away
+    /// from focus. Zero — the default — is a pinhole camera: everything sharp.
+    ///
+    /// This is the *geometric* half of depth of field: layers off the focal
+    /// plane get a blur proportional to how far out of focus they are, reusing
+    /// the per-shape blur the filter path already draws. The per-pixel sliced
+    /// version is a later upgrade; this one ships by reusing what exists.
+    pub aperture: f64,
+    /// The layer depth that is in focus. Zero is the focal plane.
+    pub focus_depth: f64,
+    /// **How long the shutter is open**, as a fraction of a frame. Zero — the
+    /// default — is an infinitely fast shutter: every frame is a clean instant,
+    /// which is how this program has always drawn.
+    ///
+    /// A film camera's shutter is open for part of each frame and records
+    /// everything that happens while it is, which is why fast motion on film is
+    /// a smear rather than a crisp displaced copy. Half a frame is the
+    /// hundred-and-eighty-degree shutter almost all cinema is shot at, and is
+    /// what "normal" motion blur looks like.
+    pub shutter: f64,
+    /// How many instants the open shutter is sampled at.
+    ///
+    /// The smear is built by drawing the frame this many times across the
+    /// shutter and adding the results up, so this is a direct multiplier on the
+    /// cost of an export — and, past a point, invisible: too few samples read
+    /// as a row of ghosts rather than a smear, and the number that fixes that
+    /// depends on how far the artwork travels, not on the resolution.
+    pub blur_samples: u32,
+    /// Named viewpoints of the staged scene — Wave 10b. Empty for every
+    /// document that never saves one.
+    pub angles: Vec<NamedAngle>,
     /// Sorted by frame.
     keys: Vec<CameraKey>,
+    /// The focus pull, sorted by frame.
+    ///
+    /// Empty in every document that never pulls focus, which is the state
+    /// `aperture` and `focus_depth` above describe on their own. That is why
+    /// this is a separate list rather than two more fields on [`CameraKey`]:
+    /// depth of field has never needed the camera track to be *enabled*, and
+    /// folding focus into the camera's own keys would have made a focus pull
+    /// require a camera move.
+    focus_keys: Vec<FocusKey>,
 }
 
 impl Default for CameraTrack {
@@ -74,7 +364,13 @@ impl Default for CameraTrack {
         Self {
             enabled: false,
             focal_distance: DEFAULT_FOCAL_DISTANCE,
+            aperture: 0.0,
+            focus_depth: 0.0,
+            shutter: 0.0,
+            blur_samples: DEFAULT_BLUR_SAMPLES,
+            angles: Vec::new(),
             keys: Vec::new(),
+            focus_keys: Vec::new(),
         }
     }
 }
@@ -104,6 +400,30 @@ impl CameraTrack {
         (distance >= NEAR_PLANE).then(|| focal / distance)
     }
 
+    /// **As near the camera as a layer may be put**, in depth.
+    ///
+    /// Negative, because depth counts away from the lens. This is the one bound
+    /// that has to hold: past it [`depth_scale`](Self::depth_scale) answers
+    /// `None` and the layer is not drawn at all. There is deliberately no
+    /// matching far bound — a layer behind the stage only ever gets smaller,
+    /// and no distance takes it out of the picture — so this is a floor and not
+    /// a range. Anything a *control* wants to bound the far side at is that
+    /// control's business.
+    ///
+    /// **Two bounds, whichever is the nearer to the stage.** [`NEAR_LIMIT`] is
+    /// the comfortable one and holds at every ordinary focal distance. It is
+    /// not sufficient on its own: it leaves a *fraction* of the focal distance
+    /// in front of the layer, and below ten units that fraction is smaller than
+    /// [`NEAR_PLANE`] — so a short lens would hand back a bound that
+    /// `depth_scale` refuses to draw, which is the one thing this must never
+    /// do. `NEAR_PLANE - focal` is that case stated exactly.
+    pub fn nearest_depth(&self) -> f64 {
+        // The same clamp `depth_scale` applies, so the two agree about where
+        // the lens is even for a focal distance smaller than the near plane.
+        let focal = self.focal_distance.max(NEAR_PLANE);
+        (-(focal * NEAR_LIMIT)).max(NEAR_PLANE - focal)
+    }
+
     /// The transform for artwork on a layer at `depth`.
     ///
     /// The same construction as [`Self::transform_at`] with the zoom scaled by
@@ -114,11 +434,11 @@ impl CameraTrack {
     /// it falls out of the projection.
     ///
     /// `None` when the layer is at or behind the camera.
-    pub fn transform_at_depth(&self, frame: u32, stage: Size, depth: f64) -> Option<Affine> {
+    pub fn transform_at_depth(&self, at: impl AtTime, stage: Size, depth: f64) -> Option<Affine> {
         let scale = self.depth_scale(depth)?;
 
         let centre = buzz_geom::Vec2::new(stage.width / 2.0, stage.height / 2.0);
-        let state = self.state_at(frame);
+        let state = self.state_at(at);
 
         // With no camera keys the camera still has a position: the middle of
         // the stage, unzoomed. Depth has to work without one, or setting a
@@ -179,7 +499,7 @@ impl CameraTrack {
     /// Before the first key it holds the first value, and after the last it
     /// holds the last — the same "hold the ends" behaviour Animate has, which
     /// stops a camera snapping to the origin outside its keyed range.
-    pub fn state_at(&self, frame: u32) -> Option<CameraKey> {
+    pub fn state_at(&self, at: impl AtTime) -> Option<CameraKey> {
         if !self.enabled || self.keys.is_empty() {
             return None;
         }
@@ -187,28 +507,36 @@ impl CameraTrack {
             return Some(self.keys[0]);
         }
 
+        // Continuous, so a shutter open between two frames sees the camera part
+        // of the way between them rather than jumping on the frame boundary.
+        let time = at.as_time();
         let first = self.keys[0];
-        if frame <= first.frame {
+        if time <= first.frame as f64 {
             return Some(first);
         }
         let last = self.keys[self.keys.len() - 1];
-        if frame >= last.frame {
+        if time >= last.frame as f64 {
             return Some(last);
         }
 
-        let after = self.keys.partition_point(|k| k.frame <= frame);
+        let after = self.keys.partition_point(|k| (k.frame as f64) <= time);
         let a = self.keys[after - 1];
         let b = self.keys[after];
 
         let span = (b.frame - a.frame) as f64;
         let t = if span > 0.0 {
-            (frame - a.frame) as f64 / span
+            (time - a.frame as f64) / span
         } else {
             0.0
         };
+        // **The key you are leaving decides the pacing.** Animate's convention
+        // for artwork, applied here so an animator does not have to hold two
+        // rules. Every channel below is eased together — a pan whose position
+        // eased while its zoom did not would drift off its own subject.
+        let t = a.ease.apply(t);
 
         Some(CameraKey {
-            frame,
+            frame: at.frame(),
             center: Point::new(
                 lerp(a.center.x, b.center.x, t),
                 lerp(a.center.y, b.center.y, t),
@@ -218,15 +546,81 @@ impl CameraTrack {
             // accelerates.
             zoom: lerp_zoom(a.zoom, b.zoom, t),
             rotation: lerp_angle(a.rotation, b.rotation, t),
+            // Tilt interpolates like rotation — the short way round — so a
+            // camera swinging from one side of straight-ahead to the other
+            // does not take the long route through the back of the scene.
+            pitch: lerp_angle(a.pitch, b.pitch, t),
+            yaw: lerp_angle(a.yaw, b.yaw, t),
+            // Carried from the span this sample came out of, so a state read
+            // back and re-keyed — which is what every camera edit does — keeps
+            // the pacing it was already moving with instead of snapping linear.
+            ease: a.ease,
         })
+    }
+
+    /// **Write a named camera move across a span**, as two ordinary keys.
+    ///
+    /// The move starts from wherever the camera already is at `from` — so a
+    /// push in pushes in on the framing you have set up, rather than on some
+    /// remembered default — except for [`CameraMove::Reveal`], which is defined
+    /// by where it *ends* and therefore derives its opening key instead.
+    ///
+    /// `stage` is the document's rectangle: a pan travels a quarter of it, and
+    /// the camera does not know how big the film is.
+    ///
+    /// Returns `false` and writes nothing for an empty or backwards span, which
+    /// is the one case where two keys would land on the same frame and the
+    /// second would silently replace the first.
+    pub fn add_move(
+        &mut self,
+        movement: CameraMove,
+        from: u32,
+        to: u32,
+        stage: Rect,
+    ) -> bool {
+        if to <= from {
+            return false;
+        }
+        let here = self
+            .state_at(from)
+            .unwrap_or_else(|| CameraKey::new(from, stage.center()));
+
+        let (mut start, mut end) = match movement {
+            // A reveal ends where you framed it and starts closer in, so the
+            // move is applied backwards: the *opening* key is the derived one.
+            CameraMove::Reveal => {
+                let mut opening = here.moved(CameraMove::PushIn, stage);
+                opening.frame = from;
+                let mut settled = here;
+                settled.frame = to;
+                (opening, settled)
+            }
+            _ => {
+                let mut opening = here;
+                opening.frame = from;
+                let mut arrived = here.moved(movement, stage);
+                arrived.frame = to;
+                (opening, arrived)
+            }
+        };
+
+        start.ease = movement.ease();
+        // The arriving key ends the move. Its own ease governs whatever comes
+        // *after* it, and a move should not impose a shape on a span somebody
+        // else will write, so it is left alone at linear.
+        end.ease = Easing::Linear;
+
+        self.set_key(start);
+        self.set_key(end);
+        true
     }
 
     /// Transform mapping document space into camera space at `frame`.
     ///
     /// Returns identity when the camera is off, so the caller can apply it
     /// unconditionally.
-    pub fn transform_at(&self, frame: u32, stage: Size) -> Affine {
-        let Some(state) = self.state_at(frame) else {
+    pub fn transform_at(&self, at: impl AtTime, stage: Size) -> Affine {
+        let Some(state) = self.state_at(at) else {
             return Affine::IDENTITY;
         };
         let centre = buzz_geom::Vec2::new(stage.width / 2.0, stage.height / 2.0);
@@ -237,6 +631,144 @@ impl CameraTrack {
             * Affine::rotate(-state.rotation)
             * Affine::scale(state.zoom.max(f64::MIN_POSITIVE))
             * Affine::translate(-state.center.to_vec2())
+    }
+
+    /// How a layer at `depth` is projected onto the frame.
+    ///
+    /// This is [`Self::transform_at_depth`] generalised: with no tilt it is
+    /// exactly that affine, and the render path takes the same route it always
+    /// did. With pitch or yaw it is a homography, and the layer's plane is
+    /// drawn in perspective — a rectangle becomes a trapezoid.
+    ///
+    /// `None` when the layer is at or behind the camera, or turned so far past
+    /// edge-on that it would be drawn inside out.
+    pub fn projection_at_depth(
+        &self,
+        at: impl AtTime,
+        stage: Size,
+        depth: f64,
+    ) -> Option<Projection> {
+        let state = self.state_at(at).map(CameraKey::clamped);
+
+        // Flat is the common case and must stay bit-exact, so it does not go
+        // near the homography at all.
+        if state.is_none_or(|s| s.is_flat()) {
+            return self
+                .transform_at_depth(at, stage, depth)
+                .map(Projection::from_affine);
+        }
+        let state = state?;
+
+        let focal = self.focal_distance.max(NEAR_PLANE);
+        let distance = focal + depth;
+        if distance < NEAR_PLANE {
+            return None;
+        }
+
+        // The lens looks at the layer's plane...
+        let lens = Projection::look_at_plane(distance, focal, state.pitch, state.yaw)?;
+
+        // ...about the point the camera is centred on, and the result is
+        // placed on the stage with the zoom and roll the shot asks for. The
+        // order matters: the camera's centre has to be subtracted *before* the
+        // projection, because that is the point the lens is pointed at.
+        let centre = buzz_geom::Vec2::new(stage.width / 2.0, stage.height / 2.0);
+        Some(
+            lens.pre_affine(Affine::translate(-state.center.to_vec2()))
+                .then_affine(
+                    Affine::translate(centre)
+                        * Affine::rotate(-state.rotation)
+                        * Affine::scale(state.zoom.max(f64::MIN_POSITIVE)),
+                ),
+        )
+    }
+
+    /// How an object that faces its own way is projected onto the frame.
+    ///
+    /// `pivot` is the point the object turns about, in document space, and
+    /// `depth` is its layer's. The object's plane passes through the pivot,
+    /// tipped by its own angles and pushed by its own `z`.
+    ///
+    /// With a flat object this is exactly [`Self::projection_at_depth`] — the
+    /// test says so — which is what keeps every document that does not use 3D
+    /// rendering through the transform it always did.
+    ///
+    /// `None` when the object is at or behind the camera, or exactly edge-on.
+    pub fn projection_for_object(
+        &self,
+        at: impl AtTime,
+        stage: Size,
+        depth: f64,
+        pivot: Point,
+        spatial: &crate::object::Spatial,
+    ) -> Option<Projection> {
+        if spatial.is_flat() {
+            return self.projection_at_depth(at, stage, depth);
+        }
+
+        let state = self.state_at(at).map(CameraKey::clamped);
+        let (camera_centre, zoom, rotation, pitch, yaw) = match state {
+            Some(s) => (s.center, s.zoom, s.rotation, s.pitch, s.yaw),
+            None => (
+                Point::new(stage.width / 2.0, stage.height / 2.0),
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+            ),
+        };
+
+        let focal = self.focal_distance.max(NEAR_PLANE);
+        let distance = focal + depth;
+        if distance < NEAR_PLANE {
+            return None;
+        }
+
+        // Where the camera is, relative to the plane the layer lies in: behind
+        // its target by `distance`, along its own view axis.
+        let (sy, cy) = yaw.sin_cos();
+        let (sp, cp) = pitch.sin_cos();
+        let forward = [sy * cp, -sp, cy * cp];
+
+        // The object's origin, seen from the camera: the pivot's offset within
+        // the layer, its own push in depth, and the camera's stand-off.
+        let offset = pivot - camera_centre.to_vec2();
+        let to_origin = [
+            offset.x + distance * forward[0],
+            offset.y + distance * forward[1],
+            spatial.z + distance * forward[2],
+        ];
+
+        let (ex, ey) = spatial.basis();
+        let lens = Projection::plane_in_view(ex, ey, to_origin, focal, pitch, yaw)?;
+
+        // The object's own coordinates are measured **from its pivot** — the
+        // point its plane passes through — and the result is placed on the
+        // stage with the shot's zoom and roll.
+        //
+        // From the pivot's *absolute* position, not from its offset to the
+        // camera: `to_origin` already says where the pivot is relative to the
+        // lens, so subtracting the offset here as well would leave the artwork
+        // measured from the stage's origin and draw it distorted and tiny. It
+        // did, and the GPU test that pushes an object towards the camera and
+        // expects it to grow is what caught it.
+        let centre = buzz_geom::Vec2::new(stage.width / 2.0, stage.height / 2.0);
+        Some(
+            lens.pre_affine(Affine::translate(-pivot.to_vec2()))
+                .then_affine(
+                    Affine::translate(centre)
+                        * Affine::rotate(-rotation)
+                        * Affine::scale(zoom.max(f64::MIN_POSITIVE)),
+                ),
+        )
+    }
+
+    /// Is any part of the shot tilted, at any frame?
+    ///
+    /// Lets the renderer and the editor skip the whole perspective path for
+    /// the documents — nearly all of them — that never tilt.
+    pub fn has_tilt(&self) -> bool {
+        self.enabled && self.keys.iter().any(|k| !k.is_flat())
     }
 
     /// Rebuild from parts, for loading and importing.
@@ -252,8 +784,189 @@ impl CameraTrack {
             } else {
                 DEFAULT_FOCAL_DISTANCE
             },
+            aperture: 0.0,
+            focus_depth: 0.0,
+            shutter: 0.0,
+            blur_samples: DEFAULT_BLUR_SAMPLES,
+            angles: Vec::new(),
             keys,
+            focus_keys: Vec::new(),
         }
+    }
+
+    /// **The lens at `frame`** — the focus pull, resolved.
+    ///
+    /// With no focus keys this is simply the static [`focus_depth`](Self::focus_depth)
+    /// and [`aperture`](Self::aperture), so a document that never pulls focus
+    /// takes exactly the path it always did.
+    ///
+    /// Unlike [`state_at`](Self::state_at) this does **not** require the camera
+    /// to be enabled. Depth of field has always applied with the camera track
+    /// switched off — it is a property of the lens, not of a camera *move* — and
+    /// making a pull the exception would mean switching the camera on, and so
+    /// keying a shot, just to soften a background.
+    ///
+    /// Before the first key it holds the first value and after the last it holds
+    /// the last, which is what a held focus is; between them it interpolates
+    /// linearly, like the camera's own keys.
+    pub fn focus_at(&self, at: impl AtTime) -> FocusKey {
+        let time = at.as_time();
+        let frame = at.frame();
+        if self.focus_keys.is_empty() {
+            return FocusKey {
+                frame,
+                focus_depth: self.focus_depth,
+                aperture: self.aperture,
+            };
+        }
+
+        let first = self.focus_keys[0];
+        if time <= first.frame as f64 {
+            return FocusKey { frame, ..first };
+        }
+        let last = self.focus_keys[self.focus_keys.len() - 1];
+        if time >= last.frame as f64 {
+            return FocusKey { frame, ..last };
+        }
+
+        let after = self.focus_keys.partition_point(|k| (k.frame as f64) <= time);
+        let a = self.focus_keys[after - 1];
+        let b = self.focus_keys[after];
+        let span = (b.frame - a.frame) as f64;
+        let t = if span > 0.0 {
+            (time - a.frame as f64) / span
+        } else {
+            0.0
+        };
+
+        FocusKey {
+            frame,
+            focus_depth: lerp(a.focus_depth, b.focus_depth, t),
+            aperture: lerp(a.aperture, b.aperture, t),
+        }
+    }
+
+    /// The depth-of-field blur, in document units, for a layer at `depth` on
+    /// `frame`.
+    ///
+    /// `None` when the lens is a pinhole (`aperture == 0`) or the layer is in
+    /// focus, so the sharp common case sets no blur at all. The blur grows with
+    /// distance from the focus depth, which is the geometric approximation to a
+    /// lens's circle of confusion.
+    ///
+    /// The frame is what makes a **focus pull** possible: with focus keyed, the
+    /// same layer at the same depth is sharp on one frame and soft on another.
+    pub fn dof_blur_at(&self, at: impl AtTime, depth: f64) -> Option<f64> {
+        let lens = self.focus_at(at);
+        if lens.aperture <= 0.0 {
+            return None;
+        }
+        let coc = lens.aperture * (depth - lens.focus_depth).abs();
+        (coc > 0.05).then_some(coc)
+    }
+
+    /// **The instants one frame's shutter is open for**, as offsets in frames.
+    ///
+    /// `None` when there is no blur to draw — no shutter, or only one sample —
+    /// and that is the answer for every document that does not ask for it, so
+    /// the export takes exactly the path it always did.
+    ///
+    /// The shutter is **centred on the frame**: the offsets run from
+    /// `-shutter/2` to `+shutter/2`, sampled at the middle of each equal slice.
+    /// Centring is what keeps the smear *around* where the artwork is rather
+    /// than trailing behind it — open the shutter at the frame instead and
+    /// every moving thing sits half a shutter late, which reads as the
+    /// animation itself having slipped.
+    pub fn shutter_offsets(&self) -> Option<Vec<f64>> {
+        if !(self.shutter > 0.0) || !self.shutter.is_finite() {
+            return None;
+        }
+        let samples = self.blur_samples.clamp(1, MAX_BLUR_SAMPLES);
+        if samples < 2 {
+            return None;
+        }
+        let n = samples as f64;
+        Some(
+            (0..samples)
+                .map(|i| self.shutter * ((i as f64 + 0.5) / n - 0.5))
+                .collect(),
+        )
+    }
+
+    /// The focus keys, sorted by frame. Empty unless the shot pulls focus.
+    pub fn focus_keys(&self) -> &[FocusKey] {
+        &self.focus_keys
+    }
+
+    /// Is the focus keyed exactly on this frame?
+    pub fn has_focus_key_at(&self, frame: u32) -> bool {
+        self.focus_keys.iter().any(|k| k.frame == frame)
+    }
+
+    /// Highest focus-keyed frame, so a shot whose only animation is a focus
+    /// pull is still as long as the pull.
+    pub fn focus_last_frame(&self) -> u32 {
+        self.focus_keys.last().map(|k| k.frame).unwrap_or(0)
+    }
+
+    /// Add or replace the focus key at `key.frame`.
+    pub fn set_focus_key(&mut self, key: FocusKey) {
+        match self.focus_keys.iter().position(|k| k.frame == key.frame) {
+            Some(index) => self.focus_keys[index] = key,
+            None => {
+                let at = self.focus_keys.partition_point(|k| k.frame < key.frame);
+                self.focus_keys.insert(at, key);
+            }
+        }
+    }
+
+    pub fn remove_focus_key(&mut self, frame: u32) -> bool {
+        let before = self.focus_keys.len();
+        self.focus_keys.retain(|k| k.frame != frame);
+        self.focus_keys.len() != before
+    }
+
+    /// Drop the pull, leaving whatever the static aperture and focus say.
+    pub fn clear_focus_keys(&mut self) {
+        self.focus_keys.clear();
+    }
+
+    /// Replace the whole pull, as the loader does.
+    ///
+    /// Sorted and de-duplicated on the way in, and a negative aperture is
+    /// clamped away: a hand-edited or corrupt file must not be able to produce
+    /// keys the lookup would read out of order.
+    pub fn set_focus_keys(&mut self, mut keys: Vec<FocusKey>) {
+        keys.sort_by_key(|k| k.frame);
+        keys.dedup_by_key(|k| k.frame);
+        for key in &mut keys {
+            key.aperture = key.aperture.max(0.0);
+        }
+        self.focus_keys = keys;
+    }
+
+    /// Save the camera's state at `frame` under `name`, replacing any angle of
+    /// the same name.
+    pub fn save_angle(&mut self, name: impl Into<String>, frame: u32) {
+        let name = name.into();
+        let state = self
+            .state_at(frame)
+            .unwrap_or_else(|| CameraKey::new(frame, Point::ORIGIN));
+        match self.angles.iter_mut().find(|a| a.name == name) {
+            Some(angle) => angle.state = state,
+            None => self.angles.push(NamedAngle { name, state }),
+        }
+    }
+
+    /// The saved angle of this name, if any.
+    pub fn angle(&self, name: &str) -> Option<&NamedAngle> {
+        self.angles.iter().find(|a| a.name == name)
+    }
+
+    pub fn remove_angle(&mut self, name: &str) -> bool {
+        let before = self.angles.len();
+        self.angles.retain(|a| a.name != name);
+        self.angles.len() != before
     }
 }
 
@@ -289,6 +1002,385 @@ mod tests {
         let mut t = CameraTrack::new();
         t.enabled = true;
         t
+    }
+
+    /// The stage a named move measures its distances against. Named apart from
+    /// the `stage()` in the projection tests below, which is a `Size`.
+    fn move_stage() -> Rect {
+        Rect::new(0.0, 0.0, 1920.0, 1080.0)
+    }
+
+    /// **A move is two keys and nothing else.** The whole promise: what comes
+    /// out is ordinary keyframes an animator can drag, re-time or delete.
+    #[test]
+    fn a_named_move_writes_two_ordinary_keys() {
+        let mut t = track();
+        assert!(t.add_move(CameraMove::PushIn, 0, 48, move_stage()));
+        assert_eq!(t.keys().len(), 2);
+        assert_eq!(t.keys()[0].frame, 0);
+        assert_eq!(t.keys()[1].frame, 48);
+    }
+
+    /// **A push in ends closer than it began, and a pull out further away.**
+    #[test]
+    fn a_push_closes_in_and_a_pull_opens_out() {
+        let mut t = track();
+        t.add_move(CameraMove::PushIn, 0, 48, move_stage());
+        let (a, b) = (t.keys()[0].zoom, t.keys()[1].zoom);
+        assert!(b > a, "the push in did not close in: {a} to {b}");
+
+        let mut t = track();
+        t.add_move(CameraMove::PullOut, 0, 48, move_stage());
+        let (a, b) = (t.keys()[0].zoom, t.keys()[1].zoom);
+        assert!(b < a, "the pull out did not open out: {a} to {b}");
+    }
+
+    /// **A reveal ends where you framed it.** It is the one move defined by its
+    /// destination, so the opening key is the derived one — get this backwards
+    /// and the shot ends somewhere the animator never chose.
+    #[test]
+    fn a_reveal_ends_on_the_framing_it_was_given() {
+        let mut t = track();
+        t.set_key(CameraKey {
+            zoom: 1.0,
+            ..CameraKey::new(0, Point::new(960.0, 540.0))
+        });
+        t.add_move(CameraMove::Reveal, 0, 60, move_stage());
+
+        let end = t.keys().last().copied().expect("an end key");
+        assert!(
+            (end.zoom - 1.0).abs() < 1e-9,
+            "the reveal did not settle on the framing it was given: {}",
+            end.zoom
+        );
+        assert!(
+            t.keys()[0].zoom > end.zoom,
+            "the reveal did not open closer in than it ends"
+        );
+    }
+
+    /// **A pan travels sideways and does not change magnification.**
+    #[test]
+    fn a_pan_travels_and_does_not_zoom() {
+        let mut t = track();
+        t.add_move(CameraMove::PanRight, 0, 48, move_stage());
+        let (a, b) = (t.keys()[0], t.keys()[1]);
+        assert!(b.center.x > a.center.x, "the pan did not go right");
+        assert_eq!(a.zoom, b.zoom, "a pan is not a zoom");
+
+        let mut t = track();
+        t.add_move(CameraMove::PanLeft, 0, 48, move_stage());
+        assert!(t.keys()[1].center.x < t.keys()[0].center.x, "the pan did not go left");
+    }
+
+    /// **A deliberate move is eased at both ends; a drift is not.**
+    ///
+    /// The drift is the exception on purpose — see [`CameraMove::ease`] — and
+    /// this is the test that stops somebody "fixing" it into consistency.
+    #[test]
+    fn moves_are_eased_and_the_drift_is_deliberately_not() {
+        let mut t = track();
+        t.add_move(CameraMove::PushIn, 0, 48, move_stage());
+        assert_eq!(t.keys()[0].ease, SMOOTH, "a push in should be eased");
+
+        let mut t = track();
+        t.add_move(CameraMove::Drift, 0, 48, move_stage());
+        assert_eq!(
+            t.keys()[0].ease,
+            Easing::Linear,
+            "a drift is meant to run under the shot unnoticed, which easing undoes"
+        );
+    }
+
+    /// **An eased move is behind a linear one at the start and ahead of it in
+    /// the middle.** This is the thing the whole feature exists for: a camera
+    /// that leaves slowly rather than at full speed.
+    #[test]
+    fn easing_changes_where_the_camera_is_mid_move() {
+        let a = CameraKey::new(0, Point::new(0.0, 0.0));
+        let mut eased = a;
+        eased.ease = SMOOTH;
+        let b = CameraKey::new(100, Point::new(1000.0, 0.0));
+
+        let mut linear_track = track();
+        linear_track.set_key(a);
+        linear_track.set_key(b);
+        let mut eased_track = track();
+        eased_track.set_key(eased);
+        eased_track.set_key(b);
+
+        let at = |t: &CameraTrack, f: u32| t.state_at(f).expect("a state").center.x;
+
+        assert!(
+            at(&eased_track, 10) < at(&linear_track, 10) - 20.0,
+            "the eased camera should still be getting under way at a tenth in"
+        );
+        assert!(
+            at(&eased_track, 90) > at(&linear_track, 90) + 20.0,
+            "and should be settling rather than still at full speed near the end"
+        );
+        // Both arrive, which is the property an ease must never break.
+        assert!((at(&eased_track, 100) - 1000.0).abs() < 1e-6);
+        assert!((at(&eased_track, 0) - 0.0).abs() < 1e-6);
+    }
+
+    /// **A backwards or empty span writes nothing.** Two keys on one frame is
+    /// the second silently replacing the first, which would look like the
+    /// command doing nothing for no stated reason.
+    #[test]
+    fn a_move_with_no_room_writes_nothing() {
+        let mut t = track();
+        assert!(!t.add_move(CameraMove::PushIn, 40, 40, move_stage()));
+        assert!(!t.add_move(CameraMove::PushIn, 40, 10, move_stage()));
+        assert!(t.keys().is_empty());
+    }
+
+    /// **A move starts from the framing already in force**, rather than from a
+    /// remembered default — so pushing in twice pushes in twice.
+    #[test]
+    fn a_move_starts_from_where_the_camera_already_is() {
+        let mut t = track();
+        t.set_key(CameraKey {
+            zoom: 2.0,
+            ..CameraKey::new(0, Point::new(300.0, 200.0))
+        });
+        t.add_move(CameraMove::PushIn, 0, 48, move_stage());
+        assert_eq!(t.keys()[0].center, Point::new(300.0, 200.0));
+        assert!(t.keys()[1].zoom > 2.0, "it did not start from the 2x it was on");
+    }
+
+    #[test]
+    fn a_camera_with_no_shutter_has_no_motion_blur() {
+        let track = CameraTrack::new();
+        assert_eq!(track.shutter, 0.0, "off by default");
+        assert!(
+            track.shutter_offsets().is_none(),
+            "no shutter, no instants to add up"
+        );
+    }
+
+    #[test]
+    fn one_sample_is_not_a_smear() {
+        let mut track = CameraTrack::new();
+        track.shutter = 0.5;
+        track.blur_samples = 1;
+        assert!(
+            track.shutter_offsets().is_none(),
+            "a single instant is the clean frame, and should take the clean path"
+        );
+    }
+
+    /// The offsets straddle the frame evenly, so the smear sits around the
+    /// artwork rather than trailing it.
+    #[test]
+    fn the_shutter_is_centred_on_the_frame() {
+        let mut track = CameraTrack::new();
+        track.shutter = 0.5;
+        track.blur_samples = 8;
+        let offsets = track.shutter_offsets().expect("a shutter");
+
+        assert_eq!(offsets.len(), 8);
+        let mean: f64 = offsets.iter().sum::<f64>() / offsets.len() as f64;
+        assert!(mean.abs() < 1e-9, "the instants average to the frame: {mean}");
+
+        let first = offsets[0];
+        let last = offsets[offsets.len() - 1];
+        assert!(first < 0.0 && last > 0.0, "they straddle it: {first}..{last}");
+        assert!(
+            first > -0.25 && last < 0.25,
+            "and stay inside the open shutter: {first}..{last}"
+        );
+
+        // Evenly spaced, so no instant is weighted more than another.
+        let step = offsets[1] - offsets[0];
+        for pair in offsets.windows(2) {
+            assert!((pair[1] - pair[0] - step).abs() < 1e-9, "even spacing");
+        }
+    }
+
+    #[test]
+    fn a_wider_shutter_reaches_further_either_way() {
+        let mut narrow = CameraTrack::new();
+        narrow.shutter = 0.25;
+        let mut wide = CameraTrack::new();
+        wide.shutter = 1.0;
+
+        let n = narrow.shutter_offsets().expect("narrow");
+        let w = wide.shutter_offsets().expect("wide");
+        assert!(
+            w[0] < n[0] && *w.last().unwrap() > *n.last().unwrap(),
+            "a longer exposure sees more of the move"
+        );
+    }
+
+    #[test]
+    fn a_nonsense_shutter_asks_for_nothing() {
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut track = CameraTrack::new();
+            track.shutter = bad;
+            assert!(track.shutter_offsets().is_none(), "for {bad}");
+        }
+    }
+
+    #[test]
+    fn the_sample_count_is_bounded() {
+        let mut track = CameraTrack::new();
+        track.shutter = 0.5;
+        track.blur_samples = 100_000;
+        let offsets = track.shutter_offsets().expect("a shutter");
+        assert_eq!(
+            offsets.len(),
+            MAX_BLUR_SAMPLES as usize,
+            "a hand-edited file cannot ask for a thousand instants"
+        );
+    }
+
+    #[test]
+    fn a_pinhole_camera_has_no_depth_of_field() {
+        let track = CameraTrack::new();
+        assert_eq!(track.aperture, 0.0);
+        assert_eq!(track.dof_blur_at(0, 500.0), None, "no aperture, no blur");
+    }
+
+    #[test]
+    fn depth_of_field_grows_with_distance_from_focus() {
+        let mut track = CameraTrack::new();
+        track.aperture = 0.02;
+        track.focus_depth = 0.0;
+        assert_eq!(track.dof_blur_at(0, 0.0), None, "the focus plane is sharp");
+        let near = track.dof_blur_at(0, 200.0).expect("out of focus");
+        let far = track.dof_blur_at(0, 800.0).expect("further out of focus");
+        assert!(far > near, "further from focus should blur more: {near} vs {far}");
+    }
+
+    /// The whole point of the static fields staying: a document that never
+    /// keys focus behaves exactly as it did before there was a pull at all,
+    /// on every frame.
+    #[test]
+    fn without_focus_keys_the_lens_never_changes() {
+        let mut track = CameraTrack::new();
+        track.aperture = 0.02;
+        track.focus_depth = 300.0;
+        for frame in [0, 1, 50, 10_000] {
+            let lens = track.focus_at(frame);
+            assert_eq!(lens.aperture, 0.02, "frame {frame}");
+            assert_eq!(lens.focus_depth, 300.0, "frame {frame}");
+        }
+    }
+
+    /// A focus pull: the lens starts focused on the background and travels to
+    /// the foreground, so the *same layer at the same depth* goes from sharp to
+    /// soft without anything on the stage moving.
+    #[test]
+    fn a_focus_pull_moves_the_sharp_plane_over_time() {
+        let mut track = CameraTrack::new();
+        track.set_focus_key(FocusKey {
+            frame: 0,
+            focus_depth: 600.0,
+            aperture: 0.05,
+        });
+        track.set_focus_key(FocusKey {
+            frame: 24,
+            focus_depth: 0.0,
+            aperture: 0.05,
+        });
+
+        // The layer sitting at depth 600: in focus at the start, out of it by
+        // the end.
+        assert_eq!(track.dof_blur_at(0, 600.0), None, "sharp where the focus is");
+        let pulled = track
+            .dof_blur_at(24, 600.0)
+            .expect("the focus has left this layer behind");
+        assert!(pulled > 1.0, "a full pull should be a real blur, got {pulled}");
+
+        // And the foreground it travelled to does the reverse.
+        assert!(track.dof_blur_at(0, 0.0).is_some(), "foreground starts soft");
+        assert_eq!(track.dof_blur_at(24, 0.0), None, "and ends sharp");
+    }
+
+    #[test]
+    fn focus_holds_before_the_first_key_and_after_the_last() {
+        let mut track = CameraTrack::new();
+        track.set_focus_key(FocusKey {
+            frame: 10,
+            focus_depth: 100.0,
+            aperture: 0.01,
+        });
+        track.set_focus_key(FocusKey {
+            frame: 20,
+            focus_depth: 200.0,
+            aperture: 0.02,
+        });
+
+        assert_eq!(track.focus_at(0).focus_depth, 100.0, "held before the first");
+        assert_eq!(track.focus_at(99).focus_depth, 200.0, "held after the last");
+        let middle = track.focus_at(15);
+        assert!(
+            (middle.focus_depth - 150.0).abs() < 1e-9,
+            "halfway is halfway: {}",
+            middle.focus_depth
+        );
+        assert!(
+            (middle.aperture - 0.015).abs() < 1e-9,
+            "the aperture rides along: {}",
+            middle.aperture
+        );
+    }
+
+    /// Focus keys arrive from a file, where nothing guarantees their order.
+    #[test]
+    fn loaded_focus_keys_are_sorted_and_sane() {
+        let mut track = CameraTrack::new();
+        track.set_focus_keys(vec![
+            FocusKey { frame: 20, focus_depth: 200.0, aperture: 0.02 },
+            FocusKey { frame: 0, focus_depth: 0.0, aperture: -1.0 },
+            FocusKey { frame: 20, focus_depth: 999.0, aperture: 0.5 },
+        ]);
+        let frames: Vec<u32> = track.focus_keys().iter().map(|k| k.frame).collect();
+        assert_eq!(frames, vec![0, 20], "sorted, one key per frame");
+        assert_eq!(
+            track.focus_keys()[0].aperture,
+            0.0,
+            "a negative aperture is clamped away"
+        );
+    }
+
+    #[test]
+    fn a_focus_key_can_be_replaced_and_removed() {
+        let mut track = CameraTrack::new();
+        let key = FocusKey { frame: 5, focus_depth: 1.0, aperture: 0.1 };
+        track.set_focus_key(key);
+        track.set_focus_key(FocusKey { focus_depth: 2.0, ..key });
+        assert_eq!(track.focus_keys().len(), 1, "re-keying replaces");
+        assert_eq!(track.focus_keys()[0].focus_depth, 2.0);
+        assert!(track.has_focus_key_at(5));
+        assert!(track.remove_focus_key(5));
+        assert!(!track.remove_focus_key(5), "removing twice is not a change");
+        assert!(track.focus_keys().is_empty());
+    }
+
+    #[test]
+    fn a_saved_angle_captures_the_camera_and_comes_back() {
+        let mut track = track();
+        track.set_key(CameraKey {
+            frame: 0,
+            center: Point::new(120.0, 80.0),
+            zoom: 2.5,
+            rotation: 0.3,
+            pitch: 0.0,
+            yaw: 0.0,
+            ease: Easing::Linear,
+        });
+        track.save_angle("Wide", 0);
+        let angle = track.angle("Wide").expect("saved");
+        assert_eq!(angle.state.center, Point::new(120.0, 80.0));
+        assert_eq!(angle.state.zoom, 2.5);
+
+        // Saving the same name again replaces it rather than duplicating.
+        track.save_angle("Wide", 0);
+        assert_eq!(track.angles.len(), 1);
+        assert!(track.remove_angle("Wide"));
+        assert!(track.angle("Wide").is_none());
     }
 
     #[test]
@@ -331,12 +1423,18 @@ mod tests {
             center: Point::ORIGIN,
             zoom: 1.0,
             rotation: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            ease: Easing::Linear,
         });
         t.set_key(CameraKey {
             frame: 10,
             center: Point::ORIGIN,
             zoom: 4.0,
             rotation: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            ease: Easing::Linear,
         });
 
         let mid = t.state_at(5).unwrap();
@@ -357,12 +1455,18 @@ mod tests {
             center: Point::ORIGIN,
             zoom: 1.0,
             rotation: deg(350.0),
+            pitch: 0.0,
+            yaw: 0.0,
+            ease: Easing::Linear,
         });
         t.set_key(CameraKey {
             frame: 10,
             center: Point::ORIGIN,
             zoom: 1.0,
             rotation: deg(10.0),
+            pitch: 0.0,
+            yaw: 0.0,
+            ease: Easing::Linear,
         });
 
         let mid = t.state_at(5).unwrap().rotation.to_degrees();
@@ -435,6 +1539,9 @@ mod tests {
             center: Point::new(275.0, 200.0),
             zoom: 2.0,
             rotation: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            ease: Easing::Linear,
         });
 
         let transform = t.transform_at(0, stage);
@@ -456,6 +1563,9 @@ mod tests {
                 center: Point::ORIGIN,
                 zoom,
                 rotation: 0.0,
+                pitch: 0.0,
+                yaw: 0.0,
+                ease: Easing::Linear,
             });
             let coeffs = t.transform_at(0, Size::new(550.0, 400.0)).as_coeffs();
             // NaN in, NaN out is acceptable for the value itself, but the
@@ -617,6 +1727,34 @@ mod tests {
         );
     }
 
+    /// **The bound the controls stop at must be a depth that still draws.**
+    ///
+    /// `nearest_depth` and `depth_scale` are two expressions of the same fact —
+    /// where the lens is — written apart, and a layer dragged exactly to the
+    /// bound and then not drawn would be the worst of both. Ties them together
+    /// so neither constant can be moved without the other.
+    #[test]
+    fn a_layer_at_the_nearest_depth_is_still_drawn() {
+        for focal in [1.0, 5.0, 50.0, 200.0, DEFAULT_FOCAL_DISTANCE, 6000.0] {
+            let mut track = CameraTrack::default();
+            track.focal_distance = focal;
+            let nearest = track.nearest_depth();
+            // Never *behind* the stage. It reaches zero only for a lens sitting
+            // on the near plane, where there is honestly no room in front of it
+            // — no control offers that, but a file or a script can.
+            assert!(nearest <= 0.0, "the bound is never behind the stage: {focal}");
+            assert!(
+                track.depth_scale(nearest).is_some(),
+                "a layer at the bound must still draw, at focal {focal}"
+            );
+            // And it is a real bound, not a formality: past it, nothing.
+            assert!(
+                track.depth_scale(-focal * 2.0).is_none(),
+                "well past the lens must not draw, at focal {focal}"
+            );
+        }
+    }
+
     #[test]
     fn a_corrupt_focal_distance_falls_back_to_the_default() {
         for bad in [0.0, -100.0, f64::NAN, f64::INFINITY] {
@@ -625,5 +1763,181 @@ mod tests {
         }
         let good = CameraTrack::from_parts(Vec::new(), false, 750.0);
         assert_eq!(good.focal_distance, 750.0);
+    }
+
+    // -- a spatial camera ----------------------------------------------------
+
+    fn stage() -> Size {
+        Size::new(550.0, 400.0)
+    }
+
+    fn tilted(pitch: f64, yaw: f64) -> CameraTrack {
+        let mut track = CameraTrack::new();
+        track.enabled = true;
+        track.set_key(CameraKey {
+            frame: 0,
+            center: Point::new(275.0, 200.0),
+            zoom: 1.0,
+            rotation: 0.0,
+            pitch,
+            yaw,
+            ease: Easing::Linear,
+        });
+        track
+    }
+
+    /// The promise every document depends on: a camera that does not tilt
+    /// produces exactly the affine it always did.
+    #[test]
+    fn an_untilted_camera_gives_exactly_the_old_transform() {
+        let track = tilted(0.0, 0.0);
+        for depth in [0.0, 500.0, -300.0, 2000.0] {
+            let affine = track.transform_at_depth(0, stage(), depth);
+            let projection = track.projection_at_depth(0, stage(), depth);
+
+            match (affine, projection) {
+                (Some(a), Some(p)) => {
+                    assert!(p.is_affine(), "depth {depth} stopped being affine");
+                    assert_eq!(
+                        p.as_affine().unwrap().as_coeffs(),
+                        a.as_coeffs(),
+                        "depth {depth} changed"
+                    );
+                }
+                (None, None) => {}
+                other => panic!("depth {depth} disagreed: {other:?}"),
+            }
+        }
+    }
+
+    /// And so does a camera that is switched off, or has no keys at all.
+    #[test]
+    fn a_camera_with_no_keys_still_projects() {
+        let track = CameraTrack::new();
+        let projection = track
+            .projection_at_depth(0, stage(), 0.0)
+            .expect("in front");
+        assert!(projection.is_affine());
+    }
+
+    /// The point of the whole exercise: pitch turns the stage into a trapezoid.
+    #[test]
+    fn pitch_makes_the_stage_a_trapezoid() {
+        let track = tilted(0.4, 0.0);
+        let projection = track
+            .projection_at_depth(0, stage(), 0.0)
+            .expect("in front");
+        assert!(!projection.is_affine());
+
+        let corners = projection
+            .map_rect(buzz_geom::Rect::new(0.0, 0.0, 550.0, 400.0))
+            .expect("all four corners in front");
+        let top = (corners[1] - corners[0]).hypot();
+        let bottom = (corners[2] - corners[3]).hypot();
+        assert!(
+            (top - bottom).abs() > 5.0,
+            "the stage should be a trapezoid: {top} vs {bottom}"
+        );
+    }
+
+    /// Yaw does the same thing about the other axis — the left and right edges
+    /// differ instead of the top and bottom.
+    #[test]
+    fn yaw_makes_the_stage_a_trapezoid_the_other_way() {
+        let projection = tilted(0.0, 0.4)
+            .projection_at_depth(0, stage(), 0.0)
+            .expect("in front");
+
+        let corners = projection
+            .map_rect(buzz_geom::Rect::new(0.0, 0.0, 550.0, 400.0))
+            .expect("in front");
+        let left = (corners[3] - corners[0]).hypot();
+        let right = (corners[2] - corners[1]).hypot();
+        assert!(
+            (left - right).abs() > 5.0,
+            "the sides should differ: {left} vs {right}"
+        );
+    }
+
+    /// A tilted camera still respects depth: a layer further away is still
+    /// drawn smaller, so tilt and parallax compose rather than replacing each
+    /// other.
+    #[test]
+    fn tilt_and_depth_work_together() {
+        let track = tilted(0.35, 0.0);
+        let area = |depth: f64| {
+            let projection = track
+                .projection_at_depth(0, stage(), depth)
+                .expect("in front");
+            let bounds = projection
+                .map_rect_bounds(buzz_geom::Rect::new(0.0, 0.0, 550.0, 400.0))
+                .expect("in front");
+            bounds.width() * bounds.height()
+        };
+        assert!(
+            area(1000.0) < area(0.0),
+            "a further layer should still be smaller"
+        );
+    }
+
+    /// Tilt is bounded. A camera turned past edge-on has nothing sensible to
+    /// draw, and a corrupt file must not produce one.
+    #[test]
+    fn tilt_is_clamped_into_range() {
+        let key = CameraKey {
+            frame: 0,
+            center: Point::ZERO,
+            zoom: 1.0,
+            rotation: 0.0,
+            pitch: 99.0,
+            yaw: -99.0,
+            ease: Easing::Linear,
+        }
+        .clamped();
+        assert!(key.pitch <= MAX_TILT && key.yaw >= -MAX_TILT);
+
+        // And the projection is built from the clamped value, so it exists.
+        let mut track = CameraTrack::new();
+        track.enabled = true;
+        track.set_key(CameraKey {
+            pitch: 99.0,
+            ..CameraKey::new(0, Point::new(275.0, 200.0))
+        });
+        assert!(track.projection_at_depth(0, stage(), 0.0).is_some());
+    }
+
+    /// Tilt interpolates between keys, the short way round.
+    #[test]
+    fn tilt_interpolates_between_keys() {
+        let mut track = CameraTrack::new();
+        track.enabled = true;
+        track.set_key(CameraKey {
+            pitch: 0.0,
+            ..CameraKey::new(0, Point::new(275.0, 200.0))
+        });
+        track.set_key(CameraKey {
+            pitch: 0.8,
+            ..CameraKey::new(10, Point::new(275.0, 200.0))
+        });
+
+        let middle = track.state_at(5).expect("keyed");
+        assert!(
+            (middle.pitch - 0.4).abs() < 1e-9,
+            "half way should be half the tilt: {}",
+            middle.pitch
+        );
+    }
+
+    /// `has_tilt` is what lets the renderer skip the perspective path for the
+    /// documents that never use it.
+    #[test]
+    fn a_flat_shot_reports_no_tilt() {
+        assert!(!tilted(0.0, 0.0).has_tilt());
+        assert!(tilted(0.3, 0.0).has_tilt());
+        assert!(tilted(0.0, -0.3).has_tilt());
+
+        let mut off = tilted(0.5, 0.5);
+        off.enabled = false;
+        assert!(!off.has_tilt(), "a camera switched off tilts nothing");
     }
 }

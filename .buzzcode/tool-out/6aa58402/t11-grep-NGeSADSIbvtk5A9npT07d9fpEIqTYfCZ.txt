@@ -1,0 +1,218 @@
+crates/buzz-app/src/tools.rs
+  136- }
+  137- 
+  138: /// Which handle of a gradient is being dragged.
+  139- ///
+  140- /// # Why these four, and why the end grip does two things
+  197-     ///
+  198-     /// A rotate, scale or skew used to be applied on release, so the artwork
+  199:     /// sat still while the handles moved and you found out what you had done
+  200-     /// only afterwards. The maths was never the missing part: this carries the
+  201-     /// *same* affine the release will commit, built by the same functions, and
+  414-         self.last_screen = screen;
+  415-         match self.tool {
+  416:             ToolId::Pencil | ToolId::Brush | ToolId::Eraser | ToolId::Lasso
+  417-             | ToolId::MotionPath => {
+  418-                 self.gesture = Gesture::Freehand {
+  493-             return false;
+  494-         }
+  495:         // `Inside` means "on none of the handles", which is also true of empty
+  496-         // stage far from the selection — and a drag out there is a marquee.
+  497:         // Free Transform has no marquee, so anywhere off its handles moves.
+  498-         self.tool == ToolId::FreeTransform || contains(bounds, at)
+  499-     }
+  502-     ///
+  503-     /// **The whole gizmo, from every tool that shows it.** Corners scale, the
+  504:     /// mid-edge handles squeeze one dimension, the edges either side of them
+  505-     /// skew and the ring outside a corner turns — for the selection
+  506:     /// tools as well as Free Transform, because the handles are drawn for all
+  507:     /// of them and a handle you can see and cannot use is worse than none.
+  508-     ///
+  509-     /// Asked once at the press, where the answer is still true: the artwork
+  844-                 | ToolId::PolyStar
+  845-                 | ToolId::Line
+  846:                 | ToolId::Pen => build_shape_path(self.tool, *origin, *current, *mods)
+  847-                     .map(Preview::Shape)
+  848-                     .unwrap_or(Preview::None),
+  1044-                         blend: buzz_scene::PaintBlend::Normal,
+  1045-                     },
+  1046:                     label: "Pencil",
+  1047-                 }
+  1048-             }
+  1175-                         }
+  1176-                     }
+  1177:                     // **A click on a handle is a mis-grab of the gizmo**, not a
+  1178:                     // selection. The handles are furniture drawn over the
+  1179-                     // artwork, and picking whatever happens to lie under a
+  1180-                     // corner would take the selection away from the very thing
+  1226-             // Text places where you click — the editor shapes the glyphs.
+  1227-             ToolId::Text => ToolAction::PlaceText { at: end },
+  1228:             ToolId::Rectangle | ToolId::Oval | ToolId::PolyStar | ToolId::Line | ToolId::Pen => {
+  1229-                 if was_click {
+  1230-                     return ToolAction::None;
+  1233-                     return ToolAction::None;
+  1234-                 };
+  1235:                 let filled = self.tool != ToolId::Line && self.tool != ToolId::Pen;
+  1236-                 // The shape's own extent is what a gradient fill is laid
+  1237-                 // across, so it has to be measured before the shape is built.
+  1301-         ToolId::PolyStar => "Draw PolyStar",
+  1302-         ToolId::Line => "Draw Line",
+  1303:         ToolId::Pen => "Draw Path",
+  1304-         _ => "Draw",
+  1305-     }
+  1319- /// its own artwork. The samples are steadied and smoothed *before* the curve is
+  1320- /// fitted, so the pencil gets the same stabiliser and smoothing the brush does —
+  1321: /// Animate's Pencil has a Smoothing setting for the same reason, and the
+  1322- /// pull-string stabiliser rides the same dial. Because the preview and the
+  1323- /// commit call this identically, what is drawn on screen is what lands.
+  1628-                 end = Point::new(origin.x + size * dx.signum(), origin.y + size * dy.signum());
+  1629-             }
+  1630:             ToolId::Line | ToolId::Pen => {
+  1631-                 let d = end - origin;
+  1632-                 let angle = d.y.atan2(d.x);
+  1663-         }
+  1664-         ToolId::PolyStar => star_path(rect.center(), rect.width().min(rect.height()) / 2.0, 5),
+  1665:         ToolId::Line | ToolId::Pen => Line::new(origin, end).to_path(1e-6),
+  1666-         _ => return None,
+  1667-     })
+  1692- 
+  1693- /// Scale the selection by dragging, anchored at the opposite corner.
+  1694: /// How far from a handle a grab still counts, in screen pixels.
+  1695- pub(crate) const TRANSFORM_GRAB_PX: f64 = 8.0;
+  1696- 
+  1700-     /// The transformation point itself.
+  1701-     Pivot,
+  1702:     /// A corner handle: scale.
+  1703-     Corner,
+  1704-     /// Just outside a corner: rotate.
+  1705-     Rotate,
+  1706:     /// A mid-edge handle: **squeeze or stretch in one axis**. `true` for a
+  1707:     /// handle on a horizontal edge — the top or the bottom — which scales in y.
+  1708-     ///
+  1709-     /// The square drawn at the middle of each edge, and the answer to "press
+  1710-     /// it down from the top". Dragging the edge *line* still skews; this is
+  1711:     /// the handle sitting on it, and it is the only part of the gizmo that
+  1712-     /// changes one dimension without touching the other.
+  1713-     Side(bool),
+  1733- /// explicit order does not.
+  1734- pub fn grip_at(
+  1735:     handles: buzz_scene::GradientHandles,
+  1736-     kind: buzz_scene::GradientKind,
+  1737-     at: Point,
+  1740-     let near = |p: Point| (at - p).hypot() <= grab;
+  1741- 
+  1742:     if kind == buzz_scene::GradientKind::Radial && near(handles.focus) {
+  1743-         return Some(GradientGrip::Focus);
+  1744-     }
+  1745:     if near(handles.end) {
+  1746-         return Some(GradientGrip::End);
+  1747-     }
+  1748:     if near(handles.width) {
+  1749-         return Some(GradientGrip::Width);
+  1750-     }
+  1751:     if near(handles.center) {
+  1752-         return Some(GradientGrip::Center);
+  1753-     }
+  1784- 
+  1785- fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> TransformZone {
+  1786:     // A little more forgiving than a handle: the circle is small, it is often
+  1787-     // parked over artwork you are looking at rather than over a corner, and
+  1788-     // missing it silently *moves the artwork* instead — which is the one
+  1811-     }
+  1812- 
+  1813:     // **The mid-edge handles**, which are drawn as squares exactly here — see
+  1814-     // `stage::draw_selection_chrome`. Tested before the edge lines they sit
+  1815:     // on, so the handle wins over the skew zone it overlaps: a square you can
+  1816-     // see is a promise that grabbing it does one thing, and the line either
+  1817-     // side of it is where the other one lives.
+  1879-     let after = end - pivot;
+  1880-     let safe = |a: f64, b: f64, extent: f64| {
+  1881:         // Dragging a handle that is *on* the pivot's own row or column has no
+  1882-         // ratio to take; fall back on the selection's size so the drag still
+  1883-         // does something predictable rather than nothing.
+  1909- }
+  1910- 
+  1911: /// **Squeeze or stretch in one axis**, by dragging the handle at the middle of
+  1912- /// an edge, held at the opposite edge.
+  1913- ///
+  1914- /// # Why this is not a skew
+  1915- ///
+  1916: /// Every edge of the gizmo used to skew and nothing else, so the top handle
+  1917- /// sheared in x and a drag straight *down* it — press this flat — moved
+  1918- /// nothing at all. The pointer said as much: it turned into the horizontal
+  1921- /// thing an animator asks of a selection, and it had no gesture.
+  1922- ///
+  1923: /// So the **handle** scales and the **line either side of it** still skews.
+  1924- /// Both are reachable, both are drawn, and neither had to be given up: see
+  1925- /// [`TransformZone::Side`] for the order they are tested in.
+  1926- ///
+  1927: /// `horizontal` is true for the handle on a horizontal edge — the top or the
+  1928- /// bottom — which is the one that scales in **y**.
+  1929- ///
+  1969-         (origin.x - anchor.x, end.x - anchor.x, bounds.width())
+  1970-     };
+  1971:     // Dragging a handle that is *on* the anchor's own row has no ratio to
+  1972-     // take; the selection's own size stands in, so the drag still does
+  1973-     // something predictable rather than nothing. Same fallback as
+  2138-             zone(50.0, 0.0),
+  2139-             TransformZone::Side(true),
+  2140:             "the handle on the top edge"
+  2141-         );
+  2142-         assert_eq!(
+  2143-             zone(0.0, 50.0),
+  2144-             TransformZone::Side(false),
+  2145:             "the handle on the left edge"
+  2146-         );
+  2147:         // The line either side of a handle still skews, which is what keeps
+  2148-         // both gestures reachable on one edge.
+  2149-         assert_eq!(zone(75.0, 0.0), TransformZone::Edge(true), "a top edge");
+  2152-     }
+  2153- 
+  2154:     /// **Pressing the top handle down squashes the box and holds the bottom.**
+  2155-     ///
+  2156-     /// The gesture the gizmo had no answer for: every edge sheared, so a drag
+  2157-     /// straight down a horizontal edge — which shears in x — moved nothing.
+  2158-     #[test]
+  2159:     fn the_side_handle_squeezes_one_axis_and_holds_the_far_edge() {
+  2160-         let bounds = box_10();
+  2161-         let pivot = bounds.center();
+  2233-     /// on a corner must still be draggable.
+  2234-     #[test]
+  2235:     fn the_transformation_point_wins_over_the_handle_it_sits_on() {
+  2236-         let bounds = box_10();
+  2237-         let corner = Point::new(0.0, 0.0);
+  2306- 
+  2307-     /// Scaling about the transformation point keeps it fixed, which is what
+  2308:     /// Alt-dragging a handle is for.
+  2309-     #[test]
+  2310-     fn alt_scaling_keeps_the_transformation_point_fixed() {
+  2541-     fn freehand_tools_accumulate_a_path() {
+  2542-         let style = DrawStyle::default();
+  2543:         let mut m = ToolMachine::new(ToolId::Pencil);
+  2544-         m.pointer_down(
+  2545-             Point::new(0.0, 0.0),
+  2554-         match m.pointer_up(Point::new(20.0, 0.0), Point::ORIGIN, &ctx(&style)) {
+  2555-             ToolAction::AddShape { shape, label } => {
+  2556:                 assert_eq!(label, "Pencil");
+  2557-                 assert!(shape.path.elements().len() > 10);
+  2558-                 assert!(shape.stroke.is_some() && shape.fill.is_none());
+  3052-     fn a_single_point_freehand_gesture_produces_nothing() {
+  3053-         let style = DrawStyle::default();
+  3054:         let mut m = ToolMachine::new(ToolId::Pencil);
+  3055-         let p = Point::new(1.0, 1.0);
+  3056-         m.pointer_down(p, p, Mods::default(), &ctx(&style));
+  3378-     }
+  3379- 
+  3380:     fn handles(
+  3381-         centre: Point,
+  3382-         end: Point,
+  3397-     fn each_gradient_grip_can_be_grabbed() {
+  3398-         let style = DrawStyle::default();
+  3399:         let h = handles(
+  3400-             Point::new(100.0, 100.0),
+  3401-             Point::new(200.0, 100.0),
+  3432-         let style = DrawStyle::default();
+  3433-         let centre = Point::new(100.0, 100.0);
+  3434:         let h = handles(
+  3435-             centre,
+  3436-             Point::new(200.0, 100.0),

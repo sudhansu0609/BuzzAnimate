@@ -16,6 +16,8 @@
 //! Getting this wrong would make the drawing tools feel like a different
 //! program.
 
+use buzz_geom::Rect;
+use buzz_scene::{Gradient, GradientKind, GradientStop, Paint};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
@@ -64,16 +66,94 @@ impl StrokeKind {
     }
 }
 
+/// Animate's Color panel "type": what a new fill is painted with.
+///
+/// Animate's list also has None and Bitmap fill. None is the `fill_enabled`
+/// flag this already had; Bitmap is [`FillKind::Texture`], which paints a new
+/// shape with a procedural tile instead of a colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FillKind {
+    #[default]
+    Solid,
+    Linear,
+    Radial,
+    /// A procedural texture, tiled across whatever is drawn.
+    ///
+    /// The recipe is [`DrawStyle::fill_texture`]; the tile it has been baked
+    /// into is [`DrawStyle::fill_texture_asset`], which the editor keeps in step
+    /// because only the document can hold an image.
+    Texture,
+}
+
+impl FillKind {
+    /// Every fill kind, in menu order.
+    pub const ALL: [FillKind; 4] = [
+        FillKind::Solid,
+        FillKind::Linear,
+        FillKind::Radial,
+        FillKind::Texture,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Solid => "Solid",
+            Self::Linear => "Linear gradient",
+            Self::Radial => "Radial gradient",
+            Self::Texture => "Texture",
+        }
+    }
+
+    pub fn gradient_kind(self) -> Option<GradientKind> {
+        match self {
+            Self::Solid | Self::Texture => None,
+            Self::Linear => Some(GradientKind::Linear),
+            Self::Radial => Some(GradientKind::Radial),
+        }
+    }
+}
+
 /// The stroke and fill new shapes are drawn with.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrawStyle {
     pub stroke_color: Color,
     pub fill_color: Color,
+    /// What a new fill is painted with.
+    pub fill_kind: FillKind,
+    /// The ramp a new gradient fill is given.
+    ///
+    /// Held **without a placement**: a gradient in the panel has no shape to
+    /// sit on yet, so only the colours, their offsets and the spread mean
+    /// anything. The transform is set when the gradient reaches a shape, by
+    /// fitting it to that shape's bounds — which is what makes "draw a
+    /// rectangle" produce a ramp across the rectangle rather than a ramp
+    /// somewhere near the origin.
+    pub fill_gradient: Gradient,
+    /// The texture a new shape is filled with when [`FillKind::Texture`] is
+    /// chosen.
+    pub fill_texture: buzz_scene::TextureRecipe,
+    /// **The tile that recipe has been baked into**, once the document holds it.
+    ///
+    /// Held here rather than made on the spot because an image has to live in
+    /// the document's library to survive being saved, and a style has no
+    /// document — so the editor bakes it, puts it in the library, and hands the
+    /// result back. `None` until then, and a shape drawn in that gap simply
+    /// takes the texture's average colour rather than refusing to be drawn.
+    pub fill_texture_asset: Option<std::sync::Arc<buzz_scene::ImageAsset>>,
     /// `None` means the "no stroke" swatch.
     pub stroke_enabled: bool,
     /// `None` means the "no fill" swatch.
     pub fill_enabled: bool,
     pub stroke_width: f64,
+    /// **How wide the eraser rubs**, in document units.
+    ///
+    /// Its own setting, because it used to be four times the *stroke width*
+    /// slider — a number about outlines, defaulting to one, so the eraser was
+    /// four units across however large the brush was and nothing in the tool
+    /// options said so.
+    pub eraser_size: f64,
+    /// **What the eraser is allowed to take** — Animate's Erase Normal, Erase
+    /// Fills, Erase Lines and Erase Selected Fills.
+    pub eraser_mode: EraserMode,
     /// Animate's hairline: always one pixel, whatever the zoom.
     pub hairline: bool,
     pub stroke_kind: StrokeKind,
@@ -81,8 +161,162 @@ pub struct DrawStyle {
     /// Brush tool settings. Kept here rather than on the tool so that
     /// switching tools and coming back does not reset them.
     pub brush: crate::brush::BrushSettings,
+    /// Magic Wand settings — tolerance and whether it spreads.
+    ///
+    /// Beside the brush settings and for the same reason: they belong to the
+    /// user's way of working, not to a moment, so switching tools and coming
+    /// back does not reset them.
+    pub wand: buzz_scene::WandOptions,
+    /// Paint Bucket gap closing — how large a gap in the outline the bucket
+    /// bridges before filling. Animate's Gap Size.
+    pub gap_size: buzz_scene::GapSize,
+    /// Symmetry drawing — every stroke mirrored across the stage centre.
+    pub symmetry: SymmetrySettings,
     /// Recently used colours, most recent first.
     pub swatches: Vec<Color>,
+}
+
+/// **What the eraser is allowed to take.**
+///
+/// Animate's eraser modes. The eraser cuts through everything on the layer,
+/// which is right most of the time and exactly wrong when you are tidying line
+/// art over a flat colour: one slip takes the colour with the line. Restricting
+/// it is how that is worked around, and it is a mode changed several times a
+/// minute, so it belongs in the tool's own options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EraserMode {
+    /// Everything under the rub, lines and colour alike.
+    #[default]
+    Normal,
+    /// Only shapes that carry a fill — the flat colour, leaving the linework.
+    Fills,
+    /// Only shapes that are a line and nothing else, leaving the colour.
+    Lines,
+    /// Only the fills of shapes that are **selected**, so the rub cannot stray
+    /// onto the drawing beside the one being worked on.
+    SelectedFills,
+}
+
+impl EraserMode {
+    pub const ALL: [EraserMode; 4] = [
+        Self::Normal,
+        Self::Fills,
+        Self::Lines,
+        Self::SelectedFills,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Fills => "Fills",
+            Self::Lines => "Lines",
+            Self::SelectedFills => "Selected fills",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Normal => "Rub through everything on the layer.",
+            Self::Fills => "Rub through filled shapes only, leaving the linework alone.",
+            Self::Lines => "Rub through lines only \u{2014} shapes with a stroke and no fill.",
+            Self::SelectedFills => {
+                "Rub through the fills of selected shapes only, so the rub cannot \
+                 stray onto the drawing beside the one being worked on."
+            }
+        }
+    }
+
+    /// Does a shape with this fill and stroke fall to this eraser?
+    ///
+    /// The one place the rule lives, so the tool options and the eraser itself
+    /// cannot describe two different behaviours.
+    pub fn takes(self, has_fill: bool, has_stroke: bool, selected: bool) -> bool {
+        match self {
+            Self::Normal => true,
+            Self::Fills => has_fill,
+            Self::Lines => has_stroke && !has_fill,
+            Self::SelectedFills => selected && has_fill,
+        }
+    }
+}
+
+/// How new strokes are mirrored as they are drawn — a mandala/character-symmetry
+/// aid. The axes pass through the centre of the stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymmetryMode {
+    /// Draw once, no mirroring.
+    Off,
+    /// Mirror left↔right across the vertical centre line.
+    MirrorX,
+    /// Mirror top↔bottom across the horizontal centre line.
+    MirrorY,
+    /// Mirror across both axes at once — four-fold.
+    Both,
+    /// Rotate the stroke into `n` copies around the centre.
+    Radial,
+}
+
+impl SymmetryMode {
+    pub const ALL: [SymmetryMode; 5] = [
+        SymmetryMode::Off,
+        SymmetryMode::MirrorX,
+        SymmetryMode::MirrorY,
+        SymmetryMode::Both,
+        SymmetryMode::Radial,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SymmetryMode::Off => "Off",
+            SymmetryMode::MirrorX => "Mirror ↔",
+            SymmetryMode::MirrorY => "Mirror ↕",
+            SymmetryMode::Both => "Mirror ✛",
+            SymmetryMode::Radial => "Radial",
+        }
+    }
+
+    /// What the mode does, for the tooltip on its button.
+    pub fn description(self) -> &'static str {
+        match self {
+            SymmetryMode::Off => "Draw once. No mirroring.",
+            SymmetryMode::MirrorX => {
+                "Mirror left to right, across the vertical centre line. \
+                 For faces, and anything with a left and a right."
+            }
+            SymmetryMode::MirrorY => {
+                "Mirror top to bottom, across the horizontal centre line. \
+                 For reflections in water, and for wings seen edge on."
+            }
+            SymmetryMode::Both => {
+                "Mirror across both axes at once \u{2014} four copies of every stroke."
+            }
+            SymmetryMode::Radial => {
+                "Repeat the stroke around the centre, evenly spaced. \
+                 For mandalas, snowflakes and flowers."
+            }
+        }
+    }
+}
+
+/// Symmetry mode plus how many copies a radial symmetry makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymmetrySettings {
+    pub mode: SymmetryMode,
+    /// Number of copies for [`SymmetryMode::Radial`], 2..=24.
+    pub radial_count: u32,
+}
+
+impl Default for SymmetrySettings {
+    fn default() -> Self {
+        Self { mode: SymmetryMode::Off, radial_count: 6 }
+    }
+}
+
+impl SymmetrySettings {
+    /// Whether any mirroring is active.
+    pub fn is_on(self) -> bool {
+        self.mode != SymmetryMode::Off
+    }
 }
 
 /// Animate's default swatch row.
@@ -106,13 +340,36 @@ impl Default for DrawStyle {
         Self {
             stroke_color: Color::BLACK,
             fill_color: Color::from_rgb8(0x00, 0x66, 0xCC),
+            fill_kind: FillKind::Solid,
+            fill_texture: buzz_scene::TextureRecipe::new(
+                buzz_scene::TextureKind::Paper,
+                Color::from_rgb8(0x33, 0x33, 0x33),
+                Color::WHITE,
+            ),
+            fill_texture_asset: None,
+            // The fill colour fading to nothing: switching to a gradient then
+            // shows the colour that was already chosen, rather than replacing
+            // it with two arbitrary ones.
+            fill_gradient: Gradient::new(
+                GradientKind::Linear,
+                vec![
+                    GradientStop::new(0.0, Color::from_rgb8(0x00, 0x66, 0xCC)),
+                    GradientStop::new(1.0, Color::WHITE),
+                ],
+            ),
             stroke_enabled: true,
             fill_enabled: true,
             stroke_width: 1.0,
+            // A little wider than the default brush, as a rubber is.
+            eraser_size: 16.0,
+            eraser_mode: EraserMode::default(),
             hairline: false,
             stroke_kind: StrokeKind::Solid,
             drawing_mode: DrawingMode::default(),
             brush: crate::brush::BrushSettings::default(),
+            wand: buzz_scene::WandOptions::default(),
+            gap_size: buzz_scene::GapSize::default(),
+            symmetry: SymmetrySettings::default(),
             swatches: default_swatches(),
         }
     }
@@ -134,21 +391,77 @@ impl DrawStyle {
     }
 
     /// Remember a colour the user picked.
+    ///
+    /// **The same colour is only ever kept once.** Deduped by RGB, ignoring
+    /// opacity: picking a hue again — even at a different alpha — moves that one
+    /// chip to the front rather than filling a second slot with a near-identical
+    /// colour, so the row keeps making room for genuinely different colours. The
+    /// chip carries the alpha of the *latest* pick.
     pub fn remember(&mut self, color: Color) {
         let key = color.to_rgba8().to_u8_array();
-        self.swatches.retain(|c| c.to_rgba8().to_u8_array() != key);
+        let rgb = [key[0], key[1], key[2]];
+        self.swatches.retain(|c| {
+            let k = c.to_rgba8().to_u8_array();
+            [k[0], k[1], k[2]] != rgb
+        });
         self.swatches.insert(0, color);
         self.swatches.truncate(24);
     }
 
     /// Effective stroke for a new shape, if it has one.
     pub fn stroke_for_new_shape(&self) -> Option<(Color, f64, bool)> {
-        self.stroke_enabled
-            .then_some((self.stroke_color, self.stroke_width.max(0.0), self.hairline))
+        self.stroke_enabled.then_some((
+            self.stroke_color,
+            self.stroke_width.max(0.0),
+            self.hairline,
+        ))
     }
 
-    pub fn fill_for_new_shape(&self) -> Option<Color> {
-        self.fill_enabled.then_some(self.fill_color)
+    /// The paint a new shape covering `bounds` should be filled with.
+    ///
+    /// The bounds are what a gradient needs and a colour does not: a ramp has
+    /// to be laid across *something*, and the shape being drawn is the only
+    /// sensible thing. Animate does the same — draw a rectangle with a gradient
+    /// selected and the ramp spans the rectangle.
+    pub fn fill_for_new_shape(&self, bounds: Rect) -> Option<Paint> {
+        if !self.fill_enabled {
+            return None;
+        }
+        if self.fill_kind == FillKind::Texture {
+            return Some(match &self.fill_texture_asset {
+                Some(asset) => {
+                    // A few repeats across the shape, the same rule applying a
+                    // texture to an existing shape uses.
+                    let cell = (bounds.width().min(bounds.height()) / 5.0).max(16.0);
+                    Paint::Image(Box::new(buzz_scene::ImageFill::tiled(
+                        std::sync::Arc::clone(asset),
+                        cell,
+                    )))
+                }
+                None => Paint::Solid(self.fill_texture.fg),
+            });
+        }
+        Some(match self.fill_kind.gradient_kind() {
+            None => Paint::Solid(self.fill_color),
+            Some(kind) => {
+                let mut g = self.fill_gradient.clone();
+                g.kind = kind;
+                g.fit_to(bounds);
+                Paint::Gradient(std::sync::Arc::new(g))
+            }
+        })
+    }
+
+    /// The colour a new fill would use, ignoring gradients.
+    ///
+    /// For the places that genuinely want one colour — the tool previews drawn
+    /// as chrome, and the "can this fuse with what it overlaps" question.
+    pub fn fill_color_for_preview(&self) -> Color {
+        match self.fill_kind {
+            FillKind::Solid => self.fill_color,
+            FillKind::Texture => self.fill_texture.fg,
+            _ => self.fill_gradient.average_color(),
+        }
     }
 
     /// A shape with neither stroke nor fill would be invisible and
@@ -195,7 +508,10 @@ mod tests {
         let before = s.swatches.len();
 
         s.remember(red);
-        assert_eq!(s.swatches[0].to_rgba8().to_u8_array(), red.to_rgba8().to_u8_array());
+        assert_eq!(
+            s.swatches[0].to_rgba8().to_u8_array(),
+            red.to_rgba8().to_u8_array()
+        );
         assert_eq!(
             s.swatches.len(),
             before,
@@ -207,13 +523,52 @@ mod tests {
         assert_eq!(s.swatches.len(), before + 1);
     }
 
+    /// The same colour picked at a different opacity is not a second chip: it
+    /// deduplicates by RGB and the surviving chip carries the latest alpha.
+    #[test]
+    fn the_same_colour_at_a_new_opacity_replaces_rather_than_repeats() {
+        let mut s = DrawStyle::default();
+        let opaque = Color::from_rgba8(0x20, 0x80, 0xC0, 0xFF);
+        let faint = Color::from_rgba8(0x20, 0x80, 0xC0, 0x40);
+
+        s.remember(opaque);
+        let after_first = s.swatches.len();
+        s.remember(faint);
+
+        assert_eq!(
+            s.swatches.len(),
+            after_first,
+            "a second opacity of the same colour must not add a chip"
+        );
+        assert_eq!(
+            s.swatches[0].to_rgba8().to_u8_array(),
+            faint.to_rgba8().to_u8_array(),
+            "the surviving chip carries the latest opacity"
+        );
+        assert_eq!(
+            s.swatches
+                .iter()
+                .filter(|c| {
+                    let k = c.to_rgba8().to_u8_array();
+                    [k[0], k[1], k[2]] == [0x20, 0x80, 0xC0]
+                })
+                .count(),
+            1,
+            "only one chip of that colour, at any opacity"
+        );
+    }
+
     #[test]
     fn the_swatch_list_is_bounded() {
         let mut s = DrawStyle::default();
         for i in 0..200u8 {
             s.remember(Color::from_rgb8(i, i, i));
         }
-        assert!(s.swatches.len() <= 24, "swatches grew to {}", s.swatches.len());
+        assert!(
+            s.swatches.len() <= 24,
+            "swatches grew to {}",
+            s.swatches.len()
+        );
     }
 
     #[test]
@@ -231,11 +586,59 @@ mod tests {
     #[test]
     fn new_shape_style_respects_the_disabled_swatches() {
         let mut s = DrawStyle::default();
+        let area = Rect::new(0.0, 0.0, 100.0, 50.0);
         assert!(s.stroke_for_new_shape().is_some());
-        assert!(s.fill_for_new_shape().is_some());
+        assert!(s.fill_for_new_shape(area).is_some());
 
         s.stroke_enabled = false;
         assert!(s.stroke_for_new_shape().is_none());
+
+        s.fill_enabled = false;
+        assert!(s.fill_for_new_shape(area).is_none());
+    }
+
+    /// A gradient fill is laid across the shape being drawn, not left at the
+    /// origin — which is what makes drawing a rectangle with a gradient
+    /// selected produce a ramp across that rectangle.
+    #[test]
+    fn a_new_gradient_fill_is_fitted_to_the_shape() {
+        let s = DrawStyle {
+            fill_kind: FillKind::Linear,
+            ..Default::default()
+        };
+
+        let area = Rect::new(100.0, 200.0, 300.0, 400.0);
+        let paint = s.fill_for_new_shape(area).expect("filled");
+        let g = paint.gradient().expect("it should be a gradient");
+        let h = g.handles();
+
+        assert!((h.center.x - 200.0).abs() < 1e-9, "centre {:?}", h.center);
+        assert!((h.center.y - 300.0).abs() < 1e-9, "centre {:?}", h.center);
+        assert!(
+            (h.end.x - 300.0).abs() < 1e-9,
+            "the ramp should reach the right edge"
+        );
+    }
+
+    /// Switching the type switches the paint, and switching back gets the
+    /// solid colour that was there before rather than a colour from the ramp.
+    #[test]
+    fn the_fill_type_selects_between_a_colour_and_a_ramp() {
+        let mut s = DrawStyle::default();
+        let area = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let solid = s.fill_for_new_shape(area).expect("filled");
+        assert!(!solid.is_gradient());
+
+        s.fill_kind = FillKind::Radial;
+        let radial = s.fill_for_new_shape(area).expect("filled");
+        assert_eq!(
+            radial.gradient().map(|g| g.kind),
+            Some(GradientKind::Radial),
+            "the panel's kind must reach the shape"
+        );
+
+        s.fill_kind = FillKind::Solid;
+        assert_eq!(s.fill_for_new_shape(area), Some(solid));
     }
 
     #[test]

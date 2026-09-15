@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use buzz_geom::Affine;
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,15 @@ pub enum LayerKind {
     Folder,
     /// Its artwork defines what is visible on the masked layers beneath it.
     Mask,
+    /// The same, inverted: its artwork defines what is **hidden**.
+    ///
+    /// Animate has no such layer — a hole is cut there by drawing the mask as
+    /// a shape with a hole in it, which means redrawing the mask whenever the
+    /// artwork under it moves. This is the same region used the other way
+    /// round, and it is the honest way to do a spotlight in reverse: a
+    /// character walking behind a foreground element, a scratch-off, smoke
+    /// eating a title.
+    InverseMask,
     /// Clipped by the nearest mask layer above.
     Masked,
     /// Reference geometry. Visible while authoring, never exported.
@@ -54,7 +64,24 @@ impl LayerKind {
     /// Folders have no artwork, and guides are authoring aids that Animate
     /// deliberately excludes from published output.
     pub fn paints_to_output(self) -> bool {
-        matches!(self, Self::Normal | Self::Mask | Self::Masked | Self::Guided)
+        matches!(
+            self,
+            Self::Normal | Self::Mask | Self::InverseMask | Self::Masked | Self::Guided
+        )
+    }
+
+    /// Does this layer clip the run of masked layers below it?
+    ///
+    /// Both kinds of mask do; they differ only in which side of the region
+    /// survives. Every positional rule reads this rather than naming the two
+    /// kinds, so a third would not have to be chased through the code.
+    pub fn is_mask(self) -> bool {
+        matches!(self, Self::Mask | Self::InverseMask)
+    }
+
+    /// Does the mask hide what it covers rather than reveal it?
+    pub fn is_inverted_mask(self) -> bool {
+        matches!(self, Self::InverseMask)
     }
 
     /// Is this layer visible on the stage while authoring?
@@ -75,6 +102,7 @@ impl LayerKind {
             Self::Normal => "Normal",
             Self::Folder => "Folder",
             Self::Mask => "Mask",
+            Self::InverseMask => "Inverse Mask",
             Self::Masked => "Masked",
             Self::Guide => "Guide",
             Self::Guided => "Guided",
@@ -108,7 +136,55 @@ pub struct Layer {
     pub name: String,
     pub kind: LayerKind,
     /// Enclosing folder, if any.
+    ///
+    /// This is timeline *nesting* — the folder the layer is filed under. It is
+    /// not [`Self::follows`], which is a different relationship entirely.
     pub parent: Option<LayerId>,
+
+    /// The layer this one **follows**: Animate's Layer Parenting.
+    ///
+    /// When the followed layer's artwork moves, this layer's artwork moves with
+    /// it — a head layer parented to a body layer, an arm to a shoulder. It is
+    /// how a character is rigged without bones, and it is what Animate's Parent
+    /// column in the timeline sets.
+    ///
+    /// Deliberately separate from [`Self::parent`]: a layer can be filed in a
+    /// folder and follow a layer in a different one, and Animate keeps the two
+    /// apart for exactly that reason.
+    pub follows: Option<LayerId>,
+
+    /// **Which bone of the followed layer's rig this one follows**, if it
+    /// follows a bone rather than the whole drawing.
+    ///
+    /// Layer parenting on its own inherits the *object's* motion — where the
+    /// character is standing. That is the right answer for a prop in a hand and
+    /// the wrong one for a face: a walk carries most of its motion in the
+    /// bones, so a head parented to the body arrives in the right place and
+    /// then sits still while the skull under it nods and leans away from it.
+    /// At a wide framing nobody sees it; open on somebody running and the face
+    /// slides off the head.
+    ///
+    /// With a bone named, the link inherits the object's motion **and** that
+    /// bone's — which is what parenting a head to a head means. `None` is the
+    /// plain link, which is what every document written before this had.
+    pub follows_bone: Option<usize>,
+
+    /// This layer's own transform **at the moment it became a rig parent**.
+    ///
+    /// Layer parenting propagates a parent's motion *away from its rest pose*,
+    /// so the whole feature turns on what "rest" means. It used to mean "this
+    /// layer's first keyframe" — which is fine for a character that is already
+    /// animated and useless for one that is not: with a single keyframe, now
+    /// *is* rest, the motion is always the identity, and moving a wrist left
+    /// its palm behind. Parenting did nothing until you had animated, which is
+    /// the wrong way round, because parenting is what you set up *before* you
+    /// animate.
+    ///
+    /// Recorded when a link is made, so it stays put while the artwork moves.
+    /// `None` on a layer nothing follows, and on documents written before this
+    /// existed — those fall back to the first keyframe, which is what they were
+    /// saved expecting.
+    pub rest_pose: Option<Affine>,
 
     /// The eye column.
     pub visible: bool,
@@ -116,6 +192,18 @@ pub struct Layer {
     pub locked: bool,
     /// The outline column: draw artwork as outlines in the layer colour.
     pub outline: bool,
+    /// How solid this layer is drawn **while working**, `0.0`–`1.0`.
+    ///
+    /// Animate's layer transparency, and like Animate's it is an authoring aid
+    /// rather than a property of the film: the export draws every layer at full
+    /// strength. That is the whole use of it — dimming a reference layer to
+    /// draw over, or fading the foreground to see what is behind it, without
+    /// changing a frame of what is delivered. A layer meant to be genuinely
+    /// see-through in the film wants an alpha on its artwork instead.
+    ///
+    /// Hiding a layer is a different thing and stays a different thing:
+    /// [`Self::visible`] takes it out of the export too.
+    pub alpha: f64,
     /// Tint used for outline view and selection highlights.
     pub color: Color,
     pub height: LayerHeight,
@@ -126,14 +214,26 @@ pub struct Layer {
     /// pans. Negative is nearer: larger, and faster. This is Animate's Layer
     /// Depth, and it is what produces parallax.
     ///
-    /// Depth does **not** reorder drawing. Paint order is still the layer
+    /// Depth does **not** reorder drawing by default. Paint order is the layer
     /// order in the timeline, exactly as in Animate — a layer pushed into the
     /// distance keeps its place in the stack, so pushing a foreground layer
-    /// back shrinks it without sending it behind anything.
+    /// back shrinks it without sending it behind anything. The stage's opt-in
+    /// `sort_by_depth` changes that, ordering layers by this value instead; see
+    /// [`LayerStack::depth_paint_order`].
     pub depth: f64,
     /// Folders only: whether children are hidden in the timeline. Purely a UI
     /// state — it never affects rendering.
     pub collapsed: bool,
+
+    /// Filters applied to everything on this layer, as one subject.
+    ///
+    /// **Animate has no layer filters** — there, filters belong to a movie clip
+    /// instance, and blurring a whole layer means selecting it all and
+    /// converting it to a symbol first. These are geometry rather than a
+    /// cached raster surface (see `buzz-fx`), so a layer costs no more than an
+    /// object does, and "blur the background" is a thing animators ask for
+    /// constantly. Recorded as a deviation, with the reason.
+    pub filters: Vec<buzz_fx::Filter>,
 
     /// The layer's frames. Artwork lives in keyframes, not on the layer.
     pub frames: LayerTimeline,
@@ -169,13 +269,18 @@ impl Layer {
             name: name.into(),
             kind,
             parent: None,
+            follows: None,
+            follows_bone: None,
+            rest_pose: None,
             visible: true,
             locked: false,
             outline: false,
+            alpha: 1.0,
             height: LayerHeight::Normal,
             // On the focal plane, so a new layer is unaffected by perspective.
             depth: 0.0,
             collapsed: false,
+            filters: Vec::new(),
             frames: LayerTimeline::new(),
         }
     }
@@ -210,6 +315,15 @@ impl Layer {
     /// How many frames this layer occupies.
     pub fn length(&self) -> u32 {
         self.frames.length()
+    }
+
+    /// How many keyframes this layer holds.
+    ///
+    /// One is a single still, however long it is held. More than one means a
+    /// second drawing or the two ends of a tween — that is, animation. Used to
+    /// tell an animated symbol or asset from a static one.
+    pub fn keyframe_count(&self) -> usize {
+        self.frames.keyframe_count()
     }
 
     /// Add an object to the keyframe governing `frame`.
@@ -254,6 +368,8 @@ pub struct MaskGroup {
     pub mask: LayerId,
     /// Clipped layers, front to back, as stored.
     pub masked: Vec<LayerId>,
+    /// The mask hides what it covers instead of revealing it.
+    pub inverted: bool,
 }
 
 /// The ordered stack of layers in a scene or symbol timeline.
@@ -379,6 +495,154 @@ impl LayerStack {
         true
     }
 
+    // -- layer parenting ------------------------------------------------------
+
+    /// What a layer's artwork inherits from the layer it follows.
+    ///
+    /// Animate's Layer Parenting: move the body and the head goes with it. The
+    /// inherited transform is the **motion** of every layer above this one in
+    /// the follow chain — how far each has travelled from its own first
+    /// keyframe — composed outermost first.
+    ///
+    /// Motion, not position, is what is inherited. A head drawn in the right
+    /// place must stay in the right place the moment it is parented; inheriting
+    /// the body's absolute transform would fling it across the stage as soon as
+    /// the link was made, which is not what parenting means to an animator.
+    pub fn inherited_transform(&self, id: LayerId, at: impl crate::time::AtTime) -> Affine {
+        // Each step carries the layer it follows **and which bone of it**, so
+        // a face can follow a head while the arm it is standing next to follows
+        // the whole body.
+        let mut chain: Vec<(LayerId, Option<usize>)> = Vec::new();
+        let mut current = self.get(id).map(|l| (l.follows, l.follows_bone));
+        // Bounded by the layer count: a corrupt file can hold a follow cycle,
+        // and this must terminate rather than hang the renderer.
+        for _ in 0..self.layers.len() {
+            let Some((Some(next), bone)) = current else { break };
+            if chain.iter().any(|(seen, _)| *seen == next) {
+                break;
+            }
+            chain.push((next, bone));
+            current = self.get(next).map(|l| (l.follows, l.follows_bone));
+        }
+
+        // Outermost first: the grandparent's motion applies to the parent's,
+        // and both apply to this layer.
+        let mut out = Affine::IDENTITY;
+        for (followed, bone) in chain.iter().rev() {
+            out *= self.motion_of_bone(*followed, at.as_time(), *bone);
+        }
+        out
+    }
+
+    /// How far a layer's artwork has moved from where it started.
+    ///
+    /// # Which transform is "the layer's"
+    ///
+    /// A layer has no transform of its own — its objects do. This takes the
+    /// **first object on the layer** as the thing that represents it, because
+    /// layer parenting is used with one symbol per layer: that is how a rig is
+    /// built in Animate, and the Parent column exists to serve it. A layer
+    /// holding loose artwork can still be followed; it is the first object that
+    /// leads.
+    ///
+    /// Recorded as a deviation rather than hidden: Animate tracks a
+    /// transformation for the layer itself.
+    pub fn motion_of(&self, id: LayerId, at: impl crate::time::AtTime) -> Affine {
+        self.motion_of_bone(id, at, None)
+    }
+
+    /// [`Self::motion_of`], optionally through one bone of the layer's rig.
+    ///
+    /// See [`Layer::follows_bone`] for why a link would want that. `None` for
+    /// the bone is exactly the plain motion, so the two share every line.
+    pub fn motion_of_bone(
+        &self,
+        id: LayerId,
+        at: impl crate::time::AtTime,
+        bone: Option<usize>,
+    ) -> Affine {
+        let Some(layer) = self.get(id) else {
+            return Affine::IDENTITY;
+        };
+        // The bone's own contribution: how far it has turned from the pose the
+        // artwork was drawn in, about its own head. `pose_transform` is the
+        // identity at rest, which is what makes this compose with the plain
+        // motion below rather than replacing it.
+        let through = |object: &crate::Object| match (bone, &object.kind) {
+            (Some(index), crate::ObjectKind::Armature(rig)) if index < rig.armature.len() => {
+                rig.armature.pose_transform(index)
+            }
+            _ => Affine::IDENTITY,
+        };
+        let anchor = |at: f64| {
+            layer
+                .frames
+                .resolved_at(at)
+                .iter()
+                .next()
+                .map(|object| object.transform * through(object))
+        };
+        let Some(now) = anchor(at.as_time()) else {
+            return Affine::IDENTITY;
+        };
+        // The pose the link was made at, when there is one. Falling back to the
+        // first keyframe keeps documents written before rest poses existed
+        // behaving as they did — and those are exactly the documents whose
+        // parenting only ever showed up once they were animated.
+        let rest = match layer.rest_pose {
+            Some(recorded) => recorded,
+            None => {
+                let Some(rest_frame) = layer.frames.keyframes().first().map(|k| k.start) else {
+                    return Affine::IDENTITY;
+                };
+                let Some(rest) = anchor(rest_frame as f64) else {
+                    return Affine::IDENTITY;
+                };
+                rest
+            }
+        };
+
+        // A rest pose scaled to nothing has no inverse; a layer like that
+        // simply passes nothing on, rather than scattering its children.
+        let c = rest.as_coeffs();
+        let determinant = c[0] * c[3] - c[1] * c[2];
+        if determinant.abs() < 1e-12 {
+            return Affine::IDENTITY;
+        }
+        now * rest.inverse()
+    }
+
+    /// May `layer` follow `target` without making a cycle?
+    ///
+    /// A cycle would be a layer that follows itself through some chain, and the
+    /// renderer would have nothing sensible to draw. Refusing the link is
+    /// friendlier than resolving it arbitrarily.
+    pub fn can_follow(&self, layer: LayerId, target: LayerId) -> bool {
+        if layer == target || self.get(target).is_none() {
+            return false;
+        }
+        // Walk up from the target: if this layer is already above it, linking
+        // would close the loop.
+        let mut current = Some(target);
+        for _ in 0..self.layers.len() {
+            let Some(id) = current else { return true };
+            if id == layer {
+                return false;
+            }
+            current = self.get(id).and_then(|l| l.follows);
+        }
+        false
+    }
+
+    /// Every layer that follows `id`, directly.
+    pub fn followers_of(&self, id: LayerId) -> Vec<LayerId> {
+        self.layers
+            .iter()
+            .filter(|l| l.follows == Some(id))
+            .map(|l| l.id)
+            .collect()
+    }
+
     /// Locked directly, or inside a locked folder.
     pub fn is_effectively_locked(&self, id: LayerId) -> bool {
         let Some(mut layer) = self.get(id) else {
@@ -410,7 +674,7 @@ impl LayerStack {
     pub fn mask_groups(&self) -> Vec<MaskGroup> {
         let mut groups = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
-            if layer.kind != LayerKind::Mask {
+            if !layer.kind.is_mask() {
                 continue;
             }
             let mut masked = Vec::new();
@@ -423,6 +687,7 @@ impl LayerStack {
             groups.push(MaskGroup {
                 mask: layer.id,
                 masked,
+                inverted: layer.kind.is_inverted_mask(),
             });
         }
         groups
@@ -459,6 +724,58 @@ impl LayerStack {
             .filter(move |l| l.is_drawable_at(frame) && self.is_effectively_visible(l.id))
     }
 
+    /// Back to front, ordered by layer depth rather than by the timeline.
+    ///
+    /// Furthest from the camera (largest depth) is painted first. A mask and its
+    /// run of masked layers move as **one unit** and keep their relative order,
+    /// so the mask still owns an unbroken run — the invariant the render walk
+    /// relies on. The sort is **stable**, so layers at equal depth keep the
+    /// timeline's order; with every depth equal the result is exactly
+    /// [`Self::paint_order`], which is what makes the feature free for any
+    /// document that leaves depth alone.
+    pub fn depth_paint_order(&self) -> Vec<&Arc<Layer>> {
+        // Units in timeline (front-to-back) order, each tagged with the depth it
+        // sorts by — the mask's, for a mask group.
+        let mut units: Vec<(f64, Vec<&Arc<Layer>>)> = Vec::new();
+        let mut i = 0;
+        while i < self.layers.len() {
+            let layer = &self.layers[i];
+            if layer.kind.is_mask() {
+                let mut unit = vec![layer];
+                let mut j = i + 1;
+                while j < self.layers.len() && self.layers[j].kind == LayerKind::Masked {
+                    unit.push(&self.layers[j]);
+                    j += 1;
+                }
+                units.push((layer.depth, unit));
+                i = j;
+            } else {
+                units.push((layer.depth, vec![layer]));
+                i += 1;
+            }
+        }
+
+        // Reverse to paint order (back to front), inside units and out, so the
+        // pre-sort sequence is exactly `paint_order()`. Then a stable sort by
+        // depth descending puts the furthest unit first and leaves equal depths
+        // in that paint order — byte-identical output when nothing uses depth.
+        units.reverse();
+        for (_, unit) in &mut units {
+            unit.reverse();
+        }
+        units.sort_by(|a, b| b.0.total_cmp(&a.0));
+        units.into_iter().flat_map(|(_, unit)| unit).collect()
+    }
+
+    /// Drawable layers at `frame`, depth-ordered. The depth-sorted sibling of
+    /// [`Self::drawable_at`], used when the stage's `sort_by_depth` is on.
+    pub fn drawable_at_by_depth(&self, frame: u32) -> Vec<&Arc<Layer>> {
+        self.depth_paint_order()
+            .into_iter()
+            .filter(|l| l.is_drawable_at(frame) && self.is_effectively_visible(l.id))
+            .collect()
+    }
+
     /// Longest layer, which is the document's frame count.
     pub fn frame_count(&self) -> u32 {
         self.layers.iter().map(|l| l.length()).max().unwrap_or(1)
@@ -467,8 +784,36 @@ impl LayerStack {
     /// Layers the user can currently select on.
     pub fn selectable(&self) -> impl Iterator<Item = &Arc<Layer>> {
         self.paint_order().filter(|l| {
-            l.is_editable() && self.is_effectively_visible(l.id) && !self.is_effectively_locked(l.id)
+            l.is_editable()
+                && self.is_effectively_visible(l.id)
+                && !self.is_effectively_locked(l.id)
         })
+    }
+
+    /// Layers the user can select on, **in the order they are painted**.
+    ///
+    /// `by_depth` mirrors the stage's `sort_by_depth`. A hit test walks these
+    /// back to front and keeps the last match, so it only finds what is
+    /// actually on top if it walks them in the order they were drawn. With
+    /// depth sorting on, [`Self::selectable`] walks the timeline's order
+    /// instead — so a layer pushed to the back of the shot but sitting high in
+    /// the timeline won the click, and the artwork visibly in front of it could
+    /// not be selected at all.
+    ///
+    /// With depth sorting off, or with every depth equal, this is exactly
+    /// [`Self::selectable`].
+    pub fn selectable_in_paint_order(&self, by_depth: bool) -> Vec<&Arc<Layer>> {
+        if !by_depth {
+            return self.selectable().collect();
+        }
+        self.depth_paint_order()
+            .into_iter()
+            .filter(|l| {
+                l.is_editable()
+                    && self.is_effectively_visible(l.id)
+                    && !self.is_effectively_locked(l.id)
+            })
+            .collect()
     }
 }
 
@@ -510,10 +855,70 @@ mod tests {
         );
     }
 
+    /// With every depth equal, the depth order is exactly the timeline order —
+    /// the guarantee that makes the feature free for documents that ignore it.
+    #[test]
+    fn depth_order_with_equal_depths_matches_paint_order() {
+        let s = stack(&[
+            (1, "top", LayerKind::Normal),
+            (2, "middle", LayerKind::Normal),
+            (3, "bottom", LayerKind::Normal),
+        ]);
+        let plain: Vec<u64> = s.paint_order().map(|l| l.id.0).collect();
+        let by_depth: Vec<u64> = s.depth_paint_order().iter().map(|l| l.id.0).collect();
+        assert_eq!(by_depth, plain);
+    }
+
+    /// A layer pushed into the distance paints behind a nearer one, whatever the
+    /// timeline says.
+    #[test]
+    fn depth_order_puts_the_furthest_layer_first() {
+        let mut s = stack(&[
+            (1, "near-on-top", LayerKind::Normal),
+            (2, "far-below", LayerKind::Normal),
+        ]);
+        // Make the top layer nearer (small depth) and the bottom one far.
+        s.update(LayerId(1), |l| l.depth = -100.0);
+        s.update(LayerId(2), |l| l.depth = 500.0);
+
+        let by_depth: Vec<u64> = s.depth_paint_order().iter().map(|l| l.id.0).collect();
+        // Furthest (id 2, depth 500) paints first; nearest (id 1) last, on top.
+        assert_eq!(by_depth, vec![2, 1]);
+    }
+
+    /// A mask and its masked run move together, keeping the run unbroken.
+    #[test]
+    fn depth_order_keeps_a_mask_with_its_run() {
+        let mut s = stack(&[
+            (1, "faraway", LayerKind::Normal),
+            (2, "mask", LayerKind::Mask),
+            (3, "masked", LayerKind::Masked),
+        ]);
+        // Push the plain layer far away so it must sort behind the mask group,
+        // and give the mask group a nearer depth.
+        s.update(LayerId(1), |l| l.depth = 900.0);
+        s.update(LayerId(2), |l| l.depth = 0.0);
+
+        let ids: Vec<u64> = s.depth_paint_order().iter().map(|l| l.id.0).collect();
+        // The far plain layer paints first; then the mask group, mask and its
+        // masked layer still adjacent.
+        assert_eq!(ids, vec![1, 3, 2]);
+        let mask_pos = ids.iter().position(|&i| i == 2).unwrap();
+        let masked_pos = ids.iter().position(|&i| i == 3).unwrap();
+        assert_eq!(
+            mask_pos.abs_diff(masked_pos),
+            1,
+            "the mask and its masked layer must stay adjacent"
+        );
+    }
+
     #[test]
     fn only_folders_are_excluded_from_stage_painting() {
         assert!(LayerKind::Normal.paints_on_stage());
-        assert!(LayerKind::Guide.paints_on_stage(), "guides show while authoring");
+        assert!(
+            LayerKind::Guide.paints_on_stage(),
+            "guides show while authoring"
+        );
         assert!(!LayerKind::Folder.paints_on_stage());
     }
 
@@ -523,7 +928,10 @@ mod tests {
         assert!(LayerKind::Mask.paints_to_output());
         assert!(LayerKind::Masked.paints_to_output());
         assert!(LayerKind::Guided.paints_to_output());
-        assert!(!LayerKind::Guide.paints_to_output(), "guides are authoring aids");
+        assert!(
+            !LayerKind::Guide.paints_to_output(),
+            "guides are authoring aids"
+        );
         assert!(!LayerKind::Folder.paints_to_output());
     }
 
@@ -567,6 +975,34 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].masked, vec![LayerId(2)]);
         assert_eq!(groups[1].masked, vec![LayerId(4)]);
+    }
+
+    /// An inverse mask claims its run by exactly the same positional rule,
+    /// and says which way round it works.
+    #[test]
+    fn an_inverse_mask_claims_the_run_below_it_and_is_marked_inverted() {
+        let s = stack(&[
+            (1, "Hole", LayerKind::InverseMask),
+            (2, "Masked A", LayerKind::Masked),
+            (3, "Masked B", LayerKind::Masked),
+            (4, "Normal", LayerKind::Normal),
+        ]);
+        let groups = s.mask_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].masked, vec![LayerId(2), LayerId(3)]);
+        assert!(groups[0].inverted, "the group must know it is inverted");
+        assert_eq!(s.mask_for(LayerId(2)), Some(LayerId(1)));
+    }
+
+    /// And an ordinary mask is not marked inverted, which is the half of the
+    /// pair that a wrong default would break silently.
+    #[test]
+    fn an_ordinary_mask_is_not_inverted() {
+        let s = stack(&[
+            (1, "Mask", LayerKind::Mask),
+            (2, "Masked", LayerKind::Masked),
+        ]);
+        assert!(!s.mask_groups()[0].inverted);
     }
 
     #[test]
@@ -665,7 +1101,10 @@ mod tests {
         // Out-of-range clamps rather than panicking.
         assert!(s.reorder(LayerId(3), 99));
         assert_eq!(s.iter().last().unwrap().id, LayerId(3));
-        assert!(!s.reorder(LayerId(404), 0), "unknown layer should report failure");
+        assert!(
+            !s.reorder(LayerId(404), 0),
+            "unknown layer should report failure"
+        );
     }
 
     #[test]
@@ -692,10 +1131,7 @@ mod tests {
     /// Editing one layer must not deep-copy the others.
     #[test]
     fn updating_one_layer_leaves_the_rest_shared() {
-        let mut a = stack(&[
-            (1, "A", LayerKind::Normal),
-            (2, "B", LayerKind::Normal),
-        ]);
+        let mut a = stack(&[(1, "A", LayerKind::Normal), (2, "B", LayerKind::Normal)]);
         let snapshot = a.clone();
 
         let untouched_before = Arc::as_ptr(snapshot.get(LayerId(2)).unwrap());
@@ -708,5 +1144,135 @@ mod tests {
         );
         assert_eq!(snapshot.get(LayerId(1)).unwrap().name, "A");
         assert_eq!(a.get(LayerId(1)).unwrap().name, "renamed");
+    }
+    // -- layer parenting -----------------------------------------------------
+
+    /// A layer holding one square, keyed at frame 0 and moved by `(dx, dy)` at
+    /// frame 10, with a classic tween between them.
+    fn moving_layer(id: u64, name: &str, dx: f64, dy: f64) -> Layer {
+        use crate::object::{Object, ObjectId, ShapeData};
+        use buzz_geom::{Rect, Shape as _};
+
+        let mut layer = Layer::normal(LayerId(id), name);
+        let art = || {
+            Arc::new(Object::shape(
+                ObjectId(id * 100),
+                ShapeData::filled(Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9), Color::BLACK),
+            ))
+        };
+        layer.frames.set_objects(0, vec![art()]);
+        layer.frames.insert_keyframe(10);
+        layer.frames.set_objects(
+            10,
+            vec![Arc::new(
+                Object::shape(
+                    ObjectId(id * 100),
+                    ShapeData::filled(Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9), Color::BLACK),
+                )
+                .with_transform(Affine::translate((dx, dy))),
+            )],
+        );
+        layer
+    }
+
+    /// The point of the feature: move the body, and the head goes with it.
+    #[test]
+    fn a_following_layer_inherits_the_motion_of_the_one_it_follows() {
+        let mut s = LayerStack::new();
+        s.push_front(moving_layer(1, "Body", 60.0, 0.0));
+        s.push_front(Layer::normal(LayerId(2), "Head"));
+        s.update(LayerId(2), |l| l.follows = Some(LayerId(1)));
+
+        // At the first keyframe the body has not moved, so nothing is inherited
+        // — a layer must not jump the moment it is parented.
+        let at_rest = s.inherited_transform(LayerId(2), 0);
+        assert_eq!(at_rest, Affine::IDENTITY);
+
+        // At frame 10 the body has travelled 60 to the right, and so has the
+        // head — without anything having been keyed on the head at all.
+        let moved = s.inherited_transform(LayerId(2), 10);
+        assert_eq!(moved, Affine::translate((60.0, 0.0)));
+    }
+
+    /// Motion accumulates down a chain: hand follows arm follows body.
+    #[test]
+    fn motion_accumulates_down_a_chain() {
+        let mut s = LayerStack::new();
+        s.push_front(moving_layer(1, "Body", 10.0, 0.0));
+        s.push_front(moving_layer(2, "Arm", 0.0, 5.0));
+        s.push_front(Layer::normal(LayerId(3), "Hand"));
+        s.update(LayerId(2), |l| l.follows = Some(LayerId(1)));
+        s.update(LayerId(3), |l| l.follows = Some(LayerId(2)));
+
+        let hand = s.inherited_transform(LayerId(3), 10);
+        assert_eq!(hand, Affine::translate((10.0, 5.0)));
+
+        // The arm inherits only the body's motion; its own is already in its
+        // artwork and must not be applied twice.
+        assert_eq!(
+            s.inherited_transform(LayerId(2), 10),
+            Affine::translate((10.0, 0.0))
+        );
+    }
+
+    /// A layer that follows nothing is untouched, which is what keeps every
+    /// document that predates the feature drawing exactly as it did.
+    #[test]
+    fn a_layer_that_follows_nothing_inherits_nothing() {
+        let s = stack(&[(1, "a", LayerKind::Normal), (2, "b", LayerKind::Normal)]);
+        assert_eq!(s.inherited_transform(LayerId(1), 7), Affine::IDENTITY);
+    }
+
+    #[test]
+    fn a_layer_cannot_follow_itself_or_close_a_loop() {
+        let mut s = LayerStack::new();
+        s.push_front(Layer::normal(LayerId(1), "a"));
+        s.push_front(Layer::normal(LayerId(2), "b"));
+        s.push_front(Layer::normal(LayerId(3), "c"));
+
+        assert!(!s.can_follow(LayerId(1), LayerId(1)), "itself");
+        assert!(s.can_follow(LayerId(2), LayerId(1)));
+        s.update(LayerId(2), |l| l.follows = Some(LayerId(1)));
+        s.update(LayerId(3), |l| l.follows = Some(LayerId(2)));
+
+        // 1 following 3 would close 1 -> 3 -> 2 -> 1.
+        assert!(!s.can_follow(LayerId(1), LayerId(3)));
+        assert!(!s.can_follow(LayerId(1), LayerId(2)));
+    }
+
+    /// A corrupt file can hold a cycle anyway; resolving it must terminate.
+    #[test]
+    fn a_follow_cycle_does_not_hang() {
+        let mut s = LayerStack::new();
+        s.push_front(Layer::normal(LayerId(1), "a"));
+        s.push_front(Layer::normal(LayerId(2), "b"));
+        s.update(LayerId(1), |l| l.follows = Some(LayerId(2)));
+        s.update(LayerId(2), |l| l.follows = Some(LayerId(1)));
+
+        let _ = s.inherited_transform(LayerId(1), 3);
+        let _ = s.inherited_transform(LayerId(2), 3);
+    }
+
+    /// Following a layer that has since been deleted is harmless.
+    #[test]
+    fn following_a_missing_layer_inherits_nothing() {
+        let mut s = LayerStack::new();
+        s.push_front(Layer::normal(LayerId(1), "a"));
+        s.update(LayerId(1), |l| l.follows = Some(LayerId(99)));
+        assert_eq!(s.inherited_transform(LayerId(1), 4), Affine::IDENTITY);
+    }
+
+    #[test]
+    fn followers_are_found_so_a_deleted_layer_can_release_them() {
+        let mut s = LayerStack::new();
+        s.push_front(Layer::normal(LayerId(1), "body"));
+        s.push_front(Layer::normal(LayerId(2), "head"));
+        s.push_front(Layer::normal(LayerId(3), "hat"));
+        s.update(LayerId(2), |l| l.follows = Some(LayerId(1)));
+        s.update(LayerId(3), |l| l.follows = Some(LayerId(1)));
+
+        let mut found = s.followers_of(LayerId(1));
+        found.sort_by_key(|l| l.0);
+        assert_eq!(found, vec![LayerId(2), LayerId(3)]);
     }
 }

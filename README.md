@@ -1,4 +1,6 @@
-# BuzzAnimate
+<img src="assets/banner.png" alt="Spilled Coffee Studios" width="100%">
+
+# <img src="assets/logo-64.png" width="28" align="top"> BuzzAnimate
 
 GPU-accelerated vector animation. A from-scratch alternative to Adobe Animate,
 targeting the three limits Animate inherited from 1996-era Flash:
@@ -15,7 +17,17 @@ AVM2/ABC), ISO standards (PDF), or plain XML (XFL).
 
 ---
 
-## Status: Phases 0–3 complete
+## 📚 Documentation & User Guides
+
+New to BuzzAnimate or migrating from Adobe Animate? Explore the complete documentation suite:
+
+- 📖 [**Complete User Guide & Feature Reference Manual**](USER_GUIDE.md) — Comprehensive guide with snapshots, tool catalog, lighting, rigging, lip sync, and an exhaustive A–Z index.
+- 🚀 [**5-Minute Quickstart Tutorial**](docs/QUICKSTART.md) — Fast-track tutorial to draw, keyframe, tween, light, and export your first animated shot.
+- ⌨️ [**Keyboard & Mouse Shortcuts Cheatsheet**](docs/SHORTCUTS.md) — Instant lookup for all 23 single-key tools, timeline hotkeys, navigation chords, and symbols.
+
+---
+
+## Status: Phases 0–5 and 7 complete
 
 BuzzAnimate is now a working editor. It opens on an Animate-shaped window —
 menu bar, tool strip, rulers around a white stage on a grey pasteboard, layers
@@ -27,15 +39,33 @@ Animate's **Merge Shape** model works as it should: overlapping fills of the
 same colour fuse, a different colour cuts. Object Drawing is the alternative,
 on the `J` toggle.
 
-Phase 3 added the **timeline**: keyframes and frame spans with Animate's
-F5/F6/F7 behaviour, a frame grid using Animate's drawing conventions, playback
-that runs on wall-clock time rather than frames rendered, onion skinning, and
-an animated **camera** whose keys interpolate — zoom geometrically, rotation by
-the shortest way round.
+Since then: the **timeline** (keyframes and spans with Animate's F5/F6/F7
+behaviour, playback on wall-clock time, onion skinning, an animated camera),
+**symbols, a library and tweens**, **importers** for `.fla`/`.xfl`, `.swf` and
+`.pdf`/`.ai`, fluid/pattern/art **brushes**, **layer depth** with camera
+parallax, **scripting** through Animate's `fl` / `document` API, **rigging**
+(armatures, FABRIK inverse kinematics with joint limits and pins, skinning and
+puppet warp, poses that tween), **PNG export** of a frame or a range,
+**masking**, **sound** — a soundtrack that stays audible inside nested
+symbols, draws its waveform in the timeline, and drives automatic lip sync —
+**lighting** — a sun, a sky or a lamp, dropped on the stage and aimed by
+dragging it, with the artwork's colours, highlights and shadow direction all
+following where it is put — **filters** (blur, drop shadow, glow, bevel, adjust
+colour) and blend modes, and **layer parenting**, so a head layer follows a
+body layer without a bone in sight. Every panel docks, floats, closes and
+locks, and the arrangement is still there next time. The camera is **spatial**:
+pitch and yaw it and the stage tips away in real perspective, a rectangle drawn
+as a trapezoid — and **objects turn too**, so three flat cards at different
+angles make a tree the camera discovers rather than slides past.
 
-Not yet implemented, and honestly marked as such in the toolbar: tweening,
-gradients, Text, Lasso, Bézier pen authoring, multiple Scenes, clipboard. See
-`PROGRESS.md` §7 for the full list.
+**Video comes out too**: MP4/MOV encoded on the GPU through NVENC with the
+soundtrack muxed in, plus animated GIF and WebP — all on a **background queue**
+with a Tasks panel, so a second export joins the line rather than being refused
+and the window never freezes while one runs.
+
+Not yet implemented, and honestly marked as such in the toolbar: Text, Bézier pen
+authoring, multiple Scenes, clipboard. HTML5 export, AS3 and the Bind tool are the
+largest gaps. See `PROGRESS.md` §7 for the full list.
 
 ---
 
@@ -101,17 +131,51 @@ after that. `Camera::screen_precision_px()` reports it live in the HUD.
 
 ## Running it
 
+**Windows: double-click `BuzzAnimate.bat`.** It builds first when the sources
+have changed — a no-op once the build is warm — and then starts the editor. A
+launcher that quietly ran last week's binary would be a confusing thing to own.
+
+**macOS & Linux: run `./buzzanimate.sh`** (or double-click `BuzzAnimate.command` on macOS).
+
+```sh
+# macOS / Linux
+./buzzanimate.sh                        an empty document
+./buzzanimate.sh "path/to/Scene.buzz"   open a document
+./buzzanimate.sh --gpu "Apple M"        choose a graphics adapter by name
+./buzzanimate.sh --dev                  the debug build (faster to compile)
+```
+
+```bat
+BuzzAnimate.bat                        an empty document
+BuzzAnimate.bat "C:\work\Scene.buzz"    open a document
+BuzzAnimate.bat --gpu NVIDIA           choose a graphics adapter by name
+BuzzAnimate.bat --script tidy.js       run a script at startup
+BuzzAnimate.bat --dev                  the debug build: quicker to compile,
+                                       slower to draw
+```
+
+`Create Desktop Shortcut.bat` puts a shortcut on the desktop. It points at the
+launcher rather than at the binary, so it keeps working across a rebuild, a
+`cargo clean`, and switching between the release and debug builds.
+
+The console window that appears belongs to the editor: the adapter table is
+printed there at startup, and so is the message telling you where your work was
+written if the program ever crashes. Closing it closes the editor.
+
+From a terminal, on any platform:
+
 ```sh
 cargo run --release -p buzz-app
 ```
 
+Moving around the stage, whatever tool is selected:
+
 | Input | Action |
 |---|---|
 | Mouse wheel | Zoom about the cursor, unbounded |
-| Drag | Pan |
-| `R` | Reset / fit |
-| `Esc` | Quit |
-| HUD buttons | Jump to 2000% / 1e6 / 1e9 / 1e12, stress all cores |
+| Space + drag | Pan |
+| Middle-button drag | Pan |
+| Zoom control, top right of the stage | Zoom out / in, a draggable percentage, presets, Fit in Window |
 
 Flags: `--gpu <name-or-index>` forces an adapter, `--integrated` prefers iGPU.
 The adapter table is printed at startup.
@@ -135,16 +199,23 @@ silently. Every adapter is scored and the table is logged:
 
 | Crate | Role |
 |---|---|
-| `buzz-geom` | `f64` geometry: rebasing camera, clipping, booleans, hit-testing, path editing |
+| `buzz-geom` | `f64` geometry: rebasing camera, perspective projection, clipping, booleans, hit-testing, path editing |
 | `buzz-jobs` | Two-pool work-stealing job system; per-worker CPU metrics |
 | `buzz-render` | GPU adapter selection; Vello scene building |
 | `buzz-scene` | Copy-on-write document model; Animate's six layer types; R-tree index |
 | `buzz-doc` | `.buzz` format, undo history, autosave |
 | `buzz-ui` | Theme, menus, shortcut map, tool catalogue, panels, snapping |
 | `buzz-app` | Window, frame loop, editor state, tool behaviour, stage rendering |
+| `buzz-import-xfl` · `buzz-import-swf` · `buzz-import-pdf` | Readers for `.fla`/`.xfl`, `.swf` and `.pdf`/`.ai` |
+| `buzz-script` | Sandboxed JavaScript over the document — Animate's JSFL API |
+| `buzz-rig` | Armatures, FABRIK inverse kinematics, skinning, MLS warping |
+| `buzz-export` | Rendering frames out: PNG images and sequences |
+| `buzz-audio` | Decoding, waveforms, playback and lip-sync analysis |
+| `buzz-light` | Suns, skies and lamps; shading, highlights and cast shadows as vector geometry |
+| `buzz-fx` | Animate's filters — blur, drop shadow, glow, bevel, adjust colour — as vector geometry |
 
-Remaining crates (`buzz-scene`, `buzz-timeline`, `buzz-import-xfl`,
-`buzz-avm`, …) arrive with their phases; empty placeholders would only be noise.
+Remaining crates (`buzz-avm`, …) arrive with their phases; empty
+placeholders would only be noise.
 
 ### Dependency pinning — read before upgrading
 
@@ -164,7 +235,7 @@ grep -A1 '^name = "wgpu"' Cargo.lock   # must list exactly one version
 ## Testing
 
 ```sh
-cargo test --workspace            # 395 tests
+cargo test --workspace            # 1 084 tests
 cargo clippy --workspace --all-targets
 cargo test -p buzz-app --test headless_zoom --release -- --nocapture
 ```
@@ -177,14 +248,30 @@ GPU is present.
 
 ## Roadmap
 
-Phase 0 complete. Next: **Phase 1 — geometry and document core** (boolean ops,
-copy-on-write scene graph, R-tree spatial index, `.buzz` format, undo).
+Done: engine foundation · geometry and document core · drawing tools and the
+application shell · timeline · symbols, library and tweens · importers ·
+rigging and IK · PNG export · the scripting API · lighting · filters and
+blend modes · layer parenting · a workspace you arrange · a camera that
+tilts · 3D rotation.
 
-Then: drawing tools and UI shell · timeline · symbols and tweens · importers
-(`.fla`/`.xfl`, `.pdf`/`.ai`, `.swf`) · export (MP4 via NVENC, PNG, GIF, HTML5)
-· rigging and IK · scripting and ActionScript.
+**The engine waves** are underway: Wave 4 moved every long job — scripts, imports,
+opens, file dialogs, the first lit frame — off the UI thread so the window never
+freezes, and Wave 5 gave export a background queue, a Tasks panel, presets, and GIF
+and WebP output. Still to come: raster layers beside the vectors, a compositor, 2.5D
+depth and keyframed lights. `ARCHITECTURE.md` is the design; `IMPROVEMENTS.md` Part II
+is the summary. After those, HTML5 Canvas/SVG export and Phase 8's ActionScript runtime.
 
-**CP-1.1 done:** document-space clipping (`buzz_geom::RenderClip`) has replaced
-Phase 0's culling, so shapes far larger than the viewport are now drawn
-correctly instead of vanishing. Items drawn at 2×10¹⁴% went from 70 to 213 with
-GPU time still 0.8–1.7 ms.
+`ARCHITECTURE.md` is the forward design: how the engine waves are built, the rules
+that keep the window responsive, and what each one costs.
+
+`OVERVIEW.md` is the one-page consolidation: what is implemented, what the
+restrictions are — hard limits, absences and deliberate deviations, kept apart
+because the difference matters — and what is suggested next.
+
+`PROGRESS.md` is the detailed record: what was built, what was measured, what
+was found broken along the way, and every deviation from Animate with its
+reason.
+
+`IMPROVEMENTS.md` is the forward half of the same record: where the time
+actually goes when an animator sets up a stage, read out of the source, and the
+three waves of work that would close it.

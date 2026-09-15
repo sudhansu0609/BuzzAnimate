@@ -198,7 +198,11 @@ mod tests {
         let PathEl::CurveTo(c1, _, end) = elements[2] else {
             panic!("expected a curve")
         };
-        assert_eq!(c1, Point::new(120.0, -10.0), "outgoing handle should follow");
+        assert_eq!(
+            c1,
+            Point::new(120.0, -10.0),
+            "outgoing handle should follow"
+        );
         assert_eq!(end, Point::new(200.0, 0.0), "the far anchor must not move");
     }
 
@@ -245,7 +249,11 @@ mod tests {
         let mut path = triangle();
         assert!(move_anchor(&mut path, 0, Vec2::new(-10.0, -10.0)));
         assert_eq!(anchors(&path)[0].point, Point::new(-10.0, -10.0));
-        assert!(path.elements().iter().any(|e| matches!(e, PathEl::ClosePath)));
+        assert!(
+            path.elements()
+                .iter()
+                .any(|e| matches!(e, PathEl::ClosePath))
+        );
     }
 
     #[test]
@@ -254,7 +262,10 @@ mod tests {
         let before = path.elements().to_vec();
 
         assert!(!move_anchor(&mut path, 999, Vec2::new(1.0, 1.0)));
-        assert!(!move_anchor(&mut path, 3, Vec2::new(1.0, 1.0)), "close_path");
+        assert!(
+            !move_anchor(&mut path, 3, Vec2::new(1.0, 1.0)),
+            "close_path"
+        );
         assert!(!move_anchor(&mut path, 0, Vec2::new(f64::NAN, 0.0)));
         assert!(!move_anchor(&mut path, 0, Vec2::new(0.0, f64::INFINITY)));
 

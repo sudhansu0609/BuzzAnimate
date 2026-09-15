@@ -93,7 +93,11 @@ impl Selection {
     pub fn report(&self) -> String {
         let mut s = String::from("GPU adapters:\n");
         for c in &self.candidates {
-            let marker = if c.index == self.chosen.index { "->" } else { "  " };
+            let marker = if c.index == self.chosen.index {
+                "->"
+            } else {
+                "  "
+            };
             s.push_str(&format!("{marker} {c}\n"));
         }
         s
@@ -201,7 +205,12 @@ fn score(info: &Traits<'_>, prefer_integrated: bool) -> (Option<i64>, String) {
     // adapters. Demote by name where the device type does not reveal them.
     let lname = info.name.to_ascii_lowercase();
     const VIRTUAL_HINTS: [&str; 6] = [
-        "virtual", "remote", "idd", "mirror", "basic render", "software",
+        "virtual",
+        "remote",
+        "idd",
+        "mirror",
+        "basic render",
+        "software",
     ];
     if VIRTUAL_HINTS.iter().any(|h| lname.contains(h)) {
         score -= 900;
@@ -216,7 +225,10 @@ fn score(info: &Traits<'_>, prefer_integrated: bool) -> (Option<i64>, String) {
 /// Enumerates DX12 and Vulkan only: on Windows those are the backends that can
 /// actually run Vello's compute pipelines, and including GL would let a weak
 /// fallback win on a machine where the real driver failed to load.
-pub async fn select(instance: &Instance, preference: &GpuPreference) -> Result<Selection, SelectionError> {
+pub async fn select(
+    instance: &Instance,
+    preference: &GpuPreference,
+) -> Result<Selection, SelectionError> {
     let adapters = instance
         .enumerate_adapters(Backends::DX12 | Backends::VULKAN)
         .await;
@@ -306,7 +318,12 @@ pub async fn select(instance: &Instance, preference: &GpuPreference) -> Result<S
 mod tests {
     use super::*;
 
-    fn info(name: &str, device_type: DeviceType, backend: wgpu::Backend, vendor: u32) -> Traits<'_> {
+    fn info(
+        name: &str,
+        device_type: DeviceType,
+        backend: wgpu::Backend,
+        vendor: u32,
+    ) -> Traits<'_> {
         Traits {
             name,
             vendor,
@@ -335,7 +352,10 @@ mod tests {
             ),
             false,
         );
-        assert!(nv > intel, "discrete {nv:?} should beat integrated {intel:?}");
+        assert!(
+            nv > intel,
+            "discrete {nv:?} should beat integrated {intel:?}"
+        );
     }
 
     #[test]
@@ -407,8 +427,18 @@ mod tests {
 
     #[test]
     fn gl_backend_is_a_last_resort() {
-        let dx12 = info("GPU", DeviceType::DiscreteGpu, wgpu::Backend::Dx12, vendor::AMD);
-        let gl = info("GPU", DeviceType::DiscreteGpu, wgpu::Backend::Gl, vendor::AMD);
+        let dx12 = info(
+            "GPU",
+            DeviceType::DiscreteGpu,
+            wgpu::Backend::Dx12,
+            vendor::AMD,
+        );
+        let gl = info(
+            "GPU",
+            DeviceType::DiscreteGpu,
+            wgpu::Backend::Gl,
+            vendor::AMD,
+        );
         assert!(score(&dx12, false).0 > score(&gl, false).0);
     }
 
@@ -444,8 +474,9 @@ mod tests {
 
         // Ask for the chosen adapter by a fragment of its own name.
         let fragment: String = auto.chosen.info.name.chars().take(6).collect();
-        let forced = pollster::block_on(select(&instance, &GpuPreference::ByName(fragment.clone())))
-            .expect("override should resolve");
+        let forced =
+            pollster::block_on(select(&instance, &GpuPreference::ByName(fragment.clone())))
+                .expect("override should resolve");
         assert!(
             forced
                 .chosen
@@ -459,9 +490,6 @@ mod tests {
             &instance,
             &GpuPreference::ByName("definitely-not-a-real-gpu".into()),
         ));
-        assert!(matches!(
-            missing,
-            Err(SelectionError::OverrideNotFound(..))
-        ));
+        assert!(matches!(missing, Err(SelectionError::OverrideNotFound(..))));
     }
 }

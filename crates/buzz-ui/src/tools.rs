@@ -15,9 +15,12 @@ use egui::Key;
 pub enum ToolId {
     Selection,
     Subselection,
+    /// Freehand region select — and, on artwork, a freehand cut.
+    Lasso,
+    /// Click a colour and take everything like it.
+    MagicWand,
     FreeTransform,
     GradientTransform,
-    Lasso,
     Pen,
     Text,
     Line,
@@ -27,6 +30,10 @@ pub enum ToolId {
     Pencil,
     Brush,
     Bone,
+    /// Animate's Asset Warp: handles dropped on artwork, dragged to deform it.
+    AssetWarp,
+    /// Draw a curve; the selected object is baked travelling along it.
+    MotionPath,
     PaintBucket,
     InkBottle,
     Eyedropper,
@@ -54,9 +61,10 @@ impl ToolId {
         match self {
             Selection => "Selection",
             Subselection => "Subselection",
+            Lasso => "Lasso",
+            MagicWand => "Magic Wand",
             FreeTransform => "Free Transform",
             GradientTransform => "Gradient Transform",
-            Lasso => "Lasso",
             Pen => "Pen",
             Text => "Text",
             Line => "Line",
@@ -66,6 +74,8 @@ impl ToolId {
             Pencil => "Pencil",
             Brush => "Brush",
             Bone => "Bone",
+            AssetWarp => "Asset Warp",
+            MotionPath => "Motion Path",
             PaintBucket => "Paint Bucket",
             InkBottle => "Ink Bottle",
             Eyedropper => "Eyedropper",
@@ -82,8 +92,12 @@ impl ToolId {
         match self {
             Selection => Some(Key::V),
             Subselection => Some(Key::A),
-            FreeTransform => Some(Key::Q),
             Lasso => Some(Key::L),
+            // Animate has no letter for the Magic Wand — it is a mode of the
+            // Lasso there, not a tool. Here it is its own tool and takes the
+            // free letter next to it. Recorded in PROGRESS.md §7.
+            MagicWand => Some(Key::G),
+            FreeTransform => Some(Key::Q),
             Pen => Some(Key::P),
             Text => Some(Key::T),
             Line => Some(Key::N),
@@ -92,6 +106,11 @@ impl ToolId {
             Pencil => Some(Key::Y),
             Brush => Some(Key::B),
             Bone => Some(Key::M),
+            // Animate's own letter for Asset Warp.
+            AssetWarp => Some(Key::W),
+            // Animate has no motion-path tool; J is free and next to nothing
+            // that would be confused with it.
+            MotionPath => Some(Key::J),
             PaintBucket => Some(Key::K),
             InkBottle => Some(Key::S),
             Eyedropper => Some(Key::I),
@@ -122,11 +141,12 @@ impl ToolId {
         match self {
             Selection => "V",
             Subselection => "A",
+            Lasso => "L",
+            MagicWand => "G",
             FreeTransform => "Q",
             // No shortcut in Animate; both of these render correctly.
             GradientTransform => "◑",
             PolyStar => "☆",
-            Lasso => "L",
             Pen => "P",
             Text => "T",
             Line => "N",
@@ -135,6 +155,8 @@ impl ToolId {
             Pencil => "Y",
             Brush => "B",
             Bone => "M",
+            AssetWarp => "W",
+            MotionPath => "J",
             PaintBucket => "K",
             InkBottle => "S",
             Eyedropper => "I",
@@ -149,13 +171,10 @@ impl ToolId {
     pub fn status(self) -> ToolStatus {
         use ToolId::*;
         match self {
-            Selection | Subselection | FreeTransform | Line | Rectangle | Oval | PolyStar
-            | Pencil | Brush | Eraser | PaintBucket | InkBottle | Eyedropper | Hand | Zoom
-            | Pen | Camera => ToolStatus::Ready,
-            Text => ToolStatus::Planned("Text arrives with Phase 2 follow-up"),
-            Lasso => ToolStatus::Planned("Lasso arrives with Phase 2 follow-up"),
-            GradientTransform => ToolStatus::Planned("Gradients arrive with the Color panel"),
-            Bone => ToolStatus::Planned("Rigging arrives in Phase 7"),
+            Selection | Subselection | Lasso | MagicWand | FreeTransform | Line | Rectangle
+            | Oval | PolyStar | Pencil | Brush | Eraser | PaintBucket | InkBottle | Eyedropper
+            | Hand | Zoom | Pen | Camera | Bone | AssetWarp | MotionPath | GradientTransform
+            | Text => ToolStatus::Ready,
         }
     }
 
@@ -195,8 +214,8 @@ pub const TOOL_GROUPS: &[&[ToolId]] = &[
         ToolId::Subselection,
         ToolId::FreeTransform,
         ToolId::GradientTransform,
-        ToolId::Lasso,
     ],
+    &[ToolId::Lasso, ToolId::MagicWand],
     &[ToolId::Pen, ToolId::Text],
     &[
         ToolId::Line,
@@ -205,8 +224,13 @@ pub const TOOL_GROUPS: &[&[ToolId]] = &[
         ToolId::PolyStar,
     ],
     &[ToolId::Pencil, ToolId::Brush],
-    &[ToolId::Bone],
-    &[ToolId::PaintBucket, ToolId::InkBottle, ToolId::Eyedropper, ToolId::Eraser],
+    &[ToolId::Bone, ToolId::AssetWarp, ToolId::MotionPath],
+    &[
+        ToolId::PaintBucket,
+        ToolId::InkBottle,
+        ToolId::Eyedropper,
+        ToolId::Eraser,
+    ],
     &[ToolId::Camera, ToolId::Hand, ToolId::Zoom],
 ];
 
@@ -234,7 +258,49 @@ mod tests {
             unique.len(),
             "a tool appears in more than one group"
         );
-        assert_eq!(tools.len(), 21, "unexpected tool count");
+        // 21 through Phase 5, plus Asset Warp when rigging landed in Phase 7,
+        // plus the Lasso and the Magic Wand once bitmaps arrived and there was
+        // something for them to cut, plus the Motion Path tool.
+        assert_eq!(tools.len(), 24, "unexpected tool count");
+    }
+
+    /// **Two *object* selection tools, and only two.** Animate's first group is
+    /// Selection and Subselection with the two transform tools, and that is
+    /// what this one is.
+    ///
+    /// The Lasso and the Magic Wand sit in their own group, deliberately. They
+    /// do not pick objects: they mark out a *region* and cut artwork along it.
+    /// Putting them beside Selection would suggest a third and fourth way to
+    /// click on a thing, which is exactly the confusion the two-tool rule was
+    /// there to prevent.
+    #[test]
+    fn there_are_exactly_two_selection_tools() {
+        let selection: Vec<ToolId> = all_tools()
+            .into_iter()
+            .filter(|t| matches!(t, ToolId::Selection | ToolId::Subselection))
+            .collect();
+        assert_eq!(selection.len(), 2);
+
+        // And the first group is those two plus the transform tools, which is
+        // what Animate's first group is.
+        assert_eq!(
+            TOOL_GROUPS[0],
+            &[
+                ToolId::Selection,
+                ToolId::Subselection,
+                ToolId::FreeTransform,
+                ToolId::GradientTransform,
+            ]
+        );
+    }
+
+    /// Every tool in the palette does something now that Text places vector
+    /// type. A greyed-out promise is worse than a missing tool, so there are no
+    /// inert tools left at all.
+    #[test]
+    fn no_tool_is_still_inert() {
+        let waiting: Vec<ToolId> = all_tools().into_iter().filter(|t| !t.is_ready()).collect();
+        assert!(waiting.is_empty(), "unexpected inert tools: {waiting:?}");
     }
 
     /// Muscle memory: these letters must do what an Animate user expects.
@@ -243,8 +309,8 @@ mod tests {
         let cases = [
             (Key::V, ToolId::Selection),
             (Key::A, ToolId::Subselection),
-            (Key::Q, ToolId::FreeTransform),
             (Key::L, ToolId::Lasso),
+            (Key::Q, ToolId::FreeTransform),
             (Key::P, ToolId::Pen),
             (Key::T, ToolId::Text),
             (Key::N, ToolId::Line),
@@ -253,6 +319,7 @@ mod tests {
             (Key::Y, ToolId::Pencil),
             (Key::B, ToolId::Brush),
             (Key::M, ToolId::Bone),
+            (Key::W, ToolId::AssetWarp),
             (Key::K, ToolId::PaintBucket),
             (Key::S, ToolId::InkBottle),
             (Key::I, ToolId::Eyedropper),
@@ -303,14 +370,16 @@ mod tests {
         }
     }
 
-    /// A tool that is not implemented must say so rather than look available.
+    /// The tools that arrived across the phases are all ready, Text now among
+    /// them.
     #[test]
-    fn unimplemented_tools_declare_themselves() {
-        assert!(matches!(ToolId::Bone.status(), ToolStatus::Planned(_)));
-        assert!(matches!(ToolId::Text.status(), ToolStatus::Planned(_)));
+    fn the_implemented_tools_are_ready() {
         assert!(ToolId::Selection.is_ready());
         assert!(ToolId::Rectangle.is_ready());
         assert!(ToolId::Camera.is_ready(), "the camera arrived in Phase 3");
+        assert!(ToolId::Bone.is_ready(), "rigging arrived in Phase 7");
+        assert!(ToolId::AssetWarp.is_ready(), "and so did the warp");
+        assert!(ToolId::Text.is_ready(), "text places vector type now");
     }
 
     /// The camera edits the document, so it must not be classed as navigation

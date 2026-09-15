@@ -9,6 +9,9 @@ authors.workspace = true
 
 [dependencies]
 buzz-geom.workspace = true
+buzz-scene.workspace = true
+buzz-light.workspace = true
+buzz-fx.workspace = true
 
 vello.workspace = true
 # Use the wgpu that vello re-exports rather than a second copy: two majors of

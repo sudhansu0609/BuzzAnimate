@@ -65,8 +65,14 @@ pub struct ViewSettings {
     /// Grid spacing in document units.
     pub grid_spacing: f64,
     pub guides: Vec<Guide>,
+    /// Perspective drawing guides — vanishing points and the rays to them.
+    #[serde(default)]
+    pub perspective: PerspectiveGuides,
     /// How close, in *screen pixels*, a drag must come before it snaps.
     pub snap_tolerance_px: f64,
+    /// How rough a drawing may be and still be recognised as a circle, a
+    /// rectangle or a line. Animate keeps the same choice in Preferences.
+    pub shape_tolerance: buzz_geom::Tolerance,
 }
 
 impl Default for ViewSettings {
@@ -78,11 +84,51 @@ impl Default for ViewSettings {
             lock_guides: false,
             show_pasteboard: true,
             snap: SnapSettings::default(),
+            shape_tolerance: buzz_geom::Tolerance::Normal,
             // Animate's default grid.
             grid_spacing: 10.0,
             guides: Vec::new(),
+            perspective: PerspectiveGuides::default(),
             snap_tolerance_px: 8.0,
         }
+    }
+}
+
+/// One-, two- or three-point perspective guides: a horizon and up to three
+/// vanishing points, with rays fanning out from each so a drawing can be kept
+/// true to a common perspective. Overlay only — a drawing aid, not a snap (v1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerspectiveGuides {
+    pub show: bool,
+    /// The vanishing points, in document units. One to three of them.
+    pub vanishing_points: Vec<Point>,
+    /// The horizon line's y, in document units — where 1- and 2-point vanishing
+    /// points sit and a level to draw against.
+    pub horizon: f64,
+}
+
+impl Default for PerspectiveGuides {
+    fn default() -> Self {
+        Self { show: false, vanishing_points: Vec::new(), horizon: 0.0 }
+    }
+}
+
+impl PerspectiveGuides {
+    /// Sensible starting points for `n`-point perspective over a `width`×`height`
+    /// stage: the horizon across the middle, vanishing points spread along it.
+    pub fn seed(width: f64, height: f64, n: usize) -> Self {
+        let horizon = height / 2.0;
+        let vanishing_points = match n.clamp(1, 3) {
+            1 => vec![Point::new(width / 2.0, horizon)],
+            2 => vec![Point::new(-width * 0.5, horizon), Point::new(width * 1.5, horizon)],
+            _ => vec![
+                Point::new(-width * 0.5, horizon),
+                Point::new(width * 1.5, horizon),
+                // The third point sits below for a worm's-eye / above for bird's.
+                Point::new(width / 2.0, height * 2.0),
+            ],
+        };
+        Self { show: true, vanishing_points, horizon }
     }
 }
 
@@ -168,12 +214,7 @@ impl ViewSettings {
     ///
     /// `object_edges` are candidate coordinates from nearby geometry; the
     /// caller supplies them because only it knows what is on screen.
-    pub fn snap_point(
-        &self,
-        point: Point,
-        zoom: f64,
-        object_edges: &[Rect],
-    ) -> Snapped {
+    pub fn snap_point(&self, point: Point, zoom: f64, object_edges: &[Rect]) -> Snapped {
         if !self.snap.any() || !(zoom.is_finite() && zoom > 0.0) {
             return Snapped::unchanged(point);
         }
@@ -306,6 +347,19 @@ mod tests {
     }
 
     #[test]
+    fn perspective_seed_makes_the_right_number_of_points() {
+        assert!(!ViewSettings::default().perspective.show, "off by default");
+        for n in 1..=3 {
+            let p = PerspectiveGuides::seed(800.0, 600.0, n);
+            assert!(p.show);
+            assert_eq!(p.vanishing_points.len(), n);
+            assert!((p.horizon - 300.0).abs() < 1e-9, "horizon at mid-height");
+        }
+        // Out-of-range counts are clamped, not panicked.
+        assert_eq!(PerspectiveGuides::seed(800.0, 600.0, 9).vanishing_points.len(), 3);
+    }
+
+    #[test]
     fn defaults_match_animate() {
         let v = settings();
         assert!(v.show_rulers, "Animate shows rulers by default");
@@ -354,13 +408,22 @@ mod tests {
         });
 
         // At 1x, 8 px of tolerance is 8 document units, so 5 away snaps.
-        assert_eq!(v.snap_point(Point::new(105.0, 0.0), 1.0, &[]).point.x, 100.0);
+        assert_eq!(
+            v.snap_point(Point::new(105.0, 0.0), 1.0, &[]).point.x,
+            100.0
+        );
 
         // At 10x, 8 px is 0.8 units, so 5 away is far too distant.
-        assert_eq!(v.snap_point(Point::new(105.0, 0.0), 10.0, &[]).point.x, 105.0);
+        assert_eq!(
+            v.snap_point(Point::new(105.0, 0.0), 10.0, &[]).point.x,
+            105.0
+        );
 
         // But 0.5 away does snap at 10x.
-        assert_eq!(v.snap_point(Point::new(100.5, 0.0), 10.0, &[]).point.x, 100.0);
+        assert_eq!(
+            v.snap_point(Point::new(100.5, 0.0), 10.0, &[]).point.x,
+            100.0
+        );
     }
 
     #[test]
@@ -396,11 +459,20 @@ mod tests {
         let rect = Rect::new(0.0, 0.0, 100.0, 50.0);
 
         // Left edge.
-        assert_eq!(v.snap_point(Point::new(2.0, 200.0), 1.0, &[rect]).point.x, 0.0);
+        assert_eq!(
+            v.snap_point(Point::new(2.0, 200.0), 1.0, &[rect]).point.x,
+            0.0
+        );
         // Centre.
-        assert_eq!(v.snap_point(Point::new(48.0, 200.0), 1.0, &[rect]).point.x, 50.0);
+        assert_eq!(
+            v.snap_point(Point::new(48.0, 200.0), 1.0, &[rect]).point.x,
+            50.0
+        );
         // Right edge.
-        assert_eq!(v.snap_point(Point::new(103.0, 200.0), 1.0, &[rect]).point.x, 100.0);
+        assert_eq!(
+            v.snap_point(Point::new(103.0, 200.0), 1.0, &[rect]).point.x,
+            100.0
+        );
     }
 
     #[test]
@@ -424,7 +496,10 @@ mod tests {
             position: 100.0,
             orientation: Orientation::Vertical,
         });
-        assert_eq!(v.snap_point(Point::new(101.0, 0.0), 1.0, &[]).point.x, 101.0);
+        assert_eq!(
+            v.snap_point(Point::new(101.0, 0.0), 1.0, &[]).point.x,
+            101.0
+        );
     }
 
     #[test]
@@ -436,8 +511,14 @@ mod tests {
         });
         assert_eq!(v.guides.len(), 1);
 
-        assert!(!v.remove_guide_near(Orientation::Vertical, 50.0, 3.0), "wrong axis");
-        assert!(!v.remove_guide_near(Orientation::Horizontal, 90.0, 3.0), "too far");
+        assert!(
+            !v.remove_guide_near(Orientation::Vertical, 50.0, 3.0),
+            "wrong axis"
+        );
+        assert!(
+            !v.remove_guide_near(Orientation::Horizontal, 90.0, 3.0),
+            "too far"
+        );
         assert!(v.remove_guide_near(Orientation::Horizontal, 51.0, 3.0));
         assert!(v.guides.is_empty());
     }

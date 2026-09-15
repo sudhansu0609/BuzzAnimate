@@ -31,17 +31,64 @@ pub enum ToolAction {
     /// Nothing yet; the gesture is still in progress.
     None,
     /// Add this shape to the active layer, honouring the drawing mode.
-    AddShape { shape: ShapeData, label: &'static str },
+    AddShape {
+        shape: ShapeData,
+        label: &'static str,
+    },
     /// Replace the selection with whatever is under the point.
     PickAt { point: Point, additive: bool },
     /// Select everything intersecting the rectangle.
     PickInRect { rect: Rect, additive: bool },
+    /// Select everything inside a freehand region — and, where that region cuts
+    /// across artwork, cut the artwork along it and select the part inside.
+    ///
+    /// The cutting is what makes this the Lasso rather than a bendy marquee,
+    /// and it is what Animate's Lasso does to a shape.
+    PickInRegion { region: BezPath, additive: bool },
+    /// Take everything the colour of what is under the point — the Magic Wand.
+    ///
+    /// The region cannot be worked out here, because it depends on the pixels
+    /// of whatever was hit, and this module cannot see the scene. So the
+    /// editor is handed the click and does the flood fill itself.
+    WandAt { point: Point, additive: bool },
     /// Move the current selection.
     MoveSelection { delta: Vec2 },
     /// Scale the selection about a fixed corner.
     TransformSelection { transform: Affine },
     /// Drag one anchor of the selected path — Animate's Subselection tool.
     MoveAnchor { element: usize, delta: Vec2 },
+    /// Place a painted stroke: a bitmap, and the rectangle it fills.
+    ///
+    /// The tool cannot make this artwork itself, because a bitmap needs an id
+    /// from the document's library and this module cannot see the document.
+    PaintRaster {
+        canvas: buzz_scene::Canvas,
+        brush: buzz_scene::SoftBrush,
+    },
+    /// Place an effect stroke's artwork: vector shapes and painted bitmaps
+    /// together, in order, as one undo step and one selectable thing.
+    ///
+    /// Handed over as pieces rather than finished shapes for the same reason
+    /// [`Self::PaintRaster`] is: the bitmaps in it need ids from the
+    /// document's library, and this module cannot see the document.
+    AddArtwork {
+        pieces: Vec<buzz_scene::ArtPiece>,
+        label: &'static str,
+    },
+    /// Place **one drawing per frame**: an animation, from a single stroke.
+    ///
+    /// The Wave brush is the one brush whose stroke is not a drawing but a
+    /// cycle — see [`buzz_scene::wave`]. Handing over a list of frames rather
+    /// than asking the editor to re-run the generator keeps the promise every
+    /// other brush here keeps, that what was previewed is what is committed:
+    /// `frames[0]` *is* the artwork that was on screen.
+    ///
+    /// One entry per frame, laid down from the current frame onwards, as one
+    /// undo step.
+    AddArtworkFrames {
+        frames: Vec<Vec<buzz_scene::ArtPiece>>,
+        label: &'static str,
+    },
     /// Erase within a stroked path.
     Erase { path: BezPath, width: f64 },
     /// Fill whatever is under the point with the current fill colour.
@@ -53,11 +100,65 @@ pub enum ToolAction {
     /// Pan the view.
     PanView { delta_screen: Vec2 },
     /// Move the document camera. Unlike `PanView` this changes the animation.
-    MoveCamera { delta_doc: Vec2 },
+    ///
+    /// In **screen pixels**, like [`Self::PanView`], and for two reasons that
+    /// both showed up as a shot that shook while it was being aimed.
+    ///
+    /// The pointer's document position is *snapped* — pulled to nearby artwork
+    /// edges — which is right for drawing and nonsense for a camera: the shot
+    /// jumped from edge to edge as the pointer crossed the stage. And the
+    /// document position is measured *through the camera*, so moving the camera
+    /// moves the frame the measurement is made in; each step was measured
+    /// against a ruler the previous step had already shifted. Screen pixels are
+    /// what the hand actually did, and neither problem can reach them.
+    MoveCamera { delta_screen: Vec2 },
     /// Zoom about a screen point.
     ZoomView { factor: f64, at_screen: Point },
     /// Clear the selection.
     Deselect,
+    /// Put the transformation point here — Animate's white circle, dragged.
+    SetTransformPoint { at: Point },
+    /// Put it back at the centre of the selection.
+    ResetTransformPoint,
+    /// Drag one grip of the selected shape's gradient — Animate's Gradient
+    /// Transform tool.
+    DragGradient { grip: GradientGrip, to: Point },
+    /// A drawn motion path, to bind the selected object to.
+    ///
+    /// Like [`Self::AddArtwork`] the tool cannot finish the job itself: which
+    /// object travels, over which frames, with what timing, is a decision the
+    /// editor takes with the selection and a dialog in front of it. The tool's
+    /// part is only the curve.
+    DrawMotionPath { path: BezPath },
+    /// Place a text object here. The editor shapes the glyphs (it holds the
+    /// font), so the tool only says where.
+    PlaceText { at: Point },
+}
+
+/// Which handle of a gradient is being dragged.
+///
+/// # Why these four, and why the end grip does two things
+///
+/// Animate draws four grips on a gradient and gives *scale* and *rotate* one
+/// each, on the same line. Here the end of the ramp does both at once: dragging
+/// it puts the ramp's end where the pointer is. It is one grip instead of two
+/// adjacent ones a few pixels apart, and there is never a question of which was
+/// grabbed. Recorded as a deviation in PROGRESS.md §7.
+///
+/// The grips are the matrix's own parts, which is what makes this exact rather
+/// than a decomposition: the centre is its translation, the end is its first
+/// column and the width is its second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GradientGrip {
+    /// Move the whole gradient.
+    Center,
+    /// The end of the ramp: its direction and its length together.
+    End,
+    /// How thick the ramp is across its own axis. For a radial gradient this
+    /// is what makes it an ellipse.
+    Width,
+    /// Radial only: the hot spot, sliding along the ramp's axis.
+    Focus,
 }
 
 /// Live feedback while a gesture is in progress.
@@ -69,12 +170,46 @@ pub enum Preview {
     /// Rubber-band selection rectangle.
     Marquee(Rect),
     /// Freehand stroke so far.
-    Stroke { path: BezPath, width: f64 },
-    /// Brush artwork as it will actually be painted, in its real colour.
+    Stroke {
+        path: BezPath,
+        width: f64,
+    },
+    /// Brush artwork **exactly as the release will commit it** — same
+    /// geometry, same paint, same blend, built by the same function under the
+    /// same budget.
     ///
     /// Drawn by the artwork renderer rather than the chrome, because for a
-    /// brush the preview is the result.
-    Ink { path: BezPath, color: Color },
+    /// brush the preview is the result — and it has to be *the* result: a
+    /// preview that differs from the commit, even slightly, is the stroke
+    /// visibly changing the moment the pointer lifts, which breaks the feel
+    /// of drawing more than any lag does.
+    Artwork(Vec<ShapeData>),
+    /// Artwork as it will be painted, in its real paint.
+    ///
+    /// For the soft brush, whose result is a bitmap rather than an outline:
+    /// what it lays down cannot be described by a silhouette, so the preview
+    /// is the bitmap itself, filling the rectangle it will occupy.
+    Painted {
+        area: Rect,
+        paint: buzz_scene::Paint,
+    },
+    /// **The selection as the transform in progress would leave it.**
+    ///
+    /// A rotate, scale or skew used to be applied on release, so the artwork
+    /// sat still while the handles moved and you found out what you had done
+    /// only afterwards. The maths was never the missing part: this carries the
+    /// *same* affine the release will commit, built by the same functions, and
+    /// the stage draws the selected outlines through it.
+    ///
+    /// Nothing is edited until the pointer comes up, so a drag is still one
+    /// undo step rather than one per pixel.
+    Transform(Affine),
+    /// The transformation point being dragged, where the pointer has it.
+    ///
+    /// The point only *moves* when the drag ends — it is one edit, not one per
+    /// pixel — so without this the circle sat still under a moving pointer and
+    /// the gesture looked as though it had not taken.
+    Pivot(Point),
 }
 
 /// State shared with a tool for the duration of a gesture.
@@ -88,6 +223,16 @@ pub struct ToolContext<'a> {
     /// Supplied by the editor because only it can see the scene; empty unless
     /// exactly one shape is selected.
     pub anchors: &'a [buzz_geom::Anchor],
+    /// The selection's transformation point, in document space — what a
+    /// rotation or a skew turns about. `None` when nothing is selected.
+    pub pivot: Option<Point>,
+    /// The grips of the selected shape's gradient fill, in document space.
+    ///
+    /// `None` unless exactly one shape is selected and its fill is a gradient,
+    /// which is precisely when the Gradient Transform tool has something to do.
+    /// Supplied by the editor for the same reason the anchors are: only it can
+    /// see the scene.
+    pub gradient: Option<(buzz_scene::GradientHandles, buzz_scene::GradientKind)>,
 }
 
 /// A gesture in progress.
@@ -95,18 +240,68 @@ pub struct ToolContext<'a> {
 enum Gesture {
     Idle,
     /// Press-drag-release from a fixed origin.
-    Dragging { origin: Point, current: Point, mods: Mods },
+    Dragging {
+        origin: Point,
+        current: Point,
+        mods: Mods,
+        /// This drag is **moving the selection**, decided when it began.
+        ///
+        /// Recorded rather than re-derived on every move because the artwork
+        /// travels *as the pointer does*, so the selection's bounds are no
+        /// longer where they were when the press landed — asking "did this
+        /// start inside the selection?" at release would be asking about a
+        /// selection that has since moved out from under the question. What the
+        /// drag began on decides what it does, which is the rule the rest of
+        /// this file already follows.
+        moving: bool,
+        /// This drag is **transforming the selection** — turning it, scaling
+        /// it from a corner, or skewing it from an edge — and from where.
+        ///
+        /// Recorded for the same reason `moving` is, and needed for the same
+        /// reason: the transform is applied as the pointer travels, so by the
+        /// second step the selection is no longer where it was when the
+        /// question could have been asked.
+        transforming: Option<Transforming>,
+    },
     /// Accumulating freehand samples.
     ///
     /// Samples rather than bare points because a brush needs *when* as well as
     /// where: the width of a fluid stroke follows how fast it was drawn.
-    Freehand { samples: Vec<buzz_geom::StrokeSample> },
+    Freehand {
+        samples: Vec<buzz_geom::StrokeSample>,
+        /// What was held when the gesture began.
+        ///
+        /// Only the Lasso reads it — Shift adds to the selection there, as it
+        /// does for a marquee — but it costs nothing to record for all of them
+        /// and saves a second gesture variant that differs in one field.
+        mods: Mods,
+    },
     /// Dragging one anchor of a path.
     Anchor {
         element: usize,
         origin: Point,
         current: Point,
     },
+}
+
+/// A rotation in progress: the point it turns about, and how far it has gone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Transforming {
+    /// Which part of the gizmo the drag began on, decided once.
+    zone: TransformZone,
+    /// The point a rotation or an Alt-scale turns about.
+    pivot: Point,
+    /// The selection's box **as it was when the drag began**.
+    ///
+    /// Held rather than re-read, because the artwork is transformed as the
+    /// pointer travels: by the second step the box is no longer the one the
+    /// scale is a proportion of, and reading it again would compound the
+    /// gesture against itself.
+    bounds: Rect,
+    /// Everything committed to the document so far, so each move can commit
+    /// the *difference*. Applying the whole transform each time would apply it
+    /// on top of itself once per frame.
+    applied: Affine,
 }
 
 /// Where stroke timing comes from.
@@ -193,11 +388,36 @@ impl ToolMachine {
         mods: Mods,
         ctx: &ToolContext<'_>,
     ) -> ToolAction {
+        self.pointer_down_at(doc, screen, mods, ctx, None, None)
+    }
+
+    /// A pointer press the window has timed. See [`Self::pointer_move_at`].
+    ///
+    /// **A stroke's samples must all be on one clock.** The first one is taken
+    /// here and the rest as the pointer moves, so if the press read a wall
+    /// clock while the moves were stamped by the window the two would have
+    /// different origins entirely — and the very first segment of every
+    /// stroke would be measured against a gap of seconds or a negative one.
+    pub fn pointer_down_at(
+        &mut self,
+        doc: Point,
+        screen: Point,
+        mods: Mods,
+        ctx: &ToolContext<'_>,
+        time: Option<f64>,
+        pressure: Option<f64>,
+    ) -> ToolAction {
+        let now = match self.clock {
+            Clock::Manual(t) => t,
+            Clock::Wall(_) => time.unwrap_or_else(|| self.clock.now()),
+        };
         self.last_screen = screen;
         match self.tool {
-            ToolId::Pencil | ToolId::Brush | ToolId::Eraser => {
+            ToolId::Pencil | ToolId::Brush | ToolId::Eraser | ToolId::Lasso
+            | ToolId::MotionPath => {
                 self.gesture = Gesture::Freehand {
-                    samples: vec![buzz_geom::StrokeSample::new(doc, self.clock.now())],
+                    samples: vec![sample_at(doc, now, pressure)],
+                    mods,
                 };
             }
             // Subselection grabs an anchor if one is close enough; otherwise it
@@ -222,6 +442,8 @@ impl ToolMachine {
                         origin: doc,
                         current: doc,
                         mods,
+                        moving: self.begins_a_move(doc, ctx),
+                        transforming: self.begins_a_transform(doc, ctx),
                     },
                 };
             }
@@ -230,13 +452,123 @@ impl ToolMachine {
                     origin: doc,
                     current: doc,
                     mods,
+                    moving: self.begins_a_move(doc, ctx),
+                    transforming: self.begins_a_transform(doc, ctx),
                 };
             }
         }
         ToolAction::None
     }
 
+    /// Does a press at `at` begin a move of the selection?
+    ///
+    /// The same question `finish_drag` used to ask on release, asked once at
+    /// the start where the answer is still true. Only the tools that can move
+    /// artwork by dragging it answer yes.
+    fn begins_a_move(&self, at: Point, ctx: &ToolContext<'_>) -> bool {
+        if !matches!(
+            self.tool,
+            ToolId::Selection | ToolId::Subselection | ToolId::FreeTransform
+        ) {
+            return false;
+        }
+        let Some(bounds) = ctx.selection_bounds else {
+            return false;
+        };
+        // Which point counts as "the transformation point" is per tool, and
+        // matches what `finish_drag` does with it. Free Transform always draws
+        // one, falling back to the centre. The selection tools can only grab a
+        // point that actually exists — without one the centre of a selection is
+        // ordinary artwork, and a press there moves it like anywhere else.
+        let pivot = match (self.tool, ctx.pivot) {
+            (ToolId::FreeTransform, p) => p.unwrap_or_else(|| bounds.center()),
+            (_, Some(p)) => p,
+            (_, None) => return contains(bounds, at),
+        };
+        let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+        if !matches!(
+            transform_zone(bounds, pivot, at, grab),
+            TransformZone::Inside
+        ) {
+            return false;
+        }
+        // `Inside` means "on none of the handles", which is also true of empty
+        // stage far from the selection — and a drag out there is a marquee.
+        // Free Transform has no marquee, so anywhere off its handles moves.
+        self.tool == ToolId::FreeTransform || contains(bounds, at)
+    }
+
+    /// Which part of the gizmo a press at `at` grabbed, if any.
+    ///
+    /// **The whole gizmo, from every tool that shows it.** Corners scale, the
+    /// mid-edge handles squeeze one dimension, the edges either side of them
+    /// skew and the ring outside a corner turns — for the selection
+    /// tools as well as Free Transform, because the handles are drawn for all
+    /// of them and a handle you can see and cannot use is worse than none.
+    ///
+    /// Asked once at the press, where the answer is still true: the artwork
+    /// moves under the pointer from the next step onwards.
+    fn begins_a_transform(&self, at: Point, ctx: &ToolContext<'_>) -> Option<Transforming> {
+        if !matches!(
+            self.tool,
+            ToolId::Selection | ToolId::Subselection | ToolId::FreeTransform
+        ) {
+            return None;
+        }
+        let bounds = ctx.selection_bounds?;
+        let pivot = match (self.tool, ctx.pivot) {
+            (ToolId::FreeTransform, p) => p.unwrap_or_else(|| bounds.center()),
+            (_, Some(p)) => p,
+            (_, None) => return None,
+        };
+        let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+        let zone = transform_zone(bounds, pivot, at, grab);
+        matches!(
+            zone,
+            TransformZone::Rotate
+                | TransformZone::Corner
+                | TransformZone::Edge(_)
+                | TransformZone::Side(_)
+        )
+        .then_some(Transforming {
+            zone,
+            pivot,
+            bounds,
+            applied: Affine::IDENTITY,
+        })
+    }
+
+
+
     pub fn pointer_move(&mut self, doc: Point, screen: Point, mods: Mods) -> ToolAction {
+        self.pointer_move_at(doc, screen, mods, None, None)
+    }
+
+    /// A pointer move that already knows *when* it happened.
+    ///
+    /// **Several pointer moves arrive per frame and they are not simultaneous.**
+    /// A pen reports at 200 Hz or more, so a frame carries three or four of
+    /// them; read off a wall clock in the loop that dispatches them they come
+    /// out microseconds apart, and a fluid brush divides distance by that to
+    /// get its width. Every stroke would be drawn at the minimum. The window
+    /// knows the interval those moves were spread over, so it says.
+    ///
+    /// `None` keeps the old behaviour — read the clock — which is what a
+    /// single move a frame wants and what every test does.
+    pub fn pointer_move_at(
+        &mut self,
+        doc: Point,
+        screen: Point,
+        mods: Mods,
+        time: Option<f64>,
+        pressure: Option<f64>,
+    ) -> ToolAction {
+        // A manual clock is a test driving the brush deliberately; nothing the
+        // window says about timing may override it.
+        let now = match self.clock {
+            Clock::Manual(t) => t,
+            Clock::Wall(_) => time.unwrap_or_else(|| self.clock.now()),
+        };
         let delta_screen = screen - self.last_screen;
         self.last_screen = screen;
 
@@ -246,7 +578,7 @@ impl ToolMachine {
                 *current = doc;
                 ToolAction::None
             }
-            Gesture::Freehand { samples } => {
+            Gesture::Freehand { samples, .. } => {
                 // Drop samples that add nothing, so a slow drag does not build
                 // a path with thousands of coincident vertices. The brush
                 // decimates properly later; this is only to stop the list
@@ -255,25 +587,76 @@ impl ToolMachine {
                     .last()
                     .is_none_or(|s| (doc - s.point).hypot() > f64::EPSILON)
                 {
-                    samples.push(buzz_geom::StrokeSample::new(doc, self.clock.now()));
+                    samples.push(sample_at(doc, now, pressure));
                 }
                 ToolAction::None
             }
             Gesture::Dragging {
+                origin,
                 current,
                 mods: m,
-                ..
+                moving,
+                transforming,
             } => {
                 let previous = *current;
+                let moving = *moving;
+                let origin = *origin;
                 *current = doc;
                 *m = mods;
+
+                // **The artwork transforms under the pointer.**
+                //
+                // A turn, a scale or a skew used to be drawn as an outline and
+                // committed on release, so the drawing sat still while a
+                // wireframe moved around it and you found out what you had
+                // done afterwards.
+                //
+                // Committed as the *difference* from what has already been
+                // applied rather than as the whole transform each time — that
+                // one would land on top of itself once per frame. Taking the
+                // difference against the target also keeps Shift's snaps
+                // exact: the target is computed fresh from the pointer, so a
+                // 45-degree turn is 45 degrees and not the sum of a hundred
+                // roundings.
+                if let Some(t) = transforming {
+                    let target = transform_for(t, origin, doc, mods);
+                    // A transform collapsed to nothing cannot be undone —
+                    // a scale dragged through zero — and a step measured
+                    // against it would be infinite. Waiting for the pointer to
+                    // come back out is the only sane answer.
+                    let c = t.applied.as_coeffs();
+                    if (c[0] * c[3] - c[1] * c[2]).abs() < 1e-12 {
+                        return ToolAction::None;
+                    }
+                    let step = target * t.applied.inverse();
+                    t.applied = target;
+                    return if step.as_coeffs() == Affine::IDENTITY.as_coeffs() {
+                        ToolAction::None
+                    } else {
+                        ToolAction::TransformSelection { transform: step }
+                    };
+                }
+                // **The artwork travels with the pointer.**
+                //
+                // A move used to be committed only on release, so the drag
+                // showed a marquee stretched across the artwork and then the
+                // artwork teleported — the gesture gave no feedback at all
+                // about the thing it was doing. Applied by the step since the
+                // last move, exactly as the camera already is, and collapsed
+                // into a single undo step by `end_gesture` on release.
+                if moving {
+                    let delta = doc - previous;
+                    return if delta.hypot() > 0.0 {
+                        ToolAction::MoveSelection { delta }
+                    } else {
+                        ToolAction::None
+                    };
+                }
                 match self.tool {
                     ToolId::Hand => ToolAction::PanView { delta_screen },
                     // The camera moves live so the user can see the framing
                     // they are choosing, rather than only on release.
-                    ToolId::Camera => ToolAction::MoveCamera {
-                        delta_doc: doc - previous,
-                    },
+                    ToolId::Camera => ToolAction::MoveCamera { delta_screen },
                     _ => ToolAction::None,
                 }
             }
@@ -281,12 +664,30 @@ impl ToolMachine {
     }
 
     pub fn pointer_up(&mut self, doc: Point, screen: Point, ctx: &ToolContext<'_>) -> ToolAction {
+        self.pointer_up_at(doc, screen, ctx, None, None)
+    }
+
+    /// A pointer release the window has timed. See [`Self::pointer_down_at`].
+    pub fn pointer_up_at(
+        &mut self,
+        doc: Point,
+        screen: Point,
+        ctx: &ToolContext<'_>,
+        time: Option<f64>,
+        pressure: Option<f64>,
+    ) -> ToolAction {
+        let now = match self.clock {
+            Clock::Manual(t) => t,
+            Clock::Wall(_) => time.unwrap_or_else(|| self.clock.now()),
+        };
         let gesture = std::mem::replace(&mut self.gesture, Gesture::Idle);
         self.last_screen = screen;
 
         match gesture {
             Gesture::Idle => ToolAction::None,
-            Gesture::Anchor { element, origin, .. } => {
+            Gesture::Anchor {
+                element, origin, ..
+            } => {
                 let delta = doc - origin;
                 if delta.hypot() <= f64::EPSILON {
                     ToolAction::None
@@ -294,16 +695,30 @@ impl ToolMachine {
                     ToolAction::MoveAnchor { element, delta }
                 }
             }
-            Gesture::Freehand { mut samples } => {
+            Gesture::Freehand { mut samples, mods } => {
                 if samples.last().is_none_or(|s| s.point != doc) {
-                    samples.push(buzz_geom::StrokeSample::new(doc, self.clock.now()));
+                    samples.push(sample_at(doc, now, pressure));
                 }
-                self.finish_freehand(samples, ctx)
+                self.finish_freehand(samples, mods, ctx)
             }
-            Gesture::Dragging { origin, mods, .. } => {
-                self.finish_drag(origin, doc, mods, ctx)
-            }
+            Gesture::Dragging {
+                origin,
+                mods,
+                moving,
+                transforming,
+                ..
+            } => self.finish_drag(origin, doc, mods, moving || transforming.is_some(), ctx),
         }
+    }
+
+    /// Does the current gesture preview as painted artwork
+    /// ([`Preview::Artwork`] or [`Preview::Painted`]) rather than as chrome?
+    ///
+    /// The cheap form of asking [`Self::preview`] and matching, for callers
+    /// that only need the yes or no: building a brush preview costs real work
+    /// per call, and it is already built once a frame to be drawn.
+    pub fn painting_preview(&self) -> bool {
+        matches!(self.gesture, Gesture::Freehand { .. }) && self.tool == ToolId::Brush
     }
 
     /// The current preview, for drawing feedback on the stage.
@@ -313,49 +728,183 @@ impl ToolMachine {
             // The stage already draws anchors for the selected path; a
             // rubber-band line here would just add noise.
             Gesture::Anchor { .. } => Preview::None,
-            Gesture::Freehand { samples } => match self.tool {
-                ToolId::Eraser => Preview::Stroke {
-                    path: centreline_of(samples),
-                    width: ctx.style.stroke_width.max(1.0) * 4.0,
+            Gesture::Freehand { samples, .. } => match self.tool {
+                // The lasso previews the region it is enclosing, closed, so the
+                // user can see what is about to be caught rather than only the
+                // line they have drawn so far.
+                ToolId::Lasso => match lasso_region(samples) {
+                    Some(path) => Preview::Shape(path),
+                    None => Preview::None,
                 },
-                // The brush previews what it will actually paint, under the
-                // *preview* budget. That budget is what keeps a long stroke
-                // interactive: this runs on every pointer move, so it has to
-                // cost a fraction of the committed geometry, and a pattern
-                // brush at close spacing would otherwise place thousands of
-                // stamps per frame.
+                ToolId::Eraser => Preview::Stroke {
+                    path: centreline_of(samples, ctx.style.brush.conditioning()),
+                    width: ctx.style.eraser_size.max(0.5),
+                },
+                // A soft brush previews its own pixels, because the pixels are
+                // the point: an outline of where the paint would go says
+                // nothing about how it fades.
+                ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Raster => {
+                    match paint_soft_stroke(samples, ctx.style) {
+                        Some((canvas, brush)) => {
+                            let area = canvas.area();
+                            // A fresh identity every move, because every move
+                            // really is new pixels — which `to_asset` gives
+                            // without being asked, since a bitmap's identity is
+                            // issued at construction rather than worked out.
+                            let asset = std::sync::Arc::new(canvas.to_asset(
+                                buzz_scene::ImageId(0),
+                                "preview",
+                                &brush,
+                            ));
+                            let mut fill = buzz_scene::ImageFill::new(asset, area);
+                            fill.smooth = false;
+                            Preview::Painted {
+                                area,
+                                paint: buzz_scene::Paint::Image(Box::new(fill)),
+                            }
+                        }
+                        None => Preview::None,
+                    }
+                }
+                // An effect brush previews the exact artwork the release will
+                // commit: same pieces, same seed, same everything. Bitmap
+                // pieces are given a throwaway identity, exactly as the soft
+                // brush's preview is.
+                ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Effect => {
+                    let pieces = build_effect_pieces(samples, ctx.style);
+                    if pieces.is_empty() {
+                        Preview::None
+                    } else {
+                        Preview::Artwork(art_pieces_as_shapes(&pieces))
+                    }
+                }
+                // A wave previews its **first frame**, which is the frame the
+                // release commits first. Previewing the whole cycle at once
+                // would show a smear nobody is going to draw.
+                ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Wave => {
+                    let pieces = build_wave_pieces(samples, ctx.style, 0.0);
+                    if pieces.is_empty() {
+                        Preview::None
+                    } else {
+                        Preview::Artwork(art_pieces_as_shapes(&pieces))
+                    }
+                }
+                // A brush captured from artwork, stamping that artwork's own
+                // colours and textures. Same builder and budget as the commit,
+                // so what is on screen while drawing is what lands.
+                ToolId::Brush if ctx.style.brush.stamps_its_own_paint() => {
+                    let budget = buzz_geom::BrushBudget::default();
+                    let shapes = build_stamped_artwork(samples, ctx.style, &budget);
+                    if shapes.is_empty() {
+                        Preview::None
+                    } else {
+                        Preview::Artwork(shapes)
+                    }
+                }
+                // **The brush previews the committed stroke itself.** Same
+                // builder, same budget as the release — smoothing, taper and
+                // width response all happen *while drawing*, and nothing
+                // changes when the pointer lifts. The budgets already bound
+                // the cost of one stroke; a preview that took a cheaper path
+                // here would buy a little speed by re-shaping the artwork on
+                // release, which is the wrong trade for a drawing tool.
                 ToolId::Brush => {
-                    let budget = buzz_geom::BrushBudget::preview();
-                    let color = ctx
-                        .style
-                        .fill_for_new_shape()
-                        .unwrap_or(Color::BLACK)
-                        // Slightly transparent, so the preview reads as
-                        // provisional without misrepresenting its shape.
-                        .multiply_alpha(0.85);
-                    match build_brush_path(samples, ctx.style, &budget) {
-                        Some(path) => Preview::Ink { path, color },
+                    let budget = buzz_geom::BrushBudget::default();
+                    match vector_brush_shape(samples, ctx.style, &budget) {
+                        Some(shape) => Preview::Artwork(vec![shape]),
                         None => Preview::Stroke {
-                            path: centreline_of(samples),
+                            path: centreline_of(samples, ctx.style.brush.conditioning()),
                             width: ctx.style.brush.size.max(1.0),
                         },
                     }
                 }
                 _ => Preview::Stroke {
-                    path: centreline_of(samples),
+                    path: centreline_of(samples, ctx.style.brush.conditioning()),
                     width: brush_width(self.tool, ctx.style),
                 },
             },
-            Gesture::Dragging { origin, current, mods } => match self.tool {
-                ToolId::Rectangle | ToolId::Oval | ToolId::PolyStar | ToolId::Line | ToolId::Pen => {
-                    build_shape_path(self.tool, *origin, *current, *mods)
-                        .map(Preview::Shape)
-                        .unwrap_or(Preview::None)
-                }
-                ToolId::Selection | ToolId::Lasso | ToolId::Subselection => {
-                    Preview::Marquee(Rect::from_points(*origin, *current))
-                }
+            // **A move previews nothing.** The artwork is already travelling
+            // with the pointer (see `pointer_move`), and an outline over the
+            // top of it would be a second, redundant answer to "where is this
+            // going?" — drawn in the place the artwork already is.
+            Gesture::Dragging { moving: true, .. } => Preview::None,
+            // A live transform shows itself, for the same reason a move does.
+            Gesture::Dragging {
+                transforming: Some(_),
+                ..
+            } => Preview::None,
+            Gesture::Dragging {
+                origin,
+                current,
+                mods,
+                ..
+            } => match self.tool {
+                ToolId::Rectangle
+                | ToolId::Oval
+                | ToolId::PolyStar
+                | ToolId::Line
+                | ToolId::Pen => build_shape_path(self.tool, *origin, *current, *mods)
+                    .map(Preview::Shape)
+                    .unwrap_or(Preview::None),
                 ToolId::Zoom => Preview::Marquee(Rect::from_points(*origin, *current)),
+
+                // What the drag *began* on decides what it previews, exactly
+                // as it decides what the release commits — the pointer's shape
+                // there is the promise, and the preview has to keep it.
+                ToolId::FreeTransform | ToolId::Selection | ToolId::Subselection => {
+                    let zone = match (ctx.pivot, ctx.selection_bounds) {
+                        (Some(pivot), Some(bounds)) => {
+                            let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+                            Some((pivot, bounds, transform_zone(bounds, pivot, *origin, grab)))
+                        }
+                        _ => None,
+                    };
+                    // A marquee everywhere the tools do not transform.
+                    let marquee = || {
+                        if self.tool == ToolId::FreeTransform {
+                            Preview::None
+                        } else {
+                            Preview::Marquee(Rect::from_points(*origin, *current))
+                        }
+                    };
+                    match zone {
+                        Some((_, _, TransformZone::Pivot)) => Preview::Pivot(*current),
+
+                        // **The live preview.** The affine is built by the same
+                        // functions the release calls, so what is drawn is what
+                        // will happen rather than a second approximation of it.
+                        // Nothing is edited until the pointer comes up, so the
+                        // whole drag is still one undo step.
+                        Some((pivot, _, TransformZone::Rotate)) => Preview::Transform(
+                            rotate_about(pivot, *origin, *current, mods.shift),
+                        ),
+                        Some((pivot, bounds, TransformZone::Corner))
+                            if self.tool == ToolId::FreeTransform =>
+                        {
+                            Preview::Transform(if mods.alt {
+                                scale_about(pivot, bounds, *origin, *current, mods.shift)
+                            } else {
+                                scale_about_corner(bounds, *origin, *current, mods.shift)
+                            })
+                        }
+                        Some((pivot, bounds, TransformZone::Side(horizontal)))
+                            if self.tool == ToolId::FreeTransform =>
+                        {
+                            Preview::Transform(scale_about_side(
+                                pivot, bounds, *origin, *current, horizontal, *mods,
+                            ))
+                        }
+                        Some((pivot, bounds, TransformZone::Edge(horizontal)))
+                            if self.tool == ToolId::FreeTransform =>
+                        {
+                            Preview::Transform(skew_about(
+                                pivot, bounds, *origin, *current, horizontal,
+                            ))
+                        }
+
+                        _ => marquee(),
+                    }
+                }
                 _ => Preview::None,
             },
         }
@@ -364,6 +913,7 @@ impl ToolMachine {
     fn finish_freehand(
         &self,
         samples: Vec<buzz_geom::StrokeSample>,
+        mods: Mods,
         ctx: &ToolContext<'_>,
     ) -> ToolAction {
         // A brush tap paints a dot, so one sample is enough for it; every
@@ -373,43 +923,123 @@ impl ToolMachine {
             return ToolAction::None;
         }
 
+        // **Hold Control to flip merge and build-up for the stroke in hand.**
+        //
+        // The Build-up toggle in the tool options sets the usual behaviour;
+        // Control overrides it for this one stroke — down to build up over a
+        // merging default, up to merge over a build-up default — the same way a
+        // modifier flips other tools without disturbing their setting. Only the
+        // brush honours build-up, so this is the only tool it changes; the
+        // flipped copy is made only when it is actually needed.
+        let flipped_style;
+        let style: &DrawStyle = if is_brush && mods.ctrl {
+            flipped_style = {
+                let mut s = ctx.style.clone();
+                s.brush.build_up = !s.brush.build_up;
+                s
+            };
+            &flipped_style
+        } else {
+            ctx.style
+        };
+
         match self.tool {
-            ToolId::Eraser => ToolAction::Erase {
-                path: centreline_of(&samples),
-                width: ctx.style.stroke_width.max(1.0) * 4.0,
+            ToolId::Lasso => match lasso_region(&samples) {
+                Some(region) => ToolAction::PickInRegion {
+                    region,
+                    additive: mods.shift,
+                },
+                None => ToolAction::None,
             },
-            ToolId::Brush => {
-                // The brush paints a filled stroke, so its colour comes from
-                // the fill swatch — as in Animate.
-                let budget = buzz_geom::BrushBudget::default();
-                let Some(path) = build_brush_path(&samples, ctx.style, &budget) else {
-                    return ToolAction::None;
-                };
-                if path.elements().is_empty() {
+            ToolId::Eraser => ToolAction::Erase {
+                path: centreline_of(&samples, ctx.style.brush.conditioning()),
+                width: ctx.style.eraser_size.max(0.5),
+            },
+            ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Raster => {
+                match paint_soft_stroke(&samples, style) {
+                    Some((canvas, brush)) => ToolAction::PaintRaster { canvas, brush },
+                    None => ToolAction::None,
+                }
+            }
+            ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Effect => {
+                let pieces = build_effect_pieces(&samples, ctx.style);
+                if pieces.is_empty() {
                     return ToolAction::None;
                 }
-                ToolAction::AddShape {
-                    shape: ShapeData::filled(
-                        path,
-                        ctx.style.fill_for_new_shape().unwrap_or(Color::BLACK),
-                    )
-                    .with_blend(ctx.style.brush.blend()),
+                ToolAction::AddArtwork {
+                    pieces,
+                    label: ctx.style.brush.effect.label(),
+                }
+            }
+            // A wave commits a *cycle*: one drawing per frame, seamlessly
+            // looping, starting with the frame that was previewed. At one
+            // frame it is an ordinary still, and goes down the ordinary path
+            // so it costs no extra keyframe.
+            ToolId::Brush if ctx.style.brush.kind == buzz_ui::BrushKind::Wave => {
+                let label = ctx.style.brush.wave.label();
+                if !ctx.style.brush.wave_settings.is_animated() {
+                    let pieces = build_wave_pieces(&samples, ctx.style, 0.0);
+                    if pieces.is_empty() {
+                        return ToolAction::None;
+                    }
+                    return ToolAction::AddArtwork { pieces, label };
+                }
+                let frames = buzz_scene::wave_loop(
+                    ctx.style.brush.wave,
+                    &wave_stroke(&samples, ctx.style),
+                );
+                if frames.iter().all(Vec::is_empty) {
+                    return ToolAction::None;
+                }
+                ToolAction::AddArtworkFrames { frames, label }
+            }
+            ToolId::Brush if ctx.style.brush.stamps_its_own_paint() => {
+                let budget = buzz_geom::BrushBudget::default();
+                let shapes = build_stamped_artwork(&samples, ctx.style, &budget);
+                if shapes.is_empty() {
+                    return ToolAction::None;
+                }
+                ToolAction::AddArtwork {
+                    pieces: shapes.into_iter().map(buzz_scene::ArtPiece::Shape).collect(),
                     label: "Brush",
                 }
             }
+            ToolId::Brush => {
+                // The same builder, budget and paint the preview used on every
+                // pointer move, so what was on screen while drawing is what is
+                // committed — see `Preview::Artwork`.
+                let budget = buzz_geom::BrushBudget::default();
+                match vector_brush_shape(&samples, style, &budget) {
+                    Some(shape) => ToolAction::AddShape {
+                        shape,
+                        label: "Brush",
+                    },
+                    None => ToolAction::None,
+                }
+            }
+            // The motion-path tool hands over the drawn curve, smoothed the same
+            // way the pencil's is. A tap with no length is not a path.
+            ToolId::MotionPath => {
+                let path = centreline_of(&samples, ctx.style.brush.conditioning());
+                if path.segments().next().is_none() {
+                    return ToolAction::None;
+                }
+                ToolAction::DrawMotionPath { path }
+            }
             _ => {
-                let (color, width, hairline) = ctx
-                    .style
-                    .stroke_for_new_shape()
-                    .unwrap_or((Color::BLACK, 1.0, false));
+                let (color, width, hairline) =
+                    ctx.style
+                        .stroke_for_new_shape()
+                        .unwrap_or((Color::BLACK, 1.0, false));
                 ToolAction::AddShape {
                     shape: ShapeData {
-                        path: centreline_of(&samples),
+                        path: centreline_of(&samples, ctx.style.brush.conditioning()),
                         fill: None,
                         stroke: Some(buzz_scene::StrokeSpec {
-                            color,
+                            paint: buzz_scene::Paint::Solid(color),
                             width,
                             hairline,
+                            swatch: None,
                         }),
                         blend: buzz_scene::PaintBlend::Normal,
                     },
@@ -424,44 +1054,177 @@ impl ToolMachine {
         origin: Point,
         end: Point,
         mods: Mods,
+        moving: bool,
         ctx: &ToolContext<'_>,
     ) -> ToolAction {
         let slop = CLICK_SLOP_PX / ctx.zoom.max(f64::MIN_POSITIVE);
         let was_click = (end - origin).hypot() <= slop;
 
+        // **A move is already done.** `pointer_move` applied it step by step,
+        // so the release has nothing left to commit — re-applying the whole
+        // delta here would move the artwork twice as far as the pointer went.
+        // `end_gesture` still collapses the run into one undo step.
+        //
+        // Taken before the transformation-point branch below, which asks how
+        // close the press was to the pivot: the pivot has travelled with the
+        // selection, so on a long move it can end up under the point the drag
+        // started from and claim a gesture that was never about it.
+        if moving && !was_click {
+            return ToolAction::None;
+        }
+
+        // **The transformation point can be dragged with the selection tools
+        // too**, not only with Free Transform.
+        //
+        // A deviation from Animate, and a deliberate one: the point is what a
+        // rotation, a skew and an Alt-scale all turn about, and having to
+        // change tools to move it — then change back to carry on selecting —
+        // is a step nobody thanks you for. Only a **drag** counts, so clicking
+        // the middle of a shape still selects and moves it as before.
+        if matches!(self.tool, ToolId::Selection | ToolId::Subselection)
+            && !was_click
+            && let Some(pivot) = ctx.pivot
+            && ctx.selection_bounds.is_some()
+            && (origin - pivot).hypot()
+                <= (TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE)) * 1.5
+        {
+            return ToolAction::SetTransformPoint { at: end };
+        }
+
         match self.tool {
-            ToolId::Selection | ToolId::Subselection => {
-                if was_click {
-                    ToolAction::PickAt {
+            // Animate's Gradient Transform: grab a grip and the ramp follows.
+            // With nothing gradient-filled selected it selects, so picking the
+            // shape you meant to adjust does not need a trip back to the
+            // Selection tool.
+            ToolId::GradientTransform => {
+                let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+                match ctx
+                    .gradient
+                    .and_then(|(h, kind)| grip_at(h, kind, origin, grab))
+                {
+                    Some(grip) => ToolAction::DragGradient { grip, to: end },
+                    None => ToolAction::PickAt {
                         point: end,
                         additive: mods.shift,
-                    }
-                } else if ctx.selection_bounds.is_some_and(|b| contains(b, origin)) {
-                    // Started inside the selection: move it.
-                    ToolAction::MoveSelection {
-                        delta: end - origin,
-                    }
-                } else {
-                    ToolAction::PickInRect {
-                        rect: Rect::from_points(origin, end),
+                    },
+                }
+            }
+            ToolId::Selection | ToolId::Subselection => {
+                if was_click {
+                    return ToolAction::PickAt {
+                        point: end,
                         additive: mods.shift,
+                    };
+                }
+
+                // **Rotating without changing tools.**
+                //
+                // `preview` has drawn this rotation for the whole drag — the
+                // ring just outside a corner is the same one Free Transform
+                // uses, and the pointer turns there — but the release used to
+                // fall straight through to a marquee, so the artwork snapped
+                // back and the selection was replaced by whatever the rubber
+                // band had swept. A preview that promises something the release
+                // does not do is worse than no preview, and this is the file
+                // that says so.
+                //
+                // Committed by the same `rotate_about` the preview called, so
+                // the two cannot drift apart.
+                if let Some((pivot, bounds)) = ctx.pivot.zip(ctx.selection_bounds) {
+                    let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+                    if matches!(
+                        transform_zone(bounds, pivot, origin, grab),
+                        TransformZone::Rotate
+                    ) {
+                        return ToolAction::TransformSelection {
+                            transform: rotate_about(pivot, origin, end, mods.shift),
+                        };
                     }
+                }
+
+                // A drag that began inside the selection has already returned
+                // above; anything left is a marquee.
+                ToolAction::PickInRect {
+                    rect: Rect::from_points(origin, end),
+                    additive: mods.shift,
                 }
             }
 
-            ToolId::FreeTransform => match ctx.selection_bounds {
-                Some(bounds) if !was_click => {
-                    ToolAction::TransformSelection {
-                        transform: scale_about_corner(bounds, origin, end, mods.shift),
-                    }
-                }
-                Some(_) => ToolAction::None,
-                None => ToolAction::PickAt {
-                    point: end,
-                    additive: false,
-                },
-            },
+            ToolId::FreeTransform => {
+                let Some(bounds) = ctx.selection_bounds else {
+                    return ToolAction::PickAt {
+                        point: end,
+                        additive: false,
+                    };
+                };
+                let pivot = ctx.pivot.unwrap_or_else(|| bounds.center());
+                let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
 
+                // Which part of the gizmo the drag *started* on decides what
+                // it does, exactly as in Animate: the pointer's shape there is
+                // the promise, and changing the answer half way through a drag
+                // would break it.
+                match transform_zone(bounds, pivot, origin, grab) {
+                    TransformZone::Pivot => {
+                        if was_click {
+                            // A click on the circle without moving it means
+                            // "put it back", which is Animate's double-click.
+                            ToolAction::ResetTransformPoint
+                        } else {
+                            ToolAction::SetTransformPoint { at: end }
+                        }
+                    }
+                    // **A click on a handle is a mis-grab of the gizmo**, not a
+                    // selection. The handles are furniture drawn over the
+                    // artwork, and picking whatever happens to lie under a
+                    // corner would take the selection away from the very thing
+                    // the user was lining up to transform.
+                    TransformZone::Corner
+                    | TransformZone::Rotate
+                    | TransformZone::Edge(_)
+                    | TransformZone::Side(_)
+                        if was_click =>
+                    {
+                        ToolAction::None
+                    }
+
+                    // **A click anywhere else selects.**
+                    //
+                    // Every click used to answer `None` once anything was
+                    // selected, so Free Transform locked onto the first object
+                    // you picked: you could transform it forever and never
+                    // reach another one without changing tools and back. A
+                    // click is how you choose what to work on, and that has to
+                    // keep working while a gizmo is on screen.
+                    TransformZone::Inside if was_click => ToolAction::PickAt {
+                        point: end,
+                        additive: mods.shift,
+                    },
+                    TransformZone::Corner => ToolAction::TransformSelection {
+                        transform: if mods.alt {
+                            // Animate's Alt: scale about the transformation
+                            // point rather than the opposite corner.
+                            scale_about(pivot, bounds, origin, end, mods.shift)
+                        } else {
+                            scale_about_corner(bounds, origin, end, mods.shift)
+                        },
+                    },
+                    TransformZone::Rotate => ToolAction::TransformSelection {
+                        transform: rotate_about(pivot, origin, end, mods.shift),
+                    },
+                    TransformZone::Side(horizontal) => ToolAction::TransformSelection {
+                        transform: scale_about_side(pivot, bounds, origin, end, horizontal, mods),
+                    },
+                    TransformZone::Edge(horizontal) => ToolAction::TransformSelection {
+                        transform: skew_about(pivot, bounds, origin, end, horizontal),
+                    },
+                    // Already applied move by move; see the early return above.
+                    TransformZone::Inside => ToolAction::None,
+                }
+            }
+
+            // Text places where you click — the editor shapes the glyphs.
+            ToolId::Text => ToolAction::PlaceText { at: end },
             ToolId::Rectangle | ToolId::Oval | ToolId::PolyStar | ToolId::Line | ToolId::Pen => {
                 if was_click {
                     return ToolAction::None;
@@ -470,25 +1233,42 @@ impl ToolMachine {
                     return ToolAction::None;
                 };
                 let filled = self.tool != ToolId::Line && self.tool != ToolId::Pen;
+                // The shape's own extent is what a gradient fill is laid
+                // across, so it has to be measured before the shape is built.
+                let bounds = buzz_geom::Shape::bounding_box(&path);
                 ToolAction::AddShape {
                     shape: ShapeData {
                         path,
                         fill: filled
-                            .then(|| ctx.style.fill_for_new_shape())
+                            .then(|| ctx.style.fill_for_new_shape(bounds))
                             .flatten()
-                            .map(buzz_scene::FillSpec::solid),
+                            .map(|paint| buzz_scene::FillSpec {
+                                paint,
+                                rule: buzz_geom::FillMode::NonZero,
+                                swatch: None,
+                            }),
                         blend: buzz_scene::PaintBlend::Normal,
-                        stroke: ctx.style.stroke_for_new_shape().map(|(color, width, hairline)| {
-                            buzz_scene::StrokeSpec {
-                                color,
+                        stroke: ctx
+                            .style
+                            .stroke_for_new_shape()
+                            .map(|(color, width, hairline)| buzz_scene::StrokeSpec {
+                                paint: buzz_scene::Paint::Solid(color),
                                 width,
                                 hairline,
-                            }
-                        }),
+                                swatch: None,
+                            }),
                     },
                     label: shape_label(self.tool),
                 }
             }
+
+            // A wand click, wherever the pointer let go. There is nothing
+            // useful a *drag* could mean for it, and treating a small
+            // accidental drag as a miss would be a tool that ignores you.
+            ToolId::MagicWand => ToolAction::WandAt {
+                point: end,
+                additive: mods.shift,
+            },
 
             ToolId::PaintBucket => ToolAction::BucketFill { point: end },
             ToolId::InkBottle => ToolAction::ApplyStroke { point: end },
@@ -533,14 +1313,86 @@ fn brush_width(tool: ToolId, style: &DrawStyle) -> f64 {
     }
 }
 
-/// A smooth curve through the samples.
+/// A smooth curve through the samples, conditioned first.
 ///
 /// Used by the pencil, the eraser and every brush preview that is not painting
-/// its own artwork. Smoothing is applied first, so the pencil gets the same
-/// steadying the brush does — Animate's Pencil has a Smoothing setting for the
-/// same reason.
-fn centreline_of(samples: &[buzz_geom::StrokeSample]) -> BezPath {
-    buzz_geom::centreline(samples)
+/// its own artwork. The samples are steadied and smoothed *before* the curve is
+/// fitted, so the pencil gets the same stabiliser and smoothing the brush does —
+/// Animate's Pencil has a Smoothing setting for the same reason, and the
+/// pull-string stabiliser rides the same dial. Because the preview and the
+/// commit call this identically, what is drawn on screen is what lands.
+fn centreline_of(
+    samples: &[buzz_geom::StrokeSample],
+    how: buzz_geom::brush::Conditioning,
+) -> BezPath {
+    let budget = buzz_geom::BrushBudget::default();
+    let conditioned = buzz_geom::brush::condition(samples, how, &budget);
+    buzz_geom::centreline(&conditioned)
+}
+
+/// The soft brush the current style describes.
+fn soft_brush(style: &DrawStyle) -> buzz_scene::SoftBrush {
+    buzz_scene::SoftBrush {
+        // Size is a *width*, as it is for every other brush and as Animate
+        // shows it; the raster brush works in radii.
+        radius: (style.brush.size.max(0.5)) / 2.0,
+        hardness: style.brush.hardness,
+        flow: style.brush.flow,
+        // The fill swatch, as the vector brush uses — a brush paints a filled
+        // stroke, so its colour is the fill's.
+        color: style.fill_color_for_preview(),
+    }
+}
+
+/// Paint a soft-edged stroke, as artwork: a bitmap and the rectangle it fills.
+///
+/// `None` if the gesture painted nothing at all.
+fn paint_soft_stroke(
+    samples: &[buzz_geom::StrokeSample],
+    style: &DrawStyle,
+) -> Option<(buzz_scene::Canvas, buzz_scene::SoftBrush)> {
+    let brush = soft_brush(style);
+    let points: Vec<Point> = samples.iter().map(|s| s.point).collect();
+    let canvas = buzz_scene::Canvas::for_stroke(&points, &brush)?;
+    if canvas.is_blank() {
+        return None;
+    }
+    Some((canvas, brush))
+}
+
+/// The closed region a lasso gesture has drawn.
+///
+/// The user is not asked to return to where they began: releasing the button
+/// closes the loop with a straight line back to the start, which is what every
+/// lasso in every editor does and what makes the tool usable at all.
+///
+/// `None` for a gesture too small to enclose anything — a stray click with the
+/// Lasso selected should deselect, not cut a sliver out of the artwork under
+/// the pointer.
+fn lasso_region(samples: &[buzz_geom::StrokeSample]) -> Option<BezPath> {
+    if samples.len() < 3 {
+        return None;
+    }
+    let mut path = BezPath::new();
+    path.move_to(samples[0].point);
+    for s in &samples[1..] {
+        path.line_to(s.point);
+    }
+    path.close_path();
+
+    // Twice the enclosed area, by the shoelace formula. A gesture that went out
+    // and came straight back encloses nothing, however long it was.
+    let mut area = 0.0;
+    for pair in samples.windows(2) {
+        let (a, b) = (pair[0].point, pair[1].point);
+        area += a.x * b.y - b.x * a.y;
+    }
+    let (first, last) = (samples[0].point, samples[samples.len() - 1].point);
+    area += last.x * first.y - first.x * last.y;
+    if (area / 2.0).abs() < 1.0 {
+        return None;
+    }
+    Some(path)
 }
 
 /// Build what the brush will paint, whichever brush is selected.
@@ -559,14 +1411,21 @@ fn build_brush_path(
     let settings = &style.brush;
 
     match settings.kind {
-        buzz_ui::BrushKind::Fluid => {
-            Some(buzz_geom::fluid_outline(samples, &settings.profile(), budget).path)
-        }
+        // Both outlined brushes are the same construction; what differs is
+        // whether the width answers to anything, which the profile says.
+        buzz_ui::BrushKind::Fluid | buzz_ui::BrushKind::Normal => Some(
+            buzz_geom::fluid_outline(samples, &brush_profile_for(samples, settings), budget).path,
+        ),
+        // Not a single path at all: a soft stroke is pixels, built by
+        // `paint_soft_stroke`; an effect stroke is a list of pieces, built by
+        // `build_effect_pieces`; and a wave is a bundle of them per frame,
+        // built by `build_wave_pieces`. Nothing here can describe them.
+        buzz_ui::BrushKind::Raster | buzz_ui::BrushKind::Effect | buzz_ui::BrushKind::Wave => None,
         buzz_ui::BrushKind::Pattern | buzz_ui::BrushKind::Art => {
             let source = settings.pattern_path()?;
             // The stroke is conditioned first, so stamps follow the smoothed
             // curve rather than the jitter of the raw pointer.
-            let conditioned = buzz_geom::brush::condition(samples, settings.smoothing, budget);
+            let conditioned = buzz_geom::brush::condition(samples, settings.conditioning(), budget);
             if conditioned.len() < 2 {
                 // A tap with a pattern brush lays down a single stamp, which
                 // is what a stamp tool should do.
@@ -577,6 +1436,176 @@ fn build_brush_path(
             Some(buzz_geom::stamp_along(&spine, &source, settings.fit(), budget).path)
         }
     }
+}
+
+/// One pointer sample, carrying the device's pressure when it reported any.
+///
+/// `None` is a device with no pressure sensor — a mouse, a trackpad, or a pen
+/// whose driver did not send a force with this event — and reads as full
+/// pressure, which is what a mouse is doing when it draws.
+fn sample_at(point: Point, time: f64, pressure: Option<f64>) -> buzz_geom::StrokeSample {
+    match pressure {
+        Some(p) => buzz_geom::StrokeSample::with_pressure(point, p, time),
+        None => buzz_geom::StrokeSample::new(point, time),
+    }
+}
+
+/// The width profile to build this stroke with.
+///
+/// **Pressure falls back to speed when there was no pressure.** A device with
+/// no sensor reports full pressure for every sample, so a pressure-driven
+/// brush on a mouse paints a dead constant width — the setting appears to do
+/// nothing, which is exactly the complaint. A stroke that never once came in
+/// under full pressure did not come from a pen, so it is drawn the way a mouse
+/// stroke should be: answering to speed.
+///
+/// A pen held at maximum for a whole stroke is treated as a mouse by this
+/// rule. That is the honest cost of not being able to ask the device directly,
+/// and it costs nothing visible: a stroke at one pressure throughout is a
+/// stroke of one width, which is what speed gives it at one speed too.
+pub(crate) fn brush_profile_for(
+    samples: &[buzz_geom::StrokeSample],
+    settings: &buzz_ui::BrushSettings,
+) -> buzz_geom::BrushProfile {
+    let mut profile = settings.profile();
+    let saw_pressure = samples.iter().any(|s| s.pressure < 1.0);
+    if matches!(profile.response, buzz_geom::WidthResponse::Pressure) && !saw_pressure {
+        profile.response = buzz_geom::WidthResponse::Speed {
+            reference_speed: settings.reference_speed.max(1.0),
+        };
+    }
+    profile
+}
+
+/// The finished shape a vector brush stroke commits — and previews.
+///
+/// One function used by both, with the same budget, because they must be the
+/// same artwork: the brush paints a filled stroke whose colour comes from the
+/// fill swatch (as in Animate), and a gradient fill is laid across the
+/// stroke's own bounds as they are *right now*, so the ramp settles into
+/// place while the stroke is still being drawn instead of appearing on
+/// release.
+fn vector_brush_shape(
+    samples: &[buzz_geom::StrokeSample],
+    style: &DrawStyle,
+    budget: &buzz_geom::BrushBudget,
+) -> Option<ShapeData> {
+    let path = build_brush_path(samples, style, budget)?;
+    if path.elements().is_empty() {
+        return None;
+    }
+    let bounds = buzz_geom::Shape::bounding_box(&path);
+    let paint = style
+        .fill_for_new_shape(bounds)
+        .unwrap_or(buzz_scene::Paint::Solid(Color::BLACK));
+    Some(ShapeData {
+        path,
+        fill: Some(buzz_scene::FillSpec {
+            paint,
+            rule: buzz_geom::FillMode::NonZero,
+            swatch: None,
+        }),
+        stroke: None,
+        blend: style.brush.blend(),
+    })
+}
+
+/// The artwork an effect stroke lays down, preview and commit alike.
+fn build_effect_pieces(
+    samples: &[buzz_geom::StrokeSample],
+    style: &DrawStyle,
+) -> Vec<buzz_scene::ArtPiece> {
+    buzz_scene::effect_artwork(
+        style.brush.effect,
+        &buzz_scene::EffectStroke {
+            samples,
+            size: style.brush.size.max(1.0),
+            color: style.fill_color_for_preview(),
+            conditioning: style.brush.conditioning(),
+        },
+    )
+}
+
+/// The gesture a wave is generated from, as the style describes it.
+///
+/// One place, so the preview, the commit and the tests all ask for the same
+/// wave — the same reason `build_effect_pieces` exists.
+fn wave_stroke<'a>(
+    samples: &'a [buzz_geom::StrokeSample],
+    style: &DrawStyle,
+) -> buzz_scene::WaveStroke<'a> {
+    buzz_scene::WaveStroke {
+        samples,
+        size: style.brush.size.max(1.0),
+        color: style.fill_color_for_preview(),
+        conditioning: style.brush.conditioning(),
+        settings: style.brush.wave_settings,
+    }
+}
+
+/// One frame of a wave, at `phase`.
+fn build_wave_pieces(
+    samples: &[buzz_geom::StrokeSample],
+    style: &DrawStyle,
+    phase: f64,
+) -> Vec<buzz_scene::ArtPiece> {
+    buzz_scene::wave_artwork(style.brush.wave, &wave_stroke(samples, style), phase)
+}
+
+/// The artwork one stroke of a **captured** brush stamps.
+///
+/// Shared by the preview and the commit, under the same budget, for the same
+/// reason every other brush here shares one: a stroke that changed the moment
+/// the pointer lifted would not be the stroke the user drew.
+///
+/// The placements come from [`buzz_geom::stamp_transforms`] — the very
+/// arithmetic an ordinary pattern brush uses — so a captured brush and a
+/// built-in one put stamp seven in the same place.
+fn build_stamped_artwork(
+    samples: &[buzz_geom::StrokeSample],
+    style: &DrawStyle,
+    budget: &buzz_geom::BrushBudget,
+) -> Vec<ShapeData> {
+    let Some(stamp) = style.brush.pattern_stamp() else {
+        return Vec::new();
+    };
+    let size = style.brush.size.max(0.01);
+
+    // Conditioned first, so stamps follow the smoothed curve rather than the
+    // jitter of the raw pointer — as the outline path does.
+    let conditioned = buzz_geom::brush::condition(samples, style.brush.conditioning(), budget);
+    let placements: Vec<buzz_geom::Affine> = if conditioned.len() < 2 {
+        // A tap lays down a single stamp, which is what a stamp tool should
+        // do — and what the outline path already does.
+        match conditioned.first() {
+            Some(sample) => vec![buzz_scene::stamp::tap_transform(sample.point, size)],
+            None => return Vec::new(),
+        }
+    } else {
+        let spine = buzz_geom::centreline(&conditioned);
+        buzz_geom::stamp_transforms(&spine, stamp.source_rect(size), style.brush.fit(), budget)
+            .transforms
+            .iter()
+            // The placements are in the *scaled* stamp's space; the artwork
+            // is held in unit stamp space, so the size goes on here.
+            .map(|t| *t * buzz_geom::Affine::scale(size))
+            .collect()
+    };
+
+    stamp.place_many(&placements).shapes
+}
+
+/// Art pieces as drawable shapes, for the preview.
+///
+/// Bitmap pieces are developed into throwaway image fills — identity zero,
+/// exactly as the soft brush's preview does — because the preview renderer
+/// draws paints, not coverage buffers. The committed artwork gets real ids
+/// from the document's library instead; see `Editor::add_artwork`.
+fn art_pieces_as_shapes(pieces: &[buzz_scene::ArtPiece]) -> Vec<ShapeData> {
+    let mut register = |canvas: &buzz_scene::Canvas, brush: &buzz_scene::SoftBrush| {
+        std::sync::Arc::new(canvas.to_asset(buzz_scene::ImageId(0), "preview", brush))
+    };
+    buzz_scene::art::to_shapes(pieces, &mut register)
 }
 
 fn contains(rect: Rect, p: Point) -> bool {
@@ -596,10 +1625,7 @@ fn build_shape_path(tool: ToolId, origin: Point, end: Point, mods: Mods) -> Opti
                 let dx = end.x - origin.x;
                 let dy = end.y - origin.y;
                 let size = dx.abs().max(dy.abs());
-                end = Point::new(
-                    origin.x + size * dx.signum(),
-                    origin.y + size * dy.signum(),
-                );
+                end = Point::new(origin.x + size * dx.signum(), origin.y + size * dy.signum());
             }
             ToolId::Line | ToolId::Pen => {
                 let d = end - origin;
@@ -627,8 +1653,12 @@ fn build_shape_path(tool: ToolId, origin: Point, end: Point, mods: Mods) -> Opti
             if mods.shift {
                 Circle::new(rect.center(), rect.width().min(rect.height()) / 2.0).to_path(1e-3)
             } else {
-                Ellipse::new(rect.center(), (rect.width() / 2.0, rect.height() / 2.0), 0.0)
-                    .to_path(1e-3)
+                Ellipse::new(
+                    rect.center(),
+                    (rect.width() / 2.0, rect.height() / 2.0),
+                    0.0,
+                )
+                .to_path(1e-3)
             }
         }
         ToolId::PolyStar => star_path(rect.center(), rect.width().min(rect.height()) / 2.0, 5),
@@ -661,6 +1691,356 @@ fn star_path(center: Point, radius: f64, points: usize) -> BezPath {
 }
 
 /// Scale the selection by dragging, anchored at the opposite corner.
+/// How far from a handle a grab still counts, in screen pixels.
+pub(crate) const TRANSFORM_GRAB_PX: f64 = 8.0;
+
+/// Which part of the Free Transform gizmo a drag started on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransformZone {
+    /// The transformation point itself.
+    Pivot,
+    /// A corner handle: scale.
+    Corner,
+    /// Just outside a corner: rotate.
+    Rotate,
+    /// A mid-edge handle: **squeeze or stretch in one axis**. `true` for a
+    /// handle on a horizontal edge — the top or the bottom — which scales in y.
+    ///
+    /// The square drawn at the middle of each edge, and the answer to "press
+    /// it down from the top". Dragging the edge *line* still skews; this is
+    /// the handle sitting on it, and it is the only part of the gizmo that
+    /// changes one dimension without touching the other.
+    Side(bool),
+    /// An edge: skew. `true` for a horizontal edge, which shears in x.
+    Edge(bool),
+    /// Anywhere else within the selection: move it.
+    Inside,
+}
+
+/// Work out what a drag starting at `at` means.
+///
+/// The order matters and matches what is drawn: the circle wins over the box
+/// it sits inside, a corner wins over the ring around it, and the ring wins
+/// over the edges it overlaps at the ends — otherwise the corner of a small
+/// selection would be three things at once.
+/// Which gradient grip is within `grab` of `at`, if any.
+///
+/// **The centre is tested last**, deliberately. All four grips sit on the ramp
+/// and the focus starts *on top of* the centre when the focal point is zero —
+/// which is its default, so it is the usual case. Testing the centre first
+/// would make the focus unreachable on every gradient that had not already been
+/// adjusted. Nearest-wins would flicker between them when they coincide; an
+/// explicit order does not.
+pub fn grip_at(
+    handles: buzz_scene::GradientHandles,
+    kind: buzz_scene::GradientKind,
+    at: Point,
+    grab: f64,
+) -> Option<GradientGrip> {
+    let near = |p: Point| (at - p).hypot() <= grab;
+
+    if kind == buzz_scene::GradientKind::Radial && near(handles.focus) {
+        return Some(GradientGrip::Focus);
+    }
+    if near(handles.end) {
+        return Some(GradientGrip::End);
+    }
+    if near(handles.width) {
+        return Some(GradientGrip::Width);
+    }
+    if near(handles.center) {
+        return Some(GradientGrip::Center);
+    }
+    None
+}
+
+/// The whole transform a drag from `origin` to `end` asks for.
+///
+/// Built by the same functions the release used to call, from the bounds as
+/// they were when the drag began — so the answer depends only on where the
+/// pointer is now, never on how it got there. That is what lets each move
+/// commit the difference and still land exactly where a single commit would.
+///
+/// A free function rather than a method: it needs nothing from the machine,
+/// and asking `self` for it while the gesture is mutably borrowed is a borrow
+/// the compiler is right to refuse.
+fn transform_for(t: &Transforming, origin: Point, end: Point, mods: Mods) -> Affine {
+    match t.zone {
+        TransformZone::Rotate => rotate_about(t.pivot, origin, end, mods.shift),
+        TransformZone::Corner => {
+            if mods.alt {
+                scale_about(t.pivot, t.bounds, origin, end, mods.shift)
+            } else {
+                scale_about_corner(t.bounds, origin, end, mods.shift)
+            }
+        }
+        TransformZone::Side(horizontal) => {
+            scale_about_side(t.pivot, t.bounds, origin, end, horizontal, mods)
+        }
+        TransformZone::Edge(horizontal) => skew_about(t.pivot, t.bounds, origin, end, horizontal),
+        TransformZone::Pivot | TransformZone::Inside => Affine::IDENTITY,
+    }
+}
+
+fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> TransformZone {
+    // A little more forgiving than a handle: the circle is small, it is often
+    // parked over artwork you are looking at rather than over a corner, and
+    // missing it silently *moves the artwork* instead — which is the one
+    // outcome worth spending a few pixels to avoid.
+    if (at - pivot).hypot() <= grab * 1.5 {
+        return TransformZone::Pivot;
+    }
+
+    let corners = [
+        Point::new(bounds.x0, bounds.y0),
+        Point::new(bounds.x1, bounds.y0),
+        Point::new(bounds.x1, bounds.y1),
+        Point::new(bounds.x0, bounds.y1),
+    ];
+    let nearest = corners
+        .iter()
+        .map(|c| (*c - at).hypot())
+        .fold(f64::INFINITY, f64::min);
+    if nearest <= grab {
+        return TransformZone::Corner;
+    }
+    // Animate's rotate ring: just *outside* a corner, where the pointer turns
+    // into the rotation cursor.
+    if nearest <= grab * 3.0 && !contains(bounds, at) {
+        return TransformZone::Rotate;
+    }
+
+    // **The mid-edge handles**, which are drawn as squares exactly here — see
+    // `stage::draw_selection_chrome`. Tested before the edge lines they sit
+    // on, so the handle wins over the skew zone it overlaps: a square you can
+    // see is a promise that grabbing it does one thing, and the line either
+    // side of it is where the other one lives.
+    let mid = bounds.center();
+    for (p, horizontal) in [
+        (Point::new(mid.x, bounds.y0), true),
+        (Point::new(mid.x, bounds.y1), true),
+        (Point::new(bounds.x0, mid.y), false),
+        (Point::new(bounds.x1, mid.y), false),
+    ] {
+        if (p - at).hypot() <= grab {
+            return TransformZone::Side(horizontal);
+        }
+    }
+
+    // An edge, but not near a corner: skew along it.
+    let near_vertical_edge = ((at.x - bounds.x0).abs() <= grab || (at.x - bounds.x1).abs() <= grab)
+        && at.y > bounds.y0 + grab
+        && at.y < bounds.y1 - grab;
+    let near_horizontal_edge = ((at.y - bounds.y0).abs() <= grab
+        || (at.y - bounds.y1).abs() <= grab)
+        && at.x > bounds.x0 + grab
+        && at.x < bounds.x1 - grab;
+    if near_horizontal_edge {
+        return TransformZone::Edge(true);
+    }
+    if near_vertical_edge {
+        return TransformZone::Edge(false);
+    }
+
+    TransformZone::Inside
+}
+
+/// The angle a drag has swept about `pivot`, snapped to 45 degrees with Shift.
+///
+/// Pulled out of `rotate_about` so a live rotation can ask for the angle alone
+/// and commit the part of it that is left.
+fn angle_of(pivot: Point, origin: Point, end: Point, snap: bool) -> f64 {
+    let from = origin - pivot;
+    let to = end - pivot;
+    // A drag that began on the pivot has no direction to measure from.
+    if from.hypot() < 1e-9 || to.hypot() < 1e-9 {
+        return 0.0;
+    }
+    let angle = to.y.atan2(to.x) - from.y.atan2(from.x);
+    if snap {
+        let step = std::f64::consts::FRAC_PI_4;
+        (angle / step).round() * step
+    } else {
+        angle
+    }
+}
+
+/// Rotation about a point, by the angle the drag swept.
+///
+/// With Shift the angle snaps to 45°, as Animate does.
+fn rotate_about(pivot: Point, origin: Point, end: Point, snap: bool) -> Affine {
+    let angle = angle_of(pivot, origin, end, snap);
+    Affine::translate(pivot.to_vec2()) * Affine::rotate(angle) * Affine::translate(-pivot.to_vec2())
+}
+
+/// Scale about an arbitrary point rather than the opposite corner.
+fn scale_about(pivot: Point, bounds: Rect, origin: Point, end: Point, uniform: bool) -> Affine {
+    let before = origin - pivot;
+    let after = end - pivot;
+    let safe = |a: f64, b: f64, extent: f64| {
+        // Dragging a handle that is *on* the pivot's own row or column has no
+        // ratio to take; fall back on the selection's size so the drag still
+        // does something predictable rather than nothing.
+        if b.abs() > 1e-9 {
+            a / b
+        } else if extent.abs() > 1e-9 {
+            1.0 + a / extent
+        } else {
+            1.0
+        }
+    };
+    let mut sx = safe(after.x, before.x, bounds.width());
+    let mut sy = safe(after.y, before.y, bounds.height());
+    if uniform {
+        let s = (sx.abs() + sy.abs()) / 2.0;
+        sx = s * sx.signum();
+        sy = s * sy.signum();
+    }
+    const MIN: f64 = 1e-4;
+    if sx.abs() < MIN {
+        sx = MIN * if sx < 0.0 { -1.0 } else { 1.0 };
+    }
+    if sy.abs() < MIN {
+        sy = MIN * if sy < 0.0 { -1.0 } else { 1.0 };
+    }
+    Affine::translate(pivot.to_vec2())
+        * Affine::scale_non_uniform(sx, sy)
+        * Affine::translate(-pivot.to_vec2())
+}
+
+/// **Squeeze or stretch in one axis**, by dragging the handle at the middle of
+/// an edge, held at the opposite edge.
+///
+/// # Why this is not a skew
+///
+/// Every edge of the gizmo used to skew and nothing else, so the top handle
+/// sheared in x and a drag straight *down* it — press this flat — moved
+/// nothing at all. The pointer said as much: it turned into the horizontal
+/// resize arrow over the top edge, because horizontal was the only thing on
+/// offer there. Squashing and stretching one dimension is the most ordinary
+/// thing an animator asks of a selection, and it had no gesture.
+///
+/// So the **handle** scales and the **line either side of it** still skews.
+/// Both are reachable, both are drawn, and neither had to be given up: see
+/// [`TransformZone::Side`] for the order they are tested in.
+///
+/// `horizontal` is true for the handle on a horizontal edge — the top or the
+/// bottom — which is the one that scales in **y**.
+///
+/// Shift keeps the proportions, taking the other axis along with the dragged
+/// one; Alt holds the transformation point instead of the opposite edge, which
+/// is what Alt does at a corner as well.
+fn scale_about_side(
+    pivot: Point,
+    bounds: Rect,
+    origin: Point,
+    end: Point,
+    horizontal: bool,
+    mods: Mods,
+) -> Affine {
+    // What is held still while the grabbed edge moves. The opposite edge, so
+    // pressing the top down leaves the bottom on the ground rather than
+    // shrinking the artwork towards its middle — which is what "squash it"
+    // means and what a corner drag already does.
+    //
+    // The anchor's *other* coordinate is the pivot's, so the axis that is not
+    // being scaled is untouched by where the anchor sits.
+    let anchor = if mods.alt {
+        pivot
+    } else if horizontal {
+        let far = if (origin.y - bounds.y0).abs() < (origin.y - bounds.y1).abs() {
+            bounds.y1
+        } else {
+            bounds.y0
+        };
+        Point::new(pivot.x, far)
+    } else {
+        let far = if (origin.x - bounds.x0).abs() < (origin.x - bounds.x1).abs() {
+            bounds.x1
+        } else {
+            bounds.x0
+        };
+        Point::new(far, pivot.y)
+    };
+
+    let (before, after, extent) = if horizontal {
+        (origin.y - anchor.y, end.y - anchor.y, bounds.height())
+    } else {
+        (origin.x - anchor.x, end.x - anchor.x, bounds.width())
+    };
+    // Dragging a handle that is *on* the anchor's own row has no ratio to
+    // take; the selection's own size stands in, so the drag still does
+    // something predictable rather than nothing. Same fallback as
+    // `scale_about`, and for the same reason.
+    let s = if before.abs() > 1e-9 {
+        after / before
+    } else if extent.abs() > 1e-9 {
+        1.0 + after / extent
+    } else {
+        1.0
+    };
+
+    let (sx, sy) = if mods.shift {
+        (s, s)
+    } else if horizontal {
+        (1.0, s)
+    } else {
+        (s, 1.0)
+    };
+
+    // A zero scale is a singular matrix: the artwork collapses to a line and
+    // no drag back can recover it, because there is nothing left to scale.
+    const MIN: f64 = 1e-4;
+    let floor = |v: f64| {
+        if v.abs() < MIN {
+            MIN * if v < 0.0 { -1.0 } else { 1.0 }
+        } else {
+            v
+        }
+    };
+
+    Affine::translate(anchor.to_vec2())
+        * Affine::scale_non_uniform(floor(sx), floor(sy))
+        * Affine::translate(-anchor.to_vec2())
+}
+
+/// Skew about a point: dragging a horizontal edge shears in x, a vertical one
+/// in y, in proportion to the distance from the transformation point.
+fn skew_about(pivot: Point, bounds: Rect, origin: Point, end: Point, horizontal: bool) -> Affine {
+    let extent = if horizontal {
+        bounds.height()
+    } else {
+        bounds.width()
+    };
+    if extent.abs() < 1e-9 {
+        return Affine::IDENTITY;
+    }
+    // The lever is how far the grabbed edge is from the pivot: an edge through
+    // the transformation point cannot shear about it, which is the geometry
+    // rather than a special case.
+    let lever = if horizontal {
+        origin.y - pivot.y
+    } else {
+        origin.x - pivot.x
+    };
+    if lever.abs() < 1e-9 {
+        return Affine::IDENTITY;
+    }
+    let (shear_x, shear_y) = if horizontal {
+        ((end.x - origin.x) / lever, 0.0)
+    } else {
+        (0.0, (end.y - origin.y) / lever)
+    };
+
+    const LIMIT: f64 = 20.0;
+    let shear_x = shear_x.clamp(-LIMIT, LIMIT);
+    let shear_y = shear_y.clamp(-LIMIT, LIMIT);
+
+    Affine::translate(pivot.to_vec2())
+        * Affine::new([1.0, shear_y, shear_x, 1.0, 0.0, 0.0])
+        * Affine::translate(-pivot.to_vec2())
+}
+
 fn scale_about_corner(bounds: Rect, origin: Point, end: Point, uniform: bool) -> Affine {
     // Whichever corner the drag started nearest stays put... its opposite does.
     let anchor = Point::new(
@@ -680,11 +2060,7 @@ fn scale_about_corner(bounds: Rect, origin: Point, end: Point, uniform: bool) ->
     let after = end - anchor;
 
     let safe = |a: f64, b: f64| {
-        if b.abs() < 1e-9 {
-            1.0
-        } else {
-            a / b
-        }
+        if b.abs() < 1e-9 { 1.0 } else { a / b }
     };
     let mut sx = safe(after.x, before.x);
     let mut sy = safe(after.y, before.y);
@@ -719,20 +2095,243 @@ mod tests {
             zoom: 1.0,
             selection_bounds: None,
             anchors: &[],
+            pivot: None,
+            gradient: None,
         }
     }
 
-    fn drag(machine: &mut ToolMachine, from: Point, to: Point, ctx: &ToolContext<'_>) -> ToolAction {
+    fn drag(
+        machine: &mut ToolMachine,
+        from: Point,
+        to: Point,
+        ctx: &ToolContext<'_>,
+    ) -> ToolAction {
         machine.pointer_down(from, from, Mods::default(), ctx);
         machine.pointer_move(to, to, Mods::default());
         machine.pointer_up(to, to, ctx)
+    }
+
+    // -- the Free Transform gizmo ------------------------------------------
+
+    fn box_10() -> Rect {
+        Rect::new(0.0, 0.0, 100.0, 100.0)
+    }
+
+    /// Which part of the gizmo a drag lands on. Getting this wrong means a
+    /// rotation where the user asked for a scale, which is the sort of thing
+    /// that loses work.
+    #[test]
+    fn the_gizmo_reads_the_zone_a_drag_starts_in() {
+        let bounds = box_10();
+        let pivot = Point::new(50.0, 50.0);
+        let grab = 8.0;
+        let zone = |x: f64, y: f64| transform_zone(bounds, pivot, Point::new(x, y), grab);
+
+        assert_eq!(zone(50.0, 50.0), TransformZone::Pivot, "on the circle");
+        assert_eq!(zone(0.0, 0.0), TransformZone::Corner, "on a corner");
+        assert_eq!(
+            zone(-12.0, -12.0),
+            TransformZone::Rotate,
+            "just outside a corner"
+        );
+        assert_eq!(
+            zone(50.0, 0.0),
+            TransformZone::Side(true),
+            "the handle on the top edge"
+        );
+        assert_eq!(
+            zone(0.0, 50.0),
+            TransformZone::Side(false),
+            "the handle on the left edge"
+        );
+        // The line either side of a handle still skews, which is what keeps
+        // both gestures reachable on one edge.
+        assert_eq!(zone(75.0, 0.0), TransformZone::Edge(true), "a top edge");
+        assert_eq!(zone(0.0, 75.0), TransformZone::Edge(false), "a left edge");
+        assert_eq!(zone(30.0, 30.0), TransformZone::Inside, "the middle");
+    }
+
+    /// **Pressing the top handle down squashes the box and holds the bottom.**
+    ///
+    /// The gesture the gizmo had no answer for: every edge sheared, so a drag
+    /// straight down a horizontal edge — which shears in x — moved nothing.
+    #[test]
+    fn the_side_handle_squeezes_one_axis_and_holds_the_far_edge() {
+        let bounds = box_10();
+        let pivot = bounds.center();
+        let squashed = scale_about_side(
+            pivot,
+            bounds,
+            Point::new(50.0, 0.0),
+            Point::new(50.0, 50.0),
+            true,
+            Mods::default(),
+        );
+
+        // Half as tall...
+        let top = squashed * Point::new(50.0, 0.0);
+        assert!(
+            (top - Point::new(50.0, 50.0)).hypot() < 1e-9,
+            "the grabbed edge follows the pointer, got {top:?}"
+        );
+        // ...held at the bottom...
+        let bottom = squashed * Point::new(50.0, 100.0);
+        assert!(
+            (bottom - Point::new(50.0, 100.0)).hypot() < 1e-9,
+            "the far edge is the anchor, got {bottom:?}"
+        );
+        // ...and no narrower.
+        let side = squashed * Point::new(0.0, 100.0);
+        assert!(
+            (side.x - 0.0).abs() < 1e-9,
+            "one axis only: x moved to {}",
+            side.x
+        );
+
+        // A vertical edge is the other way about.
+        let pinched = scale_about_side(
+            pivot,
+            bounds,
+            Point::new(0.0, 50.0),
+            Point::new(50.0, 50.0),
+            false,
+            Mods::default(),
+        );
+        let left = pinched * Point::new(0.0, 50.0);
+        assert!((left.x - 50.0).abs() < 1e-9, "got {left:?}");
+        assert!((left.y - 50.0).abs() < 1e-9, "y is untouched, got {left:?}");
+    }
+
+    /// Alt holds the transformation point instead of the far edge — the same
+    /// thing Alt does at a corner, so one modifier means one thing.
+    #[test]
+    fn alt_squeezes_about_the_transformation_point() {
+        let bounds = box_10();
+        let pivot = bounds.center();
+        let mods = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        let squashed = scale_about_side(
+            pivot,
+            bounds,
+            Point::new(50.0, 0.0),
+            Point::new(50.0, 25.0),
+            true,
+            mods,
+        );
+        let top = squashed * Point::new(50.0, 0.0);
+        let bottom = squashed * Point::new(50.0, 100.0);
+        assert!((top.y - 25.0).abs() < 1e-9, "got {top:?}");
+        assert!(
+            (bottom.y - 75.0).abs() < 1e-9,
+            "the far edge comes in by as much, got {bottom:?}"
+        );
+    }
+
+    /// The circle wins over everything under it: a transformation point parked
+    /// on a corner must still be draggable.
+    #[test]
+    fn the_transformation_point_wins_over_the_handle_it_sits_on() {
+        let bounds = box_10();
+        let corner = Point::new(0.0, 0.0);
+        assert_eq!(
+            transform_zone(bounds, corner, corner, 8.0),
+            TransformZone::Pivot
+        );
+    }
+
+    /// A quarter turn about a point, and Shift snapping to 45°.
+    #[test]
+    fn rotation_turns_about_the_transformation_point() {
+        let pivot = Point::new(0.0, 0.0);
+        let turned = rotate_about(pivot, Point::new(10.0, 0.0), Point::new(0.0, 10.0), false);
+        let moved = turned * Point::new(10.0, 0.0);
+        assert!(
+            (moved - Point::new(0.0, 10.0)).hypot() < 1e-9,
+            "expected a quarter turn, got {moved:?}"
+        );
+
+        // 30° asked for, 45° snapped to.
+        let snapped = rotate_about(
+            pivot,
+            Point::new(10.0, 0.0),
+            Point::new(10.0_f64.to_radians().cos() * 10.0, 5.0),
+            true,
+        );
+        let angle = {
+            let p = snapped * Point::new(1.0, 0.0);
+            p.y.atan2(p.x)
+        };
+        assert!(
+            (angle - std::f64::consts::FRAC_PI_4).abs() < 1e-9 || angle.abs() < 1e-9,
+            "expected a multiple of 45°, got {}",
+            angle.to_degrees()
+        );
+    }
+
+    /// Rotating about a point leaves that point exactly where it was — the one
+    /// property the whole feature rests on.
+    #[test]
+    fn rotation_leaves_the_transformation_point_alone() {
+        let pivot = Point::new(37.0, -11.0);
+        let turned = rotate_about(pivot, Point::new(50.0, 0.0), Point::new(0.0, 50.0), false);
+        assert!((turned * pivot - pivot).hypot() < 1e-9);
+    }
+
+    /// Skew shears along the edge that was grabbed, in proportion to the
+    /// distance from the transformation point.
+    #[test]
+    fn skew_shears_about_the_transformation_point() {
+        let bounds = box_10();
+        let pivot = Point::new(50.0, 100.0);
+        // Grab the top edge and pull it 50 to the right: the top leans over,
+        // the bottom — which is on the pivot's own line — does not move.
+        let sheared = skew_about(
+            pivot,
+            bounds,
+            Point::new(50.0, 0.0),
+            Point::new(100.0, 0.0),
+            true,
+        );
+
+        let top = sheared * Point::new(50.0, 0.0);
+        let bottom = sheared * Point::new(50.0, 100.0);
+        assert!((top.x - 100.0).abs() < 1e-9, "the top should lean: {top:?}");
+        assert!(
+            (bottom - Point::new(50.0, 100.0)).hypot() < 1e-9,
+            "the pivot's own line should not move: {bottom:?}"
+        );
+    }
+
+    /// Scaling about the transformation point keeps it fixed, which is what
+    /// Alt-dragging a handle is for.
+    #[test]
+    fn alt_scaling_keeps_the_transformation_point_fixed() {
+        let bounds = box_10();
+        let pivot = Point::new(50.0, 50.0);
+        let scaled = scale_about(
+            pivot,
+            bounds,
+            Point::new(100.0, 100.0),
+            Point::new(150.0, 150.0),
+            false,
+        );
+        assert!((scaled * pivot - pivot).hypot() < 1e-9);
+        let corner = scaled * Point::new(100.0, 100.0);
+        assert!((corner - Point::new(150.0, 150.0)).hypot() < 1e-9);
     }
 
     #[test]
     fn dragging_the_rectangle_tool_creates_a_rectangle() {
         let style = DrawStyle::default();
         let mut m = ToolMachine::new(ToolId::Rectangle);
-        let action = drag(&mut m, Point::new(10.0, 10.0), Point::new(60.0, 40.0), &ctx(&style));
+        let action = drag(
+            &mut m,
+            Point::new(10.0, 10.0),
+            Point::new(60.0, 40.0),
+            &ctx(&style),
+        );
 
         match action {
             ToolAction::AddShape { shape, label } => {
@@ -752,7 +2351,10 @@ mod tests {
             ToolId::Rectangle,
             Point::new(0.0, 0.0),
             Point::new(100.0, 30.0),
-            Mods { shift: true, ..Default::default() },
+            Mods {
+                shift: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         let bb = path.bounding_box();
@@ -769,7 +2371,10 @@ mod tests {
             Point::new(0.0, 0.0),
             // Nearly horizontal, so it should snap flat.
             Point::new(100.0, 12.0),
-            Mods { shift: true, ..Default::default() },
+            Mods {
+                shift: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         let bb = path.bounding_box();
@@ -780,7 +2385,12 @@ mod tests {
     fn a_line_has_a_stroke_but_no_fill() {
         let style = DrawStyle::default();
         let mut m = ToolMachine::new(ToolId::Line);
-        match drag(&mut m, Point::new(0.0, 0.0), Point::new(50.0, 50.0), &ctx(&style)) {
+        match drag(
+            &mut m,
+            Point::new(0.0, 0.0),
+            Point::new(50.0, 50.0),
+            &ctx(&style),
+        ) {
             ToolAction::AddShape { shape, .. } => {
                 assert!(shape.stroke.is_some());
                 assert!(shape.fill.is_none(), "a line must not be filled");
@@ -808,12 +2418,26 @@ mod tests {
 
         // At 1x, 2 document units is under the 3 px slop: a click.
         let mut m = ToolMachine::new(ToolId::Rectangle);
-        let zoomed_out = ToolContext { style: &style, zoom: 1.0, selection_bounds: None, anchors: &[] };
+        let zoomed_out = ToolContext {
+            style: &style,
+            zoom: 1.0,
+            selection_bounds: None,
+            anchors: &[],
+            pivot: None,
+            gradient: None,
+        };
         assert_eq!(drag(&mut m, from, to, &zoomed_out), ToolAction::None);
 
         // At 10x, the same 2 units is 20 px: a real drag.
         let mut m = ToolMachine::new(ToolId::Rectangle);
-        let zoomed_in = ToolContext { style: &style, zoom: 10.0, selection_bounds: None, anchors: &[] };
+        let zoomed_in = ToolContext {
+            style: &style,
+            zoom: 10.0,
+            selection_bounds: None,
+            anchors: &[],
+            pivot: None,
+            gradient: None,
+        };
         assert!(matches!(
             drag(&mut m, from, to, &zoomed_in),
             ToolAction::AddShape { .. }
@@ -839,7 +2463,10 @@ mod tests {
         let style = DrawStyle::default();
         let mut m = ToolMachine::new(ToolId::Selection);
         let p = Point::new(5.0, 5.0);
-        let mods = Mods { shift: true, ..Default::default() };
+        let mods = Mods {
+            shift: true,
+            ..Default::default()
+        };
         m.pointer_down(p, p, mods, &ctx(&style));
         match m.pointer_up(p, p, &ctx(&style)) {
             ToolAction::PickAt { additive, .. } => assert!(additive),
@@ -851,7 +2478,12 @@ mod tests {
     fn dragging_empty_space_marquee_selects() {
         let style = DrawStyle::default();
         let mut m = ToolMachine::new(ToolId::Selection);
-        match drag(&mut m, Point::new(0.0, 0.0), Point::new(100.0, 80.0), &ctx(&style)) {
+        match drag(
+            &mut m,
+            Point::new(0.0, 0.0),
+            Point::new(100.0, 80.0),
+            &ctx(&style),
+        ) {
             ToolAction::PickInRect { rect, .. } => {
                 assert!((rect.width() - 100.0).abs() < 1e-9);
             }
@@ -861,6 +2493,10 @@ mod tests {
 
     /// Dragging from *inside* the selection moves it instead of starting a new
     /// marquee — the behaviour that makes the Selection tool feel right.
+    ///
+    /// The move arrives **while the pointer travels**, a step at a time, so the
+    /// artwork is under the pointer the whole way rather than jumping to it on
+    /// release. The release itself therefore has nothing left to commit.
     #[test]
     fn dragging_from_inside_the_selection_moves_it() {
         let style = DrawStyle::default();
@@ -869,21 +2505,48 @@ mod tests {
             zoom: 1.0,
             selection_bounds: Some(Rect::new(0.0, 0.0, 100.0, 100.0)),
             anchors: &[],
+            pivot: None,
+            gradient: None,
         };
         let mut m = ToolMachine::new(ToolId::Selection);
-        match drag(&mut m, Point::new(50.0, 50.0), Point::new(80.0, 90.0), &c) {
-            ToolAction::MoveSelection { delta } => {
-                assert!((delta.x - 30.0).abs() < 1e-9 && (delta.y - 40.0).abs() < 1e-9);
+        m.pointer_down(
+            Point::new(50.0, 50.0),
+            Point::new(50.0, 50.0),
+            Mods::default(),
+            &c,
+        );
+
+        // Walked in two steps, so the deltas have to add up to the whole move
+        // rather than each being measured from the origin.
+        let mut total = buzz_geom::Vec2::new(0.0, 0.0);
+        for at in [Point::new(60.0, 70.0), Point::new(80.0, 90.0)] {
+            match m.pointer_move(at, at, Mods::default()) {
+                ToolAction::MoveSelection { delta } => total += delta,
+                other => panic!("mid-drag: got {other:?}"),
             }
-            other => panic!("got {other:?}"),
         }
+        assert!(
+            (total.x - 30.0).abs() < 1e-9 && (total.y - 40.0).abs() < 1e-9,
+            "the steps should sum to the drag, got {total:?}"
+        );
+
+        let end = Point::new(80.0, 90.0);
+        assert!(
+            matches!(m.pointer_up(end, end, &c), ToolAction::None),
+            "the release must not move it a second time"
+        );
     }
 
     #[test]
     fn freehand_tools_accumulate_a_path() {
         let style = DrawStyle::default();
         let mut m = ToolMachine::new(ToolId::Pencil);
-        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default(), &ctx(&style));
+        m.pointer_down(
+            Point::new(0.0, 0.0),
+            Point::ORIGIN,
+            Mods::default(),
+            &ctx(&style),
+        );
         for i in 1..20 {
             let p = Point::new(i as f64, (i as f64).sin() * 5.0);
             m.pointer_move(p, p, Mods::default());
@@ -904,7 +2567,12 @@ mod tests {
     fn the_brush_produces_a_filled_outline() {
         let style = DrawStyle::default();
         let mut m = ToolMachine::new(ToolId::Brush);
-        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default(), &ctx(&style));
+        m.pointer_down(
+            Point::new(0.0, 0.0),
+            Point::ORIGIN,
+            Mods::default(),
+            &ctx(&style),
+        );
         for i in 1..10 {
             let p = Point::new(i as f64 * 5.0, 0.0);
             m.pointer_move(p, p, Mods::default());
@@ -914,10 +2582,45 @@ mod tests {
                 assert_eq!(label, "Brush");
                 assert!(shape.fill.is_some(), "the brush fills");
                 assert!(shape.stroke.is_none(), "the brush does not stroke");
-                assert!(shape.path.area().abs() > 0.0, "the outline should enclose area");
+                assert!(
+                    shape.path.area().abs() > 0.0,
+                    "the outline should enclose area"
+                );
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    /// Holding Control while brushing flips merge and build-up for that stroke,
+    /// without changing the persistent toggle.
+    #[test]
+    fn holding_control_flips_build_up_for_one_stroke() {
+        let style = DrawStyle::default();
+        assert!(!style.brush.build_up, "the default is merge, not build-up");
+
+        let blend_of = |mods: Mods| -> buzz_scene::PaintBlend {
+            let mut m = ToolMachine::new(ToolId::Brush);
+            m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, mods, &ctx(&style));
+            for i in 1..10 {
+                let p = Point::new(i as f64 * 5.0, 0.0);
+                m.pointer_move(p, p, mods);
+            }
+            match m.pointer_up(Point::new(50.0, 0.0), Point::ORIGIN, &ctx(&style)) {
+                ToolAction::AddShape { shape, .. } => shape.blend,
+                other => panic!("got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            blend_of(Mods::default()),
+            buzz_scene::PaintBlend::Normal,
+            "a plain stroke merges"
+        );
+        assert_eq!(
+            blend_of(Mods { ctrl: true, ..Default::default() }),
+            buzz_scene::PaintBlend::Additive,
+            "Ctrl flips the merging default into build-up for the stroke"
+        );
     }
 
     /// Drive a whole stroke through the machine, with controlled timing.
@@ -957,9 +2660,7 @@ mod tests {
     #[test]
     fn a_fast_brush_stroke_is_thinner_than_a_slow_one() {
         let style = DrawStyle::default();
-        let points: Vec<Point> = (0..60)
-            .map(|i| Point::new(i as f64 * 10.0, 0.0))
-            .collect();
+        let points: Vec<Point> = (0..60).map(|i| Point::new(i as f64 * 10.0, 0.0)).collect();
 
         let area_for = |seconds: f64| -> f64 {
             let mut m = ToolMachine::new(ToolId::Brush);
@@ -1025,7 +2726,10 @@ mod tests {
                     .filter(|e| matches!(e, kurbo::PathEl::MoveTo(_)))
                     .count();
                 assert_eq!(stamps, 1, "an art brush places one copy");
-                assert!(shape.path.bounding_box().width() > 250.0, "stretched to fit");
+                assert!(
+                    shape.path.bounding_box().width() > 250.0,
+                    "stretched to fit"
+                );
             }
             other => panic!("got {other:?}"),
         }
@@ -1063,6 +2767,176 @@ mod tests {
         }
     }
 
+    /// **What you watch being drawn is what you get.** The preview on the
+    /// last pointer move and the shape the release commits are built by the
+    /// same function under the same budget, so they must be identical — the
+    /// stroke may not change, even slightly, when the pointer lifts. This is
+    /// the regression test for the era when the preview ran under a cheaper
+    /// budget and every stroke visibly re-smoothed itself on release.
+    #[test]
+    fn the_stroke_does_not_change_when_the_pointer_lifts() {
+        for kind in [
+            buzz_ui::BrushKind::Fluid,
+            buzz_ui::BrushKind::Normal,
+            buzz_ui::BrushKind::Pattern,
+            buzz_ui::BrushKind::Art,
+        ] {
+            let mut style = DrawStyle::default();
+            style.brush.kind = kind;
+            style.brush.smoothing = 0.8;
+            // With the stabiliser on too: a lagging filter that was not
+            // deterministic would show up here as a stroke that changed on
+            // release, which is exactly what this test exists to catch.
+            style.brush.stabiliser = 0.7;
+
+            let mut m = ToolMachine::new(ToolId::Brush);
+            let points = wavy(300, 900.0);
+
+            m.set_time(0.0);
+            m.pointer_down(points[0], points[0], Mods::default(), &ctx(&style));
+            for (i, p) in points.iter().enumerate().skip(1) {
+                m.set_time(i as f64 * 0.004);
+                m.pointer_move(*p, *p, Mods::default());
+            }
+
+            let previewed = match m.preview(&ctx(&style)) {
+                Preview::Artwork(shapes) => shapes,
+                other => panic!("{kind:?} previewed {other:?}"),
+            };
+            let last = *points.last().unwrap();
+            let committed = match m.pointer_up(last, last, &ctx(&style)) {
+                ToolAction::AddShape { shape, .. } => shape,
+                other => panic!("{kind:?} committed {other:?}"),
+            };
+
+            assert_eq!(
+                previewed.len(),
+                1,
+                "a vector brush previews exactly its one shape"
+            );
+            assert_eq!(
+                previewed[0], committed,
+                "{kind:?}: the committed stroke differs from the last preview"
+            );
+        }
+    }
+
+    /// The effect brush keeps the same promise: the pieces previewed on the
+    /// last move are the pieces the release hands over.
+    #[test]
+    fn an_effect_stroke_commits_exactly_what_it_previewed() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Effect;
+        style.brush.effect = buzz_scene::EffectKind::Snow;
+
+        let mut m = ToolMachine::new(ToolId::Brush);
+        let points = wavy(120, 500.0);
+
+        m.set_time(0.0);
+        m.pointer_down(points[0], points[0], Mods::default(), &ctx(&style));
+        for (i, p) in points.iter().enumerate().skip(1) {
+            m.set_time(i as f64 * 0.004);
+            m.pointer_move(*p, *p, Mods::default());
+        }
+
+        let previewed = match m.preview(&ctx(&style)) {
+            Preview::Artwork(shapes) => shapes,
+            other => panic!("previewed {other:?}"),
+        };
+        assert!(!previewed.is_empty(), "snow should preview its flakes");
+
+        let last = *points.last().unwrap();
+        let committed = match m.pointer_up(last, last, &ctx(&style)) {
+            ToolAction::AddArtwork { pieces, label } => {
+                assert_eq!(label, "Snow");
+                pieces
+            }
+            other => panic!("committed {other:?}"),
+        };
+        assert_eq!(
+            art_pieces_as_shapes(&committed),
+            previewed,
+            "the committed pieces differ from the last preview"
+        );
+    }
+
+    /// A wave keeps the promise across an *animation*: the frame previewed on
+    /// the last move is the **first frame** the release hands over. The rest of
+    /// the cycle follows from it, so what was drawn is where the animation
+    /// starts rather than something near it.
+    #[test]
+    fn a_wave_stroke_commits_a_cycle_that_starts_with_what_it_previewed() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Wave;
+        style.brush.set_wave(buzz_scene::WaveKind::Smoke);
+        style.brush.wave_settings.frames = 10;
+
+        let mut m = ToolMachine::new(ToolId::Brush);
+        let points = wavy(120, 500.0);
+
+        m.set_time(0.0);
+        m.pointer_down(points[0], points[0], Mods::default(), &ctx(&style));
+        for (i, p) in points.iter().enumerate().skip(1) {
+            m.set_time(i as f64 * 0.004);
+            m.pointer_move(*p, *p, Mods::default());
+        }
+
+        let previewed = match m.preview(&ctx(&style)) {
+            Preview::Artwork(shapes) => shapes,
+            other => panic!("previewed {other:?}"),
+        };
+        assert!(!previewed.is_empty(), "smoke should preview its plume");
+
+        let last = *points.last().unwrap();
+        let frames = match m.pointer_up(last, last, &ctx(&style)) {
+            ToolAction::AddArtworkFrames { frames, label } => {
+                assert_eq!(label, "Smoke");
+                frames
+            }
+            other => panic!("committed {other:?}"),
+        };
+        assert_eq!(frames.len(), 10, "the whole cycle should be handed over");
+        assert_eq!(
+            art_pieces_as_shapes(&frames[0]),
+            previewed,
+            "the first committed frame differs from the last preview"
+        );
+        assert_ne!(
+            art_pieces_as_shapes(&frames[5]),
+            previewed,
+            "the cycle should move rather than repeat one drawing"
+        );
+    }
+
+    /// At one frame a wave is an ordinary still, and must go down the ordinary
+    /// path — otherwise drawing a static ribbon would cost a keyframe.
+    #[test]
+    fn a_one_frame_wave_commits_as_a_plain_drawing() {
+        let mut style = DrawStyle::default();
+        style.brush.kind = buzz_ui::BrushKind::Wave;
+        style.brush.set_wave(buzz_scene::WaveKind::Ribbon);
+        style.brush.wave_settings.frames = 1;
+
+        let mut m = ToolMachine::new(ToolId::Brush);
+        let points = wavy(120, 500.0);
+
+        m.set_time(0.0);
+        m.pointer_down(points[0], points[0], Mods::default(), &ctx(&style));
+        for (i, p) in points.iter().enumerate().skip(1) {
+            m.set_time(i as f64 * 0.004);
+            m.pointer_move(*p, *p, Mods::default());
+        }
+
+        let last = *points.last().unwrap();
+        match m.pointer_up(last, last, &ctx(&style)) {
+            ToolAction::AddArtwork { pieces, label } => {
+                assert_eq!(label, "Ribbon");
+                assert!(!pieces.is_empty());
+            }
+            other => panic!("a still wave committed {other:?}"),
+        }
+    }
+
     /// The live preview is what runs on every pointer move, so it is where a
     /// hang would actually show up. It must stay far inside a frame even when
     /// the stroke is already enormous and the spacing is absurd.
@@ -1088,9 +2962,10 @@ mod tests {
         let preview = m.preview(&ctx(&style));
         let elapsed = started.elapsed();
 
-        assert!(matches!(preview, Preview::Ink { .. }), "got {preview:?}");
+        assert!(matches!(preview, Preview::Artwork(_)), "got {preview:?}");
+        let max_ms = if cfg!(debug_assertions) { 45 } else { 16 };
         assert!(
-            elapsed.as_millis() < 16,
+            elapsed.as_millis() < max_ms,
             "one preview frame of a 6000-sample pattern stroke took {elapsed:?}; \
              at 60 fps that is a stutter the user would feel"
         );
@@ -1186,7 +3061,12 @@ mod tests {
     #[test]
     fn the_hand_tool_pans_while_dragging() {
         let mut m = ToolMachine::new(ToolId::Hand);
-        m.pointer_down(Point::ORIGIN, Point::new(100.0, 100.0), Mods::default(), &ctx(&DrawStyle::default()));
+        m.pointer_down(
+            Point::ORIGIN,
+            Point::new(100.0, 100.0),
+            Mods::default(),
+            &ctx(&DrawStyle::default()),
+        );
         match m.pointer_move(Point::ORIGIN, Point::new(120.0, 90.0), Mods::default()) {
             ToolAction::PanView { delta_screen } => {
                 assert!((delta_screen.x - 20.0).abs() < 1e-9);
@@ -1209,7 +3089,10 @@ mod tests {
         }
 
         let mut m = ToolMachine::new(ToolId::Zoom);
-        let alt = Mods { alt: true, ..Default::default() };
+        let alt = Mods {
+            alt: true,
+            ..Default::default()
+        };
         m.pointer_down(p, p, alt, &ctx(&style));
         match m.pointer_up(p, p, &ctx(&style)) {
             ToolAction::ZoomView { factor, .. } => assert!(factor < 1.0),
@@ -1224,7 +3107,12 @@ mod tests {
         let mut m = ToolMachine::new(ToolId::Oval);
         assert_eq!(m.preview(&c), Preview::None);
 
-        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default(), &ctx(&style));
+        m.pointer_down(
+            Point::new(0.0, 0.0),
+            Point::ORIGIN,
+            Mods::default(),
+            &ctx(&style),
+        );
         m.pointer_move(Point::new(40.0, 30.0), Point::ORIGIN, Mods::default());
         assert!(matches!(m.preview(&c), Preview::Shape(_)));
 
@@ -1236,7 +3124,12 @@ mod tests {
     fn escape_cancels_a_gesture_without_creating_anything() {
         let style = DrawStyle::default();
         let mut m = ToolMachine::new(ToolId::Rectangle);
-        m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default(), &ctx(&style));
+        m.pointer_down(
+            Point::new(0.0, 0.0),
+            Point::ORIGIN,
+            Mods::default(),
+            &ctx(&style),
+        );
         m.pointer_move(Point::new(50.0, 50.0), Point::ORIGIN, Mods::default());
         assert!(m.is_active());
 
@@ -1252,7 +3145,12 @@ mod tests {
     #[test]
     fn changing_tool_abandons_the_gesture() {
         let mut m = ToolMachine::new(ToolId::Rectangle);
-        m.pointer_down(Point::ORIGIN, Point::ORIGIN, Mods::default(), &ctx(&DrawStyle::default()));
+        m.pointer_down(
+            Point::ORIGIN,
+            Point::ORIGIN,
+            Mods::default(),
+            &ctx(&DrawStyle::default()),
+        );
         m.set_tool(ToolId::Oval);
         assert!(!m.is_active());
         assert_eq!(m.tool(), ToolId::Oval);
@@ -1267,7 +3165,11 @@ mod tests {
             .filter(|e| matches!(e, kurbo::PathEl::LineTo(_)))
             .count();
         assert_eq!(lines, 9, "five points means ten vertices");
-        assert!(star.elements().iter().any(|e| matches!(e, kurbo::PathEl::ClosePath)));
+        assert!(
+            star.elements()
+                .iter()
+                .any(|e| matches!(e, kurbo::PathEl::ClosePath))
+        );
         assert!(star.area().abs() > 0.0);
     }
 
@@ -1275,19 +3177,35 @@ mod tests {
     fn scaling_anchors_the_opposite_corner() {
         let bounds = Rect::new(0.0, 0.0, 100.0, 100.0);
         // Drag the bottom-right corner outwards; the top-left must stay put.
-        let t = scale_about_corner(bounds, Point::new(100.0, 100.0), Point::new(200.0, 200.0), false);
+        let t = scale_about_corner(
+            bounds,
+            Point::new(100.0, 100.0),
+            Point::new(200.0, 200.0),
+            false,
+        );
 
         let top_left = t * Point::new(0.0, 0.0);
-        assert!(top_left.to_vec2().hypot() < 1e-9, "anchor moved to {top_left:?}");
+        assert!(
+            top_left.to_vec2().hypot() < 1e-9,
+            "anchor moved to {top_left:?}"
+        );
 
         let bottom_right = t * Point::new(100.0, 100.0);
-        assert!((bottom_right.x - 200.0).abs() < 1e-6, "got {bottom_right:?}");
+        assert!(
+            (bottom_right.x - 200.0).abs() < 1e-6,
+            "got {bottom_right:?}"
+        );
     }
 
     #[test]
     fn uniform_scaling_keeps_the_aspect_ratio() {
         let bounds = Rect::new(0.0, 0.0, 100.0, 50.0);
-        let t = scale_about_corner(bounds, Point::new(100.0, 50.0), Point::new(300.0, 60.0), true);
+        let t = scale_about_corner(
+            bounds,
+            Point::new(100.0, 50.0),
+            Point::new(300.0, 60.0),
+            true,
+        );
         let c = t.as_coeffs();
         assert!(
             (c[0] - c[3]).abs() < 1e-9,
@@ -1301,7 +3219,12 @@ mod tests {
     #[test]
     fn scaling_refuses_to_collapse_geometry() {
         let bounds = Rect::new(0.0, 0.0, 100.0, 100.0);
-        let t = scale_about_corner(bounds, Point::new(100.0, 100.0), Point::new(0.0, 0.0), false);
+        let t = scale_about_corner(
+            bounds,
+            Point::new(100.0, 100.0),
+            Point::new(0.0, 0.0),
+            false,
+        );
         let c = t.as_coeffs();
         assert!(c[0].abs() > 0.0 && c[3].abs() > 0.0);
         assert!(c[0].is_finite() && c[3].is_finite());
@@ -1326,6 +3249,8 @@ mod tests {
             zoom: 1.0,
             selection_bounds: Some(Rect::new(0.0, 0.0, 100.0, 80.0)),
             anchors: &anchors,
+            pivot: None,
+            gradient: None,
         };
 
         let mut m = ToolMachine::new(ToolId::Subselection);
@@ -1355,6 +3280,8 @@ mod tests {
             zoom: 1.0,
             selection_bounds: None,
             anchors: &anchors,
+            pivot: None,
+            gradient: None,
         };
 
         let mut m = ToolMachine::new(ToolId::Subselection);
@@ -1386,6 +3313,8 @@ mod tests {
             zoom: 1.0,
             selection_bounds: None,
             anchors: &anchors,
+            pivot: None,
+            gradient: None,
         };
         let mut m = ToolMachine::new(ToolId::Subselection);
         m.pointer_down(start, start, Mods::default(), &near);
@@ -1400,6 +3329,8 @@ mod tests {
             zoom: 10.0,
             selection_bounds: None,
             anchors: &anchors,
+            pivot: None,
+            gradient: None,
         };
         let mut m = ToolMachine::new(ToolId::Subselection);
         m.pointer_down(start, start, Mods::default(), &far);
@@ -1412,10 +3343,308 @@ mod tests {
     #[test]
     fn unimplemented_tools_do_nothing_rather_than_misbehave() {
         let style = DrawStyle::default();
-        for tool in [ToolId::Bone, ToolId::Camera, ToolId::Text, ToolId::GradientTransform] {
+        // Text is no longer here — it places vector type now.
+        for tool in [ToolId::Bone, ToolId::Camera] {
             let mut m = ToolMachine::new(tool);
-            let action = drag(&mut m, Point::new(0.0, 0.0), Point::new(50.0, 50.0), &ctx(&style));
+            let action = drag(
+                &mut m,
+                Point::new(0.0, 0.0),
+                Point::new(50.0, 50.0),
+                &ctx(&style),
+            );
             assert_eq!(action, ToolAction::None, "{tool:?} should be inert");
         }
+    }
+
+    /// With nothing gradient-filled selected, the Gradient Transform tool
+    /// selects — so clicking the shape you meant to adjust does not need a trip
+    /// back to the Selection tool and back again.
+    #[test]
+    fn gradient_transform_selects_when_there_is_no_gradient_to_grab() {
+        let style = DrawStyle::default();
+        let mut m = ToolMachine::new(ToolId::GradientTransform);
+        let action = drag(
+            &mut m,
+            Point::new(0.0, 0.0),
+            Point::new(50.0, 50.0),
+            &ctx(&style),
+        );
+        assert_eq!(
+            action,
+            ToolAction::PickAt {
+                point: Point::new(50.0, 50.0),
+                additive: false,
+            }
+        );
+    }
+
+    fn handles(
+        centre: Point,
+        end: Point,
+        width: Point,
+        focus: Point,
+    ) -> buzz_scene::GradientHandles {
+        buzz_scene::GradientHandles {
+            center: centre,
+            end,
+            width,
+            focus,
+        }
+    }
+
+    /// Each grip is grabbed by starting the drag on it, and the drag reports
+    /// where it ended.
+    #[test]
+    fn each_gradient_grip_can_be_grabbed() {
+        let style = DrawStyle::default();
+        let h = handles(
+            Point::new(100.0, 100.0),
+            Point::new(200.0, 100.0),
+            Point::new(100.0, 200.0),
+            Point::new(150.0, 100.0),
+        );
+
+        for (start, expected) in [
+            (Point::new(100.0, 100.0), GradientGrip::Center),
+            (Point::new(200.0, 100.0), GradientGrip::End),
+            (Point::new(100.0, 200.0), GradientGrip::Width),
+            (Point::new(150.0, 100.0), GradientGrip::Focus),
+        ] {
+            let mut c = ctx(&style);
+            c.gradient = Some((h, buzz_scene::GradientKind::Radial));
+            let mut m = ToolMachine::new(ToolId::GradientTransform);
+            let action = drag(&mut m, start, Point::new(400.0, 400.0), &c);
+            assert_eq!(
+                action,
+                ToolAction::DragGradient {
+                    grip: expected,
+                    to: Point::new(400.0, 400.0),
+                },
+                "starting at {start:?} should grab {expected:?}"
+            );
+        }
+    }
+
+    /// **The focus wins where it coincides with the centre**, which is where it
+    /// sits on every gradient nobody has adjusted — its default is zero. Test
+    /// the centre first and the focus can never be grabbed at all.
+    #[test]
+    fn the_focus_is_reachable_when_it_sits_on_the_centre() {
+        let style = DrawStyle::default();
+        let centre = Point::new(100.0, 100.0);
+        let h = handles(
+            centre,
+            Point::new(200.0, 100.0),
+            Point::new(100.0, 200.0),
+            centre,
+        );
+
+        let mut c = ctx(&style);
+        c.gradient = Some((h, buzz_scene::GradientKind::Radial));
+        let mut m = ToolMachine::new(ToolId::GradientTransform);
+        assert_eq!(
+            drag(&mut m, centre, Point::new(160.0, 100.0), &c),
+            ToolAction::DragGradient {
+                grip: GradientGrip::Focus,
+                to: Point::new(160.0, 100.0),
+            }
+        );
+
+        // A *linear* gradient has no focus, so the same press grabs the centre.
+        let mut c = ctx(&style);
+        c.gradient = Some((h, buzz_scene::GradientKind::Linear));
+        let mut m = ToolMachine::new(ToolId::GradientTransform);
+        assert_eq!(
+            drag(&mut m, centre, Point::new(160.0, 100.0), &c),
+            ToolAction::DragGradient {
+                grip: GradientGrip::Center,
+                to: Point::new(160.0, 100.0),
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod transform_preview_tests {
+    use crate::tools::{Mods, Preview, ToolAction, ToolContext, ToolId, ToolMachine};
+    use buzz_geom::{Point, Rect};
+    use buzz_ui::DrawStyle;
+
+    const BOX: Rect = Rect {
+        x0: 0.0,
+        y0: 0.0,
+        x1: 100.0,
+        y1: 80.0,
+    };
+
+    fn context(style: &DrawStyle) -> ToolContext<'_> {
+        ToolContext {
+            style,
+            zoom: 1.0,
+            selection_bounds: Some(BOX),
+            anchors: &[],
+            pivot: Some(BOX.center()),
+            gradient: None,
+        }
+    }
+
+    /// Drag from `from` to `to` and report what was previewed mid-drag and
+    /// what was committed on release.
+    fn drag(tool: ToolId, from: Point, to: Point, mods: Mods) -> (Preview, ToolAction) {
+        let style = DrawStyle::default();
+        let ctx = context(&style);
+        let mut m = ToolMachine::new(tool);
+        m.pointer_down(from, from, mods, &ctx);
+        m.pointer_move(to, to, mods);
+        let previewed = m.preview(&ctx);
+        let committed = m.pointer_up(to, to, &ctx);
+        (previewed, committed)
+    }
+
+    /// **What is drawn while dragging is what happens when you let go.**
+    ///
+    /// The preview and the commit are built by the same functions on purpose;
+    /// this is what stops them drifting into two answers that disagree, which
+    /// would be worse than having no preview at all.
+    #[test]
+    fn the_preview_matches_what_the_release_commits() {
+        // A rotate handle sits outside a corner.
+        let cases = [
+            (ToolId::FreeTransform, Point::new(-8.0, -8.0), Point::new(60.0, -30.0)),
+            (ToolId::FreeTransform, Point::new(100.0, 80.0), Point::new(160.0, 130.0)),
+            (ToolId::FreeTransform, Point::new(50.0, 0.0), Point::new(90.0, 0.0)),
+        ];
+
+        for (tool, from, to) in cases {
+            let (previewed, committed) = drag(tool, from, to, Mods::default());
+            match (previewed, committed) {
+                (Preview::Transform(shown), ToolAction::TransformSelection { transform }) => {
+                    let a = shown.as_coeffs();
+                    let b = transform.as_coeffs();
+                    for (x, y) in a.iter().zip(b.iter()) {
+                        assert!(
+                            (x - y).abs() < 1e-9,
+                            "dragging {from:?} to {to:?} previewed {a:?} but committed {b:?}"
+                        );
+                    }
+                }
+                // Not every grab point is a transform; those that are not must
+                // preview no transform either, which is the other half of the
+                // same promise.
+                (other, ToolAction::TransformSelection { .. }) => {
+                    panic!("committed a transform but previewed {other:?}")
+                }
+                (Preview::Transform(_), other) => {
+                    panic!("previewed a transform but committed {other:?}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Shift is honoured in the preview too — a constrained rotate that
+    /// **Shift snaps the turn to 45 degrees, as it happens.**
+    ///
+    /// The rotation is applied while the pointer travels rather than drawn as
+    /// an outline and committed on release, so this asks the drag itself what
+    /// it did rather than asking a preview what it promised.
+    #[test]
+    fn a_live_rotation_honours_shift() {
+        let style = DrawStyle::default();
+        let ctx = context(&style);
+        let (from, to) = (Point::new(-8.0, -8.0), Point::new(60.0, -30.0));
+
+        let swept = |mods: Mods| -> f64 {
+            let mut m = ToolMachine::new(ToolId::FreeTransform);
+            m.pointer_down(from, from, mods, &ctx);
+            let action = m.pointer_move(to, to, mods);
+            let _ = m.pointer_up(to, to, &ctx);
+            match action {
+                ToolAction::TransformSelection { transform } => {
+                    let c = transform.as_coeffs();
+                    c[1].atan2(c[0])
+                }
+                other => panic!("a drag on the ring should turn it, got {other:?}"),
+            }
+        };
+
+        let plain = swept(Mods::default());
+        let shifted = swept(Mods {
+            shift: true,
+            ..Mods::default()
+        });
+
+        assert!(
+            (plain - shifted).abs() > 1e-9,
+            "Shift changed nothing about the turn"
+        );
+        // And the snapped one lands on a multiple of 45 degrees.
+        let step = std::f64::consts::FRAC_PI_4;
+        let off = (shifted / step) - (shifted / step).round();
+        assert!(
+            off.abs() < 1e-9,
+            "with Shift the turn should land on 45 degrees, it swept {}",
+            shifted.to_degrees()
+        );
+    }
+
+    /// **Free Transform can still choose what to work on.**
+    ///
+    /// Every click answered `None` once anything was selected, so the tool
+    /// locked onto the first object picked: you could transform it forever and
+    /// never reach another without changing tools and back.
+    #[test]
+    fn free_transform_can_still_select_another_object() {
+        let style = DrawStyle::default();
+        let ctx = context(&style);
+        let mut m = ToolMachine::new(ToolId::FreeTransform);
+
+        // A click well inside the gizmo but off every handle: pick what is
+        // under it, which is how another object is reached.
+        let at = Point::new(30.0, 40.0);
+        m.pointer_down(at, at, Mods::default(), &ctx);
+        let committed = m.pointer_up(at, at, &ctx);
+        assert!(
+            matches!(committed, ToolAction::PickAt { .. }),
+            "a click should select, got {committed:?}"
+        );
+
+        // A click on a corner handle is a mis-grab of the gizmo, not a change
+        // of selection — it must not throw away what is being transformed.
+        let corner = Point::new(0.0, 0.0);
+        m.pointer_down(corner, corner, Mods::default(), &ctx);
+        let committed = m.pointer_up(corner, corner, &ctx);
+        assert!(
+            matches!(committed, ToolAction::None),
+            "a handle click must leave the selection alone, got {committed:?}"
+        );
+    }
+
+    /// Dragging inside the selection moves it, and moving previews nothing —
+    /// a move is shown by the artwork itself, not by an outline.
+    ///
+    /// Away from the centre on purpose: the transformation point sits there,
+    /// and grabbing *it* is a third thing again.
+    #[test]
+    fn dragging_inside_still_moves_rather_than_transforming() {
+        let style = DrawStyle::default();
+        let ctx = context(&style);
+        let mut m = ToolMachine::new(ToolId::FreeTransform);
+        let (from, to) = (Point::new(25.0, 20.0), Point::new(45.0, 30.0));
+        m.pointer_down(from, from, Mods::default(), &ctx);
+
+        let moved = m.pointer_move(to, to, Mods::default());
+        assert!(
+            matches!(moved, ToolAction::MoveSelection { .. }),
+            "the artwork should move as the pointer does, got {moved:?}"
+        );
+        assert!(
+            matches!(m.preview(&ctx), Preview::None),
+            "a move should not preview a transform"
+        );
+        assert!(
+            matches!(m.pointer_up(to, to, &ctx), ToolAction::None),
+            "the release must not move it a second time"
+        );
     }
 }

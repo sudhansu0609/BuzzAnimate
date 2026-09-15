@@ -10,51 +10,266 @@ use buzz_geom::{Affine, BezPath, FillMode, Point, Rect, Shape as _};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
+use crate::gradient::Gradient;
+use crate::image::ImageFill;
+
 /// Stable identity for an object, preserved across edits and undo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObjectId(pub u64);
 
+/// What a fill or a stroke is painted with.
+///
+/// # Why the gradient is behind an `Arc`
+///
+/// A gradient carries a list of stops, so it is not `Copy`, and a fill is read
+/// on every shape of every frame. Sharing it means a `Paint` is a tag and a
+/// pointer however many stops it has, and — because artwork is immutable once
+/// shared (see the module header) — copying a shape shares its gradient rather
+/// than duplicating it. Editing one goes through [`Arc::make_mut`], exactly as
+/// editing an object does.
+/// **Not `Serialize`.** A paint can now hold a bitmap, and deriving the format
+/// off the runtime type would embed a decoded photograph — tens of megabytes of
+/// pixels — inside `document.json`. The `.buzz` format is written by the DTO
+/// layer in `buzz-doc`, which stores the image once in `media/` and refers to
+/// it by id; see the module header there for why that separation exists at all.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Paint {
+    Solid(Color),
+    Gradient(Arc<Gradient>),
+    /// A bitmap. See [`crate::image`] for why an image is a fill rather than
+    /// a kind of object — in short, because that is what Animate's Break Apart
+    /// produces, and it makes every vector tool work on a photograph.
+    Image(Box<ImageFill>),
+}
+
+impl Paint {
+    /// One colour standing in for this paint.
+    ///
+    /// Everything that can only work in one colour goes through here: the
+    /// lighting model, outline view, the Swatches panel, the colour wells. For
+    /// a gradient it is the ramp's weighted mean — see
+    /// [`Gradient::average_color`].
+    pub fn color(&self) -> Color {
+        match self {
+            Self::Solid(c) => *c,
+            Self::Gradient(g) => g.average_color(),
+            Self::Image(i) => i.average_color(),
+        }
+    }
+
+    pub fn gradient(&self) -> Option<&Gradient> {
+        match self {
+            Self::Gradient(g) => Some(g),
+            _ => None,
+        }
+    }
+
+    pub fn is_gradient(&self) -> bool {
+        matches!(self, Self::Gradient(_))
+    }
+
+    /// The bitmap this paint draws, if it is one.
+    pub fn image(&self) -> Option<&ImageFill> {
+        match self {
+            Self::Image(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    pub fn is_image(&self) -> bool {
+        matches!(self, Self::Image(_))
+    }
+
+    /// The same paint with every colour in it passed through `f`.
+    ///
+    /// A colour effect, an Adjust Color filter and an onion-skin ghost are all
+    /// defined as functions of one colour; this is how they reach a gradient,
+    /// which is a list of them.
+    pub fn map_colors(&self, f: impl Fn(Color) -> Color) -> Self {
+        match self {
+            Self::Solid(c) => Self::Solid(f(*c)),
+            Self::Gradient(g) => Self::Gradient(Arc::new(g.map_colors(f))),
+            // A bitmap's colours are its pixels, and rewriting thirty million
+            // of them for a tint would cost more than the frame it is drawn
+            // in. The renderer lays the effect **over** the picture instead, as
+            // a blend; recorded in PROGRESS.md §7.
+            //
+            // **Callers must know that.** Returning the image untouched is the
+            // right answer here and a silent no-op to anything that assumes
+            // this recolours what it is given — which is how the lights came to
+            // do nothing at all to imported artwork for a whole phase. See
+            // `buzz_render::document::draw_lit_composited` for what lighting does
+            // instead, and `buzz_light::Illumination::as_filter` for the
+            // arithmetic that makes the two agree.
+            Self::Image(i) => Self::Image(i.clone()),
+        }
+    }
+
+    /// The same paint carried through a transform, so a gradient stays where it
+    /// was painted when the artwork moves.
+    ///
+    /// A solid colour is unaffected, which is why this can be applied blindly.
+    pub fn transformed(&self, t: Affine) -> Self {
+        match self {
+            Self::Solid(c) => Self::Solid(*c),
+            Self::Gradient(g) => Self::Gradient(Arc::new(g.transformed(t))),
+            Self::Image(i) => Self::Image(Box::new(i.transformed(t))),
+        }
+    }
+
+    /// Interpolate towards `other`, for a tween.
+    pub fn lerp(&self, other: &Self, t: f64) -> Self {
+        match (self, other) {
+            (Self::Solid(a), Self::Solid(b)) => Self::Solid(crate::gradient::lerp_color(*a, *b, t)),
+            (Self::Gradient(a), Self::Gradient(b)) => Self::Gradient(Arc::new(a.lerp(b, t))),
+            // A solid tweening to a gradient, or the reverse. Interpolating the
+            // flat colour towards the gradient's average would move the colour
+            // and then jump to a ramp at the far end, which reads as a glitch
+            // rather than as a transition. It switches instead, at the halfway
+            // point, the way the spread mode does.
+            (a, b) => {
+                if t < 0.5 {
+                    a.clone()
+                } else {
+                    b.clone()
+                }
+            }
+        }
+    }
+}
+
+impl From<Color> for Paint {
+    fn from(c: Color) -> Self {
+        Self::Solid(c)
+    }
+}
+
+impl From<Gradient> for Paint {
+    fn from(g: Gradient) -> Self {
+        Self::Gradient(Arc::new(g))
+    }
+}
+
 /// How a shape is painted inside.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FillSpec {
-    pub color: Color,
+    pub paint: Paint,
     pub rule: FillMode,
+    /// **The palette colour this fill came from**, when it came from one.
+    ///
+    /// # Why the link is here and not inside [`Paint`]
+    ///
+    /// A paint is a *value* — the renderer, the lighting model and every filter
+    /// take it and ask what colour it is. Putting a palette reference inside it
+    /// would mean every one of those needed the document's palette in hand to
+    /// answer, which is a scene lookup in the middle of the draw walk. So the
+    /// paint keeps the resolved colour, exactly as it always did, and the link
+    /// sits on the *fill* — the place a colour was chosen, which is the only
+    /// place that needs to know where it came from.
+    ///
+    /// `None` for every fill painted with a colour picked freehand, which is
+    /// what every fill in every older document is.
+    ///
+    /// See [`crate::Scene::recolour_swatch`] for what the link buys: change the
+    /// swatch and every fill wearing it changes, everywhere in the document, in
+    /// one step.
+    pub swatch: Option<crate::SwatchId>,
 }
 
 impl FillSpec {
     pub fn solid(color: Color) -> Self {
         Self {
-            color,
+            paint: Paint::Solid(color),
             rule: FillMode::NonZero,
+            swatch: None,
         }
+    }
+
+    /// A fill taking its colour from a palette swatch, and keeping the link.
+    pub fn from_swatch(swatch: crate::SwatchId, color: Color) -> Self {
+        Self {
+            paint: Paint::Solid(color),
+            rule: FillMode::NonZero,
+            swatch: Some(swatch),
+        }
+    }
+
+    pub fn gradient(gradient: Gradient) -> Self {
+        Self {
+            paint: Paint::Gradient(Arc::new(gradient)),
+            rule: FillMode::NonZero,
+            swatch: None,
+        }
+    }
+
+    /// A shape filled with a bitmap — what Break Apart produces.
+    pub fn image(image: ImageFill) -> Self {
+        Self {
+            paint: Paint::Image(Box::new(image)),
+            rule: FillMode::NonZero,
+            swatch: None,
+        }
+    }
+
+    /// The one colour this fill stands for. See [`Paint::color`].
+    pub fn color(&self) -> Color {
+        self.paint.color()
     }
 }
 
 /// How a shape's outline is painted.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StrokeSpec {
-    pub color: Color,
+    pub paint: Paint,
     /// Width in document units.
     pub width: f64,
     /// Animate's "hairline": always one pixel regardless of zoom.
     pub hairline: bool,
+    /// The palette colour this stroke came from. See [`FillSpec::swatch`].
+    pub swatch: Option<crate::SwatchId>,
 }
 
 impl StrokeSpec {
     pub fn new(color: Color, width: f64) -> Self {
         Self {
-            color,
+            paint: Paint::Solid(color),
             width,
             hairline: false,
+            swatch: None,
+        }
+    }
+
+    /// A stroke taking its colour from a palette swatch, and keeping the link.
+    pub fn from_swatch(swatch: crate::SwatchId, color: Color, width: f64) -> Self {
+        Self {
+            paint: Paint::Solid(color),
+            width,
+            hairline: false,
+            swatch: Some(swatch),
+        }
+    }
+
+    pub fn gradient(gradient: Gradient, width: f64) -> Self {
+        Self {
+            paint: Paint::Gradient(Arc::new(gradient)),
+            width,
+            hairline: false,
+            swatch: None,
         }
     }
 
     pub fn hairline(color: Color) -> Self {
         Self {
-            color,
+            paint: Paint::Solid(color),
             width: 0.0,
             hairline: true,
+            swatch: None,
         }
+    }
+
+    /// The one colour this stroke stands for. See [`Paint::color`].
+    pub fn color(&self) -> Color {
+        self.paint.color()
     }
 }
 
@@ -161,6 +376,92 @@ pub enum ObjectKind {
     /// Instances carry no artwork of their own — that lives in the library —
     /// so editing the symbol updates every instance at once.
     Instance(crate::symbol::SymbolInstance),
+    /// Artwork rigged to a skeleton — Animate's Bone tool.
+    ///
+    /// The deformed artwork is derived from the pose rather than stored, so a
+    /// keyframe holds a handful of angles and there is only ever one answer to
+    /// what the rig looks like. See [`crate::rig`].
+    Armature(crate::rig::ArmatureData),
+    /// Artwork with warp handles on it — Animate's Asset Warp tool.
+    Warp(crate::rig::WarpData),
+}
+
+/// Where an object sits and faces **in space** — Animate's 3D Rotation and 3D
+/// Translation, on one object.
+///
+/// # What this is for
+///
+/// Layer depth arranges whole layers in space, and the camera can now tilt; but
+/// every object still lies flat in its layer's plane, so a camera move slides
+/// the layers past each other without ever turning anything. That reads as
+/// cards sliding, which is what it is.
+///
+/// Giving an object its own angles makes it a plane of its own. Build a tree
+/// out of three cards at slightly different angles and the camera passing it
+/// turns them past each other; do the same with the walls of a house and it
+/// has corners. It is still flat artwork — but flat artwork that faces
+/// somewhere.
+///
+/// # Deliberately on every object
+///
+/// Animate allows 3D only on movie clip instances, because its 3D is a
+/// property of a display object with a cached surface. Here it is a plane in a
+/// projection, which costs nothing extra, so any object may have it: a shape, a
+/// group, a symbol, a rigged character. Recorded as a deviation in §7.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Spatial {
+    /// Tip about the horizontal axis, in radians. Animate's rotationX.
+    pub rotation_x: f64,
+    /// Turn about the vertical axis. Animate's rotationY.
+    pub rotation_y: f64,
+    /// Spin in the object's own plane. Animate's rotationZ.
+    ///
+    /// This one is a plain rotation and stays affine, but it belongs here
+    /// rather than in [`Object::transform`] because it happens *after* the
+    /// other two: spinning a card and then tipping it is not the same as
+    /// tipping it and then spinning it.
+    pub rotation_z: f64,
+    /// How far in front of or behind its layer the object sits, in document
+    /// units. Animate's translationZ. Negative is towards the camera.
+    pub z: f64,
+}
+
+impl Spatial {
+    /// Does this leave the object flat in its layer, exactly as it was before
+    /// there was any such thing?
+    ///
+    /// The render path, the hit test and the format all take the old route when
+    /// this is true — which is every object in every document that does not use
+    /// it.
+    pub fn is_flat(&self) -> bool {
+        self.rotation_x == 0.0 && self.rotation_y == 0.0 && self.rotation_z == 0.0 && self.z == 0.0
+    }
+
+    /// The object's plane, as two basis vectors.
+    pub fn basis(&self) -> ([f64; 3], [f64; 3]) {
+        buzz_geom::Projection::rotated_basis(self.rotation_x, self.rotation_y, self.rotation_z)
+    }
+
+    /// Interpolate, so a motion tween can turn an object as it moves.
+    pub fn lerp(&self, other: &Self, t: f64) -> Self {
+        // Angles take the short way round, as every other angle here does.
+        let turn = |a: f64, b: f64| {
+            let full = std::f64::consts::TAU;
+            let mut delta = (b - a) % full;
+            if delta > full / 2.0 {
+                delta -= full;
+            } else if delta < -full / 2.0 {
+                delta += full;
+            }
+            a + delta * t
+        };
+        Self {
+            rotation_x: turn(self.rotation_x, other.rotation_x),
+            rotation_y: turn(self.rotation_y, other.rotation_y),
+            rotation_z: turn(self.rotation_z, other.rotation_z),
+            z: self.z + (other.z - self.z) * t,
+        }
+    }
 }
 
 /// An object placed on a layer.
@@ -175,6 +476,220 @@ pub struct Object {
     /// Animate lets you lock individual objects as well as layers.
     pub locked: bool,
     pub visible: bool,
+
+    /// Filters on this object — blur, drop shadow, glow, bevel, adjust colour.
+    ///
+    /// Animate allows these on movie clips, buttons and text only, because a
+    /// raster filter needs a cached surface to work on. These are geometry
+    /// (see `buzz-fx`), so there is nothing to cache and no reason to refuse
+    /// them on a plain shape. Recorded as a deviation rather than an oversight.
+    ///
+    /// Empty for almost every object ever made, and an empty `Vec` allocates
+    /// nothing.
+    pub filters: Vec<buzz_fx::Filter>,
+
+    /// How this object combines with what is painted behind it — Animate's
+    /// Blend list. Distinct from [`ShapeData::blend`], which is about how one
+    /// brush stroke accumulates with the next.
+    pub blend: buzz_fx::Blend,
+
+    /// Which way this object faces in space. Flat by default.
+    pub spatial: Spatial,
+
+    /// **The transformation point** — what this object rotates, skews and
+    /// turns in space about. Animate's white circle on the Free Transform
+    /// gizmo.
+    ///
+    /// In the object's **own** coordinates, before [`Object::transform`], so
+    /// it stays where it was put on the artwork however the object is then
+    /// moved, scaled or rotated. `None` means the centre of what the object
+    /// actually covers, which is where Animate starts one and what everything
+    /// here did before there was such a field — so a document that never
+    /// touches it behaves exactly as it always did.
+    ///
+    /// Resolving `None` needs the library for an instance, so ask the scene:
+    /// [`crate::Scene::pivot_of`].
+    pub pivot: Option<Point>,
+
+    /// **Live modifiers** — spring follow-through, wiggle — evaluated when the
+    /// object is drawn rather than baked to keyframes (see [`crate::Modifier`]).
+    /// Empty for almost every object, and an empty `Vec` allocates nothing, so
+    /// this costs those objects nothing.
+    pub modifiers: Vec<crate::Modifier>,
+
+    /// **The text this object was typed as**, when it is text. The glyph
+    /// outlines themselves live in the object's [`ShapeData`] — this is only
+    /// what they were made from, kept so the words stay editable. `None` for
+    /// everything that is not text, which is almost everything.
+    pub text: Option<TextData>,
+
+    /// **The other ways round this object can be seen** — a real turnaround.
+    ///
+    /// Empty for everything that has only one view, which is almost everything.
+    /// See [`Turnaround`].
+    pub turnaround: Turnaround,
+}
+
+/// One drawing of an object, seen from a particular way round.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnaroundView {
+    /// The apparent yaw this drawing *is* the view at, in radians, normalised
+    /// to `(-PI, PI]`. Zero is the object itself and is never stored here.
+    pub angle: f64,
+    pub drawing: Arc<Object>,
+}
+
+/// **A character drawn from more than one side.**
+///
+/// An animator does not turn a drawing in space to show its other side; they
+/// draw the other side. This holds those drawings against the angle each one is
+/// the view at — a back at 180 degrees, a profile at 90 — and the renderer swaps
+/// to whichever is nearest to how the object is actually facing.
+///
+/// The **front is implicit**: it is the object itself, at angle zero, and is
+/// never one of these. That is what makes an object with an empty turnaround
+/// exactly the object it always was.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Turnaround {
+    /// Sorted by angle, one drawing per angle, never any at zero.
+    views: Vec<TurnaroundView>,
+}
+
+impl Turnaround {
+    pub fn is_empty(&self) -> bool {
+        self.views.is_empty()
+    }
+
+    pub fn views(&self) -> &[TurnaroundView] {
+        &self.views
+    }
+
+    /// Add or replace the drawing seen at `angle`.
+    ///
+    /// An angle within a degree of straight ahead is refused: that view is the
+    /// object itself, and a second drawing claiming it would make which one gets
+    /// drawn a matter of floating-point luck.
+    pub fn set(&mut self, angle: f64, drawing: Arc<Object>) -> bool {
+        let angle = normalise_angle(angle);
+        if !angle.is_finite() || angle.abs() < 0.02 {
+            return false;
+        }
+        let view = TurnaroundView { angle, drawing };
+        match self.views.iter().position(|v| (v.angle - angle).abs() < 0.02) {
+            Some(index) => self.views[index] = view,
+            None => {
+                let at = self.views.partition_point(|v| v.angle < angle);
+                self.views.insert(at, view);
+            }
+        }
+        true
+    }
+
+    /// Forget the view nearest to `angle`, if there is one.
+    pub fn remove_nearest(&mut self, angle: f64) -> bool {
+        let angle = normalise_angle(angle);
+        let Some(index) = self
+            .views
+            .iter()
+            .enumerate()
+            .min_by(|a, b| {
+                angle_gap(a.1.angle, angle)
+                    .partial_cmp(&angle_gap(b.1.angle, angle))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+        else {
+            return false;
+        };
+        self.views.remove(index);
+        true
+    }
+
+    /// The view at 180 degrees — the back — if there is one.
+    pub fn back(&self) -> Option<&Arc<Object>> {
+        self.views
+            .iter()
+            .find(|v| angle_gap(v.angle, std::f64::consts::PI) < 0.02)
+            .map(|v| &v.drawing)
+    }
+
+    /// **Which drawing to show at this apparent yaw**, and how much of the turn
+    /// is left over once it has been chosen.
+    ///
+    /// `None` means the object's own front is the nearest view — which is the
+    /// answer for every object with no turnaround, and for any object turned
+    /// less than half way to its first other view.
+    ///
+    /// The leftover angle is what the drawing is still turned by: a back view
+    /// on an object facing exactly backwards has none, and is drawn square to
+    /// the camera, while one caught part way round is foreshortened by the
+    /// difference. That is what lets a profile drawing exist at all — at ninety
+    /// degrees the object's own plane is edge-on and has no width to draw in.
+    pub fn view_at(&self, yaw: f64) -> Option<(&Arc<Object>, f64)> {
+        let yaw = normalise_angle(yaw);
+        let front_gap = yaw.abs();
+        let nearest = self.views.iter().min_by(|a, b| {
+            angle_gap(a.angle, yaw)
+                .partial_cmp(&angle_gap(b.angle, yaw))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        (angle_gap(nearest.angle, yaw) < front_gap)
+            .then(|| (&nearest.drawing, normalise_angle(yaw - nearest.angle)))
+    }
+}
+
+/// An angle brought into `(-PI, PI]`.
+fn normalise_angle(angle: f64) -> f64 {
+    if !angle.is_finite() {
+        return 0.0;
+    }
+    let tau = std::f64::consts::TAU;
+    let mut a = angle % tau;
+    if a > std::f64::consts::PI {
+        a -= tau;
+    } else if a <= -std::f64::consts::PI {
+        a += tau;
+    }
+    a
+}
+
+/// How far apart two angles are, the short way round.
+fn angle_gap(a: f64, b: f64) -> f64 {
+    normalise_angle(a - b).abs()
+}
+
+/// The source of a text object: the string and its size. The rendered outlines
+/// are the object's `ShapeData`; regenerating them from this is how editing the
+/// words works. See [`crate::Object::text`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextData {
+    pub content: String,
+    /// Nominal glyph height, in document units.
+    pub size: f64,
+    /// Font family to render with, e.g. "Nirmala UI" for Hindi. `None` uses a
+    /// system default, so old documents and the default Text tool still work.
+    pub font: Option<String>,
+    /// **Which cut of the family** — bold, italic, both or neither.
+    ///
+    /// A choice, not a face: a document that named the face would not find it
+    /// again on a machine that spells the same weight differently. Regular for
+    /// every document written before there was a choice.
+    pub style: buzz_text::FontStyle,
+    /// How the lines line up with each other. Only visible on more than one.
+    pub align: buzz_text::TextAlign,
+}
+
+impl TextData {
+    /// Plain text: the words, a size, and a family to set them in.
+    pub fn new(content: impl Into<String>, size: f64, font: Option<String>) -> Self {
+        Self {
+            content: content.into(),
+            size,
+            font,
+            style: buzz_text::FontStyle::REGULAR,
+            align: buzz_text::TextAlign::Left,
+        }
+    }
 }
 
 impl Object {
@@ -186,6 +701,13 @@ impl Object {
             kind: ObjectKind::Shape(shape),
             locked: false,
             visible: true,
+            filters: Vec::new(),
+            blend: buzz_fx::Blend::Normal,
+            spatial: Default::default(),
+            pivot: None,
+            modifiers: Vec::new(),
+            text: None,
+            turnaround: Turnaround::default(),
         }
     }
 
@@ -197,6 +719,13 @@ impl Object {
             kind: ObjectKind::Group(children),
             locked: false,
             visible: true,
+            filters: Vec::new(),
+            blend: buzz_fx::Blend::Normal,
+            spatial: Default::default(),
+            pivot: None,
+            modifiers: Vec::new(),
+            text: None,
+            turnaround: Turnaround::default(),
         }
     }
 
@@ -235,10 +764,25 @@ impl Object {
             // through `Scene::instance_bounds`; this keeps hit-testing and
             // culling from silently treating an instance as empty.
             ObjectKind::Instance(_) => Rect::new(-1.0, -1.0, 1.0, 1.0),
+            // Rigged artwork is measured **posed**: the bounds of a bent arm
+            // are not the bounds it was drawn at, and selection handles left
+            // behind where the artwork used to be are worse than none.
+            ObjectKind::Armature(rig) => rig.local_bounds(),
+            ObjectKind::Warp(warp) => warp.local_bounds(),
         }
     }
 
     /// Bounds after this object's own transform.
+    /// The transformation point in the object's own space, when it does not
+    /// need the library to work out.
+    ///
+    /// An instance measures nothing on its own — [`Object::local_bounds`]
+    /// returns a placeholder for one — so anything holding a scene should use
+    /// [`crate::Scene::pivot_local_of`], which resolves it properly.
+    pub fn pivot_local(&self) -> Point {
+        self.pivot.unwrap_or_else(|| self.local_bounds().center())
+    }
+
     pub fn bounds(&self) -> Rect {
         let local = self.local_bounds();
         if local == Rect::ZERO {
@@ -267,6 +811,15 @@ impl Object {
             // Instances need the library to resolve, so they are skipped here
             // and expanded by the renderer, which has it.
             ObjectKind::Instance(_) => {}
+            // Rigged artwork flattens to what it currently *looks* like, which
+            // is what every caller means: the renderer, hit-testing and
+            // culling all want the posed artwork, never the drawn one.
+            ObjectKind::Armature(rig) => {
+                for part in rig.posed() {
+                    part.flatten(world, out);
+                }
+            }
+            ObjectKind::Warp(warp) => out.push((world, warp.warped())),
         }
     }
 
@@ -276,6 +829,8 @@ impl Object {
             ObjectKind::Shape(_) => 1,
             ObjectKind::Group(children) => children.iter().map(|c| c.shape_count()).sum(),
             ObjectKind::Instance(_) => 1,
+            ObjectKind::Armature(rig) => rig.parts.iter().map(|p| p.artwork.shape_count()).sum(),
+            ObjectKind::Warp(_) => 1,
         }
     }
 
@@ -296,6 +851,13 @@ impl Object {
             kind: ObjectKind::Instance(crate::symbol::SymbolInstance::new(symbol)),
             locked: false,
             visible: true,
+            filters: Vec::new(),
+            blend: buzz_fx::Blend::Normal,
+            spatial: Default::default(),
+            pivot: None,
+            modifiers: Vec::new(),
+            text: None,
+            turnaround: Turnaround::default(),
         }
     }
 }
@@ -320,6 +882,123 @@ pub fn transform_rect(t: Affine, r: Rect) -> Rect {
 }
 
 #[cfg(test)]
+mod turnaround_tests {
+    use super::*;
+    use std::f64::consts::{FRAC_PI_2, PI};
+
+    fn drawing(id: u64) -> Arc<Object> {
+        Arc::new(Object::shape(
+            ObjectId(id),
+            ShapeData::filled(buzz_geom::BezPath::new(), peniko::Color::BLACK),
+        ))
+    }
+
+    #[test]
+    fn an_object_with_no_turnaround_is_always_its_own_front() {
+        let turnaround = Turnaround::default();
+        for yaw in [0.0, 1.0, PI, -2.0, 6.0] {
+            assert!(turnaround.view_at(yaw).is_none(), "at {yaw}");
+        }
+    }
+
+    #[test]
+    fn the_front_holds_until_another_view_is_nearer() {
+        let mut turnaround = Turnaround::default();
+        turnaround.set(PI, drawing(2));
+
+        assert!(turnaround.view_at(0.0).is_none(), "facing forwards");
+        assert!(turnaround.view_at(1.0).is_none(), "barely turned");
+        assert!(
+            turnaround.view_at(PI - 0.1).is_some(),
+            "nearly backwards is the back"
+        );
+        assert!(turnaround.view_at(PI).is_some(), "and so is backwards");
+    }
+
+    /// The point of the leftover angle: a back view on an object facing exactly
+    /// backwards is square to the camera, not foreshortened to nothing.
+    #[test]
+    fn a_matched_view_has_no_turn_left_over() {
+        let mut turnaround = Turnaround::default();
+        turnaround.set(PI, drawing(2));
+        let (_, residual) = turnaround.view_at(PI).expect("the back");
+        assert!(residual.abs() < 1e-9, "no turn left, got {residual}");
+    }
+
+    /// And a profile at ninety degrees is visible at all — the object's own
+    /// plane is edge-on there.
+    #[test]
+    fn a_profile_is_drawn_square_when_the_object_is_side_on() {
+        let mut turnaround = Turnaround::default();
+        turnaround.set(FRAC_PI_2, drawing(3));
+        let (_, residual) = turnaround.view_at(FRAC_PI_2).expect("the profile");
+        assert!(residual.abs() < 1e-9);
+
+        // Part way to it, the profile is chosen and the rest of the turn
+        // foreshortens it.
+        let (_, partial) = turnaround
+            .view_at(FRAC_PI_2 - 0.3)
+            .expect("nearer the profile than the front");
+        assert!((partial + 0.3).abs() < 1e-9, "got {partial}");
+    }
+
+    #[test]
+    fn the_nearest_view_wins_the_short_way_round() {
+        let mut turnaround = Turnaround::default();
+        turnaround.set(FRAC_PI_2, drawing(3));
+        turnaround.set(-FRAC_PI_2, drawing(4));
+        turnaround.set(PI, drawing(2));
+
+        let id = |yaw: f64| {
+            turnaround
+                .view_at(yaw)
+                .map(|(d, _)| d.id.0)
+                .expect("some view")
+        };
+        assert_eq!(id(1.4), 3, "just short of the right profile");
+        assert_eq!(id(-1.4), 4, "and the left one");
+        assert_eq!(id(3.0), 2, "nearly backwards");
+        // Past PI it wraps: -3.0 is nearer the back than either profile.
+        assert_eq!(id(-3.0), 2, "the short way round");
+    }
+
+    #[test]
+    fn a_view_at_the_front_is_refused() {
+        let mut turnaround = Turnaround::default();
+        assert!(!turnaround.set(0.0, drawing(2)), "that view is the object");
+        assert!(!turnaround.set(0.001, drawing(2)), "and so is this one");
+        assert!(turnaround.is_empty());
+    }
+
+    #[test]
+    fn setting_the_same_angle_twice_replaces_it() {
+        let mut turnaround = Turnaround::default();
+        turnaround.set(PI, drawing(2));
+        turnaround.set(PI, drawing(5));
+        assert_eq!(turnaround.views().len(), 1);
+        assert_eq!(turnaround.back().expect("a back").id.0, 5);
+    }
+
+    #[test]
+    fn an_angle_is_stored_the_short_way_round() {
+        let mut turnaround = Turnaround::default();
+        // Three full turns plus a half is still a half.
+        turnaround.set(PI + std::f64::consts::TAU * 3.0, drawing(2));
+        assert!(turnaround.back().is_some(), "it is still the back view");
+    }
+
+    #[test]
+    fn removing_takes_the_nearest_one() {
+        let mut turnaround = Turnaround::default();
+        turnaround.set(FRAC_PI_2, drawing(3));
+        turnaround.set(PI, drawing(2));
+        assert!(turnaround.remove_nearest(1.4));
+        assert_eq!(turnaround.views().len(), 1);
+        assert!(turnaround.back().is_some(), "the profile went, not the back");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use kurbo::Rect as KRect;
@@ -339,15 +1018,17 @@ mod tests {
     fn shape_bounds_follow_the_transform() {
         let o = shape_at(1, 0.0, 0.0).with_transform(Affine::translate((100.0, 50.0)));
         let bb = o.bounds();
-        assert!((bb.x0 - 100.0).abs() < 1e-9 && (bb.y0 - 50.0).abs() < 1e-9, "{bb:?}");
+        assert!(
+            (bb.x0 - 100.0).abs() < 1e-9 && (bb.y0 - 50.0).abs() < 1e-9,
+            "{bb:?}"
+        );
         assert!((bb.width() - 10.0).abs() < 1e-9);
     }
 
     /// A rotated rectangle's bounds must cover all four corners.
     #[test]
     fn rotation_expands_bounds_correctly() {
-        let o = shape_at(1, -5.0, -5.0)
-            .with_transform(Affine::rotate(std::f64::consts::FRAC_PI_4));
+        let o = shape_at(1, -5.0, -5.0).with_transform(Affine::rotate(std::f64::consts::FRAC_PI_4));
         let bb = o.bounds();
         let expected = 10.0 * std::f64::consts::SQRT_2;
         assert!(
@@ -423,7 +1104,10 @@ mod tests {
         let mut alpha = 0.0;
         for expected in [0.2, 0.4, 0.6, 0.8, 1.0] {
             alpha = PaintBlend::Additive.combine_alpha(alpha, 0.2);
-            assert!((alpha - expected).abs() < 1e-12, "got {alpha}, want {expected}");
+            assert!(
+                (alpha - expected).abs() < 1e-12,
+                "got {alpha}, want {expected}"
+            );
         }
         // The sixth stroke can add nothing; it is already opaque.
         assert_eq!(PaintBlend::Additive.combine_alpha(alpha, 0.2), 1.0);
@@ -465,7 +1149,10 @@ mod tests {
             ],
         );
         let bb = g.bounds();
-        assert!((bb.x0 - 0.0).abs() < 1e-9 && (bb.x1 - 110.0).abs() < 1e-9, "{bb:?}");
+        assert!(
+            (bb.x0 - 0.0).abs() < 1e-9 && (bb.x1 - 110.0).abs() < 1e-9,
+            "{bb:?}"
+        );
     }
 
     #[test]

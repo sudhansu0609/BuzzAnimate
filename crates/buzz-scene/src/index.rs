@@ -37,7 +37,10 @@ impl RTreeObject for IndexEntry {
     type Envelope = AABB<[f64; 2]>;
 
     fn envelope(&self) -> Self::Envelope {
-        AABB::from_corners([self.bounds.x0, self.bounds.y0], [self.bounds.x1, self.bounds.y1])
+        AABB::from_corners(
+            [self.bounds.x0, self.bounds.y0],
+            [self.bounds.x1, self.bounds.y1],
+        )
     }
 }
 
@@ -238,7 +241,10 @@ mod tests {
                 .collect();
             from_index.sort_unstable();
             brute.sort_unstable();
-            assert_eq!(from_index, brute, "index disagreed with a scan for {rect:?}");
+            assert_eq!(
+                from_index, brute,
+                "index disagreed with a scan for {rect:?}"
+            );
         }
     }
 

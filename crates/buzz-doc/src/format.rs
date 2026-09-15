@@ -1,4 +1,4 @@
-﻿//! The `.buzz` container.
+//! The `.buzz` container.
 //!
 //! A zip archive, laid out so the parts that will grow later already have a
 //! home:
@@ -40,6 +40,7 @@ pub const MIMETYPE: &str = "application/vnd.buzzcaf.buzzanimate";
 const ENTRY_MIMETYPE: &str = "mimetype";
 const ENTRY_META: &str = "meta.json";
 const ENTRY_DOCUMENT: &str = "document.json";
+const ENTRY_SCENES: &str = "scenes.json";
 
 /// The customary extension.
 pub const EXTENSION: &str = "buzz";
@@ -98,12 +99,50 @@ fn now_unix() -> u64 {
 /// Separated from the file writing so autosave can build the bytes on a
 /// background thread and only touch the disk at the end.
 pub fn to_bytes(scene: &Scene) -> Result<Vec<u8>, DocError> {
+    to_bytes_scenes(&[("Scene 1", scene)], 0)
+}
+
+/// The scene index for a multi-scene document: the scene names and which one
+/// was active. Absent from a single-scene file — which is every file older
+/// versions wrote — so its absence means "one scene".
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ScenesDto {
+    active: usize,
+    names: Vec<String>,
+}
+
+/// The archive entry holding one scene's document JSON, and the media directory
+/// its sounds and images live under. Scene 0 keeps the original names
+/// (`document.json`, `media/`) so a single-scene file is byte-for-byte what it
+/// always was and older readers still open it; later scenes are numbered.
+fn scene_entry(index: usize) -> String {
+    if index == 0 {
+        ENTRY_DOCUMENT.to_string()
+    } else {
+        format!("scene-{index}.json")
+    }
+}
+
+fn media_prefix(index: usize) -> String {
+    if index == 0 {
+        "media/".to_string()
+    } else {
+        format!("media/s{index}/")
+    }
+}
+
+/// Serialise several named scenes into one `.buzz` archive.
+pub fn to_bytes_scenes(scenes: &[(&str, &Scene)], active: usize) -> Result<Vec<u8>, DocError> {
     let mut buffer = Cursor::new(Vec::new());
-    write_archive(&mut buffer, scene)?;
+    write_archive(&mut buffer, scenes, active)?;
     Ok(buffer.into_inner())
 }
 
-fn write_archive<W: Write + Seek>(writer: &mut W, scene: &Scene) -> Result<(), DocError> {
+fn write_archive<W: Write + Seek>(
+    writer: &mut W,
+    scenes: &[(&str, &Scene)],
+    active: usize,
+) -> Result<(), DocError> {
     let mut zip = ZipWriter::new(writer);
 
     // Stored, not deflated, and written first: that is what makes the archive
@@ -119,16 +158,77 @@ fn write_archive<W: Write + Seek>(writer: &mut W, scene: &Scene) -> Result<(), D
     zip.start_file(ENTRY_META, deflated)?;
     zip.write_all(&serde_json::to_vec_pretty(&Meta::default())?)?;
 
-    zip.start_file(ENTRY_DOCUMENT, deflated)?;
-    let dto = DocumentDto::from_scene(scene);
-    zip.write_all(&serde_json::to_vec_pretty(&dto)?)?;
+    // The scene index — only when there is more than one, so a single-scene
+    // document stays exactly the file it was and opens in older versions.
+    if scenes.len() > 1 {
+        let index = ScenesDto {
+            active,
+            names: scenes.iter().map(|(name, _)| name.to_string()).collect(),
+        };
+        zip.start_file(ENTRY_SCENES, deflated)?;
+        zip.write_all(&serde_json::to_vec_pretty(&index)?)?;
+    }
+
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    for (i, (_, scene)) in scenes.iter().enumerate() {
+        zip.start_file(scene_entry(i), deflated)?;
+        let dto = DocumentDto::from_scene(scene);
+        zip.write_all(&serde_json::to_vec_pretty(&dto)?)?;
+        write_media(&mut zip, scene, &media_prefix(i), stored)?;
+    }
 
     zip.finish()?;
     Ok(())
 }
 
-/// Read a scene from `.buzz` bytes.
+/// Write a scene's sounds and images into the archive under `prefix`.
+///
+/// **Stored, not deflated.** MP3 and compressed WAV do not compress again;
+/// deflating them costs time on every save and gives back a fraction of a
+/// percent, and an uncompressed entry unzips to a playable file directly. A
+/// painted bitmap that cannot be written is reported and skipped rather than
+/// losing the whole save — the artwork keeps its place and shows a grey fill.
+fn write_media<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    scene: &Scene,
+    prefix: &str,
+    stored: SimpleFileOptions,
+) -> Result<(), DocError> {
+    for sound in scene.sounds().iter() {
+        zip.start_file(format!("{prefix}{}", sound.file_name()), stored)?;
+        zip.write_all(&sound.data)?;
+    }
+    for image in scene.images().iter() {
+        // A procedural texture travels as its recipe in the document JSON, so
+        // there is nothing to put in the archive for it — see `ImageAssetDto`.
+        if image.recipe.is_some() {
+            continue;
+        }
+        match image.bytes_for_storage() {
+            Ok(bytes) => {
+                zip.start_file(format!("{prefix}{}", image.file_name()), stored)?;
+                zip.write_all(&bytes)?;
+            }
+            Err(e) => tracing::warn!("could not store {}: {e}", image.name),
+        }
+    }
+    Ok(())
+}
+
+/// Read the first (or only) scene from `.buzz` bytes.
 pub fn from_bytes(bytes: &[u8]) -> Result<Scene, DocError> {
+    Ok(from_bytes_scenes(bytes)?
+        .0
+        .into_iter()
+        .next()
+        .map(|(_, scene)| scene)
+        .unwrap_or_else(Scene::empty))
+}
+
+/// Read every named scene from `.buzz` bytes, and which one was active. A file
+/// with no scene index is a single-scene document — every file older versions
+/// wrote — and comes back as one scene named "Scene 1".
+pub fn from_bytes_scenes(bytes: &[u8]) -> Result<(Vec<(String, Scene)>, usize), DocError> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
 
     // Check the type before trusting anything else in the file.
@@ -141,11 +241,104 @@ pub fn from_bytes(bytes: &[u8]) -> Result<Scene, DocError> {
         return Err(DocError::WrongType(mimetype.trim().to_string()));
     }
 
-    let mut document = String::new();
-    archive.by_name(ENTRY_DOCUMENT)?.read_to_string(&mut document)?;
+    let (names, active): (Vec<String>, usize) = match archive.by_name(ENTRY_SCENES) {
+        Ok(mut file) => {
+            let mut json = String::new();
+            file.read_to_string(&mut json)?;
+            let index: ScenesDto = serde_json::from_str(&json)?;
+            (index.names, index.active)
+        }
+        Err(_) => (vec!["Scene 1".to_string()], 0),
+    };
 
+    let mut scenes = Vec::with_capacity(names.len());
+    for (i, name) in names.into_iter().enumerate() {
+        let scene = read_scene(&mut archive, &scene_entry(i), &media_prefix(i))?;
+        scenes.push((name, scene));
+    }
+    let active = active.min(scenes.len().saturating_sub(1));
+    Ok((scenes, active))
+}
+
+/// Read one scene's document JSON and the media under `prefix`.
+fn read_scene<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    doc_entry: &str,
+    prefix: &str,
+) -> Result<Scene, DocError> {
+    let mut document = String::new();
+    archive.by_name(doc_entry)?.read_to_string(&mut document)?;
     let dto: DocumentDto = serde_json::from_str(&document)?;
-    Ok(dto.to_scene()?)
+
+    // **Bitmaps are decoded before the scene is built**, because a fill refers
+    // to one by id and resolves against it as the layers are read. Sounds can
+    // be reunited afterwards — nothing points *into* them — but an image fill
+    // with no image is a shape with no picture, so the library has to exist
+    // first.
+    let mut images = buzz_scene::ImageLibrary::default();
+    for entry in &dto.images {
+        // A procedural texture has no media entry to read: the recipe is the
+        // file, and `to_scene_with_images` bakes it. A recipe naming a kind
+        // this build does not know falls through to the media path and, finding
+        // nothing, warns like any other missing image.
+        if entry.recipe.as_ref().and_then(|r| r.to_recipe()).is_some() {
+            continue;
+        }
+        let name = format!("{prefix}image-{}.{}", entry.id, entry.format);
+        let mut bytes = Vec::new();
+        match archive.by_name(&name) {
+            Ok(mut file) => file.read_to_end(&mut bytes)?,
+            Err(_) => {
+                tracing::warn!("{name} is missing from the document; that image will be blank");
+                continue;
+            }
+        };
+        match buzz_scene::ImageAsset::decode(
+            buzz_scene::ImageId(entry.id),
+            entry.name.clone(),
+            &bytes,
+        ) {
+            Ok(mut asset) => {
+                // Whether it was painted is in the document, not in the PNG:
+                // the decoder cannot know, and a stroke has to still be paint
+                // when the file is reopened or it would stop fusing.
+                asset.painted = entry.painted;
+                images.insert(asset);
+            }
+            Err(e) => tracing::warn!("{name} could not be decoded: {e}"),
+        }
+    }
+
+    let mut scene = dto.to_scene_with_images(images)?;
+
+    // Reunite each sound with its bytes. A sound whose file is missing keeps
+    // its entry — name, duration and every keyframe that references it — and
+    // simply plays nothing. Dropping it instead would silently delete the
+    // user's edits along with it.
+    let names: Vec<(buzz_scene::SoundId, String)> = scene
+        .sounds()
+        .iter()
+        .map(|s| (s.id, format!("{prefix}{}", s.file_name())))
+        .collect();
+    for (id, name) in names {
+        let mut bytes = Vec::new();
+        match archive.by_name(&name) {
+            Ok(mut entry) => {
+                entry.read_to_end(&mut bytes)?;
+            }
+            Err(_) => {
+                tracing::warn!("{name} is missing from the document; that sound will be silent");
+                continue;
+            }
+        }
+        if let Some(asset) = scene.sounds_mut().get(id).cloned() {
+            let mut updated = (*asset).clone();
+            updated.data = std::sync::Arc::new(bytes);
+            scene.sounds_mut().insert(updated);
+        }
+    }
+
+    Ok(scene)
 }
 
 /// Read the metadata without loading the artwork.
@@ -164,9 +357,17 @@ pub fn read_meta(path: impl AsRef<Path>) -> Result<Meta, DocError> {
 /// Writes a sibling temporary file and renames it over the target, so an
 /// interrupted save cannot destroy the previous version.
 pub fn save(scene: &Scene, path: impl AsRef<Path>) -> Result<(), DocError> {
-    let path = path.as_ref();
-    let bytes = to_bytes(scene)?;
-    write_atomic(path, &bytes)
+    save_scenes(&[("Scene 1", scene)], 0, path)
+}
+
+/// Save several named scenes to `path`, atomically.
+pub fn save_scenes(
+    scenes: &[(&str, &Scene)],
+    active: usize,
+    path: impl AsRef<Path>,
+) -> Result<(), DocError> {
+    let bytes = to_bytes_scenes(scenes, active)?;
+    write_atomic(path.as_ref(), &bytes)
 }
 
 /// Write bytes to `path` via a temporary file and a rename.
@@ -202,15 +403,152 @@ fn temp_sibling(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tmp"))
 }
 
-/// Load a scene from `path`.
+/// Load the first (or only) scene from `path`.
 pub fn load(path: impl AsRef<Path>) -> Result<Scene, DocError> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
     from_bytes(&bytes)
 }
 
+/// Load every named scene from `path`, and which one was active.
+pub fn load_scenes(path: impl AsRef<Path>) -> Result<(Vec<(String, Scene)>, usize), DocError> {
+    let mut bytes = Vec::new();
+    File::open(path)?.read_to_end(&mut bytes)?;
+    from_bytes_scenes(&bytes)
+}
+
 #[cfg(test)]
 mod tests {
+    /// **A bitmap survives a save and reopen**, pixels and placement both.
+    ///
+    /// The picture goes into `media/` once and the fill refers to it by id, so
+    /// this is really two claims: that the file comes back byte-identical, and
+    /// that the shape which was filled with it still is.
+    #[test]
+    fn a_bitmap_round_trips_through_the_container() {
+        use buzz_scene::{FillSpec, ImageAsset, ImageFill, ImageId, LayerKind, ShapeData};
+
+        // A small painted canvas, encoded as a real PNG.
+        let mut canvas = ImageAsset::blank(ImageId(7), "Canvas", 8, 6);
+        {
+            let pixels = std::sync::Arc::make_mut(&mut canvas.pixels);
+            for (i, chunk) in pixels.chunks_exact_mut(4).enumerate() {
+                chunk.copy_from_slice(&[(i * 7) as u8, (i * 3) as u8, 200, 255]);
+            }
+        }
+        let png = canvas.encode_png().expect("it encodes");
+        let asset = ImageAsset::decode(ImageId(7), "Canvas", &png).expect("it decodes");
+        let (width, height) = (asset.width, asset.height);
+        let sample = asset.pixel(3, 2);
+
+        let mut scene = Scene::empty();
+        let stored = scene.images_mut().insert(asset);
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let area = buzz_geom::Rect::new(40.0, 20.0, 140.0, 95.0);
+        scene
+            .add_shape(
+                layer,
+                ShapeData {
+                    path: buzz_geom::Shape::to_path(&area, 1e-9),
+                    fill: Some(FillSpec::image(ImageFill::new(stored, area))),
+                    stroke: None,
+                    blend: buzz_scene::PaintBlend::Normal,
+                },
+            )
+            .expect("the image shape");
+
+        let bytes = to_bytes(&scene).expect("it saves");
+        let back = from_bytes(&bytes).expect("it opens");
+
+        assert_eq!(back.images().len(), 1, "the bitmap was lost");
+        let reopened = back
+            .images()
+            .get(ImageId(7))
+            .expect("the bitmap should still be there");
+        assert_eq!((reopened.width, reopened.height), (width, height));
+        assert_eq!(
+            reopened.pixel(3, 2),
+            sample,
+            "the pixels changed on the way through"
+        );
+
+        // And the shape still refers to it, in the same place.
+        let fill = back
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0))
+            .find_map(|o| match &o.kind {
+                buzz_scene::ObjectKind::Shape(shape) => {
+                    shape.fill.as_ref().and_then(|f| f.paint.image().cloned())
+                }
+                _ => None,
+            })
+            .expect("the fill should still be an image");
+        assert_eq!(fill.asset.id, ImageId(7));
+        let placed = fill.transform * buzz_geom::Point::new(0.0, 0.0);
+        assert!(
+            (placed.x - 40.0).abs() < 1e-9 && (placed.y - 20.0).abs() < 1e-9,
+            "the picture moved: {placed:?}"
+        );
+    }
+
+    /// A document whose `media/` entry has gone keeps the artwork and loses
+    /// only the picture. Refusing to open would throw away everything else.
+    #[test]
+    fn a_missing_bitmap_leaves_the_artwork_standing() {
+        use buzz_scene::{FillSpec, ImageAsset, ImageFill, ImageId, LayerKind, ShapeData};
+
+        let canvas = ImageAsset::blank(ImageId(9), "Gone", 4, 4);
+        let png = canvas.encode_png().expect("encodes");
+        let asset = ImageAsset::decode(ImageId(9), "Gone", &png).expect("decodes");
+
+        let mut scene = Scene::empty();
+        let stored = scene.images_mut().insert(asset);
+        let layer = scene.add_layer("Art", LayerKind::Normal);
+        let area = buzz_geom::Rect::new(0.0, 0.0, 50.0, 50.0);
+        scene
+            .add_shape(
+                layer,
+                ShapeData {
+                    path: buzz_geom::Shape::to_path(&area, 1e-9),
+                    fill: Some(FillSpec::image(ImageFill::new(stored, area))),
+                    stroke: None,
+                    blend: buzz_scene::PaintBlend::Normal,
+                },
+            )
+            .expect("the shape");
+
+        // Save, then rebuild the archive without the media entry.
+        let bytes = to_bytes(&scene).expect("saves");
+        let mut stripped = Vec::new();
+        {
+            let mut source = zip::ZipArchive::new(Cursor::new(&bytes)).expect("readable");
+            let mut out = zip::ZipWriter::new(Cursor::new(&mut stripped));
+            for i in 0..source.len() {
+                let mut entry = source.by_index(i).expect("an entry");
+                let name = entry.name().to_string();
+                if name.starts_with("media/") {
+                    continue;
+                }
+                let mut data = Vec::new();
+                entry.read_to_end(&mut data).expect("readable");
+                out.start_file::<_, ()>(name, SimpleFileOptions::default())
+                    .expect("writable");
+                out.write_all(&data).expect("written");
+            }
+            out.finish().expect("finished");
+        }
+
+        let back = from_bytes(&stripped).expect("it should still open");
+        let shapes: usize = back
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0))
+            .filter(|o| matches!(o.kind, buzz_scene::ObjectKind::Shape(_)))
+            .count();
+        assert_eq!(shapes, 1, "the artwork was thrown away with the picture");
+    }
+
     use super::*;
     use buzz_geom::Shape as _;
     use buzz_scene::{LayerKind, ShapeData};
@@ -241,6 +579,52 @@ mod tests {
         assert_eq!(back.shape_count(), scene.shape_count());
         assert_eq!(back.layers().len(), scene.layers().len());
         assert_eq!(back.stage().size, scene.stage().size);
+    }
+
+    /// **Every scene survives a save and reopen**, in order, with its name and
+    /// its own artwork — and the file remembers which one was active.
+    #[test]
+    fn several_scenes_round_trip_with_their_names() {
+        let mut second = Scene::empty();
+        let layer = second.add_layer("Only here", LayerKind::Normal);
+        second.add_shape(
+            layer,
+            ShapeData::filled(Rect::new(0.0, 0.0, 4.0, 4.0).to_path(1e-9), Color::WHITE),
+        );
+
+        let first = sample();
+        let scenes = [("Opening", &first), ("Chase", &second)];
+        let bytes = to_bytes_scenes(&scenes, 1).unwrap();
+        let (back, active) = from_bytes_scenes(&bytes).unwrap();
+        assert_eq!(active, 1, "the active scene was not remembered");
+
+        assert_eq!(back.len(), 2, "a scene was lost");
+        assert_eq!(back[0].0, "Opening");
+        assert_eq!(back[1].0, "Chase");
+        assert_eq!(back[0].1.shape_count(), first.shape_count());
+        assert_eq!(back[1].1.shape_count(), 1);
+        assert!(
+            back[1]
+                .1
+                .layers()
+                .iter()
+                .any(|l| l.name == "Only here"),
+            "the second scene's layers were mixed up with the first's"
+        );
+    }
+
+    /// A single-scene file — every file written before scenes existed — opens
+    /// as one scene named "Scene 1". Backward compatibility.
+    #[test]
+    fn an_old_single_scene_file_opens_as_one_scene() {
+        let scene = sample();
+        let bytes = to_bytes(&scene).unwrap();
+        let (back, active) = from_bytes_scenes(&bytes).unwrap();
+
+        assert_eq!(back.len(), 1);
+        assert_eq!(active, 0);
+        assert_eq!(back[0].0, "Scene 1");
+        assert_eq!(back[0].1.shape_count(), scene.shape_count());
     }
 
     #[test]
@@ -304,7 +688,8 @@ mod tests {
         let mut buffer = Cursor::new(Vec::new());
         {
             let mut zip = ZipWriter::new(&mut buffer);
-            zip.start_file("mimetype", SimpleFileOptions::default()).unwrap();
+            zip.start_file("mimetype", SimpleFileOptions::default())
+                .unwrap();
             zip.write_all(b"application/zip").unwrap();
             zip.finish().unwrap();
         }

@@ -62,9 +62,7 @@ impl BoolOp {
 }
 
 /// How overlapping sub-regions of a single path are filled.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum FillMode {
     /// Overlaps stay filled. The sane default for artwork and what Vello uses.
     #[default]
@@ -239,7 +237,10 @@ pub(crate) fn refit_checked(
     let diagonal = source_bb.width().hypot(source_bb.height());
     let slack = (accuracy * 4.0).max(diagonal * 1e-4);
 
-    if !source_bb.inflate(slack, slack).contains_rect(fitted.bounding_box()) {
+    if !source_bb
+        .inflate(slack, slack)
+        .contains_rect(fitted.bounding_box())
+    {
         return source.clone();
     }
 
@@ -326,18 +327,15 @@ pub fn boolean_many(paths: &[BezPath], op: BoolOp, opts: BooleanOptions) -> BezP
             .fold(paths[0].clone(), |acc, p| boolean(&acc, p, op, opts));
     }
 
-    paths
-        .par_iter()
-        .cloned()
-        .reduce(BezPath::new, |a, b| {
-            if a.elements().is_empty() {
-                return b;
-            }
-            if b.elements().is_empty() {
-                return a;
-            }
-            boolean(&a, &b, op, opts)
-        })
+    paths.par_iter().cloned().reduce(BezPath::new, |a, b| {
+        if a.elements().is_empty() {
+            return b;
+        }
+        if b.elements().is_empty() {
+            return a;
+        }
+        boolean(&a, &b, op, opts)
+    })
 }
 
 /// Merge overlapping shapes into as few paths as possible.
@@ -478,7 +476,12 @@ mod tests {
     fn a_hole_can_be_punched_and_measured() {
         let outer = square(0.0, 0.0, 20.0);
         let inner = square(5.0, 5.0, 10.0);
-        let r = boolean(&outer, &inner, BoolOp::Difference, BooleanOptions::default());
+        let r = boolean(
+            &outer,
+            &inner,
+            BoolOp::Difference,
+            BooleanOptions::default(),
+        );
         // 400 - 100
         assert!(
             (area(&r) - 300.0).abs() < 1.0,
@@ -592,18 +595,13 @@ mod tests {
 
     #[test]
     fn union_all_matches_a_sequential_fold() {
-        let squares: Vec<BezPath> = (0..24)
-            .map(|i| square(i as f64 * 4.0, 0.0, 10.0))
-            .collect();
+        let squares: Vec<BezPath> = (0..24).map(|i| square(i as f64 * 4.0, 0.0, 10.0)).collect();
         let opts = options_for(&squares);
 
         let parallel = union_all(&squares, opts);
-        let sequential = squares
-            .iter()
-            .skip(1)
-            .fold(squares[0].clone(), |acc, p| {
-                boolean(&acc, p, BoolOp::Union, opts)
-            });
+        let sequential = squares.iter().skip(1).fold(squares[0].clone(), |acc, p| {
+            boolean(&acc, p, BoolOp::Union, opts)
+        });
 
         assert!(
             (area(&parallel) - area(&sequential)).abs() < 1.0,
@@ -619,17 +617,15 @@ mod tests {
         assert!(area(&boolean_many(&[], BoolOp::Union, o)) < 1e-6);
 
         let one = square(0.0, 0.0, 10.0);
-        assert!((area(&boolean_many(std::slice::from_ref(&one), BoolOp::Union, o)) - 100.0).abs() < 0.5);
+        assert!(
+            (area(&boolean_many(std::slice::from_ref(&one), BoolOp::Union, o)) - 100.0).abs() < 0.5
+        );
     }
 
     #[test]
     fn difference_across_many_subtracts_all_of_them() {
         let base = square(0.0, 0.0, 20.0);
-        let cuts = vec![
-            base.clone(),
-            square(0.0, 0.0, 5.0),
-            square(15.0, 15.0, 5.0),
-        ];
+        let cuts = vec![base.clone(), square(0.0, 0.0, 5.0), square(15.0, 15.0, 5.0)];
         let r = boolean_many(&cuts, BoolOp::Difference, BooleanOptions::default());
         // 400 - 25 - 25
         assert!(

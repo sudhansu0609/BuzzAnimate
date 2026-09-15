@@ -36,14 +36,12 @@ pub struct DepthResponse {
     pub distribute: bool,
 }
 
-/// The depth range the panel offers.
+/// How far behind the stage the panel will drag a layer.
 ///
-/// Bounded well short of the camera: a layer may be brought forward, but the
-/// slider will not take it to the plane where the projection blows up. Typing
-/// a value past this is still possible through the document, and the renderer
-/// handles it by not drawing the layer — but a slider should not lead you
-/// somewhere the picture disappears.
-const NEAR_LIMIT: f64 = -0.9;
+/// There is no near constant to match it: how near the camera a layer may come
+/// is the camera's own business, and asking it
+/// ([`buzz_scene::CameraTrack::nearest_depth`]) is what stops this control and
+/// the timeline's depth column stopping in two different places.
 const FAR_LIMIT: f64 = 4.0;
 
 /// Draw the Layer Depth panel.
@@ -69,6 +67,11 @@ pub fn depth_panel(ui: &mut Ui, scene: &Scene, active: Option<LayerId>) -> Depth
     ui.horizontal(|ui| {
         ui.label("Camera depth");
         let mut value = focal;
+        // **The slider takes what is left of the row, not egui's fixed 100
+        // points.** A label, a 100-point slider and its number box come to
+        // more than a dock column at its narrowest, and the number box — the
+        // half you can type into — was the part that ended up off the panel.
+        ui.spacing_mut().slider_width = (ui.available_width() - 66.0).max(40.0);
         if ui
             .add(
                 egui::Slider::new(&mut value, 200.0..=6000.0)
@@ -105,52 +108,55 @@ pub fn depth_panel(ui: &mut Ui, scene: &Scene, active: Option<LayerId>) -> Depth
     ui.separator();
 
     // -- per-layer depth ----------------------------------------------------
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let rows: Vec<(LayerId, String, f64, Color32)> = scene
-                .layers()
-                .iter()
-                .map(|l| {
-                    let [r, g, b, a] = l.color.to_rgba8().to_u8_array();
-                    (
-                        l.id,
-                        l.name.clone(),
-                        l.depth,
-                        Color32::from_rgba_unmultiplied(r, g, b, a),
-                    )
-                })
-                .collect();
+    // The dock column already scrolls; see the note on `tool_bar`.
 
-            for (id, name, depth, colour) in rows {
-                ui.horizontal(|ui| {
-                    let (chip, _) =
-                        ui.allocate_exact_size(egui::vec2(7.0, 12.0), egui::Sense::hover());
-                    ui.painter().rect_filled(chip, 1.0, colour);
+    let rows: Vec<(LayerId, String, f64, Color32)> = scene
+        .layers()
+        .iter()
+        .map(|l| {
+            let [r, g, b, a] = l.color.to_rgba8().to_u8_array();
+            (
+                l.id,
+                l.name.clone(),
+                l.depth,
+                Color32::from_rgba_unmultiplied(r, g, b, a),
+            )
+        })
+        .collect();
 
-                    if ui
-                        .selectable_label(active == Some(id), &name)
-                        .clicked()
-                    {
-                        response.select_layer = Some(id);
-                    }
+    for (id, name, depth, colour) in rows {
+        ui.horizontal(|ui| {
+            let (chip, _) = ui.allocate_exact_size(egui::vec2(7.0, 12.0), egui::Sense::hover());
+            ui.painter().rect_filled(chip, 1.0, colour);
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut value = depth;
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut value)
-                                    .speed(5.0)
-                                    .range(focal * NEAR_LIMIT..=focal * FAR_LIMIT),
-                            )
-                            .changed()
-                        {
-                            response.set_depth = Some((id, value));
-                        }
-                    });
-                });
+            // Truncated: a layer name has no length limit, and the depth field
+            // on the right of this row is what a long one pushes off the panel.
+            if ui
+                .add(
+                    egui::Button::selectable(active == Some(id), &name)
+                        .truncate()
+                        .min_size(egui::vec2((ui.available_width() - 64.0).max(1.0), 0.0)),
+                )
+                .clicked()
+            {
+                response.select_layer = Some(id);
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut value = depth;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut value)
+                            .speed(5.0)
+                            .range(scene.camera().nearest_depth()..=focal * FAR_LIMIT),
+                    )
+                    .changed()
+                {
+                    response.set_depth = Some((id, value));
+                }
+            });
         });
+    }
 
     response
 }
@@ -158,11 +164,11 @@ pub fn depth_panel(ui: &mut Ui, scene: &Scene, active: Option<LayerId>) -> Depth
 /// The scene from the side: camera at the left, depth increasing rightwards.
 fn perspective_view(ui: &mut Ui, scene: &Scene, active: Option<LayerId>, out: &mut DepthResponse) {
     let (rect, view) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 132.0),
+        egui::vec2(ui.available_width(), 158.0),
         egui::Sense::click(),
     );
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 3.0, Palette::PANEL);
+    painter.rect_filled(rect, 3.0, Palette::panel());
 
     let focal = scene.camera().focal_distance.max(1.0);
 
@@ -186,13 +192,13 @@ fn perspective_view(ui: &mut Ui, scene: &Scene, active: Option<LayerId>, out: &m
     };
 
     // The camera, as an eye at the origin of the axis.
-    painter.circle_filled(egui::pos2(left, axis_y), 4.0, Palette::TEXT);
+    painter.circle_filled(egui::pos2(left, axis_y), 4.0, Palette::text());
     painter.text(
         egui::pos2(rect.left() + 4.0, axis_y - 14.0),
         egui::Align2::LEFT_CENTER,
         "cam",
         egui::FontId::proportional(9.0),
-        Palette::TEXT_DIM,
+        Palette::text_dim(),
     );
 
     // The focal plane, dashed, because it is the reference every depth is
@@ -202,7 +208,7 @@ fn perspective_view(ui: &mut Ui, scene: &Scene, active: Option<LayerId>, out: &m
         let y0 = rect.top() + 10.0 + i as f32 * 13.0;
         painter.line_segment(
             [egui::pos2(focal_x, y0), egui::pos2(focal_x, y0 + 6.0)],
-            egui::Stroke::new(1.0, Palette::BORDER),
+            egui::Stroke::new(1.0, Palette::border()),
         );
     }
     painter.text(
@@ -210,13 +216,13 @@ fn perspective_view(ui: &mut Ui, scene: &Scene, active: Option<LayerId>, out: &m
         egui::Align2::CENTER_CENTER,
         "stage",
         egui::FontId::proportional(9.0),
-        Palette::TEXT_DIM,
+        Palette::text_dim(),
     );
 
     // Each layer as a plane, drawn at the height perspective gives it. Front
     // of the stack last, so it is drawn over the others.
     let layers: Vec<_> = scene.layers().iter().cloned().collect();
-    for layer in layers.iter().rev() {
+    for (index, layer) in layers.iter().enumerate().rev() {
         let distance = focal + layer.depth;
         // Behind the camera: nothing to draw, but say so rather than leave a
         // gap the user cannot explain.
@@ -241,12 +247,27 @@ fn perspective_view(ui: &mut Ui, scene: &Scene, active: Option<LayerId>, out: &m
         let colour = Color32::from_rgba_unmultiplied(r, g, b, if selected { 255 } else { 170 });
 
         painter.line_segment(
-            [
-                egui::pos2(x, axis_y - half),
-                egui::pos2(x, axis_y + half),
-            ],
+            [egui::pos2(x, axis_y - half), egui::pos2(x, axis_y + half)],
             egui::Stroke::new(if selected { 3.0 } else { 2.0 }, colour),
         );
+
+        // **Each plane says which layer it is.**
+        //
+        // Without this the view showed the arrangement and not *whose*
+        // arrangement: a row of coloured bars that could only be identified by
+        // clicking them one at a time, which is the question the picture was
+        // supposed to answer at a glance. Staggered by position in the stack so
+        // two layers at nearly the same depth do not print over each other.
+        let above = axis_y - half - 4.0;
+        let stagger = if index % 2 == 0 { 0.0 } else { -10.0 };
+        painter.text(
+            egui::pos2(x, (above + stagger).max(rect.top() + 6.0)),
+            egui::Align2::CENTER_BOTTOM,
+            &layer.name,
+            egui::FontId::proportional(9.0),
+            if selected { Palette::text() } else { colour },
+        );
+
         // Sight lines from the camera to the plane's edges, which is what makes
         // the drawing read as a perspective frustum rather than a bar chart.
         if selected {
@@ -256,6 +277,25 @@ fn perspective_view(ui: &mut Ui, scene: &Scene, active: Option<LayerId>, out: &m
                     egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(r, g, b, 60)),
                 );
             }
+            // **How far away, in so many words.** The picture shows the
+            // ordering; the number is what you need to type into another
+            // layer to match it, and what "how close is this" actually means.
+            painter.text(
+                egui::pos2(x, axis_y + half + 3.0),
+                egui::Align2::CENTER_TOP,
+                format!(
+                    "{distance:.0} px from camera \u{b7} {} the stage",
+                    if layer.depth.abs() < 0.5 {
+                        "on".to_string()
+                    } else if layer.depth > 0.0 {
+                        format!("{:.0} behind", layer.depth)
+                    } else {
+                        format!("{:.0} in front of", -layer.depth)
+                    }
+                ),
+                egui::FontId::proportional(9.0),
+                Palette::text_dim(),
+            );
         }
     }
 

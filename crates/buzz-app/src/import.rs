@@ -33,10 +33,38 @@ pub struct ImportSummary {
     pub title: String,
     pub what_arrived: String,
     pub unsupported: Vec<String>,
+    /// This is a *failure*, not a partial success.
+    ///
+    /// The same dialog serves both, because the question a user has is the
+    /// same either way — what happened to my file? — and a failure that only
+    /// writes a line into the status bar is one nobody reads. It is worded
+    /// differently and it does not claim that everything else imported
+    /// normally, because nothing did.
+    pub failed: bool,
 }
 
 /// File extensions the importers understand, for the dialog's filter.
 pub const IMPORTABLE: &[&str] = &["fla", "xfl", "swf", "pdf", "ai"];
+
+/// Sound files, which File > Import also accepts.
+///
+/// **A sound is not read by any of the importers above** - it goes into the
+/// library rather than onto the stage, so it takes a different route entirely
+/// (`Editor::import_sound`). It still has to be *offered* here, because File >
+/// Import is the command anybody reaches for with a dialogue track in hand, and
+/// answering "BuzzAnimate cannot import .mp3 files" from a program with a sound
+/// library, a waveform display and a lip-sync dialog is simply untrue. The
+/// router below sends these to the sound path.
+///
+/// The same list the Import Sound dialog filters on, so the two cannot drift.
+pub const AUDIBLE: &[&str] = &["wav", "mp3", "ogg", "flac", "m4a", "aac"];
+
+/// Is this a sound file, and so bound for the library rather than the stage?
+pub fn is_audio(path: &Path) -> bool {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|e| AUDIBLE.contains(&e.as_str()))
+}
 
 /// Read a file into a scene.
 ///
@@ -58,9 +86,17 @@ pub fn read(path: &Path) -> Result<Imported, String> {
         "swf" => read_swf(path),
         "pdf" | "ai" => read_pdf(path),
         "" => Err("that file has no extension, so there is no way to tell what it is".into()),
+        // Handled by the caller before it ever gets here: a sound has no scene
+        // to return. Reaching this arm means the routing was bypassed, and
+        // saying so is more use than the general refusal below.
+        other if AUDIBLE.contains(&other) => Err(format!(
+            ".{other} is a sound rather than artwork. Bring it in with \
+             File > Import Sound."
+        )),
         other => Err(format!(
             "BuzzAnimate cannot import .{other} files. It reads .fla and .xfl \
-             from Animate, .swf movies, and .pdf or .ai artwork."
+             from Animate, .swf movies, .pdf or .ai artwork, and sound as \
+             .wav, .mp3, .ogg, .flac, .m4a or .aac."
         )),
     }
 }
@@ -114,7 +150,10 @@ mod tests {
     #[test]
     fn an_unknown_extension_says_what_is_supported() {
         let error = read(&PathBuf::from("drawing.psd")).unwrap_err();
-        assert!(error.contains(".psd"), "it should name what was refused: {error}");
+        assert!(
+            error.contains(".psd"),
+            "it should name what was refused: {error}"
+        );
         assert!(error.contains(".fla"), "and list what works: {error}");
     }
 

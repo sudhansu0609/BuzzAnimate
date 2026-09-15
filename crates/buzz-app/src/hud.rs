@@ -58,7 +58,10 @@ pub fn format_zoom(percent: f64) -> String {
 /// Describe the precision budget in words the user can act on.
 pub fn describe_precision(px: f64) -> (String, egui::Color32) {
     if px < 0.01 {
-        ("exact".to_string(), egui::Color32::from_rgb(0x5B, 0xD6, 0x8A))
+        (
+            "exact".to_string(),
+            egui::Color32::from_rgb(0x5B, 0xD6, 0x8A),
+        )
     } else if px < 0.25 {
         (
             format!("{px:.3} px steps"),
@@ -214,18 +217,13 @@ fn draw_core_bars(ui: &mut egui::Ui, per_worker: &[f64]) {
         let load = load.clamp(0.0, 1.0) as f32;
         let x = rect.left() + i as f32 * (BAR_W + GAP);
 
-        let track = egui::Rect::from_min_size(
-            egui::pos2(x, rect.top()),
-            egui::vec2(BAR_W, BAR_H),
-        );
+        let track = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(BAR_W, BAR_H));
         painter.rect_filled(track, 1.0, egui::Color32::from_gray(38));
 
         if load > 0.0 {
             let h = (BAR_H * load).max(1.0);
-            let filled = egui::Rect::from_min_size(
-                egui::pos2(x, rect.bottom() - h),
-                egui::vec2(BAR_W, h),
-            );
+            let filled =
+                egui::Rect::from_min_size(egui::pos2(x, rect.bottom() - h), egui::vec2(BAR_W, h));
             // Green through amber to red as a core saturates.
             let colour = egui::Color32::from_rgb(
                 (70.0 + 170.0 * load) as u8,

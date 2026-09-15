@@ -10,13 +10,21 @@ authors.workspace = true
 [dependencies]
 buzz-geom.workspace = true
 buzz-scene.workspace = true
+# For the font picker's previews, which outline each family in itself with the
+# same call the Text tool draws with.
+buzz-text.workspace = true
+buzz-rig.workspace = true
 buzz-doc.workspace = true
 
 egui.workspace = true
 kurbo.workspace = true
 peniko.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+
+# The About window's banner is a PNG, decoded when that window first opens.
+png = "0.18"
 tracing.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+tempfile = "3"

@@ -74,16 +74,35 @@ pub fn nearest_on_path(path: &BezPath, point: Point, accuracy: f64) -> Option<Ne
     best
 }
 
+/// **Is the point inside the fill, or close enough to its edge to count?**
+///
+/// # Why a fill needs slack at all
+///
+/// `fill_contains` is exact: the point is inside the path or it is not. That is
+/// right for asking what colour is under the pointer and wrong for asking what
+/// the user meant to click. Line art is very often drawn as *filled* paths
+/// rather than stroked ones — every brush stroke here becomes one, and imported
+/// artwork is nothing else — and a filled path a pixel or two wide has almost
+/// no interior to land in. Selecting a line meant hitting it exactly, which is
+/// the "selecting lines is tedious" report.
+///
+/// A stroke already had this slack. This is the same slack for a fill: inside
+/// counts, and so does within `tolerance` of the outline. On a thin sliver that
+/// is the difference between a target a pixel wide and one the width of the
+/// pick radius; on a large shape it adds an imperceptible halo and changes
+/// nothing about clicking in the middle of it.
+pub fn fill_contains_near(path: &BezPath, point: Point, fill: FillMode, tolerance: f64) -> bool {
+    fill_contains(path, point, fill)
+        // Zero width: the reach is the tolerance alone, measured from the
+        // outline, which is exactly "near the edge".
+        || (tolerance > 0.0 && stroke_contains(path, point, 0.0, tolerance))
+}
+
 /// Did the user click on the stroke of `path`?
 ///
 /// `stroke_width` is the drawn width; `tolerance` is the extra slack in
 /// document units, so a hairline is still clickable.
-pub fn stroke_contains(
-    path: &BezPath,
-    point: Point,
-    stroke_width: f64,
-    tolerance: f64,
-) -> bool {
+pub fn stroke_contains(path: &BezPath, point: Point, stroke_width: f64, tolerance: f64) -> bool {
     let reach = (stroke_width.max(0.0) * 0.5) + tolerance.max(0.0);
     if reach <= 0.0 {
         return false;
@@ -155,7 +174,12 @@ pub struct Hit {
 }
 
 /// Test one target.
-fn test_one(target: &HitTarget<'_>, point: Point, tolerance: f64, fill: FillMode) -> Option<HitPart> {
+fn test_one(
+    target: &HitTarget<'_>,
+    point: Point,
+    tolerance: f64,
+    fill: FillMode,
+) -> Option<HitPart> {
     if !target.selectable {
         return None;
     }
@@ -166,7 +190,7 @@ fn test_one(target: &HitTarget<'_>, point: Point, tolerance: f64, fill: FillMode
     {
         return Some(HitPart::Stroke);
     }
-    if target.filled && fill_contains(target.path, point, fill) {
+    if target.filled && fill_contains_near(target.path, point, fill, tolerance) {
         return Some(HitPart::Fill);
     }
     None
@@ -190,11 +214,9 @@ pub fn hit_test_topmost(
     const PARALLEL_THRESHOLD: usize = 64;
 
     if targets.len() < PARALLEL_THRESHOLD {
-        return targets
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, t)| test_one(t, point, tolerance, fill).map(|part| Hit { index, part }));
+        return targets.iter().enumerate().rev().find_map(|(index, t)| {
+            test_one(t, point, tolerance, fill).map(|part| Hit { index, part })
+        });
     }
 
     targets
@@ -264,8 +286,16 @@ mod tests {
     fn fill_hit_testing_respects_the_boundary() {
         let sq = square(0.0, 0.0, 10.0);
         assert!(fill_contains(&sq, Point::new(5.0, 5.0), FillMode::NonZero));
-        assert!(!fill_contains(&sq, Point::new(15.0, 5.0), FillMode::NonZero));
-        assert!(!fill_contains(&sq, Point::new(-1.0, 5.0), FillMode::NonZero));
+        assert!(!fill_contains(
+            &sq,
+            Point::new(15.0, 5.0),
+            FillMode::NonZero
+        ));
+        assert!(!fill_contains(
+            &sq,
+            Point::new(-1.0, 5.0),
+            FillMode::NonZero
+        ));
     }
 
     #[test]
@@ -283,6 +313,48 @@ mod tests {
             !fill_contains(&path, inside_inner, FillMode::EvenOdd),
             "even-odd should punch a hole"
         );
+    }
+
+    /// **The report: selecting lines was tedious.**
+    ///
+    /// A stroke has always had a few pixels of slack. A *fill* had none — the
+    /// point was inside the path or it was not. Line art is very often drawn as
+    /// filled paths rather than stroked ones: every brush stroke here becomes
+    /// one, and imported artwork is nothing else. A filled path two units wide
+    /// therefore had a two-unit target, and had to be clicked dead on.
+    #[test]
+    fn a_thin_filled_line_is_clickable_from_beside_it() {
+        // A line drawn as a filled sliver two units wide, as a brush stroke is.
+        let sliver = Rect::new(0.0, 49.0, 100.0, 51.0).to_path(1e-9);
+        let beside = Point::new(50.0, 53.0);
+
+        assert!(
+            !fill_contains(&sliver, beside, FillMode::NonZero),
+            "the fixture is not thin enough to be testing anything"
+        );
+        assert!(
+            !fill_contains_near(&sliver, beside, FillMode::NonZero, 0.0),
+            "with no tolerance a miss is still a miss"
+        );
+        assert!(
+            fill_contains_near(&sliver, beside, FillMode::NonZero, 6.0),
+            "three units from a filled line, with six of slack, should select it"
+        );
+    }
+
+    /// The slack is slack, not a free-for-all: well clear of the shape is still
+    /// a miss, and the inside of a shape is unaffected.
+    #[test]
+    fn the_fill_slack_does_not_reach_across_the_stage() {
+        let square = Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9);
+        assert!(fill_contains_near(&square, Point::new(50.0, 50.0), FillMode::NonZero, 6.0));
+        assert!(fill_contains_near(&square, Point::new(103.0, 50.0), FillMode::NonZero, 6.0));
+        assert!(!fill_contains_near(
+            &square,
+            Point::new(140.0, 50.0),
+            FillMode::NonZero,
+            6.0
+        ));
     }
 
     #[test]
@@ -360,7 +432,9 @@ mod tests {
     fn unselectable_targets_are_skipped() {
         let sq = square(0.0, 0.0, 20.0);
         let targets = vec![HitTarget::new(&sq).selectable(false)];
-        assert!(hit_test_topmost(&targets, Point::new(10.0, 10.0), 0.0, FillMode::NonZero).is_none());
+        assert!(
+            hit_test_topmost(&targets, Point::new(10.0, 10.0), 0.0, FillMode::NonZero).is_none()
+        );
     }
 
     #[test]
@@ -369,11 +443,13 @@ mod tests {
         let targets = vec![HitTarget::new(&sq).with_stroke(4.0)];
 
         // On the edge: the stroke.
-        let hit = hit_test_topmost(&targets, Point::new(0.5, 10.0), 0.0, FillMode::NonZero).unwrap();
+        let hit =
+            hit_test_topmost(&targets, Point::new(0.5, 10.0), 0.0, FillMode::NonZero).unwrap();
         assert_eq!(hit.part, HitPart::Stroke);
 
         // Well inside: the fill.
-        let hit = hit_test_topmost(&targets, Point::new(10.0, 10.0), 0.0, FillMode::NonZero).unwrap();
+        let hit =
+            hit_test_topmost(&targets, Point::new(10.0, 10.0), 0.0, FillMode::NonZero).unwrap();
         assert_eq!(hit.part, HitPart::Fill);
     }
 
@@ -382,8 +458,12 @@ mod tests {
         let sq = square(0.0, 0.0, 20.0);
         let targets = vec![HitTarget::new(&sq).filled(false).with_stroke(2.0)];
 
-        assert!(hit_test_topmost(&targets, Point::new(10.0, 10.0), 0.0, FillMode::NonZero).is_none());
-        assert!(hit_test_topmost(&targets, Point::new(0.0, 10.0), 0.0, FillMode::NonZero).is_some());
+        assert!(
+            hit_test_topmost(&targets, Point::new(10.0, 10.0), 0.0, FillMode::NonZero).is_none()
+        );
+        assert!(
+            hit_test_topmost(&targets, Point::new(0.0, 10.0), 0.0, FillMode::NonZero).is_some()
+        );
     }
 
     /// The parallel path must agree with the sequential one.
@@ -397,13 +477,9 @@ mod tests {
             let point = Point::new(x, 15.0);
 
             let parallel = hit_test_topmost(&targets, point, 0.0, FillMode::NonZero);
-            let sequential = targets
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(i, t)| {
-                    test_one(t, point, 0.0, FillMode::NonZero).map(|part| Hit { index: i, part })
-                });
+            let sequential = targets.iter().enumerate().rev().find_map(|(i, t)| {
+                test_one(t, point, 0.0, FillMode::NonZero).map(|part| Hit { index: i, part })
+            });
 
             assert_eq!(
                 parallel.map(|h| h.index),
@@ -454,10 +530,22 @@ mod tests {
     fn curved_shapes_hit_test_correctly() {
         let circle = Circle::new(Point::new(0.0, 0.0), 50.0).to_path(1e-9);
 
-        assert!(fill_contains(&circle, Point::new(0.0, 0.0), FillMode::NonZero));
-        assert!(fill_contains(&circle, Point::new(35.0, 35.0), FillMode::NonZero));
+        assert!(fill_contains(
+            &circle,
+            Point::new(0.0, 0.0),
+            FillMode::NonZero
+        ));
+        assert!(fill_contains(
+            &circle,
+            Point::new(35.0, 35.0),
+            FillMode::NonZero
+        ));
         // Inside the bounding box but outside the circle.
-        assert!(!fill_contains(&circle, Point::new(45.0, 45.0), FillMode::NonZero));
+        assert!(!fill_contains(
+            &circle,
+            Point::new(45.0, 45.0),
+            FillMode::NonZero
+        ));
 
         let n = nearest_on_path(&circle, Point::new(100.0, 0.0), 1e-9).unwrap();
         assert!(

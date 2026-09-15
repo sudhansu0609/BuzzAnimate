@@ -1,0 +1,10 @@
+[package]
+name = "buzz-physics"
+description = "Damped-spring integration for secondary motion (follow-through, overlap)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]

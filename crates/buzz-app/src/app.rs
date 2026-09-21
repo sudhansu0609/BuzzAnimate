@@ -4910,6 +4910,40 @@ impl App {
             }
         }
 
+        // **An asset dragged out of the Assets panel, dropped where it lands.**
+        //
+        // The same as a Library symbol above, and here for the same reasons:
+        // the release that ends the drag must place the asset rather than fall
+        // through to the tools and deselect what was under it, and it lands
+        // where it is let go rather than at the coordinates it was saved with.
+        // Dropping on a folder in the panel still files it; only a drop over
+        // the stage places it.
+        if egui::DragAndDrop::has_payload_of_type::<buzz_ui::assets_panel::DraggedAsset>(&ctx) {
+            let over = ctx
+                .input(|i| i.pointer.hover_pos())
+                .is_some_and(|p| area.contains(p));
+            if over {
+                ctx.set_cursor_icon(egui::CursorIcon::Copy);
+                // A ghost of where it will land, so the drop is aimed.
+                if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
+                    ui.painter().circle_stroke(
+                        p,
+                        7.0,
+                        egui::Stroke::new(1.5, buzz_ui::Palette::active()),
+                    );
+                }
+            }
+            if over && ctx.input(|i| i.pointer.any_released()) {
+                if let Some(dropped) =
+                    egui::DragAndDrop::take_payload::<buzz_ui::assets_panel::DraggedAsset>(&ctx)
+                    && let Some(p) = ctx.input(|i| i.pointer.interact_pos())
+                {
+                    self.editor.place_asset_at(&dropped.0, local(p));
+                }
+                return;
+            }
+        }
+
         // **A slot in the Rigging panel is waiting for a drawing.**
         //
         // Taken before the tools, because every tool already means something on

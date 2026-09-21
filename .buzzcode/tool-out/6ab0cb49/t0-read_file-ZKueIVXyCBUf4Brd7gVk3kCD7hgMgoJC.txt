@@ -1,0 +1,320 @@
+crates/buzz-ui/src/tools.rs (lines 1-318 of 414)
+  1	//! The tool set, its shortcuts, and how the toolbar is grouped.
+  2	//!
+  3	//! This module is the *catalogue*: what tools exist, what they are called, what
+  4	//! key selects them, and how they group in the toolbar. The behaviour lives in
+  5	//! `buzz-app`, so the shortcut map can be tested without a window.
+  6	//!
+  7	//! Letters follow Animate exactly. Muscle memory is the whole point — a user
+  8	//! who presses `V` expects the Selection tool, and getting that wrong is worse
+  9	//! than having fewer tools.
+ 10	
+ 11	use egui::Key;
+ 12	
+ 13	/// Every tool in the toolbar.
+ 14	#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+ 15	pub enum ToolId {
+ 16	    Selection,
+ 17	    Subselection,
+ 18	    /// Freehand region select — and, on artwork, a freehand cut.
+ 19	    Lasso,
+ 20	    /// Click a colour and take everything like it.
+ 21	    MagicWand,
+ 22	    FreeTransform,
+ 23	    GradientTransform,
+ 24	    Pen,
+ 25	    Text,
+ 26	    Line,
+ 27	    Rectangle,
+ 28	    Oval,
+ 29	    PolyStar,
+ 30	    Pencil,
+ 31	    Brush,
+ 32	    Bone,
+ 33	    /// Animate's Asset Warp: handles dropped on artwork, dragged to deform it.
+ 34	    AssetWarp,
+ 35	    /// Draw a curve; the selected object is baked travelling along it.
+ 36	    MotionPath,
+ 37	    PaintBucket,
+ 38	    InkBottle,
+ 39	    Eyedropper,
+ 40	    Eraser,
+ 41	    Camera,
+ 42	    Hand,
+ 43	    Zoom,
+ 44	}
+ 45	
+ 46	/// Whether a tool is usable yet.
+ 47	///
+ 48	/// Shown honestly in the toolbar. A tool that looks available but silently does
+ 49	/// nothing is worse than one that says it is not ready.
+ 50	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ 51	pub enum ToolStatus {
+ 52	    Ready,
+ 53	    /// Arrives in a later phase; the tooltip says which.
+ 54	    Planned(&'static str),
+ 55	}
+ 56	
+ 57	impl ToolId {
+ 58	    /// Name as shown in the tooltip.
+ 59	    pub fn name(self) -> &'static str {
+ 60	        use ToolId::*;
+ 61	        match self {
+ 62	            Selection => "Selection",
+ 63	            Subselection => "Subselection",
+ 64	            Lasso => "Lasso",
+ 65	            MagicWand => "Magic Wand",
+ 66	            FreeTransform => "Free Transform",
+ 67	            GradientTransform => "Gradient Transform",
+ 68	            Pen => "Pen",
+ 69	            Text => "Text",
+ 70	            Line => "Line",
+ 71	            Rectangle => "Rectangle",
+ 72	            Oval => "Oval",
+ 73	            PolyStar => "PolyStar",
+ 74	            Pencil => "Pencil",
+ 75	            Brush => "Brush",
+ 76	            Bone => "Bone",
+ 77	            AssetWarp => "Asset Warp",
+ 78	            MotionPath => "Motion Path",
+ 79	            PaintBucket => "Paint Bucket",
+ 80	            InkBottle => "Ink Bottle",
+ 81	            Eyedropper => "Eyedropper",
+ 82	            Eraser => "Eraser",
+ 83	            Camera => "Camera",
+ 84	            Hand => "Hand",
+ 85	            Zoom => "Zoom",
+ 86	        }
+ 87	    }
+ 88	
+ 89	    /// Animate's single-letter shortcut.
+ 90	    pub fn shortcut(self) -> Option<Key> {
+ 91	        use ToolId::*;
+ 92	        match self {
+ 93	            Selection => Some(Key::V),
+ 94	            Subselection => Some(Key::A),
+ 95	            Lasso => Some(Key::L),
+ 96	            // Animate has no letter for the Magic Wand — it is a mode of the
+ 97	            // Lasso there, not a tool. Here it is its own tool and takes the
+ 98	            // free letter next to it. Recorded in PROGRESS.md §7.
+ 99	            MagicWand => Some(Key::G),
+100	            FreeTransform => Some(Key::Q),
+101	            Pen => Some(Key::P),
+102	            Text => Some(Key::T),
+103	            Line => Some(Key::N),
+104	            Rectangle => Some(Key::R),
+105	            Oval => Some(Key::O),
+106	            Pencil => Some(Key::Y),
+107	            Brush => Some(Key::B),
+108	            Bone => Some(Key::M),
+109	            // Animate's own letter for Asset Warp.
+110	            AssetWarp => Some(Key::W),
+111	            // Animate has no motion-path tool; J is free and next to nothing
+112	            // that would be confused with it.
+113	            MotionPath => Some(Key::J),
+114	            PaintBucket => Some(Key::K),
+115	            InkBottle => Some(Key::S),
+116	            Eyedropper => Some(Key::I),
+117	            Eraser => Some(Key::E),
+118	            Camera => Some(Key::C),
+119	            Hand => Some(Key::H),
+120	            Zoom => Some(Key::Z),
+121	            // Animate leaves these two without a letter.
+122	            GradientTransform | PolyStar => None,
+123	        }
+124	    }
+125	
+126	    /// The button's glyph.
+127	    ///
+128	    /// # Why these are letters
+129	    ///
+130	    /// Adobe's tool icons cannot be used, and egui's bundled fonts cover only a
+131	    /// scattering of the symbols a tool palette wants — measured on the real
+132	    /// window, `▭ ◯ ╱ ➤ ⇱ ⤢ ✒ ▨` all rendered as empty boxes, which is worse
+133	    /// than no icon at all.
+134	    ///
+135	    /// So each button shows its **shortcut letter**. It always renders, and it
+136	    /// teaches the keyboard shortcut every time the user looks at the palette.
+137	    /// The two tools Animate leaves without a letter use symbols confirmed to
+138	    /// render. Full names are in the tooltip.
+139	    pub fn glyph(self) -> &'static str {
+140	        use ToolId::*;
+141	        match self {
+142	            Selection => "V",
+143	            Subselection => "A",
+144	            Lasso => "L",
+145	            MagicWand => "G",
+146	            FreeTransform => "Q",
+147	            // No shortcut in Animate; both of these render correctly.
+148	            GradientTransform => "◑",
+149	            PolyStar => "☆",
+150	            Pen => "P",
+151	            Text => "T",
+152	            Line => "N",
+153	            Rectangle => "R",
+154	            Oval => "O",
+155	            Pencil => "Y",
+156	            Brush => "B",
+157	            Bone => "M",
+158	            AssetWarp => "W",
+159	            MotionPath => "J",
+160	            PaintBucket => "K",
+161	            InkBottle => "S",
+162	            Eyedropper => "I",
+163	            Eraser => "E",
+164	            Camera => "C",
+165	            Hand => "H",
+166	            Zoom => "Z",
+167	        }
+168	    }
+169	
+170	    /// Is this tool implemented?
+171	    pub fn status(self) -> ToolStatus {
+172	        use ToolId::*;
+173	        match self {
+174	            Selection | Subselection | Lasso | MagicWand | FreeTransform | Line | Rectangle
+175	            | Oval | PolyStar | Pencil | Brush | Eraser | PaintBucket | InkBottle | Eyedropper
+176	            | Hand | Zoom | Pen | Camera | Bone | AssetWarp | MotionPath | GradientTransform
+177	            | Text => ToolStatus::Ready,
+178	        }
+179	    }
+180	
+181	    pub fn is_ready(self) -> bool {
+182	        matches!(self.status(), ToolStatus::Ready)
+183	    }
+184	
+185	    /// Does this tool draw a new shape, rather than edit existing ones?
+186	    pub fn is_drawing_tool(self) -> bool {
+187	        use ToolId::*;
+188	        matches!(
+189	            self,
+190	            Line | Rectangle | Oval | PolyStar | Pencil | Brush | Pen
+191	        )
+192	    }
+193	
+194	    /// Does the tool navigate rather than modify the document?
+195	    ///
+196	    /// Navigation tools stay usable on a locked layer.
+197	    pub fn is_navigation(self) -> bool {
+198	        matches!(self, ToolId::Hand | ToolId::Zoom)
+199	    }
+200	
+201	    /// Does the tool edit the camera rather than artwork?
+202	    ///
+203	    /// The camera belongs to the document, so this is *not* navigation even
+204	    /// though it looks like panning: moving it changes the exported result.
+205	    pub fn is_camera(self) -> bool {
+206	        matches!(self, ToolId::Camera)
+207	    }
+208	}
+209	
+210	/// Toolbar groups, separated by a divider, following Animate's arrangement.
+211	pub const TOOL_GROUPS: &[&[ToolId]] = &[
+212	    &[
+213	        ToolId::Selection,
+214	        ToolId::Subselection,
+215	        ToolId::FreeTransform,
+216	        ToolId::GradientTransform,
+217	    ],
+218	    &[ToolId::Lasso, ToolId::MagicWand],
+219	    &[ToolId::Pen, ToolId::Text],
+220	    &[
+221	        ToolId::Line,
+222	        ToolId::Rectangle,
+223	        ToolId::Oval,
+224	        ToolId::PolyStar,
+225	    ],
+226	    &[ToolId::Pencil, ToolId::Brush],
+227	    &[ToolId::Bone, ToolId::AssetWarp, ToolId::MotionPath],
+228	    &[
+229	        ToolId::PaintBucket,
+230	        ToolId::InkBottle,
+231	        ToolId::Eyedropper,
+232	        ToolId::Eraser,
+233	    ],
+234	    &[ToolId::Camera, ToolId::Hand, ToolId::Zoom],
+235	];
+236	
+237	/// Every tool, in toolbar order.
+238	pub fn all_tools() -> Vec<ToolId> {
+239	    TOOL_GROUPS.iter().flat_map(|g| g.iter().copied()).collect()
+240	}
+241	
+242	/// Which tool a bare letter selects.
+243	pub fn tool_for_key(key: Key) -> Option<ToolId> {
+244	    all_tools().into_iter().find(|t| t.shortcut() == Some(key))
+245	}
+246	
+247	#[cfg(test)]
+248	mod tests {
+249	    use super::*;
+250	    use std::collections::HashSet;
+251	
+252	    #[test]
+253	    fn the_toolbar_contains_every_tool_exactly_once() {
+254	        let tools = all_tools();
+255	        let unique: HashSet<ToolId> = tools.iter().copied().collect();
+256	        assert_eq!(
+257	            tools.len(),
+258	            unique.len(),
+259	            "a tool appears in more than one group"
+260	        );
+261	        // 21 through Phase 5, plus Asset Warp when rigging landed in Phase 7,
+262	        // plus the Lasso and the Magic Wand once bitmaps arrived and there was
+263	        // something for them to cut, plus the Motion Path tool.
+264	        assert_eq!(tools.len(), 24, "unexpected tool count");
+265	    }
+266	
+267	    /// **Two *object* selection tools, and only two.** Animate's first group is
+268	    /// Selection and Subselection with the two transform tools, and that is
+269	    /// what this one is.
+270	    ///
+271	    /// The Lasso and the Magic Wand sit in their own group, deliberately. They
+272	    /// do not pick objects: they mark out a *region* and cut artwork along it.
+273	    /// Putting them beside Selection would suggest a third and fourth way to
+274	    /// click on a thing, which is exactly the confusion the two-tool rule was
+275	    /// there to prevent.
+276	    #[test]
+277	    fn there_are_exactly_two_selection_tools() {
+278	        let selection: Vec<ToolId> = all_tools()
+279	            .into_iter()
+280	            .filter(|t| matches!(t, ToolId::Selection | ToolId::Subselection))
+281	            .collect();
+282	        assert_eq!(selection.len(), 2);
+283	
+284	        // And the first group is those two plus the transform tools, which is
+285	        // what Animate's first group is.
+286	        assert_eq!(
+287	            TOOL_GROUPS[0],
+288	            &[
+289	                ToolId::Selection,
+290	                ToolId::Subselection,
+291	                ToolId::FreeTransform,
+292	                ToolId::GradientTransform,
+293	            ]
+294	        );
+295	    }
+296	
+297	    /// Every tool in the palette does something now that Text places vector
+298	    /// type. A greyed-out promise is worse than a missing tool, so there are no
+299	    /// inert tools left at all.
+300	    #[test]
+301	    fn no_tool_is_still_inert() {
+302	        let waiting: Vec<ToolId> = all_tools().into_iter().filter(|t| !t.is_ready()).collect();
+303	        assert!(waiting.is_empty(), "unexpected inert tools: {waiting:?}");
+304	    }
+305	
+306	    /// Muscle memory: these letters must do what an Animate user expects.
+307	    #[test]
+308	    fn letter_shortcuts_match_animate() {
+309	        let cases = [
+310	            (Key::V, ToolId::Selection),
+311	            (Key::A, ToolId::Subselection),
+312	            (Key::L, ToolId::Lasso),
+313	            (Key::Q, ToolId::FreeTransform),
+314	            (Key::P, ToolId::Pen),
+315	            (Key::T, ToolId::Text),
+316	            (Key::N, ToolId::Line),
+317	            (Key::R, ToolId::Rectangle),
+318	            (Key::O, ToolId::Oval),
+… 96 more lines. Continue with read_file(path="crates/buzz-ui/src/tools.rs", offset=319).

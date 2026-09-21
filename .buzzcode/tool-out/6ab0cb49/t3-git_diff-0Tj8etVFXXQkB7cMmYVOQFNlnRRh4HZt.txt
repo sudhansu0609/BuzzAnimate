@@ -1,0 +1,279 @@
+diff --git a/crates/buzz-scene/src/lib.rs b/crates/buzz-scene/src/lib.rs
+index 4a6ce82..468859d 100644
+--- a/crates/buzz-scene/src/lib.rs
++++ b/crates/buzz-scene/src/lib.rs
+@@ -954,24 +954,22 @@ impl Scene {
+     /// the library, so it returns a placeholder; anything that needs real
+     /// extents for an instance comes here.
+     pub fn instance_bounds(&self, object: &Object) -> Option<Rect> {
+-        self.instance_bounds_within(object, 0)
+-    }
+-
+-    /// How deep symbol nesting is followed when measuring.
+-    ///
+-    /// A symbol that contains an instance of itself is a cycle, and measuring
+-    /// it would recurse until the stack ran out. Animate refuses to create one;
+-    /// an imported or hand-edited file can contain one anyway. The same limit
+-    /// the renderer uses, for the same reason.
+-    const MAX_MEASURE_DEPTH: usize = 12;
+-
+-    fn instance_bounds_within(&self, object: &Object, depth: usize) -> Option<Rect> {
+-        if depth >= Self::MAX_MEASURE_DEPTH {
+-            return None;
+-        }
+         let instance = object.instance()?;
+-        let symbol = self.library.get(instance.symbol)?;
+-        let local = self.symbol_bounds_within(symbol, depth + 1)?;
++        // Through the memoised table, not a recursion measured afresh per call.
++        //
++        // Measuring an instance used to walk its whole subtree from scratch,
++        // and because a symbol referenced more than once was re-measured once
++        // per reference, the cost was **exponential in the nesting depth**.
++        // Opening a deeply nested character — or drawing its Library thumbnail,
++        // which measures the symbol to frame it — then walked millions of
++        // instances and the window froze. The table is linear in the library
++        // and cached for a revision, so this is a lookup. See
++        // [`Self::symbol_bounds_table`].
++        let table = self.cached_bounds_table();
++        let local = table
++            .get(&instance.symbol)
++            .copied()
++            .filter(|r| *r != Rect::ZERO)?;
+         Some(object::transform_rect(object.transform, local))
+     }
+ 
+@@ -991,42 +989,15 @@ impl Scene {
+     /// pinpoint, and put its transformation point in the wrong place. The
+     /// symptom is "I cannot get inside my character", and the cause is here.
+     pub fn symbol_bounds(&self, symbol: SymbolId) -> Option<Rect> {
+-        let symbol = self.library.get(symbol)?;
+-        self.symbol_bounds_within(symbol, 0)
+-    }
+-
+-    fn symbol_bounds_within(&self, symbol: &Symbol, depth: usize) -> Option<Rect> {
+-        if depth >= Self::MAX_MEASURE_DEPTH {
+-            return None;
+-        }
+-        // Across every frame, as `Symbol::bounds` does: a symbol's extent is
+-        // what it covers over its whole timeline, not what one frame shows.
+-        //
+-        // **Through the symbol's own layer parenting**, which is how a
+-        // character symbol is rigged inside itself — the renderer draws a part
+-        // through the chain it follows (`buzz_render::document`), so measuring
+-        // the parts where they were drawn at rest gives a symbol smaller than
+-        // the character on screen. Everything downstream inherits that error:
+-        // the cheap rejection in hit testing throws away clicks that land on a
+-        // limb the rig has carried outside the measured box, so the click falls
+-        // through to whatever is behind it.
+-        //
+-        // Per keyframe, because where a parent has taken a part depends on the
+-        // frame. Memoised by `symbol_bounds_table`, so this runs once per
+-        // symbol per revision rather than once per measurement.
+-        symbol
+-            .layers
+-            .iter()
+-            .flat_map(|layer| {
+-                layer.frames.keyframes().iter().flat_map(move |key| {
+-                    let follows = symbol.layers.inherited_transform(layer.id, key.start);
+-                    key.objects.iter().map(move |o| (follows, o))
+-                })
+-            })
+-            .map(|(follows, o)| {
+-                crate::object::transform_rect(follows, self.resolved_bounds_within(o, depth))
+-            })
+-            .reduce(|a, b| a.union(b))
++        // Through the memoised, cycle-safe table rather than a recursion run
++        // afresh per call. The recursion re-measured a symbol once per place it
++        // was used, so a deeply nested import was exponential to measure and the
++        // window froze on opening it or drawing its thumbnail — see
++        // [`Self::instance_bounds`]. The table measures each symbol across every
++        // keyframe and through its own layer parenting (below), so a rig's real
++        // extent — not its parts at rest — still comes back.
++        let table = self.cached_bounds_table();
++        table.get(&symbol).copied().filter(|r| *r != Rect::ZERO)
+     }
+ 
+     /// Bounds of an object, resolving instances through the library.
+@@ -1072,14 +1043,15 @@ impl Scene {
+     }
+ 
+     pub fn resolved_bounds(&self, object: &Object) -> Rect {
+-        // Through the memoised table, not the naive recursion below: an
+-        // instance nested N deep costs the recursion time exponential in N,
+-        // because each level re-measures every level under it from scratch.
+-        // Selecting an imported character (rigs inside rigs) then re-measured
+-        // the whole tree every frame the selection chrome was drawn, and the
+-        // stage froze. The table is linear in the library, and cached across
+-        // calls at one revision, so a steady document resolves any object with
+-        // a walk of the object plus a lookup per instance.
++        // Through the memoised table, never a per-object recursion into the
++        // library: an instance nested N deep, measured afresh, costs time
++        // exponential in N, because each level re-measures every level under it
++        // and a symbol used more than once is measured once per use. Selecting
++        // an imported character (rigs inside rigs) then re-measured the whole
++        // tree every frame the selection chrome was drawn, and the stage froze.
++        // The table is linear in the library, and cached across calls at one
++        // revision, so a steady document resolves any object with a walk of the
++        // object plus a lookup per instance.
+         let table = self.cached_bounds_table();
+         self.resolved_bounds_with(object, &table)
+     }
+@@ -1103,31 +1075,16 @@ impl Scene {
+         table
+     }
+ 
+-    fn resolved_bounds_within(&self, object: &Object, depth: usize) -> Rect {
+-        match &object.kind {
+-            ObjectKind::Instance(_) => self
+-                .instance_bounds_within(object, depth)
+-                .unwrap_or_else(|| object.bounds()),
+-            ObjectKind::Group(children) => children
+-                .iter()
+-                .map(|c| {
+-                    object::transform_rect(object.transform, self.resolved_bounds_within(c, depth))
+-                })
+-                .reduce(|a, b| a.union(b))
+-                .unwrap_or_else(|| object.bounds()),
+-            // Rigged artwork measures itself, posed, and needs no library.
+-            ObjectKind::Shape(_) | ObjectKind::Armature(_) | ObjectKind::Warp(_) => object.bounds(),
+-        }
+-    }
+-
+     /// Every symbol's resolved extent, computed in **one memoised pass** — linear
+     /// in the library, not exponential in its nesting.
+     ///
+-    /// [`Self::resolved_bounds`] re-walks a symbol's whole subtree per call, so
+-    /// resolving many objects (a whole frame's worth, every frame while
+-    /// scrubbing) re-measures the same rigs over and over. Build this table once
+-    /// per document revision and resolve objects against it with
+-    /// [`Self::resolved_bounds_with`], and the per-object cost becomes a lookup.
++    /// Measuring an instance's real extent means reaching through the library,
++    /// and doing that per object per frame re-measures the same rigs over and
++    /// over. Build this table once per document revision and resolve objects
++    /// against it with [`Self::resolved_bounds_with`], and the per-object cost
++    /// becomes a lookup. It is the single source of truth for every "how big is
++    /// this symbol, resolved" question — hit testing, the selection chrome,
++    /// [`Self::symbol_bounds`] and [`Self::instance_bounds`] all read it.
+     pub fn symbol_bounds_table(&self) -> std::collections::HashMap<SymbolId, Rect> {
+         let mut table = std::collections::HashMap::new();
+         let mut visiting = std::collections::HashSet::new();
+@@ -1155,12 +1112,23 @@ impl Scene {
+         if !visiting.insert(id) {
+             return Rect::ZERO;
+         }
++        // Across every keyframe, and **through the symbol's own layer
++        // parenting** — a character symbol is rigged inside itself, so a part
++        // carried by a parent layer is drawn far from where its geometry sits.
++        // Measuring the part at rest gives a box smaller than the character on
++        // screen, and the cheap rejection in hit testing then throws away
++        // clicks that land on a limb the rig has carried outside it. Where the
++        // parent has taken a part depends on the frame, hence per keyframe.
+         let mut bounds: Option<Rect> = None;
+         for layer in symbol.layers.iter() {
+-            for object in layer.all_objects() {
+-                let b = self.object_bounds_memo(object, table, visiting);
+-                if b != Rect::ZERO {
+-                    bounds = Some(bounds.map_or(b, |acc| acc.union(b)));
++            for key in layer.frames.keyframes() {
++                let follows = symbol.layers.inherited_transform(layer.id, key.start);
++                for object in key.objects.iter() {
++                    let child = self.object_bounds_memo(object, table, visiting);
++                    if child != Rect::ZERO {
++                        let b = object::transform_rect(follows, child);
++                        bounds = Some(bounds.map_or(b, |acc| acc.union(b)));
++                    }
+                 }
+             }
+         }
+@@ -2729,6 +2697,88 @@ mod tests {
+         );
+     }
+ 
++    /// **The reported hang: opening a big, deeply nested symbol.**
++    ///
++    /// Measuring a symbol's extent used to recurse into the library afresh,
++    /// re-measuring a shared child once per place it appeared — time
++    /// exponential in the nesting depth. A dozen levels that each place a
++    /// handful of the level below is millions of measurements, and
++    /// [`Scene::symbol_bounds`] (reached on opening a symbol, and when drawing
++    /// its Library thumbnail) froze the window. The memoised table measures
++    /// each symbol once, so this is linear in the library and returns at once.
++    #[test]
++    fn measuring_a_deeply_nested_symbol_is_not_exponential() {
++        let mut scene = Scene::default();
++
++        let first_layer = |scene: &Scene, sym: SymbolId| {
++            scene
++                .library()
++                .get(sym)
++                .unwrap()
++                .layers
++                .iter()
++                .next()
++                .unwrap()
++                .id
++        };
++
++        // A leaf with a real 10-unit shape, so the extent is non-degenerate.
++        let leaf = scene.add_symbol("leaf", SymbolKind::Graphic, None);
++        let leaf_layer = first_layer(&scene, leaf);
++        scene.library_mut().update(leaf, |s| {
++            s.layers.update(leaf_layer, |l| {
++                l.frames.push_object(
++                    0,
++                    Arc::new(Object::shape(
++                        ObjectId(1),
++                        ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
++                    )),
++                );
++            });
++        });
++
++        // Twelve levels, each placing FOUR instances of the level below — the
++        // shared child a naive measure would re-walk 4^12 ≈ 16 million times.
++        const LEVELS: usize = 12;
++        const FANOUT: usize = 4;
++        let mut child = leaf;
++        let mut oid = 100u64;
++        for level in 0..LEVELS {
++            let sym = scene.add_symbol(format!("level{level}"), SymbolKind::Graphic, None);
++            let layer = first_layer(&scene, sym);
++            let placements: Vec<Object> = (0..FANOUT)
++                .map(|k| {
++                    oid += 1;
++                    Object::instance_of(ObjectId(oid), child)
++                        .with_transform(Affine::translate((k as f64 * 20.0, 0.0)))
++                })
++                .collect();
++            scene.library_mut().update(sym, |s| {
++                s.layers.update(layer, |l| {
++                    for object in &placements {
++                        l.frames.push_object(0, Arc::new(object.clone()));
++                    }
++                });
++            });
++            child = sym;
++        }
++        let top = child;
++
++        let start = std::time::Instant::now();
++        let bounds = scene.symbol_bounds(top);
++        let elapsed = start.elapsed();
++
++        let bounds = bounds.expect("a nested symbol has a real extent");
++        assert!(
++            bounds.width() > 10.0 && bounds.height() >= 10.0,
++            "the extent must cover the placed leaves, got {bounds:?}"
++        );
++        assert!(
++            elapsed < std::time::Duration::from_millis(200),
++            "measuring a 12-deep, 4-wide symbol took {elapsed:?} — the recursion is exponential again"
++        );
++    }
++
+     #[test]
+     fn a_new_document_matches_animates_defaults() {
+         let scene = Scene::default();
+
+warning: CRLF will be replaced by LF in crates/buzz-scene/src/lib.rs.
+The file will have its original line endings in your working directory

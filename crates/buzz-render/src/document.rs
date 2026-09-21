@@ -728,7 +728,7 @@ fn build_symbol(
 /// in the parent's space, folding nested symbols' whole (already-computed) flags
 /// and extents in and hashing their fingerprints into `hasher`.
 ///
-/// The bounds mirror `Scene::resolved_bounds_within` exactly, but read a nested
+/// The bounds mirror `Scene::resolved_bounds_with` exactly, but read a nested
 /// instance's extent from the memo rather than re-measuring the library.
 fn scan_object(
     object: &Object,

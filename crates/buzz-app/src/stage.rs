@@ -684,47 +684,60 @@ fn draw_selection(
         return;
     }
 
-    // Handles only for the tool that can use them — but the transformation
-    // point is drawn for the selection tools as well, because they can move it
-    // (see `tools::finish_drag`), and a control you can grab and cannot see is
-    // worse than one that is not there.
     if editor.tool() == buzz_ui::ToolId::GradientTransform {
         draw_gradient_handles(painter, editor, &to_screen);
         return;
     }
-    // **The whole gizmo, for every tool that can work it.**
-    //
-    // The handles used to be Free Transform's alone, so with the Selection
-    // tool an object had a box round it and nothing else: no sign that its
-    // corners resize, that its edges skew, or that the ring outside a corner
-    // turns. Three transforms, all reachable, none of them visible — and the
-    // zones sit a few pixels apart, so reaching for one and landing in another
-    // is how a rotation ends up scaling or skewing the artwork instead.
-    //
-    // They are drawn for the selection tools now because they *work* from the
-    // selection tools; see `tools::begins_a_transform`. A handle you can see
-    // and cannot use would be worse than none, and so is the reverse.
-    draw_rotate_hint(painter, rect, pointer);
 
-    const HANDLE: f32 = 6.0;
-    for corner in [
-        rect.left_top(),
-        rect.center_top(),
-        rect.right_top(),
-        rect.right_center(),
-        rect.right_bottom(),
-        rect.center_bottom(),
-        rect.left_bottom(),
-        rect.left_center(),
-    ] {
-        let handle = egui::Rect::from_center_size(corner, egui::vec2(HANDLE, HANDLE));
-        painter.rect_filled(handle, 0.0, Palette::handle_fill());
-        painter.rect_stroke(
-            handle,
-            0.0,
-            Stroke::new(1.0, Palette::handle_stroke()),
-            StrokeKind::Outside,
-        );
+    // **Each tool's selection wears its own chrome**, so which one is in hand is
+    // never in doubt at a glance:
+    //
+    // * Subselection (handled above) shows the path's anchors.
+    // * Free Transform shows the full rig — eight filled square handles and the
+    //   rotate ring outside the corners.
+    // * The plain Selection tool shows a lighter mark: hollow round handles at
+    //   the four corners, and no ring.
+    //
+    // All three still move the transformation point, so it is drawn for each;
+    // and the corners still resize and the edges still skew from the Selection
+    // tool too (see `tools::begins_a_transform`) — the arrow simply does not
+    // dress itself up as the transform rig to say so.
+    if editor.tool() == buzz_ui::ToolId::FreeTransform {
+        draw_rotate_hint(painter, rect, pointer);
+
+        const HANDLE: f32 = 6.0;
+        for corner in [
+            rect.left_top(),
+            rect.center_top(),
+            rect.right_top(),
+            rect.right_center(),
+            rect.right_bottom(),
+            rect.center_bottom(),
+            rect.left_bottom(),
+            rect.left_center(),
+        ] {
+            let handle = egui::Rect::from_center_size(corner, egui::vec2(HANDLE, HANDLE));
+            painter.rect_filled(handle, 0.0, Palette::handle_fill());
+            painter.rect_stroke(
+                handle,
+                0.0,
+                Stroke::new(1.0, Palette::handle_stroke()),
+                StrokeKind::Outside,
+            );
+        }
+    } else {
+        // The Selection tool: hollow round handles at the corners only, so its
+        // box reads as "selected, movable" rather than as the transform rig.
+        const RADIUS: f32 = 4.5;
+        for corner in [
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+        ] {
+            painter.circle_filled(corner, RADIUS, Palette::handle_fill());
+            painter.circle_stroke(corner, RADIUS, Stroke::new(1.0, Palette::handle_stroke()));
+        }
     }
 
     // The transformation point: Animate's white circle, and what rotation,

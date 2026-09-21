@@ -538,7 +538,16 @@ impl ToolMachine {
         })
     }
 
-
+    /// Would a press at `at` take hold of the selection's transform gizmo — a
+    /// corner, an edge, a side handle or the rotate ring?
+    ///
+    /// The editor asks before its click-to-grab selects what is under the
+    /// point: the gizmo is drawn *outside* the artwork, so a handle can sit over
+    /// another object, and reaching for the handle to resize must not pick that
+    /// object up instead. A press that grabs the gizmo is left for the gizmo.
+    pub fn press_on_gizmo(&self, at: Point, ctx: &ToolContext<'_>) -> bool {
+        self.begins_a_transform(at, ctx).is_some()
+    }
 
     pub fn pointer_move(&mut self, doc: Point, screen: Point, mods: Mods) -> ToolAction {
         self.pointer_move_at(doc, screen, mods, None, None)
@@ -1783,14 +1792,6 @@ fn transform_for(t: &Transforming, origin: Point, end: Point, mods: Mods) -> Aff
 }
 
 fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> TransformZone {
-    // A little more forgiving than a handle: the circle is small, it is often
-    // parked over artwork you are looking at rather than over a corner, and
-    // missing it silently *moves the artwork* instead — which is the one
-    // outcome worth spending a few pixels to avoid.
-    if (at - pivot).hypot() <= grab * 1.5 {
-        return TransformZone::Pivot;
-    }
-
     let corners = [
         Point::new(bounds.x0, bounds.y0),
         Point::new(bounds.x1, bounds.y0),
@@ -1801,6 +1802,23 @@ fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> Transform
         .iter()
         .map(|c| (*c - at).hypot())
         .fold(f64::INFINITY, f64::min);
+    let to_pivot = (at - pivot).hypot();
+
+    // A little more forgiving than a handle: the circle is small, it is often
+    // parked over artwork you are looking at rather than over a corner, and
+    // missing it silently *moves the artwork* instead — which is the one
+    // outcome worth spending a few pixels to avoid.
+    //
+    // **But never at the cost of a corner.** On a small selection the centre
+    // sits within a handle's reach of every corner, so a pivot that always won
+    // its radius left the corners — and therefore resizing — dead: the pointer
+    // showed the resize arrow and the drag moved the artwork instead. The pivot
+    // takes its zone only where the press is at least as close to it as to the
+    // nearest corner. A point genuinely on a corner scales; a pivot parked *on*
+    // a corner still wins there, because the two distances tie.
+    if to_pivot <= grab * 1.5 && to_pivot <= nearest {
+        return TransformZone::Pivot;
+    }
     if nearest <= grab {
         return TransformZone::Corner;
     }
@@ -2149,6 +2167,30 @@ mod tests {
         assert_eq!(zone(75.0, 0.0), TransformZone::Edge(true), "a top edge");
         assert_eq!(zone(0.0, 75.0), TransformZone::Edge(false), "a left edge");
         assert_eq!(zone(30.0, 30.0), TransformZone::Inside, "the middle");
+    }
+
+    /// **A small selection can still be resized from its corners.** On a small
+    /// box the centre sits within a handle's reach of every corner, and a
+    /// transformation point that always won its radius left the corners dead —
+    /// the pointer showed the resize arrow and the drag moved the artwork
+    /// instead. A corner press now scales; the centre is still the point.
+    #[test]
+    fn a_small_selection_still_scales_from_its_corners() {
+        // A 12-unit box: half its diagonal (~8.5) is inside the pivot's 12-unit
+        // reach, so the old rule swallowed the corners.
+        let bounds = Rect::new(0.0, 0.0, 12.0, 12.0);
+        let pivot = bounds.center();
+        let grab = 8.0;
+        assert_eq!(
+            transform_zone(bounds, pivot, Point::new(0.0, 0.0), grab),
+            TransformZone::Corner,
+            "the corner of a small box must scale, not be swallowed by the point"
+        );
+        assert_eq!(
+            transform_zone(bounds, pivot, pivot, grab),
+            TransformZone::Pivot,
+            "the centre is still the transformation point"
+        );
     }
 
     /// **Pressing the top handle down squashes the box and holds the bottom.**

@@ -1680,6 +1680,53 @@ impl Editor {
             return;
         }
 
+        // **Click any object and drag it, without selecting it first.**
+        //
+        // The Selection tool used to need two gestures to move something: a
+        // click to select it, then a second drag from *inside* the selection to
+        // move it — a press straight onto an object that was not yet selected
+        // read as "outside the selection" and swept a marquee instead. Picking
+        // it here, at the press, means the drag that follows moves whatever is
+        // under the pointer, the way grabbing a thing on a table moves it.
+        //
+        // Only what the tool machine cannot see is decided here — which object
+        // the point is over. Whether the drag then moves or marquees is still
+        // the machine's own call in `begins_a_move`; selecting the object first
+        // just puts it inside the selection the machine looks for. Empty stage
+        // still marquees, Shift is left to extend the selection, and an object
+        // already selected is left alone so a multi-selection drags as one
+        // rather than collapsing to whatever the press happened to land on.
+        //
+        // **A press on a resize or rotate handle is left for the handle.** The
+        // transform gizmo is drawn just outside the selection, so a corner can
+        // sit over another object; grabbing that object here would take the
+        // selection off the very thing the user was lining up to scale or turn.
+        // Asked against the current selection, before the grab changes it.
+        let on_gizmo = self.machine.tool() == ToolId::Selection && {
+            let ctx = ToolContext {
+                style: &self.style,
+                zoom: self.camera.zoom,
+                selection_bounds: self.selection_bounds_drawn(),
+                anchors: &[],
+                pivot: self.pivot(),
+                gradient: None,
+            };
+            self.machine.press_on_gizmo(doc, &ctx)
+        };
+        if self.machine.tool() == ToolId::Selection
+            && !mods.shift
+            && !on_gizmo
+            && let Some(id) = self.object_at(doc, self.pick_tolerance())
+            && !self.selection.contains(id)
+        {
+            self.selection.select_one(id);
+            // Its layer becomes the active one, exactly as a click-to-select
+            // does, so the timeline lights up the row the grabbed object is on.
+            if let Some((layer, _)) = self.doc.scene().find_object(id) {
+                self.selection.set_active_layer(Some(layer));
+            }
+        }
+
         let anchors = self.selected_anchors();
         let selection_bounds = self.selection_bounds_drawn();
         let pivot = self.pivot();
@@ -1788,8 +1835,8 @@ impl Editor {
         self.doc.end_gesture();
     }
 
-    /// Snap a point for the *active* tool, which for a freehand tool means not
-    /// snapping it at all.
+    /// Snap a point for the *active* tool, which for the freehand tools and the
+    /// Selection tool means not snapping it at all.
     ///
     /// **A drawn line is not a placed one.** Snapping exists so that a
     /// rectangle's corner meets the guide the animator put there, and it does
@@ -1802,11 +1849,20 @@ impl Editor {
     /// hand drew a curve, and object snapping is on by default. Animate snaps
     /// what you place and never what you draw.
     ///
+    /// **A dragged object is not a placed one either.** The Selection tool
+    /// neither draws nor places — it picks and it drags — and snapping its
+    /// pointer while it drags is what made moving a symbol *stick* to every
+    /// nearby edge and then jump ahead of the hand, the very jitter the Camera
+    /// tool was freed from by measuring its drag in screen pixels instead. A
+    /// move should track the pointer exactly, so the arrow does not snap; the
+    /// transform tools, which line a handle up against a guide, still do.
+    ///
     /// The pen, which places anchors one at a time, still snaps — that is a
     /// placed point in every sense.
     fn snap_for_tool(&self, point: Point) -> Point {
         match self.machine.tool() {
-            ToolId::Brush | ToolId::Pencil | ToolId::Eraser | ToolId::Lasso => point,
+            ToolId::Brush | ToolId::Pencil | ToolId::Eraser | ToolId::Lasso
+            | ToolId::Selection => point,
             _ => self.snap(point),
         }
     }
@@ -1851,10 +1907,35 @@ impl Editor {
                 let tolerance = self.pick_tolerance();
                 match self.object_at(point, tolerance) {
                     Some(id) => {
-                        if additive {
-                            self.selection.toggle(id);
+                        // **Free Transform grabs the whole drawing, not one
+                        // piece of it.** A drawing is laid down as separate
+                        // primitives — two colours and an outline are three raw
+                        // shapes, so each can be erased, recoloured or
+                        // sub-selected on its own (see `lay_shape`). Under the
+                        // transform box that read as three things to move one at
+                        // a time; clicking any raw piece with Free Transform
+                        // takes every raw shape on that layer, so the drawing
+                        // scales and turns as one. An instance, group or rig is
+                        // grabbed alone — a character's parts must stay
+                        // individually selectable, and only the Subselection
+                        // tool reaches inside a single raw shape.
+                        let group = if self.machine.tool() == ToolId::FreeTransform {
+                            self.drawing_group_of(id)
                         } else {
-                            self.selection.select_one(id);
+                            vec![id]
+                        };
+                        if additive {
+                            // Shift toggles the drawing as a unit: out if it is
+                            // wholly in, in otherwise.
+                            if group.iter().all(|g| self.selection.contains(*g)) {
+                                for g in &group {
+                                    self.selection.remove(*g);
+                                }
+                            } else {
+                                self.selection.extend(group.iter().copied());
+                            }
+                        } else {
+                            self.selection.set(group);
                         }
                         // Selecting an object makes its layer the active layer, so
                         // the timeline highlights the layer the selection lives on
@@ -2728,6 +2809,101 @@ impl Editor {
                 .map(|l| (frame, l.id))
         };
         on(self.current_frame).or_else(|| self.multi_frames().into_iter().find_map(on))
+    }
+
+    /// The raw shapes that make up the drawing `id` belongs to — what Free
+    /// Transform grabs when a single piece is clicked.
+    ///
+    /// A drawing is stored as separate primitives: two fills and an outline are
+    /// three objects, kept apart on purpose so each can be erased, recoloured or
+    /// sub-selected on its own (see `lay_shape`). Under the transform box that
+    /// reads as three things to move one at a time, so a click grows the pick to
+    /// the whole drawing — but **only the pieces that actually touch**. Two
+    /// separate drawings that happen to share a layer are left apart: growing to
+    /// the whole layer would move a drawing the user never pointed at.
+    ///
+    /// Touching is tested on the ink, not the bounding boxes — a line's own
+    /// width is outlined, so a stroke that crosses a fill joins it while two
+    /// strokes lying side by side do not. The set is flooded, so a fill joined
+    /// to a line joined to another fill comes as one.
+    ///
+    /// Only raw shapes group. An instance, a group or a rigged armature has its
+    /// own identity — a character's head is meant to be grabbed on its own — so
+    /// clicking one of those returns it alone.
+    fn drawing_group_of(&self, id: ObjectId) -> Vec<ObjectId> {
+        let scene = self.doc.scene();
+        let Some((_, object)) = scene.find_object(id) else {
+            return vec![id];
+        };
+        if !matches!(object.kind, ObjectKind::Shape(_)) {
+            return vec![id];
+        }
+        let Some((frame, layer_id)) = self.drawn_at(id) else {
+            return vec![id];
+        };
+        let Some(layer) = scene.layers().get(layer_id) else {
+            return vec![id];
+        };
+
+        // Every grabbable raw shape on the layer, with the region it actually
+        // paints (in layer space) and that region's box for a cheap pre-filter.
+        // The same visible/unlocked rule hit-testing uses, so a piece that could
+        // not be clicked is not swept in either.
+        let pieces: Vec<(ObjectId, BezPath, Rect)> = layer
+            .objects_at(frame)
+            .iter()
+            .filter(|o| o.visible && !o.locked)
+            .filter_map(|o| {
+                let region = shape_region(o)?;
+                let bb = region.bounding_box();
+                Some((o.id, region, bb))
+            })
+            .collect();
+
+        // A layer with a great many raw pieces is unusual — they fuse as they
+        // are drawn — but cap the geometric work so a click can never stall.
+        const MAX_PIECES: usize = 400;
+        let Some(start) = pieces.iter().position(|(oid, _, _)| *oid == id) else {
+            return vec![id];
+        };
+        if pieces.len() > MAX_PIECES {
+            return vec![id];
+        }
+
+        // Flood from the clicked piece: a piece joins when its ink overlaps a
+        // piece already in the set. Bounding boxes reject most pairs for free;
+        // only where they cross is the real intersection measured.
+        let opts = buzz_geom::BooleanOptions::default();
+        let mut in_group = vec![false; pieces.len()];
+        in_group[start] = true;
+        let mut stack = vec![start];
+        while let Some(i) = stack.pop() {
+            for j in 0..pieces.len() {
+                if in_group[j] || !pieces[i].2.overlaps(pieces[j].2) {
+                    continue;
+                }
+                let touches = buzz_geom::boolean(
+                    &pieces[i].1,
+                    &pieces[j].1,
+                    buzz_geom::BoolOp::Intersect,
+                    opts,
+                )
+                .area()
+                .abs()
+                    > 1e-6;
+                if touches {
+                    in_group[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+
+        let group: Vec<ObjectId> = pieces
+            .iter()
+            .zip(in_group)
+            .filter_map(|((oid, _, _), yes)| yes.then_some(*oid))
+            .collect();
+        if group.is_empty() { vec![id] } else { group }
     }
 
     /// Objects fully inside `rect`, matching Animate's marquee.
@@ -5278,6 +5454,98 @@ impl Editor {
                 self.library.selected = Some(symbol);
             }
             None => self.status = Some("Could not place the instance here".into()),
+        }
+    }
+
+    /// Place an asset with its middle under the pointer, in **screen**
+    /// coordinates — the drop end of dragging one out of the Assets panel.
+    ///
+    /// The "Place" button drops an asset at the coordinates it was saved with;
+    /// a drag says *here*. Placing merges a whole little document in on new
+    /// layers, so the fresh artwork is carried as one to sit centred on the
+    /// point it was let go over — all inside the one "Place Asset" step, so a
+    /// single undo removes it cleanly.
+    pub fn place_asset_at(&mut self, asset: &buzz_doc::Asset, screen: Point) {
+        let at = self.camera.screen_to_doc(screen);
+        let frame = self.current_frame;
+        let edit_at = self.edit_at();
+        let library = self.assets.clone();
+
+        // What is already here, so the merged-in artwork can be told apart and
+        // moved — the same before/after diff the Place button uses.
+        let before: std::collections::HashSet<ObjectId> = self
+            .doc
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(frame).iter().map(|o| o.id))
+            .collect();
+
+        type Placed = (buzz_scene::MergeReport, Vec<ObjectId>);
+        let mut outcome: Option<Result<Placed, buzz_doc::DocError>> = None;
+        self.doc.edit("Place Asset", |scene| {
+            let report = match library.place(asset, scene) {
+                Ok(report) => report,
+                Err(e) => {
+                    outcome = Some(Err(e));
+                    return;
+                }
+            };
+
+            // The freshly arrived artwork, and the box around all of it.
+            // `resolved_bounds`, not `Object::bounds`: an instance's own bounds
+            // are a small placeholder about its origin, while the artwork it
+            // draws sits wherever the symbol puts it — the same box the
+            // selection chrome measures, so the drop lands where it looks.
+            let mut arrived = Vec::new();
+            let mut union: Option<Rect> = None;
+            for layer in scene.layers().iter() {
+                for object in layer.objects_at(frame).iter() {
+                    if before.contains(&object.id) {
+                        continue;
+                    }
+                    arrived.push(object.id);
+                    let b = scene.resolved_bounds(object);
+                    union = Some(union.map_or(b, |u: Rect| u.union(b)));
+                }
+            }
+
+            // Carry the whole of it so its middle lands under the drop.
+            if let Some(u) = union {
+                let delta = at - u.center();
+                if delta.hypot() > 0.0 {
+                    for id in &arrived {
+                        update_object(scene, edit_at, *id, |o| {
+                            o.transform = Affine::translate((delta.x, delta.y)) * o.transform;
+                        });
+                    }
+                }
+            }
+
+            outcome = Some(Ok((report, arrived)));
+        });
+
+        match outcome {
+            Some(Ok((report, arrived))) if !arrived.is_empty() => {
+                // Arrives selected with the transform handles on it, exactly as
+                // it does after the Place button or an import.
+                self.selection.set(arrived);
+                self.selection.ensure_active_layer(self.doc.scene());
+                self.status = Some(format!(
+                    "Placed {} \u{2014} {} layers, {} symbols",
+                    asset.name, report.layers, report.symbols
+                ));
+            }
+            // Nothing landed on this frame — the merge still happened, so keep
+            // it, but there is nothing here to select or carry.
+            Some(Ok(_)) => self.status = Some(format!("Placed {}", asset.name)),
+            Some(Err(e)) => {
+                // The edit recorded a step for a merge that did not take; drop
+                // it rather than leave an empty "Place Asset" in the history.
+                self.doc.undo();
+                self.status = Some(format!("Could not place {}: {e}", asset.name));
+            }
+            None => {}
         }
     }
 
@@ -8265,6 +8533,43 @@ fn ensure_keyframe_for_drawing(scene: &mut Scene, layer: LayerId, frame: u32, au
     }
 }
 
+/// The area a raw shape actually paints, in its **layer's** space.
+///
+/// Its fill, its stroke outlined at its own width, or the union of the two —
+/// so that "do these two pieces touch?" can be asked of the ink itself rather
+/// than of the bounding boxes, which cross whenever two shapes are merely near.
+/// A hairline is given a real width, so a fine line laid across a fill still
+/// reads as touching it. `None` for anything that is not a raw shape, and for a
+/// shape that paints nothing. See [`Editor::drawing_group_of`].
+fn shape_region(object: &Object) -> Option<BezPath> {
+    let ObjectKind::Shape(shape) = &object.kind else {
+        return None;
+    };
+    let mut region: Option<BezPath> = None;
+    if shape.fill.is_some() {
+        region = Some(shape.path.clone());
+    }
+    if let Some(stroke) = &shape.stroke {
+        let band = buzz_geom::outline_stroke(
+            &shape.path,
+            buzz_geom::StrokeStyle::new(stroke.width.max(1.0)),
+            0.25,
+        );
+        region = Some(match region {
+            Some(fill) => buzz_geom::boolean(
+                &fill,
+                &band,
+                buzz_geom::BoolOp::Union,
+                buzz_geom::BooleanOptions::default(),
+            ),
+            None => band,
+        });
+    }
+    // Into the layer's space, so two shapes carrying different transforms are
+    // compared where they are actually drawn.
+    region.map(|r| object.transform * r)
+}
+
 /// **Lay one drawn shape onto the layer, honouring the drawing mode.**
 ///
 /// Object Drawing keeps it whole, as its own object. Merge Shape treats a fill
@@ -10290,6 +10595,126 @@ mod tests {
         assert!(e.selection.is_empty());
     }
 
+    /// **Free Transform grabs the touching pieces of a drawing, and only
+    /// those.** A drawing is laid down as separate raw shapes — two colours and
+    /// a line are three objects — and under the transform box that read as three
+    /// things to move one at a time. Clicking any piece now takes the pieces
+    /// that touch it; a separate drawing that merely shares the layer is left
+    /// alone.
+    #[test]
+    fn free_transform_grabs_the_touching_pieces_of_a_drawing() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        // Two overlapping pieces (one drawing) and one well away (another).
+        let a = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a");
+        let b = draw_square(&mut e, 20.0, 20.0, 40.0, Color::WHITE).expect("b");
+        let far = draw_square(&mut e, 300.0, 300.0, 40.0, Color::WHITE).expect("far");
+
+        e.set_tool(ToolId::FreeTransform);
+        e.selection.clear();
+
+        // Click a spot that is inside `a` only.
+        e.apply(ToolAction::PickAt {
+            point: Point::new(8.0, 8.0),
+            additive: false,
+        });
+
+        assert!(
+            e.selection.contains(a) && e.selection.contains(b),
+            "the two touching pieces should be grabbed as one"
+        );
+        assert!(
+            !e.selection.contains(far),
+            "a separate drawing on the same layer must not be swept in"
+        );
+        assert_eq!(e.selection.len(), 2);
+    }
+
+    /// **But a symbol instance is grabbed alone.** A character's parts each live
+    /// as their own instance on the layer, and grabbing one must not sweep up
+    /// the rest — only raw shapes group, so a rig stays individually selectable.
+    #[test]
+    fn free_transform_grabs_one_instance_not_the_whole_layer() {
+        let mut e = editor();
+        let layer = e.active_layer().expect("a layer");
+        let (mut first, mut second) = (ObjectId(0), ObjectId(0));
+        e.doc.edit("Build", |scene| {
+            let symbol = scene.add_symbol("Part", buzz_scene::SymbolKind::Graphic, None);
+            let inner = scene
+                .library()
+                .get(symbol)
+                .and_then(|s| s.layers.iter().next())
+                .map(|l| l.id)
+                .expect("a layer inside the symbol");
+            let art = Object::shape(
+                scene.next_object_id(),
+                ShapeData::filled(square(0.0, 0.0, 40.0), Color::WHITE),
+            );
+            scene.library_mut().update(symbol, |s| {
+                s.layers.update(inner, |l| {
+                    l.frames.set_objects(0, vec![Arc::new(art)]);
+                });
+            });
+            first = scene
+                .add_instance_at(layer, 0, symbol, Affine::translate((0.0, 0.0)))
+                .expect("first instance");
+            second = scene
+                .add_instance_at(layer, 0, symbol, Affine::translate((100.0, 0.0)))
+                .expect("second instance");
+        });
+
+        e.set_tool(ToolId::FreeTransform);
+        e.selection.clear();
+
+        // Click the first instance's artwork.
+        e.apply(ToolAction::PickAt {
+            point: Point::new(20.0, 20.0),
+            additive: false,
+        });
+
+        assert_eq!(e.selection.len(), 1, "an instance is grabbed on its own");
+        assert!(e.selection.contains(first) && !e.selection.contains(second));
+    }
+
+    /// **Subselection still reaches a single piece**, which is how you edit one
+    /// colour of a drawing on its own — the whole point of keeping the pieces
+    /// apart under the transform tools.
+    #[test]
+    fn subselection_still_picks_a_single_piece_of_a_drawing() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let a = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a");
+        let _b = draw_square(&mut e, 60.0, 0.0, 40.0, Color::WHITE).expect("b");
+
+        e.set_tool(ToolId::Subselection);
+        e.selection.clear();
+        e.apply(ToolAction::PickAt {
+            point: Point::new(20.0, 20.0),
+            additive: false,
+        });
+
+        assert_eq!(e.selection.ids(), vec![a], "Subselection picks one piece");
+    }
+
+    /// The plain arrow keeps grabbing a single piece — only Free Transform
+    /// groups the drawing (the chosen behaviour).
+    #[test]
+    fn the_arrow_tool_still_picks_a_single_piece() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let a = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a");
+        let _b = draw_square(&mut e, 60.0, 0.0, 40.0, Color::WHITE).expect("b");
+
+        e.set_tool(ToolId::Selection);
+        e.selection.clear();
+        e.apply(ToolAction::PickAt {
+            point: Point::new(20.0, 20.0),
+            additive: false,
+        });
+
+        assert_eq!(e.selection.ids(), vec![a], "the arrow grabs one piece");
+    }
+
     // Build an asset scene holding a symbol instance whose artwork is a square
     // at (0,0)-(100,100), like a placed character.
     fn instance_asset_scene() -> Scene {
@@ -10622,6 +11047,173 @@ mod tests {
         assert!(
             (undone.x0 - before.x0).abs() < 1e-6,
             "one undo should reverse the whole drag, got {undone:?}"
+        );
+    }
+
+    /// **A press straight onto an object grabs it — no click to select first.**
+    ///
+    /// One gesture with the Selection tool picks the object up and moves it,
+    /// even when nothing was selected when the press landed. The old two-step
+    /// "click to select, then drag from inside" is gone.
+    #[test]
+    fn a_press_on_an_object_grabs_and_moves_it_in_one_gesture() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a square");
+        // Nothing selected: the gesture has to both select and move.
+        e.selection.clear();
+        assert!(e.selection.is_empty(), "starts with nothing selected");
+        assert_eq!(e.tool(), ToolId::Selection, "the tool it opens with");
+
+        let before = e.scene().find_object(id).unwrap().1.bounds();
+        let camera = e.camera.clone();
+        let screen = |p: Point| camera.doc_to_screen(p);
+        // Pressed off the centre, as `dragging_a_selection` is: the middle is
+        // the transformation point, and grabbing that is a different gesture.
+        e.pointer_down(screen(Point::new(30.0, 30.0)), Mods::default());
+        for step in 1..=10 {
+            let at = Point::new(30.0 + step as f64 * 5.0, 30.0);
+            e.pointer_move(screen(at), Mods::default());
+        }
+        e.pointer_up(screen(Point::new(80.0, 30.0)));
+
+        assert!(e.selection.contains(id), "the press selected what it grabbed");
+        let after = e.scene().find_object(id).unwrap().1.bounds();
+        assert!(
+            (after.x0 - before.x0 - 50.0).abs() < 1e-6,
+            "the one gesture moved it the whole drag, {before:?} -> {after:?}"
+        );
+    }
+
+    /// A press off the artwork still marquees rather than moving the selection:
+    /// grabbing what is under the pointer must not turn empty stage into a
+    /// handle for the current selection.
+    #[test]
+    fn a_press_off_the_artwork_does_not_move_the_selection() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        let before = e.scene().find_object(id).unwrap().1.bounds();
+
+        let camera = e.camera.clone();
+        let screen = |p: Point| camera.doc_to_screen(p);
+        // Well clear of the 40-unit square, so the press is on empty stage.
+        e.pointer_down(screen(Point::new(200.0, 200.0)), Mods::default());
+        e.pointer_move(screen(Point::new(260.0, 260.0)), Mods::default());
+        e.pointer_up(screen(Point::new(260.0, 260.0)));
+
+        let after = e.scene().find_object(id).unwrap().1.bounds();
+        assert!(
+            (after.x0 - before.x0).abs() < 1e-9 && (after.y0 - before.y0).abs() < 1e-9,
+            "a marquee off the artwork must leave it where it was, {before:?} -> {after:?}"
+        );
+    }
+
+    /// **Dragging a symbol is smooth over artwork.** Object snapping used to
+    /// pull every pointer sample onto the nearest edge, so a symbol dragged
+    /// past other artwork stuck and then jumped ahead of the hand. The arrow no
+    /// longer snaps, so an even sweep of the pointer moves it by an even step —
+    /// the same jitter, and the same cure, as `aiming_the_camera_is_steady`.
+    #[test]
+    fn dragging_a_symbol_is_smooth_over_artwork() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        // Obstacles straddling the drag path, so snapping would have plenty to
+        // grab at as the symbol passes them.
+        for i in 1..8 {
+            draw_square(&mut e, i as f64 * 50.0, 10.0, 20.0, Color::WHITE);
+        }
+        let id = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a square");
+        // Object snapping on — the setting the jitter came from.
+        e.view.snap.to_objects = true;
+        e.selection.select_one(id);
+
+        let camera = e.camera.clone();
+        let screen = |p: Point| camera.doc_to_screen(p);
+        // Off the centre (20, 20), which is the transformation point.
+        let start = Point::new(8.0, 8.0);
+        e.pointer_down(screen(start), Mods::default());
+        let mut xs = Vec::new();
+        for step in 1..=24 {
+            let at = Point::new(start.x + step as f64 * 8.0, start.y);
+            e.pointer_move(screen(at), Mods::default());
+            xs.push(e.scene().find_object(id).unwrap().1.bounds().x0);
+        }
+        e.pointer_up(screen(Point::new(start.x + 24.0 * 8.0, start.y)));
+
+        // Every step moved the symbol by the same amount; jitter shows up here
+        // as one step disagreeing with its neighbours.
+        let steps: Vec<f64> = xs.windows(2).map(|w| w[1] - w[0]).collect();
+        let first = steps[0];
+        assert!(first.abs() > 0.0, "the symbol should move at all");
+        for (i, s) in steps.iter().enumerate() {
+            assert!(
+                (s - first).abs() < 1e-9,
+                "step {i} moved the symbol by {s} where every other step moved it {first}"
+            );
+        }
+    }
+
+    /// **The corners resize with the Selection tool, no tool change.** Grabbing
+    /// a corner of the gizmo and pulling it out scales the artwork; the handles
+    /// are drawn for the arrow, not only for Free Transform, so they work for it.
+    #[test]
+    fn the_selection_tool_scales_from_a_corner() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        let before = e.scene().find_object(id).unwrap().1.bounds();
+
+        // The bottom-right corner, pulled further out.
+        let camera = e.camera.clone();
+        let screen = |p: Point| camera.doc_to_screen(p);
+        let corner = Point::new(before.x1, before.y1);
+        e.pointer_down(screen(corner), Mods::default());
+        e.pointer_move(screen(Point::new(corner.x + 60.0, corner.y + 60.0)), Mods::default());
+        e.pointer_up(screen(Point::new(corner.x + 60.0, corner.y + 60.0)));
+
+        assert!(e.selection.contains(id), "the object stays selected through a scale");
+        let after = e.scene().find_object(id).unwrap().1.bounds();
+        assert!(
+            after.width() > before.width() + 1.0 && after.height() > before.height() + 1.0,
+            "dragging the corner should have scaled it up, {before:?} -> {after:?}"
+        );
+    }
+
+    /// **A corner handle wins over the artwork beneath it.** The gizmo is drawn
+    /// outside the selection, so a corner can sit over another object; reaching
+    /// for the handle to resize must keep the selected object rather than grab
+    /// what happens to lie under the corner (which click-to-grab would do).
+    #[test]
+    fn a_corner_handle_over_another_object_still_scales() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let a = draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE).expect("A");
+        // B sits under A's bottom-right corner at (100, 100).
+        let b = draw_square(&mut e, 90.0, 90.0, 40.0, Color::WHITE).expect("B");
+        e.selection.select_one(a);
+        let a_before = e.scene().find_object(a).unwrap().1.bounds();
+        let b_before = e.scene().find_object(b).unwrap().1.bounds();
+
+        let camera = e.camera.clone();
+        let screen = |p: Point| camera.doc_to_screen(p);
+        let corner = Point::new(a_before.x1, a_before.y1);
+        e.pointer_down(screen(corner), Mods::default());
+        e.pointer_move(screen(Point::new(corner.x + 60.0, corner.y + 60.0)), Mods::default());
+        e.pointer_up(screen(Point::new(corner.x + 60.0, corner.y + 60.0)));
+
+        assert!(
+            e.selection.contains(a) && !e.selection.contains(b),
+            "the corner press must keep the gizmo's object, not grab the one under it"
+        );
+        let a_after = e.scene().find_object(a).unwrap().1.bounds();
+        let b_after = e.scene().find_object(b).unwrap().1.bounds();
+        assert!(a_after.width() > a_before.width() + 1.0, "A should have scaled");
+        assert!(
+            (b_after.width() - b_before.width()).abs() < 1e-6,
+            "B, under the handle, should be untouched"
         );
     }
 
@@ -14428,6 +15020,47 @@ mod tests {
         let _ = placed;
         let reopened = buzz_doc::AssetLibrary::at(dir.path());
         assert_eq!(reopened.len(), 1, "the asset did not survive on disk");
+    }
+
+    /// **A dragged asset lands where it is let go.** The Place button drops an
+    /// asset at the coordinates it was saved with; dragging it onto the stage
+    /// carries the fresh artwork so its middle sits under the drop, and it
+    /// arrives selected, ready to move or scale.
+    #[test]
+    fn dragging_an_asset_drops_it_where_it_is_let_go() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut e = editor();
+        e.assets = buzz_doc::AssetLibrary::at(dir.path());
+
+        // An asset built from a square well away from the origin, so "where it
+        // was saved" and "where it was dropped" are plainly different places.
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let art = draw_square(&mut e, 300.0, 300.0, 40.0, Color::WHITE).expect("a square");
+        e.selection.set([art]);
+        e.run(Command::ConvertToSymbol);
+        let symbol = e.library.selected.expect("the symbol");
+        e.doc.edit("Name", |scene| {
+            scene.library_mut().update(symbol, |s| s.name = "Prop".into());
+        });
+        e.run(Command::SymbolToAsset);
+        let asset = e.assets.assets().first().cloned().expect("the asset");
+
+        // A clean document to drop it into.
+        let mut f = editor();
+        f.assets = buzz_doc::AssetLibrary::at(dir.path());
+
+        let drop_screen = Point::new(120.0, 80.0);
+        let expected = f.camera.screen_to_doc(drop_screen);
+        f.place_asset_at(&asset, drop_screen);
+
+        let bounds = f
+            .selection_bounds_drawn()
+            .expect("the placed artwork arrives selected");
+        let centre = bounds.center();
+        assert!(
+            (centre.x - expected.x).abs() < 1.0 && (centre.y - expected.y).abs() < 1.0,
+            "the asset should land centred on the drop, {centre:?} vs {expected:?}"
+        );
     }
 
     /// **The report: a symbol could not be named when it was made.**

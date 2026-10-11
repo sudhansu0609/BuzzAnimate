@@ -8,9 +8,7 @@
 use buzz_export::{ExportSettings, Exporter, Frame};
 use buzz_geom::{Point, Rect, Shape as _};
 use buzz_render::GpuPreference;
-use buzz_scene::{
-    Light, LightId, LightKey, LightKind, LightTrack, LayerKind, Scene, ShapeData,
-};
+use buzz_scene::{LayerKind, Light, LightId, LightKey, LightKind, LightTrack, Scene, ShapeData};
 use peniko::Color;
 
 const ART: Color = Color::from_rgb8(0x90, 0x90, 0x90);
@@ -56,6 +54,7 @@ fn document() -> Scene {
         softness: 0.35,
         standing_height: 40.0,
         shadow_strength: 0.45,
+        shadow_adjustment: Default::default(),
         kind: LightKind::Sun {
             azimuth: 0.0,
             elevation: 0.15,
@@ -69,6 +68,7 @@ fn document() -> Scene {
         softness: 0.35,
         standing_height: 40.0,
         shadow_strength: 0.45,
+        shadow_adjustment: Default::default(),
         kind: LightKind::Sun {
             azimuth: 0.0,
             elevation: 1.4,
@@ -79,8 +79,7 @@ fn document() -> Scene {
     let rig = scene.lights_mut();
     rig.enabled = true;
     rig.lights.push(sun);
-    rig
-        .lights
+    rig.lights
         .push(Light::new(LightId(2), "Sky", LightKind::sky()));
     scene
 }

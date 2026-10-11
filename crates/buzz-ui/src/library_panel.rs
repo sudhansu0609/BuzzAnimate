@@ -222,7 +222,9 @@ pub fn library_panel(
         if ui.text_edit_singleline(&mut state.search).changed() && state.is_searching() {
             state.expand_all(scene);
         }
-        if !state.search.is_empty() && ui.small_button("x").on_hover_text("Clear").clicked() {
+        if !state.search.is_empty()
+            && crate::widgets::icon_button(ui, "x", "Clear the search", None).clicked()
+        {
             state.search.clear();
         }
     });
@@ -277,8 +279,10 @@ pub fn library_panel(
                 for i in range {
                     // Each row is built inside a fixed-height slot so the
                     // virtualized layout stays aligned with its scrollbar.
-                    let (slot, _) =
-                        ui.allocate_exact_size(egui::vec2(ui.available_width(), row_height), egui::Sense::hover());
+                    let (slot, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), row_height),
+                        egui::Sense::hover(),
+                    );
                     let mut row_ui = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(slot)
@@ -299,8 +303,16 @@ pub fn library_panel(
                         } => {
                             let indent = *depth as f32 * 14.0;
                             draw_symbol_row(
-                                &mut row_ui, scene, state, *id, name, *kind, indent, usage,
-                                thumbnail, &mut command,
+                                &mut row_ui,
+                                scene,
+                                state,
+                                *id,
+                                name,
+                                *kind,
+                                indent,
+                                usage,
+                                thumbnail,
+                                &mut command,
                             );
                         }
                     }
@@ -335,10 +347,7 @@ enum Row {
     },
     /// An "Animated" or "Static" heading over the symbols that follow, shown
     /// only when the filter is [`MotionFilter::All`] and that group has members.
-    Group {
-        label: &'static str,
-        depth: usize,
-    },
+    Group { label: &'static str, depth: usize },
     Symbol {
         id: SymbolId,
         name: String,
@@ -350,7 +359,13 @@ enum Row {
 /// Flatten the visible tree — expanded folders and matching symbols — into a
 /// list of rows, in display order. Reads only; the widgets are built later.
 fn flatten_rows(scene: &Scene, state: &LibraryState) -> Vec<Row> {
-    fn walk(scene: &Scene, state: &LibraryState, parent: Option<&str>, depth: usize, rows: &mut Vec<Row>) {
+    fn walk(
+        scene: &Scene,
+        state: &LibraryState,
+        parent: Option<&str>,
+        depth: usize,
+        rows: &mut Vec<Row>,
+    ) {
         for folder in scene.library().child_folders(parent) {
             let leaf = folder.rsplit('/').next().unwrap_or(&folder).to_string();
             rows.push(Row::Folder {
@@ -424,7 +439,9 @@ fn draw_folder_row(ui: &mut Ui, state: &mut LibraryState, path: &str, leaf: &str
         // `⏷` rather than `▼`: the bundled fonts have a glyph for U+23F7 and
         // none for U+25BC, so an expanded folder used to be marked with an empty
         // box. `▶` for a closed one does render.
-        if ui.small_button(if open { "⏷" } else { "▶" }).clicked() {
+        let glyph = if open { "\u{23F7}" } else { "\u{25B6}" };
+        if crate::widgets::icon_button(ui, glyph, "Expand or collapse the folder", None).clicked()
+        {
             state.toggle(path);
         }
         ui.label(RichText::new("F").small().weak())
@@ -485,10 +502,8 @@ fn draw_symbol_row(
         //
         // Grabbing the picture is also what a library is expected to offer.
         let dragged = ui.dnd_drag_source(drag_id, DraggedSymbol(id), |ui| {
-            let (slot, _) = ui.allocate_exact_size(
-                egui::vec2(THUMBNAIL, THUMBNAIL),
-                egui::Sense::hover(),
-            );
+            let (slot, _) =
+                ui.allocate_exact_size(egui::vec2(THUMBNAIL, THUMBNAIL), egui::Sense::hover());
             match thumbnail(id) {
                 Some(texture) => {
                     egui::Image::new((texture, egui::vec2(THUMBNAIL, THUMBNAIL)))
@@ -630,15 +645,21 @@ fn draw_footer(
                     ui.selectable_value(&mut state.new_symbol_kind, kind, kind.label());
                 }
             });
-        if ui
-            .small_button("➕")
-            .on_hover_text(Command::NewSymbol.label())
-            .clicked()
+        let new_symbol_shortcut = crate::command::shortcut_text(ui.ctx(), Command::NewSymbol);
+        if crate::widgets::icon_button(
+            ui,
+            "\u{2795}",
+            Command::NewSymbol.label(),
+            (!new_symbol_shortcut.is_empty()).then_some(new_symbol_shortcut.as_str()),
+        )
+        .clicked()
         {
             *command = Some(Command::NewSymbol);
         }
+        // Stage 6, item 3: `.small()`/`small_button` opt out of the theme's
+        // 24 px minimum hit target, which the audit test now checks for.
         if ui
-            .small_button("Fld")
+            .button("Fld")
             .on_hover_text(Command::NewLibraryFolder.label())
             .clicked()
         {
@@ -646,14 +667,14 @@ fn draw_footer(
         }
         ui.separator();
         if ui
-            .add_enabled(selected.is_some(), egui::Button::new("Place").small())
+            .add_enabled(selected.is_some(), egui::Button::new("Place"))
             .on_hover_text("Place an instance on the stage")
             .clicked()
         {
             *command = Some(Command::PlaceInstance);
         }
         if ui
-            .add_enabled(selected.is_some(), egui::Button::new("Dup").small())
+            .add_enabled(selected.is_some(), egui::Button::new("Dup"))
             .on_hover_text(Command::DuplicateSymbol.label())
             .clicked()
         {
@@ -664,14 +685,14 @@ fn draw_footer(
         // it, and deleting the instance again. The Library is where symbols
         // are, so it is where "keep this one" is asked.
         if ui
-            .add_enabled(selected.is_some(), egui::Button::new("Asset").small())
+            .add_enabled(selected.is_some(), egui::Button::new("Asset"))
             .on_hover_text("Keep this symbol in the Assets library, to reuse in any document")
             .clicked()
         {
             *command = Some(Command::SymbolToAsset);
         }
         if ui
-            .add_enabled(selected.is_some(), egui::Button::new("🗑").small())
+            .add_enabled(selected.is_some(), egui::Button::new("🗑"))
             .on_hover_text(Command::DeleteSymbol.label())
             .clicked()
         {
@@ -805,15 +826,28 @@ mod tests {
         // The movie clip sits at the root, under an "Animated" heading.
         let loop_id = scene.library().find_by_name("Loop").expect("the clip").id;
         let animated_over_loop = rows.windows(2).any(|w| {
-            matches!(w[0], Row::Group { label: "Animated", .. })
-                && matches!(&w[1], Row::Symbol { id, .. } if *id == loop_id)
+            matches!(
+                w[0],
+                Row::Group {
+                    label: "Animated",
+                    ..
+                }
+            ) && matches!(&w[1], Row::Symbol { id, .. } if *id == loop_id)
         });
-        assert!(animated_over_loop, "the movie clip is under an Animated heading");
+        assert!(
+            animated_over_loop,
+            "the movie clip is under an Animated heading"
+        );
 
         // The graphics are stills, so there is a Static heading too.
         assert!(
-            rows.iter()
-                .any(|r| matches!(r, Row::Group { label: "Static", .. })),
+            rows.iter().any(|r| matches!(
+                r,
+                Row::Group {
+                    label: "Static",
+                    ..
+                }
+            )),
             "the graphics are under a Static heading"
         );
     }
@@ -850,7 +884,11 @@ mod tests {
 
         state.motion = MotionFilter::Static;
         let rows = flatten_rows(&scene, &state);
-        assert_eq!(names(&rows), ["Hero Arm", "Hero Body"], "the rest are stills");
+        assert_eq!(
+            names(&rows),
+            ["Hero Arm", "Hero Body"],
+            "the rest are stills"
+        );
     }
 
     /// The tree the panel walks must reach every symbol exactly once, or a

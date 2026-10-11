@@ -74,10 +74,7 @@ fn face(scene: &mut Scene) -> Vec<ObjectId> {
     let head_layer = scene.add_layer("Head", LayerKind::Normal);
     let mut head = Object::shape(
         ObjectId(1),
-        ShapeData::filled(
-            ellipse(275.0, 195.0, 95.0, 112.0),
-            SKIN,
-        ),
+        ShapeData::filled(ellipse(275.0, 195.0, 95.0, 112.0), SKIN),
     );
     head.transform = Affine::IDENTITY;
     scene.add_object(head_layer, head).expect("a head");
@@ -111,17 +108,15 @@ fn face(scene: &mut Scene) -> Vec<ObjectId> {
     let mouth_layer = scene.add_layer("Mouth", LayerKind::Normal);
     let mut mouth = Object::shape(
         ObjectId(30),
-        ShapeData::stroked(
-            ellipse(275.0, 246.0, 34.0, 16.0),
-            INK,
-            3.0,
-        ),
+        ShapeData::stroked(ellipse(275.0, 246.0, 34.0, 16.0), INK, 3.0),
     );
     mouth.transform = Affine::IDENTITY;
     scene.add_object(mouth_layer, mouth).expect("a mouth");
 
     for id in [head_layer, eye_layer, mouth_layer] {
-        scene.update_layer(id, |l| { l.frames.insert_frame(120); });
+        scene.update_layer(id, |l| {
+            l.frames.insert_frame(120);
+        });
     }
     eyes
 }
@@ -218,8 +213,13 @@ fn framing_scene() -> Scene {
         let mut post = Object::shape(
             ObjectId(100 + i as u64),
             ShapeData::filled(
-                Rect::new(x - 5.0, stage.height() * 0.52, x + 5.0, stage.height() * 0.74)
-                    .to_path(1e-9),
+                Rect::new(
+                    x - 5.0,
+                    stage.height() * 0.52,
+                    x + 5.0,
+                    stage.height() * 0.74,
+                )
+                .to_path(1e-9),
                 Color::from_rgb8(0x50, 0x62, 0x80),
             ),
         );
@@ -245,7 +245,9 @@ fn framing_scene() -> Scene {
     scene.add_object(cast, body).expect("a figure");
 
     for id in [ground, posts, cast] {
-        scene.update_layer(id, |l| { l.frames.insert_frame(48); });
+        scene.update_layer(id, |l| {
+            l.frames.insert_frame(48);
+        });
     }
     scene
 }
@@ -279,7 +281,9 @@ fn figure_camera_moves() {
         ] {
             let mut scene = base.clone();
             scene.camera_mut().enabled = true;
-            scene.camera_mut().set_key(CameraKey::new(0, stage.center()));
+            scene
+                .camera_mut()
+                .set_key(CameraKey::new(0, stage.center()));
             assert!(
                 scene.camera_mut().add_move(movement, 0, 48, stage),
                 "{} wrote no keys",
@@ -288,7 +292,11 @@ fn figure_camera_moves() {
             // A reveal is shown by its *opening*, which is the derived key and
             // the thing that is surprising about it; everything else by where
             // it arrives.
-            let frame = if movement == CameraMove::Reveal { 0 } else { 48 };
+            let frame = if movement == CameraMove::Reveal {
+                0
+            } else {
+                48
+            };
             let f = render(exporter, &scene, frame);
             write(&f, name);
         }
@@ -350,11 +358,7 @@ fn figure_line_weight() {
             // actually weighted.
             let mut outer = Object::shape(
                 ObjectId(1),
-                ShapeData::stroked(
-                    ellipse(275.0, 200.0, 110.0, 130.0),
-                    INK,
-                    8.0 * factor,
-                ),
+                ShapeData::stroked(ellipse(275.0, 200.0, 110.0, 130.0), INK, 8.0 * factor),
             );
             outer.transform = Affine::IDENTITY;
             scene.add_object(layer, outer).expect("a contour");
@@ -372,7 +376,9 @@ fn figure_line_weight() {
                 detail.transform = Affine::IDENTITY;
                 scene.add_object(layer, detail).expect("a detail line");
             }
-            scene.update_layer(layer, |l| { l.frames.insert_frame(2); });
+            scene.update_layer(layer, |l| {
+                l.frames.insert_frame(2);
+            });
             scene
         };
 
@@ -430,7 +436,10 @@ fn turnable_head(scene: &mut Scene) -> ObjectId {
     // Hair, sitting on the form and turning with the rest.
     parts.push(std::sync::Arc::new(Object::shape(
         ObjectId(2),
-        ShapeData::filled(ellipse(275.0, 118.0, 92.0, 46.0), Color::from_rgb8(0x4A, 0x33, 0x28)),
+        ShapeData::filled(
+            ellipse(275.0, 118.0, 92.0, 46.0),
+            Color::from_rgb8(0x4A, 0x33, 0x28),
+        ),
     )));
     // Eyes.
     for (i, x) in [238.0_f64, 312.0].into_iter().enumerate() {
@@ -446,7 +455,10 @@ fn turnable_head(scene: &mut Scene) -> ObjectId {
     // A nose on the centre line: the feature that shows a turn most.
     parts.push(std::sync::Arc::new(Object::shape(
         ObjectId(30),
-        ShapeData::filled(ellipse(275.0, 214.0, 11.0, 22.0), Color::from_rgb8(0xE0, 0xB8, 0x98)),
+        ShapeData::filled(
+            ellipse(275.0, 214.0, 11.0, 22.0),
+            Color::from_rgb8(0xE0, 0xB8, 0x98),
+        ),
     )));
     // A mouth.
     parts.push(std::sync::Arc::new(Object::shape(
@@ -457,7 +469,9 @@ fn turnable_head(scene: &mut Scene) -> ObjectId {
     let id = scene
         .add_object(layer, Object::group(ObjectId(50), parts))
         .expect("a head");
-    scene.update_layer(layer, |l| { l.frames.insert_frame(4); });
+    scene.update_layer(layer, |l| {
+        l.frames.insert_frame(4);
+    });
     id
 }
 
@@ -547,15 +561,25 @@ fn figure_trace_bitmap() {
                 blend: Default::default(),
             };
             before.add_shape(layer, shape).expect("placed");
-            before.update_layer(layer, |l| { l.frames.insert_frame(2); });
+            before.update_layer(layer, |l| {
+                l.frames.insert_frame(2);
+            });
         }
         let f = render(exporter, &before, 0);
         write(&f, "trace_before.png");
 
         // And the same picture traced, drawn as shapes.
         for (options, name, tint) in [
-            (buzz_scene::TraceOptions::line_art(), "trace_line_art.png", true),
-            (buzz_scene::TraceOptions::default(), "trace_colour.png", false),
+            (
+                buzz_scene::TraceOptions::line_art(),
+                "trace_line_art.png",
+                true,
+            ),
+            (
+                buzz_scene::TraceOptions::default(),
+                "trace_colour.png",
+                false,
+            ),
         ] {
             let report = buzz_scene::trace(w as u32, h as u32, &pixels, &options);
             eprintln!("  {name}: {}", report.message);
@@ -575,7 +599,9 @@ fn figure_trace_bitmap() {
                 let _ = i;
                 after.add_shape(layer, shape).expect("placed");
             }
-            after.update_layer(layer, |l| { l.frames.insert_frame(2); });
+            after.update_layer(layer, |l| {
+                l.frames.insert_frame(2);
+            });
             let f = render(exporter, &after, 0);
             write(&f, name);
         }
@@ -629,14 +655,15 @@ fn figure_captions() {
         );
         // Centred by measurement, exactly as the importer does it: the align
         // setting lines rows up with each other and does not place the block.
-        let (width, _) =
-            buzz_text::measure_styled(line, size, None, buzz_text::FontStyle::REGULAR);
+        let (width, _) = buzz_text::measure_styled(line, size, None, buzz_text::FontStyle::REGULAR);
         object.transform = Affine::translate((
             stage.center().x - width / 2.0,
             stage.y1 - stage.height() * 0.12,
         ));
         scene.add_object(layer, object).expect("a caption");
-        scene.update_layer(layer, |l| { l.frames.insert_frame(4); });
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(4);
+        });
 
         let f = render(exporter, &scene, 0);
         write(&f, "captions_on_the_picture.png");
@@ -692,11 +719,8 @@ fn figure_one_shot_actions() {
                     // The pose is *added* to the rest, exactly as `perform`
                     // writes it onto the timeline.
                     let rest = rig.armature.at_rest().pose();
-                    let posed: Vec<f64> = rest
-                        .iter()
-                        .zip(&beat.joints)
-                        .map(|(r, d)| r + d)
-                        .collect();
+                    let posed: Vec<f64> =
+                        rest.iter().zip(&beat.joints).map(|(r, d)| r + d).collect();
                     rig.armature.set_pose(&posed);
                 }
                 // Spread across the stage, standing on a common ground line —
@@ -704,13 +728,12 @@ fn figure_one_shot_actions() {
                 // gets lower than the figures either side of it.
                 let x = stage.width() * (0.12 + 0.19 * i as f64);
                 let ground = stage.height() * 0.86;
-                figure.transform = Affine::translate((
-                    x + beat.offset.x,
-                    ground + beat.offset.y,
-                ));
+                figure.transform = Affine::translate((x + beat.offset.x, ground + beat.offset.y));
                 scene.add_object(layer, figure).expect("a figure");
             }
-            scene.update_layer(layer, |l| { l.frames.insert_frame(2); });
+            scene.update_layer(layer, |l| {
+                l.frames.insert_frame(2);
+            });
 
             let f = render(exporter, &scene, 0);
             write(&f, name);

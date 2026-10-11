@@ -27,11 +27,12 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
-use buzz_scene::Scene;
+use buzz_scene::{LayerId, Scene};
 use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use crate::sequence::{SceneKey, SceneRole};
 use crate::serial::{DocumentDto, FORMAT_VERSION, SerialError};
 
 /// Identifies the container.
@@ -105,10 +106,60 @@ pub fn to_bytes(scene: &Scene) -> Result<Vec<u8>, DocError> {
 /// The scene index for a multi-scene document: the scene names and which one
 /// was active. Absent from a single-scene file — which is every file older
 /// versions wrote — so its absence means "one scene".
+///
+/// The sequence-setups fields (`keys`, `roles`, `sequence`, `master_audio`)
+/// live here rather than in each scene's own `document.json` (`serial.rs`):
+/// they are facts about the *document* — which scene is which, and the order
+/// they cut in — not about any one scene's artwork. All default to "this
+/// document has never heard of setups and shots": every scene `Normal`, keys
+/// assigned by position, an empty sequence, no master audio. That is exactly
+/// what every file written before this existed means.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ScenesDto {
     active: usize,
     names: Vec<String>,
+    /// Stable per-scene identity, parallel to `names`. Rebuilt by position
+    /// when absent, or when its length disagrees with `names` — belt and
+    /// braces against a hand-edited or partially-old file.
+    #[serde(default)]
+    keys: Vec<SceneKey>,
+    /// What kind of scene each one is, parallel to `names`.
+    #[serde(default)]
+    roles: Vec<SceneRole>,
+    /// The sequence's cut: shot keys, in film order. A shot's key not listed
+    /// here is a take not in the cut.
+    #[serde(default)]
+    sequence: Vec<SceneKey>,
+    /// Where the master audio's sound keyframe lives: which scene, and which
+    /// layer on it. Not a bare sound reference — a sound id only means
+    /// anything inside the `SoundLibrary` of the scene that holds it.
+    #[serde(default)]
+    master_audio: Option<(SceneKey, LayerId)>,
+}
+
+/// One scene plus the manifest metadata that travels with it: its stable key
+/// and what kind of scene it is. What [`to_bytes_scenes_full`] and
+/// [`save_scenes_full`] take instead of a bare `(name, Scene)` pair, so a
+/// document with setups and shots round-trips them along with the artwork.
+pub struct SceneRecord<'a> {
+    pub name: &'a str,
+    pub scene: &'a Scene,
+    pub key: SceneKey,
+    pub role: SceneRole,
+}
+
+/// Every scene read back from a `.buzz` archive, with the document-level
+/// metadata that travelled alongside them in `scenes.json`. What
+/// [`from_bytes_scenes_full`] and [`load_scenes_full`] return.
+pub struct LoadedScenes {
+    pub scenes: Vec<(String, Scene)>,
+    pub active: usize,
+    /// Parallel to `scenes`, one key per entry.
+    pub keys: Vec<SceneKey>,
+    /// Parallel to `scenes`, one role per entry.
+    pub roles: Vec<SceneRole>,
+    pub sequence: Vec<SceneKey>,
+    pub master_audio: Option<(SceneKey, LayerId)>,
 }
 
 /// The archive entry holding one scene's document JSON, and the media directory
@@ -132,16 +183,44 @@ fn media_prefix(index: usize) -> String {
 }
 
 /// Serialise several named scenes into one `.buzz` archive.
+///
+/// Every scene comes back `Normal` with keys assigned by position — this is
+/// what autosave and crash recovery use, which know nothing of setups and
+/// shots. [`to_bytes_scenes_full`] carries roles, keys, the sequence and the
+/// master audio too.
 pub fn to_bytes_scenes(scenes: &[(&str, &Scene)], active: usize) -> Result<Vec<u8>, DocError> {
+    let records: Vec<SceneRecord> = scenes
+        .iter()
+        .enumerate()
+        .map(|(i, (name, scene))| SceneRecord {
+            name,
+            scene,
+            key: SceneKey(i as u32),
+            role: SceneRole::Normal,
+        })
+        .collect();
+    to_bytes_scenes_full(&records, active, &[], None)
+}
+
+/// Serialise several scenes, with their roles and stable keys, the
+/// sequence's cut and the master audio, into one `.buzz` archive.
+pub fn to_bytes_scenes_full(
+    scenes: &[SceneRecord],
+    active: usize,
+    sequence: &[SceneKey],
+    master_audio: Option<(SceneKey, LayerId)>,
+) -> Result<Vec<u8>, DocError> {
     let mut buffer = Cursor::new(Vec::new());
-    write_archive(&mut buffer, scenes, active)?;
+    write_archive(&mut buffer, scenes, active, sequence, master_audio)?;
     Ok(buffer.into_inner())
 }
 
 fn write_archive<W: Write + Seek>(
     writer: &mut W,
-    scenes: &[(&str, &Scene)],
+    scenes: &[SceneRecord],
     active: usize,
+    sequence: &[SceneKey],
+    master_audio: Option<(SceneKey, LayerId)>,
 ) -> Result<(), DocError> {
     let mut zip = ZipWriter::new(writer);
 
@@ -158,23 +237,32 @@ fn write_archive<W: Write + Seek>(
     zip.start_file(ENTRY_META, deflated)?;
     zip.write_all(&serde_json::to_vec_pretty(&Meta::default())?)?;
 
-    // The scene index — only when there is more than one, so a single-scene
+    // The scene index — only when there is more than one, or when there is
+    // some other non-default fact to remember, so a plain single-scene
     // document stays exactly the file it was and opens in older versions.
-    if scenes.len() > 1 {
+    let needs_manifest = scenes.len() > 1
+        || scenes.iter().any(|s| !matches!(s.role, SceneRole::Normal))
+        || !sequence.is_empty()
+        || master_audio.is_some();
+    if needs_manifest {
         let index = ScenesDto {
             active,
-            names: scenes.iter().map(|(name, _)| name.to_string()).collect(),
+            names: scenes.iter().map(|s| s.name.to_string()).collect(),
+            keys: scenes.iter().map(|s| s.key).collect(),
+            roles: scenes.iter().map(|s| s.role.clone()).collect(),
+            sequence: sequence.to_vec(),
+            master_audio,
         };
         zip.start_file(ENTRY_SCENES, deflated)?;
         zip.write_all(&serde_json::to_vec_pretty(&index)?)?;
     }
 
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-    for (i, (_, scene)) in scenes.iter().enumerate() {
+    for (i, record) in scenes.iter().enumerate() {
         zip.start_file(scene_entry(i), deflated)?;
-        let dto = DocumentDto::from_scene(scene);
+        let dto = DocumentDto::from_scene(record.scene);
         zip.write_all(&serde_json::to_vec_pretty(&dto)?)?;
-        write_media(&mut zip, scene, &media_prefix(i), stored)?;
+        write_media(&mut zip, record.scene, &media_prefix(i), stored)?;
     }
 
     zip.finish()?;
@@ -228,7 +316,21 @@ pub fn from_bytes(bytes: &[u8]) -> Result<Scene, DocError> {
 /// Read every named scene from `.buzz` bytes, and which one was active. A file
 /// with no scene index is a single-scene document — every file older versions
 /// wrote — and comes back as one scene named "Scene 1".
+///
+/// Discards roles, keys, the sequence and the master audio — for autosave and
+/// crash recovery, which only ever restore names and artwork. See
+/// [`from_bytes_scenes_full`] for the rest.
 pub fn from_bytes_scenes(bytes: &[u8]) -> Result<(Vec<(String, Scene)>, usize), DocError> {
+    let loaded = from_bytes_scenes_full(bytes)?;
+    Ok((loaded.scenes, loaded.active))
+}
+
+/// Read every scene from `.buzz` bytes, with the document-level metadata
+/// (roles, stable keys, the sequence's cut, the master audio) that travelled
+/// alongside them in `scenes.json`. A file with no scene index at all — every
+/// file older versions wrote — comes back as one `Normal` scene named
+/// "Scene 1", key `0`, no sequence, no master audio.
+pub fn from_bytes_scenes_full(bytes: &[u8]) -> Result<LoadedScenes, DocError> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
 
     // Check the type before trusting anything else in the file.
@@ -241,14 +343,42 @@ pub fn from_bytes_scenes(bytes: &[u8]) -> Result<(Vec<(String, Scene)>, usize), 
         return Err(DocError::WrongType(mimetype.trim().to_string()));
     }
 
-    let (names, active): (Vec<String>, usize) = match archive.by_name(ENTRY_SCENES) {
+    let (names, active, keys, roles, sequence, master_audio) = match archive.by_name(ENTRY_SCENES)
+    {
         Ok(mut file) => {
             let mut json = String::new();
             file.read_to_string(&mut json)?;
             let index: ScenesDto = serde_json::from_str(&json)?;
-            (index.names, index.active)
+            // A key or role list that disagrees in length with `names` is
+            // treated the same as an absent one: made up by position rather
+            // than trusted partially.
+            let keys = if index.keys.len() == index.names.len() {
+                index.keys
+            } else {
+                (0..index.names.len() as u32).map(SceneKey).collect()
+            };
+            let roles = if index.roles.len() == index.names.len() {
+                index.roles
+            } else {
+                vec![SceneRole::Normal; index.names.len()]
+            };
+            (
+                index.names,
+                index.active,
+                keys,
+                roles,
+                index.sequence,
+                index.master_audio,
+            )
         }
-        Err(_) => (vec!["Scene 1".to_string()], 0),
+        Err(_) => (
+            vec!["Scene 1".to_string()],
+            0,
+            vec![SceneKey(0)],
+            vec![SceneRole::Normal],
+            Vec::new(),
+            None,
+        ),
     };
 
     let mut scenes = Vec::with_capacity(names.len());
@@ -257,7 +387,14 @@ pub fn from_bytes_scenes(bytes: &[u8]) -> Result<(Vec<(String, Scene)>, usize), 
         scenes.push((name, scene));
     }
     let active = active.min(scenes.len().saturating_sub(1));
-    Ok((scenes, active))
+    Ok(LoadedScenes {
+        scenes,
+        active,
+        keys,
+        roles,
+        sequence,
+        master_audio,
+    })
 }
 
 /// Read one scene's document JSON and the media under `prefix`.
@@ -370,6 +507,19 @@ pub fn save_scenes(
     write_atomic(path.as_ref(), &bytes)
 }
 
+/// Save several scenes, with their roles and stable keys, the sequence's cut
+/// and the master audio, to `path`, atomically.
+pub fn save_scenes_full(
+    scenes: &[SceneRecord],
+    active: usize,
+    sequence: &[SceneKey],
+    master_audio: Option<(SceneKey, LayerId)>,
+    path: impl AsRef<Path>,
+) -> Result<(), DocError> {
+    let bytes = to_bytes_scenes_full(scenes, active, sequence, master_audio)?;
+    write_atomic(path.as_ref(), &bytes)
+}
+
 /// Write bytes to `path` via a temporary file and a rename.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), DocError> {
     if let Some(parent) = path.parent()
@@ -415,6 +565,15 @@ pub fn load_scenes(path: impl AsRef<Path>) -> Result<(Vec<(String, Scene)>, usiz
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
     from_bytes_scenes(&bytes)
+}
+
+/// Load every scene from `path`, with the document-level metadata (roles,
+/// stable keys, the sequence's cut, the master audio) that travelled
+/// alongside them.
+pub fn load_scenes_full(path: impl AsRef<Path>) -> Result<LoadedScenes, DocError> {
+    let mut bytes = Vec::new();
+    File::open(path)?.read_to_end(&mut bytes)?;
+    from_bytes_scenes_full(&bytes)
 }
 
 #[cfg(test)]
@@ -604,11 +763,7 @@ mod tests {
         assert_eq!(back[0].1.shape_count(), first.shape_count());
         assert_eq!(back[1].1.shape_count(), 1);
         assert!(
-            back[1]
-                .1
-                .layers()
-                .iter()
-                .any(|l| l.name == "Only here"),
+            back[1].1.layers().iter().any(|l| l.name == "Only here"),
             "the second scene's layers were mixed up with the first's"
         );
     }
@@ -715,6 +870,120 @@ mod tests {
         assert!(matches!(err, DocError::Io(_)), "got {err:?}");
     }
 
+    /// **Roles, stable keys, the sequence's cut and the master audio all
+    /// survive a save and reopen**, alongside the names and artwork they
+    /// travel with.
+    #[test]
+    fn roles_keys_sequence_and_master_audio_round_trip_through_the_container() {
+        use crate::sequence::ShotInfo;
+
+        let setup = sample();
+        let mut shot = Scene::empty();
+        let layer = shot.add_layer("Only here", LayerKind::Normal);
+        shot.add_shape(
+            layer,
+            ShapeData::filled(Rect::new(0.0, 0.0, 4.0, 4.0).to_path(1e-9), Color::WHITE),
+        );
+
+        let setup_key = SceneKey(7);
+        let shot_key = SceneKey(9);
+        let shot_info = ShotInfo {
+            from_setup: Some(setup_key),
+            setup_revision: 3,
+            audio_in: 10,
+            audio_out: 70,
+            take_of: None,
+            continue_from: None,
+            dialogue_layer: None,
+        };
+        let records = [
+            SceneRecord {
+                name: "Village",
+                scene: &setup,
+                key: setup_key,
+                role: SceneRole::Setup,
+            },
+            SceneRecord {
+                name: "Village – Shot 1",
+                scene: &shot,
+                key: shot_key,
+                role: SceneRole::Shot(shot_info),
+            },
+        ];
+        let master_audio = Some((shot_key, buzz_scene::LayerId(3)));
+        let bytes =
+            to_bytes_scenes_full(&records, 1, &[shot_key], master_audio).unwrap();
+
+        let loaded = from_bytes_scenes_full(&bytes).unwrap();
+        assert_eq!(loaded.active, 1);
+        assert_eq!(loaded.scenes.len(), 2);
+        assert_eq!(loaded.scenes[0].0, "Village");
+        assert_eq!(loaded.scenes[1].0, "Village – Shot 1");
+        assert_eq!(loaded.keys, vec![setup_key, shot_key]);
+        assert_eq!(loaded.roles[0], SceneRole::Setup);
+        assert_eq!(loaded.roles[1], SceneRole::Shot(shot_info));
+        assert_eq!(loaded.sequence, vec![shot_key]);
+        assert_eq!(loaded.master_audio, master_audio);
+    }
+
+    /// A manifest written before roles, keys, a sequence or master audio
+    /// existed — just `active` and `names`, exactly what every file older
+    /// versions wrote — still opens: every scene comes back `Normal`, with
+    /// keys assigned by its position in the file.
+    #[test]
+    fn an_old_manifest_with_only_names_opens_as_all_normal_with_keys_by_position() {
+        let first = sample();
+        let mut second = Scene::empty();
+        second.add_layer("Only here", LayerKind::Normal);
+
+        let mut bytes = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut bytes));
+            zip.start_file::<_, ()>(
+                "mimetype",
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+            )
+            .unwrap();
+            zip.write_all(MIMETYPE.as_bytes()).unwrap();
+
+            let deflated =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zip.start_file::<_, ()>("meta.json", deflated).unwrap();
+            zip.write_all(&serde_json::to_vec(&Meta::default()).unwrap())
+                .unwrap();
+
+            // The old shape: only `active` and `names`, nothing this stage
+            // added.
+            zip.start_file::<_, ()>("scenes.json", deflated).unwrap();
+            zip.write_all(br#"{"active":1,"names":["Opening","Chase"]}"#)
+                .unwrap();
+
+            zip.start_file::<_, ()>("document.json", deflated).unwrap();
+            zip.write_all(&serde_json::to_vec(&DocumentDto::from_scene(&first)).unwrap())
+                .unwrap();
+            zip.start_file::<_, ()>("scene-1.json", deflated).unwrap();
+            zip.write_all(&serde_json::to_vec(&DocumentDto::from_scene(&second)).unwrap())
+                .unwrap();
+            zip.finish().unwrap();
+        }
+
+        let loaded = from_bytes_scenes_full(&bytes).unwrap();
+        assert_eq!(loaded.scenes.len(), 2);
+        assert_eq!(loaded.active, 1);
+        assert_eq!(
+            loaded.keys,
+            vec![SceneKey(0), SceneKey(1)],
+            "keys should be made up by position"
+        );
+        assert_eq!(
+            loaded.roles,
+            vec![SceneRole::Normal, SceneRole::Normal],
+            "every scene from an old file is Normal"
+        );
+        assert!(loaded.sequence.is_empty());
+        assert!(loaded.master_audio.is_none());
+    }
+
     #[test]
     fn compression_actually_shrinks_a_repetitive_document() {
         let mut scene = Scene::empty();
@@ -738,5 +1007,71 @@ mod tests {
             archive.len(),
             raw.len()
         );
+    }
+
+    /// **The reported case, through the real container**: a rig keyed many
+    /// times saves as about one copy of its artwork, not one per key, and
+    /// comes back scene-for-scene equal.
+    #[test]
+    fn a_rig_keyed_many_times_saves_as_one_copy_of_its_artwork() {
+        use crate::serial::test_support::keyed_rig_scene;
+
+        let one = to_bytes(&keyed_rig_scene(1, 3000)).unwrap();
+        let many_scene = keyed_rig_scene(100, 3000);
+        let many = to_bytes(&many_scene).unwrap();
+        assert!(
+            many.len() < one.len() * 3,
+            "100 keys took {} bytes against {} for one",
+            many.len(),
+            one.len()
+        );
+
+        let back = from_bytes(&many).unwrap();
+        let before: Vec<_> = many_scene.stage_layers().iter().collect();
+        let after: Vec<_> = back.stage_layers().iter().collect();
+        assert_eq!(before.len(), after.len());
+        for (a, b) in before.iter().zip(&after) {
+            assert_eq!(**a, **b, "a layer changed on the way through the file");
+        }
+    }
+
+    /// A `.buzz` written before the part table, every key carrying its rig in
+    /// full, still opens and is the same scene.
+    #[test]
+    fn an_archive_with_the_rig_written_in_every_key_still_opens() {
+        use crate::serial::test_support::{as_version_45, keyed_rig_scene};
+
+        let scene = keyed_rig_scene(30, 200);
+        let old_document =
+            serde_json::to_vec_pretty(&as_version_45(DocumentDto::from_scene(&scene))).unwrap();
+
+        let mut bytes = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut bytes));
+            zip.start_file::<_, ()>(
+                "mimetype",
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+            )
+            .unwrap();
+            zip.write_all(MIMETYPE.as_bytes()).unwrap();
+            let deflated =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zip.start_file::<_, ()>("meta.json", deflated).unwrap();
+            zip.write_all(&serde_json::to_vec(&Meta::default()).unwrap())
+                .unwrap();
+            zip.start_file::<_, ()>("document.json", deflated).unwrap();
+            zip.write_all(&old_document).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let opened = from_bytes(&bytes).unwrap();
+        let before: Vec<_> = scene.stage_layers().iter().collect();
+        let after: Vec<_> = opened.stage_layers().iter().collect();
+        assert_eq!(before.len(), after.len());
+        for (a, b) in before.iter().zip(&after) {
+            assert_eq!(**a, **b);
+        }
+        // And saved again it is the smaller layout.
+        assert!(to_bytes(&opened).unwrap().len() < bytes.len());
     }
 }

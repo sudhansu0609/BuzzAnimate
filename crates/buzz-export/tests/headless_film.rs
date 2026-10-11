@@ -8,9 +8,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use buzz_export::{
-    ExportSettings, VideoSettings, concat_segments, export_video, ffmpeg_available,
-};
+use buzz_export::{ExportSettings, VideoSettings, concat_segments, export_video, ffmpeg_available};
 use buzz_geom::{Rect, Shape as _};
 use buzz_render::GpuPreference;
 use buzz_scene::{LayerKind, Scene, ShapeData};

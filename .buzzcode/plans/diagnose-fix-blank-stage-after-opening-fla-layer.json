@@ -1,0 +1,47 @@
+{
+  "title": "Diagnose & fix blank stage after opening .fla (layers show, artwork missing)",
+  "summary": "The import creates layers but the stage renders empty at the playhead frame, which points to objects being emitted onto the wrong frame index, dropped fills/paints, or transforms placing them off-stage/zero-sized. Plan: trace the .fla import path end-to-end, pin the exact drop point with a synthetic fixture test that fails before the fix, then correct frame indexing / transform / fill mapping and verify against both the synthetic fixture and a real .fla.",
+  "steps": [
+    {
+      "n": 1,
+      "description": "Trace the import path: find where Command::ImportToStage / ImportInto is handled in crates/buzz-app/src/app.rs (search for `Command::Import` handlers), then follow into the FLA/XFL reader to see how DOMLayer → LayerStack and DOMShape/DOMInstance → buzz_scene::Object are built. Record exactly which frame index each object lands on, what transform is applied, and what Paint/FillSpec is produced.",
+      "files": [
+        "crates/buzz-app/src/app.rs",
+        "crates/buzz-scene/src/lib.rs"
+      ],
+      "verification": "grep for `ImportInto|ImportToStage` handlers in app.rs; note the function that populates Scene layers/objects."
+    },
+    {
+      "n": 2,
+      "description": "Write a minimal synthetic .xfl/.fla fixture (one shape on one layer at frame 1 with a solid fill and identity transform) plus a test that imports it and asserts: ≥1 object exists in the scene, `layer.objects_at(0)` is non-empty, and its bounds intersect the stage rect. This test must FAIL before any fix, proving the drop point.",
+      "files": [
+        "crates/buzz-app/tests/fla_import.rs (or the crate owning the FLA reader)",
+        "crates/buzz-app/testdata/fixture.xfl"
+      ],
+      "verification": "`cargo test -p buzz-app fla` fails with objects_at(0) empty / no object — confirms diagnosis."
+    },
+    {
+      "n": 3,
+      "description": "Fix the identified drop point in the FLA/XFL importer: (a) correct frame indexing if XFL's 1-based frames are stored as-is while scene playback is 0-based (shift by 1 or map first keyframe to frame 0); (b) apply layer+object transforms so objects land inside stage_rect; (c) ensure solid/gradient fills produce a non-blank Paint and bitmap references fall back to a visible placeholder rather than transparent. Keep changes minimal to the importer only.",
+      "files": [
+        "crates/buzz-app/src/import.rs (or whichever module holds the FLA reader)"
+      ],
+      "verification": "`cargo test -p buzz-app fla` passes: object present at frame 0, bounds intersect stage."
+    },
+    {
+      "n": 4,
+      "description": "End-to-end verification with a real .fla: open it in the app (or via the same import function in an integration test if a sample file is available) and confirm the stage renders non-blank at the playhead; run full `cargo test` to check for regressions.",
+      "files": [],
+      "verification": "`cargo build && cargo test` clean; manual open of user's .fla shows artwork on stage."
+    }
+  ],
+  "risks": [
+    "The blank stage may be caused by multiple compounding issues (frame index AND missing fills); step 3 fixes them together, so the fixture test should assert both object presence and visible paint.",
+    "If the FLA reader stores objects per-frame lazily, fixing indexing alone won't help if `objects_at` is never called for frame 0 — check Scene::find_object / Layer::objects_at usage in the renderer.",
+    "Real .fla files may use features (bitmaps, symbols) not covered by the synthetic fixture; final verification needs the user's actual file."
+  ],
+  "questions": [
+    "Is a sample .fla file available (path?) that reproduces the blank stage, so step 4 can use it instead of only the synthetic fixture?",
+    "Should imported frames keep Adobe's 1-based numbering or be normalized to scene frame 0 as first?"
+  ]
+}

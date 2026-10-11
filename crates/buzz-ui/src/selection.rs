@@ -9,7 +9,93 @@
 use std::collections::BTreeSet;
 
 use buzz_geom::Rect;
-use buzz_scene::{LayerId, ObjectId, Scene};
+use buzz_scene::{LayerId, LayerKind, ObjectId, Scene};
+
+/// Animate's Shift+click range: every id between `anchor` and `clicked` in
+/// `order`, inclusive of both ends and regardless of which one comes first in
+/// `order`. Pure and `Scene`-free, so the sweep itself is simple to test —
+/// I2's collapsed folders are folded in separately, by
+/// [`expand_collapsed_folders`], since that needs the scene. See I1 in
+/// `docs/INTERACTION_FIXES_PLAN.md`.
+///
+/// Either id missing from `order` (for instance an anchor that has since been
+/// deleted) makes shift-click behave like a plain click on `clicked` rather
+/// than panic or silently select nothing.
+pub fn layer_range(order: &[LayerId], anchor: LayerId, clicked: LayerId) -> Vec<LayerId> {
+    let (Some(a), Some(b)) = (
+        order.iter().position(|&id| id == anchor),
+        order.iter().position(|&id| id == clicked),
+    ) else {
+        return vec![clicked];
+    };
+    let (lo, hi) = (a.min(b), a.max(b));
+    order[lo..=hi].to_vec()
+}
+
+/// I2: a range's own collapsed folders bring their hidden children with
+/// them — a folder still counts as "between" the anchor and the click even
+/// though its contents are not drawn as rows. Expands every collapsed
+/// [`LayerKind::Folder`] in `ids` to include [`buzz_scene::LayerStack::descendants_of`]
+/// it; anything else in `ids` is kept as-is.
+pub fn expand_collapsed_folders(scene: &Scene, ids: &[LayerId]) -> Vec<LayerId> {
+    let mut out = Vec::new();
+    for &id in ids {
+        out.push(id);
+        if let Some(layer) = scene.layers().get(id)
+            && layer.kind == LayerKind::Folder
+            && layer.collapsed
+        {
+            out.extend(scene.layers().descendants_of(id));
+        }
+    }
+    out
+}
+
+/// A timeline cell selection, kept separate from artwork selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineSelection {
+    pub layers: BTreeSet<LayerId>,
+    pub first_frame: u32,
+    pub last_frame: u32,
+    pub anchor_layer: LayerId,
+    pub anchor_frame: u32,
+}
+
+impl TimelineSelection {
+    pub fn cell(layer: LayerId, frame: u32) -> Self {
+        Self {
+            layers: [layer].into_iter().collect(),
+            first_frame: frame,
+            last_frame: frame,
+            anchor_layer: layer,
+            anchor_frame: frame,
+        }
+    }
+
+    pub fn new(
+        layers: impl IntoIterator<Item = LayerId>,
+        first_frame: u32,
+        last_frame: u32,
+        anchor_layer: LayerId,
+        anchor_frame: u32,
+    ) -> Self {
+        Self {
+            layers: layers.into_iter().collect(),
+            first_frame: first_frame.min(last_frame),
+            last_frame: first_frame.max(last_frame),
+            anchor_layer,
+            anchor_frame,
+        }
+    }
+
+    pub fn contains(&self, layer: LayerId, frame: u32) -> bool {
+        self.layers.contains(&layer) && (self.first_frame..=self.last_frame).contains(&frame)
+    }
+
+    pub fn frames(&self) -> std::ops::RangeInclusive<u32> {
+        self.first_frame..=self.last_frame
+    }
+}
 
 /// The current selection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -19,6 +105,15 @@ pub struct Selection {
     objects: BTreeSet<ObjectId>,
     /// The layer new artwork goes on. Animate always has exactly one.
     active_layer: Option<LayerId>,
+    /// All layers currently selected (e.g. from vertical drag across layers on a frame).
+    selected_layers: Vec<LayerId>,
+    timeline: Option<TimelineSelection>,
+    /// **I1: the last plain-clicked layer.** Shift+click sweeps a range from
+    /// here to the layer clicked; Ctrl/Cmd+click moves this to the layer it
+    /// toggles, so a shift-click right after one sweeps from there instead.
+    /// Not saved with the document — it is as much a view thing as the rest
+    /// of `Selection`.
+    range_anchor: Option<LayerId>,
 }
 
 impl Selection {
@@ -51,11 +146,13 @@ impl Selection {
     }
 
     pub fn select_one(&mut self, id: ObjectId) {
+        self.timeline = None;
         self.objects.clear();
         self.objects.insert(id);
     }
 
     pub fn add(&mut self, id: ObjectId) {
+        self.timeline = None;
         self.objects.insert(id);
     }
 
@@ -72,6 +169,7 @@ impl Selection {
     }
 
     pub fn set(&mut self, ids: impl IntoIterator<Item = ObjectId>) {
+        self.timeline = None;
         self.objects = ids.into_iter().collect();
     }
 
@@ -83,8 +181,51 @@ impl Selection {
         self.active_layer
     }
 
+    pub fn selected_layers(&self) -> &[LayerId] {
+        &self.selected_layers
+    }
+
+    pub fn timeline(&self) -> Option<&TimelineSelection> {
+        self.timeline.as_ref()
+    }
+
+    pub fn set_timeline(&mut self, selection: TimelineSelection) {
+        self.selected_layers = selection.layers.iter().copied().collect();
+        self.active_layer = Some(selection.anchor_layer);
+        self.timeline = Some(selection);
+    }
+
+    pub fn clear_timeline(&mut self) {
+        self.timeline = None;
+    }
+
+    pub fn is_layer_selected(&self, id: LayerId) -> bool {
+        self.active_layer == Some(id) || self.selected_layers.contains(&id)
+    }
+
+    pub fn set_selected_layers(&mut self, layers: &[LayerId]) {
+        self.selected_layers = layers.to_vec();
+        if self.active_layer.is_none() || !layers.iter().any(|&l| Some(l) == self.active_layer) {
+            self.active_layer = layers.first().copied();
+        }
+    }
+
     pub fn set_active_layer(&mut self, layer: Option<LayerId>) {
         self.active_layer = layer;
+        self.selected_layers = layer.into_iter().collect();
+        self.timeline = None;
+    }
+
+    /// I1: the last plain-clicked layer, which a Shift+click ranges from.
+    pub fn range_anchor(&self) -> Option<LayerId> {
+        self.range_anchor
+    }
+
+    /// Move the anchor without otherwise touching the selection — what
+    /// Ctrl/Cmd+click does, so the *next* Shift+click sweeps from the layer
+    /// just toggled rather than an older click.
+    pub fn set_range_anchor(&mut self, layer: Option<LayerId>) {
+        self.range_anchor = layer;
     }
 
     /// Drop anything no longer in the document.
@@ -94,10 +235,34 @@ impl Selection {
     /// drawn around nothing.
     pub fn prune(&mut self, scene: &Scene) {
         self.objects.retain(|id| scene.find_object(*id).is_some());
+        self.selected_layers
+            .retain(|id| scene.layers().get(*id).is_some());
+        if let Some(timeline) = &mut self.timeline {
+            timeline
+                .layers
+                .retain(|id| scene.layers().get(*id).is_some());
+            if timeline.layers.is_empty() {
+                self.timeline = None;
+            } else if !timeline.layers.contains(&timeline.anchor_layer) {
+                timeline.anchor_layer = *timeline.layers.iter().next().expect("non-empty");
+            }
+        }
         if let Some(layer) = self.active_layer
             && scene.layers().get(layer).is_none()
         {
             self.active_layer = scene.layers().iter().next().map(|l| l.id);
+            if let Some(first) = self.active_layer {
+                if !self.selected_layers.contains(&first) {
+                    self.selected_layers.push(first);
+                }
+            }
+        }
+        // A deleted anchor cannot sweep a range; the active layer is the
+        // nearest thing to "the layer last clicked" left standing.
+        if let Some(anchor) = self.range_anchor
+            && scene.layers().get(anchor).is_none()
+        {
+            self.range_anchor = self.active_layer;
         }
     }
 
@@ -182,7 +347,11 @@ impl Selection {
     pub fn local_bounds(&self, scene: &Scene) -> Option<Rect> {
         self.objects
             .iter()
-            .filter_map(|id| scene.find_object(*id).map(|(_, o)| scene.resolved_bounds(o)))
+            .filter_map(|id| {
+                scene
+                    .find_object(*id)
+                    .map(|(_, o)| scene.resolved_bounds(o))
+            })
             .reduce(|a, b| a.union(b))
     }
 
@@ -214,7 +383,11 @@ impl Selection {
     /// worse, a delete would take it.
     pub fn select_layer(&mut self, scene: &Scene, layer: LayerId, frame: u32) {
         self.active_layer = Some(layer);
+        self.selected_layers = vec![layer];
+        self.timeline = None;
         self.objects.clear();
+        // I1: a plain click is always the new anchor a Shift+click sweeps from.
+        self.range_anchor = Some(layer);
 
         // `selectable` is the same rule hit-testing uses — editable, visible
         // through its folders, and not locked through them either. Reusing it
@@ -226,6 +399,30 @@ impl Selection {
         for object in target.objects_at(frame).iter() {
             if object.visible && !object.locked {
                 self.objects.insert(object.id);
+            }
+        }
+    }
+
+    /// Select multiple layers at once (e.g. from vertical drag across frames on a column).
+    ///
+    /// The first layer in the list becomes the active layer for tools, and artwork on
+    /// all selectable specified layers at `frame` is selected.
+    pub fn select_layers(&mut self, scene: &Scene, layers: &[LayerId], frame: u32) {
+        if let Some(&first) = layers.first() {
+            self.active_layer = Some(first);
+        }
+        self.selected_layers = layers.to_vec();
+        self.timeline = None;
+        self.objects.clear();
+
+        for &layer in layers {
+            let Some(target) = scene.layers().selectable().find(|l| l.id == layer) else {
+                continue;
+            };
+            for object in target.objects_at(frame).iter() {
+                if object.visible && !object.locked {
+                    self.objects.insert(object.id);
+                }
             }
         }
     }
@@ -282,6 +479,25 @@ mod tests {
     use buzz_scene::{LayerKind, ShapeData};
     use kurbo::Rect as KRect;
     use peniko::Color;
+
+    #[test]
+    fn timeline_selection_keeps_inclusive_range_and_repairs_deleted_anchor() {
+        let mut scene = Scene::empty();
+        let first = scene.add_layer("First", LayerKind::Normal);
+        let second = scene.add_layer("Second", LayerKind::Normal);
+        let mut selection = Selection::new();
+        selection.set_timeline(TimelineSelection::new([first, second], 8, 3, first, 8));
+        let cells = selection.timeline().unwrap();
+        assert_eq!(
+            cells.frames().collect::<Vec<_>>(),
+            (3..=8).collect::<Vec<_>>()
+        );
+        scene.remove_layer(first);
+        selection.prune(&scene);
+        let cells = selection.timeline().unwrap();
+        assert_eq!(cells.anchor_layer, second);
+        assert!(cells.layers.contains(&second));
+    }
 
     fn scene_with(n: u64) -> (Scene, LayerId, Vec<ObjectId>) {
         let mut scene = Scene::empty();
@@ -532,5 +748,105 @@ mod tests {
 
         s.set(ids.iter().copied());
         assert_eq!(s.describe(&scene), "3 objects selected");
+    }
+
+    #[test]
+    fn selecting_multiple_layers_selects_artwork_across_all_of_them() {
+        let mut scene = Scene::empty();
+        let l1 = scene.add_layer("L1", LayerKind::Normal);
+        let l2 = scene.add_layer("L2", LayerKind::Normal);
+        let s1 = scene
+            .add_shape(
+                l1,
+                ShapeData::filled(KRect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9), Color::WHITE),
+            )
+            .unwrap();
+        let s2 = scene
+            .add_shape(
+                l2,
+                ShapeData::filled(
+                    KRect::new(20.0, 20.0, 30.0, 30.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .unwrap();
+
+        let mut s = Selection::new();
+        s.select_layers(&scene, &[l1, l2], 0);
+        assert_eq!(s.selected_layers(), &[l1, l2]);
+        assert_eq!(s.active_layer(), Some(l1));
+        assert!(s.contains(s1));
+        assert!(s.contains(s2));
+        assert_eq!(s.len(), 2);
+    }
+
+    /// A plain click sets the anchor a later Shift+click sweeps from.
+    #[test]
+    fn selecting_a_layer_sets_the_range_anchor() {
+        let (scene, layer, _) = scene_with(1);
+        let mut s = Selection::new();
+        assert_eq!(s.range_anchor(), None);
+        s.select_layer(&scene, layer, 0);
+        assert_eq!(s.range_anchor(), Some(layer));
+    }
+
+    /// I1's pure range function: every id between the anchor and the clicked
+    /// one, inclusive, whichever direction the sweep runs.
+    #[test]
+    fn layer_range_is_inclusive_both_directions() {
+        let order = vec![LayerId(1), LayerId(2), LayerId(3), LayerId(4), LayerId(5)];
+        assert_eq!(
+            layer_range(&order, LayerId(2), LayerId(4)),
+            vec![LayerId(2), LayerId(3), LayerId(4)]
+        );
+        assert_eq!(
+            layer_range(&order, LayerId(4), LayerId(2)),
+            vec![LayerId(2), LayerId(3), LayerId(4)],
+            "the anchor coming after the clicked layer must still sweep the same range"
+        );
+        assert_eq!(
+            layer_range(&order, LayerId(3), LayerId(3)),
+            vec![LayerId(3)],
+            "shift-clicking the anchor itself selects just the one row"
+        );
+    }
+
+    /// An anchor no longer in `order` (e.g. deleted) falls back to a plain
+    /// click on whatever was actually clicked, rather than panicking.
+    #[test]
+    fn layer_range_with_a_missing_anchor_falls_back_to_the_click() {
+        let order = vec![LayerId(1), LayerId(2), LayerId(3)];
+        assert_eq!(
+            layer_range(&order, LayerId(99), LayerId(2)),
+            vec![LayerId(2)]
+        );
+    }
+
+    /// I2: a collapsed folder caught inside the swept range brings its
+    /// hidden children along, even though their rows are not drawn.
+    #[test]
+    fn expand_collapsed_folders_pulls_in_hidden_descendants() {
+        let mut scene = Scene::empty();
+        let folder = scene.add_layer("Folder", LayerKind::Folder);
+        let child = scene.add_layer("Child", LayerKind::Normal);
+        scene.update_layer(child, |l| l.parent = Some(folder));
+        scene.update_layer(folder, |l| l.collapsed = true);
+        let other = scene.add_layer("Other", LayerKind::Normal);
+
+        let expanded = expand_collapsed_folders(&scene, &[folder, other]);
+        assert_eq!(expanded, vec![folder, child, other]);
+    }
+
+    /// An expanded folder (or anything that is not a folder) is left as-is:
+    /// its children are already rows of their own in the swept range.
+    #[test]
+    fn expand_collapsed_folders_leaves_expanded_folders_alone() {
+        let mut scene = Scene::empty();
+        let folder = scene.add_layer("Folder", LayerKind::Folder);
+        let child = scene.add_layer("Child", LayerKind::Normal);
+        scene.update_layer(child, |l| l.parent = Some(folder));
+
+        let expanded = expand_collapsed_folders(&scene, &[folder, child]);
+        assert_eq!(expanded, vec![folder, child]);
     }
 }

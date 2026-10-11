@@ -35,17 +35,96 @@ fn main() -> Result<()> {
     // `buzz_ui::workspace::claim_user_workspace`.
     buzz_ui::workspace::claim_user_workspace();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "buzz_app=info,buzz_render=info,buzz_jobs=info".into()),
-        )
-        .init();
+    // Keep the Claude key in BuzzAnimate's `.env`: move a legacy ai.json key
+    // there, or copy Buzzcaf Studio's on first launch (file IO only, no
+    // network; the key is never logged).
+    buzz_ai::ai_config::ensure_claude_key();
+
+    init_tracing();
 
     // `--gpu <substring>` forces a specific adapter; `--script <file>` runs a
     // script over the document once it is open; `--brief <file>` and
     // `--render <file>` make a film without opening one at all.
     let args = Args::parse(std::env::args().skip(1));
+
+    // **`--ui-snapshot [dir]` never opens a window either.**
+    //
+    // Stage 0 of `docs/WORKSPACE_DESIGN_PLAN.md`: a way to produce the review
+    // PNGs from the command line, not only from the `#[ignore]`d test in
+    // `ui_snapshot.rs`. Writes the same files that test writes — Dark,
+    // Light and Contrast at 100%, Dark at 150%, the twelve-layer/folder
+    // timeline fixture the workspace defects brief's item 4 asks for, and
+    // Essentials/Animator by name (Stages 4–6's close-out) — against the
+    // same fixture documents, so `docs/AUTOMATION.md`'s instructions and the
+    // test produce identical output.
+    if let Some(dir) = &args.ui_snapshot {
+        use buzz_app::ui_snapshot::{
+            SnapshotConfig, fixture_app, fixture_app_with_many_layers, write_ui_snapshot,
+        };
+        use buzz_ui::theme::{self, Theme};
+
+        let was = theme::theme();
+        let mut failed = false;
+        for (t, name) in [
+            (Theme::Dark, "dark_default"),
+            (Theme::Light, "light_default"),
+            (Theme::Contrast, "contrast_default"),
+        ] {
+            theme::set_theme(t);
+            let mut app = fixture_app();
+            if let Err(e) =
+                write_ui_snapshot(&mut app, SnapshotConfig::HD, &dir.join(format!("{name}.png")))
+            {
+                eprintln!("{name}: {e:#}");
+                failed = true;
+            }
+        }
+        theme::set_theme(Theme::Dark);
+        let mut app = fixture_app();
+        if let Err(e) = write_ui_snapshot(
+            &mut app,
+            SnapshotConfig::HD_150,
+            &dir.join("dark_default_150.png"),
+        ) {
+            eprintln!("dark_default_150: {e:#}");
+            failed = true;
+        }
+        let mut many_layers = fixture_app_with_many_layers();
+        if let Err(e) = write_ui_snapshot(
+            &mut many_layers,
+            SnapshotConfig::HD,
+            &dir.join("dark_timeline_many_layers.png"),
+        ) {
+            eprintln!("dark_timeline_many_layers: {e:#}");
+            failed = true;
+        }
+        for (t, workspace, name) in [
+            (Theme::Dark, buzz_ui::Workspace::essentials(), "dark_essentials"),
+            (Theme::Dark, buzz_ui::Workspace::animate(), "dark_animator"),
+            (Theme::Light, buzz_ui::Workspace::essentials(), "light_essentials"),
+            (
+                Theme::Contrast,
+                buzz_ui::Workspace::essentials(),
+                "contrast_essentials",
+            ),
+        ] {
+            theme::set_theme(t);
+            let mut app = fixture_app().with_workspace(workspace);
+            if let Err(e) =
+                write_ui_snapshot(&mut app, SnapshotConfig::HD, &dir.join(format!("{name}.png")))
+            {
+                eprintln!("{name}: {e:#}");
+                failed = true;
+            }
+        }
+        theme::set_theme(was);
+
+        if failed {
+            std::process::exit(1);
+        }
+        println!("wrote UI snapshots to {}", dir.display());
+        return Ok(());
+    }
 
     // **`--render` never opens a window.**
     //
@@ -86,7 +165,10 @@ fn main() -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
-    let mut app = app::App::new(args.gpu).with_proxy(proxy);
+    // `with_api`: listen for the other Buzzcaf apps on 127.0.0.1 (port 8840 or
+    // the next free one, published in the shared port ledger) once the window
+    // is up. See `buzz_app::api`.
+    let mut app = app::App::new(args.gpu).with_proxy(proxy).with_api();
 
     // A trailing path argument opens that file, so the app can be associated
     // with `.buzz` and with every format it can import.
@@ -109,7 +191,7 @@ fn main() -> Result<()> {
                     for line in &imported.unsupported {
                         println!("  did not come across: {line}");
                     }
-                    app = app.with_document(buzz_doc::Document::new(imported.scene));
+                    app = app.with_document(imported.document().with_origin(&path));
                 }
                 Err(e) => eprintln!("could not import {}: {e}", path.display()),
             }
@@ -138,6 +220,62 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// The env filter every build starts the subscriber with: `RUST_LOG` if set,
+/// otherwise info for this crate and the two it leans on hardest.
+fn default_env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "buzz_app=info,buzz_render=info,buzz_jobs=info".into())
+}
+
+/// **Debug build: tracing to the console**, exactly as before — this is the
+/// build `--dev` on the launcher asks for, and the console it keeps is where
+/// the adapter table, tracing output and a panic's backtrace already go.
+#[cfg(debug_assertions)]
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(default_env_filter())
+        .init();
+}
+
+/// **Release build: tracing to a log file**, because `windows_subsystem =
+/// "windows"` (see the module doc) means this build has no console for
+/// `tracing_subscriber`'s default stderr writer to reach — today, a hang or a
+/// crash in the field leaves no evidence at all. S0 in
+/// `docs/BIMARI5_LAG_PLAN.md`: `%LOCALAPPDATA%/BuzzAnimate/logs/last.log`,
+/// truncated fresh on every launch so it always holds the most recent run
+/// rather than growing without bound. Falls back to the ordinary stderr
+/// subscriber if the file cannot be created — a log that goes nowhere useful
+/// is still better than a process that fails to start over one that is only
+/// diagnostic.
+#[cfg(not(debug_assertions))]
+fn init_tracing() {
+    let file = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .and_then(|base| {
+            let dir = base.join("BuzzAnimate").join("logs");
+            std::fs::create_dir_all(&dir).ok()?;
+            // Truncated (not appended): `File::create` — each launch starts
+            // this file fresh, so it is always this run's own log rather
+            // than an ever-growing history of every run before it.
+            std::fs::File::create(dir.join("last.log")).ok()
+        });
+
+    match file {
+        Some(file) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(default_env_filter())
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .init();
+        }
+        None => {
+            tracing_subscriber::fmt()
+                .with_env_filter(default_env_filter())
+                .init();
+        }
+    }
+}
+
 /// What the command line asked for.
 #[derive(Debug, PartialEq)]
 struct Args {
@@ -163,6 +301,9 @@ struct Args {
     audio: Vec<buzz_app::headless::AudioIn>,
     /// Target height in pixels for a render; the width follows the aspect.
     height: Option<u32>,
+    /// Write the Stage 0 review PNGs to this directory and exit, opening no
+    /// window. Defaults to `target/ui-snapshots` when given with no value.
+    ui_snapshot: Option<std::path::PathBuf>,
 }
 
 impl Args {
@@ -183,6 +324,7 @@ impl Args {
             preview: None,
             audio: Vec::new(),
             height: None,
+            ui_snapshot: None,
         };
 
         let mut i = 0;
@@ -261,6 +403,16 @@ impl Args {
                 "--height" => {
                     if let Some(v) = value {
                         out.height = v.parse().ok();
+                        i += 1;
+                    }
+                }
+                "--ui-snapshot" => {
+                    out.ui_snapshot = Some(
+                        value
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| std::path::PathBuf::from("target/ui-snapshots")),
+                    );
+                    if value.is_some() {
                         i += 1;
                     }
                 }

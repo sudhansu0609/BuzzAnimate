@@ -132,6 +132,109 @@ impl TaperEnds {
     }
 }
 
+/// The shape of the nib a brush paints with, swept along the stroke.
+///
+/// `Round` and `Square` have no orientation of their own: a round nib is a
+/// round nib from every direction, and a square one turns to keep its flat
+/// end across the direction of travel (see [`append_square_cap`]). `Chisel`
+/// and `Ellipse` are real nibs, held at a fixed `angle` regardless of which
+/// way the stroke goes — a chisel-point pen goes thin and thick as it turns,
+/// exactly as a real one does.
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub enum TipShape {
+    #[default]
+    Round,
+    /// A flat-ended nib whose sides run with the stroke.
+    Square,
+    /// A flat nib held at a fixed angle, like a calligraphy pen: thin along
+    /// its edge, wide across its face.
+    Chisel {
+        /// The nib's long axis, in degrees from +x.
+        angle: f64,
+        /// The short axis, as a fraction of the long one, `0.05..=1`.
+        thickness: f64,
+    },
+    /// The same idea as [`Self::Chisel`], with a rounded rather than a
+    /// squared-off edge.
+    Ellipse {
+        /// The nib's long axis, in degrees from +x.
+        angle: f64,
+        /// The short axis, as a fraction of the long one, `0.05..=1`.
+        thickness: f64,
+    },
+}
+
+impl TipShape {
+    /// One of each shape, for a combo box. `Chisel` and `Ellipse` are seeded
+    /// with a usable angle and thickness rather than a degenerate one.
+    pub const KINDS: [TipShape; 4] = [
+        TipShape::Round,
+        TipShape::Square,
+        TipShape::Chisel {
+            angle: 45.0,
+            thickness: 0.25,
+        },
+        TipShape::Ellipse {
+            angle: 45.0,
+            thickness: 0.25,
+        },
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TipShape::Round => "Round",
+            TipShape::Square => "Square",
+            TipShape::Chisel { .. } => "Chisel",
+            TipShape::Ellipse { .. } => "Ellipse",
+        }
+    }
+
+    /// The width this tip sweeps perpendicular to travel, for a nib of
+    /// [`BrushProfile::width`] `width` moving along `tangent`.
+    ///
+    /// With the nib's long axis `a = (cos θ, sin θ)`, short axis
+    /// `b = (-sin θ, cos θ)`, and unit normal `n` to `tangent`:
+    /// `Round`/`Square` are `width` regardless of direction; `Chisel` is
+    /// `width·|a·n| + (width·thickness)·|b·n|`; `Ellipse` is the same two
+    /// terms combined as the axes of an ellipse,
+    /// `sqrt((width·a·n)² + (width·thickness·b·n)²)`.
+    pub fn across(self, width: f64, tangent: Vec2) -> f64 {
+        let (angle, thickness) = match self {
+            TipShape::Round | TipShape::Square => return width,
+            TipShape::Chisel { angle, thickness } | TipShape::Ellipse { angle, thickness } => {
+                (angle, thickness)
+            }
+        };
+        let theta = angle.to_radians();
+        let a = Vec2::new(theta.cos(), theta.sin());
+        let b = Vec2::new(-theta.sin(), theta.cos());
+        let length = tangent.hypot();
+        let unit_tangent = if length > 1e-9 {
+            tangent / length
+        } else {
+            Vec2::new(1.0, 0.0)
+        };
+        let n = Vec2::new(-unit_tangent.y, unit_tangent.x);
+        let long = width;
+        let short = width * thickness.clamp(0.05, 1.0);
+        let a_n = (a.x * n.x + a.y * n.y).abs();
+        let b_n = (b.x * n.x + b.y * n.y).abs();
+        match self {
+            TipShape::Chisel { .. } => long * a_n + short * b_n,
+            TipShape::Ellipse { .. } => ((long * a_n).powi(2) + (short * b_n).powi(2)).sqrt(),
+            TipShape::Round | TipShape::Square => unreachable!("returned above"),
+        }
+    }
+}
+
+/// How fast the pointer must move, in document units per second, before paint
+/// stops pooling entirely. See [`BrushProfile::viscosity`].
+const POOL_SPEED: f64 = 400.0;
+
+/// The most a lingering stroke can bulge its width by, as a fraction of the
+/// drawn width. See [`BrushProfile::viscosity`].
+const MAX_POOL: f64 = 0.6;
+
 /// How a brush turns a stroke into artwork.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrushProfile {
@@ -159,12 +262,22 @@ pub struct BrushProfile {
     /// a hand wobbles. That is what makes a finished stroke look as though it
     /// flowed outwards a little after it was drawn: thin paint spreading.
     ///
-    /// Viscosity is how far that curve is allowed to bulge. At `0.0` it is the
-    /// free Catmull-Rom construction, which is the loosest and the runniest; at
-    /// `1.0` the outline is pulled almost straight between its points and the
-    /// stroke keeps the width it was drawn at. It changes the silhouette only —
-    /// never where the stroke goes, and never how wide it is at any point.
+    /// Viscosity also decides **how much paint pools where the brush
+    /// lingers**: runny paint (low viscosity) spreads out and bulges wider
+    /// wherever the stroke slows down or sits still, exactly as thin paint
+    /// pools on paper; thick paint (high viscosity) keeps the width it was
+    /// drawn at, regardless of speed.
+    ///
+    /// Viscosity is how far the outline curve is allowed to bulge, and how far
+    /// the width is allowed to pool. At `0.0` the curve is the free
+    /// Catmull-Rom construction, the loosest and runniest, and the width pools
+    /// up to [`MAX_POOL`] wherever the brush lingers; at `1.0` the outline is
+    /// pulled almost straight between its points, there is no pooling, and the
+    /// stroke keeps exactly the width it was drawn at. It never changes where
+    /// the stroke goes.
     pub viscosity: f64,
+    /// The shape of the nib swept along the stroke. See [`TipShape`].
+    pub tip: TipShape,
 }
 
 impl Default for BrushProfile {
@@ -185,6 +298,7 @@ impl Default for BrushProfile {
             // Thick enough to hold its edge. Nought would be the free curve,
             // which reads as paint that ran after it was put down.
             viscosity: 0.65,
+            tip: TipShape::default(),
         }
     }
 }
@@ -228,6 +342,13 @@ impl BrushProfile {
         // Never quite zero: a completely slack tension is a polyline, and the
         // facets show on a big soft stroke.
         1.0 - self.viscosity.clamp(0.0, 1.0) * 0.9
+    }
+
+    /// How runny the paint is: `0.0` at full viscosity, `1.0` at none. Drives
+    /// how much the width pools where the brush lingers. See
+    /// [`Self::viscosity`].
+    fn spread(&self) -> f64 {
+        1.0 - self.viscosity.clamp(0.0, 1.0)
     }
 }
 
@@ -614,9 +735,11 @@ pub fn fluid_outline(
     if conditioned.len() < 2 {
         // A tap, not a drag. Animate paints a dot, so we do too.
         if let Some(sample) = conditioned.first() {
-            let radius = profile.width_at(sample.pressure, 0.0) / 2.0;
-            if radius > 0.0 {
-                return BrushOutput::plain(kurbo::Circle::new(sample.point, radius).to_path(1e-3));
+            let mut width = profile.width_at(sample.pressure, 0.0);
+            // A stroke that never moved has lingered completely: full pooling.
+            width *= 1.0 + MAX_POOL * profile.spread();
+            if width > 0.0 {
+                return BrushOutput::plain(tap_shape(sample.point, width, profile.tip));
             }
         }
         return BrushOutput::plain(BezPath::new());
@@ -629,8 +752,13 @@ pub fn fluid_outline(
     let mut left = Vec::with_capacity(conditioned.len());
     let mut right = Vec::with_capacity(conditioned.len());
     for i in 0..conditioned.len() {
-        let half = widths[i] / 2.0;
-        let offset = normals[i] * half;
+        // The tip's own shape decides how wide it sweeps at this angle of
+        // travel — a round or square nib the same in every direction, a
+        // chisel or ellipse thinner side-on than face-on.
+        let n = normals[i];
+        let tangent = Vec2::new(n.y, -n.x);
+        let half = profile.tip.across(widths[i], tangent) / 2.0;
+        let offset = n * half;
         left.push(conditioned[i].point + offset);
         right.push(conditioned[i].point - offset);
     }
@@ -647,23 +775,28 @@ pub fn fluid_outline(
     let back = catmull_rom_tense(&right, tension);
 
     // Join the two sides. A tapered end has collapsed to a point and a
-    // straight join across it is invisible; an untapered one is where a round
-    // cap belongs — so a stroke tapered at one end only gets exactly one cap.
+    // straight join across it is invisible; an untapered one is where a cap
+    // belongs — so a stroke tapered at one end only gets exactly one cap. The
+    // cap's own shape follows the tip: round and ellipse nibs get a curved
+    // cap, a square nib gets a flat one, and a chisel simply crosses straight
+    // over, since its two sides already meet at the corner of the nib.
     if !profile.tapers_end() {
-        append_cap(
+        append_end_cap(
             &mut path,
             conditioned[conditioned.len() - 1].point,
             left[left.len() - 1],
             right[0],
+            profile.tip,
         );
     }
     append_without_move(&mut path, &back);
     if !profile.tapers_start() {
-        append_cap(
+        append_end_cap(
             &mut path,
             conditioned[0].point,
             right[right.len() - 1],
             left[0],
+            profile.tip,
         );
     }
     path.close_path();
@@ -697,9 +830,10 @@ fn widths_along(samples: &[StrokeSample], profile: &BrushProfile) -> Vec<f64> {
         distances.push(total);
     }
 
+    // Speed from the samples either side, so a single late sample does not
+    // produce a spike.
+    let mut speeds = Vec::with_capacity(n);
     for i in 0..n {
-        // Speed from the samples either side, so a single late sample does not
-        // produce a spike.
         let speed = if n < 2 {
             0.0
         } else {
@@ -708,8 +842,33 @@ fn widths_along(samples: &[StrokeSample], profile: &BrushProfile) -> Vec<f64> {
             let dd = (b.point - a.point).hypot();
             if dt > 1e-6 { dd / dt } else { 0.0 }
         };
+        speeds.push(speed);
+    }
 
-        let mut width = profile.width_at(samples[i].pressure, speed);
+    // **Pooling.** Runny paint spreads where the brush lingers: a slow or
+    // stopped stroke gets fatter, exactly as thin paint pools on paper. `spread`
+    // is zero at full viscosity, so this is a no-op for thick paint.
+    let spread = profile.spread();
+    let linger: Vec<f64> = if spread > 0.0 {
+        let raw: Vec<f64> = speeds
+            .iter()
+            .map(|&speed| 1.0 - (speed / POOL_SPEED).clamp(0.0, 1.0))
+            .collect();
+        // Box-average over arc length, not sample count, so the pool spans a
+        // constant distance regardless of how densely the stroke was sampled.
+        box_average(&raw, &distances, profile.width.max(1.0) / 2.0)
+    } else {
+        Vec::new()
+    };
+
+    for i in 0..n {
+        let mut width = profile.width_at(samples[i].pressure, speeds[i]);
+
+        // Applied before the taper, so a tapered end still reaches a point
+        // instead of pooling into a blob.
+        if spread > 0.0 {
+            width *= 1.0 + MAX_POOL * spread * linger[i];
+        }
 
         // Taper whichever ends the profile asks for, towards a point.
         if profile.taper > 0.0 && total > 0.0 {
@@ -737,6 +896,32 @@ fn widths_along(samples: &[StrokeSample], profile: &BrushProfile) -> Vec<f64> {
         widths.push(width.max(0.0));
     }
     widths
+}
+
+/// The mean of `values` within `±radius` arc-length of each point, given the
+/// matching cumulative `distances` (non-decreasing). O(n): the window bounds
+/// only ever move forward.
+fn box_average(values: &[f64], distances: &[f64], radius: f64) -> Vec<f64> {
+    let n = values.len();
+    let mut out = Vec::with_capacity(n);
+    let mut lo = 0usize;
+    let mut hi = 0usize;
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for i in 0..n {
+        while hi < n && distances[hi] <= distances[i] + radius {
+            sum += values[hi];
+            count += 1;
+            hi += 1;
+        }
+        while lo < i && distances[i] - distances[lo] > radius {
+            sum -= values[lo];
+            count -= 1;
+            lo += 1;
+        }
+        out.push(if count > 0 { sum / count as f64 } else { values[i] });
+    }
+    out
 }
 
 /// Unit normals at every sample.
@@ -776,6 +961,78 @@ fn append_cap(path: &mut BezPath, centre: Point, from: Point, to: Point) {
 
     path.curve_to(from + across * k, mid + out * k, mid);
     path.curve_to(mid - out * k, to + across * k, to);
+}
+
+/// A flat, square-cornered cap from `from` to `to` around `centre`, its two
+/// short sides running out along the direction of travel rather than curving.
+fn append_square_cap(path: &mut BezPath, centre: Point, from: Point, to: Point) {
+    let radius = (from - centre).hypot();
+    if radius <= 1e-9 {
+        path.line_to(to);
+        return;
+    }
+    let out = (from - centre) / radius;
+    let across = Vec2::new(-out.y, out.x);
+    path.line_to(from + across * radius);
+    path.line_to(to + across * radius);
+    path.line_to(to);
+}
+
+/// The end cap `!profile.tapers_start()`/`!profile.tapers_end()` calls for,
+/// shaped to match the brush's tip: round and ellipse nibs curve, square
+/// nibs go flat, and a chisel's two sides already meet at its corner so
+/// nothing more than the join itself is needed.
+fn append_end_cap(path: &mut BezPath, centre: Point, from: Point, to: Point, tip: TipShape) {
+    match tip {
+        TipShape::Round | TipShape::Ellipse { .. } => append_cap(path, centre, from, to),
+        TipShape::Square => append_square_cap(path, centre, from, to),
+        TipShape::Chisel { .. } => path.line_to(to),
+    }
+}
+
+/// The dot a tap paints — Animate's behaviour for a click with no drag —
+/// shaped like the brush's own tip rather than always a circle.
+fn tap_shape(centre: Point, width: f64, tip: TipShape) -> BezPath {
+    let radius = width / 2.0;
+    match tip {
+        TipShape::Round => kurbo::Circle::new(centre, radius).to_path(1e-3),
+        TipShape::Square => {
+            kurbo::Rect::new(
+                centre.x - radius,
+                centre.y - radius,
+                centre.x + radius,
+                centre.y + radius,
+            )
+            .to_path(1e-9)
+        }
+        TipShape::Chisel { angle, thickness } => {
+            let theta = angle.to_radians();
+            let half_short = width * thickness.clamp(0.05, 1.0) / 2.0;
+            let a = Vec2::new(theta.cos(), theta.sin());
+            let b = Vec2::new(-theta.sin(), theta.cos());
+            let corners = [
+                centre + a * radius + b * half_short,
+                centre - a * radius + b * half_short,
+                centre - a * radius - b * half_short,
+                centre + a * radius - b * half_short,
+            ];
+            let mut path = BezPath::new();
+            path.move_to(corners[0]);
+            for corner in &corners[1..] {
+                path.line_to(*corner);
+            }
+            path.close_path();
+            path
+        }
+        TipShape::Ellipse { angle, thickness } => {
+            let theta = angle.to_radians();
+            let half_short = width * thickness.clamp(0.05, 1.0) / 2.0;
+            let transform = kurbo::Affine::scale_non_uniform(radius, half_short)
+                .then_rotate(theta)
+                .then_translate(centre.to_vec2());
+            transform * kurbo::Circle::new(Point::ORIGIN, 1.0).to_path(1e-3)
+        }
+    }
 }
 
 /// Append `other`, turning its leading `MoveTo` into a `LineTo` so the result
@@ -1081,6 +1338,21 @@ mod tests {
 
     fn unit_square() -> BezPath {
         kurbo::Rect::new(0.0, -5.0, 10.0, 5.0).to_path(1e-9)
+    }
+
+    /// The area a filled outline actually covers, by the shoelace formula over
+    /// the flattened path.
+    fn shoelace_area(path: &BezPath) -> f64 {
+        let mut points: Vec<Point> = Vec::new();
+        kurbo::flatten(path.iter(), 0.05, |el| match el {
+            kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => points.push(p),
+            _ => {}
+        });
+        let mut area = 0.0;
+        for pair in points.windows(2) {
+            area += pair[0].x * pair[1].y - pair[1].x * pair[0].y;
+        }
+        (area / 2.0).abs()
     }
 
     // -- conditioning ------------------------------------------------------
@@ -1412,6 +1684,107 @@ mod tests {
         assert!(at(0.0) > 0.0, "and zero pressure still leaves a mark");
     }
 
+    // -- tip shapes -----------------------------------------------------
+
+    /// The default tip must reproduce exactly what the outline always did
+    /// before tip shapes existed: full width, from every direction.
+    #[test]
+    fn round_tip_is_the_old_stroke() {
+        for tangent in [Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0), Vec2::new(3.0, -4.0)] {
+            assert_eq!(TipShape::Round.across(20.0, tangent), 20.0);
+        }
+    }
+
+    /// A chisel nib is thin along its own edge and wide across its face —
+    /// the whole point of one, and why a calligraphy pen thickens as it
+    /// turns.
+    #[test]
+    fn a_chisel_is_thin_along_its_nib_and_wide_across_it() {
+        // Pinned to full viscosity: this test is about the tip's shape, not
+        // about pooling, and pooling would blur the exact widths it checks.
+        let profile = BrushProfile {
+            width: 20.0,
+            response: WidthResponse::Uniform,
+            smoothing: 0.0,
+            taper: 0.0,
+            viscosity: 1.0,
+            tip: TipShape::Chisel {
+                angle: 0.0,
+                thickness: 0.2,
+            },
+            ..BrushProfile::default()
+        };
+
+        let horizontal = drag(Point::new(0.0, 0.0), Point::new(200.0, 0.0), 40);
+        let height = fluid_outline(&horizontal, &profile, &BrushBudget::default())
+            .path
+            .bounding_box()
+            .height();
+        assert!(
+            (height - 4.0).abs() <= 1.0,
+            "a horizontal stroke should be thin along the nib: {height:.2}"
+        );
+
+        let vertical = drag(Point::new(0.0, 0.0), Point::new(0.0, 200.0), 40);
+        let width = fluid_outline(&vertical, &profile, &BrushBudget::default())
+            .path
+            .bounding_box()
+            .width();
+        assert!(
+            (width - 20.0).abs() <= 1.0,
+            "a vertical stroke should be wide across the nib: {width:.2}"
+        );
+    }
+
+    /// A square tip has a straight-sided cap, unlike a round tip's curve —
+    /// a genuinely different shape at the corner, not just a different
+    /// radius.
+    ///
+    /// `append_cap`'s existing semicircle (reused here for `Round`, and the
+    /// convention `append_square_cap` matches for `Square`) is built from
+    /// `centre`, `from` and `to` alone, with no notion of which side of the
+    /// chord is "outward" along the stroke — for a straight drag it bulges
+    /// toward the body rather than past the end. `append_square_cap` follows
+    /// the same `out`/`across` construction so the two caps stay consistent
+    /// with one another, which means the straight-sided square cap cuts its
+    /// corner *harder* than the round one does, not softer. A point just
+    /// inside the round curve's corner, short of where the square tip's
+    /// straight side already ends the shape, tells the two apart.
+    #[test]
+    fn a_square_tip_has_square_ends() {
+        // Pinned to full viscosity for the same reason as the chisel test
+        // above: this checks the cap's exact shape.
+        let width = 20.0;
+        let samples = drag(Point::new(0.0, 0.0), Point::new(100.0, 0.0), 40);
+        let end = samples.last().expect("at least one sample").point;
+        // A quarter width in from the very end, and just short of the full
+        // half-width out to the side.
+        let probe = Point::new(end.x - 0.25 * width, end.y + 0.49 * width);
+
+        let profile_of = |tip: TipShape| BrushProfile {
+            width,
+            response: WidthResponse::Uniform,
+            smoothing: 0.0,
+            taper: 0.0,
+            viscosity: 1.0,
+            tip,
+            ..BrushProfile::default()
+        };
+
+        let square =
+            fluid_outline(&samples, &profile_of(TipShape::Square), &BrushBudget::default());
+        let round = fluid_outline(&samples, &profile_of(TipShape::Round), &BrushBudget::default());
+
+        assert!(
+            crate::fill_contains(&round.path, probe, crate::FillMode::NonZero),
+            "the round tip's curve should not have pulled in this far yet"
+        );
+        assert!(
+            !crate::fill_contains(&square.path, probe, crate::FillMode::NonZero),
+            "the square tip's straight side should already have cut this corner"
+        );
+    }
+
     /// A tap with no drag should leave a dot, as Animate does — not nothing.
     #[test]
     fn a_single_tap_paints_a_dot() {
@@ -1455,18 +1828,7 @@ mod tests {
                 ..BrushProfile::default()
             };
             let out = fluid_outline(&samples, &profile, &BrushBudget::default());
-            // Signed area by the shoelace formula over the flattened outline:
-            // how much stage the silhouette actually covers.
-            let mut points: Vec<Point> = Vec::new();
-            kurbo::flatten(out.path.iter(), 0.05, |el| match el {
-                kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => points.push(p),
-                _ => {}
-            });
-            let mut area = 0.0;
-            for pair in points.windows(2) {
-                area += pair[0].x * pair[1].y - pair[1].x * pair[0].y;
-            }
-            (area / 2.0).abs()
+            shoelace_area(&out.path)
         };
 
         let runny = area_of(0.0);
@@ -1479,6 +1841,106 @@ mod tests {
         assert!(
             thick > runny * 0.75,
             "viscosity must hold the edge, not eat the stroke: {thick:.0} against {runny:.0}"
+        );
+    }
+
+    /// **Paint pools where the brush lingers.** A slow-moving stroke leaves
+    /// more ink behind than the same stroke drawn fast, at low viscosity; full
+    /// viscosity holds the drawn width regardless of speed.
+    #[test]
+    fn viscosity_pools_paint_where_the_brush_lingers() {
+        // 150 samples at 2-unit steps along x, timed to move at 60 u/s.
+        let samples: Vec<StrokeSample> = (0..150)
+            .map(|i| {
+                let t = i as f64;
+                StrokeSample::new(Point::new(t * 2.0, 0.0), t * (2.0 / 60.0))
+            })
+            .collect();
+
+        let area_of = |viscosity: f64| -> f64 {
+            let profile = BrushProfile {
+                width: 20.0,
+                response: WidthResponse::Uniform,
+                smoothing: 0.0,
+                taper: 0.0,
+                viscosity,
+                ..BrushProfile::default()
+            };
+            let out = fluid_outline(&samples, &profile, &BrushBudget::default());
+            shoelace_area(&out.path)
+        };
+
+        let area0 = area_of(0.0);
+        let area_half = area_of(0.5);
+        let area1 = area_of(1.0);
+
+        assert!(
+            area0 >= 1.35 * area1,
+            "a lingering stroke should pool visibly: area0 {area0:.1} area1 {area1:.1}"
+        );
+        assert!(
+            area1 < area_half && area_half < area0,
+            "pooling should grow monotonically as viscosity drops: area1 {area1:.1} area_half {area_half:.1} area0 {area0:.1}"
+        );
+    }
+
+    /// A fast stroke has nowhere to linger, so it barely pools even at zero
+    /// viscosity.
+    #[test]
+    fn a_fast_stroke_barely_pools() {
+        // The same stroke as `viscosity_pools_paint_where_the_brush_lingers`,
+        // but timed to move at 2000 u/s instead of 60 u/s.
+        let samples: Vec<StrokeSample> = (0..150)
+            .map(|i| {
+                let t = i as f64;
+                StrokeSample::new(Point::new(t * 2.0, 0.0), t * (2.0 / 2000.0))
+            })
+            .collect();
+
+        let area_of = |viscosity: f64| -> f64 {
+            let profile = BrushProfile {
+                width: 20.0,
+                response: WidthResponse::Uniform,
+                smoothing: 0.0,
+                taper: 0.0,
+                viscosity,
+                ..BrushProfile::default()
+            };
+            let out = fluid_outline(&samples, &profile, &BrushBudget::default());
+            shoelace_area(&out.path)
+        };
+
+        let area0 = area_of(0.0);
+        let area1 = area_of(1.0);
+        assert!(
+            (area0 / area1 - 1.0).abs() < 0.03,
+            "a fast stroke should barely pool: area0 {area0:.1} area1 {area1:.1}"
+        );
+    }
+
+    /// At full viscosity, the drawn width is kept exactly — no pooling, even
+    /// on a stroke slow enough to pool heavily at low viscosity.
+    #[test]
+    fn full_viscosity_keeps_the_drawn_width() {
+        let samples: Vec<StrokeSample> = (0..150)
+            .map(|i| {
+                let t = i as f64;
+                StrokeSample::new(Point::new(t * 2.0, 0.0), t * (2.0 / 60.0))
+            })
+            .collect();
+        let profile = BrushProfile {
+            width: 20.0,
+            response: WidthResponse::Uniform,
+            smoothing: 0.0,
+            taper: 0.0,
+            viscosity: 1.0,
+            ..BrushProfile::default()
+        };
+        let out = fluid_outline(&samples, &profile, &BrushBudget::default());
+        let height = out.path.bounding_box().height();
+        assert!(
+            (height - 20.0).abs() <= 0.5,
+            "full viscosity should keep exactly the drawn width, got {height:.2}"
         );
     }
 

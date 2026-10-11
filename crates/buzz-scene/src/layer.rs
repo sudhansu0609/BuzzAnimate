@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::object::{Object, ObjectId};
 use crate::timeline::{FrameKind, LayerTimeline};
+use crate::{Blend, ColorTransform};
 
 /// Stable identity for a layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -192,6 +193,24 @@ pub struct Layer {
     pub locked: bool,
     /// The outline column: draw artwork as outlines in the layer colour.
     pub outline: bool,
+    /// Animate's Highlight Layer: a colour the user picks to pick this layer
+    /// out in the timeline and Layers panel, independent of `color` (which is
+    /// assigned automatically and used for outline view). `None` means no
+    /// highlight, and is the default for every layer.
+    pub highlight: Option<Color>,
+    /// **Ignore lights**: the scene's lights neither shade this layer nor make
+    /// it throw a cast shadow. For captions, title cards and other overlays
+    /// that sit on the screen rather than in the world. `false` for every layer
+    /// of every older document.
+    pub unlit: bool,
+    /// **Cast shadow**: whether this layer throws a cast shadow under the
+    /// scene's lights. A layer with it off is still shaded, tinted and rimmed
+    /// like any lit layer — only the shadow it would lay on the ground is
+    /// left out (set pieces: a hut or a tree far behind the cast should not
+    /// paint a long dark streak across the foreground). For a layer-rig
+    /// group, the root layer's switch decides for the whole group. `true`
+    /// for every layer of every older document.
+    pub casts_shadow: bool,
     /// How solid this layer is drawn **while working**, `0.0`–`1.0`.
     ///
     /// Animate's layer transparency, and like Animate's it is an authoring aid
@@ -204,6 +223,12 @@ pub struct Layer {
     /// Hiding a layer is a different thing and stays a different thing:
     /// [`Self::visible`] takes it out of the export too.
     pub alpha: f64,
+    /// Whole-layer colour adjustment, applied after artwork and masks.
+    pub brightness: f32,
+    pub tint: Color,
+    pub tint_amount: f32,
+    /// Blend used when the isolated layer surface is composited into the scene.
+    pub blend: Blend,
     /// Tint used for outline view and selection highlights.
     pub color: Color,
     pub height: LayerHeight,
@@ -275,7 +300,14 @@ impl Layer {
             visible: true,
             locked: false,
             outline: false,
+            highlight: None,
+            unlit: false,
+            casts_shadow: true,
             alpha: 1.0,
+            brightness: 0.0,
+            tint: Color::WHITE,
+            tint_amount: 0.0,
+            blend: Blend::Normal,
             height: LayerHeight::Normal,
             // On the focal plane, so a new layer is unaffected by perspective.
             depth: 0.0,
@@ -283,6 +315,19 @@ impl Layer {
             filters: Vec::new(),
             frames: LayerTimeline::new(),
         }
+    }
+
+    pub fn color_effect(&self) -> ColorTransform {
+        ColorTransform::brightness(self.brightness)
+            .compose(&ColorTransform::tint(self.tint, self.tint_amount))
+    }
+
+    pub fn has_layer_effects(&self) -> bool {
+        self.alpha != 1.0
+            || self.brightness != 0.0
+            || self.tint_amount != 0.0
+            || self.blend != Blend::Normal
+            || !self.filters.is_empty()
     }
 
     pub fn normal(id: LayerId, name: impl Into<String>) -> Self {
@@ -359,6 +404,37 @@ impl Layer {
         self.all_objects()
             .map(|o| o.bounds())
             .reduce(|a, b| a.union(b))
+    }
+}
+
+#[cfg(test)]
+mod layer_effect_tests {
+    use super::*;
+
+    #[test]
+    fn neutral_layer_effects_take_fast_path_and_each_control_enables_it() {
+        let mut layer = Layer::normal(LayerId(1), "Effects");
+        assert!(!layer.has_layer_effects());
+        layer.alpha = 0.5;
+        assert!(layer.has_layer_effects());
+        layer.alpha = 1.0;
+        layer.tint_amount = 0.25;
+        assert!(layer.has_layer_effects());
+        layer.tint_amount = 0.0;
+        layer.blend = Blend::Overlay;
+        assert!(layer.has_layer_effects());
+    }
+
+    #[test]
+    fn layer_tint_and_brightness_compose_as_one_color_transform() {
+        let mut layer = Layer::normal(LayerId(1), "Effects");
+        layer.brightness = 0.2;
+        layer.tint = Color::from_rgb8(255, 0, 0);
+        layer.tint_amount = 0.5;
+        assert_eq!(
+            layer.color_effect(),
+            ColorTransform::brightness(0.2).compose(&ColorTransform::tint(layer.tint, 0.5))
+        );
     }
 }
 
@@ -495,6 +571,47 @@ impl LayerStack {
         true
     }
 
+    /// **Is this layer's row hidden because an ancestor folder is
+    /// collapsed?** I2: collapsing a folder hides its children's *rows* in
+    /// the timeline and Layers panel, but never what is drawn on stage — that
+    /// is [`Self::is_effectively_visible`], deliberately untouched by
+    /// `collapsed`. See `docs/INTERACTION_FIXES_PLAN.md` I2.
+    ///
+    /// Checks ancestors only, not `id` itself: a collapsed folder's own row
+    /// always stays put, with its disclosure triangle, so it can be expanded
+    /// again.
+    pub fn is_row_hidden(&self, id: LayerId) -> bool {
+        let Some(mut layer) = self.get(id) else {
+            return false;
+        };
+        // Bounded by the layer count, the same guard `is_effectively_visible`
+        // uses against a corrupt parent cycle.
+        for _ in 0..self.layers.len() {
+            let Some(parent_id) = layer.parent else {
+                return false;
+            };
+            let Some(parent) = self.get(parent_id) else {
+                return false;
+            };
+            if parent.collapsed {
+                return true;
+            }
+            layer = parent;
+        }
+        false
+    }
+
+    /// Layer ids in stack order, skipping every row [`Self::is_row_hidden`]
+    /// hides — the order Shift+click sweeps a range across in the timeline
+    /// and Layers panel (I1), and what the two panels actually draw (I2).
+    pub fn visible_row_order(&self) -> Vec<LayerId> {
+        self.layers
+            .iter()
+            .map(|l| l.id)
+            .filter(|&id| !self.is_row_hidden(id))
+            .collect()
+    }
+
     // -- layer parenting ------------------------------------------------------
 
     /// What a layer's artwork inherits from the layer it follows.
@@ -517,7 +634,9 @@ impl LayerStack {
         // Bounded by the layer count: a corrupt file can hold a follow cycle,
         // and this must terminate rather than hang the renderer.
         for _ in 0..self.layers.len() {
-            let Some((Some(next), bone)) = current else { break };
+            let Some((Some(next), bone)) = current else {
+                break;
+            };
             if chain.iter().any(|(seen, _)| *seen == next) {
                 break;
             }
@@ -612,6 +731,32 @@ impl LayerStack {
         now * rest.inverse()
     }
 
+    /// [`crate::timeline::LayerTimeline::resolved_at`] for `id`, but — Phase
+    /// A3 — interpolated in its rig parent's own space when it has one.
+    ///
+    /// A rigged child's keyframes are `P_rest · C_rel(f)` (`bake_rig_offsets`
+    /// in `buzz-import-xfl`, and the same convention this crate's own layer
+    /// parenting keeps). Interpolating that stored product directly, as
+    /// `resolved_at` does on its own, is only the same as interpolating
+    /// `C_rel` when `P_rest` is a similarity — a plain rotation and uniform
+    /// scale. This passes `P_rest` through so a shearing or non-uniformly
+    /// scaled parent's child still tweens as `C_rel` was drawn, not as the
+    /// baked product happens to decompose.
+    pub fn resolved_at_rigged(
+        &self,
+        id: LayerId,
+        at: impl crate::time::AtTime,
+    ) -> crate::timeline::ResolvedFrame<'_> {
+        let Some(layer) = self.get(id) else {
+            return crate::timeline::ResolvedFrame::Stored(&[]);
+        };
+        let frame_of_reference = layer
+            .follows
+            .and_then(|parent| self.get(parent))
+            .and_then(|parent| parent.rest_pose);
+        layer.frames.resolved_at_with_reference(at, frame_of_reference)
+    }
+
     /// May `layer` follow `target` without making a cycle?
     ///
     /// A cycle would be a layer that follows itself through some chain, and the
@@ -643,6 +788,49 @@ impl LayerStack {
             .collect()
     }
 
+    /// **Which layer rig each layer belongs to**: every layer in a follow tree
+    /// of two or more layers, mapped to the tree's root (the layer at the top
+    /// of its follow chain, which follows nothing). A layer that neither
+    /// follows nor is followed is not in the map, so a document with no layer
+    /// parenting gets an empty map and nothing else.
+    ///
+    /// The tree is found the way `buzz_act::layer_rig::rig_of_layer` finds it —
+    /// up the follow chain to the top — so the renderer can treat a layer rig
+    /// as one character (one cast shadow). One pass over the stack: ask it
+    /// once per frame, not once per layer.
+    pub fn follow_roots(&self) -> std::collections::HashMap<LayerId, LayerId> {
+        let mut roots = std::collections::HashMap::new();
+        if !self.layers.iter().any(|l| l.follows.is_some()) {
+            return roots;
+        }
+        let ids: std::collections::HashSet<LayerId> = self.layers.iter().map(|l| l.id).collect();
+        let up: std::collections::HashMap<LayerId, LayerId> = self
+            .layers
+            .iter()
+            .filter_map(|l| {
+                l.follows
+                    .filter(|f| *f != l.id && ids.contains(f))
+                    .map(|f| (l.id, f))
+            })
+            .collect();
+        for layer in self.layers.iter() {
+            if !up.contains_key(&layer.id) {
+                continue;
+            }
+            let mut top = layer.id;
+            // Bounded by the layer count, against a follow cycle in a corrupt file.
+            for _ in 0..self.layers.len() {
+                match up.get(&top) {
+                    Some(next) if *next != layer.id => top = *next,
+                    _ => break,
+                }
+            }
+            roots.insert(layer.id, top);
+            roots.insert(top, top);
+        }
+        roots
+    }
+
     /// Locked directly, or inside a locked folder.
     pub fn is_effectively_locked(&self, id: LayerId) -> bool {
         let Some(mut layer) = self.get(id) else {
@@ -664,6 +852,112 @@ impl LayerStack {
             layer = parent;
         }
         false
+    }
+
+    /// Is `id` filed inside `folder` — directly, or through any number of
+    /// enclosing folders? Bounded by the layer count, so a corrupt parent
+    /// cycle cannot hang, the same guard [`Self::is_effectively_visible`] and
+    /// [`Self::is_effectively_locked`] use.
+    fn is_inside(&self, id: LayerId, folder: LayerId) -> bool {
+        let mut current = self.get(id).and_then(|l| l.parent);
+        for _ in 0..self.layers.len() {
+            match current {
+                Some(p) if p == folder => return true,
+                Some(p) => current = self.get(p).and_then(|l| l.parent),
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Every layer nested under `folder`, at any depth — unlike
+    /// [`Self::children_of`], which is direct children only. Used to cascade a
+    /// folder's own switches (show/hide, lock, outline) onto everything it
+    /// holds, and to move a folder's whole block in [`Self::move_to`].
+    pub fn descendants_of(&self, folder: LayerId) -> Vec<LayerId> {
+        self.layers
+            .iter()
+            .filter(|l| self.is_inside(l.id, folder))
+            .map(|l| l.id)
+            .collect()
+    }
+
+    /// **Moves `id` — and everything filed under it, kept in their existing
+    /// relative order — to sit at `index`, filing the whole block under
+    /// `parent`.** This is the drag the timeline's layer names offer:
+    /// dropping a layer into a folder, out of one, or elsewhere in the stack
+    /// takes its contents with it, exactly as Animate's own drag does.
+    ///
+    /// `index` is read against the stack **as it is now**, before the move —
+    /// the row the timeline's drop indicator points at — not against the
+    /// stack with the block already removed.
+    ///
+    /// Refuses (returns `false`, changes nothing):
+    /// - filing a folder into itself or one of its own descendants, which
+    ///   would be a cycle with nothing sensible to draw;
+    /// - a `parent` that is not a [`LayerKind::Folder`] (`None`, the top
+    ///   level, is always allowed).
+    pub fn move_to(&mut self, id: LayerId, index: usize, parent: Option<LayerId>) -> bool {
+        if self.get(id).is_none() {
+            return false;
+        }
+        if let Some(p) = parent {
+            if p == id || self.is_inside(p, id) {
+                return false;
+            }
+            match self.get(p) {
+                Some(layer) if layer.kind == LayerKind::Folder => {}
+                _ => return false,
+            }
+        }
+
+        // The block being moved: `id` and everything nested under it, in
+        // their current relative order.
+        let in_block: Vec<bool> = self
+            .layers
+            .iter()
+            .map(|l| l.id == id || self.is_inside(l.id, id))
+            .collect();
+        // How many of the block's own members sit before the drop row:
+        // removing them shifts everything after left by that many, so the
+        // row the block is dropped in front of is not where it lands without
+        // this correction.
+        let before = in_block
+            .iter()
+            .take(index.min(in_block.len()))
+            .filter(|b| **b)
+            .count();
+
+        let layers = Arc::make_mut(&mut self.layers);
+        let mut moved: Vec<Arc<Layer>> = Vec::new();
+        let mut rest: Vec<Arc<Layer>> = Vec::with_capacity(layers.len());
+        for (layer, block) in layers.drain(..).zip(in_block) {
+            if block {
+                moved.push(layer);
+            } else {
+                rest.push(layer);
+            }
+        }
+        if moved.is_empty() {
+            // `id` cannot have vanished — it was confirmed present above —
+            // but this leaves the stack whole rather than silently emptying
+            // it if it somehow did.
+            *layers = rest;
+            return false;
+        }
+        // File the dragged layer under its new parent. Everything else in
+        // the block keeps whatever parent it already had inside it — a
+        // folder's contents do not re-parent themselves just because the
+        // folder moved.
+        for layer in moved.iter_mut() {
+            if layer.id == id {
+                Arc::make_mut(layer).parent = parent;
+            }
+        }
+        let at = index.saturating_sub(before).min(rest.len());
+        rest.splice(at..at, moved);
+        *layers = rest;
+        true
     }
 
     /// Resolve which layers each mask clips.
@@ -1046,6 +1340,70 @@ mod tests {
         );
     }
 
+    /// I2: collapsing a folder hides its children's *rows*, but must never
+    /// touch what is drawn on stage — collapse is not the same thing as hide.
+    #[test]
+    fn collapsing_a_folder_hides_rows_but_not_the_stage() {
+        let mut s = LayerStack::new();
+        s.push_front(Layer::new(LayerId(1), "Folder", LayerKind::Folder));
+        let mut child = Layer::normal(LayerId(2), "Inside");
+        child.parent = Some(LayerId(1));
+        s.insert(1, child);
+
+        assert!(!s.is_row_hidden(LayerId(1)), "the folder's own row stays put");
+        assert!(!s.is_row_hidden(LayerId(2)));
+        assert!(s.is_effectively_visible(LayerId(2)));
+
+        s.update(LayerId(1), |l| l.collapsed = true);
+        assert!(
+            s.is_row_hidden(LayerId(2)),
+            "a collapsed folder's child row must be hidden"
+        );
+        assert!(
+            !s.is_row_hidden(LayerId(1)),
+            "the collapsed folder's own row is never hidden"
+        );
+        assert!(
+            s.is_effectively_visible(LayerId(2)),
+            "collapse must not affect what is drawn on stage"
+        );
+    }
+
+    /// Nested folders: collapsing the outer one hides everything inside the
+    /// inner one too, even though the inner folder is not itself collapsed.
+    #[test]
+    fn collapsing_a_folder_hides_nested_grandchildren() {
+        let mut s = LayerStack::new();
+        s.push_front(Layer::new(LayerId(1), "Outer", LayerKind::Folder));
+        let mut inner = Layer::new(LayerId(2), "Inner", LayerKind::Folder);
+        inner.parent = Some(LayerId(1));
+        s.insert(1, inner);
+        let mut leaf = Layer::normal(LayerId(3), "Leaf");
+        leaf.parent = Some(LayerId(2));
+        s.insert(2, leaf);
+
+        assert_eq!(
+            s.visible_row_order(),
+            vec![LayerId(1), LayerId(2), LayerId(3)]
+        );
+
+        s.update(LayerId(1), |l| l.collapsed = true);
+        assert_eq!(
+            s.visible_row_order(),
+            vec![LayerId(1)],
+            "collapsing the outer folder hides the inner folder and its own child"
+        );
+
+        // Expanding it again restores every row — collapse is view state,
+        // not a change to the document's contents.
+        s.update(LayerId(1), |l| l.collapsed = false);
+        assert_eq!(
+            s.visible_row_order(),
+            vec![LayerId(1), LayerId(2), LayerId(3)],
+            "expanding the folder restores its rows"
+        );
+    }
+
     #[test]
     fn locking_a_folder_locks_its_children() {
         let mut s = LayerStack::new();
@@ -1274,5 +1632,63 @@ mod tests {
         let mut found = s.followers_of(LayerId(1));
         found.sort_by_key(|l| l.0);
         assert_eq!(found, vec![LayerId(2), LayerId(3)]);
+    }
+
+    /// **Dropping a layer into a folder files it and its own contents with
+    /// it**, in one contiguous block — the timeline's own drag, F1.
+    #[test]
+    fn moving_a_layer_into_a_folder_brings_its_children_with_it() {
+        let mut s = LayerStack::new();
+        // Front to back: Above, Moved (a folder), its Child, Target (a folder).
+        s.push_front(Layer::new(LayerId(4), "Target", LayerKind::Folder));
+        let mut child = Layer::normal(LayerId(2), "Child");
+        child.parent = Some(LayerId(3));
+        s.push_front(child);
+        s.push_front(Layer::new(LayerId(3), "Moved", LayerKind::Folder));
+        s.push_front(Layer::normal(LayerId(1), "Above"));
+        // Stack is now: Above, Moved, Child, Target.
+
+        // One past Target's own row — "drop below/into Target" — the same
+        // index the timeline's drop-zone decision hands `move_to`.
+        assert!(s.move_to(LayerId(3), 4, Some(LayerId(4))));
+        let order: Vec<LayerId> = s.iter().map(|l| l.id).collect();
+        assert_eq!(
+            order,
+            vec![LayerId(1), LayerId(4), LayerId(3), LayerId(2)],
+            "the moved folder and its child land together, after the target, \
+             and keep their own relative order"
+        );
+        assert_eq!(s.get(LayerId(3)).unwrap().parent, Some(LayerId(4)));
+        assert_eq!(
+            s.get(LayerId(2)).unwrap().parent,
+            Some(LayerId(3)),
+            "a child's own parent link is untouched by the move"
+        );
+        assert_eq!(s.descendants_of(LayerId(4)), vec![LayerId(3), LayerId(2)]);
+    }
+
+    /// A folder cannot be filed into itself, nor into one of its own
+    /// descendants — both would be a cycle with nothing sensible to draw.
+    #[test]
+    fn moving_a_folder_into_itself_or_its_own_child_is_refused() {
+        let mut s = LayerStack::new();
+        s.push_front(Layer::new(LayerId(1), "Folder", LayerKind::Folder));
+        let mut child = Layer::new(LayerId(2), "Nested", LayerKind::Folder);
+        child.parent = Some(LayerId(1));
+        s.push_front(child);
+        let before = s.clone();
+
+        assert!(!s.move_to(LayerId(1), 0, Some(LayerId(1))));
+        assert!(!s.move_to(LayerId(1), 0, Some(LayerId(2))));
+        assert_eq!(s, before, "a refused move changes nothing");
+    }
+
+    /// The target of a move must be a folder, or the top level (`None`).
+    #[test]
+    fn moving_a_layer_into_a_non_folder_is_refused() {
+        let mut s = LayerStack::new();
+        s.push_front(Layer::normal(LayerId(1), "Not a folder"));
+        s.push_front(Layer::normal(LayerId(2), "Moved"));
+        assert!(!s.move_to(LayerId(2), 0, Some(LayerId(1))));
     }
 }

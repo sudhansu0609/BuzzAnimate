@@ -55,7 +55,10 @@ pub struct FontStyle {
 }
 
 impl FontStyle {
-    pub const REGULAR: FontStyle = FontStyle { bold: false, italic: false };
+    pub const REGULAR: FontStyle = FontStyle {
+        bold: false,
+        italic: false,
+    };
 
     pub fn new(bold: bool, italic: bool) -> Self {
         Self { bold, italic }
@@ -264,7 +267,11 @@ pub fn outline_styled(
     };
     let widest = widths.iter().copied().fold(0.0f64, f64::max);
 
-    let mut pen = OutlineToPath { path: BezPath::new(), origin_x: 0.0, origin_y: 0.0 };
+    let mut pen = OutlineToPath {
+        path: BezPath::new(),
+        origin_x: 0.0,
+        origin_y: 0.0,
+    };
     for (line_index, line) in lines.iter().enumerate() {
         let baseline = line_index as f64 * line_height;
         let mut cursor_x = align.offset(widths[line_index], widest);
@@ -280,6 +287,383 @@ pub fn outline_styled(
     }
 
     (!pen.path.elements().is_empty()).then_some(pen.path)
+}
+
+/// **One shaped cluster** of a line: the smallest piece of text that can be
+/// drawn on its own without breaking the script — a Latin letter, or a whole
+/// Devanagari syllable with its conjuncts and matras. See [`outline_clusters`].
+#[derive(Debug, Clone)]
+pub struct GlyphCluster {
+    /// Byte range of the cluster in the `content` passed in.
+    pub range: std::ops::Range<usize>,
+    /// Which line (split on `\n`) it sits on.
+    pub line: usize,
+    /// Its outlines, placed exactly where [`outline_styled`] draws them. Empty
+    /// for a space.
+    pub path: BezPath,
+    /// Where the pen stood when the cluster began, and how far it moved.
+    pub x: f64,
+    pub advance: f64,
+}
+
+impl GlyphCluster {
+    /// The text the cluster draws.
+    pub fn text<'a>(&self, content: &'a str) -> &'a str {
+        &content[self.range.clone()]
+    }
+
+    /// Whether this cluster is blank space.
+    pub fn is_space(&self, content: &str) -> bool {
+        self.text(content).chars().all(char::is_whitespace)
+    }
+}
+
+/// A Devanagari combining sign (matra, nukta, candrabindu, anusvara, visarga,
+/// virama, stress marks): never the start of a unit of its own.
+fn is_devanagari_mark(c: char) -> bool {
+    matches!(c as u32,
+        0x0900..=0x0903 | 0x093A..=0x093C | 0x093E..=0x094F | 0x0951..=0x0957 | 0x0962..=0x0963)
+}
+
+/// **The outlines of `content`, one piece per shaped cluster.**
+///
+/// The same layout as [`outline_styled`] (same shaping, same pen, same line
+/// stacking and alignment), so drawing every cluster's path at the origin
+/// gives exactly the whole string's picture. The clusters come from the
+/// **shaping**: glyphs are grouped by the cluster the shaper assigned them,
+/// which keeps a reordered matra (ि) with the consonant it is drawn before
+/// and a ligated conjunct (क्ष) whole. On top of that, a cluster that ends in
+/// a virama or a joiner is merged with the next, and one that begins with a
+/// combining sign is merged into the one before — so a half-form conjunct
+/// whose glyphs the font left in separate clusters is never split either.
+///
+/// Empty if there is no font or no text.
+pub fn outline_clusters(
+    content: &str,
+    size_px: f64,
+    font: Option<&str>,
+    style: FontStyle,
+    align: TextAlign,
+) -> Vec<GlyphCluster> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let Some(data) = resolve_font(font, style) else {
+        return Vec::new();
+    };
+    let Ok(font_ref) = FontRef::from_index(data.bytes(), data.index) else {
+        return Vec::new();
+    };
+    let size = Size::new(size_px as f32);
+    let location = LocationRef::default();
+    let glyphs = font_ref.outline_glyphs();
+    let shaper_data = ShaperData::new(&font_ref);
+    let shaper = shaper_data.shaper(&font_ref).build();
+    let scale = size_px / shaper.units_per_em() as f64;
+    let line_height = size_px * LINE_SPACING;
+
+    let lines: Vec<&str> = content.split('\n').collect();
+    let widths: Vec<f64> = lines
+        .iter()
+        .map(|line| {
+            shape_line(&shaper, line)
+                .glyph_positions()
+                .iter()
+                .map(|pos| pos.x_advance as f64 * scale)
+                .sum::<f64>()
+        })
+        .collect();
+    let widest = widths.iter().copied().fold(0.0f64, f64::max);
+
+    let mut out: Vec<GlyphCluster> = Vec::new();
+    let mut line_start = 0usize;
+    for (line_index, line) in lines.iter().enumerate() {
+        let baseline = line_index as f64 * line_height;
+        let mut cursor_x = align.offset(widths[line_index], widest);
+        let shaped = shape_line(&shaper, line);
+
+        // Every cluster start the shaper reported, in text order, and the
+        // glyphs drawn for each.
+        let mut starts: Vec<usize> = shaped
+            .glyph_infos()
+            .iter()
+            .map(|i| i.cluster as usize)
+            .filter(|&c| c < line.len())
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        if starts.first() != Some(&0) && !line.is_empty() {
+            starts.insert(0, 0);
+        }
+        let mut pieces: Vec<GlyphCluster> = starts
+            .iter()
+            .enumerate()
+            .map(|(k, &s)| GlyphCluster {
+                range: s..starts.get(k + 1).copied().unwrap_or(line.len()),
+                line: line_index,
+                path: BezPath::new(),
+                x: f64::INFINITY,
+                advance: 0.0,
+            })
+            .collect();
+        for (info, pos) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
+            let at = starts
+                .partition_point(|&s| s <= info.cluster as usize)
+                .saturating_sub(1);
+            if let Some(piece) = pieces.get_mut(at) {
+                let mut pen = OutlineToPath {
+                    path: std::mem::take(&mut piece.path),
+                    origin_x: cursor_x + pos.x_offset as f64 * scale,
+                    origin_y: baseline - pos.y_offset as f64 * scale,
+                };
+                if let Some(glyph) = glyphs.get(GlyphId::new(info.glyph_id)) {
+                    let _ = glyph.draw(DrawSettings::unhinted(size, location), &mut pen);
+                }
+                piece.path = pen.path;
+                piece.x = piece.x.min(cursor_x);
+                piece.advance += pos.x_advance as f64 * scale;
+            }
+            cursor_x += pos.x_advance as f64 * scale;
+        }
+
+        // Never split a conjunct or a matra, whatever the font did.
+        let mut merged: Vec<GlyphCluster> = Vec::new();
+        for piece in pieces {
+            let text = &line[piece.range.clone()];
+            let joins_back = text.chars().next().is_some_and(|c| {
+                is_devanagari_mark(c) || c == '\u{200D}' || c == '\u{200C}'
+            });
+            let joins_on = merged.last().is_some_and(|prev: &GlyphCluster| {
+                line[prev.range.clone()]
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c == '\u{094D}' || c == '\u{200D}')
+            });
+            match merged.last_mut() {
+                Some(prev) if (joins_back || joins_on) && !text.starts_with(char::is_whitespace) => {
+                    prev.range.end = piece.range.end;
+                    prev.path.extend(piece.path.elements().iter().copied());
+                    prev.x = prev.x.min(piece.x);
+                    prev.advance += piece.advance;
+                }
+                _ => merged.push(piece),
+            }
+        }
+        for mut piece in merged {
+            if !piece.x.is_finite() {
+                piece.x = cursor_x;
+            }
+            piece.range = piece.range.start + line_start..piece.range.end + line_start;
+            out.push(piece);
+        }
+        line_start += line.len() + 1;
+    }
+    out
+}
+
+/// **One contiguous, single-style piece of text** for [`outline_runs`] to lay
+/// out — already resolved against whatever base a caller is filling gaps
+/// from. Char-indexed into the text's `content` (`chars()` indices,
+/// half-open), the same convention as `buzz_scene::TextData::runs`.
+///
+/// This is a *view* the caller builds, not a run itself: a run only records
+/// where it differs from the base, while a span here already knows the face
+/// and size it draws in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextSpan {
+    pub start: usize,
+    pub end: usize,
+    pub size: f64,
+    pub font: Option<String>,
+    pub style: FontStyle,
+}
+
+/// **The outlines of `content`, laid out per-character-styled** rather than
+/// uniformly — one [`BezPath`] per piece, tagged with which element of
+/// `spans` it came from.
+///
+/// `spans`, if not empty, must be sorted, non-overlapping and cover the whole
+/// of `content` — building that partition from `TextData::runs` and its base
+/// look (filling every gap between runs with the base) is the caller's job,
+/// because only the caller knows what colour each piece should be painted.  An
+/// **empty** `spans` lays out the whole string in `size_px`/`font`/`style`
+/// instead, which is what makes a single span covering everything in that
+/// same look produce **exactly** the picture [`outline_styled`] would — the
+/// parity a plain, unstyled text object relies on to look the same whichever
+/// function drew it.
+///
+/// Spans are laid out sequentially along a shared baseline per line, each
+/// shaped in its own face and size (advance = that span's own measured
+/// width); a line's height is the tallest span drawn on it. The returned
+/// `usize` is the position in `spans` the piece came from (`0` for every
+/// piece when `spans` was empty), so the caller can gather the pieces of one
+/// span into one shape and paint it in that span's own colour — a span that
+/// crosses a line break contributes more than one piece, all tagged with the
+/// same index.
+pub fn outline_runs(
+    content: &str,
+    size_px: f64,
+    font: Option<&str>,
+    style: FontStyle,
+    align: TextAlign,
+    spans: &[TextSpan],
+) -> Vec<(BezPath, usize)> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<char> = content.chars().collect();
+
+    // An empty `spans` behaves exactly like `outline_styled`: one span, in
+    // the base look, covering everything.
+    let fallback = [TextSpan {
+        start: 0,
+        end: chars.len(),
+        size: size_px,
+        font: font.map(str::to_string),
+        style,
+    }];
+    let spans: &[TextSpan] = if spans.is_empty() { &fallback } else { spans };
+
+    // Line boundaries in the same char indices as `spans`, excluding the
+    // newline itself (it still occupies one slot in the index space, which is
+    // what the `+ 1` below accounts for).
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0usize;
+    for line in content.split('\n') {
+        let len = line.chars().count();
+        lines.push((at, at + len));
+        at += len + 1;
+    }
+
+    // Every drawable piece: which line it is on, its own text, its style, and
+    // which span it came from — spans are visited in order, so pieces land in
+    // reading order within each line.
+    struct Piece<'a> {
+        line: usize,
+        text: String,
+        size: f64,
+        font: Option<&'a str>,
+        style: FontStyle,
+        span: usize,
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    for (line_index, &(line_start, line_end)) in lines.iter().enumerate() {
+        for (span_index, span) in spans.iter().enumerate() {
+            let start = span.start.max(line_start);
+            let end = span.end.min(line_end);
+            if start >= end {
+                continue;
+            }
+            pieces.push(Piece {
+                line: line_index,
+                text: chars[start..end].iter().collect(),
+                size: span.size,
+                font: span.font.as_deref(),
+                style: span.style,
+                span: span_index,
+            });
+        }
+    }
+
+    // Each line's height is set by its tallest span (falling back to the base
+    // size for a line with nothing on it), and lines stack directly under one
+    // another exactly as `outline_styled` stacks its own uniform lines.
+    let line_height: Vec<f64> = (0..lines.len())
+        .map(|i| {
+            let tallest = pieces
+                .iter()
+                .filter(|p| p.line == i)
+                .map(|p| p.size)
+                .fold(0.0f64, f64::max);
+            (if tallest > 0.0 { tallest } else { size_px }) * LINE_SPACING
+        })
+        .collect();
+    let baseline: Vec<f64> = {
+        let mut acc = 0.0;
+        line_height
+            .iter()
+            .map(|h| {
+                let b = acc;
+                acc += h;
+                b
+            })
+            .collect()
+    };
+
+    // Each line's width, for alignment — each span measured in its own face
+    // and size, the way it will actually be drawn.
+    let line_width: Vec<f64> = (0..lines.len())
+        .map(|i| {
+            pieces
+                .iter()
+                .filter(|p| p.line == i)
+                .map(|p| piece_width(&p.text, p.size, p.font, p.style))
+                .sum()
+        })
+        .collect();
+    let widest = line_width.iter().copied().fold(0.0f64, f64::max);
+
+    let mut out: Vec<(BezPath, usize)> = Vec::new();
+    let mut current_line = usize::MAX;
+    let mut cursor_x = 0.0f64;
+    for piece in &pieces {
+        if piece.line != current_line {
+            current_line = piece.line;
+            cursor_x = align.offset(line_width[current_line], widest);
+        }
+        let Some(data) = resolve_font(piece.font, piece.style) else {
+            continue;
+        };
+        let Ok(font_ref) = FontRef::from_index(data.bytes(), data.index) else {
+            continue;
+        };
+        let size = Size::new(piece.size as f32);
+        let location = LocationRef::default();
+        let glyphs = font_ref.outline_glyphs();
+        let shaper_data = ShaperData::new(&font_ref);
+        let shaper = shaper_data.shaper(&font_ref).build();
+        let scale = piece.size / shaper.units_per_em() as f64;
+        let baseline_y = baseline[piece.line];
+        let shaped = shape_line(&shaper, &piece.text);
+
+        let mut pen = OutlineToPath {
+            path: BezPath::new(),
+            origin_x: 0.0,
+            origin_y: 0.0,
+        };
+        for (info, pos) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
+            pen.origin_x = cursor_x + pos.x_offset as f64 * scale;
+            pen.origin_y = baseline_y - pos.y_offset as f64 * scale;
+            if let Some(glyph) = glyphs.get(GlyphId::new(info.glyph_id)) {
+                let _ = glyph.draw(DrawSettings::unhinted(size, location), &mut pen);
+            }
+            cursor_x += pos.x_advance as f64 * scale;
+        }
+        if !pen.path.elements().is_empty() {
+            out.push((pen.path, piece.span));
+        }
+    }
+    out
+}
+
+/// The advance width of `text` set in its own face and size — one span's
+/// share of a line, measured the same way [`measure_styled`] measures a whole
+/// line.
+fn piece_width(text: &str, size_px: f64, font: Option<&str>, style: FontStyle) -> f64 {
+    let Some(data) = resolve_font(font, style) else {
+        return 0.0;
+    };
+    let Ok(font_ref) = FontRef::from_index(data.bytes(), data.index) else {
+        return 0.0;
+    };
+    let shaper_data = ShaperData::new(&font_ref);
+    let shaper = shaper_data.shaper(&font_ref).build();
+    let scale = size_px / shaper.units_per_em() as f64;
+    shape_line(&shaper, text)
+        .glyph_positions()
+        .iter()
+        .map(|pos| pos.x_advance as f64 * scale)
+        .sum()
 }
 
 /// The bounding advance width and total height of `content` at `size_px` in the
@@ -417,11 +801,17 @@ fn resolve_font(name: Option<&str>, style: FontStyle) -> Option<ResolvedFont> {
             .or_else(|| of_family().next());
         if let Some(face) = face {
             if let Some(bytes) = load_bytes(&face.path) {
-                return Some(ResolvedFont { data: FontData::Shared(bytes), index: face.index });
+                return Some(ResolvedFont {
+                    data: FontData::Shared(bytes),
+                    index: face.index,
+                });
             }
         }
     }
-    default_font().map(|b| ResolvedFont { data: FontData::Static(b), index: 0 })
+    default_font().map(|b| ResolvedFont {
+        data: FontData::Static(b),
+        index: 0,
+    })
 }
 
 /// Read a font file once and keep its bytes for the process, so re-editing text
@@ -540,7 +930,10 @@ fn collect_dir(dir: &Path, out: &mut Vec<FontFace>, depth: usize) {
 /// True for `.ttf` / `.otf` / `.ttc` files, case-insensitively.
 fn is_font_file(path: &Path) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref(),
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
         Some("ttf" | "otf" | "ttc")
     )
 }
@@ -610,7 +1003,10 @@ mod tests {
         };
         assert!(!path.elements().is_empty(), "outline produced no geometry");
         let bb = path.bounding_box();
-        assert!(bb.width() > 0.0 && bb.height() > 0.0, "text has no extent: {bb:?}");
+        assert!(
+            bb.width() > 0.0 && bb.height() > 0.0,
+            "text has no extent: {bb:?}"
+        );
     }
 
     #[test]
@@ -626,7 +1022,10 @@ mod tests {
             eprintln!("skipping: no system font found");
             return;
         }
-        assert!(wide > thin, "'wwww' ({wide}) should be wider than 'i' ({thin})");
+        assert!(
+            wide > thin,
+            "'wwww' ({wide}) should be wider than 'i' ({thin})"
+        );
     }
 
     #[test]
@@ -637,7 +1036,10 @@ mod tests {
             // No font: measure returned the (0, size_px) fallback for both.
             return;
         }
-        assert!(three > one, "three lines ({three}) should be taller than one ({one})");
+        assert!(
+            three > one,
+            "three lines ({three}) should be taller than one ({one})"
+        );
     }
 
     #[test]
@@ -648,9 +1050,17 @@ mod tests {
         };
         // "नमस्ते" — has a matra and a conjunct, so it only renders right if the
         // text is actually shaped rather than laid out codepoint by codepoint.
-        let path = outline("\u{0928}\u{092E}\u{0938}\u{094D}\u{0924}\u{0947}", 64.0, Some(&face.family));
+        let path = outline(
+            "\u{0928}\u{092E}\u{0938}\u{094D}\u{0924}\u{0947}",
+            64.0,
+            Some(&face.family),
+        );
         let path = path.expect("Hindi produced no outline");
-        assert!(!path.elements().is_empty(), "Hindi outline is empty in {:?}", face.family);
+        assert!(
+            !path.elements().is_empty(),
+            "Hindi outline is empty in {:?}",
+            face.family
+        );
     }
 
     #[test]
@@ -782,6 +1192,86 @@ mod style_tests {
         );
         if default_font().is_some() {
             assert!(drawn.is_some(), "it falls back rather than refusing");
+        }
+    }
+
+    /// A single, uniform span covering everything in the base look must draw
+    /// exactly the picture `outline_styled` would — that parity is what lets a
+    /// plain text object look the same whichever function drew it.
+    #[test]
+    fn a_single_uniform_span_matches_outline_styled() {
+        let text = "Wide line here\nshort";
+        let Some(plain) = outline_styled(text, 32.0, None, FontStyle::REGULAR, TextAlign::Centre)
+        else {
+            eprintln!("skipping: no font on this machine");
+            return;
+        };
+
+        let spans = [TextSpan {
+            start: 0,
+            end: text.chars().count(),
+            size: 32.0,
+            font: None,
+            style: FontStyle::REGULAR,
+        }];
+        let pieces = outline_runs(text, 32.0, None, FontStyle::REGULAR, TextAlign::Centre, &spans);
+        let mut combined = BezPath::new();
+        for (path, index) in &pieces {
+            assert_eq!(*index, 0, "there is only the one span");
+            combined.extend(path.elements().iter().copied());
+        }
+        assert_eq!(combined.to_svg(), plain.to_svg());
+
+        // An empty `spans` behaves the same way, using the base look.
+        let via_empty = outline_runs(text, 32.0, None, FontStyle::REGULAR, TextAlign::Centre, &[]);
+        let mut combined_empty = BezPath::new();
+        for (path, _) in &via_empty {
+            combined_empty.extend(path.elements().iter().copied());
+        }
+        assert_eq!(combined_empty.to_svg(), plain.to_svg());
+    }
+
+    /// Two spans of different sizes on one line each come back tagged with
+    /// their own index, laid side by side rather than overlapping.
+    #[test]
+    fn two_spans_lay_out_side_by_side_each_tagged_with_its_own_index() {
+        use buzz_geom::Shape as _;
+        let text = "Hi!";
+        let spans = [
+            TextSpan {
+                start: 0,
+                end: 2,
+                size: 32.0,
+                font: None,
+                style: FontStyle::REGULAR,
+            },
+            TextSpan {
+                start: 2,
+                end: 3,
+                size: 64.0,
+                font: None,
+                style: FontStyle::new(true, false),
+            },
+        ];
+        let pieces = outline_runs(text, 32.0, None, FontStyle::REGULAR, TextAlign::Left, &spans);
+        if pieces.is_empty() {
+            eprintln!("skipping: no font on this machine");
+            return;
+        }
+        let indices: Vec<usize> = pieces.iter().map(|(_, i)| *i).collect();
+        assert!(indices.contains(&0) && indices.contains(&1));
+
+        // The second span's piece sits to the right of the first's.
+        let first_bb = pieces
+            .iter()
+            .find(|(_, i)| *i == 0)
+            .map(|(p, _)| p.bounding_box());
+        let second_bb = pieces
+            .iter()
+            .find(|(_, i)| *i == 1)
+            .map(|(p, _)| p.bounding_box());
+        if let (Some(a), Some(b)) = (first_bb, second_bb) {
+            assert!(b.x0 >= a.x0, "the second span should start no earlier");
         }
     }
 }

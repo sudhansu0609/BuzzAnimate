@@ -12,7 +12,14 @@ use peniko::Color;
 
 fn editor_with_motion_tween() -> (Editor, LayerId) {
     let mut editor = Editor::default();
-    let layer = editor.doc.scene().layers().iter().next().expect("a layer").id;
+    let layer = editor
+        .doc
+        .scene()
+        .layers()
+        .iter()
+        .next()
+        .expect("a layer")
+        .id;
     editor.doc.edit("setup", |scene| {
         scene.add_shape(
             layer,
@@ -78,7 +85,10 @@ fn setting_a_curve_is_one_undo_step() {
         x2: 1.0,
         y2: 1.0,
     });
-    assert!(matches!(tween_at(&editor, layer, 3).easing, Easing::CubicBezier { .. }));
+    assert!(matches!(
+        tween_at(&editor, layer, 3).easing,
+        Easing::CubicBezier { .. }
+    ));
 
     editor.doc.undo();
     assert_eq!(

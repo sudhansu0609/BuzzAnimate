@@ -16,7 +16,11 @@ const BRIEF: &str = "Night. Ana walks in from the left.\n\
 #[test]
 fn a_brief_with_two_shots_makes_two_scenes() {
     let mut editor = Editor::default();
-    assert_eq!(editor.doc.scene_names().len(), 1, "a document starts with one");
+    assert_eq!(
+        editor.doc.scene_names().len(),
+        1,
+        "a document starts with one"
+    );
 
     let directed = editor.direct_sequence(BRIEF);
     assert_eq!(directed, 2, "both shots were directed");

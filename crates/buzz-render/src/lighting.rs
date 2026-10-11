@@ -90,6 +90,28 @@ struct Aim {
     direction: i32,
     /// Softness in steps of [`SOFTNESS_STEPS`].
     softness: i32,
+    /// **How square-on the light strikes**, `buzz_light`'s `lz` quantised to
+    /// steps of [`FACING_STEPS`] — what [`ShadeModel::Form`] shades from
+    /// instead of softness. `None` for the Crescent model, which never reads
+    /// it.
+    ///
+    /// **`Option`, not a bare `0` for Crescent.** A document switches model
+    /// live — the panel's own Model row — and the cache is not thrown away
+    /// when it does (see [`LightCache::begin`]'s own note): an entry already
+    /// built under Crescent for a given placement, direction and softness
+    /// stays in [`Slot::built`] exactly as it was. If Crescent's "no facing"
+    /// and Form's "a light exactly to the side" (`lz = 0.0`) both quantised to
+    /// the same bare `i8`, a Form request at that direction and softness
+    /// would find the stale Crescent entry already sitting under the key it
+    /// was about to ask for, and draw the old narrow band under the new model
+    /// forever — until something else moved the direction or softness enough
+    /// to miss. A sun levelled to `elevation = 0` for "a hard light straight
+    /// from the side" is the most natural way to hit exactly that point, not
+    /// a corner nobody reaches. `Option<i8>` keeps `None` and `Some(0)` apart,
+    /// so the two models never share a key.
+    ///
+    /// [`ShadeModel::Form`]: buzz_light::ShadeModel::Form
+    facing: Option<i8>,
 }
 
 /// How finely a light's direction is resolved: 512 steps round the circle is
@@ -101,6 +123,10 @@ const DIRECTION_STEPS: f64 = 512.0;
 /// How finely softness is resolved. It is a `0..=1` fraction of the shape.
 const SOFTNESS_STEPS: f64 = 256.0;
 
+/// How finely `lz` is resolved: `-1..=1` in steps of a thirty-second, which
+/// is far finer than the eye can tell one terminator width from the next.
+const FACING_STEPS: f64 = 32.0;
+
 /// How many directions one placement keeps geometry for before starting over.
 ///
 /// Small: this is a *drag* buffer, not a history. Twelve covers the few steps a
@@ -109,12 +135,17 @@ const SOFTNESS_STEPS: f64 = 256.0;
 const MAX_AIMS: usize = 12;
 
 impl Aim {
-    /// Round a direction and softness to the cache's steps.
-    fn of(towards: Vec2, softness: f64) -> Self {
+    /// Round a direction, an optional `lz` and a softness to the cache's
+    /// steps. `lz` is `Some` for [`ShadeModel::Form`] and `None` for the
+    /// Crescent model, which stays `None` — see [`Aim::facing`].
+    ///
+    /// [`ShadeModel::Form`]: buzz_light::ShadeModel::Form
+    fn of(towards: Vec2, lz: Option<f64>, softness: f64) -> Self {
         let step = std::f64::consts::TAU / DIRECTION_STEPS;
         Self {
             direction: (towards.atan2() / step).round() as i32,
             softness: (softness.clamp(0.0, 1.0) * SOFTNESS_STEPS).round() as i32,
+            facing: lz.map(|v| (v.clamp(-1.0, 1.0) * FACING_STEPS).round() as i8),
         }
     }
 
@@ -127,6 +158,12 @@ impl Aim {
 
     fn softness(self) -> f64 {
         self.softness as f64 / SOFTNESS_STEPS
+    }
+
+    /// The `lz` this rounds to, for a Form build. Meaningless — and never
+    /// read — for a Crescent one, where `facing` is `None`.
+    fn lz(self) -> f64 {
+        self.facing.unwrap_or(0) as f64 / FACING_STEPS
     }
 }
 
@@ -171,6 +208,12 @@ pub struct Miss {
     key: (Place, Aim),
     path: BezPath,
     owner: Arc<Object>,
+    /// **Which model this was queued under**: `Some(_)` builds
+    /// [`buzz_light::crescents_form`] (off the queued `Aim`'s own quantised
+    /// `lz` — [`Aim::lz`]), `None` builds [`buzz_light::crescents`]. Only the
+    /// discriminant is read; the value agrees with the queued `Aim`'s own
+    /// `facing.is_some()` by construction (see [`Aim::of`]).
+    lz: Option<f64>,
 }
 
 impl Miss {
@@ -180,11 +223,7 @@ impl Miss {
         let aim = self.key.1;
         Built {
             key: self.key,
-            geometry: Arc::new(buzz_light::crescents(
-                &self.path,
-                aim.towards(),
-                aim.softness(),
-            )),
+            geometry: Arc::new(build_geometry(&self.path, aim, self.lz)),
             owner: self.owner,
         }
     }
@@ -233,8 +272,23 @@ pub struct LightCache {
     /// path in it and on a hit there is nothing to build from them. See
     /// [`LightCache::ready`].
     collecting: Option<BezPath>,
+    /// **The filled paths a lit symbol stamp is being built from**, one entry
+    /// per shape exactly as [`add_silhouette`](Self::add_silhouette) received
+    /// it, in the stamp's own local space (`RIG_SCENE_LAG_PLAN` L3'').
+    ///
+    /// While this is `Some`, `add_silhouette` feeds it *instead of*
+    /// `collecting`: the build runs in the stamp's local space, and a figure
+    /// being gathered around it needs the stamp's paths placed in document
+    /// space, which [`add_stamp_silhouette`](Self::add_stamp_silhouette) does
+    /// afterwards (and on every later hit). Kept per shape, not concatenated,
+    /// because the winding fix in `add_silhouette` is decided per path and a
+    /// mirrored placement flips it.
+    pieces: Option<Vec<BezPath>>,
     /// The "nothing" handed back when there is not even stale geometry to show.
     empty: Arc<ShadeGeometry>,
+    /// How many crescent booleans this thread has run for this cache, inline
+    /// (cached or owner-less). A test counter: see [`LightCache::builds`].
+    builds: u64,
 }
 
 impl Default for LightCache {
@@ -257,7 +311,9 @@ impl Default for LightCache {
             queued: HashSet::new(),
             stale: false,
             collecting: None,
+            pieces: None,
             empty: Arc::default(),
+            builds: 0,
         }
     }
 }
@@ -317,6 +373,7 @@ impl LightCache {
         self.queued.clear();
         self.stale = false;
         self.collecting = None;
+        self.pieces = None;
         self.inline_spent = std::time::Duration::ZERO;
     }
 
@@ -352,6 +409,21 @@ impl LightCache {
 
     pub fn is_empty(&self) -> bool {
         self.places.is_empty()
+    }
+
+    /// How many crescent booleans have been built inline on this cache, for
+    /// the lifetime of the cache. **A test counter**: a frame that hits the
+    /// cache everywhere leaves it where it was.
+    #[doc(hidden)]
+    pub fn builds(&self) -> u64 {
+        self.builds
+    }
+
+    /// How much of this frame's inline build budget has been spent. A test
+    /// reading: a settled frame spends none.
+    #[doc(hidden)]
+    pub fn inline_spent(&self) -> std::time::Duration {
+        self.inline_spent
     }
 
     /// How long this frame may spend building misses on this thread.
@@ -440,12 +512,15 @@ impl LightCache {
         content: u64,
         doc: Affine,
         towards: Vec2,
+        lz: Option<f64>,
         softness: f64,
     ) -> Option<Arc<ShadeGeometry>> {
         let place = Self::place(owner?, shape_index, content, doc);
         let slot = self.places.get_mut(&place)?;
         slot.used = self.frame;
-        slot.built.get(&Aim::of(towards, softness)).map(Arc::clone)
+        slot.built
+            .get(&Aim::of(towards, lz, softness))
+            .map(Arc::clone)
     }
 
     /// The key one piece of artwork is cached under.
@@ -469,7 +544,32 @@ impl LightCache {
     /// Is a figure being gathered? Read by the shape path, which is on the hot
     /// route and must not pay for a figure nobody is collecting.
     pub fn collecting(&self) -> bool {
-        self.collecting.is_some()
+        self.collecting.is_some() || self.pieces.is_some()
+    }
+
+    /// Start recording the filled paths of a lit symbol stamp being built.
+    /// Returns what was being recorded outside it (a stamp built inside
+    /// another's build), to hand back to [`end_pieces`](Self::end_pieces).
+    pub fn begin_pieces(&mut self) -> Option<Vec<BezPath>> {
+        self.pieces.replace(Vec::new())
+    }
+
+    /// Stop recording and return the stamp's pieces, restoring `outer`.
+    pub fn end_pieces(&mut self, outer: Option<Vec<BezPath>>) -> Vec<BezPath> {
+        std::mem::replace(&mut self.pieces, outer).unwrap_or_default()
+    }
+
+    /// Add a stamp's recorded pieces, placed by `placement`, to whatever is
+    /// gathering a silhouette (a figure, or an enclosing stamp's own build).
+    /// The same calls `add_silhouette` would have had from the live draw, one
+    /// per shape, in draw order, with the path in document space.
+    pub fn add_stamp_silhouette(&mut self, placement: Affine, pieces: &[BezPath]) {
+        if !self.collecting() {
+            return;
+        }
+        for piece in pieces {
+            self.add_silhouette(&(placement * piece.clone()));
+        }
     }
 
     /// Add one drawn path to the figure being gathered.
@@ -491,6 +591,10 @@ impl LightCache {
     /// [`buzz_geom::turns_backwards`]. A path already the right way round is
     /// not copied.
     pub fn add_silhouette(&mut self, placed: &BezPath) {
+        if let Some(pieces) = &mut self.pieces {
+            pieces.push(placed.clone());
+            return;
+        }
         if let Some(out) = &mut self.collecting {
             for element in buzz_geom::wound_forward(placed).elements() {
                 out.push(*element);
@@ -521,6 +625,16 @@ impl LightCache {
     /// every frame only wastes the memory. Tweened artwork is also built inline
     /// however tight the budget, because there is nothing to defer *to*: it will
     /// not be here next frame either.
+    ///
+    /// `lz` is `Some` under [`ShadeModel::Form`] — how square-on the light
+    /// strikes here, [`buzz_light::Light::facing_at`] — and `None` under the
+    /// Crescent model, which does not read it.
+    ///
+    /// [`ShadeModel::Form`]: buzz_light::ShadeModel::Form
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the cache key, spelled out; a struct would only move it"
+    )]
     pub fn crescents(
         &mut self,
         owner: Option<&Arc<Object>>,
@@ -528,9 +642,10 @@ impl LightCache {
         placed: &BezPath,
         doc: Affine,
         towards: Vec2,
+        lz: Option<f64>,
         softness: f64,
     ) -> Arc<ShadeGeometry> {
-        self.geometry(owner, shape_index, 0, placed, doc, towards, softness)
+        self.geometry(owner, shape_index, 0, placed, doc, towards, lz, softness)
     }
 
     /// The crescents for **a whole figure**, from the silhouette it drew.
@@ -538,7 +653,12 @@ impl LightCache {
     /// The same cache and the same deferral as one shape's, under the figure's
     /// reserved index ([`FIGURE`](Self::FIGURE)) and with `content` standing in
     /// for everything about the artwork that the object's own address does not
-    /// carry — see [`Place::content`].
+    /// carry — see [`Place::content`]. `lz` is as [`crescents`](Self::crescents)
+    /// takes it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the cache key, spelled out; a struct would only move it"
+    )]
     pub fn figure(
         &mut self,
         owner: Option<&Arc<Object>>,
@@ -546,6 +666,7 @@ impl LightCache {
         silhouette: &BezPath,
         doc: Affine,
         towards: Vec2,
+        lz: Option<f64>,
         softness: f64,
     ) -> Arc<ShadeGeometry> {
         self.geometry(
@@ -555,6 +676,7 @@ impl LightCache {
             silhouette,
             doc,
             towards,
+            lz,
             softness,
         )
     }
@@ -571,12 +693,14 @@ impl LightCache {
         placed: &BezPath,
         doc: Affine,
         towards: Vec2,
+        lz: Option<f64>,
         softness: f64,
     ) -> Arc<ShadeGeometry> {
-        let aim = Aim::of(towards, softness);
+        let aim = Aim::of(towards, lz, softness);
 
         let Some(owner) = owner else {
-            return Arc::new(buzz_light::crescents(placed, aim.towards(), aim.softness()));
+            self.builds += 1;
+            return Arc::new(build_geometry(placed, aim, lz));
         };
 
         let place = Self::place(owner, shape_index, content, doc);
@@ -591,11 +715,8 @@ impl LightCache {
 
         if self.inline_spent < self.inline_budget {
             let began = std::time::Instant::now();
-            let geometry = Arc::new(buzz_light::crescents(
-                placed,
-                aim.towards(),
-                aim.softness(),
-            ));
+            self.builds += 1;
+            let geometry = Arc::new(build_geometry(placed, aim, lz));
             self.inline_spent = self.inline_spent.saturating_add(began.elapsed());
             self.install(vec![Built {
                 key: (place, aim),
@@ -618,12 +739,35 @@ impl LightCache {
                 key: (place, aim),
                 path: placed.clone(),
                 owner: Arc::clone(owner),
+                lz,
             });
         }
         match self.places.get(&place) {
             Some(slot) => Arc::clone(&slot.last),
             None => Arc::clone(&self.empty),
         }
+    }
+}
+
+/// **Build the geometry one `Aim` describes**, picking the formula `lz`
+/// names: [`buzz_light::crescents_form`] when it is `Some` — [`ShadeModel::Form`]
+/// — and [`buzz_light::crescents`], the softness-widened kind, when it is
+/// `None`. Shared by the inline build path and [`Miss::build`] so an entry
+/// built now and one built off-thread can never disagree about which formula
+/// its own key asked for.
+///
+/// [`ShadeModel::Form`]: buzz_light::ShadeModel::Form
+fn build_geometry(path: &BezPath, aim: Aim, lz: Option<f64>) -> ShadeGeometry {
+    match lz {
+        Some(_) => buzz_light::crescents_form(
+            path,
+            buzz_light::Aim3 {
+                planar: aim.towards(),
+                lz: aim.lz(),
+            },
+            aim.softness(),
+        ),
+        None => buzz_light::crescents(path, aim.towards(), aim.softness()),
     }
 }
 
@@ -682,6 +826,7 @@ mod tests {
             &path_of(object),
             Affine::IDENTITY,
             towards(light),
+            None,
             light.softness,
         )
     }
@@ -1002,6 +1147,7 @@ mod tests {
             &path_of(&object),
             Affine::IDENTITY,
             towards(&light),
+            None,
             light.softness,
         );
 
@@ -1021,7 +1167,15 @@ mod tests {
         let light = sun();
         let path = path_of(&object);
         let ask_at = |cache: &mut LightCache, doc: Affine| {
-            cache.crescents(Some(&object), 0, &path, doc, towards(&light), light.softness)
+            cache.crescents(
+                Some(&object),
+                0,
+                &path,
+                doc,
+                towards(&light),
+                None,
+                light.softness,
+            )
         };
 
         cache.begin();

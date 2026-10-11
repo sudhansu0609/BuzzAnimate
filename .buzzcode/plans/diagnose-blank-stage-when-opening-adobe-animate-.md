@@ -1,0 +1,24 @@
+# Diagnose blank stage when opening Adobe Animate .fla files
+
+The user reports that opening an Animate `.fla` file shows layers but a blank stage, meaning the import path builds layer/scene structure successfully yet produces no visible drawable objects (or objects that are invisible at render time). The plan is to trace the FLA import code in `crates/buzz-app/src/app.rs` and locate where shapes/objects fail to be emitted or get mis-mapped (frame span, transform, fill), then fix the specific defect with a regression test.
+
+## Steps
+
+1. Locate the FLA import code path in crates/buzz-app/src/app.rs (and any helper module it calls). Identify where layers are created vs. where shape/vector objects are parsed and attached to layers/frames.
+   - files: crates/buzz-app/src/app.rs
+   - verify: Map out: which function creates layers, which parses shapes, how frame spans and transforms are assigned.
+
+2. Inspect the object-emission logic for defects that would make objects invisible while still creating layers: (a) objects attached to wrong/empty frame ranges so `objects_at(frame)` returns nothing at the current playhead; (b) coordinate-space mismatch (Animate Y-up vs. scene space, or missing stage-offset transform); (c) fills/paint dropped (e.g., gradient/bitmap fill mapped to transparent); (d) objects added but layer kind not one that renders.
+   - files: crates/buzz-app/src/app.rs, crates/buzz-scene/src/layer.rs
+   - verify: Confirm the exact defect by reading the mapping code; cross-check with Layer::objects_at / drawable_at semantics in buzz-scene.
+
+3. Fix the identified defect (most likely frame-span or transform/fill mapping) so imported objects are present and visible on stage at frame 0.
+   - files: crates/buzz-app/src/app.rs
+   - verify: cargo build; open a real .fla file — shapes appear on stage. Add/adjust a unit test that imports a minimal FLA fixture (or constructs the parsed structures) and asserts objects_at(0) is non-empty with in-stage bounds.
+
+## Risks
+- FLA files are ZIP containers with XML timelines; if shapes live in separate shape-data entries, the bug may be a missing join between timeline refs and shape payloads rather than a simple mapping slip.
+- Without an actual sample .fla file to reproduce against, verification will rely on code inspection plus a synthetic fixture test.
+
+## Open questions
+- Do you have a specific .fla file (ideally small) that reproduces the blank stage? A minimal repro would let me verify the fix directly.

@@ -39,7 +39,7 @@
 //! Angles are shown in **degrees** and stored in radians. Nobody thinks about
 //! an elbow in radians.
 
-use buzz_rig::{Armature, RigPattern};
+use buzz_rig::{Armature, Direction, JointLimitDefaults, RigKind, RigPattern, RotationMode};
 use buzz_scene::{LayerId, ObjectId};
 use egui::{RichText, Ui};
 
@@ -73,6 +73,10 @@ pub enum DraggedPart {
 pub struct RigResponse {
     /// A bone's joint limits were changed, in radians. `None` clears them.
     pub set_limits: Option<(usize, Option<(f64, f64)>)>,
+    /// A bone's joint widget asked for its limits on more than one bone:
+    /// [`JointEdit::ApplyToChain`](crate::joint_widget::JointEdit::ApplyToChain)
+    /// or [`JointEdit::ApplyToAll`](crate::joint_widget::JointEdit::ApplyToAll).
+    pub apply_limits: Option<crate::joint_widget::JointEdit>,
     /// A bone was pinned or unpinned.
     pub set_pinned: Option<(usize, bool)>,
     /// A bone was renamed.
@@ -115,11 +119,24 @@ pub struct RigResponse {
     pub replace_part: Option<(usize, ObjectId)>,
     /// Select a drawing on the stage, so the animator can see which one it is.
     pub select_part: Option<ObjectId>,
+
+    // -- default joint limits ----------------------------------------------
+    /// **Save as default**: write this table as the user's `rig_limits.json`.
+    pub save_default_limits: Option<JointLimitDefaults>,
+    /// **Apply to this rig**: give the selected rig's bones these limits,
+    /// each about its own rest angle.
+    pub apply_default_limits: Option<JointLimitDefaults>,
+
+    // -- converting between bone and layer rigs -------------------------------
+    /// **Convert to layer rig**: take the selected bone rig apart into layers.
+    pub convert_to_layers: bool,
+    /// **Convert to bone rig**: rebuild the selected layer rig as an armature.
+    pub convert_to_bones: bool,
 }
 
 /// State the panel keeps between frames. All of it is about what is on screen
 /// rather than what is in the document, which is why it lives here.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct RigPanelState {
     pub new_pose_name: String,
 
@@ -132,6 +149,32 @@ pub struct RigPanelState {
     pub armed: Option<usize>,
     /// What the last gesture did, said under the list.
     pub note: Option<String>,
+    /// The **Default limits** table being edited — the user's saved
+    /// `rig_limits.json`, filled in by the app; the built-in anatomical table
+    /// until it is.
+    pub default_limits: Option<JointLimitDefaults>,
+    /// What **Rig Character** builds: an armature, or layer parenting.
+    pub kind: RigKind,
+    /// Whether the selection is part of a layer rig, so **Convert to bone
+    /// rig** is offered. Set by the app before the panel is drawn.
+    pub layer_rig: bool,
+}
+
+impl Default for RigPanelState {
+    /// **Rig Character** builds a layer rig unless the user picks Bones
+    /// (LR2): layer parenting is what new characters get.
+    fn default() -> Self {
+        Self {
+            new_pose_name: String::new(),
+            pattern: 0,
+            slots: Vec::new(),
+            armed: None,
+            note: None,
+            default_limits: None,
+            kind: RigKind::Layers,
+            layer_rig: false,
+        }
+    }
 }
 
 impl RigPanelState {
@@ -206,26 +249,27 @@ pub fn rig_panel(
     // *drawing* tool, and the skeleton is in the way of both the pen and the
     // pointer.
     ui.horizontal_wrapped(|ui| {
-        ui.checkbox(&mut rig.show_bones, "Show bones")
+        use crate::workspace::BoneMode;
+        ui.checkbox(&mut rig.show_bones, "Show bones while the Bone tool is active")
             .on_hover_text(
                 "Hidden, the bones are out of the pointer's way as well as out \
-                 of sight, so the artwork under them can be worked on",
+                 of sight, so the artwork under them can be worked on. With any \
+                 other tool they are never drawn",
             );
         ui.separator();
-        ui.label(RichText::new("Drag:").small().weak());
         if ui
-            .selectable_label(!rig.build, "poses")
-            .on_hover_text("Drag any part of a bone, including its end, to move the limb")
+            .selectable_label(rig.mode == BoneMode::Create, BoneMode::Create.label())
+            .on_hover_text("The Bone tool builds: start, extend or branch a chain (Shift+M toggles)")
             .clicked()
         {
-            rig.build = false;
+            rig.mode = BoneMode::Create;
         }
         if ui
-            .selectable_label(rig.build, "builds")
-            .on_hover_text("Drag from a bone's end to add the next bone in the chain")
+            .selectable_label(rig.mode == BoneMode::Move, BoneMode::Move.label())
+            .on_hover_text("The Bone tool poses: drag any part of a bone to move the limb (Shift+M toggles)")
             .clicked()
         {
-            rig.build = true;
+            rig.mode = BoneMode::Move;
         }
     });
     ui.separator();
@@ -237,9 +281,152 @@ pub fn rig_panel(
         None => assembly(ui, parts, state, &mut response),
     }
 
+    // Converting a rig that already exists, either way, one undo step each.
+    if armature.is_some() || state.layer_rig {
+        ui.horizontal_wrapped(|ui| {
+            if armature.is_some()
+                && ui
+                    .small_button("Convert to layer rig")
+                    .on_hover_text(
+                        "One layer per part, each turning about its joint and following the \
+                         part it hangs off. One undo step",
+                    )
+                    .clicked()
+            {
+                response.convert_to_layers = true;
+            }
+            if state.layer_rig
+                && ui
+                    .small_button("Convert to bone rig")
+                    .on_hover_text(
+                        "Build a skeleton from these layers, read by their slot names. One undo step",
+                    )
+                    .clicked()
+            {
+                response.convert_to_bones = true;
+            }
+        });
+    }
+
+    // The table is for the pattern on screen: the selected rig's own, or the
+    // one being assembled.
+    let pattern = bound
+        .and_then(|(name, _)| RigPattern::named(name))
+        .unwrap_or_else(|| state.pattern());
+    default_limits(ui, &pattern, armature.is_some(), state, &mut response);
+
     ui.separator();
     armature_section(ui, armature, poses, state, &mut response);
     response
+}
+
+// ---------------------------------------------------------------------------
+// The default joint limits, per slot.
+// ---------------------------------------------------------------------------
+
+/// One row per slot of `pattern`, in slot order: the slot's name and its
+/// limits in `table` — a slot the table does not name turns freely.
+pub fn default_limit_rows(
+    pattern: &RigPattern,
+    table: &JointLimitDefaults,
+) -> Vec<(String, crate::joint_widget::LimitSpec)> {
+    pattern
+        .slots
+        .iter()
+        .map(|slot| {
+            let spec = table
+                .rows
+                .get(&slot.name)
+                .copied()
+                .unwrap_or((RotationMode::Free, Direction::Both, 0.0, 0.0));
+            (slot.name.clone(), spec)
+        })
+        .collect()
+}
+
+/// **Default limits**: how far each joint of a newly built rig may turn,
+/// slot by slot, with the joint widget's own row pieces. Closed until asked
+/// for — it is a setting, not something done to the rig on screen.
+fn default_limits(
+    ui: &mut Ui,
+    pattern: &RigPattern,
+    has_rig: bool,
+    state: &mut RigPanelState,
+    out: &mut RigResponse,
+) {
+    use crate::joint_widget::{direction_buttons, mode_buttons, range_values};
+
+    egui::CollapsingHeader::new(RichText::new("Default limits").strong())
+        .id_salt("rig-default-limits")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "How far each joint of a {} may turn, from the angle it is drawn at. \
+                     Every rig built after Save as default uses this table.",
+                    pattern.name
+                ))
+                .small()
+                .weak()
+                .italics(),
+            );
+            let table = state
+                .default_limits
+                .get_or_insert_with(JointLimitDefaults::anatomical);
+
+            for (name, mut spec) in default_limit_rows(pattern, table) {
+                ui.push_id(("default-limit", name.as_str()), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_sized(
+                            egui::vec2(64.0, ui.spacing().interact_size.y),
+                            egui::Label::new(RichText::new(&name).small()).truncate(),
+                        );
+                        let mut changed = mode_buttons(ui, &mut spec);
+                        if spec.0 == RotationMode::Limited {
+                            changed |= direction_buttons(ui, &mut spec);
+                            changed |= range_values(ui, &mut spec);
+                        }
+                        if changed {
+                            table.rows.insert(name.clone(), spec);
+                        }
+                    });
+                });
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .small_button("Save as default")
+                    .on_hover_text(
+                        "Keep this table: every rig built from now on \u{2014} Rig Character, \
+                         Character from Image, the series tools \u{2014} uses it",
+                    )
+                    .clicked()
+                {
+                    out.save_default_limits = Some(table.clone());
+                }
+                if ui
+                    .small_button("Reset to anatomical")
+                    .on_hover_text(
+                        "Put back the built-in table. Nothing is kept until Save as default",
+                    )
+                    .clicked()
+                {
+                    *table = JointLimitDefaults::anatomical();
+                }
+                if ui
+                    .add_enabled(has_rig, egui::Button::new("Apply to this rig").small())
+                    .on_hover_text(
+                        "Give the selected rig's bones these limits, each measured from the \
+                         angle that bone was drawn at. Bones the table does not name are \
+                         left alone",
+                    )
+                    .on_disabled_hover_text("Select a rig first")
+                    .clicked()
+                {
+                    out.apply_default_limits = Some(table.clone());
+                }
+            });
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -273,10 +460,7 @@ fn assembly(ui: &mut Ui, parts: &[LoosePart], state: &mut RigPanelState, out: &m
             .width(96.0)
             .show_ui(ui, |ui| {
                 for (index, name) in names.iter().enumerate() {
-                    if ui
-                        .selectable_label(index == state.pattern, name)
-                        .clicked()
-                    {
+                    if ui.selectable_label(index == state.pattern, name).clicked() {
                         state.pattern = index;
                         // A different skeleton has different slots, so nothing
                         // sorted into the old one survives.
@@ -349,6 +533,8 @@ fn assembly(ui: &mut Ui, parts: &[LoosePart], state: &mut RigPanelState, out: &m
         ui.label(RichText::new(note).small().weak().italics());
     }
 
+    rig_kind_row(ui, &mut state.kind);
+
     ui.horizontal(|ui| {
         let room = ui.available_width().max(1.0);
         if ui
@@ -357,9 +543,7 @@ fn assembly(ui: &mut Ui, parts: &[LoosePart], state: &mut RigPanelState, out: &m
                 egui::Button::new(RichText::new("Rig Character").strong())
                     .min_size(egui::vec2(room, 0.0)),
             )
-            .on_hover_text(
-                "Build the skeleton and move these drawings into it. One undo step",
-            )
+            .on_hover_text("Build the skeleton and move these drawings into it. One undo step")
             .on_disabled_hover_text("Put a drawing in at least one slot first")
             .clicked()
         {
@@ -368,6 +552,21 @@ fn assembly(ui: &mut Ui, parts: &[LoosePart], state: &mut RigPanelState, out: &m
     });
 
     tray(ui, parts, state);
+}
+
+/// `Rig kind: ◉ Bones ○ Layers`, and the one line about what a layer rig
+/// cannot do. Shared by the Rig panel and the AI character dialog.
+pub fn rig_kind_row(ui: &mut Ui, kind: &mut RigKind) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Rig kind:").small());
+        ui.radio_value(kind, RigKind::Bones, "Bones")
+            .on_hover_text("An armature: IK, the director's verbs and lip-sync");
+        ui.radio_value(kind, RigKind::Layers, "Layers")
+            .on_hover_text("Layer parenting: one layer per part, posed with Free Transform");
+    });
+    if *kind == RigKind::Layers {
+        ui.label(RichText::new(RigKind::LAYERS_HINT).small().weak().italics());
+    }
 }
 
 /// One slot: its name, what is in it, and every way of putting something there.
@@ -587,7 +786,10 @@ fn auto_assign(pattern: &RigPattern, parts: &[LoosePart], state: &mut RigPanelSt
         0 => "No layer name looked like a body part. Sort them by hand, or rename the \
               layers and try again."
             .to_string(),
-        _ => format!("Named {filled} of {} from the layer names.", state.slots.len()),
+        _ => format!(
+            "Named {filled} of {} from the layer names.",
+            state.slots.len()
+        ),
     });
 }
 
@@ -613,9 +815,11 @@ fn rigged_slots(
         // A pattern this build does not have — a file from a later version, or
         // one that was renamed. The bone list below still works.
         ui.label(
-            RichText::new(format!("Rigged to an unknown pattern, \u{201C}{pattern_name}\u{201D}."))
-                .small()
-                .weak(),
+            RichText::new(format!(
+                "Rigged to an unknown pattern, \u{201C}{pattern_name}\u{201D}."
+            ))
+            .small()
+            .weak(),
         );
         return;
     };
@@ -914,59 +1118,21 @@ fn bone_row(
             }
         });
 
-        ui.horizontal(|ui| {
-            let mut limited = bone.limits.is_some();
-            if ui
-                .checkbox(&mut limited, "Limit")
-                .on_hover_text("Restrict how far this joint may turn")
-                .changed()
-            {
-                response.set_limits = Some((
-                    index,
-                    // A joint that has just been limited starts at a quarter
-                    // turn either way — wide enough to be usable immediately,
-                    // narrow enough to show that the limit is doing something.
-                    limited.then_some((-FRAC_QUARTER, FRAC_QUARTER)),
-                ));
+        // How far the joint may turn, relative to the angle it was drawn at —
+        // the same widget as the Bone tool's Tool Options.
+        match crate::joint_widget::joint_limits(ui, bone, index) {
+            Some(crate::joint_widget::JointEdit::Set { index, limits }) => {
+                response.set_limits = Some((index, limits.map(|l| (l.min, l.max))));
             }
-
-            if let Some(limits) = bone.limits {
-                let mut min = limits.min.to_degrees();
-                let mut max = limits.max.to_degrees();
-                let changed = ui
-                    .add(
-                        egui::DragValue::new(&mut min)
-                            .speed(1.0)
-                            .range(-180.0..=180.0)
-                            .suffix("°"),
-                    )
-                    .changed()
-                    | ui.add(
-                        egui::DragValue::new(&mut max)
-                            .speed(1.0)
-                            .range(-180.0..=180.0)
-                            .suffix("°"),
-                    )
-                    .changed();
-
-                if changed {
-                    response.set_limits = Some((index, Some((min.to_radians(), max.to_radians()))));
-                }
-            }
-
-            ui.label(
-                RichText::new(format!("{:.0}°", bone.angle.to_degrees()))
-                    .small()
-                    .weak(),
-            )
-            .on_hover_text("Where this joint is now, relative to its parent");
-        });
+            Some(edit) => response.apply_limits = Some(edit),
+            None => {}
+        }
         ui.separator();
     });
 }
 
 /// A quarter turn, in radians: the range a newly limited joint starts with.
-const FRAC_QUARTER: f64 = std::f64::consts::FRAC_PI_2;
+pub(crate) const FRAC_QUARTER: f64 = std::f64::consts::FRAC_PI_2;
 
 /// How wide one loose part sits in the tray. Two to a row in the narrowest
 /// dock column, which is the arrangement `dock_columns` measures.
@@ -1006,6 +1172,12 @@ mod tests {
         assert!((limits.min.to_degrees() - -90.0).abs() < 1e-9);
         assert!((limits.max.to_degrees() - 90.0).abs() < 1e-9);
         assert!(((-90.0f64).to_radians() - limits.min).abs() < 1e-9);
+    }
+
+    /// LR2: a fresh Rig panel builds a layer rig.
+    #[test]
+    fn a_fresh_rig_panel_defaults_to_a_layer_rig() {
+        assert_eq!(RigPanelState::default().kind, RigKind::Layers);
     }
 
     /// The button that does most of the work, checked without a screen: the
@@ -1094,7 +1266,10 @@ mod tests {
 
         assert_eq!(state.slots.len(), 3);
         assert!(state.slots.iter().all(Option::is_none));
-        assert_eq!(state.armed, None, "a slot that no longer exists stayed armed");
+        assert_eq!(
+            state.armed, None,
+            "a slot that no longer exists stayed armed"
+        );
     }
 
     /// A layer stands for the one drawing on it. Two drawings on it is a
@@ -1138,12 +1313,36 @@ mod tests {
         let _ = ctx.run_ui(Default::default(), |ui| {
             let mut state = RigPanelState::default();
             // Nothing selected, nothing on the stage.
-            let empty = rig_panel(ui, None, &[], &[], None, &mut state, &mut Default::default());
+            let empty = rig_panel(
+                ui,
+                None,
+                &[],
+                &[],
+                None,
+                &mut state,
+                &mut Default::default(),
+            );
             assert_eq!(empty, RigResponse::default());
             // Parts on the stage, waiting to be sorted.
-            let _ = rig_panel(ui, None, &[], &parts, None, &mut state, &mut Default::default());
+            let _ = rig_panel(
+                ui,
+                None,
+                &[],
+                &parts,
+                None,
+                &mut state,
+                &mut Default::default(),
+            );
             // A rig selected, built the old way.
-            let _ = rig_panel(ui, Some(&armature), &[], &parts, None, &mut state, &mut Default::default());
+            let _ = rig_panel(
+                ui,
+                Some(&armature),
+                &[],
+                &parts,
+                None,
+                &mut state,
+                &mut Default::default(),
+            );
             // A rig selected that was assembled from a pattern.
             let bound = [(0usize, "L_arm".to_string())];
             let _ = rig_panel(

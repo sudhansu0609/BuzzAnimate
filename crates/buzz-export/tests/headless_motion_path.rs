@@ -92,12 +92,17 @@ fn a_baked_object_travels_across_the_stage() {
         let settings = ExportSettings::for_stage(&scene);
 
         let first = exporter.render(&scene, 0, &settings).expect("frame 0");
-        let last = exporter.render(&scene, 24, &settings).expect("the last frame");
+        let last = exporter
+            .render(&scene, 24, &settings)
+            .expect("the last frame");
 
         let (start_x, start_n) = bright_centroid_x(&first);
         let (end_x, end_n) = bright_centroid_x(&last);
 
-        assert!(start_n > 400, "the object did not reach the stage at the start ({start_n} px)");
+        assert!(
+            start_n > 400,
+            "the object did not reach the stage at the start ({start_n} px)"
+        );
         assert!(end_n > 400, "the object was gone by the end ({end_n} px)");
         assert!(
             end_x - start_x > 150.0,

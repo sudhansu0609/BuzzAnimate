@@ -103,7 +103,9 @@ fn baked_follow_through_moves_pixels() {
         .expect("follow-through baked");
         assert!(report.keyframes > 1, "the bake wrote no animation");
 
-        let after = exporter.render(&scene, 14, &settings).expect("frame 14 again");
+        let after = exporter
+            .render(&scene, 14, &settings)
+            .expect("frame 14 again");
 
         let moved = changed_pixels(&before, &after);
         assert!(
@@ -126,9 +128,19 @@ fn a_settled_arm_matches_the_rigid_pose() {
         let settings = ExportSettings::for_stage(&scene);
 
         let rigid_late = exporter.render(&scene, 78, &settings).expect("frame 78");
-        follow_through_bake(&mut scene, actor, Joint::ShoulderL.index(), Spring::stiff(), 0..80, 2, 0.0)
-            .expect("baked");
-        let sprung_late = exporter.render(&scene, 78, &settings).expect("frame 78 again");
+        follow_through_bake(
+            &mut scene,
+            actor,
+            Joint::ShoulderL.index(),
+            Spring::stiff(),
+            0..80,
+            2,
+            0.0,
+        )
+        .expect("baked");
+        let sprung_late = exporter
+            .render(&scene, 78, &settings)
+            .expect("frame 78 again");
 
         // A near-critical spring, long after the body stopped, sits on the pose.
         let moved = changed_pixels(&rigid_late, &sprung_late);

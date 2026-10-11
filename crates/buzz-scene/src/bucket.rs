@@ -21,7 +21,7 @@
 use crate::object::ShapeData;
 use buzz_geom::{Affine, BezPath, FillMode, Point, Rect, Shape as _, StrokeStyle, outline_stroke};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// How large a gap in the outline the bucket will bridge before flooding.
 ///
@@ -240,9 +240,8 @@ pub fn fill_region(boundaries: &[Boundary], seed: Point, gap: GapSize) -> Option
         return None;
     }
 
-    let px_to_doc = |gx: usize, gy: usize| {
-        Point::new(area.x0 + gx as f64 / ppu, area.y0 + gy as f64 / ppu)
-    };
+    let px_to_doc =
+        |gx: usize, gy: usize| Point::new(area.x0 + gx as f64 / ppu, area.y0 + gy as f64 / ppu);
 
     let mut path = BezPath::new();
     for loop_pts in loops {
@@ -459,12 +458,37 @@ fn rasterise_fill(path: &BezPath, grid: &mut Grid, area: Rect, ppu: f64) {
 /// Directed boundary edges are collected — each set pixel contributes an edge
 /// on every side where its neighbour is unset — and chained end-to-end into
 /// loops. Interior holes fall out as their own loops.
+///
+/// Winding: the fill is always on the walker's right, so an outer loop runs
+/// clockwise on screen (positive shoelace area in y-down grid space) and a
+/// hole the other way.
+///
+/// **Corner contacts.** Two set pixels that touch only at a corner leave that
+/// grid corner with *two* outgoing edges (and two incoming). A one-edge-per-
+/// corner map keeps only the later of them, so the walk loses an edge and
+/// closes its loop with a straight chord across the shape. Each corner here
+/// holds every outgoing direction, and the walk takes, at a corner, the
+/// leftmost way on that is available (left turn, else straight, else right).
+/// At a diagonal contact that always crosses from one pixel to the other, so
+/// pixels of one region that touch at a corner stay one connected piece (as
+/// the fill is 8-connected and the hole 4-connected, which keeps a hole a
+/// hole), the choice depends only on the heading in so it cannot vary from run
+/// to run, and corners without a contact have one way on and behave exactly
+/// as before.
 pub(crate) fn trace_contours(grid: &Grid) -> Vec<Vec<(usize, usize)>> {
-    // A directed edge from one grid corner to the next, walking the fill so the
-    // interior is on a consistent side.
-    let mut next: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
+    // Headings, clockwise on screen: 0 right, 1 down, 2 left, 3 up.
+    const DX: [isize; 4] = [1, 0, -1, 0];
+    const DY: [isize; 4] = [0, 1, 0, -1];
+
+    // The directed edges leaving each grid corner, as a bit per heading, walking
+    // the fill so the interior is on a consistent side.
+    let mut out: HashMap<(usize, usize), u8> = HashMap::new();
     let filled = |x: isize, y: isize| {
-        x >= 0 && y >= 0 && (x as usize) < grid.w && (y as usize) < grid.h && grid.get(x as usize, y as usize)
+        x >= 0
+            && y >= 0
+            && (x as usize) < grid.w
+            && (y as usize) < grid.h
+            && grid.get(x as usize, y as usize)
     };
     for y in 0..grid.h {
         for x in 0..grid.w {
@@ -476,16 +500,16 @@ pub(crate) fn trace_contours(grid: &Grid) -> Vec<Vec<(usize, usize)>> {
             // A side is a boundary when the neighbour across it is unset. Emit
             // it directed so the fill is on the right.
             if !filled(xi, yi - 1) {
-                next.insert((x, y), (x + 1, y)); // top, left→right
+                *out.entry((x, y)).or_insert(0) |= 1 << 0; // top, left→right
             }
             if !filled(xi + 1, yi) {
-                next.insert((x + 1, y), (x + 1, y + 1)); // right, top→bottom
+                *out.entry((x + 1, y)).or_insert(0) |= 1 << 1; // right, top→bottom
             }
             if !filled(xi, yi + 1) {
-                next.insert((x + 1, y + 1), (x, y + 1)); // bottom, right→left
+                *out.entry((x + 1, y + 1)).or_insert(0) |= 1 << 2; // bottom, right→left
             }
             if !filled(xi - 1, yi) {
-                next.insert((x, y + 1), (x, y)); // left, bottom→top
+                *out.entry((x, y + 1)).or_insert(0) |= 1 << 3; // left, bottom→top
             }
         }
     }
@@ -500,22 +524,47 @@ pub(crate) fn trace_contours(grid: &Grid) -> Vec<Vec<(usize, usize)>> {
     // either time, which is what made it worth pinning down — a bucket fill,
     // and now a trace, has to be reproducible or the same document saved twice
     // is two different documents.
-    let mut starts: Vec<(usize, usize)> = next.keys().copied().collect();
-    starts.sort_unstable_by_key(|&(x, y)| (y, x));
+    let mut starts: Vec<((usize, usize), usize)> = Vec::new();
+    for (&p, &mask) in &out {
+        for d in 0..4 {
+            if mask & (1 << d) != 0 {
+                starts.push((p, d));
+            }
+        }
+    }
+    starts.sort_unstable_by_key(|&((x, y), d)| (y, x, d));
 
+    // Edges already walked; `out` itself is left whole so the turn choice at a
+    // corner never depends on what has been used.
+    let mut used: HashSet<((usize, usize), usize)> = HashSet::new();
     let mut loops = Vec::new();
-    for start in starts {
-        if !next.contains_key(&start) {
+    for (start, start_d) in starts {
+        if used.contains(&(start, start_d)) {
             continue;
         }
         let mut loop_pts = Vec::new();
-        let mut p = start;
+        let (mut p, mut d) = (start, start_d);
         loop {
+            used.insert((p, d));
             loop_pts.push(p);
-            let Some(&n) = next.get(&p) else { break };
-            next.remove(&p);
+            let n = (
+                (p.0 as isize + DX[d]) as usize,
+                (p.1 as isize + DY[d]) as usize,
+            );
+            let Some(&mask) = out.get(&n) else { break };
+            // Leftmost way on: left turn, else straight, else right.
+            let Some(nd) = [(d + 3) % 4, d, (d + 1) % 4]
+                .into_iter()
+                .find(|&nd| mask & (1 << nd) != 0)
+            else {
+                break;
+            };
             p = n;
-            if p == start {
+            d = nd;
+            // Closed when the next edge is the one the loop began with — not
+            // merely when the start *corner* is reached again, which at a
+            // corner contact happens mid-loop.
+            if (p, d) == (start, start_d) {
                 break;
             }
         }
@@ -596,7 +645,10 @@ mod tests {
         // The fill lands inside the square, close to its full extent.
         assert!(bbox.x0 >= 18.0 && bbox.y0 >= 18.0, "{bbox:?}");
         assert!(bbox.x1 <= 122.0 && bbox.y1 <= 122.0, "{bbox:?}");
-        assert!(bbox.width() > 80.0 && bbox.height() > 80.0, "too small: {bbox:?}");
+        assert!(
+            bbox.width() > 80.0 && bbox.height() > 80.0,
+            "too small: {bbox:?}"
+        );
     }
 
     /// A square with a gap in one side leaks with no gap closing, and fills once
@@ -626,7 +678,11 @@ mod tests {
         );
 
         // A large enough gap size bridges the ~30-unit opening.
-        let filled = fill_region(&[boundary(&path)], Point::new(70.0, 70.0), GapSize::ExtraLarge);
+        let filled = fill_region(
+            &[boundary(&path)],
+            Point::new(70.0, 70.0),
+            GapSize::ExtraLarge,
+        );
         assert!(filled.is_some(), "the gap should close at Extra Large");
     }
 
@@ -652,13 +708,19 @@ mod tests {
         let region = fill_region(&[boundary], Point::new(200.0, 130.0), GapSize::None)
             .expect("the top half is enclosed and should fill");
         // Only the top half: the divider held the flood back from the bottom.
-        assert!(region.winding(Point::new(200.0, 130.0)) != 0, "the clicked half");
+        assert!(
+            region.winding(Point::new(200.0, 130.0)) != 0,
+            "the clicked half"
+        );
         assert!(
             region.winding(Point::new(200.0, 190.0)) == 0,
             "the flood must not have leaked into the other half"
         );
         let bbox = region.bounding_box();
-        assert!(bbox.y1 <= 162.0, "the fill reached past the divider: {bbox:?}");
+        assert!(
+            bbox.y1 <= 162.0,
+            "the fill reached past the divider: {bbox:?}"
+        );
     }
 
     /// Clicking on the line itself fills nothing.
@@ -682,5 +744,161 @@ mod tests {
         for pair in sizes.windows(2) {
             assert!(pair[1] > pair[0], "gap sizes must increase: {sizes:?}");
         }
+    }
+
+    // ---- contour tracing ------------------------------------------------------
+
+    /// A grid from rows of text: `X` is a set pixel, anything else is unset.
+    fn grid_from(rows: &[&str]) -> Grid {
+        let w = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut grid = Grid::new(w, rows.len());
+        for (y, row) in rows.iter().enumerate() {
+            for (x, c) in row.bytes().enumerate() {
+                if c == b'X' {
+                    grid.set(x, y);
+                }
+            }
+        }
+        grid
+    }
+
+    fn is_set(grid: &Grid, x: isize, y: isize) -> bool {
+        x >= 0 && y >= 0 && (x as usize) < grid.w && (y as usize) < grid.h && grid.get(x as usize, y as usize)
+    }
+
+    /// Twice the signed (shoelace) area of a loop, in y-down grid space, so an
+    /// outer loop is positive and a hole negative.
+    fn twice_area(points: &[(usize, usize)]) -> i64 {
+        let n = points.len();
+        (0..n)
+            .map(|i| {
+                let (x0, y0) = points[i];
+                let (x1, y1) = points[(i + 1) % n];
+                x0 as i64 * y1 as i64 - x1 as i64 * y0 as i64
+            })
+            .sum()
+    }
+
+    /// Trace `rows` and hold the result to the true pixel boundary: every step
+    /// is one unit along a grid line with the set pixel on its right and an
+    /// unset one on its left, no edge is used twice, every boundary edge of
+    /// every set pixel is used, and so the signed areas add up to exactly the
+    /// pixel count.
+    fn trace_exact(rows: &[&str]) -> Vec<Vec<(usize, usize)>> {
+        let grid = grid_from(rows);
+        let loops = trace_contours(&grid);
+
+        let mut seen = std::collections::HashSet::new();
+        let mut edges = 0usize;
+        let mut twice = 0i64;
+        for lp in &loops {
+            assert!(lp.len() >= 4, "a loop too short to be a shape: {lp:?}");
+            for i in 0..lp.len() {
+                let (a, b) = (lp[i], lp[(i + 1) % lp.len()]);
+                let (ax, ay) = (a.0 as isize, a.1 as isize);
+                let (dx, dy) = (b.0 as isize - ax, b.1 as isize - ay);
+                assert_eq!(dx.abs() + dy.abs(), 1, "a chord, not a pixel edge: {a:?} -> {b:?}");
+                let (right, left) = match (dx, dy) {
+                    (1, 0) => ((ax, ay), (ax, ay - 1)),
+                    (0, 1) => ((ax - 1, ay), (ax, ay)),
+                    (-1, 0) => ((ax - 1, ay - 1), (ax - 1, ay)),
+                    _ => ((ax, ay - 1), (ax - 1, ay - 1)),
+                };
+                assert!(is_set(&grid, right.0, right.1), "no fill on the right of {a:?} -> {b:?}");
+                assert!(!is_set(&grid, left.0, left.1), "fill on the left of {a:?} -> {b:?}");
+                assert!(seen.insert((a, b)), "edge {a:?} -> {b:?} used twice");
+                edges += 1;
+            }
+            twice += twice_area(lp);
+        }
+
+        let mut boundary = 0usize;
+        let mut count = 0i64;
+        for y in 0..grid.h as isize {
+            for x in 0..grid.w as isize {
+                if !is_set(&grid, x, y) {
+                    continue;
+                }
+                count += 1;
+                for (nx, ny) in [(x, y - 1), (x + 1, y), (x, y + 1), (x - 1, y)] {
+                    if !is_set(&grid, nx, ny) {
+                        boundary += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(edges, boundary, "a boundary edge was lost: {loops:?}");
+        assert_eq!(twice, 2 * count, "area is not the pixel count: {loops:?}");
+        loops
+    }
+
+    /// Two pixels of one region meeting only at a corner are one piece joined
+    /// there, traced as one loop of eight edges — not a loop closed by a chord.
+    #[test]
+    fn a_diagonal_pair_of_pixels_traces_every_edge() {
+        for rows in [["X.", ".X"], [".X", "X."]] {
+            let loops = trace_exact(&rows);
+            assert_eq!(loops.len(), 1, "{rows:?}: {loops:?}");
+            assert_eq!(loops[0].len(), 8, "{rows:?}: {loops:?}");
+        }
+    }
+
+    #[test]
+    fn a_checkerboard_traces_every_edge() {
+        trace_exact(&["X.X.", ".X.X", "X.X.", ".X.X"]);
+        trace_exact(&[".X.X", "X.X.", ".X.X", "X.X."]);
+    }
+
+    /// An L of pixels with another piece touching its outer corner.
+    #[test]
+    fn an_l_meeting_another_piece_at_a_corner_traces_every_edge() {
+        let loops = trace_exact(&["X...", "X...", "XX..", "..XX"]);
+        assert_eq!(loops.len(), 1, "{loops:?}");
+        // And the other way round, so both diagonals and both turn senses at
+        // the pinch are met.
+        trace_exact(&["...X", "...X", "..XX", "XX.."]);
+        trace_exact(&["XX..", "..XX", "...X", "...X"]);
+        trace_exact(&["..XX", "XX..", "X...", "X..."]);
+    }
+
+    /// A ring of pixels closed only by corner contacts: the outer boundary and
+    /// the hole stay separate loops, the hole winding the other way.
+    #[test]
+    fn a_ring_touching_itself_at_corners_traces_every_edge() {
+        let loops = trace_exact(&[".X.", "X.X", ".X."]);
+        let mut areas: Vec<i64> = loops.iter().map(|l| twice_area(l)).collect();
+        areas.sort_unstable();
+        assert_eq!(areas, vec![-2, 10], "{loops:?}");
+
+        // A thicker ring with one side closed by a corner contact only.
+        trace_exact(&["XXXX.", "X..XX", "X..X.", "XXX.."]);
+    }
+
+    /// A region with a hole that reaches the outside only through a corner:
+    /// the hole is still a hole, and the area is the pixel count.
+    #[test]
+    fn a_hole_touching_the_outside_at_a_corner_traces_every_edge() {
+        let loops = trace_exact(&[".XXX.", ".X.X.", ".XX.."]);
+        let mut areas: Vec<i64> = loops.iter().map(|l| twice_area(l)).collect();
+        areas.sort_unstable();
+        assert_eq!(areas, vec![-2, 16], "{loops:?}");
+    }
+
+    /// Without any corner contact the walk is what it always was: loops in
+    /// raster order of their first corner, the outer loop clockwise and a hole
+    /// the other way.
+    #[test]
+    fn a_region_without_corner_contacts_traces_as_before() {
+        let loops = trace_exact(&["XXX", "X.X", "XXX"]);
+        assert_eq!(
+            loops,
+            vec![
+                vec![
+                    (0, 0), (1, 0), (2, 0), (3, 0), (3, 1), (3, 2),
+                    (3, 3), (2, 3), (1, 3), (0, 3), (0, 2), (0, 1),
+                ],
+                vec![(1, 1), (1, 2), (2, 2), (2, 1)],
+            ]
+        );
     }
 }

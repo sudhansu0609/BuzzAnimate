@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use buzz_geom::{Camera, Size};
+use buzz_geom::{Camera, Point, Rect, Size};
 use buzz_render::{GpuContext, GpuPreference, RENDER_FORMAT, SceneBuilder, document, wgpu};
 use buzz_scene::Scene;
 use peniko::Color;
@@ -180,6 +180,12 @@ pub struct Exporter {
     /// path so a document with no look allocates nothing extra.
     compositor: Option<buzz_render::Compositor>,
     post_target: Option<PostTarget>,
+    /// On by default; `set_cull(false)` is the only way left to get a truly
+    /// unculled render out of `draw_into_target`; once culling is on, leaving
+    /// a caller's own `FrameOptions::cull` at `None` no longer means "render
+    /// everything" here, it means "fill it in". A parity test that wants to
+    /// compare the two needs a way to ask for the old behaviour honestly.
+    cull: bool,
 }
 
 /// A second render target the compositor writes into, sized to the frame.
@@ -204,13 +210,29 @@ struct Target {
 impl Exporter {
     /// Bring up a GPU for exporting.
     pub fn new(preference: &GpuPreference) -> Result<Self> {
-        let gpu = GpuContext::new_blocking(preference).context("starting the GPU for export")?;
+        let mut gpu = GpuContext::new_blocking(preference).context("starting the GPU for export")?;
+        // V2/V5 (`docs/VRAM_ADAPTIVE_BUFFERS_PLAN.md`): an export has no
+        // frame budget and must never degrade quality, so unlike the window
+        // (which now starts at `buffer_scale` `1` and only grows on demand)
+        // this context starts generous, at the adapter's own
+        // `max_buffer_scale` — exactly what `GpuContext::new` used to set
+        // `buffer_scale` to directly, before V2 made the window's own start
+        // small.
+        gpu.start_generous();
+        let mut lights = buzz_render::document::DrawCache::new();
+        // P2 (`docs/IMPORT_PERF_PLAN.md`): adopt this exporter's own GPU
+        // context's buffer scale, captured once, rather than leaving the
+        // cache at `DrawCache::default()`'s scale of `1` — which would judge
+        // every export against Vello's upstream buffer size and band-split
+        // far more than P1's bigger transient buffers actually need.
+        lights.set_scale(gpu.buffer_scale);
         Ok(Self {
             gpu,
             target: None,
-            lights: buzz_render::document::DrawCache::new(),
+            lights,
             compositor: None,
             post_target: None,
+            cull: true,
         })
     }
 
@@ -231,6 +253,37 @@ impl Exporter {
         self.lights.set_symbol_reuse(on);
     }
 
+    /// Turn the per-layer encode cache on or off for this exporter — P2 in
+    /// `docs/IMPORT_PERF_PLAN.md`. Exposed for the same reason
+    /// `set_symbol_reuse` is: a parity test can render both ways, and a test
+    /// that means to isolate a *different* cache (the symbol one) can hold
+    /// this one off so it cannot short-circuit the layer walk that other
+    /// cache's own stamping is measured through.
+    pub fn set_layer_reuse(&mut self, on: bool) {
+        self.lights.set_layer_reuse(on);
+    }
+
+    /// Pin this exporter's own `DrawCache` to `scale` rather than whatever
+    /// `Self::new` picked from the real adapter's own limits. P2 in
+    /// `docs/IMPORT_PERF_PLAN.md`: the budget belongs to the cache, not the
+    /// process, so a fixture calibrated to overrun the ceiling at Vello's
+    /// upstream buffer size (`scale: 1`) stays meaningful regardless of which
+    /// GPU runs the suite — without reaching for the process-wide
+    /// `vello_encoding::set_buffer_scale`, which only ever rises and would
+    /// race every other GPU context in the same test binary.
+    pub fn set_budget_scale(&mut self, scale: u32) {
+        self.lights.set_scale(scale);
+    }
+
+    /// Turn culling to the output rectangle on or off. On by default. Exposed
+    /// so a parity test can ask `draw_into_target` for the old, genuinely
+    /// unculled behaviour: once culling is on, a caller's own
+    /// `FrameOptions::cull` left at `None` is filled in rather than honoured,
+    /// so `None` alone can no longer say "render everything, undisturbed."
+    pub fn set_cull(&mut self, on: bool) {
+        self.cull = on;
+    }
+
     /// (builds, stamps) of the symbol cache so far — for a parity test to
     /// confirm the cache actually engaged rather than passing vacuously.
     pub fn symbol_cache_stats(&self) -> (u64, u64) {
@@ -240,12 +293,23 @@ impl Exporter {
         )
     }
 
+    /// Was the last frame drawn judged over either budget — the segment
+    /// ceiling or the line budget — even at `LightDetail::Flat`, the bottom
+    /// of the automatic ladder? Exposed so a test of `Self::render_bands` can
+    /// assert its fixture actually reaches that path rather than passing
+    /// vacuously through the ordinary single-pass one. See Phase 4d.
+    pub fn lights_over_budget(&self) -> bool {
+        self.lights.over_budget()
+    }
+
     /// Drop all retained render geometry. The symbol table already refuses to
     /// serve one document's symbols for another, so this is not needed for
     /// correctness; a test uses it to render each unrelated document from a
     /// clean slate.
     pub fn reset_caches(&mut self) {
-        self.lights = buzz_render::document::DrawCache::new();
+        let mut lights = buzz_render::document::DrawCache::new();
+        lights.set_scale(self.gpu.buffer_scale);
+        self.lights = lights;
     }
 
     /// Render one frame.
@@ -449,14 +513,35 @@ impl Exporter {
             Size::new(settings.width as f64, settings.height as f64),
         );
 
+        // **Cull to the output.** Before this the exporter passed `cull: None`
+        // and encoded the document however far it ran past the frame, which is
+        // fine for a small render but for a large import means paying to
+        // encode artwork nobody will ever see — the same cost `stage.rs` no
+        // longer pays. The rectangle is the one the camera above frames: the
+        // render region if there is one, the stage otherwise, in the camera's
+        // shot space (the same space the stage's own cull uses). Grown by 2%
+        // on each side, because a stroke or a seam seal can poke a hair past
+        // an object's own fill bounds. Only filled in when the caller left
+        // `cull` unset — a caller with its own opinion (the working-view pass,
+        // a comparison test) keeps it. Gated on `self.cull` too: with it off,
+        // `None` means what it always did, "render everything, undisturbed" —
+        // `culling_to_the_viewport_matches_no_cull` is the test that needs
+        // that honoured exactly.
+        let mut options = *options;
+        if self.cull && options.cull.is_none() {
+            let region = settings.region.unwrap_or(stage);
+            options.cull = Some(region.inflate(region.width() * 0.02, region.height() * 0.02));
+        }
+        let options = &options;
+
         let mut vello_scene = buzz_render::vello::Scene::new();
         // Build, then let the cache judge what was built. A frame too big for
         // the rasteriser is not drawn at all — and an export has no next frame
         // to correct itself on, so it is encoded again with less of the light
         // rather than written out as whatever was in the target before. See
         // `buzz_render::document::DrawCache::reconsider`.
-        for _ in 0..3 {
-            let segments = {
+        for _ in 0..4 {
+            let (segments, lines) = {
                 let mut builder = SceneBuilder::new(&mut vello_scene, &camera);
                 if !settings.transparent {
                     builder.fill_shape(&stage, scene.stage().background);
@@ -471,12 +556,26 @@ impl Exporter {
                     options,
                     &mut self.lights,
                 );
-                builder.encoded_segments()
+                (builder.encoded_segments(), builder.estimated_lines())
             };
+            // Noted before `reconsider` judges the pass, so the ladder can
+            // give up modelling, shadows and finally the seam seal for a
+            // frame whose *lines* overrun the GPU's buffer well under the
+            // segment ceiling — see Phase 4c.
+            self.lights.note_lines(lines);
+            if std::env::var("BUZZ_DEBUG_LAYER_CACHE").is_ok() {
+                eprintln!(
+                    "draw_into_target: segments={segments} lines={lines} detail_before={:?}",
+                    self.lights.detail()
+                );
+            }
             if !self
                 .lights
                 .reconsider(segments, (settings.width as f64) * (settings.height as f64))
             {
+                if std::env::var("BUZZ_DEBUG_LAYER_CACHE").is_ok() {
+                    eprintln!("draw_into_target: settled detail={:?}", self.lights.detail());
+                }
                 break;
             }
         }
@@ -490,18 +589,144 @@ impl Exporter {
             scene.stage().background
         };
 
-        let target = self.target.as_ref().expect("target just ensured");
-        self.gpu
-            .render(
-                &vello_scene,
-                &target.view,
-                settings.width,
-                settings.height,
-                background,
-            )
-            .context("rendering the frame")?;
+        // **The segment ceiling is not a safe trigger by itself** (Phase 4,
+        // "Status after Phases 1-3"): Vello's line buffer can overflow, and
+        // silently drop the whole frame, well under it on curvy, heavily
+        // stroked artwork. The ladder above already gave up everything it
+        // automatically can, down to `Flat`; a document still over either
+        // budget there is one whose *artwork* does not fit a single sealed
+        // pass at any lighting level, and the only way left to guarantee it
+        // draws is to draw less of it at a time — not to trade away the seam
+        // seal for a little more headroom. See `Self::render_bands` and
+        // `docs/RENDER_SEAMS_PLAN.md` Step 1.
+        if self.lights.over_budget() {
+            self.render_bands(scene, frame, settings, options, &camera, stage, background)?;
+        } else {
+            let target = self.target.as_ref().expect("target just ensured");
+            self.gpu
+                .render(
+                    &vello_scene,
+                    &target.view,
+                    settings.width,
+                    settings.height,
+                    background,
+                )
+                .context("rendering the frame")?;
+        }
 
         Ok(())
+    }
+
+    /// Draw `frame` in horizontal strips, each culled to its own rows and
+    /// rendered as its own Vello pass, so a frame the ladder still calls
+    /// over budget at `Flat` never has to fit one GPU pass all at once — see
+    /// Phase 4d in `docs/FLA_IMPORT_BLANK_AND_LAG_PLAN.md`.
+    ///
+    /// The level `draw_into_target`'s ladder settled on is **held**: a band
+    /// encodes at that level without reconsidering, because reconsidering a
+    /// fraction of the artwork against the whole frame's budget would answer
+    /// a different question than the one already answered.
+    fn render_bands(
+        &mut self,
+        scene: &Scene,
+        frame: u32,
+        settings: &ExportSettings,
+        options: &document::FrameOptions,
+        camera: &Camera,
+        stage: Rect,
+        background: Color,
+    ) -> Result<()> {
+        let mut n = self.lights.bands_needed();
+        loop {
+            let row_bytes = settings.width as usize * 4;
+            let mut buffer = vec![0u8; row_bytes * settings.height as usize];
+            let mut any_band_over = false;
+
+            for i in 0..n {
+                let y0 = (u64::from(settings.height) * u64::from(i) / u64::from(n)) as u32;
+                let y1 = (u64::from(settings.height) * u64::from(i + 1) / u64::from(n)) as u32;
+                if y1 <= y0 {
+                    continue;
+                }
+
+                // The document-space rect the export camera frames those
+                // rows to, grown by 2% for the same reason the whole-frame
+                // cull is: a stroke or a seam seal can poke a hair past an
+                // object's own fill bounds.
+                let top_left = camera.screen_to_doc(Point::new(0.0, f64::from(y0)));
+                let bottom_right =
+                    camera.screen_to_doc(Point::new(f64::from(settings.width), f64::from(y1)));
+                let band = Rect::new(
+                    top_left.x.min(bottom_right.x),
+                    top_left.y.min(bottom_right.y),
+                    top_left.x.max(bottom_right.x),
+                    top_left.y.max(bottom_right.y),
+                );
+                let band = band.inflate(band.width() * 0.02, band.height() * 0.02);
+
+                let mut band_options = *options;
+                band_options.cull = Some(band);
+                // `stamp_view` stays `None` (inherited from `*options`), so
+                // `try_stamp_symbol`'s off-screen rule falls back to `cull`
+                // above — this band's own strip. Setting it to the *frame's*
+                // whole cull instead was tried and reverted: a symbol that
+                // then passed the rule was appended whole, unclipped to any
+                // one band, into every band it touched, so more bands stopped
+                // shrinking the largest band's own lines. See H0 item 1 in
+                // `docs/IMPORT_PERF_PLAN.md` and
+                // `buzz_render::document::FrameOptions::stamp_view`.
+
+                let mut band_scene = buzz_render::vello::Scene::new();
+                let lines = {
+                    let mut builder = SceneBuilder::new(&mut band_scene, camera);
+                    if !settings.transparent {
+                        builder.fill_shape(&stage, scene.stage().background);
+                    }
+                    document::draw_frame_cached(
+                        &mut builder,
+                        scene,
+                        frame,
+                        scene.camera_transform(options.at(frame)),
+                        &band_options,
+                        &mut self.lights,
+                    );
+                    builder.estimated_lines()
+                };
+                // V2 (`docs/VRAM_ADAPTIVE_BUFFERS_PLAN.md`): this cache's own
+                // scale, not the thread-local `vello_encoding` reads.
+                if lines > self.lights.line_budget() {
+                    any_band_over = true;
+                }
+
+                let target = self.target.as_ref().expect("target just ensured");
+                self.gpu
+                    .render(
+                        &band_scene,
+                        &target.view,
+                        settings.width,
+                        settings.height,
+                        background,
+                    )
+                    .context("rendering a band")?;
+                let sample = self.read_raw()?;
+                for y in y0..y1 {
+                    let start = y as usize * row_bytes;
+                    buffer[start..start + row_bytes]
+                        .copy_from_slice(&sample.pixels[start..start + row_bytes]);
+                }
+            }
+
+            if any_band_over && n < 64 {
+                n = (n * 2).min(64);
+                continue;
+            }
+
+            // Put the stitched picture back into the target exactly as
+            // `render_blurred` does, so the compositor and read-back that
+            // follow see it as an ordinary finished frame.
+            self.upload(&buffer, settings.width, settings.height)?;
+            return Ok(());
+        }
     }
 
     /// Make sure the render target matches the requested size.
@@ -557,13 +782,7 @@ impl Exporter {
 
     /// Run the compositor over the just-rendered frame and copy its result back
     /// into the main target, so read-back is unchanged.
-    fn apply_post(
-        &mut self,
-        frame: u32,
-        post: &buzz_scene::PostSettings,
-        width: u32,
-        height: u32,
-    ) {
+    fn apply_post(&mut self, frame: u32, post: &buzz_scene::PostSettings, width: u32, height: u32) {
         // A matching second target for the compositor's output.
         if !matches!(&self.post_target, Some(p) if p.width == width && p.height == height) {
             let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -589,7 +808,10 @@ impl Exporter {
             });
         }
         if self.compositor.is_none() {
-            self.compositor = Some(buzz_render::Compositor::new(&self.gpu.device, RENDER_FORMAT));
+            self.compositor = Some(buzz_render::Compositor::new(
+                &self.gpu.device,
+                RENDER_FORMAT,
+            ));
         }
 
         let target = self.target.as_ref().expect("a target has been made");
@@ -682,19 +904,35 @@ impl Exporter {
         );
         self.gpu.queue.submit([encoder.finish()]);
 
-        let slice = target.readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |r| {
-            if let Err(e) = r {
-                tracing::error!("export readback failed: {e:?}");
-            }
+        // **The map's own result decides whether the bytes are read** (F7.5,
+        // `docs/LOCAL_AI_PLAN.md`). This used to log a failed map and call
+        // `get_mapped_range` anyway, which panics — "Buffer with
+        // 'export-readback' label has been destroyed" was what one exporter
+        // reused across very different sizes and scenes eventually hit. A
+        // failed or unfinished map is now an `Err`, and the target is dropped
+        // so the next frame builds a fresh one instead of inheriting a
+        // buffer left mid-map.
+        let readback = target.readback.clone();
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
         });
-        self.gpu
-            .device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: Some(std::time::Duration::from_secs(60)),
-            })
-            .context("waiting for the GPU to finish the frame")?;
+        let polled = self.gpu.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(60)),
+        });
+        let mapped_ok = match (polled, rx.try_recv()) {
+            (Ok(_), Ok(Ok(()))) => Ok(()),
+            (Err(e), _) => Err(format!("waiting for the GPU to finish the frame: {e}")),
+            (_, Ok(Err(e))) => Err(format!("export read-back failed: {e}")),
+            (_, Err(_)) => Err("export read-back did not complete".to_string()),
+        };
+        if let Err(msg) = mapped_ok {
+            tracing::error!("{msg}");
+            self.target = None;
+            bail!(msg);
+        }
 
         let mut pixels = Vec::with_capacity((width * height * 4) as usize);
         {
@@ -705,7 +943,7 @@ impl Exporter {
                 pixels.extend_from_slice(&mapped[start..start + row_bytes]);
             }
         }
-        target.readback.unmap();
+        readback.unmap();
 
         Ok(Frame {
             width,
@@ -914,6 +1152,27 @@ mod tests {
             ),
         );
         scene
+    }
+
+    /// F7.5 (`docs/LOCAL_AI_PLAN.md`): one `Exporter` reused across very
+    /// different output sizes — the whole stage, 256² thumbnails, a large
+    /// frame, and back — must render every one at its own size with the right
+    /// pixels, not panic on a destroyed read-back buffer.
+    #[test]
+    fn one_exporter_renders_frames_of_changing_sizes() {
+        let Ok(mut exporter) = Exporter::new(&GpuPreference::Automatic) else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let scene = document();
+        for (w, h) in [(550, 400), (256, 256), (1100, 800), (256, 256), (97, 301), (550, 400)] {
+            let settings = ExportSettings { width: w, height: h, ..ExportSettings::for_stage(&scene) };
+            let frame = exporter.render(&scene, 0, &settings).expect("renders");
+            assert_eq!((frame.width, frame.height), (w, h));
+            assert_eq!(frame.pixels.len(), (w * h * 4) as usize);
+            let [r, g, b, _] = frame.pixel(w / 2, h / 2);
+            assert!(r > 200 && g < 40 && b < 40, "{w}x{h}: centre is {r},{g},{b}");
+        }
     }
 
     #[test]

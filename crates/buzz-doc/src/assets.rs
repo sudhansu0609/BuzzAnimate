@@ -26,7 +26,8 @@
 
 use std::path::{Path, PathBuf};
 
-use buzz_scene::{ImportTarget, MergeReport, Scene};
+use buzz_rig::RigKind;
+use buzz_scene::{ImportTarget, LayerStack, MergeReport, ObjectKind, Scene};
 
 use crate::format::{self, DocError};
 
@@ -44,6 +45,27 @@ pub fn default_root() -> PathBuf {
     base.join("BuzzAnimate").join("assets")
 }
 
+/// How the character in `scene` is rigged, for the Cast panel: an armature on
+/// any layer (the main timeline's or a library symbol's) is a bone rig; layers
+/// that follow other layers, with no armature anywhere, are a layer rig;
+/// anything else is not a rig.
+pub fn rig_kind_of(scene: &Scene) -> Option<RigKind> {
+    let stacks = || std::iter::once(scene.layers()).chain(scene.library().iter().map(|s| &s.layers));
+    let armature = |stack: &LayerStack| {
+        stack
+            .iter()
+            .flat_map(|l| l.all_objects())
+            .any(|o| matches!(o.kind, ObjectKind::Armature(_)))
+    };
+    if stacks().any(armature) {
+        Some(RigKind::Bones)
+    } else if stacks().any(|stack| stack.iter().any(|l| l.follows.is_some())) {
+        Some(RigKind::Layers)
+    } else {
+        None
+    }
+}
+
 /// One saved asset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
@@ -59,6 +81,13 @@ pub struct Asset {
     /// library is scanned so the panel can separate animated assets from static
     /// ones. See [`buzz_scene::Scene::is_animated`].
     pub animated: bool,
+    /// How the character in it is rigged, read from the saved document when
+    /// the library is scanned: an armature anywhere makes it a bone rig;
+    /// layers that follow other layers, with no armature, a layer rig;
+    /// anything else `None`. Shown on the Cast panel's row. See [`rig_kind_of`].
+    pub rig_kind: Option<RigKind>,
+    /// Semantic tags describing this asset.
+    pub tags: Vec<String>,
 }
 
 impl Asset {
@@ -88,7 +117,9 @@ pub struct AssetLibrary {
     /// rescan — and a rescan follows every save, rename, move and delete — is
     /// the per-frame-scale cost the rest of this module is careful to avoid, so
     /// an unchanged file is read once and remembered.
-    animation: std::collections::HashMap<PathBuf, (std::time::SystemTime, bool)>,
+    /// The asset's [`Asset::rig_kind`] rides along in the same entry, read
+    /// from the same load.
+    animation: std::collections::HashMap<PathBuf, (std::time::SystemTime, bool, Option<RigKind>)>,
     /// What went wrong last time, for the panel to show. An unreadable library
     /// must not be silent — an empty panel looks like "you have no assets".
     pub last_error: Option<String>,
@@ -181,6 +212,12 @@ impl AssetLibrary {
                 let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
+                // Hidden folders are the library's own housekeeping (the
+                // asset index's thumbnails and arrange log), not folders of
+                // assets.
+                if name.starts_with('.') {
+                    continue;
+                }
                 let child = if folder.is_empty() {
                     name.to_string()
                 } else {
@@ -192,12 +229,14 @@ impl AssetLibrary {
                 && let Some(name) = path.file_stem().and_then(|n| n.to_str())
             {
                 let name = name.to_string();
-                let animated = self.resolve_animated(&path);
+                let (animated, rig_kind) = self.resolve_animated(&path);
                 self.assets.push(Asset {
                     name,
                     folder: folder.to_string(),
                     path,
                     animated,
+                    rig_kind,
+                    tags: Vec::new(),
                 });
             }
         }
@@ -208,19 +247,22 @@ impl AssetLibrary {
     /// modification time so an unchanged file is read once rather than on every
     /// rescan. A file that has changed since, or that has never been seen, is
     /// read; one that cannot be read counts as static rather than being dropped.
-    fn resolve_animated(&mut self, path: &Path) -> bool {
+    /// The asset's [`Asset::rig_kind`] comes from the same read.
+    fn resolve_animated(&mut self, path: &Path) -> (bool, Option<RigKind>) {
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         if let Some(mtime) = mtime
-            && let Some((seen, animated)) = self.animation.get(path)
+            && let Some((seen, animated, rig_kind)) = self.animation.get(path)
             && *seen == mtime
         {
-            return *animated;
+            return (*animated, *rig_kind);
         }
-        let animated = format::load(path).map(|s| s.is_animated()).unwrap_or(false);
+        let (animated, rig_kind) = format::load(path)
+            .map(|s| (s.is_animated(), rig_kind_of(&s)))
+            .unwrap_or((false, None));
         if let Some(mtime) = mtime {
-            self.animation.insert(path.to_path_buf(), (mtime, animated));
+            self.animation.insert(path.to_path_buf(), (mtime, animated, rig_kind));
         }
-        animated
+        (animated, rig_kind)
     }
 
     /// Save a scene as an asset called `name` inside `folder`.
@@ -246,12 +288,15 @@ impl AssetLibrary {
         format::save(scene, &path)?;
 
         let animated = scene.is_animated();
+        let rig_kind = rig_kind_of(scene);
         self.rescan();
         Ok(Asset {
             name,
             folder: folder.to_string(),
             path,
             animated,
+            rig_kind,
+            tags: Vec::new(),
         })
     }
 
@@ -327,6 +372,13 @@ impl AssetLibrary {
         if target == asset.path {
             return Ok(());
         }
+        // Never onto a file that is already there: `rename` replaces it.
+        if target.exists() {
+            return Err(DocError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} already exists", target.display()),
+            )));
+        }
         std::fs::rename(&asset.path, &target).map_err(DocError::Io)?;
         self.rescan();
         Ok(())
@@ -383,10 +435,25 @@ impl AssetLibrary {
 
     /// A name not already used in `folder`.
     pub fn unique_name(&self, wanted: &str, folder: &str) -> String {
+        // **Taken regardless of case**, and on the disk as well as in the
+        // listing: Windows and macOS file names ignore case, so `moon` and
+        // `Moon` are one file there, and a rename onto it replaces it. The
+        // 2026-10-11 arrange lost an asset exactly that way.
+        let dir = self.root.as_ref().map(|root| {
+            if folder.is_empty() {
+                root.clone()
+            } else {
+                root.join(folder.replace('/', std::path::MAIN_SEPARATOR_STR))
+            }
+        });
         let taken = |name: &str| {
+            let lower = name.to_lowercase();
             self.assets
                 .iter()
-                .any(|a| a.folder == folder && a.name == name)
+                .any(|a| a.folder.to_lowercase() == folder.to_lowercase() && a.name.to_lowercase() == lower)
+                || dir
+                    .as_ref()
+                    .is_some_and(|d| d.join(format!("{name}.{}", format::EXTENSION)).exists())
         };
         let wanted = sanitise(wanted);
         if !taken(&wanted) {
@@ -443,7 +510,12 @@ mod tests {
         assert_eq!(oak.folder, "Trees");
 
         library.move_to_folder(&oak, "Props").expect("moved");
-        let moved = library.assets().iter().next().cloned().expect("still there");
+        let moved = library
+            .assets()
+            .iter()
+            .next()
+            .cloned()
+            .expect("still there");
         assert_eq!(moved.folder, "Props", "it did not land in the new folder");
         assert_eq!(moved.name, "Oak", "it lost its name on the way");
         assert!(moved.path.exists(), "the file did not follow");
@@ -462,7 +534,12 @@ mod tests {
         let oak = library.assets().iter().next().cloned().expect("the oak");
 
         library.move_to_folder(&oak, "").expect("moved to the root");
-        let moved = library.assets().iter().next().cloned().expect("still there");
+        let moved = library
+            .assets()
+            .iter()
+            .next()
+            .cloned()
+            .expect("still there");
         assert_eq!(moved.folder, "");
 
         library.move_to_folder(&moved, "").expect("moved nowhere");
@@ -488,12 +565,14 @@ mod tests {
             .cloned()
             .expect("the one in Trees");
 
-        library
-            .move_to_folder(&from_trees, "Props")
-            .expect("moved");
+        library.move_to_folder(&from_trees, "Props").expect("moved");
         assert_eq!(library.len(), 2, "one of them was overwritten");
         assert_eq!(
-            library.assets().iter().filter(|a| a.folder == "Props").count(),
+            library
+                .assets()
+                .iter()
+                .filter(|a| a.folder == "Props")
+                .count(),
             2,
             "they are not both in Props"
         );
@@ -511,7 +590,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut library = AssetLibrary::at(dir.path());
         library.save("Oak", "Trees", &a_tree()).expect("save");
-        library.save("Pine", "Trees/Conifers", &a_tree()).expect("save");
+        library
+            .save("Pine", "Trees/Conifers", &a_tree())
+            .expect("save");
         library.save("Lamp", "", &a_tree()).expect("save");
         assert_eq!(library.len(), 3);
 
@@ -532,7 +613,7 @@ mod tests {
         );
     }
 
-    use buzz_geom::{Rect, Shape as _};
+    use buzz_geom::{Point, Rect, Shape as _};
     use buzz_scene::{LayerKind, ShapeData};
     use peniko::Color;
 
@@ -653,6 +734,49 @@ mod tests {
         };
         assert_eq!(scanned("Oak"), Some(false));
         assert_eq!(scanned("Wind"), Some(true));
+    }
+
+    /// **L3: scanning the Cast records each character's rig kind.** An
+    /// armature makes a bone rig; layers that follow layers, with no armature,
+    /// a layer rig; a plain drawing is neither.
+    #[test]
+    fn scanning_a_cast_folder_reports_each_rig_kind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut library = AssetLibrary::at(dir.path());
+
+        // A bone rig: an armature object on a layer.
+        let mut boned = Scene::default();
+        let layer = boned.add_layer("Character", LayerKind::Normal);
+        let mut armature = buzz_rig::Armature::new(Point::new(100.0, 100.0));
+        armature.push(buzz_rig::Bone::new("upper", None, 50.0, 0.2));
+        let mut object = buzz_scene::Object::shape(
+            buzz_scene::ObjectId(900),
+            ShapeData::filled(Rect::new(0.0, 0.0, 1.0, 1.0).to_path(1e-9), Color::WHITE),
+        );
+        object.kind = ObjectKind::Armature(buzz_scene::ArmatureData::new(armature));
+        boned.add_object(layer, object).expect("the armature is placed");
+        library.save("Boned", "Cast", &boned).expect("save");
+
+        // A layer rig: a forearm layer following an upper-arm layer.
+        let mut layered = a_tree();
+        let upper = layered.add_layer("Upper", LayerKind::Normal);
+        let fore = layered.add_layer("Fore", LayerKind::Normal);
+        assert!(layered.set_follows(fore, Some(upper), 0), "the link is made");
+        library.save("Layered", "Cast", &layered).expect("save");
+
+        library.save("Oak", "Cast", &a_tree()).expect("save");
+
+        let found = AssetLibrary::at(dir.path());
+        let kind = |name: &str| {
+            found
+                .in_folder("Cast")
+                .into_iter()
+                .find(|a| a.name == name)
+                .map(|a| a.rig_kind)
+        };
+        assert_eq!(kind("Boned"), Some(Some(RigKind::Bones)));
+        assert_eq!(kind("Layered"), Some(Some(RigKind::Layers)));
+        assert_eq!(kind("Oak"), Some(None), "a drawing is not a rig");
     }
 
     /// Two assets of the same name in one folder would be one file.

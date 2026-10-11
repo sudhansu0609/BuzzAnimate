@@ -162,7 +162,10 @@ pub fn motion_editor_panel(
             to_screen(t, easing.apply(t))
         })
         .collect();
-    painter.add(egui::Shape::line(samples, Stroke::new(1.5, Color32::from_gray(120))));
+    painter.add(egui::Shape::line(
+        samples,
+        Stroke::new(1.5, Color32::from_gray(120)),
+    ));
 
     // The editable bezier, and its handle guide-lines.
     let p0 = to_screen(0.0, 0.0);
@@ -184,7 +187,11 @@ pub fn motion_editor_panel(
     // -- the two draggable handles ------------------------------------------
     for (i, centre) in [h1, h2].into_iter().enumerate() {
         let handle_rect = Rect::from_center_size(centre, vec2(16.0, 16.0));
-        let resp = ui.interact(handle_rect, Id::new(("motion-cp", i)), Sense::click_and_drag());
+        let resp = ui.interact(
+            handle_rect,
+            Id::new(("motion-cp", i)),
+            Sense::click_and_drag(),
+        );
         if resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }

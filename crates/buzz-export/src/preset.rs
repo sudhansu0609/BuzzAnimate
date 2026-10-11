@@ -201,7 +201,10 @@ mod tests {
             ..ExportPreset::built_ins()[0].clone()
         };
         let json = serde_json::to_string(&user).unwrap();
-        assert!(!json.contains("builtin"), "the false flag is skipped: {json}");
+        assert!(
+            !json.contains("builtin"),
+            "the false flag is skipped: {json}"
+        );
 
         let round: ExportPreset = serde_json::from_str(&json).unwrap();
         assert!(!round.builtin);

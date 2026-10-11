@@ -188,7 +188,10 @@ pub fn camera_panel(
                 .hint_text("Name")
                 .desired_width(120.0),
         );
-        if ui.small_button("Save Angle").on_hover_text("Save this shot under the name").clicked()
+        if ui
+            .small_button("Save Angle")
+            .on_hover_text("Save this shot under the name")
+            .clicked()
         {
             let name = state.new_angle_name.trim();
             let name = if name.is_empty() {
@@ -202,11 +205,18 @@ pub fn camera_panel(
     });
     for (i, angle) in camera.angles.iter().enumerate() {
         ui.horizontal(|ui| {
-            if ui.small_button("Cut").on_hover_text("Cut to this angle at the playhead").clicked()
+            if ui
+                .small_button("Cut")
+                .on_hover_text("Cut to this angle at the playhead")
+                .clicked()
             {
                 out.cut_angle = Some(i);
             }
-            if ui.add(egui::Button::new("✕").small()).on_hover_text("Delete").clicked() {
+            if ui
+                .add(egui::Button::new("✕").small())
+                .on_hover_text("Delete")
+                .clicked()
+            {
                 out.delete_angle = Some(i);
             }
             ui.label(&angle.name);
@@ -241,7 +251,6 @@ fn angle(ui: &mut Ui, label: &str, radians: &mut f64, limit: f64, hint: &str) ->
     changed
 }
 
-
 /// **Animate's on-stage camera controls**, as a strip that sits over the stage
 /// while the camera is the thing being worked on.
 ///
@@ -259,12 +268,7 @@ fn angle(ui: &mut Ui, label: &str, radians: &mut f64, limit: f64, hint: &str) ->
 ///
 /// Every control keys the camera at `frame`, which is what the Camera tool does
 /// when it is dragged.
-pub fn camera_hud(
-    ui: &mut Ui,
-    camera: &CameraTrack,
-    frame: u32,
-    driving: bool,
-) -> CameraResponse {
+pub fn camera_hud(ui: &mut Ui, camera: &CameraTrack, frame: u32, driving: bool) -> CameraResponse {
     let mut out = CameraResponse::default();
 
     if !camera.enabled {
@@ -308,7 +312,11 @@ pub fn camera_hud(
 
         // -- zoom ----------------------------------------------------------
         ui.label(RichText::new("Zoom").small().weak());
-        if ui.small_button("\u{2212}").on_hover_text("Pull back").clicked() {
+        if ui
+            .small_button("\u{2212}")
+            .on_hover_text("Pull back")
+            .clicked()
+        {
             key.zoom = (key.zoom / 1.1).clamp(0.1, 8.0);
             changed = true;
         }

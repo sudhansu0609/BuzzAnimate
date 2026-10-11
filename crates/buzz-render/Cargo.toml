@@ -18,6 +18,9 @@ vello.workspace = true
 # wgpu in one binary produce structurally distinct Device types that cannot
 # share a surface.
 wgpu.workspace = true
+# Sets the process-wide buffer scale (patched, see third_party/vello_encoding)
+# before the Vello renderer is created.
+vello_encoding.workspace = true
 kurbo.workspace = true
 peniko.workspace = true
 
@@ -26,3 +29,11 @@ thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 pollster.workspace = true
+
+[features]
+# Ground truth GPU counters for calibrating `SceneBuilder::estimated_lines`
+# against what Vello's rasteriser actually used — `GpuContext::render_measured`.
+# Off by default: it pulls in Vello's own `debug_layers` feature, which pays
+# for a full GPU read-back on every render, and a normal build must not carry
+# that cost. See Phase 4b in `docs/FLA_IMPORT_BLANK_AND_LAG_PLAN.md`.
+gpu-truth = ["vello/debug_layers"]

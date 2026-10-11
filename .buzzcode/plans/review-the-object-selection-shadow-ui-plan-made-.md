@@ -1,0 +1,28 @@
+# Review the Object Selection / Shadow / UI plan made 1–2h ago
+
+The recent plan is docs/OBJECT_SELECTION_SHADOW_UI_PLAN.md (plus a - Copy variant and related .buzzcode/plans files). It is explicitly "planning only" and records that prior partial implementations were interrupted, so its first directive is to re-inspect the current diff and establish a per-area baseline before implementing anything. This plan verifies what state each of the four areas is actually in right now.
+
+## Steps
+
+1. Read docs/OBJECT_SELECTION_SHADOW_UI_PLAN.md in full (633 lines) and diff it against 'OBJECT_SELECTION_SHADOW_UI_PLAN - Copy.md' to see which revision is current.
+   - files: docs/OBJECT_SELECTION_SHADOW_UI_PLAN.md, docs/OBJECT_SELECTION_SHADOW_UI_PLAN - Copy.md
+   - verify: Confirm the two files differ only in review-correction revisions; identify the newer one.
+
+2. Cross-check the plan's 'Changes already present' table against the live working tree (git diff --stat on buzz-app/src/tools.rs, buzz-scene shadow/modifier files, buzz-ui panels) to classify each area as verified/incomplete/unverified.
+   - files: crates/buzz-app/src/tools.rs, crates/buzz-scene/src/lib.rs, crates/buzz-ui/src/panels.rs
+   - verify: git diff --stat shows which areas still have uncommitted changes; note that the whole tree is dirty, so rely on per-file inspection.
+
+3. Run the relevant existing test suites to establish a baseline (selection/free-transform, shadow, panel layout tests).
+   - files: crates/buzz-app/tests/rigging_panel.rs, crates/buzz-ui/tests/real_layout_migration.rs
+   - verify: cargo test -p buzz-app --test rigging_panel and cargo test -p buzz-ui pass/fail results recorded as the pre-implementation baseline.
+
+4. Report a concise status summary per plan area (selection transform, shadows, right-side UI, Adobe import fidelity) with what is done vs. remaining, so the user can decide whether to authorize implementation.
+   - verify: User receives the status report; no code changes made.
+
+## Risks
+- The working tree has ~150 modified files from interrupted work; attributing changes per plan area is ambiguous.
+- A '- Copy' duplicate of the plan exists — unclear which revision is authoritative.
+
+## Open questions
+- Did you mean the OBJECT_SELECTION_SHADOW_UI_PLAN.md plan (or one of the .buzzcode/plans/* free-transform plans)?
+- Do you want a read-only status review, or should I proceed to implement part of it?

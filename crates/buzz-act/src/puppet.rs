@@ -401,7 +401,10 @@ mod tests {
         let (scene, puppet) = built();
         let face = scene.layers().get(puppet.face_layer).expect("a face layer");
         assert_eq!(face.follows, Some(puppet.body_layer));
-        let mouth = scene.layers().get(puppet.mouth_layer).expect("a mouth layer");
+        let mouth = scene
+            .layers()
+            .get(puppet.mouth_layer)
+            .expect("a mouth layer");
         assert_eq!(mouth.follows, Some(puppet.body_layer));
     }
 
@@ -462,10 +465,7 @@ mod tests {
     #[test]
     fn the_face_moves_when_the_head_bone_does() {
         let (mut scene, puppet) = built();
-        let face = scene
-            .layers()
-            .get(puppet.face_layer)
-            .expect("a face layer");
+        let face = scene.layers().get(puppet.face_layer).expect("a face layer");
         assert_eq!(
             face.follows_bone,
             Some(figure::Joint::Head.index()),

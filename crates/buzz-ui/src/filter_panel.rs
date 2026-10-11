@@ -50,12 +50,24 @@ pub struct FilterResponse {
     pub reorder: Option<(usize, i32)>,
     /// A new blend mode for the selected object.
     pub set_blend: Option<Blend>,
+    pub set_layer_alpha: Option<f64>,
+    pub set_layer_brightness: Option<f32>,
+    pub set_layer_tint: Option<(peniko::Color, f32)>,
     /// Attach this live modifier to the selected object.
     pub add_modifier: Option<Modifier>,
     /// Remove the modifier at this index.
     pub remove_modifier: Option<usize>,
     /// Replace the modifier at this index (a parameter was dragged).
     pub set_modifier: Option<(usize, Modifier)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerEffects {
+    pub alpha: f64,
+    pub brightness: f32,
+    pub tint: peniko::Color,
+    pub tint_amount: f32,
+    pub blend: Blend,
 }
 
 /// Draw the panel.
@@ -69,11 +81,12 @@ pub fn filter_panel(
     modifiers: &[Modifier],
     state: &mut FilterPanelState,
     has_selection: bool,
+    layer_effects: Option<LayerEffects>,
 ) -> FilterResponse {
     let mut out = FilterResponse::default();
 
     ui.horizontal(|ui| {
-        ui.heading("Filters");
+        ui.heading("Effects");
         if !filters.is_empty() {
             ui.label(RichText::new(format!("{}", filters.len())).small().weak());
         }
@@ -97,12 +110,9 @@ pub fn filter_panel(
     }
 
     // -- blend mode ---------------------------------------------------------
-    if state.target == FilterTarget::Object
-        && let Some(current) = blend
-    {
-        ui.horizontal(|ui| {
-            ui.label("Blend");
-            egui::ComboBox::from_id_salt("object-blend")
+    if let Some(current) = blend {
+        crate::panels::property_row(ui, "Blend", None, |ui| {
+            egui::ComboBox::from_id_salt("effects-blend")
                 .selected_text(current.label())
                 .width(120.0)
                 .show_ui(ui, |ui| {
@@ -113,6 +123,52 @@ pub fn filter_panel(
                     }
                 });
         });
+    }
+
+    if state.target == FilterTarget::Layer {
+        let Some(current) = layer_effects else {
+            ui.label(
+                RichText::new("Select a layer to edit its effects.")
+                    .small()
+                    .weak(),
+            );
+            return out;
+        };
+        ui.separator();
+        ui.label(RichText::new("Layer Effects").strong());
+        let mut opacity = current.alpha * 100.0;
+        if ui
+            .add(egui::Slider::new(&mut opacity, 0.0..=100.0).text("Opacity %"))
+            .changed()
+        {
+            out.set_layer_alpha = Some((opacity / 100.0).clamp(0.0, 1.0));
+        }
+        let mut brightness = current.brightness * 100.0;
+        if ui
+            .add(egui::Slider::new(&mut brightness, -100.0..=100.0).text("Brightness %"))
+            .changed()
+        {
+            out.set_layer_brightness = Some((brightness / 100.0).clamp(-1.0, 1.0));
+        }
+        let mut tint = to_egui(current.tint);
+        let mut amount = current.tint_amount * 100.0;
+        ui.horizontal(|ui| {
+            ui.label("Tint");
+            if ui.color_edit_button_srgba(&mut tint).changed() {
+                out.set_layer_tint = Some((from_egui(tint), current.tint_amount));
+            }
+        });
+        if ui
+            .add(egui::Slider::new(&mut amount, 0.0..=100.0).text("Tint amount %"))
+            .changed()
+        {
+            out.set_layer_tint = Some((current.tint, (amount / 100.0).clamp(0.0, 1.0)));
+        }
+        ui.label(
+            RichText::new("Color Overlay uses Tint at 100%; Overlay above is the blend mode.")
+                .small()
+                .weak(),
+        );
     }
 
     // -- live motion (procedural modifiers) ---------------------------------
@@ -230,7 +286,11 @@ pub fn filter_panel(
             let mut edited = *modifier;
             let mut changed = false;
             ui.horizontal(|ui| {
-                if ui.small_button("\u{2715}").on_hover_text("Remove").clicked() {
+                if ui
+                    .small_button("\u{2715}")
+                    .on_hover_text("Remove")
+                    .clicked()
+                {
                     out.remove_modifier = Some(i);
                 }
                 ui.label(modifier.label());
@@ -239,14 +299,22 @@ pub fn filter_panel(
                         amplitude,
                         frequency,
                     } => {
-                        changed |= ui.add(egui::DragValue::new(amplitude).prefix("amp ").speed(0.2)).changed();
-                        changed |= ui.add(egui::DragValue::new(frequency).prefix("Hz ").speed(0.05)).changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(amplitude).prefix("amp ").speed(0.2))
+                            .changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(frequency).prefix("Hz ").speed(0.05))
+                            .changed();
                     }
                     Modifier::Spring {
                         stiffness, damping, ..
                     } => {
-                        changed |= ui.add(egui::DragValue::new(stiffness).prefix("k ").speed(1.0)).changed();
-                        changed |= ui.add(egui::DragValue::new(damping).prefix("d ").speed(0.2)).changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(stiffness).prefix("k ").speed(1.0))
+                            .changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(damping).prefix("d ").speed(0.2))
+                            .changed();
                     }
                     Modifier::LookAt { x, y } => {
                         changed |= ui.add(egui::DragValue::new(x).prefix("x ")).changed();
@@ -552,8 +620,7 @@ fn parameters(ui: &mut Ui, kind: &mut FilterKind) -> bool {
             changed |= distance_field(ui, distance);
             changed |= colour_field(ui, "Highlight", highlight);
             changed |= colour_field(ui, "Shadow", shadow);
-            ui.horizontal(|ui| {
-                ui.label("Type");
+            crate::panels::property_row(ui, "Type", None, |ui| {
                 for option in BevelKind::ALL {
                     if ui
                         .selectable_label(*kind == option, option.label())
@@ -582,68 +649,51 @@ fn parameters(ui: &mut Ui, kind: &mut FilterKind) -> bool {
 
 fn blur_fields(ui: &mut Ui, x: &mut f64, y: &mut f64) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label("Blur X");
-        changed |= ui
-            .add(egui::Slider::new(x, 0.0..=100.0).fixed_decimals(1))
-            .changed();
+    changed |= crate::panels::property_row(ui, "Blur X", None, |ui| {
+        ui.add(egui::Slider::new(x, 0.0..=100.0).fixed_decimals(1))
+            .changed()
     });
-    ui.horizontal(|ui| {
-        ui.label("Blur Y");
-        changed |= ui
-            .add(egui::Slider::new(y, 0.0..=100.0).fixed_decimals(1))
-            .changed();
+    changed |= crate::panels::property_row(ui, "Blur Y", None, |ui| {
+        ui.add(egui::Slider::new(y, 0.0..=100.0).fixed_decimals(1))
+            .changed()
     });
     changed
 }
 
 fn strength_field(ui: &mut Ui, strength: &mut f64) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label("Strength");
-        changed |= ui
-            .add(egui::Slider::new(strength, 0.0..=1.0).fixed_decimals(2))
-            .changed();
-    });
-    changed
+    crate::panels::property_row(ui, "Strength", None, |ui| {
+        ui.add(egui::Slider::new(strength, 0.0..=1.0).fixed_decimals(2))
+            .changed()
+    })
 }
 
 /// Angle in **degrees**, like Animate's — nobody aims a shadow in radians.
 fn angle_field(ui: &mut Ui, angle: &mut f64) -> bool {
     let mut degrees = angle.to_degrees();
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label("Angle");
-        if ui
-            .add(
-                egui::Slider::new(&mut degrees, -180.0..=180.0)
-                    .suffix("\u{b0}")
-                    .fixed_decimals(0),
-            )
-            .changed()
-        {
-            *angle = degrees.to_radians();
-            changed = true;
-        }
+    let changed = crate::panels::property_row(ui, "Angle", None, |ui| {
+        ui.add(
+            egui::Slider::new(&mut degrees, -180.0..=180.0)
+                .suffix("\u{b0}")
+                .fixed_decimals(0),
+        )
+        .changed()
     });
+    if changed {
+        *angle = degrees.to_radians();
+    }
     changed
 }
 
 fn distance_field(ui: &mut Ui, distance: &mut f64) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label("Distance");
-        changed |= ui
-            .add(egui::Slider::new(distance, -60.0..=60.0).fixed_decimals(1))
-            .changed();
-    });
-    changed
+    crate::panels::property_row(ui, "Distance", None, |ui| {
+        ui.add(egui::Slider::new(distance, -60.0..=60.0).fixed_decimals(1))
+            .changed()
+    })
 }
 
 fn colour_field(ui: &mut Ui, label: &str, color: &mut peniko::Color) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(label);
+    crate::panels::property_row(ui, label, None, |ui| {
         let mut rgba = to_egui(*color);
         if ui.color_edit_button_srgba(&mut rgba).changed() {
             *color = from_egui(rgba);
@@ -655,8 +705,7 @@ fn colour_field(ui: &mut Ui, label: &str, color: &mut peniko::Color) -> bool {
 
 fn quality_field(ui: &mut Ui, quality: &mut Quality) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label("Quality");
+    crate::panels::property_row(ui, "Quality", None, |ui| {
         for option in Quality::ALL {
             if ui
                 .selectable_label(*quality == option, option.label())
@@ -679,11 +728,9 @@ fn adjust_fields(ui: &mut Ui, adjust: &mut ColorAdjust) -> bool {
         ("Saturation", &mut adjust.saturation, -100.0..=100.0),
         ("Hue", &mut adjust.hue, -180.0..=180.0),
     ] {
-        ui.horizontal(|ui| {
-            ui.label(label);
-            changed |= ui
-                .add(egui::Slider::new(value, range).fixed_decimals(0))
-                .changed();
+        changed |= crate::panels::property_row(ui, label, None, |ui| {
+            ui.add(egui::Slider::new(value, range).fixed_decimals(0))
+                .changed()
         });
     }
     changed
@@ -702,7 +749,15 @@ mod tests {
         crate::theme::apply(&ctx);
         let mut response = FilterResponse::default();
         let _ = ctx.run_ui(Default::default(), |ui| {
-            response = filter_panel(ui, filters, Some(Blend::Normal), &[], state, has_selection);
+            response = filter_panel(
+                ui,
+                filters,
+                Some(Blend::Normal),
+                &[],
+                state,
+                has_selection,
+                None,
+            );
         });
         response
     }

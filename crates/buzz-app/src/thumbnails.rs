@@ -232,7 +232,10 @@ impl Thumbnails {
         self.requested.clear();
     }
 
-    #[allow(clippy::too_many_arguments, reason = "one call site, in the render path")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one call site, in the render path"
+    )]
     fn draw(
         &mut self,
         gpu: &mut buzz_render::GpuContext,
@@ -263,22 +266,24 @@ impl Thumbnails {
             cache,
         );
 
-        let texture = gpu.device.create_texture(&buzz_render::wgpu::TextureDescriptor {
-            label: Some("thumbnail"),
-            size: buzz_render::wgpu::Extent3d {
-                width: SIZE,
-                height: SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: buzz_render::wgpu::TextureDimension::D2,
-            format: buzz_render::RENDER_FORMAT,
-            usage: buzz_render::wgpu::TextureUsages::STORAGE_BINDING
-                | buzz_render::wgpu::TextureUsages::TEXTURE_BINDING
-                | buzz_render::wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let texture = gpu
+            .device
+            .create_texture(&buzz_render::wgpu::TextureDescriptor {
+                label: Some("thumbnail"),
+                size: buzz_render::wgpu::Extent3d {
+                    width: SIZE,
+                    height: SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: buzz_render::wgpu::TextureDimension::D2,
+                format: buzz_render::RENDER_FORMAT,
+                usage: buzz_render::wgpu::TextureUsages::STORAGE_BINDING
+                    | buzz_render::wgpu::TextureUsages::TEXTURE_BINDING
+                    | buzz_render::wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
         let view = texture.create_view(&buzz_render::wgpu::TextureViewDescriptor::default());
 
         // Transparent, so a thumbnail sits on the panel's own colour and works
@@ -286,7 +291,11 @@ impl Thumbnails {
         gpu.render(vello, &view, SIZE, SIZE, peniko::Color::TRANSPARENT)
             .ok()?;
 
-        let id = egui_renderer.register_native_texture(&gpu.device, &view, buzz_render::wgpu::FilterMode::Linear);
+        let id = egui_renderer.register_native_texture(
+            &gpu.device,
+            &view,
+            buzz_render::wgpu::FilterMode::Linear,
+        );
         Some(Entry {
             symbol: arc,
             texture,
@@ -510,7 +519,7 @@ impl AssetThumbnails {
 ///
 /// `None` when there is nothing on it — no picture to draw, rather than an
 /// error.
-fn scene_bounds(scene: &Scene) -> Option<Rect> {
+pub(crate) fn scene_bounds(scene: &Scene) -> Option<Rect> {
     let table = scene.symbol_bounds_table();
     let layers: Vec<_> = scene.layers().drawable_at(0).collect();
     layers
@@ -538,11 +547,7 @@ fn scene_bounds(scene: &Scene) -> Option<Rect> {
 /// being squashed into a square box.
 fn fit(bounds: Rect, size: u32) -> Camera {
     let size = f64::from(size);
-    let mut camera = Camera::new(
-        bounds.center(),
-        1.0,
-        Size::new(size, size),
-    );
+    let mut camera = Camera::new(bounds.center(), 1.0, Size::new(size, size));
     // A symbol with no extent in either axis cannot be framed; leaving the
     // camera at its default is harmless, because there is nothing to draw.
     camera.fit_to_rect(bounds, MARGIN);
@@ -594,8 +599,8 @@ mod tests {
         let size = f64::from(SIZE);
         for bounds in [
             rect(0.0, 0.0, 100.0, 100.0),
-            rect(-500.0, -20.0, 500.0, 20.0), // very wide
-            rect(10.0, -400.0, 30.0, 400.0),  // very tall
+            rect(-500.0, -20.0, 500.0, 20.0),     // very wide
+            rect(10.0, -400.0, 30.0, 400.0),      // very tall
             rect(1000.0, 1000.0, 1002.0, 1002.0), // tiny, far from the origin
         ] {
             let camera = fit(bounds, SIZE);

@@ -62,11 +62,9 @@ fn nested_library(levels: usize, fanout: usize) -> Scene {
                         oid += 1;
                         l.frames.push_object(
                             0,
-                            Arc::new(
-                                Object::instance_of(ObjectId(oid), child).with_transform(
-                                    Affine::translate((j as f64 * 12.0, lvl as f64 * 12.0)),
-                                ),
-                            ),
+                            Arc::new(Object::instance_of(ObjectId(oid), child).with_transform(
+                                Affine::translate((j as f64 * 12.0, lvl as f64 * 12.0)),
+                            )),
                         );
                     });
                 }

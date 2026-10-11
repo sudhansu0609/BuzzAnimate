@@ -47,7 +47,10 @@ fn monster() -> Scene {
             let x = (oi * 12) as f64;
             scene.add_shape(
                 layer,
-                ShapeData::filled(Rect::new(x, 0.0, x + 10.0, 10.0).to_path(1e-9), Color::WHITE),
+                ShapeData::filled(
+                    Rect::new(x, 0.0, x + 10.0, 10.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
             );
         }
     }
@@ -118,6 +121,9 @@ fn the_timeline_panel_is_bounded_on_the_monster() {
     let state = TimelineState {
         current_frame: 0,
         active_layer: None,
+        selected_layers: Vec::new(),
+        range_anchor: None,
+        timeline_selection: None,
         camera_selected: false,
         selected_light: None,
         playing: false,
@@ -134,6 +140,7 @@ fn the_timeline_panel_is_bounded_on_the_monster() {
         nearest_depth: -buzz_scene::DEFAULT_FOCAL_DISTANCE * 0.9,
         waveforms: std::collections::BTreeMap::new(),
         beats: Vec::new(),
+        shot_end: None,
     };
 
     let ctx = egui::Context::default();
@@ -213,6 +220,9 @@ fn committing_a_merged_monster_and_drawing_is_bounded() {
     let state = TimelineState {
         current_frame: 0,
         active_layer: None,
+        selected_layers: Vec::new(),
+        range_anchor: None,
+        timeline_selection: None,
         camera_selected: false,
         selected_light: None,
         playing: false,
@@ -229,6 +239,7 @@ fn committing_a_merged_monster_and_drawing_is_bounded() {
         nearest_depth: -buzz_scene::DEFAULT_FOCAL_DISTANCE * 0.9,
         waveforms: std::collections::BTreeMap::new(),
         beats: Vec::new(),
+        shot_end: None,
     };
     let ctx = egui::Context::default();
     buzz_ui::theme::apply(&ctx);

@@ -26,20 +26,26 @@
 //!
 //! * **Hull entirely inside the clip bounds** → emit the segment untouched.
 //!   This is the common case and costs nothing.
-//! * **Hull does not meet the bounds** → the segment is invisible. Emit a
-//!   single straight line to its (clamped) endpoint. Connectivity and winding
-//!   are preserved, so fills stay correct, but the invisible detail costs one
-//!   segment instead of thousands.
-//! * **Otherwise** → subdivide and recurse, down to a depth and budget limit.
+//! * **Hull does not meet the bounds** → the segment is invisible. Emit its
+//!   straight chord through `line_to_clipped`. Connectivity and winding are
+//!   preserved, so fills stay correct, but the invisible detail costs a few
+//!   segments instead of thousands.
+//! * **Otherwise** → subdivide and recurse, down to a depth and budget limit
+//!   (the leftover piece is emitted as a clipped chord).
 //!
-//! Every emitted coordinate is clamped into the bounds, which caps magnitude.
+//! Every straight edge (LineTo, the implicit closing edge, collapsed chords)
+//! goes through `line_to_clipped`: it is split at its crossings with the four
+//! bound lines and each piece's endpoint is clamped. Within one of the 9 regions
+//! around the rectangle clamp is affine, so the result is a continuous
+//! projection that is the identity inside the bounds; geometry inside the
+//! bounds is exact. Every emitted coordinate lies in the bounds, which caps
+//! magnitude.
 //!
 //! # Why clamping is safe
 //!
-//! [`RenderClip`] expands the visible rectangle by a generous margin before
-//! clipping, so clamped points land well outside what the user can see.
-//! Coverage *inside the visible area* is preserved; the approximation is
-//! confined to the region beyond the margin. This is a render-path operation
+//! Geometry *inside the bounds* is unchanged and winding there is preserved.
+//! [`RenderClip`] expands the visible rectangle by a margin, so the only
+//! approximation is confined to the region beyond the margin. This is a render-path operation
 //! only — the document is never modified, and clipping is not used for
 //! editing, hit-testing, or export geometry.
 
@@ -133,7 +139,7 @@ impl RenderClip {
                     subpath_start = p;
                 }
                 PathEl::LineTo(p) => {
-                    out.line_to(self.clamp(p));
+                    self.line_to_clipped(cursor, p, &mut out);
                     cursor = p;
                     budget = budget.saturating_sub(1);
                 }
@@ -150,6 +156,10 @@ impl RenderClip {
                     cursor = p;
                 }
                 PathEl::ClosePath => {
+                    // The implicit closing edge must be split like any other.
+                    if cursor != subpath_start {
+                        self.line_to_clipped(cursor, subpath_start, &mut out);
+                    }
                     out.close_path();
                     cursor = subpath_start;
                 }
@@ -157,6 +167,55 @@ impl RenderClip {
         }
 
         out
+    }
+
+    /// Emit the straight edge `from -> to` (both UNclamped) so that the part
+    /// inside the bounds is exact.
+    ///
+    /// The edge is split at its crossings with the four bound lines; each piece
+    /// lies in one of the 9 regions around the rectangle, where `clamp` is
+    /// affine, so inside pieces are unchanged and outside pieces land on the
+    /// border. The overall map is a continuous projection, the identity inside.
+    fn line_to_clipped(&self, from: Point, to: Point, out: &mut BezPath) {
+        let b = self.bounds;
+        let inside = |p: Point| p.x >= b.x0 && p.x <= b.x1 && p.y >= b.y0 && p.y <= b.y1;
+        if inside(from) && inside(to) {
+            out.line_to(to);
+            return;
+        }
+        // Both ends strictly beyond the same bound line: the whole edge is
+        // outside and projects onto the border, so the endpoint suffices.
+        if (from.x < b.x0 && to.x < b.x0)
+            || (from.x > b.x1 && to.x > b.x1)
+            || (from.y < b.y0 && to.y < b.y0)
+            || (from.y > b.y1 && to.y > b.y1)
+        {
+            out.line_to(self.clamp(to));
+            return;
+        }
+        let d = to - from;
+        let mut ts = [0.0f64; 4];
+        let mut n = 0;
+        let mut add = |t: f64| {
+            if t > 0.0 && t < 1.0 {
+                ts[n] = t;
+                n += 1;
+            }
+        };
+        if d.x != 0.0 {
+            add((b.x0 - from.x) / d.x);
+            add((b.x1 - from.x) / d.x);
+        }
+        if d.y != 0.0 {
+            add((b.y0 - from.y) / d.y);
+            add((b.y1 - from.y) / d.y);
+        }
+        let ts = &mut ts[..n];
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        for &t in ts.iter() {
+            out.line_to(self.clamp(from + d * t));
+        }
+        out.line_to(self.clamp(to));
     }
 
     /// Emit one cubic, subdividing only where it meets the clip bounds.
@@ -167,7 +226,7 @@ impl RenderClip {
         // (rather than dropping the segment) is what preserves winding, so
         // fills that enclose the viewport still fill it.
         if !hull.overlaps(self.bounds) {
-            out.line_to(self.clamp(c.p3));
+            self.line_to_clipped(c.p0, c.p3, out);
             *budget = budget.saturating_sub(1);
             return;
         }
@@ -180,9 +239,9 @@ impl RenderClip {
         }
 
         // Straddling the boundary. Subdivide unless we have run out of room,
-        // in which case emit a clamped approximation.
+        // in which case emit the exact-clipped chord.
         if depth >= MAX_DEPTH || *budget == 0 {
-            out.curve_to(self.clamp(c.p1), self.clamp(c.p2), self.clamp(c.p3));
+            self.line_to_clipped(c.p0, c.p3, out);
             *budget = budget.saturating_sub(1);
             return;
         }
@@ -451,5 +510,107 @@ mod tests {
         let l = Line::new(Point::new(-1e9, -1e9), Point::new(-1e9, 1e9));
         let clipped = clip.apply(&l.to_path(1e-9));
         assert!(clipped.bounding_box().x1 < visible().x0);
+    }
+
+    fn dist_to_path(path: &BezPath, p: Point) -> f64 {
+        let mut best = f64::INFINITY;
+        let mut cur = Point::ORIGIN;
+        for el in path.elements() {
+            match *el {
+                PathEl::MoveTo(q) => cur = q,
+                PathEl::LineTo(q) => {
+                    let (a, b) = (cur, q);
+                    let ab = b - a;
+                    let len2 = ab.hypot2();
+                    let t = if len2 == 0.0 { 0.0 } else { (((p - a).x * ab.x + (p - a).y * ab.y) / len2).clamp(0.0, 1.0) };
+                    best = best.min((a + ab * t - p).hypot());
+                    cur = q;
+                }
+                _ => {}
+            }
+        }
+        best
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+    }
+
+    #[test]
+    fn a_long_diagonal_line_is_exact_inside_the_bounds() {
+        let clip = RenderClip::new(visible());
+        let b = clip.bounds();
+        let from = Point::new(-3e6, -1.7e6);
+        let to = Point::new(3.0e6 + 1900.0, 1.7e6 + 1100.0);
+        let mut path = BezPath::new();
+        path.move_to(from);
+        path.line_to(to);
+        let clipped = clip.apply(&path);
+        let mut checked = 0;
+        for i in 0..=20_000 {
+            let t = i as f64 / 20_000.0;
+            let p = from + (to - from) * t;
+            if p.x >= b.x0 && p.x <= b.x1 && p.y >= b.y0 && p.y <= b.y1 {
+                checked += 1;
+                let d = dist_to_path(&clipped, p);
+                assert!(d < 1e-9, "point {p:?} is {d} off the clipped path");
+            }
+        }
+        assert!(checked > 0, "the test line never entered the bounds");
+    }
+
+    #[test]
+    fn winding_inside_the_bounds_is_preserved_for_far_polygons() {
+        let clip = RenderClip::new(visible());
+        let b = clip.bounds();
+        let mut rng = Lcg(0x1234_5678_9abc_def0);
+        for _ in 0..300 {
+            let n = 3 + (rng.next() * 5.0) as usize;
+            let mut path = BezPath::new();
+            for k in 0..n {
+                let far = if rng.next() < 0.7 { 1e5 } else { 3e3 };
+                let p = Point::new((rng.next() - 0.5) * far, (rng.next() - 0.5) * far);
+                if k == 0 { path.move_to(p) } else { path.line_to(p) }
+            }
+            path.close_path();
+            let clipped = clip.apply(&path);
+            for _ in 0..40 {
+                let q = Point::new(
+                    b.x0 + rng.next() * b.width(),
+                    b.y0 + rng.next() * b.height(),
+                );
+                assert_eq!(
+                    path.winding(q),
+                    clipped.winding(q),
+                    "winding changed at {q:?} for {path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_implicit_closing_edge_is_clipped_exactly() {
+        let clip = RenderClip::new(visible());
+        let b = clip.bounds();
+        // Open-looking triangle whose closing edge crosses the bounds.
+        let mut path = BezPath::new();
+        path.move_to(Point::new(-1e6, 500.0));
+        path.line_to(Point::new(-1e6, 3e6));
+        path.line_to(Point::new(1e6, 3e6));
+        path.line_to(Point::new(1e6, 700.0));
+        path.close_path();
+        let clipped = clip.apply(&path);
+        let mut rng = Lcg(42);
+        for _ in 0..500 {
+            let q = Point::new(b.x0 + rng.next() * b.width(), b.y0 + rng.next() * b.height());
+            assert_eq!(path.winding(q), clipped.winding(q), "closing edge at {q:?}");
+        }
+        // Closing edge (1e6,700)->(-1e6,500): its point at x = 960 lies on the output.
+        let y = 500.0 + (960.0 + 1e6) / 2e6 * 200.0;
+        assert!(dist_to_path(&clipped, Point::new(960.0, y)) < 1e-9);
     }
 }

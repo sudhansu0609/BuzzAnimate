@@ -133,7 +133,11 @@ fn running_row(ui: &mut Ui, row: &TaskRow) -> Option<TaskAction> {
         None => {
             // Length unknown: a moving bar says "working" without lying about
             // how far along it is.
-            ui.add(egui::ProgressBar::new(0.0).desired_height(6.0).animate(true));
+            ui.add(
+                egui::ProgressBar::new(0.0)
+                    .desired_height(6.0)
+                    .animate(true),
+            );
         }
     }
     if !row.detail.is_empty() {

@@ -1,0 +1,55 @@
+{
+  "title": "Adobe import fidelity: diagnostics + bitmap fills in buzz-import-xfl",
+  "summary": "Follow plan §4 (docs/OBJECT_SELECTION_SHADOW_UI_PLAN.md, \"Large Adobe Animate imports\") starting with its steps 1–2 and the media-resolution part of step 3. Make ImportReport carry structured, per-entry diagnostics so nothing is lost silently, add a source-vs-parsed inventory reconciliation, then replace the flat-grey bitmap-fill fallback with real decoded image fills (including fill matrices) wired into buzz-scene's ImageLibrary/Paint::image. Text/video/sound get explicit placeholders + report entries this round rather than silent drops.",
+  "steps": [
+    {
+      "n": 1,
+      "description": "Extend ImportReport in crates/buzz-import-xfl/src/lib.rs: add a structured `issues` list (archive entry name, symbol path, layer/frame where known, reason) alongside the existing deduped `unsupported` strings; convert the tracing::warn at line ~225 (skipped library entry) and every note_unsupported call site to record location. Keep unsupported/is_complete behavior for backward compat.",
+      "files": [
+        "crates/buzz-import-xfl/src/lib.rs"
+      ],
+      "verification": "cargo test -p buzz-import-xfl passes; existing tests a_library_entry_that_will_not_decode_is_skipped_not_fatal and unsupported_features_are_reported still pass; add one test asserting the skipped-entry issue carries its entry name."
+    },
+    {
+      "n": 2,
+      "description": "Add source inventory reconciliation (plan step 1): count archive entries vs parsed library definitions/instances/layers in ImportReport (new fields: entries_total, symbols_parsed, instances_resolved, unresolved_refs), computed during import; expose them for app-level display. Never mark a partial import complete when counts don't reconcile.",
+      "files": [
+        "crates/buzz-import-xfl/src/lib.rs",
+        "crates/buzz-app/src/staging.rs (or wherever ImportReport is surfaced)"
+      ],
+      "verification": "cargo test -p buzz-import-xfl; new test on MINIMAL_DOCUMENT asserting counts match and a tampered fixture (extra library entry with bad XML) shows entries_total > symbols_parsed."
+    },
+    {
+      "n": 3,
+      "description": "Implement real bitmap fills: in the style-table parser (line ~1513 'BitmapFill' branch), resolve DOMBitmapFill to the decoded asset from self.bitmaps and emit buzz-scene Paint::image(ImageFill) with the fill matrix applied (map XFL transform matrix onto ImageFill/shape placement); drop the flat-grey fallback. Preserve dimensions and alpha from decode.",
+      "files": [
+        "crates/buzz-import-xfl/src/lib.rs",
+        "crates/buzz-scene/src/image.rs (only if ImageFill lacks a matrix field)"
+      ],
+      "verification": "New fixture test: XFL with an embedded PNG bitmap fill asserts the resulting object's Paint::image() resolves to the asset and pixel data matches; existing grey-fallback tests updated."
+    },
+    {
+      "n": 4,
+      "description": "Give text/video/sound explicit placeholders (plan step 3 'explicit placeholders where conversion is incomplete'): DOMStaticText/DynamicText/InputText -> placeholder shape sized from the XFL bounds with a report entry naming the frame/layer; DOMVideoInstance and DOMSoundItem keep their current unsupported entries but attach location info. No silent drops.",
+      "files": [
+        "crates/buzz-import-xfl/src/lib.rs"
+      ],
+      "verification": "cargo test -p buzz-import-xfl: extend unsupported_features_are_reported to assert placeholders exist for text and that report issues include the element name."
+    },
+    {
+      "n": 5,
+      "description": "Run full verification: cargo test -p buzz-import-xfl && cargo test -p buzz-doc (serialization of imported scenes) and build the app. If a real failing FLA is available, import it and compare inventory counts before/after.",
+      "files": [],
+      "verification": "All listed suites pass; import report on the fixture shows zero unexplained omissions for supported constructs."
+    }
+  ],
+  "risks": [
+    "Working tree has ~150 dirty files from interrupted work — new changes must not clobber unrelated edits.",
+    "XFL fill-matrix semantics (registration point vs. transform) are easy to get subtly wrong; need an Animate-authored fixture or careful derivation, image similarity alone won't prove it.",
+    "No licensed Adobe Animate available for round-trip validation per the plan's own caveat — mark Adobe-side checks unavailable."
+  ],
+  "questions": [
+    "Do you have a representative failing .fla/.xfl file to use as the regression fixture (plan §4 requires one)?",
+    "Priority check: bitmap fills first, or should text rendering come before them this round?"
+  ]
+}

@@ -13,8 +13,8 @@ use peniko::Color;
 use crate::command::{Command, shortcut_text};
 use crate::selection::Selection;
 use crate::style::{DrawStyle, DrawingMode, FillKind, StrokeKind, SymmetryMode};
-use crate::theme::{Metrics, Palette};
-use crate::tools::{TOOL_GROUPS, ToolId, ToolStatus};
+use crate::theme::{Metrics, Palette, Tokens};
+use crate::tools::{TOOL_FAMILIES, ToolId, ToolStatus};
 use crate::view::ViewSettings;
 
 /// Convert a document colour into an egui colour.
@@ -64,6 +64,36 @@ pub struct MenuState<'a> {
     /// than paths: a menu shows names, and the editor holds the list this
     /// indexes into.
     pub templates: &'a [String],
+    /// What the Sequence and Shot menus need about the active scene and the
+    /// document's setups — gathered fresh each frame, like `templates`,
+    /// because a menu cannot borrow the editor while it draws. See
+    /// `docs/SEQUENCE_SETUPS_PLAN.md`.
+    pub sequence: &'a SequenceMenuInfo,
+}
+
+/// What the Sequence and Shot menus need about the active scene and the
+/// document's setups. See [`MenuState::sequence`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SequenceMenuInfo {
+    /// The active scene's own key, if it is a Shot — what the Shot menu's
+    /// commands act on.
+    pub active_shot: Option<buzz_doc::SceneKey>,
+    /// That shot's own setup, if it has one on record — what "Edit Setup"
+    /// switches to.
+    pub active_shot_setup: Option<buzz_doc::SceneKey>,
+    /// A master audio is already set.
+    pub master_audio_set: bool,
+    /// Every Setup scene, by key and name — for "New Shot from Setup" and
+    /// "Try Another Setup" to list.
+    pub setups: Vec<(buzz_doc::SceneKey, String)>,
+    /// Sound-bearing layers of the active scene at frame 0, for "Set Master
+    /// Audio" to offer picking one instead of importing a new file.
+    pub sound_layers: Vec<(buzz_scene::LayerId, String)>,
+    /// Shots earlier in the sequence than `active_shot`, stamped from the
+    /// same setup, by key and name — what "Continue from Shot" lists. Empty
+    /// if `active_shot` is `None`, has no setup on record, or is the first
+    /// shot of its setup in the cut.
+    pub continue_from_choices: Vec<(buzz_doc::SceneKey, String)>,
 }
 
 /// Draw the menu bar. Returns whatever the user chose.
@@ -77,6 +107,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         workspace,
         light_gizmos,
         templates,
+        sequence,
     } = *state;
     let mut raised = Vec::new();
 
@@ -143,6 +174,10 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                     item(ui, c, true, &mut raised);
                 }
             });
+            // The other apps of the estate: BuzzEdit edits the film, Buzzcaf
+            // Studio writes the script (`docs/ECOSYSTEM_BRIDGE_PLAN.md`).
+            item(ui, Command::SendToBuzzEdit, true, &mut raised);
+            item(ui, Command::ImportScriptFromStudio, true, &mut raised);
             ui.separator();
             for c in [Command::Save, Command::SaveAs] {
                 item(ui, c, true, &mut raised);
@@ -221,6 +256,10 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 view.show_pasteboard,
                 &mut raised,
             );
+            // Opens a dialog rather than toggling straight away, so this is
+            // a plain `item`, not a `toggle` — "Match theme" versus a picked
+            // colour is a choice, not an on/off switch.
+            item(ui, Command::PasteboardColour, true, &mut raised);
             toggle(ui, Command::ToggleLightGizmos, light_gizmos, &mut raised);
             // Hiding the skeleton is wanted most by somebody holding a drawing
             // tool, who cannot reach the Bone tool's own options.
@@ -228,6 +267,33 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 ui,
                 Command::ToggleBoneRig,
                 workspace.rig.show_bones,
+                &mut raised,
+            );
+            ui.separator();
+
+            // **Stage 6, item 1**: 100–200 %, by name rather than a slider —
+            // the same reasoning as the Theme menu above it.
+            let current_scale = (workspace.ui_scale * 100.0).round() as u32;
+            ui.menu_button(format!("UI Size ({current_scale}%)"), |ui| {
+                for percent in [100u32, 125, 150, 175, 200] {
+                    let mark = if percent == current_scale {
+                        "\u{2714} "
+                    } else {
+                        "   "
+                    };
+                    if ui.button(format!("{mark}{percent}%")).clicked() {
+                        raised.push(Command::SetUiScale(percent));
+                        ui.close();
+                    }
+                }
+            });
+            // **Stage 6, item 5**: egui's own tooltip fades, spinner spins and
+            // caret blink all read as motion; this is the one switch for
+            // every one of them at once.
+            toggle(
+                ui,
+                Command::ToggleReduceMotion,
+                workspace.reduce_motion,
                 &mut raised,
             );
         });
@@ -240,11 +306,50 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 } else {
                     "   "
                 };
-                if ui.button(format!("{mark}{}", id.title())).clicked() {
+                // Stage 4, item 2 of `docs/WORKSPACE_DESIGN_PLAN.md`: every
+                // panel with its shortcut, not just a name and a tick — most
+                // have none, and the button is simply blank at the right.
+                let shortcut =
+                    crate::command::format_shortcut(ui.ctx(), workspace.shortcut_for(Command::TogglePanel(id)));
+                if ui
+                    .add(
+                        egui::Button::new(format!("{mark}{}", id.title())).shortcut_text(shortcut),
+                    )
+                    .clicked()
+                {
                     raised.push(Command::TogglePanel(id));
                     ui.close();
                 }
             }
+            ui.separator();
+
+            // **Workspace: the three named presets, and the two ways to
+            // manage one of your own.** Stage 4, item 2.
+            ui.menu_button("Workspace", |ui| {
+                for preset in crate::workspace::WorkspacePreset::ALL {
+                    if ui.button(preset.label()).clicked() {
+                        raised.push(Command::SetWorkspacePreset(preset));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui
+                    .button("Reset Layout")
+                    .on_hover_text("Put every panel back where it started")
+                    .clicked()
+                {
+                    raised.push(Command::ResetWorkspace);
+                    ui.close();
+                }
+                if ui
+                    .button("Save Current")
+                    .on_hover_text("Write the layout out now")
+                    .clicked()
+                {
+                    raised.push(Command::SaveWorkspace);
+                    ui.close();
+                }
+            });
             ui.separator();
 
             // The interface theme. Animate keeps this in Preferences; there
@@ -300,14 +405,9 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 raised.push(Command::ToggleLayoutLock);
                 ui.close();
             }
-            if ui
-                .button("Reset Layout")
-                .on_hover_text("Put every panel back where it started")
-                .clicked()
-            {
-                raised.push(Command::ResetWorkspace);
-                ui.close();
-            }
+            // Reset Layout now lives in the Workspace submenu above, beside
+            // the presets it resets among; kept out of here too so there is
+            // one place for it in this menu, not two.
             ui.separator();
             item(ui, Command::ShortcutEditor, true, &mut raised);
         });
@@ -343,6 +443,10 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 scene.layers().len() > 1,
                 &mut raised,
             );
+
+            // A titled line of text animated on and off (T).
+            ui.separator();
+            item(ui, Command::AddTitleCard, true, &mut raised);
 
             // Blender puts lights under Add; Animate has no lighting at all,
             // so Insert is where a user of either would look first.
@@ -405,6 +509,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         // Animate keeps playback under Control and the camera under View; the
         // camera gets its own menu here because it has more than one item.
         ui.menu_button("Control", |ui| {
+            item(ui, Command::TestMovie, true, &mut raised);
+            ui.separator();
             for c in [
                 Command::PlayPause,
                 Command::FirstFrame,
@@ -501,6 +607,101 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             );
         });
 
+        // **Reusable setups, shots cut on the dialogue.** See
+        // `docs/SEQUENCE_SETUPS_PLAN.md` and `docs/SEQUENCE_GUIDE.md` — the
+        // menu names here match the guide's quick reference exactly.
+        ui.menu_button("Sequence", |ui| {
+            item(ui, Command::SetMasterAudio, true, &mut raised);
+            if !sequence.sound_layers.is_empty() {
+                ui.menu_button("Use Existing Sound Layer", |ui| {
+                    for (id, name) in &sequence.sound_layers {
+                        if ui.button(name).clicked() {
+                            raised.push(Command::SetMasterAudioFromLayer(*id));
+                            ui.close();
+                        }
+                    }
+                });
+            }
+            ui.separator();
+            item(ui, Command::MakeSetupFromScene, true, &mut raised);
+            ui.add_enabled_ui(!sequence.setups.is_empty(), |ui| {
+                ui.menu_button("New Shot from Setup", |ui| {
+                    for (key, name) in &sequence.setups {
+                        if ui.button(name).clicked() {
+                            raised.push(Command::NewShotFromSetup(*key));
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Cut on Dialogue", |ui| {
+                    for (key, name) in &sequence.setups {
+                        if ui.button(name).clicked() {
+                            raised.push(Command::CutOnDialogue(*key));
+                            ui.close();
+                        }
+                    }
+                });
+            });
+            ui.separator();
+            item(ui, Command::FlattenToMasterScene, true, &mut raised);
+        });
+
+        ui.menu_button("Shot", |ui| {
+            let shot = sequence.active_shot;
+            item(ui, Command::SplitAtPlayhead, shot.is_some(), &mut raised);
+            ui.add_enabled_ui(shot.is_some(), |ui| {
+                ui.menu_button("Try Another Setup", |ui| {
+                    if sequence.setups.is_empty() {
+                        ui.label(RichText::new("No setups yet").small().weak());
+                    }
+                    for (key, name) in &sequence.setups {
+                        if ui.button(name).clicked()
+                            && let Some(shot) = shot
+                        {
+                            raised.push(Command::TryAnotherSetup(shot, *key));
+                            ui.close();
+                        }
+                    }
+                });
+                if ui.button("Duplicate Shot").clicked()
+                    && let Some(shot) = shot
+                {
+                    raised.push(Command::DuplicateShot(shot));
+                    ui.close();
+                }
+                if ui.button("Add Missing Setup Layers").clicked()
+                    && let Some(shot) = shot
+                {
+                    raised.push(Command::AddMissingSetupLayers(shot));
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        sequence.active_shot_setup.is_some(),
+                        egui::Button::new("Edit Setup"),
+                    )
+                    .clicked()
+                    && let Some(setup) = sequence.active_shot_setup
+                {
+                    raised.push(Command::EditSetup(setup));
+                    ui.close();
+                }
+                ui.menu_button("Continue from Shot", |ui| {
+                    if sequence.continue_from_choices.is_empty() {
+                        ui.label(RichText::new("No earlier shot of this setup").small().weak());
+                    }
+                    for (key, name) in &sequence.continue_from_choices {
+                        if ui.button(name).clicked()
+                            && let Some(shot) = shot
+                        {
+                            raised.push(Command::ContinueFromShot(shot, *key));
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        });
+
         // Animate's Commands menu holds saved JSFL commands. Ours runs what is
         // in the Actions panel, which is the same idea before there is anywhere
         // to save one.
@@ -512,6 +713,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::ImportCaptions, true, &mut raised);
             item(ui, Command::ExportCaptions, true, &mut raised);
             item(ui, Command::LipSyncFromCaptions, true, &mut raised);
+            item(ui, Command::TranscribeWithBuzzEdit, true, &mut raised);
             ui.separator();
             item(ui, Command::ToggleActionsPanel, true, &mut raised);
             ui.separator();
@@ -533,6 +735,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             ui.separator();
             item(ui, Command::GroupSelection, has_selection, &mut raised);
             item(ui, Command::UngroupSelection, has_selection, &mut raised);
+            item(ui, Command::BreakApart, has_selection, &mut raised);
             ui.separator();
 
             // Animate keeps Align in a submenu of Modify, and a panel besides.
@@ -613,7 +816,11 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::BrushFromSelection, has_selection, &mut raised);
             ui.separator();
             ui.label(RichText::new("Bitmap").small().weak());
-            for c in [Command::TraceBitmap, Command::TraceLineArt] {
+            for c in [
+                Command::TraceBitmapOptions,
+                Command::TraceBitmap,
+                Command::TraceLineArt,
+            ] {
                 item(ui, c, has_selection, &mut raised);
             }
             ui.separator();
@@ -644,6 +851,24 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             });
         });
 
+        // `min_size`: the shortest label in the menu bar ("AI", two
+        // characters) was the one menu that fell under Stage 6, item 3's
+        // 24 px hit-target minimum on width alone; every longer label already
+        // clears it from its own text.
+        egui::containers::menu::MenuButton::from_button(
+            egui::Button::new("AI").min_size(egui::vec2(24.0, 0.0)),
+        )
+        .ui(ui, |ui| {
+            item(ui, Command::AiModels, true, &mut raised);
+            item(ui, Command::VoicePushToTalk, true, &mut raised);
+            item(ui, Command::VoiceMute, true, &mut raised);
+            item(ui, Command::AiCharacterFromImage, true, &mut raised);
+            item(ui, Command::AiIdentifyAssets, true, &mut raised);
+            item(ui, Command::AiRigVectorCharacter, true, &mut raised);
+            item(ui, Command::AiSceneFromImage, true, &mut raised);
+            item(ui, Command::AiDirectStory, true, &mut raised);
+        });
+
         // Last, as it is everywhere.
         ui.menu_button("Help", |ui| {
             item(ui, Command::About, true, &mut raised);
@@ -667,15 +892,25 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
     raised
 }
 
-/// The vertical tool strip.
+/// The vertical tool strip — Stage 3 of `docs/WORKSPACE_DESIGN_PLAN.md`, as
+/// amended by the workspace defects brief's item 1: **every tool has its own
+/// button, always visible.** A family's flyout used to be where a related
+/// tool went instead of a second column — which meant most of the toolbar
+/// was reachable only by shortcut or by discovering the right-click. Now
+/// every one of the 24 tools gets a button laid out in the strip itself: one
+/// column when the panel is tall enough to hold all of them, two (28 px
+/// buttons, `Tokens::SPACE_1` = 4 px gap) when it is not. The flyout is kept
+/// only as the optional right-click shortcut the brief asks for — nothing is
+/// ever reachable *only* through it, so it drops the corner triangle that
+/// used to mark "a flyout lives here": every button looks the same because
+/// every button already does the same thing, show and select its own tool.
 ///
 /// **Scrolls.** The strip is as tall as the window leaves it, and opening the
-/// Actions panel or a tall timeline takes that height away — which silently
-/// cut off everything below the Brush, including the Bone and Asset Warp
-/// tools. A tool you cannot reach is worse than one that is greyed out with a
-/// reason, and a screenshot was the only way that was ever going to be seen.
+/// Actions panel or a tall timeline takes that height away — which is
+/// exactly the case the column-count decision below exists for.
 pub fn tool_bar(ui: &mut Ui, active: ToolId, style: &mut DrawStyle) -> Option<ToolId> {
     let mut chosen = None;
+    let tools = crate::tools::all_tools();
 
     // **No scroll area of its own.** The dock column it sits in already
     // scrolls, and a vertical scroll area inside another one is told it has
@@ -683,68 +918,249 @@ pub fn tool_bar(ui: &mut Ui, active: ToolId, style: &mut DrawStyle) -> Option<To
     // top of the column's, and every panel below it is pushed off the bottom
     // of the window. That single mistake, repeated in five panels, is what hid
     // the Library and the Assets panel entirely.
-    {
-        // **As many columns as it has been given room for.** One column
-        // is Animate's strip and what the default width holds; widen the
-        // dock and the tools flow into two or three rather than leaving a
-        // column of empty space beside them.
-        let spacing = ui.spacing().item_spacing.x;
-        let per_row = ((ui.available_width() + spacing) / (Metrics::TOOL_BUTTON + spacing))
-            .floor()
-            .clamp(1.0, 8.0) as usize;
+    ui.vertical_centered(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(Tokens::SPACE_1, Tokens::SPACE_1);
 
-        ui.vertical_centered(|ui| {
-            for (index, group) in TOOL_GROUPS.iter().enumerate() {
-                if index > 0 {
-                    ui.add_space(2.0);
-                    ui.separator();
-                    ui.add_space(2.0);
-                }
-                for row in group.chunks(per_row) {
-                    ui.horizontal(|ui| {
-                        for tool in row.iter().copied() {
-                            if tool_button(ui, tool, tool == active) {
-                                chosen = Some(tool);
-                            }
-                        }
-                    });
-                }
+        // **`ui.clip_rect().height()`, not `ui.available_height()`.** The
+        // tool strip sits inside the dock column's own `ScrollArea` (see
+        // above), and a `ScrollArea`'s content `Ui` reports its *layout*
+        // space as tall as the content wants to be — effectively unbounded —
+        // while `clip_rect` stays the scroll viewport actually on screen.
+        // Measured against `available_height` here, the two-column fallback
+        // this decides between never fired: a panel too short to show
+        // twenty-four 28 px buttons in one column still measured "plenty of
+        // room" and stayed one column, scrollable but not what item (b) of
+        // the workspace defects brief asks for.
+        let columns = tool_strip_columns(
+            ui.clip_rect().height(),
+            tools.len(),
+            tool_strip_footer_height(),
+        );
+
+        // Anchors for the optional flyout: the rect of whichever button
+        // happens to be its family's first member, the only one the flyout
+        // ever needs to position itself against (see `flyout_id`).
+        let mut anchors: Vec<(ToolId, egui::Rect)> = Vec::new();
+
+        if columns == 1 {
+            for tool in tools.iter().copied() {
+                place_tool_button(ui, tool, active, &mut chosen, &mut anchors);
             }
+        } else {
+            for pair in tools.chunks(2) {
+                ui.horizontal(|ui| {
+                    for tool in pair.iter().copied() {
+                        place_tool_button(ui, tool, active, &mut chosen, &mut anchors);
+                    }
+                });
+            }
+        }
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(6.0);
-            color_wells(ui, style);
-        });
-    }
+        draw_family_flyouts(ui, active, &anchors, &mut chosen);
+
+        ui.add_space(Tokens::SPACE_2);
+        ui.separator();
+        ui.add_space(Tokens::SPACE_1);
+        color_wells(ui, style);
+    });
 
     chosen
 }
 
-fn tool_button(ui: &mut Ui, tool: ToolId, active: bool) -> bool {
+/// One column when the panel is tall enough to stack every tool with no
+/// gaps missing; otherwise two — never fewer, and never a flyout standing in
+/// for a button the strip could have drawn instead. Pure and `Ui`-free so a
+/// headless test can check it directly rather than through a whole layout
+/// pass.
+pub fn tool_strip_columns(available_height: f32, tool_count: usize, footer_height: f32) -> usize {
+    if tool_count == 0 {
+        return 1;
+    }
+    let button = Metrics::TOOL_BUTTON;
+    let gap = Tokens::SPACE_1;
+    let one_column_height = tool_count as f32 * button + (tool_count as f32 - 1.0) * gap;
+    if available_height - footer_height >= one_column_height {
+        1
+    } else {
+        2
+    }
+}
+
+/// A generous estimate of the colour wells' own height — the separator, the
+/// stroke and fill wells, and the swap/reset buttons below the tool grid —
+/// so the one-vs-two-column decision leaves them room rather than assuming
+/// the tool grid alone fills the panel.
+fn tool_strip_footer_height() -> f32 {
+    Tokens::SPACE_2 + 1.0 + Tokens::SPACE_1 + Tokens::CONTROL_H * 2.0 + Tokens::SPACE_1 * 3.0
+}
+
+/// A global id for tool-strip flyout state, keyed on a family's first member
+/// (unique — every tool is in exactly one family, see
+/// `every_tool_is_in_exactly_one_family`) rather than on whatever `Ui` egui
+/// hands the strip that frame. There is only ever one tool strip on screen
+/// (`PanelId::Tools` is a single slot, docked or floating but never both), so
+/// nothing collides — and a headless test can name the id directly instead
+/// of reaching into egui's own id bookkeeping to find it.
+fn flyout_id(first: ToolId, purpose: &str) -> egui::Id {
+    egui::Id::new(("tool-family-flyout", first, purpose))
+}
+
+/// Draw one tool's own button, always visible (defects brief item 1b).
+/// Right-clicking a button that belongs to a family of more than one tool
+/// toggles that family's flyout — the one place any of this still matters,
+/// since every member already has its own button in the strip above. The
+/// flyout is anchored on whichever member happens to be its family's first
+/// (`anchors` records that rect when this is it), so it has somewhere to
+/// draw itself regardless of which member was right-clicked.
+fn place_tool_button(
+    ui: &mut Ui,
+    tool: ToolId,
+    active: ToolId,
+    chosen: &mut Option<ToolId>,
+    anchors: &mut Vec<(ToolId, egui::Rect)>,
+) {
+    let response = tool_button(ui, tool, tool == active);
+    if response.clicked() {
+        *chosen = Some(tool);
+    }
+
+    let family = crate::tools::family_of(tool);
+    if family.len() > 1 {
+        if family[0] == tool {
+            anchors.push((tool, response.rect));
+        }
+        if response.secondary_clicked() {
+            let key = flyout_id(family[0], "open");
+            let open = ui
+                .memory(|mem| mem.data.get_temp::<bool>(key))
+                .unwrap_or(false);
+            ui.memory_mut(|mem| mem.data.insert_temp(key, !open));
+        }
+    }
+}
+
+/// The optional right-click flyout itself (defects brief item 1b: "keep the
+/// flyout only as an optional right-click shortcut"). Every family with more
+/// than one member gets a chance to draw its own, anchored under whichever
+/// of its members `place_tool_button` recorded as `family[0]`'s rect;
+/// families with no open flag set, or with no anchor recorded this frame
+/// (the strip did not draw that button, which cannot happen today but is
+/// cheap to guard), simply draw nothing.
+fn draw_family_flyouts(
+    ui: &mut Ui,
+    active: ToolId,
+    anchors: &[(ToolId, egui::Rect)],
+    chosen: &mut Option<ToolId>,
+) {
+    for family in TOOL_FAMILIES {
+        if family.len() <= 1 {
+            continue;
+        }
+        let open_key = flyout_id(family[0], "open");
+        let mut open = ui
+            .memory(|mem| mem.data.get_temp::<bool>(open_key))
+            .unwrap_or(false);
+        if !open {
+            continue;
+        }
+        let Some(&(_, anchor_rect)) = anchors.iter().find(|(tool, _)| *tool == family[0]) else {
+            continue;
+        };
+
+        let mut picked = None;
+        let area = egui::Area::new(flyout_id(family[0], "area"))
+            .fixed_pos(anchor_rect.right_top() + egui::vec2(Tokens::SPACE_1, 0.0))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for tool in family.iter().copied() {
+                            if tool_button(ui, tool, tool == active).clicked() {
+                                picked = Some(tool);
+                            }
+                        }
+                    });
+                });
+            })
+            .response;
+
+        // Picking one closes it; so does a click that lands nowhere on the
+        // flyout or the button that opened it — a menu left open by a click
+        // it did not notice is a menu that looks broken. **Excluding the
+        // anchor matters**: the right-click that opens the flyout is itself
+        // a click, on the very frame `open` turns true, landing on the
+        // anchor rather than the (not yet drawn) flyout — without this the
+        // flyout closed on the same frame it opened.
+        let pointer_on_anchor = ui
+            .input(|i| i.pointer.interact_pos())
+            .is_some_and(|p| anchor_rect.contains(p));
+        if picked.is_some()
+            || (ui.input(|i| i.pointer.any_click())
+                && !area.contains_pointer()
+                && !pointer_on_anchor)
+        {
+            open = false;
+        }
+        if let Some(tool) = picked {
+            *chosen = Some(tool);
+        }
+        ui.memory_mut(|mem| mem.data.insert_temp(open_key, open));
+    }
+}
+
+fn tool_button(ui: &mut Ui, tool: ToolId, active: bool) -> egui::Response {
     let size = egui::vec2(Metrics::TOOL_BUTTON, Metrics::TOOL_BUTTON);
     let ready = tool.is_ready();
-
-    // An empty button, with the symbol painted into it afterwards. The symbol
-    // is drawn geometry rather than a character — see [`crate::icons`] — so it
-    // cannot come out as an empty box the way a missing glyph does.
-    let button = egui::Button::new("").min_size(size).fill(if active {
-        Palette::active()
+    // Hover only, not click, when the tool is not ready — the tooltip still
+    // explains why, but nothing short of ready is selectable.
+    let sense = if ready {
+        egui::Sense::click()
     } else {
-        Palette::raised()
-    });
-
-    let response = ui.add_enabled(ready, button);
-
-    // Bright when it is the tool in hand or under the pointer, dim otherwise —
-    // so the strip reads as one active tool rather than twenty-two equals.
-    let ink = if ready && (active || response.hovered()) {
-        Palette::text()
-    } else {
-        Palette::text_dim()
+        egui::Sense::hover()
     };
-    // Inset, so the symbol does not touch the button's edge.
-    crate::icons::tool_icon(ui.painter(), response.rect.shrink(6.0), tool, ink);
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+
+    if ui.is_rect_visible(rect) {
+        // **Ghost at rest.** No fill until the pointer arrives, and then only
+        // `hover`; the accent is reserved for the tool actually in hand — see
+        // Stage 3, item 1.
+        let fill = if active {
+            Some(Palette::active())
+        } else if response.hovered() {
+            Some(Palette::hover())
+        } else {
+            None
+        };
+        if let Some(fill) = fill {
+            ui.painter().rect_filled(rect, Tokens::RADIUS as f32, fill);
+        }
+
+        // One ink for both the raster outline and the painted glyph — the
+        // icons-as-outlines follow-up's own rule, "one stroke weight
+        // everywhere, `Palette::text()` at rest, `Palette::accent_text()`
+        // when active". Defect (a), previously: the active tool's fill *is*
+        // `Palette::accent()` (see `Colors::active`'s own doc comment — it
+        // is drawn straight from the accent seed), so painting the glyph in
+        // that same accent colour on top of it drew a solid accent square
+        // with an invisible glyph: ink identical to the fill it sat on.
+        // `accent_text` is exactly the role Stage 1 added to read against an
+        // `accent` fill — see `the_accent_can_be_written_on`.
+        let ink = if !ready {
+            Palette::text_dim()
+        } else if active {
+            Palette::accent_text()
+        } else {
+            // White on a dark theme, black on a light one.
+            crate::icon_sheet::ink()
+        };
+
+        // Inset to a 16 px box inside the 28 px button (Stage 3, item 4), so
+        // the symbol does not touch the button's edge. Every tool draws its
+        // own hand-authored painter-path glyph — see `icons.rs`'s own module
+        // docstring for why the raster outline masks this used to fall back
+        // to for some tools are gone.
+        crate::icons::tool_icon(ui.painter(), rect.shrink(6.0), tool, ink);
+    }
 
     let tip = match tool.status() {
         ToolStatus::Ready => match tool.shortcut() {
@@ -753,7 +1169,12 @@ fn tool_button(ui: &mut Ui, tool: ToolId, active: bool) -> bool {
         },
         ToolStatus::Planned(note) => format!("{} — not yet available\n{note}", tool.name()),
     };
-    response.on_hover_text(tip).clicked()
+    // Stage 6, item 4: painted, not text — same reason `icon_button`'s own
+    // doc comment gives — so without this a screen reader has no name for
+    // any tool in the strip. The tooltip string already carries the name and
+    // the shortcut both.
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ready, tip.clone()));
+    response.on_hover_text(tip)
 }
 
 /// Stroke and fill wells, with Animate's swap and reset controls.
@@ -774,19 +1195,12 @@ fn color_wells(ui: &mut Ui, style: &mut DrawStyle) {
 
     ui.horizontal(|ui| {
         // Letters, not symbols: `X` and `D` are Animate's own shortcuts for
-        // these actions, and they always render.
-        if ui
-            .small_button("X")
-            .on_hover_text("Swap stroke and fill (X)")
-            .clicked()
-        {
+        // these actions, and they always render. Ghost icons (Stage 3, item
+        // 3), same as every other icon-only control.
+        if crate::widgets::icon_button(ui, "X", "Swap stroke and fill", Some("X")).clicked() {
             style.swap_colors();
         }
-        if ui
-            .small_button("D")
-            .on_hover_text("Black and white (D)")
-            .clicked()
-        {
+        if crate::widgets::icon_button(ui, "D", "Black and white", Some("D")).clicked() {
             style.reset_colors();
         }
     });
@@ -801,7 +1215,7 @@ fn well(ui: &mut Ui, label: &str, color: &mut Color, enabled: &mut bool) {
         }
         let mark = if *enabled { "*" } else { "x" };
         if ui
-            .small_button(mark)
+            .add(egui::Button::new(mark).min_size(egui::vec2(Tokens::CONTROL_H, Tokens::CONTROL_H)))
             .on_hover_text(format!("{label}: click to toggle on or off"))
             .clicked()
         {
@@ -834,9 +1248,19 @@ fn instance_properties(
 ) -> bool {
     use buzz_scene::{ColorEffect, LoopMode};
 
-    let Some((_, object)) = scene.find_object(id) else {
+    let Some((layer, earliest)) = scene.find_object(id) else {
         return false;
     };
+    // The copy *at the playhead*, not the earliest. F6 and a set pick both
+    // leave the same id on several keyframes, and the write at the bottom
+    // goes to the keyframe owning `at.frame` — so reading the earliest copy
+    // would show the wrong symbol and, on any edit, write it back over a
+    // pick made later on the timeline.
+    let object = scene
+        .layers()
+        .get(layer)
+        .and_then(|l| l.frames.objects_at(at.frame).iter().find(|o| o.id == id))
+        .unwrap_or(earliest);
     let Some(instance) = object.instance() else {
         return false;
     };
@@ -872,13 +1296,57 @@ fn instance_properties(
         .map(|s| (s.id, s.name.clone()))
         .collect();
 
-    ui.add_space(8.0);
-    ui.label(RichText::new("Symbol Instance").strong());
+    // -- the symbol set ----------------------------------------------------
+    //
+    // The symbol the instance shows at the playhead (read above), which is
+    // what the Set dropdown has to name.
+    let shown_symbol = instance.symbol;
+    let library = scene.library();
+    let symbol_name_of = |sid: buzz_scene::SymbolId| {
+        library
+            .get(sid)
+            .map(|s| s.name.clone())
+            .unwrap_or_default()
+    };
+    // Owner first, then the members; empty when the symbol is in no set.
+    let set: Vec<(buzz_scene::SymbolId, String)> = library
+        .symbol_set(shown_symbol)
+        .into_iter()
+        .map(|sid| (sid, symbol_name_of(sid)))
+        .collect();
+    let set_owner = set.first().map(|(sid, _)| *sid).unwrap_or(shown_symbol);
+    // What Include… offers: every symbol `Library::include_in_set` would
+    // accept for this owner — not the owner, not one owning a set of its own,
+    // not one already in any set.
+    let in_some_set: std::collections::HashSet<buzz_scene::SymbolId> =
+        library.iter().flat_map(|s| s.set.iter().copied()).collect();
+    let includable: Vec<(buzz_scene::SymbolId, String)> = library
+        .iter()
+        .filter(|s| s.id != set_owner && s.set.is_empty() && !in_some_set.contains(&s.id))
+        .map(|s| (s.id, s.name.clone()))
+        .collect();
+    // What Remove offers: the members, never the owner and never the symbol
+    // on stage right now (removing that would orphan what is shown).
+    let removable: Vec<(buzz_scene::SymbolId, String)> = set
+        .iter()
+        .skip(1)
+        .filter(|(sid, _)| *sid != shown_symbol)
+        .cloned()
+        .collect();
+    let shown_name = symbol_name_of(shown_symbol);
 
-    egui::Grid::new("instance-props")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.label("Symbol");
+    // Same frame / From frame 1, remembered between selections and sessions.
+    let start_key = egui::Id::new("symbol-set-start");
+    let mut from_start: bool = ui
+        .data_mut(|d| d.get_persisted(start_key))
+        .unwrap_or(false);
+    let mut picked: Option<buzz_scene::SymbolId> = None;
+    let mut include: Option<buzz_scene::SymbolId> = None;
+    let mut remove: Option<buzz_scene::SymbolId> = None;
+
+    ui.add_space(Tokens::SPACE_2);
+    property_section(ui, "instance-section", "Symbol Instance", true, |ui| {
+        property_row(ui, "Symbol", None, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&symbol_name).strong())
                     .on_hover_text(symbol_kind.label());
@@ -902,14 +1370,91 @@ fn instance_properties(
                 })
                 .response
                 .on_hover_text("Point this instance at a different symbol");
+
+                // **Include…** — add a sibling symbol to this instance's set,
+                // so it can be picked from the Set dropdown below. Built from
+                // whichever member is on stage; it always lands in the owner's
+                // set.
+                ui.menu_button("Include\u{2026}", |ui| {
+                    if includable.is_empty() {
+                        ui.label(RichText::new("no symbol can be included").small().weak());
+                    }
+                    for (sid, name) in &includable {
+                        if ui.button(name).clicked() {
+                            include = Some(*sid);
+                            ui.close();
+                        }
+                    }
+                    if !removable.is_empty() {
+                        ui.separator();
+                        ui.menu_button("Remove", |ui| {
+                            for (sid, name) in &removable {
+                                if ui.button(name).clicked() {
+                                    remove = Some(*sid);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Include another symbol in this symbol's set, to pick it from the Set menu",
+                );
             });
-            ui.end_row();
+        });
 
-            ui.label("Frames");
+        // **Set** — switch this instance to another symbol of its set, keyed
+        // at the playhead: earlier frames keep the symbol they had. Only shown
+        // when the symbol is in a set.
+        if !set.is_empty() {
+            let hover = "Swap this instance to another symbol in its set, from this frame on. \
+                         Earlier frames keep the current one.";
+            property_row(ui, "Set", Some(hover), |ui| {
+                egui::ComboBox::from_id_salt("instance-set")
+                    .selected_text(&shown_name)
+                    .show_ui(ui, |ui| {
+                        for (sid, name) in &set {
+                            if ui.selectable_label(*sid == shown_symbol, name).clicked()
+                                && *sid != shown_symbol
+                            {
+                                picked = Some(*sid);
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(hover);
+            });
+
+            property_row(
+                ui,
+                "Start",
+                Some("Which frame of the picked symbol it starts on"),
+                |ui| {
+                    let label = |from_start: bool| {
+                        if from_start { "From frame 1" } else { "Same frame" }
+                    };
+                    egui::ComboBox::from_id_salt("instance-set-start")
+                        .selected_text(label(from_start))
+                        .show_ui(ui, |ui| {
+                            for option in [false, true] {
+                                if ui
+                                    .selectable_value(&mut from_start, option, label(option))
+                                    .clicked()
+                                {
+                                    ui.data_mut(|d| d.insert_persisted(start_key, option));
+                                }
+                            }
+                        });
+                },
+            );
+        }
+
+        property_row(ui, "Frames", None, |ui| {
             ui.label(RichText::new(format!("{symbol_length}")).weak());
-            ui.end_row();
+        });
 
-            ui.label("First frame");
+        property_row(ui, "First frame", None, |ui| {
             // Frames are shown one-based, as Animate numbers them, while the
             // model counts from zero.
             let mut shown = new_first_frame + 1;
@@ -920,13 +1465,13 @@ fn instance_properties(
                 new_first_frame = shown.saturating_sub(1);
                 edited = true;
             }
-            ui.end_row();
+        });
 
-            // Only a graphic follows the parent playhead, so only a graphic has
-            // anything to loop. Showing the control for a movie clip would
-            // promise behaviour that cannot happen.
-            if symbol_kind.follows_parent_timeline() {
-                ui.label("Looping");
+        // Only a graphic follows the parent playhead, so only a graphic has
+        // anything to loop. Showing the control for a movie clip would
+        // promise behaviour that cannot happen.
+        if symbol_kind.follows_parent_timeline() {
+            property_row(ui, "Looping", None, |ui| {
                 egui::ComboBox::from_id_salt("instance-loop")
                     .selected_text(new_loop.label())
                     .show_ui(ui, |ui| {
@@ -939,35 +1484,34 @@ fn instance_properties(
                             }
                         }
                     });
-                ui.end_row();
-            }
+            });
+        }
 
-            // **Sync to root.** Lock this instance — and everything nested in
-            // it — to the stage's own frame, so a lip sync generated against
-            // the root dialogue lines up wherever the mouth actually lives.
-            // Off leaves the instance to be keyed by hand.
-            ui.label("Sync to root");
-            if ui
-                .checkbox(&mut new_sync_to_root, "Match the stage frame")
-                .on_hover_text(
-                    "Play this instance and its contents on the root timeline's frame number, \
-                     rather than from where it was placed. Turn off for manual timing.",
-                )
-                .changed()
-            {
-                edited = true;
-            }
-            ui.end_row();
-        });
+        // **Sync to root.** Lock this instance — and everything nested in
+        // it — to the stage's own frame, so a lip sync generated against
+        // the root dialogue lines up wherever the mouth actually lives.
+        // Off leaves the instance to be keyed by hand.
+        property_row(
+            ui,
+            "Sync to root",
+            Some(
+                "Play this instance and its contents on the root timeline's frame number, \
+                 rather than from where it was placed. Turn off for manual timing.",
+            ),
+            |ui| {
+                if ui.checkbox(&mut new_sync_to_root, "Match the stage frame").changed() {
+                    edited = true;
+                }
+            },
+        );
 
-    // -- colour effect ------------------------------------------------------
-    let effect = ColorEffect::from_transform(&instance.color);
+        // -- colour effect ---------------------------------------------------
+        let effect = ColorEffect::from_transform(&instance.color);
 
-    ui.label(RichText::new("Color Effect").small().weak());
-    egui::Grid::new("instance-color")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.label("Style");
+        ui.add_space(Tokens::SPACE_1);
+        ui.label(RichText::new("Color Effect").small().weak());
+
+        property_row(ui, "Style", None, |ui| {
             egui::ComboBox::from_id_salt("instance-effect")
                 .selected_text(effect.label())
                 .show_ui(ui, |ui| {
@@ -994,11 +1538,11 @@ fn instance_properties(
                         }
                     }
                 });
-            ui.end_row();
+        });
 
-            match effect {
-                ColorEffect::Brightness(amount) => {
-                    ui.label("Brightness");
+        match effect {
+            ColorEffect::Brightness(amount) => {
+                property_row(ui, "Brightness", None, |ui| {
                     let mut percent = amount * 100.0;
                     if ui
                         .add(egui::Slider::new(&mut percent, -100.0..=100.0).suffix("%"))
@@ -1007,10 +1551,10 @@ fn instance_properties(
                         new_color = buzz_scene::ColorTransform::brightness(percent / 100.0);
                         edited = true;
                     }
-                    ui.end_row();
-                }
-                ColorEffect::Alpha(amount) => {
-                    ui.label("Alpha");
+                });
+            }
+            ColorEffect::Alpha(amount) => {
+                property_row(ui, "Alpha", None, |ui| {
                     let mut percent = amount * 100.0;
                     if ui
                         .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
@@ -1019,21 +1563,21 @@ fn instance_properties(
                         new_color = buzz_scene::ColorTransform::alpha(percent / 100.0);
                         edited = true;
                     }
-                    ui.end_row();
-                }
-                ColorEffect::Tint { color, amount } => {
-                    let mut tint = to_egui(color);
-                    let mut percent = amount * 100.0;
+                });
+            }
+            ColorEffect::Tint { color, amount } => {
+                let mut tint = to_egui(color);
+                let mut percent = amount * 100.0;
 
-                    ui.label("Tint");
+                property_row(ui, "Tint", None, |ui| {
                     if ui.color_edit_button_srgba(&mut tint).changed() {
                         new_color =
                             buzz_scene::ColorTransform::tint(from_egui(tint), percent / 100.0);
                         edited = true;
                     }
-                    ui.end_row();
+                });
 
-                    ui.label("Amount");
+                property_row(ui, "Amount", None, |ui| {
                     if ui
                         .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
                         .changed()
@@ -1042,20 +1586,20 @@ fn instance_properties(
                             buzz_scene::ColorTransform::tint(from_egui(tint), percent / 100.0);
                         edited = true;
                     }
-                    ui.end_row();
-                }
-                ColorEffect::Advanced => {
-                    ui.label("Advanced");
+                });
+            }
+            ColorEffect::Advanced => {
+                property_row(ui, "Advanced", None, |ui| {
                     ui.label(RichText::new("Set by a tween or an import").small().weak())
                         .on_hover_text(
                             "This colour effect is not one of Animate's four named ones. \
                          Choosing a style above replaces it.",
                         );
-                    ui.end_row();
-                }
-                ColorEffect::None => {}
+                });
             }
-        });
+            ColorEffect::None => {}
+        }
+    });
 
     if edited {
         scene.update_object_where(at, id, |o| {
@@ -1083,6 +1627,23 @@ fn instance_properties(
                 }
             });
         }
+    }
+
+    // The set actions, each its own edit. A pick keys the layer at the
+    // playhead itself, so it must not also go through the write above.
+    if let Some(to) = picked {
+        let start = if from_start {
+            buzz_scene::SetStart::FromStart
+        } else {
+            buzz_scene::SetStart::SameFrame
+        };
+        edited |= scene.pick_from_set(at.frame, id, to, start);
+    }
+    if let Some(member) = include {
+        edited |= scene.library_mut().include_in_set(set_owner, member);
+    }
+    if let Some(member) = remove {
+        edited |= scene.library_mut().remove_from_set(set_owner, member);
     }
     edited
 }
@@ -1128,75 +1689,122 @@ fn wand_properties(ui: &mut Ui, style: &mut DrawStyle) {
 /// exists rather than one being built, which is nearly all of the time an
 /// animator spends near one. See [`crate::workspace::RigOptions`].
 fn bone_properties(ui: &mut Ui, rig: &mut crate::workspace::RigOptions) {
-    ui.checkbox(&mut rig.show_bones, "Show bones")
-        .on_hover_text(
-            "Draw the skeleton over the artwork. Hidden, it is also out of the \
-             pointer's way, so you can draw on what is underneath.",
-        );
+    use crate::workspace::BoneMode;
 
-    ui.add_space(4.0);
-    ui.label(RichText::new("Dragging a bone").small().weak());
-    // A pair rather than a checkbox: these are two things the tool does, and
-    // "Build bones: off" is a worse way to say "this poses".
+    // BM: a two-button segmented control. The tool builds or it poses, never
+    // both, so which one is a mode, not a property of where you press.
     ui.horizontal(|ui| {
         if ui
-            .selectable_label(!rig.build, "Poses")
-            .on_hover_text("Drag any part of a bone, including its end, to move the limb")
+            .selectable_label(rig.mode == BoneMode::Create, BoneMode::Create.label())
+            .on_hover_text(
+                "Drag across artwork to start a chain, from a bone's end to extend \
+                 it, from a bone's body to branch off it (Shift+M toggles)",
+            )
             .clicked()
         {
-            rig.build = false;
+            rig.mode = BoneMode::Create;
         }
         if ui
-            .selectable_label(rig.build, "Builds")
-            .on_hover_text("Drag from a bone's end to add a child bone to the chain")
+            .selectable_label(rig.mode == BoneMode::Move, BoneMode::Move.label())
+            .on_hover_text("Drag any part of a bone, including its end, to move the limb (Shift+M toggles)")
             .clicked()
         {
-            rig.build = true;
+            rig.mode = BoneMode::Move;
         }
     });
     ui.label(
-        RichText::new(if rig.build {
-            "Drag from the end of a bone to extend the chain. Drag across bare \
-             artwork to start a new one."
-        } else {
-            "Drag a bone to move the limb. Everything above it in the chain \
-             follows; everything below is carried along."
+        RichText::new(match rig.mode {
+            BoneMode::Create => {
+                "Drag across bare artwork to start a chain, from the end of a bone \
+                 to extend it, or from a bone to branch off it."
+            }
+            BoneMode::Move => {
+                "Drag a bone to move the limb. Everything above it in the chain \
+                 follows; everything below is carried along."
+            }
         })
         .small()
         .weak(),
     );
+
+    ui.add_space(4.0);
+    ui.checkbox(&mut rig.show_bones, "Show bones while the Bone tool is active")
+        .on_hover_text(
+            "Draw the skeleton over the artwork. Hidden, it is also out of the \
+             pointer's way. With any other tool the bones are never drawn.",
+        );
+}
+
+/// How far the stage moves for a given drag of the Hand tool, a Space-drag or
+/// the middle mouse button. `1.0` (the default) tracks the pointer exactly;
+/// see I4b of `docs/INTERACTION_FIXES_PLAN.md`.
+const PAN_SPEED_OPTIONS: [f32; 4] = [1.0, 1.5, 2.0, 3.0];
+
+fn hand_properties(ui: &mut Ui, pan_speed: &mut f32) {
+    ui.label(RichText::new("Pan speed").small().weak());
+    ui.horizontal(|ui| {
+        for speed in PAN_SPEED_OPTIONS {
+            let label = if speed.fract() == 0.0 {
+                format!("{}\u{00d7}", speed as i64)
+            } else {
+                format!("{speed}\u{00d7}")
+            };
+            if ui
+                .selectable_label((*pan_speed - speed).abs() < 1e-3, label)
+                .on_hover_text(
+                    "How far the stage moves for a drag of this tool, a \
+                     Space-drag or the middle mouse button. Does not change \
+                     the wheel or Ctrl+wheel zoom.",
+                )
+                .clicked()
+            {
+                *pan_speed = speed;
+            }
+        }
+    });
 }
 
 fn eraser_properties(ui: &mut Ui, style: &mut DrawStyle) {
-    egui::Grid::new("eraser-props").num_columns(2).show(ui, |ui| {
-        // **What it is allowed to take.** Animate's eraser modes, and the
-        // reason they exist: tidying line art over flat colour with an eraser
-        // that takes everything means one slip costs the colour too.
-        ui.label("Mode");
-        egui::ComboBox::from_id_salt("eraser-mode")
-            .selected_text(style.eraser_mode.label())
-            .show_ui(ui, |ui| {
-                for mode in crate::EraserMode::ALL {
-                    ui.selectable_value(&mut style.eraser_mode, mode, mode.label())
-                        .on_hover_text(mode.description());
-                }
-            })
-            .response
-            .on_hover_text(style.eraser_mode.description());
-        ui.end_row();
+    egui::Grid::new("eraser-props")
+        .num_columns(2)
+        .show(ui, |ui| {
+            // **What it is allowed to take.** Animate's eraser modes, and the
+            // reason they exist: tidying line art over flat colour with an eraser
+            // that takes everything means one slip costs the colour too.
+            ui.label("Mode");
+            egui::ComboBox::from_id_salt("eraser-mode")
+                .selected_text(style.eraser_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in crate::EraserMode::ALL {
+                        ui.selectable_value(&mut style.eraser_mode, mode, mode.label())
+                            .on_hover_text(mode.description());
+                    }
+                })
+                .response
+                .on_hover_text(style.eraser_mode.description());
+            ui.end_row();
 
-        ui.label("Size");
-        ui.add(
-            egui::Slider::new(&mut style.eraser_size, 1.0..=200.0)
-                .logarithmic(true)
-                .suffix(" px"),
-        )
-        .on_hover_text(
-            "How wide the eraser rubs, in document units \u{2014} the same units the \
+            ui.label("Size");
+            ui.add(
+                egui::Slider::new(&mut style.eraser_size, 1.0..=200.0)
+                    .logarithmic(true)
+                    .suffix(" px"),
+            )
+            .on_hover_text(
+                "How wide the eraser rubs, in document units \u{2014} the same units the \
              brush size is in.",
-        );
-        ui.end_row();
-    });
+            );
+            ui.end_row();
+
+            ui.label("Zoom size");
+            ui.checkbox(&mut style.eraser_zoom_size, "").on_hover_text(
+                "On: the eraser's size is in document units, so the rub grows on \
+             screen as the stage is zoomed in \u{2014} today's behaviour. Off: the \
+             size is in screen pixels, so the rub stays the same size on screen \
+             at any zoom.",
+            );
+            ui.end_row();
+        });
     ui.label(
         RichText::new(
             "Rubbing through a shape cuts it in two: each piece becomes a shape of \
@@ -1220,23 +1828,25 @@ fn bucket_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
 
     ui.add_space(6.0);
     ui.label(RichText::new("Gaps").strong());
-    egui::Grid::new("bucket-props").num_columns(2).show(ui, |ui| {
-        ui.label("Gap size");
-        egui::ComboBox::from_id_salt("bucket-gap")
-            .selected_text(style.gap_size.label())
-            .show_ui(ui, |ui| {
-                for gap in buzz_scene::GapSize::ALL {
-                    ui.selectable_value(&mut style.gap_size, gap, gap.label());
-                }
-            })
-            .response
-            .on_hover_text(
-                "How large a gap in the outline the bucket will close before it \
+    egui::Grid::new("bucket-props")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("Gap size");
+            egui::ComboBox::from_id_salt("bucket-gap")
+                .selected_text(style.gap_size.label())
+                .show_ui(ui, |ui| {
+                    for gap in buzz_scene::GapSize::ALL {
+                        ui.selectable_value(&mut style.gap_size, gap, gap.label());
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "How large a gap in the outline the bucket will close before it \
                  fills. Larger settings fill sketchier line art but can spill \
                  through wider openings.",
-            );
-        ui.end_row();
-    });
+                );
+            ui.end_row();
+        });
 }
 
 /// Ink Bottle settings: the line it is about to lay on whatever is clicked.
@@ -1311,6 +1921,7 @@ pub fn tool_options_panel(
     scene: &Scene,
     style: &mut DrawStyle,
     rig: &mut crate::workspace::RigOptions,
+    pan_speed: &mut f32,
 ) {
     // **Lit, the way the tool's own button is.**
     //
@@ -1358,6 +1969,7 @@ pub fn tool_options_panel(
             fill_paint_properties(ui, scene, style, "shape");
         }
         ToolId::Bone => bone_properties(ui, rig),
+        ToolId::Hand => hand_properties(ui, pan_speed),
         _ => anything = false,
     }
 
@@ -1527,6 +2139,15 @@ fn brush_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
         );
         ui.end_row();
 
+        ui.label("Zoom size");
+        ui.checkbox(&mut style.brush_zoom_size, "").on_hover_text(
+            "On: the brush's size is in document units, so the mark grows on \
+             screen as the stage is zoomed in \u{2014} today's behaviour. Off: the \
+             size is in screen pixels, so the mark stays the same size on screen \
+             at any zoom.",
+        );
+        ui.end_row();
+
         ui.label("Smoothing");
         ui.add(egui::Slider::new(&mut style.brush.smoothing, 0.0..=1.0))
             .on_hover_text(
@@ -1597,12 +2218,43 @@ fn brush_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
             ui.label("Viscosity");
             ui.add(egui::Slider::new(&mut style.brush.viscosity, 0.0..=1.0))
                 .on_hover_text(
-                    "How much the paint resists spreading. Thin paint lets the \
-                     stroke's edge bulge outwards between the points it was drawn \
-                     through, which reads as ink that ran after you drew it; thick \
-                     paint holds the edge you made.",
+                    "Thin paint pools where the brush slows and bulges between \
+                     points; thick paint keeps the width you drew.",
                 );
             ui.end_row();
+
+            ui.label("Tip");
+            let combo_id = ("brush-tip", style.brush.kind.label());
+            let current_tip = style.brush.tip();
+            if let Some(tip) = style.brush.tip_mut() {
+                egui::ComboBox::from_id_salt(combo_id)
+                    .selected_text(current_tip.label())
+                    .show_ui(ui, |ui| {
+                        for kind in buzz_geom::TipShape::KINDS {
+                            ui.selectable_value(tip, kind, kind.label());
+                        }
+                    });
+            }
+            ui.end_row();
+
+            // The live tip, not `current_tip`: a pick in the menu above has
+            // already changed it this frame, and a Round or Square nib has no
+            // angle to show. Matching the stale copy crashed on Chisel → Round.
+            if let Some(
+                buzz_geom::TipShape::Chisel { angle, thickness }
+                | buzz_geom::TipShape::Ellipse { angle, thickness },
+            ) = style.brush.tip_mut()
+            {
+                ui.label("Angle");
+                ui.add(egui::Slider::new(angle, -90.0..=90.0).suffix("°"))
+                    .on_hover_text("The nib's long axis, from the horizontal");
+                ui.end_row();
+
+                ui.label("Thickness");
+                ui.add(egui::Slider::new(thickness, 0.05..=1.0))
+                    .on_hover_text("The nib's short axis, as a fraction of its long one");
+                ui.end_row();
+            }
 
             ui.label("Taper");
             ui.add(egui::Slider::new(&mut style.brush.taper, 0.0..=0.5))
@@ -1734,7 +2386,9 @@ fn wave_settings(ui: &mut Ui, wave: &mut buzz_scene::WaveSettings) {
 
     ui.label("Drift");
     ui.add(egui::Slider::new(&mut wave.drift, -3.0..=3.0).suffix("\u{d7}"))
-        .on_hover_text("A lean that grows along the stroke \u{2014} the draught that bends a plume");
+        .on_hover_text(
+            "A lean that grows along the stroke \u{2014} the draught that bends a plume",
+        );
     ui.end_row();
 
     ui.label("Strands");
@@ -1754,7 +2408,9 @@ fn wave_settings(ui: &mut Ui, wave: &mut buzz_scene::WaveSettings) {
 
     ui.label("Taper");
     ui.add(egui::Slider::new(&mut wave.taper, 0.0..=1.0))
-        .on_hover_text("How much a strand narrows towards its far end. At 1 it finishes in a point.");
+        .on_hover_text(
+            "How much a strand narrows towards its far end. At 1 it finishes in a point.",
+        );
     ui.end_row();
 
     ui.label("Frames");
@@ -1885,15 +2541,19 @@ fn brush_pattern_preview(ui: &mut Ui, style: &DrawStyle) {
                 points.clear();
             }
         };
-        kurbo::flatten(path.iter(), 0.2 / scale.max(1e-6), |element| match element {
-            kurbo::PathEl::MoveTo(p) => {
-                flush(&mut current);
-                current.push(to_screen(p));
-            }
-            kurbo::PathEl::LineTo(p) => current.push(to_screen(p)),
-            kurbo::PathEl::ClosePath => flush(&mut current),
-            _ => {}
-        });
+        kurbo::flatten(
+            path.iter(),
+            0.2 / scale.max(1e-6),
+            |element| match element {
+                kurbo::PathEl::MoveTo(p) => {
+                    flush(&mut current);
+                    current.push(to_screen(p));
+                }
+                kurbo::PathEl::LineTo(p) => current.push(to_screen(p)),
+                kurbo::PathEl::ClosePath => flush(&mut current),
+                _ => {}
+            },
+        );
         flush(&mut current);
     }
 }
@@ -1908,13 +2568,11 @@ fn effects_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
     let mut post = scene.stage().post;
     let mut changed = false;
 
-    egui::CollapsingHeader::new(RichText::new("Effects").strong())
+    egui::CollapsingHeader::new(RichText::new("Effects").strong().color(Palette::text()))
         .id_salt("effects-section")
         .default_open(false)
         .show(ui, |ui| {
-            changed |= ui
-                .checkbox(&mut post.enabled, "Enable effects")
-                .changed();
+            changed |= ui.checkbox(&mut post.enabled, "Enable effects").changed();
             ui.add_enabled_ui(post.enabled, |ui| {
                 changed |= bloom_controls(ui, &mut post.bloom);
                 changed |= grade_controls(ui, &mut post.grade);
@@ -1942,7 +2600,12 @@ fn effects_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
 /// if there is not one yet — which is what every other keyed control in the
 /// program does, and what makes a pull something you scrub to and adjust rather
 /// than something you type.
-fn depth_of_field_properties(ui: &mut Ui, scene: &mut Scene, frame: u32) -> bool {
+fn depth_of_field_properties(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    selection: &Selection,
+    frame: u32,
+) -> bool {
     let lens = scene.camera().focus_at(frame);
     let pulling = !scene.camera().focus_keys().is_empty();
     let keyed_here = scene.camera().has_focus_key_at(frame);
@@ -1950,30 +2613,50 @@ fn depth_of_field_properties(ui: &mut Ui, scene: &mut Scene, frame: u32) -> bool
     let mut focus = lens.focus_depth;
     let mut changed = false;
 
-    egui::CollapsingHeader::new(RichText::new("Depth of Field").strong())
+    egui::CollapsingHeader::new(RichText::new("Depth of Field").strong().color(Palette::text()))
         .id_salt("dof-section")
         .default_open(false)
         .show(ui, |ui| {
-            egui::Grid::new("dof-grid").num_columns(2).show(ui, |ui| {
-                ui.label("Aperture")
-                    .on_hover_text("0 is a pinhole — everything sharp");
-                let aperture_changed = ui
-                    .add(egui::Slider::new(&mut aperture, 0.0..=0.2).step_by(0.001))
-                    .changed();
-                ui.end_row();
+            let aperture_changed = property_row(
+                ui,
+                "Aperture",
+                Some("0 is a pinhole — everything sharp"),
+                |ui| {
+                    ui.add(egui::Slider::new(&mut aperture, 0.0..=0.2).step_by(0.001))
+                        .changed()
+                },
+            );
 
-                ui.label("Focus depth")
-                    .on_hover_text("The layer depth that stays sharp");
-                let focus_changed = ui
-                    .add(egui::DragValue::new(&mut focus).speed(1.0))
-                    .changed();
-                ui.end_row();
+            let focus_changed = property_row(
+                ui,
+                "Focus depth",
+                Some("The layer depth that stays sharp"),
+                |ui| ui.add(egui::DragValue::new(&mut focus).speed(1.0)).changed(),
+            );
 
-                if aperture_changed || focus_changed {
-                    write_lens(scene, frame, pulling, focus, aperture);
-                    changed = true;
+            if aperture_changed || focus_changed {
+                write_lens(scene, frame, pulling, focus, aperture);
+                changed = true;
+            }
+
+            if let Some(active_id) = selection.active_layer().or_else(|| selection.selected_layers().first().copied()) {
+                if let Some(layer) = scene.layers().get(active_id) {
+                    let layer_name = layer.name.clone();
+                    let layer_depth = layer.depth;
+                    if ui
+                        .button(format!("Focus on Active Layer ({layer_name})"))
+                        .on_hover_text(format!(
+                            "Set camera focus depth to {:.1} (the depth of layer '{layer_name}')",
+                            layer_depth
+                        ))
+                        .clicked()
+                    {
+                        focus = layer_depth;
+                        write_lens(scene, frame, pulling, focus, aperture);
+                        changed = true;
+                    }
                 }
-            });
+            }
 
             // The pull itself. One button while the focus is standing still —
             // pressing it is what starts a pull — and the full set once there
@@ -2048,16 +2731,18 @@ fn motion_blur_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
     let mut samples = scene.camera().blur_samples;
     let mut changed = false;
 
-    egui::CollapsingHeader::new(RichText::new("Motion Blur").strong())
+    egui::CollapsingHeader::new(RichText::new("Motion Blur").strong().color(Palette::text()))
         .id_salt("motion-blur-section")
         .default_open(false)
         .show(ui, |ui| {
-            egui::Grid::new("motion-blur-grid")
-                .num_columns(2)
-                .show(ui, |ui| {
-                    ui.label("Shutter").on_hover_text(
-                        "How long the shutter stays open, in frames. 0 is off;                          0.5 is the 180° shutter most film is shot at.",
-                    );
+            property_row(
+                ui,
+                "Shutter",
+                Some(
+                    "How long the shutter stays open, in frames. 0 is off; \
+                     0.5 is the 180° shutter most film is shot at.",
+                ),
+                |ui| {
                     if ui
                         .add(egui::Slider::new(&mut shutter, 0.0..=1.0).step_by(0.01))
                         .changed()
@@ -2065,11 +2750,17 @@ fn motion_blur_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
                         scene.camera_mut().shutter = shutter;
                         changed = true;
                     }
-                    ui.end_row();
+                },
+            );
 
-                    ui.label("Samples").on_hover_text(
-                        "How many instants across the shutter are added up. More                          is smoother and costs proportionally more to export.",
-                    );
+            property_row(
+                ui,
+                "Samples",
+                Some(
+                    "How many instants across the shutter are added up. More \
+                     is smoother and costs proportionally more to export.",
+                ),
+                |ui| {
                     let enabled = shutter > 0.0;
                     if ui
                         .add_enabled(
@@ -2084,8 +2775,8 @@ fn motion_blur_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
                         scene.camera_mut().blur_samples = samples;
                         changed = true;
                     }
-                    ui.end_row();
-                });
+                },
+            );
 
             if shutter > 0.0 {
                 ui.label(
@@ -2102,7 +2793,8 @@ fn motion_blur_properties(ui: &mut Ui, scene: &mut Scene) -> bool {
 
 /// Put an edited lens where it belongs: on the key at the playhead while the
 /// focus is being pulled, and on the camera's standing focus while it is not.
-fn write_lens(scene: &mut Scene, frame: u32, pulling: bool, focus: f64, aperture: f64) {
+/// `pub` so the AI agent's `set_property` makes this same write.
+pub fn write_lens(scene: &mut Scene, frame: u32, pulling: bool, focus: f64, aperture: f64) {
     let camera = scene.camera_mut();
     if pulling {
         camera.set_focus_key(buzz_scene::FocusKey {
@@ -2122,20 +2814,20 @@ fn bloom_controls(ui: &mut Ui, b: &mut buzz_scene::BloomSettings) -> bool {
         .id_salt("fx-bloom")
         .show(ui, |ui| {
             changed |= ui.checkbox(&mut b.enabled, "On").changed();
-            egui::Grid::new("fx-bloom-grid").num_columns(2).show(ui, |ui| {
-                ui.label("Threshold");
+            property_row(ui, "Threshold", None, |ui| {
                 changed |= ui
                     .add(egui::Slider::new(&mut b.threshold, 0.0..=1.0))
                     .changed();
-                ui.end_row();
-                ui.label("Intensity");
+            });
+            property_row(ui, "Intensity", None, |ui| {
                 changed |= ui
                     .add(egui::Slider::new(&mut b.intensity, 0.0..=3.0))
                     .changed();
-                ui.end_row();
-                ui.label("Radius");
-                changed |= ui.add(egui::Slider::new(&mut b.radius, 0.0..=1.0)).changed();
-                ui.end_row();
+            });
+            property_row(ui, "Radius", None, |ui| {
+                changed |= ui
+                    .add(egui::Slider::new(&mut b.radius, 0.0..=1.0))
+                    .changed();
             });
         });
     changed
@@ -2147,31 +2839,37 @@ fn grade_controls(ui: &mut Ui, g: &mut buzz_scene::GradeSettings) -> bool {
         .id_salt("fx-grade")
         .show(ui, |ui| {
             changed |= ui.checkbox(&mut g.enabled, "On").changed();
-            egui::Grid::new("fx-grade-grid").num_columns(2).show(ui, |ui| {
-                ui.label("Exposure");
-                changed |= ui.add(egui::Slider::new(&mut g.exposure, -3.0..=3.0)).changed();
-                ui.end_row();
-                ui.label("Contrast");
-                changed |= ui.add(egui::Slider::new(&mut g.contrast, 0.0..=2.0)).changed();
-                ui.end_row();
-                ui.label("Saturation");
-                changed |= ui.add(egui::Slider::new(&mut g.saturation, 0.0..=2.0)).changed();
-                ui.end_row();
-                ui.label("Temperature");
-                changed |= ui.add(egui::Slider::new(&mut g.temperature, -1.0..=1.0)).changed();
-                ui.end_row();
-                ui.label("Tint");
+            property_row(ui, "Exposure", None, |ui| {
+                changed |= ui
+                    .add(egui::Slider::new(&mut g.exposure, -3.0..=3.0))
+                    .changed();
+            });
+            property_row(ui, "Contrast", None, |ui| {
+                changed |= ui
+                    .add(egui::Slider::new(&mut g.contrast, 0.0..=2.0))
+                    .changed();
+            });
+            property_row(ui, "Saturation", None, |ui| {
+                changed |= ui
+                    .add(egui::Slider::new(&mut g.saturation, 0.0..=2.0))
+                    .changed();
+            });
+            property_row(ui, "Temperature", None, |ui| {
+                changed |= ui
+                    .add(egui::Slider::new(&mut g.temperature, -1.0..=1.0))
+                    .changed();
+            });
+            property_row(ui, "Tint", None, |ui| {
                 changed |= ui.add(egui::Slider::new(&mut g.tint, -1.0..=1.0)).changed();
-                ui.end_row();
-                ui.label("Lift");
+            });
+            property_row(ui, "Lift", None, |ui| {
                 changed |= ui.add(egui::Slider::new(&mut g.lift, -0.5..=0.5)).changed();
-                ui.end_row();
-                ui.label("Gamma");
+            });
+            property_row(ui, "Gamma", None, |ui| {
                 changed |= ui.add(egui::Slider::new(&mut g.gamma, 0.1..=3.0)).changed();
-                ui.end_row();
-                ui.label("Gain");
+            });
+            property_row(ui, "Gain", None, |ui| {
                 changed |= ui.add(egui::Slider::new(&mut g.gain, 0.0..=2.0)).changed();
-                ui.end_row();
             });
         });
     changed
@@ -2183,16 +2881,18 @@ fn vignette_controls(ui: &mut Ui, v: &mut buzz_scene::VignetteSettings) -> bool 
         .id_salt("fx-vignette")
         .show(ui, |ui| {
             changed |= ui.checkbox(&mut v.enabled, "On").changed();
-            egui::Grid::new("fx-vignette-grid").num_columns(2).show(ui, |ui| {
-                ui.label("Amount");
-                changed |= ui.add(egui::Slider::new(&mut v.amount, 0.0..=1.0)).changed();
-                ui.end_row();
-                ui.label("Softness");
-                changed |= ui.add(egui::Slider::new(&mut v.softness, 0.0..=1.0)).changed();
-                ui.end_row();
-                ui.label("Colour");
+            property_row(ui, "Amount", None, |ui| {
+                changed |= ui
+                    .add(egui::Slider::new(&mut v.amount, 0.0..=1.0))
+                    .changed();
+            });
+            property_row(ui, "Softness", None, |ui| {
+                changed |= ui
+                    .add(egui::Slider::new(&mut v.softness, 0.0..=1.0))
+                    .changed();
+            });
+            property_row(ui, "Colour", None, |ui| {
                 changed |= color_row(ui, "fx-vignette-colour", &mut v.color);
-                ui.end_row();
             });
         });
     changed
@@ -2204,13 +2904,13 @@ fn grain_controls(ui: &mut Ui, g: &mut buzz_scene::GrainSettings) -> bool {
         .id_salt("fx-grain")
         .show(ui, |ui| {
             changed |= ui.checkbox(&mut g.enabled, "On").changed();
-            egui::Grid::new("fx-grain-grid").num_columns(2).show(ui, |ui| {
-                ui.label("Amount");
-                changed |= ui.add(egui::Slider::new(&mut g.amount, 0.0..=1.0)).changed();
-                ui.end_row();
-                ui.label("Size");
+            property_row(ui, "Amount", None, |ui| {
+                changed |= ui
+                    .add(egui::Slider::new(&mut g.amount, 0.0..=1.0))
+                    .changed();
+            });
+            property_row(ui, "Size", None, |ui| {
                 changed |= ui.add(egui::Slider::new(&mut g.size, 1.0..=8.0)).changed();
-                ui.end_row();
             });
         });
     changed
@@ -2222,8 +2922,7 @@ fn posterise_controls(ui: &mut Ui, p: &mut buzz_scene::PosteriseSettings) -> boo
         .id_salt("fx-posterise")
         .show(ui, |ui| {
             changed |= ui.checkbox(&mut p.enabled, "On").changed();
-            ui.horizontal(|ui| {
-                ui.label("Levels");
+            property_row(ui, "Levels", None, |ui| {
                 changed |= ui.add(egui::Slider::new(&mut p.levels, 2..=16)).changed();
             });
         });
@@ -2236,9 +2935,10 @@ fn halftone_controls(ui: &mut Ui, h: &mut buzz_scene::HalftoneSettings) -> bool 
         .id_salt("fx-halftone")
         .show(ui, |ui| {
             changed |= ui.checkbox(&mut h.enabled, "On").changed();
-            ui.horizontal(|ui| {
-                ui.label("Dot size");
-                changed |= ui.add(egui::Slider::new(&mut h.scale, 2.0..=24.0)).changed();
+            property_row(ui, "Dot size", None, |ui| {
+                changed |= ui
+                    .add(egui::Slider::new(&mut h.scale, 2.0..=24.0))
+                    .changed();
             });
         });
     changed
@@ -2250,12 +2950,83 @@ fn hatching_controls(ui: &mut Ui, h: &mut buzz_scene::HatchingSettings) -> bool 
         .id_salt("fx-hatching")
         .show(ui, |ui| {
             changed |= ui.checkbox(&mut h.enabled, "On").changed();
-            ui.horizontal(|ui| {
-                ui.label("Line spacing");
-                changed |= ui.add(egui::Slider::new(&mut h.scale, 2.0..=24.0)).changed();
+            property_row(ui, "Line spacing", None, |ui| {
+                changed |= ui
+                    .add(egui::Slider::new(&mut h.scale, 2.0..=24.0))
+                    .changed();
             });
         });
     changed
+}
+
+/// **A property row**: Stage 5 item 1's two-column layout — a fixed 96 px
+/// label column in `text`, and the field at `Tokens::CONTROL_H` filling
+/// what is left. Replaces an `egui::Grid`'s auto-sized label column, where a
+/// long label in one row pushed that row's field out of line with every
+/// other row's.
+///
+/// `hover`, when given, is the label's tooltip — several existing rows carry
+/// one (e.g. "Sort by depth"), and moving to this layout must not drop it.
+///
+/// `pub(crate)` rather than private: `filter_panel.rs`'s own label-then-field
+/// rows (Stage 5 item 1's "and all the object/instance/text/filter
+/// sections") are the same shape and get the same 96 px column from here
+/// rather than a second copy of it.
+pub(crate) fn property_row<R>(
+    ui: &mut Ui,
+    label: &str,
+    hover: Option<&str>,
+    add_field: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    const LABEL_WIDTH: f32 = 96.0;
+    let mut result = None;
+    ui.horizontal(|ui| {
+        ui.set_min_height(Tokens::CONTROL_H);
+        let label_response = ui
+            .allocate_ui_with_layout(
+                egui::vec2(LABEL_WIDTH, Tokens::CONTROL_H),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| ui.label(RichText::new(label).color(Palette::text())),
+            )
+            .inner;
+        if let Some(hover) = hover {
+            label_response.on_hover_text(hover);
+        }
+        result = Some(add_field(ui));
+    });
+    result.expect("add_field always runs inside the horizontal closure")
+}
+
+/// **A disclosure section**: a bold, collapsible header with a hairline
+/// underneath separating it from whatever comes next — Stage 5 item 1's
+/// "sections as disclosure rows separated by hairlines, no nested frames".
+/// `egui::CollapsingHeader` draws no frame of its own, so this is the header
+/// and the divider, nothing boxed.
+fn property_section<R>(
+    ui: &mut Ui,
+    id: &str,
+    title: &str,
+    default_open: bool,
+    add_body: impl FnOnce(&mut Ui) -> R,
+) -> Option<R> {
+    let mut result = None;
+    // `.strong()` alone resolves to `Visuals::strong_text_color()` —
+    // `widgets.active.fg_stroke`, meant to read *on the accent fill* — not
+    // to the panel this header actually sits on; for a theme whose
+    // `accent_text` is black (Contrast's own accent, for one) that painted
+    // a near-invisible header on a dark panel. An explicit `.color` wins
+    // over `.strong`'s fallback and is what the user's report ("Document",
+    // "Depth of Field", "Stroke and Fill", "View" all dim) is asking for.
+    egui::CollapsingHeader::new(RichText::new(title).strong().color(Palette::text()))
+        .id_salt(id)
+        .default_open(default_open)
+        .show(ui, |ui| {
+            result = Some(add_body(ui));
+        });
+    ui.add_space(Tokens::SPACE_1);
+    ui.separator();
+    ui.add_space(Tokens::SPACE_1);
+    result
 }
 
 pub fn properties_panel(
@@ -2272,66 +3043,69 @@ pub fn properties_panel(
     ui.separator();
 
     if selection.is_empty() {
-        ui.label(RichText::new("Document").strong());
-        egui::Grid::new("doc-props").num_columns(2).show(ui, |ui| {
-            ui.label("Width");
-            let mut w = scene.stage().size.width;
-            if ui
-                .add(egui::DragValue::new(&mut w).range(1.0..=16384.0))
-                .changed()
-            {
-                scene.stage_mut().size.width = w;
-                changed = true;
-            }
-            ui.end_row();
+        property_section(ui, "doc-section", "Document", true, |ui| {
+            property_row(ui, "Width", None, |ui| {
+                let mut w = scene.stage().size.width;
+                if ui
+                    .add(egui::DragValue::new(&mut w).range(1.0..=16384.0))
+                    .changed()
+                {
+                    scene.stage_mut().size.width = w;
+                    changed = true;
+                }
+            });
 
-            ui.label("Height");
-            let mut h = scene.stage().size.height;
-            if ui
-                .add(egui::DragValue::new(&mut h).range(1.0..=16384.0))
-                .changed()
-            {
-                scene.stage_mut().size.height = h;
-                changed = true;
-            }
-            ui.end_row();
+            property_row(ui, "Height", None, |ui| {
+                let mut h = scene.stage().size.height;
+                if ui
+                    .add(egui::DragValue::new(&mut h).range(1.0..=16384.0))
+                    .changed()
+                {
+                    scene.stage_mut().size.height = h;
+                    changed = true;
+                }
+            });
 
-            ui.label("FPS");
-            let mut fps = scene.stage().frame_rate;
-            if ui
-                .add(
-                    egui::DragValue::new(&mut fps)
-                        .range(0.01..=240.0)
-                        .speed(0.1),
-                )
-                .changed()
-            {
-                scene.stage_mut().frame_rate = fps;
-                changed = true;
-            }
-            ui.end_row();
+            property_row(ui, "FPS", None, |ui| {
+                let mut fps = scene.stage().frame_rate;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut fps)
+                            .range(0.01..=240.0)
+                            .speed(0.1),
+                    )
+                    .changed()
+                {
+                    scene.stage_mut().frame_rate = fps;
+                    changed = true;
+                }
+            });
 
-            ui.label("Background");
-            let mut bg = scene.stage().background;
-            if color_row(ui, "stage-bg", &mut bg) {
-                scene.stage_mut().background = bg;
-                changed = true;
-            }
-            ui.end_row();
+            property_row(ui, "Background", None, |ui| {
+                let mut bg = scene.stage().background;
+                if color_row(ui, "stage-bg", &mut bg) {
+                    scene.stage_mut().background = bg;
+                    changed = true;
+                }
+            });
 
-            ui.label("Sort by depth")
-                .on_hover_text("Draw layers ordered by depth rather than the timeline");
-            let mut sort = scene.stage().sort_by_depth;
-            if ui.checkbox(&mut sort, "").changed() {
-                scene.stage_mut().sort_by_depth = sort;
-                changed = true;
-            }
-            ui.end_row();
+            property_row(
+                ui,
+                "Sort by depth",
+                Some("Draw layers ordered by depth rather than the timeline"),
+                |ui| {
+                    let mut sort = scene.stage().sort_by_depth;
+                    if ui.checkbox(&mut sort, "").changed() {
+                        scene.stage_mut().sort_by_depth = sort;
+                        changed = true;
+                    }
+                },
+            );
         });
 
         // Depth of field: a document-level camera setting, so it sits with the
         // document rather than in the timeline.
-        changed |= depth_of_field_properties(ui, scene, at.frame);
+        changed |= depth_of_field_properties(ui, scene, selection, at.frame);
 
         // The shutter, next to the aperture: the other half of what a camera
         // does to time and light.
@@ -2342,19 +3116,17 @@ pub fn properties_panel(
         // film, not its dimensions.
         changed |= effects_properties(ui, scene);
     } else if let Some(bounds) = selection.bounds_at(scene, at.frame) {
-        egui::Grid::new("sel-props").num_columns(2).show(ui, |ui| {
-            ui.label("X");
+        property_row(ui, "X", None, |ui| {
             ui.label(format!("{:.2}", bounds.x0));
-            ui.end_row();
-            ui.label("Y");
+        });
+        property_row(ui, "Y", None, |ui| {
             ui.label(format!("{:.2}", bounds.y0));
-            ui.end_row();
-            ui.label("W");
+        });
+        property_row(ui, "W", None, |ui| {
             ui.label(format!("{:.2}", bounds.width()));
-            ui.end_row();
-            ui.label("H");
+        });
+        property_row(ui, "H", None, |ui| {
             ui.label(format!("{:.2}", bounds.height()));
-            ui.end_row();
         });
     }
 
@@ -2380,12 +3152,9 @@ pub fn properties_panel(
     // selection can be recoloured to, which belongs with the document and the
     // selection rather than with whichever tool happens to be held.
 
-    ui.add_space(8.0);
-    ui.label(RichText::new("Stroke and Fill").strong());
-    egui::Grid::new("style-props")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.label("Width");
+    ui.add_space(Tokens::SPACE_2);
+    property_section(ui, "stroke-fill-section", "Stroke and Fill", true, |ui| {
+        property_row(ui, "Width", None, |ui| {
             let mut width = style.stroke_width;
             if ui
                 .add(
@@ -2397,13 +3166,13 @@ pub fn properties_panel(
             {
                 style.stroke_width = width;
             }
-            ui.end_row();
+        });
 
-            ui.label("Hairline");
+        property_row(ui, "Hairline", None, |ui| {
             ui.checkbox(&mut style.hairline, "");
-            ui.end_row();
+        });
 
-            ui.label("Style");
+        property_row(ui, "Style", None, |ui| {
             egui::ComboBox::from_id_salt("stroke-kind")
                 .selected_text(style.stroke_kind.label())
                 .show_ui(ui, |ui| {
@@ -2411,10 +3180,9 @@ pub fn properties_panel(
                         ui.selectable_value(&mut style.stroke_kind, kind, kind.label());
                     }
                 });
-            ui.end_row();
         });
+    });
 
-    ui.add_space(8.0);
     // The Merge Shape / Object Drawing toggle, which changes how the drawing
     // tools behave rather than how anything looks.
     let mut object_drawing = style.drawing_mode == DrawingMode::ObjectDrawing;
@@ -2433,32 +3201,28 @@ pub fn properties_panel(
         };
     }
 
-    ui.add_space(8.0);
+    ui.add_space(Tokens::SPACE_2);
     // **Rolled up.** Ten checkboxes and a number, every one of which is also on
     // the View menu with its keyboard shortcut beside it. Open, they were a
     // quarter of the panel's height for settings chosen once a project.
-    egui::CollapsingHeader::new(RichText::new("View").strong())
-        .id_salt("view-section")
-        .default_open(false)
-        .show(ui, |ui| {
-            ui.checkbox(&mut view.show_rulers, "Rulers");
-            ui.checkbox(&mut view.show_grid, "Grid");
-            ui.checkbox(&mut view.show_guides, "Guides");
-            ui.checkbox(&mut view.lock_guides, "Lock guides");
-            ui.horizontal(|ui| {
-                ui.label("Grid size");
-                ui.add(
-                    egui::DragValue::new(&mut view.grid_spacing)
-                        .range(0.1..=1000.0)
-                        .speed(0.5),
-                );
-            });
-            ui.label(RichText::new("Snap to").small().weak());
-            ui.checkbox(&mut view.snap.to_guides, "Guides");
-            ui.checkbox(&mut view.snap.to_grid, "Grid");
-            ui.checkbox(&mut view.snap.to_objects, "Objects");
-            ui.checkbox(&mut view.snap.to_pixels, "Pixels");
+    property_section(ui, "view-section", "View", false, |ui| {
+        ui.checkbox(&mut view.show_rulers, "Rulers");
+        ui.checkbox(&mut view.show_grid, "Grid");
+        ui.checkbox(&mut view.show_guides, "Guides");
+        ui.checkbox(&mut view.lock_guides, "Lock guides");
+        property_row(ui, "Grid size", None, |ui| {
+            ui.add(
+                egui::DragValue::new(&mut view.grid_spacing)
+                    .range(0.1..=1000.0)
+                    .speed(0.5),
+            );
         });
+        ui.label(RichText::new("Snap to").small().weak());
+        ui.checkbox(&mut view.snap.to_guides, "Guides");
+        ui.checkbox(&mut view.snap.to_grid, "Grid");
+        ui.checkbox(&mut view.snap.to_objects, "Objects");
+        ui.checkbox(&mut view.snap.to_pixels, "Pixels");
+    });
 
     changed
 }
@@ -3084,6 +3848,51 @@ pub const LAYER_SWITCH: f32 = 15.0;
 /// The layer's colour chip, which sits beside the switches.
 pub const CHIP_WIDTH: f32 = 8.0;
 
+/// Animate's Highlight Layer palette. Muted rather than the bright swatches a
+/// palette usually offers, because this one sits as a wash under the
+/// timeline's own marks and behind the Layers panel's row in both themes —
+/// a saturated colour would fight the content rather than just marking it.
+pub const HIGHLIGHT_SWATCHES: [(&str, Color); 6] = [
+    ("Yellow", Color::from_rgb8(0xC9, 0xA0, 0x2A)),
+    ("Orange", Color::from_rgb8(0xC9, 0x7A, 0x35)),
+    ("Red", Color::from_rgb8(0xC0, 0x50, 0x50)),
+    ("Green", Color::from_rgb8(0x4C, 0x9A, 0x5A)),
+    ("Blue", Color::from_rgb8(0x3E, 0x7B, 0xB5)),
+    ("Purple", Color::from_rgb8(0x8A, 0x5A, 0xB5)),
+];
+
+/// The body of a layer's "Highlight" submenu: the six swatches, and "Remove
+/// Highlight" once there is one to remove.
+///
+/// Shared by the timeline's layer-name menu and the Layers panel's, so the
+/// two offer exactly the same choices in exactly the same order. `on_pick`
+/// is called with the colour chosen, or `None` for "Remove Highlight"; the
+/// caller decides which layer or layers that applies to.
+pub fn highlight_menu_body(
+    ui: &mut Ui,
+    current: Option<Color>,
+    mut on_pick: impl FnMut(Option<Color>),
+) {
+    for (name, color) in HIGHLIGHT_SWATCHES {
+        ui.horizontal(|ui| {
+            let (chip, _) =
+                ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            ui.painter().rect_filled(chip, 2.0, to_egui(color));
+            if ui.selectable_label(current == Some(color), name).clicked() {
+                on_pick(Some(color));
+                ui.close();
+            }
+        });
+    }
+    if current.is_some() {
+        ui.separator();
+        if ui.button("Remove Highlight").clicked() {
+            on_pick(None);
+            ui.close();
+        }
+    }
+}
+
 /// Paint one of Animate's three layer columns into an arbitrary rectangle.
 ///
 /// # Why these are painted and not characters
@@ -3118,8 +3927,11 @@ pub fn paint_layer_icon(
         (_, true) => Palette::text(),
         (_, false) => Palette::text_dim(),
     };
+    // Ghost icon (Stage 5, item 2 of `docs/WORKSPACE_DESIGN_PLAN.md`): no
+    // fill at rest, `hover` on hover — not the deprecated `raised()` fill
+    // every other icon-only control has already moved off.
     if hovered {
-        painter.rect_filled(rect, 2.0, Palette::raised());
+        painter.rect_filled(rect, 2.0, Palette::hover());
     }
 
     let side = rect.width().min(rect.height());
@@ -3194,12 +4006,57 @@ pub fn paint_layer_icon(
     }
 }
 
+/// A light's row in the Layers panel: a sun and its name, dragged by the name
+/// to any place in the stack. Returns a drop another light made onto it.
+fn light_list_row(
+    ui: &mut Ui,
+    scene: &Scene,
+    id: buzz_scene::LightId,
+) -> Option<(buzz_scene::LightId, Option<LayerId>)> {
+    let light = scene.lights().get(id)?;
+    let (name, on) = (light.name.clone(), light.enabled);
+    let slot = scene.light_slot(id);
+    let mut dropped = None;
+    ui.horizontal(|ui| {
+        let (mark, _) = ui.allocate_exact_size(egui::vec2(14.0, Tokens::ROW_H), egui::Sense::hover());
+        let ink = if on { Palette::warning() } else { Palette::text_dim() };
+        let c = mark.center();
+        ui.painter().circle_filled(c, 2.5, ink);
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::FRAC_PI_4;
+            let d = egui::vec2(a.cos(), a.sin());
+            ui.painter()
+                .line_segment([c + d * 4.0, c + d * 5.5], egui::Stroke::new(1.0, ink));
+        }
+        let width = ui.available_width().max(1.0);
+        let drag_id = ui.id().with(("light-drag", id.0));
+        let response = ui
+            .dnd_drag_source(drag_id, crate::timeline_panel::DraggedLight(id), |ui| {
+                ui.add_sized(
+                    egui::vec2(width, Tokens::ROW_H),
+                    egui::Button::selectable(false, RichText::new(&name).italics()).truncate(),
+                )
+            })
+            .inner
+            .on_hover_text(
+                "A light. Drag it between layers: it lights the layers below it and \
+                 nothing above.",
+            );
+        dropped = crate::timeline_panel::light_drop_target(
+            ui,
+            ui.painter(),
+            response.rect,
+            scene,
+            crate::timeline_panel::DropRow::Light(slot),
+        );
+    });
+    dropped
+}
+
 /// One layer switch, as a widget, for the Layers panel's own rows.
 fn layer_toggle(ui: &mut Ui, icon: LayerIcon, on: bool, layer_color: Color) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(LAYER_SWITCH, LAYER_SWITCH),
-        egui::Sense::click(),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(LAYER_SWITCH, LAYER_SWITCH), egui::Sense::click());
     paint_layer_icon(
         ui.painter(),
         rect,
@@ -3223,22 +4080,27 @@ pub fn layers_panel(
     ui.horizontal(|ui| {
         ui.heading("Layers");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add_enabled(can_delete, egui::Button::new("\u{1F5D1}").small())
-                .on_hover_text("Delete the selected layer")
-                .on_disabled_hover_text("A document must keep at least one layer")
-                .clicked()
-            {
-                command = Some(Command::DeleteLayer);
-            }
+            // Stage 2, item 3 of `docs/WORKSPACE_DESIGN_PLAN.md`: ghost
+            // icon buttons, named by the plan text itself ("Layers
+            // new/delete"). `add_enabled_ui` rather than `add_enabled`,
+            // since `icon_button` returns a plain `Response` rather than
+            // taking a widget to disable.
+            ui.add_enabled_ui(can_delete, |ui| {
+                if crate::widgets::sheet_icon_button(
+                    ui,
+                    crate::icon_sheet::SheetIcon::DeleteLayer,
+                    "Delete the selected layer",
+                )
+                    .on_disabled_hover_text("A document must keep at least one layer")
+                    .clicked()
+                {
+                    command = Some(Command::DeleteLayer);
+                }
+            });
             if ui.small_button("Fld").on_hover_text("New folder").clicked() {
                 command = Some(Command::NewLayerFolder);
             }
-            if ui
-                .small_button("\u{2795}")
-                .on_hover_text("New layer")
-                .clicked()
-            {
+            if crate::widgets::sheet_icon_button(ui, crate::icon_sheet::SheetIcon::NewLayer, "New layer").clicked() {
                 command = Some(Command::NewLayer);
             }
         });
@@ -3303,13 +4165,56 @@ pub fn layers_panel(
         .collect();
     let mut set_follows: Option<(LayerId, Option<LayerId>)> = None;
     let mut set_kind: Option<(LayerId, LayerKind)> = None;
+    let mut reorder_to: Option<(LayerId, usize)> = None;
+    let mut place_light: Option<(buzz_scene::LightId, Option<LayerId>)> = None;
+    // I2: a folder's disclosure triangle was clicked.
+    let mut toggle_collapsed: Option<LayerId> = None;
+    // H2: a highlight colour to set, or clear, on every id in the list — one
+    // for the row that was right-clicked, or every selected layer at once
+    // when it came from "Highlight Selected Layers".
+    let mut set_highlight: Option<(Vec<LayerId>, Option<Color>)> = None;
+
+    // **Lights are rows too**, each in its place in the stack: at the top it
+    // lights everything, dragged down between two layers it lights only what
+    // is below it. Document timeline only — lights belong to the stage.
+    let on_stage = scene.edit_path().is_empty();
+    let lights_in = |scene: &Scene, slot: Option<LayerId>| -> Vec<buzz_scene::LightId> {
+        if !on_stage {
+            return Vec::new();
+        }
+        scene
+            .lights()
+            .lights
+            .iter()
+            .filter(|l| scene.light_slot(l.id) == slot)
+            .map(|l| l.id)
+            .collect()
+    };
+    for light in lights_in(scene, None) {
+        if let Some(drop) = light_list_row(ui, scene, light) {
+            place_light = Some(drop);
+        }
+    }
 
     // The dock column already scrolls; see the note on `tool_bar`.
-    for id in ids {
+    for (row_idx, id) in ids.iter().copied().enumerate() {
+        // I2: a row nested inside a collapsed folder is not drawn — neither
+        // its own row nor a light keyed to it — though the folder's own row
+        // always is, and `row_idx` still counts every layer in the stack, so
+        // the drag-and-drop maths below (which reads it against
+        // `scene.layer_index`) is unaffected by what is or is not on screen.
+        if scene.layers().is_row_hidden(id) {
+            continue;
+        }
+        for light in lights_in(scene, Some(id)) {
+            if let Some(drop) = light_list_row(ui, scene, light) {
+                place_light = Some(drop);
+            }
+        }
         let Some(layer) = scene.layers().get(id) else {
             continue;
         };
-        let (name, kind, visible, locked, outline, alpha, color, depth) = (
+        let (name, kind, visible, locked, outline, alpha, color, depth, highlight, collapsed) = (
             layer.name.clone(),
             layer.kind,
             layer.visible,
@@ -3318,6 +4223,8 @@ pub fn layers_panel(
             layer.alpha,
             layer.color,
             layer.parent.is_some() as usize,
+            layer.highlight,
+            layer.collapsed,
         );
 
         let mut set_visible = visible;
@@ -3334,7 +4241,10 @@ pub fn layers_panel(
         // the other way round for this reason: the eye, the padlock and the
         // outline box are always in the same place, and the one thing that can
         // be any length is the one that gets truncated.
-        ui.horizontal(|ui| {
+        // H2: captured so the highlight bar and wash below can be painted
+        // over the row exactly as drawn, switches and chip included — the
+        // same two marks the timeline gives a highlighted layer.
+        let row = ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 12.0);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3372,6 +4282,48 @@ pub fn layers_panel(
 
                 // Whatever the switches left over belongs to the name.
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    // I2: the disclosure triangle, one column reserved on
+                    // every row (blank unless this is a Folder) so a
+                    // folder's name and a plain layer's name still line up
+                    // with the timeline's own rows.
+                    let is_folder = kind == LayerKind::Folder;
+                    let (triangle_rect, triangle_resp) = ui.allocate_exact_size(
+                        egui::vec2(12.0, Tokens::ROW_H),
+                        if is_folder {
+                            egui::Sense::click()
+                        } else {
+                            egui::Sense::hover()
+                        },
+                    );
+                    if is_folder {
+                        let ink = if triangle_resp.hovered() {
+                            Palette::text()
+                        } else {
+                            Palette::text_dim()
+                        };
+                        let c = triangle_rect.center();
+                        let pts = if collapsed {
+                            // Pointing right: there is more here than the row shows.
+                            vec![
+                                egui::pos2(c.x - 3.0, c.y - 4.0),
+                                egui::pos2(c.x - 3.0, c.y + 4.0),
+                                egui::pos2(c.x + 4.0, c.y),
+                            ]
+                        } else {
+                            // Pointing down: everything under this folder is already shown.
+                            vec![
+                                egui::pos2(c.x - 4.0, c.y - 3.0),
+                                egui::pos2(c.x + 4.0, c.y - 3.0),
+                                egui::pos2(c.x, c.y + 4.0),
+                            ]
+                        };
+                        ui.painter()
+                            .add(egui::Shape::convex_polygon(pts, ink, egui::Stroke::NONE));
+                        if triangle_resp.clicked() {
+                            toggle_collapsed = Some(id);
+                        }
+                    }
+
                     let mark = match kind {
                         LayerKind::Folder => "F ",
                         LayerKind::Mask => "M ",
@@ -3396,25 +4348,114 @@ pub fn layers_panel(
                     // slot accepts this payload. See `rig_panel::DraggedPart`.
                     let drag_id = ui.id().with(("layer-drag", id.0));
                     let response = ui
-                        .dnd_drag_source(
-                            drag_id,
-                            crate::rig_panel::DraggedPart::Layer(id),
-                            |ui| {
-                                ui.add_sized(
-                                    egui::vec2(width, ui.spacing().interact_size.y),
-                                    egui::Button::selectable(
-                                        active == Some(id),
-                                        format!("{mark}{name}"),
-                                    )
-                                    .truncate(),
+                        .dnd_drag_source(drag_id, crate::rig_panel::DraggedPart::Layer(id), |ui| {
+                            // Stage 5, item 2: rows at `Tokens::ROW_H` (20 px),
+                            // not the taller general control height.
+                            ui.add_sized(
+                                egui::vec2(width, Tokens::ROW_H),
+                                egui::Button::selectable(
+                                    active == Some(id) || selection.is_layer_selected(id),
+                                    format!("{mark}{name}"),
                                 )
-                            },
-                        )
+                                .truncate(),
+                            )
+                        })
                         .inner;
+                    if on_stage
+                        && let Some(drop) = crate::timeline_panel::light_drop_target(
+                            ui,
+                            ui.painter(),
+                            response.rect,
+                            scene,
+                            crate::timeline_panel::DropRow::Layer(id),
+                        )
+                    {
+                        place_light = Some(drop);
+                    }
                     if response.clicked() {
-                        // Animate selects the layer's artwork with it, so the
-                        // obvious next move needs no second gesture.
-                        select_this = true;
+                        let shift = ui.input(|i| i.modifiers.shift);
+                        let toggle = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+                        if shift {
+                            // I1: sweep from the anchor (or the active layer,
+                            // if there is no anchor yet) to the layer just
+                            // clicked, in stack order — pulling in a
+                            // collapsed folder's hidden children when the
+                            // folder itself falls inside the range. The
+                            // anchor itself does not move.
+                            let anchor = selection.range_anchor().or(active).unwrap_or(id);
+                            let order = scene.layers().visible_row_order();
+                            let range = crate::selection::layer_range(&order, anchor, id);
+                            let expanded = crate::selection::expand_collapsed_folders(scene, &range);
+                            selection.select_layers(scene, &expanded, frame);
+                        } else if toggle {
+                            let mut current = selection.selected_layers().to_vec();
+                            if !current.contains(&id) {
+                                current.push(id);
+                            } else {
+                                current.retain(|&lid| lid != id);
+                            }
+                            selection.select_layers(scene, &current, frame);
+                            // Ctrl/Cmd+click moves the anchor, so a
+                            // Shift+click right after sweeps from the layer
+                            // just toggled.
+                            selection.set_range_anchor(Some(id));
+                        } else {
+                            select_this = true;
+                        }
+                    }
+
+                    if let Some(dragged) =
+                        egui::DragAndDrop::payload::<crate::rig_panel::DraggedPart>(ui.ctx())
+                    {
+                        if let crate::rig_panel::DraggedPart::Layer(dragged_layer_id) = *dragged {
+                            if let Some(hover_pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+                                if response.rect.contains(hover_pos) {
+                                    let above = hover_pos.y < response.rect.center().y;
+                                    if let Some(from) = scene.layer_index(dragged_layer_id) {
+                                        let target_slot = if above {
+                                            if from < row_idx {
+                                                row_idx.saturating_sub(1)
+                                            } else {
+                                                row_idx
+                                            }
+                                        } else {
+                                            if from < row_idx { row_idx } else { row_idx + 1 }
+                                        };
+                                        if from != target_slot {
+                                            let line_y = if above {
+                                                response.rect.top()
+                                            } else {
+                                                response.rect.bottom()
+                                            };
+                                            ui.painter().line_segment(
+                                                [
+                                                    egui::pos2(response.rect.min.x, line_y),
+                                                    egui::pos2(response.rect.max.x, line_y),
+                                                ],
+                                                egui::Stroke::new(2.0, Palette::active()),
+                                            );
+                                            if ui.input(|i| i.pointer.any_released()) {
+                                                if let Some(dropped) =
+                                                    egui::DragAndDrop::take_payload::<
+                                                        crate::rig_panel::DraggedPart,
+                                                    >(
+                                                        ui.ctx()
+                                                    )
+                                                {
+                                                    if let crate::rig_panel::DraggedPart::Layer(
+                                                        dropped_id,
+                                                    ) = *dropped
+                                                    {
+                                                        reorder_to =
+                                                            Some((dropped_id, target_slot));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // **The same switches again, by name, on the right button.**
@@ -3454,6 +4495,23 @@ pub fn layers_panel(
                             ui.close();
                         }
                         ui.separator();
+                        // H2: Animate's Highlight Layer — a colour to pick this
+                        // layer out in the timeline and here, independent of
+                        // its automatic colour chip.
+                        ui.menu_button("Highlight", |ui| {
+                            highlight_menu_body(ui, highlight, |picked| {
+                                set_highlight = Some((vec![id], picked));
+                            });
+                        });
+                        let selected_layers = selection.selected_layers().to_vec();
+                        if selected_layers.len() > 1 {
+                            ui.menu_button("Highlight Selected Layers", |ui| {
+                                highlight_menu_body(ui, None, |picked| {
+                                    set_highlight = Some((selected_layers.clone(), picked));
+                                });
+                            });
+                        }
+                        ui.separator();
                         if ui.button(Command::NewLayer.label()).clicked() {
                             command = Some(Command::NewLayer);
                             ui.close();
@@ -3462,13 +4520,31 @@ pub fn layers_panel(
                             command = Some(Command::NewLayerFolder);
                             ui.close();
                         }
+                        if ui.button(Command::MoveLayerUp.label()).clicked() {
+                            select_this = true;
+                            command = Some(Command::MoveLayerUp);
+                            ui.close();
+                        }
+                        if ui.button(Command::MoveLayerDown.label()).clicked() {
+                            select_this = true;
+                            command = Some(Command::MoveLayerDown);
+                            ui.close();
+                        }
+                        if ui.button("Select All Layers").clicked() {
+                            let all_layers: Vec<_> = scene.layers().iter().map(|l| l.id).collect();
+                            selection.select_layers(scene, &all_layers, frame);
+                            ui.close();
+                        }
                         ui.separator();
                         // Delete acts on the *active* layer, so the row being
                         // right-clicked has to become the active one first.
                         // Selecting happens below, before the command is
                         // dispatched, which is what makes that safe.
                         if ui
-                            .add_enabled(can_delete, egui::Button::new(Command::DeleteLayer.label()))
+                            .add_enabled(
+                                can_delete,
+                                egui::Button::new(Command::DeleteLayer.label()),
+                            )
                             .on_disabled_hover_text("A document must keep at least one layer")
                             .clicked()
                         {
@@ -3479,16 +4555,36 @@ pub fn layers_panel(
                     });
                 });
             });
-        });
+        })
+        .response;
+
+        // H2: the highlight bar and wash — a solid 4 px bar at the row's left
+        // edge plus a ~22% wash over it, so a highlighted layer is easy to
+        // find scrolling down the list. The wash is skipped on the active
+        // row: the selection's own blue already owns that row, and the bar
+        // is what stays visible on top of it.
+        if let Some(h) = highlight {
+            let [r, g, b, _] = h.to_rgba8().to_u8_array();
+            let is_selected = active == Some(id) || selection.is_layer_selected(id);
+            if !is_selected {
+                ui.painter().rect_filled(
+                    row.rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(r, g, b, 56),
+                );
+            }
+            let bar = egui::Rect::from_min_max(
+                row.rect.min,
+                egui::pos2(row.rect.min.x + 4.0, row.rect.max.y),
+            );
+            ui.painter().rect_filled(bar, 0.0, egui::Color32::from_rgb(r, g, b));
+        }
 
         if select_this {
             selection.select_layer(scene, id, frame);
         }
 
-        if set_visible != visible
-            || set_locked != locked
-            || set_outline != outline
-        {
+        if set_visible != visible || set_locked != locked || set_outline != outline {
             scene.update_layer(id, |l| {
                 l.visible = set_visible;
                 l.locked = set_locked;
@@ -3553,6 +4649,40 @@ pub fn layers_panel(
         });
         if set_alpha != alpha {
             scene.update_layer(id, |l| l.alpha = set_alpha);
+        }
+
+        // **Ignore lights** (F1): captions, title cards and other overlays sit
+        // on the screen, not in the world, so the lights must neither shade
+        // them nor throw them as a shadow.
+        let unlit = scene.layers().get(id).is_some_and(|l| l.unlit);
+        let mut set_unlit = unlit;
+        // **Cast shadow** beside it (AS5): still shaded and tinted, but no
+        // shadow thrown — set pieces far behind the cast. Wrapped rather than
+        // one fixed row, so a deep indent never widens the column.
+        let casts = scene.layers().get(id).is_none_or(|l| l.casts_shadow);
+        let mut set_casts = casts;
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(depth as f32 * 12.0 + 18.0);
+            ui.checkbox(&mut set_unlit, RichText::new("Ignore lights").small())
+                .on_hover_text(
+                    "The scene's lights neither shade this layer nor make it cast a \
+                     shadow \u{2014} for captions, title cards and other overlays.",
+                );
+            ui.add_enabled(
+                !set_unlit,
+                egui::Checkbox::new(&mut set_casts, RichText::new("Cast shadow").small()),
+            )
+            .on_hover_text(
+                "The lights still shade and tint this layer; off, it throws no cast \
+                 shadow \u{2014} for set pieces behind the cast. A layer rig follows \
+                 its root layer.",
+            );
+        });
+        if set_unlit != unlit {
+            scene.update_layer(id, |l| l.unlit = set_unlit);
+        }
+        if set_casts != casts {
+            scene.update_layer(id, |l| l.casts_shadow = set_casts);
         }
 
         // **One control to a row, each sized to the column.**
@@ -3646,6 +4776,15 @@ pub fn layers_panel(
         }
     }
 
+    if let Some((light, above)) = place_light {
+        scene.place_light(light, above);
+    }
+
+    if let Some((layer_to_move, to_idx)) = reorder_to {
+        scene.reorder_layer(layer_to_move, to_idx);
+        selection.set_active_layer(Some(layer_to_move));
+    }
+
     if let Some((layer, follows)) = set_follows {
         // The same call the timeline's parenting view makes, so both record
         // the pose the link was made at. See `Scene::set_follows`.
@@ -3653,6 +4792,14 @@ pub fn layers_panel(
     }
     if let Some((layer, kind)) = set_kind {
         scene.update_layer(layer, |l| l.kind = kind);
+    }
+    if let Some((layers, color)) = set_highlight {
+        for id in layers {
+            scene.update_layer(id, |l| l.highlight = color);
+        }
+    }
+    if let Some(id) = toggle_collapsed {
+        scene.update_layer(id, |l| l.collapsed = !l.collapsed);
     }
 
     // **The camera, at the foot of the layer list.**
@@ -3667,7 +4814,12 @@ pub fn layers_panel(
     ui.horizontal(|ui| {
         let on = scene.camera().enabled;
         let button = egui::Button::new(
-            RichText::new(if on { "\u{1F3A5} Camera on" } else { "\u{1F3A5} Add Camera" }).small(),
+            RichText::new(if on {
+                "\u{1F3A5} Camera on"
+            } else {
+                "\u{1F3A5} Add Camera"
+            })
+            .small(),
         )
         .selected(on);
         if ui
@@ -3730,82 +4882,81 @@ fn spatial_properties(
     let mut spatial = object.spatial;
     let before = spatial;
 
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("3D").strong());
-        if !spatial.is_flat() {
-            ui.label(RichText::new("turned").small().weak());
-        }
-    });
-
     // Bounded a little short of edge-on. A card exactly side-on has no image
     // at all, and one past it shows its back — legal, and rarely what somebody
     // reaching for a slider meant.
     const LIMIT: f64 = 85.0;
     let angle = |ui: &mut Ui, label: &str, value: &mut f64, hint: &str| {
         let mut degrees = value.to_degrees();
-        let mut touched = false;
-        ui.horizontal(|ui| {
-            ui.label(label);
-            if ui
-                .add(
-                    egui::Slider::new(&mut degrees, -LIMIT..=LIMIT)
-                        .suffix("\u{b0}")
-                        .fixed_decimals(0),
-                )
-                .on_hover_text(hint)
-                .changed()
-            {
-                *value = degrees.to_radians();
-                touched = true;
-            }
+        let touched = property_row(ui, label, Some(hint), |ui| {
+            ui.add(
+                egui::Slider::new(&mut degrees, -LIMIT..=LIMIT)
+                    .suffix("\u{b0}")
+                    .fixed_decimals(0),
+            )
+            .changed()
         });
+        if touched {
+            *value = degrees.to_radians();
+        }
         touched
     };
 
     let mut changed = false;
-    changed |= angle(
-        ui,
-        "Rotate X",
-        &mut spatial.rotation_x,
-        "Tip the object away from the viewer, about the horizontal",
-    );
-    changed |= angle(
-        ui,
-        "Rotate Y",
-        &mut spatial.rotation_y,
-        "Turn the object about the vertical — the one that makes a card read \
-         as a wall when the camera passes it",
-    );
-    changed |= angle(
-        ui,
-        "Rotate Z",
-        &mut spatial.rotation_z,
-        "Spin it in its own plane",
-    );
+    let turned = !spatial.is_flat();
 
-    ui.horizontal(|ui| {
-        ui.label("Z");
-        if ui
-            .add(
-                egui::Slider::new(&mut spatial.z, -800.0..=800.0)
-                    .suffix(" px")
-                    .fixed_decimals(0),
-            )
-            .on_hover_text(
-                "How far in front of or behind its layer the object sits. \
-                 Negative is towards the camera.",
-            )
-            .changed()
-        {
-            changed = true;
+    ui.add_space(Tokens::SPACE_2);
+    property_section(ui, "spatial-section", "3D", true, |ui| {
+        if turned {
+            ui.label(RichText::new("turned").small().weak());
         }
-    });
 
-    if !spatial.is_flat() && ui.small_button("Flatten").clicked() {
-        spatial = buzz_scene::Spatial::default();
-        changed = true;
-    }
+        changed |= angle(
+                ui,
+                "Rotate X",
+                &mut spatial.rotation_x,
+                "Tip the object away from the viewer, about the horizontal",
+            );
+            changed |= angle(
+                ui,
+                "Rotate Y",
+                &mut spatial.rotation_y,
+                "Turn the object about the vertical — the one that makes a card read \
+                 as a wall when the camera passes it",
+            );
+            changed |= angle(
+                ui,
+                "Rotate Z",
+                &mut spatial.rotation_z,
+                "Spin it in its own plane",
+            );
+
+            property_row(
+                ui,
+                "Z",
+                Some(
+                    "How far in front of or behind its layer the object sits. \
+                     Negative is towards the camera.",
+                ),
+                |ui| {
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut spatial.z, -800.0..=800.0)
+                                .suffix(" px")
+                                .fixed_decimals(0),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                },
+            );
+
+            if turned && ui.small_button("Flatten").clicked() {
+                spatial = buzz_scene::Spatial::default();
+                changed = true;
+            }
+    });
 
     if changed && spatial != before {
         scene.update_object_where(at, id, |o| o.spatial = spatial);
@@ -3880,6 +5031,261 @@ mod tests {
         }
     }
 
+    /// A tall headless frame for the menu tests below: tall enough that no
+    /// Tool Options section falls off the bottom.
+    fn menu_frame(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(600.0, 2400.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn click_events(pos: egui::Pos2) -> Vec<egui::Event> {
+        let modifiers = egui::Modifiers::default();
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers,
+            },
+        ]
+    }
+
+    fn widget_tree(output: &egui::FullOutput) -> &egui::accesskit::TreeUpdate {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit is on, so every frame has a tree")
+    }
+
+    fn centre(b: egui::accesskit::Rect) -> egui::Pos2 {
+        egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32)
+    }
+
+    /// Every dropdown on screen, top to bottom.
+    fn menus_in(output: &egui::FullOutput) -> Vec<egui::Pos2> {
+        let mut found: Vec<_> = widget_tree(output)
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == egui::accesskit::Role::ComboBox)
+            .filter_map(|(_, node)| node.bounds())
+            .map(centre)
+            .collect();
+        found.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+        found
+    }
+
+    /// What can be clicked in `opened` that was not there in `closed` — the
+    /// items of the menu that just opened, top to bottom.
+    fn new_items(closed: &egui::FullOutput, opened: &egui::FullOutput) -> Vec<egui::Pos2> {
+        let before: std::collections::HashSet<_> =
+            widget_tree(closed).nodes.iter().map(|(id, _)| *id).collect();
+        let mut found: Vec<_> = widget_tree(opened)
+            .nodes
+            .iter()
+            .filter(|(id, node)| {
+                !before.contains(id) && node.supports_action(egui::accesskit::Action::Click)
+            })
+            .filter_map(|(_, node)| node.bounds())
+            .map(centre)
+            .collect();
+        found.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+        found
+    }
+
+    /// **Picking Round from the Tip menu while the nib was a Chisel crashed
+    /// the app.** The panel read the tip before drawing the menu, and after
+    /// the menu had changed it went on to draw the Angle slider from that
+    /// stale reading — `unreachable!` on a round nib with no angle. Every
+    /// tip picked from every other, on both brushes that have one, through a
+    /// real click on the real menu.
+    #[test]
+    fn every_tip_can_be_picked_from_every_other_tip() {
+        use crate::brush::BrushKind;
+        use buzz_geom::TipShape;
+        use egui::accesskit::Role;
+
+        // The one widget showing `text` — the closed menu by its value, an
+        // item in the open menu by its label.
+        let centre_of = |output: &egui::FullOutput, text: &str, menu: bool| {
+            let hits: Vec<_> = widget_tree(output)
+                .nodes
+                .iter()
+                .filter(|(_, node)| {
+                    if menu {
+                        node.role() == Role::ComboBox && node.value() == Some(text)
+                    } else {
+                        node.role() != Role::ComboBox && node.label() == Some(text)
+                    }
+                })
+                .filter_map(|(_, node)| node.bounds())
+                .collect();
+            assert_eq!(hits.len(), 1, "exactly one widget shows {text:?}");
+            centre(hits[0])
+        };
+
+        let scene = Scene::default();
+        for kind in [BrushKind::Fluid, BrushKind::Normal] {
+            for from in TipShape::KINDS {
+                for to in TipShape::KINDS {
+                    let ctx = egui::Context::default();
+                    crate::theme::apply(&ctx);
+                    ctx.enable_accesskit();
+
+                    let mut style = DrawStyle::default();
+                    style.brush.kind = kind;
+                    *style.brush.tip_mut().expect("an outlined brush has a tip") = from;
+
+                    let mut draw = |events| {
+                        ctx.run_ui(menu_frame(events), |ui| {
+                            brush_properties(ui, &scene, &mut style)
+                        })
+                    };
+                    let shown = draw(Vec::new());
+                    let menu = centre_of(&shown, from.label(), true);
+                    let _ = draw(click_events(menu));
+                    // A popup spends its first frame measuring itself,
+                    // invisible and deaf to clicks.
+                    let opened = draw(Vec::new());
+                    let item = centre_of(&opened, to.label(), false);
+                    let _ = draw(click_events(item));
+                    // And once more, as the next frame after a pick always is.
+                    let _ = draw(Vec::new());
+
+                    assert_eq!(
+                        style.brush.tip().label(),
+                        to.label(),
+                        "{kind:?}: picking {} from {} should take",
+                        to.label(),
+                        from.label()
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Every option in every Tool Options dropdown can be picked, from
+    /// whatever was picked before it.** The Tip crash was one menu changing
+    /// what the rest of the panel then drew from — and only from Chisel or
+    /// Ellipse, so a walk from the default Round nib sails past it. This
+    /// walks every dropdown the panel shows, for every tool and every brush
+    /// type, two picks deep: every item, then every item of every dropdown
+    /// the panel shows after that. Each pick is a real click, followed by
+    /// two more frames as the app would draw. A panic is collected rather
+    /// than stopping the walk, so one run names every bad pair.
+    #[test]
+    fn every_pair_of_tool_options_dropdown_picks_draws() {
+        use crate::brush::BrushKind;
+
+        let scene = Scene::default();
+        let mut setups = Vec::new();
+        for tool in crate::tools::all_tools() {
+            if tool == ToolId::Brush {
+                setups.extend(BrushKind::ALL.into_iter().map(|kind| (tool, Some(kind))));
+            } else {
+                setups.push((tool, None));
+            }
+        }
+
+        // Draws the panel fresh and makes each `(dropdown, item)` pick in
+        // turn — dropdowns and items counted top to bottom as they stand at
+        // that moment. Then, with no `probe`, says how many dropdowns are on
+        // screen; with one, opens that dropdown and says how many items it
+        // offers. A panic comes back as its message.
+        let run = |tool: ToolId,
+                   kind: Option<BrushKind>,
+                   picks: &[(usize, usize)],
+                   probe: Option<usize>|
+         -> Result<usize, String> {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let ctx = egui::Context::default();
+                crate::theme::apply(&ctx);
+                ctx.enable_accesskit();
+                let mut style = DrawStyle::default();
+                if let Some(kind) = kind {
+                    style.brush.kind = kind;
+                }
+                let mut rig = crate::workspace::RigOptions::default();
+                let mut pan_speed = 1.0;
+                let mut draw = |events| {
+                    ctx.run_ui(menu_frame(events), |ui| {
+                        tool_options_panel(ui, tool, &scene, &mut style, &mut rig, &mut pan_speed)
+                    })
+                };
+                let mut closed = draw(Vec::new());
+                for &(menu, item) in picks {
+                    let _ = draw(click_events(menus_in(&closed)[menu]));
+                    // A popup spends its first frame measuring itself.
+                    let opened = draw(Vec::new());
+                    let _ = draw(click_events(new_items(&closed, &opened)[item]));
+                    let _ = draw(Vec::new());
+                    closed = draw(Vec::new());
+                }
+                match probe {
+                    None => menus_in(&closed).len(),
+                    Some(menu) => {
+                        let _ = draw(click_events(menus_in(&closed)[menu]));
+                        let opened = draw(Vec::new());
+                        new_items(&closed, &opened).len()
+                    }
+                }
+            }))
+            .map_err(|panic| {
+                panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            })
+        };
+
+        let mut pairs = 0;
+        let mut failures = Vec::new();
+        let mut note = |what: String, outcome: Result<usize, String>| match outcome {
+            Ok(n) => n,
+            Err(why) => {
+                failures.push(format!("{what}: {why}"));
+                0
+            }
+        };
+        for (tool, kind) in setups {
+            let at = format!("{tool:?} {kind:?}");
+            for m1 in 0..note(at.clone(), run(tool, kind, &[], None)) {
+                for i1 in 0..note(format!("{at} open {m1}"), run(tool, kind, &[], Some(m1))) {
+                    let first = [(m1, i1)];
+                    let after = note(format!("{at} {first:?}"), run(tool, kind, &first, None));
+                    for m2 in 0..after {
+                        let what = format!("{at} {first:?} then open {m2}");
+                        for i2 in 0..note(what, run(tool, kind, &first, Some(m2))) {
+                            let both = [(m1, i1), (m2, i2)];
+                            note(format!("{at} {both:?}"), run(tool, kind, &both, None));
+                            pairs += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(failures.is_empty(), "picks that crashed:\n{}", failures.join("\n"));
+        assert!(
+            pairs > 100,
+            "only {pairs} pairs were picked, so the walk never reached the menus"
+        );
+    }
+
     /// Panels must not panic on an empty document, which is the state the app
     /// starts in and the one least often exercised by hand.
     #[test]
@@ -3896,6 +5302,7 @@ mod tests {
         // are built inside `run_ui`.
         let _ = ctx.run_ui(Default::default(), |ui| {
             let workspace = crate::workspace::Workspace::animate();
+            let sequence = SequenceMenuInfo::default();
             let _ = menu_bar(
                 ui,
                 &MenuState {
@@ -3907,6 +5314,7 @@ mod tests {
                     workspace: &workspace,
                     light_gizmos: true,
                     templates: &[],
+                    sequence: &sequence,
                 },
             );
             let _ = tool_bar(ui, ToolId::Selection, &mut style);
@@ -4034,6 +5442,7 @@ mod tests {
 
         let _ = ctx.run_ui(Default::default(), |ui| {
             let workspace = crate::workspace::Workspace::animate();
+            let sequence = SequenceMenuInfo::default();
             let _ = menu_bar(
                 ui,
                 &MenuState {
@@ -4045,6 +5454,7 @@ mod tests {
                     workspace: &workspace,
                     light_gizmos: false,
                     templates: &[],
+                    sequence: &sequence,
                 },
             );
             let _ = properties_panel(
@@ -4058,6 +5468,51 @@ mod tests {
             let _ = layers_panel(ui, &mut scene, &mut selection, 0);
         });
     }
+
+    /// **Stage 3, item 5: a family's flyout opens headlessly and lists every
+    /// member.** The flyout's open/closed state and its members are kept in
+    /// global egui memory keyed only by the family's first tool (see
+    /// [`flyout_id`]), so a test can set that state directly rather than
+    /// having to reproduce whatever id egui would have handed the strip.
+    #[test]
+    fn a_familys_flyout_opens_and_lists_its_members() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut style = DrawStyle::default();
+
+        // Closed by default: nothing marks the family's own state as open,
+        // so no area is drawn for it.
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = tool_bar(ui, ToolId::Selection, &mut style);
+        });
+        assert!(
+            ctx.memory(|m| m.area_rect(flyout_id(ToolId::Selection, "area")))
+                .is_none(),
+            "the flyout drew itself without being asked"
+        );
+
+        // Asked to open — exactly what a right-click on the family's button
+        // does — it draws, and wide enough to hold a button for every member
+        // `family_of` names: one flyout button per tool, laid out in a row,
+        // so its width is the test that every member actually got one.
+        ctx.memory_mut(|m| m.data.insert_temp(flyout_id(ToolId::Selection, "open"), true));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = tool_bar(ui, ToolId::Selection, &mut style);
+        });
+        let area = ctx
+            .memory(|m| m.area_rect(flyout_id(ToolId::Selection, "area")))
+            .expect("asked to open, the flyout drew no area at all");
+        let family = crate::tools::family_of(ToolId::Selection);
+        let per_button = Metrics::TOOL_BUTTON + Tokens::SPACE_1;
+        assert!(
+            area.width() >= per_button * family.len() as f32 - 1.0,
+            "the flyout is {:.0} points wide, too narrow to hold all {} of \
+             {family:?}",
+            area.width(),
+            family.len()
+        );
+    }
+
 }
 
 #[cfg(test)]
@@ -4127,11 +5582,73 @@ mod layout_tests {
         });
 
         assert!(used > 0.0, "the tool strip drew nothing");
-        // Twenty-three tools in eight groups, one column wide, plus the colour
-        // wells. Tall, but a definite height rather than "all of it".
+        // Twenty-four tools, one column wide inside a scroll area tall
+        // enough to hold them all, plus the colour wells. Tall, but a
+        // definite height rather than "all of it".
         assert!(
             used < 1200.0,
             "the tool strip took {used:.0} points of column"
+        );
+    }
+
+    /// Defects brief item 1b: every tool gets its own button, laid out as
+    /// one column when the panel is tall enough for all of them and two
+    /// otherwise — never a flyout standing in for a tool with no button of
+    /// its own.
+    #[test]
+    fn the_tool_strip_uses_one_column_when_it_fits_and_two_when_it_does_not() {
+        let footer = tool_strip_footer_height();
+        let tool_count = crate::tools::all_tools().len();
+        let one_column_height =
+            tool_count as f32 * Metrics::TOOL_BUTTON + (tool_count as f32 - 1.0) * Tokens::SPACE_1;
+
+        assert_eq!(
+            tool_strip_columns(one_column_height + footer + 50.0, tool_count, footer),
+            1,
+            "a panel tall enough for every tool in one column should use one"
+        );
+        assert_eq!(
+            tool_strip_columns(one_column_height + footer - 50.0, tool_count, footer),
+            2,
+            "a panel too short for one column should fall back to two"
+        );
+    }
+
+    /// A panel too short for one column of 24 buttons still has to hold all
+    /// 24 — laid out two to a row rather than dropping most of them behind a
+    /// family's flyout. Measured the same way as the one-column case above:
+    /// a two-column strip of 24 buttons is 12 rows tall, roughly half the
+    /// one-column height, not the 1-2 row height a "one visible button per
+    /// family" strip used to take.
+    #[test]
+    fn every_tool_still_gets_a_button_when_the_panel_is_too_short_for_one_column() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut style = DrawStyle::default();
+        let mut used = 0.0;
+
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            ui.set_max_height(200.0);
+            egui::ScrollArea::vertical()
+                .id_salt("short-test-column")
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    let top = ui.cursor().top();
+                    let _ = tool_bar(ui, ToolId::Selection, &mut style);
+                    used = ui.cursor().top() - top;
+                });
+        });
+
+        let tool_count = crate::tools::all_tools().len();
+        let two_column_rows = tool_count.div_ceil(2) as f32;
+        let two_column_height =
+            two_column_rows * Metrics::TOOL_BUTTON + (two_column_rows - 1.0) * Tokens::SPACE_1;
+
+        assert!(
+            used >= two_column_height,
+            "the two-column strip took only {used:.0} points, too short to hold \
+             {tool_count} tools two to a row ({two_column_height:.0} needed) — a \
+             tool went missing rather than to a second column"
         );
     }
 

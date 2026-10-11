@@ -50,7 +50,6 @@ pub enum TextureKind {
     // tileable cellular lattice for the ones made of stones — so a hillside
     // covers a field of any size with no seam and costs a handful of numbers
     // in the file.
-
     /// Fine dense turf: short blades, close together, mown.
     GrassLawn,
     /// Separated upright blades with the ground showing between them.
@@ -378,7 +377,8 @@ fn sample(kind: TextureKind, x: u32, y: u32, n: u32, detail: u32) -> f32 {
             let edge = 1.0;
             let d = along as f32;
             // Soft on both sides of the stroke so the lines are not stepped.
-            let inside = smoothstep(-edge, edge, d) * (1.0 - smoothstep(width as f32 - edge, width as f32 + edge, d));
+            let inside = smoothstep(-edge, edge, d)
+                * (1.0 - smoothstep(width as f32 - edge, width as f32 + edge, d));
             inside.clamp(0.0, 1.0)
         }
         TextureKind::Wood => {
@@ -569,8 +569,7 @@ fn sample(kind: TextureKind, x: u32, y: u32, n: u32, detail: u32) -> f32 {
             let sheen = smoothstep(0.60, 0.82, mud);
             // Trodden: the fine grit that keeps a wet patch from being a blur.
             let grit = value_noise(u, v, detail * 10, 0x40_D9);
-            ((0.20 + 0.70 * mud + 0.16 * (grit - 0.5)) * (1.0 - 0.62 * wet)
-                + 0.38 * wet * sheen)
+            ((0.20 + 0.70 * mud + 0.16 * (grit - 0.5)) * (1.0 - 0.62 * wet) + 0.38 * wet * sheen)
                 .clamp(0.0, 1.0)
         }
     }
@@ -749,7 +748,9 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 /// Blend two bytes by `t` in 0..=1.
 fn lerp8(a: u8, b: u8, t: f32) -> u8 {
     let t = t.clamp(0.0, 1.0);
-    (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8
+    (a as f32 + (b as f32 - a as f32) * t)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 #[cfg(test)]
@@ -943,9 +944,7 @@ mod tests {
     fn two_colours_actually_appear() {
         // A checker must contain texels near both fg and bg.
         let px = tile(TextureKind::Checker, 64, FG, BG);
-        let near = |p: &[u8], c: [u8; 4]| {
-            (0..3).all(|i| (p[i] as i32 - c[i] as i32).abs() < 24)
-        };
+        let near = |p: &[u8], c: [u8; 4]| (0..3).all(|i| (p[i] as i32 - c[i] as i32).abs() < 24);
         let fg = FG.to_rgba8().to_u8_array();
         let bg = BG.to_rgba8().to_u8_array();
         assert!(px.chunks_exact(4).any(|p| near(p, fg)), "no foreground");

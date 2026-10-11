@@ -22,7 +22,8 @@ fn rigged_object() -> (Scene, LayerId, ObjectId, Armature) {
     };
     for i in 0..4 {
         let parent = if i == 0 { None } else { Some(i - 1) };
-        arm.bones.push(Bone::new(format!("b{i}"), parent, 40.0, 0.0));
+        arm.bones
+            .push(Bone::new(format!("b{i}"), parent, 40.0, 0.0));
     }
 
     let mut scene = Scene::default();
@@ -41,7 +42,14 @@ fn rigged_object() -> (Scene, LayerId, ObjectId, Armature) {
 /// Animate the base bone from 0 to `swing` between frame 0 and frame `at`, with a
 /// motion tween, then hold that pose out to `hold_to` (extending the span so the
 /// held pose actually resolves across the whole bake range).
-fn animate_base(scene: &mut Scene, layer: LayerId, id: ObjectId, at: u32, swing: f64, hold_to: u32) {
+fn animate_base(
+    scene: &mut Scene,
+    layer: LayerId,
+    id: ObjectId,
+    at: u32,
+    swing: f64,
+    hold_to: u32,
+) {
     scene.update_layer(layer, |l| {
         if l.frames.length() <= at {
             l.frames.insert_frame(at);
@@ -98,7 +106,10 @@ fn baking_follow_through_makes_the_chain_lag_then_settle() {
 
     let report =
         follow_through_bake(&mut scene, id, 1, Spring::tail(), 0..48, 2, 0.0).expect("baked");
-    assert!(report.keyframes > 1, "one keyframe is a hold, not follow-through");
+    assert!(
+        report.keyframes > 1,
+        "one keyframe is a hold, not follow-through"
+    );
     assert_eq!(report.bones, 3, "the chain from bone 1 is three bones");
 
     // Mid-move, the tip lags: its baked direction trails the primary's.

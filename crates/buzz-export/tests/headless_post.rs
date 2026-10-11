@@ -7,9 +7,9 @@
 //! unchanged. Skips cleanly with no GPU.
 
 use buzz_export::{ExportSettings, Exporter, Frame};
+use buzz_geom::{Rect, Shape as _};
 use buzz_render::GpuPreference;
 use buzz_scene::{LayerKind, Scene, ShapeData};
-use buzz_geom::{Rect, Shape as _};
 use peniko::Color;
 
 const MID: Color = Color::from_rgb8(0xB4, 0xB4, 0xB4);

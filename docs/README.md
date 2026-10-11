@@ -16,10 +16,16 @@ Welcome to the official documentation and learning hub for **BuzzAnimate**.
 3. [**Keyboard & Mouse Shortcuts Cheatsheet (`SHORTCUTS.md`)**](SHORTCUTS.md)
    - Printable and searchable quick-reference card for all 23 single-key tools, timeline hotkeys, canvas navigation gestures, and editing chords.
 
-4. [**Scenes, the Director, and Motion That Runs Itself (`SCENES_AND_THE_DIRECTOR.md`)**](SCENES_AND_THE_DIRECTOR.md)
+4. [**Scenes, Setups and Shots — start here (`SCENES_AND_SHOTS.md`)**](SCENES_AND_SHOTS.md)
+   - How to split a film into scenes, build reusable camera setups, cut a dialogue track into shots and takes, and let the Director make scenes from typed prose. Every Scene, Sequence and Shot menu item, the Sequence strip's mouse and keys, and what to do when a menu is greyed out.
+
+5. [**Sequence: one setup, many shots (`SEQUENCE_GUIDE.md`)**](SEQUENCE_GUIDE.md)
+   - The setup and shot rules in full: what is copied, what is shared, what survives moving a cut.
+
+6. [**Scenes, the Director, and Motion That Runs Itself (`SCENES_AND_THE_DIRECTOR.md`)**](SCENES_AND_THE_DIRECTOR.md)
    - How a shot builds itself: what *Set the Scene* arranges and the arithmetic behind it, what *Direct a Story* reads out of your prose and how it frames and cuts the shot, and every piece of the picture that keeps moving after you stop touching it — breathing, sway, drifting cloud, running water, fire and lightning.
 
-5. [**Where the Time Goes — the Automation Audit (`AUTOMATION.md`)**](AUTOMATION.md)
+7. [**Where the Time Goes — the Automation Audit (`AUTOMATION.md`)**](AUTOMATION.md)
    - What the program already does for you, ranked by the hand labour it removes — an honest list of what it still makes you do by hand, and a week-in-the-life audit for a narrated story channel.
 
 ---

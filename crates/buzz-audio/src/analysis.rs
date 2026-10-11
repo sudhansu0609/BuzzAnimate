@@ -198,7 +198,13 @@ pub fn beats_from_levels(levels: &[f32], fps: f64) -> Vec<u32> {
     // Onset strength: the positive rise in loudness, so a sustained loud note is
     // one beat at its attack, not a beat every frame it holds.
     let flux: Vec<f32> = (0..levels.len())
-        .map(|i| if i == 0 { 0.0 } else { (levels[i] - levels[i - 1]).max(0.0) })
+        .map(|i| {
+            if i == 0 {
+                0.0
+            } else {
+                (levels[i] - levels[i - 1]).max(0.0)
+            }
+        })
         .collect();
 
     let window = ((fps * 0.2).round() as usize).max(3); // ~200 ms neighbourhood

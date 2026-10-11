@@ -38,6 +38,9 @@ fn state() -> TimelineState {
     TimelineState {
         current_frame: 0,
         active_layer: None,
+        selected_layers: Vec::new(),
+        range_anchor: None,
+        timeline_selection: None,
         camera_selected: false,
         selected_light: None,
         playing: false,
@@ -54,6 +57,7 @@ fn state() -> TimelineState {
         nearest_depth: -buzz_scene::DEFAULT_FOCAL_DISTANCE * 0.9,
         waveforms: std::collections::BTreeMap::new(),
         beats: Vec::new(),
+        shot_end: None,
     }
 }
 

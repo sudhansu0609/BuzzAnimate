@@ -170,6 +170,161 @@ fn cubic_bezier_ease(x: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
     curve(t, y1, y2)
 }
 
+/// Evaluate one of Animate's custom ease curves — the Motion Editor's own
+/// shape, not the `-100..100` slider `Easing::Strength` covers.
+///
+/// `points` is Animate's own list, straight out of `<CustomEase>`: `1 + 3n`
+/// points running from `(0,0)` to `(1,1)`, the first the curve's start and
+/// every group of three after it a cubic Bézier segment (two control points,
+/// then the segment's own end point). This is a function of *time*: for the
+/// segment whose x-range contains `t`, find `u` with `x(u) == t` — Newton's
+/// method refined the same way [`cubic_bezier_ease`] solves its own single
+/// segment, since the Motion Editor does not let an animator drag a curve
+/// past vertical, so each segment is monotone in x — then return `y(u)`.
+///
+/// Fewer than four points, or a malformed list, is not a curve: `t` itself is
+/// returned, which is linear, rather than guessing at a shape nothing asked
+/// for.
+pub fn eval_bezier_ease(points: &[Point], t: f64) -> f64 {
+    if points.len() < 4 {
+        return t.clamp(0.0, 1.0);
+    }
+    let t = t.clamp(0.0, 1.0);
+    let segments = (points.len() - 1) / 3;
+    let mut p0 = points[0];
+    for segment in 0..segments {
+        let p1 = points[segment * 3 + 1];
+        let p2 = points[segment * 3 + 2];
+        let p3 = points[segment * 3 + 3];
+        // The last segment claims whatever is left, so a curve whose final
+        // point is not exactly `(1, 1)` — rounding in the file — still
+        // answers for `t == 1` instead of falling through to nothing.
+        if t <= p3.x || segment == segments - 1 {
+            let u = solve_cubic_bezier_x(p0.x, p1.x, p2.x, p3.x, t);
+            return cubic_bezier_at(p0.y, p1.y, p2.y, p3.y, u);
+        }
+        p0 = p3;
+    }
+    points.last().map(|p| p.y).unwrap_or(t)
+}
+
+fn cubic_bezier_at(a: f64, b: f64, c: f64, d: f64, u: f64) -> f64 {
+    let v = 1.0 - u;
+    v * v * v * a + 3.0 * v * v * u * b + 3.0 * v * u * u * c + u * u * u * d
+}
+
+/// Find `u` in `0..=1` with `cubic_bezier_at(x0, x1, x2, x3, u) == target_x`.
+fn solve_cubic_bezier_x(x0: f64, x1: f64, x2: f64, x3: f64, target_x: f64) -> f64 {
+    if (x3 - x0).abs() < 1e-12 {
+        return 0.5;
+    }
+    // A linear seed in this segment's own x-range converges Newton in one or
+    // two steps for the gentle curves an ease actually is.
+    let mut u = ((target_x - x0) / (x3 - x0)).clamp(0.0, 1.0);
+    for _ in 0..8 {
+        let x = cubic_bezier_at(x0, x1, x2, x3, u);
+        let error = x - target_x;
+        if error.abs() < 1e-7 {
+            return u;
+        }
+        let v = 1.0 - u;
+        let slope = 3.0 * v * v * (x1 - x0) + 6.0 * v * u * (x2 - x1) + 3.0 * u * u * (x3 - x2);
+        if slope.abs() < 1e-9 {
+            break;
+        }
+        u = (u - error / slope).clamp(0.0, 1.0);
+    }
+
+    // Bisection: slower but cannot diverge, same discipline as
+    // `cubic_bezier_ease`.
+    let (mut low, mut high) = (0.0f64, 1.0f64);
+    for _ in 0..30 {
+        let x = cubic_bezier_at(x0, x1, x2, x3, u);
+        if (x - target_x).abs() < 1e-9 {
+            break;
+        }
+        if x < target_x {
+            low = u;
+        } else {
+            high = u;
+        }
+        u = (low + high) * 0.5;
+    }
+    u
+}
+
+/// Per-property custom ease curves on one keyframe, imported from Animate's
+/// Motion Editor: `<tweens><CustomEase target="…">` and the presets
+/// `<Ease method="…" target="…">` writes. A field left `None` means that
+/// property eases by the keyframe's plain [`Tween::easing`] instead — the
+/// `all` target covers most tweens, since most are not touched by hand in the
+/// Motion Editor at all.
+///
+/// **Lives on the keyframe, not on [`Tween`].** `Tween` is `Copy` — read that
+/// way from a keyframe more than once in the same expression, in the Motion
+/// Editor panel that shows it — and an arbitrary-length point list cannot be
+/// part of a `Copy` type. Animate's own `<tweens>` element is a child of the
+/// frame for the same reason: it is not one more attribute of the span's
+/// `tweenType`, it is a curve.
+///
+/// The **minimum acceptable version** this plan asks for: `all` plus
+/// `position` / `rotation` / `scale`. Colour is not split out — every colour
+/// effect already eases by `all`, same as filters and 3D facing.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EasingSet {
+    pub all: Option<std::sync::Arc<[Point]>>,
+    pub position: Option<std::sync::Arc<[Point]>>,
+    pub rotation: Option<std::sync::Arc<[Point]>>,
+    pub scale: Option<std::sync::Arc<[Point]>>,
+}
+
+impl EasingSet {
+    pub fn is_empty(&self) -> bool {
+        self.all.is_none() && self.position.is_none() && self.rotation.is_none() && self.scale.is_none()
+    }
+}
+
+/// One property's eased progress for a single call to [`interpolate_object`]:
+/// `Tween::easing` (or an `EasingSet` override) applied to the same raw
+/// `progress`, once per property.
+#[derive(Debug, Clone, Copy)]
+struct EasedProgress {
+    all: f64,
+    position: f64,
+    rotation: f64,
+    scale: f64,
+}
+
+impl EasedProgress {
+    fn compute(tween: &Tween, curve: Option<&EasingSet>, progress: f64) -> Self {
+        let all = curve
+            .and_then(|c| c.all.as_deref())
+            .map(|points| eval_bezier_ease(points, progress))
+            .unwrap_or_else(|| tween.easing.apply(progress));
+        let property = |points: Option<&std::sync::Arc<[Point]>>| {
+            points
+                .map(|points| eval_bezier_ease(points, progress))
+                .unwrap_or(all)
+        };
+        Self {
+            all,
+            position: curve.map_or(all, |c| property(c.position.as_ref())),
+            rotation: curve.map_or(all, |c| property(c.rotation.as_ref())),
+            scale: curve.map_or(all, |c| property(c.scale.as_ref())),
+        }
+    }
+
+    #[cfg(test)]
+    fn uniform(t: f64) -> Self {
+        Self {
+            all: t,
+            position: t,
+            rotation: t,
+            scale: t,
+        }
+    }
+}
+
 /// A tween on a keyframe, running until the next keyframe.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Tween {
@@ -222,14 +377,28 @@ impl Tween {
 /// Interpolate a whole keyframe's worth of objects.
 ///
 /// `progress` is raw linear progress; easing is applied here so callers cannot
-/// forget it.
+/// forget it. `curve` is the keyframe's per-property custom eases, if Animate's
+/// Motion Editor set any (Phase B) — `None` for a plain `Tween::easing`
+/// preset, which is the overwhelming majority of tweens.
+///
+/// `frame_of_reference` is set for a layer that follows a rig parent whose
+/// rest pose `F` is not a similarity (a plain rotate-and-uniform-scale): the
+/// child's stored keyframes are `F · C_rel(f)` (`bake_rig_offsets`), and
+/// interpolating that product directly is not the same as interpolating
+/// `C_rel` when `F` shears or scales unevenly. Given `Some(F)`, this
+/// interpolates `F⁻¹·M0` and `F⁻¹·M1` instead, and left-multiplies the result
+/// by `F` again before returning it. `None` — the ordinary case — leaves this
+/// exactly as it was.
 pub fn interpolate_objects(
     from: &[std::sync::Arc<Object>],
     to: &[std::sync::Arc<Object>],
     tween: &Tween,
+    curve: Option<&EasingSet>,
     progress: f64,
+    frame_of_reference: Option<Affine>,
 ) -> Vec<Object> {
-    let t = tween.easing.apply(progress);
+    let eased = EasedProgress::compute(tween, curve, progress);
+    let t = eased.all;
 
     match tween.kind {
         TweenKind::None => from.iter().map(|o| (**o).clone()).collect(),
@@ -240,7 +409,9 @@ pub fn interpolate_objects(
                 // Matched by id, which survives reordering and works because
                 // F6 clones keyframes with their ids intact.
                 match to.iter().find(|e| e.id == start.id) {
-                    Some(end) => interpolate_object(start, end, tween, t),
+                    Some(end) => {
+                        interpolate_object(start, end, tween, eased, frame_of_reference)
+                    }
                     // Present only at the start: hold it rather than tween
                     // from nothing.
                     None => (**start).clone(),
@@ -252,7 +423,9 @@ pub fn interpolate_objects(
             // **Paired by what the drawings are, not by the order they were
             // drawn in.** See `match_drawings` for why that is the whole
             // difference between a rough inbetween and a shape crossing the
-            // frame to become something unrelated.
+            // frame to become something unrelated. Shape tweens ease as one
+            // curve — there is no separate position/rotation/scale to split
+            // vertex-level geometry into.
             let pairing = match_drawings(from, to);
             let mut out: Vec<Object> = Vec::with_capacity(from.len().max(to.len()));
             let mut matched = vec![false; to.len()];
@@ -312,7 +485,10 @@ pub fn interpolate_objects(
 /// where it has no partner and should vanish. Pieces that are not plain shapes
 /// (a group, an instance, a rig) are paired by position as before: they are not
 /// drawings and have no outline to compare.
-pub fn match_drawings(from: &[std::sync::Arc<Object>], to: &[std::sync::Arc<Object>]) -> Vec<Option<usize>> {
+pub fn match_drawings(
+    from: &[std::sync::Arc<Object>],
+    to: &[std::sync::Arc<Object>],
+) -> Vec<Option<usize>> {
     let mut pairing = vec![None; from.len()];
     let mut taken = vec![false; to.len()];
 
@@ -395,7 +571,9 @@ impl Trait {
         let ObjectKind::Shape(shape) = &object.kind else {
             return None;
         };
-        let box_ = object.transform.transform_rect_bbox(shape.path.bounding_box());
+        let box_ = object
+            .transform
+            .transform_rect_bbox(shape.path.bounding_box());
         let colour = shape
             .fill
             .as_ref()
@@ -406,7 +584,9 @@ impl Trait {
             .to_u8_array();
         Some(Trait {
             centre: box_.center(),
-            size: (box_.width().max(0.0) * box_.height().max(0.0)).sqrt().max(1e-6),
+            size: (box_.width().max(0.0) * box_.height().max(0.0))
+                .sqrt()
+                .max(1e-6),
             closed: is_closed(&shape.path),
             colour: [
                 f64::from(colour[0]) / 255.0,
@@ -427,7 +607,11 @@ impl Trait {
         let grew = (self.size / other.size).ln().abs() / 2.0;
 
         // A closed outline and an open line are different kinds of mark.
-        let shape = if self.closed == other.closed { 0.0 } else { 0.35 };
+        let shape = if self.closed == other.closed {
+            0.0
+        } else {
+            0.35
+        };
 
         // And colour, lightly: an animator redrawing a red shape draws it red,
         // but a shape may legitimately change colour through a tween.
@@ -456,7 +640,9 @@ fn drawing_span(objects: &[std::sync::Arc<Object>]) -> f64 {
         let ObjectKind::Shape(shape) = &object.kind else {
             continue;
         };
-        let box_ = object.transform.transform_rect_bbox(shape.path.bounding_box());
+        let box_ = object
+            .transform
+            .transform_rect_bbox(shape.path.bounding_box());
         bounds = Some(match bounds {
             Some(b) => b.union(box_),
             None => box_,
@@ -496,9 +682,77 @@ fn arriving(object: &Object, t: f64) -> Object {
 }
 
 /// Interpolate one object's transform and colour effect.
-fn interpolate_object(start: &Object, end: &Object, tween: &Tween, t: f64) -> Object {
+///
+/// `eased` carries one progress value per property (Phase B's per-property
+/// custom eases); with no `EasingSet` on the keyframe they are all the same
+/// number, and this behaves exactly as a single eased `t` always did.
+///
+/// `frame_of_reference` — Phase A3 — moves the whole computation into another
+/// space and back: `Some(f)` interpolates `f⁻¹·start` and `f⁻¹·end` instead of
+/// `start` and `end` themselves, then left-multiplies the result by `f`
+/// again. See [`interpolate_objects`] for why.
+fn interpolate_object(
+    start: &Object,
+    end: &Object,
+    tween: &Tween,
+    eased: EasedProgress,
+    frame_of_reference: Option<Affine>,
+) -> Object {
+    let owned_start;
+    let owned_end;
+    let (start, end) = match frame_of_reference {
+        Some(f) => {
+            let f_inv = f.inverse();
+            let mut s = start.clone();
+            s.transform = f_inv * s.transform;
+            let mut e = end.clone();
+            e.transform = f_inv * e.transform;
+            owned_start = s;
+            owned_end = e;
+            (&owned_start, &owned_end)
+        }
+        None => (start, end),
+    };
+
     let mut out = start.clone();
-    out.transform = lerp_affine(start.transform, end.transform, t, tween.extra_rotations);
+    let linear = lerp_linear_eased(
+        start.transform,
+        end.transform,
+        eased.scale,
+        eased.rotation,
+        tween.extra_rotations,
+    );
+    out.transform = match start.pivot {
+        // **The joint stays on the joint.** With no transformation point, a
+        // classic tween interpolates the raw matrix, which anchors the
+        // object's *registration* origin — almost never where a rig's joint
+        // is. Animate anchors the transformation point instead: it is the
+        // shoulder an arm swings from, and it travels in a straight line
+        // while the artwork turns and scales around it. The linear part
+        // above still gives the in-between's scale and skew; only where the
+        // translation ends up differs.
+        Some(pivot) => {
+            let world_start = start.transform * pivot;
+            let world_end = end.transform * pivot;
+            let target = world_start.lerp(world_end, eased.position);
+            // Where the pivot lands under the linear part alone, translation
+            // still zero — the gap between that and `target` is the
+            // translation this in-between needs.
+            let untranslated = linear * pivot;
+            Affine::translate(target - untranslated) * linear
+        }
+        // Registration-origin anchor: translation is the two matrices' own
+        // `tx, ty`, eased by `position` like the pivot's above.
+        None => {
+            let ca = start.transform.as_coeffs();
+            let cb = end.transform.as_coeffs();
+            let translation = buzz_geom::Vec2::new(
+                ca[4] + (cb[4] - ca[4]) * eased.position,
+                ca[5] + (cb[5] - ca[5]) * eased.position,
+            );
+            Affine::translate(translation) * linear
+        }
+    };
 
     // **Orient along the path.** Animate's "Orient to path" turns the object to
     // face the way it is travelling rather than holding the rotation it was
@@ -509,10 +763,10 @@ fn interpolate_object(start: &Object, end: &Object, tween: &Tween, t: f64) -> Ob
     if tween.orient_to_path {
         let travel = end.transform.translation() - start.transform.translation();
         if travel.hypot() > 1e-9 {
-            let (translation, _rotation, scale) = decompose(out.transform);
-            out.transform = Affine::translate(translation.to_vec2())
+            let linear = decompose(out.transform);
+            out.transform = Affine::translate(linear.translation.to_vec2())
                 * Affine::rotate(travel.y.atan2(travel.x))
-                * Affine::scale_non_uniform(scale.0, scale.1);
+                * Affine::scale_non_uniform(linear.scale_x, linear.scale_y);
         }
     }
 
@@ -520,19 +774,20 @@ fn interpolate_object(start: &Object, end: &Object, tween: &Tween, t: f64) -> Ob
     if let (ObjectKind::Instance(a), ObjectKind::Instance(b)) = (&start.kind, &end.kind)
         && let ObjectKind::Instance(target) = &mut out.kind
     {
-        target.color = a.color.lerp(&b.color, t as f32);
+        target.color = a.color.lerp(&b.color, eased.all as f32);
     }
 
     // An object's facing tweens, which is how a card turns as the camera
     // passes it — the thing 3D rotation is for.
-    out.spatial = start.spatial.lerp(&end.spatial, t);
+    out.spatial = start.spatial.lerp(&end.spatial, eased.all);
 
     // The transformation point tweens with the rest, so a hinge that moves
     // between two keyframes moves smoothly rather than jumping at the end.
     // A point set on one keyframe and not the other holds where it is, which
-    // is the same rule the filters below follow.
+    // is the same rule the filters below follow. Eased by `position`: it is
+    // itself a position.
     out.pivot = match (start.pivot, end.pivot) {
-        (Some(a), Some(b)) => Some(a.lerp(b, t)),
+        (Some(a), Some(b)) => Some(a.lerp(b, eased.position)),
         (a, b) => a.or(b),
     };
 
@@ -546,7 +801,7 @@ fn interpolate_object(start: &Object, end: &Object, tween: &Tween, t: f64) -> Ob
             .iter()
             .enumerate()
             .map(|(i, filter)| match end.filters.get(i) {
-                Some(target) => filter.lerp(target, t),
+                Some(target) => filter.lerp(target, eased.all),
                 None => filter.clone(),
             })
             .collect();
@@ -559,14 +814,18 @@ fn interpolate_object(start: &Object, end: &Object, tween: &Tween, t: f64) -> Ob
     // than geometry — and each joint turns the shortest way round, as
     // everything else that interpolates an angle here does.
     if let (ObjectKind::Armature(a), ObjectKind::Armature(b)) = (&start.kind, &end.kind) {
-        out.kind = ObjectKind::Armature(crate::rig::tween_armature(a, b, t));
+        out.kind = ObjectKind::Armature(crate::rig::tween_armature(a, b, eased.rotation));
     }
 
     // Warp handles tween the same way, which is how a puppet-warped drawing is
     // animated: place the handles once, move them, and the frames between are
     // the handle positions between.
     if let (ObjectKind::Warp(a), ObjectKind::Warp(b)) = (&start.kind, &end.kind) {
-        out.kind = ObjectKind::Warp(crate::rig::tween_warp(a, b, t));
+        out.kind = ObjectKind::Warp(crate::rig::tween_warp(a, b, eased.position));
+    }
+
+    if let Some(f) = frame_of_reference {
+        out.transform = f * out.transform;
     }
     out
 }
@@ -595,53 +854,108 @@ fn interpolate_shape_object(start: &Object, end: &Object, t: f64) -> Object {
     out
 }
 
-/// Interpolate two affines by decomposing them.
+/// Animate's own split of a matrix `[a b c d tx ty]`: independent x and y
+/// scale, and independent x and y **skew**, rather than one rotation and one
+/// scale.
 ///
-/// Interpolating the six matrix coefficients directly makes a rotating object
-/// shrink through the turn, because the midpoint of two rotation matrices is
-/// not a rotation matrix. Decomposing into translation, rotation and scale and
-/// interpolating those separately keeps the object the right size all the way
-/// round — which is very obvious when it is wrong.
-pub fn lerp_affine(a: Affine, b: Affine, t: f64, extra_rotations: i32) -> Affine {
-    let (ta, ra, sa) = decompose(a);
-    let (tb, rb, sb) = decompose(b);
+/// The two agree exactly when there is no shear — a plain rotation gives
+/// `skew_x == skew_y == angle` — which is why the old one-rotation model
+/// worked until a file used skew at all. A mirror is a 180° difference
+/// between `skew_x` and `skew_y`: Animate never writes a negative scale for
+/// one, it writes the two skews apart, and decomposing the other way threw
+/// that distinction away along with the skew itself (Findings §1 in
+/// `docs/IMPORT_FIDELITY_PLAN.md`).
+struct Decomposed {
+    translation: Point,
+    scale_x: f64,
+    scale_y: f64,
+    skew_x: f64,
+    skew_y: f64,
+}
 
-    let translation = buzz_geom::Vec2::new(ta.x + (tb.x - ta.x) * t, ta.y + (tb.y - ta.y) * t);
+fn decompose(a: Affine) -> Decomposed {
+    let c = a.as_coeffs();
+    let (a_, b_, c_, d_) = (c[0], c[1], c[2], c[3]);
+    Decomposed {
+        translation: Point::new(c[4], c[5]),
+        scale_x: a_.hypot(b_),
+        scale_y: c_.hypot(d_),
+        skew_y: b_.atan2(a_),
+        skew_x: (-c_).atan2(d_),
+    }
+}
 
-    // Shortest way round, then any whole extra turns the user asked for.
+/// The shortest turn from `from` to `to`, in `-π..=π`.
+fn shortest_delta(from: f64, to: f64) -> f64 {
     let tau = std::f64::consts::TAU;
-    let mut delta = (rb - ra) % tau;
+    let mut delta = (to - from) % tau;
     if delta > tau / 2.0 {
         delta -= tau;
     } else if delta < -tau / 2.0 {
         delta += tau;
     }
-    delta += tau * extra_rotations as f64;
-    let rotation = ra + delta * t;
-
-    let scale_x = sa.0 + (sb.0 - sa.0) * t;
-    let scale_y = sa.1 + (sb.1 - sa.1) * t;
-
-    Affine::translate(translation)
-        * Affine::rotate(rotation)
-        * Affine::scale_non_uniform(scale_x, scale_y)
+    delta
 }
 
-/// Split an affine into translation, rotation and scale.
-fn decompose(a: Affine) -> (Point, f64, (f64, f64)) {
-    let c = a.as_coeffs();
-    let translation = Point::new(c[4], c[5]);
-    let rotation = c[1].atan2(c[0]);
-    let scale_x = (c[0] * c[0] + c[1] * c[1]).sqrt();
-    // Signed, so a mirrored object stays mirrored through the tween.
-    let determinant = c[0] * c[3] - c[1] * c[2];
-    let scale_y_magnitude = (c[2] * c[2] + c[3] * c[3]).sqrt();
-    let scale_y = if determinant < 0.0 {
-        -scale_y_magnitude
-    } else {
-        scale_y_magnitude
-    };
-    (translation, rotation, (scale_x, scale_y))
+/// Interpolate two affines' **linear part only** — scale and skew, with the
+/// translation left at zero.
+///
+/// Split out of [`lerp_affine`] so a pivot-anchored tween ([`interpolate_object`])
+/// can place the translation itself, once it knows where the transformation
+/// point needs to land, rather than getting one this function already chose.
+fn lerp_linear(a: Affine, b: Affine, t: f64, extra_rotations: i32) -> Affine {
+    lerp_linear_eased(a, b, t, t, extra_rotations)
+}
+
+/// [`lerp_linear`], with scale and skew each on their own progress — how a
+/// keyframe's per-property `EasingSet` (Phase B) reaches the matrix: `scale_t`
+/// eases `Tween`'s `scale` target, `skew_t` its `rotation` target, since skew
+/// is Animate's stand-in for rotation once there is no shear (see
+/// [`Decomposed`]). Passing the same value for both is exactly [`lerp_linear`].
+fn lerp_linear_eased(a: Affine, b: Affine, scale_t: f64, skew_t: f64, extra_rotations: i32) -> Affine {
+    let da = decompose(a);
+    let db = decompose(b);
+
+    let scale_x = da.scale_x + (db.scale_x - da.scale_x) * scale_t;
+    let scale_y = da.scale_y + (db.scale_y - da.scale_y) * scale_t;
+
+    // Shortest way round, then any whole extra turns the user asked for —
+    // `motionTweenRotate`/`motionTweenRotateTimes` — added to both skews, so
+    // a rotating classic tween spins rather than shearing itself apart.
+    let extra = std::f64::consts::TAU * extra_rotations as f64;
+    let skew_x = da.skew_x + (shortest_delta(da.skew_x, db.skew_x) + extra) * skew_t;
+    let skew_y = da.skew_y + (shortest_delta(da.skew_y, db.skew_y) + extra) * skew_t;
+
+    Affine::new([
+        scale_x * skew_y.cos(),
+        scale_x * skew_y.sin(),
+        -scale_y * skew_x.sin(),
+        scale_y * skew_x.cos(),
+        0.0,
+        0.0,
+    ])
+}
+
+/// Interpolate two affines by decomposing them.
+///
+/// Interpolating the six matrix coefficients directly makes a rotating object
+/// shrink through the turn, because the midpoint of two rotation matrices is
+/// not a rotation matrix. Decomposing into scale, skew and translation and
+/// interpolating those separately keeps the object the right size all the way
+/// round — which is very obvious when it is wrong — and keeps any skew a key
+/// carries instead of snapping the in-betweens to an unsheared shape.
+///
+/// This is the registration-origin anchor: translation is the two matrices'
+/// own `tx, ty` lerped directly. [`interpolate_object`] uses this when an
+/// object has no transformation point, and anchors on the point itself when
+/// it does.
+pub fn lerp_affine(a: Affine, b: Affine, t: f64, extra_rotations: i32) -> Affine {
+    let linear = lerp_linear(a, b, t, extra_rotations);
+    let ca = a.as_coeffs();
+    let cb = b.as_coeffs();
+    let translation =
+        buzz_geom::Vec2::new(ca[4] + (cb[4] - ca[4]) * t, ca[5] + (cb[5] - ca[5]) * t);
+    Affine::translate(translation) * linear
 }
 
 /// Number of points a shape tween resamples to.
@@ -834,11 +1148,19 @@ impl StrokeTrait {
     fn cost(&self, other: &StrokeTrait, span: f64) -> f64 {
         let moved = self.centre.distance(other.centre) / span;
         let grew = (self.size / other.size).ln().abs() / 2.0;
-        let shape = if self.closed == other.closed { 0.0 } else { 0.3 };
+        let shape = if self.closed == other.closed {
+            0.0
+        } else {
+            0.3
+        };
         // A hole and an outline are not the same stroke. Heavy, because filling
         // a hole in halfway through a tween is the artefact nobody would read
         // as the tweener's fault.
-        let inside_out = if self.winding == other.winding { 0.0 } else { 0.5 };
+        let inside_out = if self.winding == other.winding {
+            0.0
+        } else {
+            0.5
+        };
         moved + grew + shape + inside_out
     }
 }
@@ -1270,7 +1592,7 @@ mod inbetween_tests {
             blob(4, (110.0, 105.0), 40.0, RED),
         ];
 
-        let middle = interpolate_objects(&from, &to, &Tween::shape(), 0.5);
+        let middle = interpolate_objects(&from, &to, &Tween::shape(), None, 0.5, None);
         assert_eq!(middle.len(), 2);
 
         // Each piece should still be near where it started, not halfway across.
@@ -1293,7 +1615,7 @@ mod inbetween_tests {
         let to = vec![blob(2, (200.0, 100.0), 40.0, RED)];
         assert_eq!(match_drawings(&from, &to), vec![Some(0)]);
 
-        let middle = interpolate_objects(&from, &to, &Tween::shape(), 0.5);
+        let middle = interpolate_objects(&from, &to, &Tween::shape(), None, 0.5, None);
         assert_eq!(middle.len(), 1);
         let c = centre_of(&middle[0]);
         assert!(
@@ -1316,7 +1638,7 @@ mod inbetween_tests {
         assert_eq!(pairing, vec![Some(0), None], "the blue one has no partner");
 
         let size_at = |t: f64| {
-            let drawn = interpolate_objects(&from, &to, &Tween::shape(), t);
+            let drawn = interpolate_objects(&from, &to, &Tween::shape(), None, t, None);
             let leaving = &drawn[1];
             let ObjectKind::Shape(shape) = &leaving.kind else {
                 panic!("expected a shape")
@@ -1344,7 +1666,7 @@ mod inbetween_tests {
             blob(3, (300.0, 300.0), 20.0, BLUE),
         ];
 
-        let drawn = interpolate_objects(&from, &to, &Tween::shape(), 0.5);
+        let drawn = interpolate_objects(&from, &to, &Tween::shape(), None, 0.5, None);
         assert_eq!(drawn.len(), 2, "the arriving piece is drawn while arriving");
 
         let arriving_piece = &drawn[1];
@@ -1439,23 +1761,199 @@ mod tests {
         let mut tween = Tween::motion();
         tween.orient_to_path = true;
 
-        let mid = interpolate_object(&a, &b, &tween, 0.5);
+        let mid = interpolate_object(&a, &b, &tween, EasedProgress::uniform(0.5), None);
         let c = mid.transform.as_coeffs();
         let angle = c[1].atan2(c[0]);
         let want = 50.0_f64.atan2(100.0);
-        assert!((angle - want).abs() < 1e-6, "faced {angle} rad, expected {want}");
+        assert!(
+            (angle - want).abs() < 1e-6,
+            "faced {angle} rad, expected {want}"
+        );
     }
 
     #[test]
     fn without_orient_to_path_an_unrotated_move_stays_unrotated() {
         let a = object(1, Affine::translate((0.0, 0.0)));
         let b = object(2, Affine::translate((100.0, 50.0)));
-        let mid = interpolate_object(&a, &b, &Tween::motion(), 0.5);
+        let mid = interpolate_object(&a, &b, &Tween::motion(), EasedProgress::uniform(0.5), None);
         let c = mid.transform.as_coeffs();
-        assert!(c[1].atan2(c[0]).abs() < 1e-9, "no orient should leave rotation alone");
+        assert!(
+            c[1].atan2(c[0]).abs() < 1e-9,
+            "no orient should leave rotation alone"
+        );
+    }
+
+    /// **The joint stays on the joint.** A limb whose artwork sits away from
+    /// its registration point — the ordinary case for a rigged part — keyed
+    /// at 0° and swung 90° about a shoulder that does not itself move. The
+    /// old registration-anchored tween swam the shoulder through the turn
+    /// (98.96, 106.04 instead of 100, 105 at the midpoint, by hand); pivot
+    /// anchoring must hold it exactly still.
+    #[test]
+    fn a_pivot_anchored_tween_keeps_the_joint_still_while_the_limb_turns() {
+        let pivot = Point::new(0.0, 5.0);
+        // Both keys place the pivot at world (100, 105); only the rotation
+        // about it differs.
+        let start_transform = Affine::translate((100.0, 100.0));
+        let end_transform = Affine::translate((105.0, 105.0)) * Affine::rotate(std::f64::consts::FRAC_PI_2);
+        assert!(
+            (start_transform * pivot - Point::new(100.0, 105.0)).hypot() < 1e-9,
+            "test setup: the start key should already place the pivot at 100,105"
+        );
+        assert!(
+            (end_transform * pivot - Point::new(100.0, 105.0)).hypot() < 1e-9,
+            "test setup: the end key should place the pivot at 100,105 too"
+        );
+
+        let mut start = (*object(1, start_transform)).clone();
+        start.pivot = Some(pivot);
+        let mut end = (*object(1, end_transform)).clone();
+        end.pivot = Some(pivot);
+
+        let mid = interpolate_object(&start, &end, &Tween::classic(), EasedProgress::uniform(0.5), None);
+        let world_pivot = mid.transform * pivot;
+        assert!(
+            (world_pivot - Point::new(100.0, 105.0)).hypot() < 1e-9,
+            "the joint should not have moved: {world_pivot:?}"
+        );
+
+        let c = mid.transform.as_coeffs();
+        let turned = c[1].atan2(c[0]);
+        assert!(
+            (turned - std::f64::consts::FRAC_PI_4).abs() < 1e-9,
+            "the limb should have turned 45° halfway through a 0→90° swing, got {} rad",
+            turned
+        );
+    }
+
+    /// With no transformation point, pivot anchoring must not engage —
+    /// today's registration-origin behaviour, which [`lerp_affine`] alone
+    /// already gives, stays exactly as it was.
+    #[test]
+    fn with_no_pivot_interpolate_object_matches_lerp_affine() {
+        let a = object(1, Affine::translate((10.0, 0.0)) * Affine::rotate(0.1));
+        let b = object(1, Affine::translate((10.0, 200.0)) * Affine::rotate(1.2));
+        let mid = interpolate_object(&a, &b, &Tween::classic(), EasedProgress::uniform(0.5), None);
+        let want = lerp_affine(a.transform, b.transform, 0.5, 0);
+        let (got, want) = (mid.transform.as_coeffs(), want.as_coeffs());
+        for k in 0..6 {
+            assert!((got[k] - want[k]).abs() < 1e-9, "coefficient {k}: {got:?} vs {want:?}");
+        }
     }
 
     // -- easing -------------------------------------------------------------
+
+    /// The sample from sustipur1's `Symbol 1.xml`: a hand-drawn CustomEase,
+    /// `(0,0) (0.4621,0.0309) (0.7312,0.5053) (1,1)`. Checked against an
+    /// independent reference that does not go through
+    /// [`solve_cubic_bezier_x`] at all: a dense sample of `x(u), y(u)` for the
+    /// same one segment, linearly interpolated across whichever pair of
+    /// samples straddles `x = 0.5`.
+    #[test]
+    fn the_sustipur1_sample_curve_matches_an_independent_dense_sample_at_t_0_5() {
+        // The plan this test comes from (`docs/IMPORT_FIDELITY_PLAN.md`, Phase
+        // B3) expects "about 0.08" here. Two independent methods — the dense
+        // sample below, and a bisection solve done outside this codebase —
+        // both put the true value of this cubic at x = 0.5 at about 0.248
+        // instead; 0.08 is closer to `y` at the Bézier's own **parameter**
+        // `u = 0.5` (0.326) or to other nearby readings, none of which match
+        // either. Solving `x(u) = t` for `u` and returning `y(u)` is the
+        // standard definition an ease curve, and what a CSS `cubic-bezier()`
+        // does with the same four points, so that is what is asserted here:
+        // the solver against a reference that does not go through it at all.
+        let points = [
+            Point::new(0.0, 0.0),
+            Point::new(0.4621, 0.0309),
+            Point::new(0.7312, 0.5053),
+            Point::new(1.0, 1.0),
+        ];
+
+        let got = eval_bezier_ease(&points, 0.5);
+
+        const SAMPLES: usize = 200_000;
+        let mut previous = (points[0].x, points[0].y);
+        let mut reference = None;
+        for i in 1..=SAMPLES {
+            let u = i as f64 / SAMPLES as f64;
+            let x = cubic_bezier_at(points[0].x, points[1].x, points[2].x, points[3].x, u);
+            let y = cubic_bezier_at(points[0].y, points[1].y, points[2].y, points[3].y, u);
+            if previous.0 <= 0.5 && x >= 0.5 {
+                let span = x - previous.0;
+                let frac = if span.abs() < 1e-12 {
+                    0.0
+                } else {
+                    (0.5 - previous.0) / span
+                };
+                reference = Some(previous.1 + (y - previous.1) * frac);
+                break;
+            }
+            previous = (x, y);
+        }
+        let reference = reference.expect("a dense sample should cross x = 0.5");
+        assert!(
+            (got - reference).abs() < 1e-3,
+            "solver gave {got}, dense-sampled reference gave {reference}"
+        );
+    }
+
+    #[test]
+    fn a_curve_with_too_few_points_is_read_as_linear_rather_than_guessed_at() {
+        assert!((eval_bezier_ease(&[], 0.3) - 0.3).abs() < 1e-9);
+        assert!(
+            (eval_bezier_ease(&[Point::new(0.0, 0.0), Point::new(1.0, 1.0)], 0.3) - 0.3).abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn a_bezier_ease_curve_still_meets_its_own_endpoints() {
+        let points = [
+            Point::new(0.0, 0.0),
+            Point::new(0.4621, 0.0309),
+            Point::new(0.7312, 0.5053),
+            Point::new(1.0, 1.0),
+        ];
+        assert!((eval_bezier_ease(&points, 0.0) - 0.0).abs() < 1e-6);
+        assert!((eval_bezier_ease(&points, 1.0) - 1.0).abs() < 1e-6);
+    }
+
+    /// Per-property easing: a keyframe whose `EasingSet` overrides `scale`
+    /// but leaves `position` and `rotation` alone must ease its size on one
+    /// curve and its move on another.
+    #[test]
+    fn a_keyframes_scale_can_ease_on_its_own_curve_while_position_stays_linear() {
+        let start = (*object(1, Affine::IDENTITY)).clone();
+        let end = (*object(1, Affine::translate((100.0, 0.0)) * Affine::scale(2.0))).clone();
+
+        // An extreme ease-in on scale: almost no growth until very late.
+        let curve = EasingSet {
+            scale: Some(std::sync::Arc::from(vec![
+                Point::new(0.0, 0.0),
+                Point::new(0.9, 0.0),
+                Point::new(0.9, 0.0),
+                Point::new(1.0, 1.0),
+            ])),
+            ..Default::default()
+        };
+
+        let out = interpolate_objects(
+            &[Arc::new(start)],
+            &[Arc::new(end)],
+            &Tween::classic(),
+            Some(&curve),
+            0.5,
+            None,
+        );
+        let c = out[0].transform.as_coeffs();
+        // Position is still plain linear: halfway there.
+        assert!((c[4] - 50.0).abs() < 1e-6, "position should not have followed the scale curve: {c:?}");
+        // Scale, eased in hard, should be far behind halfway (1.5).
+        let scale_x = c[0].hypot(c[1]);
+        assert!(
+            scale_x < 1.2,
+            "scale should have lagged behind an unequal ease, got {scale_x}"
+        );
+    }
 
     #[test]
     fn easing_always_spans_zero_to_one() {
@@ -1581,6 +2079,73 @@ mod tests {
         assert!(determinant < 0.0, "the mirror was lost: {determinant}");
     }
 
+    /// The stronger form of the test above: the mirror — Animate's 180°
+    /// difference between the skews (see [`Decomposed`]) — must not flip back
+    /// to upright at any point along the tween, only at its two ends.
+    #[test]
+    fn interpolating_between_two_mirrored_keys_keeps_the_determinant_negative_throughout() {
+        let a = Affine::scale_non_uniform(1.0, -1.0) * Affine::rotate(0.3);
+        let b = Affine::scale_non_uniform(1.6, -0.8) * Affine::rotate(-0.7);
+        for i in 0..=20 {
+            let t = i as f64 / 20.0;
+            let m = lerp_affine(a, b, t, 0);
+            let c = m.as_coeffs();
+            let determinant = c[0] * c[3] - c[1] * c[2];
+            assert!(determinant < 0.0, "the mirror flipped at t={t}: {determinant}");
+        }
+    }
+
+    /// A key with real skew must come back out the other side of a tween with
+    /// itself exactly as it went in. The old rotation-and-scale decomposition
+    /// could not represent skew at all, so a tween across a skewed key visibly
+    /// snapped to an unsheared approximation of it and back again every frame
+    /// even though both ends were identical.
+    #[test]
+    fn a_key_with_20_degrees_of_skew_survives_lerp_affine_with_itself_unchanged() {
+        let skew = 20f64.to_radians();
+        // scaleX = scaleY = 1, skewY = 0, skewX = 20°, built the way
+        // `lerp_linear` rebuilds a matrix from `Decomposed`.
+        let a = Affine::new([1.0, 0.0, -skew.sin(), skew.cos(), 0.0, 0.0]);
+
+        for i in 0..=4 {
+            let t = i as f64 / 4.0;
+            let m = lerp_affine(a, a, t, 0);
+            let c = m.as_coeffs();
+            let want = a.as_coeffs();
+            for k in 0..6 {
+                assert!(
+                    (c[k] - want[k]).abs() < 1e-9,
+                    "coefficient {k} drifted at t={t}: got {c:?}, wanted {want:?}"
+                );
+            }
+        }
+    }
+
+    /// `extra_rotations` adds whole turns to *both* skews, not just to a
+    /// single rotation angle — checked here on a key that already carries
+    /// skew, so the two would visibly diverge if only one were turned.
+    #[test]
+    fn extra_rotations_turn_both_skews() {
+        let skew = 20f64.to_radians();
+        let a = Affine::new([1.0, 0.0, -skew.sin(), skew.cos(), 0.0, 0.0]);
+        // Same key at both ends, so any movement at all comes from the extra
+        // turn — a quarter of one turn is 90° further round than the key.
+        let quarter = lerp_affine(a, a, 0.25, 1);
+        let want_skew_y = 0.0 + std::f64::consts::TAU * 0.25; // skewY started at 0
+        let c = quarter.as_coeffs();
+        let got_skew_y = c[1].atan2(c[0]);
+        assert!(
+            (got_skew_y - want_skew_y).abs() < 1e-6,
+            "skewY should have turned a quarter extra, got {got_skew_y}, wanted {want_skew_y}"
+        );
+        let got_skew_x = (-c[2]).atan2(c[3]);
+        let want_skew_x = skew + std::f64::consts::TAU * 0.25;
+        assert!(
+            (got_skew_x - want_skew_x).abs() < 1e-6,
+            "skewX should have turned a quarter extra too, got {got_skew_x}, wanted {want_skew_x}"
+        );
+    }
+
     // -- object interpolation -------------------------------------------------
 
     #[test]
@@ -1595,7 +2160,7 @@ mod tests {
             object(1, Affine::translate((100.0, 0.0))),
         ];
 
-        let out = interpolate_objects(&from, &to, &Tween::classic(), 0.5);
+        let out = interpolate_objects(&from, &to, &Tween::classic(), None, 0.5, None);
         let x = |id: u64| {
             out.iter()
                 .find(|o| o.id == ObjectId(id))
@@ -1611,7 +2176,7 @@ mod tests {
         let from = vec![object(1, Affine::IDENTITY), object(2, Affine::IDENTITY)];
         let to = vec![object(1, Affine::translate((100.0, 0.0)))];
 
-        let out = interpolate_objects(&from, &to, &Tween::classic(), 0.5);
+        let out = interpolate_objects(&from, &to, &Tween::classic(), None, 0.5, None);
         assert_eq!(out.len(), 2, "the unmatched object should survive");
         let held = out.iter().find(|o| o.id == ObjectId(2)).unwrap();
         assert_eq!(held.transform.as_coeffs(), Affine::IDENTITY.as_coeffs());
@@ -1621,7 +2186,7 @@ mod tests {
     fn no_tween_holds_the_starting_keyframe() {
         let from = vec![object(1, Affine::IDENTITY)];
         let to = vec![object(1, Affine::translate((100.0, 0.0)))];
-        let out = interpolate_objects(&from, &to, &Tween::default(), 0.5);
+        let out = interpolate_objects(&from, &to, &Tween::default(), None, 0.5, None);
         assert_eq!(out[0].transform.as_coeffs(), Affine::IDENTITY.as_coeffs());
     }
 
@@ -1634,7 +2199,7 @@ mod tests {
             easing: Easing::Strength(100.0),
             ..Tween::classic()
         };
-        let out = interpolate_objects(&from, &to, &tween, 0.25);
+        let out = interpolate_objects(&from, &to, &tween, None, 0.25, None);
         let x = (out[0].transform * Point::ORIGIN).x;
         assert!(x > 25.0, "ease out should be ahead of linear, got {x}");
     }
@@ -1815,7 +2380,7 @@ mod tests {
         let start = rigged(0.0);
         let end = rigged(1.0);
 
-        let mid = interpolate_object(&start, &end, &Tween::classic(), 0.5);
+        let mid = interpolate_object(&start, &end, &Tween::classic(), EasedProgress::uniform(0.5), None);
         let ObjectKind::Armature(rig) = &mid.kind else {
             panic!("expected an armature");
         };
@@ -1830,8 +2395,8 @@ mod tests {
         let start = rigged(0.0);
         let end = rigged(std::f64::consts::FRAC_PI_2);
 
-        let straight = interpolate_object(&start, &end, &Tween::classic(), 0.0);
-        let bent = interpolate_object(&start, &end, &Tween::classic(), 1.0);
+        let straight = interpolate_object(&start, &end, &Tween::classic(), EasedProgress::uniform(0.0), None);
+        let bent = interpolate_object(&start, &end, &Tween::classic(), EasedProgress::uniform(1.0), None);
 
         let extent = |object: &Object| object.bounds();
         assert!(
@@ -1886,7 +2451,8 @@ mod tests {
             &object(start_warp),
             &object(end_warp),
             &Tween::classic(),
-            0.5,
+            EasedProgress::uniform(0.5),
+            None,
         );
         let ObjectKind::Warp(warp) = &mid.kind else {
             panic!("expected a warp");

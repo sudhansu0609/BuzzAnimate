@@ -92,7 +92,12 @@ fn a_new_lamp_never_lands_on_one_already_there() {
             );
         }
         assert!(
-            editor.scene().stage().stage_rect().inflate(200.0, 200.0).contains(*a),
+            editor
+                .scene()
+                .stage()
+                .stage_rect()
+                .inflate(200.0, 200.0)
+                .contains(*a),
             "a new lamp must still arrive somewhere near the picture: {a:?}"
         );
     }
@@ -272,7 +277,10 @@ fn adding_a_fire_gives_a_lamp_that_gutters() {
         .lights
         .last()
         .expect("a fire was added");
-    assert!(matches!(light.kind, LightKind::Lamp { .. }), "a fire is a lamp");
+    assert!(
+        matches!(light.kind, LightKind::Lamp { .. }),
+        "a fire is a lamp"
+    );
     assert!(light.flicker > 0.0, "and it gutters");
     assert!(
         editor.scene().lights().animates(),
@@ -284,7 +292,10 @@ fn adding_a_fire_gives_a_lamp_that_gutters() {
     let LightKind::Lamp { radius, .. } = light.kind else {
         unreachable!()
     };
-    assert!(radius >= 100.0, "a fire on a 550-wide stage needs reach: {radius}");
+    assert!(
+        radius >= 100.0,
+        "a fire on a 550-wide stage needs reach: {radius}"
+    );
 }
 
 /// A second fire must not land on the first, and must not gutter in step with

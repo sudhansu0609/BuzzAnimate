@@ -171,7 +171,55 @@ use serde::{Deserialize, Serialize};
 ///   modifier kind is dropped on load, and a camera key with no ease reads as
 ///   the linear one every camera had before this. A document that uses neither
 ///   is written exactly as version 40 wrote it.
-pub const FORMAT_VERSION: u32 = 41;
+/// * **42** — a keyframe's tween can carry **per-property custom ease
+///   curves** (`EasingSet`: `all`, `position`, `rotation`, `scale`), imported
+///   from Animate's Motion Editor. Absent for every keyframe that does not
+///   use one — which is nearly all of them — so a document with none in it is
+///   written exactly as version 41 wrote it, and an older build simply never
+///   sees the field.
+/// * **43** — a bone carries an `offset`: where its head sits away from its
+///   parent's tip, for a joint a chain's ordinary head-at-parent's-tip rule
+///   does not reach. Zero for every bone the Bone tool ever dragged out,
+///   which is exactly the old behaviour, so a document with no offset bone in
+///   it is written exactly as version 42 wrote it.
+/// * **44** — a layer carries a `highlight`: a colour picked to make it easy
+///   to find in the timeline, independent of its automatic `color`. Absent
+///   for every layer, which is every layer of every older document and most
+///   layers of a newer one, so a document with no highlighted layer is
+///   written exactly as version 43 wrote it.
+/// * **45** — a text object carries `runs`: per-character styling — bold,
+///   italic, size, colour or font on a chosen range, overriding the text's
+///   own base wherever a run names something. Empty (and absent) for every
+///   text object with no per-character styling, which is every text object
+///   in every older document and most text in a newer one, so a document
+///   with no styled run in it is written exactly as version 44 wrote it.
+/// * **46** — a rig's artwork is written **once**, in the document's
+///   `rig_parts` table, and each armature lists the table slots of its parts
+///   (`part_refs`) instead of carrying the parts. A performance keys the rig
+///   every other frame and every key holds the whole rig; written in full that
+///   was megabytes per key (a 144-frame scene with five performing rigs came to
+///   254 MB). Only the pose differs between keys, so the pose stays in the key
+///   and the artwork is shared. A part is told apart from another by its
+///   content, so the table holds exactly the distinct parts and nothing is
+///   lost. Every older file still reads: `parts` is still understood inline,
+///   and a file with no `rig_parts` has no refs to resolve.
+/// * **47** — a library symbol carries a `set`: the ids of the sibling symbols
+///   included in its set, which an instance of any of them can switch between
+///   from Properties. Absent for every symbol with no set, which is every
+///   symbol of every older document and most of a newer one, so a document
+///   with no set in it is written exactly as version 46 wrote it.
+/// * **48** — a layer carries `unlit`: **Ignore lights**, so the scene's
+///   lights neither shade it nor make it cast a shadow (captions, title
+///   cards). Absent for every lit layer, which is every layer of every older
+///   document, so a document with no unlit layer is written exactly as
+///   version 47 wrote it.
+/// * **49** — a layer carries `casts_shadow: false`: **Cast shadow** off, so
+///   the layer is still shaded and tinted by the scene's lights but throws
+///   no cast shadow (set pieces dressed from the user's assets). Absent for
+///   every layer that casts, which is every layer of every older document,
+///   so a document with every layer casting is written exactly as version 48
+///   wrote it.
+pub const FORMAT_VERSION: u32 = 49;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -266,6 +314,14 @@ pub struct DocumentDto {
     /// and in every scene built by hand, which is most of them.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub brief: String,
+    /// Every distinct rig part in the document, each written once. Version 46.
+    ///
+    /// An armature names its parts by slot number (`part_refs`), so a rig keyed
+    /// a hundred times costs its artwork once. A part may refer to a slot only
+    /// *before* its own, which is what lets the table be read in one pass and
+    /// makes a cycle impossible to write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rig_parts: Vec<RigPartDto>,
 }
 
 /// A named colour.
@@ -302,6 +358,14 @@ pub struct LightRigDto {
     /// as the default, which is by figure. See [`buzz_scene::EdgeMode`].
     #[serde(default)]
     pub edges: buzz_scene::EdgeMode,
+    /// Where the terminator comes from: "crescent" or "form". An absent
+    /// field — every file written before Stage A of
+    /// `docs/HARD_LIGHT_PLAN.md` — loads as `Crescent`, which is what it
+    /// always meant: nothing here is entitled to change the look of a
+    /// document that never asked for the better model. See
+    /// [`buzz_scene::ShadeModel`].
+    #[serde(default)]
+    pub model: buzz_scene::ShadeModel,
     pub lights: Vec<LightDto>,
 }
 
@@ -326,6 +390,8 @@ pub struct LightDto {
     /// loads as 1.0, which is exactly what those files drew.
     #[serde(default = "full_shadow_length")]
     pub shadow_length: f32,
+    #[serde(default, skip_serializing_if = "is_identity_shadow")]
+    pub shadow_adjustment: buzz_scene::ShadowAdjustment,
     pub standing_height: f64,
     pub softness: f64,
     /// How much of a lamp's light is drawn as a pool. Version 22. Absent in
@@ -353,6 +419,11 @@ pub struct LightDto {
     /// files and in every light that is not a storm, which is nearly all.
     #[serde(default, skip_serializing_if = "is_calm")]
     pub storm: f32,
+    /// The layer this light sits directly above, lighting it and everything
+    /// below. Absent in older files and in every light at the top of the
+    /// stack, which lights the whole picture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub above: Option<u64>,
     /// Sun: the compass bearing and how high it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azimuth: Option<f64>,
@@ -397,6 +468,8 @@ pub struct LightKeyDto {
     pub softness: f64,
     pub standing_height: f64,
     pub shadow_strength: f32,
+    #[serde(default, skip_serializing_if = "is_identity_shadow")]
+    pub shadow_adjustment: buzz_scene::ShadowAdjustment,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azimuth: Option<f64>,
@@ -444,6 +517,10 @@ fn is_calm(storm: &f32) -> bool {
 
 fn is_unrimmed(rim: &f32) -> bool {
     *rim == 0.0
+}
+
+fn is_identity_shadow(adjustment: &buzz_scene::ShadowAdjustment) -> bool {
+    adjustment.is_identity()
 }
 
 fn kind_to_flat(kind: buzz_scene::LightKind) -> FlatKind {
@@ -545,6 +622,7 @@ impl LightKeyDto {
             softness: key.softness,
             standing_height: key.standing_height,
             shadow_strength: key.shadow_strength,
+            shadow_adjustment: key.shadow_adjustment,
             kind: flat.kind,
             azimuth: flat.azimuth,
             elevation: flat.elevation,
@@ -565,6 +643,7 @@ impl LightKeyDto {
             softness: self.softness,
             standing_height: self.standing_height,
             shadow_strength: self.shadow_strength,
+            shadow_adjustment: self.shadow_adjustment,
             kind: flat_to_kind(
                 &self.kind,
                 self.azimuth,
@@ -955,6 +1034,13 @@ pub struct SymbolDto {
     /// A symbol has its own timeline, with the same shape as the stage's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layers: Vec<LayerDto>,
+    /// Semantic tags describing this symbol.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Ids of the sibling symbols included in this symbol's set (it is the
+    /// set's owner). Absent for a symbol with no set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub set: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1153,10 +1239,30 @@ pub struct LayerDto {
     pub locked: bool,
     #[serde(default)]
     pub outline: bool,
+    /// Animate's Highlight Layer. Version 44; absent means no highlight,
+    /// which is every layer of every older document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<String>,
+    /// Ignore lights. Version 48; absent means lit, which is every layer of
+    /// every older document.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unlit: bool,
+    /// Cast shadow. Version 49; absent means the layer casts, which is every
+    /// layer of every older document.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub casts_shadow: bool,
     /// Working transparency. Version 18; absent means fully solid, which is
     /// every layer of every older document.
     #[serde(default = "full", skip_serializing_if = "is_one")]
     pub alpha: f64,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub brightness: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tint: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub tint_amount: f32,
+    #[serde(default, skip_serializing_if = "is_normal_object_blend")]
+    pub blend: buzz_scene::Blend,
     pub color: String,
     #[serde(default)]
     pub height: LayerHeight,
@@ -1191,6 +1297,10 @@ fn is_zero_f32(value: &f32) -> bool {
     *value == 0.0
 }
 
+fn is_zero_offset(value: &[f64; 2]) -> bool {
+    value[0] == 0.0 && value[1] == 0.0
+}
+
 /// The default for a fraction whose absence means "all of it".
 fn full() -> f64 {
     1.0
@@ -1220,6 +1330,12 @@ pub struct KeyframeDto {
     /// internal layout detail.
     #[serde(default, skip_serializing_if = "tween_is_absent")]
     pub tween: Tween,
+    /// Per-property custom ease curves for that tween, if Animate's Motion
+    /// Editor set any. Version 42. Stored as the runtime type, the same
+    /// judgement `tween` above makes: `EasingSet` is a small closed value —
+    /// four optional point lists — not an internal layout detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ease_curve: Option<buzz_scene::EasingSet>,
     /// A sound starting on this keyframe. Version 7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sound: Option<SoundDto>,
@@ -1269,6 +1385,10 @@ fn is_normal_blend(blend: &PaintBlend) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraDto {
     pub enabled: bool,
+    /// The camera row's own padlock. Absent (false) is an unlocked camera,
+    /// which is every file written before this existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
     /// Distance to the depth-zero plane. Version 5; older files take the
     /// default, which leaves a document with no depth looking identical.
     #[serde(default = "default_focal_distance")]
@@ -1575,6 +1695,31 @@ pub struct TextDataDto {
     /// `"right"`. Version 37.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align: Option<String>,
+    /// Per-character styling — a character or run of characters overriding
+    /// the fields above. Version 45; empty (and absent) for every text object
+    /// with no per-character styling, which is every text object in every
+    /// older file and most text in a newer one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<TextRunDto>,
+}
+
+/// One run of per-character styling on a [`TextDataDto`] — see
+/// [`buzz_scene::TextRun`]. Version 45.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextRunDto {
+    /// Char range into the text's `content`, half-open.
+    pub start: usize,
+    pub end: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
 }
 
 /// The stable name an alignment is written under.
@@ -1713,7 +1858,15 @@ pub enum ObjectKindDto {
     Armature {
         root: [f64; 2],
         bones: Vec<BoneDto>,
+        /// The parts written out in full. Every file before version 46 wrote
+        /// them this way; this build writes `part_refs` instead and still
+        /// reads these.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         parts: Vec<RigPartDto>,
+        /// The parts by slot number in the document's `rig_parts` table, in
+        /// the order the rig draws them. Version 46.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        part_refs: Vec<u32>,
         /// Named poses this character owns. Version 19.
         ///
         /// Defaulted and skipped when empty, so a rig with no poses saves
@@ -1761,6 +1914,13 @@ pub struct BoneDto {
     pub limits: Option<[f64; 2]>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// Where this bone's head sits away from its parent's tip. Version 43.
+    ///
+    /// Absent — and defaulted to zero — on every file saved before this
+    /// existed, which is exactly the old behaviour: a head glued to the
+    /// parent's tip. See `buzz_rig::Bone::offset`.
+    #[serde(default, skip_serializing_if = "is_zero_offset")]
+    pub offset: [f64; 2],
 }
 
 /// Artwork attached to an armature, and how it follows the bones.
@@ -1782,6 +1942,137 @@ pub struct RigPartDto {
     pub rigid_bone: Option<usize>,
 }
 
+impl RigPartDto {
+    /// Build the part. `pool` is the table slots already built, for artwork
+    /// that is itself a rig (it may name only those).
+    fn to_part(
+        &self,
+        images: &buzz_scene::ImageLibrary,
+        pool: &[buzz_scene::RigPart],
+    ) -> Result<buzz_scene::RigPart, SerialError> {
+        let artwork = Arc::new(self.artwork.to_object(images, pool)?);
+        let binding = match self.rigid_bone {
+            Some(bone) => buzz_scene::RigBinding::Rigid(bone),
+            None => buzz_scene::RigBinding::Skin(buzz_rig::SkinBinding {
+                points: self.weights.clone(),
+            }),
+        };
+        Ok(buzz_scene::RigPart { artwork, binding })
+    }
+}
+
+/// Build every slot of the document rig-part table, in order.
+///
+/// A slot can refer only to slots before it, so one pass is enough and a file
+/// that makes a slot refer to itself, or to a later one, is refused rather than
+/// followed round in circles.
+fn rig_parts_from_table(
+    table: &[RigPartDto],
+    images: &buzz_scene::ImageLibrary,
+) -> Result<Vec<buzz_scene::RigPart>, SerialError> {
+    let mut built = Vec::with_capacity(table.len());
+    for dto in table {
+        let part = dto.to_part(images, &built)?;
+        built.push(part);
+    }
+    Ok(built)
+}
+
+/// The rig parts of a document being written, each stored once.
+///
+/// # Why this exists
+///
+/// A performance keys a rig every other frame, and every key holds the whole
+/// rig. The artwork is the same in all of them (only the pose differs), but
+/// written per key it was megabytes a time: deflate's window is 32 KB, so it
+/// cannot see that a copy a megabyte back is the same. The fix is in the
+/// format, not the compressor: the artwork goes in a table once and a key says
+/// which slots it uses.
+///
+/// # Telling parts apart
+///
+/// Two ways, cheapest first.
+///
+/// * **By allocation.** Keys made by cloning an object share the artwork's
+///   `Arc`, so the same address with an equal binding is the same part, found
+///   without converting the artwork again. The pool keeps a handle on each
+///   artwork it has seen so an address cannot be reused by a different one
+///   while the pool lives.
+/// * **By content.** Two separate allocations that write the same bytes (a
+///   document reopened from an older file, a rig pasted twice) are still one
+///   part. The part is converted and its compact JSON compared exactly. It is
+///   the bytes themselves that are compared, not a hash of them, so there is no
+///   collision to be unlucky with, and a part that differs in anything at all
+///   gets a slot of its own.
+#[derive(Default)]
+struct PartPool {
+    /// The table, in slot order.
+    parts: Vec<RigPartDto>,
+    by_artwork: std::collections::HashMap<usize, Vec<SeenPart>>,
+    by_content: std::collections::HashMap<Vec<u8>, u32>,
+}
+
+/// A part the pool has already given a slot to.
+struct SeenPart {
+    /// Held only so the address it is filed under cannot be reused.
+    #[allow(dead_code)]
+    artwork: Arc<Object>,
+    binding: buzz_scene::RigBinding,
+    slot: u32,
+}
+
+impl PartPool {
+    /// The slot holding `part`, adding it to the table if it is new.
+    fn slot_for(&mut self, part: &buzz_scene::RigPart, max_id: &mut u64) -> u32 {
+        let address = Arc::as_ptr(&part.artwork) as usize;
+        if let Some(seen) = self
+            .by_artwork
+            .get(&address)
+            .and_then(|seen| seen.iter().find(|s| s.binding == part.binding))
+        {
+            return seen.slot;
+        }
+
+        // Converted before it is stored, so any rig *inside* this artwork gets
+        // its slots first: a slot only ever refers backwards.
+        let dto = RigPartDto {
+            artwork: ObjectDto::from_object(&part.artwork, max_id, self),
+            weights: match &part.binding {
+                buzz_scene::RigBinding::Skin(skin) => skin.points.clone(),
+                buzz_scene::RigBinding::Rigid(_) => Vec::new(),
+            },
+            rigid_bone: match &part.binding {
+                buzz_scene::RigBinding::Rigid(bone) => Some(*bone),
+                buzz_scene::RigBinding::Skin(_) => None,
+            },
+        };
+        let slot = match serde_json::to_vec(&dto) {
+            Ok(bytes) => match self.by_content.get(&bytes) {
+                Some(&slot) => slot,
+                None => {
+                    let slot = self.parts.len() as u32;
+                    self.parts.push(dto);
+                    self.by_content.insert(bytes, slot);
+                    slot
+                }
+            },
+            // Plain data does not fail to write; if it somehow did, the part
+            // still gets a slot, just without being matched against others.
+            Err(_) => {
+                let slot = self.parts.len() as u32;
+                self.parts.push(dto);
+                slot
+            }
+        };
+        self.by_artwork.entry(address).or_default().push(SeenPart {
+            artwork: part.artwork.clone(),
+            binding: part.binding.clone(),
+            slot,
+        });
+        slot
+    }
+}
+
 /// A warp handle: where it was placed, and where it has been dragged.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct HandleDto {
@@ -1791,6 +2082,10 @@ pub struct HandleDto {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 /// An instance's colour effect.
@@ -2190,7 +2485,7 @@ fn stroke_from_dto(
 // ---------------------------------------------------------------------------
 
 impl LayerDto {
-    fn from_layer(layer: &Layer, max_id: &mut u64) -> Self {
+    fn from_layer(layer: &Layer, max_id: &mut u64, pool: &mut PartPool) -> Self {
         *max_id = (*max_id).max(layer.id.0);
         Self {
             id: layer.id.0,
@@ -2203,7 +2498,14 @@ impl LayerDto {
             visible: layer.visible,
             locked: layer.locked,
             outline: layer.outline,
+            highlight: layer.highlight.map(color_to_hex),
+            unlit: layer.unlit,
+            casts_shadow: layer.casts_shadow,
             alpha: layer.alpha,
+            brightness: layer.brightness,
+            tint: (layer.tint_amount > 0.0).then(|| color_to_hex(layer.tint)),
+            tint_amount: layer.tint_amount,
+            blend: layer.blend,
             color: color_to_hex(layer.color),
             height: layer.height,
             depth: layer.depth,
@@ -2220,9 +2522,10 @@ impl LayerDto {
                     objects: k
                         .objects
                         .iter()
-                        .map(|o| ObjectDto::from_object(o, max_id))
+                        .map(|o| ObjectDto::from_object(o, max_id, pool))
                         .collect(),
                     tween: k.tween,
+                    ease_curve: k.ease_curve.clone(),
                     sound: k.sound.map(|s| SoundDto {
                         sound: s.sound.0,
                         sync: s.sync,
@@ -2237,7 +2540,11 @@ impl LayerDto {
         }
     }
 
-    fn to_layer(&self, images: &buzz_scene::ImageLibrary) -> Result<Layer, SerialError> {
+    fn to_layer(
+        &self,
+        images: &buzz_scene::ImageLibrary,
+        pool: &[buzz_scene::RigPart],
+    ) -> Result<Layer, SerialError> {
         let mut layer = Layer::new(LayerId(self.id), self.name.clone(), self.kind);
         layer.parent = self.parent.map(LayerId);
         layer.follows = self.follows.map(LayerId);
@@ -2246,6 +2553,12 @@ impl LayerDto {
         layer.visible = self.visible;
         layer.locked = self.locked;
         layer.outline = self.outline;
+        layer.unlit = self.unlit;
+        layer.casts_shadow = self.casts_shadow;
+        layer.highlight = match &self.highlight {
+            Some(h) => Some(color_from_hex(h)?),
+            None => None,
+        };
         // Clamped on the way in: a document written by hand, or by a build
         // that meant something else by this number, must not make a layer
         // invisible or brighter than it can be.
@@ -2263,6 +2576,12 @@ impl LayerDto {
             0.0
         };
         layer.collapsed = self.collapsed;
+        layer.brightness = self.brightness;
+        if let Some(t) = &self.tint {
+            layer.tint = color_from_hex(t).unwrap_or(peniko::Color::WHITE);
+        }
+        layer.tint_amount = self.tint_amount;
+        layer.blend = self.blend;
         for filter in &self.filters {
             layer.filters.push(filter.to_filter()?);
         }
@@ -2275,6 +2594,7 @@ impl LayerDto {
                 label: None,
                 objects: self.objects.clone(),
                 tween: Tween::default(),
+                ease_curve: None,
                 sound: None,
             }]
         } else {
@@ -2285,13 +2605,14 @@ impl LayerDto {
         for k in &source {
             let mut objects = Vec::with_capacity(k.objects.len());
             for object in &k.objects {
-                objects.push(Arc::new(object.to_object(images)?));
+                objects.push(Arc::new(object.to_object(images, pool)?));
             }
             keyframes.push(buzz_scene::Keyframe {
                 start: k.start,
                 objects: Arc::new(objects),
                 label: k.label.clone(),
                 tween: k.tween,
+                ease_curve: k.ease_curve.clone(),
                 sound: k.sound.map(|s| buzz_scene::SoundRef {
                     sound: buzz_scene::SoundId(s.sound),
                     sync: s.sync,
@@ -2308,7 +2629,7 @@ impl LayerDto {
 }
 
 impl SymbolDto {
-    fn from_symbol(symbol: &Symbol, max_id: &mut u64) -> Self {
+    fn from_symbol(symbol: &Symbol, max_id: &mut u64, pool: &mut PartPool) -> Self {
         *max_id = (*max_id).max(symbol.id.0);
         Self {
             id: symbol.id.0,
@@ -2319,17 +2640,25 @@ impl SymbolDto {
             layers: symbol
                 .layers
                 .iter()
-                .map(|l| LayerDto::from_layer(l, max_id))
+                .map(|l| LayerDto::from_layer(l, max_id, pool))
                 .collect(),
+            tags: symbol.tags.clone(),
+            set: symbol.set.iter().map(|id| id.0).collect(),
         }
     }
 
-    fn to_symbol(&self, images: &buzz_scene::ImageLibrary) -> Result<Symbol, SerialError> {
+    fn to_symbol(
+        &self,
+        images: &buzz_scene::ImageLibrary,
+        pool: &[buzz_scene::RigPart],
+    ) -> Result<Symbol, SerialError> {
         let mut symbol = Symbol::new(SymbolId(self.id), self.name.clone(), self.kind);
         symbol.folder = self.folder.clone();
         symbol.registration = buzz_geom::Point::new(self.registration[0], self.registration[1]);
+        symbol.tags = self.tags.clone();
+        symbol.set = self.set.iter().map(|id| SymbolId(*id)).collect();
         for (index, dto) in self.layers.iter().enumerate() {
-            symbol.layers.insert(index, dto.to_layer(images)?);
+            symbol.layers.insert(index, dto.to_layer(images, pool)?);
         }
         Ok(symbol)
     }
@@ -2338,13 +2667,16 @@ impl SymbolDto {
 impl DocumentDto {
     pub fn from_scene(scene: &Scene) -> Self {
         let mut max_id = 0u64;
+        // Every rig part in the document, each stored once however many
+        // keyframes hold it. Filled as the layers and symbols are walked.
+        let mut pool = PartPool::default();
         // `stage_layers`, not `layers`: with a symbol open for editing the
         // latter is the symbol's timeline, and saving it as the document's
         // would quietly replace the main timeline with the symbol's contents.
         let layers: Vec<LayerDto> = scene
             .stage_layers()
             .iter()
-            .map(|layer| LayerDto::from_layer(layer, &mut max_id))
+            .map(|layer| LayerDto::from_layer(layer, &mut max_id, &mut pool))
             .collect();
 
         // Symbols share the id allocator with stage layers and objects, so
@@ -2353,12 +2685,12 @@ impl DocumentDto {
             symbols: scene
                 .library()
                 .iter()
-                .map(|s| SymbolDto::from_symbol(s, &mut max_id))
+                .map(|s| SymbolDto::from_symbol(s, &mut max_id, &mut pool))
                 .collect(),
             folders: scene.library().folders().cloned().collect(),
         };
 
-        Self {
+        let mut dto = Self {
             brief: scene.brief().to_string(),
             format_version: FORMAT_VERSION,
             stage: StageDto {
@@ -2383,6 +2715,7 @@ impl DocumentDto {
                     || !cam.focus_keys().is_empty();
                 has_content.then(|| CameraDto {
                     enabled: cam.enabled,
+                    locked: cam.locked,
                     focal_distance: cam.focal_distance,
                     aperture: cam.aperture,
                     focus_depth: cam.focus_depth,
@@ -2461,6 +2794,7 @@ impl DocumentDto {
                 base: color_to_hex(scene.lights().base),
                 modelling: scene.lights().modelling,
                 edges: scene.lights().edges,
+                model: scene.lights().model,
                 lights: scene
                     .lights()
                     .lights
@@ -2478,6 +2812,7 @@ impl DocumentDto {
                             fall: light.fall,
                             shadow_strength: light.shadow_strength,
                             shadow_length: light.shadow_length,
+                            shadow_adjustment: light.shadow_adjustment,
                             standing_height: light.standing_height,
                             softness: light.softness,
                             glow: light.glow,
@@ -2485,6 +2820,7 @@ impl DocumentDto {
                             rim: light.rim,
                             glint: light.glint,
                             storm: light.storm,
+                            above: light.above,
                             azimuth: None,
                             elevation: None,
                             horizon: None,
@@ -2532,7 +2868,10 @@ impl DocumentDto {
                     })
                     .collect(),
             }),
-        }
+            rig_parts: Vec::new(),
+        };
+        dto.rig_parts = pool.parts;
+        dto
     }
 
     /// Rebuild a scene. Fails only on genuinely malformed data.
@@ -2595,10 +2934,15 @@ impl DocumentDto {
             sort_by_depth: self.stage.sort_by_depth,
         };
 
+        // The rig-part table is resolved before anything that refers to it. A
+        // slot is built once, so every keyframe naming it shares one set of
+        // artwork instead of each reading its own copy.
+        let rig_parts = rig_parts_from_table(&self.rig_parts, images)?;
+
         for (index, dto) in self.layers.iter().enumerate() {
             scene
                 .edit_stage_layers()
-                .insert(index, dto.to_layer(images)?);
+                .insert(index, dto.to_layer(images, &rig_parts)?);
         }
 
         // The library loads before anything can reference it, so an instance
@@ -2607,7 +2951,7 @@ impl DocumentDto {
             scene.library_mut().add_folder(folder);
         }
         for dto in &self.library.symbols {
-            let symbol = dto.to_symbol(images)?;
+            let symbol = dto.to_symbol(images, &rig_parts)?;
             scene.library_mut().insert(symbol);
         }
 
@@ -2623,6 +2967,7 @@ impl DocumentDto {
                 camera.enabled,
                 camera.focal_distance,
             );
+            track.locked = camera.locked;
             track.aperture = camera.aperture.max(0.0);
             track.focus_depth = camera.focus_depth;
             // A negative or nonsense shutter is simply a shut one; the sample
@@ -2715,6 +3060,7 @@ impl DocumentDto {
             lights.base = color_from_hex(&rig.base)?;
             lights.modelling = rig.modelling;
             lights.edges = rig.edges;
+            lights.model = rig.model;
 
             for dto in &rig.lights {
                 // An unknown kind loads as a sky rather than being dropped: a
@@ -2763,6 +3109,7 @@ impl DocumentDto {
                     fall: dto.fall,
                     shadow_strength: dto.shadow_strength,
                     shadow_length: dto.shadow_length,
+                    shadow_adjustment: dto.shadow_adjustment,
                     standing_height: dto.standing_height,
                     softness: dto.softness,
                     glow: dto.glow,
@@ -2770,7 +3117,12 @@ impl DocumentDto {
                     rim: dto.rim,
                     glint: dto.glint,
                     storm: dto.storm,
-                    track: dto.track.as_ref().map(LightTrackDto::to_track).transpose()?,
+                    above: dto.above,
+                    track: dto
+                        .track
+                        .as_ref()
+                        .map(LightTrackDto::to_track)
+                        .transpose()?,
                 });
             }
         }
@@ -2783,7 +3135,7 @@ impl DocumentDto {
 }
 
 impl ObjectDto {
-    fn from_object(object: &Object, max_id: &mut u64) -> Self {
+    fn from_object(object: &Object, max_id: &mut u64, pool: &mut PartPool) -> Self {
         *max_id = (*max_id).max(object.id.0);
         let kind = match &object.kind {
             ObjectKind::Shape(s) => ObjectKindDto::Shape {
@@ -2795,7 +3147,7 @@ impl ObjectDto {
             ObjectKind::Group(children) => ObjectKindDto::Group {
                 children: children
                     .iter()
-                    .map(|c| Self::from_object(c, max_id))
+                    .map(|c| Self::from_object(c, max_id, pool))
                     .collect(),
             },
             ObjectKind::Instance(i) => ObjectKindDto::Instance {
@@ -2824,22 +3176,14 @@ impl ObjectDto {
                         angle: b.angle,
                         limits: b.limits.map(|l| [l.min, l.max]),
                         pinned: b.pinned,
+                        offset: [b.offset.x, b.offset.y],
                     })
                     .collect(),
-                parts: rig
+                parts: Vec::new(),
+                part_refs: rig
                     .parts
                     .iter()
-                    .map(|part| RigPartDto {
-                        artwork: Self::from_object(&part.artwork, max_id),
-                        weights: match &part.binding {
-                            buzz_scene::RigBinding::Skin(skin) => skin.points.clone(),
-                            buzz_scene::RigBinding::Rigid(_) => Vec::new(),
-                        },
-                        rigid_bone: match &part.binding {
-                            buzz_scene::RigBinding::Rigid(bone) => Some(*bone),
-                            buzz_scene::RigBinding::Skin(_) => None,
-                        },
-                    })
+                    .map(|part| pool.slot_for(part, max_id))
                     .collect(),
                 poses: rig
                     .poses
@@ -2906,25 +3250,41 @@ impl ObjectDto {
                 // nothing: a document that does not align stays byte-identical.
                 align: (t.align != buzz_scene::TextAlign::Left)
                     .then(|| align_name(t.align).to_string()),
+                runs: t
+                    .runs
+                    .iter()
+                    .map(|r| TextRunDto {
+                        start: r.start,
+                        end: r.end,
+                        bold: r.bold,
+                        italic: r.italic,
+                        size: r.size,
+                        color: r.color.map(color_to_hex),
+                        font: r.font.clone(),
+                    })
+                    .collect(),
             }),
             // **A plain back view still writes as `reverse`.** That is what a
             // turnaround of one drawing at a hundred and eighty degrees has
             // always been, and writing it any other way would change every
             // document that has one for no gain. Anything richer — a profile, a
             // three-quarter — goes in `views`.
-            reverse: plain_back(&object.turnaround)
-                .map(|r| Box::new(Self::from_object(r, max_id))),
+            reverse: plain_back(&object.turnaround).map(|r| Box::new(Self::from_object(r, max_id, pool))),
             views: extra_views(&object.turnaround)
                 .map(|v| TurnaroundViewDto {
                     angle: v.angle,
-                    drawing: Box::new(Self::from_object(&v.drawing, max_id)),
+                    drawing: Box::new(Self::from_object(&v.drawing, max_id, pool)),
                 })
                 .collect(),
             kind,
         }
     }
 
-    fn to_object(&self, images: &buzz_scene::ImageLibrary) -> Result<Object, SerialError> {
+    fn to_object(
+        &self,
+        images: &buzz_scene::ImageLibrary,
+        pool: &[buzz_scene::RigPart],
+    ) -> Result<Object, SerialError> {
         let kind = match &self.kind {
             ObjectKindDto::Shape {
                 path,
@@ -2950,7 +3310,7 @@ impl ObjectDto {
             ObjectKindDto::Group { children } => ObjectKind::Group(
                 children
                     .iter()
-                    .map(|c| c.to_object(images).map(Arc::new))
+                    .map(|c| c.to_object(images, pool).map(Arc::new))
                     .collect::<Result<Vec<_>, _>>()?,
             ),
             ObjectKindDto::Instance {
@@ -2973,6 +3333,7 @@ impl ObjectDto {
                 root,
                 bones,
                 parts,
+                part_refs,
                 poses,
                 pattern,
             } => {
@@ -2991,19 +3352,25 @@ impl ObjectDto {
                             .limits
                             .map(|[min, max]| buzz_rig::JointLimits::new(min, max)),
                         pinned: dto.pinned,
+                        offset: buzz_geom::Vec2::new(dto.offset[0], dto.offset[1]),
                     });
                 }
 
                 let mut rig = buzz_scene::ArmatureData::new(armature);
+                // Parts written out in full (every file before version 46),
+                // then parts named by slot (version 46 on). A file written by
+                // this build has only the second kind.
                 for part in parts {
-                    let artwork = Arc::new(part.artwork.to_object(images)?);
-                    let binding = match part.rigid_bone {
-                        Some(bone) => buzz_scene::RigBinding::Rigid(bone),
-                        None => buzz_scene::RigBinding::Skin(buzz_rig::SkinBinding {
-                            points: part.weights.clone(),
-                        }),
-                    };
-                    rig.parts.push(buzz_scene::RigPart { artwork, binding });
+                    rig.parts.push(part.to_part(images, pool)?);
+                }
+                for slot in part_refs {
+                    let part = pool.get(*slot as usize).ok_or_else(|| {
+                        SerialError::Unsupported(format!(
+                            "a rig names part {slot}, but the document table holds only {}",
+                            pool.len()
+                        ))
+                    })?;
+                    rig.parts.push(part.clone());
                 }
                 rig.poses = poses
                     .iter()
@@ -3079,14 +3446,43 @@ impl ObjectDto {
                 .pivot
                 .filter(|p| p[0].is_finite() && p[1].is_finite())
                 .map(|p| buzz_geom::Point::new(p[0], p[1])),
-            modifiers: self.modifiers.iter().filter_map(ModifierDto::to_modifier).collect(),
-            text: self.text.as_ref().map(|t| buzz_scene::TextData {
-                content: t.content.clone(),
-                size: t.size,
-                font: t.font.clone(),
-                style: buzz_scene::FontStyle::new(t.bold, t.italic),
-                align: t.align.as_deref().map(align_from_name).unwrap_or_default(),
-            }),
+            modifiers: self
+                .modifiers
+                .iter()
+                .filter_map(ModifierDto::to_modifier)
+                .collect(),
+            text: self
+                .text
+                .as_ref()
+                .map(|t| -> Result<buzz_scene::TextData, SerialError> {
+                    Ok(buzz_scene::TextData {
+                        content: t.content.clone(),
+                        size: t.size,
+                        font: t.font.clone(),
+                        style: buzz_scene::FontStyle::new(t.bold, t.italic),
+                        align: t.align.as_deref().map(align_from_name).unwrap_or_default(),
+                        runs: t
+                            .runs
+                            .iter()
+                            .map(|r| -> Result<buzz_scene::TextRun, SerialError> {
+                                Ok(buzz_scene::TextRun {
+                                    start: r.start,
+                                    end: r.end,
+                                    bold: r.bold,
+                                    italic: r.italic,
+                                    size: r.size,
+                                    color: r
+                                        .color
+                                        .as_deref()
+                                        .map(color_from_hex)
+                                        .transpose()?,
+                                    font: r.font.clone(),
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    })
+                })
+                .transpose()?,
             turnaround: {
                 let mut turnaround = buzz_scene::Turnaround::default();
                 // The old single back view is a view at a hundred and eighty
@@ -3094,13 +3490,13 @@ impl ObjectDto {
                 if let Some(back) = &self.reverse {
                     turnaround.set(
                         std::f64::consts::PI,
-                        std::sync::Arc::new(back.to_object(images)?),
+                        std::sync::Arc::new(back.to_object(images, pool)?),
                     );
                 }
                 for view in &self.views {
                     turnaround.set(
                         view.angle,
-                        std::sync::Arc::new(view.drawing.to_object(images)?),
+                        std::sync::Arc::new(view.drawing.to_object(images, pool)?),
                     );
                 }
                 turnaround
@@ -3114,7 +3510,9 @@ impl ObjectDto {
 /// A document whose character has only a back is written exactly as it was
 /// before there were other angles, so this asks for both conditions at once.
 fn plain_back(turnaround: &buzz_scene::Turnaround) -> Option<&std::sync::Arc<buzz_scene::Object>> {
-    (turnaround.views().len() == 1).then(|| turnaround.back()).flatten()
+    (turnaround.views().len() == 1)
+        .then(|| turnaround.back())
+        .flatten()
 }
 
 /// Every view that is not that plain back — what `views` carries.
@@ -3253,6 +3651,99 @@ mod tests {
     }
 
     #[test]
+    fn a_layers_highlight_round_trips() {
+        let mut plain_scene = Scene::empty();
+        plain_scene.add_layer("Plain", LayerKind::Normal);
+        let plain_json = serde_json::to_string(&DocumentDto::from_scene(&plain_scene)).unwrap();
+        assert!(
+            !plain_json.contains("highlight"),
+            "a layer with no highlight must not gain a new field: {plain_json}"
+        );
+
+        let mut scene = Scene::empty();
+        let marked = scene.add_layer("Marked", LayerKind::Normal);
+        scene.update_layer(marked, |l| {
+            l.highlight = Some(Color::from_rgb8(0xFF, 0xCC, 0x00));
+        });
+
+        let dto = DocumentDto::from_scene(&scene);
+        let back = dto.to_scene().unwrap();
+        let marked_back = back.layers().iter().find(|l| l.id == marked).unwrap();
+        assert_eq!(
+            marked_back.highlight,
+            Some(Color::from_rgb8(0xFF, 0xCC, 0x00))
+        );
+
+        // A layer that clears its highlight again must not write the field
+        // either — "Remove Highlight" is really back to `None`.
+        scene.update_layer(marked, |l| l.highlight = None);
+        let cleared_json = serde_json::to_string(&DocumentDto::from_scene(&scene)).unwrap();
+        assert!(!cleared_json.contains("highlight"));
+    }
+
+    /// A symbol's set survives save and load, and a symbol with no set does
+    /// not gain a new field in the file.
+    #[test]
+    fn a_symbol_set_round_trips() {
+        let mut scene = Scene::empty();
+        let idle = scene.add_symbol("idle", buzz_scene::SymbolKind::Graphic, None);
+        let wave = scene.add_symbol("wave", buzz_scene::SymbolKind::Graphic, None);
+        let sit = scene.add_symbol("sit", buzz_scene::SymbolKind::Graphic, None);
+        let plain_json = serde_json::to_string(&DocumentDto::from_scene(&scene)).unwrap();
+        assert!(
+            !plain_json.contains("\"set\""),
+            "a symbol with no set must not gain a new field: {plain_json}"
+        );
+
+        assert!(scene.library_mut().include_in_set(idle, wave));
+        assert!(scene.library_mut().include_in_set(idle, sit));
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        assert_eq!(back.library().get(idle).unwrap().set, vec![wave, sit]);
+        assert_eq!(back.library().symbol_set(sit), vec![idle, wave, sit]);
+    }
+
+    /// A symbol written before sets existed — no `set` key at all — loads
+    /// with an empty set.
+    #[test]
+    fn a_symbol_from_an_older_file_loads_with_no_set() {
+        let dto: SymbolDto = serde_json::from_str(r#"{"id":5,"name":"old"}"#).unwrap();
+        let symbol = dto.to_symbol(&buzz_scene::ImageLibrary::default(), &[]).unwrap();
+        assert!(symbol.set.is_empty());
+    }
+
+    /// I2: a folder's collapsed state round-trips, and an older document with
+    /// no `collapsed` key at all — every file saved before this — loads
+    /// expanded rather than losing the layer or misreading its absence as
+    /// collapsed.
+    #[test]
+    fn a_folders_collapsed_state_round_trips() {
+        let mut scene = Scene::empty();
+        let folder = scene.add_layer("Folder", LayerKind::Folder);
+        scene.update_layer(folder, |l| l.collapsed = true);
+
+        let dto = DocumentDto::from_scene(&scene);
+        let back = dto.to_scene().unwrap();
+        let back_layer = back.layers().iter().find(|l| l.id == folder).unwrap();
+        assert!(
+            back_layer.collapsed,
+            "a collapsed folder must stay collapsed across save/load"
+        );
+
+        let mut json = serde_json::to_value(&dto).unwrap();
+        let layers = json["layers"].as_array_mut().expect("a layers array");
+        for layer in layers.iter_mut() {
+            layer.as_object_mut().unwrap().remove("collapsed");
+        }
+        let old: DocumentDto = serde_json::from_value(json).unwrap();
+        let old_scene = old.to_scene().unwrap();
+        let old_layer = old_scene.layers().iter().find(|l| l.id == folder).unwrap();
+        assert!(
+            !old_layer.collapsed,
+            "an old document with no collapsed key must load expanded"
+        );
+    }
+
+    #[test]
     fn layer_order_is_preserved() {
         let mut scene = Scene::empty();
         for i in 0..5 {
@@ -3381,7 +3872,8 @@ mod tests {
                 damping: 8.0,
                 coupling: 0.02,
             });
-            o.modifiers.push(buzz_scene::Modifier::LookAt { x: 12.5, y: -30.0 });
+            o.modifiers
+                .push(buzz_scene::Modifier::LookAt { x: 12.5, y: -30.0 });
             o.modifiers
                 .push(buzz_scene::Modifier::AutoSquashStretch { amount: 0.015 });
             o.modifiers.push(buzz_scene::Modifier::Breathe {
@@ -3481,7 +3973,10 @@ mod tests {
 
         // An object without text writes no `text` key.
         let plain = serde_json::to_string(&DocumentDto::from_scene(&Scene::empty())).unwrap();
-        assert!(!plain.contains("\"text\""), "no text object should write the key");
+        assert!(
+            !plain.contains("\"text\""),
+            "no text object should write the key"
+        );
     }
 
     /// A tiling image fill keeps its `tile` flag through the paint conversion,
@@ -3502,7 +3997,10 @@ mod tests {
         let asset = images.insert(asset);
 
         let tiled = Paint::Image(Box::new(buzz_scene::ImageFill::tiled(asset, 32.0)));
-        assert!(matches!(&tiled, Paint::Image(i) if i.tile), "tiled() sets the flag");
+        assert!(
+            matches!(&tiled, Paint::Image(i) if i.tile),
+            "tiled() sets the flag"
+        );
 
         // to_dto then from_dto (against the library) preserves tile.
         let (_c, _g, dto) = paint_to_dto(&tiled);
@@ -3513,7 +4011,12 @@ mod tests {
 
         // A tiling fill writes the key; a non-tiling one omits it.
         assert!(serde_json::to_string(&dto).unwrap().contains("\"tile\""));
-        let plain = ImageFillDto { image: 7, transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], smooth: true, tile: false };
+        let plain = ImageFillDto {
+            image: 7,
+            transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            smooth: true,
+            tile: false,
+        };
         assert!(
             !serde_json::to_string(&plain).unwrap().contains("\"tile\""),
             "a non-tiling fill must not write the key"
@@ -3543,18 +4046,21 @@ mod tests {
             o.turnaround.set(
                 std::f64::consts::PI,
                 std::sync::Arc::new(buzz_scene::Object::shape(
-                buzz_scene::ObjectId(4242),
-                ShapeData::filled(
-                    kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
-                    Color::BLACK,
-                ),
-            )),
+                    buzz_scene::ObjectId(4242),
+                    ShapeData::filled(
+                        kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9),
+                        Color::BLACK,
+                    ),
+                )),
             );
         });
 
         let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
         let (_, object) = back.find_object(front).expect("the front object");
-        assert!(object.turnaround.back().is_some(), "the back view came back");
+        assert!(
+            object.turnaround.back().is_some(),
+            "the back view came back"
+        );
 
         let plain = serde_json::to_string(&DocumentDto::from_scene(&Scene::empty())).unwrap();
         assert!(!plain.contains("\"reverse\""), "no back → no key");
@@ -3576,7 +4082,10 @@ mod tests {
             )
             .expect("a shape");
         let json = serde_json::to_string(&DocumentDto::from_scene(&scene)).unwrap();
-        assert!(!json.contains("modifiers"), "the empty stack should not be written");
+        assert!(
+            !json.contains("modifiers"),
+            "the empty stack should not be written"
+        );
     }
 
     /// A file written before version 27 has no `modifiers` key; it must load with
@@ -3619,7 +4128,10 @@ mod tests {
         let back: DocumentDto = serde_json::from_value(json).expect("deserialise");
         let loaded = back.to_scene().expect("to scene");
         let (_, object) = loaded.find_object(id).expect("the object");
-        assert!(object.modifiers.is_empty(), "an old file must load with no modifiers");
+        assert!(
+            object.modifiers.is_empty(),
+            "an old file must load with no modifiers"
+        );
     }
 
     /// Every part of a gradient comes back: the stops with their offsets, the
@@ -4002,6 +4514,59 @@ mod tests {
         assert!(back.layers().iter().all(|l| l.filters.is_empty()));
     }
 
+    /// A document from before Phase B's per-property ease curves (version 42)
+    /// has no `ease_curve` key at all on a keyframe that carries a tween —
+    /// not even `null` — because older builds never wrote one. It must load
+    /// with `None` rather than refusing, the same as every other additive
+    /// field this format has grown.
+    #[test]
+    fn a_document_without_ease_curves_loads_with_none() {
+        let mut scene = sample_scene();
+        let layer = scene.layers().iter().next().unwrap().id;
+        scene.edit_layers().update(layer, |l| {
+            l.frames.insert_keyframe(0);
+            l.frames.set_tween(0, Tween::classic());
+            if let Some(keyframe) = l.frames.keyframe_at_mut(0) {
+                keyframe.ease_curve = Some(buzz_scene::EasingSet {
+                    all: Some(std::sync::Arc::from(vec![
+                        Point::new(0.0, 0.0),
+                        Point::new(0.42, 0.0),
+                        Point::new(0.58, 1.0),
+                        Point::new(1.0, 1.0),
+                    ])),
+                    ..Default::default()
+                });
+            }
+        });
+
+        let mut json = serde_json::to_value(DocumentDto::from_scene(&scene)).unwrap();
+        // The field really is present until it is stripped — proof the test
+        // exercises the field it claims to, not a case that was already empty.
+        assert!(
+            json["layers"][0]["keyframes"][0]["ease_curve"].is_object(),
+            "test setup: the sample should have written a curve to strip"
+        );
+        json["layers"][0]["keyframes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("ease_curve");
+
+        let dto: DocumentDto = serde_json::from_value(json).unwrap();
+        let back = dto.to_scene().unwrap();
+        let restored = back.layers().iter().next().unwrap();
+        assert_eq!(
+            restored.frames.keyframe_at(0).unwrap().ease_curve,
+            None,
+            "a stripped field should default to no custom ease, not fail to load"
+        );
+        // The tween itself — an ordinary field, not an additive one — must
+        // still have come across.
+        assert_eq!(
+            restored.frames.tween_at(0).kind,
+            buzz_scene::TweenKind::Classic
+        );
+    }
+
     /// A filter kind this build does not know is refused rather than dropped:
     /// losing an effect silently is worse than saying the file is wrong.
     #[test]
@@ -4307,7 +4872,10 @@ mod tests {
 
         let mut armature = buzz_rig::Armature::new(Point::new(100.0, 100.0));
         armature.push(buzz_rig::Bone::new("upper", None, 50.0, 0.2));
-        armature.push(buzz_rig::Bone::new("fore", Some(0), 40.0, -0.4).with_limits(-1.2, 0.1));
+        let mut fore = buzz_rig::Bone::new("fore", Some(0), 40.0, -0.4).with_limits(-1.2, 0.1);
+        // A joint whose real head is not the parent's tip — version 43.
+        fore.offset = buzz_geom::Vec2::new(3.5, -2.25);
+        armature.push(fore);
         armature.push(buzz_rig::Bone::new("hand", Some(1), 15.0, 0.1).pinned());
 
         let mut rig = buzz_scene::ArmatureData::new(armature);
@@ -4396,6 +4964,15 @@ mod tests {
         assert!(rig.armature.bones[2].pinned, "the pin was lost");
         assert_eq!(rig.armature.bones[1].name, "fore");
 
+        // The offset, version 43: a joint whose real head is not the
+        // parent's tip. The other two bones are ordinary and round-trip at
+        // zero, which is what a file from before this existed will load as.
+        let offset = rig.armature.bones[1].offset;
+        assert!((offset.x - 3.5).abs() < 1e-12);
+        assert!((offset.y - -2.25).abs() < 1e-12);
+        assert_eq!(rig.armature.bones[0].offset, buzz_geom::Vec2::ZERO);
+        assert_eq!(rig.armature.bones[2].offset, buzz_geom::Vec2::ZERO);
+
         // The pose library, version 19. A character's poses are work in their
         // own right; losing them on save would be losing the animation.
         assert_eq!(rig.poses.len(), 2, "the saved poses are gone");
@@ -4449,6 +5026,85 @@ mod tests {
         };
         assert!(rig.pattern.is_none());
         assert_eq!(rig.armature.len(), 3, "the rest of the rig came through");
+    }
+
+    /// **A rig from before version 43 loads, every bone's offset zero.**
+    ///
+    /// Which is every rig ever built before the offset existed: the field is
+    /// `#[serde(default)]`, and absent means the ordinary head-at-parent's-tip
+    /// rig every one of them already is.
+    #[test]
+    fn a_rig_from_before_offsets_still_loads_with_every_offset_zero() {
+        let scene = rigged_scene();
+        let dto = DocumentDto::from_scene(&scene);
+        let mut json = serde_json::to_value(&dto).expect("serialise");
+
+        // Remove the field entirely, exactly as a version-42 file has it.
+        fn strip(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("offset");
+                    for (_, v) in map.iter_mut() {
+                        strip(v);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        strip(&mut json);
+
+        let back: DocumentDto = serde_json::from_value(json).expect("deserialise");
+        let loaded = back.to_scene().expect("to scene");
+        let object = loaded
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .next()
+            .expect("the armature")
+            .clone();
+
+        let ObjectKind::Armature(rig) = &object.kind else {
+            panic!("expected an armature");
+        };
+        assert_eq!(rig.armature.len(), 3, "the rest of the rig came through");
+        for (i, bone) in rig.armature.bones.iter().enumerate() {
+            assert_eq!(bone.offset, buzz_geom::Vec2::ZERO, "bone {i} kept an offset");
+        }
+    }
+
+    /// A bone with no offset writes exactly what it wrote before the field
+    /// existed — the field is skipped, not written as `[0.0, 0.0]`.
+    #[test]
+    fn a_bone_with_no_offset_writes_no_offset_field() {
+        let scene = rigged_scene();
+        let dto = DocumentDto::from_scene(&scene);
+        let json = serde_json::to_value(&dto).expect("serialise");
+
+        // Find the "bones" array wherever it landed, rather than pinning the
+        // whole DTO's shape down in this test.
+        fn find_bones(value: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::Array(bones)) = map.get("bones") {
+                        return Some(bones);
+                    }
+                    map.values().find_map(find_bones)
+                }
+                serde_json::Value::Array(items) => items.iter().find_map(find_bones),
+                _ => None,
+            }
+        }
+        let bones = find_bones(&json).expect("a bones array somewhere in the document");
+
+        assert!(
+            !bones[0].as_object().expect("bone 0").contains_key("offset"),
+            "bone 0 has no offset and should write none"
+        );
+        assert!(
+            bones[1].as_object().expect("bone 1").contains_key("offset"),
+            "bone 1 has an offset and should write one"
+        );
     }
 
     /// A rig that was never assembled from a pattern writes exactly what it
@@ -4726,9 +5382,18 @@ mod layer_alpha_tests {
                 gamma: 0.9,
                 gain: 1.1,
             },
-            posterise: buzz_scene::PosteriseSettings { enabled: true, levels: 4 },
-            halftone: buzz_scene::HalftoneSettings { enabled: true, scale: 10.0 },
-            hatching: buzz_scene::HatchingSettings { enabled: true, scale: 8.0 },
+            posterise: buzz_scene::PosteriseSettings {
+                enabled: true,
+                levels: 4,
+            },
+            halftone: buzz_scene::HalftoneSettings {
+                enabled: true,
+                scale: 10.0,
+            },
+            hatching: buzz_scene::HatchingSettings {
+                enabled: true,
+                scale: 8.0,
+            },
             ..Default::default()
         };
 
@@ -4773,7 +5438,11 @@ mod layer_alpha_tests {
         let scene = Scene::default();
         let json = serde_json::to_value(DocumentDto::from_scene(&scene)).expect("serialise");
         assert!(
-            json["stage"].as_object().expect("stage").get("post").is_none(),
+            json["stage"]
+                .as_object()
+                .expect("stage")
+                .get("post")
+                .is_none(),
             "a default look must not write a post block"
         );
     }
@@ -4799,7 +5468,11 @@ mod layer_alpha_tests {
         let back = DocumentDto::from_scene(&scene)
             .to_scene()
             .expect("round trip");
-        assert_eq!(back.lights().lights[0], expected, "the fire went out on save");
+        assert_eq!(
+            back.lights().lights[0],
+            expected,
+            "the fire went out on save"
+        );
         assert!(back.lights().animates(), "and it must still animate");
     }
 
@@ -4845,6 +5518,7 @@ mod layer_alpha_tests {
             softness: 0.35,
             standing_height: 70.0,
             shadow_strength: 0.45,
+            shadow_adjustment: Default::default(),
             kind,
         });
         track.set_key(buzz_scene::LightKey {
@@ -4854,6 +5528,7 @@ mod layer_alpha_tests {
             softness: 0.35,
             standing_height: 70.0,
             shadow_strength: 0.45,
+            shadow_adjustment: Default::default(),
             kind: buzz_scene::LightKind::Gloom {
                 edge: buzz_geom::Point::new(120.0, 77.25),
                 facing: 0.85,
@@ -4898,6 +5573,7 @@ mod layer_alpha_tests {
             softness: 0.35,
             standing_height: 40.0,
             shadow_strength: 0.45,
+            shadow_adjustment: Default::default(),
             kind: buzz_scene::LightKind::Sun {
                 azimuth: 0.2,
                 elevation: 0.3,
@@ -4910,6 +5586,7 @@ mod layer_alpha_tests {
             softness: 0.5,
             standing_height: 60.0,
             shadow_strength: 0.6,
+            shadow_adjustment: Default::default(),
             kind: buzz_scene::LightKind::Sun {
                 azimuth: 1.0,
                 elevation: 1.2,
@@ -4935,11 +5612,8 @@ mod layer_alpha_tests {
     #[test]
     fn a_light_from_before_tracks_is_static() {
         let mut scene = Scene::default();
-        let sun = buzz_scene::Light::new(
-            buzz_scene::LightId(1),
-            "Key",
-            buzz_scene::LightKind::sun(),
-        );
+        let sun =
+            buzz_scene::Light::new(buzz_scene::LightId(1), "Key", buzz_scene::LightKind::sun());
         scene.lights_mut().enabled = true;
         scene.lights_mut().lights.push(sun);
 
@@ -4965,11 +5639,8 @@ mod layer_alpha_tests {
     fn where_a_shadow_falls_survives_the_round_trip_and_defaults_to_the_ground() {
         let mut scene = Scene::default();
         scene.lights_mut().enabled = true;
-        let mut sun = buzz_scene::Light::new(
-            buzz_scene::LightId(1),
-            "Key",
-            buzz_scene::LightKind::sun(),
-        );
+        let mut sun =
+            buzz_scene::Light::new(buzz_scene::LightId(1), "Key", buzz_scene::LightKind::sun());
         sun.fall = buzz_scene::ShadowFall::Wall;
         scene.lights_mut().lights.push(sun);
 
@@ -5036,6 +5707,46 @@ mod layer_alpha_tests {
             older.to_scene().expect("to scene").lights().edges,
             buzz_scene::EdgeMode::Figure,
             "a file from before the choice must open modelling its figures"
+        );
+    }
+
+    /// **`docs/HARD_LIGHT_PLAN.md`, Stage A.** A file without `model` — every
+    /// one of them before this stage — must load `Crescent`, the model those
+    /// files were drawn against, and not the new `Form` default a brand-new
+    /// document gets.
+    #[test]
+    fn a_file_without_a_model_loads_as_crescent() {
+        let mut scene = Scene::default();
+        scene.lights_mut().enabled = true;
+        scene.lights_mut().lights.push(buzz_scene::Light::new(
+            buzz_scene::LightId(1),
+            "Key",
+            buzz_scene::LightKind::sun(),
+        ));
+        scene.lights_mut().model = buzz_scene::ShadeModel::Form;
+
+        let back = DocumentDto::from_scene(&scene)
+            .to_scene()
+            .expect("round trip");
+        assert_eq!(
+            back.lights().model,
+            buzz_scene::ShadeModel::Form,
+            "an explicit model must survive the round trip"
+        );
+
+        let mut json = serde_json::to_value(DocumentDto::from_scene(&scene)).expect("serialise");
+        assert_eq!(json["lights"]["model"], serde_json::json!("form"));
+
+        // A file from before Stage A has no `model` at all.
+        json["lights"]
+            .as_object_mut()
+            .expect("the rig")
+            .remove("model");
+        let older: DocumentDto = serde_json::from_value(json).expect("read back");
+        assert_eq!(
+            older.to_scene().expect("to scene").lights().model,
+            buzz_scene::ShadeModel::Crescent,
+            "a file from before Stage A must open on the model it was drawn against"
         );
     }
 
@@ -5181,9 +5892,77 @@ mod layer_alpha_tests {
         assert!(json.contains("centre"), "the alignment is written");
 
         let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
-        let text = back.find_object(id).expect("the object").1.text.clone().expect("text");
+        let text = back
+            .find_object(id)
+            .expect("the object")
+            .1
+            .text
+            .clone()
+            .expect("text");
         assert_eq!(text.style, buzz_scene::FontStyle::new(true, true));
         assert_eq!(text.align, buzz_scene::TextAlign::Centre);
+    }
+
+    /// Per-character styling runs survive the round trip, and a text object
+    /// with none writes no `runs` key — an unchanged document does not grow.
+    #[test]
+    fn per_character_styling_runs_survive_the_round_trip() {
+        use buzz_geom::Shape as _;
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().expect("a layer").id;
+        let id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        let run = buzz_scene::TextRun {
+            start: 1,
+            end: 3,
+            bold: Some(true),
+            italic: None,
+            size: Some(60.0),
+            color: Some(Color::from_rgba8(200, 30, 30, 255)),
+            font: Some("Nirmala UI".to_string()),
+        };
+        scene.update_object_across(0, u32::MAX, id, |o| {
+            o.text = Some(buzz_scene::TextData {
+                runs: vec![run.clone()],
+                ..buzz_scene::TextData::new("Hello", 36.0, None)
+            });
+        });
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        let text = back
+            .find_object(id)
+            .expect("the object")
+            .1
+            .text
+            .clone()
+            .expect("text");
+        assert_eq!(text.runs, vec![run]);
+
+        // A second text object with no runs writes no `runs` key for it.
+        let plain_id = scene
+            .add_shape(
+                layer,
+                ShapeData::filled(
+                    kurbo::Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            )
+            .expect("a shape");
+        scene.update_object_across(0, u32::MAX, plain_id, |o| {
+            o.text = Some(buzz_scene::TextData::new("Plain", 36.0, None));
+        });
+        let json = serde_json::to_string(&DocumentDto::from_scene(&scene)).unwrap();
+        assert!(
+            json.contains("\"Plain\"") && json.matches("\"runs\"").count() == 1,
+            "only the object with a run should write the key"
+        );
     }
 
     /// A procedural texture is stored as its recipe and baked again on the way
@@ -5230,6 +6009,40 @@ mod layer_alpha_tests {
             Some(24),
             "and it still asks for the same instants"
         );
+    }
+
+    /// The camera's own padlock (C1) must survive a save/load, the same as a
+    /// layer's does, or a locked shot could be nudged the moment a file
+    /// reopened.
+    #[test]
+    fn a_locked_camera_survives_the_round_trip() {
+        let mut scene = Scene::default();
+        {
+            let cam = scene.camera_mut();
+            cam.enabled = true;
+            cam.locked = true;
+        }
+
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        assert!(back.camera().locked);
+    }
+
+    /// Every file written before this existed has no `locked` key at all, and
+    /// must load as an unlocked camera rather than failing to parse.
+    #[test]
+    fn a_camera_with_no_locked_key_loads_unlocked() {
+        let mut scene = Scene::default();
+        scene.camera_mut().aperture = 0.01; // so a camera is written at all
+        let mut json = serde_json::to_value(DocumentDto::from_scene(&scene)).unwrap();
+        let camera = json
+            .get_mut("camera")
+            .and_then(|c| c.as_object_mut())
+            .expect("a camera was written");
+        camera.remove("locked");
+
+        let dto: DocumentDto = serde_json::from_value(json).unwrap();
+        let back = dto.to_scene().unwrap();
+        assert!(!back.camera().locked);
     }
 
     /// Every file written before version 35 has no shutter, and must go on
@@ -5312,8 +6125,15 @@ mod layer_alpha_tests {
         assert_eq!(keys[1].frame, 24);
         assert!((keys[1].aperture - 0.05).abs() < 1e-9);
         // And it still reads as a pull, not as two stored numbers.
-        assert_eq!(back.camera().dof_blur_at(0, 600.0), None, "sharp at the start");
-        assert!(back.camera().dof_blur_at(24, 600.0).is_some(), "soft at the end");
+        assert_eq!(
+            back.camera().dof_blur_at(0, 600.0),
+            None,
+            "sharp at the start"
+        );
+        assert!(
+            back.camera().dof_blur_at(24, 600.0).is_some(),
+            "soft at the end"
+        );
     }
 
     /// Every file written before version 34 has no `focus_keys`, and must go on
@@ -5351,7 +6171,10 @@ mod layer_alpha_tests {
             cam.enabled = true;
             cam.aperture = 0.03;
             cam.focus_depth = 250.0;
-            cam.set_key(buzz_scene::CameraKey::new(0, buzz_geom::Point::new(10.0, 20.0)));
+            cam.set_key(buzz_scene::CameraKey::new(
+                0,
+                buzz_geom::Point::new(10.0, 20.0),
+            ));
             cam.save_angle("Wide", 0);
             cam.save_angle("Close", 0);
         }
@@ -5362,7 +6185,10 @@ mod layer_alpha_tests {
         assert!((back.camera().aperture - 0.03).abs() < 1e-9);
         assert!((back.camera().focus_depth - 250.0).abs() < 1e-9);
         assert_eq!(back.camera().angles.len(), 2);
-        assert_eq!(back.camera().angle("Close").map(|a| a.name.as_str()), Some("Close"));
+        assert_eq!(
+            back.camera().angle("Close").map(|a| a.name.as_str()),
+            Some("Close")
+        );
     }
 
     /// A nonsense value in a file cannot make a layer invisible.
@@ -5392,5 +6218,536 @@ mod layer_alpha_tests {
                 assert_eq!(layer.alpha, want, "{written} should have been clamped");
             }
         }
+    }
+
+    #[test]
+    fn layer_effects_and_blend_survive_the_round_trip() {
+        let mut scene = Scene::default();
+        let id = scene.add_layer("EffectLayer", LayerKind::Normal);
+        scene.update_layer(id, |l| {
+            l.brightness = 0.35;
+            l.tint = Color::from_rgb8(0xFF, 0x80, 0x40);
+            l.tint_amount = 0.75;
+            l.blend = buzz_scene::Blend::Multiply;
+        });
+
+        let back = DocumentDto::from_scene(&scene)
+            .to_scene()
+            .expect("round trip");
+        let back_layer = back
+            .layers()
+            .iter()
+            .find(|l| l.name == "EffectLayer")
+            .expect("layer exists");
+        assert!((back_layer.brightness - 0.35).abs() < 1e-6);
+        assert_eq!(back_layer.tint, Color::from_rgb8(0xFF, 0x80, 0x40));
+        assert!((back_layer.tint_amount - 0.75).abs() < 1e-6);
+        assert_eq!(back_layer.blend, buzz_scene::Blend::Multiply);
+    }
+}
+
+/// Scenes with a rig keyed many times, shared by the tests that care how much
+/// a keyframe costs on disk.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use buzz_geom::{Point, Shape as _};
+
+    /// One rig on one layer, keyed every second frame `keys` times.
+    ///
+    /// The rig has a heavy skinned part (`points` path points, so its weights
+    /// are heavy too) and a light rigid one, and every key is made the way
+    /// `perform` makes it: the object cloned and re-posed, so the parts are
+    /// the very same allocations in every key. Halfway through, the light
+    /// part is swapped for a differently coloured one, as a mouth swap would.
+    pub(crate) fn keyed_rig_scene(keys: u32, points: usize) -> Scene {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Character", LayerKind::Normal);
+
+        let mut armature = buzz_rig::Armature::new(Point::new(0.0, 0.0));
+        armature.push(buzz_rig::Bone::new("hips", None, 60.0, 0.0));
+        armature.push(buzz_rig::Bone::new("arm", Some(0), 40.0, 0.5));
+        let mut rig = buzz_scene::ArmatureData::new(armature);
+
+        let mut path = BezPath::new();
+        path.move_to(Point::new(0.0, 0.0));
+        for i in 0..points {
+            path.line_to(Point::new(i as f64 * 1.25, ((i * 37) % 64) as f64 * 0.5));
+        }
+        path.close_path();
+        // Weights set by hand, to numbers that are exact in binary: a skin
+        // computed by `bind_shape` holds long fractions that JSON can carry
+        // only to the last bit or so, which would make an exact-equality test
+        // about the number parser rather than about the format.
+        rig.parts.push(buzz_scene::RigPart {
+            artwork: Arc::new(Object::shape(
+                ObjectId(50),
+                ShapeData::filled(path, Color::from_rgb8(0x88, 0x44, 0x22)),
+            )),
+            binding: buzz_scene::RigBinding::Skin(buzz_rig::SkinBinding {
+                points: (0..=points)
+                    .map(|i| {
+                        let near = 0.25 * (i % 4) as f64;
+                        vec![(0, 1.0 - near), (1, near)]
+                    })
+                    .collect(),
+            }),
+        });
+        rig.bind_rigid(Arc::new(light_part(Color::WHITE)), 1);
+
+        scene.add_object(
+            layer,
+            Object {
+                id: ObjectId(60),
+                name: Some("Rig".into()),
+                transform: Affine::translate((5.0, 5.0)),
+                kind: ObjectKind::Armature(rig),
+                locked: false,
+                visible: true,
+                filters: Vec::new(),
+                blend: Default::default(),
+                spatial: Default::default(),
+                pivot: None,
+                modifiers: Vec::new(),
+                text: None,
+                turnaround: Default::default(),
+            },
+        );
+
+        scene.update_layer(layer, |l| {
+            if l.frames.length() <= keys * 2 {
+                l.frames.insert_frame(keys * 2);
+            }
+        });
+        for k in 0..keys {
+            let frame = k * 2;
+            scene.ensure_keyframe(layer, frame);
+            scene.update_object_at(frame, ObjectId(60), |object| {
+                let ObjectKind::Armature(rig) = &mut object.kind else {
+                    return;
+                };
+                rig.armature.set_pose(&[0.0, 0.125 * k as f64]);
+                if k == keys / 2 {
+                    rig.parts[1].artwork = Arc::new(light_part(Color::from_rgb8(0xCC, 0x22, 0x22)));
+                }
+            });
+        }
+        scene
+    }
+
+    /// The document as the version-45 writer wrote it: every armature carries
+    /// its parts in full and there is no table. Built from the typed DTO, so
+    /// the field order and omissions are exactly the old struct's.
+    pub(crate) fn as_version_45(mut dto: DocumentDto) -> DocumentDto {
+        fn inline(object: &mut ObjectDto, table: &[RigPartDto]) {
+            match &mut object.kind {
+                ObjectKindDto::Armature {
+                    parts, part_refs, ..
+                } => {
+                    for slot in std::mem::take(part_refs) {
+                        let mut part = table[slot as usize].clone();
+                        inline(&mut part.artwork, table);
+                        parts.push(part);
+                    }
+                }
+                ObjectKindDto::Group { children } => {
+                    children.iter_mut().for_each(|c| inline(c, table))
+                }
+                _ => {}
+            }
+        }
+        fn layers(layers: &mut [LayerDto], table: &[RigPartDto]) {
+            for layer in layers {
+                for key in &mut layer.keyframes {
+                    key.objects.iter_mut().for_each(|o| inline(o, table));
+                }
+            }
+        }
+        let table = std::mem::take(&mut dto.rig_parts);
+        layers(&mut dto.layers, &table);
+        for symbol in &mut dto.library.symbols {
+            layers(&mut symbol.layers, &table);
+        }
+        dto.format_version = 45;
+        dto
+    }
+
+    fn light_part(colour: Color) -> Object {
+        Object::shape(
+            ObjectId(51),
+            ShapeData::filled(
+                kurbo::Rect::new(190.0, 90.0, 210.0, 110.0).to_path(1e-9),
+                colour,
+            ),
+        )
+    }
+}
+
+/// A rig keyed many times is written once, however many keys hold it.
+#[cfg(test)]
+mod rig_part_table_tests {
+    use super::test_support::keyed_rig_scene;
+    use super::*;
+
+    /// Every layer of the scene, stage first and then the symbols, as plain
+    /// values to compare.
+    fn layers_of(scene: &Scene) -> Vec<Layer> {
+        let mut out: Vec<Layer> = scene.stage_layers().iter().map(|l| (**l).clone()).collect();
+        for symbol in scene.library().iter() {
+            out.extend(symbol.layers.iter().map(|l| (**l).clone()));
+        }
+        out
+    }
+
+    fn json_of(scene: &Scene) -> String {
+        serde_json::to_string(&DocumentDto::from_scene(scene)).expect("serialise")
+    }
+
+    fn read(json: &str) -> Scene {
+        serde_json::from_str::<DocumentDto>(json)
+            .expect("deserialise")
+            .to_scene()
+            .expect("to scene")
+    }
+
+    /// Saving the loaded scene writes the same layers, library and part table
+    /// as saving the original did: nothing was lost or reordered on the way.
+    /// (Not the whole document: a loaded scene gains the default palette.)
+    fn assert_same_written_artwork(original: &Scene, loaded: &Scene) {
+        let written = |scene: &Scene| {
+            let dto = DocumentDto::from_scene(scene);
+            (
+                serde_json::to_string(&dto.layers).unwrap(),
+                serde_json::to_string(&dto.library).unwrap(),
+                serde_json::to_string(&dto.rig_parts).unwrap(),
+                dto.max_id,
+            )
+        };
+        let (a, b) = (written(original), written(loaded));
+        assert_eq!(a.0, b.0, "the layers were written differently");
+        assert_eq!(a.1, b.1, "the library was written differently");
+        assert_eq!(a.2, b.2, "the part table was written differently");
+        assert_eq!(a.3, b.3);
+    }
+
+    /// The artwork of one part of the one rig, in every key that holds it.
+    fn artworks(scene: &Scene, part: usize) -> Vec<Arc<Object>> {
+        let layer = scene.stage_layers().iter().next().expect("the layer");
+        layer
+            .frames
+            .keyframes()
+            .iter()
+            .flat_map(|k| k.objects.iter())
+            .filter_map(|o| match &o.kind {
+                ObjectKind::Armature(rig) => Some(rig.parts[part].artwork.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **The point of the change.** Forty keys of one rig cost one copy of its
+    /// artwork plus forty small poses, not forty copies of the artwork.
+    #[test]
+    fn a_rig_keyed_forty_times_writes_its_artwork_once() {
+        let one = DocumentDto::from_scene(&keyed_rig_scene(1, 2000));
+        let forty_scene = keyed_rig_scene(40, 2000);
+        let forty = DocumentDto::from_scene(&forty_scene);
+
+        // Three distinct parts: the heavy skinned one, and the light one in
+        // its two colours.
+        assert_eq!(one.rig_parts.len(), 2);
+        assert_eq!(forty.rig_parts.len(), 3);
+
+        let heavy = serde_json::to_string(&one.rig_parts[0]).unwrap().len();
+        let json_one = serde_json::to_string(&one).unwrap().len();
+        let json_forty = serde_json::to_string(&forty).unwrap().len();
+        let per_key = (json_forty - json_one) / 39;
+        assert!(heavy > 30_000, "the heavy part should be heavy: {heavy}");
+        assert!(
+            per_key * 10 < heavy,
+            "each extra key costs {per_key} bytes against {heavy} for the artwork"
+        );
+        // And in absolute terms: the whole forty-key document is a small
+        // multiple of one copy of the artwork, where it was forty times it.
+        assert!(
+            json_forty < heavy * 3,
+            "{json_forty} bytes for forty keys of a {heavy} byte rig"
+        );
+
+        // No key carries a part in full.
+        let value = serde_json::to_value(&forty).unwrap();
+        fn count_inline_parts(v: &serde_json::Value) -> usize {
+            match v {
+                serde_json::Value::Object(map) => {
+                    let here = map
+                        .get("kind")
+                        .and_then(|k| k.as_object())
+                        .filter(|k| k.get("type").and_then(|t| t.as_str()) == Some("armature"))
+                        .map(|k| k.contains_key("parts") as usize)
+                        .unwrap_or(0);
+                    here + map.values().map(count_inline_parts).sum::<usize>()
+                }
+                serde_json::Value::Array(items) => items.iter().map(count_inline_parts).sum(),
+                _ => 0,
+            }
+        }
+        assert_eq!(count_inline_parts(&value["layers"]), 0);
+    }
+
+    /// Save, load: the scene comes back equal, key for key.
+    #[test]
+    fn a_rig_keyed_many_times_round_trips_exactly() {
+        let scene = keyed_rig_scene(40, 200);
+        let json = json_of(&scene);
+        let back = read(&json);
+
+        assert_eq!(layers_of(&back), layers_of(&scene), "the layers differ");
+        assert_same_written_artwork(&scene, &back);
+
+        // The pose is per key, so it must be per key coming back too.
+        let layer = back.stage_layers().iter().next().unwrap();
+        let angles: Vec<f64> = layer
+            .frames
+            .keyframes()
+            .iter()
+            .filter_map(|k| match &k.objects[0].kind {
+                ObjectKind::Armature(rig) => Some(rig.armature.bones[1].angle),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(angles.len(), 40);
+        for (k, angle) in angles.iter().enumerate() {
+            assert_eq!(*angle, 0.125 * k as f64, "key {k} lost its pose");
+        }
+    }
+
+    /// Keys that read the same slot share the one allocation in memory too, so
+    /// opening the file does not bring the duplication back.
+    #[test]
+    fn keys_reading_one_slot_share_its_artwork_in_memory() {
+        let back = read(&json_of(&keyed_rig_scene(40, 200)));
+        let heavy = artworks(&back, 0);
+        assert_eq!(heavy.len(), 40);
+        assert!(heavy.iter().all(|a| Arc::ptr_eq(a, &heavy[0])));
+        // The light part has two versions, and each is shared by its keys.
+        let light = artworks(&back, 1);
+        let mut distinct: Vec<&Arc<Object>> = Vec::new();
+        for a in &light {
+            if !distinct.iter().any(|d| Arc::ptr_eq(d, a)) {
+                distinct.push(a);
+            }
+        }
+        assert_eq!(distinct.len(), 2);
+    }
+
+    /// Parts that are equal but were allocated separately (a rig pasted
+    /// twice, a document opened from an older file) are still one slot.
+    #[test]
+    fn equal_parts_in_separate_allocations_share_a_slot() {
+        let mut scene = keyed_rig_scene(10, 50);
+        let baseline = DocumentDto::from_scene(&scene).rig_parts.len();
+
+        // Replace each key's parts by deep copies, each in its own allocation.
+        for k in 0..10u32 {
+            scene.update_object_at(k * 2, ObjectId(60), |object| {
+                if let ObjectKind::Armature(rig) = &mut object.kind {
+                    for part in &mut rig.parts {
+                        part.artwork = Arc::new((*part.artwork).clone());
+                    }
+                }
+            });
+        }
+        let dto = DocumentDto::from_scene(&scene);
+        assert_eq!(dto.rig_parts.len(), baseline, "copies got slots of their own");
+        assert_eq!(layers_of(&read(&json_of(&scene))), layers_of(&scene));
+    }
+
+    /// A part that differs in anything at all gets a slot of its own.
+    #[test]
+    fn parts_that_differ_do_not_share_a_slot() {
+        let mut scene = keyed_rig_scene(6, 20);
+        let before = DocumentDto::from_scene(&scene).rig_parts.len();
+        scene.update_object_at(0, ObjectId(60), |object| {
+            if let ObjectKind::Armature(rig) = &mut object.kind {
+                // Same artwork, a different bone: the binding differs.
+                rig.parts[1].binding = buzz_scene::RigBinding::Rigid(0);
+            }
+        });
+        let dto = DocumentDto::from_scene(&scene);
+        assert_eq!(dto.rig_parts.len(), before + 1);
+        assert_eq!(layers_of(&read(&json_of(&scene))), layers_of(&scene));
+    }
+
+    /// A rig inside a symbol, and a rig inside a rig, are pooled too.
+    #[test]
+    fn rigs_in_symbols_and_rigs_inside_rigs_round_trip() {
+        let mut scene = keyed_rig_scene(5, 30);
+        let inner = scene
+            .stage_layers()
+            .iter()
+            .next()
+            .unwrap()
+            .frames
+            .keyframes()[0]
+            .objects[0]
+            .clone();
+
+        // The rig again, as the artwork of one part of a second rig.
+        let mut outer = buzz_scene::ArmatureData::new({
+            let mut a = buzz_rig::Armature::new(buzz_geom::Point::new(0.0, 0.0));
+            a.push(buzz_rig::Bone::new("root", None, 10.0, 0.0));
+            a
+        });
+        outer.bind_rigid(inner.clone(), 0);
+
+        let symbol = scene.add_symbol("Holder", buzz_scene::SymbolKind::MovieClip, None);
+        let symbol_layer = scene.library().get(symbol).unwrap().layers.iter().next().unwrap().id;
+        let outer_object = Object {
+            id: ObjectId(900),
+            name: None,
+            transform: Affine::IDENTITY,
+            kind: ObjectKind::Armature(outer),
+            locked: false,
+            visible: true,
+            filters: Vec::new(),
+            blend: Default::default(),
+            spatial: Default::default(),
+            pivot: None,
+            modifiers: Vec::new(),
+            text: None,
+            turnaround: Default::default(),
+        };
+        scene.library_mut().update(symbol, |s| {
+            s.layers.update(symbol_layer, |l| {
+                l.push_object_at(0, Arc::new(outer_object));
+            });
+        });
+
+        let json = json_of(&scene);
+        let dto: DocumentDto = serde_json::from_str(&json).unwrap();
+        // The inner rig's parts come before the part that holds the inner rig.
+        let holder = dto
+            .rig_parts
+            .iter()
+            .position(|p| matches!(&p.artwork.kind, ObjectKindDto::Armature { .. }))
+            .expect("a part that is itself a rig");
+        assert!(holder >= 2, "the inner parts must have earlier slots");
+        let back = read(&json);
+        assert_eq!(layers_of(&back), layers_of(&scene));
+        assert_same_written_artwork(&scene, &back);
+    }
+
+    // -- older files ----------------------------------------------------------
+
+    /// Written by the version-45 writer, before the table existed: every key
+    /// carries its parts in full. It must still load, and be the same scene.
+    ///
+    /// The fixture's layout was checked byte for byte against a file the
+    /// version-45 writer itself wrote of the same scene (with weights from
+    /// `bind_shape`); the weights here are set to exact numbers so that
+    /// equality is about the layout and not the last bit of a float parse.
+    #[test]
+    fn a_version_45_file_with_parts_written_in_every_key_still_loads() {
+        let json = include_str!("../tests/fixtures/rig_keyed_v45.json");
+        assert!(json.contains("\"parts\""), "the fixture is not the old layout");
+        assert!(!json.contains("rig_parts") && !json.contains("part_refs"));
+
+        let loaded = read(json);
+        assert_eq!(layers_of(&loaded), layers_of(&keyed_rig_scene(4, 4)));
+
+        // And saving it again moves it to the new layout without changing it.
+        let resaved = json_of(&loaded);
+        assert!(resaved.contains("rig_parts"));
+        assert!(resaved.len() < json.len());
+        assert_eq!(layers_of(&read(&resaved)), layers_of(&loaded));
+    }
+
+    /// A forty-key file in the old layout loads, and saving it again shrinks
+    /// it by the factor the table is for, without changing the scene.
+    #[test]
+    fn an_old_layout_file_with_many_keys_shrinks_when_it_is_saved_again() {
+        let scene = keyed_rig_scene(40, 500);
+        let old = serde_json::to_string(&test_support::as_version_45(
+            DocumentDto::from_scene(&scene),
+        ))
+        .unwrap();
+        assert!(old.contains("\"parts\"") && !old.contains("part_refs"));
+
+        let loaded = read(&old);
+        assert_eq!(layers_of(&loaded), layers_of(&scene));
+
+        let resaved = json_of(&loaded);
+        assert!(
+            resaved.len() * 8 < old.len(),
+            "{} bytes became {} bytes",
+            old.len(),
+            resaved.len()
+        );
+        // Matched by content: the copies the old file held in separate
+        // allocations came back down to the three distinct parts.
+        let table = DocumentDto::from_scene(&loaded).rig_parts.len();
+        assert_eq!(table, 3);
+        assert_eq!(layers_of(&read(&resaved)), layers_of(&scene));
+    }
+
+    /// An older file with parts in full and a table in the same document (a
+    /// hand merge, or a later build writing both) loads both kinds.
+    #[test]
+    fn inline_parts_and_table_parts_can_share_a_document() {
+        let scene = keyed_rig_scene(3, 10);
+        let mut value = serde_json::to_value(DocumentDto::from_scene(&scene)).unwrap();
+        // Turn the first key's refs back into inline parts, leave the rest.
+        let table = value["rig_parts"].clone();
+        let kind = &mut value["layers"][0]["keyframes"][0]["objects"][0]["kind"];
+        let refs: Vec<usize> = kind["part_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_u64().unwrap() as usize)
+            .collect();
+        kind.as_object_mut().unwrap().remove("part_refs");
+        kind["parts"] = serde_json::Value::Array(refs.iter().map(|&r| table[r].clone()).collect());
+
+        let back = read(&value.to_string());
+        assert_eq!(layers_of(&back), layers_of(&scene));
+    }
+
+    /// A slot that is not in the table is refused in words, not a panic.
+    #[test]
+    fn a_part_ref_outside_the_table_is_refused() {
+        let scene = keyed_rig_scene(2, 10);
+        let mut value = serde_json::to_value(DocumentDto::from_scene(&scene)).unwrap();
+        value["layers"][0]["keyframes"][0]["objects"][0]["kind"]["part_refs"] =
+            serde_json::json!([0, 99]);
+        let dto: DocumentDto = serde_json::from_value(value).unwrap();
+        match dto.to_scene() {
+            Err(SerialError::Unsupported(message)) => assert!(message.contains("99"), "{message}"),
+            other => panic!("expected a refusal, got {:?}", other.map(|_| "a scene")),
+        }
+    }
+
+    /// A table slot may refer only backwards, so a file whose slot refers to
+    /// itself cannot send the loader round in a circle.
+    #[test]
+    fn a_table_slot_that_refers_to_itself_is_refused() {
+        let scene = keyed_rig_scene(2, 10);
+        let mut value = serde_json::to_value(DocumentDto::from_scene(&scene)).unwrap();
+        // A part whose artwork is a rig that names slot 0 — itself.
+        let mut part = value["rig_parts"][0].clone();
+        part["artwork"]["kind"] = serde_json::json!({
+            "type": "armature", "root": [0, 0], "bones": [], "part_refs": [0]
+        });
+        value["rig_parts"] = serde_json::json!([part]);
+        let dto: DocumentDto = serde_json::from_value(value).unwrap();
+        assert!(matches!(dto.to_scene(), Err(SerialError::Unsupported(_))));
+    }
+
+    /// A document with no rig writes no table at all.
+    #[test]
+    fn a_document_with_no_rig_writes_no_table() {
+        let mut scene = Scene::empty();
+        scene.add_layer("Plain", LayerKind::Normal);
+        let value = serde_json::to_value(DocumentDto::from_scene(&scene)).unwrap();
+        assert!(value.get("rig_parts").is_none());
     }
 }

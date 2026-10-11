@@ -1,0 +1,24 @@
+# Diagnose blank stage when importing Adobe Animate .fla files
+
+Opening an `.fla` file shows layers but a blank stage, meaning the XFL importer builds layer structure successfully yet produces no visible objects (or invisible ones). The import path is `crates/buzz-app/src/import.rs → buzz_import_xfl::import`, so the defect lives in how shapes/frames are turned into scene objects. Plan: trace object creation in the importer and fix where geometry/fill/frame placement drops out.
+
+## Steps
+
+1. Read crates/buzz-import-xfl/src/lib.rs end-to-end; map how timeline XML (DOMLayer/DOMKeyFrame/DOMShape) becomes buzz_scene layers and objects. Identify where shapes should be emitted and check for silent drops: unsupported shape types skipped without report entries, empty fills, or frames indexed so nothing lands on frame 0.
+   - files: crates/buzz-import-xfl/src/lib.rs
+   - verify: Pinpoint the exact code path that leaves layers with zero objects (or objects with empty/transparent geometry).
+
+2. Check coordinate/transform handling: XFL uses a Y-up-ish coordinate space and per-frame transforms; verify imported object positions land inside stage_rect() and aren't scaled to ~0 or offset off-stage. Also check frame-index mapping (XFL frames are 1-based) so keyframes attach to the right Layer::objects_at index.
+   - files: crates/buzz-import-xfl/src/lib.rs, crates/buzz-scene/src/layer.rs
+   - verify: Add a small unit test importing a minimal synthetic .xfl/.fla fixture with one solid shape and assert the resulting Scene has ≥1 object with non-empty bounds at frame 0.
+
+3. Fix the identified drop (most likely: missing/incorrect transform or fill conversion, or objects attached to wrong frames). Re-run the new test plus existing buzz-import-xfl tests.
+   - files: crates/buzz-import-xfl/src/lib.rs
+   - verify: cargo test -p buzz-import-xfl passes; open a real .fla in BuzzAnimate and confirm shapes appear on stage.
+
+## Risks
+- Without the user's actual .fla file, root cause is inferred from code reading — if multiple shape types (e.g. gradient/bitmap fills) are unsupported, the blank stage may be by-design partial import rather than a bug.
+- A synthetic fixture test approximates real Animate output; field testing with an actual .fla is still needed.
+
+## Open questions
+- Do you have the specific .fla file that loads blank? It would let me reproduce and confirm the exact failure mode during implementation.

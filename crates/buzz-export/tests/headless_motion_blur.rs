@@ -149,7 +149,9 @@ fn a_still_shape_is_untouched_by_the_shutter() {
         let shuttered = with_shutter(document(0.0), 16);
 
         let clean = exporter.render(&still, 12, &settings).expect("clean");
-        let shot = exporter.render(&shuttered, 12, &settings).expect("shuttered");
+        let shot = exporter
+            .render(&shuttered, 12, &settings)
+            .expect("shuttered");
 
         let differing = clean
             .pixels

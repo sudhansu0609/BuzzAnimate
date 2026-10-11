@@ -197,7 +197,8 @@ impl SoundBank {
     pub fn refresh_cues(&mut self, scene: &Scene) {
         if self.cued_revision != Some(scene.revision()) {
             self.clips.retain(|id, _| scene.sounds().get(*id).is_some());
-            self.failed.retain(|id, _| scene.sounds().get(*id).is_some());
+            self.failed
+                .retain(|id, _| scene.sounds().get(*id).is_some());
             self.rebuild_cues(scene);
         }
     }
@@ -246,7 +247,8 @@ impl SoundBank {
             }
         }
         self.clips.retain(|id, _| scene.sounds().get(*id).is_some());
-        self.failed.retain(|id, _| scene.sounds().get(*id).is_some());
+        self.failed
+            .retain(|id, _| scene.sounds().get(*id).is_some());
         self.rebuild_cues(scene);
     }
 
@@ -311,6 +313,31 @@ impl SoundBank {
                 let clip = self.clips.get(&cue.sound)?;
                 Some((cue.sound, cue.start_frame, Arc::clone(clip)))
             })
+    }
+
+    /// [`Self::stage_track`], but the clip is cut to the cue's own in/out
+    /// points (`SoundRef::trim_start`/`trim_end`) first — the section that
+    /// actually plays.
+    ///
+    /// Lip sync and phrase detection both search from the front of whatever
+    /// clip they are handed, so a sound trimmed to play only part of its own
+    /// file — a shot's Dialogue layer, trimmed to its own slice of a longer
+    /// master track, but equally any sound trimmed by hand — must be handed
+    /// only that slice, or analysis searches audio that never plays here at
+    /// all.
+    pub fn stage_track_trimmed(&self, scene: &Scene) -> Option<(SoundId, u32, Arc<Clip>)> {
+        let cue = scene
+            .stage_cues()
+            .into_iter()
+            .find(|cue| cue.sync.follows_timeline())
+            .or_else(|| scene.stage_cues().into_iter().next())?;
+        let clip = self.clips.get(&cue.sound)?;
+        let clip = if cue.trim_start > 0.0 || cue.trim_end.is_some() {
+            Arc::new(clip.trimmed(cue.trim_start, cue.trim_end))
+        } else {
+            Arc::clone(clip)
+        };
+        Some((cue.sound, cue.start_frame, clip))
     }
 }
 

@@ -36,7 +36,13 @@ fn rigged_editor() -> (Editor, ObjectId) {
     let id = id.expect("the limb");
 
     editor.doc.edit("Create Armature", |scene| {
-        rigging::rig_object(scene, 0, id, Point::new(100.0, 200.0), Point::new(200.0, 200.0));
+        rigging::rig_object(
+            scene,
+            0,
+            id,
+            Point::new(100.0, 200.0),
+            Point::new(200.0, 200.0),
+        );
     });
     editor.doc.edit("Add Bone", |scene| {
         rigging::add_bone(
@@ -56,7 +62,13 @@ fn rig_of(scene: &Scene, frame: u32, id: ObjectId) -> buzz_scene::ArmatureData {
     let object = scene
         .layers()
         .iter()
-        .flat_map(|l| l.frames.resolved_at(frame).iter().cloned().collect::<Vec<_>>())
+        .flat_map(|l| {
+            l.frames
+                .resolved_at(frame)
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
         .find(|o| o.id == id)
         .expect("the rigged object");
     match &object.kind {
@@ -112,7 +124,10 @@ fn a_saved_pose_puts_the_character_back_where_it_was() {
     pose_to(&mut editor, id, Point::new(140.0, 300.0));
     let moved = rig_of(editor.doc.scene(), 0, id).armature.pose();
     assert!(
-        moved.iter().zip(&reached).any(|(a, b)| (a - b).abs() > 0.05),
+        moved
+            .iter()
+            .zip(&reached)
+            .any(|(a, b)| (a - b).abs() > 0.05),
         "the second pose should differ from the first"
     );
 

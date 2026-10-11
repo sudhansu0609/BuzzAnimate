@@ -29,12 +29,10 @@ fn placed_frames(editor: &Editor) -> Vec<u32> {
         .expect("the sequence layer");
     (0..layer.frames.length())
         .filter(|f| {
-            layer
-                .frames
-                .resolved_at(*f)
-                .iter()
-                .any(|o| matches!(&o.kind, ObjectKind::Shape(s)
-                    if s.fill.as_ref().is_some_and(|f| matches!(f.paint, Paint::Image(_)))))
+            layer.frames.resolved_at(*f).iter().any(|o| {
+                matches!(&o.kind, ObjectKind::Shape(s)
+                    if s.fill.as_ref().is_some_and(|f| matches!(f.paint, Paint::Image(_))))
+            })
         })
         .collect()
 }

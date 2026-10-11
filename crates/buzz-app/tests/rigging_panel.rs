@@ -158,7 +158,15 @@ fn rigging_a_character_is_one_undo_step() {
         );
     }
     let layer = editor.selection.active_layer().expect("a layer");
-    assert_eq!(scene.layers().get(layer).expect("layer").objects_at(0).len(), 11);
+    assert_eq!(
+        scene
+            .layers()
+            .get(layer)
+            .expect("layer")
+            .objects_at(0)
+            .len(),
+        11
+    );
 }
 
 /// Clicking a slot and then the stage picks what is under the pointer, topmost
@@ -284,7 +292,10 @@ fn a_redrawn_part_replaces_the_one_on_its_bone() {
         .iter()
         .find(|p| matches!(p.binding, buzz_scene::RigBinding::Rigid(b) if b == slot))
         .expect("something on the left elbow");
-    assert_eq!(on_the_bone.artwork.id, redrawn, "the old drawing is still on");
+    assert_eq!(
+        on_the_bone.artwork.id, redrawn,
+        "the old drawing is still on"
+    );
 
     // The skeleton is untouched: same bone, same pose library.
     assert_eq!(data.armature.bones[slot], bone_before);

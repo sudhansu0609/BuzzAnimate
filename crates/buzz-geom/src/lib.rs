@@ -16,13 +16,13 @@ pub mod hit;
 pub mod path_edit;
 pub mod projection;
 pub mod recognise;
+pub mod warp;
 
 pub use boolean::{BoolOp, BooleanOptions, FillMode, boolean, boolean_many, union_all};
 pub use brush::{
     BrushBudget, BrushOutput, BrushProfile, Conditioning, PatternFit, StampPlan, StrokeSample,
-    TaperEnds,
-    WidthResponse, catmull_rom, catmull_rom_tense, centreline, fluid_outline, stabilise,
-    stamp_along, stamp_transforms,
+    TaperEnds, TipShape, WidthResponse, catmull_rom, catmull_rom_tense, centreline, fluid_outline,
+    stabilise, stamp_along, stamp_transforms,
 };
 pub use camera::{Camera, RebasedTransform, RenderSplit};
 pub use clip::RenderClip;
@@ -33,9 +33,14 @@ pub use edit::{
 pub use hit::{
     Hit, HitPart, HitTarget, NearestPoint, fill_contains, hit_test_all, hit_test_topmost,
 };
-pub use path_edit::{Anchor, anchors, move_anchor, nearest_anchor};
+pub use path_edit::{
+    Anchor, AnchorHandles, Handle, HandleSide, anchor_handles, anchors, delete_anchors, handles,
+    SegmentHit, bend_segment, is_smooth, move_anchor, move_anchors, move_handle, nearest_anchor,
+    nearest_segment, pull_out_handles, split_segment,
+};
 pub use projection::Projection;
 pub use recognise::{Recognised, Tolerance, recognise};
+pub use warp::{BilinearWarp, bilinear_warp, drag_corner, map_points, subdivide};
 
 /// Re-exported so downstream crates share one `kurbo` and one notion of `Point`.
 pub use kurbo::{Affine, BezPath, Circle, Line, PathEl, Point, Rect, Shape, Size, Vec2};

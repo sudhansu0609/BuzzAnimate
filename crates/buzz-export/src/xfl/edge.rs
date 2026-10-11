@@ -178,12 +178,7 @@ mod tests {
             )
         };
         let (l, r) = (extent(&left), extent(&right));
-        for (a, b) in [
-            (l.x0, r.x0),
-            (l.y0, r.y0),
-            (l.x1, r.x1),
-            (l.y1, r.y1),
-        ] {
+        for (a, b) in [(l.x0, r.x0), (l.y0, r.y0), (l.x1, r.x1), (l.y1, r.y1)] {
             assert!(
                 (a - b).abs() < tolerance,
                 "the shape moved: {l:?} became {r:?}"

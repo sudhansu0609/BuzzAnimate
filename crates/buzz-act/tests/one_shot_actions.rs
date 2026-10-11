@@ -19,13 +19,18 @@ fn joint(beat: &Beat, j: Joint) -> f64 {
 }
 
 /// Every one-shot, for the properties they all share.
-const ONE_SHOTS: [Action; 6] = [
+const ONE_SHOTS: [Action; 11] = [
     Action::Sit,
     Action::Stand,
     Action::Turn,
     Action::Point,
     Action::Reach,
     Action::React,
+    Action::Wave,
+    Action::Nod,
+    Action::HeadShake,
+    Action::Shrug,
+    Action::Namaste,
 ];
 
 /// **A one-shot happens once, however long the beat is.**
@@ -71,9 +76,15 @@ fn the_end_of_a_one_shot_is_not_its_beginning() {
 #[test]
 fn a_sit_ends_seated() {
     let sat = at(Action::Sit, 1.0);
-    assert!(joint(&sat, Joint::ThighL) > 1.0, "the thighs did not come up");
+    assert!(
+        joint(&sat, Joint::ThighL) > 1.0,
+        "the thighs did not come up"
+    );
     assert!(joint(&sat, Joint::KneeL) < -1.0, "the knees did not fold");
-    assert!(sat.offset.y > 15.0, "the body did not come down onto a seat");
+    assert!(
+        sat.offset.y > 15.0,
+        "the body did not come down onto a seat"
+    );
     // And back a little, because a chair is behind you.
     assert!(sat.offset.x < 0.0, "the sit went forwards");
 }
@@ -142,7 +153,10 @@ fn no_knee_ever_bends_backwards() {
 #[test]
 fn a_point_holds_through_the_middle() {
     let up = |u: f64| -joint(&at(Action::Point, u), Joint::ShoulderR);
-    assert!(up(0.0).abs() < 1e-9, "a point does not start with the arm up");
+    assert!(
+        up(0.0).abs() < 1e-9,
+        "a point does not start with the arm up"
+    );
     let held = up(0.5);
     assert!(held > 0.5, "the arm never came up: {held}");
     // Flat across the middle third, within a hair.
@@ -197,8 +211,15 @@ fn a_reaction_recoils_then_comes_back_past_rest() {
     assert!(back > 0.0, "the recoil never came back past rest: {back}");
 
     // And it is over by the end, so the beat composes with what follows.
-    assert!(head(1.0).abs() < 0.02, "the reaction never settled: {}", head(1.0));
-    assert!(away.abs() > back.abs(), "the settle should be smaller than the recoil");
+    assert!(
+        head(1.0).abs() < 0.02,
+        "the reaction never settled: {}",
+        head(1.0)
+    );
+    assert!(
+        away.abs() > back.abs(),
+        "the settle should be smaller than the recoil"
+    );
 }
 
 /// **A turn is led by the head and finished by the hips**, which is the order a
@@ -232,7 +253,17 @@ fn a_turn_is_led_by_the_head() {
 /// exception — it ends sat, because that is what sitting down is.
 #[test]
 fn a_one_shot_leaves_the_body_where_it_found_it() {
-    for action in [Action::Turn, Action::Point, Action::Reach, Action::React] {
+    for action in [
+        Action::Turn,
+        Action::Point,
+        Action::Reach,
+        Action::React,
+        Action::Wave,
+        Action::Nod,
+        Action::HeadShake,
+        Action::Shrug,
+        Action::Namaste,
+    ] {
         let done = at(action, 1.0);
         for j in Joint::ALL {
             assert!(
@@ -270,7 +301,7 @@ fn amount_scales_without_reshaping() {
 // The timing pass
 // ---------------------------------------------------------------------------
 
-use buzz_act::perform::{apply_from, Performance as Perf};
+use buzz_act::perform::{Performance as Perf, apply_from};
 use buzz_geom::Affine;
 use buzz_scene::{LayerKind, Scene};
 
@@ -355,7 +386,10 @@ fn easing_the_pacing_does_not_move_the_destination() {
         (arrived - 400.0).abs() < 12.0,
         "the walk was sent 400 units and arrived at {arrived:.1}"
     );
-    assert!(x_at(&scene, id, 0).abs() < 1e-6, "it did not start where it was placed");
+    assert!(
+        x_at(&scene, id, 0).abs() < 1e-6,
+        "it did not start where it was placed"
+    );
 }
 
 /// **Standing actions are not eased.**
@@ -366,13 +400,7 @@ fn easing_the_pacing_does_not_move_the_destination() {
 fn a_standing_action_keeps_its_even_pacing() {
     for action in [Action::Talk, Action::Idle] {
         let (mut scene, id) = stage();
-        apply_from(
-            &mut scene,
-            id,
-            &Perf::new(action, 0..96),
-            Affine::IDENTITY,
-        )
-        .expect("performs");
+        apply_from(&mut scene, id, &Perf::new(action, 0..96), Affine::IDENTITY).expect("performs");
         // Nothing travels, so the test is that the pose at the quarter point is
         // the pose the unmodified curve gives there — no re-timing applied.
         let quarter = pose_at(action, 0.25 * Perf::new(action, 0..96).cycles(24.0), 1.0);

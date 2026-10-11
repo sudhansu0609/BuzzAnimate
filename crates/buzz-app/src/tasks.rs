@@ -67,6 +67,9 @@ pub enum TaskKind {
     AssetScan,
     Thumbnails,
     Resample,
+    /// S9: preparing a document for playback (the warm-up at open).
+    Warm,
+    Ai,
 }
 
 impl TaskKind {
@@ -80,6 +83,8 @@ impl TaskKind {
             Self::AssetScan => "Assets",
             Self::Thumbnails => "Thumbnails",
             Self::Resample => "Resample",
+            Self::Warm => "Prepare",
+            Self::Ai => "AI",
         }
     }
 
@@ -93,7 +98,7 @@ impl TaskKind {
     pub fn can_cancel(self) -> bool {
         matches!(
             self,
-            Self::Export | Self::ConcatFilm | Self::Import | Self::Open | Self::Script
+            Self::Export | Self::ConcatFilm | Self::Import | Self::Open | Self::Script | Self::Warm | Self::Ai
         )
     }
 
@@ -536,7 +541,10 @@ mod tests {
             let _ = held.recv();
             TaskOutcome::Finished(String::new())
         });
-        assert!(registry.quit_blockers().is_empty(), "thumbnails blocked quit");
+        assert!(
+            registry.quit_blockers().is_empty(),
+            "thumbnails blocked quit"
+        );
 
         let held = gate_rx.clone();
         registry.spawn_thread(TaskKind::Export, "shot3.mp4", move |_| {

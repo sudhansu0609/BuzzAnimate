@@ -33,7 +33,9 @@ fn scene_with_object(transform: Affine) -> (Scene, buzz_scene::LayerId, ObjectId
         ShapeData::filled(Rect::new(-5.0, -5.0, 5.0, 5.0).to_path(1e-9), Color::WHITE),
     );
     object.transform = transform;
-    let id = scene.add_object(layer, object).expect("object went on a layer");
+    let id = scene
+        .add_object(layer, object)
+        .expect("object went on a layer");
     (scene, layer, id)
 }
 
@@ -74,17 +76,30 @@ fn the_object_starts_and_ends_on_the_path() {
 
     let report = follow_path(&mut scene, id, &path, &opts).expect("the path was written");
     assert!(report.keyframes > 1, "a path of one keyframe is a hold");
-    assert!((report.length - 200.0).abs() < 1.0, "arc length was {}", report.length);
+    assert!(
+        (report.length - 200.0).abs() < 1.0,
+        "arc length was {}",
+        report.length
+    );
 
     let start = translation(transform_at(&scene, layer, 0));
-    assert!(start.distance(Point::new(0.0, 0.0)) < 1.0, "started at {start:?}");
+    assert!(
+        start.distance(Point::new(0.0, 0.0)) < 1.0,
+        "started at {start:?}"
+    );
 
     let end = translation(transform_at(&scene, layer, 24));
-    assert!(end.distance(Point::new(100.0, 100.0)) < 1.0, "ended at {end:?}");
+    assert!(
+        end.distance(Point::new(100.0, 100.0)) < 1.0,
+        "ended at {end:?}"
+    );
 
     // Half way through a linear traverse of a 200-long path is the corner.
     let mid = translation(transform_at(&scene, layer, 12));
-    assert!(mid.distance(Point::new(100.0, 0.0)) < 1.5, "mid was {mid:?}, not the corner");
+    assert!(
+        mid.distance(Point::new(100.0, 0.0)) < 1.5,
+        "mid was {mid:?}, not the corner"
+    );
 }
 
 #[test]
@@ -127,8 +142,16 @@ fn moving_keeps_the_object_its_own_size_and_facing() {
 
     for frame in [0u32, 12, 24] {
         let t = transform_at(&scene, layer, frame);
-        assert!((angle(t) - 0.5).abs() < 1e-6, "frame {frame} turned to {}", angle(t));
-        assert!((scale_x(t) - 2.0).abs() < 1e-6, "frame {frame} rescaled to {}", scale_x(t));
+        assert!(
+            (angle(t) - 0.5).abs() < 1e-6,
+            "frame {frame} turned to {}",
+            angle(t)
+        );
+        assert!(
+            (scale_x(t) - 2.0).abs() < 1e-6,
+            "frame {frame} rescaled to {}",
+            scale_x(t)
+        );
     }
 }
 
@@ -145,7 +168,10 @@ fn orienting_turns_the_object_to_face_along_the_path() {
 
     // Frame 4 is on the eastbound leg (fraction 1/6): facing +x, angle ~0.
     let east = angle(transform_at(&scene, layer, 4));
-    assert!(east.abs() < 0.05, "on the first leg it faced {east} rad, not east");
+    assert!(
+        east.abs() < 0.05,
+        "on the first leg it faced {east} rad, not east"
+    );
 
     // Frame 20 is on the northbound leg (fraction 5/6): facing +y, angle ~pi/2.
     let north = angle(transform_at(&scene, layer, 20));
@@ -155,7 +181,10 @@ fn orienting_turns_the_object_to_face_along_the_path() {
     );
 
     // Orienting still preserves scale.
-    assert!((scale_x(transform_at(&scene, layer, 4)) - 2.0).abs() < 1e-6, "orient rescaled");
+    assert!(
+        (scale_x(transform_at(&scene, layer, 4)) - 2.0).abs() < 1e-6,
+        "orient rescaled"
+    );
 }
 
 #[test]

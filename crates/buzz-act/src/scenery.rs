@@ -32,9 +32,7 @@
 //! parallax the depth system already gives for free.
 
 use buzz_geom::{Conditioning, Point, StrokeSample};
-use buzz_scene::{
-    EffectKind, EffectStroke, LayerKind, Scene, effect_artwork,
-};
+use buzz_scene::{EffectKind, EffectStroke, LayerKind, Scene, effect_artwork};
 use peniko::Color;
 
 use crate::staging::Setting;
@@ -105,14 +103,19 @@ impl Scenery {
         let has = |words: &[&str]| words.iter().any(|w| lower.contains(w));
 
         if has(&[
-            "village", "hamlet", "cottage", "cottages", "farmstead", "settlement",
+            "village",
+            "hamlet",
+            "cottage",
+            "cottages",
+            "farmstead",
+            "settlement",
         ]) {
             // Checked before the city, because "the village street" is a
             // village and matching *street* first would put a skyline on it.
             Self::Village
         } else if has(&[
-            "city", "street", "town", "rooftop", "skyline", "alley", "downtown",
-            "pavement", "sidewalk",
+            "city", "street", "town", "rooftop", "skyline", "alley", "downtown", "pavement",
+            "sidewalk",
         ]) {
             Self::City
         } else if has(&["forest", "wood", "trees", "pine", "grove", "thicket"]) {
@@ -161,12 +164,7 @@ impl SceneryPart {
         }
     }
 
-    pub const ALL: [SceneryPart; 4] = [
-        Self::Trees,
-        Self::Grass,
-        Self::Buildings,
-        Self::Lamps,
-    ];
+    pub const ALL: [SceneryPart; 4] = [Self::Trees, Self::Grass, Self::Buildings, Self::Lamps];
 }
 
 /// **Your own drawings, in place of the brushes.**
@@ -453,7 +451,9 @@ pub fn lay_with(
         let mut register = |canvas: &buzz_scene::Canvas, brush: &buzz_scene::SoftBrush| {
             let id = scene.next_image_id();
             let asset_name = scene.images().unique_name(name);
-            scene.images_mut().insert(canvas.to_asset(id, asset_name, brush))
+            scene
+                .images_mut()
+                .insert(canvas.to_asset(id, asset_name, brush))
         };
         let shapes = buzz_scene::art::to_shapes(&pieces, &mut register);
         for shape in shapes {
@@ -727,10 +727,22 @@ mod tests {
     /// **The prose triggers read what a writer would write.**
     #[test]
     fn a_brief_names_its_own_scenery() {
-        assert_eq!(Scenery::from_prose("Night. A dark forest."), Scenery::Forest);
-        assert_eq!(Scenery::from_prose("Ana walks down the street."), Scenery::City);
-        assert_eq!(Scenery::from_prose("Day. A field of grass."), Scenery::Meadow);
-        assert_eq!(Scenery::from_prose("Sunset by the river."), Scenery::Waterside);
+        assert_eq!(
+            Scenery::from_prose("Night. A dark forest."),
+            Scenery::Forest
+        );
+        assert_eq!(
+            Scenery::from_prose("Ana walks down the street."),
+            Scenery::City
+        );
+        assert_eq!(
+            Scenery::from_prose("Day. A field of grass."),
+            Scenery::Meadow
+        );
+        assert_eq!(
+            Scenery::from_prose("Sunset by the river."),
+            Scenery::Waterside
+        );
         assert_eq!(Scenery::from_prose("Interior. A kitchen."), Scenery::Bare);
     }
 

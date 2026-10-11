@@ -160,11 +160,7 @@ pub fn sound_panel(
         .map(|c| c.seconds as f32)
         .unwrap_or(0.0);
     if duration > 0.0 {
-        ui.label(
-            RichText::new(format!("{duration:.2} s"))
-                .small()
-                .weak(),
-        );
+        ui.label(RichText::new(format!("{duration:.2} s")).small().weak());
     }
 
     // **Trim** — which seconds of the clip actually play. The in-point cuts a
@@ -392,7 +388,10 @@ mod tests {
         assert_eq!(swapped.sync, SoundSync::Event);
         assert_eq!(swapped.volume, 0.3);
         assert_eq!(swapped.loops, 4);
-        assert_eq!(swapped.trim_start, 1.5, "the trim in-point travels with the swap");
+        assert_eq!(
+            swapped.trim_start, 1.5,
+            "the trim in-point travels with the swap"
+        );
         assert_eq!(swapped.trim_end, Some(3.0), "and the out-point");
     }
 

@@ -27,7 +27,7 @@
 //!
 //! That is the whole design, and it falls out of the cache that already exists.
 
-use crate::{Light, LightKind, mix};
+use crate::{Light, LightKind, ShadowAdjustment, mix};
 use buzz_geom::Point;
 use peniko::Color;
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,8 @@ pub struct LightKey {
     pub softness: f64,
     pub standing_height: f64,
     pub shadow_strength: f32,
+    #[serde(default)]
+    pub shadow_adjustment: ShadowAdjustment,
     /// The kind and its numbers — azimuth/elevation for a sun, position/height/
     /// radius for a lamp, the horizon colour for a sky. Interpolated within a
     /// matching variant.
@@ -62,6 +64,7 @@ impl LightKey {
             softness: light.softness,
             standing_height: light.standing_height,
             shadow_strength: light.shadow_strength,
+            shadow_adjustment: light.shadow_adjustment,
             kind: light.kind,
         }
     }
@@ -141,6 +144,7 @@ impl LightTrack {
         light.softness = key.softness;
         light.standing_height = key.standing_height;
         light.shadow_strength = key.shadow_strength;
+        light.shadow_adjustment = key.shadow_adjustment;
         light.kind = key.kind;
         light
     }
@@ -197,7 +201,23 @@ fn lerp_key(a: &LightKey, b: &LightKey, t: f64) -> LightKey {
         softness: lerp(a.softness, b.softness, t),
         standing_height: lerp(a.standing_height, b.standing_height, t),
         shadow_strength: lerp(a.shadow_strength as f64, b.shadow_strength as f64, t) as f32,
+        shadow_adjustment: lerp_shadow(a.shadow_adjustment, b.shadow_adjustment, t),
         kind: lerp_kind(a.kind, b.kind, t),
+    }
+}
+
+fn lerp_shadow(a: ShadowAdjustment, b: ShadowAdjustment, t: f64) -> ShadowAdjustment {
+    ShadowAdjustment {
+        offset: buzz_geom::Vec2::new(
+            lerp(a.offset.x, b.offset.x, t),
+            lerp(a.offset.y, b.offset.y, t),
+        ),
+        scale_x: lerp(a.scale_x, b.scale_x, t),
+        scale_y: lerp(a.scale_y, b.scale_y, t),
+        rotation: lerp_angle(a.rotation, b.rotation, t),
+        skew_x: lerp(a.skew_x, b.skew_x, t),
+        skew_y: lerp(a.skew_y, b.skew_y, t),
+        pivot: Point::new(lerp(a.pivot.x, b.pivot.x, t), lerp(a.pivot.y, b.pivot.y, t)),
     }
 }
 
@@ -288,6 +308,7 @@ mod tests {
             softness: 0.35,
             standing_height: 40.0,
             shadow_strength: 0.45,
+            shadow_adjustment: ShadowAdjustment::default(),
             kind: LightKind::Sun {
                 azimuth: 0.0,
                 elevation,

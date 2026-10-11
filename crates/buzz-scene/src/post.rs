@@ -77,7 +77,10 @@ pub struct PosteriseSettings {
 
 impl Default for PosteriseSettings {
     fn default() -> Self {
-        Self { enabled: false, levels: 6 }
+        Self {
+            enabled: false,
+            levels: 6,
+        }
     }
 }
 
@@ -92,7 +95,10 @@ pub struct HalftoneSettings {
 
 impl Default for HalftoneSettings {
     fn default() -> Self {
-        Self { enabled: false, scale: 6.0 }
+        Self {
+            enabled: false,
+            scale: 6.0,
+        }
     }
 }
 
@@ -107,7 +113,10 @@ pub struct HatchingSettings {
 
 impl Default for HatchingSettings {
     fn default() -> Self {
-        Self { enabled: false, scale: 6.0 }
+        Self {
+            enabled: false,
+            scale: 6.0,
+        }
     }
 }
 

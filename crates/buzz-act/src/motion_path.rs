@@ -95,7 +95,9 @@ impl std::fmt::Display for MotionError {
         match self {
             MotionError::NoObject => write!(f, "select an object to send along the path"),
             MotionError::NoFrames => write!(f, "there are no frames in that range to fill"),
-            MotionError::EmptyPath => write!(f, "draw a longer path \u{2014} that one has no length"),
+            MotionError::EmptyPath => {
+                write!(f, "draw a longer path \u{2014} that one has no length")
+            }
         }
     }
 }

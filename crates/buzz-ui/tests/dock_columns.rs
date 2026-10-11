@@ -72,8 +72,19 @@ fn column_overflow(width: f32, draw: impl FnOnce(&mut egui::Ui)) -> f32 {
 /// them — which is also the longest a part name usually gets.
 fn rig_parts() -> Vec<LoosePart> {
     let names = [
-        "hips", "torso", "head", "L_upperArm", "L_forearm", "R_upperArm", "R_forearm", "L_thigh",
-        "L_shin", "R_thigh", "R_shin", "cape_back", "prop_walking_stick",
+        "hips",
+        "torso",
+        "head",
+        "L_upperArm",
+        "L_forearm",
+        "R_upperArm",
+        "R_forearm",
+        "L_thigh",
+        "L_shin",
+        "R_thigh",
+        "R_shin",
+        "cape_back",
+        "prop_walking_stick",
     ];
     names
         .iter()
@@ -128,7 +139,13 @@ fn the_library_and_the_assets_panel_fit_side_by_side_in_one_column() {
     let mut asset_state = AssetPanelState::default();
 
     let used = column_height(240.0, |ui| {
-        let _ = library_panel(ui, &mut scene, &mut lib_state, &Default::default(), &mut |_| None);
+        let _ = library_panel(
+            ui,
+            &mut scene,
+            &mut lib_state,
+            &Default::default(),
+            &mut |_| None,
+        );
         ui.separator();
         // No textures in a headless layout test: the thumbnails are what the
         // closure is for, and their absence does not change a column's width.
@@ -251,7 +268,10 @@ fn a_layer_row_fits_the_narrowest_column() {
     let long = scene.add_layer("Right forearm, overlap pass", LayerKind::Normal);
     scene.add_layer("Head", LayerKind::Normal);
 
-    for (what, active) in [("no layer selected", None), ("a layer selected", Some(long))] {
+    for (what, active) in [
+        ("no layer selected", None),
+        ("a layer selected", Some(long)),
+    ] {
         let mut selection = Selection::new();
         selection.set_active_layer(active);
 
@@ -285,7 +305,9 @@ fn the_library_fits_the_narrowest_column() {
     let mut state = LibraryState::default();
 
     let over = column_overflow(narrowest, |ui| {
-        let _ = library_panel(ui, &mut scene, &mut state, &Default::default(), &mut |_| None);
+        let _ = library_panel(ui, &mut scene, &mut state, &Default::default(), &mut |_| {
+            None
+        });
     });
 
     assert!(
@@ -366,7 +388,15 @@ fn every_docked_panel_fits_the_narrowest_column() {
     check(
         "Armature",
         column_overflow(narrowest, |ui| {
-            let _ = rig_panel(ui, None, &[], &[], None, &mut RigPanelState::default(), &mut Default::default());
+            let _ = rig_panel(
+                ui,
+                None,
+                &[],
+                &[],
+                None,
+                &mut RigPanelState::default(),
+                &mut Default::default(),
+            );
         }),
         &mut failures,
     );
@@ -377,14 +407,22 @@ fn every_docked_panel_fits_the_narrowest_column() {
     check(
         "Rigging",
         column_overflow(narrowest, |ui| {
-            let _ = rig_panel(ui, None, &[], &rig_parts(), None, &mut RigPanelState::default(), &mut Default::default());
+            let _ = rig_panel(
+                ui,
+                None,
+                &[],
+                &rig_parts(),
+                None,
+                &mut RigPanelState::default(),
+                &mut Default::default(),
+            );
         }),
         &mut failures,
     );
     check(
         "Filters",
         column_overflow(narrowest, |ui| {
-            let _ = filter_panel(ui, &[], None, &[], &mut filters, false);
+            let _ = filter_panel(ui, &[], None, &[], &mut filters, false, None);
         }),
         &mut failures,
     );
@@ -453,10 +491,6 @@ fn a_layer_that_is_not_selected_costs_one_row() {
         used / 10.0
     );
 }
-
-
-
-
 
 /// **A row's controls must still work when the row can be dragged.**
 ///

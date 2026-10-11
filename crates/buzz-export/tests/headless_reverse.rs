@@ -43,7 +43,9 @@ fn turnaround(rotation_y: f64) -> Scene {
             ShapeData::filled(square(), Color::from_rgb8(0x20, 0x40, 0xE0)),
         )),
     );
-    scene.add_object(layer, front).expect("the object on a layer");
+    scene
+        .add_object(layer, front)
+        .expect("the object on a layer");
     scene
 }
 
@@ -66,7 +68,8 @@ fn a_facing_object_shows_its_front_and_a_turned_one_its_back() {
     with_exporter(|exporter| {
         let facing = turnaround(0.0);
         let settings = ExportSettings::for_stage(&facing);
-        let (red_front, blue_front) = colour_tally(&exporter.render(&facing, 0, &settings).unwrap());
+        let (red_front, blue_front) =
+            colour_tally(&exporter.render(&facing, 0, &settings).unwrap());
         assert!(
             red_front > 2000 && red_front > blue_front,
             "facing the camera should be red (front): {red_front} red, {blue_front} blue"
@@ -116,7 +119,9 @@ fn multi_angle(rotation_y: f64, camera_yaw: f64) -> Scene {
             ShapeData::filled(square(), Color::from_rgb8(0x20, 0xE0, 0x40)),
         )),
     );
-    scene.add_object(layer, front).expect("the object on a layer");
+    scene
+        .add_object(layer, front)
+        .expect("the object on a layer");
 
     if camera_yaw != 0.0 {
         let cam = scene.camera_mut();

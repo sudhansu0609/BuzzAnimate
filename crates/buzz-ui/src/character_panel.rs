@@ -54,10 +54,17 @@ pub enum CastAction {
     /// **Re-skin the character**: repaint every part painted `from` with `to`,
     /// on every pose, and write it back so the change is the character's from
     /// now on.
-    Recolour { asset: Asset, from: Color, to: Color },
+    Recolour {
+        asset: Asset,
+        from: Color,
+        to: Color,
+    },
     /// Keep the current selection as a new character in the cast.
     AddSelection,
-    Rename { asset: Asset, name: String },
+    Rename {
+        asset: Asset,
+        name: String,
+    },
     Delete(Asset),
     /// Read the cast folder again.
     Rescan,
@@ -261,6 +268,10 @@ fn character_row(
             {
                 *action = Some(CastAction::Cast(asset.clone()));
             }
+            if let Some(kind) = asset.rig_kind {
+                ui.label(RichText::new(kind.label()).small().weak())
+                    .on_hover_text("How this character is rigged");
+            }
         });
     });
 }
@@ -389,6 +400,8 @@ mod tests {
             folder: CAST_FOLDER.into(),
             path: std::path::PathBuf::from("/cast/Ana.buzz"),
             animated: false,
+            rig_kind: None,
+            tags: Vec::new(),
         }
     }
 
@@ -417,15 +430,9 @@ mod tests {
                 ..Default::default()
             };
             let _ = ctx.run_ui(Default::default(), |ui| {
-                let _ = cast_panel(
-                    ui,
-                    &chars,
-                    &palette,
-                    &poses,
-                    &mut state,
-                    true,
-                    &mut |_| None,
-                );
+                let _ = cast_panel(ui, &chars, &palette, &poses, &mut state, true, &mut |_| {
+                    None
+                });
             });
         }
     }

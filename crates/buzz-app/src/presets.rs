@@ -135,7 +135,10 @@ mod tests {
         // SAFETY: the guard above makes this the only thread touching the env
         // var for the duration of the test.
         unsafe {
-            std::env::set_var("BUZZANIMATE_EXPORT_PRESETS", dir.path().join("presets.json"));
+            std::env::set_var(
+                "BUZZANIMATE_EXPORT_PRESETS",
+                dir.path().join("presets.json"),
+            );
         }
         (dir, guard)
     }
@@ -170,7 +173,10 @@ mod tests {
         let reloaded = PresetLibrary::load();
         assert!(reloaded.names().iter().any(|n| n == "Discord"));
         assert!(reloaded.is_user("Discord"));
-        assert!(!reloaded.is_user("YouTube 1080p"), "a built-in is not the user's");
+        assert!(
+            !reloaded.is_user("YouTube 1080p"),
+            "a built-in is not the user's"
+        );
     }
 
     #[test]

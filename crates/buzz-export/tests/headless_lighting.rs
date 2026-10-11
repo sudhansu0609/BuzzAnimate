@@ -620,7 +620,8 @@ fn a_skys_strength_changes_the_picture() {
         let id = scene.add_light(LightKind::sky());
         scene.lights_mut().base = Color::from_rgb8(0x20, 0x20, 0x20);
 
-        let read = |exporter: &mut Exporter, scene: &Scene| luma(render(exporter, scene).pixel(275, 225));
+        let read =
+            |exporter: &mut Exporter, scene: &Scene| luma(render(exporter, scene).pixel(275, 225));
 
         scene.lights_mut().get_mut(id).expect("the sky").intensity = 0.25;
         let dim = read(exporter, &scene);
@@ -744,10 +745,7 @@ fn a_gloom_leaves_the_picture_alone_past_its_throw() {
         });
         let with = render(exporter, &darkened);
 
-        let (before, after) = (
-            luma(without.pixel(520, 200)),
-            luma(with.pixel(520, 200)),
-        );
+        let (before, after) = (luma(without.pixel(520, 200)), luma(with.pixel(520, 200)));
         assert!(
             (before - after).abs() < 2.0,
             "two hundred units past the end of the throw, the picture must be \
@@ -900,7 +898,11 @@ fn a_fire_lamp_changes_from_frame_to_frame() {
             height: 110.0,
             radius: 320.0,
         });
-        scene.lights_mut().get_mut(id).expect("the lamp").make_fire();
+        scene
+            .lights_mut()
+            .get_mut(id)
+            .expect("the lamp")
+            .make_fire();
         assert!(scene.lights().animates(), "a fire animates with no keys");
 
         let settings = ExportSettings::for_stage(&scene);

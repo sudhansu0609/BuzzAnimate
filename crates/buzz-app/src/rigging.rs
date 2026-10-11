@@ -38,9 +38,11 @@
 use std::sync::Arc;
 
 use buzz_geom::{Affine, Point, Vec2};
-use buzz_rig::{Armature, Bone, IkOptions};
 use buzz_rig::RigPattern;
-use buzz_scene::{ArmatureData, Object, ObjectId, ObjectKind, Scene, WarpData};
+use buzz_rig::{Armature, Bone, IkOptions};
+use buzz_scene::{
+    ArmatureData, LayerId, LayerKind, Object, ObjectId, ObjectKind, RigBinding, Scene, WarpData,
+};
 
 /// Invert an affine, or `None` if it is singular.
 ///
@@ -351,6 +353,58 @@ pub fn stage_segments(scene: &Scene, frame: u32) -> Vec<(ObjectId, Vec<(Point, P
     out
 }
 
+/// The range each limited joint may turn through, on the stage, for drawing
+/// its wedge: the joint's head, the edges of the range as stage angles
+/// (radians, y down, sweeping clockwise from `from` to `to`), and whether the
+/// joint is locked.
+///
+/// An edge is the parent's world angle plus the stored limit — which is the
+/// bone's rest angle plus the relative range — so the wedge turns with the
+/// parent as the rig is posed. A free joint has no wedge.
+pub fn stage_joint_arcs(
+    scene: &Scene,
+    frame: u32,
+) -> Vec<(ObjectId, Vec<(Point, f64, f64, bool)>)> {
+    let mut out = Vec::new();
+    for layer in scene.layers().drawable_at(frame) {
+        for object in layer.objects_at(frame).iter() {
+            let ObjectKind::Armature(rig) = &object.kind else {
+                continue;
+            };
+            let armature = &rig.armature;
+            let joints = armature.joints();
+            let transform = object.transform;
+            // A mirrored rig turns the other way on the stage.
+            let flipped = transform.determinant() < 0.0;
+            let mut arcs = Vec::new();
+            for (index, bone) in armature.bones.iter().enumerate() {
+                let Some(limits) = bone.limits else { continue };
+                let Some(&(head, _)) = joints.get(index) else {
+                    continue;
+                };
+                let parent = bone.parent.map_or(0.0, |p| armature.world_angle(p));
+                let stage_angle = |angle: f64| {
+                    let along = transform * (head + Vec2::new(angle.cos(), angle.sin()))
+                        - transform * head;
+                    along.y.atan2(along.x)
+                };
+                let span = (limits.max - limits.min).max(0.0);
+                let from = if flipped {
+                    stage_angle(parent + limits.max)
+                } else {
+                    stage_angle(parent + limits.min)
+                };
+                let locked = bone.rotation_mode() == buzz_rig::RotationMode::Locked;
+                arcs.push((transform * head, from, from + span, locked));
+            }
+            if !arcs.is_empty() {
+                out.push((object.id, arcs));
+            }
+        }
+    }
+    out
+}
+
 /// Where warp handles sit on the stage.
 pub fn stage_handles(scene: &Scene, frame: u32) -> Vec<(ObjectId, Vec<(Point, bool)>)> {
     let mut out = Vec::new();
@@ -389,12 +443,66 @@ pub fn next_bone_name(armature: &Armature) -> String {
     format!("Bone {}", armature.len() + 1)
 }
 
-/// The bone the Properties panel should show for a selection.
-pub fn selected_bone(scene: &Scene, object: ObjectId) -> Option<Bone> {
+/// The bone the Bone tool last pressed on (`Editor::selected_bone`), if its
+/// rig is still an armature that has that bone.
+pub fn selected_bone(scene: &Scene, selected: Option<(ObjectId, usize)>) -> Option<Bone> {
+    let (object, index) = selected?;
     let (_, found) = scene.find_object(object)?;
     match &found.kind {
-        ObjectKind::Armature(rig) => rig.armature.bones.first().cloned(),
+        ObjectKind::Armature(rig) => rig.armature.bones.get(index).cloned(),
         _ => None,
+    }
+}
+
+/// Apply what the joint widget asked for to a skeleton.
+///
+/// A range copied to another bone keeps its numbers **relative to that bone's
+/// own rest angle**: "−150° … 0° from where it was drawn" means the same on
+/// every bone, whatever angle each one was drawn at. The chain is the bone and
+/// every bone hanging off it; nothing above it or beside it changes.
+pub fn apply_joint_edit(armature: &mut Armature, edit: &buzz_ui::joint_widget::JointEdit) {
+    use buzz_rig::JointLimits;
+    use buzz_ui::joint_widget::JointEdit;
+
+    let (targets, relative): (Vec<usize>, Option<JointLimits>) = match *edit {
+        JointEdit::Set { index, limits } => {
+            if let Some(bone) = armature.bones.get_mut(index) {
+                bone.limits = limits;
+            }
+            return;
+        }
+        JointEdit::ApplyToChain { index, limits } => {
+            let Some(rest) = armature.bones.get(index).map(|b| b.rest_angle) else {
+                return;
+            };
+            let relative = limits.map(|l| {
+                let (min, max) = l.relative_to(rest);
+                JointLimits::new(min, max)
+            });
+            (armature.subtree(index), relative)
+        }
+        JointEdit::ApplyToAll { limits } => ((0..armature.bones.len()).collect(), limits),
+    };
+
+    for index in targets {
+        if let Some(bone) = armature.bones.get_mut(index) {
+            bone.limits =
+                relative.map(|r| JointLimits::from_relative(bone.rest_angle, r.min, r.max));
+        }
+    }
+}
+
+/// The Rig panel's **Apply to this rig**: every bone the table names (by slot
+/// name) gets that row's limits about its own rest angle; a bone the table
+/// does not name is left as it is.
+pub fn apply_default_limits(armature: &mut Armature, table: &buzz_rig::JointLimitDefaults) {
+    for bone in &mut armature.bones {
+        if !table.rows.contains_key(&bone.name) {
+            continue;
+        }
+        bone.limits = table
+            .limits_for(&bone.name)
+            .map(|r| buzz_rig::JointLimits::from_relative(bone.rest_angle, r.min, r.max));
     }
 }
 
@@ -574,6 +682,317 @@ pub fn replace_part(scene: &mut Scene, rig: ObjectId, slot: usize, drawing: Obje
         done = true;
     });
     done
+}
+
+// ---------------------------------------------------------------------------
+// Rigging a character by layer parenting instead of bones.
+// ---------------------------------------------------------------------------
+
+/// A character rigged by layer parenting (Animate's Layer Parenting) rather
+/// than by bones: one layer per part, each part turning about its joint, each
+/// layer following the layer of the part it hangs off.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerRig {
+    /// `(slot, layer)` for every part, back to front. The slot is an index
+    /// into the pattern (or into the armature's bones, for a converted rig);
+    /// the layer is named after it.
+    pub layers: Vec<(usize, LayerId)>,
+    /// The layer of the first filled slot with no filled ancestor. Any other
+    /// part with no filled ancestor follows it, so the character moves as one.
+    pub root: LayerId,
+}
+
+/// One part of a layer rig before it is placed.
+struct LayerPart {
+    slot: usize,
+    name: String,
+    /// The artwork as it should stand, in the layer's coordinates.
+    artwork: Object,
+    /// The joint it turns about, in the layer's coordinates.
+    joint: Point,
+}
+
+/// Put each part alone on a new layer named after its slot (in front of
+/// `home`, back to front, in `home`'s folder), set its transformation point on
+/// its joint, and make each layer follow the layer of its nearest filled
+/// ancestor in `parents`.
+fn place_layer_rig(
+    scene: &mut Scene,
+    frame: u32,
+    home: LayerId,
+    parts: Vec<LayerPart>,
+    parents: &[Option<usize>],
+) -> Option<LayerRig> {
+    if parts.is_empty() {
+        return None;
+    }
+    let (home_parent, home_len) = scene
+        .layers()
+        .get(home)
+        .map_or((None, 1), |l| (l.parent, l.length()));
+
+    let mut layers: Vec<(usize, LayerId)> = Vec::new();
+    let mut anchor = home;
+    for part in parts {
+        let layer = scene.add_layer(part.name.clone(), LayerKind::Normal);
+        // `add_layer` puts it on top; move it to just in front of the last one
+        // placed, so the parts keep their paint order where the character was.
+        if let Some(index) = scene.layer_index(anchor) {
+            scene.reorder_layer(layer, index.saturating_sub(1));
+        }
+        scene.update_layer(layer, |l| {
+            l.parent = home_parent;
+            if l.length() < home_len {
+                l.frames.insert_frame(home_len - 1);
+            }
+        });
+        let mut artwork = part.artwork;
+        // In the object's own coordinates, as `Object::pivot` is stored.
+        artwork.pivot = invert(artwork.transform).map(|inverse| inverse * part.joint);
+        scene.add_object(layer, artwork)?;
+        layers.push((part.slot, layer));
+        anchor = layer;
+    }
+
+    let layer_of = |slot: usize| layers.iter().find(|(s, _)| *s == slot).map(|(_, l)| *l);
+    let ancestor_layer = |slot: usize| {
+        let mut current = parents.get(slot).copied().flatten();
+        // Bounded by the slot count, against a parent cycle.
+        for _ in 0..parents.len() {
+            let parent = current?;
+            if let Some(layer) = layer_of(parent) {
+                return Some(layer);
+            }
+            current = parents.get(parent).copied().flatten();
+        }
+        None
+    };
+    let root = layers
+        .iter()
+        .map(|(slot, _)| *slot)
+        .filter(|slot| ancestor_layer(*slot).is_none())
+        .min()
+        .and_then(layer_of)?;
+
+    for &(slot, layer) in &layers {
+        let parent = ancestor_layer(slot).or((layer != root).then_some(root));
+        if parent.is_some() {
+            scene.set_follows(layer, parent, frame);
+        }
+    }
+    Some(LayerRig { layers, root })
+}
+
+/// [`rig_character`], but rigged by **layer parenting** instead of bones.
+///
+/// One layer per filled slot, named after the slot, with the part alone on
+/// it; the part's transformation point on its joint — the head of the bone
+/// [`buzz_act::autorig::fit_slots`] fits to it, the same fitting
+/// [`rig_character`] uses — and its layer following the layer of the nearest
+/// filled ancestor slot. Posing is Free Transform rotation about the pivot.
+/// The parts leave their own layers; nothing moves. The caller wraps this in
+/// one `Document::edit`.
+pub fn rig_character_layers(
+    scene: &mut Scene,
+    frame: u32,
+    pattern: &RigPattern,
+    slots: &[Option<ObjectId>],
+) -> Option<LayerRig> {
+    // Paint order, as in `rig_character`.
+    let mut ordered: Vec<(usize, ObjectId)> = Vec::new();
+    let mut home = None;
+    for layer in scene.layers().selectable() {
+        for object in layer.objects_at(frame) {
+            if let Some(slot) = slots.iter().position(|s| *s == Some(object.id))
+                && slot < pattern.slots.len()
+            {
+                ordered.push((slot, object.id));
+                home = Some(layer.id);
+            }
+        }
+    }
+    let home = home?;
+
+    let taken: Vec<(usize, Arc<Object>)> = ordered
+        .iter()
+        .filter_map(|(slot, id)| scene.find_object(*id).map(|(_, art)| (*slot, art.clone())))
+        .collect();
+    let fitted = buzz_act::autorig::fit_slots(pattern, &taken);
+    let parts: Vec<LayerPart> = taken
+        .iter()
+        .map(|(slot, art)| LayerPart {
+            slot: *slot,
+            name: pattern.slots[*slot].name.clone(),
+            artwork: (**art).clone(),
+            // A drawing too small to measure turns about its own middle.
+            joint: fitted[*slot].map_or_else(|| art.bounds().center(), |(head, _)| head),
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    for (_, id) in &ordered {
+        scene.remove_object(*id);
+    }
+    let parents: Vec<Option<usize>> = pattern.slots.iter().map(|s| s.parent).collect();
+    place_layer_rig(scene, frame, home, parts, &parents)
+}
+
+/// **Bones → Layers.** Take a bone rig apart into a layer rig: each rigidly
+/// bound part on its own layer named after its bone, standing where the pose
+/// shows it (the pose becomes the layers' rest), its pivot on the bone's head,
+/// following the layer of its nearest ancestor bone that has a part.
+///
+/// Refuses (`None`, nothing changed) a rig with skinned artwork, which bends
+/// at the joints and cannot be one layer per bone.
+pub fn bones_to_layers(scene: &mut Scene, frame: u32, rig: ObjectId) -> Option<LayerRig> {
+    let (home, holder) = scene.find_object(rig)?;
+    let ObjectKind::Armature(data) = &holder.kind else {
+        return None;
+    };
+    let armature = &data.armature;
+    let mut parts = Vec::new();
+    for part in &data.parts {
+        let RigBinding::Rigid(bone) = part.binding else {
+            return None;
+        };
+        if bone >= armature.len() {
+            return None;
+        }
+        let mut artwork = (*part.artwork).clone();
+        artwork.transform = holder.transform * armature.pose_transform(bone) * artwork.transform;
+        parts.push(LayerPart {
+            slot: bone,
+            name: armature.bones[bone].name.clone(),
+            artwork,
+            joint: holder.transform * armature.head(bone),
+        });
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let parents: Vec<Option<usize>> = armature.bones.iter().map(|b| b.parent).collect();
+
+    scene.remove_object(rig);
+    place_layer_rig(scene, frame, home, parts, &parents)
+}
+
+/// Every armature on the stage at `frame` taken apart by [`bones_to_layers`]:
+/// `(converted, refused)`. A refused rig (skinned artwork) is left as it was.
+pub fn convert_all_to_layers(scene: &mut Scene, frame: u32) -> (usize, usize) {
+    let rigs: Vec<ObjectId> = scene
+        .layers()
+        .iter()
+        .flat_map(|l| l.objects_at(frame).iter())
+        .filter(|o| matches!(o.kind, ObjectKind::Armature(_)))
+        .map(|o| o.id)
+        .collect();
+    let mut converted = 0;
+    for &rig in &rigs {
+        if bones_to_layers(scene, frame, rig).is_some() {
+            converted += 1;
+        }
+    }
+    (converted, rigs.len() - converted)
+}
+
+/// The layer rig `layer` belongs to: every layer in its follow tree, from the
+/// top of the chain down, root first. `None` when the layer neither follows
+/// nor is followed — a lone layer is not a rig.
+pub fn layer_rig_of(scene: &Scene, layer: LayerId) -> Option<Vec<LayerId>> {
+    let layers = scene.layers();
+    layers.get(layer)?;
+    let mut root = layer;
+    // Bounded by the layer count, against a follow cycle in a corrupt file.
+    for _ in 0..layers.len() {
+        match layers.get(root).and_then(|l| l.follows) {
+            Some(up) if up != layer => root = up,
+            _ => break,
+        }
+    }
+    let mut tree = vec![root];
+    let mut index = 0;
+    while index < tree.len() {
+        for child in layers.followers_of(tree[index]) {
+            if !tree.contains(&child) {
+                tree.push(child);
+            }
+        }
+        index += 1;
+    }
+    (tree.len() > 1).then_some(tree)
+}
+
+/// The built-in pattern whose slot names match the most of these layers'
+/// names (ties to the pattern with fewer slots), for **Convert to bone rig**.
+/// `None` when no layer is named after any slot.
+pub fn pattern_for_layers(scene: &Scene, layers: &[LayerId]) -> Option<RigPattern> {
+    let names: Vec<&str> = layers
+        .iter()
+        .filter_map(|id| scene.layers().get(*id).map(|l| l.name.as_str()))
+        .collect();
+    RigPattern::builtin()
+        .into_iter()
+        .map(|p| (names.iter().filter(|n| p.slot_named(n).is_some()).count(), p))
+        .filter(|(hits, _)| *hits > 0)
+        .min_by(|(a, pa), (b, pb)| b.cmp(a).then(pa.slots.len().cmp(&pb.slots.len())))
+        .map(|(_, p)| p)
+}
+
+/// **Layers → Bones.** Rebuild a bone rig from a layer rig: each layer's slot
+/// is read back from its name in `pattern`, its first part at `frame` fills
+/// it, the pose the parenting shows is kept, the links are cut, and
+/// [`rig_character`] builds the armature. Layers left empty are removed.
+pub fn layers_to_bones(
+    scene: &mut Scene,
+    frame: u32,
+    pattern: &RigPattern,
+    layers: &[LayerId],
+) -> Option<ObjectId> {
+    let mut slots: Vec<Option<ObjectId>> = vec![None; pattern.slots.len()];
+    let mut baked: Vec<(ObjectId, Affine)> = Vec::new();
+    for &id in layers {
+        let Some(layer) = scene.layers().get(id) else {
+            continue;
+        };
+        let Some(slot) = pattern.slot_named(&layer.name) else {
+            continue;
+        };
+        let Some(object) = layer.objects_at(frame).first() else {
+            continue;
+        };
+        if slots[slot].is_none() {
+            slots[slot] = Some(object.id);
+            baked.push((object.id, scene.layers().inherited_transform(id, frame)));
+        }
+    }
+    if slots.iter().all(Option::is_none) {
+        return None;
+    }
+
+    // What the parenting shows, written into each part, so nothing moves when
+    // the links are cut and the bones take over.
+    for (id, inherited) in baked {
+        scene.update_object_at(frame, id, |o| o.transform = inherited * o.transform);
+    }
+    for &id in layers {
+        scene.set_follows(id, None, frame);
+        scene.update_layer(id, |l| l.rest_pose = None);
+    }
+
+    let rig = rig_character(scene, frame, pattern, &slots)?;
+    let home = scene.find_object(rig).map(|(layer, _)| layer);
+    for &id in layers {
+        let empty = scene
+            .layers()
+            .get(id)
+            .is_some_and(|l| l.all_objects().next().is_none());
+        if empty && Some(id) != home {
+            scene.remove_layer(id);
+        }
+    }
+    Some(rig)
 }
 
 #[cfg(test)]

@@ -101,7 +101,11 @@ fn a_shape_with_no_outline_is_left_alone() {
     e.selection.select_one(id);
     e.run(Command::ThickenStroke);
 
-    assert_eq!(width(&e, id), None, "a fill was given an outline it never had");
+    assert_eq!(
+        width(&e, id),
+        None,
+        "a fill was given an outline it never had"
+    );
     assert_eq!(path_len(&e, id), before, "a fill was reshaped");
 }
 
@@ -146,6 +150,12 @@ fn re_weighting_is_one_undo_step() {
     assert!(width(&e, a).unwrap() > 3.0 && width(&e, b).unwrap() > 3.0);
 
     e.run(Command::Undo);
-    assert!((width(&e, a).unwrap() - 3.0).abs() < 1e-9, "the first line did not come back");
-    assert!((width(&e, b).unwrap() - 3.0).abs() < 1e-9, "the second line did not come back");
+    assert!(
+        (width(&e, a).unwrap() - 3.0).abs() < 1e-9,
+        "the first line did not come back"
+    );
+    assert!(
+        (width(&e, b).unwrap() - 3.0).abs() < 1e-9,
+        "the second line did not come back"
+    );
 }

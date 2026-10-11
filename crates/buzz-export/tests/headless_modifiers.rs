@@ -70,7 +70,9 @@ fn a_live_wiggle_moves_the_rendered_object() {
                 frequency: 2.0,
             });
         });
-        let wiggled = exporter.render(&scene, 10, &settings).expect("frame 10 again");
+        let wiggled = exporter
+            .render(&scene, 10, &settings)
+            .expect("frame 10 again");
 
         assert!(
             changed_pixels(&plain, &wiggled) > 200,
@@ -159,7 +161,9 @@ fn a_live_spring_lags_the_rendered_arm() {
                 coupling: 0.0,
             });
         });
-        let sprung = exporter.render(&scene, 14, &settings).expect("sprung frame");
+        let sprung = exporter
+            .render(&scene, 14, &settings)
+            .expect("sprung frame");
 
         assert!(
             changed_pixels(&rigid, &sprung) > 60,

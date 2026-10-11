@@ -30,7 +30,10 @@ pub struct Wiggle {
 
 impl Wiggle {
     pub const fn new(amplitude: f64, frequency: f64) -> Self {
-        Self { amplitude, frequency }
+        Self {
+            amplitude,
+            frequency,
+        }
     }
 
     /// A barely-there drift: a held pose that breathes rather than freezes.
@@ -138,7 +141,10 @@ mod tests {
                 same += 1;
             }
         }
-        assert!(same < 10, "seeds 1 and 2 moved together on {same} of 600 frames");
+        assert!(
+            same < 10,
+            "seeds 1 and 2 moved together on {same} of 600 frames"
+        );
     }
 
     #[test]

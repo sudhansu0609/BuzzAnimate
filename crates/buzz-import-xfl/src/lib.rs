@@ -36,7 +36,8 @@ use std::path::Path;
 use buzz_geom::Affine;
 use buzz_scene::{
     FillSpec, Gradient, GradientKind, GradientSpread, GradientStop, Layer, LayerId, LayerKind,
-    Object, ObjectId, Paint, Scene, ShapeData, StrokeSpec, Symbol, SymbolId, SymbolKind, Tween,
+    Object, ObjectId, Paint, Scene, ShapeData, SoundId, SoundRef, SoundSync, StrokeSpec, Symbol,
+    SymbolId, SymbolKind, Tween,
 };
 use peniko::Color;
 use quick_xml::events::Event;
@@ -98,6 +99,13 @@ impl From<zip::result::ZipError> for ImportError {
 /// Returned alongside the scene so the editor can tell the user plainly.
 #[derive(Debug, Default, Clone)]
 pub struct ImportReport {
+    /// The first scene's own name, as Animate's Scene panel shows it.
+    pub scene_name: Option<String>,
+    /// **Every scene after the first**, each its own timeline and camera over
+    /// the shared library. Animate keeps them apart; reading them all into
+    /// one timeline played Scene 2's layers and camera moves over Scene 1
+    /// (barish1: 36 layers and 53 camera keys where Scene 1 has 16 and 3).
+    pub more_scenes: Vec<(String, Scene)>,
     pub layers: usize,
     pub keyframes: usize,
     pub shapes: usize,
@@ -107,6 +115,12 @@ pub struct ImportReport {
     pub tweens: usize,
     /// Keyframes on Animate's camera layer.
     pub camera_keys: usize,
+    /// Layers whose rig parent named a *different* layer on some keyframes
+    /// than on others (`parentLayerIndex` changing mid-timeline). `follows`
+    /// holds one layer, so the keyframes that name a different one are baked
+    /// to their absolute pose at that frame instead of propagating from
+    /// either parent's rest pose — see `bake_rig_offsets`.
+    pub retargeted_rig_layers: usize,
     /// Features present in the file that this importer does not handle.
     pub unsupported: Vec<String>,
 }
@@ -168,11 +182,25 @@ pub fn import(path: impl AsRef<Path>) -> Result<(Scene, ImportReport), ImportErr
         return Err(ImportError::LegacyBinaryFla);
     }
 
-    import_fla_bytes(&bytes)
+    // The `.fla`'s own folder, so a sound whose `.dat` cache is missing can
+    // still be found at `sourceExternalFilepath`, which Animate writes
+    // relative to the document.
+    import_fla_bytes_from(&bytes, path.parent())
 }
 
 /// Import from `.fla` bytes.
 pub fn import_fla_bytes(bytes: &[u8]) -> Result<(Scene, ImportReport), ImportError> {
+    import_fla_bytes_from(bytes, None)
+}
+
+/// [`import_fla_bytes`], with the folder the `.fla` itself lives in, so a
+/// `sourceExternalFilepath` fallback has somewhere to resolve against. `None`
+/// when the bytes did not come from a file on disk — the fallback then simply
+/// finds nothing, same as any other missing media.
+fn import_fla_bytes_from(
+    bytes: &[u8],
+    base_dir: Option<&Path>,
+) -> Result<(Scene, ImportReport), ImportError> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
 
     // **Found by name, not assumed at the root.** Animate writes
@@ -227,7 +255,23 @@ pub fn import_fla_bytes(bytes: &[u8]) -> Result<(Scene, ImportReport), ImportErr
         }
     }
 
-    build(&document, &library_files)
+    build_with_media(&document, &library_files, base_dir, |root, name| {
+        // `bin/` sits beside `LIBRARY/`, holding the sound and bitmap caches
+        // Animate keeps under its own generated names — see [`MediaRoot`].
+        let sub = match root {
+            MediaRoot::Library => "LIBRARY",
+            MediaRoot::Bin => "bin",
+        };
+        let entry = format!("{prefix}{sub}/{name}");
+        let mut file = match archive.by_name(&entry) {
+            Ok(file) => file,
+            Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    })
 }
 
 /// Import from an uncompressed `.xfl` folder.
@@ -262,7 +306,30 @@ pub fn import_xfl_folder(folder: &Path) -> Result<(Scene, ImportReport), ImportE
         collect_library(&library_dir, &library_dir, &mut library_files)?;
     }
 
-    build(&document, &library_files)
+    build_with_media(&document, &library_files, Some(folder), |media_root, name| {
+        let relative = std::path::PathBuf::from(name.replace('\\', "/"));
+        if relative.components().any(|part| !matches!(part,
+            std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+            return Err(ImportError::Archive(format!("invalid media path: {name}")));
+        }
+        // `bin/` sits beside `LIBRARY/`, holding the sound and bitmap caches
+        // Animate keeps under its own generated names — see [`MediaRoot`].
+        let unresolved = match media_root {
+            MediaRoot::Library => library_dir.clone(),
+            MediaRoot::Bin => folder.join("bin"),
+        };
+        if !unresolved.is_dir() {
+            return Ok(None);
+        }
+        let root = unresolved.canonicalize()?;
+        let path = root.join(relative);
+        if !path.exists() { return Ok(None); }
+        let path = path.canonicalize()?;
+        if !path.starts_with(&root) {
+            return Err(ImportError::Archive(format!("media escapes library: {name}")));
+        }
+        Ok(Some(std::fs::read(path)?))
+    })
 }
 
 fn collect_library(
@@ -369,13 +436,160 @@ fn archive_listing<R: std::io::Read + std::io::Seek>(archive: &mut zip::ZipArchi
 }
 
 /// Assemble a scene from the document and its library files.
+#[cfg(test)]
 fn build(
     document: &str,
     library_files: &[(String, String)],
 ) -> Result<(Scene, ImportReport), ImportError> {
+    build_with_media(document, library_files, None, |_, _| Ok(None))
+}
+
+type BitmapMap = HashMap<String, buzz_scene::ImageFill>;
+
+/// A `DOMSoundItem`'s name (what a frame's `soundName` refers to) to the
+/// [`SoundId`] it was imported as.
+type SoundMap = HashMap<String, SoundId>;
+
+/// Which of the two folders a media file lives under.
+///
+/// Animate keeps both beside `DOMDocument.xml`: `LIBRARY/` mirrors the
+/// original bitmaps and any audio saved back out under its own name, while
+/// `bin/` holds Animate's own generated cache of everything, named after an
+/// opaque `...HRef` rather than the asset. A bitmap's `bin/` copy is
+/// re-encoded and not generally decodable as the original format, so bitmaps
+/// are read from `LIBRARY/`; a sound's `bin/` copy is the original MP3
+/// bitstream verbatim (Findings §5), so sounds are read from `bin/`.
+enum MediaRoot {
+    Library,
+    Bin,
+}
+
+fn build_with_media(
+    document: &str,
+    library_files: &[(String, String)],
+    base_dir: Option<&Path>,
+    mut read_media: impl FnMut(MediaRoot, &str) -> Result<Option<Vec<u8>>, ImportError>,
+) -> Result<(Scene, ImportReport), ImportError> {
     let mut scene = Scene::empty();
     let mut report = ImportReport::default();
     let mut ids = IdSource::default();
+    // Decode each bitmap once; stage and symbol placements share its pixels.
+    let mut bitmaps = BitmapMap::new();
+    let mut media_reader = quick_xml::Reader::from_str(document);
+    loop {
+        match media_reader.read_event()? {
+            Event::Eof => break,
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"DOMBitmapItem" => {
+                let attrs = attributes(&e);
+                let Some(name) = attrs.get("name") else { continue };
+                let href = attrs.get("href").unwrap_or(name);
+                let bytes = match read_media(MediaRoot::Library, href) {
+                    Ok(Some(bytes)) => bytes,
+                    // **No copy under `LIBRARY/`: Animate's own cache in
+                    // `bin/`.** Most bitmaps in a real file exist only there
+                    // (barish1: 18 of 21), and drawing them as nothing left
+                    // grey placeholder slabs across every tree and bush.
+                    Ok(None) => match attrs
+                        .get("bitmapDataHRef")
+                        .map(|dat| read_media(MediaRoot::Bin, dat))
+                    {
+                        Some(Ok(Some(dat))) => match decode_bitmap_dat(&dat) {
+                            Some(DatBitmap::Encoded(bytes)) => bytes,
+                            Some(DatBitmap::Pixels { width, height, rgba }) => {
+                                let asset = buzz_scene::ImageAsset::from_pixels(
+                                    buzz_scene::ImageId(ids.take()),
+                                    name.clone(),
+                                    width,
+                                    height,
+                                    std::sync::Arc::new(rgba),
+                                );
+                                // The size Animate places it at, in twips, when
+                                // the cache holds it downsampled.
+                                let w = attrs
+                                    .get("frameRight")
+                                    .and_then(|v| v.parse::<f64>().ok())
+                                    .map_or(width as f64, |t| t / 20.0);
+                                let h = attrs
+                                    .get("frameBottom")
+                                    .and_then(|v| v.parse::<f64>().ok())
+                                    .map_or(height as f64, |t| t / 20.0);
+                                let asset = scene.images_mut().insert(asset);
+                                let mut fill = buzz_scene::ImageFill::new(
+                                    asset,
+                                    buzz_geom::Rect::new(0.0, 0.0, w, h),
+                                );
+                                fill.smooth = attr_bool(&attrs, "allowSmoothing", false);
+                                bitmaps.insert(name.clone(), fill);
+                                continue;
+                            }
+                            None => {
+                                report.note_unsupported(format!("bitmap media unreadable: {name}"));
+                                continue;
+                            }
+                        },
+                        _ => {
+                            report.note_unsupported(format!("bitmap media unavailable: {name}"));
+                            continue;
+                        }
+                    },
+                    Err(error) => {
+                        report.note_unsupported(format!("bitmap media {name}: {error}"));
+                        continue;
+                    }
+                };
+                match buzz_scene::ImageAsset::decode(buzz_scene::ImageId(ids.take()), name, &bytes) {
+                    Ok(asset) => {
+                        let rect = buzz_geom::Rect::new(0.0, 0.0, asset.width as f64, asset.height as f64);
+                        let asset = scene.images_mut().insert(asset);
+                        let mut fill = buzz_scene::ImageFill::new(asset, rect);
+                        fill.smooth = attr_bool(&attrs, "allowSmoothing", false);
+                        bitmaps.insert(name.clone(), fill);
+                    }
+                    Err(error) => report.note_unsupported(format!("bitmap media {name}: {error}")),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // **Sounds, the same way, once.** A `DOMSoundItem` only ever appears in
+    // the document's own library manifest (never inside a symbol's LIBRARY
+    // file), so one pass here finds every one of them; frames that name a
+    // sound, wherever they are, look it up in `sounds` below.
+    let mut sounds = SoundMap::new();
+    let mut sound_reader = quick_xml::Reader::from_str(document);
+    loop {
+        match sound_reader.read_event()? {
+            Event::Eof => break,
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"DOMSoundItem" => {
+                let attrs = attributes(&e);
+                let Some(name) = attrs.get("name").cloned() else { continue };
+                match import_sound_bytes(&attrs, base_dir, &mut read_media) {
+                    Ok(Some((bytes, format))) => {
+                        match buzz_audio::Clip::decode(&bytes, &name) {
+                            Ok(clip) => {
+                                let id = scene.add_sound(
+                                    &name,
+                                    std::sync::Arc::new(bytes),
+                                    &format,
+                                    clip.sample_rate,
+                                    clip.channels,
+                                    clip.len() as u64,
+                                );
+                                sounds.insert(name, id);
+                            }
+                            Err(error) => {
+                                report.note_unsupported(format!("sound {name}: could not decode ({error})"))
+                            }
+                        }
+                    }
+                    Ok(None) => report.note_unsupported(format!("sound media unavailable: {name}")),
+                    Err(error) => report.note_unsupported(format!("sound {name}: {error}")),
+                }
+            }
+            _ => {}
+        }
+    }
 
     // **Two passes over the library, and the reason matters.**
     //
@@ -403,7 +617,7 @@ fn build(
     }
 
     for (path, xml, id) in pending {
-        match parse_symbol(xml, path, id, &by_name, &mut ids, &mut report) {
+        match parse_symbol(xml, path, id, &by_name, &bitmaps, &sounds, &mut ids, &mut report) {
             Ok(symbol) => {
                 scene.library_mut().insert(symbol);
                 report.symbols += 1;
@@ -412,12 +626,95 @@ fn build(
         }
     }
 
-    parse_document(document, &mut scene, &by_name, &mut ids, &mut report)?;
+    // Every scene shares the library just read; each gets its own timeline.
+    let names = timeline_names(document);
+    let shared = scene.clone();
+    parse_document(document, &mut scene, &by_name, &bitmaps, &sounds, &mut ids, &mut report, 0)?;
+    report.scene_name = names.first().cloned();
+    for (index, name) in names.iter().enumerate().skip(1) {
+        let mut more = shared.clone();
+        parse_document(document, &mut more, &by_name, &bitmaps, &sounds, &mut ids, &mut report, index)?;
+        report.more_scenes.push((name.clone(), more));
+    }
 
     // The importer allocates its own ids, so the document's allocator has to
     // be raised past them or a new object would collide with an imported one.
     scene.reserve_ids_above(ids.next);
+    for (_, more) in &mut report.more_scenes {
+        more.reserve_ids_above(ids.next);
+    }
     Ok((scene, report))
+}
+
+/// The name of every top-level `<DOMTimeline>` — Animate's scenes — in order.
+fn timeline_names(xml: &str) -> Vec<String> {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut depth = 0usize;
+    let mut names = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) if e.name().as_ref() == b"DOMTimeline" => {
+                if depth == 0 {
+                    let attrs = attributes(&e);
+                    names.push(attrs.get("name").cloned().unwrap_or_else(|| format!("Scene {}", names.len() + 1)));
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(e)) if e.name().as_ref() == b"DOMTimeline" && depth == 0 => {
+                let attrs = attributes(&e);
+                names.push(attrs.get("name").cloned().unwrap_or_else(|| format!("Scene {}", names.len() + 1)));
+            }
+            Ok(Event::End(e)) if e.name().as_ref() == b"DOMTimeline" => depth = depth.saturating_sub(1),
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    if names.is_empty() {
+        names.push("Scene 1".to_string());
+    }
+    names
+}
+
+/// Bytes for a `DOMSoundItem`, and the format tag to save them back out under.
+///
+/// **The `.dat` behind `soundDataHRef` is tried first, and it is usually
+/// enough on its own.** Unlike a bitmap's `bin/` cache, which Animate
+/// re-encodes into a format nothing else reads, a sound's cache is the
+/// **original MPEG bitstream**, byte for byte — confirmed by the frame sync
+/// this checks for (Findings §5). `sourceExternalFilepath` is only the
+/// fallback, for the archive whose cache went missing or was never an MP3 to
+/// begin with.
+fn import_sound_bytes(
+    attrs: &HashMap<String, String>,
+    base_dir: Option<&Path>,
+    read_media: &mut impl FnMut(MediaRoot, &str) -> Result<Option<Vec<u8>>, ImportError>,
+) -> Result<Option<(Vec<u8>, String)>, ImportError> {
+    if let Some(href) = attrs.get("soundDataHRef") {
+        if let Some(bytes) = read_media(MediaRoot::Bin, href)? {
+            if is_mpeg_frame_sync(&bytes) {
+                return Ok(Some((bytes, "mp3".to_string())));
+            }
+        }
+    }
+    if let (Some(base), Some(path)) = (base_dir, attrs.get("sourceExternalFilepath")) {
+        let resolved = base.join(path.replace('\\', "/"));
+        if let Ok(bytes) = std::fs::read(&resolved) {
+            let format = resolved
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_else(|| "mp3".to_string());
+            return Ok(Some((bytes, format)));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether bytes begin with an MPEG audio frame sync: `0xFF` followed by a
+/// byte with its top three bits set. Every MP3 frame starts with this
+/// eleven-bit sync word, and Animate's sound cache starts the file with one
+/// rather than wrapping it in a container.
+fn is_mpeg_frame_sync(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0
 }
 
 /// Hands out ids for imported objects.
@@ -551,6 +848,354 @@ fn parse_tween(attrs: &HashMap<String, String>) -> Tween {
     }
 }
 
+/// A `<DOMFrame>`'s `soundName` and its sync/loop attributes, resolved
+/// against the sounds already imported. `None` when the frame names no
+/// sound, or names one whose media did not come across — a dangling
+/// `soundName` should not point at nothing.
+fn parse_sound_ref(attrs: &HashMap<String, String>, sounds: &SoundMap) -> Option<SoundRef> {
+    let name = attrs.get("soundName")?;
+    let sound = *sounds.get(name)?;
+    let sync = match attrs.get("soundSync").map(String::as_str) {
+        Some("start") => SoundSync::Start,
+        Some("stop") => SoundSync::Stop,
+        Some("stream") => SoundSync::Stream,
+        // "event" is Animate's default and what it omits when writing.
+        _ => SoundSync::Event,
+    };
+    let loops = match attrs.get("soundLoopMode").map(String::as_str) {
+        // The loop checkbox: Animate does not say how many times, only that
+        // it does not stop — which is what zero means to `SoundRef::loops`.
+        Some("loop") => 0,
+        Some("repeat") => attr_u32(attrs, "soundLoop", 1).max(1),
+        _ => 1,
+    };
+    Some(SoundRef {
+        sound,
+        sync,
+        volume: 1.0,
+        loops,
+        trim_start: 0.0,
+        trim_end: None,
+    })
+}
+
+/// A cubic-Bézier equivalent for one of Animate's named `<Ease method="…">`
+/// presets, as the four points `buzz_scene::eval_bezier_ease` expects:
+/// `(0,0)`, two control points, `(1,1)`. Our own [`buzz_scene::Easing`] has no
+/// vocabulary of named curves to map onto — only `Linear`, the acceleration
+/// slider and an arbitrary Bézier — so every named preset becomes the
+/// equivalent single-segment Bézier instead, the same well-known control
+/// points CSS's `cubic-bezier()` uses for the same names. `None` for
+/// `"none"`/anything unrecognised: nothing to override with, so the property
+/// keeps easing by the tween's own slider.
+fn bezier_points_for_ease_method(method: &str) -> Option<[buzz_geom::Point; 4]> {
+    let (x1, y1, x2, y2) = match method {
+        "quadIn" => (0.11, 0.0, 0.5, 0.0),
+        "quadOut" => (0.5, 1.0, 0.89, 1.0),
+        "quadInOut" => (0.455, 0.03, 0.515, 0.955),
+        "cubicIn" => (0.55, 0.055, 0.675, 0.19),
+        "cubicOut" => (0.215, 0.61, 0.355, 1.0),
+        "cubicInOut" => (0.645, 0.045, 0.355, 1.0),
+        "quartIn" => (0.895, 0.03, 0.685, 0.22),
+        "quartOut" => (0.165, 0.84, 0.44, 1.0),
+        "quartInOut" => (0.77, 0.0, 0.175, 1.0),
+        "quintIn" => (0.755, 0.05, 0.855, 0.06),
+        "quintOut" => (0.23, 1.0, 0.32, 1.0),
+        "quintInOut" => (0.86, 0.0, 0.07, 1.0),
+        "sineIn" => (0.47, 0.0, 0.745, 0.715),
+        "sineOut" => (0.39, 0.575, 0.565, 1.0),
+        "sineInOut" => (0.445, 0.05, 0.55, 0.95),
+        "expoIn" => (0.95, 0.05, 0.795, 0.035),
+        "expoOut" => (0.19, 1.0, 0.22, 1.0),
+        "expoInOut" => (1.0, 0.0, 0.0, 1.0),
+        "circIn" => (0.6, 0.04, 0.98, 0.335),
+        "circOut" => (0.075, 0.82, 0.165, 1.0),
+        "circInOut" => (0.785, 0.135, 0.15, 0.86),
+        _ => return None,
+    };
+    Some([
+        buzz_geom::Point::new(0.0, 0.0),
+        buzz_geom::Point::new(x1, y1),
+        buzz_geom::Point::new(x2, y2),
+        buzz_geom::Point::new(1.0, 1.0),
+    ])
+}
+
+/// A Motion Tween span longer than this bakes one keyframe per **property
+/// key** (with a linear classic tween between) rather than one per frame —
+/// the difference between a handful of keyframes and thousands for a span
+/// that turns out to hold a single unanimated pose, which real files do: an
+/// object converted to a Motion Tween and never actually moved still writes
+/// its full span length.
+const MOTION_BAKE_DENSE_LIMIT: u32 = 2000;
+
+/// One property's motion curve — Animate's `AnimationCore`, evaluated by
+/// piecewise-linear interpolation between its keyframes' `(timevalue, anchor
+/// value)` pairs.
+///
+/// Animate also writes `previous`/`next` Bézier handles on every keyframe,
+/// but on both evidence files this plan was measured against — the two
+/// rotating heads with a "hold, ease into a turn, hold, ease back" curve
+/// included — every single one exactly repeats its own keyframe's anchor,
+/// keyframe after keyframe, leaving no curvature to reverse-engineer a handle
+/// convention from. Piecewise-linear reproduces every curve measured exactly;
+/// a real hand-drawn handle would be an approximation, the same trade a
+/// straight `Easing::Linear` already is for the rare classic tween whose
+/// acceleration this importer cannot read.
+#[derive(Debug, Default, Clone)]
+struct MotionCurve {
+    /// `(timevalue in ticks, value)`, sorted by tick.
+    keys: Vec<(f64, f64)>,
+}
+
+impl MotionCurve {
+    fn value_at(&self, tick: f64) -> f64 {
+        let Some(&(first_t, first_v)) = self.keys.first() else {
+            return 0.0;
+        };
+        if tick <= first_t {
+            return first_v;
+        }
+        let &(last_t, last_v) = self.keys.last().unwrap();
+        if tick >= last_t {
+            return last_v;
+        }
+        for pair in self.keys.windows(2) {
+            let (t0, v0) = pair[0];
+            let (t1, v1) = pair[1];
+            if tick >= t0 && tick <= t1 {
+                if (t1 - t0).abs() < 1e-9 {
+                    return v1;
+                }
+                return v0 + (v1 - v0) * (tick - t0) / (t1 - t0);
+            }
+        }
+        last_v
+    }
+}
+
+/// A Motion Tween's `AnimationCore`: every property it animates, plus how
+/// many ticks its span covers.
+#[derive(Debug, Default)]
+struct MotionObject {
+    ticks_total: f64,
+    properties: HashMap<String, MotionCurve>,
+}
+
+impl MotionObject {
+    fn get(&self, id: &str) -> Option<&MotionCurve> {
+        self.properties.get(id)
+    }
+
+    /// `id`'s value at `tick`, or `default` when the property is absent —
+    /// which is Animate's own rest value for it: `100` for the two scales,
+    /// `0` for everything else this reads.
+    fn value_at(&self, id: &str, tick: f64, default: f64) -> f64 {
+        match self.properties.get(id) {
+            Some(curve) if !curve.keys.is_empty() => curve.value_at(tick),
+            _ => default,
+        }
+    }
+}
+
+/// Parse the inner text of a `<motionObjectXML>` element: Animate's
+/// `AnimationCore`, a small nested document nothing else in this file reads,
+/// parsed with a reader of its own rather than folded into the flat
+/// one-level state machine the rest of the importer uses — `PropertyContainer`
+/// nests several layers deep, and that machine tracks only one.
+///
+/// The properties that matter for v1 — `Motion_X`, `Motion_Y`, `Rotation_Z`,
+/// `Skew_X`, `Skew_Y`, `Scale_X`, `Scale_Y` — are read by `id`, wherever in
+/// the container tree they sit; `Depth` and the colour/filter containers are
+/// not modelled and are named in the report when they hold anything.
+fn parse_motion_object(xml: &str, report: &mut ImportReport) -> MotionObject {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut object = MotionObject::default();
+    let mut current_property: Option<String> = None;
+    loop {
+        let (name, attrs, is_empty) = match reader.read_event() {
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => (
+                String::from_utf8_lossy(e.name().as_ref()).to_string(),
+                attributes(&e),
+                false,
+            ),
+            Ok(Event::Empty(e)) => (
+                String::from_utf8_lossy(e.name().as_ref()).to_string(),
+                attributes(&e),
+                true,
+            ),
+            Err(_) => break,
+            _ => continue,
+        };
+        match name.as_str() {
+            "AnimationCore" => object.ticks_total = attr_f64(&attrs, "duration", 0.0),
+            "Property" => current_property = attrs.get("id").cloned(),
+            "Keyframe" => {
+                if let Some(id) = current_property.clone()
+                    && let Some(anchor) = attrs.get("anchor")
+                    && let Some((_, value)) = anchor.split_once(',')
+                    && let Ok(value) = value.trim().parse::<f64>()
+                {
+                    let tick = attr_f64(&attrs, "timevalue", 0.0);
+                    object
+                        .properties
+                        .entry(id)
+                        .or_default()
+                        .keys
+                        .push((tick, value));
+                }
+            }
+            // A container with something in it to convert: named once, not
+            // per instance — `note_unsupported` already collapses repeats.
+            "PropertyContainer" if !is_empty => match attrs.get("id").map(String::as_str) {
+                Some("Colors") => report.note_unsupported("motion tween colour effects"),
+                Some("Filters") => report.note_unsupported("motion tween filters"),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    for curve in object.properties.values_mut() {
+        curve
+            .keys
+            .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    object
+}
+
+/// Convert a Motion Tween into ordinary keyframes.
+///
+/// # The convention, measured against sustipur1's `fatherFront copy 3`
+///
+/// Every property at its rest value must reproduce the `DOMSymbolInstance`'s
+/// own `<Matrix>` exactly — the check this plan asks for — and it does, with
+/// no separate "base matrix" needed at all beyond the instance's own
+/// placement: `Scale_X`/`Scale_Y` are **signed** percentages (a mirror is a
+/// negative one, not a separate flag), `Rotation_Z` adds into *both* skews
+/// the same way `extra_rotations` does in `buzz-scene`'s own tween model
+/// (Phase A), and `Skew_X`/`Skew_Y` add on top of that, one skew each:
+///
+/// ```text
+/// skewX = radians(Rotation_Z + Skew_X)      skewY = radians(Rotation_Z + Skew_Y)
+/// a = (Scale_X/100)·cos(skewY)   b = (Scale_X/100)·sin(skewY)
+/// c = -(Scale_Y/100)·sin(skewX)  d =  (Scale_Y/100)·cos(skewX)
+/// tx = instance.tx + Motion_X    ty = instance.ty + Motion_Y
+/// ```
+///
+/// `Motion_X`/`Motion_Y` are 0 at every span's own rest keyframe in both
+/// evidence files, so `instance.tx, instance.ty` is exactly the anchor
+/// `Motion_X`/`Motion_Y` measures its own move from.
+fn bake_motion_object(
+    frame: &PendingFrame,
+    motion: &MotionObject,
+    report: &mut ImportReport,
+) -> Vec<buzz_scene::Keyframe> {
+    let Some(base) = frame.objects.first() else {
+        return Vec::new();
+    };
+    let base_coeffs = base.transform.as_coeffs();
+    let frame_count = frame.duration.max(1);
+    let ticks_per_frame = if frame_count > 0 && motion.ticks_total > 0.0 {
+        motion.ticks_total / frame_count as f64
+    } else {
+        1.0
+    };
+
+    if let Some(depth) = motion.get("Depth")
+        && depth.keys.iter().any(|&(_, v)| v.abs() > 1e-6)
+    {
+        report.note_unsupported("motion tween Z-depth (3D)");
+    }
+
+    let compose = |tick: f64| -> Affine {
+        let motion_x = motion.value_at("Motion_X", tick, 0.0);
+        let motion_y = motion.value_at("Motion_Y", tick, 0.0);
+        let rotation = motion.value_at("Rotation_Z", tick, 0.0);
+        let skew_x = motion.value_at("Skew_X", tick, 0.0);
+        let skew_y = motion.value_at("Skew_Y", tick, 0.0);
+        let scale_x = motion.value_at("Scale_X", tick, 100.0) / 100.0;
+        let scale_y = motion.value_at("Scale_Y", tick, 100.0) / 100.0;
+        let angle_x = (rotation + skew_x).to_radians();
+        let angle_y = (rotation + skew_y).to_radians();
+        Affine::new([
+            scale_x * angle_y.cos(),
+            scale_x * angle_y.sin(),
+            -scale_y * angle_x.sin(),
+            scale_y * angle_x.cos(),
+            base_coeffs[4] + motion_x,
+            base_coeffs[5] + motion_y,
+        ])
+    };
+
+    let one_keyframe = |start: u32, tick: f64, label: Option<String>, sound: Option<SoundRef>, tween: Tween| {
+        let mut object = (**base).clone();
+        object.transform = compose(tick);
+        buzz_scene::Keyframe {
+            start,
+            objects: std::sync::Arc::new(vec![std::sync::Arc::new(object)]),
+            label,
+            tween,
+            ease_curve: None,
+            sound,
+        }
+    };
+
+    // A span with no real property animation bakes to a single held
+    // keyframe, whatever its length — the common case, an object converted
+    // to a Motion Tween and never actually touched. A long span with real
+    // motion bakes one keyframe per property key, classic-tweened linearly
+    // between, instead of one per frame — see `MOTION_BAKE_DENSE_LIMIT`.
+    let mut key_frames: Vec<(u32, f64)> = motion
+        .properties
+        .values()
+        .flat_map(|c| c.keys.iter().map(|&(t, _)| t))
+        .map(|t| {
+            let index = (t / ticks_per_frame).round() as u32;
+            (index.min(frame_count.saturating_sub(1)), t)
+        })
+        .collect();
+    key_frames.sort_by(|a, b| a.0.cmp(&b.0));
+    key_frames.dedup_by_key(|pair| pair.0);
+
+    if frame_count > MOTION_BAKE_DENSE_LIMIT {
+        // No property changes at all: one held keyframe for the whole span,
+        // whatever its length — an object converted to a Motion Tween and
+        // never actually touched, which real files do at spans thousands of
+        // frames long.
+        if key_frames.len() <= 1 {
+            let tick = key_frames.first().map(|&(_, t)| t).unwrap_or(0.0);
+            return vec![one_keyframe(frame.start, tick, frame.label.clone(), frame.sound, Tween::default())];
+        }
+        let last = key_frames.len() - 1;
+        return key_frames
+            .into_iter()
+            .enumerate()
+            .map(|(i, (index, tick))| {
+                one_keyframe(
+                    frame.start + index,
+                    tick,
+                    if i == 0 { frame.label.clone() } else { None },
+                    if i == 0 { frame.sound } else { None },
+                    if i == last { Tween::default() } else { Tween::classic() },
+                )
+            })
+            .collect();
+    }
+
+    (0..frame_count)
+        .map(|i| {
+            one_keyframe(
+                frame.start + i,
+                i as f64 * ticks_per_frame,
+                if i == 0 { frame.label.clone() } else { None },
+                if i == 0 { frame.sound } else { None },
+                Tween::default(),
+            )
+        })
+        .collect()
+}
+
 /// Parse `DOMDocument.xml` into the scene's main timeline.
 /// Animate's camera layer, read as it goes past.
 ///
@@ -617,8 +1262,11 @@ fn parse_document(
     xml: &str,
     scene: &mut Scene,
     symbols: &HashMap<String, SymbolId>,
+    bitmaps: &BitmapMap,
+    sounds: &SoundMap,
     ids: &mut IdSource,
     report: &mut ImportReport,
+    which: usize,
 ) -> Result<(), ImportError> {
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -627,12 +1275,19 @@ fn parse_document(
     reader.config_mut().check_end_names = true;
 
     let mut layers: Vec<PendingLayer> = Vec::new();
-    let mut context = FrameContext::default();
+    let mut context = FrameContext {
+        bitmaps: bitmaps.clone(),
+        sounds: sounds.clone(),
+        ..Default::default()
+    };
     let mut camera = CameraCapture::default();
     let mut open_elements = 0usize;
-    // Only the first timeline is the main one; symbol timelines live in
-    // LIBRARY and are parsed separately.
+    // Symbol timelines live in LIBRARY and are parsed separately. Here each
+    // top-level `<DOMTimeline>` is one of Animate's scenes, and only the
+    // `which`-th is read: the others are skipped whole.
     let mut timeline_depth = 0usize;
+    let mut timelines_seen = 0usize;
+    let mut skipping = false;
 
     loop {
         let event = reader.read_event();
@@ -653,6 +1308,29 @@ fn parse_document(
                     )));
                 }
                 break;
+            }
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
+                if skipping || (timeline_depth == 0 && e.name().as_ref() == b"DOMTimeline") =>
+            {
+                // Another scene's timeline: counted, and nested timelines
+                // tracked so its end is found, but nothing in it is read.
+                let is_start = matches!(event, Ok(Event::Start(_)));
+                if e.name().as_ref() == b"DOMTimeline" {
+                    if timeline_depth == 0 {
+                        let mine = timelines_seen == which;
+                        timelines_seen += 1;
+                        if is_start {
+                            skipping = !mine;
+                            timeline_depth += 1;
+                            if mine {
+                                let attrs = attributes(e);
+                                camera.enabled = attr_bool(&attrs, "cameraLayerEnabled", false);
+                            }
+                        }
+                    } else if is_start {
+                        timeline_depth += 1;
+                    }
+                }
             }
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
@@ -694,6 +1372,19 @@ fn parse_document(
                             context.begin_frame(&attrs, report);
                         }
                     }
+                    // **A Motion Tween's own nested document.** Parsed with a
+                    // separate reader over the raw text between here and its
+                    // closing tag, rather than folded into this flat
+                    // one-level state machine — see `parse_motion_object`.
+                    "motionObjectXML" if timeline_depth <= 1 && !camera.active => {
+                        let start = reader.buffer_position() as usize;
+                        if let Some(rel_end) =
+                            xml.get(start..).and_then(|rest| rest.find("</motionObjectXML>"))
+                        {
+                            let motion = parse_motion_object(&xml[start..start + rel_end], report);
+                            context.begin_motion_object(motion);
+                        }
+                    }
                     _ if timeline_depth <= 1 => {
                         if camera.active {
                             camera.element(&name, &attrs, scene.stage().size);
@@ -708,11 +1399,23 @@ fn parse_document(
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 if name == "DOMTimeline" {
                     timeline_depth = timeline_depth.saturating_sub(1);
+                    if timeline_depth == 0 {
+                        skipping = false;
+                    }
+                    continue;
+                }
+                if skipping {
+                    continue;
                 }
                 // The one closing tag that matters: a shape is only a shape
                 // once every one of its edges has been read.
                 if name == "DOMShape" && timeline_depth <= 1 {
                     context.finish_shape(ids, report);
+                }
+                // A custom ease's points are only complete once its own
+                // closing tag arrives.
+                if name == "CustomEase" && timeline_depth <= 1 {
+                    context.end_custom_ease();
                 }
             }
             Err(e) => return Err(ImportError::Xml(e.to_string())),
@@ -751,7 +1454,7 @@ fn parse_document(
         }
     }
 
-    resolve_layer_parents(&mut layers);
+    resolve_layer_parents(&mut layers, report);
 
     // **The file's order is the timeline's order, top first.** This was read
     // backwards for five phases and the list was being reversed, which put
@@ -770,6 +1473,8 @@ fn parse_document(
             parent_index: None,
             rig_index: None,
             rig_parent: None,
+            rig_parent_by_frame: Vec::new(),
+            rig_prop_by_frame: Vec::new(),
         });
     }
     for (index, pending) in layers.into_iter().enumerate() {
@@ -790,6 +1495,11 @@ struct PendingLayer {
     rig_index: Option<u32>,
     /// The rigging index of the layer this one follows, from its frames.
     rig_parent: Option<u32>,
+    /// Each keyframe's own rig parent, frame by frame — see
+    /// `FrameContext::rig_parent_by_frame`.
+    rig_parent_by_frame: Vec<(u32, Option<u32>)>,
+    /// Each keyframe's own `rigPropagationMatrix` — see `rig_compose`.
+    rig_prop_by_frame: Vec<(u32, Option<Affine>)>,
 }
 
 /// Turn Animate's `parentLayerIndex` into our `parent` links.
@@ -815,7 +1525,7 @@ struct PendingLayer {
 /// above it, exactly as a layer in a folder points at the folder. Waiting for
 /// `layerType="masked"` meant every mask in every real document claimed
 /// nothing and clipped nothing.
-fn resolve_layer_parents(layers: &mut [PendingLayer]) {
+fn resolve_layer_parents(layers: &mut [PendingLayer], report: &mut ImportReport) {
     let ids: Vec<LayerId> = layers.iter().map(|p| p.layer.id).collect();
     let is_folder: Vec<bool> = layers
         .iter()
@@ -865,7 +1575,7 @@ fn resolve_layer_parents(layers: &mut [PendingLayer]) {
         }
     }
 
-    bake_rig_offsets(layers);
+    bake_rig_offsets(layers, report);
 }
 
 /// Turn Animate's *relative* rig transforms into absolute ones, frame by
@@ -914,7 +1624,7 @@ fn resolve_layer_parents(layers: &mut [PendingLayer]) {
 ///
 /// The upshot: the character arrives posed exactly as Animate drew it **and**
 /// still rigged, so dragging a parent layer carries its children.
-fn bake_rig_offsets(layers: &mut [PendingLayer]) {
+fn bake_rig_offsets(layers: &mut [PendingLayer], report: &mut ImportReport) {
     use std::collections::HashMap;
 
     let follows: HashMap<LayerId, LayerId> = layers
@@ -924,6 +1634,14 @@ fn bake_rig_offsets(layers: &mut [PendingLayer]) {
     if follows.is_empty() {
         return;
     }
+
+    // Every rigged layer's own rigging index, so a keyframe's
+    // `parentLayerIndex` can be resolved to the layer it actually names —
+    // which is not always the one `follows` points at; see below.
+    let by_rig: HashMap<u32, LayerId> = layers
+        .iter()
+        .filter_map(|p| p.rig_index.map(|r| (r, p.layer.id)))
+        .collect();
 
     // How deep each layer hangs, so parents are baked before their children.
     // Bounded by the layer count, so a cycle in a corrupt file cannot spin.
@@ -945,70 +1663,369 @@ fn bake_rig_offsets(layers: &mut [PendingLayer]) {
     let mut order: Vec<usize> = (0..layers.len()).collect();
     order.sort_by_key(|i| depth(layers[*i].layer.id));
 
+    // **Animate's world, reproduced exactly at every keyframe.** Each child
+    // keyframe's world is `rig_compose(parent_world, child, pivot, parent's
+    // accumulated propagation)` — measured, see `rig_compose`. What is stored
+    // is that world with the runtime's own inherited motion divided back out,
+    // so `inherited_transform · stored` (what the renderer draws) lands on it.
+    let position = |layers: &[PendingLayer], id: LayerId| layers.iter().position(|p| p.layer.id == id);
+    let first_transform = |frames: &buzz_scene::LayerTimeline, at: u32| -> Option<Affine> {
+        frames.resolved_at(at).iter().next().map(|o| o.transform)
+    };
+    // The runtime's inherited motion for layer `id` at `at` — the same
+    // product `LayerStack::inherited_transform` draws with, over the layers
+    // baked so far.
+    fn inherited(layers: &[PendingLayer], id: LayerId, at: u32) -> Affine {
+        let mut chain = Vec::new();
+        let mut current = layers.iter().find(|p| p.layer.id == id).and_then(|p| p.layer.follows);
+        for _ in 0..layers.len() {
+            let Some(next) = current else { break };
+            if chain.contains(&next) {
+                break;
+            }
+            chain.push(next);
+            current = layers.iter().find(|p| p.layer.id == next).and_then(|p| p.layer.follows);
+        }
+        let mut out = Affine::IDENTITY;
+        for followed in chain.iter().rev() {
+            let Some(layer) = layers.iter().find(|p| p.layer.id == *followed) else { continue };
+            let Some(now) = layer.layer.frames.resolved_at(at).iter().next().map(|o| o.transform) else {
+                continue;
+            };
+            let rest = layer.layer.rest_pose.unwrap_or_else(|| parent_rest_pose(&layer.layer.frames));
+            if rest.determinant().abs() < 1e-12 {
+                continue;
+            }
+            out *= now * rest.inverse();
+        }
+        out
+    }
+    fn own_prop(p: &PendingLayer, at: u32) -> Affine {
+        p.rig_prop_by_frame
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= at)
+            .and_then(|(_, m)| *m)
+            .unwrap_or(Affine::IDENTITY)
+    }
+    // Accumulated propagation per layer, per keyframe start: a root passes on
+    // its own; a child passes on its parent's times its own.
+    let mut props: HashMap<LayerId, Vec<(u32, Affine)>> = layers
+        .iter()
+        .map(|p| {
+            let v = p.layer.frames.keyframes().iter().map(|k| (k.start, own_prop(p, k.start))).collect();
+            (p.layer.id, v)
+        })
+        .collect();
+    let prop_at = |props: &HashMap<LayerId, Vec<(u32, Affine)>>, id: LayerId, at: u32| -> Affine {
+        props
+            .get(&id)
+            .and_then(|v| v.iter().rev().find(|(s, _)| *s <= at).or(v.first()))
+            .map(|(_, m)| *m)
+            .unwrap_or(Affine::IDENTITY)
+    };
+
     for index in order {
         let Some(parent) = layers[index].layer.follows else {
             continue;
         };
-        let Some(parent_index) = layers.iter().position(|p| p.layer.id == parent) else {
+        let Some(parent_index) = position(layers, parent) else {
             layers[index].layer.follows = None;
             continue;
         };
+        // The pose the runtime measures the parent's motion from.
+        let parent_rest = parent_rest_pose(&layers[parent_index].layer.frames);
+        layers[parent_index].layer.rest_pose = Some(parent_rest);
+        let chosen_rig_index = layers[parent_index].rig_index;
 
-        // **The parent's rest pose**, which is what our model measures its
-        // motion away from — the transform on the parent's *first* keyframe,
-        // exactly as `LayerStack::motion_of` reads it. Already absolute,
-        // because parents are baked before their children.
-        let parent_rest = {
-            let frames = &layers[parent_index].layer.frames;
-            let rest = frames.keyframes().first().map(|k| k.start).unwrap_or(0);
-            frames
-                .resolved_at(rest)
+        let mut retargeted_this_layer = false;
+        let mut child_props = Vec::new();
+        let keyframes = layers[index].layer.frames.keyframes().to_vec();
+        let mut moved = Vec::with_capacity(keyframes.len());
+        for keyframe in &keyframes {
+            let s = keyframe.start;
+            // Which layer this keyframe hangs off: usually `follows`, rarely a
+            // different rigged layer named on the keyframe itself (Findings §4).
+            let named = layers[index]
+                .rig_parent_by_frame
                 .iter()
-                .next()
-                .map(|object| object.transform)
-                .unwrap_or(Affine::IDENTITY)
-        };
-
-        let moved: Vec<buzz_scene::Keyframe> = layers[index]
-            .layer
-            .frames
-            .keyframes()
-            .iter()
-            .map(|keyframe| {
-                let objects: Vec<std::sync::Arc<Object>> = keyframe
-                    .objects
-                    .iter()
-                    .map(|object| {
-                        let mut copy = (**object).clone();
-                        copy.transform = parent_rest * copy.transform;
-                        std::sync::Arc::new(copy)
-                    })
-                    .collect();
-                buzz_scene::Keyframe {
-                    objects: std::sync::Arc::new(objects),
-                    ..keyframe.clone()
-                }
-            })
-            .collect();
+                .rev()
+                .find(|(start, _)| *start <= s)
+                .and_then(|(_, n)| *n);
+            let hung_off = match named {
+                Some(n) if Some(n) != chosen_rig_index => by_rig.get(&n).copied().filter(|id| *id != parent),
+                _ => None,
+            };
+            if hung_off.is_some() {
+                retargeted_this_layer = true;
+            }
+            let from = hung_off.unwrap_or(parent);
+            let Some(from_index) = position(layers, from) else {
+                moved.push(keyframe.clone());
+                continue;
+            };
+            // A parent with nothing drawn here (a blank key before the rig
+            // appears) is taken at its rest pose, its first drawn one.
+            let parent_world = inherited(layers, from, s)
+                * first_transform(&layers[from_index].layer.frames, s)
+                    .unwrap_or_else(|| parent_rest_pose(&layers[from_index].layer.frames));
+            let parent_prop = prop_at(&props, from, s);
+            child_props.push((s, parent_prop * own_prop(&layers[index], s)));
+            // The runtime draws this keyframe under its `follows` chain.
+            let runtime = inherited(layers, layers[index].layer.id, s);
+            let undo = if runtime.determinant().abs() > 1e-12 { runtime.inverse() } else { Affine::IDENTITY };
+            let objects: Vec<std::sync::Arc<Object>> = keyframe
+                .objects
+                .iter()
+                .map(|object| {
+                    let mut copy = (**object).clone();
+                    let world = rig_compose(parent_world, copy.transform, copy.pivot, parent_prop);
+                    copy.transform = undo * world;
+                    std::sync::Arc::new(copy)
+                })
+                .collect();
+            moved.push(buzz_scene::Keyframe {
+                objects: std::sync::Arc::new(objects),
+                ..keyframe.clone()
+            });
+        }
 
         let length = layers[index].layer.frames.length();
         layers[index].layer.frames = buzz_scene::LayerTimeline::from_parts(moved, length);
-        // **And the pose the rig hangs off.** Layer parenting propagates a
-        // parent's motion away from its rest pose, and this is that pose — the
-        // one just baked into the child. Without it the model falls back to
-        // "the parent's first keyframe", which for a character that has been
-        // imported but not yet animated is the same as now: no motion to
-        // propagate, so moving a wrist would leave its palm behind.
-        layers[parent_index].layer.rest_pose = Some(parent_rest);
-        // **The link stays.** The artwork now sits where the parent's rest pose
-        // puts it, and the parent's motion from that rest pose is exactly what
-        // layer parenting adds — so the character is both posed and rigged.
+        props.insert(layers[index].layer.id, child_props);
+        // **The link stays**, so dragging a parent layer in the editor still
+        // carries its children.
+        if retargeted_this_layer {
+            report.retargeted_rig_layers += 1;
+        }
     }
+}
+
+/// An XFL `<Color>` colour effect as a multiply-then-add transform.
+///
+/// Animate writes the preset it came from (`tintColor` + `tintMultiplier`,
+/// or `brightness`) and, for Advanced, the raw per-channel `…Multiplier`
+/// (default 1) and `…Offset` (-255..255, default 0). The preset is applied
+/// first; any raw channel value the file also gives overrides it.
+fn parse_color_effect(attrs: &HashMap<String, String>) -> buzz_scene::ColorTransform {
+    let get = |k: &str| attrs.get(k).and_then(|v| v.parse::<f32>().ok());
+    let mut multiply = [1.0f32; 4];
+    let mut add = [0.0f32; 4];
+    if let Some(amount) = get("tintMultiplier") {
+        let tint = parse_color(attrs, "tintColor", "__no_alpha__");
+        let rgba = tint.to_rgba8();
+        for (i, c) in [rgba.r, rgba.g, rgba.b].into_iter().enumerate() {
+            multiply[i] = 1.0 - amount;
+            add[i] = c as f32 / 255.0 * amount;
+        }
+    }
+    if let Some(bright) = get("brightness") {
+        for i in 0..3 {
+            multiply[i] = 1.0 - bright.abs();
+            add[i] = bright.max(0.0);
+        }
+    }
+    for (i, ch) in ["red", "green", "blue", "alpha"].into_iter().enumerate() {
+        if let Some(m) = get(&format!("{ch}Multiplier")) {
+            multiply[i] = m;
+        }
+        if let Some(o) = get(&format!("{ch}Offset")) {
+            add[i] = o / 255.0;
+        }
+    }
+    buzz_scene::ColorTransform { multiply, add }
+}
+
+/// A bitmap from Animate's `bin/*.dat` cache.
+enum DatBitmap {
+    /// A JPEG or PNG kept as it came, for `ImageAsset::decode`.
+    Encoded(Vec<u8>),
+    /// Decoded pixels, straight-alpha RGBA8.
+    Pixels { width: u32, height: u32, rgba: Vec<u8> },
+}
+
+/// Decode one of Animate's cached bitmaps.
+///
+/// Two lossless layouts share a 24-byte header: a `u16` tag, the row stride in
+/// bytes, width and height (`u16` each), then the frame's left, right, top and
+/// bottom in twips (`u32` each), all little-endian.
+/// - `0x0503`, 32-bit: a has-alpha byte and a compressed byte, then the pixels
+///   as **premultiplied A, R, G, B**.
+/// - `0x0303`, 8-bit palette: a has-alpha byte, a `u16` colour count, that
+///   many colours as A, R, G, B, a compressed byte, then one index per pixel
+///   over `stride`-byte rows.
+///
+/// The pixels are one zlib stream cut into chunks, each a `u16` length and
+/// then that many bytes, ending at a zero length. Anything else, JPEG
+/// included, starts with its own file signature and is handed back whole.
+fn decode_bitmap_dat(bytes: &[u8]) -> Option<DatBitmap> {
+    if bytes.starts_with(&[0xFF, 0xD8]) || bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Some(DatBitmap::Encoded(bytes.to_vec()));
+    }
+    let u16_at = |o: usize| -> Option<u16> { Some(u16::from_le_bytes([*bytes.get(o)?, *bytes.get(o + 1)?])) };
+    let tag = u16_at(0)?;
+    let stride = u16_at(2)? as usize;
+    let width = u16_at(4)? as usize;
+    let height = u16_at(6)? as usize;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let inflate = |mut offset: usize| -> Option<Vec<u8>> {
+        let mut zipped = Vec::new();
+        loop {
+            let length = u16_at(offset)? as usize;
+            offset += 2;
+            if length == 0 {
+                break;
+            }
+            zipped.extend_from_slice(bytes.get(offset..offset + length)?);
+            offset += length;
+        }
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&zipped[..]), &mut out).ok()?;
+        Some(out)
+    };
+    let mut rgba = vec![0u8; width * height * 4];
+    match tag {
+        0x0503 => {
+            let has_alpha = *bytes.get(0x18)? != 0;
+            let raw = inflate(0x1A)?;
+            if raw.len() < width * height * 4 {
+                return None;
+            }
+            for (out, px) in rgba.chunks_exact_mut(4).zip(raw.chunks_exact(4)) {
+                let a = px[0];
+                let unpremultiply = |c: u8| -> u8 {
+                    if a == 0 || a == 255 { c } else { ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8 }
+                };
+                out.copy_from_slice(&[
+                    unpremultiply(px[1]),
+                    unpremultiply(px[2]),
+                    unpremultiply(px[3]),
+                    if has_alpha { a } else { 255 },
+                ]);
+            }
+        }
+        0x0303 => {
+            let count = u16_at(0x19)? as usize;
+            let palette_at = 0x1B;
+            let palette = bytes.get(palette_at..palette_at + count * 4)?;
+            let raw = inflate(palette_at + count * 4 + 1)?;
+            if stride < width || raw.len() < stride * height {
+                return None;
+            }
+            for y in 0..height {
+                for x in 0..width {
+                    let index = raw[y * stride + x] as usize;
+                    let out = &mut rgba[(y * width + x) * 4..][..4];
+                    if index < count {
+                        let c = &palette[index * 4..][..4];
+                        out.copy_from_slice(&[c[1], c[2], c[3], c[0]]);
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(DatBitmap::Pixels { width: width as u32, height: height as u32, rgba })
+}
+
+/// A frame's `rigPropagationMatrix`, `{"a":…,"b":…,"c":…,"d":…,"tx":…,"ty":…}`
+/// in 16.16 fixed point. Only its linear part is used — see `rig_compose`.
+fn parse_rig_propagation(text: &str) -> Option<Affine> {
+    let field = |key: &str| -> Option<f64> {
+        let at = text.find(&format!("\"{key}\""))? + key.len() + 2;
+        let rest = text[at..].trim_start().strip_prefix(':')?.trim_start();
+        let end = rest.find(|c: char| !(c == '-' || c.is_ascii_digit())).unwrap_or(rest.len());
+        rest[..end].parse::<f64>().ok()
+    };
+    Some(Affine::new([
+        field("a")? / 65536.0,
+        field("b")? / 65536.0,
+        field("c")? / 65536.0,
+        field("d")? / 65536.0,
+        0.0,
+        0.0,
+    ]))
+}
+
+/// Where Animate's layer parenting draws a child, given its parent's world
+/// matrix `parent`, the child's stored (parent-relative) matrix `child`, the
+/// child's transformation point `pivot` in its own space, and `propagation`,
+/// the parent's accumulated `rigPropagationMatrix`.
+///
+/// **Measured in Adobe Animate 2024**, not guessed: barish1's rigged
+/// characters were detached from their parents inside Animate (which keeps
+/// every part where it is drawn and rewrites its matrix in world space), and
+/// every part's world matrix matched this:
+/// - the child's **transformation point** (its joint) is placed by the
+///   parent's whole matrix, scale included;
+/// - the child's **own shape** is not scaled by the parent. It is carried by
+///   the propagation matrix Animate stores on each rigged keyframe
+///   (`rigPropagationMatrix`), accumulated down the chain: a root passes on
+///   its own; a child passes on its parent's times its own. Usually that is
+///   just the parent's turn (a half turn for a mirrored parent), but not
+///   always: barish1's wrists carry a skew their palms inherit.
+///
+/// ```text
+/// world = T(parent · (child · pivot)) · propagation · linear(child) · T(-pivot)
+/// ```
+///
+/// Composing the full matrices instead shrank every part hung under a scaled
+/// parent (the kurta man's torso came out at 0.53 × 0.57 of its size) and
+/// pulled heads and hands off their joints.
+fn rig_compose(parent: Affine, child: Affine, pivot: Option<buzz_geom::Point>, propagation: Affine) -> Affine {
+    let pivot = pivot.unwrap_or(buzz_geom::Point::ORIGIN);
+    let [a, b, c, d, ..] = child.as_coeffs();
+    let joint = parent * (child * pivot);
+    let [pa, pb, pc, pd, ..] = propagation.as_coeffs();
+    let shape = Affine::new([pa, pb, pc, pd, 0.0, 0.0]) * Affine::new([a, b, c, d, 0.0, 0.0]);
+    Affine::translate(joint.to_vec2()) * shape * Affine::translate(-pivot.to_vec2())
+}
+
+/// The pose a rig's children are baked against: the parent's own artwork on
+/// its rest frame.
+///
+/// # The first keyframe **that has an object**
+///
+/// A parent layer occasionally opens on a blank keyframe — a held clear
+/// before the rig appears — and reading the rest pose from that gave every
+/// child an identity matrix to rig against instead of the parent's real
+/// pose (Findings §4). So this looks past blank keyframes to the first one
+/// that actually draws something.
+///
+/// # The first **symbol instance**, not just the first object
+///
+/// When that keyframe holds more than one object, Animate rigs a child
+/// against the instance — not against, say, a loose shape drawn on the same
+/// layer for reference. Falls back to the first object when the keyframe
+/// holds no instance at all.
+fn parent_rest_pose(frames: &buzz_scene::LayerTimeline) -> Affine {
+    let Some(rest) = frames
+        .keyframes()
+        .iter()
+        .find(|k| !k.objects.is_empty())
+        .map(|k| k.start)
+    else {
+        return Affine::IDENTITY;
+    };
+    let resolved = frames.resolved_at(rest);
+    let objects: Vec<&Object> = resolved.iter().collect();
+    objects
+        .iter()
+        .find(|o| o.instance().is_some())
+        .or_else(|| objects.first())
+        .map(|o| o.transform)
+        .unwrap_or(Affine::IDENTITY)
 }
 
 /// Accumulates layers, frames and elements while walking the XML.
 #[derive(Default)]
 struct FrameContext {
+    bitmaps: BitmapMap,
+    /// Every sound in the library, by the name a frame's `soundName` refers
+    /// to it by.
+    sounds: SoundMap,
     layer: Option<Layer>,
     keyframes: Vec<buzz_scene::Keyframe>,
     length: u32,
@@ -1034,10 +2051,41 @@ struct FrameContext {
     edges: Vec<edge::EdgeRecord>,
     /// An instance has just been pushed and is waiting for its `<Matrix>`.
     placing: bool,
+    /// A `<DOMShape>` has opened and its own `<matrix>`, if it has one, has
+    /// not arrived yet. Only a shape inside a `<DOMGroup>` (or a drawing
+    /// object) carries one; it comes before the shape's fills and edges.
+    shape_wants_matrix: bool,
+    /// The open shape's own placement: its edges are in its own space.
+    shape_matrix: Option<Affine>,
     /// A `<transformationPoint>` is open and the `<Point>` inside it belongs
     /// to the object just pushed. `<Point>` appears elsewhere in XFL, so it
     /// is only taken when something has asked for it.
     reading_pivot: bool,
+    /// An instance's `<color>` is open: the `<Color>` inside it is that
+    /// instance's colour effect (alpha, tint, brightness, advanced).
+    reading_color: bool,
+    /// The open frame's `<SoundEnvelope>` has given its volume already.
+    /// `<SoundEnvelopePoint>` can appear more than once, to shape the volume
+    /// over the clip's length; only the first is read for now, so later ones
+    /// must not overwrite it.
+    envelope_taken: bool,
+    /// A `<CustomEase>` is open, and which property it eases —
+    /// `target="all" | "position" | "rotation" | "scale" | "color"` — so its
+    /// `<Point>` children (which are `<Point>` the same way a
+    /// `<transformationPoint>`'s is, and must not be confused with it) are
+    /// collected into the right curve.
+    reading_custom_ease: Option<String>,
+    /// Points accumulated for the open `<CustomEase>`, in file order: the
+    /// curve's own start, then two control points and an end point per
+    /// segment. Built by `<Point>` and committed by `end_custom_ease`.
+    custom_ease_points: Vec<buzz_geom::Point>,
+    /// Each finished keyframe's own `parentLayerIndex`, alongside
+    /// `keyframes` — `bake_rig_offsets` reads this to find the rare layer
+    /// that re-parents mid-timeline, which `rig_parent` above (the layer's
+    /// single, first-stated link) cannot represent.
+    rig_parent_by_frame: Vec<(u32, Option<u32>)>,
+    /// Each finished keyframe's own `rigPropagationMatrix`, the same way.
+    rig_prop_by_frame: Vec<(u32, Option<Affine>)>,
 }
 
 /// Flash's gradients are declared in a fixed square 32 768 twips across —
@@ -1083,6 +2131,9 @@ struct ShapeStyleTable {
     /// encloses it; this is how the gradient's own is told apart from the one
     /// that places a symbol instance.
     gradient_wants_matrix: bool,
+    /// A `<BitmapFill>` is open and waiting for its `<Matrix>`: the image laid
+    /// across its natural size, before the fill's own placement.
+    bitmap_wants_matrix: Option<buzz_scene::ImageFill>,
 }
 
 #[derive(Clone, Copy)]
@@ -1100,6 +2151,7 @@ impl ShapeStyleTable {
     }
 
     fn end_gradient(&mut self) {
+        self.bitmap_wants_matrix = None;
         self.gradient = None;
         self.gradient_stops.clear();
         self.gradient_wants_matrix = false;
@@ -1134,6 +2186,29 @@ impl ShapeStyleTable {
                 .unwrap_or(Paint::Solid(Color::BLACK));
             self.strokes.insert(index, (paint, width));
         }
+    }
+
+    /// Open a bitmap fill: the picture at its natural size until its own
+    /// `<Matrix>` arrives. Animate tiles a bitmap fill unless it is marked
+    /// `bitmapIsClipped`.
+    fn begin_bitmap(&mut self, mut fill: buzz_scene::ImageFill, clipped: bool) {
+        self.end_gradient();
+        fill.tile = !clipped;
+        self.set_paint(Paint::Image(Box::new(fill.clone())));
+        self.bitmap_wants_matrix = Some(fill);
+    }
+
+    /// Claim a `<Matrix>` for the open bitmap fill, if there is one. XFL writes
+    /// it in twips per image pixel, like SWF: `a="20"` is the picture at 1:1.
+    fn place_bitmap(&mut self, matrix: Affine) -> bool {
+        let Some(mut fill) = self.bitmap_wants_matrix.take() else {
+            return false;
+        };
+        let [a, b, c, d, e, f] = matrix.as_coeffs();
+        let placed = Affine::new([a / 20.0, b / 20.0, c / 20.0, d / 20.0, e, f]);
+        fill.transform = placed * fill.transform;
+        self.set_paint(Paint::Image(Box::new(fill)));
+        true
     }
 
     /// Open a gradient. Its stops and its matrix arrive as later elements.
@@ -1216,6 +2291,21 @@ struct PendingFrame {
     label: Option<String>,
     tween: Tween,
     objects: Vec<std::sync::Arc<Object>>,
+    sound: Option<SoundRef>,
+    /// Per-property custom eases from this frame's `<tweens>`, if it had any.
+    ease_curve: Option<buzz_scene::EasingSet>,
+    /// This frame's own `parentLayerIndex`, unlike `FrameContext::rig_parent`
+    /// which keeps only the first one a layer states. Most layers never
+    /// re-parent, so this is the same value on every one of their keyframes;
+    /// `bake_rig_offsets` reads it to catch the few that do.
+    rig_parent: Option<u32>,
+    /// This frame's `rigPropagationMatrix`: the linear part Animate passes on
+    /// to the layers hung off this one (see `rig_compose`).
+    rig_prop: Option<Affine>,
+    /// This frame's `<motionObjectXML>` (Animate's Motion Tween), parsed —
+    /// `None` for every other kind of frame. `finish_frame` bakes it into
+    /// ordinary per-frame keyframes instead of pushing this one frame as is.
+    motion_object: Option<MotionObject>,
 }
 
 impl FrameContext {
@@ -1315,6 +2405,17 @@ impl FrameContext {
             push(path, None, Some((paint, width)));
         }
 
+        // The shape's own placement, when it has one (see `shape_matrix`).
+        if let Some(matrix) = self.shape_matrix.take()
+            && let Some(frame) = self.current.as_mut()
+        {
+            let from = frame.objects.len().saturating_sub(made);
+            for object in &mut frame.objects[from..] {
+                let object = std::sync::Arc::make_mut(object);
+                object.transform = matrix * object.transform;
+            }
+        }
+        self.shape_wants_matrix = false;
         // Counted after the closure has finished with `report`.
         report.shapes += made;
         if gaps > 0 {
@@ -1323,14 +2424,18 @@ impl FrameContext {
     }
 
     fn begin_frame(&mut self, attrs: &HashMap<String, String>, report: &mut ImportReport) {
-        self.finish_frame();
+        self.finish_frame(report);
+        // This frame's own rig parent, whatever it says.
+        let frame_rig_parent = attrs
+            .get("parentLayerIndex")
+            .and_then(|v| v.trim().parse::<u32>().ok());
         // Which layer this one follows, by rigging index. Animate keeps it on
         // the frame because a rig can be re-parented part way through a shot;
-        // our model has one link per layer, so the first one stated wins.
+        // our model has one link per layer, so the first one stated wins —
+        // `frame_rig_parent` above keeps every frame's own, for
+        // `bake_rig_offsets` to catch the rare one that changes.
         if self.rig_parent.is_none() {
-            self.rig_parent = attrs
-                .get("parentLayerIndex")
-                .and_then(|v| v.trim().parse::<u32>().ok());
+            self.rig_parent = frame_rig_parent;
         }
         let start = attr_u32(attrs, "index", 0);
         let duration = attr_u32(attrs, "duration", 1).max(1);
@@ -1338,12 +2443,20 @@ impl FrameContext {
         if tween.is_active() {
             report.tweens += 1;
         }
+        self.envelope_taken = false;
+        self.reading_custom_ease = None;
+        self.custom_ease_points.clear();
         self.current = Some(PendingFrame {
             start,
             duration,
             label: attrs.get("name").cloned().filter(|s| !s.is_empty()),
             tween,
             objects: Vec::new(),
+            sound: parse_sound_ref(attrs, &self.sounds),
+            ease_curve: None,
+            rig_parent: frame_rig_parent,
+            rig_prop: attrs.get("rigPropagationMatrix").and_then(|v| parse_rig_propagation(v)),
+            motion_object: None,
         });
         report.keyframes += 1;
     }
@@ -1393,6 +2506,12 @@ impl FrameContext {
             "DOMShape" => {
                 self.finish_shape(ids, report);
                 self.styles.begin_shape();
+                self.shape_wants_matrix = true;
+                self.shape_matrix = None;
+            }
+            // Past the point where a shape's own matrix could come.
+            "fills" | "strokes" | "edges" => {
+                self.shape_wants_matrix = false;
             }
 
             "FillStyle" => {
@@ -1438,10 +2557,16 @@ impl FrameContext {
                 self.styles
                     .add_gradient_stop(parse_color(attrs, "color", "alpha"), ratio);
             }
-            "BitmapFill" => {
-                report.note_unsupported("a bitmap fill, imported as a flat colour");
-                self.styles.set_color(Color::from_rgb8(0x80, 0x80, 0x80));
-            }
+            "BitmapFill" => match attrs.get("bitmapPath").and_then(|p| self.bitmaps.get(p)) {
+                Some(fill) => {
+                    let fill = fill.clone();
+                    self.styles.begin_bitmap(fill, attr_bool(attrs, "bitmapIsClipped", false));
+                }
+                None => {
+                    report.note_unsupported("a bitmap fill whose picture is missing, imported as a flat colour");
+                    self.styles.set_color(Color::from_rgb8(0x80, 0x80, 0x80));
+                }
+            },
 
             "Edge" => {
                 // Collected, not drawn. A shape's outlines are spread across
@@ -1505,10 +2630,62 @@ impl FrameContext {
                 }
             }
             "DOMGroup" => report.groups += 1,
-            "DOMBitmapInstance" => report.note_unsupported("bitmap"),
+            "DOMBitmapInstance" => {
+                let Some(name) = attrs.get("libraryItemName") else { return };
+                let Some(fill) = self.bitmaps.get(name) else {
+                    report.note_unsupported(format!("bitmap instance unavailable: {name}"));
+                    return;
+                };
+                let rect = buzz_geom::Rect::new(0.0, 0.0, fill.asset.width as f64, fill.asset.height as f64);
+                let mut object = Object::shape(ObjectId(ids.take()), ShapeData {
+                    path: buzz_geom::Shape::to_path(&rect, 1e-9),
+                    fill: Some(FillSpec::image(fill.clone())),
+                    stroke: None,
+                    blend: buzz_scene::PaintBlend::Normal,
+                });
+                object.visible = attr_bool(attrs, "isVisible", true);
+                frame.objects.push(std::sync::Arc::new(object));
+                report.shapes += 1;
+                self.placing = true;
+            }
             "DOMStaticText" | "DOMDynamicText" | "DOMInputText" => report.note_unsupported("text"),
             "DOMVideoInstance" => report.note_unsupported("video"),
-            "DOMSoundItem" => report.note_unsupported("sound"),
+            // `DOMSoundItem` is a library item, read by the sound pass in
+            // `build_with_media` before any frame is open — never a stage
+            // instance, so there is nothing to place here.
+            //
+            // **A custom ease curve, drawn by hand in the Motion Editor.**
+            // `target` says which property it governs — `all` covers most of
+            // them — and its points arrive as the `<Point>` children that
+            // follow, collected until `</CustomEase>` closes it (see
+            // `end_custom_ease`).
+            "CustomEase" => {
+                self.reading_custom_ease =
+                    Some(attrs.get("target").cloned().unwrap_or_else(|| "all".into()));
+                self.custom_ease_points.clear();
+            }
+            "Point" if self.reading_custom_ease.is_some() => {
+                self.custom_ease_points.push(buzz_geom::Point::new(
+                    attr_f64(attrs, "x", 0.0),
+                    attr_f64(attrs, "y", 0.0),
+                ));
+            }
+            // **A named ease preset, per property.** Distinct from the
+            // acceleration slider (`parse_tween`'s `Easing::Strength`, which
+            // is written on the `DOMFrame` itself): this is the Motion
+            // Editor's dropdown of named curves — `quadInOut` and the rest —
+            // applied to one property rather than the whole tween. Mapped
+            // onto an equivalent Bézier, the same shape a `<CustomEase>`
+            // would carry, since our model has no named-preset vocabulary of
+            // its own to match it against.
+            "Ease" => {
+                if let Some(method) = attrs.get("method")
+                    && let Some(points) = bezier_points_for_ease_method(method)
+                {
+                    let target = attrs.get("target").map(String::as_str).unwrap_or("all");
+                    self.set_ease_target(target, std::sync::Arc::from(points));
+                }
+            }
             // **The transformation point an animator placed.**
             //
             // Animate writes it beside the matrix on anything that can be
@@ -1520,6 +2697,21 @@ impl FrameContext {
             // we store it too.
             "transformationPoint" => {
                 self.reading_pivot = true;
+            }
+            // **The instance's colour effect.** Dropping it drew every faded
+            // or tinted symbol at full strength: barish1's rain, set to 36%
+            // alpha, came out solid white over the whole scene.
+            "color" => {
+                self.reading_color = true;
+            }
+            "Color" if self.reading_color => {
+                self.reading_color = false;
+                if let Some(last) = frame.objects.last_mut()
+                    && let buzz_scene::ObjectKind::Instance(placed) =
+                        &mut std::sync::Arc::make_mut(last).kind
+                {
+                    placed.color = parse_color_effect(attrs);
+                }
             }
             "Point" if self.reading_pivot => {
                 self.reading_pivot = false;
@@ -1535,11 +2727,25 @@ impl FrameContext {
                     std::sync::Arc::make_mut(last).pivot = Some(buzz_geom::Point::new(x, y));
                 }
             }
+            "Matrix" if self.shape_wants_matrix => {
+                // **A grouped shape's own placement.** Animate writes the
+                // group's matrix on the `<DOMGroup>` and again, already
+                // composed, on each member shape; its edges are in that
+                // shape's own space. Ignoring it drew every grouped shape at
+                // its raw coordinates: barish1's left eyeball sat at the
+                // symbol's corner, clipped by the eye-white mask to a sliver.
+                self.shape_wants_matrix = false;
+                self.shape_matrix = Some(parse_matrix(attrs));
+            }
             "Matrix" => {
                 // **A gradient's matrix is its own.** It says where the ramp
                 // runs, and it is claimed here before anything else can mistake
                 // it for a placement.
                 if self.styles.place_gradient(parse_matrix(attrs)) {
+                    return;
+                }
+                // A bitmap fill's matrix lays its picture down; also its own.
+                if self.styles.place_bitmap(parse_matrix(attrs)) {
                     return;
                 }
                 // **Otherwise, only the one that places an instance.**
@@ -1558,40 +2764,150 @@ impl FrameContext {
                     std::sync::Arc::make_mut(last).transform = transform;
                 }
             }
+            // **A frame's volume, if it was shaped.** Animate can fade a
+            // sound across its own span with several of these; only the
+            // first is read for now, which is the clip's starting level and a
+            // fair stand-in for a curve we do not yet model.
+            "SoundEnvelopePoint" if !self.envelope_taken => {
+                self.envelope_taken = true;
+                if let Some(sound) = frame.sound.as_mut() {
+                    let level0 = attr_f64(attrs, "level0", 32_768.0);
+                    let level1 = attr_f64(attrs, "level1", level0);
+                    sound.volume = (((level0 + level1) / 2.0) / 32_768.0).clamp(0.0, 1.0) as f32;
+                }
+            }
             _ => {}
         }
     }
 
-    fn finish_frame(&mut self) {
+    fn finish_frame(&mut self, report: &mut ImportReport) {
+        // A well-formed file has already closed every `<CustomEase>` by now;
+        // this only matters for one that reads truncated, so its points are
+        // not simply dropped.
+        self.end_custom_ease();
         let Some(frame) = self.current.take() else {
             return;
         };
         self.length = self.length.max(frame.start + frame.duration);
+        self.rig_parent_by_frame.push((frame.start, frame.rig_parent));
+        self.rig_prop_by_frame.push((frame.start, frame.rig_prop));
+
+        // **Bake, don't model.** A Motion Tween's animation lives in its
+        // `AnimationCore` property curves, not in anything our own tween
+        // model can run — so it is converted into ordinary keyframes right
+        // here, once, rather than carried as a kind of tween the renderer
+        // would have to understand forever after.
+        if let Some(motion) = &frame.motion_object {
+            for keyframe in bake_motion_object(&frame, motion, report) {
+                self.keyframes.push(keyframe);
+            }
+            return;
+        }
+
         self.keyframes.push(buzz_scene::Keyframe {
             start: frame.start,
             objects: std::sync::Arc::new(frame.objects),
             label: frame.label,
             tween: frame.tween,
-            // Imported formats carry no sound yet (PROGRESS §7).
-            sound: None,
+            ease_curve: frame.ease_curve,
+            sound: frame.sound,
         });
     }
 
-    fn flush_layer(&mut self, layers: &mut Vec<PendingLayer>, _report: &mut ImportReport) {
-        self.finish_frame();
+    /// Commit the open `<CustomEase>`'s points onto the pending frame, keyed
+    /// by the target it named. Fewer than four points is not a curve — `1 +
+    /// 3n` from `(0,0)` to `(1,1)` needs at least one full segment — so it is
+    /// dropped rather than kept as something that cannot be evaluated.
+    fn end_custom_ease(&mut self) {
+        let Some(target) = self.reading_custom_ease.take() else {
+            return;
+        };
+        let points = std::mem::take(&mut self.custom_ease_points);
+        if points.len() < 4 {
+            return;
+        }
+        self.set_ease_target(&target, std::sync::Arc::from(points));
+    }
+
+    /// Write one property's ease curve onto the open frame's [`EasingSet`],
+    /// creating it on first use. `position`, `rotation` and `scale` are their
+    /// own fields; everything else — `all`, `color`, `filters` — falls back
+    /// to `all`, which is the minimum acceptable version this plan asks for.
+    fn set_ease_target(&mut self, target: &str, points: std::sync::Arc<[buzz_geom::Point]>) {
+        let Some(frame) = self.current.as_mut() else {
+            return;
+        };
+        let set = frame
+            .ease_curve
+            .get_or_insert_with(buzz_scene::EasingSet::default);
+        match target {
+            "position" => set.position = Some(points),
+            "rotation" => set.rotation = Some(points),
+            "scale" => set.scale = Some(points),
+            _ => set.all = Some(points),
+        }
+    }
+
+    /// Attach a parsed `<motionObjectXML>` to the frame it belongs to.
+    /// `finish_frame` bakes it once the frame closes.
+    fn begin_motion_object(&mut self, motion: MotionObject) {
+        if let Some(frame) = self.current.as_mut() {
+            frame.motion_object = Some(motion);
+        }
+    }
+
+    fn flush_layer(&mut self, layers: &mut Vec<PendingLayer>, report: &mut ImportReport) {
+        self.finish_frame(report);
         let Some(mut layer) = self.layer.take() else {
             return;
         };
-        layer.frames = buzz_scene::LayerTimeline::from_parts(
-            std::mem::take(&mut self.keyframes),
-            self.length.max(1),
-        );
+        let mut keyframes = std::mem::take(&mut self.keyframes);
+        link_tweened_objects(&mut keyframes);
+        layer.frames = buzz_scene::LayerTimeline::from_parts(keyframes, self.length.max(1));
         layers.push(PendingLayer {
             layer,
             parent_index: self.parent_index.take(),
             rig_index: self.rig_index.take(),
             rig_parent: self.rig_parent.take(),
+            rig_parent_by_frame: std::mem::take(&mut self.rig_parent_by_frame),
+            rig_prop_by_frame: std::mem::take(&mut self.rig_prop_by_frame),
         });
+    }
+}
+
+/// **Give a classic tween's far keyframe the ids of the objects it tweens
+/// from.** Our tweens pair an object with its counterpart on the next
+/// keyframe by id (F6 carries ids forward), while this importer gave every
+/// object on every keyframe a fresh one, so nothing ever paired: every
+/// imported classic tween held its first pose and jumped at the next key
+/// (barish1's digging swing, 2Bhatta2's walks). Animate tweens the instances
+/// on the two keyframes in order, so they are paired in order here, instance
+/// with instance; the chain carries through, so a pose tweened 0 -> 12 -> 26
+/// keeps one id throughout. Shape tweens pair by what the drawings are
+/// instead (`match_drawings`) and are left alone.
+fn link_tweened_objects(keyframes: &mut [buzz_scene::Keyframe]) {
+    use buzz_scene::tween::TweenKind;
+    for index in 0..keyframes.len().saturating_sub(1) {
+        if !matches!(keyframes[index].tween.kind, TweenKind::Classic | TweenKind::Motion) {
+            continue;
+        }
+        let from: Vec<(ObjectId, bool)> = keyframes[index]
+            .objects
+            .iter()
+            .map(|o| (o.id, o.instance().is_some()))
+            .collect();
+        let next = &mut keyframes[index + 1];
+        let mut objects: Vec<std::sync::Arc<Object>> = next.objects.as_ref().clone();
+        let mut changed = false;
+        for ((id, from_is_instance), object) in from.iter().zip(objects.iter_mut()) {
+            if *from_is_instance == object.instance().is_some() && object.id != *id {
+                std::sync::Arc::make_mut(object).id = *id;
+                changed = true;
+            }
+        }
+        if changed {
+            next.objects = std::sync::Arc::new(objects);
+        }
     }
 }
 
@@ -1653,6 +2969,8 @@ fn parse_symbol(
     path: &str,
     id: SymbolId,
     symbols: &HashMap<String, SymbolId>,
+    bitmaps: &BitmapMap,
+    sounds: &SoundMap,
     ids: &mut IdSource,
     report: &mut ImportReport,
 ) -> Result<Symbol, ImportError> {
@@ -1673,7 +2991,11 @@ fn parse_symbol(
     let mut symbol = Symbol::new(id, file_name, SymbolKind::Graphic);
     symbol.folder = folder;
 
-    let mut context = FrameContext::default();
+    let mut context = FrameContext {
+        bitmaps: bitmaps.clone(),
+        sounds: sounds.clone(),
+        ..Default::default()
+    };
     let mut layers: Vec<PendingLayer> = Vec::new();
 
     loop {
@@ -1700,11 +3022,23 @@ fn parse_symbol(
                         context.begin_layer(&attrs, ids);
                     }
                     "DOMFrame" => context.begin_frame(&attrs, report),
+                    "motionObjectXML" => {
+                        let start = reader.buffer_position() as usize;
+                        if let Some(rel_end) =
+                            xml.get(start..).and_then(|rest| rest.find("</motionObjectXML>"))
+                        {
+                            let motion = parse_motion_object(&xml[start..start + rel_end], report);
+                            context.begin_motion_object(motion);
+                        }
+                    }
                     _ => context.element(&name, &attrs, symbols, ids, report),
                 }
             }
             Ok(Event::End(e)) if e.name().as_ref() == b"DOMShape" => {
                 context.finish_shape(ids, report);
+            }
+            Ok(Event::End(e)) if e.name().as_ref() == b"CustomEase" => {
+                context.end_custom_ease();
             }
             Err(e) => {
                 // **Animate itself writes broken symbol files.** Real
@@ -1727,7 +3061,7 @@ fn parse_symbol(
 
     // A symbol's timeline has layer folders and masks just as the document's
     // does, and the same top-first order.
-    resolve_layer_parents(&mut layers);
+    resolve_layer_parents(&mut layers, report);
 
     if layers.is_empty() {
         layers.push(PendingLayer {
@@ -1735,6 +3069,8 @@ fn parse_symbol(
             parent_index: None,
             rig_index: None,
             rig_parent: None,
+            rig_parent_by_frame: Vec::new(),
+            rig_prop_by_frame: Vec::new(),
         });
     }
     for (index, pending) in layers.into_iter().enumerate() {
@@ -2006,6 +3342,239 @@ mod tests {
         let tween = foreground.frames.tween_at(0);
         assert_eq!(tween.kind, buzz_scene::TweenKind::Classic);
         assert!(matches!(tween.easing, buzz_scene::Easing::Strength(a) if (a - 50.0).abs() < 1e-9));
+    }
+
+    /// Hand-computed: x moves 0 → 100, rotating 0° → 90° with a flip
+    /// (`Scale_X` 100 → -100) over 11 frames (0..=10). Checked at 0, 5 and 10
+    /// against matrices worked out by hand from `bake_motion_object`'s own
+    /// documented convention.
+    #[test]
+    fn a_motion_tween_bakes_matrices_matching_hand_computed_ones() {
+        const DOCUMENT: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="200" height="200">
+  <timelines><DOMTimeline name="Scene 1"><layers>
+    <DOMLayer name="Art"><frames>
+      <DOMFrame index="0" duration="11" tweenType="motion object" isMotionObject="true">
+        <motionObjectXML><AnimationCore TimeScale="24000" Version="1" duration="11000">
+          <TimeMap strength="0" type="Quadratic"/>
+          <metadata><Settings xformPtXOffsetPct="0.5" xformPtYOffsetPct="0.5"/></metadata>
+          <PropertyContainer id="root">
+            <PropertyContainer id="Basic_Motion">
+              <Property id="Motion_X"><Keyframe anchor="0,0" next="0,0" previous="0,0" timevalue="0"/><Keyframe anchor="0,100" next="0,100" previous="0,100" timevalue="10000"/></Property>
+              <Property id="Motion_Y"><Keyframe anchor="0,0" next="0,0" previous="0,0" timevalue="0"/></Property>
+              <Property id="Rotation_Z"><Keyframe anchor="0,0" next="0,0" previous="0,0" timevalue="0"/><Keyframe anchor="0,90" next="0,90" previous="0,90" timevalue="10000"/></Property>
+              <Property id="Depth"><Keyframe anchor="0,0" next="0,0" previous="0,0" timevalue="0"/></Property>
+            </PropertyContainer>
+            <PropertyContainer id="Transformation">
+              <Property id="Skew_X"><Keyframe anchor="0,0" next="0,0" previous="0,0" timevalue="0"/></Property>
+              <Property id="Skew_Y"><Keyframe anchor="0,0" next="0,0" previous="0,0" timevalue="0"/></Property>
+              <Property id="Scale_X"><Keyframe anchor="0,100" next="0,100" previous="0,100" timevalue="0"/><Keyframe anchor="0,-100" next="0,-100" previous="0,-100" timevalue="10000"/></Property>
+              <Property id="Scale_Y"><Keyframe anchor="0,100" next="0,100" previous="0,100" timevalue="0"/></Property>
+            </PropertyContainer>
+            <PropertyContainer id="Colors"/>
+            <PropertyContainer id="Filters"/>
+          </PropertyContainer>
+        </AnimationCore></motionObjectXML>
+        <elements>
+          <DOMSymbolInstance libraryItemName="part">
+            <matrix><Matrix tx="0" ty="0"/></matrix>
+          </DOMSymbolInstance>
+        </elements>
+      </DOMFrame>
+    </frames></DOMLayer>
+  </layers></DOMTimeline></timelines>
+</DOMDocument>"##;
+
+        let (scene, report) = build(
+            DOCUMENT,
+            &[("LIBRARY/part.xml".to_string(), RIG_PART.to_string())],
+        )
+        .unwrap();
+
+        let layer = scene.layers().iter().next().unwrap();
+        let at = |frame: u32| layer.objects_at(frame)[0].transform.as_coeffs();
+
+        let c0 = at(0);
+        for (k, want) in [1.0, 0.0, 0.0, 1.0, 0.0, 0.0].into_iter().enumerate() {
+            assert!((c0[k] - want).abs() < 1e-6, "frame 0 coeff {k}: {c0:?}");
+        }
+
+        let c5 = at(5);
+        let want5 = [
+            0.0,
+            0.0,
+            -std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+            50.0,
+            0.0,
+        ];
+        for k in 0..6 {
+            assert!((c5[k] - want5[k]).abs() < 1e-6, "frame 5 coeff {k}: {c5:?} vs {want5:?}");
+        }
+
+        let c10 = at(10);
+        for (k, want) in [0.0, -1.0, -1.0, 0.0, 100.0, 0.0].into_iter().enumerate() {
+            assert!((c10[k] - want).abs() < 1e-6, "frame 10 coeff {k}: {c10:?}");
+        }
+
+        assert!(report.tweens == 0, "a baked motion tween carries no classic/shape tween count");
+    }
+
+    /// bhatta2/sustipur1's real Motion Tweens hold a static, unanimated pose
+    /// on spans thousands of frames long — an object converted to a Motion
+    /// Tween and never actually touched. `bake_motion_object` must not write
+    /// one keyframe per frame for that: a single held one is exact and
+    /// leaves the layer's own length untouched.
+    #[test]
+    fn a_long_unanimated_motion_tween_span_bakes_to_one_held_keyframe() {
+        const DOCUMENT: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="200" height="200">
+  <timelines><DOMTimeline name="Scene 1"><layers>
+    <DOMLayer name="Art"><frames>
+      <DOMFrame index="0" duration="4641" tweenType="motion object" isMotionObject="true">
+        <motionObjectXML><AnimationCore TimeScale="24000" Version="1" duration="4641000">
+          <PropertyContainer id="root">
+            <PropertyContainer id="Basic_Motion">
+              <Property id="Motion_X"><Keyframe anchor="0,0" next="0,0" previous="0,0" timevalue="0"/></Property>
+              <Property id="Motion_Y"><Keyframe anchor="0,0" next="0,0" previous="0,0" timevalue="0"/></Property>
+              <Property id="Rotation_Z"><Keyframe anchor="0,-8.94977" next="0,-8.94977" previous="0,-8.94977" timevalue="0"/></Property>
+            </PropertyContainer>
+            <PropertyContainer id="Transformation">
+              <Property id="Scale_X"><Keyframe anchor="0,-168.153" next="0,-168.153" previous="0,-168.153" timevalue="0"/></Property>
+              <Property id="Scale_Y"><Keyframe anchor="0,168.153" next="0,168.153" previous="0,168.153" timevalue="0"/></Property>
+            </PropertyContainer>
+          </PropertyContainer>
+        </AnimationCore></motionObjectXML>
+        <elements>
+          <DOMSymbolInstance libraryItemName="part">
+            <matrix><Matrix a="-1.66104125976562" b="0.261581420898438" c="0.261581420898438" d="1.66104125976562" tx="388.05" ty="209"/></matrix>
+          </DOMSymbolInstance>
+        </elements>
+      </DOMFrame>
+    </frames></DOMLayer>
+  </layers></DOMTimeline></timelines>
+</DOMDocument>"##;
+
+        let (scene, _) = build(
+            DOCUMENT,
+            &[("LIBRARY/part.xml".to_string(), RIG_PART.to_string())],
+        )
+        .unwrap();
+
+        let layer = scene.layers().iter().next().unwrap();
+        assert_eq!(
+            layer.frames.keyframes().len(),
+            1,
+            "an unanimated span should bake to one held keyframe, not one per frame"
+        );
+
+        // The frame-0 identity check this plan asks for: at rest, the baked
+        // matrix must equal the instance's own written `<Matrix>` exactly —
+        // the real numbers from sustipur1's `fatherFront copy 3`
+        // (`EyebrowRight`), which is where `bake_motion_object`'s convention
+        // was verified against a real file.
+        let c = layer.objects_at(0)[0].transform.as_coeffs();
+        let want = [
+            -1.66104125976562,
+            0.261581420898438,
+            0.261581420898438,
+            1.66104125976562,
+            388.05,
+            209.0,
+        ];
+        // The file's own `Scale_X`/`Scale_Y`/`Rotation_Z` are themselves
+        // written to 3 decimal places (a UI rounding, not a measurement),
+        // so reconstructing from them cannot land closer than that lets it —
+        // 1e-4 here is tight for the coefficients themselves, not a loose
+        // pass.
+        for k in 0..6 {
+            assert!(
+                (c[k] - want[k]).abs() < 1e-4,
+                "coefficient {k}: baked {c:?}, instance wrote {want:?}"
+            );
+        }
+    }
+
+    /// The sample from sustipur1's `pradhanOldman__assets__/Symbol 1.xml`: a
+    /// `<CustomEase target="all">` with a bare `<Point/>` for its start.
+    #[test]
+    fn a_custom_ease_curve_produces_that_easing_on_the_keyframe() {
+        const DOCUMENT: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="200" height="200">
+  <timelines><DOMTimeline name="Scene 1"><layers>
+    <DOMLayer name="Art"><frames>
+      <DOMFrame index="0" duration="10" tweenType="motion" hasCustomEase="true">
+        <tweens>
+          <CustomEase target="all">
+            <Point/>
+            <Point x="0.462061801615505" y="0.0309006166962531"/>
+            <Point x="0.731165356194802" y="0.505253119561007"/>
+            <Point x="1" y="1"/>
+          </CustomEase>
+        </tweens>
+        <elements>
+          <DOMShape><edges><Edge fillStyle1="1" edges="!0 0|400 0|400 400|0 400|0 0"/></edges></DOMShape>
+        </elements>
+      </DOMFrame>
+      <DOMFrame index="10" duration="1"/>
+    </frames></DOMLayer>
+  </layers></DOMTimeline></timelines>
+</DOMDocument>"##;
+
+        let (scene, _) = build(DOCUMENT, &[]).unwrap();
+        let layer = scene.layers().iter().next().unwrap();
+        let curve = layer
+            .frames
+            .keyframe_at(0)
+            .unwrap()
+            .ease_curve
+            .clone()
+            .expect("a custom ease should have been captured");
+        let all = curve.all.expect("target=\"all\" should be set");
+        assert_eq!(all.len(), 4);
+        assert!(
+            all[0].x.abs() < 1e-9 && all[0].y.abs() < 1e-9,
+            "a bare <Point/> means (0,0), got {:?}",
+            all[0]
+        );
+        assert!((all[1].x - 0.462061801615505).abs() < 1e-9);
+        assert!((all[3].x - 1.0).abs() < 1e-9 && (all[3].y - 1.0).abs() < 1e-9);
+    }
+
+    /// bhatta2's `fatherBackPose.xml`: a preset named ease rather than a
+    /// hand-drawn curve.
+    #[test]
+    fn a_named_ease_method_produces_an_equivalent_bezier_on_the_keyframe() {
+        const DOCUMENT: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="200" height="200">
+  <timelines><DOMTimeline name="Scene 1"><layers>
+    <DOMLayer name="Art"><frames>
+      <DOMFrame index="0" duration="10" tweenType="motion" easeMethodName="quadInOut">
+        <tweens><Ease target="all" method="quadInOut"/></tweens>
+        <elements>
+          <DOMShape><edges><Edge fillStyle1="1" edges="!0 0|400 0|400 400|0 400|0 0"/></edges></DOMShape>
+        </elements>
+      </DOMFrame>
+      <DOMFrame index="10" duration="1"/>
+    </frames></DOMLayer>
+  </layers></DOMTimeline></timelines>
+</DOMDocument>"##;
+
+        let (scene, _) = build(DOCUMENT, &[]).unwrap();
+        let layer = scene.layers().iter().next().unwrap();
+        let curve = layer
+            .frames
+            .keyframe_at(0)
+            .unwrap()
+            .ease_curve
+            .clone()
+            .expect("a named ease method should have been mapped onto a curve");
+        let all = curve.all.expect("target=\"all\" should be set");
+        assert_eq!(all.len(), 4);
+        assert!(all[0].x.abs() < 1e-9 && all[0].y.abs() < 1e-9);
+        assert!((all[3].x - 1.0).abs() < 1e-9 && (all[3].y - 1.0).abs() < 1e-9);
+        // Not the identity line: it is a real ease, not a pass-through.
+        assert!(all[1].y.abs() > 1e-6 || all[2].y.abs() > 1e-6);
     }
 
     #[test]
@@ -2384,6 +3953,233 @@ mod tests {
                 (x, y)
             );
         }
+    }
+
+    const RIG_PART: &str = r##"<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="part"
+         symbolType="graphic"><timeline><DOMTimeline name="part"><layers>
+         <DOMLayer name="Layer_1"><frames><DOMFrame index="0" duration="1"/>
+         </frames></DOMLayer></layers></DOMTimeline></timeline></DOMSymbolItem>"##;
+
+    /// A parent layer that opens on a **blank** keyframe: the rig has to look
+    /// past it to the first keyframe that actually draws something, or every
+    /// child bakes against the identity matrix instead of the parent's real
+    /// pose (Findings §4).
+    #[test]
+    fn a_parent_whose_first_keyframe_is_blank_is_rigged_from_its_first_real_one() {
+        const RIG: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="figure" symbolType="graphic">
+  <timeline>
+    <DOMTimeline name="figure">
+      <layers>
+        <DOMLayer name="head" layerRiggingIndex="9">
+          <frames>
+            <DOMFrame index="0" duration="2" parentLayerIndex="5">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="10" ty="-20"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+        <DOMLayer name="body" layerRiggingIndex="5">
+          <frames>
+            <DOMFrame index="0" duration="1"/>
+            <DOMFrame index="1" duration="1">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="300" ty="400"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timeline>
+</DOMSymbolItem>"##;
+
+        let (scene, _) = build(
+            MINIMAL_DOCUMENT,
+            &[
+                ("LIBRARY/figure.xml".to_string(), RIG.to_string()),
+                ("LIBRARY/part.xml".to_string(), RIG_PART.to_string()),
+            ],
+        )
+        .unwrap();
+
+        let figure = scene.library().find_by_name("figure").unwrap();
+        let head = figure.layers.iter().find(|l| l.name == "head").unwrap();
+        let placed = head.objects_at(0)[0].transform.as_coeffs();
+        assert!(
+            (placed[4] - 310.0).abs() < 1e-9 && (placed[5] - 380.0).abs() < 1e-9,
+            "the rest pose should come from the body's first *drawn* keyframe (300,400), \
+             not its blank one, got {:?}",
+            (placed[4], placed[5])
+        );
+    }
+
+    /// A parent keyframe holding several objects rigs against the **symbol
+    /// instance** among them, not whichever object happens to be drawn first.
+    #[test]
+    fn a_parent_keyframe_with_several_objects_rigs_from_the_symbol_instance() {
+        const RIG: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="figure" symbolType="graphic">
+  <timeline>
+    <DOMTimeline name="figure">
+      <layers>
+        <DOMLayer name="head" layerRiggingIndex="9">
+          <frames>
+            <DOMFrame index="0" duration="1" parentLayerIndex="5">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="10" ty="-20"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+        <DOMLayer name="body" layerRiggingIndex="5">
+          <frames>
+            <DOMFrame index="0" duration="1">
+              <elements>
+                <DOMShape>
+                  <edges><Edge fillStyle1="1" edges="!0 0|400 0|400 400|0 400|0 0"/></edges>
+                </DOMShape>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="300" ty="400"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timeline>
+</DOMSymbolItem>"##;
+
+        let (scene, _) = build(
+            MINIMAL_DOCUMENT,
+            &[
+                ("LIBRARY/figure.xml".to_string(), RIG.to_string()),
+                ("LIBRARY/part.xml".to_string(), RIG_PART.to_string()),
+            ],
+        )
+        .unwrap();
+
+        let figure = scene.library().find_by_name("figure").unwrap();
+        let head = figure.layers.iter().find(|l| l.name == "head").unwrap();
+        let placed = head.objects_at(0)[0].transform.as_coeffs();
+        assert!(
+            (placed[4] - 310.0).abs() < 1e-9 && (placed[5] - 380.0).abs() < 1e-9,
+            "the rest pose should come from the instance (300,400), not the \
+             decorative shape drawn before it, got {:?}",
+            (placed[4], placed[5])
+        );
+    }
+
+    /// A child whose rig parent changes mid-timeline: `follows` can only hold
+    /// the one link (the first parent it named), so the keyframe naming a
+    /// *different* parent bakes to its absolute pose at that frame instead.
+    #[test]
+    fn a_child_that_changes_rig_parent_mid_timeline_bakes_the_other_keyframe_absolute() {
+        const RIG: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMSymbolItem xmlns="http://ns.adobe.com/xfl/2008/" name="figure" symbolType="graphic">
+  <timeline>
+    <DOMTimeline name="figure">
+      <layers>
+        <DOMLayer name="head" layerRiggingIndex="9">
+          <frames>
+            <DOMFrame index="0" duration="1" parentLayerIndex="5">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="10" ty="-20"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+            <DOMFrame index="1" duration="1" parentLayerIndex="6">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="1" ty="1"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+        <DOMLayer name="body" layerRiggingIndex="5">
+          <frames>
+            <DOMFrame index="0" duration="2">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="300" ty="400"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+        <DOMLayer name="prop" layerRiggingIndex="6">
+          <frames>
+            <DOMFrame index="0" duration="1">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="0" ty="0"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+            <DOMFrame index="1" duration="1">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="500" ty="600"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timeline>
+</DOMSymbolItem>"##;
+
+        let (scene, report) = build(
+            MINIMAL_DOCUMENT,
+            &[
+                ("LIBRARY/figure.xml".to_string(), RIG.to_string()),
+                ("LIBRARY/part.xml".to_string(), RIG_PART.to_string()),
+            ],
+        )
+        .unwrap();
+
+        let figure = scene.library().find_by_name("figure").unwrap();
+        let head = figure.layers.iter().find(|l| l.name == "head").unwrap();
+        let body = figure.layers.iter().find(|l| l.name == "body").unwrap();
+
+        // `follows` keeps the first parent it named — the body.
+        assert_eq!(head.follows, Some(body.id));
+
+        // Frame 0 names the body it already follows: baked normally, against
+        // the body's rest pose (300,400).
+        let at0 = head.objects_at(0)[0].transform.as_coeffs();
+        assert!(
+            (at0[4] - 310.0).abs() < 1e-9 && (at0[5] - 380.0).abs() < 1e-9,
+            "frame 0 should still bake against the body, got {:?}",
+            (at0[4], at0[5])
+        );
+
+        // Frame 1 names the prop instead — a different rigged layer. Baked to
+        // its **absolute** pose there: the prop's own frame-1 transform
+        // (500,600), composed with the head's local (1,1), since there is no
+        // `follows` link to propagate a rest-relative motion through.
+        let at1 = head.objects_at(1)[0].transform.as_coeffs();
+        assert!(
+            (at1[4] - 501.0).abs() < 1e-9 && (at1[5] - 601.0).abs() < 1e-9,
+            "frame 1 should bake absolute against the prop (500,600) + (1,1), got {:?}",
+            (at1[4], at1[5])
+        );
+
+        assert_eq!(
+            report.retargeted_rig_layers, 1,
+            "one layer changed rig parent mid-timeline"
+        );
     }
 
     /// **A joint placed in Animate is still a joint after importing.**
@@ -3278,5 +5074,361 @@ mod tests {
         for layer in scene.layers().iter() {
             assert_eq!(layer.parent, None, "{} should have no parent", layer.name);
         }
+    }
+
+    // -- sound (Phase E) ------------------------------------------------------
+
+    /// A tiny MP3, committed rather than generated: `buzz-audio` has no
+    /// encoder, only decoders (its own doc comment says so), so there is
+    /// nothing in the workspace to make one with at test time.
+    const TINY_MP3: &[u8] = include_bytes!("../tests/data/tiny.mp3");
+
+    #[test]
+    fn a_sound_in_the_bin_cache_becomes_a_library_asset_and_a_frame_cue() {
+        const DOCUMENT: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="200" height="200" frameRate="24">
+  <media>
+    <DOMSoundItem name="Beep.mp3" href="Beep.mp3" soundDataHRef="Beep.dat"
+                  sourceExternalFilepath="../audios/Beep.mp3"/>
+  </media>
+  <timelines>
+    <DOMTimeline name="Scene 1">
+      <layers>
+        <DOMLayer name="sound">
+          <frames>
+            <DOMFrame index="0" duration="1" soundName="Beep.mp3" soundSync="stream">
+              <SoundEnvelope>
+                <SoundEnvelopePoint level0="16384" level1="16384"/>
+              </SoundEnvelope>
+              <elements/>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timelines>
+</DOMDocument>"##;
+
+        let bytes = zip_up(&[
+            ("DOMDocument.xml", DOCUMENT.as_bytes()),
+            ("bin/Beep.dat", TINY_MP3),
+        ]);
+        let (scene, report) = import_fla_bytes(&bytes).expect("the sound should import");
+
+        assert_eq!(scene.sounds().len(), 1, "{:?}", report);
+        let asset = scene.sounds().iter().next().expect("one sound asset");
+        assert_eq!(asset.name, "Beep.mp3");
+        assert_eq!(asset.format, "mp3");
+        assert!(asset.sample_rate > 0 && asset.length > 0);
+
+        let layer = scene
+            .layers()
+            .iter()
+            .find(|l| l.name == "sound")
+            .expect("the sound layer");
+        let cue = layer
+            .frames
+            .keyframe_at(0)
+            .and_then(|k| k.sound)
+            .expect("the frame should carry the cue");
+        assert_eq!(cue.sound, asset.id);
+        assert_eq!(cue.sync, buzz_scene::SoundSync::Stream);
+        assert!(
+            (cue.volume - 0.5).abs() < 1e-6,
+            "16384/32768 should read as half volume, got {}",
+            cue.volume
+        );
+    }
+
+    #[test]
+    fn a_sound_whose_cache_is_missing_falls_back_to_its_external_file() {
+        const DOCUMENT: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="200" height="200" frameRate="24">
+  <media>
+    <DOMSoundItem name="Beep.mp3" href="Beep.mp3" soundDataHRef="NotThere.dat"
+                  sourceExternalFilepath="audios/Beep.mp3"/>
+  </media>
+  <timelines>
+    <DOMTimeline name="Scene 1">
+      <layers>
+        <DOMLayer name="sound"><frames><DOMFrame index="0" duration="1"/></frames></DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timelines>
+</DOMDocument>"##;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("DOMDocument.xml"), DOCUMENT).unwrap();
+        std::fs::create_dir_all(dir.path().join("audios")).unwrap();
+        std::fs::write(dir.path().join("audios/Beep.mp3"), TINY_MP3).unwrap();
+
+        let (scene, _) = import(dir.path()).expect("the fallback file should import");
+        assert_eq!(scene.sounds().len(), 1);
+        let asset = scene.sounds().iter().next().unwrap();
+        assert_eq!(asset.format, "mp3");
+    }
+
+    #[test]
+    fn a_sound_with_no_media_anywhere_is_reported_not_fatal() {
+        const DOCUMENT: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="200" height="200">
+  <media>
+    <DOMSoundItem name="Gone.mp3" href="Gone.mp3" soundDataHRef="Gone.dat"/>
+  </media>
+  <timelines><DOMTimeline name="Scene 1"><layers/></DOMTimeline></timelines>
+</DOMDocument>"##;
+
+        let (scene, report) = build(DOCUMENT, &[]).expect("a missing sound is not fatal");
+        assert_eq!(scene.sounds().len(), 0);
+        assert!(
+            report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("sound media unavailable: Gone.mp3")),
+            "{:?}",
+            report.unsupported
+        );
+    }
+
+    /// bhatta2 is a real production file kept outside the repository (see
+    /// `docs/IMPORT_FIDELITY_PLAN.md`'s Evidence files); this only runs where
+    /// it happens to be, so its absence on another machine or in CI is not a
+    /// failure.
+    #[test]
+    fn bhatta2_imports_its_three_sounds_and_they_are_not_silent() {
+        let path = Path::new("B:/youtubeProjects/Khayal3Baje/stories/bhatta/animate/bhatta2.fla");
+        if !path.exists() {
+            eprintln!("skipping: {} is not on this machine", path.display());
+            return;
+        }
+        let (scene, report) = import(path).expect("bhatta2 should import");
+        assert_eq!(scene.sounds().len(), 3, "{:?}", report.unsupported);
+        assert!(
+            !report.unsupported.iter().any(|u| u.starts_with("sound")),
+            "sound should no longer be reported as unsupported: {:?}",
+            report.unsupported
+        );
+
+        let mut cues = 0;
+        for layer in scene.layers().iter() {
+            cues += layer.frames.keyframes().iter().filter(|k| k.sound.is_some()).count();
+        }
+        for symbol in scene.library().iter() {
+            for layer in symbol.layers.iter() {
+                cues += layer.frames.keyframes().iter().filter(|k| k.sound.is_some()).count();
+            }
+        }
+        assert_eq!(cues, 15, "15 frames name a sound across the document and its symbols");
+
+        // Not literally the first 0.5s of each clip: two of the three are
+        // dialogue "marker" recordings that lead with a real, silent pause
+        // before the line starts, so that would assert on the pause rather
+        // than on whether the sound decoded. Checked non-silent overall
+        // instead, which still catches a decode that produced only zeroes.
+        for asset in scene.sounds().iter() {
+            let clip = buzz_audio::Clip::decode(&asset.data, &asset.name)
+                .unwrap_or_else(|e| panic!("{} should decode: {e}", asset.name));
+            let heard = clip.samples.iter().any(|s| s.abs() > 1e-4);
+            assert!(heard, "{} should not be silent", asset.name);
+        }
+    }
+
+    /// The zlib stream Animate cuts into `u16`-length chunks, ending at zero.
+    fn chunked_zlib(raw: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(raw).unwrap();
+        let zipped = z.finish().unwrap();
+        let mut out = Vec::new();
+        for piece in zipped.chunks(3) {
+            out.extend_from_slice(&(piece.len() as u16).to_le_bytes());
+            out.extend_from_slice(piece);
+        }
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    fn dat_header(tag: u16, stride: u16, w: u16, h: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        for v in [tag, stride, w, h] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0u32, w as u32 * 20, 0, h as u32 * 20] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// Animate's 32-bit cache: premultiplied ARGB comes out straight RGBA.
+    #[test]
+    fn a_lossless_dat_bitmap_decodes_to_straight_rgba() {
+        let mut dat = dat_header(0x0503, 8, 2, 1);
+        dat.extend_from_slice(&[1, 1]);
+        // Opaque red, then half-transparent white (premultiplied to 128).
+        dat.extend(chunked_zlib(&[255, 255, 0, 0, 128, 128, 128, 128]));
+        let Some(DatBitmap::Pixels { width, height, rgba }) = decode_bitmap_dat(&dat) else {
+            panic!("should decode");
+        };
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(rgba, vec![255, 0, 0, 255, 255, 255, 255, 128]);
+    }
+
+    /// Animate's 8-bit cache: a palette of ARGB colours and an index per pixel.
+    #[test]
+    fn a_palette_dat_bitmap_decodes_through_its_colours() {
+        let mut dat = dat_header(0x0303, 4, 2, 2);
+        dat.push(0);
+        dat.extend_from_slice(&2u16.to_le_bytes());
+        dat.extend_from_slice(&[255, 10, 20, 30, 255, 200, 100, 50]);
+        dat.push(1);
+        // Rows padded to a 4-byte stride.
+        dat.extend(chunked_zlib(&[0, 1, 9, 9, 1, 0, 9, 9]));
+        let Some(DatBitmap::Pixels { rgba, .. }) = decode_bitmap_dat(&dat) else {
+            panic!("should decode");
+        };
+        assert_eq!(&rgba[..8], &[10, 20, 30, 255, 200, 100, 50, 255]);
+        assert_eq!(&rgba[8..], &[200, 100, 50, 255, 10, 20, 30, 255]);
+    }
+
+    /// An instance's `<color>` is its colour effect, not decoration.
+    #[test]
+    fn an_instance_keeps_its_alpha_and_tint() {
+        let alpha: HashMap<String, String> = [("alphaMultiplier".to_string(), "0.359375".to_string())].into();
+        let fx = parse_color_effect(&alpha);
+        assert_eq!(fx.multiply, [1.0, 1.0, 1.0, 0.359375]);
+        assert_eq!(fx.add, [0.0; 4]);
+
+        let tint: HashMap<String, String> = [
+            ("tintMultiplier".to_string(), "0.5".to_string()),
+            ("tintColor".to_string(), "#FF0000".to_string()),
+        ]
+        .into();
+        let fx = parse_color_effect(&tint);
+        assert_eq!(fx.multiply, [0.5, 0.5, 0.5, 1.0]);
+        assert_eq!(fx.add, [0.5, 0.0, 0.0, 0.0]);
+    }
+
+    /// Layer parenting as Adobe Animate 2024 itself draws it — numbers read
+    /// back from Animate for barish1's kurta man, by detaching his head from
+    /// its torso in Animate (which keeps it where it is drawn): the joint rides
+    /// the torso's whole matrix, but the head keeps its own 0.1766 scale.
+    #[test]
+    fn a_rigged_part_sits_where_animate_draws_it() {
+        let torso_world = Affine::new([0.5723, 0.0, 0.0, 0.5723, -844.85, 314.85]);
+        let head_local = Affine::new([0.176_574_7, 0.0, 0.0, 0.176_574_7, 5.55, -147.9]);
+        let pivot = buzz_geom::Point::new(726.3, 1101.5);
+        let world = rig_compose(torso_world, head_local, Some(pivot), Affine::IDENTITY).as_coeffs();
+        assert!((world[0] - 0.1766).abs() < 1e-3 && (world[3] - 0.1766).abs() < 1e-3, "{world:?}");
+        assert!((world[4] - -896.5).abs() < 0.5 && (world[5] - 147.0).abs() < 0.5, "{world:?}");
+
+        // A wrist whose propagation carries a skew hands it on to its palm:
+        // majdoorside's right palm, again as Animate draws it.
+        let arm_prop = Affine::new([62990.0 / 65536.0, -17872.0 / 65536.0, 17872.0 / 65536.0, 62990.0 / 65536.0, 0.0, 0.0]);
+        let wrist_prop = parse_rig_propagation(r#"{"a":67736,"b":8272,"c":8273,"d":96640,"tx":-819,"ty":-3083}"#).unwrap();
+        let palm_local = Affine::new([-0.085_434, -0.086_365, -0.094_070, 0.062_134, -209.7, -277.1]);
+        let palm = rig_compose(Affine::IDENTITY, palm_local, None, arm_prop * wrist_prop).as_coeffs();
+        for (got, want) in palm[..4].iter().zip([-0.132, -0.106, -0.064, 0.101]) {
+            assert!((got - want).abs() < 2e-3, "{palm:?}");
+        }
+    }
+
+    const TWO_SCENES_WITH_A_TWEEN: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="640" height="480" frameRate="24">
+  <timelines>
+    <DOMTimeline name="Scene 1">
+      <layers>
+        <DOMLayer name="mover">
+          <frames>
+            <DOMFrame index="0" duration="10" tweenType="motion">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="0" ty="0"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+            <DOMFrame index="10">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="100" ty="0"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+        <DOMLayer name="grouped">
+          <frames>
+            <DOMFrame index="0" duration="11">
+              <elements>
+                <DOMGroup>
+                  <matrix><Matrix a="2" d="2" tx="300" ty="200"/></matrix>
+                  <members>
+                    <DOMShape>
+                      <matrix><Matrix a="2" d="2" tx="300" ty="200"/></matrix>
+                      <fills><FillStyle index="1"><SolidColor color="#FF0000"/></FillStyle></fills>
+                      <edges><Edge fillStyle1="1" edges="!0 0|200 0!200 0|200 200!200 200|0 200!0 200|0 0"/></edges>
+                    </DOMShape>
+                  </members>
+                </DOMGroup>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+    <DOMTimeline name="Village">
+      <layers>
+        <DOMLayer name="only in scene two">
+          <frames>
+            <DOMFrame index="0" duration="3">
+              <elements>
+                <DOMSymbolInstance libraryItemName="part">
+                  <matrix><Matrix tx="7" ty="7"/></matrix>
+                </DOMSymbolInstance>
+              </elements>
+            </DOMFrame>
+          </frames>
+        </DOMLayer>
+      </layers>
+    </DOMTimeline>
+  </timelines>
+</DOMDocument>"##;
+
+    fn two_scenes() -> (Scene, ImportReport) {
+        build(TWO_SCENES_WITH_A_TWEEN, &[("LIBRARY/part.xml".to_string(), RIG_PART.to_string())]).unwrap()
+    }
+
+    /// An imported classic tween moves between its keyframes, instead of
+    /// holding the first pose and jumping at the second.
+    #[test]
+    fn an_imported_classic_tween_moves_between_its_keyframes() {
+        let (scene, _) = two_scenes();
+        let mover = scene.layers().iter().find(|l| l.name == "mover").unwrap();
+        let x = |f: u32| mover.frames.resolved_at(f).iter().next().unwrap().transform.as_coeffs()[4];
+        assert!((x(0) - 0.0).abs() < 1e-9 && (x(10) - 100.0).abs() < 1e-9);
+        assert!((x(5) - 50.0).abs() < 1e-6, "halfway should be at 50, got {}", x(5));
+    }
+
+    /// A shape inside a group is placed by its own matrix, applied once.
+    #[test]
+    fn a_grouped_shape_is_placed_by_its_own_matrix() {
+        let (scene, _) = two_scenes();
+        let grouped = scene.layers().iter().find(|l| l.name == "grouped").unwrap();
+        let shape = &grouped.objects_at(0)[0];
+        let placed = shape.transform * buzz_geom::Point::new(10.0, 10.0);
+        // Edge (200, 200) twips = (10, 10) px, then scale 2 and move (300, 200).
+        assert!((placed.x - 320.0).abs() < 1e-6 && (placed.y - 220.0).abs() < 1e-6, "{placed:?}");
+    }
+
+    /// Each of Animate's scenes is its own timeline, not merged into the first.
+    #[test]
+    fn each_animate_scene_imports_as_its_own_scene() {
+        let (scene, report) = two_scenes();
+        assert!(scene.layers().iter().all(|l| l.name != "only in scene two"));
+        assert_eq!(report.scene_name.as_deref(), Some("Scene 1"));
+        assert_eq!(report.more_scenes.len(), 1);
+        let (name, village) = &report.more_scenes[0];
+        assert_eq!(name, "Village");
+        assert!(village.layers().iter().any(|l| l.name == "only in scene two"));
+        assert!(village.layers().iter().all(|l| l.name != "mover"));
     }
 }

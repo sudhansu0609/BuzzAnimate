@@ -16,6 +16,16 @@
 
 use egui::{Color32, RichText, Ui};
 
+/// The code editor's widget id, exposed so a global shortcut — Ctrl+Enter —
+/// can tell whether it has focus before deciding between running the script
+/// and opening Test Movie. See `script_shortcuts` in `buzz-app`.
+///
+/// An absolute id (`TextEdit::id`, not `id_salt`) on purpose: a salted id is
+/// combined with the enclosing `Ui`'s, which moves with the panel as it is
+/// docked, floated or tabbed — this has to name the same widget from outside
+/// that hierarchy entirely.
+pub const CODE_EDITOR_ID: &str = "actions-code-editor";
+
 /// Everything the panel remembers between frames.
 ///
 /// View state, not document state: a script in the box is not part of the
@@ -158,7 +168,11 @@ pub fn actions_panel(
                 .clicked()
             {
                 let name = state.save_name.trim();
-                let name = if name.is_empty() { "Command".to_string() } else { name.to_string() };
+                let name = if name.is_empty() {
+                    "Command".to_string()
+                } else {
+                    name.to_string()
+                };
                 response.save = Some(name);
                 state.save_name.clear();
                 ui.close();
@@ -205,6 +219,7 @@ fn source_editor(ui: &mut Ui, state: &mut ActionsState) {
         .show(ui, |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut state.source)
+                    .id(egui::Id::new(CODE_EDITOR_ID))
                     .code_editor()
                     .desired_rows(8)
                     .desired_width(f32::INFINITY)

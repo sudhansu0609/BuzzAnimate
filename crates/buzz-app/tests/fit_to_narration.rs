@@ -127,9 +127,21 @@ fn a_narration_becomes_a_timeline() {
     );
     // The lines start at roughly 0.3s, 2.3s and 3.9s.
     let seconds: Vec<f64> = lines.iter().map(|f| *f as f64 / 24.0).collect();
-    assert!((seconds[0] - 0.3).abs() < 0.3, "first line at {:.2}s", seconds[0]);
-    assert!((seconds[1] - 2.3).abs() < 0.4, "second line at {:.2}s", seconds[1]);
-    assert!((seconds[2] - 3.9).abs() < 0.4, "third line at {:.2}s", seconds[2]);
+    assert!(
+        (seconds[0] - 0.3).abs() < 0.3,
+        "first line at {:.2}s",
+        seconds[0]
+    );
+    assert!(
+        (seconds[1] - 2.3).abs() < 0.4,
+        "second line at {:.2}s",
+        seconds[1]
+    );
+    assert!(
+        (seconds[2] - 3.9).abs() < 0.4,
+        "third line at {:.2}s",
+        seconds[2]
+    );
 }
 
 /// **The lines are marked on the ruler**, so they can be seen as well as drawn
@@ -183,7 +195,11 @@ fn running_it_again_keeps_what_was_drawn() {
 
     editor.run(Command::FitToNarration);
 
-    assert_eq!(keyframes(&editor, layer), first, "the lines moved on their own");
+    assert_eq!(
+        keyframes(&editor, layer),
+        first,
+        "the lines moved on their own"
+    );
     let drawn_after = editor
         .doc
         .scene()

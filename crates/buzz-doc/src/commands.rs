@@ -38,7 +38,10 @@ pub struct CommandLibrary {
 
 impl CommandLibrary {
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        let mut library = Self { root: Some(root.into()), ..Default::default() };
+        let mut library = Self {
+            root: Some(root.into()),
+            ..Default::default()
+        };
         library.rescan();
         library
     }
@@ -79,7 +82,10 @@ impl CommandLibrary {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("js")) {
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("js"))
+            {
                 if let (Some(name), Ok(source)) = (
                     path.file_stem().map(|s| s.to_string_lossy().to_string()),
                     std::fs::read_to_string(&path),
@@ -96,24 +102,39 @@ impl CommandLibrary {
         let cleaned: String = wanted
             .trim()
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let cleaned = cleaned.trim().to_string();
-        if cleaned.is_empty() { "Command".to_string() } else { cleaned }
+        if cleaned.is_empty() {
+            "Command".to_string()
+        } else {
+            cleaned
+        }
     }
 
     /// Keep `source` as a command under `name`, replacing any of the same name
     /// (unlike a template — a command you re-save is the same command improved).
     pub fn save(&mut self, name: &str, source: &str) -> Result<SavedCommand, DocError> {
         let Some(root) = self.root.clone() else {
-            return Err(DocError::Io(std::io::Error::other("no commands folder is configured")));
+            return Err(DocError::Io(std::io::Error::other(
+                "no commands folder is configured",
+            )));
         };
         std::fs::create_dir_all(&root)?;
         let name = Self::safe_name(name);
         let path = root.join(format!("{name}.js"));
         std::fs::write(&path, source)?;
         self.rescan();
-        Ok(SavedCommand { name, source: source.to_string() })
+        Ok(SavedCommand {
+            name,
+            source: source.to_string(),
+        })
     }
 
     pub fn remove(&mut self, name: &str) -> bool {
@@ -144,7 +165,9 @@ mod tests {
     fn a_saved_command_comes_back_with_its_source() {
         let root = temp_root("save");
         let mut library = CommandLibrary::at(&root);
-        let saved = library.save("Grow By Ten", "fl.trace('hi');").expect("save");
+        let saved = library
+            .save("Grow By Ten", "fl.trace('hi');")
+            .expect("save");
         assert_eq!(saved.name, "Grow By Ten");
 
         let reloaded = CommandLibrary::at(&root);

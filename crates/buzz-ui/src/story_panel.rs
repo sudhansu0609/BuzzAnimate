@@ -142,7 +142,10 @@ pub struct ShotSummary {
 impl ShotSummary {
     /// The first line of the brief, for the list. Empty when there is none.
     fn first_line(&self) -> &str {
-        self.brief.lines().find(|l| !l.trim().is_empty()).unwrap_or("")
+        self.brief
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
     }
 }
 
@@ -165,6 +168,13 @@ pub struct StoryState {
     pub clouds: bool,
     pub water: bool,
     pub frames: u32,
+    /// **Use my assets** (AS3): Set the scene and Direct dress the set from
+    /// the asset library (its index) instead of the scenery brushes. On by
+    /// default; it only acts when the library has an index.
+    pub use_my_assets: bool,
+    /// Whether the asset library has an index, refreshed by the shell before
+    /// the panel is drawn (the checkbox is greyed out without one).
+    pub assets_indexed: bool,
 
     // -- the scenery --
     pub scenery: SceneryChoice,
@@ -210,6 +220,8 @@ impl Default for StoryState {
             clouds: false,
             water: false,
             frames: 48,
+            use_my_assets: true,
+            assets_indexed: false,
             scenery: SceneryChoice::Bare,
             art: [0; 4],
             report: None,
@@ -311,7 +323,10 @@ fn shot_list(ui: &mut Ui, shots: &[ShotSummary], current: usize, response: &mut 
                 }
                 let line = shot.first_line();
                 let detail = if line.is_empty() {
-                    format!("{} frames, {} layers — built by hand", shot.frames, shot.layers)
+                    format!(
+                        "{} frames, {} layers — built by hand",
+                        shot.frames, shot.layers
+                    )
                 } else {
                     format!("\u{201c}{line}\u{201d}")
                 };
@@ -430,7 +445,13 @@ fn the_set(ui: &mut Ui, state: &mut StoryState, response: &mut StoryResponse) {
                 });
         });
 
-        slider(ui, "Horizon", &mut state.horizon, 0.2..=0.9, "story-horizon");
+        slider(
+            ui,
+            "Horizon",
+            &mut state.horizon,
+            0.2..=0.9,
+            "story-horizon",
+        );
         slider(
             ui,
             "Figure size",
@@ -451,6 +472,15 @@ fn the_set(ui: &mut Ui, state: &mut StoryState, response: &mut StoryResponse) {
             ui.checkbox(&mut state.clouds, "Cloud");
             ui.checkbox(&mut state.water, "Water");
         });
+        ui.add_enabled(state.assets_indexed, egui::Checkbox::new(&mut state.use_my_assets, "Use my assets"))
+            .on_hover_text(
+                "Set the scene and Direct build the set from your own assets: a sky, trees and \
+                 houses along the horizon, bushes clear of the cast, or a room indoors, chosen \
+                 from the asset index by the words.",
+            )
+            .on_disabled_hover_text(
+                "Your assets are not indexed yet: Assets panel \u{25b8} Arrange by type & style\u{2026} builds the index",
+            );
 
         if ui
             .button("Set the scene")
@@ -526,17 +556,15 @@ fn the_scenery(
         let usable = state.scenery != SceneryChoice::Bare;
         if ui
             .add_enabled(usable, egui::Button::new("Lay the scenery"))
-            .on_hover_text("Behind the cast where it belongs behind, in front where it belongs in front")
+            .on_hover_text(
+                "Behind the cast where it belongs behind, in front where it belongs in front",
+            )
             .clicked()
         {
             response.lay_scenery = true;
         }
         if !usable {
-            ui.label(
-                RichText::new("Bare has nothing to lay.")
-                    .small()
-                    .weak(),
-            );
+            ui.label(RichText::new("Bare has nothing to lay.").small().weak());
         }
     });
 }

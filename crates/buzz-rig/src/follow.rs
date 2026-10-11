@@ -90,12 +90,10 @@ pub fn follow_through_coupled(
     // anything with weight (opposite the acceleration). Read off the per-frame
     // transform; an absent transform is a still object.
     let obj_rotation = |f: usize| -> f64 {
-        object_world
-            .get(f)
-            .map_or(0.0, |a| {
-                let c = a.as_coeffs();
-                c[1].atan2(c[0])
-            })
+        object_world.get(f).map_or(0.0, |a| {
+            let c = a.as_coeffs();
+            c[1].atan2(c[0])
+        })
     };
     let obj_position = |f: usize| -> Vec2 {
         object_world.get(f).map_or(Vec2::ZERO, |a| {
@@ -188,7 +186,8 @@ mod tests {
         };
         for i in 0..n {
             let parent = if i == 0 { None } else { Some(i - 1) };
-            arm.bones.push(Bone::new(format!("b{i}"), parent, 40.0, 0.0));
+            arm.bones
+                .push(Bone::new(format!("b{i}"), parent, 40.0, 0.0));
         }
         arm
     }
@@ -281,7 +280,10 @@ mod tests {
         let modified = follow_through(&arm, 0, Spring::hair(), &primary, 24.0);
         for (f, pose) in modified.iter().enumerate() {
             for (b, angle) in pose.iter().enumerate() {
-                assert!(angle.abs() < 1e-6 || b == 0, "frame {f} bone {b} drifted to {angle}");
+                assert!(
+                    angle.abs() < 1e-6 || b == 0,
+                    "frame {f} bone {b} drifted to {angle}"
+                );
             }
         }
     }
@@ -305,7 +307,8 @@ mod tests {
             .map(|f| Affine::rotate(if f >= 10 { 1.0 } else { f as f64 / 10.0 }))
             .collect();
 
-        let modified = follow_through_coupled(&arm, 0, Spring::tail(), &primary, &object, 0.0, 24.0);
+        let modified =
+            follow_through_coupled(&arm, 0, Spring::tail(), &primary, &object, 0.0, 24.0);
         // Mid-turn, the root lags the body's rotation: its angle *relative to the
         // turning body* is behind, so its own local angle dips below rest.
         assert!(

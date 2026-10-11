@@ -106,6 +106,7 @@
 | **`Ctrl + K`** | **Command Palette** (instant search across all commands) |
 | **`Ctrl + Shift + L`** | Toggle Stage **Light Gizmos** |
 | **`Ctrl + Alt + L`** | **Lock / Unlock Layout** (prevents dragging docks) |
+| **`Shift + M`** *(Bone tool active)* | Toggle the Bone tool between **Create bones** and **Move bones** |
 | **`F9`** | Toggle **Actions (Scripting)** panel |
 | **`Ctrl + Enter`** *(in Actions)* | **Run JavaScript Script** |
 | **`Ctrl + Alt + Shift + R`** | Toggle Rulers |

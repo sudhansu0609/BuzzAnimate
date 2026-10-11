@@ -32,11 +32,7 @@ fn outline(editor: &mut Editor, layer: LayerId, frame: u32, x: f64) {
         scene.add_shape_at(
             layer,
             frame,
-            ShapeData::stroked(
-                Rect::new(x, 40.0, x + 120.0, 160.0).to_path(1e-9),
-                INK,
-                2.0,
-            ),
+            ShapeData::stroked(Rect::new(x, 40.0, x + 120.0, 160.0).to_path(1e-9), INK, 2.0),
         );
     });
 }
@@ -84,7 +80,14 @@ fn fill_colour(editor: &Editor, layer: LayerId, frame: u32) -> Option<Color> {
 /// Three frames of a shape that drifts a little, coloured once on the first.
 fn a_short_sequence(drift: f64) -> (Editor, LayerId) {
     let mut editor = Editor::default();
-    let layer = editor.doc.scene().layers().iter().next().expect("a layer").id;
+    let layer = editor
+        .doc
+        .scene()
+        .layers()
+        .iter()
+        .next()
+        .expect("a layer")
+        .id;
     for frame in 0..3u32 {
         outline(&mut editor, layer, frame, 100.0 + drift * f64::from(frame));
     }
@@ -191,7 +194,14 @@ fn a_drawing_that_moved_too_far_is_reported_not_guessed() {
 #[test]
 fn line_art_is_not_mistaken_for_paint() {
     let mut editor = Editor::default();
-    let layer = editor.doc.scene().layers().iter().next().expect("a layer").id;
+    let layer = editor
+        .doc
+        .scene()
+        .layers()
+        .iter()
+        .next()
+        .expect("a layer")
+        .id;
     for frame in 0..2u32 {
         editor.doc.edit("draw", |scene| {
             if frame > 0 {

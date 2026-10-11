@@ -82,11 +82,7 @@ pub(crate) fn install<'js>(
 /// The one addition without which none of the others compose: a script that can
 /// stage, cast and perform a scene but cannot make a second one can automate a
 /// shot and never a film.
-fn scenes<'js>(
-    ctx: &Ctx<'js>,
-    host: &JsObject<'js>,
-    state: &Rc<RefCell<State>>,
-) -> JsResult<()> {
+fn scenes<'js>(ctx: &Ctx<'js>, host: &JsObject<'js>, state: &Rc<RefCell<State>>) -> JsResult<()> {
     host_fn!(ctx, host, state, "sceneCount", |state| {
         Ok(state.borrow().scenes.len() as i32)
     });
@@ -207,11 +203,7 @@ fn scenes<'js>(
 // Sets
 // ---------------------------------------------------------------------------
 
-fn sets<'js>(
-    ctx: &Ctx<'js>,
-    host: &JsObject<'js>,
-    state: &Rc<RefCell<State>>,
-) -> JsResult<()> {
+fn sets<'js>(ctx: &Ctx<'js>, host: &JsObject<'js>, state: &Rc<RefCell<State>>) -> JsResult<()> {
     // **Set the scene**: ground, backdrop, a light rig, and optionally cloud
     // and water. The dialog's own call, with the dialog taken off it.
     host_fn!(ctx, host, state, "setTheScene", |state, options: String| {
@@ -233,8 +225,14 @@ fn sets<'js>(
         if let Some(v) = options.get("frames").and_then(Value::as_u64) {
             recipe.frames = v as u32;
         }
-        recipe.clouds = options.get("clouds").and_then(Value::as_bool).unwrap_or(false);
-        recipe.water = options.get("water").and_then(Value::as_bool).unwrap_or(false);
+        recipe.clouds = options
+            .get("clouds")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        recipe.water = options
+            .get("water")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let mut s = state.borrow_mut();
         let staged = buzz_act::staging::build(s.scene_mut(), &recipe);
@@ -286,47 +284,53 @@ fn sets<'js>(
     // A light. `json` carries whatever the kind needs: a sun's azimuth and
     // elevation, a lamp's position and reach, everything's colour and
     // intensity.
-    host_fn!(ctx, host, state, "addLight", |state, kind: String, options: String| {
-        let options = parse_json(&options)?;
-        let mut s = state.borrow_mut();
-        let stage = s.scene().stage().stage_rect();
-        let light_kind = match kind.to_ascii_lowercase().as_str() {
-            "sun" => buzz_scene::LightKind::Sun {
-                azimuth: number(&options, "azimuth").unwrap_or(-0.6),
-                elevation: number(&options, "elevation").unwrap_or(0.9),
-            },
-            "sky" => buzz_scene::LightKind::Sky {
-                horizon: colour(&options, "horizon")?
-                    .unwrap_or(peniko::Color::from_rgb8(0x6E, 0x86, 0xA8)),
-            },
-            "lamp" => buzz_scene::LightKind::Lamp {
-                position: Point::new(
-                    number(&options, "x").unwrap_or(stage.center().x),
-                    number(&options, "y").unwrap_or(stage.center().y),
-                ),
-                height: number(&options, "height").unwrap_or(160.0),
-                radius: number(&options, "reach")
-                    .unwrap_or((stage.width().min(stage.height()) * 0.5).max(40.0)),
-            },
-            other => {
-                return Err(throw(&format!(
-                    "unknown light {other:?}; expected sun, sky or lamp"
-                )));
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "addLight",
+        |state, kind: String, options: String| {
+            let options = parse_json(&options)?;
+            let mut s = state.borrow_mut();
+            let stage = s.scene().stage().stage_rect();
+            let light_kind = match kind.to_ascii_lowercase().as_str() {
+                "sun" => buzz_scene::LightKind::Sun {
+                    azimuth: number(&options, "azimuth").unwrap_or(-0.6),
+                    elevation: number(&options, "elevation").unwrap_or(0.9),
+                },
+                "sky" => buzz_scene::LightKind::Sky {
+                    horizon: colour(&options, "horizon")?
+                        .unwrap_or(peniko::Color::from_rgb8(0x6E, 0x86, 0xA8)),
+                },
+                "lamp" => buzz_scene::LightKind::Lamp {
+                    position: Point::new(
+                        number(&options, "x").unwrap_or(stage.center().x),
+                        number(&options, "y").unwrap_or(stage.center().y),
+                    ),
+                    height: number(&options, "height").unwrap_or(160.0),
+                    radius: number(&options, "reach")
+                        .unwrap_or((stage.width().min(stage.height()) * 0.5).max(40.0)),
+                },
+                other => {
+                    return Err(throw(&format!(
+                        "unknown light {other:?}; expected sun, sky or lamp"
+                    )));
+                }
+            };
+            let id = s.scene_mut().add_light(light_kind);
+            let tint = colour(&options, "color")?;
+            let intensity = number(&options, "intensity");
+            if let Some(light) = s.scene_mut().lights_mut().get_mut(id) {
+                if let Some(tint) = tint {
+                    light.color = tint;
+                }
+                if let Some(intensity) = intensity {
+                    light.intensity = intensity as f32;
+                }
             }
-        };
-        let id = s.scene_mut().add_light(light_kind);
-        let tint = colour(&options, "color")?;
-        let intensity = number(&options, "intensity");
-        if let Some(light) = s.scene_mut().lights_mut().get_mut(id) {
-            if let Some(tint) = tint {
-                light.color = tint;
-            }
-            if let Some(intensity) = intensity {
-                light.intensity = intensity as f32;
-            }
+            Ok(id.0)
         }
-        Ok(id.0)
-    });
+    );
     Ok(())
 }
 
@@ -334,61 +338,64 @@ fn sets<'js>(
 // Cast
 // ---------------------------------------------------------------------------
 
-fn cast<'js>(
-    ctx: &Ctx<'js>,
-    host: &JsObject<'js>,
-    state: &Rc<RefCell<State>>,
-) -> JsResult<()> {
+fn cast<'js>(ctx: &Ctx<'js>, host: &JsObject<'js>, state: &Rc<RefCell<State>>) -> JsResult<()> {
     // **Cast a character**: a bone-rigged body, a face parented to it, a
     // blink, and a breath. See [`buzz_act::puppet`].
-    host_fn!(ctx, host, state, "addCharacter", |state, options: String| {
-        let options = parse_json(&options)?;
-        let mut s = state.borrow_mut();
-        let stage = s.scene().stage().stage_rect();
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "addCharacter",
+        |state, options: String| {
+            let options = parse_json(&options)?;
+            let mut s = state.borrow_mut();
+            let stage = s.scene().stage().stage_rect();
 
-        let mut figure = buzz_act::figure::FigureSpec::default();
-        if let Some(v) = number(&options, "height") {
-            figure.height = v;
-        }
-        if let Some(v) = number(&options, "headRatio") {
-            figure.head_ratio = v;
-        }
-        if let Some(v) = number(&options, "facing") {
-            figure.facing = v;
-        }
-        if let Some(c) = colour(&options, "skin")? {
-            figure.palette.skin = c;
-        }
-        if let Some(c) = colour(&options, "shirt")? {
-            figure.palette.shirt = c;
-        }
-        if let Some(c) = colour(&options, "trousers")? {
-            figure.palette.trousers = c;
-        }
+            let mut figure = buzz_act::figure::FigureSpec::default();
+            if let Some(v) = number(&options, "height") {
+                figure.height = v;
+            }
+            if let Some(v) = number(&options, "headRatio") {
+                figure.head_ratio = v;
+            }
+            if let Some(v) = number(&options, "facing") {
+                figure.facing = v;
+            }
+            if let Some(c) = colour(&options, "skin")? {
+                figure.palette.skin = c;
+            }
+            if let Some(c) = colour(&options, "shirt")? {
+                figure.palette.shirt = c;
+            }
+            if let Some(c) = colour(&options, "trousers")? {
+                figure.palette.trousers = c;
+            }
 
-        let spec = buzz_act::puppet::PuppetSpec {
-            name: options
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("Person")
-                .to_string(),
-            figure,
-            at: Point::new(
-                number(&options, "x").unwrap_or(stage.center().x),
-                number(&options, "y").unwrap_or(stage.y1 - stage.height() * 0.08),
-            ),
-            blink_rate: number(&options, "blink").unwrap_or(12.0),
-            breathe_rate: number(&options, "breathe").unwrap_or(14.0),
-            eyes: colour(&options, "eyes")?
-                .unwrap_or(peniko::Color::from_rgb8(0x2A, 0x1C, 0x12)),
-            frames: options
-                .get("frames")
-                .and_then(Value::as_u64)
-                .unwrap_or_else(|| s.scene().frame_count().max(1) as u64) as u32,
-        };
-        let puppet = buzz_act::puppet::build(s.scene_mut(), &spec);
-        Ok(puppet_json(&puppet).to_string())
-    });
+            let spec = buzz_act::puppet::PuppetSpec {
+                name: options
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Person")
+                    .to_string(),
+                figure,
+                at: Point::new(
+                    number(&options, "x").unwrap_or(stage.center().x),
+                    number(&options, "y").unwrap_or(stage.y1 - stage.height() * 0.08),
+                ),
+                blink_rate: number(&options, "blink").unwrap_or(12.0),
+                breathe_rate: number(&options, "breathe").unwrap_or(14.0),
+                eyes: colour(&options, "eyes")?
+                    .unwrap_or(peniko::Color::from_rgb8(0x2A, 0x1C, 0x12)),
+                frames: options
+                    .get("frames")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| s.scene().frame_count().max(1) as u64)
+                    as u32,
+            };
+            let puppet = buzz_act::puppet::build(s.scene_mut(), &spec);
+            Ok(puppet_json(&puppet).to_string())
+        }
+    );
 
     // **Direct a whole shot, and be told who it cast and when they speak.**
     //
@@ -403,8 +410,8 @@ fn cast<'js>(
     // cast with every id a mouth needs, and the talk beats with their frames.
     host_fn!(ctx, host, state, "directScene", |state, story: String| {
         let mut s = state.borrow_mut();
-        let directed = buzz_act::direct(s.scene_mut(), &story)
-            .map_err(|e| throw(&format!("{e}")))?;
+        let directed =
+            buzz_act::direct(s.scene_mut(), &story).map_err(|e| throw(&format!("{e}")))?;
 
         let cast: Vec<Value> = directed
             .staged
@@ -552,11 +559,7 @@ fn cast<'js>(
 // Rigging
 // ---------------------------------------------------------------------------
 
-fn rigging<'js>(
-    ctx: &Ctx<'js>,
-    host: &JsObject<'js>,
-    state: &Rc<RefCell<State>>,
-) -> JsResult<()> {
+fn rigging<'js>(ctx: &Ctx<'js>, host: &JsObject<'js>, state: &Rc<RefCell<State>>) -> JsResult<()> {
     // **Layer parenting** -- Animate's Parent column, and the half of a puppet
     // rig that is not bones. Pass `0` as the parent to unlink.
     host_fn!(
@@ -617,7 +620,10 @@ fn rigging<'js>(
         |state, layer: u64, kind: String| {
             let kind = layer_kind_named(&kind)?;
             let mut s = state.borrow_mut();
-            if !s.scene_mut().update_layer(LayerId(layer), |l| l.kind = kind) {
+            if !s
+                .scene_mut()
+                .update_layer(LayerId(layer), |l| l.kind = kind)
+            {
                 return Err(throw(&format!("there is no layer {layer}")));
             }
             Ok(())
@@ -762,11 +768,7 @@ fn rigging<'js>(
 // Dialogue
 // ---------------------------------------------------------------------------
 
-fn dialogue<'js>(
-    ctx: &Ctx<'js>,
-    host: &JsObject<'js>,
-    state: &Rc<RefCell<State>>,
-) -> JsResult<()> {
+fn dialogue<'js>(ctx: &Ctx<'js>, host: &JsObject<'js>, state: &Rc<RefCell<State>>) -> JsResult<()> {
     // The tracks the host decoded on the way in.
     host_fn!(ctx, host, state, "soundCount", |state| {
         Ok(state.borrow().sounds.len() as i32)
@@ -835,8 +837,10 @@ fn dialogue<'js>(
             if !s.scene_mut().set_frame_sound(layer, frame, Some(reference)) {
                 return Err(throw("the sound had no keyframe to attach to"));
             }
-            Ok(json!({"sound": sound.0, "layer": layer.0, "frames": clip.duration_frames(fps)})
-                .to_string())
+            Ok(
+                json!({"sound": sound.0, "layer": layer.0, "frames": clip.duration_frames(fps)})
+                    .to_string(),
+            )
         }
     );
 
@@ -920,11 +924,7 @@ fn dialogue<'js>(
 // Library and assets
 // ---------------------------------------------------------------------------
 
-fn library<'js>(
-    ctx: &Ctx<'js>,
-    host: &JsObject<'js>,
-    state: &Rc<RefCell<State>>,
-) -> JsResult<()> {
+fn library<'js>(ctx: &Ctx<'js>, host: &JsObject<'js>, state: &Rc<RefCell<State>>) -> JsResult<()> {
     // A symbol by name, or `0`. How a script **recalls** what an earlier scene
     // filed rather than drawing it a second time.
     host_fn!(ctx, host, state, "findSymbol", |state, name: String| {
@@ -1012,12 +1012,14 @@ fn library<'js>(
                     l.frames.set_objects(0, lifted);
                 });
             });
-            let placed = s
-                .scene_mut()
-                .add_instance_at(LayerId(layer), frame, symbol, Affine::IDENTITY);
-            Ok(json!({"symbol": symbol.0, "instance": placed.map(|p| p.0).unwrap_or(0),
+            let placed =
+                s.scene_mut()
+                    .add_instance_at(LayerId(layer), frame, symbol, Affine::IDENTITY);
+            Ok(
+                json!({"symbol": symbol.0, "instance": placed.map(|p| p.0).unwrap_or(0),
                       "lifted": count})
-            .to_string())
+                .to_string(),
+            )
         }
     );
 
@@ -1061,9 +1063,10 @@ fn library<'js>(
         |state, name: String, folder: String| {
             let root = {
                 let s = state.borrow();
-                s.context.asset_root.clone().ok_or_else(|| {
-                    throw("no asset library is available on this machine")
-                })?
+                s.context
+                    .asset_root
+                    .clone()
+                    .ok_or_else(|| throw("no asset library is available on this machine"))?
             };
             let mut library = buzz_doc::AssetLibrary::at(root);
             library.rescan();
@@ -1126,11 +1129,7 @@ fn library<'js>(
 // Camera
 // ---------------------------------------------------------------------------
 
-fn camera<'js>(
-    ctx: &Ctx<'js>,
-    host: &JsObject<'js>,
-    state: &Rc<RefCell<State>>,
-) -> JsResult<()> {
+fn camera<'js>(ctx: &Ctx<'js>, host: &JsObject<'js>, state: &Rc<RefCell<State>>) -> JsResult<()> {
     // **A named camera move**, already eased -- push in, pull out, pan left or
     // right, reveal, drift. The eased pair of keys `Camera > Move` writes.
     host_fn!(

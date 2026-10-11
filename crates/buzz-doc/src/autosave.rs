@@ -99,13 +99,25 @@ impl Autosave {
 
     /// Autosave into a directory, for a document that has never been saved.
     ///
-    /// **One slot per session.** Every unsaved document would otherwise share
-    /// the name `untitled`, and the first autosave of a *new* session would
-    /// overwrite the recovery a crashed one left behind — destroying the work
-    /// while the prompt offering it was still on screen. Found exactly that
-    /// way, by crashing the program and relaunching it.
+    /// **One slot per session — now per *document*, not per process.** Every
+    /// unsaved document would otherwise share the name `untitled`, and the
+    /// first autosave of a *new* session would overwrite the recovery a
+    /// crashed one left behind — destroying the work while the prompt
+    /// offering it was still on screen. Found exactly that way, by crashing
+    /// the program and relaunching it.
+    ///
+    /// The process id alone stopped being enough once D2 (docs/DOCUMENTS_PLAN.md)
+    /// let one process hold several untitled documents open as tabs at once:
+    /// without the counter below, two Untitled tabs autosaved to the same
+    /// file and each one's background write clobbered the other's.
     pub fn untitled(directory: impl Into<PathBuf>) -> Self {
-        Self::new(directory.into(), format!("untitled-{}", std::process::id()))
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self::new(
+            directory.into(),
+            format!("untitled-{}-{n}", std::process::id()),
+        )
     }
 
     /// A fresh slot in the same directory, for a document that has just become
@@ -218,6 +230,7 @@ impl Autosave {
             active,
             path: self.recovery_path(),
             revision,
+            sequence: None,
         })
     }
 
@@ -249,6 +262,21 @@ pub struct AutosavePlan {
     active: usize,
     path: PathBuf,
     revision: u64,
+    /// **What makes a scene a setup or a shot**, and the cut's order. Without
+    /// it a recovered sequence came back as a pile of plain scenes: every
+    /// shot's audio slice and every setup forgotten, by the very file meant to
+    /// save work from a crash. `None` writes the plain names-only manifest.
+    sequence: Option<SequenceMeta>,
+}
+
+/// The sequence metadata a recovery copy carries — see
+/// [`AutosavePlan::with_sequence`].
+#[derive(Debug, Clone)]
+pub struct SequenceMeta {
+    pub keys: Vec<crate::SceneKey>,
+    pub roles: Vec<crate::SceneRole>,
+    pub sequence: Vec<crate::SceneKey>,
+    pub master_audio: Option<(crate::SceneKey, buzz_scene::LayerId)>,
 }
 
 impl AutosavePlan {
@@ -260,14 +288,38 @@ impl AutosavePlan {
         self.revision
     }
 
+    /// Carry the document's setups, shots and cut into the recovery copy.
+    pub fn with_sequence(mut self, meta: SequenceMeta) -> Self {
+        self.sequence = Some(meta);
+        self
+    }
+
     /// Serialise and write. Intended to run on the background pool.
     pub fn write(&self) -> Result<(), DocError> {
-        let refs: Vec<(&str, &Scene)> = self
-            .scenes
-            .iter()
-            .map(|(name, scene)| (name.as_str(), scene))
-            .collect();
-        let bytes = format::to_bytes_scenes(&refs, self.active)?;
+        let bytes = match &self.sequence {
+            Some(meta) if meta.keys.len() == self.scenes.len() && meta.roles.len() == self.scenes.len() => {
+                let records: Vec<format::SceneRecord> = self
+                    .scenes
+                    .iter()
+                    .zip(meta.keys.iter().zip(&meta.roles))
+                    .map(|((name, scene), (key, role))| format::SceneRecord {
+                        name: name.as_str(),
+                        scene,
+                        key: *key,
+                        role: role.clone(),
+                    })
+                    .collect();
+                format::to_bytes_scenes_full(&records, self.active, &meta.sequence, meta.master_audio)?
+            }
+            _ => {
+                let refs: Vec<(&str, &Scene)> = self
+                    .scenes
+                    .iter()
+                    .map(|(name, scene)| (name.as_str(), scene))
+                    .collect();
+                format::to_bytes_scenes(&refs, self.active)?
+            }
+        };
         format::write_atomic(&self.path, &bytes)?;
         tracing::debug!(path = %self.path.display(), revision = self.revision, "autosaved");
         Ok(())
@@ -346,7 +398,18 @@ pub fn remember_scenes_for_crash(
     revision: u64,
     path: PathBuf,
 ) {
-    let plan = AutosavePlan {
+    remember_plan_for_crash(crash_plan(scenes, active, revision, path));
+}
+
+/// The plan [`remember_scenes_for_crash`] would hold, so a caller can add the
+/// sequence to it first — see [`AutosavePlan::with_sequence`].
+pub fn crash_plan(
+    scenes: &[(&str, &Scene)],
+    active: usize,
+    revision: u64,
+    path: PathBuf,
+) -> AutosavePlan {
+    AutosavePlan {
         scenes: scenes
             .iter()
             .map(|(name, scene)| ((*name).to_string(), (*scene).clone()))
@@ -354,7 +417,13 @@ pub fn remember_scenes_for_crash(
         active,
         path,
         revision,
-    };
+        sequence: None,
+    }
+}
+
+/// [`remember_scenes_for_crash`], for a plan the caller has already built —
+/// so a sequence document's crash copy keeps its setups and shots.
+pub fn remember_plan_for_crash(plan: AutosavePlan) {
     if let Ok(mut slot) = LAST_CHANCE.lock() {
         *slot = Some(plan);
     }

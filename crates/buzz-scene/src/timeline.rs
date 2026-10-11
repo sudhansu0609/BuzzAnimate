@@ -36,6 +36,11 @@ pub struct Keyframe {
     pub label: Option<String>,
     /// A tween running from here to the next keyframe.
     pub tween: crate::tween::Tween,
+    /// Per-property custom ease curves for that tween — Animate's Motion
+    /// Editor, imported from `<tweens><CustomEase>`/`<Ease>`. `None` for the
+    /// ordinary case, a plain `tween.easing` preset with nothing drawn by
+    /// hand. Kept off `Tween` itself: see [`crate::tween::EasingSet`] for why.
+    pub ease_curve: Option<crate::tween::EasingSet>,
     /// A sound starting here — Animate attaches sound to a keyframe rather
     /// than to a layer, so one layer can carry a whole scene's effects.
     pub sound: Option<crate::sound::SoundRef>,
@@ -48,6 +53,7 @@ impl Keyframe {
             objects: Arc::new(Vec::new()),
             label: None,
             tween: crate::tween::Tween::default(),
+            ease_curve: None,
             sound: None,
         }
     }
@@ -112,6 +118,20 @@ impl TweenSpan {
             None => layer_length.saturating_sub(1),
         }
     }
+}
+
+/// A run of frames lifted off a layer by [`LayerTimeline::segment`], ready to
+/// be written somewhere else with [`LayerTimeline::overwrite`].
+///
+/// Keyframes are kept whole — artwork, label, tween, ease curves and sound —
+/// and re-based so the first starts at frame 0. Public so a move between
+/// layers can give the artwork fresh object ids on the way.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameSegment {
+    /// Sorted by `start`; the first always starts at 0.
+    pub keyframes: Vec<Keyframe>,
+    /// Frames the segment covers, at least 1.
+    pub length: u32,
 }
 
 /// What a frame resolves to once tweening is taken into account.
@@ -228,6 +248,19 @@ impl LayerTimeline {
     /// allocates nothing; a tween has to build new objects because the
     /// interpolated state does not exist anywhere in the document.
     pub fn resolved_at(&self, at: impl crate::time::AtTime) -> ResolvedFrame<'_> {
+        self.resolved_at_with_reference(at, None)
+    }
+
+    /// [`Self::resolved_at`], interpolated in another space and back —
+    /// Phase A3, for a layer that follows a rig parent whose rest pose is not
+    /// a similarity. `None` is exactly [`Self::resolved_at`]; see
+    /// [`crate::tween::interpolate_objects`] for what `frame_of_reference`
+    /// does. [`crate::LayerStack::resolved_at_rigged`] is what passes it.
+    pub fn resolved_at_with_reference(
+        &self,
+        at: impl crate::time::AtTime,
+        frame_of_reference: Option<buzz_geom::Affine>,
+    ) -> ResolvedFrame<'_> {
         let Some(index) = self.index_at(at.frame()) else {
             return ResolvedFrame::Stored(&[]);
         };
@@ -259,7 +292,9 @@ impl LayerTimeline {
             &keyframe.objects,
             &next.objects,
             &keyframe.tween,
+            keyframe.ease_curve.as_ref(),
             progress,
+            frame_of_reference,
         ))
     }
 
@@ -397,6 +432,7 @@ impl LayerTimeline {
             objects,
             label: None,
             tween: crate::tween::Tween::default(),
+            ease_curve: None,
             // A duplicated keyframe does *not* duplicate its sound: F6 on a
             // dialogue layer would otherwise start the whole take again from
             // the new frame, on top of the one already playing.
@@ -613,6 +649,117 @@ impl LayerTimeline {
             }
             None => false,
         }
+    }
+
+    /// **Move Frames** — drag frames `first..=last` so they start at `to`.
+    ///
+    /// What Animate does when a frame selection is dragged sideways: the
+    /// frames land at `to..=to + (last − first)` with their keyframes whole —
+    /// artwork, label, tween, ease curves and sound — overwriting whatever was
+    /// there; the place they left becomes **one blank keyframe** (unless
+    /// `copy`, which leaves the source alone); and the frames after both the
+    /// source and the destination keep showing what they showed before.
+    ///
+    /// `last` is clamped to the layer's last frame. Returns `false`, changing
+    /// nothing, when `to == first` or `first` is past the end of the layer.
+    ///
+    /// The composition of [`Self::segment`], [`Self::blank_range`] and
+    /// [`Self::overwrite`] on one layer. A move **between** layers uses the
+    /// same three calls across several, in the same order, so layers can
+    /// trade frames.
+    ///
+    /// # Order matters
+    ///
+    /// The segment is taken before either write, and the destination is
+    /// written after the source is blanked, so a move that overlaps itself
+    /// (one frame to the right, say) keeps every moved frame.
+    ///
+    /// # Known limitation
+    ///
+    /// A range starting part-way through a span gets a keyframe synthesised at
+    /// `first` the way F6 makes one: the span's stored drawing, no tween, no
+    /// sound. Inside a tween that is the tween's start pose, not the
+    /// in-between one shown on that frame — the editor's F6 does the same.
+    pub fn move_frames(&mut self, first: u32, last: u32, to: u32, copy: bool) -> bool {
+        if to == first {
+            return false;
+        }
+        let Some(segment) = self.segment(first, last) else {
+            return false;
+        };
+        if !copy {
+            self.blank_range(first, last);
+        }
+        self.overwrite(to, &segment);
+        true
+    }
+
+    /// The frames `first..=last`, keyframes whole, re-based to start at 0 —
+    /// step one of [`Self::move_frames`], and read-only.
+    ///
+    /// A keyframe is synthesised at `first` when the range starts part-way
+    /// through a span (F6's copy), so the segment always opens with a drawing.
+    /// `last` is clamped to the layer's last frame; `None` when `first` is
+    /// past the end or `last` is before `first`.
+    pub fn segment(&self, first: u32, last: u32) -> Option<FrameSegment> {
+        if first >= self.length || last < first {
+            return None;
+        }
+        let last = last.min(self.length - 1);
+        let mut source = self.clone();
+        source.insert_keyframe(first);
+        let keyframes = source
+            .keyframes
+            .into_iter()
+            .filter(|k| k.start >= first && k.start <= last)
+            .map(|mut k| {
+                k.start -= first;
+                k
+            })
+            .collect();
+        Some(FrameSegment {
+            keyframes,
+            length: last - first + 1,
+        })
+    }
+
+    /// Make frames `first..=last` **one blank keyframe** — what a move leaves
+    /// behind. The frame after the range keeps showing what it showed, by
+    /// being given a keyframe of its own first. `last` is clamped to the
+    /// layer; nothing happens when `first` is past the end.
+    pub fn blank_range(&mut self, first: u32, last: u32) {
+        if first >= self.length || last < first {
+            return;
+        }
+        let last = last.min(self.length - 1);
+        if last + 1 < self.length {
+            self.insert_keyframe(last + 1);
+        }
+        self.keyframes.retain(|k| k.start <= first || k.start > last);
+        match self.keyframes.iter_mut().find(|k| k.start == first) {
+            Some(k) => *k = Keyframe::new(first),
+            None => self.push_keyframe(Keyframe::new(first)),
+        }
+    }
+
+    /// Write `segment` so it starts at `to`, replacing whatever was there.
+    ///
+    /// What followed the destination keeps showing what it showed (it is
+    /// given a keyframe of its own first), frames before `to` are only cut at
+    /// `to`, and the layer grows when the segment runs past its end.
+    pub fn overwrite(&mut self, to: u32, segment: &FrameSegment) {
+        let end = to.saturating_add(segment.length);
+        if end < self.length {
+            self.insert_keyframe(end);
+        }
+        self.keyframes.retain(|k| k.start < to || k.start >= end);
+        for keyframe in &segment.keyframes {
+            let mut keyframe = keyframe.clone();
+            keyframe.start += to;
+            self.push_keyframe(keyframe);
+        }
+        let length = self.length.max(end);
+        *self = Self::from_parts(std::mem::take(&mut self.keyframes), length);
     }
 
     /// Rebuild from parts, for the importer and the loader.
@@ -881,7 +1028,10 @@ mod tests {
         let mut t = LayerTimeline::new();
         t.push_object(0, object(1));
         t.insert_frame(9);
-        assert!(!t.clear_keyframe(400), "cleared a keyframe that is not there");
+        assert!(
+            !t.clear_keyframe(400),
+            "cleared a keyframe that is not there"
+        );
     }
 
     /// A layer must always start with a keyframe, or early frames would have
@@ -1050,7 +1200,10 @@ mod exposure_tests {
         assert_eq!(t.keyframe_count(), 8, "it starts on ones");
 
         let dropped = t.expose_on(0, 7, 2);
-        assert_eq!(dropped, 4, "half the drawings fold into the ones they follow");
+        assert_eq!(
+            dropped, 4,
+            "half the drawings fold into the ones they follow"
+        );
 
         let kept: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
         assert_eq!(kept, vec![0, 2, 4, 6]);
@@ -1086,7 +1239,11 @@ mod exposure_tests {
         let mut t = on_ones(8);
         t.expose_on(3, 7, 2);
         let kept: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
-        assert_eq!(kept, vec![0, 1, 2, 3, 5, 7], "outside the range is untouched");
+        assert_eq!(
+            kept,
+            vec![0, 1, 2, 3, 5, 7],
+            "outside the range is untouched"
+        );
     }
 
     #[test]
@@ -1107,5 +1264,172 @@ mod exposure_tests {
         assert_eq!(t.expose_on(0, 7, 2), 0, "nothing left to fold");
         let after_second: Vec<u32> = t.keyframes().iter().map(|k| k.start).collect();
         assert_eq!(after_first, after_second);
+    }
+}
+
+/// **Move Frames** — dragging a frame selection to a new place.
+#[cfg(test)]
+mod move_frames_tests {
+    use super::*;
+    use crate::object::ShapeData;
+    use buzz_geom::Shape as _;
+    use kurbo::Rect;
+    use peniko::Color;
+
+    fn object(id: u64) -> Arc<Object> {
+        Arc::new(Object::shape(
+            ObjectId(id),
+            ShapeData::filled(Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9), Color::WHITE),
+        ))
+    }
+
+    /// A layer `length` frames long with a keyframe at each of `starts`, each
+    /// holding one object whose id is its start plus one, so every drawing
+    /// can be told apart after a move.
+    fn drawn(length: u32, starts: &[u32]) -> LayerTimeline {
+        let keyframes = starts
+            .iter()
+            .map(|&start| {
+                let mut k = Keyframe::new(start);
+                k.objects = Arc::new(vec![object(start as u64 + 1)]);
+                k
+            })
+            .collect();
+        LayerTimeline::from_parts(keyframes, length)
+    }
+
+    /// Ids of the drawing shown on `frame`; empty for a blank one.
+    fn shown(t: &LayerTimeline, frame: u32) -> Vec<u64> {
+        t.objects_at(frame).iter().map(|o| o.id.0).collect()
+    }
+
+    fn starts(t: &LayerTimeline) -> Vec<u32> {
+        t.keyframes().iter().map(|k| k.start).collect()
+    }
+
+    /// Dragging frames into the empty frames past the end grows the layer;
+    /// the vacated frames are one blank keyframe, and the frame right after
+    /// them still shows the drawing it showed before.
+    #[test]
+    fn moving_frames_right_into_empty_frames_grows_the_layer() {
+        let mut t = drawn(8, &[0, 2]);
+        assert!(t.move_frames(2, 3, 10, false));
+
+        assert_eq!(t.length(), 12, "the layer reaches the moved frames");
+        assert_eq!(t.frame_kind(2), FrameKind::BlankKeyframe);
+        assert!(shown(&t, 3).is_empty(), "one blank keyframe spans the vacated frames");
+        assert_eq!(t.frame_kind(4), FrameKind::Keyframe, "cut so what followed is kept");
+        assert_eq!(shown(&t, 4), vec![3]);
+        assert_eq!(shown(&t, 7), vec![3]);
+        assert_eq!(t.frame_kind(10), FrameKind::Keyframe);
+        assert_eq!(shown(&t, 10), vec![3]);
+        assert_eq!(shown(&t, 11), vec![3]);
+        assert_eq!(shown(&t, 0), vec![1], "frames before are untouched");
+    }
+
+    /// Dragging left overwrites what was there; what followed the destination
+    /// keeps its drawing.
+    #[test]
+    fn moving_frames_left_overwrites_the_destination() {
+        let mut t = drawn(9, &[0, 3, 6]);
+        assert!(t.move_frames(6, 8, 1, false));
+
+        assert_eq!(starts(&t), vec![0, 1, 4, 6]);
+        assert_eq!(shown(&t, 0), vec![1]);
+        assert_eq!(shown(&t, 1), vec![7], "the moved drawing lands at frame 1");
+        assert_eq!(shown(&t, 3), vec![7]);
+        assert_eq!(shown(&t, 4), vec![4], "frame 4 still shows what it showed");
+        assert_eq!(t.frame_kind(6), FrameKind::BlankKeyframe);
+        assert_eq!(t.length(), 9);
+    }
+
+    /// A move of one frame overlaps itself; every moved frame survives, in
+    /// both directions.
+    #[test]
+    fn an_overlapping_move_by_one_keeps_every_moved_frame() {
+        let mut right = drawn(7, &[0, 2, 3, 5]);
+        assert!(right.move_frames(2, 3, 3, false));
+        assert_eq!(starts(&right), vec![0, 2, 3, 4, 5]);
+        assert!(shown(&right, 2).is_empty(), "the vacated frame is blank");
+        assert_eq!(shown(&right, 3), vec![3]);
+        assert_eq!(shown(&right, 4), vec![4]);
+        assert_eq!(shown(&right, 5), vec![6]);
+
+        let mut left = drawn(7, &[0, 2, 3, 5]);
+        assert!(left.move_frames(2, 3, 1, false));
+        assert_eq!(shown(&left, 0), vec![1]);
+        assert_eq!(shown(&left, 1), vec![3]);
+        assert_eq!(shown(&left, 2), vec![4]);
+        assert!(shown(&left, 3).is_empty(), "the vacated frame is blank");
+        assert_eq!(shown(&left, 4), vec![4], "frame 4 still shows what it showed");
+        assert_eq!(shown(&left, 5), vec![6]);
+    }
+
+    /// A range starting part-way through a span gets a keyframe of its own
+    /// (F6's copy); the frames before it keep the old drawing.
+    #[test]
+    fn a_range_starting_mid_span_synthesises_its_keyframe() {
+        let mut t = drawn(10, &[0]);
+        assert!(t.move_frames(4, 5, 7, false));
+
+        for frame in 0..4 {
+            assert_eq!(shown(&t, frame), vec![1], "frame {frame} keeps the old drawing");
+        }
+        assert_eq!(t.frame_kind(4), FrameKind::BlankKeyframe);
+        assert!(shown(&t, 5).is_empty());
+        assert_eq!(shown(&t, 6), vec![1]);
+        assert_eq!(t.frame_kind(7), FrameKind::Keyframe);
+        assert_eq!(shown(&t, 7), vec![1]);
+        assert_eq!(shown(&t, 9), vec![1]);
+    }
+
+    /// A keyframe is moved whole: its label, tween and sound go with it, and
+    /// the blank keyframe left behind carries none of them.
+    #[test]
+    fn labels_tweens_and_sounds_travel_with_the_frames() {
+        let mut t = drawn(9, &[0, 3, 6]);
+        let sound = crate::sound::SoundRef::stream(crate::sound::SoundId(7));
+        {
+            let k = t.keyframe_at_mut(3).unwrap();
+            k.label = Some("hit".into());
+            k.tween = crate::tween::Tween::classic();
+            k.sound = Some(sound);
+        }
+        assert!(t.move_frames(3, 5, 10, false));
+
+        let moved = t.keyframe_at(10).unwrap();
+        assert_eq!(moved.start, 10);
+        assert_eq!(moved.label.as_deref(), Some("hit"));
+        assert!(moved.tween.is_active());
+        assert_eq!(moved.sound, Some(sound));
+
+        let left = t.keyframe_at(3).unwrap();
+        assert_eq!(left.start, 3);
+        assert!(left.is_blank());
+        assert!(left.label.is_none());
+        assert!(!left.tween.is_active());
+        assert!(left.sound.is_none());
+    }
+
+    /// Copy (Alt-drag) leaves the source exactly as it was.
+    #[test]
+    fn copying_frames_leaves_the_source_alone() {
+        let mut t = drawn(4, &[0, 2]);
+        assert!(t.move_frames(2, 3, 6, true));
+        assert_eq!(starts(&t), vec![0, 2, 6]);
+        assert_eq!(shown(&t, 2), vec![3]);
+        assert_eq!(shown(&t, 3), vec![3]);
+        assert_eq!(shown(&t, 6), vec![3]);
+        assert_eq!(t.length(), 8);
+    }
+
+    /// Nowhere to go, or nothing to move: no change.
+    #[test]
+    fn a_move_to_the_same_place_or_from_past_the_end_is_refused() {
+        let mut t = drawn(6, &[0, 2]);
+        let before = t.clone();
+        assert!(!t.move_frames(2, 3, 2, false));
+        assert!(!t.move_frames(6, 8, 1, false));
+        assert_eq!(t, before);
     }
 }

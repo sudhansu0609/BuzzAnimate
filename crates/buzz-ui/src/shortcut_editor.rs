@@ -13,7 +13,7 @@
 
 use egui::{Event, Key, RichText};
 
-use crate::command::{palette_commands, Command};
+use crate::command::{Command, palette_commands};
 use crate::workspace::{KeyChord, Workspace};
 
 /// The editor's open state and what it is doing.
@@ -50,13 +50,21 @@ pub fn shortcut_editor(
     if let Some(command) = state.capturing {
         let captured = ctx.input(|i| {
             i.events.iter().find_map(|e| match e {
-                Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+                Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => Some((*key, *modifiers)),
                 _ => None,
             })
         });
         if let Some((key, modifiers)) = captured {
             if key != Key::Escape {
-                workspace.rebind(command, KeyChord::from_shortcut(egui::KeyboardShortcut::new(modifiers, key)));
+                workspace.rebind(
+                    command,
+                    KeyChord::from_shortcut(egui::KeyboardShortcut::new(modifiers, key)),
+                );
                 changed = true;
             }
             state.capturing = None;
@@ -74,7 +82,11 @@ pub fn shortcut_editor(
             ui.horizontal(|ui| {
                 ui.label("Filter");
                 ui.text_edit_singleline(&mut state.filter);
-                if ui.button("Reset all").on_hover_text("Return every shortcut to its default").clicked() {
+                if ui
+                    .button("Reset all")
+                    .on_hover_text("Return every shortcut to its default")
+                    .clicked()
+                {
                     workspace.reset_all_shortcuts();
                     changed = true;
                 }
@@ -82,56 +94,65 @@ pub fn shortcut_editor(
             ui.separator();
 
             let query = state.filter.to_lowercase();
-            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                egui::Grid::new("shortcut-grid")
-                    .num_columns(3)
-                    .striped(true)
-                    .spacing([10.0, 4.0])
-                    .show(ui, |ui| {
-                        for command in palette_commands() {
-                            let label = command.label();
-                            if !query.is_empty() && !label.to_lowercase().contains(&query) {
-                                continue;
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("shortcut-grid")
+                        .num_columns(3)
+                        .striped(true)
+                        .spacing([10.0, 4.0])
+                        .show(ui, |ui| {
+                            for command in palette_commands() {
+                                let label = command.label();
+                                if !query.is_empty() && !label.to_lowercase().contains(&query) {
+                                    continue;
+                                }
+                                ui.label(label);
+
+                                // The current binding, or a prompt while capturing.
+                                let capturing = state.capturing == Some(command);
+                                let shown = if capturing {
+                                    RichText::new("press a key…").italics()
+                                } else {
+                                    match workspace
+                                        .shortcut_for(command)
+                                        .map(KeyChord::from_shortcut)
+                                    {
+                                        Some(chord) => RichText::new(chord.label()).monospace(),
+                                        None => RichText::new("—").weak(),
+                                    }
+                                };
+                                let overridden = workspace.has_shortcut_override(command);
+                                let shown = if overridden { shown.strong() } else { shown };
+                                ui.label(shown);
+
+                                ui.horizontal(|ui| {
+                                    let set = if capturing { "…" } else { "Set" };
+                                    if ui.small_button(set).clicked() {
+                                        state.capturing = Some(command);
+                                    }
+                                    if ui
+                                        .small_button("Clear")
+                                        .on_hover_text("No shortcut")
+                                        .clicked()
+                                    {
+                                        workspace.unbind(command);
+                                        state.capturing = None;
+                                        changed = true;
+                                    }
+                                    if ui
+                                        .add_enabled(overridden, egui::Button::new("Reset").small())
+                                        .on_hover_text("Back to the default")
+                                        .clicked()
+                                    {
+                                        workspace.reset_shortcut(command);
+                                        changed = true;
+                                    }
+                                });
+                                ui.end_row();
                             }
-                            ui.label(label);
-
-                            // The current binding, or a prompt while capturing.
-                            let capturing = state.capturing == Some(command);
-                            let shown = if capturing {
-                                RichText::new("press a key…").italics()
-                            } else {
-                                match workspace.shortcut_for(command).map(KeyChord::from_shortcut) {
-                                    Some(chord) => RichText::new(chord.label()).monospace(),
-                                    None => RichText::new("—").weak(),
-                                }
-                            };
-                            let overridden = workspace.has_shortcut_override(command);
-                            let shown = if overridden { shown.strong() } else { shown };
-                            ui.label(shown);
-
-                            ui.horizontal(|ui| {
-                                let set = if capturing { "…" } else { "Set" };
-                                if ui.small_button(set).clicked() {
-                                    state.capturing = Some(command);
-                                }
-                                if ui.small_button("Clear").on_hover_text("No shortcut").clicked() {
-                                    workspace.unbind(command);
-                                    state.capturing = None;
-                                    changed = true;
-                                }
-                                if ui
-                                    .add_enabled(overridden, egui::Button::new("Reset").small())
-                                    .on_hover_text("Back to the default")
-                                    .clicked()
-                                {
-                                    workspace.reset_shortcut(command);
-                                    changed = true;
-                                }
-                            });
-                            ui.end_row();
-                        }
-                    });
-            });
+                        });
+                });
         });
 
     if !open {

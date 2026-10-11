@@ -30,8 +30,9 @@
 //! *fraction of the figure's height*, so one table describes a child, an adult
 //! and a giant.
 
-use crate::{JointLimits, wrap_pi};
+use crate::{Direction, JointLimits, RotationMode, wrap_pi};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Which side of the body a slot belongs to.
 ///
@@ -45,6 +46,42 @@ pub enum Side {
     Either,
     Left,
     Right,
+}
+
+/// How a character's parts are held together.
+///
+/// `Bones` is an armature (IK, the director, lip-sync); `Layers` is Animate's
+/// layer parenting — one layer per part, each turning about its joint and
+/// following the layer of the part it hangs off, posed with Free Transform.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RigKind {
+    #[default]
+    Bones,
+    Layers,
+}
+
+impl RigKind {
+    /// `"bones"` / `"layers"`, as the Cast shows it and the CLI takes it.
+    pub fn label(self) -> &'static str {
+        match self {
+            RigKind::Bones => "bones",
+            RigKind::Layers => "layers",
+        }
+    }
+
+    /// The inverse of [`RigKind::label`], case-insensitively.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "bones" | "bone" => Some(RigKind::Bones),
+            "layers" | "layer" => Some(RigKind::Layers),
+            _ => None,
+        }
+    }
+
+    /// The one line the kind picker says about layer rigs.
+    pub const LAYERS_HINT: &'static str = "Layer rig: pose with Free Transform; the director, gestures, blinks and \
+         lip sync work on it; joint limits are bone-rig only";
 }
 
 /// One named place in a rig, and the bone that will stand in it.
@@ -64,6 +101,10 @@ pub struct Slot {
     /// complete: a character with no separate chest drawing still has a chest
     /// to turn. A slot that was filled takes its length from the drawing.
     pub rest_len: f64,
+    /// How far the joint may turn, **relative to the bone's rest angle** (the
+    /// rest angle is only known once the bone is fitted to its drawing, so the
+    /// auto-rigger turns these into the bone's absolute [`JointLimits`] with
+    /// [`JointLimits::from_relative`]). `None` is a free joint.
     pub limits: Option<JointLimits>,
     pub side: Side,
     /// A slot the character does not really work without. The panel says which
@@ -120,7 +161,7 @@ impl RigPattern {
     /// numbers `figure::build` uses — see the notes there for why each landmark
     /// sits where it does.
     pub fn biped() -> Self {
-        Self {
+        let mut pattern = Self {
             name: "Biped".into(),
             slots: vec![
                 // The spine, upwards from the pelvis.
@@ -228,7 +269,97 @@ impl RigPattern {
                     &["knee", "shin", "lower leg", "calf", "foot", "boot"],
                 ),
             ],
+        };
+        pattern.apply_limits(&JointLimitDefaults::anatomical());
+        pattern
+    }
+
+    /// **A person with wrists, ankles and eyebrows of their own.** Seventeen
+    /// bones: [`RigPattern::biped`]'s eleven, unchanged and in the same order,
+    /// then `Wrist L/R` (off the elbows), `Ankle L/R` (off the knees) and
+    /// `Brow L/R` (off the head).
+    ///
+    /// The new slots are *appended* and never renumbered, so every performance,
+    /// pose and lip-sync that addresses bones 0–10 by index keeps working, and a
+    /// pose written for eleven bones applies to this rig "as far as it goes".
+    /// Image-built characters use this pattern (`buzz_ai::character`); the
+    /// built-in puppet and the director keep [`RigPattern::biped`].
+    ///
+    /// "hand", "foot" and "boot" are aliases of the wrist and ankle here, so
+    /// they are taken off the elbow and knee (where `biped` still has them): the
+    /// longest alias wins and an equal one would otherwise go to the earlier slot.
+    pub fn biped_full() -> Self {
+        let mut slots = Self::biped().slots;
+        for slot in slots.iter_mut() {
+            match slot.name.as_str() {
+                "Elbow L" | "Elbow R" => slot.aliases.retain(|a| a != "hand"),
+                "Knee L" | "Knee R" => slot.aliases.retain(|a| a != "foot" && a != "boot"),
+                _ => {}
+            }
         }
+        // Hands point on from the forearm, so no rest turn of their own.
+        slots.push(slot(
+            "Wrist L",
+            Some(4),
+            0.0,
+            0.06,
+            Side::Left,
+            false,
+            &["wrist", "hand", "palm", "fingers"],
+        ));
+        slots.push(slot(
+            "Wrist R",
+            Some(6),
+            0.0,
+            0.06,
+            Side::Right,
+            false,
+            &["wrist", "hand", "palm", "fingers"],
+        ));
+        // A foot points forward, a quarter turn from the shin (which points
+        // down), a little short of it.
+        slots.push(slot(
+            "Ankle L",
+            Some(8),
+            -FRAC_PI_2 + 0.2,
+            0.07,
+            Side::Left,
+            false,
+            &["ankle", "foot", "toes", "boot"],
+        ));
+        slots.push(slot(
+            "Ankle R",
+            Some(10),
+            -FRAC_PI_2 + 0.2,
+            0.07,
+            Side::Right,
+            false,
+            &["ankle", "foot", "toes", "boot"],
+        ));
+        slots.push(slot(
+            "Brow L",
+            Some(2),
+            0.0,
+            0.04,
+            Side::Left,
+            false,
+            &["brow", "eyebrow"],
+        ));
+        slots.push(slot(
+            "Brow R",
+            Some(2),
+            0.0,
+            0.04,
+            Side::Right,
+            false,
+            &["brow", "eyebrow"],
+        ));
+        let mut pattern = Self {
+            name: "Biped Full".into(),
+            slots,
+        };
+        pattern.apply_limits(&JointLimitDefaults::anatomical());
+        pattern
     }
 
     /// **A four-legged animal.** A horse, a dog, a cat.
@@ -393,7 +524,13 @@ impl RigPattern {
                     0.34,
                     Side::Left,
                     false,
-                    &["primaries", "wing tip", "outer wing", "lower wing", "feathers"],
+                    &[
+                        "primaries",
+                        "wing tip",
+                        "outer wing",
+                        "lower wing",
+                        "feathers",
+                    ],
                 ),
                 slot(
                     "Wing R",
@@ -411,7 +548,13 @@ impl RigPattern {
                     0.34,
                     Side::Right,
                     false,
-                    &["primaries", "wing tip", "outer wing", "lower wing", "feathers"],
+                    &[
+                        "primaries",
+                        "wing tip",
+                        "outer wing",
+                        "lower wing",
+                        "feathers",
+                    ],
                 ),
                 slot(
                     "Leg L",
@@ -482,6 +625,7 @@ impl RigPattern {
             Self::quadruped(),
             Self::bird(),
             Self::prop(),
+            Self::biped_full(),
         ]
     }
 
@@ -500,6 +644,15 @@ impl RigPattern {
 
     pub fn slot_named(&self, name: &str) -> Option<usize> {
         self.slots.iter().position(|s| s.name == name)
+    }
+
+    /// Give every slot the limits `defaults` has for its name (relative to the
+    /// rest angle); a slot the table does not name, or names as free, turns
+    /// freely.
+    pub fn apply_limits(&mut self, defaults: &JointLimitDefaults) {
+        for slot in &mut self.slots {
+            slot.limits = defaults.limits_for(&slot.name);
+        }
     }
 
     /// Which way each slot points in the world, following the parent chain.
@@ -531,6 +684,100 @@ impl RigPattern {
             .filter(|(i, slot)| slot.required && !filled.get(*i).copied().unwrap_or(false))
             .map(|(_, slot)| slot.name.as_str())
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default joint limits per slot.
+// ---------------------------------------------------------------------------
+
+/// **Joint limits per slot name**, relative to each bone's rest angle, in
+/// degrees: `name → (mode, direction, min, max)`.
+///
+/// A table rather than code so it can be saved, edited and read back (the
+/// user's own copy overrides [`JointLimitDefaults::anatomical`]).
+///
+/// # The director is the ground truth
+///
+/// The signs follow the director's performances (`buzz_act::perform`), not a
+/// left/right mirror: every verb bends *both* knees the same way (negative),
+/// so a mirrored limit would freeze one side of every walk; the elbows bend
+/// either way (see the table). A limit that clamps a verb is wrong by
+/// definition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JointLimitDefaults {
+    pub rows: BTreeMap<String, (RotationMode, Direction, f64, f64)>,
+}
+
+impl JointLimitDefaults {
+    /// The built-in table for [`RigPattern::biped`] and
+    /// [`RigPattern::biped_full`]. The hips are the root and carry the whole
+    /// body's lean, so they turn freely; there is no neck or spine slot, so
+    /// the head and chest carry those ranges.
+    pub fn anatomical() -> Self {
+        use Direction::{Both, CounterClockwise};
+        use RotationMode::{Free, Limited};
+        let table: [(&str, RotationMode, Direction, f64, f64); 17] = [
+            ("Hips", Free, Both, 0.0, 0.0),
+            ("Chest", Limited, Both, -30.0, 30.0),
+            ("Head", Limited, Both, -40.0, 40.0),
+            ("Shoulder L", Limited, Both, -170.0, 170.0),
+            ("Shoulder R", Limited, Both, -170.0, 170.0),
+            // Both ways, on both sides. The director solves its gestures'
+            // arms toward hand targets on each rig (`buzz_act::perform::
+            // solve_arm`), so which way an elbow bends depends on the gesture
+            // and on which way round the rig is drawn — a shrug's forearm
+            // folds out one way on the puppet and the other on a front-view
+            // Cast rig. The right elbow also carries `buzz_ai`'s "wave":
+            // +117° on the plain biped, +107° on the traced pujariFront test
+            // character.
+            ("Elbow L", Limited, Both, -150.0, 150.0),
+            ("Elbow R", Limited, Both, -150.0, 150.0),
+            ("Thigh L", Limited, Both, -120.0, 90.0),
+            ("Thigh R", Limited, Both, -120.0, 90.0),
+            ("Knee L", Limited, CounterClockwise, -150.0, 0.0),
+            ("Knee R", Limited, CounterClockwise, -150.0, 0.0),
+            ("Wrist L", Limited, Both, -80.0, 80.0),
+            ("Wrist R", Limited, Both, -80.0, 80.0),
+            ("Ankle L", Limited, Both, -45.0, 45.0),
+            ("Ankle R", Limited, Both, -45.0, 45.0),
+            ("Brow L", Limited, Both, -15.0, 15.0),
+            ("Brow R", Limited, Both, -15.0, 15.0),
+        ];
+        Self {
+            rows: table
+                .into_iter()
+                .map(|(name, mode, direction, min, max)| {
+                    (name.to_string(), (mode, direction, min, max))
+                })
+                .collect(),
+        }
+    }
+
+    /// The limits for `slot`, **relative to its rest angle, in radians**, or
+    /// `None` for a free joint or one the table does not name. A one-way
+    /// direction keeps only its side of the range.
+    pub fn limits_for(&self, slot: &str) -> Option<JointLimits> {
+        let (mode, direction, min, max) = *self.rows.get(slot)?;
+        match mode {
+            RotationMode::Free => None,
+            RotationMode::Locked => Some(JointLimits::new(0.0, 0.0)),
+            RotationMode::Limited => {
+                let (mut min, mut max) = (min.min(max), min.max(max));
+                match direction {
+                    Direction::Both => {}
+                    Direction::Clockwise => {
+                        min = min.max(0.0);
+                        max = max.max(0.0);
+                    }
+                    Direction::CounterClockwise => {
+                        min = min.min(0.0);
+                        max = max.min(0.0);
+                    }
+                }
+                Some(JointLimits::new(min.to_radians(), max.to_radians()))
+            }
+        }
     }
 }
 
@@ -841,6 +1088,107 @@ mod tests {
         assert!((angles[1] - UP).abs() < 1e-9);
         // A left thigh is a root pointing down and a little outwards.
         assert!(angles[7] > 0.0, "a thigh should point down the screen");
+    }
+
+    /// The eleven standard slots keep their numbers: a performance addresses
+    /// bones by index, so `biped_full` may only append.
+    #[test]
+    fn biped_full_is_the_biped_plus_six_appended_slots() {
+        let base = RigPattern::biped();
+        let full = RigPattern::biped_full();
+        assert_eq!(full.name, "Biped Full");
+        assert_eq!(full.slots.len(), 17);
+        for (a, b) in base.slots.iter().zip(full.slots.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.parent, b.parent);
+            assert_eq!(a.rest_angle, b.rest_angle);
+            assert_eq!(a.rest_len, b.rest_len);
+            assert_eq!(a.side, b.side);
+            assert_eq!(a.required, b.required);
+        }
+        let appended: Vec<(&str, Option<usize>, Side)> = full.slots[11..]
+            .iter()
+            .map(|s| (s.name.as_str(), s.parent, s.side))
+            .collect();
+        assert_eq!(
+            appended,
+            [
+                ("Wrist L", Some(4), Side::Left),
+                ("Wrist R", Some(6), Side::Right),
+                ("Ankle L", Some(8), Side::Left),
+                ("Ankle R", Some(10), Side::Right),
+                ("Brow L", Some(2), Side::Left),
+                ("Brow R", Some(2), Side::Right),
+            ]
+        );
+        assert!(full.slots[11..].iter().all(|s| !s.required));
+        // `biped` itself is untouched: its elbow and knee still answer to hand and foot.
+        assert!(base.slots[4].aliases.iter().any(|a| a == "hand"));
+        assert!(base.slots[8].aliases.iter().any(|a| a == "foot"));
+        assert_eq!(base.slots.len(), 11);
+    }
+
+    #[test]
+    fn biped_full_sends_hands_feet_and_brows_to_their_own_slots() {
+        let pattern = RigPattern::biped_full();
+        let filled = match_parts(
+            &pattern,
+            &names(&[
+                "L_forearm",
+                "L_hand",
+                "R_shin",
+                "R_foot",
+                "Left Eyebrow",
+                "R_brow",
+            ]),
+        );
+        let slot = |n: &str| pattern.slot_named(n).unwrap();
+        assert_eq!(filled[slot("Elbow L")], Some(0));
+        assert_eq!(filled[slot("Wrist L")], Some(1));
+        assert_eq!(filled[slot("Knee R")], Some(2));
+        assert_eq!(filled[slot("Ankle R")], Some(3));
+        assert_eq!(filled[slot("Brow L")], Some(4));
+        assert_eq!(filled[slot("Brow R")], Some(5));
+    }
+
+    /// Elbows and knees bend one way — the way the director bends them — and
+    /// the same way on both sides: no left/right mirror (see
+    /// `JointLimitDefaults`).
+    #[test]
+    fn elbows_and_knees_bend_one_way_on_both_sides() {
+        let pattern = RigPattern::biped();
+        let relative = |name: &str| {
+            let limits = pattern.slots[pattern.slot_named(name).unwrap()]
+                .limits
+                .unwrap_or_else(|| panic!("{name} has no limits"));
+            (limits.min.to_degrees(), limits.max.to_degrees())
+        };
+        for name in ["Knee L", "Knee R"] {
+            let (min, max) = relative(name);
+            assert!((min + 150.0).abs() < 1e-9 && max.abs() < 1e-9, "{name}: {min}..{max}");
+            let limits = JointLimits::new(min.to_radians(), max.to_radians());
+            assert_eq!(limits.direction(0.0), Direction::CounterClockwise, "{name}");
+        }
+        for name in ["Elbow L", "Elbow R"] {
+            let (min, max) = relative(name);
+            assert!((min + 150.0).abs() < 1e-9, "{name}: {min}..{max}");
+            assert!(max >= 0.0, "{name} reaches no further than rest: {max}");
+        }
+        // The right elbow reaches further the other way, for the wave.
+        assert!(relative("Elbow R").1 >= 117.0, "the wave needs +117°: {:?}", relative("Elbow R"));
+        assert_eq!(relative("Knee L"), relative("Knee R"), "knees mirrored");
+        assert!(pattern.slots[0].limits.is_none(), "the root hips turn freely");
+
+        // Every slot of the full biped is named in the table, so nothing is
+        // left free by a typo.
+        let full = RigPattern::biped_full();
+        for slot in &full.slots[1..] {
+            assert!(slot.limits.is_some(), "{} is free", slot.name);
+        }
+        // And each range contains the rest angle, so a fresh rig is legal.
+        for limits in full.slots.iter().filter_map(|s| s.limits) {
+            assert!(limits.min <= 0.0 && limits.max >= 0.0, "{limits:?}");
+        }
     }
 
     #[test]

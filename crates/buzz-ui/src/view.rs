@@ -109,7 +109,11 @@ pub struct PerspectiveGuides {
 
 impl Default for PerspectiveGuides {
     fn default() -> Self {
-        Self { show: false, vanishing_points: Vec::new(), horizon: 0.0 }
+        Self {
+            show: false,
+            vanishing_points: Vec::new(),
+            horizon: 0.0,
+        }
     }
 }
 
@@ -120,7 +124,10 @@ impl PerspectiveGuides {
         let horizon = height / 2.0;
         let vanishing_points = match n.clamp(1, 3) {
             1 => vec![Point::new(width / 2.0, horizon)],
-            2 => vec![Point::new(-width * 0.5, horizon), Point::new(width * 1.5, horizon)],
+            2 => vec![
+                Point::new(-width * 0.5, horizon),
+                Point::new(width * 1.5, horizon),
+            ],
             _ => vec![
                 Point::new(-width * 0.5, horizon),
                 Point::new(width * 1.5, horizon),
@@ -128,7 +135,11 @@ impl PerspectiveGuides {
                 Point::new(width / 2.0, height * 2.0),
             ],
         };
-        Self { show: true, vanishing_points, horizon }
+        Self {
+            show: true,
+            vanishing_points,
+            horizon,
+        }
     }
 }
 
@@ -356,7 +367,12 @@ mod tests {
             assert!((p.horizon - 300.0).abs() < 1e-9, "horizon at mid-height");
         }
         // Out-of-range counts are clamped, not panicked.
-        assert_eq!(PerspectiveGuides::seed(800.0, 600.0, 9).vanishing_points.len(), 3);
+        assert_eq!(
+            PerspectiveGuides::seed(800.0, 600.0, 9)
+                .vanishing_points
+                .len(),
+            3
+        );
     }
 
     #[test]

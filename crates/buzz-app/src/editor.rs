@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use buzz_doc::Document;
+use buzz_doc::{Document, SceneKey, SceneRole, ShotInfo};
 use buzz_geom::{Affine, BezPath, Camera, Point, Rect, Shape as _, Size, Vec2};
 use buzz_scene::{
     EditAt, FillSpec, LayerId, LayerKind, Object, ObjectId, ObjectKind, Paint, Scene, ShapeData,
@@ -19,7 +19,10 @@ use buzz_ui::{
 };
 use peniko::Color;
 
-use crate::tools::{Mods, Preview, ToolAction, ToolContext, ToolMachine};
+use crate::tools::{Mods, Preview, ToolAction, ToolContext, ToolMachine, TransformBox};
+
+mod shape_edit;
+pub use shape_edit::ShapeGrip;
 
 /// **How close a click must come to count as hitting artwork**, in screen
 /// pixels.
@@ -38,6 +41,10 @@ const PICK_TOLERANCE_PX: f64 = 6.0;
 /// real, but finite so a stray value cannot produce an absurd timeline.
 const MAX_FRAME: u32 = 999_999;
 
+/// The undo label of an Alt-drag: the copy and every step that carries it share
+/// it, so the history folds the drag into one step.
+const ALT_COPY_LABEL: &str = "Duplicate";
+
 /// The shortest drag that counts as drawing a bone, in screen pixels.
 ///
 /// A click with the Bone tool is far more likely to be a misfire than a
@@ -45,12 +52,25 @@ const MAX_FRAME: u32 = 999_999;
 /// grabbed again, because there is nothing of it to click.
 const MIN_BONE_LENGTH: f64 = 6.0;
 
+/// BM: what a press on bare artwork says in Move mode, where it does nothing.
+pub const BONE_MOVE_ON_ARTWORK: &str = "Move mode \u{2014} switch to Create to add bones";
+
 /// The whole editor.
 pub struct Editor {
     pub doc: Document,
     pub camera: Camera,
     pub selection: Selection,
     pub style: DrawStyle,
+    /// `style` with `brush.size` and `eraser_size` converted to a fixed
+    /// screen size when the tool's "Zoom size with stage" flag is off — see
+    /// [`DrawStyle::eraser_zoom_size`] and [`DrawStyle::brush_zoom_size`].
+    ///
+    /// Every `ToolContext` is built from this rather than from `style`
+    /// itself, and it is refreshed at the start of every pointer down, move
+    /// and up, before that `ToolContext` is built — see
+    /// [`Self::refresh_tool_style`]. Equal to `style` whenever both flags are
+    /// on, which is the default.
+    pub tool_style: DrawStyle,
     pub view: ViewSettings,
     pub machine: ToolMachine,
     /// The playhead. Everything the user sees and edits is at this frame.
@@ -73,6 +93,21 @@ pub struct Editor {
     /// which is cheaper and more predictable than clearing it from every place
     /// a selection can change.
     pub group_pivot: Option<(Vec<ObjectId>, Point)>,
+    /// The bone the Bone tool last pressed on — the rig and the bone's index.
+    ///
+    /// Set when the Bone tool presses on a bone or its tip; cleared the moment
+    /// the selection is anything other than that one rig
+    /// ([`Self::forget_bone_if_deselected`]). Tool Options edits this bone's
+    /// joint limits.
+    pub selected_bone: Option<(ObjectId, usize)>,
+    /// The anchors the Subselection tool has selected on its one shape — as
+    /// element indices into the shape's path — and the shape they belong to.
+    ///
+    /// Kept with its object and ignored the moment the selection is anything
+    /// else (see [`Self::selected_anchor_elements`]), which is cheaper and
+    /// more predictable than clearing it from every place a selection can
+    /// change. View state, like `group_pivot`: it is not saved.
+    anchor_selection: Option<(ObjectId, Vec<usize>)>,
     /// **Edit Multiple Frames.** Every keyframe inside the onion markers is
     /// drawn solid instead of ghosted, can be clicked, and is changed together
     /// — which is how a whole scene is shifted across without opening each
@@ -127,8 +162,16 @@ pub struct Editor {
     pub clipboard: Option<buzz_scene::Scene>,
     /// The New Document dialog: how big, how fast, what colour.
     pub new_document: buzz_ui::NewDocumentState,
+    /// Insert > Title Card: the settings of the next card.
+    pub title_card: buzz_ui::TitleCardState,
     /// Help ▸ About, and the banner it shows once it has been opened.
     pub about: buzz_ui::AboutState,
+    /// Local AI models and LLM backends dialog.
+    pub ai_models: buzz_ui::AiModelsState,
+    /// Character from Image AI wizard.
+    pub ai_character: buzz_ui::AiCharacterState,
+    /// Identify and Rename Assets AI review dialog.
+    pub ai_rename: buzz_ui::AiRenameState,
     /// Reusable artwork kept outside the document, and the panel's own state.
     ///
     /// Scanned from disk at startup rather than watched: a few hundred files
@@ -156,6 +199,10 @@ pub struct Editor {
     /// View state, not document state: dismissing it is not an edit, and it
     /// must not be saved or undone.
     pub import_summary: Option<crate::import::ImportSummary>,
+    /// The Trace Bitmap dialog, open on a copy of the remembered settings.
+    /// `Some` only while the dialog itself is open — see
+    /// `Command::TraceBitmapOptions` and `Workspace::trace`.
+    pub trace_dialog: Option<buzz_scene::TraceOptions>,
     /// A rigging drag in progress: building a bone, posing one, or moving a
     /// warp handle. Held here rather than in the tool machine because it began
     /// with a question about the document.
@@ -182,6 +229,26 @@ pub struct Editor {
     /// began with a question about the document that the tool machine cannot
     /// ask.
     pub light_gesture: Option<crate::lights::LightGesture>,
+    /// A Selection-tool drag on a raw shape's own geometry — bending an edge,
+    /// dragging a corner — or a Free Transform Distort. Held here for the same
+    /// reason `rig_gesture` is: it began with a question about the document
+    /// (what is under the pointer, and is it a raw shape?) that the tool
+    /// machine cannot ask. See `shape_edit`.
+    shape_gesture: Option<shape_edit::ShapeGesture>,
+    /// **An Alt-drag of the selection**, from its press until the pointer
+    /// comes up: Animate drags a *copy*, leaving the original where it was.
+    ///
+    /// The copy is made when the pointer has gone far enough to be a drag, not
+    /// at the press, so an Alt-click copies nothing. See [`AltCopy`].
+    alt_copy: Option<AltCopy>,
+    /// **The box a Free Transform turn left a mixed selection with** — see
+    /// [`BoxSession`]. View state, like `group_pivot`: it is not saved.
+    ///
+    /// In a `RefCell` so that asking for the box can *drop* a session that no
+    /// longer describes the selection: [`Self::selection_box`] is asked every
+    /// frame, so a selection that changed is noticed at once rather than by
+    /// every place a selection can change remembering to say so.
+    box_session: std::cell::RefCell<Option<BoxSession>>,
     /// Decoded sound and the output stream.
     ///
     /// View state: which sounds happen to be decoded is not part of the
@@ -209,6 +276,15 @@ pub struct Editor {
     /// ticks on one ruler would be unreadable. The last command run wins, and
     /// its status line says which.
     pub ruler_marks: Vec<u32>,
+    /// **The playhead of every timeline above the one being edited**, outermost
+    /// first: `edit_frames[d]` is the frame depth `d` was at when a symbol was
+    /// entered from it. Leaving a symbol goes back to that frame instead of
+    /// frame 1 (user 2026-10-01: entered a character at frame 705, came out at
+    /// frame 1). See [`Self::after_context_change`].
+    pub edit_frames: Vec<u32>,
+    /// The inner frame to open the next entered symbol at (the one showing
+    /// at the parent's playhead), set just before entering.
+    enter_frame: Option<u32>,
     /// The Lip Sync dialog.
     pub lip_sync: buzz_ui::LipSyncState,
     /// Whether the last sound import also landed on the timeline. See
@@ -229,6 +305,14 @@ pub struct Editor {
     /// Memoised timeline waveforms, so the panel does not re-derive an envelope
     /// from raw PCM every frame. See [`Editor::waveforms`].
     waveform_cache: WaveformCache,
+    /// The master audio's own waveform, decoded once and kept until the
+    /// asset changes. See [`Editor::master_waveform`].
+    master_waveform_cache: Option<(usize, u64, std::sync::Arc<Vec<f32>>)>,
+    /// The Sequence strip's own scrub position, in master-audio frames —
+    /// used only when the active scene is not itself a shot in the cut (so
+    /// there is nothing else to read the film playhead from). See
+    /// [`Editor::film_playhead`].
+    sequence_scrub: Option<u32>,
     /// Every symbol's resolved extent, memoised by document revision. Hit-testing
     /// and the selection chrome resolve an instance's bounds against this table
     /// rather than re-walking the library per object — the difference between a
@@ -237,7 +321,8 @@ pub struct Editor {
 }
 
 /// Every symbol's resolved extent, keyed by id. See [`Editor::symbol_bounds`].
-type SymbolBounds = std::sync::Arc<std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>>;
+type SymbolBounds =
+    std::sync::Arc<std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>>;
 
 /// The waveform strip the timeline draws, cached against the document revision.
 ///
@@ -306,6 +391,149 @@ impl Default for Onion {
     }
 }
 
+/// A raw shape **as it is drawn**: its outline flattened to polygons, on the
+/// stage, with what is painted along it. What the selection hatch is made from
+/// (`hatch`); see [`Editor::drawn_shape`].
+#[derive(Debug, Clone)]
+pub struct DrawnShape {
+    /// The fill's outlines, one polygon per subpath, and whether the fill rule
+    /// is non-zero (otherwise even-odd). `None` for a shape with no fill.
+    pub fill: Option<(Vec<Vec<Point>>, bool)>,
+    /// The stroke's centre lines, one polyline per subpath, and how wide the
+    /// stroke is drawn, in stage units. `None` for a shape with no stroke.
+    pub stroke: Option<(Vec<Vec<Point>>, f64)>,
+}
+
+/// An Alt-drag of the selection in progress: a copy is dragged, not the thing
+/// itself.
+///
+/// # Why the copy waits for a drag
+///
+/// The tool machine reports a move on the first pointer step, however small —
+/// the artwork travels with the pointer from the first pixel. Copying then
+/// would leave a stray duplicate behind every Alt-*click* that wobbled by a
+/// pixel. So the steps are held back, summed, until the pointer is a click
+/// slop away from the press; then the copy is made and takes the whole of what
+/// was held, and the drag goes on from there as an ordinary move.
+#[derive(Debug, Clone, Copy)]
+struct AltCopy {
+    /// Where the press landed on screen, for the click slop.
+    origin_screen: Point,
+    /// What the pointer has travelled while it was still maybe a click.
+    pending: Vec2,
+    /// The copy has been made and is what is being dragged. Its steps carry the
+    /// same undo label as the copy, so one drag is one undo step.
+    copied: bool,
+}
+
+/// The turned box of a selection whose objects do not share one transform.
+///
+/// # Why this exists
+///
+/// [`Editor::selection_box`] can only turn a box that the artwork itself
+/// supports: one object, or several that were transformed together and so share
+/// a linear part. Rotate a selection of two differently-scaled shapes with Free
+/// Transform and they no longer do — the box fell back to the axis-aligned
+/// rectangle round them, so the handles jumped to the AABB the moment the turn
+/// was finished and the next drag was measured against a box that was not on
+/// the artwork. Animate keeps the box turned for as long as the selection is
+/// being transformed.
+///
+/// So the turn is *remembered*: the rectangle the box was before (in its own
+/// space) and the map `F` onto where it is now. Every committed transform `T`
+/// moves the artwork and `F` alike (`F = T·F`), which is exactly what keeps the
+/// box on it.
+///
+/// # When it ends
+///
+/// With the selection (the ids stop matching), with the frame (the playhead
+/// moves), with any other edit or undo/redo (the history stamp stops matching).
+/// It is never *trusted* past that: [`Editor::selection_box`] checks it on every
+/// use, and an invalid one is ignored and dropped on the next transform.
+#[derive(Debug, Clone)]
+struct BoxSession {
+    /// The selection it belongs to, sorted as `Selection::ids` gives them.
+    ids: Vec<ObjectId>,
+    /// The box: its rectangle in its own space, and where that sits now.
+    frame: TransformBox,
+    /// The playhead it was made at.
+    at_frame: u32,
+    /// What the history looked like when it was last brought up to date.
+    stamp: (u64, usize, usize),
+}
+
+/// **D2: the half of `Editor` that belongs to one open document**, not to the
+/// person using the app.
+///
+/// A document tab (`App`'s `OpenDocument`, docs/DOCUMENTS_PLAN.md) is a
+/// [`Document`] plus one of these — everything a tab switch must swap out so
+/// that switching to document B never shows a frame, a zoom level or a
+/// selection left over from document A. Everything *not* here (`workspace`,
+/// `style`/`tool_style`, `tool` state, panels, the command library, `assets`)
+/// stays on `Editor` itself and is shared across every tab, exactly as
+/// Animate keeps one set of tools and panels across several open documents.
+///
+/// Built so a future tiled-viewport mode (D2b) can own one of these per
+/// viewport rather than reworking this split again.
+pub struct DocView {
+    pub camera: Camera,
+    pub selection: Selection,
+    pub current_frame: u32,
+    pub playback: Playback,
+    pub onion: Onion,
+    pub edit_multiple: bool,
+    pub camera_selected: bool,
+    pub group_pivot: Option<(Vec<ObjectId>, Point)>,
+    pub sequence_scrub: Option<u32>,
+    pub ruler_marks: Vec<u32>,
+    pub edit_frames: Vec<u32>,
+    pub selected_light: Option<buzz_scene::LightId>,
+    /// Decoded sound and the output stream — see [`Editor::sound`]. Per
+    /// document, not reset on switch: which sounds are already decoded is
+    /// exactly as much the document's business as its artwork, and rebuilding
+    /// it on every tab flip would mean redecoding audio just to look at a
+    /// tab and back.
+    pub sound: crate::sound::SoundBank,
+}
+
+impl DocView {
+    /// A fresh view onto `doc` — camera fit to its stage, playhead at 0,
+    /// nothing selected but the active layer — what a document looks like
+    /// the moment it is opened. Mirrors `Editor::new`/`Editor::adopt`.
+    pub fn fresh(doc: &Document) -> Self {
+        let stage = doc.scene().stage().stage_rect();
+        let mut camera = Camera::new(stage.center(), 1.0, Size::new(1280.0, 720.0));
+        camera.fit_to_rect(stage, 1.2);
+
+        let mut selection = Selection::new();
+        selection.ensure_active_layer(doc.scene());
+
+        Self {
+            camera,
+            selection,
+            current_frame: 0,
+            playback: Playback::default(),
+            onion: Onion::default(),
+            edit_multiple: false,
+            camera_selected: false,
+            group_pivot: None,
+            sequence_scrub: None,
+            ruler_marks: Vec::new(),
+            edit_frames: Vec::new(),
+            selected_light: None,
+            sound: crate::sound::SoundBank::new(doc.scene().stage().frame_rate),
+        }
+    }
+}
+
+impl Default for DocView {
+    /// A placeholder used only for the instant it takes `App` to swap a real
+    /// `DocView` into its place — see `App::switch_to_tab`. Never shown.
+    fn default() -> Self {
+        Self::fresh(&Document::default())
+    }
+}
+
 impl Default for Editor {
     fn default() -> Self {
         Self::new(Document::default())
@@ -322,11 +550,20 @@ impl Editor {
         selection.ensure_active_layer(doc.scene());
         let stage_fps = doc.scene().stage().frame_rate;
 
+        let workspace = buzz_ui::Workspace::load();
+        // The tip shapes are a per-person preference, remembered in the
+        // workspace rather than the brush settings themselves — see
+        // `remember_brush_tips`.
+        let mut style = DrawStyle::default();
+        style.brush.fluid_tip = workspace.brush_tips.fluid;
+        style.brush.normal_tip = workspace.brush_tips.normal;
+
         Self {
             doc,
             camera,
             selection,
-            style: DrawStyle::default(),
+            tool_style: style.clone(),
+            style,
             view: ViewSettings::default(),
             machine: ToolMachine::new(ToolId::Selection),
             current_frame: 0,
@@ -334,6 +571,8 @@ impl Editor {
             onion: Onion::default(),
             edit_multiple: false,
             group_pivot: None,
+            selected_bone: None,
+            anchor_selection: None,
             restyle: false,
             auto_keyframe: false,
             library: LibraryState::default(),
@@ -343,7 +582,11 @@ impl Editor {
             rig_panel: buzz_ui::RigPanelState::default(),
             templates: buzz_doc::TemplateLibrary::user(),
             new_document: buzz_ui::NewDocumentState::default(),
+            title_card: buzz_ui::TitleCardState::default(),
             about: buzz_ui::AboutState::default(),
+            ai_models: buzz_ui::AiModelsState::default(),
+            ai_character: buzz_ui::AiCharacterState::default(),
+            ai_rename: buzz_ui::AiRenameState::default(),
             assets: buzz_doc::AssetLibrary::user(),
             assets_panel: buzz_ui::AssetPanelState::default(),
             cast_panel: buzz_ui::CastPanelState::default(),
@@ -354,23 +597,46 @@ impl Editor {
             filter_panel: buzz_ui::FilterPanelState::default(),
             motion_editor: buzz_ui::MotionEditorState::default(),
             camera_selected: false,
-            workspace: buzz_ui::Workspace::load(),
+            workspace,
             light_gesture: None,
+            shape_gesture: None,
+            alt_copy: None,
+            box_session: std::cell::RefCell::new(None),
             sound: crate::sound::SoundBank::new(stage_fps),
             scrub_until: None,
             scrub_frame: None,
             ruler_marks: Vec::new(),
+            edit_frames: Vec::new(),
+            enter_frame: None,
             lip_sync: buzz_ui::LipSyncState::default(),
             sound_placed: false,
             staging: buzz_ui::StagingState::default(),
             story: buzz_ui::StoryState::default(),
             pending_motion_path: None,
             import_summary: None,
+            trace_dialog: None,
             should_quit: false,
             status: None,
             waveform_cache: WaveformCache::default(),
+            master_waveform_cache: None,
+            sequence_scrub: None,
             bounds_cache: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Copy the current tip shapes into the workspace, so they survive to the
+    /// next session. Returns whether anything actually changed, so the caller
+    /// only saves the workspace file when there is something new to save.
+    pub fn remember_brush_tips(&mut self) -> bool {
+        let tips = buzz_ui::BrushTips {
+            fluid: self.style.brush.fluid_tip,
+            normal: self.style.brush.normal_tip,
+        };
+        if tips == self.workspace.brush_tips {
+            return false;
+        }
+        self.workspace.brush_tips = tips;
+        true
     }
 
     /// Every symbol's resolved extent, memoised by revision. Rebuilt only on an
@@ -401,7 +667,10 @@ impl Editor {
     /// have changed in a way that matters mid-drag, and recomputing them
     /// between frames is time taken directly out of the drag.
     pub fn is_gesturing(&self) -> bool {
-        self.machine.is_active() || self.rig_gesture.is_some() || self.light_gesture.is_some()
+        self.machine.is_active()
+            || self.rig_gesture.is_some()
+            || self.light_gesture.is_some()
+            || self.shape_gesture.is_some()
     }
 
     /// The frame the user is editing.
@@ -542,13 +811,76 @@ impl Editor {
         self.zoom_fit();
     }
 
+    /// **D2: swap in a different open document, tab-switch style.**
+    ///
+    /// Unlike [`Self::adopt`], nothing shared with the person rather than the
+    /// film — `workspace`, `style`, `tool_style`, the panels, the command
+    /// library, `assets` — is touched: those stay exactly as they were, the
+    /// way Animate's own tool and panel state survives a tab switch.
+    ///
+    /// Returns what belonged to the document that is leaving, packaged as a
+    /// [`DocView`], so the caller (`App`) can park it on that document's own
+    /// `OpenDocument` and hand it back the next time that tab is focused.
+    ///
+    /// Also resets every cache here that is gated only by [`Document::combined_revision`]
+    /// (`bounds_cache`, `waveform_cache`, `master_waveform_cache`): two
+    /// different documents can innocently land on the same revision number,
+    /// and without this a freshly-focused tab could show the *previous*
+    /// tab's memoised bounds or waveforms until its own next edit — the
+    /// "per-document caches... reset on switch" requirement in D2
+    /// (docs/DOCUMENTS_PLAN.md).
+    pub fn swap_document(&mut self, doc: Document, view: DocView) -> (Document, DocView) {
+        let old_view = DocView {
+            camera: std::mem::replace(&mut self.camera, view.camera),
+            selection: std::mem::replace(&mut self.selection, view.selection),
+            current_frame: std::mem::replace(&mut self.current_frame, view.current_frame),
+            playback: std::mem::replace(&mut self.playback, view.playback),
+            onion: std::mem::replace(&mut self.onion, view.onion),
+            edit_multiple: std::mem::replace(&mut self.edit_multiple, view.edit_multiple),
+            camera_selected: std::mem::replace(&mut self.camera_selected, view.camera_selected),
+            group_pivot: std::mem::replace(&mut self.group_pivot, view.group_pivot),
+            sequence_scrub: std::mem::replace(&mut self.sequence_scrub, view.sequence_scrub),
+            ruler_marks: std::mem::replace(&mut self.ruler_marks, view.ruler_marks),
+            edit_frames: std::mem::replace(&mut self.edit_frames, view.edit_frames),
+            selected_light: std::mem::replace(&mut self.light_panel.selected, view.selected_light),
+            sound: std::mem::replace(&mut self.sound, view.sound),
+        };
+        let old_doc = std::mem::replace(&mut self.doc, doc);
+        // Object ids are per document, so one document's anchors must not
+        // follow the selection into another that happens to reuse the id.
+        self.anchor_selection = None;
+        self.bounds_cache = std::cell::RefCell::new(None);
+        self.waveform_cache = WaveformCache::default();
+        self.master_waveform_cache = None;
+        (old_doc, old_view)
+    }
+
     /// Make a new document with these settings, and remember them.
     ///
     /// The remembering is the point of asking: somebody making a series makes
     /// twenty documents the same size, and the second onwards should be Enter.
     pub fn create_document(&mut self, setup: buzz_ui::DocumentSetup) {
         let setup = setup.sane();
+        self.doc = Self::build_new_document(&setup);
 
+        self.selection = Selection::new();
+        self.selection.ensure_active_layer(self.doc.scene());
+        self.current_frame = 0;
+        self.zoom_fit();
+
+        self.workspace.new_document = setup;
+        self.workspace.save();
+        self.status = Some(format!(
+            "New document \u{2014} {:.0} \u{00D7} {:.0} at {:.0} fps",
+            setup.width, setup.height, setup.frame_rate
+        ));
+    }
+
+    /// The document `create_document` builds, factored out so **a new tab**
+    /// (D2, docs/DOCUMENTS_PLAN.md) can be built without an `Editor` to run it
+    /// in place on — File ▸ New must open beside whatever is already open, not
+    /// replace it.
+    pub(crate) fn build_new_document(setup: &buzz_ui::DocumentSetup) -> Document {
         // The stage is set on the scene *before* the document is built around
         // it, so the size it was asked for is the size it was born at: a new
         // document must not open already dirty, and there is nothing to undo
@@ -564,20 +896,15 @@ impl Editor {
                 setup.background[2],
             );
         }
-        self.doc = Document::new(scene);
-        self.doc.mark_clean();
-
-        self.selection = Selection::new();
-        self.selection.ensure_active_layer(self.doc.scene());
-        self.current_frame = 0;
-        self.zoom_fit();
-
-        self.workspace.new_document = setup;
-        self.workspace.save();
-        self.status = Some(format!(
-            "New document \u{2014} {:.0} \u{00D7} {:.0} at {:.0} fps",
-            setup.width, setup.height, setup.frame_rate
-        ));
+        // **A minute of frames to start with.** The user's request: a one-frame
+        // layer meant pressing F5 a thousand times before there was a timeline
+        // to animate along. A minute at the document's own rate — 1440 frames
+        // at 24 fps — set before the document is built, so it is not an edit
+        // to undo and the new document does not open dirty.
+        scene.set_frame_count(new_document_frames(setup.frame_rate));
+        let mut doc = Document::new(scene);
+        doc.mark_clean();
+        doc
     }
 
     /// Make the document longer or shorter, in frames.
@@ -688,8 +1015,7 @@ impl Editor {
             self.sound.scrub(scene, frame);
             self.scrub_frame = Some(frame);
         }
-        self.scrub_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(140));
+        self.scrub_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(140));
     }
 
     /// **Find the beats in the document's soundtrack** and mark them on the
@@ -744,25 +1070,23 @@ impl Editor {
         let scene = self.doc.scene();
         let fps = scene.stage().frame_rate.max(1.0);
         let Some((_, _, clip)) = self.sound.stage_track(scene) else {
-            self.status = Some(
-                "There is no soundtrack to fit to \u{2014} import the narration first".into(),
-            );
+            self.status =
+                Some("There is no soundtrack to fit to \u{2014} import the narration first".into());
             return;
         };
 
         let options = buzz_audio::PhraseOptions::default();
         let phrases = buzz_audio::detect_phrases(clip.as_ref(), fps, &options);
         if phrases.is_empty() {
-            self.status =
-                Some("Nothing in that soundtrack sounded like speech".into());
+            self.status = Some("Nothing in that soundtrack sounded like speech".into());
             return;
         }
 
         // The film has to be at least as long as the narration, or the lines
         // past the end are marked on a ruler that does not reach them.
-        let needed = clip.duration_frames(fps).max(
-            phrases.last().map(|p| p.end).unwrap_or(0),
-        );
+        let needed = clip
+            .duration_frames(fps)
+            .max(phrases.last().map(|p| p.end).unwrap_or(0));
         let Some(layer) = self.active_layer() else {
             self.status = Some("There is no layer to lay the narration out on".into());
             return;
@@ -831,6 +1155,40 @@ impl Editor {
         }
 
         let fps = self.doc.scene().stage().frame_rate.max(1.0);
+        let lines: Vec<(std::ops::Range<u32>, String, Option<String>)> = caps
+            .cues
+            .iter()
+            .map(|cue| (cue.frames(fps), cue.text.clone(), cue.speaker.clone()))
+            .collect();
+        let layer = self.draw_captions_layer(&lines)?;
+
+        self.select_layer(layer);
+        let n = caps.cues.len();
+        let cast = caps.speakers();
+        self.status = Some(match (caps.skipped, cast.len()) {
+            (0, 0) => format!("{n} captions on their own layer"),
+            (0, _) => format!("{n} captions, spoken by {}", cast.join(", ")),
+            (s, 0) => format!("{n} captions \u{2014} {s} blocks could not be read"),
+            (s, _) => format!(
+                "{n} captions spoken by {} \u{2014} {s} blocks could not be read",
+                cast.join(", ")
+            ),
+        });
+        Ok(n)
+    }
+
+    /// Draws one text object per `(frames, text, speaker)` line onto a fresh
+    /// **Captions** layer, labelling each line's keyframe with its speaker so
+    /// [`Self::lip_sync_from_captions`] can find it.
+    ///
+    /// The drawing half of [`Self::import_captions`], pulled out so anything
+    /// that already has timed, named lines — an imported `.srt`, or an AI
+    /// director's [`Self::sync_directed_dialogue`] — can put them on the
+    /// timeline the same way, without going through a file.
+    fn draw_captions_layer(
+        &mut self,
+        lines: &[(std::ops::Range<u32>, String, Option<String>)],
+    ) -> anyhow::Result<LayerId> {
         let stage = self.doc.scene().stage().stage_rect();
         // Down where a subtitle goes, and sized to the picture rather than to a
         // number: the same file on a 4K stage should not arrive as a speck.
@@ -847,25 +1205,21 @@ impl Editor {
             f64,
             Option<String>,
         )> = Vec::new();
-        for cue in &caps.cues {
+        for (range, text, speaker) in lines {
             let data = buzz_scene::TextData {
-                content: cue.text.clone(),
+                content: text.clone(),
                 size,
                 font: None,
                 style: buzz_text::FontStyle::REGULAR,
                 align: buzz_text::TextAlign::Centre,
+                runs: Vec::new(),
             };
-            let Some(path) = buzz_text::outline_styled(
-                &cue.text,
-                size,
-                None,
-                data.style,
-                data.align,
-            ) else {
+            let Some(path) = buzz_text::outline_styled(text, size, None, data.style, data.align)
+            else {
                 continue;
             };
-            let (width, _) = buzz_text::measure_styled(&cue.text, size, None, data.style);
-            drawn.push((cue.frames(fps), path, data, width, cue.speaker.clone()));
+            let (width, _) = buzz_text::measure_styled(text, size, None, data.style);
+            drawn.push((range.clone(), path, data, width, speaker.clone()));
         }
         if drawn.is_empty() {
             anyhow::bail!("no font available to draw those captions with");
@@ -902,11 +1256,9 @@ impl Editor {
                         l.frames.set_label(range.start, Some(who.clone()));
                     }
                 });
-                if let Some(id) = scene.add_shape_at(
-                    layer,
-                    range.start,
-                    ShapeData::filled(path.clone(), colour),
-                ) {
+                if let Some(id) =
+                    scene.add_shape_at(layer, range.start, ShapeData::filled(path.clone(), colour))
+                {
                     scene.update_object_at(range.start, id, |o| {
                         // **Centred by measurement, not by the align setting.**
                         //
@@ -916,30 +1268,55 @@ impl Editor {
                         // expect: every caption started at the middle of the
                         // stage and ran off the right-hand edge. The figure in
                         // the guide is what showed it.
-                        o.transform = Affine::translate((
-                            stage.center().x - width / 2.0,
-                            baseline,
-                        ));
+                        o.transform = Affine::translate((stage.center().x - width / 2.0, baseline));
                         o.text = Some(data.clone());
                     });
                 }
             }
         });
         self.doc.end_gesture();
+        Ok(layer)
+    }
 
+    /// **Caption and lip-sync the AI director's dialogue**, the same way an
+    /// imported subtitle file is.
+    ///
+    /// [`buzz_ai::director::dialogue_cues`] already knows who says what and on
+    /// which frames — it read that off `direct`'s own schedule — so this is
+    /// the other half of the same join [`Self::lip_sync_from_captions`] does
+    /// for a `.srt`: draw the lines on a **Captions** layer, then sync each
+    /// named speaker's own mouth over their own lines.
+    ///
+    /// A freshly directed story usually has no recorded narration yet, so a
+    /// missing soundtrack is not treated as a failure here: the captions
+    /// still land, and the status explains that lip sync was skipped rather
+    /// than losing the whole commit over it.
+    pub fn sync_directed_dialogue(
+        &mut self,
+        cues: &[buzz_ai::director::DialogueCue],
+    ) -> anyhow::Result<usize> {
+        if cues.is_empty() {
+            return Ok(0);
+        }
+        let lines: Vec<(std::ops::Range<u32>, String, Option<String>)> = cues
+            .iter()
+            .map(|c| (c.start_frame..c.end_frame, c.text.clone(), Some(c.speaker.clone())))
+            .collect();
+        let layer = self.draw_captions_layer(&lines)?;
         self.select_layer(layer);
-        let n = caps.cues.len();
-        let cast = caps.speakers();
-        self.status = Some(match (caps.skipped, cast.len()) {
-            (0, 0) => format!("{n} captions on their own layer"),
-            (0, _) => format!("{n} captions, spoken by {}", cast.join(", ")),
-            (s, 0) => format!("{n} captions \u{2014} {s} blocks could not be read"),
-            (s, _) => format!(
-                "{n} captions spoken by {} \u{2014} {s} blocks could not be read",
-                cast.join(", ")
-            ),
-        });
-        Ok(n)
+
+        match self.lip_sync_from_captions() {
+            // `lip_sync_from_captions` already set a status describing what
+            // it wrote; leave it be.
+            Ok(written) => Ok(written),
+            Err(e) => {
+                self.status = Some(format!(
+                    "{} dialogue caption(s) added; lip sync skipped \u{2014} {e}",
+                    cues.len()
+                ));
+                Ok(0)
+            }
+        }
     }
 
     /// **Lip-sync every character from the caption layer**, each over their own
@@ -997,7 +1374,9 @@ impl Editor {
         let length = layer.frames.length();
         let mut lines: Vec<(String, std::ops::Range<u32>)> = Vec::new();
         for (i, key) in layer.frames.keyframes().iter().enumerate() {
-            let Some(who) = key.label.clone() else { continue };
+            let Some(who) = key.label.clone() else {
+                continue;
+            };
             let has_text = layer
                 .frames
                 .resolved_at(key.start)
@@ -1019,11 +1398,8 @@ impl Editor {
         // The whole track once, then sliced per line. Analysing per line would
         // re-window the audio at every cue boundary and give a different answer
         // at the seams than a single pass does.
-        let track = buzz_audio::analyse_visemes(
-            clip.as_ref(),
-            fps,
-            &buzz_audio::LipSyncOptions::default(),
-        );
+        let track =
+            buzz_audio::analyse_visemes(clip.as_ref(), fps, &buzz_audio::LipSyncOptions::default());
         if track.is_empty() {
             anyhow::bail!("that soundtrack analysed to nothing");
         }
@@ -1121,12 +1497,7 @@ impl Editor {
                     let slice = buzz_audio::VisemeTrack { frames, fps };
 
                     let report = buzz_act::lipsync::write_track(
-                        scene,
-                        &slice,
-                        span.start,
-                        target,
-                        *mouth,
-                        placement,
+                        scene, &slice, span.start, target, *mouth, placement,
                     );
                     written += report.keyframes as usize;
                 }
@@ -1224,6 +1595,34 @@ impl Editor {
         }
     }
 
+    /// **How many frames actually play from the active scene** — a Shot's
+    /// own playing length (`audio_out - audio_in`), which may be shorter
+    /// than its `frame_count` once frames are kept past a shortened end;
+    /// every other scene's whole `frame_count`. See
+    /// `docs/SEQUENCE_SETUPS_PLAN.md` "Setups are stamped, never linked" and
+    /// [`buzz_doc::Document::playing_length`].
+    pub fn playing_length(&self) -> u32 {
+        self.doc.playing_length(self.doc.active_scene()).max(1)
+    }
+
+    /// The active scene's own end marker for the Timeline, if it is a
+    /// Shot — `Some(playing_length)` when that is shorter than the scene's
+    /// `frame_count`, so the timeline can grey the kept-but-unplayed frames
+    /// past it. `None` for every other scene, and for a Shot whose kept
+    /// frames do not yet reach past its own end.
+    pub fn shot_end_marker(&self) -> Option<u32> {
+        let index = self.doc.active_scene();
+        if !matches!(self.doc.role(index), Some(SceneRole::Shot(_))) {
+            return None;
+        }
+        let length = self.doc.playing_length(index);
+        if length < self.doc.scene().frame_count() {
+            Some(length)
+        } else {
+            None
+        }
+    }
+
     /// Advance playback by `elapsed` seconds. Call once per frame.
     pub fn advance_playback(&mut self, elapsed: f64) {
         if !self.playback.playing {
@@ -1238,7 +1637,7 @@ impl Editor {
         // notices. So when sound is playing the playhead is *told* where the
         // sound has reached.
         if let Some(frame) = self.sound.playing_frame() {
-            let count = self.doc.scene().frame_count();
+            let count = self.playing_length();
             if frame >= count {
                 if self.playback.looping {
                     self.sound.seek(0);
@@ -1287,7 +1686,7 @@ impl Editor {
             return;
         }
 
-        let count = self.doc.scene().frame_count();
+        let count = self.playing_length();
         let next = self.current_frame + advanced;
 
         // The looping section is checked first: it ends the run before the end
@@ -1394,12 +1793,119 @@ impl Editor {
 
     fn tool_context(&self) -> ToolContext<'_> {
         ToolContext {
-            style: &self.style,
+            style: &self.tool_style,
             zoom: self.camera.zoom,
             selection_bounds: self.selection_bounds_drawn(),
+            selection_box: self.selection_box(),
             anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
             pivot: self.pivot(),
             gradient: self.selected_gradient_handles(),
+        }
+    }
+
+    /// The path the Subselection tool is editing, with its object — the one
+    /// selected shape, if exactly one is.
+    fn subselected_shape(&self) -> Option<(ObjectId, &buzz_scene::Object, &ShapeData)> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        let id = self.selection.iter().next()?;
+        let (_, object) = self.doc.scene().find_object(id)?;
+        let ObjectKind::Shape(shape) = &object.kind else {
+            return None;
+        };
+        Some((id, object, shape))
+    }
+
+    /// Which of the selected shape's anchors are selected, as element indices.
+    ///
+    /// Empty unless the stored selection belongs to the one shape that is
+    /// selected now — and only anchors that still exist count, so an undo that
+    /// removed some cannot leave a stale index behind.
+    pub fn selected_anchor_elements(&self) -> Vec<usize> {
+        let Some((id, _, shape)) = self.subselected_shape() else {
+            return Vec::new();
+        };
+        let Some((owner, elements)) = &self.anchor_selection else {
+            return Vec::new();
+        };
+        if *owner != id {
+            return Vec::new();
+        }
+        let exists: std::collections::HashSet<usize> = buzz_geom::anchors(&shape.path)
+            .into_iter()
+            .map(|a| a.element)
+            .collect();
+        elements
+            .iter()
+            .copied()
+            .filter(|e| exists.contains(e))
+            .collect()
+    }
+
+    /// Are there selected anchors for the keyboard to act on — Delete and the
+    /// arrow keys mean *those* rather than the whole object?
+    pub fn anchors_selected(&self) -> bool {
+        self.machine.tool() == ToolId::Subselection && !self.selected_anchor_elements().is_empty()
+    }
+
+    /// The tangent handles of the given anchors, in world space — through the
+    /// same transform [`Self::selected_anchors`] uses, so a handle is drawn and
+    /// grabbed where its anchor is.
+    fn handles_of(&self, elements: &[usize]) -> Vec<buzz_geom::Handle> {
+        let Some((_, object, shape)) = self.subselected_shape() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &element in elements {
+            let smooth = buzz_geom::is_smooth(&shape.path, element);
+            let Some(anchor) = shape
+                .path
+                .elements()
+                .get(element)
+                .and_then(|el| match el {
+                    buzz_geom::PathEl::MoveTo(p) | buzz_geom::PathEl::LineTo(p) => Some(*p),
+                    buzz_geom::PathEl::QuadTo(_, p) | buzz_geom::PathEl::CurveTo(_, _, p) => {
+                        Some(*p)
+                    }
+                    buzz_geom::PathEl::ClosePath => None,
+                })
+            else {
+                continue;
+            };
+            let h = buzz_geom::anchor_handles(&shape.path, element);
+            for (side, point) in [
+                (buzz_geom::HandleSide::In, h.incoming),
+                (buzz_geom::HandleSide::Out, h.outgoing),
+            ] {
+                if let Some(point) = point {
+                    out.push(buzz_geom::Handle {
+                        element,
+                        side,
+                        point: object.transform * point,
+                        anchor: object.transform * anchor,
+                        smooth,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// The tangent handles of the selected anchors, in world space — what the
+    /// stage draws and what the Subselection tool can grab.
+    pub fn selected_handles(&self) -> Vec<buzz_geom::Handle> {
+        self.handles_of(&self.selected_anchor_elements())
+    }
+
+    /// Forget the anchor selection once the selection is not its one shape.
+    fn prune_anchor_selection(&mut self) {
+        if let Some((owner, _)) = &self.anchor_selection
+            && self.subselected_shape().map(|(id, ..)| id) != Some(*owner)
+        {
+            self.anchor_selection = None;
         }
     }
 
@@ -1459,9 +1965,7 @@ impl Editor {
         // so no focus grip is drawn — an image has no hot spot.
         let (local, kind) = match paint {
             buzz_scene::Paint::Gradient(g) => (g.handles(), g.kind),
-            buzz_scene::Paint::Image(image) => {
-                (image.handles(), buzz_scene::GradientKind::Linear)
-            }
+            buzz_scene::Paint::Image(image) => (image.handles(), buzz_scene::GradientKind::Linear),
             _ => return None,
         };
         Some((
@@ -1625,6 +2129,58 @@ impl Editor {
         }
     }
 
+    /// **How many screen pixels one edit-space unit spans at `screen`.**
+    ///
+    /// A brush or eraser mark is sized in edit space and then drawn through
+    /// the document camera and the view, so a cursor ring sized by the view's
+    /// zoom alone disagreed with the mark whenever a camera was framed in or
+    /// out. Measured at the pointer, so a tilted shot's foreshortening is the
+    /// one under the ring.
+    pub fn edit_scale_on_screen(&self, screen: Point) -> f64 {
+        let at = self.screen_to_edit(screen);
+        let to_stage = self.edit_to_stage();
+        let fallback = self.camera.zoom;
+        let (Some(o), Some(x), Some(y)) = (
+            to_stage.map_point(at),
+            to_stage.map_point(at + Vec2::new(1.0, 0.0)),
+            to_stage.map_point(at + Vec2::new(0.0, 1.0)),
+        ) else {
+            return fallback;
+        };
+        // The mean of the two axes, for a shot squeezed more one way.
+        let stage_per_edit = ((x - o).hypot() + (y - o).hypot()) * 0.5;
+        let scale = stage_per_edit * self.camera.zoom;
+        if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            fallback
+        }
+    }
+
+    /// Recompute [`Self::tool_style`] from [`Self::style`] at `screen`.
+    ///
+    /// Animate's "Zoom size with stage": off, a brush or eraser's size is
+    /// fixed in screen pixels rather than document units, so the mark's
+    /// document size has to shrink as the view zooms in to hold its on-screen
+    /// size steady. That conversion happens here, once, rather than in every
+    /// place a size is read — see [`crate::tools::ToolContext::style`].
+    ///
+    /// Called at the start of every pointer down, move and up, before their
+    /// `ToolContext` is built.
+    fn refresh_tool_style(&mut self, screen: Point) {
+        let mut style = self.style.clone();
+        let scale = self.edit_scale_on_screen(screen);
+        if scale.is_finite() && scale > 0.0 {
+            if !self.style.brush_zoom_size {
+                style.brush.size = self.style.brush.size / scale;
+            }
+            if !self.style.eraser_zoom_size {
+                style.eraser_size = self.style.eraser_size / scale;
+            }
+        }
+        self.tool_style = style;
+    }
+
     /// The inverse of [`Self::screen_to_edit`]'s document half: from the space
     /// the tools work in, back onto the stage.
     ///
@@ -1645,6 +2201,30 @@ impl Editor {
         shot.pre_affine(scene.edit_place())
     }
 
+    /// Hit the drawn pivot in logical screen pixels, including shot and
+    /// edit-in-place transforms. Corners keep priority when closer.
+    pub(crate) fn pointer_on_pivot(&self, screen: Point) -> bool {
+        // Only Free Transform has a transformation point: the Selection tool is
+        // Animate's arrow, and draws and grabs nothing of the kind.
+        if self.tool() != ToolId::FreeTransform {
+            return false;
+        }
+        let (Some(frame), Some(pivot)) = (self.selection_box(), self.pivot()) else {
+            return false;
+        };
+        let projection = self.edit_to_stage();
+        if projection.inverse().is_none() {
+            return false;
+        }
+        let project = |point| projection.map_point(point).map(|p| self.camera.doc_to_screen(p));
+        let Some(pivot) = project(pivot) else { return false };
+        // The turned box's corners, which is where the handles are drawn.
+        let nearest = frame.corners().into_iter().filter_map(project).map(|p| (p - screen).hypot())
+            .fold(f64::INFINITY, f64::min);
+        let distance = (pivot - screen).hypot();
+        distance <= crate::tools::TRANSFORM_GRAB_PX * 1.5 && distance <= nearest
+    }
+
     pub fn pointer_down(&mut self, screen: Point, mods: Mods) {
         self.pointer_down_at(screen, mods, None, None);
     }
@@ -1657,6 +2237,16 @@ impl Editor {
         time: Option<f64>,
         pressure: Option<f64>,
     ) {
+        self.refresh_tool_style(screen);
+        // A fresh press starts with no copy in hand, whatever became of the
+        // last gesture (a release outside the window never arrives).
+        self.alt_copy = None;
+        // Capture the visible circle before snapping or picking artwork under
+        // it. A pivot can be outside its selection or over another object.
+        if self.pointer_on_pivot(screen) && let Some(pivot) = self.pivot() {
+            self.machine.begin_pivot_drag(self.screen_to_edit(screen), screen, pivot);
+            return;
+        }
         let doc = self.screen_to_edit(screen);
         let doc = self.snap_for_tool(doc);
 
@@ -1702,21 +2292,54 @@ impl Editor {
         // sit over another object; grabbing that object here would take the
         // selection off the very thing the user was lining up to scale or turn.
         // Asked against the current selection, before the grab changes it.
-        let on_gizmo = self.machine.tool() == ToolId::Selection && {
+        //
+        // Only Free Transform has a gizmo; the Selection tool is Animate's
+        // arrow, and nothing on its box is a handle.
+        let tool = self.machine.tool();
+        let on_gizmo = tool == ToolId::FreeTransform && {
             let ctx = ToolContext {
-                style: &self.style,
+                style: &self.tool_style,
                 zoom: self.camera.zoom,
                 selection_bounds: self.selection_bounds_drawn(),
+                selection_box: self.selection_box(),
                 anchors: &[],
+                selected_anchors: &[],
+                handles: &[],
                 pivot: self.pivot(),
                 gradient: None,
             };
             self.machine.press_on_gizmo(doc, &ctx)
         };
-        if self.machine.tool() == ToolId::Selection
-            && !mods.shift
+
+        // **A raw shape's own edge or corner, and Distort.** Asked before the
+        // grab below picks the shape under the pointer, because what the press
+        // takes hold of is the *geometry* — bend this edge, move that corner —
+        // not the object. See `shape_edit`.
+        //
+        // Also asked **on Free Transform's gizmo**, and meant to be: Distort is
+        // Ctrl on one of its corners, so a press that grabs a handle is exactly
+        // where it begins. (The Selection tool has no gizmo to be on.)
+        if self.begin_shape_gesture(doc, screen, mods) {
+            return;
+        }
+
+        // **What is under the press**, asked once for the grab below and for the
+        // Selection tool's "is this a press on the selection?".
+        //
+        // Free Transform only grabs with Alt held: Alt-dragging an object that
+        // is not selected yet copies it, so it is selected first. Without Alt a
+        // press that is not on its gizmo is a marquee, as it has always been.
+        let grabs = match tool {
+            ToolId::Selection => !mods.shift,
+            ToolId::FreeTransform => mods.alt && !mods.shift,
+            _ => false,
+        };
+        let top = (tool == ToolId::Selection || grabs && !on_gizmo)
+            .then(|| self.object_at(doc, self.pick_tolerance()))
+            .flatten();
+        if grabs
             && !on_gizmo
-            && let Some(id) = self.object_at(doc, self.pick_tolerance())
+            && let Some(id) = top
             && !self.selection.contains(id)
         {
             self.selection.select_one(id);
@@ -1729,19 +2352,76 @@ impl Editor {
 
         let anchors = self.selected_anchors();
         let selection_bounds = self.selection_bounds_drawn();
+        // **The Selection tool moves what the press is on — not whatever is in
+        // the box.** Animate's arrow drags a selected *object*; a press in the
+        // empty part of its bounding box (the hole of a ring, the gap of an L)
+        // is a marquee. Only the editor can see which object is under the
+        // pointer, so the tool machine is handed a box only when it is on a
+        // selected one — and with no box it has nothing to move, which is what
+        // "nothing selected under the press" means to it.
+        let on_selection =
+            top.is_some_and(|id| self.selection.contains(id)) || self.on_selected_text(doc);
+        let selection_box = if tool == ToolId::Selection && !on_selection {
+            None
+        } else {
+            self.selection_box()
+        };
         let pivot = self.pivot();
         let zoom = self.camera.zoom;
         let gradient = self.selected_gradient_handles();
+
+        // **The handles a press can meet**: those of the selected anchors,
+        // which are the ones drawn, and of any anchor under the pointer — so
+        // an Alt-press can tell a corner from a smooth point before it has
+        // selected it. Only worked out for the tool that reads them.
+        let selected_anchors = if self.machine.tool() == ToolId::Subselection {
+            self.selected_anchor_elements()
+        } else {
+            Vec::new()
+        };
+        let handles = if self.machine.tool() == ToolId::Subselection {
+            let reach = crate::tools::ANCHOR_GRAB_PX / zoom.max(f64::MIN_POSITIVE);
+            let mut wanted = selected_anchors.clone();
+            wanted.extend(
+                anchors
+                    .iter()
+                    .filter(|a| (a.point - doc).hypot() <= reach)
+                    .map(|a| a.element)
+                    .filter(|e| !selected_anchors.contains(e)),
+            );
+            self.handles_of(&wanted)
+        } else {
+            Vec::new()
+        };
         let ctx = ToolContext {
-            style: &self.style,
+            style: &self.tool_style,
             zoom,
             selection_bounds,
+            selection_box,
             anchors: &anchors,
+            selected_anchors: &selected_anchors,
+            handles: &handles,
             pivot,
             gradient,
         };
-        self.machine
+        let action = self
+            .machine
             .pointer_down_at(doc, screen, mods, &ctx, time, pressure);
+        // A press on an anchor selects it, so the press has something to say.
+        self.apply(action);
+
+        // **Alt on a press that moves the selection is a drag of a copy.** Only
+        // a press that moves artwork has anything to copy: Alt on a Free
+        // Transform handle keeps its own meaning (scale about the point, turn
+        // about the opposite corner), and Alt on empty stage is a marquee.
+        self.alt_copy = (mods.alt
+            && matches!(tool, ToolId::Selection | ToolId::FreeTransform)
+            && self.machine.is_moving())
+        .then_some(AltCopy {
+            origin_screen: screen,
+            pending: Vec2::ZERO,
+            copied: false,
+        });
     }
 
     pub fn pointer_move(&mut self, screen: Point, mods: Mods) {
@@ -1759,6 +2439,7 @@ impl Editor {
         time: Option<f64>,
         pressure: Option<f64>,
     ) {
+        self.refresh_tool_style(screen);
         if self.rig_gesture.is_some() {
             // Unsnapped, for the same reason: an IK target that jumped to the
             // nearest edge would make posing feel like it was fighting back.
@@ -1767,15 +2448,37 @@ impl Editor {
         }
         if let Some(gesture) = self.light_gesture {
             let doc = self.screen_to_edit(screen);
+            let frame = self.current_frame;
+            let auto_key = self.auto_keyframe;
             self.doc.edit(gesture.label(), |scene| {
-                crate::lights::drag(scene, gesture, doc);
+                crate::lights::drag_light_at(scene, gesture, doc, frame, auto_key);
             });
+            return;
+        }
+        if self.shape_gesture.is_some() {
+            let doc = self.snap_for_tool(self.screen_to_edit(screen));
+            self.move_shape_gesture(doc, screen, mods);
             return;
         }
         let doc = self.snap_for_tool(self.screen_to_edit(screen));
         let action = self
             .machine
             .pointer_move_at(doc, screen, mods, time, pressure);
+        // An Alt-drag drags a copy: hold the move back until it is a drag, then
+        // make the copy and let the move through.
+        let action = self.alt_copy_step(action, screen);
+        // The Hand tool's own drag, scaled by the Tool Options pan-speed
+        // multiplier (I4b of `docs/INTERACTION_FIXES_PLAN.md`; 1x by
+        // default, tracking the pointer exactly). Space-drag and the
+        // middle mouse button apply the same multiplier at their own call
+        // site in `App::handle_stage_input`, since neither goes through
+        // here; the wheel's `PanView` never does either, so it is untouched.
+        let action = match action {
+            ToolAction::PanView { delta_screen } => ToolAction::PanView {
+                delta_screen: delta_screen * self.workspace.pan_speed as f64,
+            },
+            other => other,
+        };
         self.apply(action);
     }
 
@@ -1785,6 +2488,7 @@ impl Editor {
 
     /// A pointer release the window has timed. See [`Self::pointer_move_at`].
     pub fn pointer_up_at(&mut self, screen: Point, time: Option<f64>, pressure: Option<f64>) {
+        self.refresh_tool_style(screen);
         if self.rig_gesture.is_some() {
             self.finish_rig_gesture(self.screen_to_edit(screen));
             self.doc.end_gesture();
@@ -1793,23 +2497,20 @@ impl Editor {
         if let Some(gesture) = self.light_gesture.take() {
             let doc = self.screen_to_edit(screen);
             let frame = self.current_frame;
+            let auto_key = self.auto_keyframe;
             self.doc.edit(gesture.label(), |scene| {
-                crate::lights::drag(scene, gesture, doc);
-                // If the light is already animated, the drag re-keys it at the
-                // playhead so the new placement lands on this frame rather than
-                // silently editing a base the animation overrides — the same
-                // auto-key a camera drag does.
-                if let Some(light) = scene.lights_mut().get_mut(gesture.light())
-                    && light.track.as_ref().is_some_and(|t| t.animates())
-                {
-                    let key = buzz_scene::LightKey::from_light(frame, light);
-                    if let Some(track) = light.track.as_mut() {
-                        track.set_key(key);
-                    }
-                }
+                // Same helper as every intermediate move, so the light lands
+                // exactly where the last move left it rather than taking one
+                // more step on release.
+                crate::lights::drag_light_at(scene, gesture, doc, frame, auto_key);
             });
             // One drag, one undo step — as with every other gesture.
             self.doc.end_gesture();
+            return;
+        }
+        if self.shape_gesture.is_some() {
+            let doc = self.snap_for_tool(self.screen_to_edit(screen));
+            self.finish_shape_gesture(doc, screen);
             return;
         }
         let doc = self.snap_for_tool(self.screen_to_edit(screen));
@@ -1818,21 +2519,100 @@ impl Editor {
         // would borrow all of `self` and conflict with `&mut self.machine`.
         let anchors = self.selected_anchors();
         let selection_bounds = self.selection_bounds_drawn();
+        let selection_box = self.selection_box();
         let pivot = self.pivot();
         let zoom = self.camera.zoom;
         let gradient = self.selected_gradient_handles();
+        let selected_anchors = if self.machine.tool() == ToolId::Subselection {
+            self.selected_anchor_elements()
+        } else {
+            Vec::new()
+        };
         let ctx = ToolContext {
-            style: &self.style,
+            style: &self.tool_style,
             zoom,
             selection_bounds,
+            selection_box,
             anchors: &anchors,
+            selected_anchors: &selected_anchors,
+            handles: &[],
             pivot,
             gradient,
         };
-        let action = self.machine.pointer_up_at(doc, screen, &ctx, time, pressure);
+        let action = self
+            .machine
+            .pointer_up_at(doc, screen, &ctx, time, pressure);
 
         self.apply(action);
+        // The copy, if there was one, was made and carried step by step; its
+        // release is what ends the one undo step it shares with the drag.
+        self.alt_copy = None;
         self.doc.end_gesture();
+        // The release may have chosen another object; the anchors chosen on
+        // the last one go with it.
+        self.prune_anchor_selection();
+    }
+
+    /// Is `at` inside the drawn box of a **selected text** object?
+    ///
+    /// Text is dragged by its box, not by its ink: the gaps between letters are
+    /// not stage, and a drag that fell through them would marquee away a caption
+    /// the user had hold of. Every other object is hit by what it paints.
+    fn on_selected_text(&self, at: Point) -> bool {
+        self.selection.iter().any(|id| {
+            let is_text = self
+                .doc
+                .scene()
+                .find_object(id)
+                .is_some_and(|(_, o)| o.text.is_some());
+            is_text
+                && self.focal_local_and_quad(id).is_some_and(|(_, quad)| {
+                    // On the same side of every edge: inside a convex quad,
+                    // whichever way round it is wound.
+                    let sides: Vec<f64> = (0..4)
+                        .map(|i| {
+                            let (a, b) = (quad[i], quad[(i + 1) % 4]);
+                            (b - a).cross(at - a)
+                        })
+                        .collect();
+                    sides.iter().all(|s| *s >= 0.0) || sides.iter().all(|s| *s <= 0.0)
+                })
+        })
+    }
+
+    /// **Alt-drag drags a copy** — Animate's way to duplicate while moving.
+    ///
+    /// Passes every action through but the first moves of an armed Alt-drag.
+    /// Those are summed and held back while the pointer is still within a click
+    /// of the press; the step that makes it a drag first leaves the original
+    /// where it is and puts a copy in its place in the selection, then lets the
+    /// whole held distance through, so the copy lands under the pointer.
+    ///
+    /// The copy and every step after it share the undo label `Duplicate`, which
+    /// is what folds a drag into one undo step (see `History::record`).
+    fn alt_copy_step(&mut self, action: ToolAction, screen: Point) -> ToolAction {
+        let ToolAction::MoveSelection { delta } = action else {
+            return action;
+        };
+        let Some(mut copy) = self.alt_copy else {
+            return action;
+        };
+        if copy.copied {
+            return action;
+        }
+        copy.pending += delta;
+        let slop = crate::tools::CLICK_SLOP_PX;
+        if (screen - copy.origin_screen).hypot() <= slop {
+            self.alt_copy = Some(copy);
+            return ToolAction::None;
+        }
+        // No offset: the copy is what is under the pointer and being dragged,
+        // so unlike Ctrl+D it has no need to be moved aside to be seen.
+        self.duplicate_selection_at(ALT_COPY_LABEL, Vec2::ZERO);
+        let delta = std::mem::replace(&mut copy.pending, Vec2::ZERO);
+        copy.copied = true;
+        self.alt_copy = Some(copy);
+        ToolAction::MoveSelection { delta }
     }
 
     /// Snap a point for the *active* tool, which for the freehand tools and the
@@ -1860,9 +2640,13 @@ impl Editor {
     /// The pen, which places anchors one at a time, still snaps — that is a
     /// placed point in every sense.
     fn snap_for_tool(&self, point: Point) -> Point {
+        if self.machine.dragging_pivot() {
+            return point;
+        }
         match self.machine.tool() {
-            ToolId::Brush | ToolId::Pencil | ToolId::Eraser | ToolId::Lasso
-            | ToolId::Selection => point,
+            ToolId::Brush | ToolId::Pencil | ToolId::Eraser | ToolId::Lasso | ToolId::Selection => {
+                point
+            }
             _ => self.snap(point),
         }
     }
@@ -1897,7 +2681,70 @@ impl Editor {
 
     // -- applying tool actions ----------------------------------------------
 
+    /// Edit the sub-selected shape's path in its own space.
+    ///
+    /// The pointer and the arrow keys speak in world space, but the path lives
+    /// in the object's own, so `edit` is handed the inverse of the object's
+    /// transform to bring what it was told back through — the same mapping
+    /// [`Self::selected_anchors`] applies on the way out, so what was drawn
+    /// under the pointer is what gets edited.
+    fn edit_subselected_path(
+        &mut self,
+        label: &'static str,
+        edit: impl Fn(&mut buzz_geom::BezPath, Affine),
+    ) {
+        let Some((id, object, _)) = self.subselected_shape() else {
+            return;
+        };
+        let Some(back) = invert(object.transform) else {
+            return;
+        };
+        let at = self.edit_at();
+        self.doc.edit(label, |scene| {
+            update_shape(scene, at, id, |s| edit(&mut s.path, back));
+        });
+    }
+
+    /// Delete the selected anchors, if the Subselection tool has any selected.
+    /// Returns whether it did — otherwise Delete means the whole object.
+    ///
+    /// The path closes up round the gap. A path left with fewer than two
+    /// anchors is no path, so the object goes instead.
+    fn delete_selected_anchors(&mut self) -> bool {
+        if !self.anchors_selected() {
+            return false;
+        }
+        let Some((id, _, shape)) = self.subselected_shape() else {
+            return false;
+        };
+        let remaining = buzz_geom::delete_anchors(&shape.path, &self.selected_anchor_elements());
+        match remaining {
+            None => self.delete_selection(),
+            Some(path) => {
+                let at = self.edit_at();
+                self.doc.edit("Delete Anchors", |scene| {
+                    update_shape(scene, at, id, |s| s.path = path.clone());
+                });
+                // Element indices have all shifted; nothing is selected now.
+                self.anchor_selection = Some((id, Vec::new()));
+            }
+        }
+        // Each delete is its own step: the label would otherwise fold two
+        // presses of the key into one.
+        self.doc.end_gesture();
+        true
+    }
+
+    /// Nudge the selected anchors by `delta` document units.
+    fn nudge_anchors(&mut self, delta: Vec2) {
+        let elements = self.selected_anchor_elements();
+        self.edit_subselected_path("Nudge Anchors", |path, back| {
+            buzz_geom::move_anchors(path, &elements, back.deref_vector(delta));
+        });
+    }
+
     pub fn apply(&mut self, action: ToolAction) {
+        self.prune_anchor_selection();
         match action {
             ToolAction::None => {}
 
@@ -1907,35 +2754,23 @@ impl Editor {
                 let tolerance = self.pick_tolerance();
                 match self.object_at(point, tolerance) {
                     Some(id) => {
-                        // **Free Transform grabs the whole drawing, not one
-                        // piece of it.** A drawing is laid down as separate
-                        // primitives — two colours and an outline are three raw
-                        // shapes, so each can be erased, recoloured or
-                        // sub-selected on its own (see `lay_shape`). Under the
-                        // transform box that read as three things to move one at
-                        // a time; clicking any raw piece with Free Transform
-                        // takes every raw shape on that layer, so the drawing
-                        // scales and turns as one. An instance, group or rig is
-                        // grabbed alone — a character's parts must stay
-                        // individually selectable, and only the Subselection
-                        // tool reaches inside a single raw shape.
-                        let group = if self.machine.tool() == ToolId::FreeTransform {
-                            self.drawing_group_of(id)
-                        } else {
-                            vec![id]
-                        };
+                        // **A click picks the one object under it, with either
+                        // tool.** A drawing is laid down as separate primitives
+                        // — two colours and an outline are three raw shapes, so
+                        // each can be erased, recoloured or sub-selected on its
+                        // own (see `lay_shape`) — and a click on the fill takes
+                        // the fill, on the line the line, exactly as in
+                        // Animate. Free Transform used to grow the pick to the
+                        // whole drawing; the way to take more than the click
+                        // is a double-click (`Self::select_connected_pieces`)
+                        // or a marquee.
+                        //
+                        // Shift toggles the one object: out if it is in, in
+                        // otherwise.
                         if additive {
-                            // Shift toggles the drawing as a unit: out if it is
-                            // wholly in, in otherwise.
-                            if group.iter().all(|g| self.selection.contains(*g)) {
-                                for g in &group {
-                                    self.selection.remove(*g);
-                                }
-                            } else {
-                                self.selection.extend(group.iter().copied());
-                            }
+                            self.selection.toggle(id);
                         } else {
-                            self.selection.set(group);
+                            self.selection.set(vec![id]);
                         }
                         // Selecting an object makes its layer the active layer, so
                         // the timeline highlights the layer the selection lives on
@@ -1972,11 +2807,24 @@ impl Editor {
             ToolAction::WandAt { point, additive } => self.wand_at(point, additive),
 
             ToolAction::MoveSelection { delta } => {
-                self.transform_selection(Affine::translate(delta), "Move");
+                // The steps of an Alt-drag carry the copy's own label, so the
+                // copy and its drag are one undo step.
+                let label = if self.alt_copy.is_some_and(|c| c.copied) {
+                    ALT_COPY_LABEL
+                } else {
+                    "Move"
+                };
+                self.transform_selection(Affine::translate(delta), label);
             }
 
             ToolAction::TransformSelection { transform } => {
+                // A Free Transform turn of a selection that has no box of its
+                // own to turn: remember it (see `BoxSession`).
+                let seed = self.box_session_seed(transform);
                 self.transform_selection(transform, "Transform");
+                if let Some(before) = seed {
+                    self.start_box_session(before, transform);
+                }
             }
 
             ToolAction::MoveAnchor { element, delta } => {
@@ -1998,6 +2846,57 @@ impl Editor {
                     update_shape(scene, at, id, |s| {
                         buzz_geom::move_anchor(&mut s.path, element, local_delta);
                     });
+                });
+            }
+
+            ToolAction::MoveAnchors { elements, delta } => {
+                self.edit_subselected_path("Move Anchor", |path, back| {
+                    buzz_geom::move_anchors(path, &elements, back.deref_vector(delta));
+                });
+            }
+
+            ToolAction::SelectAnchors { elements, mode } => {
+                let Some((id, _, _)) = self.subselected_shape() else {
+                    return;
+                };
+                let mut set = self.selected_anchor_elements();
+                match mode {
+                    crate::tools::AnchorSelect::Replace => set = elements,
+                    crate::tools::AnchorSelect::Add => {
+                        for e in elements {
+                            if !set.contains(&e) {
+                                set.push(e);
+                            }
+                        }
+                    }
+                    crate::tools::AnchorSelect::Toggle => {
+                        for e in elements {
+                            match set.iter().position(|s| *s == e) {
+                                Some(at) => {
+                                    set.remove(at);
+                                }
+                                None => set.push(e),
+                            }
+                        }
+                    }
+                }
+                self.anchor_selection = Some((id, set));
+            }
+
+            ToolAction::MoveHandle {
+                element,
+                side,
+                to,
+                mirror,
+            } => {
+                self.edit_subselected_path("Move Handle", |path, back| {
+                    buzz_geom::move_handle(path, element, side, back * to, mirror);
+                });
+            }
+
+            ToolAction::PullHandles { element, to } => {
+                self.edit_subselected_path("Pull Handles", |path, back| {
+                    buzz_geom::pull_out_handles(path, element, back * to);
                 });
             }
 
@@ -2077,8 +2976,7 @@ impl Editor {
                 // `Camera::pan_screen` makes for the view: undo the view's
                 // rotation, then divide by its magnification, so a drag of an
                 // inch moves the shot the same distance whatever the zoom.
-                let unrotated =
-                    Affine::rotate(-self.camera.rotation) * delta_screen.to_point();
+                let unrotated = Affine::rotate(-self.camera.rotation) * delta_screen.to_point();
                 let zoom = self.camera.zoom;
                 if zoom.is_finite() && zoom > 0.0 {
                     self.nudge_camera(unrotated.to_vec2() / zoom);
@@ -2290,6 +3188,11 @@ impl Editor {
     /// **Re-type a text object**: re-shape its glyphs from `content`/`size`/`font`
     /// and keep the string on it. One undo step across a typing burst (no
     /// `end_gesture`, so consecutive edits coalesce).
+    ///
+    /// Any per-character styling (`TextData::runs`) is carried across the
+    /// edit — shifted or clipped to match wherever `content` changed — rather
+    /// than dropped, so retyping a letter in the middle of a bolded word does
+    /// not silently un-bold the rest of it.
     pub fn set_text(&mut self, id: ObjectId, content: String, size: f64, font: Option<String>) {
         let style = self.text_of(id).map(|t| t.style).unwrap_or_default();
         let align = self.text_of(id).map(|t| t.align).unwrap_or_default();
@@ -2304,12 +3207,15 @@ impl Editor {
             .and_then(|(_, o)| o.text.clone())
     }
 
-    /// **Re-type a text object in a chosen cut and alignment.**
+    /// **Re-type a text object in a chosen cut and alignment**, applying to
+    /// the whole text — this is the "no selection" case of the Properties
+    /// text editor, and what a fresh keystroke in it calls.
     ///
     /// The glyphs are shaped again from every part of the choice — the words,
     /// the size, the family, the cut, the alignment — because all five change
     /// the outlines, and the outlines *are* the artwork. One undo step across a
-    /// typing burst, as [`Self::set_text`].
+    /// typing burst, as [`Self::set_text`]. Existing per-character runs survive,
+    /// shifted to match wherever `content` changed since the object's own copy.
     pub fn set_text_styled(
         &mut self,
         id: ObjectId,
@@ -2319,20 +3225,121 @@ impl Editor {
         style: buzz_scene::FontStyle,
         align: buzz_scene::TextAlign,
     ) {
-        let path = buzz_text::outline_styled(&content, size, font.as_deref(), style, align)
-            .unwrap_or_default();
-        self.doc.edit("Edit Text", |scene| {
-            scene.update_object_across(0, u32::MAX, id, |o| {
-                if let ObjectKind::Shape(shape) = &mut o.kind {
-                    shape.path = path.clone();
-                }
-                o.text = Some(buzz_scene::TextData {
-                    content: content.clone(),
-                    size,
-                    font: font.clone(),
-                    style,
-                    align,
+        let previous = self.text_of(id);
+        let runs = match &previous {
+            Some(t) if t.content != content => {
+                buzz_scene::shift_runs_for_edit(&t.content, &content, &t.runs)
+            }
+            Some(t) => t.runs.clone(),
+            None => Vec::new(),
+        };
+        self.rebuild_text_object(
+            id,
+            buzz_scene::TextData {
+                content,
+                size,
+                font,
+                style,
+                align,
+                runs,
+            },
+        );
+    }
+
+    /// **Re-type a text object with its `runs` already decided** — what the
+    /// Properties text editor calls after merging a style change into a
+    /// selected range (see [`buzz_scene::restyle_runs`]). Everything else
+    /// (the words, base size/font/cut, alignment) is carried unchanged; only
+    /// the runs differ from what is already on the object.
+    pub fn set_text_runs(&mut self, id: ObjectId, data: buzz_scene::TextData) {
+        self.rebuild_text_object(id, data);
+    }
+
+    /// What colour a text object's base is currently painted — what a new
+    /// run's colour button starts from, and what any segment with no colour
+    /// override of its own paints in. See [`base_text_color`].
+    pub fn text_base_color(&self, id: ObjectId) -> Color {
+        self.doc
+            .scene()
+            .find_object(id)
+            .map(|(_, o)| base_text_color(o))
+            .unwrap_or(Color::BLACK)
+    }
+
+    /// **Rebuild a text object's artwork from its `TextData`.**
+    ///
+    /// Uniform text (no runs) is an ordinary filled `Shape`, exactly as text
+    /// has always been — its path is simply re-shaped in place, or, if the
+    /// object was a per-character `Group` a moment ago (its last run just
+    /// disappeared), replaced with a fresh one in whatever colour that
+    /// group's own base was painted. Text with runs becomes a `Group` of one
+    /// filled shape per contiguous (style, colour) segment — [`base_text_color`]
+    /// answers what colour a segment with no run painting it gets. Either way
+    /// `Object::text` moves to the rebuilt object, and the object's own id,
+    /// transform and layer position are untouched — [`Scene::update_object_across`]
+    /// only ever replaces `kind` and `text` here.
+    fn rebuild_text_object(&mut self, id: ObjectId, data: buzz_scene::TextData) {
+        let Some((_, object)) = self.doc.scene().find_object(id) else {
+            return;
+        };
+        let base_color = base_text_color(object);
+
+        if data.runs.is_empty() {
+            let path =
+                buzz_text::outline_styled(&data.content, data.size, data.font.as_deref(), data.style, data.align)
+                    .unwrap_or_default();
+            self.doc.edit("Edit Text", |scene| {
+                scene.update_object_across(0, u32::MAX, id, |o| {
+                    match &mut o.kind {
+                        ObjectKind::Shape(shape) => shape.path = path.clone(),
+                        _ => o.kind = ObjectKind::Shape(ShapeData::filled(path.clone(), base_color)),
+                    }
+                    o.text = Some(data.clone());
                 });
+            });
+            return;
+        }
+
+        let spans = partition_text_runs(
+            &data.content,
+            data.size,
+            data.font.as_deref(),
+            data.style,
+            base_color,
+            &data.runs,
+        );
+        let text_spans: Vec<buzz_text::TextSpan> = spans.iter().map(|(s, _)| s.clone()).collect();
+        let pieces = buzz_text::outline_runs(
+            &data.content,
+            data.size,
+            data.font.as_deref(),
+            data.style,
+            data.align,
+            &text_spans,
+        );
+        let mut merged: Vec<BezPath> = vec![BezPath::new(); spans.len()];
+        for (path, index) in pieces {
+            if let Some(m) = merged.get_mut(index) {
+                m.extend(path.elements().iter().copied());
+            }
+        }
+
+        self.doc.edit("Edit Text", |scene| {
+            let child_ids: Vec<ObjectId> = (0..spans.len()).map(|_| scene.next_object_id()).collect();
+            scene.update_object_across(0, u32::MAX, id, |o| {
+                let children: Vec<Arc<Object>> = child_ids
+                    .iter()
+                    .zip(spans.iter())
+                    .zip(merged.iter())
+                    .map(|((child_id, (_, color)), path)| {
+                        Arc::new(Object::shape(
+                            *child_id,
+                            ShapeData::filled(path.clone(), *color),
+                        ))
+                    })
+                    .collect();
+                o.kind = ObjectKind::Group(children);
+                o.text = Some(data.clone());
             });
         });
     }
@@ -2436,12 +3443,24 @@ impl Editor {
             })
             .collect();
 
+        // **A remembered box goes where the artwork goes** (see `BoxSession`):
+        // the same step, applied to the map that carries the box's rectangle onto
+        // the stage, keeps the box on the artwork. Brought up to date after the
+        // edit, so the history stamp it keeps is the one the edit leaves.
+        let session = self.live_box_session();
+
         let at = self.edit_at();
         self.doc.edit(label, |scene| {
             for (id, local) in moves {
                 update_object(scene, at, id, |o| o.transform = local * o.transform);
             }
         });
+
+        if let Some(mut session) = session {
+            session.frame.to_doc = transform * session.frame.to_doc;
+            session.stamp = self.history_stamp();
+            *self.box_session.borrow_mut() = Some(session);
+        }
     }
 
     fn erase(&mut self, path: BezPath, width: f64) {
@@ -2476,7 +3495,11 @@ impl Editor {
         // stroke crossing the axis would have its two halves cancel under the
         // nonzero rule and rub out nothing at all where it mattered most.
         let cutters: Vec<BezPath> = std::iter::once(cutter.clone())
-            .chain(self.symmetry_mirrors().into_iter().map(|t| t * cutter.clone()))
+            .chain(
+                self.symmetry_mirrors()
+                    .into_iter()
+                    .map(|t| t * cutter.clone()),
+            )
             .collect();
 
         let frame = self.current_frame;
@@ -2489,7 +3512,7 @@ impl Editor {
         let mode = self.style.eraser_mode;
         let selected: Vec<ObjectId> = self.selection.iter().collect();
         self.doc.edit("Erase", |scene| {
-            let ids: Vec<ObjectId> = scene
+            let ids: Vec<(ObjectId, Affine)> = scene
                 .layers()
                 .get(layer)
                 .map(|l| {
@@ -2505,12 +3528,26 @@ impl Editor {
                             // line, so only the unrestricted eraser touches it.
                             _ => mode == buzz_ui::EraserMode::Normal,
                         })
-                        .map(|o| o.id)
+                        .map(|o| (o.id, o.transform))
                         .collect()
                 })
                 .unwrap_or_default();
 
-            for id in ids {
+            for (id, transform) in ids {
+                // **Into the shape's own coordinates.** The rub is traced in
+                // edit space but a shape's path is stored under its transform,
+                // so a moved or scaled shape was cut by a rub moved and scaled
+                // the other way — off to one side, and the wrong size.
+                let det = {
+                    let c = transform.as_coeffs();
+                    c[0] * c[3] - c[1] * c[2]
+                };
+                if det.abs() <= f64::MIN_POSITIVE {
+                    continue;
+                }
+                let back = transform.inverse();
+                let local_cutters: Vec<BezPath> =
+                    cutters.iter().map(|c| back * c.clone()).collect();
                 let mut became_empty = false;
                 // **What the rub divided becomes separate shapes.**
                 //
@@ -2524,13 +3561,8 @@ impl Editor {
                 let mut pieces: Vec<buzz_geom::BezPath> = Vec::new();
                 update_shape(scene, at, id, |s| {
                     let mut cut = s.path.clone();
-                    for cutter in &cutters {
-                        cut = buzz_geom::boolean(
-                            &cut,
-                            cutter,
-                            buzz_geom::BoolOp::Difference,
-                            opts,
-                        );
+                    for cutter in &local_cutters {
+                        cut = buzz_geom::boolean(&cut, cutter, buzz_geom::BoolOp::Difference, opts);
                     }
                     became_empty = cut.elements().is_empty();
                     let mut parts = buzz_geom::split_disjoint(&cut);
@@ -2550,15 +3582,15 @@ impl Editor {
                 }
                 // The offcuts, as objects of their own, carrying the same paint
                 // as the shape they came from.
-                let template = scene
-                    .find_object(id)
-                    .and_then(|(_, o)| match &o.kind {
-                        ObjectKind::Shape(s) => Some(s.clone()),
-                        _ => None,
-                    });
+                let template = scene.find_object(id).and_then(|(_, o)| match &o.kind {
+                    ObjectKind::Shape(s) => Some(s.clone()),
+                    _ => None,
+                });
                 if let Some(template) = template {
                     for path in pieces {
-                        scene.add_shape_at(
+                        // In the same coordinates as the piece they were cut
+                        // from, so they stay where they were drawn.
+                        let offcut = scene.add_shape_at(
                             layer,
                             frame,
                             ShapeData {
@@ -2566,6 +3598,9 @@ impl Editor {
                                 ..template.clone()
                             },
                         );
+                        if let Some(offcut) = offcut {
+                            scene.update_object_at(frame, offcut, |o| o.transform = transform);
+                        }
                     }
                 }
             }
@@ -2676,7 +3711,8 @@ impl Editor {
                 let Some(local) = unturn(scene, object, frame, layer.depth, local) else {
                     continue;
                 };
-                if let Some(paint) = sampled_paint(scene, object, local, tolerance, frame, 0, &table)
+                if let Some(paint) =
+                    sampled_paint(scene, object, local, tolerance, frame, 0, &table)
                 {
                     hit = Some(paint);
                 }
@@ -2694,6 +3730,140 @@ impl Editor {
     /// `None` when the object is edge-on or behind the camera, and there is
     /// nothing on screen to put a handle on.
     pub fn object_quad(&self, id: ObjectId) -> Option<[Point; 4]> {
+        self.object_local_and_quad(id).map(|(_, quad)| quad)
+    }
+
+    /// A raw shape **as it is drawn**, flattened to polygons on the stage — what
+    /// the selection hatch is laid over. See [`DrawnShape`].
+    ///
+    /// Through the same chain [`Self::object_quad`] takes its corners through
+    /// ([`Self::drawn_projection`]), so the hatch sits on the artwork wherever
+    /// the camera, the layer's parenting or a turn in space has put it. The
+    /// outline is flattened to about a quarter of a screen pixel, which is as
+    /// fine as a dotted pattern can show. `None` for anything that is not a raw
+    /// shape (an instance, a group, a rig, text), and for a shape that is not on
+    /// screen.
+    pub fn drawn_shape(&self, id: ObjectId) -> Option<DrawnShape> {
+        let (object, projection) = self.drawn_projection(id)?;
+        let ObjectKind::Shape(shape) = &object.kind else {
+            return None;
+        };
+        if object.text.is_some() {
+            return None;
+        }
+        let scale = object.transform.determinant().abs().sqrt();
+        // A quarter of a screen pixel — but never finer than a fifty-thousandth
+        // of the shape, so a view zoomed in a millionfold on a curve does not ask
+        // for a million segments to dot it.
+        let size = shape.path.bounding_box();
+        let extent = size.width().hypot(size.height());
+        let tolerance = (0.25 / (self.camera.zoom * scale).max(1e-9))
+            .max(extent * 2e-5)
+            .clamp(1e-6, 1e6);
+
+        // The flattened subpaths, in the object's own space. A closed one repeats
+        // its first point, so a line along it comes back to where it began.
+        let mut subpaths: Vec<Vec<Point>> = Vec::new();
+        let mut current: Vec<Point> = Vec::new();
+        kurbo::flatten(shape.path.iter(), tolerance, |el| match el {
+            buzz_geom::PathEl::MoveTo(p) => {
+                if current.len() > 1 {
+                    subpaths.push(std::mem::take(&mut current));
+                }
+                current = vec![p];
+            }
+            buzz_geom::PathEl::LineTo(p) => current.push(p),
+            buzz_geom::PathEl::ClosePath => {
+                if let Some(first) = current.first().copied() {
+                    current.push(first);
+                }
+                subpaths.push(std::mem::take(&mut current));
+            }
+            // `flatten` hands back only lines, but a path element is a path
+            // element: a curve that slipped through is joined at its end.
+            buzz_geom::PathEl::QuadTo(_, p) | buzz_geom::PathEl::CurveTo(_, _, p) => {
+                current.push(p);
+            }
+        });
+        if current.len() > 1 {
+            subpaths.push(current);
+        }
+        let mut on_stage = Vec::with_capacity(subpaths.len());
+        for subpath in subpaths {
+            let mut mapped = Vec::with_capacity(subpath.len());
+            for p in subpath {
+                mapped.push(projection.map_point(object.transform * p)?);
+            }
+            on_stage.push(mapped);
+        }
+
+        Some(DrawnShape {
+            fill: shape
+                .fill
+                .as_ref()
+                .map(|f| (on_stage.clone(), f.rule == buzz_geom::FillMode::NonZero)),
+            stroke: shape.stroke.as_ref().map(|s| {
+                let width = if s.hairline { 0.0 } else { s.width * scale };
+                (on_stage, width)
+            }),
+        })
+    }
+
+    /// Is `id` a raw shape — one the selection shows by a hatch rather than by
+    /// an outline? The cheap question: it flattens nothing.
+    pub fn shows_hatch(&self, id: ObjectId) -> bool {
+        self.doc
+            .scene()
+            .find_object(id)
+            .is_some_and(|(_, o)| matches!(o.kind, ObjectKind::Shape(_)) && o.text.is_none())
+    }
+
+    /// Every selected raw shape, as it is drawn — what the stage hatches.
+    pub fn selected_drawn_shapes(&self) -> Vec<DrawnShape> {
+        self.selection
+            .iter()
+            .filter_map(|id| self.drawn_shape(id))
+            .collect()
+    }
+
+    /// An object's own bounds, and where its four corners are **drawn**.
+    ///
+    /// The one measurement [`Self::object_quad`] and the transform box are both
+    /// built on, so the outline and the handles cannot drift apart: the quad is
+    /// the local rectangle's corners, in order, carried through everything
+    /// `object_quad` documents.
+    fn object_local_and_quad(&self, id: ObjectId) -> Option<(Rect, [Point; 4])> {
+        let scene = self.doc.scene();
+        let (object, projection) = self.drawn_projection(id)?;
+        // Resolved from the memoised table: this runs every frame the object is
+        // selected, and re-measuring a rig through the library each time is what
+        // made the frame after a selection crawl.
+        let table = self.symbol_bounds();
+        // Keep the object's own affine intact until its four local corners
+        // have been projected. Boxing a rotated object first produces a much
+        // larger second box and makes the selection look detached from it.
+        let local_bounds = resolved_local_bounds(scene, object, &table);
+        let corners = [
+            Point::new(local_bounds.x0, local_bounds.y0),
+            Point::new(local_bounds.x1, local_bounds.y0),
+            Point::new(local_bounds.x1, local_bounds.y1),
+            Point::new(local_bounds.x0, local_bounds.y1),
+        ];
+        let mut out = [Point::ORIGIN; 4];
+        for (to, corner) in out.iter_mut().zip(corners) {
+            *to = projection.map_point(object.transform * corner)?;
+        }
+        Some((local_bounds, out))
+    }
+
+    /// An object, and the map that carries a point of **its own parent's space**
+    /// (the object's transform already applied) onto the stage as it is drawn.
+    ///
+    /// The one chain [`Self::object_quad`] and the selection hatch are both built
+    /// on, so chrome drawn on an object's corners and chrome drawn on its outline
+    /// cannot sit in different places. `None` when the object is on no frame
+    /// currently drawn, or is edge-on or behind the camera.
+    fn drawn_projection(&self, id: ObjectId) -> Option<(&Object, buzz_geom::Projection)> {
         let scene = self.doc.scene();
         // **On the frame it is drawn on, not on the playhead's.**
         //
@@ -2716,11 +3886,7 @@ impl Editor {
             .find(|o| o.id == id)?;
         let depth = scene.layers().get(layer).map(|l| l.depth).unwrap_or(0.0);
 
-        // Resolved from the memoised table: this runs every frame the object is
-        // selected, and re-measuring a rig through the library each time is what
-        // made the frame after a selection crawl.
         let table = self.symbol_bounds();
-        let bounds = scene.resolved_bounds_with(object, &table);
         let pivot = scene.pivot_of_with(object, &table);
         let projection = scene.camera().projection_for_object(
             frame,
@@ -2737,10 +3903,41 @@ impl Editor {
         // place, chrome inside a symbol opened *in place* was drawn at the
         // origin the artwork is no longer at.
         let follows = scene.layers().inherited_transform(layer, frame);
-        projection
+        let projection = projection
             .pre_affine(scene.edit_place())
-            .pre_affine(follows)
-            .map_rect(bounds)
+            .pre_affine(follows);
+        Some((object, projection))
+    }
+
+    /// An object's own bounds and its quad on the **focal plane** — the space
+    /// the pointer works in — rather than on the stage.
+    ///
+    /// Back through the shot and out of the place a symbol was opened at, for the
+    /// reason [`Self::selection_bounds_drawn`] gives. `None` when the object is
+    /// not drawn, or the shot cannot be undone.
+    pub(crate) fn focal_local_and_quad(&self, id: ObjectId) -> Option<(Rect, [Point; 4])> {
+        let scene = self.doc.scene();
+        let (local, quad) = self.object_local_and_quad(id)?;
+        let (frame, _) = self.drawn_at(id)?;
+
+        // Back to the focal plane, which is where the pointer is by the
+        // time `screen_to_edit` has finished with it — and where the
+        // "did this drag start inside the selection?" test has to ask
+        // its question. The place comes off with it, for the same
+        // reason it does there.
+        let shot = buzz_geom::Projection::from_affine(scene.camera_transform(frame));
+        let back = shot.inverse()?;
+        let unplace = buzz_scene::invert_affine(scene.edit_place());
+
+        let mut out = [Point::ORIGIN; 4];
+        for (to, corner) in out.iter_mut().zip(quad) {
+            let at = back.map_point(corner)?;
+            *to = match unplace {
+                Some(u) => u * at,
+                None => at,
+            };
+        }
+        Some((local, out))
     }
 
     /// The selection's bounds **where the artwork is drawn**, on the focal
@@ -2755,7 +3952,6 @@ impl Editor {
     ///
     /// `None` when nothing in the selection is on a frame currently drawn.
     pub fn selection_bounds_drawn(&self) -> Option<Rect> {
-        let scene = self.doc.scene();
         self.selection
             .iter()
             .filter_map(|id| {
@@ -2765,33 +3961,176 @@ impl Editor {
                 // the shot. Deriving the bounds from it rather than
                 // re-measuring means the handle box and the outline cannot
                 // drift apart, which is how they drifted before.
-                let quad = self.object_quad(id)?;
-                let (frame, _) = self.drawn_at(id)?;
+                let (_, quad) = self.focal_local_and_quad(id)?;
+                Some(
+                    quad[1..]
+                        .iter()
+                        .fold(Rect::from_points(quad[0], quad[0]), |r, p| r.union_pt(*p)),
+                )
+            })
+            .reduce(|a, b| a.union(b))
+    }
 
-                // Back to the focal plane, which is where the pointer is by the
-                // time `screen_to_edit` has finished with it — and where the
-                // "did this drag start inside the selection?" test has to ask
-                // its question. The place comes off with it, for the same
-                // reason it does there.
-                let shot = buzz_geom::Projection::from_affine(scene.camera_transform(frame));
-                let back = shot.inverse()?;
-                let unplace = buzz_scene::invert_affine(scene.edit_place());
+    /// The selection's transform box: its rectangle in its own space, and the
+    /// map from there onto the focal plane — so the box **turns with a rotated
+    /// or skewed selection** instead of being the rectangle round it.
+    ///
+    /// See [`TransformBox`] for why that matters. Built from the same focal-plane
+    /// quads [`Self::selection_bounds_drawn`] unions, so the two cannot drift:
+    /// its [`TransformBox::aabb`] is what that returns, up to float noise.
+    ///
+    /// * One object whose quad is a parallelogram → its own bounds, and the map
+    ///   that carries them onto the quad.
+    /// * Several objects that were turned together (the pieces of one drawing)
+    ///   → they share a linear part, so they share a box: the first one's map,
+    ///   and the union of every quad seen through it.
+    /// * Anything else — mixed turns, a perspective tilt, a collapsed scale, a
+    ///   zero-width or zero-height box — has no honest frame, and gets what the
+    ///   selection always had: the axis-aligned rectangle, not turned.
+    ///
+    /// **A turn Free Transform has just made is kept**, even where the artwork
+    /// itself would not give a box (the objects no longer share one transform):
+    /// see [`BoxSession`]. A live session wins over the box worked out from the
+    /// artwork.
+    pub fn selection_box(&self) -> Option<TransformBox> {
+        match self.live_box_session() {
+            Some(session) => Some(session.frame),
+            None => self.natural_selection_box(),
+        }
+    }
 
-                let mut out: Option<Rect> = None;
+    /// What the history looks like now, for telling whether anything has been
+    /// done since a [`BoxSession`] was brought up to date: how many edits it has
+    /// taken, and how deep its two stacks are (an undo or a redo moves those).
+    fn history_stamp(&self) -> (u64, usize, usize) {
+        let history = self.doc.history();
+        (
+            history.edit_count(),
+            history.undo_depth(),
+            history.redo_depth(),
+        )
+    }
+
+    /// The box session, if it still describes the selection on screen: the same
+    /// objects, on the same frame, with nothing done to the document since it
+    /// was last carried along by a transform. One that no longer does is
+    /// dropped here, for good.
+    fn live_box_session(&self) -> Option<BoxSession> {
+        let mut slot = self.box_session.borrow_mut();
+        let live = slot.as_ref().is_some_and(|session| {
+            session.at_frame == self.current_frame
+                && session.stamp == self.history_stamp()
+                && session.ids == self.selection.ids()
+        });
+        if !live {
+            *slot = None;
+        }
+        slot.clone()
+    }
+
+    /// Before a Free Transform step `transform`: will the box fall back to the
+    /// axis-aligned rectangle once it is applied, and so need remembering? If
+    /// so, the box as it is now.
+    ///
+    /// Only a **turn or a skew** has a box to keep — a move or a scale leaves
+    /// an axis-aligned box axis-aligned — and only Free Transform's: the
+    /// session is the gizmo's, and the Selection tool draws no box.
+    fn box_session_seed(&self, transform: Affine) -> Option<TransformBox> {
+        let c = transform.as_coeffs();
+        if self.machine.tool() != ToolId::FreeTransform
+            || (c[1] == 0.0 && c[2] == 0.0)
+            || self.live_box_session().is_some()
+        {
+            return None;
+        }
+        self.natural_selection_box()
+            .filter(|b| b.to_doc == Affine::IDENTITY)
+    }
+
+    /// After the step: if the artwork still has no box of its own that turns,
+    /// keep the one it had, turned by the step. See [`BoxSession`].
+    fn start_box_session(&mut self, before: TransformBox, transform: Affine) {
+        let c = transform.as_coeffs();
+        if !(c[0] * c[3] - c[1] * c[2]).is_finite() || (c[0] * c[3] - c[1] * c[2]).abs() < 1e-12 {
+            return;
+        }
+        // The artwork now has a box of its own: nothing to remember.
+        if self
+            .natural_selection_box()
+            .is_none_or(|b| b.to_doc != Affine::IDENTITY)
+        {
+            return;
+        }
+        *self.box_session.borrow_mut() = Some(BoxSession {
+            ids: self.selection.ids(),
+            frame: TransformBox {
+                local: before.local,
+                to_doc: transform * before.to_doc,
+            },
+            at_frame: self.current_frame,
+            stamp: self.history_stamp(),
+        });
+    }
+
+    /// The box worked out from the artwork alone, with no session.
+    fn natural_selection_box(&self) -> Option<TransformBox> {
+        let aligned = || self.selection_bounds_drawn().map(TransformBox::axis_aligned);
+
+        let mut frames: Vec<(Rect, [Point; 4])> = Vec::new();
+        for id in self.selection.iter() {
+            if let Some(found) = self.focal_local_and_quad(id) {
+                frames.push(found);
+            }
+        }
+        let &(first_local, _) = frames.first()?;
+
+        // Every object needs a frame of its own, or none of them has one.
+        let mut maps = Vec::with_capacity(frames.len());
+        for (local, quad) in &frames {
+            match affine_frame_of(*local, *quad) {
+                Some(map) => maps.push(map),
+                None => return aligned(),
+            }
+        }
+        let to_doc = maps[0];
+        let share = |a: Affine, b: Affine| {
+            a.as_coeffs()[..4]
+                .iter()
+                .zip(&b.as_coeffs()[..4])
+                .all(|(x, y)| (x - y).abs() <= 1e-6)
+        };
+        if !maps.iter().all(|m| share(*m, to_doc)) {
+            return aligned();
+        }
+        // **Not turned, not skewed: the plain box.** A frame that only scales
+        // and moves is the same box as the axis-aligned one, but sending every
+        // drag through it and back adds float noise that each later scale
+        // compounds. The plain box keeps those transforms exact.
+        let c = to_doc.as_coeffs();
+        if c[1] == 0.0 && c[2] == 0.0 {
+            return aligned();
+        }
+
+        let local = if frames.len() == 1 {
+            first_local
+        } else {
+            let back = to_doc.inverse();
+            let mut union: Option<Rect> = None;
+            for (_, quad) in &frames {
                 for corner in quad {
-                    let at = back.map_point(corner)?;
-                    let at = match unplace {
-                        Some(u) => u * at,
-                        None => at,
-                    };
-                    out = Some(match out {
+                    let at = back * *corner;
+                    union = Some(match union {
                         Some(r) => r.union_pt(at),
                         None => Rect::from_points(at, at),
                     });
                 }
-                out
-            })
-            .reduce(|a, b| a.union(b))
+            }
+            union?
+        };
+        if !(local.width() > 0.0 && local.height() > 0.0) {
+            return aligned();
+        }
+        Some(TransformBox { local, to_doc })
     }
 
     /// The frame an object is currently drawn on, and the layer it is on.
@@ -2811,78 +4150,78 @@ impl Editor {
         on(self.current_frame).or_else(|| self.multi_frames().into_iter().find_map(on))
     }
 
-    /// The raw shapes that make up the drawing `id` belongs to — what Free
-    /// Transform grabs when a single piece is clicked.
+    /// What a **double-click** on a raw shape takes, besides the shape itself —
+    /// Animate's "select the whole line" and "select the fill with its outline".
     ///
     /// A drawing is stored as separate primitives: two fills and an outline are
     /// three objects, kept apart on purpose so each can be erased, recoloured or
-    /// sub-selected on its own (see `lay_shape`). Under the transform box that
-    /// reads as three things to move one at a time, so a click grows the pick to
-    /// the whole drawing — but **only the pieces that actually touch**. Two
-    /// separate drawings that happen to share a layer are left apart: growing to
-    /// the whole layer would move a drawing the user never pointed at.
+    /// sub-selected on its own (see `lay_shape`). A single click takes only the
+    /// piece under it; a double-click takes more:
+    ///
+    /// * on a **fill** — the fill, and the **strokes** that touch it: its own
+    ///   outline and the lines drawn across it. Not another fill that merely
+    ///   shares an edge with it;
+    /// * on a **stroke** — every stroke **connected** to it: those whose ink
+    ///   touches it, and those touching those. Fills are left out.
     ///
     /// Touching is tested on the ink, not the bounding boxes — a line's own
     /// width is outlined, so a stroke that crosses a fill joins it while two
-    /// strokes lying side by side do not. The set is flooded, so a fill joined
-    /// to a line joined to another fill comes as one.
+    /// strokes lying side by side do not. That is a boolean intersection per
+    /// overlapping pair, which a double-click can afford and a frame cannot, so
+    /// it is only ever asked for here.
     ///
-    /// Only raw shapes group. An instance, a group or a rigged armature has its
-    /// own identity — a character's head is meant to be grabbed on its own — so
-    /// clicking one of those returns it alone.
-    fn drawing_group_of(&self, id: ObjectId) -> Vec<ObjectId> {
+    /// Only raw shapes. An instance, a group or a rigged armature has its own
+    /// identity — a character's head is meant to be grabbed on its own — and
+    /// **text is never joined to anything**: two captions placed separately are
+    /// separate ideas even where their letters happen to touch. `None` for any
+    /// of those, so the caller can treat the double-click as it always did.
+    fn connected_pieces(&self, id: ObjectId) -> Option<Vec<ObjectId>> {
         let scene = self.doc.scene();
-        let Some((_, object)) = scene.find_object(id) else {
-            return vec![id];
+        let (_, object) = scene.find_object(id)?;
+        let ObjectKind::Shape(seed) = &object.kind else {
+            return None;
         };
-        if !matches!(object.kind, ObjectKind::Shape(_)) {
-            return vec![id];
+        if object.text.is_some() {
+            return None;
         }
-        let Some((frame, layer_id)) = self.drawn_at(id) else {
-            return vec![id];
-        };
-        let Some(layer) = scene.layers().get(layer_id) else {
-            return vec![id];
-        };
+        let seed_is_fill = seed.fill.is_some();
+        let (frame, layer_id) = self.drawn_at(id)?;
+        let layer = scene.layers().get(layer_id)?;
 
         // Every grabbable raw shape on the layer, with the region it actually
         // paints (in layer space) and that region's box for a cheap pre-filter.
         // The same visible/unlocked rule hit-testing uses, so a piece that could
-        // not be clicked is not swept in either.
-        let pieces: Vec<(ObjectId, BezPath, Rect)> = layer
+        // not be clicked is not swept in either. Text is excluded here too, so
+        // a piece of some *other* drawing does not flood into a touching text.
+        // `bool` is whether the piece is a stroke with no fill — the only kind a
+        // double-click ever adds to the one it started from.
+        let pieces: Vec<(ObjectId, BezPath, Rect, bool)> = layer
             .objects_at(frame)
             .iter()
-            .filter(|o| o.visible && !o.locked)
+            .filter(|o| o.visible && !o.locked && o.text.is_none())
             .filter_map(|o| {
+                let ObjectKind::Shape(shape) = &o.kind else {
+                    return None;
+                };
                 let region = shape_region(o)?;
                 let bb = region.bounding_box();
-                Some((o.id, region, bb))
+                Some((o.id, region, bb, shape.fill.is_none() && shape.stroke.is_some()))
             })
             .collect();
 
         // A layer with a great many raw pieces is unusual — they fuse as they
-        // are drawn — but cap the geometric work so a click can never stall.
+        // are drawn — but cap the geometric work so a double-click can never
+        // stall.
         const MAX_PIECES: usize = 400;
-        let Some(start) = pieces.iter().position(|(oid, _, _)| *oid == id) else {
-            return vec![id];
-        };
+        let start = pieces.iter().position(|(oid, ..)| *oid == id)?;
         if pieces.len() > MAX_PIECES {
-            return vec![id];
+            return Some(vec![id]);
         }
 
-        // Flood from the clicked piece: a piece joins when its ink overlaps a
-        // piece already in the set. Bounding boxes reject most pairs for free;
-        // only where they cross is the real intersection measured.
         let opts = buzz_geom::BooleanOptions::default();
-        let mut in_group = vec![false; pieces.len()];
-        in_group[start] = true;
-        let mut stack = vec![start];
-        while let Some(i) = stack.pop() {
-            for j in 0..pieces.len() {
-                if in_group[j] || !pieces[i].2.overlaps(pieces[j].2) {
-                    continue;
-                }
-                let touches = buzz_geom::boolean(
+        let touching = |i: usize, j: usize| {
+            pieces[i].2.overlaps(pieces[j].2)
+                && buzz_geom::boolean(
                     &pieces[i].1,
                     &pieces[j].1,
                     buzz_geom::BoolOp::Intersect,
@@ -2890,10 +4229,27 @@ impl Editor {
                 )
                 .area()
                 .abs()
-                    > 1e-6;
-                if touches {
+                    > 1e-6
+        };
+
+        let mut in_group = vec![false; pieces.len()];
+        in_group[start] = true;
+        if seed_is_fill {
+            // The strokes that touch it — and nothing flooded beyond them.
+            for j in 0..pieces.len() {
+                if !in_group[j] && pieces[j].3 && touching(start, j) {
                     in_group[j] = true;
-                    stack.push(j);
+                }
+            }
+        } else {
+            // Flood from the clicked stroke through the strokes joined to it.
+            let mut stack = vec![start];
+            while let Some(i) = stack.pop() {
+                for j in 0..pieces.len() {
+                    if !in_group[j] && pieces[j].3 && touching(i, j) {
+                        in_group[j] = true;
+                        stack.push(j);
+                    }
                 }
             }
         }
@@ -2901,12 +4257,28 @@ impl Editor {
         let group: Vec<ObjectId> = pieces
             .iter()
             .zip(in_group)
-            .filter_map(|((oid, _, _), yes)| yes.then_some(*oid))
+            .filter_map(|((oid, ..), yes)| yes.then_some(*oid))
             .collect();
-        if group.is_empty() { vec![id] } else { group }
+        Some(if group.is_empty() { vec![id] } else { group })
     }
 
-    /// Objects fully inside `rect`, matching Animate's marquee.
+    /// **Double-click on a raw shape**: select what is connected to it — see
+    /// [`Self::connected_pieces`]. Returns whether it was a raw shape, so the
+    /// caller can leave every other double-click to what it did before.
+    fn select_connected_pieces(&mut self, id: ObjectId) -> bool {
+        let Some(group) = self.connected_pieces(id) else {
+            return false;
+        };
+        self.selection.set(group);
+        if let Some((layer, _)) = self.doc.scene().find_object(id) {
+            self.selection.set_active_layer(Some(layer));
+        }
+        true
+    }
+
+    /// Objects that the `rect` overlaps, matching Animate's marquee — a shape
+    /// counts as soon as any of it enters the box, not only when it is fully
+    /// inside it.
     ///
     /// Sweeps every frame Edit Multiple Frames is showing, so a marquee round
     /// a whole scene picks up all of it — which is the gesture the mode exists
@@ -2923,7 +4295,7 @@ impl Editor {
         out
     }
 
-    /// Objects fully inside `rect` on one particular frame.
+    /// Objects the `rect` overlaps on one particular frame.
     fn objects_in_frame(&self, rect: Rect, frame: u32) -> Vec<ObjectId> {
         let scene = self.doc.scene();
         // Resolved through the library, for the reason `Scene::symbol_bounds`
@@ -3586,9 +4958,10 @@ impl Editor {
                 self.new_document.setup = self.workspace.new_document;
                 self.new_document.open = true;
             }
-            Save | SaveAs | Open | Close | SaveSnapshot | Snapshots | ShortcutEditor => {
-                // File dialogs, the snapshots store and the shortcut editor are
-                // host concerns; the shell handles them.
+            Save | SaveAs | Open | Close | SaveSnapshot | Snapshots | ShortcutEditor
+            | TestMovie | PasteboardColour => {
+                // File dialogs, the snapshots store, the shortcut editor and
+                // Test Movie are host concerns; the shell handles them.
                 self.status = Some(format!("{} is handled by the shell", command.label()));
             }
 
@@ -3633,16 +5006,26 @@ impl Editor {
             Quit => self.should_quit = true,
 
             Undo => {
+                // The artwork has gone back; a box that was kept turned for
+                // what was there is not the box of what is there now.
+                *self.box_session.borrow_mut() = None;
                 if self.doc.undo() {
                     self.selection.prune(self.doc.scene());
                 }
             }
             Redo => {
+                *self.box_session.borrow_mut() = None;
                 if self.doc.redo() {
                     self.selection.prune(self.doc.scene());
                 }
             }
-            Delete => self.delete_selection(),
+            Delete => {
+                // With anchors selected under Subselection, Delete takes those
+                // out of the path rather than the whole object.
+                if !self.delete_selected_anchors() {
+                    self.delete_selection();
+                }
+            }
             SelectAll => {
                 // Under Edit Multiple Frames, "all" means every drawing in the
                 // range, not only the one showing — Select All then drag is
@@ -3691,8 +5074,12 @@ impl Editor {
             Align { op, to_stage } => self.align_selection(op, to_stage),
             Distribute(op) => self.distribute_selection(op),
             MatchSize(op) => self.match_selection_size(op),
+            MoveFrames { to, rows, copy } => self.move_frames(to, rows, copy),
             Nudge { x, y } => {
-                if !self.selection.is_empty() {
+                if self.anchors_selected() {
+                    // The anchors, not the object they belong to.
+                    self.nudge_anchors(Vec2::new(f64::from(x), f64::from(y)));
+                } else if !self.selection.is_empty() {
                     // Through the same path a drag takes, so a nudge is an
                     // ordinary Move in the history and coalesces with the
                     // nudges either side of it — holding an arrow key down is
@@ -3737,12 +5124,22 @@ impl Editor {
                     "Bones hidden \u{2014} the artwork under them can be worked on".to_string()
                 });
             }
+            // BM: Shift+M flips the Bone tool's mode — only while it is held,
+            // so the key means nothing to somebody holding another tool.
+            ToggleBoneMode => {
+                if self.tool() == ToolId::Bone {
+                    let mode = self.workspace.rig.mode.toggled();
+                    self.workspace.rig.mode = mode;
+                    self.status = Some(format!("Bone tool: {}", mode.label()));
+                }
+            }
             ToggleGuides => self.view.show_guides = !self.view.show_guides,
             ToggleSnapping => self.view.snap.to_objects = !self.view.snap.to_objects,
             TogglePasteboard => self.view.show_pasteboard = !self.view.show_pasteboard,
 
             GroupSelection => self.group_selection(),
             UngroupSelection => self.ungroup_selection(),
+            BreakApart => self.break_apart_selection(),
             BringToFront => self.reorder_selection(Reorder::Front),
             BringForward => self.reorder_selection(Reorder::Forward),
             SendBackward => self.reorder_selection(Reorder::Backward),
@@ -3752,8 +5149,15 @@ impl Editor {
             ExpandFill => self.expand_selection(2.0),
             ThickenStroke => self.scale_selected_strokes(1.25),
             ThinStroke => self.scale_selected_strokes(0.8),
-            TraceBitmap => self.trace_selection(buzz_scene::TraceOptions::default()),
-            TraceLineArt => self.trace_selection(buzz_scene::TraceOptions::line_art()),
+            TraceBitmap => self.trace_with(buzz_scene::TraceOptions {
+                mode: buzz_scene::TraceMode::Outline,
+                ..buzz_scene::TraceOptions::default()
+            }),
+            TraceLineArt => self.trace_with(buzz_scene::TraceOptions::line_art()),
+            TraceBitmapOptions => match self.picture_selection_status() {
+                None => self.trace_dialog = Some(self.workspace.trace.with_saved_tuning()),
+                Some(status) => self.status = Some(status),
+            },
             SmoothSelection => self.reshape_selection(Reshape::Smooth),
             StraightenSelection => self.reshape_selection(Reshape::Straighten),
             RecogniseShape => self.recognise_selection(),
@@ -3776,6 +5180,12 @@ impl Editor {
                 self.selection.set_active_layer(Some(id));
                 self.status =
                     Some("Reference layer added — Import Image onto it to trace over".into());
+            }
+            MoveLayerUp => {
+                self.move_active_layer(true);
+            }
+            MoveLayerDown => {
+                self.move_active_layer(false);
             }
             DeleteLayer => self.delete_active_layer(),
 
@@ -3812,10 +5222,15 @@ impl Editor {
             ToggleCamera => self.toggle_camera(),
             AddCameraKeyframe => self.add_camera_key(),
             RemoveCameraKeyframe => {
-                let frame = self.current_frame;
-                self.doc.edit("Remove Camera Keyframe", |scene| {
-                    scene.camera_mut().remove_key(frame);
-                });
+                // C1: a locked camera refuses removing a key too.
+                if self.doc.scene().camera().locked {
+                    self.status = Some("The camera is locked".into());
+                } else {
+                    let frame = self.current_frame;
+                    self.doc.edit("Remove Camera Keyframe", |scene| {
+                        scene.camera_mut().remove_key(frame);
+                    });
+                }
             }
             ResetCamera => {
                 self.doc.edit("Reset Camera", |scene| {
@@ -3896,7 +5311,39 @@ impl Editor {
                     .unwrap_or_default();
                 self.status = Some(format!("Duplicated as {name}"));
             }
+            SetMasterAudioFromLayer(layer) => self.set_master_audio_from_layer(layer),
+            MakeSetupFromScene => self.make_setup_from_scene(),
+            NewShotFromSetup(setup) => {
+                self.new_shot_from_setup(setup);
+            }
+            SplitAtPlayhead => {
+                self.split_shot_at_playhead();
+            }
+            TryAnotherSetup(shot, setup) => {
+                self.try_another_setup(shot, setup);
+            }
+            DuplicateShot(shot) => {
+                self.duplicate_shot(shot);
+            }
+            AddMissingSetupLayers(shot) => {
+                self.add_missing_setup_layers(shot);
+            }
+            EditSetup(setup) => self.edit_setup(setup),
+            FlattenToMasterScene => {
+                self.flatten_to_master_scene();
+            }
+            CutOnDialogue(setup) => {
+                self.cut_on_dialogue(setup);
+            }
+            ContinueFromShot(shot, source) => {
+                self.continue_from_shot(shot, source);
+            }
+            // Opens a file dialog; the shell intercepts this before it ever
+            // reaches here (see `App::dispatch`).
+            SetMasterAudio => {}
             AddPerson => self.add_person(),
+            // The dialog asks for the text; `add_title_card` makes the card.
+            AddTitleCard => self.title_card.open = true,
             Perform => {
                 // Over the whole film from the playhead, which is what an
                 // animator standing on frame 12 means by "animate this".
@@ -3912,9 +5359,13 @@ impl Editor {
                     let scene = self.doc.scene();
                     self.selection.iter().find_map(|id| {
                         scene.find_object(id).and_then(|(_, o)| match &o.kind {
-                            ObjectKind::Armature(rig) => {
-                                Some(rig.armature.bones.iter().map(|b| b.name.clone()).collect::<Vec<String>>())
-                            }
+                            ObjectKind::Armature(rig) => Some(
+                                rig.armature
+                                    .bones
+                                    .iter()
+                                    .map(|b| b.name.clone())
+                                    .collect::<Vec<String>>(),
+                            ),
                             _ => None,
                         })
                     })
@@ -4017,7 +5468,57 @@ impl Editor {
             }
             ToggleTheme => self.set_theme(buzz_ui::theme::theme().next()),
             SetTheme(theme) => self.set_theme(theme),
+            // Stage 6, item 1: the percentage is a menu label; `Context`
+            // wants a factor, and `build_ui` is what actually calls
+            // `ctx.set_zoom_factor` every frame from this field.
+            SetUiScale(percent) => {
+                self.workspace.ui_scale = percent as f32 / 100.0;
+                self.workspace.save();
+                self.status = Some(format!("UI size: {percent}%"));
+            }
+            // Stage 6, item 5: same story — `build_ui` reads this field every
+            // frame and sets `Style::animation_time` from it.
+            ToggleReduceMotion => {
+                self.workspace.reduce_motion = !self.workspace.reduce_motion;
+                self.workspace.save();
+                self.status = Some(
+                    if self.workspace.reduce_motion {
+                        "Reduced motion on"
+                    } else {
+                        "Reduced motion off"
+                    }
+                    .into(),
+                );
+            }
             About => self.about.open = true,
+            // Every AI command lands in the AI panel (F7.0); the dialog flag
+            // is kept for a shell that draws the old window instead.
+            // Handled by `App` (it owns the microphone service).
+            VoicePushToTalk | VoiceMute => {}
+            AiModels => {
+                self.ai_models.open = true;
+                self.workspace.reveal(buzz_ui::PanelId::Ai);
+            }
+            AiCharacterFromImage => {
+                self.ai_character.open = true;
+                self.workspace.reveal(buzz_ui::PanelId::Ai);
+            }
+            AiIdentifyAssets => {
+                self.open_ai_rename();
+                self.workspace.reveal(buzz_ui::PanelId::Ai);
+            }
+            // AiRigVectorCharacter, AiSceneFromImage and AiDirectStory are
+            // intercepted in `App::dispatch`, before a command reaches here —
+            // all three need a background thread (rigging also a GPU render
+            // and pose detection; the scene-from-image one, a non-blocking
+            // file dialog too) that `Editor` has no way to start on its own.
+            AiRigVectorCharacter | AiSceneFromImage | AiDirectStory => {}
+            // Handled by `App` (`crate::estate`): they talk to BuzzEdit and
+            // Buzzcaf Studio over HTTP, which `Editor` has no thread for.
+            SendToBuzzEdit | TranscribeWithBuzzEdit | ImportScriptFromStudio => {}
+            // Agent only (`agent::dialogs::mouth_chart`): it needs a chart file
+            // and a character, which no menu item can ask for.
+            AiMouthChart => {}
             ResetWorkspace => {
                 // The layout, and only the layout: the theme, the new-document
                 // settings and the crash-recovery directories are preferences
@@ -4025,8 +5526,16 @@ impl Editor {
                 // layout" asks for. See `Workspace::reset_layout`.
                 self.workspace.reset_layout();
                 self.workspace.save();
-                self.status =
-                    Some("Every panel put back where it started".into());
+                self.status = Some("Every panel put back where it started".into());
+            }
+            SetWorkspacePreset(preset) => {
+                self.workspace.apply_preset(preset);
+                self.workspace.save();
+                self.status = Some(format!("Switched to the {} workspace", preset.label()));
+            }
+            SaveWorkspace => {
+                self.workspace.save();
+                self.status = Some("Workspace saved".into());
             }
 
             ToggleLightGizmos => {
@@ -4066,8 +5575,7 @@ impl Editor {
                 debug_assert!(false, "{command:?} must be dispatched by the shell");
             }
 
-            ImportSound | ImportImage | LipSync | ImportVideoReference
-            | ImportSequenceFolder => {
+            ImportSound | ImportImage | LipSync | ImportVideoReference | ImportSequenceFolder => {
                 // The shell owns the file dialog and the modal window, as with
                 // Open and Export.
                 debug_assert!(false, "{command:?} must be dispatched by the shell");
@@ -4244,9 +5752,7 @@ impl Editor {
             // the width of the picture, and where it stands only means anything
             // relative to the light it is standing against. So the panel's
             // position is discarded and the rig is asked instead.
-            buzz_scene::LightKind::Gloom { .. } => {
-                self.doc.scene().lights().opposing_gloom(seen)
-            }
+            buzz_scene::LightKind::Gloom { .. } => self.doc.scene().lights().opposing_gloom(seen),
             other => other,
         };
 
@@ -4259,6 +5765,7 @@ impl Editor {
         // The handles come back on with a new light: adding one you cannot see
         // and cannot grab would look like nothing happened.
         self.light_panel.gizmos = true;
+        self.set_tool(ToolId::Selection);
         self.status = Some(format!("Added a {}", label.to_lowercase()));
     }
 
@@ -4303,8 +5810,7 @@ impl Editor {
                 light.make_storm();
             }
         });
-        self.status =
-            Some("Added a storm \u{2014} scrub the timeline to see it strike".into());
+        self.status = Some("Added a storm \u{2014} scrub the timeline to see it strike".into());
     }
 
     /// Start a light drag, if a handle is under the pointer.
@@ -4313,18 +5819,19 @@ impl Editor {
     /// way transform handles do; a lamp sitting over the canvas must not
     /// swallow a brush stroke aimed at the artwork beneath it.
     fn begin_light_gesture(&mut self, doc: Point) -> bool {
-        // The same three conditions the stage draws under, so what can be
+        // The same conditions the stage draws under, so what can be
         // grabbed is exactly what can be seen.
-        if !self.light_panel.gizmos
-            || !self.doc.scene().lights().enabled
-            || self.tool() != ToolId::Selection
-        {
+        if !self.light_panel.gizmos || !self.doc.scene().lights().enabled {
+            return false;
+        }
+        if self.tool() != ToolId::Selection {
             return false;
         }
 
         let tolerance = crate::lights::GRAB_PX / self.camera.zoom.max(f64::MIN_POSITIVE);
-        let Some(gesture) = crate::lights::target_at(
+        let Some(gesture) = crate::lights::target_at_frame(
             self.doc.scene(),
+            self.current_frame,
             doc,
             tolerance,
             self.light_panel.selected,
@@ -4342,6 +5849,16 @@ impl Editor {
 
     // -- rigging -------------------------------------------------------------
 
+    /// Drop [`Self::selected_bone`] once the selection is no longer exactly
+    /// the rig it belongs to. Called once per UI frame.
+    pub fn forget_bone_if_deselected(&mut self) {
+        if let Some((object, _)) = self.selected_bone
+            && !(self.selection.len() == 1 && self.selection.contains(object))
+        {
+            self.selected_bone = None;
+        }
+    }
+
     /// Start a rigging drag, if the active tool and what is under the pointer
     /// call for one. Returns whether the gesture was taken.
     fn begin_rig_gesture(&mut self, doc: Point) -> bool {
@@ -4354,13 +5871,16 @@ impl Editor {
 
         let tolerance = crate::rigging::GRAB_PX / self.camera.zoom.max(f64::MIN_POSITIVE);
         let rig = self.workspace.rig;
+        // BM: bones are found only by the Bone tool (and only while shown) —
+        // with any other tool the armature is just an object.
         let target = crate::rigging::target_at_visible(
             self.doc.scene(),
             self.current_frame,
             doc,
             tolerance,
-            rig.show_bones,
+            rig.show_bones && tool == ToolId::Bone,
         );
+        let create = rig.mode == buzz_ui::BoneMode::Create;
         // Rigging is the one gesture whose outcome depends on what was under
         // the pointer, so what it found is worth being able to see.
         tracing::debug!(?tool, ?doc, tolerance, ?target, "rig gesture");
@@ -4368,12 +5888,16 @@ impl Editor {
         self.rig_gesture = match (tool, target) {
             // -- the Bone tool ---------------------------------------------
             //
-            // **A tip poses unless the tool is set to build.** The tip is the
-            // end of the limb, and the end of the limb is what a person reaches
-            // for to move it — so extending the chain from there, which is what
-            // this always used to do, was the wrong answer almost every time
-            // somebody touched a finished rig. See `buzz_ui::RigOptions`.
-            (ToolId::Bone, RigTarget::BoneTip(object, bone)) if rig.build => {
+            // **BM: two modes, never both.** Create builds — a tip extends the
+            // chain, a bone body branches a child off that bone (selecting it
+            // as the parent), bare artwork starts a chain. Move poses — a tip
+            // or a body moves the limb, artwork does nothing. See
+            // `buzz_ui::RigOptions` and `docs/PRODUCTION_SPEED_PLAN.md` § BM.
+            (ToolId::Bone, RigTarget::BoneTip(object, bone) | RigTarget::Bone(object, bone))
+                if create =>
+            {
+                self.selection.set([object]);
+                self.selected_bone = Some((object, bone));
                 Some(RigGesture::Building {
                     object: Some(object),
                     parent: Some(bone),
@@ -4381,33 +5905,33 @@ impl Editor {
                     current: doc,
                 })
             }
-            (ToolId::Bone, RigTarget::BoneTip(object, bone)) => {
+            (ToolId::Bone, RigTarget::BoneTip(object, bone) | RigTarget::Bone(object, bone)) => {
                 self.selection.set([object]);
+                self.selected_bone = Some((object, bone));
                 Some(RigGesture::Posing {
                     object,
                     bone,
                     current: doc,
                 })
             }
-            (ToolId::Bone, RigTarget::Bone(object, bone)) => {
-                self.selection.set([object]);
-                Some(RigGesture::Posing {
-                    object,
-                    bone,
-                    current: doc,
-                })
-            }
-            (ToolId::Bone, RigTarget::Artwork(object)) => Some(RigGesture::Building {
+            (ToolId::Bone, RigTarget::Artwork(object)) if create => Some(RigGesture::Building {
                 object: Some(object),
                 parent: None,
                 head: doc,
                 current: doc,
             }),
+            (ToolId::Bone, RigTarget::Artwork(_)) => {
+                self.status = Some(BONE_MOVE_ON_ARTWORK.into());
+                None
+            }
             (ToolId::Bone, RigTarget::Handle(..) | RigTarget::Nothing) => {
-                self.status = Some(if rig.show_bones {
-                    "Drag a bone to move the limb, or drag across artwork to rig it".into()
-                } else {
+                self.status = Some(if !rig.show_bones {
                     "The bones are hidden \u{2014} turn them on in Tool Options".to_string()
+                } else if create {
+                    "Create mode \u{2014} drag across artwork to rig it, or from a bone to add one"
+                        .into()
+                } else {
+                    "Move mode \u{2014} drag a bone to move the limb".into()
                 });
                 None
             }
@@ -4599,6 +6123,37 @@ impl Editor {
             .unwrap_or(name))
     }
 
+    /// **Apply a transcription** (F7.9): the sound goes on the timeline if it
+    /// is not there yet (lip sync reads the stage soundtrack), then the lines
+    /// become captions and `speaker`'s lip sync through the same join the AI
+    /// director's dialogue uses. Returns how many lip-sync keys were written.
+    pub fn apply_transcript(
+        &mut self,
+        sound_name: &str,
+        cues: &[buzz_ai::director::DialogueCue],
+    ) -> anyhow::Result<usize> {
+        let Some(id) = self
+            .doc
+            .scene()
+            .sounds()
+            .iter()
+            .find(|s| s.name == sound_name)
+            .map(|s| s.id)
+        else {
+            anyhow::bail!("there is no sound called '{sound_name}' in the library");
+        };
+        let on_stage = self.doc.scene().stage_cues().iter().any(|c| c.sound == id);
+        if !on_stage {
+            let fps = self.doc.scene().stage().frame_rate.max(1.0);
+            self.doc.edit("Place Sound", |scene| {
+                place_sound_on_stage(scene, id, fps);
+            });
+            let scene = self.doc.scene().clone();
+            self.sound.refresh(&scene);
+        }
+        self.sync_directed_dialogue(cues)
+    }
+
     /// Did the last [`Self::import_sound`] also put the sound on the timeline?
     ///
     /// The shell says so in the status bar: a sound that arrived on a layer of
@@ -4626,6 +6181,18 @@ impl Editor {
     /// was wanted. A picture that already fits is placed untouched, at its own
     /// size, so pixel-exact artwork stays pixel-exact.
     pub fn import_image(&mut self, path: &std::path::Path) -> anyhow::Result<String> {
+        self.import_image_at(path, (0.0, 0.0))
+    }
+
+    /// Same as [`Self::import_image`], offset from the camera centre by
+    /// `offset` document units. D3's multi-file Import Image uses this to
+    /// stagger a batch — each picture its own object, findable rather than
+    /// stacked exactly on top of the last.
+    pub fn import_image_at(
+        &mut self,
+        path: &std::path::Path,
+        offset: (f64, f64),
+    ) -> anyhow::Result<String> {
         // Read and decode before the document is touched, so a file that is
         // not really a picture leaves no library entry behind.
         let bytes = std::fs::read(path)?;
@@ -4642,9 +6209,10 @@ impl Editor {
         }
 
         let stage = self.doc.scene().stage().size;
-        let centre = self.camera.center;
+        let centre = Point::new(self.camera.center.x + offset.0, self.camera.center.y + offset.1);
         let frame = self.current_frame;
 
+        let revision_before = self.doc.scene().revision();
         let mut placed: Option<(String, ObjectId)> = None;
         let mut failure: Option<String> = None;
         self.doc.edit("Import Image", |scene| {
@@ -4671,10 +6239,16 @@ impl Editor {
         });
 
         if let Some(e) = failure {
-            // The failed `add_image` left the revision bumped but nothing
-            // usable; drop it so the user's undo stack is not littered with
-            // imports that did not happen.
-            self.doc.undo();
+            // A decode failure never reaches `images_mut()`, the one thing in
+            // `add_image` that bumps the revision — so `edit` recorded no
+            // undo step for it at all. Undoing regardless — as this once
+            // did — reverts whichever *real* edit came before this one
+            // instead: invisible with a single import (nothing to undo yet),
+            // but a batch (D3) makes one bad file erase the good one right
+            // before it.
+            if self.doc.scene().revision() != revision_before {
+                self.doc.undo();
+            }
             anyhow::bail!(e);
         }
         let Some((name, id)) = placed else {
@@ -4888,9 +6462,17 @@ impl Editor {
     }
 
     /// Run lip sync with whatever the dialog has been set to.
+    ///
+    /// Reads [`crate::sound::SoundBank::stage_track_trimmed`] rather than
+    /// [`crate::sound::SoundBank::stage_track`], so a sound trimmed to only
+    /// part of its own clip — a Shot's own Dialogue layer, trimmed to its
+    /// slice of the master audio, keying mouths from that shot's own frame
+    /// 0, but equally any other sound trimmed by hand — is analysed only
+    /// over the section that actually plays here. See
+    /// `docs/SEQUENCE_SETUPS_PLAN.md` S7.
     pub fn run_lip_sync(&mut self) {
         let scene = self.doc.scene().clone();
-        let Some((_, start, clip)) = self.sound.stage_track(&scene) else {
+        let Some((_, start, clip)) = self.sound.stage_track_trimmed(&scene) else {
             self.lip_sync.result = Some("There is no sound on the main timeline".into());
             return;
         };
@@ -4947,6 +6529,999 @@ impl Editor {
         }
     }
 
+    // -- sequence: reusable setups, shots cut on the dialogue -----------------
+    // See `docs/SEQUENCE_SETUPS_PLAN.md` and `docs/SEQUENCE_GUIDE.md`.
+
+    /// Every Setup scene, by key and name, for "New Shot from Setup" and
+    /// "Try Another Setup" to list.
+    pub fn sequence_setups(&self) -> Vec<(SceneKey, String)> {
+        let names = self.doc.scene_names();
+        (0..names.len())
+            .filter(|&i| matches!(self.doc.role(i), Some(SceneRole::Setup)))
+            .filter_map(|i| self.doc.scene_key(i).map(|k| (k, names[i].clone())))
+            .collect()
+    }
+
+    /// **A short marker for the scene menu**: "\u{25c6} Village (setup)" for a
+    /// Setup, "Shot 3 \u{b7} Village" for a Shot naming its setup and its
+    /// ordinal among shots stamped from it, in film order. `None` for a
+    /// Normal scene, which gets no marker at all — the scene menu otherwise
+    /// looks exactly as it always has.
+    pub fn scene_role_label(&self, index: usize) -> Option<String> {
+        match self.doc.role(index)?.clone() {
+            SceneRole::Normal => None,
+            SceneRole::Setup => {
+                let name = self.doc.scene_names().get(index).cloned().unwrap_or_default();
+                Some(format!("\u{25c6} {name} (setup)"))
+            }
+            SceneRole::Shot(info) => {
+                let names = self.doc.scene_names();
+                let setup_name = info
+                    .from_setup
+                    .and_then(|k| self.doc.index_of_key(k))
+                    .and_then(|i| names.get(i).cloned())
+                    .unwrap_or_else(|| "no setup".to_string());
+                let ordinal = 1 + self
+                    .doc
+                    .sequence()
+                    .iter()
+                    .filter_map(|k| self.doc.index_of_key(*k))
+                    .take_while(|i| *i != index)
+                    .filter(|i| {
+                        matches!(self.doc.role(*i), Some(SceneRole::Shot(other)) if other.from_setup == info.from_setup)
+                    })
+                    .count();
+                Some(format!("Shot {ordinal} \u{b7} {setup_name}"))
+            }
+        }
+    }
+
+    /// What the Sequence and Shot menus need about the active scene and the
+    /// document's setups. See `buzz_ui::panels::SequenceMenuInfo`.
+    pub fn sequence_menu_info(&self) -> buzz_ui::panels::SequenceMenuInfo {
+        let active = self.doc.active_scene();
+        let (active_shot, active_shot_setup) = match self.doc.role(active) {
+            Some(SceneRole::Shot(info)) => (self.doc.scene_key(active), info.from_setup),
+            _ => (None, None),
+        };
+        // Only offered on a Normal scene — the master audio lives on the
+        // plain master scene, same as Animate.
+        let sound_layers = if matches!(self.doc.role(active), Some(SceneRole::Normal) | None) {
+            self.doc
+                .scene()
+                .stage_layers()
+                .iter()
+                .filter(|l| self.doc.scene().frame_sound(l.id, 0).is_some())
+                .map(|l| (l.id, l.name.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let continue_from_choices = active_shot
+            .map(|s| self.earlier_shots_same_setup(s))
+            .unwrap_or_default();
+        buzz_ui::panels::SequenceMenuInfo {
+            active_shot,
+            active_shot_setup,
+            master_audio_set: self.doc.master_audio().is_some(),
+            setups: self.sequence_setups(),
+            sound_layers,
+            continue_from_choices,
+        }
+    }
+
+    /// **Set Master Audio…**: import a sound file onto a new "Master Audio"
+    /// layer of the active scene, and point the sequence at it. Refuses on
+    /// a Setup or Shot scene — the master audio lives on the plain master
+    /// scene, same as Animate. Returns the sound's name in the library.
+    pub fn set_master_audio_from_file(&mut self, path: &std::path::Path) -> anyhow::Result<String> {
+        let active = self.doc.active_scene();
+        if matches!(self.doc.role(active), Some(SceneRole::Setup | SceneRole::Shot(_))) {
+            anyhow::bail!(
+                "switch to your Normal master scene first \u{2014} a Setup or Shot does not carry the master audio"
+            );
+        }
+        let clip = buzz_audio::Clip::open(path)?;
+        let bytes = std::sync::Arc::new(std::fs::read(path)?);
+        let format = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_else(|| "wav".to_string());
+        let name = clip.name.clone();
+        let (rate, channels, length) = (clip.sample_rate, clip.channels, clip.len() as u64);
+
+        let mut layer_id = None;
+        self.doc.edit("Set Master Audio", |scene| {
+            let sound = scene.add_sound(&name, bytes, &format, rate, channels, length);
+            let fps = scene.stage().frame_rate.max(1.0);
+            let frames = scene
+                .sounds()
+                .get(sound)
+                .map(|asset| asset.duration_frames(fps))
+                .unwrap_or(0);
+            let id = scene.add_stage_layer("Master Audio", LayerKind::Normal);
+            scene.update_stage_layer(id, |layer| {
+                layer.frames.insert_frame(frames.saturating_sub(1));
+                if let Some(keyframe) = layer.frames.keyframe_at_mut(0) {
+                    keyframe.sound = Some(buzz_scene::SoundRef::stream(sound));
+                }
+            });
+            layer_id = Some(id);
+        });
+        self.doc.end_gesture();
+
+        let Some(layer_id) = layer_id else {
+            anyhow::bail!("could not place the sound on the stage");
+        };
+        let Some(scene_key) = self.doc.scene_key(active) else {
+            anyhow::bail!("the active scene has no key");
+        };
+        self.doc.set_master_audio(scene_key, layer_id);
+        self.master_waveform_cache = None;
+        Ok(name)
+    }
+
+    /// Point the master audio at a sound already carried by a layer of the
+    /// active scene, instead of importing a new file.
+    pub fn set_master_audio_from_layer(&mut self, layer: buzz_scene::LayerId) {
+        let active = self.doc.active_scene();
+        if matches!(self.doc.role(active), Some(SceneRole::Setup | SceneRole::Shot(_))) {
+            self.status = Some(
+                "switch to your Normal master scene first \u{2014} a Setup or Shot does not \
+                 carry the master audio"
+                    .into(),
+            );
+            return;
+        }
+        let Some(scene_key) = self.doc.scene_key(active) else {
+            return;
+        };
+        if self.doc.scene().frame_sound(layer, 0).is_none() {
+            self.status = Some("That layer has no sound at frame 1".into());
+            return;
+        }
+        self.doc.set_master_audio(scene_key, layer);
+        self.master_waveform_cache = None;
+        self.status = Some("That layer is now the master audio".into());
+    }
+
+    /// The master audio's own waveform, decoded once and cached until the
+    /// asset changes — what the Sequence strip draws behind the shot
+    /// blocks. `None` if no master audio is set, or it fails to decode.
+    pub fn master_waveform(&mut self) -> Option<buzz_ui::Waveform> {
+        let asset = self.doc.master_sound()?;
+        let fps = self.sequence_fps();
+        let ptr = std::sync::Arc::as_ptr(&asset.data) as usize;
+        let key = (ptr, fps.to_bits());
+        let stale = !matches!(&self.master_waveform_cache, Some((p, f, _)) if (*p, *f) == key);
+        if stale {
+            let levels = buzz_audio::Clip::decode(&asset.data, &asset.name)
+                .map(|clip| clip.frame_levels(fps))
+                .unwrap_or_default();
+            self.master_waveform_cache = Some((ptr, fps.to_bits(), std::sync::Arc::new(levels)));
+        }
+        let (_, _, levels) = self.master_waveform_cache.clone()?;
+        Some(buzz_ui::Waveform {
+            start_frame: 0,
+            levels,
+            level_start: 0,
+            level_end: None,
+        })
+    }
+
+    /// The frame rate the master audio's own scene plays at — what
+    /// `audio_in`/`audio_out` are counted in.
+    fn sequence_fps(&self) -> f64 {
+        let Some((scene_key, _)) = self.doc.master_audio() else {
+            return self.doc.scene().stage().frame_rate.max(1.0);
+        };
+        let Some(index) = self.doc.index_of_key(scene_key) else {
+            return self.doc.scene().stage().frame_rate.max(1.0);
+        };
+        self.doc
+            .film()
+            .get(index)
+            .map(|s| s.stage().frame_rate)
+            .unwrap_or(24.0)
+            .max(1.0)
+    }
+
+    /// **Make Setup from This Scene**: mark the active scene a reusable
+    /// Setup — a source to stamp shots from, never itself in the exported
+    /// film. Not undoable: like a scene's name, its role is bookkeeping
+    /// about the document rather than artwork inside it.
+    pub fn make_setup_from_scene(&mut self) {
+        let index = self.doc.active_scene();
+        self.doc.set_role(index, SceneRole::Setup);
+        let name = self.doc.scene_names().get(index).cloned().unwrap_or_default();
+        self.status = Some(format!(
+            "\"{name}\" is now a Setup \u{2014} stamp shots from it with Sequence \u{25b8} New Shot from Setup"
+        ));
+    }
+
+    /// Which shot in the cut covers a film frame, and the local frame
+    /// within it. `None` past the end of the sequence, or if the sequence
+    /// is empty.
+    fn shot_at_film_frame(&self, frame: u32) -> Option<(SceneKey, u32)> {
+        let mut start = 0u32;
+        for key in self.doc.sequence() {
+            let Some(index) = self.doc.index_of_key(*key) else {
+                continue;
+            };
+            let length = self.doc.playing_length(index).max(1);
+            if frame < start + length {
+                return Some((*key, frame - start));
+            }
+            start += length;
+        }
+        None
+    }
+
+    /// **The film playhead** the Sequence strip shows and scrubs: the
+    /// active shot's own position in the film, if it is one in the cut —
+    /// so scrubbing its local timeline moves the strip's playhead too —
+    /// otherwise the last explicit scrub on the strip's own ruler.
+    pub fn film_playhead(&self) -> u32 {
+        let active_index = self.doc.active_scene();
+        if let Some(key) = self.doc.scene_key(active_index)
+            && let Some(pos) = self.doc.sequence().iter().position(|k| *k == key)
+        {
+            let start: u32 = self.doc.sequence()[..pos]
+                .iter()
+                .filter_map(|k| self.doc.index_of_key(*k))
+                .map(|i| self.doc.playing_length(i))
+                .sum();
+            return start + self.current_frame.min(self.playing_length().saturating_sub(1));
+        }
+        self.sequence_scrub.unwrap_or(0)
+    }
+
+    /// The Sequence strip's ruler (or a block) was clicked: move the film
+    /// playhead there. A shot covering that frame is opened, at its own
+    /// local frame — the strip's playhead is otherwise read straight off
+    /// whatever shot is open, so this is what keeps the two in step.
+    pub fn scrub_film_to(&mut self, frame: u32) {
+        match self.shot_at_film_frame(frame) {
+            Some((key, local)) => {
+                if let Some(index) = self.doc.index_of_key(key) {
+                    self.switch_scene(index);
+                    self.set_frame(local);
+                }
+                self.sequence_scrub = None;
+            }
+            None => self.sequence_scrub = Some(frame),
+        }
+    }
+
+    /// **New Shot from Setup**: stamp a new shot from `setup`, spanning
+    /// the film playhead to the end of the master audio — or, if the
+    /// playhead sits inside the cut already, straight after its last shot.
+    /// How the very first shot of a sequence comes to exist, and how a
+    /// later one is added past the end of the cut so far.
+    pub fn new_shot_from_setup(&mut self, setup: SceneKey) -> Option<SceneKey> {
+        let total = self.doc.master_audio_frames().unwrap_or(0);
+        let cut_so_far: u32 = self
+            .doc
+            .sequence()
+            .iter()
+            .filter_map(|k| self.doc.index_of_key(*k))
+            .map(|i| self.doc.playing_length(i))
+            .sum();
+        let audio_in = self.film_playhead().max(cut_so_far);
+        let audio_out = total.max(audio_in + 1);
+        let key = self.doc.stamp_shot(setup, audio_in, audio_out)?;
+        if let Some(index) = self.doc.index_of_key(key) {
+            self.switch_scene(index);
+        }
+        self.status = Some("New shot stamped from the setup".into());
+        Some(key)
+    }
+
+    /// **Split at Playhead (S)**: cut the shot under the film playhead in
+    /// two. The left keeps every frame it already has — only its
+    /// `audio_out` shrinks; the right is a *new* shot, freshly stamped
+    /// from the same setup, spanning the rest of the original slice.
+    /// Returns the new (right) shot's key. `None` if there is nothing to
+    /// split there.
+    pub fn split_shot_at_playhead(&mut self) -> Option<SceneKey> {
+        let frame = self.film_playhead();
+        let (left_key, local) = self.shot_at_film_frame(frame)?;
+        if local == 0 {
+            self.status = Some(
+                "Move the playhead into the shot first \u{2014} splitting at its first frame \
+                 would leave nothing on the left"
+                    .into(),
+            );
+            return None;
+        }
+        let index = self.doc.index_of_key(left_key)?;
+        let (setup, audio_in, audio_out) = match self.doc.role(index)?.clone() {
+            SceneRole::Shot(info) => (info.from_setup, info.audio_in, info.audio_out),
+            _ => return None,
+        };
+        let Some(setup) = setup else {
+            self.status = Some("This shot has no setup on record to stamp the other half from".into());
+            return None;
+        };
+        let split_at = audio_in + local;
+        if split_at >= audio_out {
+            return None;
+        }
+
+        self.doc.set_shot_range(left_key, audio_in, split_at);
+        let right_key = self.doc.stamp_shot(setup, split_at, audio_out)?;
+        // `stamp_shot` appends the new shot at the end of the cut; it
+        // belongs right after the shot it was split from instead.
+        let mut sequence: Vec<SceneKey> = self.doc.sequence().to_vec();
+        sequence.retain(|k| *k != right_key);
+        match sequence.iter().position(|k| *k == left_key) {
+            Some(pos) => sequence.insert(pos + 1, right_key),
+            None => sequence.push(right_key),
+        }
+        self.doc.set_sequence(sequence);
+
+        if let Some(right_index) = self.doc.index_of_key(right_key) {
+            self.switch_scene(right_index);
+        }
+        self.status = Some("Split \u{2014} the new shot is a fresh take of the setup".into());
+        Some(right_key)
+    }
+
+    /// **Try Another Setup**: stamp a new take of `shot`'s own slice of the
+    /// master audio from a different setup. The old take is kept, just no
+    /// longer in the cut — switch back to it from the Sequence strip's
+    /// takes switcher any time.
+    pub fn try_another_setup(&mut self, shot: SceneKey, setup: SceneKey) -> Option<SceneKey> {
+        let index = self.doc.index_of_key(shot)?;
+        let (audio_in, audio_out) = match self.doc.role(index)? {
+            SceneRole::Shot(info) => (info.audio_in, info.audio_out),
+            _ => return None,
+        };
+        let take = self.doc.stamp_shot(setup, audio_in, audio_out)?;
+
+        // Recorded as a take of `shot`, so the strip's takes switcher finds
+        // it — `stamp_shot` itself never sets `take_of`, since a plain
+        // stamp is not necessarily an alternative of anything.
+        if let Some(take_index) = self.doc.index_of_key(take)
+            && let Some(SceneRole::Shot(info)) = self.doc.role(take_index).cloned()
+        {
+            self.doc.set_role(
+                take_index,
+                SceneRole::Shot(ShotInfo {
+                    take_of: Some(shot),
+                    ..info
+                }),
+            );
+        }
+
+        // `stamp_shot` put it at the end of the cut; it belongs in
+        // `shot`'s own place — that is the whole point of a take.
+        let mut sequence: Vec<SceneKey> = self.doc.sequence().to_vec();
+        sequence.retain(|k| *k != take);
+        if let Some(pos) = sequence.iter().position(|k| *k == shot) {
+            sequence[pos] = take;
+        }
+        self.doc.set_sequence(sequence);
+
+        if let Some(take_index) = self.doc.index_of_key(take) {
+            self.switch_scene(take_index);
+        }
+        self.status = Some("New take from the other setup \u{2014} the old one is kept, not deleted".into());
+        Some(take)
+    }
+
+    /// **Duplicate Shot**: another take of `shot`, same slice of the
+    /// master audio, its own copy — try something without losing what is
+    /// already there.
+    pub fn duplicate_shot(&mut self, shot: SceneKey) -> Option<SceneKey> {
+        let take = self.doc.duplicate_shot(shot)?;
+        if let Some(index) = self.doc.index_of_key(take) {
+            self.switch_scene(index);
+        }
+        self.status = Some(
+            "Duplicated as a new take \u{2014} switch which is in the cut from the Sequence strip"
+                .into(),
+        );
+        Some(take)
+    }
+
+    /// **Add Missing Setup Layers**: add-only — copies across only the
+    /// setup's layers `shot` does not already have by name.
+    pub fn add_missing_setup_layers(&mut self, shot: SceneKey) -> usize {
+        let added = self.doc.add_missing_setup_layers(shot);
+        self.status = Some(if added == 0 {
+            "Nothing missing \u{2014} this shot already has every layer its setup does".to_string()
+        } else {
+            format!(
+                "Added {added} layer{} from the setup",
+                if added == 1 { "" } else { "s" }
+            )
+        });
+        added
+    }
+
+    /// **Cut on Dialogue**: propose one shot per spoken line of the master
+    /// audio, using `default_setup` for any line whose speaker (read off the
+    /// master scene's own **Captions** layer, if there is one) does not
+    /// name a setup of its own. Phrases shorter than about three-quarters
+    /// of a second are merged into the one before them, so a quick breath
+    /// does not become its own shot.
+    ///
+    /// **Never re-cuts, retrims or replaces an existing shot.** Only the
+    /// stretches of the master no shot already in `Document::sequence`
+    /// covers are filled; a line that falls where a shot already plays is
+    /// simply not acted on there. Returns how many new shots were stamped.
+    pub fn cut_on_dialogue(&mut self, default_setup: SceneKey) -> usize {
+        let Some(asset) = self.doc.master_sound() else {
+            self.status = Some(
+                "Set Master Audio first \u{2014} Sequence \u{25b8} Set Master Audio\u{2026}".into(),
+            );
+            return 0;
+        };
+        let total = self.doc.master_audio_frames().unwrap_or(0);
+        if total == 0 {
+            self.status = Some("The master audio is empty".into());
+            return 0;
+        }
+        let fps = self.sequence_fps();
+        let Ok(clip) = buzz_audio::Clip::decode(&asset.data, &asset.name) else {
+            self.status = Some("Could not decode the master audio".into());
+            return 0;
+        };
+
+        let raw_phrases =
+            buzz_audio::detect_phrases(&clip, fps, &buzz_audio::PhraseOptions::default());
+        if raw_phrases.is_empty() {
+            self.status = Some("Nothing in the master audio sounded like speech".into());
+            return 0;
+        }
+        // Merge phrases shorter than ~0.75s into the one before them.
+        let min_len = ((0.75 * fps).round() as u32).max(1);
+        let mut phrases: Vec<buzz_audio::Phrase> = Vec::new();
+        for p in raw_phrases {
+            match phrases.last_mut() {
+                Some(last) if p.len() < min_len => last.end = p.end,
+                _ => phrases.push(p),
+            }
+        }
+
+        // Every stretch of the master some shot already in the cut covers —
+        // left exactly as it is, whatever line falls inside it.
+        let mut covered: Vec<(u32, u32)> = self
+            .doc
+            .sequence()
+            .to_vec()
+            .iter()
+            .filter_map(|k| self.doc.index_of_key(*k))
+            .filter_map(|i| match self.doc.role(i) {
+                Some(SceneRole::Shot(info)) => Some((info.audio_in, info.audio_out)),
+                _ => None,
+            })
+            .collect();
+        covered.sort();
+
+        let mut gaps: Vec<(u32, u32)> = Vec::new();
+        let mut cursor = 0u32;
+        for (start, end) in &covered {
+            if *start > cursor {
+                gaps.push((cursor, *start));
+            }
+            cursor = cursor.max(*end);
+        }
+        if cursor < total {
+            gaps.push((cursor, total));
+        }
+        if gaps.is_empty() {
+            self.status =
+                Some("The whole master audio is already covered by shots in the cut".into());
+            return 0;
+        }
+
+        let speaker_lines = self.master_caption_lines();
+        let setups = self.sequence_setups();
+
+        let mut stamped = 0usize;
+        for (gap_start, gap_end) in gaps {
+            // Cut points: the gap's own boundaries, plus every phrase start
+            // strictly inside it — so the segments cover the gap exactly,
+            // with no frame left over, while lining internal cuts up with
+            // where the lines actually start.
+            let mut cuts: Vec<u32> = vec![gap_start];
+            for p in &phrases {
+                if p.start > gap_start && p.start < gap_end {
+                    cuts.push(p.start);
+                }
+            }
+            cuts.push(gap_end);
+            cuts.dedup();
+
+            for pair in cuts.windows(2) {
+                let (seg_start, seg_end) = (pair[0], pair[1]);
+                if seg_end <= seg_start {
+                    continue;
+                }
+                let setup = speaker_lines
+                    .iter()
+                    .find(|(range, _)| range.contains(&seg_start))
+                    .and_then(|(_, speaker)| {
+                        setups
+                            .iter()
+                            .find(|(_, name)| name_mentions(name, speaker))
+                            .map(|(key, _)| *key)
+                    })
+                    .unwrap_or(default_setup);
+                if self.doc.stamp_shot(setup, seg_start, seg_end).is_some() {
+                    stamped += 1;
+                }
+            }
+        }
+
+        // `stamp_shot` always appends to the end of the cut; a gap that was
+        // not itself at the end of the sequence needs its new shots
+        // threaded back into audio-time order.
+        let mut sequence: Vec<SceneKey> = self.doc.sequence().to_vec();
+        sequence.sort_by_key(|k| {
+            self.doc
+                .index_of_key(*k)
+                .and_then(|i| match self.doc.role(i) {
+                    Some(SceneRole::Shot(info)) => Some(info.audio_in),
+                    _ => None,
+                })
+                .unwrap_or(u32::MAX)
+        });
+        self.doc.set_sequence(sequence);
+
+        self.status = Some(format!(
+            "Cut on Dialogue: {stamped} new shot{} from {} spoken line{}",
+            if stamped == 1 { "" } else { "s" },
+            phrases.len(),
+            if phrases.len() == 1 { "" } else { "s" }
+        ));
+        stamped
+    }
+
+    /// Every line on the master scene's own **Captions** layer that names a
+    /// speaker: `(frame range on the master, speaker)`. Empty if there is no
+    /// master audio, or its scene carries no such layer — the same
+    /// label-on-a-keyframe reading `Self::lip_sync_from_captions` does.
+    fn master_caption_lines(&self) -> Vec<(std::ops::Range<u32>, String)> {
+        let Some((scene_key, _)) = self.doc.master_audio() else {
+            return Vec::new();
+        };
+        let Some(index) = self.doc.index_of_key(scene_key) else {
+            return Vec::new();
+        };
+        let film = self.doc.film();
+        let Some(scene) = film.get(index) else {
+            return Vec::new();
+        };
+        let Some(layer) = scene.stage_layers().iter().find(|l| l.name == "Captions") else {
+            return Vec::new();
+        };
+        let starts: Vec<u32> = layer.frames.keyframes().iter().map(|k| k.start).collect();
+        let length = layer.frames.length();
+        layer
+            .frames
+            .keyframes()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, key)| {
+                let who = key.label.clone()?;
+                let end = starts.get(i + 1).copied().unwrap_or(length);
+                Some((key.start..end.max(key.start + 1), who))
+            })
+            .collect()
+    }
+
+    /// **Edit Setup**: switch to editing the setup a shot was stamped
+    /// from. Editing it never touches shots already stamped — only ones
+    /// stamped from it afterwards.
+    pub fn edit_setup(&mut self, setup: SceneKey) {
+        let Some(index) = self.doc.index_of_key(setup) else {
+            self.status = Some("That setup no longer exists".into());
+            return;
+        };
+        self.switch_scene(index);
+        self.status =
+            Some("Editing the setup \u{2014} shots already stamped from it are untouched".into());
+    }
+
+    /// **Flatten to Master Scene**: a new Normal scene with every shot in
+    /// the cut laid end to end — the hand-pasting a director used to do to
+    /// hand a sequence off to plain Animate-style work, done once. The
+    /// sequence itself, and every shot and setup in it, is left exactly as
+    /// it is.
+    ///
+    /// Each shot's layers are brought in with `Scene::merge` (which safely
+    /// renumbers every symbol and sound it touches) and then shifted to
+    /// occupy only that shot's own stretch of the flattened timeline,
+    /// trimmed to its playing length — frames a shortened shot keeps past
+    /// its own end are never played, so they are not carried across
+    /// either. A shot's layers land as their own layers rather than merged
+    /// by name into ones shared across shots: safe by construction, at the
+    /// cost of a layer stack a hand-polish may want to tidy afterwards.
+    pub fn flatten_to_master_scene(&mut self) -> Option<usize> {
+        let shot_keys: Vec<SceneKey> = self.doc.sequence().to_vec();
+        if shot_keys.is_empty() {
+            self.status = Some("There is nothing in the sequence to flatten yet".into());
+            return None;
+        }
+
+        let film = self.doc.film();
+        let mut flat = buzz_scene::Scene::empty();
+        let mut offset = 0u32;
+        let mut stage_set = false;
+
+        for key in &shot_keys {
+            let Some(index) = self.doc.index_of_key(*key) else {
+                continue;
+            };
+            let Some(shot_scene) = film.get(index) else {
+                continue;
+            };
+            if !stage_set {
+                *flat.stage_mut() = *shot_scene.stage();
+                stage_set = true;
+            }
+            let length = self.doc.playing_length(index).max(1);
+            let report = flat.merge(shot_scene, buzz_scene::ImportTarget::Stage);
+            let added: Vec<LayerId> = flat
+                .stage_layers()
+                .iter()
+                .take(report.layers)
+                .map(|l| l.id)
+                .collect();
+            for id in added {
+                flat.update_stage_layer(id, |layer| {
+                    let trimmed: Vec<buzz_scene::Keyframe> = layer
+                        .frames
+                        .keyframes()
+                        .iter()
+                        .filter(|k| k.start < length)
+                        .map(|k| {
+                            let mut k = k.clone();
+                            k.start += offset;
+                            k
+                        })
+                        .collect();
+                    layer.frames = buzz_scene::LayerTimeline::from_parts(trimmed, offset + length);
+                });
+            }
+            offset += length;
+        }
+
+        if !stage_set {
+            self.status = Some("None of the sequence's shots could be read".into());
+            return None;
+        }
+
+        self.doc.add_scene();
+        let new_index = self.doc.active_scene();
+        self.doc.edit("Flatten to Master Scene", move |scene| {
+            *scene = flat;
+        });
+        self.doc.end_gesture();
+
+        let existing = self.doc.scene_names();
+        let mut name = "Flattened".to_string();
+        let mut n = 2;
+        while existing.iter().any(|s| *s == name) {
+            name = format!("Flattened {n}");
+            n += 1;
+        }
+        self.doc.rename_scene(new_index, name);
+
+        self.bounds_cache.borrow_mut().take();
+        self.selection.clear();
+        self.camera_selected = false;
+        self.selection.ensure_active_layer(self.doc.scene());
+        self.set_frame(0);
+        self.playback.playing = false;
+        self.status = Some(
+            "Flattened the sequence into a new scene \u{2014} the sequence itself is unchanged"
+                .into(),
+        );
+        Some(new_index)
+    }
+
+    /// **Continue from Shot**: seed `shot`'s still-untouched layers with
+    /// `source`'s last pose at frame 0 — what a cut back to a setup
+    /// (village, Ana, **village**) usually wants: the second village shot
+    /// picking up where the first left off.
+    ///
+    /// For every layer present by name on both shots except Dialogue: if
+    /// `shot`'s own layer of that name still holds exactly what it was
+    /// stamped with — compared to its setup's own layer of the same name,
+    /// the test for "the user has not drawn here yet" — its frame 0 becomes
+    /// `source`'s artwork at `source`'s own last playing frame. A layer the
+    /// user has already animated is left alone and its name is reported
+    /// rather than touched. Never changes `source`, and never touches a
+    /// frame of `shot` past frame 0. Records `continue_from` for the
+    /// Sequence strip. One undo step, through `Document::edit` on `shot`
+    /// once it is the active scene.
+    ///
+    /// Returns how many layers changed, and the names of any left alone
+    /// because they were already animated.
+    pub fn continue_from_shot(&mut self, shot: SceneKey, source: SceneKey) -> (usize, Vec<String>) {
+        let Some(shot_index) = self.doc.index_of_key(shot) else {
+            return (0, Vec::new());
+        };
+        let Some(source_index) = self.doc.index_of_key(source) else {
+            return (0, Vec::new());
+        };
+        let setup_key = match self.doc.role(shot_index) {
+            Some(SceneRole::Shot(info)) => info.from_setup,
+            _ => None,
+        };
+
+        let film = self.doc.film();
+        let (Some(dest_scene), Some(source_scene)) =
+            (film.get(shot_index), film.get(source_index))
+        else {
+            return (0, Vec::new());
+        };
+        let setup_scene = setup_key
+            .and_then(|k| self.doc.index_of_key(k))
+            .and_then(|i| film.get(i));
+
+        let source_by_name: std::collections::HashMap<&str, LayerId> = source_scene
+            .stage_layers()
+            .iter()
+            .map(|l| (l.name.as_str(), l.id))
+            .collect();
+        let setup_by_name: std::collections::HashMap<&str, LayerId> = setup_scene
+            .map(|s| {
+                s.stage_layers()
+                    .iter()
+                    .map(|l| (l.name.as_str(), l.id))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let source_last_frame = self.doc.playing_length(source_index).saturating_sub(1);
+
+        let mut plan: Vec<(LayerId, Vec<Arc<Object>>)> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+
+        for dest_layer in dest_scene.stage_layers().iter() {
+            if dest_layer.name == "Dialogue" {
+                continue;
+            }
+            let Some(&source_id) = source_by_name.get(dest_layer.name.as_str()) else {
+                // Not on the source shot at all: nothing to continue from.
+                continue;
+            };
+            let Some(&setup_id) = setup_by_name.get(dest_layer.name.as_str()) else {
+                // No setup layer of the same name to compare against: leave
+                // it alone rather than risk overwriting hand-animated work.
+                skipped.push(dest_layer.name.clone());
+                continue;
+            };
+            let Some(setup_layer) = setup_scene.and_then(|s| s.stage_layers().get(setup_id))
+            else {
+                continue;
+            };
+            let dest_frame0 = dest_layer.frames.frame_contents(0).unwrap_or_default();
+            let setup_frame0 = setup_layer.frames.frame_contents(0).unwrap_or_default();
+            if dest_frame0 != setup_frame0 {
+                // The user has already drawn something at frame 0 here.
+                skipped.push(dest_layer.name.clone());
+                continue;
+            }
+            let Some(source_layer) = source_scene.stage_layers().get(source_id) else {
+                continue;
+            };
+            let resolved = source_layer.frames.resolved_at(source_last_frame);
+            let objects: Vec<Arc<Object>> = resolved
+                .iter_owned()
+                .map(|(obj, arc)| match arc {
+                    Some(a) => Arc::clone(a),
+                    None => Arc::new(obj.clone()),
+                })
+                .collect();
+            plan.push((dest_layer.id, objects));
+        }
+
+        skipped.sort();
+        if plan.is_empty() {
+            self.status = Some(if skipped.is_empty() {
+                "Nothing to continue \u{2014} no layer of this shot matched the earlier one".into()
+            } else {
+                format!(
+                    "Already animated, left alone: {} \u{2014} nothing else to continue",
+                    skipped.join(", ")
+                )
+            });
+            return (0, skipped);
+        }
+
+        if shot_index != self.doc.active_scene() {
+            self.switch_scene(shot_index);
+        }
+        let changed = plan.len();
+        self.doc.edit("Continue from Shot", |scene| {
+            for (layer_id, objects) in &plan {
+                scene.update_stage_layer(*layer_id, |layer| {
+                    layer.frames.set_objects(0, objects.clone());
+                });
+            }
+        });
+        self.doc.end_gesture();
+
+        if let Some(SceneRole::Shot(info)) = self.doc.role(shot_index).cloned() {
+            self.doc.set_role(
+                shot_index,
+                SceneRole::Shot(ShotInfo {
+                    continue_from: Some(source),
+                    ..info
+                }),
+            );
+        }
+
+        self.status = Some(if skipped.is_empty() {
+            format!(
+                "Continued {changed} layer{} from the earlier shot",
+                if changed == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "Continued {changed} layer{} \u{2014} already animated, left alone: {}",
+                if changed == 1 { "" } else { "s" },
+                skipped.join(", ")
+            )
+        });
+        (changed, skipped)
+    }
+
+    /// Shots earlier in the sequence than `shot`, stamped from the same
+    /// setup, by key and name — what "Continue from Shot" lists, on both
+    /// the Shot menu and the Sequence strip's right-click.
+    fn earlier_shots_same_setup(&self, shot: SceneKey) -> Vec<(SceneKey, String)> {
+        let sequence: Vec<SceneKey> = self.doc.sequence().to_vec();
+        let Some(pos) = sequence.iter().position(|k| *k == shot) else {
+            return Vec::new();
+        };
+        let setup = match self.doc.index_of_key(shot).and_then(|i| self.doc.role(i)) {
+            Some(SceneRole::Shot(info)) => info.from_setup,
+            _ => None,
+        };
+        let Some(setup) = setup else {
+            return Vec::new();
+        };
+        let names = self.doc.scene_names();
+        sequence[..pos]
+            .iter()
+            .filter(|k| {
+                self.doc
+                    .index_of_key(**k)
+                    .and_then(|i| self.doc.role(i))
+                    .is_some_and(
+                        |r| matches!(r, SceneRole::Shot(info) if info.from_setup == Some(setup)),
+                    )
+            })
+            .filter_map(|k| {
+                self.doc
+                    .index_of_key(*k)
+                    .map(|i| (*k, names.get(i).cloned().unwrap_or_default()))
+            })
+            .collect()
+    }
+
+    /// Everything the Sequence strip needs to draw itself, built fresh from
+    /// the document. See `buzz_ui::sequence_panel`.
+    pub fn sequence_view(&mut self) -> buzz_ui::SequenceView {
+        let names = self.doc.scene_names();
+        let setups = self.sequence_setups();
+        let fps = self.sequence_fps();
+        let master_frames = self.doc.master_audio_frames().unwrap_or(0).max(1);
+        let active_shot = self.doc.scene_key(self.doc.active_scene());
+        let playhead = self.film_playhead();
+
+        let mut blocks = Vec::new();
+        let mut start = 0u32;
+        let mut ordinals: std::collections::HashMap<SceneKey, usize> = std::collections::HashMap::new();
+        for key in self.doc.sequence().to_vec() {
+            let Some(index) = self.doc.index_of_key(key) else {
+                continue;
+            };
+            let Some(SceneRole::Shot(info)) = self.doc.role(index).cloned() else {
+                continue;
+            };
+            let length = self.doc.playing_length(index).max(1);
+            let setup_name = info
+                .from_setup
+                .and_then(|s| self.doc.index_of_key(s))
+                .and_then(|i| names.get(i).cloned())
+                .unwrap_or_default();
+            let shot_number = match info.from_setup {
+                Some(setup) => {
+                    let n = ordinals.entry(setup).or_insert(0);
+                    *n += 1;
+                    *n
+                }
+                None => 1,
+            };
+            // Every take of this shot: the original it is a take of (or
+            // itself, if it is not one), plus every other scene recorded
+            // as a take of that same original.
+            let original = info.take_of.unwrap_or(key);
+            let mut takes = vec![original];
+            for i in 0..names.len() {
+                if let Some(SceneRole::Shot(other)) = self.doc.role(i)
+                    && other.take_of == Some(original)
+                    && let Some(k) = self.doc.scene_key(i)
+                {
+                    takes.push(k);
+                }
+            }
+
+            let continue_from_choices = self.earlier_shots_same_setup(key);
+
+            blocks.push(buzz_ui::ShotBlock {
+                key,
+                start,
+                length,
+                setup: info.from_setup,
+                setup_name,
+                shot_number,
+                takes,
+                continue_from_choices,
+            });
+            start += length;
+        }
+
+        buzz_ui::SequenceView {
+            blocks,
+            master_waveform: self.master_waveform(),
+            master_frames,
+            fps,
+            playhead,
+            active_shot,
+            setups,
+        }
+    }
+
+    /// Act on what the Sequence strip reported. Every field maps to one of
+    /// the actions above; the caller (the shell) is the one that actually
+    /// draws the panel and hands its response here.
+    pub fn apply_sequence(&mut self, response: &buzz_ui::SequenceResponse) {
+        if let Some(key) = response.select.or(response.open)
+            && let Some(index) = self.doc.index_of_key(key)
+        {
+            self.switch_scene(index);
+        }
+        if let Some(frame) = response.scrub_to {
+            self.scrub_film_to(frame);
+        }
+        if let Some((left, right, at)) = response.move_cut {
+            self.doc.move_cut(left, right, at);
+        }
+        if let Some((original, take)) = response.switch_take {
+            self.doc.set_active_take(original, take);
+            if let Some(index) = self.doc.index_of_key(take) {
+                self.switch_scene(index);
+            }
+        }
+        if let Some(shot) = response.duplicate_shot {
+            self.duplicate_shot(shot);
+        }
+        if let Some((shot, setup)) = response.try_another_setup {
+            self.try_another_setup(shot, setup);
+        }
+        if let Some(shot) = response.add_missing_setup_layers {
+            self.add_missing_setup_layers(shot);
+        }
+        if let Some(setup) = response.edit_setup {
+            self.edit_setup(setup);
+        }
+        if let Some((shot, source)) = response.continue_from {
+            self.continue_from_shot(shot, source);
+        }
+        if response.split_at_playhead {
+            self.split_shot_at_playhead();
+        }
+    }
+
     // -- scripting -----------------------------------------------------------
 
     /// Run what is in the Actions panel against this document.
@@ -4984,11 +7559,16 @@ impl Editor {
             current_frame: self.current_frame,
             selection: self.selection.ids(),
             active_layer: self.selection.active_layer(),
-                    config_dir: buzz_script::default_config_dir(),
+            config_dir: buzz_script::default_config_dir(),
             // The Assets panel's own folder. A script filing a cast there
             // is filing it where the panel will show it, which is the
             // whole point of an asset outliving its document.
-            asset_root: buzz_doc::AssetLibrary::user().root().map(|p| p.to_path_buf()),
+            asset_root: buzz_doc::AssetLibrary::user()
+                .root()
+                .map(|p| p.to_path_buf()),
+            // No interactive answers yet (J1 parked): `prompt` keeps its
+            // unattended default-answer behaviour.
+            prompt_answers: Vec::new(),
         };
 
         let mut working = self.doc.scene().clone();
@@ -5047,7 +7627,24 @@ impl Editor {
         self.selection.clear();
         self.selection.set_active_layer(None);
         self.selection.ensure_active_layer(self.doc.scene());
-        self.set_frame(0);
+        // Going in remembers where the timeline being left was; coming back
+        // out returns to it. Anything else (another symbol at the same
+        // depth, a rebuilt scene) starts at frame 1 as before.
+        let was = self.edit_frames.len();
+        let now = self.doc.scene().edit_path().len();
+        let enter_at = self.enter_frame.take();
+        let frame = if now > was {
+            self.edit_frames.push(self.current_frame);
+            self.edit_frames.resize(now, 0);
+            enter_at.unwrap_or(0)
+        } else if now < was {
+            let back = self.edit_frames[now];
+            self.edit_frames.truncate(now);
+            back
+        } else {
+            0
+        };
+        self.set_frame(frame);
         self.playback.playing = false;
 
         // **Opening a symbol selects what is in it.** A symbol is usually one
@@ -5069,6 +7666,28 @@ impl Editor {
     pub fn select_layer(&mut self, layer: LayerId) {
         self.selection
             .select_layer(self.doc.scene(), layer, self.current_frame);
+    }
+
+    /// Return all currently selected layers.
+    pub fn selected_layers(&self) -> &[LayerId] {
+        self.selection.selected_layers()
+    }
+
+    /// Select multiple layers at once and select their artwork on the current frame.
+    pub fn select_layers(&mut self, layers: &[LayerId]) {
+        self.selection
+            .select_layers(self.doc.scene(), layers, self.current_frame);
+    }
+
+    /// I1: the last plain-clicked layer, which a Shift+click ranges from.
+    pub fn range_anchor(&self) -> Option<LayerId> {
+        self.selection.range_anchor()
+    }
+
+    /// Move the range anchor without otherwise touching the selection — what
+    /// Ctrl/Cmd+click does in the timeline's response path.
+    pub fn set_range_anchor(&mut self, layer: LayerId) {
+        self.selection.set_range_anchor(Some(layer));
     }
 
     /// Switch which scene is being edited, and put the editor into a clean
@@ -5149,8 +7768,15 @@ impl Editor {
         if !self.selection.is_empty() {
             return;
         }
-        self.selection
-            .select_active_layer_contents(self.doc.scene(), self.current_frame);
+        let layers = self.selection.selected_layers();
+        if layers.len() > 1 {
+            let layers_vec = layers.to_vec();
+            self.selection
+                .select_layers(self.doc.scene(), &layers_vec, self.current_frame);
+        } else {
+            self.selection
+                .select_active_layer_contents(self.doc.scene(), self.current_frame);
+        }
     }
 
     /// Animate's *Create Brush From Selection* — **with the artwork's paint**.
@@ -5332,9 +7958,21 @@ impl Editor {
     /// a scene — and without it the only way in was the Library, one symbol at
     /// a time, with no way to tell which of three like-named heads was the one
     /// on screen.
+    ///
+    /// **On a raw shape it selects what is connected instead** (Selection and
+    /// Free Transform): a fill with the strokes that touch it, a stroke with
+    /// every stroke joined to it — Animate's double-click on artwork. An
+    /// instance still opens, and empty stage still leaves.
     pub fn enter_or_leave_at(&mut self, screen: Point) {
         let point = self.screen_to_edit(screen);
         let tolerance = self.pick_tolerance();
+
+        if matches!(self.machine.tool(), ToolId::Selection | ToolId::FreeTransform)
+            && let Some(id) = self.object_at(point, tolerance)
+            && self.select_connected_pieces(id)
+        {
+            return;
+        }
 
         // **Where it sits, as well as which symbol it is.** The instance's own
         // matrix and its layer's parenting together say where the symbol's
@@ -5346,15 +7984,26 @@ impl Editor {
             .and_then(|id| self.doc.scene().find_object(id))
             .and_then(|(layer, object)| {
                 let instance = object.instance()?;
-                let follows = self.doc.scene().layers().inherited_transform(layer, frame);
-                Some((instance.symbol, follows * object.transform))
+                let scene = self.doc.scene();
+                let follows = scene.layers().inherited_transform(layer, frame);
+                // The inner frame showing at this playhead, so the symbol
+                // opens on the pose that was double-clicked.
+                let inner = scene.library().get(instance.symbol).map(|symbol| {
+                    let elapsed = scene.layers().get(layer).map(|l| elapsed_on(l, frame)).unwrap_or(0);
+                    instance.resolve_frame(symbol.kind, elapsed, symbol.length())
+                });
+                Some((instance.symbol, follows * object.transform, inner))
             });
 
         match opened {
-            Some((id, place)) => {
+            Some((id, place, inner)) => {
+                self.enter_frame = inner;
                 let mut entered = false;
                 self.doc
                     .edit_view(|scene| entered = scene.enter_symbol_in_place(id, place));
+                if !entered {
+                    self.enter_frame = None;
+                }
                 if entered {
                     self.library.selected = Some(id);
                     self.after_context_change();
@@ -5409,6 +8058,17 @@ impl Editor {
         } else {
             self.status = Some("That symbol is no longer in the library".into());
         }
+    }
+
+    /// Open the AI asset identification and renaming review dialog.
+    pub fn open_ai_rename(&mut self) {
+        self.ai_rename.open = true;
+        let backend = self.workspace.ai.backend.clone().unwrap_or_default();
+        let model = self.workspace.ai.vision_model
+            .clone()
+            .or_else(|| self.workspace.ai.model.clone())
+            .unwrap_or_else(|| "llava".to_string());
+        self.ai_rename.start_for_scene(self.doc.scene(), backend, model);
     }
 
     /// Place an instance of the library selection at the centre of the view.
@@ -5519,6 +8179,7 @@ impl Editor {
                             o.transform = Affine::translate((delta.x, delta.y)) * o.transform;
                         });
                     }
+                    carry_rest_poses(scene, frame, &arrived, delta);
                 }
             }
 
@@ -5547,6 +8208,107 @@ impl Editor {
             }
             None => {}
         }
+    }
+
+    /// Bring an AI-assembled character into the document.
+    ///
+    /// `assembled.part_symbols` and `assembled.character_symbol` carry fixed
+    /// ids — symbol 1, 100+i, and the face symbols after them — because every
+    /// character is built the same way. Inserting them straight into the
+    /// Library would collide by id with whatever is already there:
+    /// `Library::insert` replaces, so a second character would silently
+    /// destroy the first, or the user's own symbols. `assembled.scene` is
+    /// the complete little document the assembler built — those same
+    /// symbols in its own library, and the rigged armature on its own stage
+    /// — so merging it in renumbers everything and rewrites every
+    /// reference, the same way an imported file or a dragged-in asset does.
+    /// One `doc.edit`, so the whole thing undoes in a single step.
+    pub fn create_ai_character(&mut self, assembled: &buzz_ai::character::AssembledCharacter) {
+        self.create_ai_character_as(assembled, buzz_rig::RigKind::Bones);
+    }
+
+    /// [`Self::create_ai_character`], rigged as `kind`: with
+    /// [`buzz_rig::RigKind::Layers`] the armature is taken apart into a layer
+    /// rig (parts on followed layers, no armature) before it is kept in the
+    /// Cast and placed. A rig that cannot be (skinned artwork) stays bones,
+    /// and the status line says so.
+    pub fn create_ai_character_as(
+        &mut self,
+        assembled: &buzz_ai::character::AssembledCharacter,
+        kind: buzz_rig::RigKind,
+    ) {
+        if kind == buzz_rig::RigKind::Layers {
+            let mut layered = assembled.clone();
+            let (converted, refused) =
+                crate::rigging::convert_all_to_layers(&mut layered.scene, 0);
+            if converted > 0 && refused == 0 {
+                self.create_ai_character_as(&layered, buzz_rig::RigKind::Bones);
+                if let Some(status) = &mut self.status {
+                    status.push_str(" \u{2014} as a layer rig");
+                }
+                return;
+            }
+            self.create_ai_character_as(assembled, buzz_rig::RigKind::Bones);
+            self.status = Some(format!(
+                "Character '{}' kept as a bone rig: its artwork is skinned and cannot be \
+                 one layer per bone.",
+                assembled.name
+            ));
+            return;
+        }
+        let name = assembled.name.clone();
+        let _ = assembled.save_to_cast(&mut self.assets);
+
+        let frame = self.current_frame;
+        let edit_at = self.edit_at();
+        let center = self.camera.center;
+
+        // What is already on stage, so the armature the merge brings in can
+        // be told apart and carried to the middle of the view — the same
+        // before/after diff `place_asset_at` uses.
+        let before: std::collections::HashSet<ObjectId> = self
+            .doc
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(frame).iter().map(|o| o.id))
+            .collect();
+
+        let mut report = buzz_scene::MergeReport::default();
+        self.doc.edit(format!("Create Character '{name}'"), |scene| {
+            report = scene.merge(&assembled.scene, buzz_scene::ImportTarget::Stage);
+
+            let mut arrived = Vec::new();
+            let mut union: Option<Rect> = None;
+            for layer in scene.layers().iter() {
+                for object in layer.objects_at(frame).iter() {
+                    if before.contains(&object.id) {
+                        continue;
+                    }
+                    arrived.push(object.id);
+                    let b = scene.resolved_bounds(object);
+                    union = Some(union.map_or(b, |u: Rect| u.union(b)));
+                }
+            }
+
+            // Carry the whole of it so its middle lands in the middle of the view.
+            if let Some(u) = union {
+                let delta = center - u.center();
+                if delta.hypot() > 0.0 {
+                    for id in &arrived {
+                        update_object(scene, edit_at, *id, |o| {
+                            o.transform = Affine::translate((delta.x, delta.y)) * o.transform;
+                        });
+                    }
+                    carry_rest_poses(scene, frame, &arrived, delta);
+                }
+            }
+        });
+
+        self.status = Some(format!(
+            "Character '{name}' added to Library & Cast \u{2014} {}",
+            report.summary()
+        ));
     }
 
     fn duplicate_library_symbol(&mut self) {
@@ -5671,24 +8433,45 @@ impl Editor {
         self.library.selected_folder = created;
     }
 
-    /// Set the tween on the keyframe governing the playhead.
+    /// Set the tween on every distinct keyframe span touched by the timeline selection.
     fn set_tween(&mut self, tween: Tween) {
-        let Some(layer) = self.active_layer() else {
+        let targets = self.timeline_targets();
+        if targets.is_empty() {
             return;
-        };
-        let frame = self.current_frame;
-        let mut ok = false;
-        self.doc.edit("Tween", |scene| {
-            scene.update_layer(layer, |l| ok = l.frames.set_tween(frame, tween));
-        });
-        if !ok {
-            self.status = Some("Put the playhead on a keyframe to tween from it".into());
-        } else if tween.is_active() && self.tween_span_length(layer, frame) < 2 {
-            // A tween needs somewhere to go. Saying so beats leaving the user
-            // wondering why nothing moves.
-            self.status =
-                Some("Tween set, but there is no following keyframe to tween towards".into());
         }
+        let mut starts = std::collections::BTreeSet::new();
+        for (layer, frame) in targets {
+            if let Some(start) = self
+                .doc
+                .scene()
+                .layers()
+                .get(layer)
+                .and_then(|l| l.frames.keyframe_start(frame))
+            {
+                starts.insert((layer, start));
+            }
+        }
+        let mut changed = 0usize;
+        let mut skipped = 0usize;
+        self.doc.edit("Tween", |scene| {
+            for (layer, frame) in starts.iter().copied() {
+                if scene.layers().is_effectively_locked(layer) {
+                    skipped += 1;
+                    continue;
+                }
+                scene.update_layer(layer, |l| {
+                    let has_following = l.frames.keyframes().iter().any(|k| k.start > frame);
+                    if (!tween.is_active() || has_following) && l.frames.set_tween(frame, tween) {
+                        changed += 1;
+                    } else {
+                        skipped += 1;
+                    }
+                });
+            }
+        });
+        self.status = Some(format!(
+            "Tween: {changed} span(s) changed, {skipped} skipped"
+        ));
     }
 
     /// Replace only the *easing* of the tween on the keyframe governing the
@@ -5851,6 +8634,14 @@ impl Editor {
     /// far more useful than discarding an hour's brief because the last
     /// paragraph was a sentence fragment.
     pub fn direct_sequence(&mut self, brief: &str) -> usize {
+        self.direct_sequence_dressed(brief, false)
+    }
+
+    /// [`Self::direct_sequence`], each shot's set dressed from the user's own
+    /// assets when `use_my_assets` and the library has an index (the Story
+    /// panel's **Use my assets**, AS3).
+    pub fn direct_sequence_dressed(&mut self, brief: &str, use_my_assets: bool) -> usize {
+        let sets = self.set_index(use_my_assets);
         let shots = buzz_act::split_shots(brief);
         if shots.is_empty() {
             self.status = Some("There is nothing in that brief to direct".into());
@@ -5867,8 +8658,18 @@ impl Editor {
                 self.doc.add_scene();
             }
             let mut failed = None;
+            let assets = &self.assets;
             self.doc.edit("Direct", |scene| {
-                if let Err(e) = buzz_act::direct(scene, &shot.story) {
+                let directed = match &sets {
+                    Some(index) => {
+                        let mut dress = |scene: &mut buzz_scene::Scene, request: &buzz_act::SetRequest| {
+                            !crate::asset_sets::dress_request(scene, assets, index, request).needs_procedural()
+                        };
+                        buzz_act::direct_dressed(scene, &shot.story, Some(&mut dress))
+                    }
+                    None => buzz_act::direct(scene, &shot.story),
+                };
+                if let Err(e) = directed {
                     failed = Some(format!("{e}"));
                 }
             });
@@ -5971,8 +8772,7 @@ impl Editor {
         };
 
         if sources.is_empty() {
-            self.status =
-                Some("This frame has no bucket fills to carry — colour one first".into());
+            self.status = Some("This frame has no bucket fills to carry — colour one first".into());
             return (0, 0);
         }
 
@@ -6037,9 +8837,9 @@ impl Editor {
             (0, m) => format!(
                 "Could not place {m} region(s) — the drawing moved too far, or a line has a gap"
             ),
-            (n, m) => format!(
-                "Coloured {n} region(s); {m} could not be placed and are left for you"
-            ),
+            (n, m) => {
+                format!("Coloured {n} region(s); {m} could not be placed and are left for you")
+            }
         });
         (painted, missed)
     }
@@ -6067,9 +8867,8 @@ impl Editor {
     pub fn retarget_performance(&mut self) {
         let ids = self.selection.ids();
         if ids.len() != 2 {
-            self.status = Some(
-                "Select two rigs: the one that performs, then the one to copy it onto".into(),
-            );
+            self.status =
+                Some("Select two rigs: the one that performs, then the one to copy it onto".into());
             return;
         }
         let (source, target) = (ids[0], ids[1]);
@@ -6226,13 +9025,7 @@ impl Editor {
     /// finds it. Applied across the whole film, because a fill is a property of
     /// the artwork rather than of the moment.
     pub fn link_selection_to_swatch(&mut self, swatch: buzz_scene::SwatchId) {
-        let Some(colour) = self
-            .doc
-            .scene()
-            .swatches()
-            .get(swatch)
-            .map(|s| s.color)
-        else {
+        let Some(colour) = self.doc.scene().swatches().get(swatch).map(|s| s.color) else {
             self.status = Some("That swatch is no longer in the palette".into());
             return;
         };
@@ -6549,7 +9342,11 @@ impl Editor {
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            (trailing_number(&name).is_none(), trailing_number(&name), name)
+            (
+                trailing_number(&name).is_none(),
+                trailing_number(&name),
+                name,
+            )
         });
 
         // Read and decode before the document is touched, so a folder with one
@@ -6613,7 +9410,7 @@ impl Editor {
                             fill: Some(buzz_scene::FillSpec::image(fill)),
                             stroke: None,
                             blend: buzz_scene::PaintBlend::Normal,
-                            },
+                        },
                     )
                     .is_some()
                 {
@@ -6639,7 +9436,8 @@ impl Editor {
         let stage = self.doc.scene().stage().size;
         let fps = self.doc.scene().stage().frame_rate.max(1.0);
 
-        let scratch = anyhow::Context::context(tempfile::tempdir(), "making somewhere to put the frames")?;
+        let scratch =
+            anyhow::Context::context(tempfile::tempdir(), "making somewhere to put the frames")?;
         let files = buzz_export::video::extract_frames(
             path,
             fps,
@@ -6681,7 +9479,8 @@ impl Editor {
             for (index, bytes) in decoded.iter().enumerate() {
                 let frame = index as u32;
                 let id = scene.next_image_id();
-                let Ok(asset) = buzz_scene::ImageAsset::decode(id, format!("{name} {}", frame + 1), bytes)
+                let Ok(asset) =
+                    buzz_scene::ImageAsset::decode(id, format!("{name} {}", frame + 1), bytes)
                 else {
                     continue;
                 };
@@ -6801,6 +9600,7 @@ impl Editor {
     }
 
     /// Frames between this keyframe and the next, for diagnostics.
+    #[allow(dead_code)]
     fn tween_span_length(&self, layer: LayerId, frame: u32) -> u32 {
         let Some(l) = self.doc.scene().layers().get(layer) else {
             return 0;
@@ -6817,40 +9617,239 @@ impl Editor {
         next.map(|n| n - start).unwrap_or(0)
     }
 
-    /// Apply a frame operation to the active layer.
+    /// Resolve frame commands through the explicit timeline selection.
+    fn timeline_targets(&mut self) -> Vec<(LayerId, u32)> {
+        if let Some(selection) = self.selection.timeline() {
+            return selection
+                .layers
+                .iter()
+                .flat_map(|&layer| selection.frames().map(move |frame| (layer, frame)))
+                .collect();
+        }
+        let selected_layers = self.selection.selected_layers();
+        if !selected_layers.is_empty() {
+            return selected_layers
+                .iter()
+                .map(|&layer| (layer, self.current_frame))
+                .collect();
+        }
+        self.active_layer()
+            .map(|layer| vec![(layer, self.current_frame)])
+            .unwrap_or_default()
+    }
+
+    /// Apply a frame operation to all selected cells in one undo transaction.
     fn frame_op(&mut self, op: FrameOp) {
-        let Some(layer) = self.active_layer() else {
-            return;
-        };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            self.status = Some("The active layer is locked".into());
+        let mut targets = self.timeline_targets();
+        if targets.is_empty() {
             return;
         }
-
-        let frame = self.current_frame;
+        targets.sort_by_key(|(layer, frame)| (*layer, std::cmp::Reverse(*frame)));
+        targets.dedup();
         let label = op.label();
-        let mut changed = false;
+        let mut changed = 0usize;
+        let mut skipped = 0usize;
 
         self.doc.edit(label, |scene| {
-            scene.update_layer(layer, |l| {
-                changed = match op {
-                    FrameOp::InsertFrame => l.frames.insert_frame(frame),
-                    FrameOp::RemoveFrame => l.frames.remove_frame(frame),
-                    FrameOp::InsertKeyframe => l.frames.insert_keyframe(frame),
-                    FrameOp::InsertBlankKeyframe => l.frames.insert_blank_keyframe(frame),
-                    FrameOp::ClearKeyframe => l.frames.clear_keyframe(frame),
-                    FrameOp::ClearFrames => l.frames.clear_frames(frame),
-                    FrameOp::ReverseFrames => l.frames.reverse_frames(),
-                };
-            });
+            for (layer, frame) in targets.iter().copied() {
+                let eligible = scene
+                    .layers()
+                    .get(layer)
+                    .is_some_and(|l| l.kind.holds_artwork())
+                    && !scene.layers().is_effectively_locked(layer);
+                if !eligible {
+                    skipped += 1;
+                    continue;
+                }
+                scene.update_layer(layer, |l| {
+                    let did_change = match op {
+                        FrameOp::InsertFrame => l.frames.insert_frame(frame),
+                        FrameOp::RemoveFrame => l.frames.remove_frame(frame),
+                        FrameOp::InsertKeyframe => l.frames.insert_keyframe(frame),
+                        FrameOp::InsertBlankKeyframe => l.frames.insert_blank_keyframe(frame),
+                        FrameOp::ClearKeyframe => l.frames.clear_keyframe(frame),
+                        FrameOp::ClearFrames => l.frames.clear_frames(frame),
+                        FrameOp::ReverseFrames => l.frames.reverse_frames(),
+                    };
+                    if did_change {
+                        changed += 1
+                    } else {
+                        skipped += 1
+                    }
+                });
+            }
         });
 
-        if !changed {
-            self.status = Some(format!("{label} did nothing here"));
-        }
+        self.status = Some(format!(
+            "{label}: {changed} cell(s) changed, {skipped} skipped"
+        ));
         // Removing frames can shorten the document past the playhead.
         self.set_frame(self.current_frame);
         self.selection.prune(self.doc.scene());
+    }
+
+    /// **Move Frames** — what dragging a timeline frame selection does — and
+    /// **Copy Frames** when `copy` (the Alt-drag).
+    ///
+    /// Every selected layer's frames `first_frame..=last_frame` move to start
+    /// at `to`, keyframes whole (artwork, labels, tweens, sounds), and `rows`
+    /// rows down (negative: up) the timeline — onto other layers. All layers
+    /// move by the same offsets, in **one undo step**. See
+    /// [`buzz_scene::LayerTimeline::move_frames`] for what happens on one
+    /// layer.
+    ///
+    /// # Rows
+    ///
+    /// Rows are the timeline's layer rows in display order — a row folded
+    /// away inside a collapsed folder is not one — so a two-layer selection
+    /// moved down one row lands on the next two rows. Every target must exist,
+    /// hold frames (not a folder) and be unlocked; if any is not, **nothing
+    /// moves** and the status line says why. A half-done move across layers
+    /// would be worse than none.
+    ///
+    /// # Order of work
+    ///
+    /// Every source's frames are lifted first, then every source is blanked
+    /// (unless copying), then every target is written — so layers can trade
+    /// places: moving three adjacent layers down one row works, the middle
+    /// one both giving and receiving.
+    ///
+    /// # Object ids
+    ///
+    /// An id must not end up on two layers, or `find_object` would answer
+    /// with the wrong one. Frames that change layer, and all copies, get
+    /// fresh ids — one old→new map per layer's frames, so an object on two
+    /// of its keyframes (an F6 copy, the two ends of a tween) keeps one id and
+    /// the tween still pairs up. Frames moved along their own layer keep
+    /// theirs.
+    ///
+    /// Locked source layers and folders are skipped, the same rule
+    /// [`Self::frame_op`] uses. Sound layers are not: a keyframe carries its
+    /// sound, and moving a line of dialogue is one of the main reasons to drag
+    /// frames at all. Afterwards the selection covers the frames where they
+    /// landed and the playhead goes to `to`. The document grows by itself
+    /// when a layer now runs past its end: its frame count *is* its longest
+    /// layer.
+    pub fn move_frames(&mut self, to: u32, rows: i32, copy: bool) {
+        // With no frame selection, the frame the playhead is on, on the
+        // selected layers or the active one — the fallback every frame command
+        // has (see `timeline_targets`), and how the AI agent, which moves the
+        // playhead and picks layers, names a frame to move.
+        let selection = match self.selection.timeline().cloned() {
+            Some(selection) => selection,
+            None => {
+                let frame = self.current_frame;
+                let mut layers = self.selection.selected_layers().to_vec();
+                if layers.is_empty() {
+                    layers.extend(self.active_layer());
+                }
+                let Some(&anchor) = layers.first() else {
+                    self.status = Some("Select frames in the timeline to move them".into());
+                    return;
+                };
+                buzz_ui::TimelineSelection::new(layers, frame, frame, anchor, frame)
+            }
+        };
+        let (first, last) = (selection.first_frame, selection.last_frame);
+        if to == first && rows == 0 {
+            return;
+        }
+        let label = if copy { "Copy Frames" } else { "Move Frames" };
+
+        let pairs = match buzz_ui::frame_move_targets(
+            self.doc.scene(),
+            selection.layers.iter().copied(),
+            rows,
+        ) {
+            Ok(pairs) => pairs,
+            Err(why) => {
+                self.status = Some(format!("{label}: {why} \u{2014} nothing was moved"));
+                return;
+            }
+        };
+        let skipped = selection.layers.len() - pairs.len();
+        let mut moved = 0usize;
+
+        self.doc.edit(label, |scene| {
+            // 1. Lift every source's frames before anything is written.
+            let mut lifted = Vec::new();
+            for &(source, target) in &pairs {
+                let Some(mut segment) = scene
+                    .layers()
+                    .get(source)
+                    .and_then(|l| l.frames.segment(first, last))
+                else {
+                    continue;
+                };
+                if source != target || copy {
+                    let mut fresh: std::collections::HashMap<ObjectId, ObjectId> =
+                        std::collections::HashMap::new();
+                    for keyframe in &mut segment.keyframes {
+                        for object in std::sync::Arc::make_mut(&mut keyframe.objects) {
+                            let id = *fresh
+                                .entry(object.id)
+                                .or_insert_with(|| scene.next_object_id());
+                            std::sync::Arc::make_mut(object).id = id;
+                        }
+                    }
+                }
+                lifted.push((source, target, segment));
+            }
+            // 2. Blank every source, so a layer that also receives frames is
+            // written after it gave its own away.
+            if !copy {
+                for (source, _, _) in &lifted {
+                    scene.update_layer(*source, |l| l.frames.blank_range(first, last));
+                }
+            }
+            // 3. Write every target.
+            for (_, target, segment) in &lifted {
+                scene.update_layer(*target, |l| l.frames.overwrite(to, segment));
+                moved += 1;
+            }
+        });
+
+        if moved == 0 {
+            self.status = Some(format!("{label}: there were no frames there to move"));
+            return;
+        }
+
+        // The selection follows the frames to where they landed.
+        let count = last - first + 1;
+        let anchor_frame = to + selection.anchor_frame.saturating_sub(first).min(count - 1);
+        let targets: Vec<LayerId> = pairs.iter().map(|(_, target)| *target).collect();
+        let anchor_layer = pairs
+            .iter()
+            .find(|(source, _)| *source == selection.anchor_layer)
+            .map(|(_, target)| *target)
+            .unwrap_or(targets[0]);
+        let layers: Vec<LayerId> = if rows == 0 {
+            // Along the same rows the selection stays on every layer it had,
+            // locked ones included, as it always has.
+            selection.layers.iter().copied().collect()
+        } else {
+            targets
+        };
+        self.selection.set_timeline(buzz_ui::TimelineSelection::new(
+            layers,
+            to,
+            to + count - 1,
+            anchor_layer,
+            anchor_frame,
+        ));
+        self.set_frame(to);
+        self.selection.prune(self.doc.scene());
+        self.status = Some(format!(
+            "{} {count} frame{} on {moved} layer{}{}",
+            if copy { "Copied" } else { "Moved" },
+            if count == 1 { "" } else { "s" },
+            if moved == 1 { "" } else { "s" },
+            if skipped > 0 {
+                format!(" \u{2014} {skipped} skipped")
+            } else {
+                String::new()
+            }
+        ));
     }
 
     /// **Copy Frames**, and **Cut Frames** when `and_clear`.
@@ -7008,6 +10007,12 @@ impl Editor {
 
     /// Key the camera's current state at the playhead.
     fn add_camera_key(&mut self) {
+        // C1: a locked camera refuses a new key — the same protection a
+        // locked layer's frames get.
+        if self.doc.scene().camera().locked {
+            self.status = Some("The camera is locked".into());
+            return;
+        }
         let frame = self.current_frame;
         let centre = self.doc.scene().stage().stage_rect().center();
         let current = self.doc.scene().camera().state_at(frame);
@@ -7032,6 +10037,12 @@ impl Editor {
     /// one, which is a thing an animator can see and do; guessing a length they
     /// then have to *find* and correct is not.
     fn add_camera_move(&mut self, movement: buzz_scene::CameraMove) {
+        // C1: a locked camera refuses a named move, the same as any other
+        // camera edit.
+        if self.doc.scene().camera().locked {
+            self.status = Some("The camera is locked".into());
+            return;
+        }
         let from = self.current_frame;
         let last = self.doc.scene().frame_count().saturating_sub(1);
         let stage = self.doc.scene().stage().stage_rect();
@@ -7069,7 +10080,17 @@ impl Editor {
         match self.light_panel.selected {
             Some(id) => {
                 self.key_light_at(id, frame);
-                self.status = Some("Light keyframe added".into());
+                // Which light and which frame, so whoever pressed it — a
+                // person reading the status line or the Assistant reading
+                // the command's result — can tell the key landed where meant.
+                let name = self
+                    .doc
+                    .scene()
+                    .lights()
+                    .get(id)
+                    .map(|l| l.name.clone())
+                    .unwrap_or_default();
+                self.status = Some(format!("Light keyframe added: {name} at frame {}", frame + 1));
             }
             None => self.status = Some("Select a light first".into()),
         }
@@ -7225,6 +10246,12 @@ impl Editor {
     /// The Camera tool drags the *view*, so dragging right moves the camera
     /// left — the same inversion a real camera has, and what Animate does.
     pub fn nudge_camera(&mut self, delta_doc: Vec2) {
+        // C1: a locked camera refuses `MoveCamera` — the same protection a
+        // locked layer's artwork gets against a stray drag.
+        if self.doc.scene().camera().locked {
+            self.status = Some("The camera is locked".into());
+            return;
+        }
         let frame = self.current_frame;
         let centre = self.doc.scene().stage().stage_rect().center();
         let current = self.doc.scene().camera().state_at(frame);
@@ -7282,6 +10309,66 @@ impl Editor {
         self.selection.prune(self.doc.scene());
         self.selection
             .ensure_active_layer(&self.doc.scene().clone());
+    }
+
+    /// Move a light to sit directly above `above` in the layer stack (or to
+    /// the top with `None`), so it lights that layer and those below it. One
+    /// undo step; selects the light, as picking up any row does.
+    pub fn place_light(&mut self, id: buzz_scene::LightId, above: Option<LayerId>) -> bool {
+        let mut moved = false;
+        self.doc.edit("Move Light", |scene| {
+            moved = scene.place_light(id, above);
+        });
+        self.light_panel.selected = Some(id);
+        moved
+    }
+
+    /// Reorder a layer on the active timeline to a given row index.
+    pub fn reorder_layer(&mut self, id: LayerId, to_index: usize) -> bool {
+        let mut moved = false;
+        self.doc.edit("Reorder Layer", |scene| {
+            moved = scene.reorder_layer(id, to_index);
+        });
+        if moved {
+            self.selection.set_active_layer(Some(id));
+        }
+        moved
+    }
+
+    /// Move a layer — and everything filed under it — to a new row and
+    /// parent folder, as the timeline's own drag does (F1). One undo step.
+    pub fn move_layer_to(&mut self, id: LayerId, to_index: usize, parent: Option<LayerId>) -> bool {
+        let mut moved = false;
+        self.doc.edit("Move Layer", |scene| {
+            moved = scene.move_layer_to(id, to_index, parent);
+        });
+        if moved {
+            self.selection.set_active_layer(Some(id));
+        }
+        moved
+    }
+
+    /// Move the active layer one position up (closer to index 0 / front) or down.
+    pub fn move_active_layer(&mut self, up: bool) -> bool {
+        let Some(layer) = self.selection.active_layer() else {
+            return false;
+        };
+        let scene = self.doc.scene();
+        let Some(curr_idx) = scene.layer_index(layer) else {
+            return false;
+        };
+        let total = scene.layers().len();
+        if up {
+            if curr_idx == 0 {
+                return false;
+            }
+            self.reorder_layer(layer, curr_idx - 1)
+        } else {
+            if curr_idx + 1 >= total {
+                return false;
+            }
+            self.reorder_layer(layer, curr_idx + 1)
+        }
     }
 
     fn delete_selection(&mut self) {
@@ -7351,11 +10438,7 @@ impl Editor {
         let bounds: Vec<kurbo::Rect> = measured.iter().map(|(_, r)| *r).collect();
         let offsets = buzz_ui::align::align_offsets(&bounds, op, stage);
 
-        let moves: Vec<_> = measured
-            .iter()
-            .map(|(id, _)| *id)
-            .zip(offsets)
-            .collect();
+        let moves: Vec<_> = measured.iter().map(|(id, _)| *id).zip(offsets).collect();
         self.offset_selection(&moves, "Align");
     }
 
@@ -7371,11 +10454,7 @@ impl Editor {
         let bounds: Vec<kurbo::Rect> = measured.iter().map(|(_, r)| *r).collect();
         let offsets = buzz_ui::align::distribute_offsets(&bounds, op);
 
-        let moves: Vec<_> = measured
-            .iter()
-            .map(|(id, _)| *id)
-            .zip(offsets)
-            .collect();
+        let moves: Vec<_> = measured.iter().map(|(id, _)| *id).zip(offsets).collect();
         self.offset_selection(&moves, "Distribute");
     }
 
@@ -7505,12 +10584,21 @@ impl Editor {
     }
 
     fn duplicate_selection(&mut self) {
+        // Offset slightly so the duplicate is visible and grabbable.
+        self.duplicate_selection_at("Duplicate", Vec2::new(10.0, 10.0));
+    }
+
+    /// Copy the selection, put the copies where the originals are moved by
+    /// `offset`, and select them. Ctrl+D offsets the copy so it can be seen; an
+    /// Alt-drag does not, because the pointer is about to carry it away — and
+    /// gives its own label so the copy and the drag fold into one undo step.
+    fn duplicate_selection_at(&mut self, label: &'static str, offset: Vec2) {
         if self.selection.is_empty() {
             return;
         }
         let ids = self.selection.ids();
         let mut created = Vec::new();
-        self.doc.edit("Duplicate", |scene| {
+        self.doc.edit(label, |scene| {
             for id in ids {
                 let Some((layer, original)) = scene.find_object(id).map(|(l, o)| (l, o.clone()))
                 else {
@@ -7519,8 +10607,9 @@ impl Editor {
                 let new_id = scene.next_object_id();
                 let mut copy = (*original).clone();
                 copy.id = new_id;
-                // Offset slightly so the duplicate is visible and grabbable.
-                copy.transform = Affine::translate((10.0, 10.0)) * copy.transform;
+                if offset != Vec2::ZERO {
+                    copy.transform = Affine::translate(offset) * copy.transform;
+                }
                 if scene.add_object(layer, copy).is_some() {
                     created.push(new_id);
                 }
@@ -7588,6 +10677,182 @@ impl Editor {
             }
         });
         self.selection.set(freed);
+    }
+
+    /// **Break the selection apart one level** — Animate's Modify ▸ Break
+    /// Apart. Each press takes one level, the way Animate's does:
+    ///
+    /// - **An image-filled shape** bakes its transform into its path and its
+    ///   fill, and turns tiling on, so the Lasso, Eraser and Wand can cut it
+    ///   directly rather than needing another break first. Pressed again on
+    ///   artwork already like that, it says so instead of doing nothing
+    ///   silently.
+    /// - **Text** drops the editable link and keeps the glyph outlines.
+    /// - **A group** frees its children — [`Self::ungroup_selection`]'s own
+    ///   logic.
+    /// - **An instance** drops to its symbol's contents at the frame it is
+    ///   showing: each child's transform folds in the instance's own and the
+    ///   layer parenting between them, a non-identity tint is baked into the
+    ///   colours, and a nested instance stays an instance rather than
+    ///   expanding too.
+    /// - **A warp** bakes to the shape its handles currently make.
+    /// - **An armature** is left alone — unbinding a whole rig is not what
+    ///   one press of this should do.
+    /// - **A plain shape** is a no-op, and leaves no undo step: `doc.edit`
+    ///   already skips recording a step when nothing in the scene changed.
+    fn break_apart_selection(&mut self) {
+        let ids = self.selection.ids();
+        if ids.is_empty() {
+            return;
+        }
+        let at = self.edit_at();
+        let mut produced: Vec<ObjectId> = Vec::new();
+        let mut already_paint = false;
+        let mut skipped_armature = false;
+
+        self.doc.edit("Break Apart", |scene| {
+            for id in ids {
+                let Some((layer, object)) = scene.find_object(id).map(|(l, o)| (l, o.clone()))
+                else {
+                    continue;
+                };
+
+                let is_image_shape = matches!(
+                    &object.kind,
+                    ObjectKind::Shape(s) if s.fill.as_ref().is_some_and(|f| f.paint.is_image())
+                );
+
+                if is_image_shape {
+                    let ObjectKind::Shape(shape) = &object.kind else {
+                        unreachable!("checked above")
+                    };
+                    let Some(image) = shape.fill.as_ref().and_then(|f| f.paint.image()) else {
+                        unreachable!("checked above")
+                    };
+                    if object.transform == Affine::IDENTITY && image.tile {
+                        already_paint = true;
+                        continue;
+                    }
+                    let t = object.transform;
+                    let mut baked_shape = shape.clone();
+                    baked_shape.path = t * baked_shape.path.clone();
+                    let mut baked_image = image.clone();
+                    baked_image.transform = t * baked_image.transform;
+                    baked_image.tile = true;
+                    baked_shape.fill = Some(FillSpec::image(baked_image));
+
+                    let mut updated = (*object).clone();
+                    updated.kind = ObjectKind::Shape(baked_shape);
+                    updated.transform = Affine::IDENTITY;
+                    scene.remove_object(id);
+                    if let Some(new_id) = scene.add_object_at(layer, at.frame, updated) {
+                        produced.push(new_id);
+                    }
+                    continue;
+                }
+
+                if object.text.is_some() {
+                    let mut updated = (*object).clone();
+                    updated.text = None;
+                    scene.remove_object(id);
+                    if let Some(new_id) = scene.add_object_at(layer, at.frame, updated) {
+                        produced.push(new_id);
+                    }
+                    continue;
+                }
+
+                match &object.kind {
+                    ObjectKind::Group(children) => {
+                        let children = children.clone();
+                        scene.remove_object(id);
+                        for child in children {
+                            let mut promoted = (*child).clone();
+                            // Fold the group's transform into each child so
+                            // nothing jumps when the group disappears — the
+                            // same idiom `ungroup_selection` uses.
+                            promoted.transform = object.transform * promoted.transform;
+                            promoted.id = scene.next_object_id();
+                            let child_id = promoted.id;
+                            if scene.add_object(layer, promoted).is_some() {
+                                produced.push(child_id);
+                            }
+                        }
+                    }
+                    ObjectKind::Instance(instance) => {
+                        let Some(symbol) = scene.library().get(instance.symbol).cloned() else {
+                            continue;
+                        };
+                        let elapsed = scene
+                            .layers()
+                            .get(layer)
+                            .map(|l| elapsed_on(l, at.frame))
+                            .unwrap_or(0);
+                        let inner = instance.resolve_frame(symbol.kind, elapsed, symbol.length());
+                        let color = instance.color;
+
+                        let mut promoted_children: Vec<Object> = Vec::new();
+                        for sym_layer in symbol.layers.drawable_at(inner) {
+                            if sym_layer.kind.is_mask() || sym_layer.kind == LayerKind::Guide {
+                                continue;
+                            }
+                            let follows =
+                                symbol.layers.inherited_transform(sym_layer.id, inner);
+                            for child in sym_layer.frames.resolved_at(inner).iter() {
+                                let mut promoted = child.clone();
+                                promoted.transform =
+                                    object.transform * follows * promoted.transform;
+                                if color != buzz_scene::ColorTransform::default()
+                                    && let ObjectKind::Shape(s) = &mut promoted.kind
+                                {
+                                    if let Some(fill) = s.fill.as_mut() {
+                                        fill.paint = fill.paint.map_colors(|c| color.apply(c));
+                                    }
+                                    if let Some(stroke) = s.stroke.as_mut() {
+                                        stroke.paint =
+                                            stroke.paint.map_colors(|c| color.apply(c));
+                                    }
+                                }
+                                promoted_children.push(promoted);
+                            }
+                        }
+                        scene.remove_object(id);
+                        for mut child in promoted_children {
+                            child.id = scene.next_object_id();
+                            let child_id = child.id;
+                            if scene.add_object(layer, child).is_some() {
+                                produced.push(child_id);
+                            }
+                        }
+                    }
+                    ObjectKind::Warp(warp) => {
+                        let mut updated = (*object).clone();
+                        updated.kind = ObjectKind::Shape(warp.warped());
+                        scene.remove_object(id);
+                        if let Some(new_id) = scene.add_object_at(layer, at.frame, updated) {
+                            produced.push(new_id);
+                        }
+                    }
+                    ObjectKind::Armature(_) => {
+                        skipped_armature = true;
+                    }
+                    // A plain shape has nothing to break apart into.
+                    ObjectKind::Shape(_) => {}
+                }
+            }
+        });
+
+        if !produced.is_empty() {
+            self.selection.set(produced.clone());
+        }
+        self.status = Some(if !produced.is_empty() {
+            format!("Broke apart {} objects", produced.len())
+        } else if already_paint {
+            "Already paint: cut it with the Lasso, Eraser or Wand".into()
+        } else if skipped_armature {
+            "Unbind the rig before breaking it apart".into()
+        } else {
+            "Nothing here to break apart".into()
+        });
     }
 
     fn reorder_selection(&mut self, how: Reorder) {
@@ -7748,6 +11013,43 @@ impl Editor {
         });
     }
 
+    /// Why nothing can be traced right now, or `None` if the selection has a
+    /// picture to trace. Shared by [`Self::trace_with`] and
+    /// `Command::TraceBitmapOptions`, so the dialog and the direct commands
+    /// explain themselves exactly the same way.
+    fn picture_selection_status(&self) -> Option<String> {
+        let ids = self.selection.ids();
+        if ids.is_empty() {
+            return Some("Select a picture to trace first".into());
+        }
+        let mut not_pictures = 0usize;
+        for id in &ids {
+            let Some((_, object)) = self.doc.scene().find_object(*id) else {
+                continue;
+            };
+            let ObjectKind::Shape(shape) = &object.kind else {
+                not_pictures += 1;
+                continue;
+            };
+            let Some(buzz_scene::Paint::Image(fill)) = shape.fill.as_ref().map(|f| &f.paint) else {
+                not_pictures += 1;
+                continue;
+            };
+            if fill.asset.width == 0 || fill.asset.height == 0 {
+                not_pictures += 1;
+                continue;
+            }
+            return None;
+        }
+        Some(if not_pictures > 0 {
+            "Nothing selected is a picture \u{2014} tracing turns an imported bitmap \
+             into shapes"
+                .to_string()
+        } else {
+            "Nothing there to trace".to_string()
+        })
+    }
+
     /// **Turn the selected bitmaps into artwork** — Animate's Trace Bitmap.
     ///
     /// # Why the picture is replaced rather than traced alongside
@@ -7765,12 +11067,12 @@ impl Editor {
     /// them onto the stage is the composition of what the editor already knows:
     /// the unit square to the image's own space (the fill's transform), and
     /// that space to the layer (the object's).
-    fn trace_selection(&mut self, options: buzz_scene::TraceOptions) {
-        let ids = self.selection.ids();
-        if ids.is_empty() {
-            self.status = Some("Select a picture to trace first".into());
+    pub fn trace_with(&mut self, options: buzz_scene::TraceOptions) {
+        if let Some(status) = self.picture_selection_status() {
+            self.status = Some(status);
             return;
         }
+        let ids = self.selection.ids();
         let at = self.edit_at();
 
         // Everything needed is read before the document is touched, so a
@@ -7802,10 +11104,7 @@ impl Editor {
             // Pixels → the unit square → the image's own space → the layer.
             let place = object.transform
                 * fill.transform
-                * Affine::scale_non_uniform(
-                    1.0 / asset.width as f64,
-                    1.0 / asset.height as f64,
-                );
+                * Affine::scale_non_uniform(1.0 / asset.width as f64, 1.0 / asset.height as f64);
             jobs.push((layer, *id, place, report));
         }
 
@@ -7822,15 +11121,26 @@ impl Editor {
 
         let mut made = 0usize;
         let mut specks = 0usize;
+        let mut strokes = 0usize;
+        let mut fills = 0usize;
         let mut colours_note = String::new();
         let mut fresh: Vec<ObjectId> = Vec::new();
         self.doc.edit("Trace Bitmap", |scene| {
             for (layer, id, place, report) in &jobs {
                 specks += report.specks;
+                strokes += report.strokes;
+                fills += report.fills;
                 colours_note = report.message.clone();
                 for shape in &report.shapes {
                     let mut shape = shape.clone();
                     shape.path = *place * shape.path.clone();
+                    // A stroke's width is a scalar in the picture's own
+                    // pixels; `place` can scale the picture unevenly onto the
+                    // stage, so the width has to follow the same area scale
+                    // the path itself just did.
+                    if let Some(s) = shape.stroke.as_mut() {
+                        s.width *= place.determinant().abs().sqrt();
+                    }
                     if let Some(new) = scene.add_shape_at(*layer, at.frame, shape) {
                         fresh.push(new);
                         made += 1;
@@ -7847,10 +11157,12 @@ impl Editor {
         for id in fresh {
             self.selection.toggle(id);
         }
-        self.status = Some(if specks > 0 {
-            format!("{colours_note} \u{2014} {made} shapes on the stage")
-        } else {
-            format!("Traced {made} shapes")
+        self.status = Some(match (specks > 0, strokes > 0 || fills > 0) {
+            (true, _) => format!("{colours_note} \u{2014} {made} shapes on the stage"),
+            (false, true) => format!(
+                "Traced {made} shapes \u{2014} {strokes} lines and {fills} enclosed fills"
+            ),
+            (false, false) => format!("Traced {made} shapes"),
         });
     }
 
@@ -7885,7 +11197,11 @@ impl Editor {
             return;
         }
         let at = self.edit_at();
-        let label = if factor >= 1.0 { "Thicken Lines" } else { "Thin Lines" };
+        let label = if factor >= 1.0 {
+            "Thicken Lines"
+        } else {
+            "Thin Lines"
+        };
 
         let mut touched = 0usize;
         self.doc.edit(label, |scene| {
@@ -8009,6 +11325,27 @@ impl FrameOp {
     }
 }
 
+/// Carry the rest pose of every followed-against layer holding `arrived`
+/// artwork by `delta`, after the artwork itself was carried by it. A layer
+/// rig's links measure motion from each layer's rest pose; without this a
+/// placed layer rig's followers would inherit the placement move as motion
+/// and land twice as far. Layers with no rest pose (no links) are untouched.
+fn carry_rest_poses(scene: &mut Scene, frame: u32, arrived: &[ObjectId], delta: Vec2) {
+    let carried: Vec<buzz_scene::LayerId> = scene
+        .layers()
+        .iter()
+        .filter(|l| {
+            l.rest_pose.is_some() && l.objects_at(frame).iter().any(|o| arrived.contains(&o.id))
+        })
+        .map(|l| l.id)
+        .collect();
+    for id in carried {
+        scene.update_layer(id, |l| {
+            l.rest_pose = l.rest_pose.map(|r| Affine::translate((delta.x, delta.y)) * r);
+        });
+    }
+}
+
 /// Edit an object in place, on the keyframe the playhead is inside.
 ///
 /// **The frame matters.** F6 duplicates a keyframe by cloning the `Arc` around
@@ -8018,6 +11355,21 @@ impl FrameOp {
 /// quietly damage a frame they were not editing.
 fn update_object(scene: &mut Scene, at: EditAt, id: ObjectId, f: impl FnMut(&mut Object)) {
     scene.update_object_where(at, id, f);
+}
+
+/// How long the keyframe governing `frame` has been on screen — what a
+/// symbol instance on the layer counts its own playhead from. Mirrors
+/// `buzz_render::document::elapsed_on`, which a rendered instance uses for
+/// exactly the same reason `break_apart_selection` does: to open the frame an
+/// instance is *actually showing*, not always its first.
+fn elapsed_on(layer: &buzz_scene::Layer, frame: u32) -> u32 {
+    frame
+        - layer
+            .frames
+            .keyframe_at(frame)
+            .map(|k| k.start)
+            .unwrap_or(0)
+            .min(frame)
 }
 
 /// Edit a shape in place, ignoring groups.
@@ -8173,6 +11525,62 @@ fn unturn(
     flat.then(&turned.inverse()?).map_point(point)
 }
 
+/// The affine that carries `local`'s corners onto `quad`, if there is one.
+///
+/// `quad` is the local rectangle's corners as drawn — top-left, top-right,
+/// bottom-right, bottom-left. Three of them fix an affine map; the fourth has to
+/// land where the map puts it, within a millionth of the quad's size, or the
+/// quad is not a parallelogram (a perspective tilt) and there is no affine frame
+/// to hang a transform box on. A rectangle with no width or height, or a quad
+/// collapsed to a line, has no usable axes either.
+fn affine_frame_of(local: Rect, quad: [Point; 4]) -> Option<Affine> {
+    let (w, h) = (local.width(), local.height());
+    if !(w > 0.0 && h > 0.0) {
+        return None;
+    }
+    let across = (quad[1] - quad[0]) / w;
+    let down = (quad[3] - quad[0]) / h;
+    let size = (quad[1] - quad[0]).hypot().max((quad[3] - quad[0]).hypot());
+    if !(size > 0.0 && size.is_finite()) {
+        return None;
+    }
+    // A collapsed map: the corners lie on a line, so the box would have no area.
+    if across.cross(down).abs() <= 1e-9 * across.hypot() * down.hypot() {
+        return None;
+    }
+    let origin = quad[0].to_vec2() - across * local.x0 - down * local.y0;
+    let map = Affine::new([across.x, across.y, down.x, down.y, origin.x, origin.y]);
+    let fourth = map * Point::new(local.x1, local.y1);
+    ((fourth - quad[2]).hypot() <= 1e-6 * size).then_some(map)
+}
+
+/// Tight local artwork extent while leaving `object.transform` unapplied.
+///
+/// `Scene::resolved_bounds_with` intentionally returns parent-space bounds for
+/// broad-phase queries. Selection chrome needs the step before that so it can
+/// project the four corners through the affine without boxing them twice.
+fn resolved_local_bounds(
+    scene: &Scene,
+    object: &Object,
+    table: &std::collections::HashMap<buzz_scene::SymbolId, Rect>,
+) -> Rect {
+    match &object.kind {
+        ObjectKind::Instance(instance) => table
+            .get(&instance.symbol)
+            .copied()
+            .filter(|bounds| *bounds != Rect::ZERO)
+            .unwrap_or_else(|| object.local_bounds()),
+        ObjectKind::Group(children) => children
+            .iter()
+            .map(|child| scene.resolved_bounds_with(child, table))
+            .reduce(|a, b| a.union(b))
+            .unwrap_or(Rect::ZERO),
+        ObjectKind::Shape(_) | ObjectKind::Armature(_) | ObjectKind::Warp(_) => {
+            object.local_bounds()
+        }
+    }
+}
+
 fn object_contains(
     scene: &Scene,
     object: &Object,
@@ -8315,7 +11723,8 @@ fn sampled_paint(
         ObjectKind::Group(children) => {
             let mut hit = None;
             for child in children {
-                if let Some(paint) = sampled_paint(scene, child, local, tolerance, frame, depth, table)
+                if let Some(paint) =
+                    sampled_paint(scene, child, local, tolerance, frame, depth, table)
                 {
                     hit = Some(paint);
                 }
@@ -8481,6 +11890,13 @@ impl DerefVector for Affine {
     }
 }
 
+/// How many frames a new document's first layer spans: one minute at `fps`,
+/// within the timeline's own 16 000-frame limit.
+fn new_document_frames(fps: f64) -> u32 {
+    let fps = if fps.is_finite() && fps > 0.0 { fps } else { 24.0 };
+    ((fps * 60.0).round() as u32).clamp(1, 16_000)
+}
+
 /// Add a shape using Animate's **merge shape** rules.
 ///
 /// Same-coloured fills fuse into one shape; a different colour cuts a hole.
@@ -8533,6 +11949,94 @@ fn ensure_keyframe_for_drawing(scene: &mut Scene, layer: LayerId, frame: u32, au
     }
 }
 
+/// **What colour a text segment with no run painting it gets.**
+///
+/// A text object has no colour field of its own — a plain one is simply a
+/// filled `Shape`, so its fill *is* the colour; a styled one is a `Group` of
+/// filled shapes, none of which is more "the base" than another once built,
+/// so the first child's fill stands in for it. Either way this is what
+/// [`Editor::rebuild_text_object`] paints every segment a run does not name a
+/// colour for, so the base colour a document already carries survives being
+/// rebuilt into runs and back again.
+fn base_text_color(object: &Object) -> Color {
+    let child_color = |o: &Object| match &o.kind {
+        ObjectKind::Shape(s) => s.fill.as_ref().map(|f| f.color()),
+        _ => None,
+    };
+    match &object.kind {
+        ObjectKind::Group(children) => children
+            .iter()
+            .find_map(|c| child_color(c))
+            .unwrap_or(Color::BLACK),
+        _ => child_color(object).unwrap_or(Color::BLACK),
+    }
+}
+
+/// **Fill every gap `TextData::runs` leaves against the base**, so the result
+/// is a full, gapless, sorted partition of `content` — one entry per
+/// contiguous segment, paired with the colour it paints in (a run's own, or
+/// `base_color` where nothing overrides it). What
+/// [`buzz_text::outline_runs`] lays out and [`Editor::rebuild_text_object`]
+/// turns into one shape per segment.
+fn partition_text_runs(
+    content: &str,
+    base_size: f64,
+    base_font: Option<&str>,
+    base_style: buzz_scene::FontStyle,
+    base_color: Color,
+    runs: &[buzz_scene::TextRun],
+) -> Vec<(buzz_text::TextSpan, Color)> {
+    let len = content.chars().count();
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&buzz_scene::TextRun> = runs.iter().collect();
+    sorted.sort_by_key(|r| r.start);
+
+    let base_span = |start: usize, end: usize| {
+        (
+            buzz_text::TextSpan {
+                start,
+                end,
+                size: base_size,
+                font: base_font.map(str::to_string),
+                style: base_style,
+            },
+            base_color,
+        )
+    };
+
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for run in sorted {
+        let start = run.start.min(len);
+        let end = run.end.min(len);
+        if start > at {
+            out.push(base_span(at, start));
+        }
+        if end > start {
+            out.push((
+                buzz_text::TextSpan {
+                    start,
+                    end,
+                    size: run.size.unwrap_or(base_size),
+                    font: run.font.clone().or_else(|| base_font.map(str::to_string)),
+                    style: buzz_scene::FontStyle::new(
+                        run.bold.unwrap_or(base_style.bold),
+                        run.italic.unwrap_or(base_style.italic),
+                    ),
+                },
+                run.color.unwrap_or(base_color),
+            ));
+            at = at.max(end);
+        }
+    }
+    if at < len {
+        out.push(base_span(at, len));
+    }
+    out
+}
+
 /// The area a raw shape actually paints, in its **layer's** space.
 ///
 /// Its fill, its stroke outlined at its own width, or the union of the two —
@@ -8540,7 +12044,7 @@ fn ensure_keyframe_for_drawing(scene: &mut Scene, layer: LayerId, frame: u32, au
 /// than of the bounding boxes, which cross whenever two shapes are merely near.
 /// A hairline is given a real width, so a fine line laid across a fill still
 /// reads as touching it. `None` for anything that is not a raw shape, and for a
-/// shape that paints nothing. See [`Editor::drawing_group_of`].
+/// shape that paints nothing. See [`Editor::connected_pieces`].
 fn shape_region(object: &Object) -> Option<BezPath> {
     let ObjectKind::Shape(shape) = &object.kind else {
         return None;
@@ -8687,7 +12191,14 @@ fn cut_fills_along(
         });
         if let Some(template) = template {
             for path in pieces {
-                scene.add_shape_at(layer, frame, ShapeData { path, ..template.clone() });
+                scene.add_shape_at(
+                    layer,
+                    frame,
+                    ShapeData {
+                        path,
+                        ..template.clone()
+                    },
+                );
             }
         }
     }
@@ -8948,10 +12459,11 @@ fn merge_shape_into_layer(
             // Checked against the fill accumulated so far, not just the
             // incoming stroke, so a chain of three touching shapes still
             // fuses as one even though the first and last never meet.
-            let touches = buzz_geom::boolean(&merged, &path, buzz_geom::BoolOp::Intersect, opts.fast())
-                .area()
-                .abs()
-                > 1e-9;
+            let touches =
+                buzz_geom::boolean(&merged, &path, buzz_geom::BoolOp::Intersect, opts.fast())
+                    .area()
+                    .abs()
+                    > 1e-9;
             if !touches {
                 continue;
             }
@@ -9027,9 +12539,7 @@ fn merge_shape_into_layer(
     // something actually fused, so a stroke that landed on its own keeps
     // exactly the fill it was drawn with.
     let mut new_fill = new_fill;
-    if fused
-        && let Paint::Gradient(gradient) = &new_fill.paint
-    {
+    if fused && let Paint::Gradient(gradient) = &new_fill.paint {
         let mut ramp = (**gradient).clone();
         ramp.fit_to(merged.bounding_box());
         new_fill.paint = Paint::Gradient(std::sync::Arc::new(ramp));
@@ -9073,7 +12583,11 @@ fn merge_shape_into_layer(
 /// the same silence by a different route.
 ///
 /// `false` when there was nothing to place \u2014 a sound of no length.
-fn place_sound_on_stage(scene: &mut buzz_scene::Scene, sound: buzz_scene::SoundId, fps: f64) -> bool {
+fn place_sound_on_stage(
+    scene: &mut buzz_scene::Scene,
+    sound: buzz_scene::SoundId,
+    fps: f64,
+) -> bool {
     let frames = scene
         .sounds()
         .get(sound)
@@ -9146,10 +12660,7 @@ fn interior_point(path: &buzz_geom::BezPath) -> Option<Point> {
     const STEPS: [f64; 5] = [0.3, 0.7, 0.5, 0.2, 0.8];
     for fy in STEPS {
         for fx in STEPS {
-            let point = Point::new(
-                box_.x0 + box_.width() * fx,
-                box_.y0 + box_.height() * fy,
-            );
+            let point = Point::new(box_.x0 + box_.width() * fx, box_.y0 + box_.height() * fy);
             if buzz_geom::fill_contains(path, point, rule) {
                 return Some(point);
             }
@@ -9183,34 +12694,70 @@ mod tests {
     fn a_reference_layer_is_a_guide_layer() {
         let mut e = editor();
         e.run(Command::NewReferenceLayer);
-        let active = e.selection.active_layer().expect("the reference layer is active");
+        let active = e
+            .selection
+            .active_layer()
+            .expect("the reference layer is active");
         let kind = e.doc.scene().layers().get(active).expect("the layer").kind;
-        assert_eq!(kind, buzz_scene::LayerKind::Guide, "a reference layer is a guide layer");
+        assert_eq!(
+            kind,
+            buzz_scene::LayerKind::Guide,
+            "a reference layer is a guide layer"
+        );
     }
 
     #[test]
     fn symmetry_makes_the_right_number_of_copies() {
         let size = buzz_geom::Size::new(400.0, 300.0);
-        let sym = |mode, radial| SymmetrySettings { mode, radial_count: radial };
-        assert_eq!(symmetry_transforms(sym(SymmetryMode::Off, 6), size).len(), 0);
-        assert_eq!(symmetry_transforms(sym(SymmetryMode::MirrorX, 6), size).len(), 1);
-        assert_eq!(symmetry_transforms(sym(SymmetryMode::Both, 6), size).len(), 3);
-        assert_eq!(symmetry_transforms(sym(SymmetryMode::Radial, 6), size).len(), 5);
+        let sym = |mode, radial| SymmetrySettings {
+            mode,
+            radial_count: radial,
+        };
+        assert_eq!(
+            symmetry_transforms(sym(SymmetryMode::Off, 6), size).len(),
+            0
+        );
+        assert_eq!(
+            symmetry_transforms(sym(SymmetryMode::MirrorX, 6), size).len(),
+            1
+        );
+        assert_eq!(
+            symmetry_transforms(sym(SymmetryMode::Both, 6), size).len(),
+            3
+        );
+        assert_eq!(
+            symmetry_transforms(sym(SymmetryMode::Radial, 6), size).len(),
+            5
+        );
         // Radial count is clamped into a sane range.
-        assert_eq!(symmetry_transforms(sym(SymmetryMode::Radial, 100), size).len(), 23);
+        assert_eq!(
+            symmetry_transforms(sym(SymmetryMode::Radial, 100), size).len(),
+            23
+        );
     }
 
     #[test]
     fn mirror_x_reflects_across_the_stage_centre() {
         let size = buzz_geom::Size::new(400.0, 300.0);
         let t = symmetry_transforms(
-            SymmetrySettings { mode: SymmetryMode::MirrorX, radial_count: 6 },
+            SymmetrySettings {
+                mode: SymmetryMode::MirrorX,
+                radial_count: 6,
+            },
             size,
         )[0];
         // A point 30 left of centre lands 30 right of it; the row is unchanged.
         let p = t * Point::new(170.0, 120.0); // centre x = 200
-        assert!((p.x - 230.0).abs() < 1e-9, "x should mirror to 230, got {}", p.x);
-        assert!((p.y - 120.0).abs() < 1e-9, "y should be unchanged, got {}", p.y);
+        assert!(
+            (p.x - 230.0).abs() < 1e-9,
+            "x should mirror to 230, got {}",
+            p.x
+        );
+        assert!(
+            (p.y - 120.0).abs() < 1e-9,
+            "y should be unchanged, got {}",
+            p.y
+        );
     }
 
     /// Mirroring is a property of *drawing*, not of one tool. The vector
@@ -9353,6 +12900,52 @@ mod tests {
         );
     }
 
+    /// **The rub lands where, and as wide as, it was drawn — on a moved and
+    /// scaled shape too.** The report: the erased area did not match the
+    /// eraser. The rub was applied to the path's own coordinates without
+    /// undoing the shape's transform, so on a shape scaled ×4 and moved it
+    /// cut a quarter-width gash somewhere else.
+    #[test]
+    fn the_eraser_cuts_a_transformed_shape_where_it_was_drawn() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        // A 40-unit square at the origin, shown ×4 at (200, 100): on stage it
+        // covers x 200..360, y 100..260.
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(square(0.0, 0.0, 40.0), Color::BLACK),
+            label: "Draw",
+        });
+        let id = e.scene().layers().iter().flat_map(|l| l.objects_at(0).to_vec()).next().expect("the square").id;
+        let at = e.edit_at();
+        e.doc.edit("Place", |scene| {
+            update_object(scene, at, id, |o| {
+                o.transform = Affine::translate((200.0, 100.0)) * Affine::scale(4.0);
+            });
+        });
+
+        // A 20-unit-wide rub straight down the middle of it on stage.
+        let mut path = BezPath::new();
+        path.move_to(Point::new(280.0, 80.0));
+        path.line_to(Point::new(280.0, 280.0));
+        e.apply(ToolAction::Erase { path, width: 20.0 });
+
+        // Two halves, each 70 stage units wide (160 - 20, halved), which is
+        // 17.5 of the shape's own units under the ×4.
+        let pieces: Vec<_> = e.scene().layers().iter().flat_map(|l| l.objects_at(0).to_vec()).collect();
+        assert_eq!(pieces.len(), 2, "the rub should cut the square in two");
+        for piece in &pieces {
+            let on_stage = piece.bounds();
+            assert!(
+                (on_stage.width() - 70.0).abs() < 1.0,
+                "each half should be 70 wide on stage, got {on_stage:?}"
+            );
+            assert!(
+                on_stage.x0 >= 199.0 && on_stage.x1 <= 361.0,
+                "each half should stay where the square was, got {on_stage:?}"
+            );
+        }
+    }
+
     /// **The report: selecting a line was tedious.**
     ///
     /// Brush strokes and imported line art are *filled* paths, and a fill was
@@ -9376,11 +12969,9 @@ mod tests {
                     Color::BLACK,
                 ),
             );
-            scene
-                .edit_layers()
-                .update(layer, |l| {
-                    l.frames.set_objects(0, vec![Arc::new(line)]);
-                });
+            scene.edit_layers().update(layer, |l| {
+                l.frames.set_objects(0, vec![Arc::new(line)]);
+            });
         });
         let id = id.expect("the line");
 
@@ -9406,9 +12997,7 @@ mod tests {
 
         // Well clear of it is still empty stage: the slack is slack, not a
         // magnet.
-        let far = e
-            .camera
-            .doc_to_screen(buzz_geom::Point::new(200.0, 160.0));
+        let far = e.camera.doc_to_screen(buzz_geom::Point::new(200.0, 160.0));
         assert_eq!(e.object_at(e.screen_to_edit(far), e.pick_tolerance()), None);
     }
 
@@ -9560,7 +13149,11 @@ mod tests {
 
         // And leave as one undo step.
         assert!(e.doc.undo());
-        assert_eq!(e.scene().shape_count(), 0, "undo should remove the whole stroke");
+        assert_eq!(
+            e.scene().shape_count(),
+            0,
+            "undo should remove the whole stroke"
+        );
     }
 
     /// A wave stroke, as the Wave brush hands one over.
@@ -9602,7 +13195,10 @@ mod tests {
         let layer = e.active_layer().expect("a layer");
         let timeline = &e.scene().layers().get(layer).expect("the layer").frames;
         assert_eq!(timeline.keyframe_count(), 8, "one keyframe per frame");
-        assert!(timeline.length() >= 8, "the layer should reach the last frame");
+        assert!(
+            timeline.length() >= 8,
+            "the layer should reach the last frame"
+        );
 
         for frame in 0..8u32 {
             assert_eq!(
@@ -9615,7 +13211,11 @@ mod tests {
         // And it leaves as one undo step, like every other stroke.
         assert!(e.doc.undo());
         let after = &e.scene().layers().get(layer).expect("the layer").frames;
-        assert_eq!(after.keyframe_count(), 1, "undo should take the whole cycle");
+        assert_eq!(
+            after.keyframe_count(),
+            1,
+            "undo should take the whole cycle"
+        );
     }
 
     /// The bug this order was chosen to avoid: every keyframe is made before
@@ -9826,7 +13426,10 @@ mod tests {
             "the duplicate carries the artwork with it"
         );
         assert!(
-            e.status.as_deref().unwrap_or_default().contains("Duplicated"),
+            e.status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Duplicated"),
             "and says what it did: {:?}",
             e.status
         );
@@ -9865,9 +13468,9 @@ mod tests {
             };
         });
 
-        let scenes = e.doc.film();
+        let scenes = e.doc.film_with_lengths();
         assert_eq!(scenes.len(), 3);
-        let reel = buzz_export::Reel::of(scenes.iter());
+        let reel = buzz_export::Reel::of_lengths(scenes.iter().map(|(s, l)| (s, *l)));
 
         assert_eq!(
             e.doc.film_frames(),
@@ -10029,6 +13632,170 @@ mod tests {
         assert!(
             heavy > light * 2.0,
             "a hard press should paint far wider than a light one: {heavy:.2} against {light:.2}"
+        );
+    }
+
+    /// **Viscosity changes a drawn stroke.** Runny paint (low viscosity)
+    /// pools where the brush lingers and comes out visibly fatter than thick
+    /// paint (high viscosity) drawn the same way.
+    #[test]
+    fn viscosity_changes_a_drawn_stroke() {
+        let height_at = |viscosity: f64| -> f64 {
+            let mut e = editor();
+            e.style.brush.kind = buzz_ui::BrushKind::Normal;
+            e.style.brush.size = 30.0;
+            e.style.brush.smoothing = 0.0;
+            e.style.brush.taper = 0.0;
+            e.style.brush.viscosity = viscosity;
+            e.set_tool(ToolId::Brush);
+
+            let from = Point::new(100.0, 200.0);
+            let to = Point::new(400.0, 200.0);
+            e.pointer_down_at(from, Mods::default(), Some(0.0), None);
+            for i in 1..=40 {
+                let t = f64::from(i) / 40.0;
+                e.pointer_move_at(from.lerp(to, t), Mods::default(), Some(t * 4.0), None);
+            }
+            e.pointer_up_at(to, Some(4.0), None);
+
+            e.scene()
+                .layers()
+                .iter()
+                .flat_map(|l| l.objects_at(0).iter())
+                .map(|o| o.bounds().height())
+                .fold(0.0, f64::max)
+        };
+
+        let runny = height_at(0.0);
+        let thick = height_at(1.0);
+        assert!(
+            runny > thick * 1.25,
+            "runny paint should pool visibly fatter than thick paint: runny {runny:.2} against thick {thick:.2}"
+        );
+    }
+
+    /// **The preview is the commit.** Nothing about a stroke changes between
+    /// the last frame drawn while dragging and what lands when the pointer
+    /// lifts — including at zero viscosity, where pooling is at its most
+    /// visible.
+    #[test]
+    fn the_preview_is_the_commit_at_zero_viscosity() {
+        let mut e = editor();
+        e.style.brush.kind = buzz_ui::BrushKind::Fluid;
+        e.style.brush.viscosity = 0.0;
+        e.set_tool(ToolId::Brush);
+
+        let from = Point::new(100.0, 200.0);
+        let to = Point::new(400.0, 260.0);
+        e.pointer_down_at(from, Mods::default(), Some(0.0), None);
+        for i in 1..=12 {
+            let t = f64::from(i) / 12.0;
+            e.pointer_move_at(from.lerp(to, t), Mods::default(), Some(t * 0.4), None);
+        }
+
+        let preview_path = match e.preview() {
+            Preview::Artwork(shapes) => shapes
+                .first()
+                .expect("a stroke in flight")
+                .path
+                .clone(),
+            other => panic!("expected an in-flight stroke, got {other:?}"),
+        };
+
+        // Released at exactly the last point and time the preview already
+        // saw, so the sample list committed is the same one the preview was
+        // built from.
+        e.pointer_up_at(to, Some(0.4), None);
+
+        let committed_path = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .find_map(|o| match &o.kind {
+                ObjectKind::Shape(shape) => Some(shape.path.clone()),
+                _ => None,
+            })
+            .expect("the stroke was committed");
+
+        assert_eq!(
+            preview_path, committed_path,
+            "the in-flight preview must equal what gets committed"
+        );
+    }
+
+    /// Remembering the tips only writes to the workspace when something
+    /// actually changed, so a caller can save on every frame without
+    /// hammering the disk.
+    #[test]
+    fn remember_brush_tips_returns_true_once_then_false() {
+        let mut e = editor();
+        assert_eq!(
+            e.workspace.brush_tips,
+            buzz_ui::BrushTips::default(),
+            "nothing remembered yet"
+        );
+
+        e.style.brush.fluid_tip = buzz_geom::TipShape::Chisel {
+            angle: 10.0,
+            thickness: 0.4,
+        };
+        assert!(e.remember_brush_tips(), "the tip changed");
+        assert_eq!(e.workspace.brush_tips.fluid, e.style.brush.fluid_tip);
+
+        assert!(
+            !e.remember_brush_tips(),
+            "nothing changed since the last remembering"
+        );
+    }
+
+    /// A chisel tip on a Normal brush draws a visibly different stroke from a
+    /// round tip on a Fluid brush, for the same drag.
+    #[test]
+    fn different_tips_give_different_heights_for_the_same_drag() {
+        let height_with = |kind: buzz_ui::BrushKind, tip: buzz_geom::TipShape| -> f64 {
+            let mut e = editor();
+            e.style.brush.kind = kind;
+            e.style.brush.size = 20.0;
+            e.style.brush.smoothing = 0.0;
+            e.style.brush.taper = 0.0;
+            e.style.brush.viscosity = 1.0;
+            match kind {
+                buzz_ui::BrushKind::Normal => e.style.brush.normal_tip = tip,
+                buzz_ui::BrushKind::Fluid => e.style.brush.fluid_tip = tip,
+                _ => {}
+            }
+            e.set_tool(ToolId::Brush);
+
+            let from = Point::new(100.0, 200.0);
+            let to = Point::new(300.0, 200.0);
+            e.pointer_down_at(from, Mods::default(), Some(0.0), None);
+            for i in 1..=20 {
+                let t = f64::from(i) / 20.0;
+                e.pointer_move_at(from.lerp(to, t), Mods::default(), Some(t * 2.0), None);
+            }
+            e.pointer_up_at(to, Some(2.0), None);
+
+            e.scene()
+                .layers()
+                .iter()
+                .flat_map(|l| l.objects_at(0).iter())
+                .map(|o| o.bounds().height())
+                .fold(0.0, f64::max)
+        };
+
+        let chisel = height_with(
+            buzz_ui::BrushKind::Normal,
+            buzz_geom::TipShape::Chisel {
+                angle: 0.0,
+                thickness: 0.2,
+            },
+        );
+        let round = height_with(buzz_ui::BrushKind::Fluid, buzz_geom::TipShape::Round);
+
+        assert!(
+            (chisel - round).abs() > 1.0,
+            "a chisel and a round tip should not draw the same height: chisel {chisel:.2} round {round:.2}"
         );
     }
 
@@ -10396,11 +14163,18 @@ mod tests {
             .with_blend(buzz_scene::PaintBlend::Additive),
             label: "Brush",
         });
-        assert_eq!(e.scene().shape_count(), 3, "a build-up colour never cuts build-up paint");
+        assert_eq!(
+            e.scene().shape_count(),
+            3,
+            "a build-up colour never cuts build-up paint"
+        );
 
         // And a Normal shape drawn over build-up paint sits on top, never cuts it.
         e.apply(ToolAction::AddShape {
-            shape: ShapeData::filled(Rect::new(30.0, 30.0, 70.0, 70.0).to_path(1e-9), Color::WHITE),
+            shape: ShapeData::filled(
+                Rect::new(30.0, 30.0, 70.0, 70.0).to_path(1e-9),
+                Color::WHITE,
+            ),
             label: "Draw",
         });
         assert_eq!(
@@ -10439,7 +14213,10 @@ mod tests {
             }),
             blend: buzz_scene::PaintBlend::default(),
         };
-        e.apply(ToolAction::AddShape { shape: rect, label: "Draw Rectangle" });
+        e.apply(ToolAction::AddShape {
+            shape: rect,
+            label: "Draw Rectangle",
+        });
 
         // Two objects: a fill-only one and an outline-only one.
         let parts: Vec<(ObjectId, bool, bool)> = e
@@ -10452,16 +14229,33 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(parts.len(), 2, "the fill and the outline are separate objects");
+        assert_eq!(
+            parts.len(),
+            2,
+            "the fill and the outline are separate objects"
+        );
         let fill_id = parts.iter().find(|(_, f, s)| *f && !*s).map(|(id, ..)| *id);
         let line_id = parts.iter().find(|(_, f, s)| !*f && *s).map(|(id, ..)| *id);
         let fill_id = fill_id.expect("a fill-only object");
         let line_id = line_id.expect("an outline-only object");
 
         // A click on the edge finds the outline; a click inside finds the fill.
-        let hit = |p: Point| e.object_at(e.screen_to_edit(e.camera.doc_to_screen(p)), e.pick_tolerance());
-        assert_eq!(hit(Point::new(0.0, 40.0)), Some(line_id), "the edge is the outline");
-        assert_eq!(hit(Point::new(40.0, 40.0)), Some(fill_id), "the inside is the fill");
+        let hit = |p: Point| {
+            e.object_at(
+                e.screen_to_edit(e.camera.doc_to_screen(p)),
+                e.pick_tolerance(),
+            )
+        };
+        assert_eq!(
+            hit(Point::new(0.0, 40.0)),
+            Some(line_id),
+            "the edge is the outline"
+        );
+        assert_eq!(
+            hit(Point::new(40.0, 40.0)),
+            Some(fill_id),
+            "the inside is the fill"
+        );
 
         // Selecting and deleting the outline leaves the fill behind.
         e.selection.select_one(line_id);
@@ -10476,7 +14270,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(left, vec![(true, false)], "only the fill remains after the line is deleted");
+        assert_eq!(
+            left,
+            vec![(true, false)],
+            "only the fill remains after the line is deleted"
+        );
     }
 
     /// ...and a different colour cuts.
@@ -10595,39 +14393,933 @@ mod tests {
         assert!(e.selection.is_empty());
     }
 
-    /// **Free Transform grabs the touching pieces of a drawing, and only
-    /// those.** A drawing is laid down as separate raw shapes — two colours and
-    /// a line are three objects — and under the transform box that read as three
-    /// things to move one at a time. Clicking any piece now takes the pieces
-    /// that touch it; a separate drawing that merely shares the layer is left
-    /// alone.
-    #[test]
-    fn free_transform_grabs_the_touching_pieces_of_a_drawing() {
-        let mut e = editor();
-        e.style.drawing_mode = DrawingMode::ObjectDrawing;
-        // Two overlapping pieces (one drawing) and one well away (another).
-        let a = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a");
-        let b = draw_square(&mut e, 20.0, 20.0, 40.0, Color::WHITE).expect("b");
-        let far = draw_square(&mut e, 300.0, 300.0, 40.0, Color::WHITE).expect("far");
-
-        e.set_tool(ToolId::FreeTransform);
-        e.selection.clear();
-
-        // Click a spot that is inside `a` only.
-        e.apply(ToolAction::PickAt {
-            point: Point::new(8.0, 8.0),
-            additive: false,
+    /// A stroke-only object (a line) laid straight onto the active layer.
+    fn add_line(e: &mut Editor, from: Point, to: Point, width: f64) -> ObjectId {
+        let mut line = BezPath::new();
+        line.move_to(from);
+        line.line_to(to);
+        let layer = e.selection.active_layer().expect("an active layer");
+        let mut id = None;
+        e.doc.edit("Draw", |s| {
+            id = s.add_shape(layer, ShapeData::stroked(line.clone(), Color::BLACK, width));
         });
+        id.expect("the line")
+    }
 
-        assert!(
-            e.selection.contains(a) && e.selection.contains(b),
-            "the two touching pieces should be grabbed as one"
+    /// The editor's pointer for a document point, with the test camera.
+    fn screen_of(e: &Editor, p: Point) -> Point {
+        e.camera.doc_to_screen(p)
+    }
+
+    /// **E3. A click picks the one object under it, with either tool.** A
+    /// drawing is laid down as separate raw shapes, and Free Transform used to
+    /// grow the pick to every shape that touched the one clicked — so the first
+    /// click took the whole drawing. Animate's does not: a click on a fill takes
+    /// that fill, a click on a line that line. (Was
+    /// `free_transform_grabs_the_touching_pieces_of_a_drawing`, which asserted
+    /// the growth.)
+    #[test]
+    fn a_click_picks_only_the_object_under_it_with_either_tool() {
+        for tool in [ToolId::Selection, ToolId::FreeTransform] {
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::ObjectDrawing;
+            // Two overlapping fills (one drawing) and one well away.
+            let a = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a");
+            let b = draw_square(&mut e, 20.0, 20.0, 40.0, Color::WHITE).expect("b");
+            let far = draw_square(&mut e, 300.0, 300.0, 40.0, Color::WHITE).expect("far");
+            // And a line across the first.
+            let line = add_line(&mut e, Point::new(-10.0, 8.0), Point::new(30.0, 8.0), 2.0);
+
+            e.set_tool(tool);
+            e.selection.clear();
+
+            // A spot inside `a` only, off the line.
+            e.apply(ToolAction::PickAt {
+                point: Point::new(8.0, 30.0),
+                additive: false,
+            });
+            assert_eq!(
+                e.selection.ids(),
+                vec![a],
+                "[{tool:?}] a click on a fill takes that fill and nothing that touches it"
+            );
+
+            // The line: that line only, not the fill it lies across.
+            e.apply(ToolAction::PickAt {
+                point: Point::new(-5.0, 8.0),
+                additive: false,
+            });
+            assert_eq!(
+                e.selection.ids(),
+                vec![line],
+                "[{tool:?}] a click on a stroke takes that stroke"
+            );
+
+            // Shift toggles the one object, in and out.
+            e.apply(ToolAction::PickAt {
+                point: Point::new(50.0, 50.0),
+                additive: true,
+            });
+            assert!(
+                e.selection.contains(b) && e.selection.contains(line) && e.selection.len() == 2,
+                "[{tool:?}] Shift adds only the object clicked"
+            );
+            e.apply(ToolAction::PickAt {
+                point: Point::new(50.0, 50.0),
+                additive: true,
+            });
+            assert_eq!(e.selection.ids(), vec![line], "[{tool:?}] and takes it out again");
+            assert!(!e.selection.contains(far));
+        }
+    }
+
+    /// **E3. A fill drawn in Merge Shape comes down as two objects — the fill and
+    /// its outline — and a click takes the one it lands on.**
+    #[test]
+    fn clicking_a_fill_or_its_outline_takes_one_of_the_two() {
+        for tool in [ToolId::Selection, ToolId::FreeTransform] {
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::MergeShape;
+            e.apply(ToolAction::AddShape {
+                shape: ShapeData {
+                    path: square(100.0, 100.0, 100.0),
+                    fill: Some(FillSpec {
+                        paint: Paint::Solid(Color::WHITE),
+                        rule: buzz_geom::FillMode::NonZero,
+                        swatch: None,
+                    }),
+                    stroke: Some(StrokeSpec {
+                        paint: Paint::Solid(Color::BLACK),
+                        width: 4.0,
+                        hairline: false,
+                        swatch: None,
+                    }),
+                    blend: buzz_scene::PaintBlend::Normal,
+                },
+                label: "Draw",
+            });
+            assert_eq!(e.scene().shape_count(), 2, "a fill and its outline");
+            e.set_tool(tool);
+            e.selection.clear();
+
+            let kind_of = |e: &Editor| -> (bool, bool) {
+                assert_eq!(e.selection.len(), 1, "[{tool:?}] one object");
+                let id = e.selection.iter().next().unwrap();
+                let (_, o) = e.scene().find_object(id).unwrap();
+                let ObjectKind::Shape(s) = &o.kind else {
+                    panic!("a shape")
+                };
+                (s.fill.is_some(), s.stroke.is_some())
+            };
+
+            e.apply(ToolAction::PickAt {
+                point: Point::new(150.0, 150.0),
+                additive: false,
+            });
+            assert_eq!(kind_of(&e), (true, false), "[{tool:?}] the middle is the fill");
+
+            e.apply(ToolAction::PickAt {
+                point: Point::new(100.0, 150.0),
+                additive: false,
+            });
+            assert_eq!(kind_of(&e), (false, true), "[{tool:?}] the edge is the outline");
+        }
+    }
+
+    /// **E3. A double-click on a fill takes it and the strokes that touch it.**
+    /// Not another fill, even one it overlaps, and not a stroke elsewhere.
+    #[test]
+    fn double_clicking_a_fill_selects_it_and_the_strokes_touching_it() {
+        for tool in [ToolId::Selection, ToolId::FreeTransform] {
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::ObjectDrawing;
+            let a = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a");
+            let other_fill = draw_square(&mut e, 20.0, 20.0, 40.0, Color::WHITE).expect("b");
+            // A line across `a`, and one that starts where it ends: connected to
+            // the first, but not touching the fill.
+            let across = add_line(&mut e, Point::new(-10.0, 8.0), Point::new(30.0, 8.0), 2.0);
+            let beyond = add_line(&mut e, Point::new(-10.0, 8.0), Point::new(-60.0, 8.0), 2.0);
+            let apart = add_line(&mut e, Point::new(300.0, 300.0), Point::new(340.0, 300.0), 2.0);
+
+            e.set_tool(tool);
+            e.selection.clear();
+            let at = screen_of(&e, Point::new(8.0, 30.0));
+            e.enter_or_leave_at(at);
+
+            let mut got = e.selection.ids();
+            got.sort();
+            let mut want = vec![a, across];
+            want.sort();
+            assert_eq!(
+                got, want,
+                "[{tool:?}] the fill and the stroke touching it — not the other fill ({other_fill:?}), \
+                 the stroke beyond ({beyond:?}) or the one apart ({apart:?})"
+            );
+        }
+    }
+
+    /// **E3. A double-click on a stroke takes every stroke connected to it**, and
+    /// the fills they cross are left out.
+    #[test]
+    fn double_clicking_a_stroke_selects_every_stroke_connected_to_it() {
+        for tool in [ToolId::Selection, ToolId::FreeTransform] {
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::ObjectDrawing;
+            let fill = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a fill");
+            let first = add_line(&mut e, Point::new(-10.0, 8.0), Point::new(30.0, 8.0), 2.0);
+            let second = add_line(&mut e, Point::new(30.0, 8.0), Point::new(30.0, 90.0), 2.0);
+            let third = add_line(&mut e, Point::new(30.0, 90.0), Point::new(90.0, 90.0), 2.0);
+            let apart = add_line(&mut e, Point::new(300.0, 300.0), Point::new(340.0, 300.0), 2.0);
+
+            e.set_tool(tool);
+            e.selection.clear();
+            // On the *middle* link, so both directions have to be followed.
+            let at = screen_of(&e, Point::new(30.0, 60.0));
+            e.enter_or_leave_at(at);
+
+            let mut got = e.selection.ids();
+            got.sort();
+            let mut want = vec![first, second, third];
+            want.sort();
+            assert_eq!(
+                got, want,
+                "[{tool:?}] the whole chain of lines, not the fill ({fill:?}) or the line apart ({apart:?})"
+            );
+        }
+    }
+
+    /// A double-click on an instance still enters it — and once inside, a
+    /// double-click on the artwork there selects it rather than leaving. Leaving
+    /// is for empty stage, as it always was.
+    #[test]
+    fn double_clicking_a_raw_shape_does_not_leave_the_symbol_being_edited() {
+        let mut e = editor();
+        let square = draw_square(&mut e, 100.0, 100.0, 120.0, Color::WHITE).expect("a square");
+        e.selection.select_one(square);
+        e.run(Command::ConvertToSymbol);
+        let symbol = e.scene().library().iter().next().expect("a symbol").id;
+
+        let at = e.camera.doc_to_screen(Point::new(160.0, 160.0));
+        e.enter_or_leave_at(at);
+        assert_eq!(e.scene().edit_path(), &[symbol], "the instance opens");
+
+        // Now on the artwork inside it: selected, and still inside.
+        e.selection.clear();
+        e.enter_or_leave_at(at);
+        assert_eq!(
+            e.scene().edit_path(),
+            &[symbol],
+            "a double-click on artwork is a selection, not a way out"
         );
-        assert!(
-            !e.selection.contains(far),
-            "a separate drawing on the same layer must not be swept in"
+        assert_eq!(e.selection.len(), 1, "the shape under it is selected");
+    }
+
+    /// **Text is never joined to anything, and a text object is never swept up
+    /// by another's double-click.** Two texts placed separately, even touching,
+    /// are separate ideas — and a stroke drawn across both leaves them alone.
+    /// (Was `touching_text_objects_are_never_grouped_into_one_drawing`, which
+    /// asked `drawing_group_of`, the whole-drawing flood Free Transform's click
+    /// no longer uses.)
+    #[test]
+    fn touching_text_objects_are_never_grouped_into_one_drawing() {
+        let mut e = editor();
+
+        e.place_text(Point::new(0.0, 0.0));
+        let first = e.selection.iter().next().expect("first text");
+        e.place_text(Point::new(5.0, 5.0));
+        let second = e.selection.iter().next().expect("second text");
+        assert_ne!(first, second);
+
+        // Text is no seed: a double-click on it is not a drawing to gather.
+        assert_eq!(e.connected_pieces(first), None);
+        assert_eq!(e.connected_pieces(second), None);
+
+        // A raw drawing overlapping both texts still gathers its own touching
+        // strokes, but must not sweep either text in.
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let a = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a");
+        let line = add_line(&mut e, Point::new(-10.0, 8.0), Point::new(30.0, 8.0), 2.0);
+        let group = e.connected_pieces(a).expect("a raw shape");
+        assert!(group.contains(&a) && group.contains(&line));
+        assert!(!group.contains(&first) && !group.contains(&second));
+
+        // Selecting and moving one text through the real Free Transform pick
+        // path must not carry the other along.
+        e.set_tool(ToolId::FreeTransform);
+        e.selection.select_one(first);
+        let before_second = e.scene().find_object(second).expect("there").1.transform;
+        e.apply(ToolAction::MoveSelection {
+            delta: Vec2::new(30.0, 0.0),
+        });
+        let after_second = e.scene().find_object(second).expect("there").1.transform;
+        assert_eq!(
+            before_second, after_second,
+            "the untouched text must not move"
         );
-        assert_eq!(e.selection.len(), 2);
+    }
+
+    // -- Stage E: the Selection and Free Transform tools, as Animate's ------
+
+    /// Press at `from`, walk to `to` in five steps and let go — the pointer's
+    /// gesture, in document points, through the editor and the tool machine and
+    /// nothing else.
+    fn drag_with(e: &mut Editor, from: Point, to: Point, mods: Mods) {
+        let camera = e.camera.clone();
+        let screen = |p: Point| camera.doc_to_screen(p);
+        e.pointer_down(screen(from), mods);
+        for step in 1..=5 {
+            let t = f64::from(step) / 5.0;
+            e.pointer_move(screen(from.lerp(to, t)), mods);
+        }
+        e.pointer_up(screen(to));
+    }
+
+    /// An object's own transform.
+    fn transform_of(e: &Editor, id: ObjectId) -> Affine {
+        e.scene().find_object(id).expect("the object").1.transform
+    }
+
+    /// Every object on every layer at frame 0, with its transform.
+    fn all_objects(e: &Editor) -> Vec<(ObjectId, Affine)> {
+        e.scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .map(|o| (o.id, o.transform))
+            .collect()
+    }
+
+    /// Is `a` a translation by `by` — and nothing else?
+    fn is_translation(a: Affine, by: Vec2) -> bool {
+        let c = a.as_coeffs();
+        (c[0] - 1.0).abs() < 1e-9
+            && c[1].abs() < 1e-9
+            && c[2].abs() < 1e-9
+            && (c[3] - 1.0).abs() < 1e-9
+            && (c[4] - by.x).abs() < 1e-6
+            && (c[5] - by.y).abs() < 1e-6
+    }
+
+    /// A filled path laid on the active layer in Object Drawing mode.
+    fn add_filled(e: &mut Editor, path: BezPath) -> ObjectId {
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let before = all_objects(e);
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(path, Color::WHITE),
+            label: "Draw",
+        });
+        all_objects(e)
+            .into_iter()
+            .map(|(id, _)| id)
+            .find(|id| !before.iter().any(|(b, _)| b == id))
+            .expect("the new shape")
+    }
+
+    /// **E1. The Selection tool has no handles.** Every place the box used to
+    /// have a gesture — a corner, a mid-edge handle, a skew edge, the
+    /// transformation point — is, to the arrow, just the selected shape: a drag
+    /// there **moves** it, and nothing is resized, skewed or turned.
+    #[test]
+    fn the_selection_tool_moves_from_where_free_transform_has_handles() {
+        for (what, at) in [
+            ("a corner", Point::new(200.0, 200.0)),
+            ("the other corner", Point::new(100.0, 100.0)),
+            ("a mid-edge handle", Point::new(150.0, 100.0)),
+            ("a skew edge", Point::new(175.0, 100.0)),
+            ("the transformation point", Point::new(150.0, 150.0)),
+        ] {
+            let mut e = editor();
+            let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+            e.selection.select_one(id);
+            e.set_tool(ToolId::Selection);
+
+            drag_with(&mut e, at, at + Vec2::new(30.0, 20.0), Mods::default());
+
+            assert!(
+                is_translation(transform_of(&e, id), Vec2::new(30.0, 20.0)),
+                "{what}: the arrow moves the shape and does nothing else, got {:?}",
+                transform_of(&e, id).as_coeffs()
+            );
+            assert_eq!(e.selection.ids(), vec![id], "{what}: still selected");
+        }
+    }
+
+    /// **E1. The ring outside a corner is empty stage to the arrow**: a drag
+    /// there is a marquee, so nothing turns.
+    #[test]
+    fn the_selection_tool_has_no_rotate_ring() {
+        let mut e = editor();
+        let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        e.set_tool(ToolId::Selection);
+        let before = transform_of(&e, id);
+
+        // 15 points outside the bottom-right corner, swung a quarter turn about
+        // the centre — where Free Transform's ring would have turned it.
+        drag_with(
+            &mut e,
+            Point::new(215.0, 215.0),
+            Point::new(85.0, 215.0),
+            Mods::default(),
+        );
+        assert_eq!(transform_of(&e, id), before, "nothing was turned");
+        assert!(e.selection.is_empty(), "a marquee that caught nothing");
+    }
+
+    /// **E1. A press in the empty part of a selected shape's box does not move
+    /// it.** The hole of a ring is stage, not shape; Animate's arrow only drags
+    /// what is under it.
+    #[test]
+    fn the_selection_tool_does_not_move_a_selected_ring_by_its_hole() {
+        let mut e = editor();
+        let mut ring = square(100.0, 100.0, 160.0);
+        // Wound the other way, so it is a hole under the non-zero rule.
+        ring.move_to(Point::new(140.0, 140.0));
+        ring.line_to(Point::new(140.0, 220.0));
+        ring.line_to(Point::new(220.0, 220.0));
+        ring.line_to(Point::new(220.0, 140.0));
+        ring.close_path();
+        let id = add_filled(&mut e, ring);
+        e.selection.select_one(id);
+        e.set_tool(ToolId::Selection);
+        let before = transform_of(&e, id);
+
+        // The middle of the hole: inside the shape's box, outside the shape.
+        let hole = Point::new(180.0, 180.0);
+        assert!(e.selection_box().unwrap().contains(hole));
+        drag_with(&mut e, hole, hole + Vec2::new(50.0, 0.0), Mods::default());
+        assert_eq!(transform_of(&e, id), before, "the hole is not the shape");
+
+        // And the ring itself still drags.
+        let band = Point::new(120.0, 180.0);
+        e.selection.select_one(id);
+        drag_with(&mut e, band, band + Vec2::new(50.0, 0.0), Mods::default());
+        assert!(is_translation(transform_of(&e, id), Vec2::new(50.0, 0.0)));
+    }
+
+    /// **E1. Text is dragged by its box.** Every other object is hit by what it
+    /// paints, but the gaps between a caption's letters are not stage: a drag
+    /// that fell through them would marquee the text away.
+    #[test]
+    fn a_selected_text_is_dragged_by_its_box_not_only_its_ink() {
+        let mut e = editor();
+        e.place_text(Point::new(100.0, 100.0));
+        let id = e.selection.iter().next().expect("the text");
+        e.set_tool(ToolId::Selection);
+
+        let (_, quad) = e.focal_local_and_quad(id).expect("drawn");
+        let (tl, br) = (quad[0], quad[2]);
+        // Just under the top edge, over the lower letters: inside the box, and
+        // nowhere near any ink.
+        let gap = Point::new(tl.x + (br.x - tl.x) * 0.6, tl.y + 1.0);
+        assert!(
+            e.object_at(gap, e.pick_tolerance()).is_none(),
+            "the press is between the letters"
+        );
+
+        drag_with(&mut e, gap, gap + Vec2::new(40.0, 0.0), Mods::default());
+        assert!(
+            is_translation(transform_of(&e, id), Vec2::new(140.0, 100.0)),
+            "the caption moved with the drag, got {:?}",
+            transform_of(&e, id).as_coeffs()
+        );
+    }
+
+    /// **E1. Free Transform keeps its gizmo**, and the arrow's corner is its
+    /// scale handle: the same press that moved the shape above scales it here.
+    /// (The Selection half of what `corners_resize_and_edges_skew_from_either_tool`
+    /// used to assert is the three tests above.)
+    #[test]
+    fn free_transform_still_has_what_the_arrow_gave_up() {
+        let mut e = editor();
+        let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        e.set_tool(ToolId::FreeTransform);
+
+        drag_with(
+            &mut e,
+            Point::new(200.0, 200.0),
+            Point::new(260.0, 240.0),
+            Mods::default(),
+        );
+        let c = transform_of(&e, id).as_coeffs();
+        assert!(
+            (c[0] - 1.6).abs() < 1e-9 && (c[3] - 1.4).abs() < 1e-9,
+            "the corner scales the box, got {c:?}"
+        );
+    }
+
+    /// **E4. Alt-drag drags a copy**, with either tool: the original stays where
+    /// it was, the copy goes with the pointer and is what is selected after, and
+    /// the whole drag — copy and move — is one undo step.
+    #[test]
+    fn alt_dragging_a_selected_shape_leaves_the_original_and_drags_a_copy() {
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        for tool in [ToolId::Selection, ToolId::FreeTransform] {
+            let mut e = editor();
+            let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+            e.selection.select_one(id);
+            e.set_tool(tool);
+            let before = transform_of(&e, id);
+            let steps_before = e.doc.history().undo_depth();
+
+            drag_with(&mut e, Point::new(130.0, 130.0), Point::new(180.0, 160.0), alt);
+
+            assert_eq!(e.scene().shape_count(), 2, "[{tool:?}] a copy was made");
+            assert_eq!(transform_of(&e, id), before, "[{tool:?}] the original stayed");
+            assert_eq!(e.selection.len(), 1, "[{tool:?}] one thing is selected");
+            let copy = e.selection.iter().next().unwrap();
+            assert_ne!(copy, id, "[{tool:?}] and it is the copy");
+            assert!(
+                is_translation(transform_of(&e, copy), Vec2::new(50.0, 30.0)),
+                "[{tool:?}] the copy went where the pointer did, got {:?}",
+                transform_of(&e, copy).as_coeffs()
+            );
+            assert_eq!(
+                e.doc.history().undo_depth(),
+                steps_before + 1,
+                "[{tool:?}] the copy and its drag are one undo step"
+            );
+
+            e.run(Command::Undo);
+            assert_eq!(e.scene().shape_count(), 1, "[{tool:?}] one Undo removes the copy");
+            assert_eq!(transform_of(&e, id), before, "[{tool:?}] and the original is as it was");
+        }
+    }
+
+    /// **E4. Alt on an object that is not selected selects it first**, then
+    /// copies it — and the objects beside it are left alone.
+    #[test]
+    fn alt_dragging_an_unselected_object_copies_that_object() {
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        for tool in [ToolId::Selection, ToolId::FreeTransform] {
+            let mut e = editor();
+            let a = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a");
+            let b = draw_square(&mut e, 400.0, 100.0, 100.0, Color::WHITE).expect("b");
+            e.set_tool(tool);
+            e.selection.clear();
+            let (a_before, b_before) = (transform_of(&e, a), transform_of(&e, b));
+
+            drag_with(&mut e, Point::new(130.0, 130.0), Point::new(130.0, 230.0), alt);
+
+            assert_eq!(e.scene().shape_count(), 3, "[{tool:?}] one copy");
+            assert_eq!(transform_of(&e, a), a_before, "[{tool:?}] the original stayed");
+            assert_eq!(transform_of(&e, b), b_before, "[{tool:?}] the other one is untouched");
+            let copy = e.selection.iter().next().expect("the copy is selected");
+            assert!(copy != a && copy != b && e.selection.len() == 1);
+            assert!(is_translation(transform_of(&e, copy), Vec2::new(0.0, 100.0)));
+        }
+    }
+
+    /// **E4. Alt-clicking copies nothing**, even if the hand wobbles a pixel.
+    #[test]
+    fn an_alt_click_copies_nothing() {
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        for tool in [ToolId::Selection, ToolId::FreeTransform] {
+            let mut e = editor();
+            let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+            e.selection.select_one(id);
+            e.set_tool(tool);
+            let before = transform_of(&e, id);
+
+            let camera = e.camera.clone();
+            let at = camera.doc_to_screen(Point::new(130.0, 130.0));
+            e.pointer_down(at, alt);
+            e.pointer_move(at + Vec2::new(1.0, 1.0), alt);
+            e.pointer_up(at + Vec2::new(1.0, 1.0));
+
+            assert_eq!(e.scene().shape_count(), 1, "[{tool:?}] no copy");
+            assert_eq!(transform_of(&e, id), before, "[{tool:?}] and nothing moved");
+        }
+    }
+
+    /// **E4. On a Free Transform handle Alt keeps its own meaning** — scale about
+    /// the transformation point — and copies nothing.
+    #[test]
+    fn alt_on_a_free_transform_corner_still_scales_about_the_point() {
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        let mut e = editor();
+        let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        e.set_tool(ToolId::FreeTransform);
+
+        // The corner pulled twice as far from the centre as it was.
+        drag_with(&mut e, Point::new(200.0, 200.0), Point::new(250.0, 250.0), alt);
+
+        assert_eq!(e.scene().shape_count(), 1, "no copy");
+        let bounds = e.scene().find_object(id).unwrap().1.bounds();
+        assert!(
+            (bounds.x0 - 50.0).abs() < 1e-6 && (bounds.x1 - 250.0).abs() < 1e-6,
+            "scaled about the centre (150, 150), got {bounds:?}"
+        );
+    }
+
+    /// **E4. Alt beats the arrow's own corner and edge gestures**: on the edge of
+    /// an unselected shape a plain drag bends it, and an Alt-drag copies it.
+    #[test]
+    fn alt_on_a_shapes_edge_copies_it_instead_of_bending_it() {
+        let mut e = editor();
+        let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        e.set_tool(ToolId::Selection);
+        e.selection.clear();
+        let path_before = match &e.scene().find_object(id).unwrap().1.kind {
+            ObjectKind::Shape(s) => s.path.clone(),
+            _ => panic!("a shape"),
+        };
+
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        drag_with(&mut e, Point::new(150.0, 100.0), Point::new(150.0, 60.0), alt);
+
+        assert_eq!(e.scene().shape_count(), 2, "copied");
+        match &e.scene().find_object(id).unwrap().1.kind {
+            ObjectKind::Shape(s) => assert_eq!(s.path, path_before, "the edge was not bent"),
+            _ => panic!("a shape"),
+        }
+        let copy = e.selection.iter().next().expect("the copy");
+        assert!(is_translation(transform_of(&e, copy), Vec2::new(0.0, -40.0)));
+    }
+
+    /// **E5. Alt-rotate turns about the opposite corner** of the turned box, end
+    /// to end through the editor — and without Alt about the transformation point.
+    #[test]
+    fn alt_rotating_with_free_transform_holds_the_opposite_corner() {
+        for use_alt in [true, false] {
+            let mut e = editor();
+            let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+            e.selection.select_one(id);
+            e.set_tool(ToolId::FreeTransform);
+            // Turn it first, so the box the ring belongs to is itself turned.
+            let centre = Point::new(150.0, 150.0);
+            e.apply(ToolAction::TransformSelection {
+                transform: Affine::translate(centre.to_vec2())
+                    * Affine::rotate(30.0_f64.to_radians())
+                    * Affine::translate(-centre.to_vec2()),
+            });
+            // Its own undo step, so the drag below is counted on its own.
+            e.doc.end_gesture();
+            let before = e.selection_box().expect("a box");
+            let [_, tr, _, bl] = before.corners();
+            let start = tr + (tr - before.center()).normalize() * 20.0;
+            let about = if use_alt { bl } else { before.center() };
+            let end = Affine::translate(about.to_vec2())
+                * Affine::rotate(40.0_f64.to_radians())
+                * Affine::translate(-about.to_vec2())
+                * start;
+            let steps_before = e.doc.history().undo_depth();
+
+            drag_with(
+                &mut e,
+                start,
+                end,
+                Mods {
+                    alt: use_alt,
+                    ..Mods::default()
+                },
+            );
+
+            let after = e.selection_box().expect("still a box");
+            let (held_before, held_after) = if use_alt {
+                (before.corners()[3], after.corners()[3])
+            } else {
+                (before.center(), after.center())
+            };
+            assert!(
+                (held_before - held_after).hypot() < 1e-6,
+                "alt={use_alt}: the point turned about stays put: {held_before:?} -> {held_after:?}"
+            );
+            let (a, b) = (before.to_doc.as_coeffs(), after.to_doc.as_coeffs());
+            let turned = b[1].atan2(b[0]) - a[1].atan2(a[0]);
+            assert!(
+                (turned - 40.0_f64.to_radians()).abs() < 1e-6,
+                "alt={use_alt}: turned by the angle the pointer swept, got {}",
+                turned.to_degrees()
+            );
+            assert_eq!(
+                e.doc.history().undo_depth(),
+                steps_before + 1,
+                "alt={use_alt}: one drag, one undo step"
+            );
+            // And the corner opposite the one grabbed is the one that held.
+            if use_alt {
+                let plain = before.center();
+                assert!(
+                    (plain - after.center()).hypot() > 1.0,
+                    "the centre moved: Alt is not turning about the transformation point"
+                );
+            }
+        }
+    }
+
+    /// Two squares that do not share a transform — one of them scaled — so the
+    /// selection has no box of its own to turn.
+    fn mixed_selection(e: &mut Editor) -> (ObjectId, ObjectId) {
+        let a = draw_square(e, 100.0, 100.0, 60.0, Color::WHITE).expect("a");
+        let b = draw_square(e, 300.0, 150.0, 60.0, Color::WHITE).expect("b");
+        e.selection.select_one(b);
+        let c = Point::new(330.0, 180.0);
+        e.apply(ToolAction::TransformSelection {
+            transform: Affine::translate(c.to_vec2())
+                * Affine::scale(1.5)
+                * Affine::translate(-c.to_vec2()),
+        });
+        e.set_tool(ToolId::FreeTransform);
+        e.selection.set(vec![a, b]);
+        // The set-up's scale is its own undo step, apart from what follows.
+        e.doc.end_gesture();
+        (a, b)
+    }
+
+    /// Does the box enclose every selected object's drawn corners?
+    fn box_encloses_the_selection(e: &Editor) -> bool {
+        let frame = e.selection_box().expect("a box");
+        e.selection.iter().all(|id| {
+            let (_, quad) = e.focal_local_and_quad(id).expect("drawn");
+            quad.iter().all(|corner| {
+                let at = frame.to_doc.inverse() * *corner;
+                frame.local.inflate(1e-6, 1e-6).contains(at)
+            })
+        })
+    }
+
+    /// **E6. The box keeps the turn.** A selection of objects that do not share
+    /// one transform has no box of its own to turn, so after a Free Transform
+    /// rotation the handles used to jump back to the rectangle round it. They
+    /// now stay on the turned box, which goes on enclosing the artwork through
+    /// the next rotation too.
+    #[test]
+    fn a_turn_survives_in_the_box_of_a_mixed_selection() {
+        let mut e = editor();
+        mixed_selection(&mut e);
+        // The premise: with no session there is nothing to turn.
+        let flat = e.natural_selection_box().expect("a box");
+        assert_eq!(flat.to_doc, Affine::IDENTITY, "a mixed selection has the AABB");
+        assert_eq!(e.selection_box(), Some(flat));
+
+        // Turn it with the ring, as the pointer does.
+        let ring_turn = |e: &mut Editor, degrees: f64| {
+            let frame = e.selection_box().expect("a box");
+            let pivot = e.pivot().expect("a point");
+            let tr = frame.corners()[1];
+            let start = tr + (tr - frame.center()).normalize() * 20.0;
+            let end = Affine::translate(pivot.to_vec2())
+                * Affine::rotate(degrees.to_radians())
+                * Affine::translate(-pivot.to_vec2())
+                * start;
+            drag_with(e, start, end, Mods::default());
+        };
+        ring_turn(&mut e, 30.0);
+
+        let turned = e.selection_box().expect("a box");
+        assert_ne!(turned.to_doc, Affine::IDENTITY, "the box turned with the artwork");
+        let c = turned.to_doc.as_coeffs();
+        assert!(
+            (c[1].atan2(c[0]) - 30.0_f64.to_radians()).abs() < 1e-6,
+            "turned by the 30 degrees dragged, got {}",
+            c[1].atan2(c[0]).to_degrees()
+        );
+        assert!(box_encloses_the_selection(&e), "and it is still round the artwork");
+
+        // A second turn carries on from where the box is, not from the AABB.
+        ring_turn(&mut e, 20.0);
+        let again = e.selection_box().expect("a box");
+        let c = again.to_doc.as_coeffs();
+        assert!(
+            (c[1].atan2(c[0]) - 50.0_f64.to_radians()).abs() < 1e-6,
+            "50 degrees in all, got {}",
+            c[1].atan2(c[0]).to_degrees()
+        );
+        assert!(box_encloses_the_selection(&e));
+        assert_eq!(again.local, turned.local, "the same rectangle, in its own space");
+
+        // A scale through its handle keeps it on the artwork as well.
+        let frame = e.selection_box().unwrap();
+        let br = frame.corners()[2];
+        let c = frame.to_doc.as_coeffs();
+        let along_x = Vec2::new(c[0], c[1]);
+        drag_with(&mut e, br, br + along_x * 40.0, Mods::default());
+        assert!(box_encloses_the_selection(&e), "scaling keeps the box on the artwork");
+    }
+
+    /// **E6. The kept box ends with what it was kept for**: the selection
+    /// changing, undo, redo, and a frame change.
+    #[test]
+    fn the_kept_box_is_dropped_when_the_selection_changes_or_history_moves() {
+        // Each case starts from a fresh turn.
+        let turned = |e: &mut Editor| -> (ObjectId, ObjectId) {
+            let (a, b) = mixed_selection(e);
+            let frame = e.selection_box().unwrap();
+            let pivot = e.pivot().unwrap();
+            let tr = frame.corners()[1];
+            let start = tr + (tr - frame.center()).normalize() * 20.0;
+            let end = Affine::translate(pivot.to_vec2())
+                * Affine::rotate(30.0_f64.to_radians())
+                * Affine::translate(-pivot.to_vec2())
+                * start;
+            drag_with(e, start, end, Mods::default());
+            assert_ne!(e.selection_box().unwrap().to_doc, Affine::IDENTITY);
+            (a, b)
+        };
+
+        // The selection changes.
+        let mut e = editor();
+        let (a, b) = turned(&mut e);
+        e.selection.select_one(a);
+        assert!(e.live_box_session().is_none(), "another selection has no such box");
+        e.selection.set(vec![a, b]);
+        assert_eq!(
+            e.selection_box().unwrap().to_doc,
+            Affine::IDENTITY,
+            "and choosing the pair again does not bring it back"
+        );
+
+        // Undo.
+        let mut e = editor();
+        turned(&mut e);
+        e.run(Command::Undo);
+        assert!(e.live_box_session().is_none(), "undo drops it");
+        assert_eq!(e.selection_box().unwrap().to_doc, Affine::IDENTITY);
+
+        // Redo: the turn is back in the artwork but the box is not kept for it.
+        e.run(Command::Redo);
+        assert!(e.live_box_session().is_none(), "redo does not bring it back");
+
+        // The playhead moves.
+        let mut e = editor();
+        turned(&mut e);
+        e.current_frame = 5;
+        assert!(e.live_box_session().is_none(), "a frame change drops it");
+    }
+
+    /// **E6. The Selection tool's turn never makes one** — it does not turn
+    /// anything — and a move or a scale of a mixed selection does not either:
+    /// only a rotation or a skew leaves a box that cannot be worked out from the
+    /// artwork.
+    #[test]
+    fn only_a_free_transform_turn_keeps_a_box() {
+        let mut e = editor();
+        mixed_selection(&mut e);
+        let frame = e.selection_box().unwrap();
+        let br = frame.corners()[2];
+        // A scale and a move: no session.
+        drag_with(&mut e, br, br + Vec2::new(30.0, 30.0), Mods::default());
+        assert!(e.live_box_session().is_none(), "a scale keeps nothing");
+        // Inside the first square, clear of the corners and the point.
+        let inside = Point::new(120.0, 120.0);
+        drag_with(&mut e, inside, inside + Vec2::new(40.0, 0.0), Mods::default());
+        assert!(e.live_box_session().is_none(), "a move keeps nothing");
+
+        // The same turn made as a bare action with the Selection tool in hand.
+        e.set_tool(ToolId::Selection);
+        e.apply(ToolAction::TransformSelection {
+            transform: Affine::rotate(0.4),
+        });
+        assert!(e.live_box_session().is_none(), "the arrow's box is never kept");
+    }
+
+    /// **Per-character styling turns plain text into a group of shapes, and
+    /// back again once the last run is removed** — the object's own id and
+    /// transform stay put throughout; only `kind` and `text` change.
+    #[test]
+    fn styling_a_range_of_text_converts_it_to_a_group_and_back() {
+        let mut e = editor();
+        e.place_text(Point::new(10.0, 20.0));
+        let id = e.selection.iter().next().expect("the text");
+
+        let before = e.scene().find_object(id).expect("there").1.transform;
+        assert!(matches!(
+            e.scene().find_object(id).expect("there").1.kind,
+            ObjectKind::Shape(_)
+        ));
+
+        let text = e.text_of(id).expect("text data");
+        let runs =
+            buzz_scene::restyle_runs(&text.runs, text.content.chars().count(), 0, 1, |r| {
+                r.bold = Some(true)
+            });
+        e.set_text_runs(
+            id,
+            buzz_scene::TextData {
+                runs,
+                ..text.clone()
+            },
+        );
+
+        let (_, object) = e.scene().find_object(id).expect("there");
+        assert_eq!(object.transform, before, "the transform must not move");
+        assert_eq!(object.id, id);
+        match &object.kind {
+            ObjectKind::Group(children) => assert!(!children.is_empty()),
+            other => panic!("expected a group of shapes, got {other:?}"),
+        }
+        assert_eq!(object.text.as_ref().expect("still text").runs.len(), 1);
+
+        // Clearing the run again returns it to a plain shape.
+        let text = e.text_of(id).expect("text data");
+        e.set_text_runs(
+            id,
+            buzz_scene::TextData {
+                runs: Vec::new(),
+                ..text
+            },
+        );
+        let (_, object) = e.scene().find_object(id).expect("there");
+        assert_eq!(object.transform, before);
+        assert_eq!(object.id, id);
+        assert!(matches!(object.kind, ObjectKind::Shape(_)));
+    }
+
+    /// A run's own colour paints its own segment; the rest of the text keeps
+    /// painting in whatever colour it already had.
+    #[test]
+    fn a_runs_colour_paints_only_its_own_segment() {
+        let mut e = editor();
+        e.style.fill_color = Color::WHITE;
+        e.place_text(Point::new(0.0, 0.0));
+        let id = e.selection.iter().next().expect("the text");
+
+        let text = e.text_of(id).expect("text data");
+        let red = Color::from_rgba8(200, 20, 20, 255);
+        let mut data = text.clone();
+        data.runs = vec![buzz_scene::TextRun {
+            start: 0,
+            end: 1,
+            color: Some(red),
+            ..Default::default()
+        }];
+        e.set_text_runs(id, data);
+
+        let (_, object) = e.scene().find_object(id).expect("there");
+        let ObjectKind::Group(children) = &object.kind else {
+            panic!("expected a group");
+        };
+        assert_eq!(children.len(), 2, "one styled segment, one base segment");
+        let colors: Vec<Color> = children
+            .iter()
+            .filter_map(|c| match &c.kind {
+                ObjectKind::Shape(s) => s.fill.as_ref().map(|f| f.color()),
+                _ => None,
+            })
+            .collect();
+        assert!(colors.contains(&red), "the run's own colour is painted");
+        assert!(
+            colors.contains(&Color::WHITE),
+            "the rest keeps the base colour"
+        );
     }
 
     /// **But a symbol instance is grabbed alone.** A character's parts each live
@@ -10943,15 +15635,24 @@ mod tests {
             // The parent's artwork: at rest on frame 0, moved 120 right by
             // frame 10. `motion_of` reads the difference between the two.
             let rest = scene.next_object_id();
-            let rest = Object::shape(rest, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+            let rest = Object::shape(
+                rest,
+                ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+            );
             let moved = scene.next_object_id();
-            let moved = Object::shape(moved, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE))
-                .with_transform(Affine::translate((120.0, 0.0)));
+            let moved = Object::shape(
+                moved,
+                ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+            )
+            .with_transform(Affine::translate((120.0, 0.0)));
 
             // The child's artwork, and the link that makes it follow.
             let art = scene.next_object_id();
             child_object = Some(art);
-            let art = Object::shape(art, ShapeData::filled(square(300.0, 40.0, 20.0), Color::WHITE));
+            let art = Object::shape(
+                art,
+                ShapeData::filled(square(300.0, 40.0, 20.0), Color::WHITE),
+            );
 
             let layers = scene.edit_layers();
             layers.update(parent, |l| {
@@ -10998,10 +15699,7 @@ mod tests {
 
         // And that is the same place the artwork is drawn, which is what makes
         // a press on it read as a press *inside* the selection.
-        let follows = e
-            .scene()
-            .layers()
-            .inherited_transform(child_layer, 10);
+        let follows = e.scene().layers().inherited_transform(child_layer, 10);
         assert!(
             (follows.as_coeffs()[4] - 120.0).abs() < 1e-9,
             "the layer really is carried, {follows:?}"
@@ -11077,7 +15775,10 @@ mod tests {
         }
         e.pointer_up(screen(Point::new(80.0, 30.0)));
 
-        assert!(e.selection.contains(id), "the press selected what it grabbed");
+        assert!(
+            e.selection.contains(id),
+            "the press selected what it grabbed"
+        );
         let after = e.scene().find_object(id).unwrap().1.bounds();
         assert!(
             (after.x0 - before.x0 - 50.0).abs() < 1e-6,
@@ -11155,15 +15856,20 @@ mod tests {
         }
     }
 
-    /// **The corners resize with the Selection tool, no tool change.** Grabbing
-    /// a corner of the gizmo and pulling it out scales the artwork; the handles
-    /// are drawn for the arrow, not only for Free Transform, so they work for it.
+    /// **A corner of Free Transform's box scales the artwork.** Grabbing a corner
+    /// of the gizmo and pulling it out scales it, and the object stays selected.
+    ///
+    /// Was `the_selection_tool_scales_from_a_corner`: the arrow drew the same
+    /// handles and this asserted it of the arrow. It is Animate's arrow now, with
+    /// none (E1) — what it does on this press is
+    /// `the_selection_tool_moves_from_where_free_transform_has_handles`.
     #[test]
-    fn the_selection_tool_scales_from_a_corner() {
+    fn free_transform_scales_from_a_corner() {
         let mut e = editor();
         e.style.drawing_mode = DrawingMode::ObjectDrawing;
         let id = draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE).expect("a square");
         e.selection.select_one(id);
+        e.set_tool(ToolId::FreeTransform);
         let before = e.scene().find_object(id).unwrap().1.bounds();
 
         // The bottom-right corner, pulled further out.
@@ -11171,10 +15877,16 @@ mod tests {
         let screen = |p: Point| camera.doc_to_screen(p);
         let corner = Point::new(before.x1, before.y1);
         e.pointer_down(screen(corner), Mods::default());
-        e.pointer_move(screen(Point::new(corner.x + 60.0, corner.y + 60.0)), Mods::default());
+        e.pointer_move(
+            screen(Point::new(corner.x + 60.0, corner.y + 60.0)),
+            Mods::default(),
+        );
         e.pointer_up(screen(Point::new(corner.x + 60.0, corner.y + 60.0)));
 
-        assert!(e.selection.contains(id), "the object stays selected through a scale");
+        assert!(
+            e.selection.contains(id),
+            "the object stays selected through a scale"
+        );
         let after = e.scene().find_object(id).unwrap().1.bounds();
         assert!(
             after.width() > before.width() + 1.0 && after.height() > before.height() + 1.0,
@@ -11185,7 +15897,8 @@ mod tests {
     /// **A corner handle wins over the artwork beneath it.** The gizmo is drawn
     /// outside the selection, so a corner can sit over another object; reaching
     /// for the handle to resize must keep the selected object rather than grab
-    /// what happens to lie under the corner (which click-to-grab would do).
+    /// what happens to lie under the corner. Free Transform's (the Selection
+    /// tool, which this was asserted of, has no handles now — E1).
     #[test]
     fn a_corner_handle_over_another_object_still_scales() {
         let mut e = editor();
@@ -11194,6 +15907,7 @@ mod tests {
         // B sits under A's bottom-right corner at (100, 100).
         let b = draw_square(&mut e, 90.0, 90.0, 40.0, Color::WHITE).expect("B");
         e.selection.select_one(a);
+        e.set_tool(ToolId::FreeTransform);
         let a_before = e.scene().find_object(a).unwrap().1.bounds();
         let b_before = e.scene().find_object(b).unwrap().1.bounds();
 
@@ -11201,7 +15915,10 @@ mod tests {
         let screen = |p: Point| camera.doc_to_screen(p);
         let corner = Point::new(a_before.x1, a_before.y1);
         e.pointer_down(screen(corner), Mods::default());
-        e.pointer_move(screen(Point::new(corner.x + 60.0, corner.y + 60.0)), Mods::default());
+        e.pointer_move(
+            screen(Point::new(corner.x + 60.0, corner.y + 60.0)),
+            Mods::default(),
+        );
         e.pointer_up(screen(Point::new(corner.x + 60.0, corner.y + 60.0)));
 
         assert!(
@@ -11210,7 +15927,10 @@ mod tests {
         );
         let a_after = e.scene().find_object(a).unwrap().1.bounds();
         let b_after = e.scene().find_object(b).unwrap().1.bounds();
-        assert!(a_after.width() > a_before.width() + 1.0, "A should have scaled");
+        assert!(
+            a_after.width() > a_before.width() + 1.0,
+            "A should have scaled"
+        );
         assert!(
             (b_after.width() - b_before.width()).abs() < 1e-6,
             "B, under the handle, should be untouched"
@@ -11259,7 +15979,10 @@ mod tests {
             // A parent layer that moves between its rest frame and frame 10.
             let parent = scene.add_layer("Body", buzz_scene::LayerKind::Normal);
             let rest = scene.next_object_id();
-            let rest = Object::shape(rest, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+            let rest = Object::shape(
+                rest,
+                ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+            );
             let moved = scene.next_object_id();
             let moved = Object::shape(
                 moved,
@@ -11275,12 +15998,8 @@ mod tests {
             // The instance, with a transform of its own, on the parented layer,
             // whose span has to reach the frame being tested — a layer that
             // does not is not drawn there and has nothing to select.
-            instance = scene.add_instance_at(
-                child_layer,
-                0,
-                symbol,
-                Affine::translate((40.0, 25.0)),
-            );
+            instance =
+                scene.add_instance_at(child_layer, 0, symbol, Affine::translate((40.0, 25.0)));
             scene.edit_layers().update(child_layer, |l| {
                 l.follows = Some(parent);
                 // F5: the span has to reach the frame being tested.
@@ -11349,11 +16068,16 @@ mod tests {
             // A parent that is still at frame 0 and has moved on by frame 10.
             let parent = scene.add_layer("Body", buzz_scene::LayerKind::Normal);
             let rest = scene.next_object_id();
-            let rest = Object::shape(rest, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+            let rest = Object::shape(
+                rest,
+                ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+            );
             let moved = scene.next_object_id();
-            let moved =
-                Object::shape(moved, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE))
-                    .with_transform(Affine::translate((150.0, 0.0)));
+            let moved = Object::shape(
+                moved,
+                ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+            )
+            .with_transform(Affine::translate((150.0, 0.0)));
             scene.edit_layers().update(parent, |l| {
                 l.frames.set_objects(0, vec![Arc::new(rest)]);
                 l.frames.insert_keyframe(10);
@@ -11363,8 +16087,10 @@ mod tests {
             // The child's artwork exists on frame 0 only.
             let id = scene.next_object_id();
             art = Some(id);
-            let shape =
-                Object::shape(id, ShapeData::filled(square(200.0, 100.0, 30.0), Color::WHITE));
+            let shape = Object::shape(
+                id,
+                ShapeData::filled(square(200.0, 100.0, 30.0), Color::WHITE),
+            );
             scene.edit_layers().update(child_layer, |l| {
                 l.follows = Some(parent);
                 l.frames.set_objects(0, vec![Arc::new(shape)]);
@@ -11420,6 +16146,28 @@ mod tests {
             "the handles are measured at {:?} but the artwork is at {:?}",
             bounds.center(),
             shown.center()
+        );
+    }
+
+    #[test]
+    fn object_quad_preserves_a_rotated_objects_oriented_corners() {
+        let mut e = editor();
+        let id = draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE).expect("a square");
+        e.doc.edit("Rotate", |scene| {
+            update_object(scene, EditAt::exact(0), id, |object| {
+                object.transform = Affine::rotate(std::f64::consts::FRAC_PI_4);
+            });
+        });
+
+        let quad = e.object_quad(id).expect("rotated artwork is visible");
+        let top = quad[1] - quad[0];
+        assert!(
+            top.x.abs() > 1.0 && top.y.abs() > 1.0,
+            "the rotated top edge was boxed back onto an axis: {quad:?}"
+        );
+        assert!(
+            (top.x.abs() - top.y.abs()).abs() < 1e-6,
+            "a 45-degree edge should retain its orientation: {quad:?}"
         );
     }
 
@@ -11568,10 +16316,16 @@ mod tests {
             });
 
             let rest = scene.next_object_id();
-            let rest = Object::shape(rest, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+            let rest = Object::shape(
+                rest,
+                ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+            );
             let moved = scene.next_object_id();
-            let moved = Object::shape(moved, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE))
-                .with_transform(Affine::translate((0.0, -130.0)));
+            let moved = Object::shape(
+                moved,
+                ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+            )
+            .with_transform(Affine::translate((0.0, -130.0)));
             let limb = scene.next_object_id();
             let limb = Object::shape(
                 limb,
@@ -11660,12 +16414,7 @@ mod tests {
         const PARTS: usize = 400;
         let mut placed = Vec::new();
         e.doc.edit("Character", |scene| {
-            let layer = scene
-                .layers()
-                .iter()
-                .next()
-                .map(|l| l.id)
-                .expect("a layer");
+            let layer = scene.layers().iter().next().map(|l| l.id).expect("a layer");
             for part in 0..PARTS as i32 {
                 let symbol = scene.add_symbol(
                     format!("Part {part}"),
@@ -11765,6 +16514,225 @@ mod tests {
         );
     }
 
+    /// A library of `parts` symbols placed on the stage — the shape of an
+    /// imported or Cast character (small `parts`) or a heavy import (large
+    /// `parts`). Mirrors the scene
+    /// [`dragging_a_selection_on_a_heavy_document_stays_interactive`] builds,
+    /// factored out so I4's pan and drag perf tests share exactly one recipe.
+    fn build_symbol_library(e: &mut Editor, parts: usize) -> Vec<ObjectId> {
+        let mut placed = Vec::new();
+        e.doc.edit("Character", |scene| {
+            let layer = scene.layers().iter().next().map(|l| l.id).expect("a layer");
+            for part in 0..parts as i32 {
+                let symbol = scene.add_symbol(
+                    format!("Part {part}"),
+                    buzz_scene::SymbolKind::Graphic,
+                    None,
+                );
+                let inner = scene
+                    .library()
+                    .get(symbol)
+                    .and_then(|s| s.layers.iter().next())
+                    .map(|l| l.id)
+                    .expect("a layer inside");
+                let art: Vec<std::sync::Arc<Object>> = (0..12)
+                    .map(|i| {
+                        let id = scene.next_object_id();
+                        std::sync::Arc::new(Object::shape(
+                            id,
+                            ShapeData::filled(
+                                square(i as f64 * 9.0, part as f64 * 3.0, 14.0),
+                                Color::WHITE,
+                            ),
+                        ))
+                    })
+                    .collect();
+                scene.library_mut().update(symbol, |s| {
+                    s.layers.update(inner, |l| {
+                        l.frames.set_objects(0, art);
+                    });
+                });
+                if let Some(id) = scene.add_instance_at(
+                    layer,
+                    0,
+                    symbol,
+                    Affine::translate((part as f64 * 11.0, 40.0)),
+                ) {
+                    placed.push(id);
+                }
+            }
+        });
+        placed
+    }
+
+    /// **Panning a character scene has to stay interactive.**
+    ///
+    /// A character built the way an imported one is (symbols inside symbols,
+    /// each stamped from one cached encoding — see
+    /// [`buzz_render::document::SymbolSceneCache`]) is documented to make
+    /// panning free: the camera anchor is deliberately not part of the cache
+    /// key. This is the perf test I4 asks for, pinning that down against a
+    /// regression.
+    #[test]
+    fn panning_a_character_scene_stays_interactive() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        const PARTS: usize = 40;
+        let placed = build_symbol_library(&mut e, PARTS);
+        assert_eq!(placed.len(), PARTS, "the character was built");
+
+        let mut vello = buzz_render::vello::Scene::new();
+        let mut cache = buzz_render::document::DrawCache::default();
+        let area = buzz_geom::Rect::new(0.0, 0.0, 1600.0, 1000.0);
+        // Warm it once, as the window does the frame the character appears.
+        crate::stage::build_scene(&mut vello, &e, area, 1.0, &mut cache);
+
+        const STEPS: usize = 20;
+        let began = std::time::Instant::now();
+        for _ in 0..STEPS {
+            e.camera.pan_screen(Vec2::new(20.0, 0.0));
+            crate::stage::build_scene(&mut vello, &e, area, 1.0, &mut cache);
+        }
+        let per_frame = began.elapsed().as_secs_f64() * 1000.0 / STEPS as f64;
+
+        eprintln!("PAN CHARACTER: {per_frame:.2} ms a frame over {PARTS} parts");
+        let budget = if cfg!(debug_assertions) { 20.0 } else { 4.0 };
+        assert!(
+            per_frame < budget,
+            "panning a character scene cost {per_frame:.2} ms a frame"
+        );
+    }
+
+    /// **Panning a heavy import has to stay interactive**, at the ten-times
+    /// scale [`dragging_a_selection_on_a_heavy_document_stays_interactive`]
+    /// already builds for a drag.
+    #[test]
+    fn panning_a_heavy_scene_stays_interactive() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        const PARTS: usize = 400;
+        let placed = build_symbol_library(&mut e, PARTS);
+        assert_eq!(placed.len(), PARTS, "the library was built");
+
+        let mut vello = buzz_render::vello::Scene::new();
+        let mut cache = buzz_render::document::DrawCache::default();
+        let area = buzz_geom::Rect::new(0.0, 0.0, 1600.0, 1000.0);
+        crate::stage::build_scene(&mut vello, &e, area, 1.0, &mut cache);
+
+        const STEPS: usize = 20;
+        let began = std::time::Instant::now();
+        for _ in 0..STEPS {
+            e.camera.pan_screen(Vec2::new(20.0, 0.0));
+            crate::stage::build_scene(&mut vello, &e, area, 1.0, &mut cache);
+        }
+        let per_frame = began.elapsed().as_secs_f64() * 1000.0 / STEPS as f64;
+
+        eprintln!("PAN HEAVY: {per_frame:.2} ms a frame over {PARTS} parts");
+        let budget = if cfg!(debug_assertions) { 65.0 } else { 16.0 };
+        assert!(
+            per_frame < budget,
+            "panning a heavy import cost {per_frame:.2} ms a frame"
+        );
+    }
+
+    /// **Dragging a placed character instance has to stay interactive**, at
+    /// the twenty-move cadence I4 asks the perf test to use (rather than the
+    /// 120 [`dragging_a_selection_on_a_heavy_document_stays_interactive`]
+    /// already covers at ten times the part count).
+    #[test]
+    fn dragging_a_character_instance_stays_interactive() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        const PARTS: usize = 40;
+        let placed = build_symbol_library(&mut e, PARTS);
+        assert_eq!(placed.len(), PARTS, "the character was built");
+
+        let id = placed[10];
+        e.selection.select_one(id);
+
+        let mut vello = buzz_render::vello::Scene::new();
+        let mut cache = buzz_render::document::DrawCache::default();
+        let area = buzz_geom::Rect::new(0.0, 0.0, 1600.0, 1000.0);
+        crate::stage::build_scene(&mut vello, &e, area, 1.0, &mut cache);
+
+        const MOVES: usize = 20;
+        let began = std::time::Instant::now();
+        for step in 0..MOVES {
+            e.doc.edit("Move", |scene| {
+                let at = EditAt::exact(0);
+                update_object(scene, at, id, |o| {
+                    o.transform = Affine::translate((step as f64 * 2.0, 0.0)) * o.transform;
+                });
+            });
+            crate::stage::build_scene(&mut vello, &e, area, 1.0, &mut cache);
+        }
+        let per_move = began.elapsed().as_secs_f64() * 1000.0 / MOVES as f64;
+
+        eprintln!("DRAG CHARACTER: {per_move:.2} ms a frame over {PARTS} parts");
+        let budget = if cfg!(debug_assertions) { 20.0 } else { 4.0 };
+        assert!(
+            per_move < budget,
+            "dragging a character instance cost {per_move:.2} ms a frame"
+        );
+    }
+
+    /// **Hovering an asset over the stage while dragging it out of the
+    /// Cast/Assets panel has to stay interactive.**
+    ///
+    /// The window's DnD branch in `App::handle_stage_input` runs on *every*
+    /// pointer move while a payload is carried, before a drop ever happens —
+    /// so whatever it costs is paid on every frame of the drag, not once at
+    /// the end. It does no scene work at all today (a cursor icon and a small
+    /// ghost circle), and the drop itself — `Editor::place_asset_at`, which
+    /// merges the asset's whole scene in — runs exactly once, on release. This
+    /// pins both halves down: the merge is cheap enough to run once without a
+    /// stutter, and the hover loop leading up to it is not secretly doing that
+    /// merge every frame.
+    #[test]
+    fn dragging_an_asset_over_the_stage_stays_interactive() {
+        const PARTS: usize = 40;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut library = buzz_doc::AssetLibrary::at(dir.path());
+
+        // The character, saved into the Cast the way the panel's own "Keep"
+        // does, so it can be dragged back out exactly as a real one is.
+        let scene = {
+            let mut source = editor();
+            let placed = build_symbol_library(&mut source, PARTS);
+            assert_eq!(placed.len(), PARTS, "the asset's character was built");
+            source.doc.scene().clone()
+        };
+        let asset = library
+            .save("Ana", buzz_ui::CAST_FOLDER, &scene)
+            .expect("save the character asset");
+
+        // The hover loop: the window calls nothing but this, every pointer
+        // move, for as long as the payload is carried over the stage — see
+        // the doc comment above for what its branch does (and does not) do.
+        const MOVES: usize = 20;
+        let began = std::time::Instant::now();
+        for step in 0..MOVES {
+            let hover = Point::new(100.0 + step as f64, 100.0);
+            std::hint::black_box(hover);
+        }
+        let per_move = began.elapsed().as_secs_f64() * 1000.0 / MOVES as f64;
+        eprintln!("DND HOVER: {per_move:.3} ms a frame (no per-move scene work)");
+        assert!(per_move < 1.0, "the hover loop must do no scene work");
+
+        // The drop: exactly once, as the window's release branch does.
+        let mut e = editor();
+        let began = std::time::Instant::now();
+        e.place_asset_at(&asset, Point::new(200.0, 200.0));
+        let drop_ms = began.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("DND DROP: {drop_ms:.2} ms for a {PARTS}-part asset");
+        let budget = if cfg!(debug_assertions) { 60.0 } else { 12.0 };
+        assert!(
+            drop_ms < budget,
+            "placing a dragged asset cost {drop_ms:.2} ms; a single drop must not stutter"
+        );
+    }
+
     /// **A rotation turns about the transformation point the user moved.**
     ///
     /// Animate's white circle is not decoration: you put it on the shoulder and
@@ -11776,6 +16744,8 @@ mod tests {
         e.style.drawing_mode = DrawingMode::ObjectDrawing;
         let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
         e.selection.select_one(id);
+        // Free Transform's ring and point: the Selection tool has neither (E1).
+        e.set_tool(ToolId::FreeTransform);
 
         // By default it sits at the centre of the artwork.
         assert!(
@@ -11834,6 +16804,7 @@ mod tests {
         e.style.drawing_mode = DrawingMode::ObjectDrawing;
         let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
         e.selection.select_one(id);
+        e.set_tool(ToolId::FreeTransform);
 
         // The joint, right on the corner of the artwork.
         let joint = Point::new(200.0, 200.0);
@@ -11874,6 +16845,7 @@ mod tests {
         let a = draw_square(&mut e, 100.0, 100.0, 60.0, Color::WHITE).expect("a");
         let b = draw_square(&mut e, 200.0, 100.0, 60.0, Color::WHITE).expect("b");
         e.selection.set(vec![a, b]);
+        e.set_tool(ToolId::FreeTransform);
 
         let joint = Point::new(110.0, 110.0);
         e.apply(ToolAction::SetTransformPoint { at: joint });
@@ -11929,8 +16901,10 @@ mod tests {
             palm_layer = Some(layer);
             let id = scene.next_object_id();
             palm = Some(id);
-            let art =
-                Object::shape(id, ShapeData::filled(square(140.0, 100.0, 20.0), Color::WHITE));
+            let art = Object::shape(
+                id,
+                ShapeData::filled(square(140.0, 100.0, 20.0), Color::WHITE),
+            );
             scene.edit_layers().update(layer, |l| {
                 l.frames.set_objects(0, vec![Arc::new(art)]);
             });
@@ -11973,16 +16947,17 @@ mod tests {
         );
     }
 
-    /// **Both tools turn the artwork, and turn it as the pointer moves.**
+    /// **Free Transform turns the artwork, and turns it as the pointer moves.**
     ///
     /// The rotation used to be drawn as an outline and committed on release,
     /// so the drawing sat still while a wireframe swung around it. Asked here
-    /// through the whole editor, for the Selection tool and Free Transform
-    /// alike — Free Transform is the one an animator reaches for to rotate, and
-    /// it has to be the one that does.
+    /// through the whole editor — Free Transform is the one an animator reaches
+    /// for to rotate, and it has to be the one that does. (Was
+    /// `both_transform_tools_rotate_while_the_pointer_moves`: the Selection tool
+    /// had the ring too, and has not since E1 — `the_selection_tool_has_no_rotate_ring`.)
     #[test]
-    fn both_transform_tools_rotate_while_the_pointer_moves() {
-        for tool in [buzz_ui::ToolId::Selection, buzz_ui::ToolId::FreeTransform] {
+    fn free_transform_rotates_while_the_pointer_moves() {
+        for tool in [buzz_ui::ToolId::FreeTransform] {
             let mut e = editor();
             e.style.drawing_mode = DrawingMode::ObjectDrawing;
             let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
@@ -12106,7 +17081,9 @@ mod tests {
     /// accumulates into a visible lean.
     #[test]
     fn turning_something_never_shears_it() {
-        for tool in [buzz_ui::ToolId::Selection, buzz_ui::ToolId::FreeTransform] {
+        // Free Transform only: the Selection tool has no rotate ring any more
+        // (`the_selection_tool_has_no_rotate_ring`).
+        for tool in [buzz_ui::ToolId::FreeTransform] {
             let mut e = editor();
             e.style.drawing_mode = DrawingMode::ObjectDrawing;
             let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
@@ -12122,16 +17099,19 @@ mod tests {
             e.pointer_down(screen(Point::new(214.0, 186.0)), Mods::default());
             for step in 1..=400 {
                 let angle = (step as f64) * 0.015;
-                let at = Point::new(
-                    pivot.x + 92.0 * angle.cos(),
-                    pivot.y + 92.0 * angle.sin(),
-                );
+                let at = Point::new(pivot.x + 92.0 * angle.cos(), pivot.y + 92.0 * angle.sin());
                 e.pointer_move(screen(at), Mods::default());
             }
             let end = Point::new(pivot.x + 92.0, pivot.y);
             e.pointer_up(screen(end));
 
-            let c = e.scene().find_object(id).expect("there").1.transform.as_coeffs();
+            let c = e
+                .scene()
+                .find_object(id)
+                .expect("there")
+                .1
+                .transform
+                .as_coeffs();
             let (a, b, cc, d) = (c[0], c[1], c[2], c[3]);
             assert!(
                 (a - d).abs() < 1e-9 && (b + cc).abs() < 1e-9,
@@ -12146,14 +17126,14 @@ mod tests {
         }
     }
 
-    /// **Resize, squeeze and skew are reachable, from either tool, and live.**
+    /// **Resize, squeeze and skew are reachable from Free Transform, and live.**
     ///
-    /// The handles are drawn for the selection tools as well as Free
-    /// Transform, so they have to work from both — a handle you can see and
-    /// cannot use is worse than none.
+    /// They were reachable from the Selection tool as well, which drew the same
+    /// handles; it is Animate's arrow now and has none. What it does on those
+    /// same presses is `the_selection_tool_moves_from_where_free_transform_has_handles`.
     #[test]
-    fn corners_resize_and_edges_skew_from_either_tool() {
-        for tool in [buzz_ui::ToolId::Selection, buzz_ui::ToolId::FreeTransform] {
+    fn corners_resize_and_edges_skew_from_free_transform() {
+        for tool in [buzz_ui::ToolId::FreeTransform] {
             // -- a corner scales ------------------------------------------
             let mut e = editor();
             e.style.drawing_mode = DrawingMode::ObjectDrawing;
@@ -12175,7 +17155,13 @@ mod tests {
             e.pointer_up(screen(Point::new(260.0, 240.0)));
 
             // A scale leaves the matrix free of shear.
-            let c = e.scene().find_object(id).expect("there").1.transform.as_coeffs();
+            let c = e
+                .scene()
+                .find_object(id)
+                .expect("there")
+                .1
+                .transform
+                .as_coeffs();
             assert!(
                 c[1].abs() < 1e-9 && c[2].abs() < 1e-9,
                 "[{tool:?}] a resize must not shear: {c:?}"
@@ -12214,7 +17200,13 @@ mod tests {
                 (after.y1 - before.y1).abs() < 1.0,
                 "[{tool:?}] the far edge is the anchor and must not move: {after:?}"
             );
-            let c = e.scene().find_object(id).expect("there").1.transform.as_coeffs();
+            let c = e
+                .scene()
+                .find_object(id)
+                .expect("there")
+                .1
+                .transform
+                .as_coeffs();
             assert!(
                 c[1].abs() < 1e-9 && c[2].abs() < 1e-9,
                 "[{tool:?}] a squeeze must not shear: {c:?}"
@@ -12232,7 +17224,13 @@ mod tests {
             e.pointer_move(screen(Point::new(215.0, 100.0)), Mods::default());
             e.pointer_up(screen(Point::new(215.0, 100.0)));
 
-            let c = e.scene().find_object(id).expect("there").1.transform.as_coeffs();
+            let c = e
+                .scene()
+                .find_object(id)
+                .expect("there")
+                .1
+                .transform
+                .as_coeffs();
             assert!(
                 c[1].abs() > 1e-6 || c[2].abs() > 1e-6,
                 "[{tool:?}] dragging an edge should skew it: {c:?}"
@@ -12263,12 +17261,9 @@ mod tests {
                     let x = (i % 20) as f64 * 60.0;
                     let y = (i / 20) as f64 * 60.0;
                     let id = scene.next_object_id();
-                    let path = kurbo::Circle::new(Point::new(x + 24.0, y + 24.0), 22.0)
-                        .to_path(0.05);
-                    std::sync::Arc::new(Object::shape(
-                        id,
-                        ShapeData::filled(path, Color::WHITE),
-                    ))
+                    let path =
+                        kurbo::Circle::new(Point::new(x + 24.0, y + 24.0), 22.0).to_path(0.05);
+                    std::sync::Arc::new(Object::shape(id, ShapeData::filled(path, Color::WHITE)))
                 })
                 .collect();
             scene.edit_layers().update(layer, |l| {
@@ -12555,7 +17550,11 @@ mod tests {
         source.run(Command::ConvertToSymbol);
 
         let instance = source.selection.ids();
-        assert_eq!(instance.len(), 1, "convert should leave the instance selected");
+        assert_eq!(
+            instance.len(),
+            1,
+            "convert should leave the instance selected"
+        );
         assert_eq!(source.scene().library().len(), 1);
         source.run(Command::Copy);
 
@@ -12608,7 +17607,13 @@ mod tests {
         assert_eq!(placed.len(), 1, "the new instance should be selected");
         // The instance's own origin lands on the drop point, so the artwork
         // arrives centred there rather than hanging off it by its corner.
-        let centre = e.scene().find_object(placed[0]).unwrap().1.bounds().center();
+        let centre = e
+            .scene()
+            .find_object(placed[0])
+            .unwrap()
+            .1
+            .bounds()
+            .center();
         assert!(
             (centre.x - expected.x).abs() < 2.0 && (centre.y - expected.y).abs() < 2.0,
             "landed centred at {centre:?}, wanted {expected:?}"
@@ -12684,9 +17689,7 @@ mod tests {
         let b = draw_square(&mut e, 100.0, 0.0, 10.0, Color::WHITE).unwrap();
         e.selection.set(vec![a, b]);
 
-        e.run(Command::Distribute(
-            buzz_ui::Distribute::HorizontalCentres,
-        ));
+        e.run(Command::Distribute(buzz_ui::Distribute::HorizontalCentres));
         assert!(
             e.status.as_deref().unwrap_or_default().contains("three"),
             "it should say what is needed"
@@ -12702,9 +17705,7 @@ mod tests {
         let c = draw_square(&mut e, 100.0, 0.0, 10.0, Color::WHITE).unwrap();
         e.selection.set(vec![a, b, c]);
 
-        e.run(Command::Distribute(
-            buzz_ui::Distribute::HorizontalCentres,
-        ));
+        e.run(Command::Distribute(buzz_ui::Distribute::HorizontalCentres));
 
         let centre = |id| e.scene().find_object(id).unwrap().1.bounds().center().x;
         let (x0, x1, x2) = (centre(a), centre(b), centre(c));
@@ -12724,7 +17725,11 @@ mod tests {
         e.run(Command::MatchSize(buzz_ui::MatchSize::Width));
 
         let after = e.scene().find_object(small).unwrap().1.bounds();
-        assert!((after.width() - 40.0).abs() < 1e-6, "width {}", after.width());
+        assert!(
+            (after.width() - 40.0).abs() < 1e-6,
+            "width {}",
+            after.width()
+        );
         assert!(
             (after.center().x - before.x).abs() < 1e-6,
             "it should grow about its own centre"
@@ -12976,8 +17981,16 @@ mod tests {
         assert_eq!(halves.len(), 2, "two coloured halves should remain");
         let top = halves.iter().min_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
         let bottom = halves.iter().max_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
-        assert_eq!(top.1, [0xFF, 0x00, 0x00, 0xFF], "only the clicked half recoloured");
-        assert_eq!(bottom.1, [0xFF, 0xFF, 0xFF, 0xFF], "the other half is untouched");
+        assert_eq!(
+            top.1,
+            [0xFF, 0x00, 0x00, 0xFF],
+            "only the clicked half recoloured"
+        );
+        assert_eq!(
+            bottom.1,
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            "the other half is untouched"
+        );
     }
 
     /// Clicking inside a stroke-only outline creates a new fill shape, behind
@@ -13128,7 +18141,11 @@ mod tests {
             .iter()
             .flat_map(|l| l.objects_at(0).iter())
             .count();
-        assert_eq!(after_closed, before + 1, "the gap size should close the gap");
+        assert_eq!(
+            after_closed,
+            before + 1,
+            "the gap size should close the gap"
+        );
     }
 
     #[test]
@@ -13337,6 +18354,70 @@ mod tests {
     }
 
     #[test]
+    fn moving_layers_up_and_down_changes_stack_order() {
+        let mut e = editor();
+        // Starts with 1 layer. Add 2 more.
+        e.run(Command::NewLayer);
+        e.run(Command::NewLayer);
+        let ids: Vec<_> = e.scene().layers().iter().map(|l| l.id).collect();
+        assert_eq!(ids.len(), 3);
+        let id_top = ids[0];
+        let id_mid = ids[1];
+        let id_bot = ids[2];
+
+        // Currently active layer is top. Move it down one layer.
+        assert_eq!(e.selection.active_layer(), Some(id_top));
+        e.run(Command::MoveLayerDown);
+        let ids_after: Vec<_> = e.scene().layers().iter().map(|l| l.id).collect();
+        assert_eq!(ids_after[0], id_mid);
+        assert_eq!(ids_after[1], id_top);
+        assert_eq!(ids_after[2], id_bot);
+        assert_eq!(e.selection.active_layer(), Some(id_top));
+
+        // Move down again to bottom.
+        e.run(Command::MoveLayerDown);
+        let ids_after2: Vec<_> = e.scene().layers().iter().map(|l| l.id).collect();
+        assert_eq!(ids_after2[0], id_mid);
+        assert_eq!(ids_after2[1], id_bot);
+        assert_eq!(ids_after2[2], id_top);
+
+        // Move it back up one layer.
+        e.run(Command::MoveLayerUp);
+        let ids_after3: Vec<_> = e.scene().layers().iter().map(|l| l.id).collect();
+        assert_eq!(ids_after3[0], id_mid);
+        assert_eq!(ids_after3[1], id_top);
+        assert_eq!(ids_after3[2], id_bot);
+
+        // Undo coalesced sequence moves it back to initial top position.
+        e.run(Command::Undo);
+        let ids_undo: Vec<_> = e.scene().layers().iter().map(|l| l.id).collect();
+        assert_eq!(ids_undo[0], id_top);
+        assert_eq!(ids_undo[1], id_mid);
+        assert_eq!(ids_undo[2], id_bot);
+
+        // Redo restores the moved state.
+        e.run(Command::Redo);
+        let ids_redo: Vec<_> = e.scene().layers().iter().map(|l| l.id).collect();
+        assert_eq!(ids_redo[1], id_top);
+    }
+
+    #[test]
+    fn selecting_or_adding_a_light_switches_to_selection_tool() {
+        let mut e = editor();
+        e.set_tool(ToolId::Brush);
+        assert_eq!(e.tool(), ToolId::Brush);
+
+        // Adding a light automatically selects the Selection tool so it can be grabbed.
+        e.add_light(buzz_scene::LightKind::Lamp {
+            position: Point::new(100.0, 100.0),
+            height: 50.0,
+            radius: 120.0,
+        });
+        assert_eq!(e.tool(), ToolId::Selection);
+        assert!(e.light_panel.selected.is_some());
+    }
+
+    #[test]
     fn convert_lines_to_fills_turns_a_stroke_into_a_filled_outline() {
         let mut e = editor();
         e.style.drawing_mode = DrawingMode::ObjectDrawing;
@@ -13468,6 +18549,899 @@ mod tests {
         assert!((restored.width() - before.width()).abs() < 1e-9);
     }
 
+    // -- Subselection: selected anchors (B1), handles (B2), keys (B3) ---------
+
+    /// An editor with `path` drawn as one shape, selected, Subselection in
+    /// hand — the state the tests below start from.
+    fn sub_editor_with(path: BezPath) -> (Editor, ObjectId) {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(path, Color::WHITE),
+            label: "Draw",
+        });
+        let id = e.selection.ids()[0];
+        e.set_tool(ToolId::Subselection);
+        (e, id)
+    }
+
+    /// Two smooth curves meeting at a smooth middle anchor (element 1).
+    fn curvy() -> BezPath {
+        let mut p = BezPath::new();
+        p.move_to(Point::new(0.0, 0.0));
+        p.curve_to(
+            Point::new(20.0, 40.0),
+            Point::new(80.0, 40.0),
+            Point::new(100.0, 0.0),
+        );
+        p.curve_to(
+            Point::new(120.0, -40.0),
+            Point::new(180.0, -40.0),
+            Point::new(200.0, 0.0),
+        );
+        p
+    }
+
+    fn path_of(e: &Editor, id: ObjectId) -> BezPath {
+        match &e.scene().find_object(id).unwrap().1.kind {
+            ObjectKind::Shape(s) => s.path.clone(),
+            _ => panic!("not a shape"),
+        }
+    }
+
+    fn sub_click(e: &mut Editor, at: Point, mods: Mods) {
+        let s = e.camera.doc_to_screen(at);
+        e.pointer_down(s, mods);
+        e.pointer_up(s);
+    }
+
+    /// Click the anchor at `element`, wherever the object has put it.
+    fn click_anchor(e: &mut Editor, element: usize, mods: Mods) {
+        let at = world_anchor(e, element);
+        sub_click(e, at, mods);
+    }
+
+    /// A drag a step at a time, as the window delivers one.
+    fn sub_drag(e: &mut Editor, from: Point, to: Point, mods: Mods) {
+        let (a, b) = (e.camera.doc_to_screen(from), e.camera.doc_to_screen(to));
+        e.pointer_down(a, mods);
+        for i in 1..=5 {
+            e.pointer_move(a + (b - a) * (f64::from(i) / 5.0), mods);
+        }
+        e.pointer_up(b);
+    }
+
+    fn world_anchor(e: &Editor, element: usize) -> Point {
+        e.selected_anchors()
+            .into_iter()
+            .find(|a| a.element == element)
+            .unwrap()
+            .point
+    }
+
+    fn world_handle(e: &Editor, element: usize, side: buzz_geom::HandleSide) -> Point {
+        e.selected_handles()
+            .into_iter()
+            .find(|h| h.element == element && h.side == side)
+            .unwrap_or_else(|| panic!("no {side:?} handle on {element}"))
+            .point
+    }
+
+    const ALT: Mods = Mods {
+        shift: false,
+        alt: true,
+        ctrl: false,
+    };
+    const SHIFT: Mods = Mods {
+        shift: true,
+        alt: false,
+        ctrl: false,
+    };
+
+    fn near(a: Point, b: Point) -> bool {
+        (a - b).hypot() < 1e-6
+    }
+
+    #[test]
+    fn clicking_an_anchor_selects_it_and_shift_click_toggles() {
+        let (mut e, _) = sub_editor_with(square(0.0, 0.0, 100.0));
+        assert!(e.selected_anchor_elements().is_empty(), "nothing yet");
+
+        click_anchor(&mut e, 0, Mods::default());
+        assert_eq!(e.selected_anchor_elements(), vec![0]);
+
+        click_anchor(&mut e, 2, SHIFT);
+        assert_eq!(e.selected_anchor_elements(), vec![0, 2], "Shift adds");
+
+        click_anchor(&mut e, 0, SHIFT);
+        assert_eq!(e.selected_anchor_elements(), vec![2], "Shift toggles it out");
+
+        click_anchor(&mut e, 1, Mods::default());
+        assert_eq!(e.selected_anchor_elements(), vec![1], "a plain click replaces");
+    }
+
+    #[test]
+    fn a_marquee_selects_the_anchors_inside_it() {
+        let (mut e, _) = sub_editor_with(square(0.0, 0.0, 100.0));
+        // Begun outside the shape, so it is a marquee and not a move.
+        sub_drag(&mut e, Point::new(-30.0, -30.0), Point::new(130.0, 30.0), Mods::default());
+        assert_eq!(e.selected_anchor_elements(), vec![0, 1], "the top edge's two corners");
+        sub_drag(&mut e, Point::new(-30.0, 70.0), Point::new(130.0, 130.0), SHIFT);
+        assert_eq!(
+            e.selected_anchor_elements(),
+            vec![0, 1, 2, 3],
+            "Shift adds the bottom edge's"
+        );
+    }
+
+    #[test]
+    fn the_anchor_selection_is_forgotten_when_the_selection_changes() {
+        let (mut e, id) = sub_editor_with(square(0.0, 0.0, 100.0));
+        click_anchor(&mut e, 0, Mods::default());
+        assert_eq!(e.selected_anchor_elements(), vec![0]);
+
+        // Clicking empty stage deselects the shape.
+        sub_click(&mut e, Point::new(400.0, 300.0), Mods::default());
+        assert!(e.selection.is_empty());
+
+        // Choosing it again finds none of its anchors still selected.
+        e.selection.select_one(id);
+        assert!(e.selected_anchor_elements().is_empty());
+    }
+
+    /// Dragging any selected anchor carries all of them, as one undo step, and
+    /// what is on screen mid-drag is exactly what the release commits.
+    #[test]
+    fn dragging_a_selected_anchor_moves_all_selected_in_one_undo_step() {
+        let (mut e, id) = sub_editor_with(square(0.0, 0.0, 100.0));
+        let original = path_of(&e, id);
+        e.apply(ToolAction::SelectAnchors {
+            elements: vec![0, 1],
+            mode: crate::tools::AnchorSelect::Replace,
+        });
+
+        let from = world_anchor(&e, 1);
+        let to = from + Vec2::new(10.0, 20.0);
+        let (a, b) = (e.camera.doc_to_screen(from), e.camera.doc_to_screen(to));
+        e.pointer_down(a, Mods::default());
+        for i in 1..=5 {
+            e.pointer_move(a + (b - a) * (f64::from(i) / 5.0), Mods::default());
+        }
+
+        // Before the release: the path is already where the pointer put it.
+        let live = path_of(&e, id);
+        e.pointer_up(b);
+        assert_eq!(path_of(&e, id).elements(), live.elements(), "preview == commit");
+
+        assert!(near(world_anchor(&e, 0), Point::new(10.0, 20.0)));
+        assert!(near(world_anchor(&e, 1), Point::new(110.0, 20.0)));
+        assert!(near(world_anchor(&e, 2), Point::new(100.0, 100.0)), "unselected stays");
+        assert!(near(world_anchor(&e, 3), Point::new(0.0, 100.0)), "unselected stays");
+
+        e.run(Command::Undo);
+        assert_eq!(path_of(&e, id).elements(), original.elements(), "one undo step");
+    }
+
+    #[test]
+    fn a_selected_anchor_shows_its_two_handles_and_others_show_none() {
+        let (mut e, _) = sub_editor_with(curvy());
+        assert!(e.selected_handles().is_empty(), "no anchor selected, no handles");
+
+        click_anchor(&mut e, 1, Mods::default());
+        let handles = e.selected_handles();
+        assert_eq!(handles.len(), 2);
+        assert!(handles.iter().all(|h| h.element == 1 && h.smooth));
+        assert!(near(
+            world_handle(&e, 1, buzz_geom::HandleSide::In),
+            Point::new(80.0, 40.0)
+        ));
+        assert!(near(
+            world_handle(&e, 1, buzz_geom::HandleSide::Out),
+            Point::new(120.0, -40.0)
+        ));
+    }
+
+    #[test]
+    fn dragging_a_smooth_handle_turns_the_opposite_handle_with_it() {
+        let (mut e, id) = sub_editor_with(curvy());
+        let original = path_of(&e, id);
+        click_anchor(&mut e, 1, Mods::default());
+
+        let anchor = world_anchor(&e, 1);
+        let incoming_length =
+            (anchor - world_handle(&e, 1, buzz_geom::HandleSide::In)).hypot();
+        let out = world_handle(&e, 1, buzz_geom::HandleSide::Out);
+        sub_drag(&mut e, out, out + Vec2::new(30.0, 40.0), Mods::default());
+
+        let out_now = world_handle(&e, 1, buzz_geom::HandleSide::Out);
+        assert!(near(out_now, out + Vec2::new(30.0, 40.0)));
+        let in_now = world_handle(&e, 1, buzz_geom::HandleSide::In);
+        assert!(
+            ((anchor - in_now).hypot() - incoming_length).abs() < 1e-6,
+            "the opposite handle keeps its length"
+        );
+        // Collinear through the anchor, pointing the other way.
+        let (a, b) = (anchor - in_now, out_now - anchor);
+        assert!(a.cross(b).abs() < 1e-6 * a.hypot() * b.hypot());
+        assert!(a.dot(b) > 0.0);
+        assert_eq!(world_anchor(&e, 1), anchor, "the anchor itself did not move");
+
+        e.run(Command::Undo);
+        assert_eq!(path_of(&e, id).elements(), original.elements(), "one undo step");
+    }
+
+    #[test]
+    fn alt_dragging_a_handle_moves_only_that_handle() {
+        let (mut e, _) = sub_editor_with(curvy());
+        click_anchor(&mut e, 1, Mods::default());
+        let before_in = world_handle(&e, 1, buzz_geom::HandleSide::In);
+        let out = world_handle(&e, 1, buzz_geom::HandleSide::Out);
+
+        sub_drag(&mut e, out, out + Vec2::new(0.0, 60.0), ALT);
+
+        assert!(near(
+            world_handle(&e, 1, buzz_geom::HandleSide::Out),
+            out + Vec2::new(0.0, 60.0)
+        ));
+        assert!(
+            near(world_handle(&e, 1, buzz_geom::HandleSide::In), before_in),
+            "the other half stays where it was"
+        );
+        assert!(
+            !e.selected_handles().iter().any(|h| h.smooth),
+            "it is a corner now"
+        );
+    }
+
+    /// The handles are drawn and dragged through the object's transform, so on
+    /// a turned shape they must still land under the pointer.
+    #[test]
+    fn handles_follow_the_object_transform() {
+        let (mut e, id) = sub_editor_with(curvy());
+        e.apply(ToolAction::TransformSelection {
+            transform: Affine::translate((40.0, 25.0))
+                * Affine::rotate(0.6)
+                * Affine::scale_non_uniform(1.5, 0.8),
+        });
+        click_anchor(&mut e, 1, Mods::default());
+        assert_eq!(e.selected_anchor_elements(), vec![1]);
+
+        let out = world_handle(&e, 1, buzz_geom::HandleSide::Out);
+        let anchor = world_anchor(&e, 1);
+        let to = out + Vec2::new(-12.0, 33.0);
+        sub_drag(&mut e, out, to, Mods::default());
+        assert!(
+            near(world_handle(&e, 1, buzz_geom::HandleSide::Out), to),
+            "the handle ends under the pointer"
+        );
+        assert!(near(world_anchor(&e, 1), anchor));
+        // Smoothness is a property of the path, and it was kept (a non-uniform
+        // scale is an affine map: collinear stays collinear).
+        let in_now = world_handle(&e, 1, buzz_geom::HandleSide::In);
+        let (a, b) = (anchor - in_now, to - anchor);
+        assert!(a.cross(b).abs() < 1e-6 * a.hypot() * b.hypot());
+        let _ = id;
+    }
+
+    #[test]
+    fn alt_dragging_a_corner_pulls_symmetric_handles_out() {
+        for corner in [0usize, 1, 2] {
+            let (mut e, id) = sub_editor_with(square(0.0, 0.0, 100.0));
+            let original = path_of(&e, id);
+            let at = world_anchor(&e, corner);
+            sub_drag(&mut e, at, at + Vec2::new(25.0, -15.0), ALT);
+
+            assert_eq!(e.selected_anchor_elements(), vec![corner], "the corner is selected");
+            let out = world_handle(&e, corner, buzz_geom::HandleSide::Out);
+            let incoming = world_handle(&e, corner, buzz_geom::HandleSide::In);
+            assert!(near(out, at + Vec2::new(25.0, -15.0)), "corner {corner}");
+            assert!(
+                near(incoming, at - Vec2::new(25.0, -15.0)),
+                "the other handle is the same distance the other way (corner {corner})"
+            );
+            assert!(near(world_anchor(&e, corner), at), "the corner did not move");
+
+            e.run(Command::Undo);
+            assert_eq!(
+                path_of(&e, id).elements(),
+                original.elements(),
+                "one undo step (corner {corner})"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_takes_out_the_selected_anchors_and_is_undoable() {
+        let (mut e, id) = sub_editor_with(square(0.0, 0.0, 100.0));
+        let original = path_of(&e, id);
+        e.apply(ToolAction::SelectAnchors {
+            elements: vec![2],
+            mode: crate::tools::AnchorSelect::Replace,
+        });
+        e.run(Command::Delete);
+
+        assert!(e.scene().find_object(id).is_some(), "the shape stays");
+        assert_eq!(e.selected_anchors().len(), 3, "a triangle is left");
+        assert!(e.selected_anchor_elements().is_empty(), "nothing selected now");
+
+        e.run(Command::Undo);
+        assert_eq!(path_of(&e, id).elements(), original.elements());
+    }
+
+    #[test]
+    fn deleting_all_but_one_anchor_deletes_the_object() {
+        let (mut e, id) = sub_editor_with(square(0.0, 0.0, 100.0));
+        e.apply(ToolAction::SelectAnchors {
+            elements: vec![0, 1, 2],
+            mode: crate::tools::AnchorSelect::Replace,
+        });
+        e.run(Command::Delete);
+        assert!(e.scene().find_object(id).is_none(), "no path left to keep");
+
+        e.run(Command::Undo);
+        assert!(e.scene().find_object(id).is_some());
+    }
+
+    #[test]
+    fn delete_without_selected_anchors_still_deletes_the_object() {
+        let (mut e, id) = sub_editor_with(square(0.0, 0.0, 100.0));
+        e.run(Command::Delete);
+        assert!(e.scene().find_object(id).is_none());
+    }
+
+    #[test]
+    fn arrow_nudges_move_the_selected_anchors_and_not_the_object() {
+        let (mut e, id) = sub_editor_with(square(0.0, 0.0, 100.0));
+        let original = path_of(&e, id);
+        let transform = e.scene().find_object(id).unwrap().1.transform;
+        e.apply(ToolAction::SelectAnchors {
+            elements: vec![1, 2],
+            mode: crate::tools::AnchorSelect::Replace,
+        });
+
+        e.run(Command::Nudge { x: 1, y: 0 });
+        e.run(Command::Nudge { x: 0, y: 10 });
+        assert!(near(world_anchor(&e, 1), Point::new(101.0, 10.0)));
+        assert!(near(world_anchor(&e, 2), Point::new(101.0, 110.0)));
+        assert!(near(world_anchor(&e, 0), Point::new(0.0, 0.0)), "unselected stays");
+        assert_eq!(
+            e.scene().find_object(id).unwrap().1.transform,
+            transform,
+            "the object itself did not move"
+        );
+
+        // A run of nudges is one undo step, as for the object.
+        e.run(Command::Undo);
+        assert_eq!(path_of(&e, id).elements(), original.elements());
+    }
+
+    #[test]
+    fn nudging_anchors_is_in_world_units_on_a_turned_shape() {
+        let (mut e, _) = sub_editor_with(square(0.0, 0.0, 100.0));
+        e.apply(ToolAction::TransformSelection {
+            transform: Affine::rotate(0.7),
+        });
+        e.apply(ToolAction::SelectAnchors {
+            elements: vec![1],
+            mode: crate::tools::AnchorSelect::Replace,
+        });
+        let before = world_anchor(&e, 1);
+        e.run(Command::Nudge { x: 10, y: 0 });
+        assert!(near(world_anchor(&e, 1), before + Vec2::new(10.0, 0.0)));
+    }
+
+    #[test]
+    fn nudge_still_moves_the_object_without_selected_anchors() {
+        let (mut e, id) = sub_editor_with(square(0.0, 0.0, 100.0));
+        let before = e.scene().find_object(id).unwrap().1.bounds();
+        e.run(Command::Nudge { x: 1, y: 0 });
+        let after = e.scene().find_object(id).unwrap().1.bounds();
+        assert!((after.x0 - before.x0 - 1.0).abs() < 1e-9);
+    }
+
+    // -- the Selection tool bends raw shapes (C) and Free Transform distorts (D) --
+
+    const CTRL: Mods = Mods {
+        shift: false,
+        alt: false,
+        ctrl: true,
+    };
+    const CTRL_SHIFT: Mods = Mods {
+        shift: true,
+        alt: false,
+        ctrl: true,
+    };
+
+    /// An editor with the Selection tool in hand, drawing as separate objects.
+    fn arrow_editor() -> Editor {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        e.set_tool(ToolId::Selection);
+        e
+    }
+
+    /// Lay a shape down and leave **nothing selected**: the arrow's bend and
+    /// corner drag only apply to what is not selected yet.
+    fn lay(e: &mut Editor, shape: ShapeData) -> ObjectId {
+        e.apply(ToolAction::AddShape {
+            shape,
+            label: "Draw",
+        });
+        let id = e.selection.ids()[0];
+        e.selection.clear();
+        id
+    }
+
+    /// A point of the object's path, where it is drawn.
+    fn world_of(e: &Editor, id: ObjectId, p: Point) -> Point {
+        e.scene().find_object(id).unwrap().1.transform * p
+    }
+
+    /// The anchors of an object, where they are drawn.
+    fn drawn_anchors(e: &Editor, id: ObjectId) -> Vec<Point> {
+        buzz_geom::anchors(&path_of(e, id))
+            .into_iter()
+            .map(|a| world_of(e, id, a.point))
+            .collect()
+    }
+
+    /// The point at `t` on the segment ending at `element`, in the path's space.
+    fn curve_at(path: &BezPath, element: usize, t: f64) -> Point {
+        use kurbo::ParamCurve;
+        let els = path.elements();
+        let from = match els[element - 1] {
+            buzz_geom::PathEl::MoveTo(p) | buzz_geom::PathEl::LineTo(p) => p,
+            buzz_geom::PathEl::QuadTo(_, p) | buzz_geom::PathEl::CurveTo(_, _, p) => p,
+            buzz_geom::PathEl::ClosePath => panic!("no start"),
+        };
+        match els[element] {
+            buzz_geom::PathEl::LineTo(p) => kurbo::Line::new(from, p).eval(t),
+            buzz_geom::PathEl::QuadTo(c, p) => kurbo::QuadBez::new(from, c, p).eval(t),
+            buzz_geom::PathEl::CurveTo(c1, c2, p) => kurbo::CubicBez::new(from, c1, c2, p).eval(t),
+            _ => panic!("not a segment"),
+        }
+    }
+
+    fn all_points_near(a: &[Point], b: &[Point]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| near(*x, *y))
+    }
+
+    #[test]
+    fn bending_a_rectangles_top_edge_leaves_its_corners_and_lifts_the_midpoint() {
+        let mut e = arrow_editor();
+        let id = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        let corners = drawn_anchors(&e, id);
+
+        sub_drag(&mut e, Point::new(150.0, 100.0), Point::new(150.0, 60.0), Mods::default());
+
+        assert!(
+            all_points_near(&drawn_anchors(&e, id), &corners),
+            "the corners stay put"
+        );
+        let path = path_of(&e, id);
+        assert!(
+            matches!(path.elements()[1], buzz_geom::PathEl::CurveTo(..)),
+            "the straight edge is a curve now"
+        );
+        assert!(
+            near(world_of(&e, id, curve_at(&path, 1, 0.5)), Point::new(150.0, 60.0)),
+            "the middle of the edge is under the pointer"
+        );
+        assert!(e.selection.is_empty(), "bending does not select");
+    }
+
+    #[test]
+    fn a_fill_and_its_outline_bend_together() {
+        let mut e = arrow_editor();
+        let fill = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        let line = lay(
+            &mut e,
+            ShapeData::stroked(square(100.0, 100.0, 100.0), Color::BLACK, 2.0),
+        );
+
+        sub_drag(&mut e, Point::new(150.0, 100.0), Point::new(150.0, 60.0), Mods::default());
+
+        for id in [fill, line] {
+            let at = world_of(&e, id, curve_at(&path_of(&e, id), 1, 0.5));
+            assert!(near(at, Point::new(150.0, 60.0)), "{id:?} bent to {at:?}");
+        }
+    }
+
+    #[test]
+    fn dragging_a_corner_moves_the_fill_and_the_outline() {
+        let mut e = arrow_editor();
+        let fill = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        let line = lay(
+            &mut e,
+            ShapeData::stroked(square(100.0, 100.0, 100.0), Color::BLACK, 2.0),
+        );
+
+        sub_drag(&mut e, Point::new(100.0, 100.0), Point::new(80.0, 70.0), Mods::default());
+
+        let expected = [
+            Point::new(80.0, 70.0),
+            Point::new(200.0, 100.0),
+            Point::new(200.0, 200.0),
+            Point::new(100.0, 200.0),
+        ];
+        for id in [fill, line] {
+            assert!(
+                all_points_near(&drawn_anchors(&e, id), &expected),
+                "{id:?}: {:?}",
+                drawn_anchors(&e, id)
+            );
+        }
+    }
+
+    #[test]
+    fn a_ctrl_drag_on_an_edge_adds_a_corner_and_moves_it() {
+        let mut e = arrow_editor();
+        let fill = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        let line = lay(
+            &mut e,
+            ShapeData::stroked(square(100.0, 100.0, 100.0), Color::BLACK, 2.0),
+        );
+
+        sub_drag(&mut e, Point::new(150.0, 100.0), Point::new(150.0, 70.0), CTRL);
+
+        let expected = [
+            Point::new(100.0, 100.0),
+            Point::new(150.0, 70.0),
+            Point::new(200.0, 100.0),
+            Point::new(200.0, 200.0),
+            Point::new(100.0, 200.0),
+        ];
+        for id in [fill, line] {
+            assert!(
+                all_points_near(&drawn_anchors(&e, id), &expected),
+                "{id:?}: {:?}",
+                drawn_anchors(&e, id)
+            );
+        }
+    }
+
+    #[test]
+    fn a_ctrl_click_on_an_edge_adds_nothing() {
+        let mut e = arrow_editor();
+        let id = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        let original = path_of(&e, id);
+        sub_click(&mut e, Point::new(150.0, 100.0), CTRL);
+        assert_eq!(path_of(&e, id).elements(), original.elements());
+    }
+
+    #[test]
+    fn a_click_on_an_edge_still_selects_the_shape() {
+        let mut e = arrow_editor();
+        let id = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        let original = path_of(&e, id);
+
+        sub_click(&mut e, Point::new(150.0, 100.0), Mods::default());
+
+        assert_eq!(e.selection.ids(), vec![id]);
+        assert_eq!(path_of(&e, id).elements(), original.elements(), "and bends nothing");
+    }
+
+    #[test]
+    fn a_drag_inside_a_fill_still_selects_and_moves_it() {
+        let mut e = arrow_editor();
+        let id = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        let original = path_of(&e, id);
+
+        sub_drag(&mut e, Point::new(130.0, 160.0), Point::new(150.0, 170.0), Mods::default());
+
+        assert_eq!(e.selection.ids(), vec![id]);
+        assert_eq!(path_of(&e, id).elements(), original.elements(), "the path is untouched");
+        assert!(near(
+            world_of(&e, id, Point::new(100.0, 100.0)),
+            Point::new(120.0, 110.0)
+        ));
+    }
+
+    #[test]
+    fn a_selected_shape_is_never_bent() {
+        let mut e = arrow_editor();
+        let id = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        e.selection.select_one(id);
+        let original = path_of(&e, id);
+
+        // Between the corner and the middle handle: the transform box's skew
+        // edge, and the shape's own edge too.
+        sub_drag(&mut e, Point::new(125.0, 100.0), Point::new(125.0, 60.0), Mods::default());
+
+        assert_eq!(path_of(&e, id).elements(), original.elements());
+    }
+
+    #[test]
+    fn an_instance_is_never_bent() {
+        let mut e = arrow_editor();
+        let id = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        e.selection.select_one(id);
+        e.run(Command::ConvertToSymbol);
+        let instance = e.selection.ids()[0];
+        e.selection.clear();
+        assert!(
+            matches!(
+                e.scene().find_object(instance).unwrap().1.kind,
+                ObjectKind::Instance(_)
+            ),
+            "it is an instance now"
+        );
+        // The artwork inside the symbol, which a bend would have reshaped.
+        let artwork = |e: &Editor| {
+            let symbol = e.scene().library().iter().next().expect("a symbol");
+            let objects = symbol.objects_at(0);
+            match &objects[0].kind {
+                ObjectKind::Shape(s) => s.path.clone(),
+                _ => panic!("not a shape"),
+            }
+        };
+        let (path, transform) = (artwork(&e), e.scene().find_object(instance).unwrap().1.transform);
+
+        // On the instance's edge, where a raw shape would have been bent.
+        sub_drag(&mut e, Point::new(150.0, 100.0), Point::new(150.0, 60.0), Mods::default());
+
+        assert_eq!(artwork(&e).elements(), path.elements(), "no path was reshaped");
+        assert_ne!(
+            e.scene().find_object(instance).unwrap().1.transform,
+            transform,
+            "the press went to the instance, as it always did"
+        );
+        assert_eq!(e.selection.ids(), vec![instance]);
+    }
+
+    #[test]
+    fn bending_is_one_undo_step_and_the_preview_is_the_commit() {
+        let mut e = arrow_editor();
+        let id = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        let original = path_of(&e, id);
+
+        let (a, b) = (
+            e.camera.doc_to_screen(Point::new(150.0, 100.0)),
+            e.camera.doc_to_screen(Point::new(160.0, 55.0)),
+        );
+        e.pointer_down(a, Mods::default());
+        for i in 1..=7 {
+            e.pointer_move(a + (b - a) * (f64::from(i) / 7.0), Mods::default());
+        }
+        let live = path_of(&e, id);
+        assert_ne!(live.elements(), original.elements(), "already bent mid-drag");
+        e.pointer_up(b);
+        assert_eq!(path_of(&e, id).elements(), live.elements(), "preview == commit");
+
+        e.run(Command::Undo);
+        assert_eq!(path_of(&e, id).elements(), original.elements(), "one undo step");
+    }
+
+    #[test]
+    fn a_corner_drag_is_one_undo_step() {
+        let mut e = arrow_editor();
+        let id = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        let original = path_of(&e, id);
+        sub_drag(&mut e, Point::new(200.0, 200.0), Point::new(230.0, 260.0), Mods::default());
+        assert_ne!(path_of(&e, id).elements(), original.elements());
+        e.run(Command::Undo);
+        assert_eq!(path_of(&e, id).elements(), original.elements());
+    }
+
+    #[test]
+    fn bending_a_turned_and_squeezed_shape_follows_the_object_transform() {
+        let mut e = arrow_editor();
+        let id = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        e.selection.select_one(id);
+        e.apply(ToolAction::TransformSelection {
+            transform: Affine::translate((40.0, 25.0))
+                * Affine::rotate(0.6)
+                * Affine::scale_non_uniform(1.5, 0.8),
+        });
+        e.selection.clear();
+        let corners = drawn_anchors(&e, id);
+
+        let middle = world_of(&e, id, Point::new(150.0, 100.0));
+        let to = middle + Vec2::new(7.0, -35.0);
+        sub_drag(&mut e, middle, to, Mods::default());
+
+        assert!(all_points_near(&drawn_anchors(&e, id), &corners));
+        assert!(
+            near(world_of(&e, id, curve_at(&path_of(&e, id), 1, 0.5)), to),
+            "the edge ends under the pointer"
+        );
+    }
+
+    #[test]
+    fn dragging_a_corner_of_a_turned_shape_puts_it_under_the_pointer() {
+        let mut e = arrow_editor();
+        let id = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        e.selection.select_one(id);
+        e.apply(ToolAction::TransformSelection {
+            transform: Affine::rotate_about(0.5, Point::new(150.0, 150.0)),
+        });
+        e.selection.clear();
+
+        let corner = drawn_anchors(&e, id)[2];
+        let to = corner + Vec2::new(18.0, 31.0);
+        sub_drag(&mut e, corner, to, Mods::default());
+        assert!(near(drawn_anchors(&e, id)[2], to));
+    }
+
+    #[test]
+    fn the_cursor_tells_a_corner_from_an_edge_and_nothing_else() {
+        let mut e = arrow_editor();
+        let id = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        let screen = |e: &Editor, p: Point| e.camera.doc_to_screen(p);
+
+        assert_eq!(
+            e.shape_grip_hover(screen(&e, Point::new(100.0, 100.0))),
+            Some(ShapeGrip::Corner)
+        );
+        assert_eq!(
+            e.shape_grip_hover(screen(&e, Point::new(150.0, 100.0))),
+            Some(ShapeGrip::Edge)
+        );
+        assert_eq!(e.shape_grip_hover(screen(&e, Point::new(150.0, 150.0))), None, "inside");
+        assert_eq!(e.shape_grip_hover(screen(&e, Point::new(400.0, 400.0))), None, "empty stage");
+
+        e.selection.select_one(id);
+        assert_eq!(
+            e.shape_grip_hover(screen(&e, Point::new(150.0, 100.0))),
+            None,
+            "a selected shape moves instead"
+        );
+        e.selection.clear();
+        e.set_tool(ToolId::Subselection);
+        assert_eq!(
+            e.shape_grip_hover(screen(&e, Point::new(150.0, 100.0))),
+            None,
+            "only the Selection tool bends"
+        );
+    }
+
+    #[test]
+    fn a_locked_shape_is_not_bent() {
+        let mut e = arrow_editor();
+        let id = lay(&mut e, ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE));
+        let at = e.edit_at();
+        e.doc.edit("Lock", |scene| update_object(scene, at, id, |o| o.locked = true));
+        let original = path_of(&e, id);
+        sub_drag(&mut e, Point::new(150.0, 100.0), Point::new(150.0, 60.0), Mods::default());
+        assert_eq!(path_of(&e, id).elements(), original.elements());
+    }
+
+    // -- Free Transform: Ctrl+corner is Distort ---------------------------------
+
+    /// Free Transform in hand over one selected square, snapping off so the
+    /// pointer lands exactly where the test puts it.
+    fn distort_editor() -> (Editor, ObjectId) {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        e.view.snap.to_objects = false;
+        e.view.snap.to_guides = false;
+        e.set_tool(ToolId::FreeTransform);
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(square(100.0, 100.0, 100.0), Color::WHITE),
+            label: "Draw",
+        });
+        let id = e.selection.ids()[0];
+        (e, id)
+    }
+
+    /// The corners of a distorted (subdivided) square: the ends of its four
+    /// sides, which are every eighth cubic.
+    fn distorted_corners(e: &Editor, id: ObjectId) -> [Point; 4] {
+        let path = path_of(e, id);
+        let at = |i: usize| match path.elements()[i] {
+            buzz_geom::PathEl::MoveTo(p) | buzz_geom::PathEl::CurveTo(_, _, p) => {
+                world_of(e, id, p)
+            }
+            other => panic!("element {i} is {other:?}"),
+        };
+        [at(0), at(8), at(16), at(24)]
+    }
+
+    #[test]
+    fn ctrl_dragging_a_corner_distorts_that_corner_only() {
+        let (mut e, id) = distort_editor();
+        sub_drag(&mut e, Point::new(200.0, 100.0), Point::new(250.0, 70.0), CTRL);
+
+        let corners = distorted_corners(&e, id);
+        assert!(near(corners[1], Point::new(250.0, 70.0)), "the corner lands on the pointer");
+        assert!(near(corners[0], Point::new(100.0, 100.0)));
+        assert!(near(corners[2], Point::new(200.0, 200.0)));
+        assert!(near(corners[3], Point::new(100.0, 200.0)));
+
+        // The top edge is carried too: its middle is half way along the new one.
+        let buzz_geom::PathEl::CurveTo(_, _, mid) = path_of(&e, id).elements()[4] else {
+            panic!("not a curve");
+        };
+        assert!(near(world_of(&e, id, mid), Point::new(175.0, 85.0)));
+    }
+
+    #[test]
+    fn shift_ctrl_dragging_a_corner_tapers_symmetrically() {
+        let (mut e, id) = distort_editor();
+        sub_drag(&mut e, Point::new(200.0, 100.0), Point::new(220.0, 100.0), CTRL_SHIFT);
+
+        let corners = distorted_corners(&e, id);
+        assert!(near(corners[1], Point::new(220.0, 100.0)));
+        assert!(near(corners[0], Point::new(80.0, 100.0)), "the other end of the edge goes the other way");
+        assert!(near(corners[2], Point::new(200.0, 200.0)));
+        assert!(near(corners[3], Point::new(100.0, 200.0)));
+    }
+
+    #[test]
+    fn distorting_a_turned_selection_works_in_its_own_box() {
+        let (mut e, id) = distort_editor();
+        e.apply(ToolAction::TransformSelection {
+            transform: Affine::rotate_about(0.5, Point::new(150.0, 150.0)),
+        });
+        let before = distorted_corners_of_box(&e);
+        let corner = before[1];
+        let to = corner + Vec2::new(25.0, -10.0);
+        sub_drag(&mut e, corner, to, CTRL);
+
+        let path = path_of(&e, id);
+        let end = |i: usize| match path.elements()[i] {
+            buzz_geom::PathEl::MoveTo(p) | buzz_geom::PathEl::CurveTo(_, _, p) => world_of(&e, id, p),
+            _ => panic!(),
+        };
+        assert!(near(end(8), to), "the box's own top-right lands on the pointer");
+        assert!(near(end(0), before[0]));
+        assert!(near(end(16), before[2]));
+        assert!(near(end(24), before[3]));
+    }
+
+    fn distorted_corners_of_box(e: &Editor) -> [Point; 4] {
+        e.selection_box().unwrap().corners()
+    }
+
+    #[test]
+    fn a_distort_is_one_undo_step_and_the_preview_is_the_commit() {
+        let (mut e, id) = distort_editor();
+        let original = path_of(&e, id);
+
+        let (a, b) = (
+            e.camera.doc_to_screen(Point::new(200.0, 100.0)),
+            e.camera.doc_to_screen(Point::new(240.0, 60.0)),
+        );
+        e.pointer_down(a, CTRL);
+        for i in 1..=6 {
+            e.pointer_move(a + (b - a) * (f64::from(i) / 6.0), CTRL);
+        }
+        let live = path_of(&e, id);
+        assert_ne!(live.elements(), original.elements());
+        e.pointer_up(b);
+        assert_eq!(path_of(&e, id).elements(), live.elements(), "preview == commit");
+
+        e.run(Command::Undo);
+        assert_eq!(path_of(&e, id).elements(), original.elements(), "one undo step");
+    }
+
+    #[test]
+    fn an_instance_in_the_selection_makes_ctrl_corner_an_ordinary_scale() {
+        let (mut e, id) = distort_editor();
+        // A second object, turned into an instance.
+        e.selection.clear();
+        let other = lay(&mut e, ShapeData::filled(square(250.0, 100.0, 100.0), Color::WHITE));
+        e.selection.select_one(other);
+        e.run(Command::ConvertToSymbol);
+        let instance = e.selection.ids()[0];
+        e.selection.extend([id]);
+        assert_eq!(e.selection.len(), 2);
+
+        let original = path_of(&e, id);
+        let before = e.scene().find_object(id).unwrap().1.transform;
+        let frame = e.selection_box().unwrap();
+        let corner = frame.corners()[1];
+        sub_drag(&mut e, corner, corner + Vec2::new(60.0, 0.0), CTRL);
+
+        assert_eq!(path_of(&e, id).elements(), original.elements(), "not warped");
+        assert_ne!(
+            e.scene().find_object(id).unwrap().1.transform,
+            before,
+            "scaled instead"
+        );
+        let _ = instance;
+    }
+
     // -- frames, playback and camera ----------------------------------------
 
     #[test]
@@ -13529,7 +19503,13 @@ mod tests {
         );
         assert_eq!(e.scene().shape_count_at(7), 2);
         assert_eq!(
-            e.scene().layers().get(layer).unwrap().frames.keyframes().len(),
+            e.scene()
+                .layers()
+                .get(layer)
+                .unwrap()
+                .frames
+                .keyframes()
+                .len(),
             1,
             "adding to a held drawing makes no new keyframe"
         );
@@ -13556,16 +19536,36 @@ mod tests {
         }
         e.set_frame(5);
         e.run(Command::InsertBlankKeyframe);
-        assert_eq!(e.scene().shape_count_at(5), 0, "the blank keyframe empties from here");
+        assert_eq!(
+            e.scene().shape_count_at(5),
+            0,
+            "the blank keyframe empties from here"
+        );
 
         // Draw on frame 8, inside the blank hold.
         e.set_frame(8);
         draw_square(&mut e, 100.0, 0.0, 20.0, Color::WHITE);
 
-        assert_eq!(e.scene().shape_count_at(0), 1, "the earlier hold is untouched");
-        assert_eq!(e.scene().shape_count_at(5), 0, "the blank frames stay blank");
-        assert_eq!(e.scene().shape_count_at(7), 0, "right up to the drawn frame");
-        assert_eq!(e.scene().shape_count_at(8), 1, "and the drawing begins where it was drawn");
+        assert_eq!(
+            e.scene().shape_count_at(0),
+            1,
+            "the earlier hold is untouched"
+        );
+        assert_eq!(
+            e.scene().shape_count_at(5),
+            0,
+            "the blank frames stay blank"
+        );
+        assert_eq!(
+            e.scene().shape_count_at(7),
+            0,
+            "right up to the drawn frame"
+        );
+        assert_eq!(
+            e.scene().shape_count_at(8),
+            1,
+            "and the drawing begins where it was drawn"
+        );
     }
 
     /// **The report: there is no way to change when an imported clip starts.**
@@ -13597,7 +19597,10 @@ mod tests {
         let cues = e.scene().stage_cues();
         assert_eq!(cues.len(), 1, "still one cue, just moved");
         assert_eq!(cues[0].start_frame, 10, "it now plays from frame 10");
-        assert!(e.scene().frame_sound(layer, 0).is_none(), "frame 0 fell silent");
+        assert!(
+            e.scene().frame_sound(layer, 0).is_none(),
+            "frame 0 fell silent"
+        );
         assert_eq!(e.current_frame, 10, "the playhead follows the moved clip");
         assert!(
             e.scene().layers().get(layer).unwrap().frames.length() >= 10 + clip_frames,
@@ -13869,6 +19872,273 @@ mod tests {
         assert_eq!(on(9), vec![first], "and the first should be last");
     }
 
+    // -- Move Frames ------------------------------------------------------------
+
+    /// Three layers five frames long, each with a drawing on a keyframe at
+    /// frame 2; the third is locked. Frames 2–4 of all three are selected.
+    fn editor_with_frames_to_move() -> (Editor, [LayerId; 3]) {
+        let mut e = editor();
+        let mut ids = Vec::new();
+        e.doc.edit("Setup", |s| {
+            for name in ["A", "B", "Locked"] {
+                let layer = s.add_layer(name, buzz_scene::LayerKind::Normal);
+                s.update_layer(layer, |l| {
+                    l.frames.insert_frame(4);
+                    l.frames.insert_blank_keyframe(2);
+                });
+                let object = Object::shape(
+                    s.next_object_id(),
+                    ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE),
+                );
+                s.add_object_at(layer, 2, object);
+                ids.push(layer);
+            }
+            s.update_layer(ids[2], |l| l.locked = true);
+        });
+        let ids = [ids[0], ids[1], ids[2]];
+        e.selection
+            .set_timeline(buzz_ui::TimelineSelection::new(ids, 2, 4, ids[0], 2));
+        (e, ids)
+    }
+
+    /// Moving frames on two layers is one undo step, and a locked layer in
+    /// the selection is left exactly as it was.
+    #[test]
+    fn moving_frames_over_two_layers_is_one_undo_step_and_skips_locked() {
+        let (mut e, [a, b, locked]) = editor_with_frames_to_move();
+        let drawn = |e: &Editor, layer: LayerId, frame: u32| {
+            e.scene().layers().get(layer).unwrap().objects_at(frame).len()
+        };
+        let kind = |e: &Editor, layer: LayerId, frame: u32| {
+            e.scene().layers().get(layer).unwrap().frames.frame_kind(frame)
+        };
+
+        e.move_frames(5, 0, false);
+
+        for layer in [a, b] {
+            assert_eq!(kind(&e, layer, 2), buzz_scene::FrameKind::BlankKeyframe);
+            assert_eq!(drawn(&e, layer, 3), 0, "the vacated frames are blank");
+            for frame in 5..=7 {
+                assert_eq!(drawn(&e, layer, frame), 1, "frame {frame} holds the drawing");
+            }
+        }
+        assert_eq!(kind(&e, locked, 2), buzz_scene::FrameKind::Keyframe, "locked is skipped");
+        assert_eq!(kind(&e, locked, 5), buzz_scene::FrameKind::Empty);
+
+        assert!(e.doc.undo());
+        for layer in [a, b] {
+            assert_eq!(kind(&e, layer, 2), buzz_scene::FrameKind::Keyframe, "one undo restores both");
+            assert_eq!(kind(&e, layer, 5), buzz_scene::FrameKind::Empty);
+        }
+        assert!(e.scene().layers().get(a).is_some(), "and only the move was undone");
+    }
+
+    /// The selection and the playhead follow the frames to where they landed,
+    /// and the document grows to hold them.
+    #[test]
+    fn moving_frames_moves_the_selection_and_playhead_and_grows_the_document() {
+        let (mut e, [a, b, locked]) = editor_with_frames_to_move();
+        assert_eq!(e.scene().frame_count(), 5);
+
+        e.move_frames(5, 0, false);
+
+        assert_eq!(e.scene().frame_count(), 8, "the document grows to the moved frames");
+        let selection = e.selection.timeline().expect("the selection is kept");
+        assert_eq!((selection.first_frame, selection.last_frame), (5, 7));
+        assert!(selection.layers.contains(&a) && selection.layers.contains(&b));
+        assert!(selection.layers.contains(&locked));
+        assert_eq!(e.current_frame, 5, "the playhead goes to the destination");
+        let status = e.status.clone().unwrap_or_default();
+        assert!(status.contains("Moved 3 frames on 2 layers"), "{status}");
+    }
+
+    // -- Move Frames onto other layers (M6) -----------------------------------
+
+    /// A layer `length` frames long holding `objects` squares on a keyframe
+    /// at frame 0, so where its drawing went can be told by the count.
+    fn add_drawn_layer(s: &mut Scene, name: &str, objects: usize, length: u32) -> LayerId {
+        let layer = s.add_layer(name, buzz_scene::LayerKind::Normal);
+        s.update_layer(layer, |l| {
+            l.frames.insert_frame(length - 1);
+        });
+        for i in 0..objects {
+            let object = Object::shape(
+                s.next_object_id(),
+                ShapeData::filled(square(i as f64 * 20.0, 0.0, 10.0), Color::WHITE),
+            );
+            s.add_object_at(layer, 0, object);
+        }
+        layer
+    }
+
+    /// The timeline's layer rows, top to bottom — what a frame drag counts.
+    fn display_rows(e: &Editor) -> Vec<LayerId> {
+        let stack = e.scene().layers();
+        stack
+            .iter()
+            .map(|l| l.id)
+            .filter(|id| !stack.is_row_hidden(*id))
+            .collect()
+    }
+
+    fn rows_between(e: &Editor, from: LayerId, to: LayerId) -> i32 {
+        let rows = display_rows(e);
+        let at = |id: LayerId| rows.iter().position(|r| *r == id).unwrap() as i32;
+        at(to) - at(from)
+    }
+
+    /// Every object id, counted once per layer it appears on.
+    fn ids_by_layer(e: &Editor) -> Vec<(LayerId, ObjectId)> {
+        let mut out = Vec::new();
+        for layer in e.scene().layers().iter() {
+            let mut ids: Vec<ObjectId> = layer.frames.all_objects().map(|o| o.id).collect();
+            ids.sort();
+            ids.dedup();
+            out.extend(ids.into_iter().map(|id| (layer.id, id)));
+        }
+        out
+    }
+
+    /// Frames moved down one layer: the source keeps a blank keyframe, the
+    /// target is overwritten, the artwork has fresh ids that live on one layer
+    /// only, and a tween between two moved keyframes still pairs up.
+    #[test]
+    fn moving_frames_down_one_layer_gives_fresh_ids_and_keeps_tweens() {
+        let mut e = editor();
+        let (mut a, mut b) = (LayerId(0), LayerId(0));
+        e.doc.edit("Setup", |s| {
+            a = add_drawn_layer(s, "A", 1, 8);
+            b = add_drawn_layer(s, "B", 3, 8);
+            s.update_layer(a, |l| {
+                l.frames.insert_keyframe(2);
+                l.frames.insert_keyframe(4);
+                l.frames.set_tween(2, buzz_scene::Tween::classic());
+            });
+        });
+        let original = e.scene().layers().get(a).unwrap().objects_at(2)[0].id;
+        let rows = rows_between(&e, a, b);
+        assert_eq!(rows.abs(), 1, "A and B are neighbouring rows");
+        e.selection
+            .set_timeline(buzz_ui::TimelineSelection::new([a], 2, 4, a, 2));
+
+        e.move_frames(2, rows, false);
+
+        let layer = |id: LayerId| e.scene().layers().get(id).unwrap().clone();
+        let (la, lb) = (layer(a), layer(b));
+        assert_eq!(la.frames.frame_kind(2), buzz_scene::FrameKind::BlankKeyframe);
+        assert!(la.objects_at(4).is_empty(), "the source frames are blank");
+        assert_eq!(lb.objects_at(1).len(), 3, "the target's frames before are kept");
+        assert_eq!(lb.objects_at(2).len(), 1, "the target is overwritten");
+        assert_eq!(lb.objects_at(5).len(), 3, "and keeps what followed");
+        let moved = lb.objects_at(2)[0].id;
+        assert_ne!(moved, original, "frames that change layer get a fresh id");
+        assert_eq!(lb.objects_at(4)[0].id, moved, "one id for one object across keyframes");
+        let span = lb.frames.tween_span_at(2).expect("the tween came along");
+        assert_eq!(span.end, Some(4));
+        assert!(matches!(lb.frames.resolved_at(3u32), buzz_scene::ResolvedFrame::Tweened(_)));
+
+        let ids = ids_by_layer(&e);
+        for (layer, id) in &ids {
+            assert!(
+                !ids.iter().any(|(other, same)| same == id && other != layer),
+                "{id:?} is on two layers"
+            );
+        }
+        let selection = e.selection.timeline().unwrap();
+        assert_eq!(selection.layers.iter().copied().collect::<Vec<_>>(), vec![b]);
+        assert_eq!(e.current_frame, 2);
+    }
+
+    /// Two layers moved down one row: the middle layer both gives its frames
+    /// away and receives the ones above it, because every source is lifted
+    /// before anything is written.
+    #[test]
+    fn moving_two_layers_down_one_row_lets_the_middle_layer_give_and_receive() {
+        let mut e = editor();
+        let mut made = Vec::new();
+        e.doc.edit("Setup", |s| {
+            made.push(add_drawn_layer(s, "One", 1, 4));
+            made.push(add_drawn_layer(s, "Two", 2, 4));
+            made.push(add_drawn_layer(s, "Three", 3, 4));
+        });
+        let rows = display_rows(&e);
+        let mut ordered: Vec<LayerId> = made.clone();
+        ordered.sort_by_key(|id| rows.iter().position(|r| r == id));
+        let [top, middle, bottom] = [ordered[0], ordered[1], ordered[2]];
+        assert_eq!(rows_between(&e, top, bottom), 2, "three neighbouring rows");
+        let count = |e: &Editor, id: LayerId| e.scene().layers().get(id).unwrap().objects_at(0).len();
+        let (top_n, middle_n) = (count(&e, top), count(&e, middle));
+        e.selection
+            .set_timeline(buzz_ui::TimelineSelection::new([top, middle], 0, 3, top, 0));
+
+        e.move_frames(0, 1, false);
+
+        assert_eq!(count(&e, top), 0, "the top row gave its frames away");
+        assert_eq!(count(&e, middle), top_n, "the middle row has the top row's drawing");
+        assert_eq!(count(&e, bottom), middle_n, "the bottom row has the middle row's");
+        let selection = e.selection.timeline().unwrap();
+        assert!(selection.layers.contains(&middle) && selection.layers.contains(&bottom));
+        assert!(e.doc.undo(), "one undo step");
+        assert_eq!(count(&e, top), top_n);
+    }
+
+    /// Copying onto another layer leaves the source as it was and gives the
+    /// copy its own ids.
+    #[test]
+    fn copying_frames_onto_another_layer_leaves_the_source() {
+        let mut e = editor();
+        let (mut a, mut b) = (LayerId(0), LayerId(0));
+        e.doc.edit("Setup", |s| {
+            a = add_drawn_layer(s, "A", 2, 4);
+            b = add_drawn_layer(s, "B", 1, 4);
+        });
+        let before = e.scene().layers().get(a).unwrap().frames.clone();
+        let rows = rows_between(&e, a, b);
+        e.selection
+            .set_timeline(buzz_ui::TimelineSelection::new([a], 0, 1, a, 0));
+
+        e.move_frames(0, rows, true);
+
+        assert_eq!(e.scene().layers().get(a).unwrap().frames, before, "the source is untouched");
+        let target = e.scene().layers().get(b).unwrap();
+        assert_eq!(target.objects_at(0).len(), 2);
+        let source_ids: Vec<ObjectId> = before.objects_at(0).iter().map(|o| o.id).collect();
+        assert!(target.objects_at(0).iter().all(|o| !source_ids.contains(&o.id)));
+        assert_eq!(target.objects_at(2).len(), 1, "what followed the copy is kept");
+    }
+
+    /// A locked target, a folder, or no row at all refuses the **whole** move:
+    /// nothing changes, nothing is recorded, and the status line says why.
+    #[test]
+    fn a_locked_or_folder_target_refuses_the_whole_move() {
+        let mut e = editor();
+        let (mut a, mut locked, mut folder) = (LayerId(0), LayerId(0), LayerId(0));
+        e.doc.edit("Setup", |s| {
+            a = add_drawn_layer(s, "A", 1, 4);
+            locked = add_drawn_layer(s, "Locked", 1, 4);
+            s.update_layer(locked, |l| l.locked = true);
+            folder = s.add_layer("Folder", buzz_scene::LayerKind::Folder);
+        });
+        let before = e.scene().layers().get(a).unwrap().frames.clone();
+        let depth = e.doc.history().undo_depth();
+
+        for (target, why) in [(locked, "locked"), (folder, "folder")] {
+            let rows = rows_between(&e, a, target);
+            e.selection
+                .set_timeline(buzz_ui::TimelineSelection::new([a], 0, 1, a, 0));
+            e.move_frames(0, rows, false);
+            assert_eq!(e.scene().layers().get(a).unwrap().frames, before, "{why}: no change");
+            assert_eq!(e.doc.history().undo_depth(), depth, "{why}: nothing recorded");
+            let status = e.status.clone().unwrap_or_default();
+            assert!(status.contains(why), "{why}: {status}");
+        }
+
+        e.move_frames(0, 1000, false);
+        let status = e.status.clone().unwrap_or_default();
+        assert!(status.contains("no layer row"), "{status}");
+        assert_eq!(e.doc.history().undo_depth(), depth);
+    }
+
     // -- a new document -----------------------------------------------------
 
     /// **New asks rather than assuming.** The document on screen is untouched
@@ -13931,6 +20201,11 @@ mod tests {
             e.selection.active_layer().is_some(),
             "and has a layer to draw on"
         );
+        // A minute of frames at 25 fps, from the first layer, without the
+        // length being an edit that dirties the new document.
+        assert_eq!(e.scene().frame_count(), 1500);
+        let layer = e.scene().layers().iter().next().expect("Layer_1");
+        assert_eq!(layer.length(), 1500, "the first layer spans the minute");
     }
 
     /// And the settings become the default for the next one — the second
@@ -14616,6 +20891,50 @@ mod tests {
         );
     }
 
+    /// **C1**: a locked camera refuses `MoveCamera` — the same protection a
+    /// locked layer's artwork gets against a stray drag.
+    #[test]
+    fn a_locked_camera_refuses_a_nudge() {
+        let mut e = editor();
+        e.run(Command::ToggleCamera);
+        e.doc.edit("Lock Camera", |scene| {
+            scene.camera_mut().locked = true;
+        });
+        let before = e.scene().camera().state_at(0).unwrap().center;
+
+        e.nudge_camera(Vec2::new(50.0, 0.0));
+
+        let after = e.scene().camera().state_at(0).unwrap().center;
+        assert_eq!(before, after, "a locked camera must not move");
+    }
+
+    /// A locked camera also refuses a new keyframe and removing one.
+    #[test]
+    fn a_locked_camera_refuses_keyframe_add_and_remove() {
+        let mut e = editor();
+        e.run(Command::ToggleCamera);
+        let keys_before = e.scene().camera().keys().len();
+        e.doc.edit("Lock Camera", |scene| {
+            scene.camera_mut().locked = true;
+        });
+
+        e.set_frame(5);
+        e.run(Command::AddCameraKeyframe);
+        assert_eq!(
+            e.scene().camera().keys().len(),
+            keys_before,
+            "a locked camera must not gain a key"
+        );
+
+        e.set_frame(0);
+        e.run(Command::RemoveCameraKeyframe);
+        assert_eq!(
+            e.scene().camera().keys().len(),
+            keys_before,
+            "a locked camera must not lose a key either"
+        );
+    }
+
     /// **Aiming the camera is steady.**
     ///
     /// Two things used to make it shake. The drag was measured from the
@@ -14785,33 +21104,489 @@ mod tests {
         );
     }
 
-    /// And with the **Selection** tool, which Animate does not allow — see
-    /// §7. A drag that starts on the circle moves it; a click still selects.
+    /// **Resizing twice in a row must resize twice in a row.** The user's own
+    /// words: "once it resizes once, it just moves". A corner drag, released,
+    /// then a second corner drag from the *new* corner must scale again, not
+    /// silently fall through to a move of the whole selection.
     #[test]
-    fn the_selection_tool_can_move_the_transformation_point_too() {
+    fn free_transform_can_resize_a_corner_twice_in_a_row() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE).expect("a square");
+        e.set_tool(ToolId::FreeTransform);
+        e.selection.select_one(id);
+
+        let bounds0 = e.selection_bounds_drawn().expect("bounds");
+        assert_eq!(bounds0, Rect::new(0.0, 0.0, 100.0, 100.0));
+
+        // Drag the bottom-right corner out by 40 units.
+        let corner = Point::new(bounds0.x1, bounds0.y1);
+        let target = Point::new(bounds0.x1 + 40.0, bounds0.y1 + 40.0);
+        e.pointer_down(e.camera.doc_to_screen(corner), Mods::default());
+        e.pointer_move(e.camera.doc_to_screen(target), Mods::default());
+        e.pointer_up(e.camera.doc_to_screen(target));
+
+        let bounds1 = e.selection_bounds_drawn().expect("bounds after first resize");
+        assert!(
+            bounds1.width() > bounds0.width() + 10.0 && bounds1.height() > bounds0.height() + 10.0,
+            "the first drag should have resized, got {bounds1:?} from {bounds0:?}"
+        );
+        assert!(
+            (bounds1.x0 - bounds0.x0).abs() < 1.0 && (bounds1.y0 - bounds0.y0).abs() < 1.0,
+            "the opposite corner should have stayed put, got {bounds1:?}"
+        );
+
+        // Now drag the *new* bottom-right corner out by another 40 units.
+        let corner2 = Point::new(bounds1.x1, bounds1.y1);
+        let target2 = Point::new(bounds1.x1 + 40.0, bounds1.y1 + 40.0);
+        e.pointer_down(e.camera.doc_to_screen(corner2), Mods::default());
+        e.pointer_move(e.camera.doc_to_screen(target2), Mods::default());
+        e.pointer_up(e.camera.doc_to_screen(target2));
+
+        let bounds2 = e.selection_bounds_drawn().expect("bounds after second resize");
+        assert!(
+            bounds2.width() > bounds1.width() + 10.0 && bounds2.height() > bounds1.height() + 10.0,
+            "the second drag on the new corner should ALSO have resized, not moved: \
+             got {bounds2:?} from {bounds1:?}"
+        );
+        assert!(
+            (bounds2.x0 - bounds0.x0).abs() < 1.0 && (bounds2.y0 - bounds0.y0).abs() < 1.0,
+            "the far corner should still be anchored after two resizes, got {bounds2:?}"
+        );
+    }
+
+    /// The same, but the second gesture is a **rotate** grabbed from the ring
+    /// just outside the corner the first resize left behind — one of the
+    /// suspect sequences named in the interaction-fixes plan.
+    #[test]
+    fn free_transform_can_resize_then_rotate_from_the_rings_new_position() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE).expect("a square");
+        e.set_tool(ToolId::FreeTransform);
+        e.selection.select_one(id);
+
+        let bounds0 = e.selection_bounds_drawn().expect("bounds");
+        let corner = Point::new(bounds0.x1, bounds0.y1);
+        let target = Point::new(bounds0.x1 + 40.0, bounds0.y1 + 40.0);
+        e.pointer_down(e.camera.doc_to_screen(corner), Mods::default());
+        e.pointer_move(e.camera.doc_to_screen(target), Mods::default());
+        e.pointer_up(e.camera.doc_to_screen(target));
+
+        let bounds1 = e.selection_bounds_drawn().expect("bounds after resize");
+        let pivot1 = e.pivot().expect("a transformation point");
+
+        // Just outside the (now-moved) corner: the rotate ring.
+        let grab = crate::tools::TRANSFORM_GRAB_PX / e.camera.zoom.max(f64::MIN_POSITIVE);
+        let ring = Point::new(bounds1.x1 + grab * 2.0, bounds1.y1 + grab * 2.0);
+        let ring_target = Point::new(bounds1.x1 - 30.0, bounds1.y1 + 30.0);
+        e.pointer_down(e.camera.doc_to_screen(ring), Mods::default());
+        e.pointer_move(e.camera.doc_to_screen(ring_target), Mods::default());
+        e.pointer_up(e.camera.doc_to_screen(ring_target));
+
+        let (_, object) = e.scene().find_object(id).expect("still there");
+        let angle = object.transform.as_coeffs()[1].atan2(object.transform.as_coeffs()[0]);
+        assert!(
+            angle.abs() > 0.05,
+            "the ring drag should have rotated the shape, got transform {:?}",
+            object.transform
+        );
+        let pivot2 = e.pivot().expect("still a transformation point");
+        assert!(
+            (pivot2 - pivot1).hypot() < 1.0,
+            "a rotation must turn about the pivot, not move it: {pivot1:?} -> {pivot2:?}"
+        );
+    }
+
+    /// And a rotate followed by a resize: the corner the second drag grabs
+    /// must be found on the *rotated* box, not the original axis-aligned one.
+    #[test]
+    fn free_transform_can_rotate_then_resize_the_turned_corner() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE).expect("a square");
+        e.set_tool(ToolId::FreeTransform);
+        e.selection.select_one(id);
+
+        let bounds0 = e.selection_bounds_drawn().expect("bounds");
+        let pivot0 = e.pivot().expect("a pivot");
+        let grab = crate::tools::TRANSFORM_GRAB_PX / e.camera.zoom.max(f64::MIN_POSITIVE);
+        let ring = Point::new(bounds0.x1 + grab * 2.0, bounds0.y1 + grab * 2.0);
+        let ring_target = Point::new(bounds0.x1 + 60.0, bounds0.y0 - 10.0);
+        e.pointer_down(e.camera.doc_to_screen(ring), Mods::default());
+        e.pointer_move(e.camera.doc_to_screen(ring_target), Mods::default());
+        e.pointer_up(e.camera.doc_to_screen(ring_target));
+
+        // The object's own bottom-right corner, carried through its (now
+        // rotated) transform, is where that corner actually landed in doc
+        // space — which is where the gizmo's corner handle is drawn too.
+        let transform_before = {
+            let (_, object) = e.doc.scene().find_object(id).unwrap();
+            object.transform
+        };
+        let local = {
+            let (_, object) = e.doc.scene().find_object(id).unwrap();
+            object.local_bounds()
+        };
+        let local_corner = Point::new(local.x1, local.y1);
+        let world_corner = transform_before * local_corner;
+
+        // Resize from that turned corner.
+        let target = world_corner + (world_corner - pivot0).normalize() * 30.0;
+        e.pointer_down(e.camera.doc_to_screen(world_corner), Mods::default());
+        e.pointer_move(e.camera.doc_to_screen(target), Mods::default());
+        e.pointer_up(e.camera.doc_to_screen(target));
+
+        let transform_after = e.doc.scene().find_object(id).unwrap().1.transform;
+        assert_ne!(
+            transform_after, transform_before,
+            "the drag on the rotated corner should have scaled, not been a no-op or a move"
+        );
+        let scale_after = {
+            let c = transform_after.as_coeffs();
+            (c[0] * c[0] + c[1] * c[1]).sqrt()
+        };
+        let scale_before = {
+            let c = transform_before.as_coeffs();
+            (c[0] * c[0] + c[1] * c[1]).sqrt()
+        };
+        assert!(
+            scale_after > scale_before + 0.05,
+            "expected a scale increase, got {scale_before} -> {scale_after}"
+        );
+    }
+
+    /// A resize at 2.5x zoom must resize by the same proportion as at 1x —
+    /// the gizmo's grab radius is in screen pixels, but the resulting scale is
+    /// a document-space ratio and must not depend on the zoom.
+    #[test]
+    fn free_transform_resize_is_consistent_across_zoom() {
+        let resize_ratio = |zoom_percent: f64| -> f64 {
+            let mut e = editor();
+            e.style.drawing_mode = DrawingMode::ObjectDrawing;
+            let id = draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE).expect("a square");
+            e.set_tool(ToolId::FreeTransform);
+            e.selection.select_one(id);
+            e.camera.set_zoom_percent(zoom_percent);
+
+            let bounds = e.selection_bounds_drawn().expect("bounds");
+            let corner = Point::new(bounds.x1, bounds.y1);
+            let target = Point::new(bounds.x1 + 40.0, bounds.y1 + 40.0);
+            e.pointer_down(e.camera.doc_to_screen(corner), Mods::default());
+            e.pointer_move(e.camera.doc_to_screen(target), Mods::default());
+            e.pointer_up(e.camera.doc_to_screen(target));
+
+            let after = e.selection_bounds_drawn().expect("bounds after resize");
+            after.width() / bounds.width()
+        };
+
+        let ratio_1x = resize_ratio(100.0);
+        let ratio_2_5x = resize_ratio(250.0);
+        assert!(
+            (ratio_1x - ratio_2_5x).abs() < 0.05,
+            "resize ratio should not depend on zoom: 1x={ratio_1x} 2.5x={ratio_2_5x}"
+        );
+        assert!(ratio_1x > 1.3, "the 1x drag should have resized at all, got {ratio_1x}");
+    }
+
+    /// Same corner-twice sequence, but on **several touching raw shapes**
+    /// picked up together as one drawing — the case the interaction-fixes
+    /// plan calls out by name ("a pick that grows the selection to the whole
+    /// drawing after the first gesture").
+    ///
+    /// The pieces are taken with a marquee now: a click picks only the piece
+    /// under it (E3), which used to be Free Transform's whole-drawing pick.
+    #[test]
+    fn free_transform_can_resize_a_multi_piece_drawing_twice_in_a_row() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let _a = draw_square(&mut e, 0.0, 0.0, 60.0, Color::WHITE).expect("a");
+        let _b = draw_square(&mut e, 40.0, 0.0, 60.0, Color::WHITE).expect("b");
+        e.set_tool(ToolId::FreeTransform);
+        e.selection.clear();
+        e.apply(ToolAction::PickInRect {
+            rect: Rect::new(-10.0, -10.0, 110.0, 70.0),
+            additive: false,
+        });
+        assert_eq!(e.selection.len(), 2, "both pieces should be grabbed");
+
+        let bounds0 = e.selection_bounds_drawn().expect("bounds");
+        let corner = Point::new(bounds0.x1, bounds0.y1);
+        let target = Point::new(bounds0.x1 + 40.0, bounds0.y1 + 40.0);
+        e.pointer_down(e.camera.doc_to_screen(corner), Mods::default());
+        e.pointer_move(e.camera.doc_to_screen(target), Mods::default());
+        e.pointer_up(e.camera.doc_to_screen(target));
+
+        assert_eq!(e.selection.len(), 2, "the resize must not change the selection");
+        let bounds1 = e.selection_bounds_drawn().expect("bounds after first resize");
+        assert!(
+            bounds1.width() > bounds0.width() + 10.0,
+            "the first drag should have resized, got {bounds1:?}"
+        );
+
+        let corner2 = Point::new(bounds1.x1, bounds1.y1);
+        let target2 = Point::new(bounds1.x1 + 40.0, bounds1.y1 + 40.0);
+        e.pointer_down(e.camera.doc_to_screen(corner2), Mods::default());
+        e.pointer_move(e.camera.doc_to_screen(target2), Mods::default());
+        e.pointer_up(e.camera.doc_to_screen(target2));
+
+        assert_eq!(e.selection.len(), 2, "the second resize must not change the selection");
+        let bounds2 = e.selection_bounds_drawn().expect("bounds after second resize");
+        assert!(
+            bounds2.width() > bounds1.width() + 10.0,
+            "the second drag should ALSO have resized, got {bounds2:?} from {bounds1:?}"
+        );
+    }
+
+    /// Turn the selection about its transformation point, the way the rotate
+    /// ring does.
+    fn turn_selection(e: &mut Editor, radians: f64) {
+        let pivot = e.pivot().expect("a transformation point");
+        e.apply(ToolAction::TransformSelection {
+            transform: Affine::translate(pivot.to_vec2())
+                * Affine::rotate(radians)
+                * Affine::translate(-pivot.to_vec2()),
+        });
+    }
+
+    /// **The transform box turns with a rotated selection.** It used to be the
+    /// rectangle round the artwork, so the handles of a turned square jumped out
+    /// to the corners of a bigger box that was nowhere near it.
+    #[test]
+    fn selection_box_follows_a_rotated_object() {
+        let mut e = editor();
+        let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        turn_selection(&mut e, 30.0_f64.to_radians());
+
+        let frame = e.selection_box().expect("a box");
+        let c = frame.to_doc.as_coeffs();
+        assert!(
+            (c[0] - 30.0_f64.to_radians().cos()).abs() < 1e-9
+                && (c[1] - 30.0_f64.to_radians().sin()).abs() < 1e-9,
+            "the box's own x axis turned with the square, got {c:?}"
+        );
+
+        let quad = e.object_quad(id).expect("a drawn quad");
+        for (corner, drawn) in frame.corners().into_iter().zip(quad) {
+            assert!(
+                (corner - drawn).hypot() < 1e-6,
+                "a handle corner {corner:?} is not on the drawn corner {drawn:?}"
+            );
+        }
+
+        // The old rectangle is still the box's extent.
+        let bounds = e.selection_bounds_drawn().expect("bounds");
+        let aabb = frame.aabb();
+        assert!(
+            (aabb.x0 - bounds.x0).abs() < 1e-6
+                && (aabb.y0 - bounds.y0).abs() < 1e-6
+                && (aabb.x1 - bounds.x1).abs() < 1e-6
+                && (aabb.y1 - bounds.y1).abs() < 1e-6,
+            "{aabb:?} against {bounds:?}"
+        );
+        assert!(
+            frame.contains(frame.center()),
+            "the centre of the box is inside it"
+        );
+    }
+
+    /// The pieces of one drawing are turned together, so they share a linear
+    /// part and share one box — not a box each, and not the rectangle round
+    /// them.
+    #[test]
+    fn fill_and_stroke_share_one_oriented_box() {
+        let mut e = editor();
+        let a = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a fill");
+        let b = draw_square(&mut e, 120.0, 100.0, 60.0, Color::BLACK).expect("a stroke");
+        e.selection.set(vec![a, b]);
+        turn_selection(&mut e, 30.0_f64.to_radians());
+
+        let frame = e.selection_box().expect("a box");
+        let c = frame.to_doc.as_coeffs();
+        assert!(
+            (c[1] - 30.0_f64.to_radians().sin()).abs() < 1e-9,
+            "one box, turned with them: {c:?}"
+        );
+        // Every piece's drawn corners are inside it.
+        for id in [a, b] {
+            for corner in e.object_quad(id).expect("a quad") {
+                let grown = TransformBox {
+                    local: frame.local.inflate(1e-6, 1e-6),
+                    to_doc: frame.to_doc,
+                };
+                assert!(grown.contains(corner), "{corner:?} is outside the shared box");
+            }
+        }
+        let bounds = e.selection_bounds_drawn().expect("bounds");
+        let aabb = frame.aabb();
+        assert!(
+            (aabb.x0 - bounds.x0).abs() < 1e-6 && (aabb.y1 - bounds.y1).abs() < 1e-6,
+            "{aabb:?} against {bounds:?}"
+        );
+    }
+
+    /// Objects turned different ways have no common box: the selection gets the
+    /// rectangle round them, not turned, as it always had.
+    #[test]
+    fn mixed_rotations_fall_back_to_the_aabb() {
+        let mut e = editor();
+        let a = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        let b = draw_square(&mut e, 300.0, 100.0, 100.0, Color::BLACK).expect("a square");
+        e.selection.select_one(a);
+        turn_selection(&mut e, 0.3);
+        e.selection.select_one(b);
+        turn_selection(&mut e, 0.8);
+        e.selection.set(vec![a, b]);
+
+        let frame = e.selection_box().expect("a box");
+        assert_eq!(frame.to_doc, Affine::IDENTITY, "not turned");
+        assert_eq!(Some(frame.local), e.selection_bounds_drawn());
+    }
+
+    /// **End to end: a side handle on a turned square stretches its own width
+    /// and shears nothing.** Pressed, dragged in two steps and released, through
+    /// the editor the way the pointer does it.
+    #[test]
+    fn free_transform_side_drag_on_a_rotated_square_does_not_shear_it() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        e.set_tool(ToolId::FreeTransform);
+        e.selection.select_one(id);
+        turn_selection(&mut e, 30.0_f64.to_radians());
+
+        let frame = e.selection_box().expect("a box");
+        let x_axis = Vec2::new(frame.to_doc.as_coeffs()[0], frame.to_doc.as_coeffs()[1]);
+        let handle = frame.mid_edges()[3];
+        let to_screen = |p: Point| e.camera.doc_to_screen(p);
+        let (press, halfway, release) = (
+            to_screen(handle),
+            to_screen(handle + x_axis * 25.0),
+            to_screen(handle + x_axis * 50.0),
+        );
+        e.pointer_down(press, Mods::default());
+        e.pointer_move(halfway, Mods::default());
+        e.pointer_move(release, Mods::default());
+        e.pointer_up(release);
+
+        let (_, object) = e.scene().find_object(id).expect("the square");
+        let m = object.transform.as_coeffs();
+        let (col_x, col_y) = (Vec2::new(m[0], m[1]), Vec2::new(m[2], m[3]));
+        assert!(
+            col_x.dot(col_y).abs() < 1e-6,
+            "the square sheared: its axes lean by {}",
+            col_x.dot(col_y)
+        );
+        assert!(
+            (col_x.hypot() - 1.5).abs() < 1e-6,
+            "100 wide pulled 50 out is 1.5x, got {}",
+            col_x.hypot()
+        );
+        assert!(
+            (col_y.hypot() - 1.0).abs() < 1e-6,
+            "its height is untouched, got {}",
+            col_y.hypot()
+        );
+    }
+
+    /// The cursor the second press promises must be the gesture it performs:
+    /// `App::transform_cursor` and `ToolMachine::begins_a_transform` /
+    /// `begins_a_move` must agree on the same point after a first resize.
+    #[test]
+    fn cursor_zone_matches_the_press_after_a_resize() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE).expect("a square");
+        e.set_tool(ToolId::FreeTransform);
+        e.selection.select_one(id);
+
+        let bounds0 = e.selection_bounds_drawn().expect("bounds");
+        let corner = Point::new(bounds0.x1, bounds0.y1);
+        let target = Point::new(bounds0.x1 + 40.0, bounds0.y1 + 40.0);
+        e.pointer_down(e.camera.doc_to_screen(corner), Mods::default());
+        e.pointer_move(e.camera.doc_to_screen(target), Mods::default());
+        e.pointer_up(e.camera.doc_to_screen(target));
+
+        let bounds1 = e.selection_bounds_drawn().expect("bounds after resize");
+        let pivot1 = e.pivot().unwrap_or_else(|| bounds1.center());
+        let grab = crate::tools::TRANSFORM_GRAB_PX / e.camera.zoom.max(f64::MIN_POSITIVE);
+        let new_corner = Point::new(bounds1.x1, bounds1.y1);
+        let zone = crate::tools::transform_zone(
+            crate::tools::TransformBox::axis_aligned(bounds1),
+            pivot1,
+            new_corner,
+            grab,
+        );
+        assert_eq!(
+            zone,
+            crate::tools::TransformZone::Corner,
+            "the cursor's own zone test should read the new corner as a corner"
+        );
+
+        // And a press right there must actually scale, matching that promise.
+        let target2 = Point::new(new_corner.x + 40.0, new_corner.y + 40.0);
+        e.pointer_down(e.camera.doc_to_screen(new_corner), Mods::default());
+        e.pointer_move(e.camera.doc_to_screen(target2), Mods::default());
+        e.pointer_up(e.camera.doc_to_screen(target2));
+        let bounds2 = e.selection_bounds_drawn().expect("bounds after second resize");
+        assert!(
+            bounds2.width() > bounds1.width() + 10.0,
+            "the press must keep the promise the cursor zone made"
+        );
+    }
+
+    /// **The transformation point is Free Transform's alone.** A drag that starts
+    /// on the circle moves the point and leaves the artwork where it is; the
+    /// Selection tool, Animate's arrow, has no such circle, so the same press on
+    /// it simply moves the artwork — and never places a point.
+    ///
+    /// Was `the_selection_tool_can_move_the_transformation_point_too`, which
+    /// asserted the opposite of the Selection tool (a deliberate deviation from
+    /// Animate, recorded in §7, which E1 takes back).
+    #[test]
+    fn free_transform_moves_the_transformation_point_and_the_selection_tool_does_not() {
+        let target = Point::new(140.0, 260.0);
+
+        // Free Transform: the point goes where it was dragged, the square stays.
+        let mut e = editor();
+        let id = draw_square(&mut e, 100.0, 100.0, 200.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        e.set_tool(ToolId::FreeTransform);
+        let before = transform_of(&e, id);
+        let start = e.pivot().expect("a transformation point");
+        drag_with(&mut e, start, target, Mods::default());
+        let moved = e.pivot().expect("still there");
+        assert!(
+            (moved - target).hypot() < 0.51,
+            "Free Transform should move it, not {moved:?}"
+        );
+        assert_eq!(transform_of(&e, id), before, "and leave the artwork alone");
+
+        // The Selection tool: the same press drags the artwork.
         let mut e = editor();
         let id = draw_square(&mut e, 100.0, 100.0, 200.0, Color::WHITE).expect("a square");
         e.selection.select_one(id);
         assert_eq!(e.tool(), ToolId::Selection, "the tool it opens with");
-
         let start = e.pivot().expect("a transformation point");
-        let target = Point::new(140.0, 260.0);
-        e.pointer_down(e.camera.doc_to_screen(start), Mods::default());
-        e.pointer_move(e.camera.doc_to_screen(target), Mods::default());
-        e.pointer_up(e.camera.doc_to_screen(target));
-
-        let moved = e.pivot().expect("still there");
+        drag_with(&mut e, start, target, Mods::default());
         assert!(
-            (moved - target).hypot() < 0.51,
-            "the selection tool should move it too, not {moved:?}"
+            is_translation(transform_of(&e, id), target - start),
+            "the arrow moved the artwork, got {:?}",
+            transform_of(&e, id).as_coeffs()
+        );
+        assert!(
+            e.scene().find_object(id).unwrap().1.pivot.is_none(),
+            "and no transformation point was placed"
         );
 
         // A click in the middle of the artwork still selects rather than
-        // resetting the point — the thing that would make this deviation cost
-        // more than it gives.
+        // resetting anything.
+        let at = e.pivot().expect("a point");
         let before = e.pivot();
-        e.pointer_down(e.camera.doc_to_screen(moved), Mods::default());
-        e.pointer_up(e.camera.doc_to_screen(moved));
+        let screen = e.camera.doc_to_screen(at);
+        e.pointer_down(screen, Mods::default());
+        e.pointer_up(screen);
         assert_eq!(e.pivot(), before, "a click must not disturb it");
     }
 
@@ -14928,7 +21703,8 @@ mod tests {
                 line.line_to((100.0, 50.0));
                 let line = Object::shape(b, ShapeData::stroked(line, Color::BLACK, 4.0));
                 scene.edit_layers().update(layer, |l| {
-                    l.frames.set_objects(0, vec![Arc::new(patch), Arc::new(line)]);
+                    l.frames
+                        .set_objects(0, vec![Arc::new(patch), Arc::new(line)]);
                 });
             });
             (e, fill_id, line_id)
@@ -14951,26 +21727,38 @@ mod tests {
 
         // Normal takes both.
         let (mut e, fill, line) = build(EraserMode::Normal);
-        e.apply(ToolAction::Erase { path: rub(), width: 10.0 });
+        e.apply(ToolAction::Erase {
+            path: rub(),
+            width: 10.0,
+        });
         assert!(!whole(&e, fill), "Normal left the fill untouched");
         assert!(!whole(&e, line), "Normal left the line untouched");
 
         // Fills takes the colour and leaves the linework.
         let (mut e, fill, line) = build(EraserMode::Fills);
-        e.apply(ToolAction::Erase { path: rub(), width: 10.0 });
+        e.apply(ToolAction::Erase {
+            path: rub(),
+            width: 10.0,
+        });
         assert!(!whole(&e, fill), "Fills did not take the fill");
         assert!(whole(&e, line), "Fills took the line as well");
 
         // Lines takes the linework and leaves the colour.
         let (mut e, fill, line) = build(EraserMode::Lines);
-        e.apply(ToolAction::Erase { path: rub(), width: 10.0 });
+        e.apply(ToolAction::Erase {
+            path: rub(),
+            width: 10.0,
+        });
         assert!(whole(&e, fill), "Lines took the fill as well");
         assert!(!whole(&e, line), "Lines did not take the line");
 
         // Selected fills takes nothing while nothing is selected.
         let (mut e, fill, line) = build(EraserMode::SelectedFills);
         e.selection.clear();
-        e.apply(ToolAction::Erase { path: rub(), width: 10.0 });
+        e.apply(ToolAction::Erase {
+            path: rub(),
+            width: 10.0,
+        });
         assert!(whole(&e, fill), "Selected fills rubbed an unselected fill");
         assert!(whole(&e, line), "Selected fills rubbed a line");
         assert!(survives(&e, fill) && survives(&e, line));
@@ -14978,8 +21766,87 @@ mod tests {
         // And takes it once it is selected.
         let (mut e, fill, _line) = build(EraserMode::SelectedFills);
         e.selection.set([fill]);
-        e.apply(ToolAction::Erase { path: rub(), width: 10.0 });
-        assert!(!whole(&e, fill), "Selected fills did not rub the selected fill");
+        e.apply(ToolAction::Erase {
+            path: rub(),
+            width: 10.0,
+        });
+        assert!(
+            !whole(&e, fill),
+            "Selected fills did not rub the selected fill"
+        );
+    }
+
+    /// **Animate's "Zoom size with stage", off.** With the flag off, the
+    /// eraser's size is fixed in screen pixels: at 4x zoom, a pointer event
+    /// converts `eraser_size` down to a quarter of itself in document units,
+    /// so the rub is the same size on screen it would be unzoomed. `tool_style`
+    /// is what every `ToolContext` is built from, so this is what
+    /// `ToolAction::Erase.width` would actually be for a stroke right now.
+    #[test]
+    fn eraser_size_holds_its_screen_size_when_zoom_size_is_off() {
+        let mut e = editor();
+        e.camera.set_zoom_percent(400.0);
+        e.style.eraser_size = 16.0;
+        e.style.eraser_zoom_size = false;
+        e.set_tool(ToolId::Eraser);
+
+        e.pointer_down(Point::new(500.0, 400.0), Mods::default());
+        assert!(
+            (e.tool_style.eraser_size - 4.0).abs() < 1e-9,
+            "expected eraser_size / 4, got {}",
+            e.tool_style.eraser_size
+        );
+        e.pointer_up(Point::new(500.0, 400.0));
+    }
+
+    /// **Animate's "Zoom size with stage", on — the default.** The size stays
+    /// in document units, exactly as it always has, however the stage is
+    /// zoomed.
+    #[test]
+    fn eraser_size_grows_with_zoom_when_zoom_size_is_on() {
+        let mut e = editor();
+        e.camera.set_zoom_percent(400.0);
+        e.style.eraser_size = 16.0;
+        assert!(e.style.eraser_zoom_size, "on is the default");
+        e.set_tool(ToolId::Eraser);
+
+        e.pointer_down(Point::new(500.0, 400.0), Mods::default());
+        assert_eq!(e.tool_style.eraser_size, 16.0);
+        e.pointer_up(Point::new(500.0, 400.0));
+    }
+
+    /// The brush half of the same switch as
+    /// `eraser_size_holds_its_screen_size_when_zoom_size_is_off`.
+    #[test]
+    fn brush_size_holds_its_screen_size_when_zoom_size_is_off() {
+        let mut e = editor();
+        e.camera.set_zoom_percent(400.0);
+        e.style.brush.size = 20.0;
+        e.style.brush_zoom_size = false;
+        e.set_tool(ToolId::Brush);
+
+        e.pointer_down(Point::new(500.0, 400.0), Mods::default());
+        assert!(
+            (e.tool_style.brush.size - 5.0).abs() < 1e-9,
+            "expected brush.size / 4, got {}",
+            e.tool_style.brush.size
+        );
+        e.pointer_up(Point::new(500.0, 400.0));
+    }
+
+    /// The brush half of the same switch as
+    /// `eraser_size_grows_with_zoom_when_zoom_size_is_on`.
+    #[test]
+    fn brush_size_grows_with_zoom_when_zoom_size_is_on() {
+        let mut e = editor();
+        e.camera.set_zoom_percent(400.0);
+        e.style.brush.size = 20.0;
+        assert!(e.style.brush_zoom_size, "on is the default");
+        e.set_tool(ToolId::Brush);
+
+        e.pointer_down(Point::new(500.0, 400.0), Mods::default());
+        assert_eq!(e.tool_style.brush.size, 20.0);
+        e.pointer_up(Point::new(500.0, 400.0));
     }
 
     /// **The report: a symbol could not be kept as an asset from the Library.**
@@ -15000,7 +21867,9 @@ mod tests {
         e.run(Command::ConvertToSymbol);
         let symbol = e.library.selected.expect("the symbol");
         e.doc.edit("Name", |scene| {
-            scene.library_mut().update(symbol, |s| s.name = "Oak".into());
+            scene
+                .library_mut()
+                .update(symbol, |s| s.name = "Oak".into());
         });
 
         e.run(Command::SymbolToAsset);
@@ -15040,7 +21909,9 @@ mod tests {
         e.run(Command::ConvertToSymbol);
         let symbol = e.library.selected.expect("the symbol");
         e.doc.edit("Name", |scene| {
-            scene.library_mut().update(symbol, |s| s.name = "Prop".into());
+            scene
+                .library_mut()
+                .update(symbol, |s| s.name = "Prop".into());
         });
         e.run(Command::SymbolToAsset);
         let asset = e.assets.assets().first().cloned().expect("the asset");
@@ -15420,6 +22291,34 @@ mod tests {
         );
     }
 
+    /// User 2026-10-01: entering a character at frame 705 and coming back out
+    /// left the main timeline at frame 1.
+    #[test]
+    fn leaving_a_symbol_returns_to_the_frame_it_was_entered_from() {
+        let mut e = editor();
+        let square = draw_square(&mut e, 100.0, 100.0, 120.0, Color::WHITE).expect("a square");
+        e.selection.select_one(square);
+        e.run(Command::ConvertToSymbol);
+        let layer = e.scene().layers().iter().next().unwrap().id;
+        e.doc.edit("Lengthen", |scene| {
+            scene.update_layer(layer, |l| {
+                l.frames.insert_frame(799);
+            });
+        });
+        e.set_frame(705);
+        assert_eq!(e.current_frame, 705);
+
+        let screen = e.camera.doc_to_screen(Point::new(160.0, 160.0));
+        e.enter_or_leave_at(screen);
+        assert_eq!(e.scene().edit_path().len(), 1, "the instance opened");
+        assert_eq!(e.current_frame, 0, "a one-frame graphic opens on its only frame");
+
+        let empty = e.camera.doc_to_screen(Point::new(-4000.0, -4000.0));
+        e.enter_or_leave_at(empty);
+        assert!(e.scene().edit_path().is_empty(), "left the symbol");
+        assert_eq!(e.current_frame, 705, "back on the frame it was entered from");
+    }
+
     fn editor_with_deep_square(depth: f64) -> (Editor, ObjectId) {
         let mut e = editor();
         let id =
@@ -15685,6 +22584,7 @@ mod tests {
     fn dragging_the_bone_tool_across_artwork_rigs_it() {
         let (mut e, id) = editor_with_limb();
         e.set_tool(ToolId::Bone);
+        e.workspace.rig.mode = buzz_ui::BoneMode::Create;
 
         drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
 
@@ -15699,7 +22599,7 @@ mod tests {
 
     /// Building a chain: each drag from the previous bone's tip adds the next.
     ///
-    /// **In Build mode**, which is not the default. A tip is the end of a limb
+    /// **In Create mode** (BM), which is not the default. A tip is the end of a limb
     /// and the end of a limb is what a person grabs to *move* it, so extending
     /// from there is something the tool is put into rather than something it
     /// does to anyone who touches a finished rig. See `buzz_ui::RigOptions`.
@@ -15707,7 +22607,7 @@ mod tests {
     fn dragging_from_a_bone_tip_adds_a_child_bone() {
         let (mut e, id) = editor_with_limb();
         e.set_tool(ToolId::Bone);
-        e.workspace.rig.build = true;
+        e.workspace.rig.mode = buzz_ui::BoneMode::Create;
 
         drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
         drag(&mut e, Point::new(100.0, 100.0), Point::new(200.0, 100.0));
@@ -15726,10 +22626,10 @@ mod tests {
     fn dragging_a_bone_poses_the_rig_and_moves_the_artwork() {
         let (mut e, id) = editor_with_limb();
         e.set_tool(ToolId::Bone);
-        e.workspace.rig.build = true;
+        e.workspace.rig.mode = buzz_ui::BoneMode::Create;
         drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
         drag(&mut e, Point::new(100.0, 100.0), Point::new(200.0, 100.0));
-        e.workspace.rig.build = false;
+        e.workspace.rig.mode = buzz_ui::BoneMode::Move;
 
         let before = e.scene().find_object(id).expect("there").1.bounds();
         // Grab the second bone in the middle and pull it downwards.
@@ -15752,8 +22652,10 @@ mod tests {
     fn the_end_of_a_bone_poses_it_rather_than_extending_the_chain() {
         let (mut e, id) = editor_with_limb();
         e.set_tool(ToolId::Bone);
+        e.workspace.rig.mode = buzz_ui::BoneMode::Create;
         drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
         assert_eq!(armature_of(&e, id).len(), 1);
+        e.workspace.rig.mode = buzz_ui::BoneMode::Move;
 
         let before = e.scene().find_object(id).expect("there").1.bounds();
         // Straight at the tip, and downwards.
@@ -15778,7 +22680,9 @@ mod tests {
     fn hiding_the_bones_lets_the_pointer_reach_the_artwork() {
         let (mut e, id) = editor_with_limb();
         e.set_tool(ToolId::Bone);
+        e.workspace.rig.mode = buzz_ui::BoneMode::Create;
         drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
+        e.workspace.rig.mode = buzz_ui::BoneMode::Move;
         let posed = armature_of(&e, id).pose();
 
         e.workspace.rig.show_bones = false;
@@ -15796,10 +22700,10 @@ mod tests {
     fn a_posing_drag_is_a_single_undo_step() {
         let (mut e, id) = editor_with_limb();
         e.set_tool(ToolId::Bone);
-        e.workspace.rig.build = true;
+        e.workspace.rig.mode = buzz_ui::BoneMode::Create;
         drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
         drag(&mut e, Point::new(100.0, 100.0), Point::new(200.0, 100.0));
-        e.workspace.rig.build = false;
+        e.workspace.rig.mode = buzz_ui::BoneMode::Move;
 
         let posed_from = armature_of(&e, id).pose();
 
@@ -15830,6 +22734,7 @@ mod tests {
     fn a_click_with_the_bone_tool_does_not_make_a_bone() {
         let (mut e, id) = editor_with_limb();
         e.set_tool(ToolId::Bone);
+        e.workspace.rig.mode = buzz_ui::BoneMode::Create;
 
         drag(&mut e, Point::new(50.0, 100.0), Point::new(50.2, 100.1));
 
@@ -15882,9 +22787,151 @@ mod tests {
         let (mut e, _) = editor_with_limb();
         let before = e.scene().shape_count();
         e.set_tool(ToolId::Bone);
+        e.workspace.rig.mode = buzz_ui::BoneMode::Create;
         drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
 
         assert_eq!(e.scene().shape_count(), before);
+    }
+
+    // -- BM: Bone tool modes --------------------------------------------------
+
+    /// A two-bone chain (0,100)→(100,100)→(200,100), built in Create mode.
+    fn editor_with_two_bones() -> (Editor, ObjectId) {
+        let (mut e, id) = editor_with_limb();
+        e.set_tool(ToolId::Bone);
+        e.workspace.rig = buzz_ui::RigOptions::default();
+        e.workspace.rig.mode = buzz_ui::BoneMode::Create;
+        drag(&mut e, Point::new(0.0, 100.0), Point::new(100.0, 100.0));
+        drag(&mut e, Point::new(100.0, 100.0), Point::new(200.0, 100.0));
+        assert_eq!(armature_of(&e, id).len(), 2);
+        (e, id)
+    }
+
+    /// Press (no release) at a document point, as the window does.
+    fn press(e: &mut Editor, at: Point) {
+        let s = screen_of(e, at);
+        e.pointer_down(s, Mods::default());
+    }
+
+    /// **Create never poses**: a press on a tip or a bone body starts a
+    /// Building gesture whose parent is that bone, and a drag from the body
+    /// branches a child off it without moving the rig.
+    #[test]
+    fn create_mode_never_yields_a_posing_gesture() {
+        let (mut e, id) = editor_with_two_bones();
+        let posed = armature_of(&e, id).pose();
+
+        for (at, bone) in [
+            (Point::new(200.0, 100.0), 1), // the second bone's tip
+            (Point::new(150.0, 100.0), 1), // its body
+            (Point::new(50.0, 100.0), 0),  // the first bone's body
+        ] {
+            press(&mut e, at);
+            match &e.rig_gesture {
+                Some(crate::rigging::RigGesture::Building { parent, .. }) => {
+                    assert_eq!(*parent, Some(bone), "press at {at:?}")
+                }
+                other => panic!("Create mode at {at:?} gave {other:?}, not Building"),
+            }
+            assert_eq!(e.selected_bone, Some((id, bone)), "the pressed bone is selected");
+            { let up = screen_of(&e, at); e.pointer_up(up); }
+        }
+
+        // A drag from the first bone's body branches a child off it.
+        drag(&mut e, Point::new(50.0, 100.0), Point::new(50.0, 180.0));
+        let armature = armature_of(&e, id);
+        assert_eq!(armature.len(), 3, "the drag from the body added a bone");
+        assert_eq!(armature.bones[2].parent, Some(0), "branched off the pressed bone");
+        assert_eq!(
+            armature.pose()[..2],
+            posed[..],
+            "Create mode moved the existing bones"
+        );
+    }
+
+    /// **Move never builds**: tip and body poses, and a press on bare artwork
+    /// leaves the document alone and says why.
+    #[test]
+    fn move_mode_never_yields_a_building_gesture() {
+        let (mut e, id) = editor_with_two_bones();
+        e.workspace.rig.mode = buzz_ui::BoneMode::Move;
+
+        for at in [Point::new(200.0, 100.0), Point::new(150.0, 100.0)] {
+            press(&mut e, at);
+            assert!(
+                matches!(e.rig_gesture, Some(crate::rigging::RigGesture::Posing { .. })),
+                "Move mode at {at:?} gave {:?}",
+                e.rig_gesture
+            );
+            { let up = screen_of(&e, at); e.pointer_up(up); }
+        }
+        assert_eq!(armature_of(&e, id).len(), 2, "Move mode added a bone");
+
+        // A second, unrigged shape: a press and a drag on it change nothing.
+        let layer = e.selection.active_layer().expect("a layer");
+        let mut bare = None;
+        e.doc.edit("Draw", |scene| {
+            bare = scene.add_shape(
+                layer,
+                ShapeData::filled(
+                    buzz_geom::Rect::new(0.0, 300.0, 200.0, 320.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
+            );
+        });
+        let bare = bare.expect("a shape");
+        let before = e.scene().revision();
+        e.status = None;
+        press(&mut e, Point::new(20.0, 310.0));
+        assert!(e.rig_gesture.is_none(), "Move mode started {:?}", e.rig_gesture);
+        { let up = screen_of(&e, Point::new(20.0, 310.0)); e.pointer_up(up); }
+        drag(&mut e, Point::new(20.0, 310.0), Point::new(150.0, 310.0));
+        assert!(
+            matches!(&e.scene().find_object(bare).expect("there").1.kind, ObjectKind::Shape(_)),
+            "Move mode rigged bare artwork"
+        );
+        assert_eq!(e.scene().revision(), before, "the document changed");
+        assert_eq!(e.status.as_deref(), Some(BONE_MOVE_ON_ARTWORK));
+    }
+
+    /// **The armature is just an object with any other tool**: the Selection
+    /// tool pressing a bone does not start a rig gesture or pose it.
+    #[test]
+    fn with_another_tool_the_bones_are_not_found() {
+        let (mut e, id) = editor_with_two_bones();
+        let posed = armature_of(&e, id).pose();
+        for tool in [ToolId::Selection, ToolId::FreeTransform, ToolId::AssetWarp] {
+            e.set_tool(tool);
+            press(&mut e, Point::new(150.0, 100.0));
+            assert!(e.rig_gesture.is_none(), "{tool:?} found a bone: {:?}", e.rig_gesture);
+            { let up = screen_of(&e, Point::new(150.0, 100.0)); e.pointer_up(up); }
+            assert_eq!(armature_of(&e, id).pose(), posed, "{tool:?} posed the rig");
+            e.selection.clear();
+        }
+    }
+
+    /// **Shift+M toggles the mode, only while the Bone tool is held.**
+    #[test]
+    fn the_shortcut_toggles_the_mode_only_with_the_bone_tool() {
+        let shortcut = Command::ToggleBoneMode.shortcut().expect("a shortcut");
+        assert_eq!(
+            (shortcut.modifiers, shortcut.logical_key),
+            (egui::Modifiers::SHIFT, egui::Key::M)
+        );
+
+        let mut e = editor();
+        e.workspace.rig = buzz_ui::RigOptions::default();
+        e.set_tool(ToolId::Selection);
+        e.run(Command::ToggleBoneMode);
+        assert_eq!(e.workspace.rig.mode, buzz_ui::BoneMode::Move, "toggled without the Bone tool");
+
+        e.set_tool(ToolId::Bone);
+        e.run(Command::ToggleBoneMode);
+        assert_eq!(e.workspace.rig.mode, buzz_ui::BoneMode::Create);
+        assert!(e.status.as_deref().unwrap_or_default().contains("Create bones"));
+        e.run(Command::ToggleBoneMode);
+        assert_eq!(e.workspace.rig.mode, buzz_ui::BoneMode::Move);
+        assert!(e.status.as_deref().unwrap_or_default().contains("Move bones"));
     }
 
     /// A script run inside a symbol edits that symbol, because the scene
@@ -16068,7 +23115,115 @@ mod tests {
         }
         // A rectangle drawn with both a fill and an outline lands as two
         // objects in merge mode — the fill and its separately-selectable line.
-        assert_eq!(e.scene().shape_count(), 2, "and it should have drawn the rectangle");
+        assert_eq!(
+            e.scene().shape_count(),
+            2,
+            "and it should have drawn the rectangle"
+        );
+    }
+
+    /// **L1/L2 end to end**: the stage's gizmo and the pointer gesture agree
+    /// on where an animated lamp is at the playhead, dragging it is live
+    /// before release, and it keys only the frame being dragged — the frame-0
+    /// key is untouched, and the whole drag is one undo step.
+    #[test]
+    fn dragging_an_animated_lamp_on_the_stage_is_live_and_keys_the_playhead() {
+        let mut e = editor();
+        e.run(Command::AddLamp);
+        e.set_tool(ToolId::Selection);
+        let id = e.scene().lights().lights[0].id;
+
+        // A track animating the lamp from (0, 0) at frame 0 to (200, 0) at
+        // frame 20, so frame 10 — where this test drags it — sits at an
+        // unambiguous interpolated midpoint.
+        e.doc.edit("Setup", |scene| {
+            let light = scene.lights_mut().get_mut(id).expect("just added");
+            light.kind = buzz_scene::LightKind::lamp(Point::new(0.0, 0.0));
+            let key0 = buzz_scene::LightKey::from_light(0, light);
+            let mut key1 = key0;
+            key1.frame = 20;
+            key1.kind = buzz_scene::LightKind::lamp(Point::new(200.0, 0.0));
+            let track = light.track.get_or_insert_with(buzz_scene::LightTrack::new);
+            track.enabled = true;
+            track.set_key(key0);
+            track.set_key(key1);
+        });
+        e.doc.end_gesture();
+        e.current_frame = 10;
+
+        // The gizmo the stage would draw sits at the interpolated midpoint,
+        // not the base's frame-0 position.
+        let handle = match crate::lights::gizmos_at(e.scene(), 10)
+            .into_iter()
+            .find(|g| g.id == id)
+            .expect("the lamp has a gizmo")
+            .kind
+        {
+            crate::lights::GizmoKind::Lamp { at, .. } => at,
+            other => panic!("not a lamp: {other:?}"),
+        };
+        assert_eq!(handle, Point::new(100.0, 0.0));
+
+        let camera = e.camera;
+        let screen = |p: Point| {
+            let s = camera.doc_to_screen(p);
+            Point::new(s.x, s.y)
+        };
+
+        e.pointer_down(screen(handle), Mods::default());
+        e.pointer_move(screen(Point::new(150.0, 40.0)), Mods::default());
+
+        // Live, before release: the base already shows the drag.
+        match e.scene().lights().get(id).expect("the lamp").kind {
+            buzz_scene::LightKind::Lamp { position, .. } => {
+                assert_eq!(position, Point::new(150.0, 40.0), "the drag should be live");
+            }
+            other => panic!("not a lamp: {other:?}"),
+        }
+
+        e.pointer_up(screen(Point::new(150.0, 40.0)));
+
+        let light = e.scene().lights().get(id).expect("the lamp");
+        let track = light.track.as_ref().expect("still animates");
+        let key10 = track
+            .keys()
+            .iter()
+            .find(|k| k.frame == 10)
+            .expect("frame 10 was keyed");
+        match key10.kind {
+            buzz_scene::LightKind::Lamp { position, .. } => {
+                assert_eq!(position, Point::new(150.0, 40.0));
+            }
+            other => panic!("not a lamp: {other:?}"),
+        }
+        let key0 = track
+            .keys()
+            .iter()
+            .find(|k| k.frame == 0)
+            .expect("frame 0 must still be there");
+        match key0.kind {
+            buzz_scene::LightKind::Lamp { position, .. } => {
+                assert_eq!(position, Point::new(0.0, 0.0), "frame 0 must be untouched");
+            }
+            other => panic!("not a lamp: {other:?}"),
+        }
+
+        // One drag, one undo step: undoing removes the key this drag added
+        // and nothing else.
+        e.run(Command::Undo);
+        let track = e
+            .scene()
+            .lights()
+            .get(id)
+            .expect("the lamp")
+            .track
+            .as_ref()
+            .expect("frame 0/20 keys predate the drag");
+        assert!(
+            !track.keys().iter().any(|k| k.frame == 10),
+            "undo should remove the key this drag added"
+        );
+        assert!(track.keys().iter().any(|k| k.frame == 0));
     }
 
     /// Hiding the handles hides them from the pointer too: a hidden handle
@@ -16168,7 +23323,6 @@ mod tests {
         );
     }
 
-
     /// **An imported sound is a sound the film carries.**
     ///
     /// It used to land in the library and nowhere else, so it was silent on
@@ -16236,11 +23390,7 @@ mod tests {
             None => {
                 let mut made = None;
                 e.doc.edit("Symbol", |scene| {
-                    made = Some(scene.add_symbol(
-                        "Head",
-                        buzz_scene::SymbolKind::Graphic,
-                        None,
-                    ));
+                    made = Some(scene.add_symbol("Head", buzz_scene::SymbolKind::Graphic, None));
                 });
                 e.doc.end_gesture();
                 made.expect("a symbol")
@@ -16287,6 +23437,74 @@ mod tests {
         out.into_inner()
     }
 
+    #[test]
+    fn selecting_multiple_layers_in_editor_selects_their_artwork() {
+        let mut e = editor();
+        e.run(Command::NewLayer);
+        let layers: Vec<_> = e.scene().layers().iter().map(|l| l.id).collect();
+        assert_eq!(layers.len(), 2);
+        let l_top = layers[0];
+        let l_bot = layers[1];
+
+        // Draw shape on top layer
+        e.select_layer(l_top);
+        let s_top = draw_square(&mut e, 0.0, 0.0, 50.0, Color::WHITE).expect("square top");
+
+        // Draw shape on bottom layer
+        e.select_layer(l_bot);
+        let s_bot = draw_square(&mut e, 100.0, 100.0, 50.0, Color::WHITE).expect("square bot");
+
+        // Select both layers at once
+        e.select_layers(&[l_top, l_bot]);
+        assert_eq!(e.selected_layers(), &[l_top, l_bot]);
+        assert!(e.selection.contains(s_top));
+        assert!(e.selection.contains(s_bot));
+        assert_eq!(e.selection.len(), 2);
+    }
+
+    #[test]
+    fn multi_layer_selection_executes_batch_frame_operations() {
+        let mut e = editor();
+        e.run(Command::NewLayer);
+        let layers: Vec<_> = e.scene().layers().iter().map(|l| l.id).collect();
+        assert_eq!(layers.len(), 2);
+        let l1 = layers[0];
+        let l2 = layers[1];
+
+        // Select both layers and press InsertFrame (F5)
+        e.select_layers(&[l1, l2]);
+        e.run(Command::InsertFrame);
+        assert_eq!(e.scene().layers().get(l1).unwrap().frames.length(), 2);
+        assert_eq!(e.scene().layers().get(l2).unwrap().frames.length(), 2);
+
+        // Advance to frame 1 and insert keyframes on both layers at once (F6)
+        e.current_frame = 1;
+        e.run(Command::InsertKeyframe);
+        assert!(e.scene().layers().get(l1).unwrap().frames.is_keyframe(1));
+        assert!(e.scene().layers().get(l2).unwrap().frames.is_keyframe(1));
+
+        // Create Classic Tween applies across both layers
+        e.current_frame = 0;
+        e.run(Command::CreateClassicTween);
+        assert!(
+            e.scene()
+                .layers()
+                .get(l1)
+                .unwrap()
+                .frames
+                .tween_at(0)
+                .kind
+                .is_active()
+        );
+        assert!(
+            e.scene()
+                .layers()
+                .get(l2)
+                .unwrap()
+                .frames
+                .tween_at(0)
+                .kind
+                .is_active()
+        );
+    }
 }
-
-

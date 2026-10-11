@@ -24,7 +24,9 @@ fn red_fraction(frame: &Frame) -> f64 {
     let mut red = 0usize;
     let total = (frame.pixels.len() / 4).max(1);
     for px in frame.pixels.chunks(4) {
-        if px[0] as i32 > 140 && px[0] as i32 > px[1] as i32 + 50 && px[0] as i32 > px[2] as i32 + 50
+        if px[0] as i32 > 140
+            && px[0] as i32 > px[1] as i32 + 50
+            && px[0] as i32 > px[2] as i32 + 50
         {
             red += 1;
         }
@@ -52,9 +54,17 @@ fn a_region_renders_only_its_rectangle() {
 
         let full = ExportSettings::for_stage(&scene);
         let whole = red_fraction(&exporter.render(&scene, 0, &full).unwrap());
-        assert!(whole < 0.2, "the square is a small part of the whole stage: {whole}");
+        assert!(
+            whole < 0.2,
+            "the square is a small part of the whole stage: {whole}"
+        );
 
-        let region = ExportSettings { width: 100, height: 100, region: Some(square), ..full };
+        let region = ExportSettings {
+            width: 100,
+            height: 100,
+            region: Some(square),
+            ..full
+        };
         let cropped = red_fraction(&exporter.render(&scene, 0, &region).unwrap());
         assert!(
             cropped > 0.8,

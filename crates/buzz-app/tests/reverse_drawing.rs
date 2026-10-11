@@ -12,7 +12,14 @@ use peniko::Color;
 
 fn two_shapes() -> (Editor, LayerId, ObjectId, ObjectId) {
     let mut editor = Editor::default();
-    let layer = editor.doc.scene().layers().iter().next().expect("a layer").id;
+    let layer = editor
+        .doc
+        .scene()
+        .layers()
+        .iter()
+        .next()
+        .expect("a layer")
+        .id;
     let (mut front, mut back) = (None, None);
     editor.doc.edit("setup", |scene| {
         front = scene.add_shape(
@@ -49,7 +56,10 @@ fn set_reverse_folds_the_back_into_the_front() {
 
     editor.run(Command::SetReverse);
 
-    assert!(has_reverse(&editor, front), "the front carries the back view");
+    assert!(
+        has_reverse(&editor, front),
+        "the front carries the back view"
+    );
     assert!(
         editor.doc.scene().find_object(back).is_none(),
         "the back left the stage — it lives inside the front now"
@@ -57,7 +67,10 @@ fn set_reverse_folds_the_back_into_the_front() {
 
     editor.doc.undo();
     assert!(!has_reverse(&editor, front), "undo removes the reverse");
-    assert!(editor.doc.scene().find_object(back).is_some(), "and brings the back back");
+    assert!(
+        editor.doc.scene().find_object(back).is_some(),
+        "and brings the back back"
+    );
 }
 
 #[test]
@@ -78,5 +91,8 @@ fn set_reverse_needs_exactly_two() {
     let (mut editor, _layer, front, _back) = two_shapes();
     editor.selection.select_one(front); // only one
     editor.run(Command::SetReverse);
-    assert!(!has_reverse(&editor, front), "one object is not enough to set a reverse");
+    assert!(
+        !has_reverse(&editor, front),
+        "one object is not enough to set a reverse"
+    );
 }

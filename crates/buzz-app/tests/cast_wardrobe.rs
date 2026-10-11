@@ -51,11 +51,16 @@ fn re_skinning_a_character_changes_every_part_and_sticks() {
     // Change that colour, exactly as the panel's well does.
     let new = Color::from_rgb8(0x01, 0x99, 0xEE);
     let painted = scene.recolour_matching(worn, new);
-    assert_eq!(painted, count, "every part wearing it was repainted, and only those");
+    assert_eq!(
+        painted, count,
+        "every part wearing it was repainted, and only those"
+    );
 
     // Write it back, and read it fresh off disk — the change is the
     // character's from now on.
-    library.save("Ana", buzz_ui::CAST_FOLDER, &scene).expect("save back");
+    library
+        .save("Ana", buzz_ui::CAST_FOLDER, &scene)
+        .expect("save back");
     let reloaded = library.load(&asset).expect("read it again");
 
     let after = reloaded.colours_used();
@@ -74,7 +79,10 @@ fn re_skinning_a_character_changes_every_part_and_sticks() {
         .iter()
         .flat_map(|l| l.objects_at(0).iter())
         .any(|o| is_figure(o));
-    assert!(still_rigged, "re-skinning must not cost the character its rig");
+    assert!(
+        still_rigged,
+        "re-skinning must not cost the character its rig"
+    );
 }
 
 /// Re-skinning to a colour nothing wears, or to the colour already worn,
@@ -115,12 +123,20 @@ fn a_drawn_costume_part_re_skins() {
         layer,
         ShapeData::filled(Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9), cap),
     );
-    let asset = library.save("Ben", buzz_ui::CAST_FOLDER, &scene).expect("save");
+    let asset = library
+        .save("Ben", buzz_ui::CAST_FOLDER, &scene)
+        .expect("save");
 
     let mut loaded = library.load(&asset).expect("read");
     let new = Color::from_rgb8(0x20, 0x60, 0xC0);
-    assert_eq!(loaded.recolour_matching(cap, new), 1, "the cap was repainted");
-    library.save("Ben", buzz_ui::CAST_FOLDER, &loaded).expect("save back");
+    assert_eq!(
+        loaded.recolour_matching(cap, new),
+        1,
+        "the cap was repainted"
+    );
+    library
+        .save("Ben", buzz_ui::CAST_FOLDER, &loaded)
+        .expect("save back");
 
     let reloaded = library.load(&asset).expect("read again");
     assert!(

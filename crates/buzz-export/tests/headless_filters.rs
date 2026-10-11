@@ -6,10 +6,11 @@
 //! exporter use, and look at what came out.
 
 use buzz_export::{ExportSettings, Exporter, Frame};
-use buzz_geom::{Rect, Shape as _};
+use buzz_geom::{Affine, Rect, Shape as _};
 use buzz_render::GpuPreference;
 use buzz_scene::{
     Blend, ColorAdjust, Filter, FilterKind, LayerKind, ObjectId, Quality, Scene, ShapeData,
+    SymbolKind, Tween,
 };
 use peniko::Color;
 
@@ -49,6 +50,11 @@ fn document() -> (Scene, ObjectId) {
 fn render(exporter: &mut Exporter, scene: &Scene) -> Frame {
     let settings = ExportSettings::for_stage(scene);
     exporter.render(scene, 0, &settings).expect("render")
+}
+
+fn render_at(exporter: &mut Exporter, scene: &Scene, frame: u32) -> Frame {
+    let settings = ExportSettings::for_stage(scene);
+    exporter.render(scene, frame, &settings).expect("render")
 }
 
 fn luma(pixel: [u8; 4]) -> f32 {
@@ -382,5 +388,178 @@ fn a_disabled_filter_is_not_drawn() {
         });
 
         assert_eq!(before.pixels, render(exporter, &scene).pixels);
+    });
+}
+
+/// A blend mode on the *layer* blends all artwork on it with the underlying layers.
+#[test]
+fn a_layer_blend_mode_multiplies_over_underlying_layers() {
+    with_exporter(|exporter| {
+        let mut scene = Scene::default();
+        scene.stage_mut().background = Color::WHITE;
+        let back = scene.add_layer("Back", LayerKind::Normal);
+        let front = scene.add_layer("Front", LayerKind::Normal);
+
+        scene.add_shape(
+            back,
+            ShapeData::filled(
+                Rect::new(150.0, 150.0, 300.0, 300.0).to_path(1e-9),
+                Color::from_rgb8(0xC0, 0xC0, 0x40),
+            ),
+        );
+        scene.add_shape(
+            front,
+            ShapeData::filled(
+                Rect::new(220.0, 150.0, 380.0, 300.0).to_path(1e-9),
+                Color::from_rgb8(0x40, 0xC0, 0xC0),
+            ),
+        );
+
+        let plain = render(exporter, &scene).pixel(260, 225);
+        scene.update_layer(front, |l| l.blend = Blend::Multiply);
+        let multiplied = render(exporter, &scene).pixel(260, 225);
+
+        assert!(
+            luma(multiplied) < luma(plain),
+            "layer multiply should darken the overlap: {plain:?} -> {multiplied:?}"
+        );
+    });
+}
+
+/// A layer filter applies to symbol instances on that layer, generating a valid silhouette.
+#[test]
+fn a_layer_filter_applies_to_symbol_instances() {
+    with_exporter(|exporter| {
+        let mut scene = Scene::default();
+        scene.stage_mut().background = Color::WHITE;
+        let sym_id = scene.add_symbol("glyph", SymbolKind::Graphic, None);
+        let sym_layer = scene
+            .library()
+            .get(sym_id)
+            .unwrap()
+            .layers
+            .iter()
+            .next()
+            .unwrap()
+            .id;
+
+        scene.library_mut().update(sym_id, |s| {
+            s.layers.update(sym_layer, |l| {
+                l.frames.push_object(
+                    0,
+                    std::sync::Arc::new(buzz_scene::Object::shape(
+                        ObjectId(100),
+                        ShapeData::filled(Rect::new(200.0, 150.0, 350.0, 300.0).to_path(1e-9), ART),
+                    )),
+                );
+            });
+        });
+
+        let layer = scene.add_layer("InstanceLayer", LayerKind::Normal);
+        scene.add_instance_at(layer, 0, sym_id, Affine::IDENTITY);
+
+        let before = render(exporter, &scene);
+        scene.update_layer(layer, |l| {
+            l.filters = vec![Filter::new(FilterKind::Glow {
+                x: 14.0,
+                y: 14.0,
+                strength: 1.0,
+                color: Color::from_rgb8(0xFF, 0x00, 0x00),
+                inner: false,
+                knockout: false,
+                quality: Quality::Low,
+            })];
+        });
+        let after = render(exporter, &scene);
+
+        assert_ne!(
+            before.pixels, after.pixels,
+            "layer filter did not affect symbol instance"
+        );
+        let glow_pixel = after.pixel(360, 225);
+        assert!(
+            glow_pixel[0] > glow_pixel[2] + 20,
+            "glow should appear outside the symbol instance: {glow_pixel:?}"
+        );
+    });
+}
+
+/// A layer silhouette follows a symbol's interpolated frame. The sample is
+/// deliberately halfway between two keyframes so a stale `objects_at(frame)`
+/// walk puts the shadow at one of the stored poses instead of under the live
+/// artwork.
+#[test]
+fn animated_symbol_layer_shadow_uses_the_interpolated_pose() {
+    with_exporter(|exporter| {
+        let mut scene = Scene::default();
+        scene.stage_mut().background = Color::WHITE;
+        let sym_id = scene.add_symbol("moving limb", SymbolKind::Graphic, None);
+        let sym_layer = scene
+            .library()
+            .get(sym_id)
+            .unwrap()
+            .layers
+            .iter()
+            .next()
+            .unwrap()
+            .id;
+        scene.library_mut().update(sym_id, |s| {
+            s.layers.update(sym_layer, |layer| {
+                layer.frames.push_object(
+                    0,
+                    std::sync::Arc::new(buzz_scene::Object::shape(
+                        ObjectId(201),
+                        ShapeData::filled(Rect::new(120.0, 160.0, 160.0, 220.0).to_path(1e-9), ART),
+                    )),
+                );
+                while layer.frames.length() <= 20 {
+                    layer.frames.insert_frame(layer.frames.length());
+                }
+                layer.frames.insert_blank_keyframe(20);
+                layer.frames.push_object(
+                    20,
+                    std::sync::Arc::new(buzz_scene::Object::shape(
+                        ObjectId(202),
+                        ShapeData::filled(Rect::new(320.0, 160.0, 360.0, 220.0).to_path(1e-9), ART),
+                    )),
+                );
+                layer.frames.set_tween(0, Tween::shape());
+            });
+        });
+        let layer = scene.add_layer("character", LayerKind::Normal);
+        scene.add_instance_at(layer, 0, sym_id, Affine::IDENTITY);
+        scene.update_layer(layer, |l| {
+            // Hold the instance on the stage through the halfway sample.
+            while l.frames.length() <= 20 {
+                l.frames.insert_frame(l.frames.length());
+            }
+            l.filters = vec![Filter::new(FilterKind::DropShadow {
+                x: 0.0,
+                y: 0.0,
+                strength: 1.0,
+                angle: 0.0,
+                distance: 100.0,
+                color: Color::BLACK,
+                inner: false,
+                knockout: false,
+                hide_object: true,
+                quality: Quality::Low,
+            })];
+        });
+
+        let plain = {
+            let mut copy = scene.clone();
+            copy.update_layer(layer, |l| l.filters.clear());
+            render_at(exporter, &copy, 10)
+        };
+        let filtered = render_at(exporter, &scene, 10);
+        // The shape tween puts the live artwork at x=220..260 on frame 10.
+        // With a 100px eastward throw, the shadow must therefore be at
+        // x=320..360. The old `objects_at(frame)` silhouette used the first
+        // stored pose (x=120..160), leaving this sample white.
+        assert!(plain.pixel(240, 190)[2] > 80, "midpoint artwork is missing");
+        assert!(plain.pixel(330, 190)[0] > 245, "shadow sample must start white");
+        assert!(filtered.pixel(330, 190)[0] < 40, "shadow did not follow midpoint pose");
+        assert!(filtered.pixel(230, 190)[0] > 245, "shadow remained at first stored pose");
     });
 }

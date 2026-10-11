@@ -53,12 +53,23 @@ fn assert_parity(exporter: &mut Exporter, scene: &Scene, expect_engage: bool) {
 
     // Each fixture is an unrelated document; render it from a clean cache.
     exporter.reset_caches();
+    // P2 (`docs/IMPORT_PERF_PLAN.md`) added a second, independent cache that
+    // can encode a whole eligible layer at once — which would otherwise
+    // short-circuit the very symbol-stamp walk this test measures, making
+    // `expect_engage` fail vacuously on a fixture simple enough for both
+    // caches to reach. Held off throughout so only the symbol cache's own
+    // `set_symbol_reuse` toggle below decides what gets drawn.
+    exporter.set_layer_reuse(false);
     exporter.set_symbol_reuse(false);
-    let off = exporter.render(scene, 0, &settings).expect("render, cache off");
+    let off = exporter
+        .render(scene, 0, &settings)
+        .expect("render, cache off");
 
     let before = exporter.symbol_cache_stats();
     exporter.set_symbol_reuse(true);
-    let on = exporter.render(scene, 0, &settings).expect("render, cache on");
+    let on = exporter
+        .render(scene, 0, &settings)
+        .expect("render, cache on");
     let after = exporter.symbol_cache_stats();
 
     if expect_engage {
@@ -88,7 +99,10 @@ fn assert_parity(exporter: &mut Exporter, scene: &Scene, expect_engage: bool) {
         exact += same as usize;
     }
     let frac = exact as f64 / px as f64;
-    assert!(max_diff <= 2, "cache changed a pixel by {max_diff} (> 2 LSB)");
+    assert!(
+        max_diff <= 2,
+        "cache changed a pixel by {max_diff} (> 2 LSB)"
+    );
     assert!(
         frac >= 0.999,
         "only {:.4}% of pixels identical with the cache on",
@@ -257,7 +271,11 @@ fn a_mask_inside_a_symbol() {
                 l.kind = LayerKind::Masked;
                 l.frames.set_objects(
                     0,
-                    vec![Arc::new(filled(9001, Rect::new(0.0, 0.0, 120.0, 120.0), BLUE))],
+                    vec![Arc::new(filled(
+                        9001,
+                        Rect::new(0.0, 0.0, 120.0, 120.0),
+                        BLUE,
+                    ))],
                 );
             });
             let mask = Layer {
@@ -268,7 +286,11 @@ fn a_mask_inside_a_symbol() {
             s.layers.update(LayerId(9002), |l| {
                 l.frames.set_objects(
                     0,
-                    vec![Arc::new(filled(9003, Rect::new(0.0, 0.0, 60.0, 120.0), RED))],
+                    vec![Arc::new(filled(
+                        9003,
+                        Rect::new(0.0, 0.0, 60.0, 120.0),
+                        RED,
+                    ))],
                 );
             });
         });
@@ -294,11 +316,7 @@ fn a_gradient_fill_inside_a_symbol() {
         shape.fill = Some(buzz_scene::FillSpec::gradient(Gradient::linear(
             RED, BLUE, rect,
         )));
-        let blob = symbol_of(
-            &mut scene,
-            "blob",
-            vec![Object::shape(ObjectId(1), shape)],
-        );
+        let blob = symbol_of(&mut scene, "blob", vec![Object::shape(ObjectId(1), shape)]);
         let cast = scene.add_layer("Cast", LayerKind::Normal);
         for i in 0..3 {
             place(
@@ -391,7 +409,11 @@ fn guide_and_outline_layers_inside_a_symbol() {
             s.layers.update(LayerId(9101), |l| {
                 l.frames.set_objects(
                     0,
-                    vec![Arc::new(filled(2, Rect::new(40.0, 40.0, 120.0, 120.0), GREEN))],
+                    vec![Arc::new(filled(
+                        2,
+                        Rect::new(40.0, 40.0, 120.0, 120.0),
+                        GREEN,
+                    ))],
                 );
             });
             // An outline layer, which draws as silhouettes in the layer colour.

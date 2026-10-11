@@ -1,0 +1,21 @@
+# Wrap up: tests + verification for FreeTransform marquee and dashed Selection outline
+
+Both features' code is now in the working tree: Feature 1 (FreeTransform drag ⇒ `PickInRect`, marquee preview, `contains_rect` → `overlaps` in `Editor::objects_in_frame`) was verified in the diff earlier, and Feature 2 (dashed per-object/fallback selection outlines when the Selection tool is active, solid under Free Transform, via a `dashed_outline` helper in `stage.rs`) was completed by the second pass. Only the test work and the verification run remain.
+
+## Steps
+
+1. crates/buzz-app/src/tools.rs (tests module): next to the existing Selection marquee test (search `PickInRect`) and the FreeTransform tests (search `free_transform_can_still_select_another_object`), add: FreeTransform non-click drag with no selection ⇒ `ToolAction::PickInRect` with the drawn rect; same drag with shift ⇒ `additive: true`; FreeTransform click (origin == end) ⇒ still `PickAt`.
+   - files: crates/buzz-app/src/tools.rs
+   - verify: cargo test -p buzz-app --lib tools (filter) passes with the new tests.
+
+2. crates/buzz-app/src/editor.rs (tests module): in the `PickInRect`/marquee tests (search `PickInRect` in tests, near the pre-edit lines ~10840–10920), update any assertion still encoding the old 'fully inside' rule to overlap semantics, and add a case where an object only partially overlapping the marquee rect is selected (the new `in_layer.overlaps(bounds)` behaviour in `objects_in_frame`).
+   - files: crates/buzz-app/src/editor.rs
+   - verify: cargo test -p buzz-app — marquee/PickInRect tests pass under overlap semantics.
+
+3. Full verification from the workspace root (B:/youtubeProjects/Buzzcaf_Media/BuzzAnimate): `cargo build`, `cargo test -p buzz-app`, `cargo test -p buzz-ui`. If any pre-existing test still encodes the old behaviour (FreeTransform drag = no-op, or marquee requires full containment), update it to the new intended behaviour rather than weakening the feature.
+   - verify: All three commands exit 0; report final test counts and any test assertions that had to change.
+
+## Risks
+- The second subagent was cut off while writing tests — before step 3, check `git diff` in tools.rs/editor.rs to see if it left partial/unfinished test edits that need cleaning up.
+- stage.rs's `dashed_outline` was written by the subagent and not yet compile-checked against my spec; the `cargo build` in step 3 is the first real check of it.
+- Visual behaviour (dash size on screen, dashed vs solid under each tool) can only be confirmed by running the app, not by unit tests.

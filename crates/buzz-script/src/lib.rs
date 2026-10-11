@@ -107,6 +107,19 @@ pub struct ScriptContext {
     /// builds a cast has to be able to file it and a later one has to be able
     /// to fetch it. Confined to this directory, and `None` turns it off.
     pub asset_root: Option<std::path::PathBuf>,
+
+    /// **Answers for `prompt()`, in the order the script asks.**
+    ///
+    /// A script runs with nobody watching, so the first pass through it can
+    /// only answer its own `prompt()` calls with the default it offered —
+    /// which is exactly what happens when this is empty, and is today's
+    /// unattended behaviour unchanged. A caller that wants to *ask* first
+    /// (the Actions panel does) runs the script once to collect the
+    /// questions, shows them to a person with their defaults, and runs it a
+    /// second time with their answers here — discarding the first run's
+    /// document changes rather than committing them, since that run was only
+    /// ever a rehearsal to find out what to ask.
+    pub prompt_answers: Vec<String>,
 }
 
 /// Where a shelf of JSFL commands lives on this machine.
@@ -122,7 +135,17 @@ pub struct ScriptContext {
 pub fn default_config_dir() -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
 
-    // Ours: `%APPDATA%/BuzzAnimate/Configuration`, beside the assets library.
+    // Ours first: the very folder saved commands already live in
+    // (`buzz_doc::commands::commands_root`). Animate's Configuration folder
+    // has a nested `Commands/` beneath it because that folder holds more than
+    // scripts; ours holds nothing else, so `fl.configURI` points straight at
+    // it and a ported command drops the `"Commands/"` segment it used to
+    // concatenate — the one deliberate difference from the original's path,
+    // recorded here rather than left to be rediscovered as a bug.
+    candidates.push(buzz_doc::commands::commands_root());
+
+    // `%APPDATA%/BuzzAnimate/Configuration`, kept as a second BuzzAnimate
+    // candidate for anyone who already has scripts filed the old way.
     if let Some(dir) = dirs_next_config() {
         candidates.push(dir);
     }
@@ -180,6 +203,16 @@ pub struct ScriptOutcome {
     /// their first line of error handling — the question is recorded and
     /// answered with its own default, and the host shows the list afterwards.
     pub alerts: Vec<String>,
+    /// Every `prompt()` question the script asked, with the default it
+    /// offered — in the order it asked them.
+    ///
+    /// Separate from [`Self::alerts`], which still gets a "question -
+    /// answered ..." line for each one so the trace log reads exactly as it
+    /// always has. This is for a caller that wants to *ask* rather than
+    /// silently answer: show each question with its default, editable, and
+    /// run the script again with the answers in
+    /// [`ScriptContext::prompt_answers`].
+    pub prompts: Vec<(String, String)>,
     /// The failure, already formatted for a person, or `None` on success.
     pub error: Option<String>,
     /// Editor state as the script left it.
@@ -240,6 +273,13 @@ pub(crate) struct State {
     pub context: ScriptContext,
     pub trace: Vec<String>,
     pub alerts: Vec<String>,
+    /// Every `prompt()` question asked so far, with its default — see
+    /// [`ScriptOutcome::prompts`].
+    pub prompts: Vec<(String, String)>,
+    /// How many of `context.prompt_answers` have been consumed so far. A
+    /// script that asks the same question twice gets its own two answers, in
+    /// order, rather than the same one both times.
+    pub prompt_index: usize,
     /// Sounds the host decoded before the run, offered to the script by index.
     ///
     /// A script cannot open a file — that is the sandbox, and it stays. What
@@ -247,6 +287,26 @@ pub(crate) struct State {
     /// track a script can attach and lip-sync against is most of what an
     /// unattended film needs that a scene alone does not carry.
     pub sounds: Vec<buzz_audio::Clip>,
+
+    // -- the JSFL command-shelf subset (Impl J) -----------------------------
+    //
+    // Animate's own timeline selection: which layer `setSelectedLayers` last
+    // named, and the frame ranges `setSelectedFrames` last named for it —
+    // `removeFrames`, `clearKeyframes`, `copyFrames`, `pasteFrames` and
+    // `createMotionTween` all act on this rather than on an argument, exactly
+    // as their JSFL originals do. It lives only for this one run: Animate's
+    // own timeline selection does not survive between separate script runs
+    // either.
+    /// The layer index `setSelectedLayers` last named.
+    pub selected_layer: Option<i32>,
+    /// `(layerIndex, start, end)` triples, `end` exclusive — Animate's own
+    /// convention for `getSelectedFrames`, kept here so a value it returned
+    /// can be fed straight back into `setSelectedFrames`.
+    pub selected_ranges: Vec<(i32, u32, u32)>,
+    /// What `copyFrames` last cut, for `pasteFrames` to lay back down: one
+    /// entry per copied range, each the keyframes inside it with their start
+    /// made relative to the range's own start.
+    pub frame_clip: Vec<(LayerId, Vec<(u32, buzz_scene::timeline::Keyframe)>)>,
 }
 
 impl State {
@@ -357,7 +417,12 @@ pub fn run_film(
         context,
         trace: Vec::new(),
         alerts: Vec::new(),
+        prompts: Vec::new(),
+        prompt_index: 0,
         sounds: film.sounds.clone(),
+        selected_layer: None,
+        selected_ranges: Vec::new(),
+        frame_clip: Vec::new(),
     }));
 
     let (error, stopped) = evaluate(&state, source, limits, stop);
@@ -377,6 +442,7 @@ pub fn run_film(
     ScriptOutcome {
         trace: finished.trace,
         alerts: finished.alerts,
+        prompts: finished.prompts,
         error,
         context: finished.context,
         changed,
@@ -396,6 +462,11 @@ impl State {
             context: self.context.clone(),
             trace: self.trace.clone(),
             alerts: self.alerts.clone(),
+            prompts: self.prompts.clone(),
+            prompt_index: self.prompt_index,
+            selected_layer: self.selected_layer,
+            selected_ranges: self.selected_ranges.clone(),
+            frame_clip: self.frame_clip.clone(),
         }
     }
 }
@@ -660,14 +731,17 @@ mod tests {
         let modifiers: Vec<_> = scene
             .layers()
             .iter()
-            .flat_map(|l| l.frames.resolved_at(0u32).iter().cloned().collect::<Vec<_>>())
+            .flat_map(|l| {
+                l.frames
+                    .resolved_at(0u32)
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
             .flat_map(|o| o.modifiers.clone())
             .collect();
         assert_eq!(modifiers.len(), 1, "one wiggle landed");
-        assert!(matches!(
-            modifiers[0],
-            buzz_scene::Modifier::Wiggle { .. }
-        ));
+        assert!(matches!(modifiers[0], buzz_scene::Modifier::Wiggle { .. }));
     }
 
     #[test]
@@ -694,7 +768,13 @@ mod tests {
         let text = scene
             .layers()
             .iter()
-            .flat_map(|l| l.frames.resolved_at(0u32).iter().cloned().collect::<Vec<_>>())
+            .flat_map(|l| {
+                l.frames
+                    .resolved_at(0u32)
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
             .find_map(|o| o.text.clone())
             .expect("the text object records what it was typed as");
         assert_eq!(text.content, "Hello");
@@ -799,7 +879,11 @@ var CONFIG = { moveAmount: 5, browFrames: 10 };
         let dir = tempfile::tempdir().expect("temp dir");
         let commands = dir.path().join("Commands");
         std::fs::create_dir_all(&commands).expect("commands dir");
-        let secret = dir.path().parent().expect("a parent").join("buzz-secret.txt");
+        let secret = dir
+            .path()
+            .parent()
+            .expect("a parent")
+            .join("buzz-secret.txt");
         std::fs::write(&secret, "not for scripts").expect("write");
 
         let context = ScriptContext {
@@ -872,7 +956,11 @@ var CONFIG = { moveAmount: 5, browFrames: 10 };
             std::collections::BTreeMap::new();
         let mut ran = 0usize;
 
-        println!("\n=== {} scripts in {} ===", scripts.len(), commands.display());
+        println!(
+            "\n=== {} scripts in {} ===",
+            scripts.len(),
+            commands.display()
+        );
         for path in &scripts {
             let Ok(source) = std::fs::read_to_string(path) else {
                 continue;

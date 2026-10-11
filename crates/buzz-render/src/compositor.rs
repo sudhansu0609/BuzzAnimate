@@ -86,8 +86,8 @@ pub struct Compositor {
     blur_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
 
-    io_layout: wgpu::BindGroupLayout,      // {tex, sampler, uniform}
-    blur_layout: wgpu::BindGroupLayout,    // {tex, sampler, dynamic uniform}
+    io_layout: wgpu::BindGroupLayout,   // {tex, sampler, uniform}
+    blur_layout: wgpu::BindGroupLayout, // {tex, sampler, dynamic uniform}
     composite_layout: wgpu::BindGroupLayout, // {tex, tex, sampler, uniform}
 
     bright_uniform: wgpu::Buffer,
@@ -360,11 +360,7 @@ impl Compositor {
         // ignores it via the flag.
         let mut final_bloom = &bloom.a;
         if bloom_on {
-            queue.write_buffer(
-                &self.bright_uniform,
-                0,
-                &pack_bright(post.bloom.threshold),
-            );
+            queue.write_buffer(&self.bright_uniform, 0, &pack_bright(post.bloom.threshold));
 
             // Bright-pass: input -> a.
             let bright_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {

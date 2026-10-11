@@ -210,7 +210,10 @@ fn name_the_speakers(cues: &mut [Cue]) {
         };
         let recurs = seen.get(&name.to_lowercase()).copied().unwrap_or(0) >= 2;
         let shouted = name.chars().any(|c| c.is_alphabetic())
-            && name.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase());
+            && name
+                .chars()
+                .filter(|c| c.is_alphabetic())
+                .all(|c| c.is_uppercase());
         if recurs || shouted {
             cue.speaker = Some(name.to_string());
             cue.text = rest.to_string();
@@ -262,7 +265,9 @@ fn read_timecode(field: &str) -> Option<u64> {
     let mut seconds = 0u64;
     let mut parts = 0;
     for part in clock.split(':') {
-        seconds = seconds.checked_mul(60)?.checked_add(part.trim().parse::<u64>().ok()?)?;
+        seconds = seconds
+            .checked_mul(60)?
+            .checked_add(part.trim().parse::<u64>().ok()?)?;
         parts += 1;
     }
     if parts == 0 || parts > 3 {
@@ -320,7 +325,8 @@ fn name_prefix(text: &str) -> Option<(&str, &str)> {
         && head.chars().count() <= 24
         && words.iter().all(|w| {
             w.chars().next().is_some_and(|c| c.is_uppercase())
-                && w.chars().all(|c| c.is_alphabetic() || c == '\'' || c == '-')
+                && w.chars()
+                    .all(|c| c.is_alphabetic() || c == '\'' || c == '-')
         });
     name_shaped.then_some((head, rest))
 }
@@ -428,7 +434,8 @@ Ben said nothing.
     /// **The index line is optional**, because plenty of files do not have one.
     #[test]
     fn a_file_with_no_numbers_still_reads() {
-        let caps = parse("00:00:01,000 --> 00:00:02,000\nOne.\n\n00:00:03,000 --> 00:00:04,000\nTwo.\n");
+        let caps =
+            parse("00:00:01,000 --> 00:00:02,000\nOne.\n\n00:00:03,000 --> 00:00:04,000\nTwo.\n");
         assert_eq!(caps.cues.len(), 2, "{caps:?}");
     }
 
@@ -506,7 +513,10 @@ Ben said nothing.
     fn a_word_that_appears_once_is_not_a_speaker() {
         let caps = parse("1\n00:00:01,000 --> 00:00:02,000\nMeanwhile: the door opened.\n");
         assert_eq!(caps.cues[0].speaker, None);
-        assert_eq!(caps.cues[0].text, "Meanwhile: the door opened.", "words were lost");
+        assert_eq!(
+            caps.cues[0].text, "Meanwhile: the door opened.",
+            "words were lost"
+        );
     }
 
     /// **Somebody who speaks twice is a character.** The whole-file rule.

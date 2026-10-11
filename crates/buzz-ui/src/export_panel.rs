@@ -143,9 +143,7 @@ impl VideoChoice {
             Self::H264 => "Plays everywhere. Choose this unless you have a reason not to.",
             Self::Hevc => "Smaller at the same quality; not every player opens it.",
             Self::Av1 => "Smaller again, and needs a recent player.",
-            Self::ProRes4444 => {
-                "Keeps a real alpha channel for compositing. Large .mov files."
-            }
+            Self::ProRes4444 => "Keeps a real alpha channel for compositing. Large .mov files.",
         }
     }
 
@@ -284,7 +282,17 @@ impl ExportState {
     ///
     /// The frame range is deliberately not in it: a preset does not carry one,
     /// so narrowing the range does not stop the settings being that preset.
-    fn fingerprint(&self) -> (Option<ExportKind>, u32, u32, bool, VideoOptions, GifOptions, WebpOptions) {
+    fn fingerprint(
+        &self,
+    ) -> (
+        Option<ExportKind>,
+        u32,
+        u32,
+        bool,
+        VideoOptions,
+        GifOptions,
+        WebpOptions,
+    ) {
         (
             self.open,
             self.width,
@@ -473,14 +481,9 @@ fn preview_view(
                         // strip rather than a staircase.
                         let scale = 100.0 / shot.size.y.max(1.0);
                         ui.add(
-                            egui::Image::new((shot.texture, shot.size * scale))
-                                .corner_radius(2.0),
+                            egui::Image::new((shot.texture, shot.size * scale)).corner_radius(2.0),
                         );
-                        ui.label(
-                            RichText::new(format!("{}", shot.frame))
-                                .small()
-                                .weak(),
-                        );
+                        ui.label(RichText::new(format!("{}", shot.frame)).small().weak());
                     });
                 }
             });

@@ -127,6 +127,8 @@ impl Remapper<'_> {
             copy.visible = layer.visible;
             copy.locked = layer.locked;
             copy.outline = layer.outline;
+            copy.unlit = layer.unlit;
+            copy.casts_shadow = layer.casts_shadow;
             copy.alpha = layer.alpha;
             copy.color = layer.color;
             copy.height = layer.height;
@@ -153,6 +155,7 @@ impl Remapper<'_> {
                 ),
                 label: k.label.clone(),
                 tween: k.tween,
+                ease_curve: k.ease_curve.clone(),
                 // Sound ids are remapped by the caller alongside symbol ids;
                 // a merge that kept the source's id would point at whichever
                 // local sound happened to share the number.
@@ -269,6 +272,15 @@ impl Scene {
                 folder: symbol.folder.clone(),
                 layers: remap.layer_stack(&symbol.layers),
                 registration: symbol.registration,
+                tags: symbol.tags.clone(),
+                // The set lists sibling symbols by id, so it follows them
+                // through the same renumbering; an id that was not copied
+                // across has nothing to point at here and is dropped.
+                set: symbol
+                    .set
+                    .iter()
+                    .filter_map(|member| remap.symbols.get(member).copied())
+                    .collect(),
             });
         }
 
@@ -425,9 +437,16 @@ mod tests {
             l.follows = Some(body);
             l.follows_bone = Some(2);
         });
-        guest.edit_layers().update(body, |l| l.rest_pose = Some(rest));
+        guest
+            .edit_layers()
+            .update(body, |l| l.rest_pose = Some(rest));
         // And inside a symbol, which is where a character keeps its rig.
-        let outer = guest.library().iter().find(|s| s.name == "Guest Outer").unwrap().id;
+        let outer = guest
+            .library()
+            .iter()
+            .find(|s| s.name == "Guest Outer")
+            .unwrap()
+            .id;
         guest.library_mut().update(outer, |s| {
             let torso = s.layers.iter().next().unwrap().id;
             let mut arm = Layer::normal(LayerId(9_999), "Arm");
@@ -446,8 +465,16 @@ mod tests {
                 .clone()
         };
         let (body, head) = (find("Body"), find("Head"));
-        assert_eq!(head.follows, Some(body.id), "the head no longer follows the body");
-        assert_eq!(head.follows_bone, Some(2), "and lost which bone it followed");
+        assert_eq!(
+            head.follows,
+            Some(body.id),
+            "the head no longer follows the body"
+        );
+        assert_eq!(
+            head.follows_bone,
+            Some(2),
+            "and lost which bone it followed"
+        );
         assert_eq!(body.rest_pose, Some(rest), "the rest pose was dropped");
         assert_ne!(body.id, LayerId(9_999), "ids were not renumbered");
 
@@ -456,9 +483,21 @@ mod tests {
             .iter()
             .find(|s| s.name == "Guest Outer")
             .expect("the guest's outer symbol");
-        let arm = outer.layers.iter().find(|l| l.name == "Arm").expect("the arm");
-        let torso = outer.layers.iter().find(|l| l.name != "Arm").expect("the torso");
-        assert_eq!(arm.follows, Some(torso.id), "inside the symbol, the arm let go");
+        let arm = outer
+            .layers
+            .iter()
+            .find(|l| l.name == "Arm")
+            .expect("the arm");
+        let torso = outer
+            .layers
+            .iter()
+            .find(|l| l.name != "Arm")
+            .expect("the torso");
+        assert_eq!(
+            arm.follows,
+            Some(torso.id),
+            "inside the symbol, the arm let go"
+        );
     }
 
     /// A link to a layer that did not come across cannot be honoured, and a
@@ -552,6 +591,26 @@ mod tests {
         }
         let inner = host.library().find_by_name("Host Inner").unwrap();
         assert_eq!(inner.bounds().unwrap().width(), 10.0);
+    }
+
+    /// A symbol set comes across pointing at the *copied* symbols, and an id
+    /// that was not copied (it had already gone from the guest) is dropped.
+    #[test]
+    fn a_symbol_set_is_remapped_through_a_merge() {
+        let mut host = document("Host", 10.0);
+        let mut guest = document("Guest", 99.0);
+        let inner = guest.library().find_by_name("Guest Inner").unwrap().id;
+        let outer = guest.library().find_by_name("Guest Outer").unwrap().id;
+        guest
+            .library_mut()
+            .update(outer, |s| s.set = vec![inner, SymbolId(987_654)]);
+
+        host.merge(&guest, ImportTarget::Library);
+
+        let new_outer = host.library().find_by_name("Guest Outer").unwrap();
+        let new_inner = host.library().find_by_name("Guest Inner").unwrap().id;
+        assert_ne!(new_inner, inner, "the copy was renumbered");
+        assert_eq!(new_outer.set, vec![new_inner]);
     }
 
     #[test]

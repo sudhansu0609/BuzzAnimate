@@ -156,9 +156,17 @@ impl FrameProfiler {
         let f = self.last();
         let mut parts = Vec::new();
         for s in Section::ALL {
-            parts.push(format!("{} {:.1}", s.label(), f.section(s).as_secs_f64() * 1000.0));
+            parts.push(format!(
+                "{} {:.1}",
+                s.label(),
+                f.section(s).as_secs_f64() * 1000.0
+            ));
         }
-        format!("{} | total {:.1} ms", parts.join("  "), f.total().as_secs_f64() * 1000.0)
+        format!(
+            "{} | total {:.1} ms",
+            parts.join("  "),
+            f.total().as_secs_f64() * 1000.0
+        )
     }
 }
 

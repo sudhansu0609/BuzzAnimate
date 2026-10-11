@@ -21,7 +21,14 @@ const UNRELATED: Color = Color::from_rgb8(0x11, 0x22, 0x33);
 
 fn editor() -> (Editor, LayerId) {
     let editor = Editor::default();
-    let layer = editor.doc.scene().layers().iter().next().expect("a layer").id;
+    let layer = editor
+        .doc
+        .scene()
+        .layers()
+        .iter()
+        .next()
+        .expect("a layer")
+        .id;
     (editor, layer)
 }
 
@@ -65,8 +72,14 @@ fn changing_a_swatch_repaints_everything_linked_to_it() {
 
     editor.recolour_swatch(swatch, GREEN);
 
-    assert_eq!(fill_colour(&editor, a).to_rgba8().to_u8_array(), GREEN.to_rgba8().to_u8_array());
-    assert_eq!(fill_colour(&editor, b).to_rgba8().to_u8_array(), GREEN.to_rgba8().to_u8_array());
+    assert_eq!(
+        fill_colour(&editor, a).to_rgba8().to_u8_array(),
+        GREEN.to_rgba8().to_u8_array()
+    );
+    assert_eq!(
+        fill_colour(&editor, b).to_rgba8().to_u8_array(),
+        GREEN.to_rgba8().to_u8_array()
+    );
 }
 
 /// **And leaves everything else alone.** A recolour that reached artwork nobody
@@ -123,7 +136,13 @@ fn the_recolour_reaches_inside_a_symbol() {
             symbol
                 .layers
                 .iter()
-                .flat_map(|l| l.frames.resolved_at(0u32).iter().cloned().collect::<Vec<_>>())
+                .flat_map(|l| {
+                    l.frames
+                        .resolved_at(0u32)
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>()
         })
         .filter_map(|o| match &o.kind {

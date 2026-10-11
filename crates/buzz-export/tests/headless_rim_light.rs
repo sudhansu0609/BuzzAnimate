@@ -98,7 +98,9 @@ fn a_rim_brightens_the_background_beside_the_artwork() {
         let bare = document(0.0);
         let settings = ExportSettings::for_stage(&bare);
 
-        let without = exporter.render(&bare, 0, &settings).expect("unrimmed frame");
+        let without = exporter
+            .render(&bare, 0, &settings)
+            .expect("unrimmed frame");
         let with = exporter
             .render(&document(0.9), 0, &settings)
             .expect("rimmed frame");
@@ -143,7 +145,9 @@ fn a_dimmer_light_lays_a_fainter_rim() {
 
         let settings = ExportSettings::for_stage(&bright);
         let dim = exporter.render(&dim, 0, &settings).expect("dim frame");
-        let bright = exporter.render(&bright, 0, &settings).expect("bright frame");
+        let bright = exporter
+            .render(&bright, 0, &settings)
+            .expect("bright frame");
 
         let (d, b) = (beside_the_edge(&dim), beside_the_edge(&bright));
         assert!(

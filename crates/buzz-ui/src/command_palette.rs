@@ -7,7 +7,7 @@
 
 use egui::{Key, Modifiers};
 
-use crate::command::{palette_commands, Command};
+use crate::command::{Command, palette_commands};
 
 /// The palette's open state and current query. Held by the shell across frames.
 #[derive(Debug, Default)]
@@ -96,24 +96,26 @@ pub fn command_palette(
             let submit = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
 
             ui.separator();
-            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                for (i, command) in matches.iter().enumerate() {
-                    let runnable = enabled(*command);
-                    let label = command.label();
-                    let text = if runnable {
-                        egui::RichText::new(label)
-                    } else {
-                        egui::RichText::new(label).weak()
-                    };
-                    let row = ui.selectable_label(i == state.selected, text);
-                    if row.hovered() {
-                        state.selected = i;
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    for (i, command) in matches.iter().enumerate() {
+                        let runnable = enabled(*command);
+                        let label = command.label();
+                        let text = if runnable {
+                            egui::RichText::new(label)
+                        } else {
+                            egui::RichText::new(label).weak()
+                        };
+                        let row = ui.selectable_label(i == state.selected, text);
+                        if row.hovered() {
+                            state.selected = i;
+                        }
+                        if runnable && row.clicked() {
+                            chosen = Some(*command);
+                        }
                     }
-                    if runnable && row.clicked() {
-                        chosen = Some(*command);
-                    }
-                }
-            });
+                });
 
             if submit {
                 if let Some(command) = matches.get(state.selected).copied() {

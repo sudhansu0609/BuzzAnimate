@@ -45,17 +45,75 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
 pub use geometry::{
-    GloomBand, HIGHLIGHT_SHARE, LightPool, RIM_REACH, RimGlow, ShadeGeometry, ShadowThrow,
-    cast_shadow, crescent_direction, crescent_offset, crescents, gloom_at, gloom_band,
-    highlight_crescent, highlight_reach, light_pool, rim_glow, shade_crescent, shade_feather,
-    shade_reach, shade_width,
-    shadow_throw, shadow_transform,
+    Aim3, GloomBand, HIGHLIGHT_SHARE, LightPool, RIM_REACH, RimGlow, ShadeGeometry, ShadowThrow,
+    cast_shadow, crescent_aim, crescent_direction, crescent_offset, crescents, crescents_form,
+    form_lit_width, form_shade_width, gloom_at, gloom_band, highlight_crescent,
+    highlight_crescent_form, highlight_reach, highlight_reach_form, light_pool, rim_glow,
+    shade_crescent, shade_crescent_form, shade_feather, shade_reach, shade_reach_form,
+    shade_width, shadow_throw, shadow_transform,
 };
 pub use track::{LightKey, LightTrack};
 
 /// Stable identity for a light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LightId(pub u64);
+
+/// Animator-authored adjustment applied after the physical shadow projection.
+/// Identity values preserve the projection of every existing document.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ShadowAdjustment {
+    pub offset: Vec2,
+    pub scale_x: f64,
+    pub scale_y: f64,
+    /// Clockwise in the editor's y-down document coordinates.
+    pub rotation: f64,
+    /// Shear angles in radians, kept separately so the panel can name them.
+    pub skew_x: f64,
+    pub skew_y: f64,
+    /// Receiver-local point about which scale, rotation and skew operate.
+    pub pivot: Point,
+}
+
+impl Default for ShadowAdjustment {
+    fn default() -> Self {
+        Self {
+            offset: Vec2::ZERO,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            skew_x: 0.0,
+            skew_y: 0.0,
+            pivot: Point::ZERO,
+        }
+    }
+}
+
+impl ShadowAdjustment {
+    pub fn is_identity(self) -> bool {
+        self == Self::default()
+    }
+
+    /// Receiver-local matrix, composed after the light's automatic projection.
+    pub fn affine(self) -> buzz_geom::Affine {
+        let finite =
+            |value: f64, fallback: f64| value.is_finite().then_some(value).unwrap_or(fallback);
+        let offset = Vec2::new(finite(self.offset.x, 0.0), finite(self.offset.y, 0.0));
+        let pivot = Point::new(finite(self.pivot.x, 0.0), finite(self.pivot.y, 0.0)).to_vec2();
+        let max_skew = 80.0_f64.to_radians();
+        let skew_x = finite(self.skew_x, 0.0).clamp(-max_skew, max_skew);
+        let skew_y = finite(self.skew_y, 0.0).clamp(-max_skew, max_skew);
+        let shear = buzz_geom::Affine::new([1.0, skew_y.tan(), skew_x.tan(), 1.0, 0.0, 0.0]);
+        buzz_geom::Affine::translate(offset)
+            * buzz_geom::Affine::translate(pivot)
+            * buzz_geom::Affine::rotate(finite(self.rotation, 0.0))
+            * shear
+            * buzz_geom::Affine::scale_non_uniform(
+                finite(self.scale_x, 1.0).clamp(0.01, 100.0),
+                finite(self.scale_y, 1.0).clamp(0.01, 100.0),
+            )
+            * buzz_geom::Affine::translate(-pivot)
+    }
+}
 
 /// The three kinds Blender's lamp menu offers that mean anything in two
 /// dimensions.
@@ -223,6 +281,9 @@ pub struct Light {
     /// audience does notice.
     #[serde(default = "default_shadow_length")]
     pub shadow_length: f32,
+    /// Editable placement of the projected silhouette on its receiver.
+    #[serde(default)]
+    pub shadow_adjustment: ShadowAdjustment,
     /// How far off the background flat artwork is assumed to stand, in
     /// document units. Layer depth is added to it.
     pub standing_height: f64,
@@ -372,6 +433,16 @@ pub struct Light {
     /// not one of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track: Option<LightTrack>,
+    /// **Where the light sits in the layer stack**: directly above the layer
+    /// with this id, lighting that layer and every layer below it and nothing
+    /// above — the way an adjustment layer works. `None` is the top of the
+    /// stack, lighting everything, which is every light until this existed.
+    ///
+    /// A raw layer id rather than `LayerId` because this crate sits beneath
+    /// the scene. An id that names no layer — its layer was deleted — reads
+    /// as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub above: Option<u64>,
 }
 
 /// The serde default for [`Light::glow`]: a lamp in a file written before the
@@ -426,6 +497,7 @@ impl Light {
             enabled: true,
             shadows: true,
             shadow_length: 1.0,
+            shadow_adjustment: ShadowAdjustment::default(),
             fall: ShadowFall::default(),
             shadow_strength: 0.45,
             // **How a flat drawing gets a shadow at all**, so the default has to
@@ -467,6 +539,7 @@ impl Light {
             // ever added a sky would put lightning in finished films.
             storm: 0.0,
             track: None,
+            above: None,
         };
 
         // **A gloom reads every one of these backwards**, so it cannot take the
@@ -693,6 +766,9 @@ impl Light {
         self.fall.hash(hasher);
         self.shadow_strength.to_bits().hash(hasher);
         self.shadow_length.to_bits().hash(hasher);
+        for value in self.shadow_adjustment.affine().as_coeffs() {
+            value.to_bits().hash(hasher);
+        }
         f(hasher, self.standing_height);
         f(hasher, self.softness);
         self.glow.to_bits().hash(hasher);
@@ -815,8 +891,43 @@ impl Light {
                 let (sin_e, cos_e) = elevation.sin_cos();
                 Some(Vec2::new(azimuth.cos() * cos_e, -sin_e))
             }
-            _ => self.towards(point, depth).map(|(towards, _)| towards.planar()),
+            _ => self
+                .towards(point, depth)
+                .map(|(towards, _)| towards.planar()),
         }
+    }
+
+    /// **How square-on this light strikes `point`** — `lz` in `-1..=1`, the
+    /// geometry [`ShadeModel::Form`] shades from.
+    ///
+    /// `1` is a light straight in front (no terminator at all); `0` is a
+    /// light exactly to the side (half the form dark); `-1` is a light
+    /// directly behind. A lamp's is `towards().z`: how far in front of the
+    /// layer it stands, seen from here, which is exactly what [`direct_at`]
+    /// already reads as `N·L`. A sun's is `sin(elevation)` — it has no
+    /// position to be "in front of", so how high it stands over the stage's
+    /// own plane is the whole answer, and elevation *is* that angle.
+    ///
+    /// `None` for a sky or a gloom, neither of which has a direction to shade
+    /// from.
+    ///
+    /// [`direct_at`]: Self::direct_at
+    pub fn facing_at(&self, point: Point, depth: f64) -> Option<f64> {
+        match self.kind {
+            LightKind::Sky { .. } | LightKind::Gloom { .. } => None,
+            LightKind::Sun { elevation, .. } => Some(elevation.sin()),
+            LightKind::Lamp { .. } => self.towards(point, depth).map(|(towards, _)| towards.z),
+        }
+    }
+
+    /// [`screen_towards`](Self::screen_towards) and [`facing_at`](Self::facing_at)
+    /// together, as [`ShadeModel::Form`] wants them: which way the light lies
+    /// across the picture, and how square-on it strikes. `None` when either
+    /// is — a sky or a gloom, which have neither.
+    pub fn aim_at(&self, point: Point, depth: f64) -> Option<geometry::Aim3> {
+        let planar = self.screen_towards(point, depth)?;
+        let lz = self.facing_at(point, depth)?;
+        Some(geometry::Aim3 { planar, lz })
     }
 
     /// **This one light's direct contribution at `point`**, in linear light.
@@ -1114,6 +1225,52 @@ pub struct LightRig {
     /// dialled in a second time.
     #[serde(default)]
     pub edges: EdgeMode,
+    /// **Where the terminator comes from.** See [`ShadeModel`].
+    ///
+    /// `#[serde(default)]` reads `Crescent` on a file that predates this,
+    /// which is what every one of them means — but [`LightRig::default`], for
+    /// a document that has never touched lighting, sets `Form`: a document
+    /// that has nothing to keep looking the way it did is the one place the
+    /// better model can simply be the one it starts with.
+    #[serde(default)]
+    pub model: ShadeModel,
+}
+
+/// **Where a light's terminator comes from.**
+///
+/// The whole subject of `docs/HARD_LIGHT_PLAN.md`'s Stage A: `Crescent` reads
+/// the shaded side's width off the softness slider, so a hard light and a
+/// narrow one are the same setting and a side light can never darken half a
+/// face. `Form` reads it off *geometry* — how far in front of the figure the
+/// light stands — so a hard light gets a razor terminator across half the
+/// form and a lamp brought round to the front thins the band to nothing
+/// instead of popping off in one step. See [`crate::geometry::form_shade_width`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShadeModel {
+    /// **Today's model.** The shaded side is a crescent whose width comes
+    /// from [`Light::softness`], never from where the light stands. What
+    /// every document drawn before this existed means, and what a file with
+    /// no `model` field loads as.
+    #[default]
+    Crescent,
+    /// **The terminator from geometry.** The shaded side's width comes from
+    /// how square-on the light strikes — see [`Light::facing_at`] — and
+    /// softness only feathers how sharply it arrives. A light behind the
+    /// figure lights a rim instead of shading a crescent.
+    Form,
+}
+
+impl ShadeModel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Crescent => "Crescent",
+            Self::Form => "Form",
+        }
+    }
+
+    /// Every model, in the order they are offered.
+    pub const ALL: [ShadeModel; 2] = [ShadeModel::Crescent, ShadeModel::Form];
 }
 
 /// **What a light draws its edges around.**
@@ -1268,6 +1425,7 @@ impl LightRig {
         colour(&mut hasher, self.base);
         self.modelling.to_bits().hash(&mut hasher);
         self.edges.hash(&mut hasher);
+        self.model.hash(&mut hasher);
         self.lights.len().hash(&mut hasher);
 
         // Each light hashes itself, through the same routine `Light::fingerprint`
@@ -1290,6 +1448,12 @@ impl Default for LightRig {
             base: Color::from_rgb8(0x6E, 0x74, 0x82),
             modelling: 0.8,
             edges: EdgeMode::default(),
+            // **A new document starts on the better model.** Nothing has
+            // looked a particular way yet, so there is nothing for `Form` to
+            // change — see [`ShadeModel`]. An opened file that has never
+            // mentioned `model` is a different question, and
+            // `#[serde(default)]` answers it `Crescent` instead.
+            model: ShadeModel::Form,
         }
     }
 }
@@ -1310,7 +1474,12 @@ impl LightRig {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.modelling.to_bits().hash(&mut hasher);
         self.edges.hash(&mut hasher);
-        for light in self.lights.iter().filter(|l| l.enabled && l.is_directional()) {
+        self.model.hash(&mut hasher);
+        for light in self
+            .lights
+            .iter()
+            .filter(|l| l.enabled && l.is_directional())
+        {
             light.id.0.hash(&mut hasher);
             light.softness.to_bits().hash(&mut hasher);
             match light.kind {
@@ -1359,8 +1528,58 @@ impl LightRig {
     }
 
     /// Is there anything that would change how the document looks?
+    /// This rig with only the lights `keep` accepts, given each light's index
+    /// — what one layer is lit by, once each light's place in the stack has
+    /// been taken into account.
+    pub fn only(&self, keep: impl Fn(usize, &Light) -> bool) -> LightRig {
+        LightRig {
+            lights: self
+                .lights
+                .iter()
+                .enumerate()
+                .filter(|(i, l)| keep(*i, l))
+                .map(|(_, l)| l.clone())
+                .collect(),
+            ..self.clone_settings()
+        }
+    }
+
+    /// Everything but the lights.
+    fn clone_settings(&self) -> LightRig {
+        LightRig {
+            lights: Vec::new(),
+            enabled: self.enabled,
+            base: self.base,
+            modelling: self.modelling,
+            edges: self.edges,
+            model: self.model,
+        }
+    }
+
     pub fn is_active(&self) -> bool {
         self.enabled && self.lights.iter().any(|l| l.enabled)
+    }
+
+    /// Does [`field`](Self::field) give the same answer wherever it is asked?
+    ///
+    /// True when the rig is active and every enabled light is *position-free*:
+    /// a sun's direct term has a fixed direction and strength, a flat sky
+    /// (`horizon == color`) mixes a colour with itself (`x + (x - x) * t` is
+    /// exactly `x` for every `t`), a gloom does not enter `field` at all. A
+    /// lamp (falloff and direction from the point) or a sky whose horizon
+    /// differs from its colour (a height mix) is not. Then the `Illumination`
+    /// of a shape does not depend on where its instance stands, so a symbol
+    /// stamp encoded with the light applied is the live encoding for every
+    /// instance under this rig (`RIG_SCENE_LAG_PLAN` L3'').
+    ///
+    /// A `NaN` in a sky colour compares unequal and so refuses: the safe side.
+    pub fn is_position_independent(&self) -> bool {
+        self.is_active()
+            && self.lights.iter().filter(|l| l.enabled).all(|l| match l.kind {
+                LightKind::Lamp { .. } => false,
+                LightKind::Sky { horizon } => horizon.components == l.color.components,
+                LightKind::Sun { .. } | LightKind::Gloom { .. } => true,
+            })
     }
 
     /// Does any light in the rig animate?
@@ -1426,6 +1645,36 @@ impl LightRig {
         Cow::Owned(rig)
     }
 
+    /// The rig with every light's *track* resolved to its state at `frame` —
+    /// no flicker, no storm.
+    ///
+    /// Flicker and storm are render effects: a gutter or a strike is something
+    /// that happens *around* the light's authored state, not something an
+    /// artist sets or a gizmo should show. A keyframed position, colour or
+    /// intensity is that authored state, so gizmos, drag and the light panel
+    /// all read and write through here rather than through
+    /// [`resolved_at`](Self::resolved_at), which would otherwise show a
+    /// flickering handle jittering around the frame the user is trying to
+    /// key.
+    pub fn keyed_at(&self, frame: u32) -> Cow<'_, LightRig> {
+        let any_track = self
+            .lights
+            .iter()
+            .any(|l| l.track.as_ref().is_some_and(|t| t.animates()));
+        if !any_track {
+            return Cow::Borrowed(self);
+        }
+        let mut rig = self.clone();
+        for light in &mut rig.lights {
+            if let Some(track) = light.track.clone()
+                && track.animates()
+            {
+                *light = track.state_at(frame, light);
+            }
+        }
+        Cow::Owned(rig)
+    }
+
     /// The highest frame any light in the rig is keyed at, for working out the
     /// document's animated length.
     pub fn last_animated_frame(&self) -> u32 {
@@ -1453,7 +1702,9 @@ impl LightRig {
 
     /// The lights that cast: everything directional and enabled.
     pub fn casters(&self) -> impl Iterator<Item = &Light> {
-        self.lights.iter().filter(|l| l.enabled && l.is_directional())
+        self.lights
+            .iter()
+            .filter(|l| l.enabled && l.is_directional())
     }
 
     /// The **key light**: the strongest directional one, which is the light
@@ -1548,7 +1799,11 @@ impl LightRig {
         }
 
         let mut direct = [0.0f32; 3];
-        for light in self.lights.iter().filter(|l| l.enabled && l.is_directional()) {
+        for light in self
+            .lights
+            .iter()
+            .filter(|l| l.enabled && l.is_directional())
+        {
             // **A lamp lights the artwork, and it used to be left out of here.**
             //
             // The argument for leaving it out was that this term is one colour
@@ -1641,7 +1896,11 @@ impl LightRig {
 
         // The lamp with the most to say across these bounds.
         let mut ramping: Option<(f32, LightId, f64, f64)> = None;
-        for light in self.lights.iter().filter(|l| l.enabled && l.is_directional()) {
+        for light in self
+            .lights
+            .iter()
+            .filter(|l| l.enabled && l.is_directional())
+        {
             let LightKind::Lamp { position, .. } = light.kind else {
                 continue;
             };
@@ -1660,7 +1919,11 @@ impl LightRig {
 
         // Everything not being ramped, taken at the middle.
         let mut uniform = [0.0f32; 3];
-        for light in self.lights.iter().filter(|l| l.enabled && l.is_directional()) {
+        for light in self
+            .lights
+            .iter()
+            .filter(|l| l.enabled && l.is_directional())
+        {
             if ramping.is_some_and(|(_, id, ..)| id == light.id) {
                 continue;
             }
@@ -2197,7 +2460,6 @@ mod tests {
         }
     }
 
-
     fn gloom(edge: Point, facing: f64) -> Light {
         Light::new(
             LightId(9),
@@ -2350,7 +2612,10 @@ mod tests {
 
         let brightness: Vec<f32> = (0..48).map(|f| lamp.flickered(f).intensity).collect();
         for pair in brightness.windows(2) {
-            assert_ne!(pair[0], pair[1], "two frames running at the same brightness");
+            assert_ne!(
+                pair[0], pair[1],
+                "two frames running at the same brightness"
+            );
         }
         for (frame, level) in brightness.iter().enumerate() {
             assert!(
@@ -2478,7 +2743,10 @@ mod tests {
             (slow_seconds - fast_seconds).abs() < 0.15,
             "the strikes lasted {slow_seconds:.2}s at 24 fps and {fast_seconds:.2}s at 60"
         );
-        assert!(slow_strikes >= 2, "only {slow_strikes} strikes in ten seconds");
+        assert!(
+            slow_strikes >= 2,
+            "only {slow_strikes} strikes in ten seconds"
+        );
     }
 
     /// **A fire's shadow gutters with it.**
@@ -2491,7 +2759,9 @@ mod tests {
         let mut fire = Light::new(LightId(9), "Fire", LightKind::lamp(Point::new(0.0, 0.0)));
         fire.make_fire();
 
-        let shadows: Vec<f32> = (0..120).map(|f| fire.flickered(f).shadow_strength).collect();
+        let shadows: Vec<f32> = (0..120)
+            .map(|f| fire.flickered(f).shadow_strength)
+            .collect();
         let lo = shadows.iter().copied().fold(f32::INFINITY, f32::min);
         let hi = shadows.iter().copied().fold(0.0f32, f32::max);
         assert!(
@@ -2700,6 +2970,65 @@ mod tests {
             bottom.to_rgba8().to_u8_array()[0] > 200,
             "the bottom is the horizon"
         );
+    }
+
+    /// `RIG_SCENE_LAG_PLAN` L3'': a rig of suns and a flat sky answers
+    /// `field` identically everywhere (so a stamp may carry its light); a
+    /// lamp or a sky that mixes by height does not.
+    #[test]
+    fn position_independence_is_suns_flat_skies_and_gloom_only() {
+        let flat_sky = |colour: Color| {
+            let mut sky = Light::new(LightId(3), "Sky", LightKind::sky());
+            sky.color = colour;
+            sky.kind = LightKind::Sky { horizon: colour };
+            sky
+        };
+        let blue = Color::from_rgb8(0x40, 0x60, 0xFF);
+
+        // Inactive rigs are not position-independent (nothing to stamp with).
+        assert!(!LightRig::default().is_position_independent());
+        let mut off = rig_with(sun(0.6, 0.7));
+        off.enabled = false;
+        assert!(!off.is_position_independent());
+
+        // A sun alone; a sun with a flat sky; with a gloom as well.
+        let mut rig = rig_with(sun(0.6, 0.7));
+        assert!(rig.is_position_independent());
+        rig.lights.push(flat_sky(blue));
+        assert!(rig.is_position_independent());
+        rig.lights.push(gloom(Point::new(-300.0, 0.0), 0.0));
+        assert!(rig.is_position_independent());
+
+        // The claim itself: `field` is the same wherever it is asked, at any
+        // depth and any stage height of the *region* (not of the document).
+        let near = rig.field(Rect::new(0.0, 0.0, 10.0, 10.0), 0.0, 400.0);
+        for (x, y) in [(0.0, 0.0), (900.0, 17.0), (-300.0, 399.0), (50.0, 5_000.0)] {
+            let here = rig.field(Rect::new(x, y, x + 40.0, y + 25.0), 0.0, 400.0);
+            assert_eq!(here, near, "field differs at ({x}, {y})");
+        }
+
+        // A sky that mixes by height is not.
+        let mut mixed = flat_sky(blue);
+        mixed.kind = LightKind::Sky {
+            horizon: Color::from_rgb8(0xFF, 0x80, 0x20),
+        };
+        let mut rig_mixed = rig_with(sun(0.6, 0.7));
+        rig_mixed.lights.push(mixed);
+        assert!(!rig_mixed.is_position_independent());
+        // ... unless it is disabled.
+        rig_mixed.lights[1].enabled = false;
+        assert!(rig_mixed.is_position_independent());
+
+        // A lamp is not; a disabled lamp does not count.
+        let mut with_lamp = rig_with(sun(0.6, 0.7));
+        with_lamp.lights.push(Light::new(
+            LightId(7),
+            "Lamp",
+            LightKind::lamp(Point::new(100.0, 100.0)),
+        ));
+        assert!(!with_lamp.is_position_independent());
+        with_lamp.lights[1].enabled = false;
+        assert!(with_lamp.is_position_independent());
     }
 
     /// A light low on the horizon fills very little — its energy goes sideways,

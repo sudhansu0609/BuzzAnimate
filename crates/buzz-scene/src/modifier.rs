@@ -488,9 +488,7 @@ fn turn_object(object: &mut Object, yaw: f64, round: f64) {
                     // A point that has gone round the side has nowhere to be on
                     // a path that must stay closed, so it is held at the
                     // silhouette. Dropping it would tear the outline open.
-                    .unwrap_or_else(|| {
-                        Point::new(cx + r * yaw.signum() * 0.995, p.y)
-                    })
+                    .unwrap_or_else(|| Point::new(cx + r * yaw.signum() * 0.995, p.y))
             };
             shape.path = map_path(&shape.path, map);
         }
@@ -734,7 +732,8 @@ impl Scene {
                     // Integrated frame by frame, so there is no state between two of
                     // them to ask for: the pose is held across the shutter.
                     let spring = Spring { stiffness, damping };
-                    if let Some(seq) = self.spring_sequence(layer, object, root, spring, coupling, fps)
+                    if let Some(seq) =
+                        self.spring_sequence(layer, object, root, spring, coupling, fps)
                     {
                         let index = (frame as usize).min(seq.len().saturating_sub(1));
                         if let Some(pose) = seq.get(index) {
@@ -787,10 +786,8 @@ impl Scene {
                         let squash = Affine::rotate(heading)
                             * Affine::scale_non_uniform(stretch, 1.0 / stretch)
                             * Affine::rotate(-heading);
-                        prepend = Affine::translate(here)
-                            * squash
-                            * Affine::translate(-here)
-                            * prepend;
+                        prepend =
+                            Affine::translate(here) * squash * Affine::translate(-here) * prepend;
                     }
                 }
                 Modifier::Breathe { rate, depth } => {
@@ -803,7 +800,8 @@ impl Scene {
                     // placeholder a few units across — measured that way, the
                     // bands below would all land in the same place and the
                     // breath would do nothing at all.
-                    let bounds = crate::object::transform_rect(prepend, self.resolved_bounds(object));
+                    let bounds =
+                        crate::object::transform_rect(prepend, self.resolved_bounds(object));
                     if bounds.width() > 0.0 && bounds.height() > 0.0 {
                         let s = breath_at(object.id.0, rate, time / fps);
                         let depth = depth.clamp(0.0, 4.0);
@@ -1003,7 +1001,9 @@ impl Scene {
         }
 
         let modified = if coupling > 0.0 {
-            buzz_rig::follow_through_coupled(&topology, root, spring, &primary, &world, coupling, fps)
+            buzz_rig::follow_through_coupled(
+                &topology, root, spring, &primary, &world, coupling, fps,
+            )
         } else {
             buzz_rig::follow_through(&topology, root, spring, &primary, fps)
         };
@@ -1041,7 +1041,8 @@ mod tests {
         };
         for i in 0..4 {
             let parent = if i == 0 { None } else { Some(i - 1) };
-            arm.bones.push(Bone::new(format!("b{i}"), parent, 40.0, 0.0));
+            arm.bones
+                .push(Bone::new(format!("b{i}"), parent, 40.0, 0.0));
         }
         let mut scene = Scene::empty();
         let layer = scene.add_layer("Rig", LayerKind::Normal);
@@ -1117,7 +1118,10 @@ mod tests {
 
         let obj = resolved(&scene, layer, id, 5);
         let eval = scene.modified_object_at(layer, &obj, 5).expect("a wiggle");
-        assert!(eval.object.is_none(), "a wiggle should not re-pose, only offset");
+        assert!(
+            eval.object.is_none(),
+            "a wiggle should not re-pose, only offset"
+        );
 
         let fps = scene.stage().frame_rate.max(1.0);
         let want = buzz_physics::wiggle_at(
@@ -1180,7 +1184,10 @@ mod tests {
                 ObjectKind::Armature(d) => d.armature.pose(),
                 _ => unreachable!(),
             };
-            assert_eq!(live, expected[frame as usize], "frame {frame} differs from the solver");
+            assert_eq!(
+                live, expected[frame as usize],
+                "frame {frame} differs from the solver"
+            );
         }
     }
 
@@ -1191,7 +1198,10 @@ mod tests {
         let object = Object::shape(
             ObjectId(id),
             // Top at y = 0, base at y = 100, a hundred wide.
-            ShapeData::filled(Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9), Color::WHITE),
+            ShapeData::filled(
+                Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9),
+                Color::WHITE,
+            ),
         );
         let placed = scene.add_object(layer, object).unwrap();
         scene.update_layer(layer, |l| {
@@ -1396,7 +1406,10 @@ mod tests {
     fn a_blink_closes_the_eye_and_opens_it_again() {
         let s = blink_samples(7, 12.0, 0.16, 60.0);
         let shut = s.iter().copied().fold(f64::INFINITY, f64::min);
-        assert!(shut < 0.05, "the lid never arrived: the closest it came was {shut}");
+        assert!(
+            shut < 0.05,
+            "the lid never arrived: the closest it came was {shut}"
+        );
         assert!(
             s.first().copied().unwrap() > 0.99 && s.last().copied().unwrap() > 0.99,
             "the eye did not come back open"
@@ -1447,7 +1460,11 @@ mod tests {
             .filter(|(_, w)| w[0] > 0.5 && w[1] <= 0.5)
             .map(|(i, _)| i)
             .collect();
-        assert!(starts.len() > 8, "not enough blinks to judge: {}", starts.len());
+        assert!(
+            starts.len() > 8,
+            "not enough blinks to judge: {}",
+            starts.len()
+        );
         let gaps: Vec<f64> = starts.windows(2).map(|w| (w[1] - w[0]) as f64).collect();
         let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
         let spread = gaps
@@ -1523,21 +1540,21 @@ mod tests {
         let part = |n: u64, x0: f64, x1: f64| {
             Arc::new(Object::shape(
                 ObjectId(n),
-                ShapeData::filled(
-                    Rect::new(x0, 40.0, x1, 60.0).to_path(1e-9),
-                    Color::WHITE,
-                ),
+                ShapeData::filled(Rect::new(x0, 40.0, x1, 60.0).to_path(1e-9), Color::WHITE),
             ))
         };
         let children = vec![
             // The form: the whole head, 0..100.
             Arc::new(Object::shape(
                 ObjectId(id * 10),
-                ShapeData::filled(Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9), Color::WHITE),
+                ShapeData::filled(
+                    Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9),
+                    Color::WHITE,
+                ),
             )),
-            part(id * 10 + 1, 20.0, 30.0),  // left eye,  centre 25
-            part(id * 10 + 2, 47.0, 53.0),  // nose,      centre 50
-            part(id * 10 + 3, 70.0, 80.0),  // right eye, centre 75
+            part(id * 10 + 1, 20.0, 30.0), // left eye,  centre 25
+            part(id * 10 + 2, 47.0, 53.0), // nose,      centre 50
+            part(id * 10 + 3, 70.0, 80.0), // right eye, centre 75
         ];
         let placed = scene
             .add_object(layer, Object::group(ObjectId(id), children))
@@ -1556,9 +1573,7 @@ mod tests {
             .expect("a modifier");
         let drawn = eval.object.expect("the turn re-poses, so it owns a copy");
         match &drawn.kind {
-            ObjectKind::Group(children) => {
-                children.iter().map(|c| c.bounds().center().x).collect()
-            }
+            ObjectKind::Group(children) => children.iter().map(|c| c.bounds().center().x).collect(),
             _ => unreachable!("the fixture is a group"),
         }
     }
@@ -1580,7 +1595,9 @@ mod tests {
     fn a_head_at_rest_is_left_exactly_alone() {
         let (scene, layer, id) = turned_face(0.0);
         let object = resolved(&scene, layer, id, 0);
-        let eval = scene.modified_object_at(layer, &object, 0u32).expect("evaluated");
+        let eval = scene
+            .modified_object_at(layer, &object, 0u32)
+            .expect("evaluated");
         assert!(
             eval.object.is_none(),
             "an unturned head should not even be copied"
@@ -1600,16 +1617,18 @@ mod tests {
             let object = resolved(&scene, layer, id, 0);
             assert!(scene.modified_object_at(layer, &object, 0u32).is_none());
             match &object.kind {
-                ObjectKind::Group(c) => {
-                    c.iter().map(|c| c.bounds().center().x).collect::<Vec<_>>()
-                }
+                ObjectKind::Group(c) => c.iter().map(|c| c.bounds().center().x).collect::<Vec<_>>(),
                 _ => unreachable!(),
             }
         };
 
         let (scene, layer, id) = turned_face(0.5);
         let now = part_centres(&scene, layer, id);
-        assert_eq!(now.len(), rest.len(), "nothing should have gone round the back yet");
+        assert_eq!(
+            now.len(),
+            rest.len(),
+            "nothing should have gone round the back yet"
+        );
 
         // Every feature moved the same way as the turn.
         for i in 1..now.len() {
@@ -1691,7 +1710,10 @@ mod tests {
     fn the_turn_spends_the_yaw_it_used() {
         let (scene, layer, id) = turned_face(0.5);
         let object = resolved(&scene, layer, id, 0);
-        assert_eq!(object.spatial.rotation_y, 0.5, "the source still carries it");
+        assert_eq!(
+            object.spatial.rotation_y, 0.5,
+            "the source still carries it"
+        );
         let drawn = scene
             .modified_object_at(layer, &object, 0u32)
             .expect("a modifier")
@@ -1716,12 +1738,15 @@ mod tests {
         ));
         scene.update_object_across(0, 30, id, |o| {
             o.spatial.rotation_y = 1.4;
-            o.turnaround.set(std::f64::consts::FRAC_PI_2, profile.clone());
+            o.turnaround
+                .set(std::f64::consts::FRAC_PI_2, profile.clone());
             o.modifiers.push(Modifier::Turn { round: 1.0 });
         });
 
         let object = resolved(&scene, layer, id, 0);
-        let eval = scene.modified_object_at(layer, &object, 0u32).expect("evaluated");
+        let eval = scene
+            .modified_object_at(layer, &object, 0u32)
+            .expect("evaluated");
         assert!(
             eval.object.is_none(),
             "the drawn profile was nearer, so the turn should have done nothing"
@@ -1751,7 +1776,10 @@ mod tests {
     #[test]
     fn a_flat_board_slides_without_foreshortening() {
         let (u, squeeze) = turn_at(0.7, 0.5, 0.0).expect("visible");
-        assert!((u - 0.5_f64.sin()).abs() < 1e-9, "a board should just slide");
+        assert!(
+            (u - 0.5_f64.sin()).abs() < 1e-9,
+            "a board should just slide"
+        );
         assert!((squeeze - 0.5_f64.cos()).abs() < 1e-9);
     }
 
@@ -1858,7 +1886,9 @@ mod tests {
         // At (100,100), facing +x. Target straight below (+y), so it should turn
         // a quarter turn.
         object.transform = Affine::translate((100.0, 100.0));
-        object.modifiers.push(Modifier::LookAt { x: 100.0, y: 300.0 });
+        object
+            .modifiers
+            .push(Modifier::LookAt { x: 100.0, y: 300.0 });
         let id = scene.add_object(layer, object).unwrap();
 
         let obj = resolved(&scene, layer, id, 0);
@@ -1880,7 +1910,9 @@ mod tests {
             ShapeData::filled(Rect::new(-5.0, -5.0, 5.0, 5.0).to_path(1e-9), Color::WHITE),
         );
         object.transform = Affine::translate((0.0, 100.0));
-        object.modifiers.push(Modifier::AutoSquashStretch { amount: 0.02 });
+        object
+            .modifiers
+            .push(Modifier::AutoSquashStretch { amount: 0.02 });
         let id = scene.add_object(layer, object).unwrap();
 
         // Slide it along +x from 0 to 200 over ten frames.
@@ -1898,7 +1930,11 @@ mod tests {
         });
 
         let obj = resolved(&scene, layer, id, 5);
-        let c = scene.modified_object_at(layer, &obj, 5).unwrap().prepend.as_coeffs();
+        let c = scene
+            .modified_object_at(layer, &obj, 5)
+            .unwrap()
+            .prepend
+            .as_coeffs();
         // Motion is +x, so the linear part scales x up and y down, and preserves
         // area (x scale * y scale ~= 1).
         assert!(c[0] > 1.1, "x should stretch, was {}", c[0]);
@@ -1949,6 +1985,9 @@ mod tests {
             _ => unreachable!(),
         };
 
-        assert_ne!(pose_before, pose_after, "the cache did not recompute after the edit");
+        assert_ne!(
+            pose_before, pose_after,
+            "the cache did not recompute after the edit"
+        );
     }
 }

@@ -184,7 +184,10 @@ pub fn distribute_offsets(bounds: &[Rect], op: Distribute) -> Vec<Vec2> {
             // Equal gaps: the room left over once every object has taken its
             // own size, shared between the spaces between them.
             let span = high(&bounds[last]) - low(&bounds[first]);
-            let filled: f64 = order.iter().map(|&i| high(&bounds[i]) - low(&bounds[i])).sum();
+            let filled: f64 = order
+                .iter()
+                .map(|&i| high(&bounds[i]) - low(&bounds[i]))
+                .sum();
             let gap = (span - filled) / (order.len() - 1) as f64;
             let mut at = low(&bounds[first]);
             let mut targets = Vec::with_capacity(order.len());

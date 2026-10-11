@@ -14,7 +14,10 @@ fn a_sign_at(place: Affine) -> (Scene, LayerId, ObjectId) {
     let layer = scene.add_layer("Sign", LayerKind::Normal);
     let mut object = Object::shape(
         ObjectId(1),
-        ShapeData::filled(Rect::new(-10.0, -10.0, 10.0, 10.0).to_path(1e-9), Color::WHITE),
+        ShapeData::filled(
+            Rect::new(-10.0, -10.0, 10.0, 10.0).to_path(1e-9),
+            Color::WHITE,
+        ),
     );
     object.transform = place;
     let id = scene.add_object(layer, object).expect("on a layer");
@@ -58,7 +61,10 @@ fn a_wiggle_moves_the_object_within_its_amplitude() {
             moved_somewhere = true;
         }
     }
-    assert!(moved_somewhere, "the wiggle never actually moved the object");
+    assert!(
+        moved_somewhere,
+        "the wiggle never actually moved the object"
+    );
 }
 
 #[test]

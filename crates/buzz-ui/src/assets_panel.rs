@@ -18,12 +18,10 @@ use crate::MotionFilter;
 /// How the panel asks the shell for an asset's picture.
 ///
 /// The same arrangement the Library panel uses: the panel has no GPU and no
-/// business reading files, so it asks by path and draws what comes back. 
+/// business reading files, so it asks by path and draws what comes back.
 /// means "not yet" — pictures arrive over the next few frames — and the row
 /// shows its name in the meantime rather than a gap.
 pub type AssetThumbnailSource<'a> = &'a mut dyn FnMut(&std::path::Path) -> Option<egui::TextureId>;
-
-
 
 /// What the user asked the panel to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +55,9 @@ pub enum AssetAction {
     Rescan,
     /// Bring an entire Animate asset library across.
     ImportFromAnimate,
+    /// **Arrange by type & style…** (AS2): open the preview of proposed
+    /// folder moves.
+    ArrangeByTypeAndStyle,
 }
 
 /// How big the pictures are drawn, and — because the two are the same
@@ -285,6 +286,16 @@ pub fn assets_panel(
         {
             action = Some(AssetAction::ImportFromAnimate);
         }
+        if ui
+            .small_button("Arrange by type & style\u{2026}")
+            .on_hover_text(
+                "File assets into Type folders (Characters, Buildings, Trees\u{2026}) and \
+                 Style folders inside them \u{2014} previewed first, and undoable",
+            )
+            .clicked()
+        {
+            action = Some(AssetAction::ArrangeByTypeAndStyle);
+        }
         if !state.selected_folder.is_empty() {
             ui.label(RichText::new(&state.selected_folder).small().weak());
         }
@@ -342,15 +353,13 @@ fn draw_folder(
             // target rather than the whole row, so the drop lands on the thing
             // that is named — dropping on the Delete button at the far end
             // would be a filing gesture that reads as a destructive one.
-            let dropped = ui.dnd_drop_zone::<DraggedAsset, egui::Response>(
-                egui::Frame::NONE,
-                |ui| {
+            let dropped =
+                ui.dnd_drop_zone::<DraggedAsset, egui::Response>(egui::Frame::NONE, |ui| {
                     ui.selectable_label(selected, &leaf).on_hover_text(
                         "Click makes this the folder new assets go into \u{b7} drop \
                          an asset here to file it",
                     )
-                },
-            );
+                });
             let label = dropped.0.inner;
             if let Some(payload) = dropped.1 {
                 *action = Some(AssetAction::MoveToFolder {
@@ -499,10 +508,8 @@ fn asset_cell(
 
     ui.allocate_ui(egui::vec2(size.cell(), edge + 22.0), |ui| {
         ui.vertical_centered(|ui| {
-            let (rect, response) = ui.allocate_exact_size(
-                egui::vec2(edge, edge),
-                egui::Sense::click(),
-            );
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(edge, edge), egui::Sense::click());
             draw_thumbnail(ui, rect, asset, thumbnail);
 
             let response = response.on_hover_text(format!(
@@ -526,12 +533,7 @@ fn asset_cell(
 ///
 /// The square is always reserved so rows and columns do not jump about as
 /// pictures arrive over the next few frames.
-fn draw_thumbnail(
-    ui: &Ui,
-    rect: egui::Rect,
-    asset: &Asset,
-    thumbnail: AssetThumbnailSource<'_>,
-) {
+fn draw_thumbnail(ui: &Ui, rect: egui::Rect, asset: &Asset, thumbnail: AssetThumbnailSource<'_>) {
     match thumbnail(&asset.path) {
         Some(texture) => {
             egui::Image::new((texture, rect.size())).paint_at(ui, rect);
@@ -590,7 +592,11 @@ fn asset_menu(
     // has something to land on.
     let armed = state.confirm_delete_asset.as_deref() == Some(asset.path.as_path());
     if ui
-        .button(if armed { "Delete \u{2014} confirm?" } else { "Delete" })
+        .button(if armed {
+            "Delete \u{2014} confirm?"
+        } else {
+            "Delete"
+        })
         .clicked()
     {
         *action = Some(AssetAction::Delete(asset.clone()));
@@ -599,7 +605,6 @@ fn asset_menu(
         }
     }
 }
-
 
 fn asset_row(
     ui: &mut Ui,

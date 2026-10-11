@@ -1,5 +1,7 @@
 # Outstanding Items — Execution Plan
 
+**2026-09-21 editor and lighting request:** See the [detailed implementation plan](docs/EDITOR_LIGHTING_IMPLEMENTATION_PLAN.md) and [progress tracker](docs/EDITOR_LIGHTING_PROGRESS.md). Planning is complete; implementation and runtime validation are pending.
+
 **Derived from:** `PROGRESS.md` §7 (the record), `IMPROVEMENTS.md` Parts I–III, `ARCHITECTURE.md`.
 If this file and `PROGRESS.md` ever disagree, **`PROGRESS.md` is right.**
 

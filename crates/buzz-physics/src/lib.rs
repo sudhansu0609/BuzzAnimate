@@ -162,16 +162,27 @@ mod tests {
     fn a_spring_overshoots_its_target_then_settles() {
         let series = response(Spring::hair(), 1.0, 200);
         let peak = series.iter().cloned().fold(f64::MIN, f64::max);
-        assert!(peak > 1.0, "a bouncy spring should overshoot 1.0, peaked at {peak}");
+        assert!(
+            peak > 1.0,
+            "a bouncy spring should overshoot 1.0, peaked at {peak}"
+        );
         let end = *series.last().unwrap();
-        assert!((end - 1.0).abs() < 1e-3, "it should settle on the target, ended at {end}");
+        assert!(
+            (end - 1.0).abs() < 1e-3,
+            "it should settle on the target, ended at {end}"
+        );
     }
 
     #[test]
     fn more_damping_means_less_overshoot() {
         let bouncy = Spring::new(120.0, 8.0);
         let firm = Spring::new(120.0, 30.0);
-        let peak = |s: Spring| response(s, 1.0, 200).iter().cloned().fold(f64::MIN, f64::max);
+        let peak = |s: Spring| {
+            response(s, 1.0, 200)
+                .iter()
+                .cloned()
+                .fold(f64::MIN, f64::max)
+        };
         assert!(
             peak(firm) < peak(bouncy),
             "raising damping should reduce the overshoot: firm {}, bouncy {}",
@@ -219,7 +230,11 @@ mod tests {
         // One firm step should move it a little, and toward the target across the
         // seam — so it should wrap to just above +π (i.e. a negative value near
         // -π) rather than swinging down through zero.
-        assert!(s.value.abs() > PI - 0.3, "the spring unwound the long way to {}", s.value);
+        assert!(
+            s.value.abs() > PI - 0.3,
+            "the spring unwound the long way to {}",
+            s.value
+        );
     }
 
     #[test]

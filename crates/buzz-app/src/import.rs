@@ -25,6 +25,25 @@ pub struct Imported {
     pub summary: String,
     /// What did not come across. Empty means a complete import.
     pub unsupported: Vec<String>,
+    /// The first scene's name, when the file names its scenes (Animate does).
+    pub scene_name: Option<String>,
+    /// Every scene after the first, in order — an Animate document with two
+    /// scenes opens as a document with two scenes, not one timeline holding
+    /// both.
+    pub more_scenes: Vec<(String, Scene)>,
+}
+
+impl Imported {
+    /// The document this import opens as: one scene per scene in the file.
+    pub fn document(&self) -> buzz_doc::Document {
+        if self.more_scenes.is_empty() {
+            return buzz_doc::Document::new(self.scene.clone());
+        }
+        let first = self.scene_name.clone().unwrap_or_else(|| "Scene 1".to_string());
+        let mut scenes = vec![(first, self.scene.clone())];
+        scenes.extend(self.more_scenes.iter().cloned());
+        buzz_doc::Document::from_scenes(scenes)
+    }
 }
 
 /// What the user is shown after an import.
@@ -102,11 +121,18 @@ pub fn read(path: &Path) -> Result<Imported, String> {
 }
 
 fn read_xfl(path: &Path) -> Result<Imported, String> {
-    let (scene, report) = buzz_import_xfl::import(path).map_err(|e| e.to_string())?;
+    let (scene, mut report) = buzz_import_xfl::import(path).map_err(|e| e.to_string())?;
+    let more_scenes = std::mem::take(&mut report.more_scenes);
+    let mut summary = report.summary();
+    if !more_scenes.is_empty() {
+        summary.push_str(&format!(", {} scenes", more_scenes.len() + 1));
+    }
     Ok(Imported {
         scene,
-        summary: report.summary(),
+        summary,
         unsupported: report.unsupported,
+        scene_name: report.scene_name,
+        more_scenes,
     })
 }
 
@@ -116,6 +142,8 @@ fn read_swf(path: &Path) -> Result<Imported, String> {
         scene,
         summary: report.summary(),
         unsupported: report.unsupported,
+        scene_name: None,
+        more_scenes: Vec::new(),
     })
 }
 
@@ -125,6 +153,8 @@ fn read_pdf(path: &Path) -> Result<Imported, String> {
         scene,
         summary: report.summary(),
         unsupported: report.unsupported,
+        scene_name: None,
+        more_scenes: Vec::new(),
     })
 }
 

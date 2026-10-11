@@ -38,7 +38,14 @@ fn stage(background: Color) -> Scene {
 }
 
 /// Draw one wave onto a scene at `phase`, as the editor commits one.
-fn draw(scene: &mut Scene, kind: WaveKind, samples: &[StrokeSample], size: f64, color: Color, phase: f64) {
+fn draw(
+    scene: &mut Scene,
+    kind: WaveKind,
+    samples: &[StrokeSample],
+    size: f64,
+    color: Color,
+    phase: f64,
+) {
     let layer = scene.add_layer(kind.label(), LayerKind::Normal);
     let pieces = wave_artwork(
         kind,

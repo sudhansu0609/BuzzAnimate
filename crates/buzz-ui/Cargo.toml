@@ -15,12 +15,18 @@ buzz-scene.workspace = true
 buzz-text.workspace = true
 buzz-rig.workspace = true
 buzz-doc.workspace = true
+buzz-ai.workspace = true
+buzz-export.workspace = true
+buzz-render.workspace = true
 
 egui.workspace = true
 kurbo.workspace = true
 peniko.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+crossbeam-channel.workspace = true
+image.workspace = true
+rfd = { version = "0.16", default-features = false, features = ["xdg-portal"] }
 
 # The About window's banner is a PNG, decoded when that window first opens.
 png = "0.18"

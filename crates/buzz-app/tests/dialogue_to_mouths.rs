@@ -123,8 +123,14 @@ fn each_speaker_gets_their_own_mouth() {
 
     let ana = layer_named(&editor, "Ana").expect("a layer for Ana");
     let ben = layer_named(&editor, "Ben").expect("a layer for Ben");
-    assert!(!mouth_frames(&editor, ana).is_empty(), "Ana has no mouth keys");
-    assert!(!mouth_frames(&editor, ben).is_empty(), "Ben has no mouth keys");
+    assert!(
+        !mouth_frames(&editor, ana).is_empty(),
+        "Ana has no mouth keys"
+    );
+    assert!(
+        !mouth_frames(&editor, ben).is_empty(),
+        "Ben has no mouth keys"
+    );
 }
 
 /// **Nobody mouths anybody else's lines.**
@@ -213,7 +219,10 @@ fn a_speaker_with_no_mouth_symbol_is_named() {
 
     editor.lip_sync_from_captions().expect("Ana can still sync");
     let status = editor.status.clone().unwrap_or_default();
-    assert!(status.contains("Ben"), "Ben was skipped in silence: {status:?}");
+    assert!(
+        status.contains("Ben"),
+        "Ben was skipped in silence: {status:?}"
+    );
 }
 
 /// **Captions that name nobody explain themselves** rather than doing nothing.

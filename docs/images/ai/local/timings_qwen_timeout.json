@@ -1,0 +1,85 @@
+{
+  "autorig_detect_s": 1.9558382,
+  "autorig_mapping": [
+    [
+      "leftArm",
+      "Shoulder R"
+    ],
+    [
+      "sideHead1",
+      "Head"
+    ],
+    [
+      "leftWrist",
+      "Elbow R"
+    ],
+    [
+      "leftPalm",
+      "Elbow R"
+    ],
+    [
+      "sadhuSideTorso2",
+      "Chest"
+    ],
+    [
+      "sideTorso1Sadhu",
+      "Chest"
+    ],
+    [
+      "rightWrist",
+      "Elbow L"
+    ],
+    [
+      "rightArm",
+      "Shoulder L"
+    ],
+    [
+      "rightPalm",
+      "Elbow L"
+    ],
+    [
+      "leftThigh",
+      "Thigh R"
+    ],
+    [
+      "leftShin",
+      "Knee R"
+    ],
+    [
+      "rightThigh",
+      "Thigh L"
+    ],
+    [
+      "rightShin",
+      "Knee L"
+    ],
+    [
+      "leftFoot",
+      "Knee R"
+    ],
+    [
+      "righFoot",
+      "Knee L"
+    ]
+  ],
+  "character_bones": 11,
+  "character_create_s": 0.0671365,
+  "character_detect_s": 1.5007935,
+  "character_pose_sheet_s": 2.231702,
+  "character_process_s": 1.6321828,
+  "scene_analyse_s": 62.4739155,
+  "scene_model": "google/gemma-4-12b",
+  "scene_rows": [
+    "elderly_man_center -> Symbol 4 0.77",
+    "person_bottom_left -> Symbol 23 0.74",
+    "person_bottom_right -> lantern SwingingLatest 0.79",
+    "exterior_foliage_view -> jungle 0.85",
+    "interior_wall_texture -> -",
+    "doorframe_structure -> -"
+  ],
+  "scene_status": "Reconstructed scene: 4 placed, 2 unmatched",
+  "story_brief": "Morning. Village. Ramu walks in from the left and waves. Thakur turns to him and says, \"The rain is late this year.\" Ramu listens, then says, \"Then we pray tonight.\" Ramu walks off.",
+  "story_error": "LLM brief parsing failed: Request timed out: The model took longer than 900s to respond. Local reasoning models can take minutes to answer a large image batch or a complex schema — this is not a connectivity problem.",
+  "story_model": "qwen/qwen3.8-27b",
+  "story_parse_s": 900.0389362
+}

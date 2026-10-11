@@ -66,7 +66,14 @@ fn translation(editor: &Editor, layer: LayerId, id: ObjectId, frame: u32) -> Poi
 fn baking_writes_keyframes_and_drops_the_modifier() {
     let (mut editor, layer, id) = shape_with_wiggle();
     assert_eq!(
-        editor.doc.scene().find_object(id).unwrap().1.modifiers.len(),
+        editor
+            .doc
+            .scene()
+            .find_object(id)
+            .unwrap()
+            .1
+            .modifiers
+            .len(),
         1,
         "the wiggle is attached"
     );
@@ -101,11 +108,27 @@ fn baking_writes_keyframes_and_drops_the_modifier() {
 fn baking_is_one_undo_step() {
     let (mut editor, _layer, id) = shape_with_wiggle();
     editor.run(Command::BakeModifiers);
-    assert!(editor.doc.scene().find_object(id).unwrap().1.modifiers.is_empty());
+    assert!(
+        editor
+            .doc
+            .scene()
+            .find_object(id)
+            .unwrap()
+            .1
+            .modifiers
+            .is_empty()
+    );
 
     editor.doc.undo();
     assert_eq!(
-        editor.doc.scene().find_object(id).unwrap().1.modifiers.len(),
+        editor
+            .doc
+            .scene()
+            .find_object(id)
+            .unwrap()
+            .1
+            .modifiers
+            .len(),
         1,
         "one Ctrl+Z restores the live modifier"
     );

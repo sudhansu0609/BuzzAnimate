@@ -41,5 +41,8 @@ fn a_real_saved_layout_puts_the_story_panel_back_in_view() {
         .max()
         .expect("a right column");
     let mine = migrated.slot(PanelId::Story).expect("a slot").order;
-    assert!(mine < last, "still at the bottom of the column ({mine} of {last})");
+    assert!(
+        mine < last,
+        "still at the bottom of the column ({mine} of {last})"
+    );
 }

@@ -347,8 +347,18 @@ mod tests {
     #[test]
     fn the_fill_slack_does_not_reach_across_the_stage() {
         let square = Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9);
-        assert!(fill_contains_near(&square, Point::new(50.0, 50.0), FillMode::NonZero, 6.0));
-        assert!(fill_contains_near(&square, Point::new(103.0, 50.0), FillMode::NonZero, 6.0));
+        assert!(fill_contains_near(
+            &square,
+            Point::new(50.0, 50.0),
+            FillMode::NonZero,
+            6.0
+        ));
+        assert!(fill_contains_near(
+            &square,
+            Point::new(103.0, 50.0),
+            FillMode::NonZero,
+            6.0
+        ));
         assert!(!fill_contains_near(
             &square,
             Point::new(140.0, 50.0),

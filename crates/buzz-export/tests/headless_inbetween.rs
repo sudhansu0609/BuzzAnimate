@@ -29,7 +29,11 @@ fn with_exporter(test: impl FnOnce(&mut Exporter)) {
 fn two_strokes(swapped: bool, shift: f64) -> buzz_geom::BezPath {
     let small = Rect::new(40.0 + shift, 80.0, 80.0 + shift, 120.0).to_path(1e-9);
     let large = Rect::new(240.0 + shift, 60.0, 340.0 + shift, 140.0).to_path(1e-9);
-    let (first, second) = if swapped { (large, small) } else { (small, large) };
+    let (first, second) = if swapped {
+        (large, small)
+    } else {
+        (small, large)
+    };
     let mut path = first;
     for element in second.elements() {
         path.push(*element);
@@ -54,11 +58,7 @@ fn document() -> Scene {
     });
     // The far keyframe: the same two strokes, barely moved, drawn the other way
     // round.
-    scene.add_shape_at(
-        layer,
-        20,
-        ShapeData::filled(two_strokes(true, 8.0), ART),
-    );
+    scene.add_shape_at(layer, 20, ShapeData::filled(two_strokes(true, 8.0), ART));
     scene.update_layer(layer, |l| {
         l.frames.set_tween(0, Tween::shape());
     });

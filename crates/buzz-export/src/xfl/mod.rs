@@ -76,7 +76,10 @@ impl FlaReport {
             if self.symbols == 1 { "" } else { "s" }
         );
         if !self.skipped.is_empty() {
-            text.push_str(&format!(" \u{2014} not carried: {}", self.skipped.join(", ")));
+            text.push_str(&format!(
+                " \u{2014} not carried: {}",
+                self.skipped.join(", ")
+            ));
         }
         text
     }
@@ -275,7 +278,13 @@ fn symbol_xml(scene: &Scene, symbol: &Symbol, report: &mut FlaReport) -> String 
     ));
     out.push('\n');
     out.push_str("  <timeline>\n");
-    out.push_str(&timeline_xml(scene, &symbol.name, &symbol.layers, report, 4));
+    out.push_str(&timeline_xml(
+        scene,
+        &symbol.name,
+        &symbol.layers,
+        report,
+        4,
+    ));
     out.push_str("  </timeline>\n");
     out.push_str("</DOMSymbolItem>\n");
     out
@@ -311,11 +320,8 @@ fn timeline_xml(
     let ordered: Vec<&std::sync::Arc<Layer>> = layers.iter().collect();
     // `parentLayerIndex` and the rigging links are written by *index*, so the
     // positions have to be known before any layer is written.
-    let index_of: BTreeMap<buzz_scene::LayerId, usize> = ordered
-        .iter()
-        .enumerate()
-        .map(|(i, l)| (l.id, i))
-        .collect();
+    let index_of: BTreeMap<buzz_scene::LayerId, usize> =
+        ordered.iter().enumerate().map(|(i, l)| (l.id, i)).collect();
 
     // Which layers something hangs off, so only those are marked as rig
     // parents.
@@ -592,9 +598,7 @@ fn shape_xml(
 /// carry — which is noted rather than passed over.
 fn solid(paint: &buzz_scene::Paint, report: &mut FlaReport) -> Option<(String, f32)> {
     match paint {
-        buzz_scene::Paint::Solid(colour) => {
-            Some((hex(*colour), colour.components[3]))
-        }
+        buzz_scene::Paint::Solid(colour) => Some((hex(*colour), colour.components[3])),
         buzz_scene::Paint::Gradient(_) => {
             report.skip("gradients");
             None

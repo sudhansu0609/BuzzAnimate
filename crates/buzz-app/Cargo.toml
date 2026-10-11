@@ -31,6 +31,7 @@ buzz-script.workspace = true
 buzz-export.workspace = true
 buzz-rig.workspace = true
 buzz-audio.workspace = true
+buzz-ai.workspace = true
 
 vello.workspace = true
 kurbo.workspace = true
@@ -41,7 +42,11 @@ winit.workspace = true
 # cannot use. See the note in the workspace manifest.
 egui.workspace = true
 egui-wgpu.workspace = true
-egui-winit.workspace = true
+# `accesskit`: the winit-side half of Stage 6, item 4 — egui's own
+# accessibility tree (`Context::enable_accesskit`) is built unconditionally,
+# but forwarding it to a screen reader through `accesskit_winit` needs this
+# feature. See `Active::new` in `app.rs` for where it is turned on.
+egui-winit = { workspace = true, features = ["accesskit"] }
 
 anyhow.workspace = true
 thiserror.workspace = true
@@ -55,11 +60,27 @@ tracing-subscriber.workspace = true
 # The window icon is decoded at startup from the PNG in `assets/`.
 png = "0.18"
 # Animate's asset manifests are JSON.
+serde.workspace = true
 serde_json.workspace = true
+image.workspace = true
+# A snapshot's PNG arrives from the executor as base64.
+base64 = "0.22"
 
 # The soundtrack is written out for the video encoder to read, into a directory
 # that lives exactly as long as the encode does.
 tempfile = "3"
+
+# The local API (`src/api.rs`, ECOSYSTEM_BRIDGE_PLAN step E1): a small,
+# synchronous HTTP server on its own thread, so Buzzcaf Studio and BuzzEdit
+# can drive the app. Pinned exactly; nothing async is pulled in for it.
+tiny_http = "=0.12.0"
+# `ports.rs` is a copy of BuzzCode's, which stamps the ledger's `started_at`
+# with this crate's RFC 3339 formatter.
+humantime = "=2.4.0"
+# The clients for BuzzEdit and Buzzcaf Studio (`src/estate.rs`, steps E2 and
+# E3): the same blocking HTTP client `buzz-ai` already uses, so nothing new is
+# compiled. Only ever called off the UI thread.
+ureq = { version = "2.10", features = ["json"] }
 
 [target.'cfg(windows)'.build-dependencies]
 # Embeds the icon into the .exe, so Explorer and the taskbar show it too.
@@ -71,3 +92,7 @@ tempfile = "3"
 hound = "3.5"
 zip.workspace = true
 swf.workspace = true
+
+[features]
+# Forwards to `buzz-render`'s own opt-in calibration feature; see there.
+gpu-truth = ["buzz-render/gpu-truth"]

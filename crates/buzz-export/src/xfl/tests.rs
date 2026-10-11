@@ -66,7 +66,10 @@ fn a_shape_keeps_its_place_and_its_colour() {
     let layer = scene.add_layer("Art", LayerKind::Normal);
     scene.add_shape(
         layer,
-        ShapeData::filled(square(120.0, 80.0, 60.0), Color::from_rgba8(0xE0, 0x40, 0x60, 0xFF)),
+        ShapeData::filled(
+            square(120.0, 80.0, 60.0),
+            Color::from_rgba8(0xE0, 0x40, 0x60, 0xFF),
+        ),
     );
 
     let (back, _) = round_trip(&scene);
@@ -122,8 +125,14 @@ fn layer_parenting_goes_back_out() {
     let mut scene = Scene::default();
     let body = scene.add_layer("body", LayerKind::Normal);
     let arm = scene.add_layer("arm", LayerKind::Normal);
-    scene.add_shape(body, ShapeData::filled(square(0.0, 0.0, 40.0), Color::WHITE));
-    scene.add_shape(arm, ShapeData::filled(square(50.0, 0.0, 20.0), Color::WHITE));
+    scene.add_shape(
+        body,
+        ShapeData::filled(square(0.0, 0.0, 40.0), Color::WHITE),
+    );
+    scene.add_shape(
+        arm,
+        ShapeData::filled(square(50.0, 0.0, 20.0), Color::WHITE),
+    );
     scene.update_layer(arm, |l| l.follows = Some(body));
 
     let (back, _) = round_trip(&scene);
@@ -157,7 +166,10 @@ fn a_symbol_and_its_instance_survive() {
     let art = scene.next_object_id();
     let art = Object::shape(
         art,
-        ShapeData::filled(square(0.0, 0.0, 30.0), Color::from_rgba8(0x30, 0xC0, 0x60, 0xFF)),
+        ShapeData::filled(
+            square(0.0, 0.0, 30.0),
+            Color::from_rgba8(0x30, 0xC0, 0x60, 0xFF),
+        ),
     );
     scene.library_mut().update(symbol, |s| {
         s.layers.update(inner, |l| {
@@ -194,7 +206,10 @@ fn a_symbol_and_its_instance_survive() {
 fn keyframes_and_their_spans_survive() {
     let mut scene = Scene::default();
     let layer = scene.add_layer("Art", LayerKind::Normal);
-    scene.add_shape(layer, ShapeData::filled(square(0.0, 0.0, 20.0), Color::WHITE));
+    scene.add_shape(
+        layer,
+        ShapeData::filled(square(0.0, 0.0, 20.0), Color::WHITE),
+    );
     scene.edit_layers().update(layer, |l| {
         l.frames.insert_keyframe(10);
         l.frames.insert_frame(20);
@@ -263,8 +278,7 @@ fn an_awkward_symbol_name_is_still_written_safely() {
     scene.add_instance_at(layer, 0, symbol, Affine::IDENTITY);
 
     let (bytes, _) = fla_bytes(&scene).expect("it should still write");
-    let reader =
-        zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("a readable package");
+    let reader = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("a readable package");
     for name in reader.file_names() {
         assert!(
             !name.contains(".."),
@@ -356,7 +370,9 @@ fn compare_against_a_real_fla() {
     let attributes = |xml: &str| -> std::collections::BTreeSet<String> {
         let mut out = std::collections::BTreeSet::new();
         for chunk in xml.split('<').skip(1) {
-            let Some(tag_end) = chunk.find('>') else { continue };
+            let Some(tag_end) = chunk.find('>') else {
+                continue;
+            };
             for piece in chunk[..tag_end].split_whitespace().skip(1) {
                 if let Some(name) = piece.split('=').next()
                     && !name.is_empty()

@@ -1,0 +1,67 @@
+# Implement OBJECT_SELECTION_SHADOW_UI_PLAN.md end-to-end
+
+Implement the full plan document in its revised execution order: (1) audit the existing partial diff and fix keyboard/clipboard/Tab reliability first; (2) rebuild selection/transform geometry on a shared oriented gizmo with stable pivot (sections 1 & 5); (3) complete XFL/FLA import diagnostics and fidelity plus editable export round-trip (section 4); (4) align pose-aware drop shadows with the renderer's authoritative evaluation path (section 2); (5) finish the right-side workspace redesign and layout migration (section 3); (6) run all validation commands and capture acceptance evidence. All existing partial source changes are preserved, and each bug fix ships with a failing-before/passing-after regression test.
+
+## Steps
+
+1. Baseline audit: record the current working-tree diff (git status/diff) and classify each area (selection, shadows, UI, import) as complete/incomplete/unverified with file references; verify the workspace compiles (cargo check --workspace) and record baseline test results for the planned validation commands (note any zero-test-matched filters). No functional changes.
+   - files: docs/OBJECT_SELECTION_SHADOW_UI_PLAN.md
+   - verify: cargo check --workspace succeeds; baseline report written with test counts per command
+
+2. Fix standard keyboard commands, clipboard and Tab reliability (section 6) first, per the revised priority: audit key-event routing in app/editor (Ctrl+C/Ctrl+V copy-paste of selection, Tab focus movement across stage/timeline/library/inspector/text fields/dialogs, and behavior after focus switches or document switches); add focused failing tests for copy/paste/Tab in each context, then implement routing fixes so all pass.
+   - files: crates/buzz-app/src/app.rs, crates/buzz-app/src/editor.rs
+   - verify: cargo test -p buzz-app editor::tests:: --lib and new clipboard/tab tests pass (record counts > 0)
+
+3. Build the shared transform-zone classifier and oriented gizmo geometry (sections 1 & 5): one geometry source for painting, hover, and pointer-down classification in tools.rs; replace the axis-aligned rectangle in editor.rs::selection_bounds_drawn and stage.rs::draw_selection with the transformed quad (handles on true projected corners/edge midpoints, rotation ring outside corners, pivot, edge/skew zones); measure hit areas in screen-space logical px through the full camera+symbol placement chain, converting back to edit space for the transform math; resolve pivot/corner overlap by proximity (pivot wins only when deliberately on a corner).
+   - files: crates/buzz-app/src/tools.rs, crates/buzz-app/src/editor.rs, crates/buzz-app/src/stage.rs, crates/buzz-ui/src/tools.rs
+   - verify: New integration tests in buzz-app stage/editor assert drawn handles, hover, and drag classification agree at identical pointer locations (within documented px tolerance) at 100/150/200% scaling and under camera zoom/pan; cargo test -p buzz-app stage::tests:: tools::tests:: --lib pass
+
+4. Implement the transform gesture behaviors: corner resize, just-outside rotation, middle-edge axis resize, edge skew, inside-drag move, movable pivot; Shift corner = proportional resize, Shift rotation = 45° snap, Alt/Option opposite-corner rotation (kept distinct from Alt-scale); missing pivot defaults to selection center; Subselection must not advertise transform gestures. Freeze selection frame, drag-start bounds, pivot and baseline transforms per gesture; preview and commit share one D = T(p)*R(θ)*T(-p) calculation path; one gesture = one undo op, cancel/no-op = none.
+   - files: crates/buzz-app/src/tools.rs, crates/buzz-app/src/editor.rs
+   - verify: Explicit tests for Shift-resize, Shift-rotate snap, Alt opposite-corner, pivot-on-corner, rotation at all four corners, 0/45/90/180/360 + repeated turns returning within numerical tolerance, and undo/redo restore exact geometry; cargo test -p buzz-app tools::transform_preview_tests:: --lib passes (record count)
+
+5. Pivot stability fixes: store a single object's pivot in its defined local space and map through the exact evaluated transform chain (including inherited layer transforms, nested symbol edit-in-place, camera/depth); keep symbol registration distinct from the user pivot; define multi-selection pivot lifetime and invalidate only on real selection/context changes; alternate-corner rotation must not overwrite the saved pivot; handle near-singular/non-invertible transforms explicitly without invalid coordinates.
+   - files: crates/buzz-app/src/editor.rs, crates/buzz-app/src/tools.rs
+   - verify: Tests: own-pivot rotation keeps world pivot and local coordinates invariant across preview/commit/next gesture; asymmetric multi-selection pivot stable; skew/negative-scale cases do not produce NaN/inf; save/reopen preserves pivot
+
+6. Import diagnostics and asset/structure fidelity (section 4, steps 1-2): add a pre-conversion source inventory (archive entries, scenes, library defs incl. unused, instances, layer/frame counts, media refs) reconciled against parsed/resolved/saved/rendered content; replace log-only skips in buzz-import-xfl with persistent diagnostics (entry/symbol/layer/frame/element/reason); detect dangling refs, missing media, parse failures; never report partial import as fully successful.
+   - files: crates/buzz-import-xfl/src/lib.rs
+   - verify: cargo test -p buzz-import-xfl passes; new tests assert diagnostics are surfaced (not just logged) for skipped bitmap/text/media entries and dangling symbol instances
+
+7. Complete media/library resolution in the importer (section 4, steps 3-5): support DOMBitmapInstance, bitmap fill matrices, text attributes, embedded media decode with dimensions/alpha; register all definitions before resolving instances, keep shared definitions non-duplicated; handle Unicode/escaped names, folders, case collisions, cycles; add missing scene-model fields (mask membership, animated layer-follow links, registration points, instance timing) with versioned migrations in buzz-doc rather than flattening.
+   - files: crates/buzz-import-xfl/src/lib.rs, crates/buzz-scene/src/object.rs, crates/buzz-doc/src/lib.rs
+   - verify: cargo test -p buzz-import-xfl and cargo test -p buzz-doc pass; fixture tests for deep/shared symbols, unused assets, Unicode names, bitmap instances/fills, nested masks, animated parenting, multi-scene
+
+8. Exporter fidelity and editable round-trip (section 4, steps 6-9 + native save): extend the existing FLA/XFL writer in buzz-export to emit gradient paints and bitmap fills (fix the solid helper returning no paint), masks, color transforms, timelines and media packaging with stable ID mapping; verify native .buzz save/reopen round-trips all new model fields. Mark Adobe-open validation as unavailable if no licensed Animate is present, per the doc.
+   - files: crates/buzz-export/src/xfl/mod.rs, crates/buzz-doc/src/format.rs
+   - verify: cargo test -p buzz-export passes; import->save->export->reimport round-trip test asserts zero unexplained omissions and zero unresolved references
+
+9. Pose-aware character drop shadows (section 2): route shadow silhouette through the renderer's single authoritative artwork-evaluation path (stage/symbol/root-sync/clip timing, keyframe elapsed time, tweens); traverse nested symbols with drawable-layer + mask clipping rules; apply inherited transforms exactly once; apply live modifiers (spring/wiggle/pose, breathing) and warp/deformation to the same evaluation as visible draw; derive coverage from evaluated visible alpha (transparent regions, partial opacity, vector holes, stroke caps/joins) using an alpha mask where concatenated paths cannot represent it; preserve culling, reach margins, blur, export/preview parity.
+   - files: crates/buzz-render/src/lib.rs
+   - verify: cargo test -p buzz-export --test headless_filters -- --nocapture plus new buzz-render shadow tests: in-between tween frame rejects both endpoint poses with pixel/silhouette (not bounding-box) assertions; nested symbol uses stage frame; inherited transform applied once; mask clips silhouette; breathing affects same frame; existing static shadow/glow/blend tests still pass. Record whether GPU actually ran or tests skipped (report skips as unverified)
+
+10. Right-side workspace redesign (section 3): implement exact default order in the main right column (Inspector[Properties/Effects/Tool Options] expanded with Properties selected; Layers expanded with 180px capped scrolling body; Palette[Color/Swatches] collapsed; Utilities[Story/Depth/Rigging/Lighting/Sound] collapsed), outer Library/Assets/Cast tab dock with Library default; compact tabs, icon buttons, collapsible advanced sections; Properties default focus with tab focus not stolen by selection changes; narrow-window usability (capped bodies, overflow menus, compact Library control); Window menu shows every panel; reset-layout command.
+   - files: crates/buzz-ui/src/dock.rs, crates/buzz-ui/src/inspector.rs, crates/buzz-app/src/app.rs
+   - verify: cargo test -p buzz-ui --lib passes; dock_columns and real_layout_migration integration tests pass at 1920x1080, 1366x768, 1280x720 (record logical viewports)
+
+11. Layout-version migration: bump layout version; detect untouched legacy defaults by full saved state (positions, grouping, tabs, collapse) before adopting new defaults; a layout customized only by tab/collapse/grouping/size/floating position is preserved; migration idempotent across repeated loads; audit earlier migrations that could overwrite state; audit all panels remain in the Window menu.
+   - files: crates/buzz-ui/src/dock.rs, crates/buzz-doc/src/lib.rs
+   - verify: cargo test -p buzz-ui --test real_layout_migration -- --nocapture with cases for untouched legacy, tab-only customization, collapse-only, grouping, dimensions, floating position, repeated-load idempotence
+
+12. Final validation and evidence: run the full planned command set (cargo fmt --all -- --check; cargo check --workspace; the buzz-app filtered suites: tools::tests, tools::transform_preview_tests, editor::tests, stage::tests, app::dock_geometry_tests; cargo test -p buzz-ui --lib; headless_filters; dock_columns; real_layout_migration; cargo test -p buzz-import-xfl; cargo test -p buzz-doc; cargo test -p buzz-export; cargo test --workspace). Capture before/after UI screenshots at fixed window sizes, pose/shadow comparison frames, and a final report of changed files, test counts, failing-before/passing-after evidence, GPU-ran-vs-skipped status, and explicitly unverified items (Adobe round-trip if unavailable).
+   - verify: All listed commands pass with recorded test counts; no zero-match filters; evidence report complete and honest about unverified items
+
+## Risks
+- Enormous scope (6 major features across 8 crates); any single step can span many hours and steps depend on each other in the mandated order.
+- The working tree has pre-existing partial changes; a regression in selection/shadow/UI could destroy prior accepted work — mitigated by baseline audit (step 1) and checkpoint commits.
+- GPU-dependent shadow tests may silently skip without a GPU, producing false confidence; logs must be inspected and reported as unverified if skipped.
+- Adobe round-trip acceptance is impossible to fully verify without licensed Animate and a real failing fixture; those items must stay on the acceptance list as unverified rather than being silently narrowed.
+- The plan's own warning that existing test-pass reports are not final sign-off: earlier 'passing' baselines may mask the very bugs this work must fix, hence failing-before tests are mandatory.
+- Transform-math changes (singular matrices, skew, non-uniform scale) are numerically risky; explicit tolerance-based tests are required to catch drift.
+- Migration of saved workspaces risks clobbering user-customized layouts; full-state untouched-detection and idempotence tests are critical.
+- Keyboard routing fixes could regress IME/text-field handling; tests must cover text contexts explicitly.
+
+## Open questions
+- The document says implementation must use 'GPT-5.6 Luna' and requires explicit authorization — you have now authorized; I will implement with the current model since I cannot switch models mid-session. Proceed?
+- Section 4 requires real Adobe Animate validation of the exported artifact and a representative failing large-FLA fixture. Neither may be available in this environment; should I mark those acceptance items as unverified per the doc, or do you have a failing FLA/XFL file I should use?
+- Should I commit intermediate checkpoints after each major step (1-11) so the audit/preserve-partial-work requirement is safe, or a single final commit?

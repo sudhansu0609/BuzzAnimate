@@ -727,8 +727,14 @@ mod tests {
             shadow: Color::from_rgb8(0x10, 0x20, 0x30),
             highlight: Color::from_rgb8(0xF0, 0xE0, 0xD0),
         };
-        assert_eq!(map.apply(Color::BLACK).to_rgba8().to_u8_array()[..3], [0x10, 0x20, 0x30]);
-        assert_eq!(map.apply(Color::WHITE).to_rgba8().to_u8_array()[..3], [0xF0, 0xE0, 0xD0]);
+        assert_eq!(
+            map.apply(Color::BLACK).to_rgba8().to_u8_array()[..3],
+            [0x10, 0x20, 0x30]
+        );
+        assert_eq!(
+            map.apply(Color::WHITE).to_rgba8().to_u8_array()[..3],
+            [0xF0, 0xE0, 0xD0]
+        );
         // Alpha rides through untouched, so a cut-out stays cut out.
         let translucent = Color::from_rgba8(0, 0, 0, 0x80);
         assert_eq!(map.apply(translucent).to_rgba8().to_u8_array()[3], 0x80);

@@ -146,10 +146,8 @@ impl Editor {
         // Where the camera is looking, on the ground: a character added while
         // the animator is looking somewhere else should arrive where they are
         // looking, not at the origin of a stage scrolled off screen.
-        let stands_on = buzz_geom::Point::new(
-            self.camera.center.x,
-            stage.y0 + stage.height() * 0.9,
-        );
+        let stands_on =
+            buzz_geom::Point::new(self.camera.center.x, stage.y0 + stage.height() * 0.9);
 
         let mut placed = None;
         let mut name = String::new();
@@ -165,8 +163,7 @@ impl Editor {
             let id = scene.next_object_id();
             let mut person = buzz_act::build_figure(&spec, id, || scene.next_object_id());
             person.name = Some(name.clone());
-            person.transform =
-                buzz_geom::Affine::translate(stands_on.to_vec2()) * person.transform;
+            person.transform = buzz_geom::Affine::translate(stands_on.to_vec2()) * person.transform;
             placed = scene.add_object(layer, person);
 
             // As long as the film, or the new arrival vanishes after frame one
@@ -189,6 +186,54 @@ impl Editor {
         }
     }
 
+    /// **Insert ▸ Title Card…**: the dialog's settings as a card starting at
+    /// the playhead, on a new top layer that ignores the lights — one undo
+    /// step. The agent's `add_title_card` calls this too.
+    pub fn add_title_card(
+        &mut self,
+        settings: &buzz_ui::TitleCardSettings,
+    ) -> Result<buzz_act::title::TitleCard, String> {
+        use buzz_act::title::{TitlePlate, TitlePosition, TitlePreset, TitleSpec};
+        let rgb = |c: [u8; 3]| peniko::Color::from_rgb8(c[0], c[1], c[2]);
+        let spec = TitleSpec {
+            text: settings.text.clone(),
+            font: Some(settings.font.trim().to_string()).filter(|f| !f.is_empty()),
+            size: settings.size,
+            color: rgb(settings.color),
+            plate: settings.plate.then(|| TitlePlate {
+                color: rgb(settings.plate_color),
+                opacity: settings.plate_opacity,
+            }),
+            preset: TitlePreset::from_id(settings.preset).unwrap_or_default(),
+            hold_seconds: settings.hold_seconds,
+            position: TitlePosition::from_id(settings.position).unwrap_or_default(),
+            start: self.current_frame,
+            total_frames: None,
+        };
+        let mut made = None;
+        self.doc.end_gesture();
+        self.doc.edit("Add Title Card", |scene| {
+            made = Some(buzz_act::title::add_title_card(scene, &spec));
+        });
+        self.doc.end_gesture();
+        match made {
+            Some(Ok(card)) => {
+                self.status = Some(format!(
+                    "Title card added: {} frames from frame {}",
+                    card.frames,
+                    card.start + 1
+                ));
+                Ok(card)
+            }
+            Some(Err(e)) => {
+                let why = e.to_string();
+                self.status = Some(format!("No title card: {why}"));
+                Err(why)
+            }
+            None => Err("the document could not be edited".into()),
+        }
+    }
+
     /// Is the selection something a performance could drive?
     ///
     /// Asked by the dialog so the button can be disabled with a reason rather
@@ -200,13 +245,10 @@ impl Editor {
     /// The selected rig, if exactly one rigged thing is selected.
     fn performable_selection(&self) -> Option<ObjectId> {
         let scene: &Scene = self.doc.scene();
-        self.selection
-            .iter()
-            .find(|id| {
-                scene
-                    .find_object(*id)
-                    .is_some_and(|(_, object)| buzz_act::is_figure(object))
-            })
+        // A bone rig with a person's bones, or any part of a layer rig.
+        self.selection.iter().find(|id| {
+            buzz_act::layer_rig::rig_of(scene, *id).is_some_and(|rig| rig.performable(scene))
+        })
     }
 
     /// **Animate the selection.** Writes ordinary pose keyframes and returns.
@@ -230,7 +272,11 @@ impl Editor {
             frames: state.range(),
             amount: state.amount,
             tempo: state.tempo,
-            distance: if action.travels() { state.distance } else { 0.0 },
+            distance: if action.travels() {
+                state.distance
+            } else {
+                0.0
+            },
             step: state.step,
         };
 

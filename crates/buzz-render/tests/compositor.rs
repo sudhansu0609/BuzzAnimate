@@ -219,7 +219,10 @@ fn bloom_bleeds_past_a_bright_dot() {
     let out = run(&mut gpu, &input, &post, 0);
     // A pixel well outside the block was black; bloom should have lifted it.
     let away = out[at(W / 2 + 10, H / 2)];
-    assert!(away > 0, "bloom should bleed past the block's edge, was {away}");
+    assert!(
+        away > 0,
+        "bloom should bleed past the block's edge, was {away}"
+    );
 }
 
 #[test]

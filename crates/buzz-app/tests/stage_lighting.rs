@@ -51,8 +51,7 @@ struct Harness {
 /// test ever needed a different size it would need its own target, and this is
 /// the note that says so.
 fn harness() -> Option<std::sync::MutexGuard<'static, Harness>> {
-    static GPU: std::sync::OnceLock<Option<std::sync::Mutex<Harness>>> =
-        std::sync::OnceLock::new();
+    static GPU: std::sync::OnceLock<Option<std::sync::Mutex<Harness>>> = std::sync::OnceLock::new();
 
     let shared = GPU.get_or_init(|| Harness::new().map(std::sync::Mutex::new));
     // **A poisoned lock is recovered rather than propagated.** One test that
@@ -707,7 +706,10 @@ fn lights_survive_a_save_and_a_reopen() {
 
     assert!(after.enabled, "the rig came back switched off");
     assert_eq!(after.lights.len(), 1, "the sun did not come back");
-    assert_eq!(&before, after, "the rig changed on the way through the file");
+    assert_eq!(
+        &before, after,
+        "the rig changed on the way through the file"
+    );
 }
 
 /// **The second frame must look like the first.**
@@ -776,7 +778,10 @@ fn imported_document(stroked: bool) -> Editor {
                 ObjectId(4242),
                 shape,
             ))]),
-            ..Object::shape(ObjectId(4241), ShapeData::filled(Rect::ZERO.to_path(1e-9), ART))
+            ..Object::shape(
+                ObjectId(4241),
+                ShapeData::filled(Rect::ZERO.to_path(1e-9), ART),
+            )
         },
     );
 
@@ -940,18 +945,27 @@ fn diagnose_a_real_document() {
         scene.lights_mut().base = Color::from_rgb8(0xFF, 0x00, 0x00);
     });
     let absurd = h.stage(&editor, &mut cache);
-    eprintln!("an absurd red light changed {:.3}%", difference(&unlit, &absurd) * 100.0);
+    eprintln!(
+        "an absurd red light changed {:.3}%",
+        difference(&unlit, &absurd) * 100.0
+    );
 
     editor.doc.edit("Background", |scene| {
         scene.stage_mut().background = Color::from_rgb8(0x00, 0xFF, 0x00);
     });
     let green = h.stage(&editor, &mut cache);
-    eprintln!("a green stage changed {:.3}%", difference(&absurd, &green) * 100.0);
+    eprintln!(
+        "a green stage changed {:.3}%",
+        difference(&absurd, &green) * 100.0
+    );
 
     let sum = |p: &[u8]| p.iter().map(|&b| b as u64).sum::<u64>();
     eprintln!(
         "checksums: unlit={} lit={} absurd={} green={}",
-        sum(&unlit), sum(&lit), sum(&absurd), sum(&green)
+        sum(&unlit),
+        sum(&lit),
+        sum(&absurd),
+        sum(&green)
     );
     // A harness built from scratch, in case the first one is holding stale
     // pixels rather than the renderer producing them. **Deliberately a second
@@ -962,7 +976,11 @@ fn diagnose_a_real_document() {
     if let Some(mut fresh) = Harness::new() {
         let mut cold = DrawCache::default();
         let again = fresh.stage(&editor, &mut cold);
-        eprintln!("fresh harness checksum={} vs green={}", sum(&again), sum(&green));
+        eprintln!(
+            "fresh harness checksum={} vs green={}",
+            sum(&again),
+            sum(&green)
+        );
     }
 
     if let Ok(out) = std::env::var("BUZZ_DUMP") {
@@ -1108,7 +1126,6 @@ fn a_default_sun_lights_rather_than_dims() {
     );
 }
 
-
 /// **Switching the edges off must leave the light and take only the bands.**
 ///
 /// The report: a light was put on a character and every edge in the drawing lit
@@ -1182,7 +1199,6 @@ fn edges_off_drops_the_bands_and_keeps_the_light() {
         warmth(&unlit)
     );
 }
-
 
 /// **A figure drawn as many shapes, and the same figure drawn as one.**
 ///
@@ -1367,7 +1383,6 @@ fn a_highlight_keeps_the_colour_it_falls_on() {
     );
 }
 
-
 /// Not an assertion: the three edge modes on one figure, side by side, so the
 /// choice can be judged by eye. `BUZZ_DUMP=<dir> cargo test -p buzz-app --test
 /// stage_lighting dump_edge_modes -- --ignored`.
@@ -1473,7 +1488,6 @@ fn dump_edge_modes() {
     eprintln!("wrote {}", out.display());
 }
 
-
 // -- what a lamp does to a face ----------------------------------------------
 
 /// Two squares, one where the lamp will stand and one across the stage: a face
@@ -1486,10 +1500,7 @@ fn two_faces() -> Editor {
     for x in [60.0, 350.0] {
         scene.add_shape(
             layer,
-            ShapeData::filled(
-                Rect::new(x, 150.0, x + 140.0, 290.0).to_path(1e-9),
-                ART,
-            ),
+            ShapeData::filled(Rect::new(x, 150.0, x + 140.0, 290.0).to_path(1e-9), ART),
         );
     }
     let mut editor = Editor::new(Document::new(scene));
@@ -2023,7 +2034,10 @@ fn a_lamp_added_after_the_last_one_was_deleted_still_lights() {
 
     editor.add_light(LightKind::lamp(Point::new(160.0, 140.0)));
     let first = h.stage(&editor, &mut cache);
-    assert!(difference(&unlit, &first) > 0.02, "the first lamp did nothing");
+    assert!(
+        difference(&unlit, &first) > 0.02,
+        "the first lamp did nothing"
+    );
 
     delete_first_light(&mut editor);
     let _ = h.stage(&editor, &mut cache);
@@ -2258,7 +2272,10 @@ fn a_gloom_switched_off_and_on_again_darkens_the_same_way() {
 
     editor.add_light(LightKind::gloom(Point::ORIGIN));
     let first = h.stage(&editor, &mut cache);
-    assert!(mean_luma(&first) < mean_luma(&lamp_only) - 4.0, "no darkness at all");
+    assert!(
+        mean_luma(&first) < mean_luma(&lamp_only) - 4.0,
+        "no darkness at all"
+    );
 
     editor.doc.edit("Light", |scene| {
         let id = scene.lights().lights[1].id;
@@ -2293,11 +2310,15 @@ fn the_rig_switched_off_and_on_again_lights_the_same_way() {
     editor.add_light(LightKind::lamp(Point::ORIGIN));
     let first = h.stage(&editor, &mut cache);
 
-    editor.doc.edit("Lighting", |scene| scene.lights_mut().enabled = false);
+    editor
+        .doc
+        .edit("Lighting", |scene| scene.lights_mut().enabled = false);
     for _ in 0..6 {
         let _ = h.stage(&editor, &mut cache);
     }
-    editor.doc.edit("Lighting", |scene| scene.lights_mut().enabled = true);
+    editor
+        .doc
+        .edit("Lighting", |scene| scene.lights_mut().enabled = true);
 
     let again = h.stage(&editor, &mut cache);
     assert!(
@@ -2687,7 +2708,6 @@ fn a_lamp_recolours_after_the_rig_has_been_switched_off_and_on() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // **A frame the rasteriser cannot take.**
 //
@@ -2798,22 +2818,43 @@ fn encode_stage(editor: &Editor, cache: &mut DrawCache) -> u32 {
 /// what the rasteriser can take.
 #[test]
 fn a_frame_too_big_to_rasterise_trims_its_lighting_rather_than_vanishing() {
-    use buzz_render::document::{LightDetail, segment_ceiling};
+    use buzz_render::document::LightDetail;
 
     // **Calibrated to straddle the ceiling**: it must fit unlit and not fit
-    // lit, or it is measuring nothing. That makes it sensitive to anything that
-    // changes what lighting costs — it has had to grow once already, when the
-    // shading direction started following the light's height and the crescents
-    // came out simpler. If this fails on the first assertion the fixture is too
-    // big for the ceiling; if it fails on the second, lighting got cheaper and
-    // the fixture needs to grow again. Neither is the trimming being broken.
-    let mut editor = dense_document(900, 600);
+    // lit, or it is measuring nothing. That makes it sensitive to anything
+    // that changes what lighting costs — it has had to grow once already,
+    // when the shading direction started following the light's height and
+    // the crescents came out simpler, and had to shrink once (900 -> 500
+    // shapes) when `docs/RENDER_SEAMS_PLAN.md` Steps 1 and 3 stopped letting
+    // the seal and the line estimate hide the fixture's own honest cost.
+    // Measured with `GpuContext::render_measured` (`--features gpu-truth`),
+    // built exactly as this test builds it: Step 1 seals every opaque fill
+    // unconditionally, and once lines are counted by the join each one
+    // actually turns rather than a flat worst-case, the unlit *900*-shape
+    // fixture's real Vello line count was 2,700,004 — 150% of
+    // `LINE_BUDGET`'s 1,800,000, over on its own geometry and not on any
+    // estimate's slack, which no amount of retuning the estimator could fix
+    // honestly. At 500 shapes it measures 1,500,004 (83% of `LINE_BUDGET`,
+    // 600,504 of 1,458,407 segments — both comfortably under, so `Full`
+    // still holds unlit) and still forces the lit frame down to `Flat`. If
+    // this fails on the first assertion the fixture is too big for the
+    // ceiling; if it fails on the second, lighting got cheaper and the
+    // fixture needs to grow again. Neither is the trimming being broken.
+    //
+    // P2 (`docs/IMPORT_PERF_PLAN.md`): the budget belongs to `DrawCache`, not
+    // the process — `DrawCache::default()` below always judges at buffer
+    // scale 1, regardless of what any other test in this binary has raised
+    // the process-wide scale to by building a real `GpuContext`. So there is
+    // no longer a global to pin back here; the ceiling is instead read from
+    // the cache itself (`last_ceiling`) once it has judged a frame, which is
+    // exactly the same number by construction.
+    let mut editor = dense_document(500, 600);
     let mut cache = DrawCache::default();
 
     // Unlit, this document is already most of what can be encoded, and nothing
     // is trimmed: there is no light to trim.
-    let ceiling = segment_ceiling((W as f64) * (H as f64));
     let unlit = encode_stage(&editor, &mut cache);
+    let ceiling = cache.last_ceiling();
     assert!(
         unlit < ceiling,
         "the fixture must fit unlit, or it is testing the wrong thing: {unlit} of {ceiling}"
@@ -2828,8 +2869,9 @@ fn a_frame_too_big_to_rasterise_trims_its_lighting_rather_than_vanishing() {
         "a frame this size cannot carry its modelling and must say so"
     );
     assert!(
-        lit <= ceiling,
-        "what was handed to the rasteriser is still over the ceiling: {lit} of {ceiling}"
+        lit <= cache.last_ceiling(),
+        "what was handed to the rasteriser is still over the ceiling: {lit} of {}",
+        cache.last_ceiling()
     );
 
     // **Not asserted here: that the trimmed frame then renders.**
@@ -2898,11 +2940,23 @@ fn a_trimmed_document_lights_the_same_after_a_switch_off_and_on() {
     }
     let lit = h.stage(&editor, &mut cache);
     let settled = cache.detail();
-    eprintln!("lit:  {:?} encode {} ceiling {}", cache.detail(), cache.last_encode(), cache.last_ceiling());
+    eprintln!(
+        "lit:  {:?} encode {} ceiling {}",
+        cache.detail(),
+        cache.last_encode(),
+        cache.last_ceiling()
+    );
 
-    editor.doc.edit("Rig off", |s| s.lights_mut().enabled = false);
+    editor
+        .doc
+        .edit("Rig off", |s| s.lights_mut().enabled = false);
     let off = h.stage(&editor, &mut cache);
-    eprintln!("off:  {:?} encode {} ceiling {}", cache.detail(), cache.last_encode(), cache.last_ceiling());
+    eprintln!(
+        "off:  {:?} encode {} ceiling {}",
+        cache.detail(),
+        cache.last_encode(),
+        cache.last_ceiling()
+    );
     assert!(
         difference(&lit, &off) > 0.02,
         "switching the rig off must change the picture, or this proves nothing"
@@ -2910,7 +2964,12 @@ fn a_trimmed_document_lights_the_same_after_a_switch_off_and_on() {
 
     editor.doc.edit("Rig on", |s| s.lights_mut().enabled = true);
     let back = h.stage(&editor, &mut cache);
-    eprintln!("back: {:?} encode {} ceiling {}", cache.detail(), cache.last_encode(), cache.last_ceiling());
+    eprintln!(
+        "back: {:?} encode {} ceiling {}",
+        cache.detail(),
+        cache.last_encode(),
+        cache.last_ceiling()
+    );
     let again = h.stage(&editor, &mut cache);
     eprintln!(
         "again: {:?} encode {} | back==off {} | again==off {} | again==lit {}",
@@ -2921,7 +2980,7 @@ fn a_trimmed_document_lights_the_same_after_a_switch_off_and_on() {
         again == lit,
     );
     {
-        let d = "B:/youtubeProjects/Buzzcaf_Media/BuzzAnimate/graphify-out/toggle";
+        let d = concat!(env!("CARGO_TARGET_TMPDIR"), "/toggle");
         std::fs::create_dir_all(d).ok();
         for (n, px) in [("1-lit", &lit), ("2-off", &off), ("3-back", &back)] {
             let f = std::fs::File::create(format!("{d}/{n}.png")).unwrap();
@@ -3100,7 +3159,10 @@ fn overlapping_shapes_cast_one_shadow_at_one_tone() {
             darker += 1;
         }
     }
-    assert!(at_single > 200, "no shadow was drawn at all: {at_single} pixels");
+    assert!(
+        at_single > 200,
+        "no shadow was drawn at all: {at_single} pixels"
+    );
     assert!(
         darker * 200 < at_single,
         "{darker} pixels are darker than one shadow ({single:.0}) against          {at_single} at it — around {stacked:.0}, two shapes' shadows are          stacking where they overlap instead of making one silhouette"
@@ -3168,12 +3230,17 @@ fn diagnose_a_saved_document() {
             let mut enc = png::Encoder::new(std::io::BufWriter::new(file), W, H);
             enc.set_color(png::ColorType::Rgba);
             enc.set_depth(png::BitDepth::Eight);
-            enc.write_header().expect("h").write_image_data(&px).expect("d");
+            enc.write_header()
+                .expect("h")
+                .write_image_data(&px)
+                .expect("d");
         }
         px
     };
 
-    editor.doc.edit("Rig off", |s| s.lights_mut().enabled = false);
+    editor
+        .doc
+        .edit("Rig off", |s| s.lights_mut().enabled = false);
     let unlit = shot(&mut h, &mut cache, &editor, "unlit");
     editor.doc.edit("Rig on", |s| s.lights_mut().enabled = true);
     // What each level would cost, and whether the frame survives it. A frame
@@ -3185,7 +3252,9 @@ fn diagnose_a_saved_document() {
         buzz_render::document::LightDetail::Full,
     ] {
         cache.pin_detail(Some(buzz_render::document::LightDetail::Flat));
-        editor.doc.edit("Rig off", |s| s.lights_mut().enabled = false);
+        editor
+            .doc
+            .edit("Rig off", |s| s.lights_mut().enabled = false);
         let blank = h.stage(&editor, &mut cache);
         editor.doc.edit("Rig on", |s| s.lights_mut().enabled = true);
         cache.pin_detail(Some(detail));
@@ -3193,17 +3262,26 @@ fn diagnose_a_saved_document() {
         eprintln!(
             "  pinned {detail:?}: encode {} -> {}",
             cache.last_encode(),
-            if px == blank { "FRAME LOST" } else { "rendered" }
+            if px == blank {
+                "FRAME LOST"
+            } else {
+                "rendered"
+            }
         );
     }
     cache.pin_detail(None);
     let lit = shot(&mut h, &mut cache, &editor, "lit");
-    eprintln!("the light moved {:.3}% of the stage", difference(&unlit, &lit) * 100.0);
+    eprintln!(
+        "the light moved {:.3}% of the stage",
+        difference(&unlit, &lit) * 100.0
+    );
     eprintln!("warmth unlit {:.2} lit {:.2}", warmth(&unlit), warmth(&lit));
 
     // **The report: switch it off and on again.**
     let off = shot(&mut h, &mut cache, &editor, "toggle-1-off-rig");
-    editor.doc.edit("Rig off", |s| s.lights_mut().enabled = false);
+    editor
+        .doc
+        .edit("Rig off", |s| s.lights_mut().enabled = false);
     let off = shot(&mut h, &mut cache, &editor, "toggle-2-rig-off");
     editor.doc.edit("Rig on", |s| s.lights_mut().enabled = true);
     let back = shot(&mut h, &mut cache, &editor, "toggle-3-rig-back");
@@ -3362,7 +3440,11 @@ fn diagnose_the_ceiling_against_output_size() {
         };
 
         eprint!("  {w}x{h}:");
-        for detail in [LightDetail::Flat, LightDetail::NoModelling, LightDetail::Full] {
+        for detail in [
+            LightDetail::Flat,
+            LightDetail::NoModelling,
+            LightDetail::Full,
+        ] {
             let mut cache = DrawCache::default();
             cache.pin_detail(Some(LightDetail::Flat));
             editor.doc.edit("Off", |s| s.lights_mut().enabled = false);
@@ -3544,7 +3626,10 @@ fn diagnose_the_switch_through_the_window() {
 
     // And undo, which puts the document's revision back to a number the
     // retained encoding has already seen.
-    window.editor.doc.edit("Rig off", |s| s.lights_mut().enabled = false);
+    window
+        .editor
+        .doc
+        .edit("Rig off", |s| s.lights_mut().enabled = false);
     let _ = window.settle(&mut h);
     window.editor.doc.undo();
     let undone = window.settle(&mut h);
@@ -3553,7 +3638,6 @@ fn diagnose_the_switch_through_the_window() {
         difference(&lit, &undone) * 100.0
     );
 }
-
 
 /// **A rigged character is one body to the light, joints included.**
 ///
@@ -3582,8 +3666,18 @@ fn a_rigged_figure_has_no_seam_at_its_joints() {
     let layer = scene.add_layer("Art", LayerKind::Normal);
 
     let mut armature = buzz_rig::Armature::default();
-    armature.push_dragged("upper", None, Point::new(275.0, 130.0), Point::new(275.0, 200.0));
-    armature.push_dragged("fore", Some(0), Point::new(275.0, 200.0), Point::new(275.0, 270.0));
+    armature.push_dragged(
+        "upper",
+        None,
+        Point::new(275.0, 130.0),
+        Point::new(275.0, 200.0),
+    );
+    armature.push_dragged(
+        "fore",
+        Some(0),
+        Point::new(275.0, 200.0),
+        Point::new(275.0, 270.0),
+    );
 
     let limb = |id: u64, y0: f64, y1: f64, bone: usize| buzz_scene::rig::RigPart {
         artwork: std::sync::Arc::new(buzz_scene::Object::shape(
@@ -3633,7 +3727,6 @@ fn a_rigged_figure_has_no_seam_at_its_joints() {
          {below:.1} below it, and {seam:.1} across it"
     );
 }
-
 
 /// **The same two limbs, drawn as separate objects rather than bound to one
 /// armature** — which is how cut-out artwork arrives from an import, and how a
@@ -3742,8 +3835,11 @@ fn a_cast_shadow_has_no_gap_where_the_artwork_has_a_line() {
         .into_iter()
         .enumerate()
         {
-            let mut inner =
-                buzz_scene::Layer::new(buzz_scene::LayerId(8100 + i as u64), name, LayerKind::Normal);
+            let mut inner = buzz_scene::Layer::new(
+                buzz_scene::LayerId(8100 + i as u64),
+                name,
+                LayerKind::Normal,
+            );
             inner.frames.set_objects(0, vec![art]);
             symbol.layers.push_front(inner);
         }

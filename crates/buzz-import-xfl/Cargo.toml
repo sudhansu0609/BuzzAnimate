@@ -8,9 +8,11 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+buzz-audio.workspace = true
 buzz-geom.workspace = true
 buzz-scene.workspace = true
 
+flate2 = "1"
 kurbo.workspace = true
 peniko.workspace = true
 quick-xml.workspace = true

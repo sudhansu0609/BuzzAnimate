@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 pub use follow::{follow_through, follow_through_coupled};
 pub use ik::{IkOptions, IkOutcome, solve_to};
-pub use pattern::{RigPattern, Side, Slot, match_parts};
+pub use pattern::{JointLimitDefaults, RigKind, RigPattern, Side, Slot, match_parts};
 pub use skin::{SkinBinding, bind_path, deform_path};
 pub use warp::{WarpHandle, warp_path};
 
@@ -59,6 +59,24 @@ pub struct Bone {
     pub limits: Option<JointLimits>,
     /// A pinned joint stays where it is: IK solves *up to* it and no further.
     pub pinned: bool,
+    /// Where this bone's head sits, away from the joint an ordinary chain
+    /// would put it at.
+    ///
+    /// An ordinary bone's head is exactly its parent's tip — that is what
+    /// makes a chain a chain. This is the escape hatch for the bone whose
+    /// real joint is not there: a shoulder that does not start at the neck, a
+    /// thigh that does not start at its sibling's hip. The offset is
+    /// expressed **in the parent's own frame**, so it turns with the parent
+    /// rather than staying pinned to one place on the stage — a shoulder
+    /// offset from the chest swings with the chest, the way a real shoulder
+    /// does. For a root bone (no parent) it is relative to
+    /// [`Armature::root`], and — having no parent frame to turn with — is not
+    /// rotated.
+    ///
+    /// Zero for every bone an animator drags out with the Bone tool, which is
+    /// what keeps every rig drawn before this existed bit-identical: zero
+    /// offset is exactly the old behaviour, a head glued to the parent's tip.
+    pub offset: Vec2,
 }
 
 impl Bone {
@@ -72,6 +90,7 @@ impl Bone {
             angle,
             limits: None,
             pinned: false,
+            offset: Vec2::ZERO,
         }
     }
 
@@ -87,12 +106,62 @@ impl Bone {
     }
 
     /// The pose angle, clamped into the joint's limits.
+    ///
+    /// Only an angle the limits actually stop is changed. One already inside
+    /// them — perhaps written a whole turn away from the range's own numbers,
+    /// as a pose wrapped into `-π..=π` often is — is kept exactly as given, so
+    /// a pose reads back as it was set.
     fn constrain(&self, angle: f64) -> f64 {
         match &self.limits {
-            Some(limits) => limits.clamp(angle),
+            Some(limits) => {
+                let clamped = limits.clamp(angle);
+                if wrap_pi(clamped - angle).abs() <= 1e-12 {
+                    angle
+                } else {
+                    clamped
+                }
+            }
             None => angle,
         }
     }
+
+    /// How this joint may turn, read from its limits rather than stored: no
+    /// limits is [`RotationMode::Free`], a range of zero width is
+    /// [`RotationMode::Locked`] (the bone holds one angle — Animate's "Enable
+    /// rotation" off), anything else is [`RotationMode::Limited`].
+    pub fn rotation_mode(&self) -> RotationMode {
+        match &self.limits {
+            None => RotationMode::Free,
+            Some(limits) if limits.span().abs() <= LOCKED_SPAN => RotationMode::Locked,
+            Some(_) => RotationMode::Limited,
+        }
+    }
+}
+
+/// A limit range narrower than this is a locked joint, not a limited one.
+const LOCKED_SPAN: f64 = 1e-9;
+
+/// Whether a joint turns freely, within a range, or not at all.
+///
+/// Derived from [`Bone::limits`] by [`Bone::rotation_mode`], never stored, so a
+/// saved document has exactly one source of truth for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RotationMode {
+    Free,
+    Limited,
+    Locked,
+}
+
+/// Which way a limited joint may turn away from its rest angle.
+///
+/// Screen space, y down, as everywhere in this crate: [`Direction::Clockwise`]
+/// is a positive turn. Read back from the signs of the range relative to the
+/// rest angle by [`JointLimits::direction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    Both,
+    Clockwise,
+    CounterClockwise,
 }
 
 /// How far a joint may turn, relative to its parent.
@@ -124,6 +193,32 @@ impl JointLimits {
 
     pub fn span(&self) -> f64 {
         self.max - self.min
+    }
+
+    /// Limits given relative to a bone's `rest` angle (`min ≤ 0 ≤ max` is the
+    /// usual case), stored the way every limit is stored: absolute, relative to
+    /// the parent. Saved documents and the IK solver never see the difference.
+    pub fn from_relative(rest: f64, min: f64, max: f64) -> Self {
+        Self::new(rest + min, rest + max)
+    }
+
+    /// This range as offsets from `rest`: `(min - rest, max - rest)`.
+    pub fn relative_to(&self, rest: f64) -> (f64, f64) {
+        (self.min - rest, self.max - rest)
+    }
+
+    /// Which way the joint may turn away from `rest`, read from the signs of
+    /// the range relative to it. A range that reaches both sides of the rest
+    /// angle — or none, for a locked joint — is [`Direction::Both`].
+    pub fn direction(&self, rest: f64) -> Direction {
+        let (min, max) = self.relative_to(rest);
+        if min >= -LOCKED_SPAN && max > LOCKED_SPAN {
+            Direction::Clockwise
+        } else if max <= LOCKED_SPAN && min < -LOCKED_SPAN {
+            Direction::CounterClockwise
+        } else {
+            Direction::Both
+        }
     }
 }
 
@@ -236,10 +331,19 @@ impl Armature {
     }
 
     /// Where a bone's head sits, in the artwork's coordinates.
+    ///
+    /// With no offset this is exactly the parent's tip — an ordinary chain.
+    /// A nonzero offset (see [`Bone::offset`]) moves the head away from that
+    /// tip, turning with the parent; a root bone's offset moves it away from
+    /// [`Armature::root`] without turning, since a root has no parent frame
+    /// to turn with.
     pub fn head(&self, index: usize) -> Point {
-        match self.bones.get(index).and_then(|b| b.parent) {
-            Some(parent) => self.tip(parent),
-            None => self.root,
+        let Some(bone) = self.bones.get(index) else {
+            return self.root;
+        };
+        match bone.parent {
+            Some(parent) => self.tip(parent) + rotate(bone.offset, self.world_angle(parent)),
+            None => self.root + bone.offset,
         }
     }
 
@@ -265,8 +369,8 @@ impl Armature {
         for (i, bone) in self.bones.iter().enumerate() {
             let (head, parent_angle) = match bone.parent {
                 // Parents always come first, so this is already computed.
-                Some(p) if p < i => (out[p].1, angles[p]),
-                _ => (self.root, 0.0),
+                Some(p) if p < i => (out[p].1 + rotate(bone.offset, angles[p]), angles[p]),
+                _ => (self.root + bone.offset, 0.0),
             };
             let angle = parent_angle + bone.angle;
             let tip = head + Vec2::new(angle.cos(), angle.sin()) * bone.length;
@@ -563,6 +667,13 @@ impl Armature {
     }
 }
 
+/// Turn a vector by `angle`, the same convention as everywhere in this crate:
+/// radians, y downwards, so a positive angle turns clockwise on screen.
+pub(crate) fn rotate(v: Vec2, angle: f64) -> Vec2 {
+    let (s, c) = angle.sin_cos();
+    Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
+}
+
 /// Distance from a point to a line segment.
 pub(crate) fn distance_to_segment(point: Point, a: Point, b: Point) -> f64 {
     let ab = b - a;
@@ -698,6 +809,61 @@ mod tests {
             "an unlimited joint takes the value"
         );
         assert_eq!(arm.bones[1].angle, 0.5, "a limited one is clamped");
+    }
+
+    /// Limits edited relative to the rest angle are stored absolute and read
+    /// back to the same numbers, and the direction comes from their signs.
+    #[test]
+    fn relative_limits_round_trip() {
+        let rest = 2.5;
+        let limits = JointLimits::from_relative(rest, -0.4, 1.1);
+        assert!((limits.min - 2.1).abs() < 1e-12 && (limits.max - 3.6).abs() < 1e-12);
+        let (min, max) = limits.relative_to(rest);
+        assert!((min + 0.4).abs() < 1e-12 && (max - 1.1).abs() < 1e-12);
+        assert_eq!(limits.direction(rest), Direction::Both);
+
+        let clockwise = JointLimits::from_relative(rest, 0.0, 2.6);
+        assert_eq!(clockwise.direction(rest), Direction::Clockwise);
+        let counter = JointLimits::from_relative(rest, -2.6, 0.0);
+        assert_eq!(counter.direction(rest), Direction::CounterClockwise);
+        // Backwards input is still ordered, as `new` promises.
+        let backwards = JointLimits::from_relative(rest, 0.3, -0.3);
+        let (min, max) = backwards.relative_to(rest);
+        assert!((min + 0.3).abs() < 1e-12 && (max - 0.3).abs() < 1e-12);
+    }
+
+    /// `Locked` is a range of zero width, `Free` is no limits; nothing extra is
+    /// stored, and a locked joint holds its rest angle whatever it is asked.
+    #[test]
+    fn locked_is_min_equals_max() {
+        let mut arm = arm();
+        assert_eq!(arm.bones[1].rotation_mode(), RotationMode::Free);
+
+        arm.bones[1].rest_angle = 0.7;
+        arm.bones[1].limits = Some(JointLimits::from_relative(0.7, 0.0, 0.0));
+        assert_eq!(arm.bones[1].rotation_mode(), RotationMode::Locked);
+        assert_eq!(arm.bones[1].limits.unwrap().direction(0.7), Direction::Both);
+        arm.set_pose(&[0.0, -1.2]);
+        assert!((arm.bones[1].angle - 0.7).abs() < 1e-12, "{}", arm.bones[1].angle);
+
+        arm.bones[1].limits = Some(JointLimits::from_relative(0.7, -0.1, 0.1));
+        assert_eq!(arm.bones[1].rotation_mode(), RotationMode::Limited);
+    }
+
+    /// A limit that does not bind leaves the number alone, even when it is a
+    /// whole turn away from the range's own numbers: the pose reads back as
+    /// it was set.
+    #[test]
+    fn an_angle_inside_the_limits_is_kept_as_written() {
+        let mut arm = arm();
+        let rest = -2.9;
+        arm.bones[1].limits = Some(JointLimits::from_relative(rest, -2.9, 2.9));
+        // 3.0 is -3.28 one turn round: inside rest ± 2.9, written outside it.
+        arm.set_pose(&[0.0, 3.0]);
+        assert_eq!(arm.bones[1].angle, 3.0);
+        // Outside the range in every turn: clamped to the near end.
+        arm.set_pose(&[0.0, 0.2]);
+        assert!((arm.bones[1].angle - 0.0).abs() < 1e-12, "{}", arm.bones[1].angle);
     }
 
     /// A rig edited after a pose was keyed should lose that bone, not the pose.
@@ -837,18 +1003,27 @@ mod mirror_tests {
     fn mirroring_reaches_the_other_side() {
         let mut a = arm();
         let tip_right = a.tip(1);
-        assert!(tip_right.x > 0.0, "the test arm should start pointing right");
+        assert!(
+            tip_right.x > 0.0,
+            "the test arm should start pointing right"
+        );
 
         let flipped = a.mirrored_pose();
         a.set_pose(&flipped);
         let tip_left = a.tip(1);
 
-        assert!(tip_left.x < 0.0, "it should now point left, not {tip_left:?}");
+        assert!(
+            tip_left.x < 0.0,
+            "it should now point left, not {tip_left:?}"
+        );
         assert!(
             (tip_left.x + tip_right.x).abs() < 1e-9,
             "and the same distance out: {tip_right:?} vs {tip_left:?}"
         );
-        assert!((tip_left.y - tip_right.y).abs() < 1e-9, "height is unchanged");
+        assert!(
+            (tip_left.y - tip_right.y).abs() < 1e-9,
+            "height is unchanged"
+        );
     }
 
     /// Mirroring twice is the pose you started with.
@@ -905,6 +1080,102 @@ mod mirror_tests {
     fn mirroring_an_empty_rig_is_empty() {
         let a = Armature::new(Point::ZERO);
         assert!(a.mirrored_pose().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+    use std::f64::consts::FRAC_PI_2;
+
+    fn close(a: Point, b: Point) -> bool {
+        (a - b).hypot() < 1e-9
+    }
+
+    /// With no offset a bone's head is exactly its parent's tip; an offset
+    /// moves it away from there, in the parent's own frame.
+    #[test]
+    fn an_offset_head_sits_away_from_the_parents_tip() {
+        let mut arm = Armature::new(Point::new(100.0, 100.0));
+        arm.push(Bone::new("upper", None, 50.0, 0.0)); // tip at (150, 100)
+        let mut fore = Bone::new("fore", Some(0), 40.0, 0.0);
+        fore.offset = Vec2::new(0.0, 10.0);
+        arm.push(fore);
+
+        assert!(close(arm.head(1), Point::new(150.0, 110.0)));
+        assert!(close(arm.tip(1), Point::new(190.0, 110.0)));
+    }
+
+    /// A root bone's offset moves it away from the armature's root, but is
+    /// **not** rotated — a root has no parent frame to turn with.
+    #[test]
+    fn a_root_bones_offset_is_not_rotated() {
+        let mut arm = Armature::new(Point::new(0.0, 0.0));
+        let mut thigh = Bone::new("thigh", None, 30.0, FRAC_PI_2);
+        thigh.offset = Vec2::new(20.0, 0.0);
+        arm.push(thigh);
+
+        assert!(close(arm.head(0), Point::new(20.0, 0.0)));
+    }
+
+    /// A child's offset head turns with the parent, the way a shoulder swings
+    /// when the chest does — it does not stay pinned to one place on stage.
+    #[test]
+    fn an_offset_head_rotates_with_the_parent() {
+        let mut arm = Armature::new(Point::ZERO);
+        arm.push(Bone::new("upper", None, 50.0, 0.0));
+        let mut fore = Bone::new("fore", Some(0), 10.0, 0.0);
+        fore.offset = Vec2::new(0.0, 20.0);
+        arm.push(fore);
+
+        arm.bones[0].angle = FRAC_PI_2; // the parent turns a quarter turn
+        // The parent's tip is now at (0, 50); the offset (0, 20) turns with
+        // it to (-20, 0).
+        assert!(close(arm.head(1), Point::new(-20.0, 50.0)));
+    }
+
+    /// `joints()` must agree with walking each bone individually, offset or
+    /// not — it is the fast path the renderer and hit test both rely on.
+    #[test]
+    fn joints_agrees_with_head_and_tip_when_bones_carry_an_offset() {
+        let mut arm = Armature::new(Point::new(5.0, 5.0));
+        let mut root_bone = Bone::new("a", None, 20.0, 0.3);
+        root_bone.offset = Vec2::new(3.0, -4.0);
+        arm.push(root_bone);
+        let mut child = Bone::new("b", Some(0), 15.0, -0.5);
+        child.offset = Vec2::new(2.0, 6.0);
+        arm.push(child);
+
+        for (i, (head, tip)) in arm.joints().iter().enumerate() {
+            assert!(close(*head, arm.head(i)), "head {i}");
+            assert!(close(*tip, arm.tip(i)), "tip {i}");
+        }
+    }
+
+    /// The property skinning and rigid parts both rest on: posing a bone that
+    /// carries an offset still turns artwork about *that bone's own* head,
+    /// not about the parent's tip the offset moved it away from.
+    #[test]
+    fn the_pose_transform_rotates_a_child_about_its_offset_head() {
+        let mut arm = Armature::new(Point::ZERO);
+        arm.push(Bone::new("upper", None, 50.0, 0.0));
+        let mut fore = Bone::new("fore", Some(0), 40.0, 0.0);
+        fore.offset = Vec2::new(0.0, 20.0);
+        arm.push(fore);
+
+        let rest_head = arm.head(1);
+        let rest_tip = arm.tip(1);
+
+        arm.bones[1].angle = FRAC_PI_2; // the child itself turns, not the parent
+        let t = arm.pose_transform(1);
+
+        // The parent did not move, so neither did this bone's offset head.
+        assert!(close(arm.head(1), rest_head));
+        assert!(close(t * rest_head, rest_head), "the offset head itself moved");
+
+        // A point at the rest tip swings a quarter turn about that head.
+        let expected = rest_head + Vec2::new(0.0, rest_tip.x - rest_head.x);
+        assert!(close(t * rest_tip, expected));
     }
 }
 

@@ -45,9 +45,7 @@ pub fn concat_segments(segments: &[PathBuf], output: &Path) -> Result<()> {
         let mut list = std::fs::File::create(&list_path)
             .with_context(|| format!("writing the concat list at {}", list_path.display()))?;
         for segment in segments {
-            let abs = segment
-                .canonicalize()
-                .unwrap_or_else(|_| segment.clone());
+            let abs = segment.canonicalize().unwrap_or_else(|_| segment.clone());
             // Single quotes are the demuxer's escape; a quote inside a path is
             // written as `'\''`, which is the documented escape.
             let escaped = abs.to_string_lossy().replace('\'', r"'\''");

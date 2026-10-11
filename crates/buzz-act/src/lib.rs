@@ -41,23 +41,32 @@
 pub mod autorig;
 pub mod direct;
 pub mod figure;
+pub mod layer_rig;
 pub mod lipsync;
 pub mod motion_path;
 pub mod perform;
-pub mod puppet;
 pub mod physics;
+pub mod puppet;
 pub mod scenery;
+pub mod screenplay;
+pub mod script_timing;
 pub mod staging;
+pub mod textsync;
+pub mod title;
 
-pub use autorig::assemble;
+pub use autorig::{assemble, assemble_from_joints};
 pub use buzz_physics::{Spring, Wiggle};
-pub use direct::{DirectError, DirectedScene, PlannedBeat, PlannedShot, direct, split_shots};
+pub use direct::{
+    DirectError, DirectedScene, PlannedBeat, PlannedShot, SetDresser, SetRequest, direct, direct_dressed, split_shots,
+};
 pub use figure::{FigureSpec, Joint, Palette, build as build_figure, is_figure, rest_pose};
 pub use motion_path::{MotionError, MotionPathOptions, MotionReport, follow as follow_path};
-pub use scenery::{Scenery, SceneryReport, lay as lay_scenery, lay_weather, weather_for};
-pub use physics::{PhysicsError, PhysicsReport, bake as follow_through_bake, wiggle as wiggle_bake};
 pub use perform::{
     Action, Beat, PerformError, PerformReport, Performance, apply as perform,
-    apply_from as perform_from, pose_at,
+    apply_from as perform_from, pose_at, pose_on,
 };
+pub use physics::{
+    PhysicsError, PhysicsReport, bake as follow_through_bake, wiggle as wiggle_bake,
+};
+pub use scenery::{Scenery, SceneryReport, lay as lay_scenery, lay_weather, weather_for};
 pub use staging::{SceneRecipe, Setting, StagedScene, build as stage_scene};

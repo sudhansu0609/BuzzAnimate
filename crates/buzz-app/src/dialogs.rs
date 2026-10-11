@@ -81,6 +81,15 @@ impl Request {
         Self::of(Ask::Folder)
     }
 
+    /// Pick one or more existing files at once (D3: Import to Stage, Import
+    /// to Library, Import Sound and Import Image all accept a batch).
+    /// Built the same as [`Self::open_file`]; what differs is which method of
+    /// [`Pending`] runs it — [`PendingMany::ask`], which calls
+    /// [`Self::show_many`] rather than [`Self::show`].
+    pub fn open_files() -> Self {
+        Self::of(Ask::OpenFile)
+    }
+
     fn of(ask: Ask) -> Self {
         Self {
             ask,
@@ -111,8 +120,19 @@ impl Request {
         self
     }
 
-    /// Run it, on the calling thread. Not for the UI thread — see [`ask`].
-    fn show(self, parent: Parent) -> Option<PathBuf> {
+    #[cfg(test)]
+    pub fn suggested_file_name(&self) -> Option<&str> {
+        self.file_name.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn suggested_directory(&self) -> Option<&std::path::Path> {
+        self.directory.as_deref()
+    }
+
+    /// Everything both [`Self::show`] and [`Self::show_many`] set up before
+    /// asking the backend for an answer.
+    fn dialog(&self, parent: Parent) -> rfd::FileDialog {
         let mut dialog = rfd::FileDialog::new();
         if let Some(title) = &self.title {
             dialog = dialog.set_title(title);
@@ -132,12 +152,25 @@ impl Request {
         if let Some(owner) = parent.owner() {
             dialog = dialog.set_parent(&owner);
         }
+        dialog
+    }
 
+    /// Run it, on the calling thread. Not for the UI thread — see [`ask`].
+    fn show(self, parent: Parent) -> Option<PathBuf> {
+        let dialog = self.dialog(parent);
         match self.ask {
             Ask::OpenFile => dialog.pick_file(),
             Ask::SaveFile => dialog.save_file(),
             Ask::Folder => dialog.pick_folder(),
         }
+    }
+
+    /// Run it for [`Self::open_files`], on the calling thread — not for the UI
+    /// thread; see [`PendingMany::ask`]. Every one of D3's multi-file pickers
+    /// is an open dialog, so this always asks for files rather than
+    /// consulting `self.ask`.
+    fn show_many(self, parent: Parent) -> Option<Vec<PathBuf>> {
+        self.dialog(parent).pick_files()
     }
 }
 
@@ -290,6 +323,17 @@ impl<P> Pending<P> {
         true
     }
 
+    /// A picker that already has its answer, as if the dialog thread had
+    /// already replied — for tests, which cannot click through a real one.
+    #[cfg(test)]
+    pub fn resolved(purpose: P, path: Option<PathBuf>) -> Self {
+        let (send, answer) = crossbeam_channel::bounded(1);
+        let _ = send.send(path);
+        Self {
+            open: Some(Open { answer, purpose }),
+        }
+    }
+
     /// The answer, once there is one.
     ///
     /// `Some((purpose, None))` is the user pressing Cancel, which is a normal
@@ -300,6 +344,95 @@ impl<P> Pending<P> {
             Ok(path) => {
                 let open = self.open.take()?;
                 Some((open.purpose, path))
+            }
+            // The thread died without answering. Treat it as a cancel: the
+            // alternative is a picker that is for ever "already open".
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                let open = self.open.take()?;
+                Some((open.purpose, None))
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => None,
+        }
+    }
+}
+
+/// The same idea as [`Pending`], for a dialog that can answer with more than
+/// one path — D3's Import to Stage, Import to Library, Import Sound and
+/// Import Image, which all now accept a multi-select.
+///
+/// A separate type rather than making [`Pending`] generic over the answer:
+/// every existing picker (Open, Save As, Import Caption, and so on) wants
+/// exactly one path, and `Option<Vec<PathBuf>>` everywhere would make those
+/// call sites pattern-match a `Vec` just to reach the single element they
+/// actually want.
+pub struct PendingMany<P> {
+    open: Option<OpenMany<P>>,
+}
+
+struct OpenMany<P> {
+    answer: Receiver<Option<Vec<PathBuf>>>,
+    purpose: P,
+}
+
+impl<P> Default for PendingMany<P> {
+    fn default() -> Self {
+        Self { open: None }
+    }
+}
+
+impl<P> PendingMany<P> {
+    /// Is a picker already up?
+    pub fn busy(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Open a picker, unless one is already open.
+    ///
+    /// Returns false when it declined, so the caller can say why.
+    pub fn ask(&mut self, request: Request, parent: Parent, purpose: P) -> bool {
+        if self.busy() {
+            return false;
+        }
+
+        let (send, answer) = crossbeam_channel::bounded(1);
+        let spawned = std::thread::Builder::new()
+            .name("buzz-picker-many".into())
+            .spawn(move || {
+                let _ = send.send(request.show_many(parent));
+            })
+            .is_ok();
+
+        if !spawned {
+            return false;
+        }
+
+        self.open = Some(OpenMany { answer, purpose });
+        true
+    }
+
+    /// A picker that already has its answer, as if the dialog thread had
+    /// already replied — for tests, which cannot click through a real one.
+    #[cfg(test)]
+    pub fn resolved(purpose: P, paths: Option<Vec<PathBuf>>) -> Self {
+        let (send, answer) = crossbeam_channel::bounded(1);
+        let _ = send.send(paths);
+        Self {
+            open: Some(OpenMany { answer, purpose }),
+        }
+    }
+
+    /// The answer, once there is one.
+    ///
+    /// `Some((purpose, None))` is the user pressing Cancel; `Some((purpose,
+    /// Some(paths)))` never carries an empty `paths` — a backend that answers
+    /// with nothing chosen is treated the same as Cancel.
+    pub fn poll(&mut self) -> Option<(P, Option<Vec<PathBuf>>)> {
+        let open = self.open.as_ref()?;
+        match open.answer.try_recv() {
+            Ok(paths) => {
+                let open = self.open.take()?;
+                let paths = paths.filter(|p| !p.is_empty());
+                Some((open.purpose, paths))
             }
             // The thread died without answering. Treat it as a cancel: the
             // alternative is a picker that is for ever "already open".

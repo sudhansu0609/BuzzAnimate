@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use buzz_scene::Scene;
 
-use crate::{templates::Template, DocError, Document, TemplateLibrary};
+use crate::{DocError, Document, TemplateLibrary, templates::Template};
 
 /// Where snapshots live — beside the user's other application data, in a folder
 /// of their own, never beside the film.
@@ -34,7 +34,9 @@ pub struct SnapshotLibrary {
 
 impl SnapshotLibrary {
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { inner: TemplateLibrary::at(root) }
+        Self {
+            inner: TemplateLibrary::at(root),
+        }
     }
 
     /// The library in the user's own data directory.
@@ -76,8 +78,10 @@ mod tests {
     use buzz_scene::LayerKind;
 
     fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("buzzanimate-snapshots-{}-{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "buzzanimate-snapshots-{}-{tag}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

@@ -305,8 +305,10 @@ fn backdrop(painter: &egui::Painter, screen: Rect, veil: f32) {
     let mut mesh = egui::Mesh::default();
     mesh.vertices.push(theme::vertex(screen.left_top(), top));
     mesh.vertices.push(theme::vertex(screen.right_top(), top));
-    mesh.vertices.push(theme::vertex(screen.right_bottom(), bottom));
-    mesh.vertices.push(theme::vertex(screen.left_bottom(), bottom));
+    mesh.vertices
+        .push(theme::vertex(screen.right_bottom(), bottom));
+    mesh.vertices
+        .push(theme::vertex(screen.left_bottom(), bottom));
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
     painter.add(egui::Shape::mesh(mesh));
@@ -328,8 +330,12 @@ fn backdrop(painter: &egui::Painter, screen: Rect, veil: f32) {
         let c1 = theme::brand_at(t1).gamma_multiply(veil);
         let i = strip.vertices.len() as u32;
         strip.vertices.push(theme::vertex(pos2(x0, band.top()), c0));
-        strip.vertices.push(theme::vertex(pos2(x0, band.bottom()), c0));
-        strip.vertices.push(theme::vertex(pos2(x1, band.bottom()), c1));
+        strip
+            .vertices
+            .push(theme::vertex(pos2(x0, band.bottom()), c0));
+        strip
+            .vertices
+            .push(theme::vertex(pos2(x1, band.bottom()), c1));
         strip.vertices.push(theme::vertex(pos2(x1, band.top()), c1));
         strip.add_triangle(i, i + 1, i + 2);
         strip.add_triangle(i, i + 2, i + 3);
@@ -485,6 +491,9 @@ mod tests {
         assert_eq!(ease_out(0.0), 0.0);
         assert_eq!(ease_out(1.0), 1.0);
         assert_eq!(ease_out(4.0), 1.0);
-        assert!(ease_out(0.5) > 0.5, "it decelerates, so it is ahead by half");
+        assert!(
+            ease_out(0.5) > 0.5,
+            "it decelerates, so it is ahead by half"
+        );
     }
 }

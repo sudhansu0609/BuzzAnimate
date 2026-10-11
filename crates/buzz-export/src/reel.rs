@@ -81,6 +81,46 @@ impl<'a> Reel<'a> {
         }
     }
 
+    /// A film of scenes, in the order they play, each contributing
+    /// **exactly** the number of film frames given alongside it rather than
+    /// its own whole rendered length.
+    ///
+    /// The length is drawn from the scene's own loop playlist (see
+    /// [`Self::of`]) — truncated to `length` if the playlist is longer, or
+    /// held on its last frame if the playlist is shorter. This is what a
+    /// sequence's Shots need: a shot's playing length is
+    /// `audio_out - audio_in` (see `docs/SEQUENCE_SETUPS_PLAN.md`, "The
+    /// audio is the timeline"), which can be shorter than the scene's own
+    /// frame count — frames kept past the shot's end are not played. A
+    /// Normal or Setup scene's own length (its `rendered_frame_count`)
+    /// matches its playlist exactly, so passing that back through here
+    /// behaves exactly as [`Self::of`] does.
+    pub fn of_lengths(scenes: impl IntoIterator<Item = (&'a Scene, u32)>) -> Self {
+        let items: Vec<(&Scene, u32)> = scenes.into_iter().collect();
+        let mut scene_list = Vec::with_capacity(items.len());
+        let mut playlist = Vec::new();
+        let mut starts = Vec::with_capacity(items.len());
+
+        for (index, (scene, length)) in items.into_iter().enumerate() {
+            starts.push(playlist.len() as u32);
+            let own_playlist = scene.playlist();
+            for f in 0..length {
+                let frame = own_playlist
+                    .get(f as usize)
+                    .copied()
+                    .unwrap_or_else(|| own_playlist.last().copied().unwrap_or(0));
+                playlist.push((index, frame));
+            }
+            scene_list.push(scene);
+        }
+
+        Self {
+            scenes: scene_list,
+            playlist,
+            starts,
+        }
+    }
+
     /// How long the finished film is, in frames.
     pub fn frames(&self) -> u32 {
         self.playlist.len() as u32
@@ -120,6 +160,12 @@ impl<'a> Reel<'a> {
 
     pub fn scene_count(&self) -> usize {
         self.scenes.len()
+    }
+
+    /// The first film frame of a scene, by index — where its soundtrack
+    /// starts if Test Movie plays it from the top of that scene.
+    pub fn start_of(&self, scene_index: usize) -> Option<u32> {
+        self.starts.get(scene_index).copied()
     }
 
     /// Every scene, with the film frame it starts at.
@@ -175,7 +221,10 @@ mod tests {
         // Film frame 0..4 is the first scene's own frames 0..4.
         for f in 0..4 {
             let (which, frame) = reel.at(f).expect("in the film");
-            assert!(std::ptr::eq(which, &a), "frame {f} came from the wrong scene");
+            assert!(
+                std::ptr::eq(which, &a),
+                "frame {f} came from the wrong scene"
+            );
             assert_eq!(frame, f);
         }
         // Then the second scene, from *its* frame zero.
@@ -222,7 +271,10 @@ mod tests {
         assert_eq!(frames, vec![0, 1, 2, 1, 2, 1, 2, 3]);
 
         let (which, frame) = reel.at(8).unwrap();
-        assert!(std::ptr::eq(which, &after), "the next shot follows the repeats");
+        assert!(
+            std::ptr::eq(which, &after),
+            "the next shot follows the repeats"
+        );
         assert_eq!(frame, 0);
     }
 
@@ -236,7 +288,11 @@ mod tests {
         assert_eq!(reel.film_frame_of(0, 0), Some(0));
         assert_eq!(reel.film_frame_of(1, 1), Some(5));
         assert_eq!(reel.film_frame_of(2, 2), Some(8));
-        assert_eq!(reel.film_frame_of(2, 9), None, "no such frame in that scene");
+        assert_eq!(
+            reel.film_frame_of(2, 9),
+            None,
+            "no such frame in that scene"
+        );
         assert_eq!(reel.film_frame_of(7, 0), None, "no such scene");
     }
 
@@ -272,5 +328,192 @@ mod tests {
         let (which, frame) = reel.at_clamped(99).unwrap();
         assert!(std::ptr::eq(which, &b));
         assert_eq!(frame, 1, "the last frame of the last scene");
+    }
+
+    /// **`of_lengths` truncates a longer playlist and holds a shorter one** —
+    /// the two things a shot's playing length needs, independent of any
+    /// document at all. See `docs/SEQUENCE_SETUPS_PLAN.md` S6.
+    #[test]
+    fn of_lengths_truncates_or_holds_to_the_length_given() {
+        let long = scene(10);
+        let short = scene(2);
+
+        // Longer than asked: only the first 4 frames play.
+        let truncated = Reel::of_lengths([(&long, 4)]);
+        assert_eq!(truncated.frames(), 4);
+        let frames: Vec<u32> = (0..4).map(|f| truncated.at(f).unwrap().1).collect();
+        assert_eq!(frames, vec![0, 1, 2, 3]);
+
+        // Shorter than asked: the last frame holds out to the length given.
+        let held = Reel::of_lengths([(&short, 5)]);
+        assert_eq!(held.frames(), 5);
+        let frames: Vec<u32> = (0..5).map(|f| held.at(f).unwrap().1).collect();
+        assert_eq!(frames, vec![0, 1, 1, 1, 1]);
+    }
+
+    /// **A Normal scene's own length routed back through `of_lengths` behaves
+    /// exactly as `of` does** — the case every existing all-Normal document
+    /// must keep behaving like.
+    #[test]
+    fn of_lengths_with_a_scenes_own_length_matches_of() {
+        let (a, b) = (scene(4), scene(3));
+        let via_of = Reel::of([&a, &b]);
+        let via_lengths =
+            Reel::of_lengths([(&a, a.rendered_frame_count()), (&b, b.rendered_frame_count())]);
+        assert_eq!(via_of.frames(), via_lengths.frames());
+        for f in 0..via_of.frames() {
+            assert_eq!(via_of.at(f).unwrap().1, via_lengths.at(f).unwrap().1);
+        }
+    }
+}
+
+/// Sequence-aware reel behaviour: setups skipped, shots played in
+/// `sequence` order at their playing length. See
+/// `docs/SEQUENCE_SETUPS_PLAN.md` S6.
+#[cfg(test)]
+mod sequence_tests {
+    use super::*;
+    use buzz_doc::{Document, SceneKey, SceneRole};
+    use buzz_scene::{LayerKind, SoundRef};
+
+    /// Puts a stub clip on the active scene's stage timeline and points the
+    /// document's master audio at it — long enough to cover every
+    /// `audio_in`/`audio_out` a test slices out of it. Mirrors the private
+    /// `buzz_doc::tests::stub_master_audio` helper, needed here too for the
+    /// dialogue-continuity test.
+    fn stub_master_audio(doc: &mut Document, frames: u32) {
+        let mut layer_id = None;
+        doc.edit("Add master audio", |scene| {
+            let layer = scene.add_stage_layer("Master Audio", LayerKind::Normal);
+            let sound = scene.add_sound(
+                "Dialogue Track",
+                std::sync::Arc::new(vec![0u8; 16]),
+                "wav",
+                24,
+                1,
+                frames as u64,
+            );
+            scene.update_stage_layer(layer, |l| {
+                if l.frames.length() < frames {
+                    l.frames.insert_frame(frames - 1);
+                }
+            });
+            scene.set_frame_sound(layer, 0, Some(SoundRef::stream(sound)));
+            layer_id = Some(layer);
+        });
+        let scene_key = doc.scene_key(doc.active_scene()).unwrap();
+        doc.set_master_audio(scene_key, layer_id.unwrap());
+    }
+
+    /// The exported/previewed film skips the setup and plays the shots in
+    /// `sequence` order, not the document's own scene order.
+    #[test]
+    fn film_skips_setups_and_plays_shots_in_sequence_order() {
+        let mut doc = Document::default();
+        doc.rename_scene(0, "Village");
+        doc.set_role(0, SceneRole::Setup);
+        let setup_key = doc.scene_key(0).unwrap();
+
+        let shot_a = doc.stamp_shot(setup_key, 0, 30).unwrap();
+        let shot_b = doc.stamp_shot(setup_key, 30, 80).unwrap();
+        // Reverse the cut: b plays before a.
+        doc.set_sequence(vec![shot_b, shot_a]);
+
+        let scenes = doc.film_with_lengths();
+        assert_eq!(scenes.len(), 2, "the setup itself never plays");
+        assert_eq!(scenes[0].1, 50, "b's length (80-30) plays first");
+        assert_eq!(scenes[1].1, 30, "then a's length (30-0)");
+
+        let reel = Reel::of_lengths(scenes.iter().map(|(s, l)| (s, *l)));
+        assert_eq!(reel.frames(), 80);
+    }
+
+    /// A take not in `sequence` is open and editable but never plays.
+    #[test]
+    fn an_inactive_take_is_skipped_from_the_film() {
+        let mut doc = Document::default();
+        doc.rename_scene(0, "Village");
+        doc.set_role(0, SceneRole::Setup);
+        let setup_key = doc.scene_key(0).unwrap();
+        let shot = doc.stamp_shot(setup_key, 0, 10).unwrap();
+        let _take = doc.duplicate_shot(shot).unwrap();
+
+        let scenes = doc.film_with_lengths();
+        assert_eq!(
+            scenes.len(),
+            1,
+            "the take is not in the cut, so it does not play"
+        );
+        let reel = Reel::of_lengths(scenes.iter().map(|(s, l)| (s, *l)));
+        assert_eq!(reel.frames(), 10);
+    }
+
+    /// A shortened shot contributes `audio_out - audio_in` film frames even
+    /// though its own timeline is longer (frames kept past the new end, not
+    /// deleted — see `docs/SEQUENCE_SETUPS_PLAN.md` "Nothing destructive by
+    /// timing either").
+    #[test]
+    fn a_shortened_shot_contributes_only_its_playing_length() {
+        let mut doc = Document::default();
+        doc.rename_scene(0, "Village");
+        doc.set_role(0, SceneRole::Setup);
+        let setup_key = doc.scene_key(0).unwrap();
+        let shot = doc.stamp_shot(setup_key, 0, 10).unwrap();
+        assert!(doc.set_shot_range(shot, 0, 4));
+
+        let scenes = doc.film_with_lengths();
+        assert_eq!(scenes.len(), 1);
+        let (scene, length) = &scenes[0];
+        assert_eq!(
+            *length, 4,
+            "audio_out - audio_in, not the scene's own frame count"
+        );
+        assert!(
+            scene.frame_count() > 4,
+            "the shot's own timeline kept its longer frames"
+        );
+
+        let reel = Reel::of_lengths(scenes.iter().map(|(s, l)| (s, *l)));
+        assert_eq!(reel.frames(), 4);
+    }
+
+    /// **Dialogue is continuous across a cut.** The film frame where the
+    /// second shot starts is that shot's own timeline frame 0, whose
+    /// Dialogue trim_start equals the first shot's trim_end — the same
+    /// moment of the master audio either side of the cut.
+    #[test]
+    fn dialogue_is_continuous_across_a_cut() {
+        let mut doc = Document::default();
+        stub_master_audio(&mut doc, 1000);
+        doc.add_scene();
+        doc.rename_scene(1, "Village");
+        doc.set_role(1, SceneRole::Setup);
+        let setup_key = doc.scene_key(1).unwrap();
+
+        let shot_a = doc.stamp_shot(setup_key, 0, 30).unwrap();
+        let shot_b = doc.stamp_shot(setup_key, 30, 80).unwrap();
+
+        let dialogue_ref = |doc: &Document, shot: SceneKey| -> SoundRef {
+            let index = doc.index_of_key(shot).unwrap();
+            let layer = match doc.role(index) {
+                Some(SceneRole::Shot(info)) => info.dialogue_layer.unwrap(),
+                other => panic!("expected a Shot, got {other:?}"),
+            };
+            doc.film()[index].frame_sound(layer, 0).unwrap()
+        };
+
+        let a_end = dialogue_ref(&doc, shot_a).trim_end.unwrap();
+        let b_start = dialogue_ref(&doc, shot_b).trim_start;
+        assert!(
+            (a_end - b_start).abs() < 1e-4,
+            "shot a ends on the master ({a_end}) where shot b's frame 0 begins ({b_start})"
+        );
+
+        // And the reel really does cut straight from one into the other: the
+        // film frame shot b starts at is shot b's own timeline frame 0.
+        let scenes = doc.film_with_lengths();
+        let reel = Reel::of_lengths(scenes.iter().map(|(s, l)| (s, *l)));
+        let shot_b_start = reel.start_of(1).unwrap();
+        assert_eq!(reel.at(shot_b_start).unwrap().1, 0);
     }
 }

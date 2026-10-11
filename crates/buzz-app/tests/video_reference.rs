@@ -68,7 +68,12 @@ fn a_video_lands_a_frame_at_a_time_on_a_guide_layer() {
 
     // A frame of artwork on each of the film's frames, not one picture held.
     let scene = editor.doc.scene();
-    let frames = scene.layers().get(layer).expect("the layer").frames.length();
+    let frames = scene
+        .layers()
+        .get(layer)
+        .expect("the layer")
+        .frames
+        .length();
     assert!(
         frames >= 20,
         "two seconds at twelve should be about 24 frames, got {frames}"
@@ -137,7 +142,13 @@ fn the_reference_is_not_exported() {
         .expect("the clip imports");
 
     let layer = guide_layers(&editor)[0];
-    let kind = editor.doc.scene().layers().get(layer).expect("the layer").kind;
+    let kind = editor
+        .doc
+        .scene()
+        .layers()
+        .get(layer)
+        .expect("the layer")
+        .kind;
     assert!(
         !kind.paints_to_output(),
         "a reference layer must stay out of the film"

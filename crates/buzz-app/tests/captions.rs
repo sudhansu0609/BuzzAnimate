@@ -201,7 +201,12 @@ fn the_menu_commands_are_inert_without_a_file() {
     editor.run(Command::ImportCaptions);
     editor.run(Command::ExportCaptions);
     assert!(
-        editor.doc.scene().layers().iter().all(|l| l.name != "Captions"),
+        editor
+            .doc
+            .scene()
+            .layers()
+            .iter()
+            .all(|l| l.name != "Captions"),
         "the command acted without being given a file"
     );
 }

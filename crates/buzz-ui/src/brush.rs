@@ -19,7 +19,7 @@
 //! asset. That keeps the application self-contained, keeps the shapes exact at
 //! any zoom, and avoids shipping artwork whose provenance would need checking.
 
-use buzz_geom::{BezPath, BrushProfile, PatternFit, Point, Shape as _, WidthResponse};
+use buzz_geom::{BezPath, BrushProfile, PatternFit, Point, Shape as _, TipShape, WidthResponse};
 use serde::{Deserialize, Serialize};
 
 /// Which brush the Brush tool is currently being.
@@ -237,6 +237,12 @@ pub struct BrushSettings {
     /// How much the paint resists spreading. See
     /// [`buzz_geom::BrushProfile::viscosity`].
     pub viscosity: f64,
+    /// The Fluid brush's own nib shape. Kept separate from
+    /// [`Self::normal_tip`] so switching brushes does not throw away either
+    /// one's tip — see [`Self::tip`].
+    pub fluid_tip: TipShape,
+    /// The Normal brush's own nib shape. See [`Self::fluid_tip`].
+    pub normal_tip: TipShape,
     /// Which ends [`Self::taper`] applies to.
     pub taper_ends: buzz_geom::TaperEnds,
     /// Narrowest width as a fraction of [`Self::size`].
@@ -308,6 +314,8 @@ impl Default for BrushSettings {
             // without being switched on reads as the application being slow.
             stabiliser: 0.0,
             viscosity: 0.65,
+            fluid_tip: TipShape::default(),
+            normal_tip: TipShape::default(),
             taper_ends: buzz_geom::TaperEnds::default(),
             min_ratio: 0.35,
             taper: 0.12,
@@ -352,6 +360,28 @@ impl BrushSettings {
             taper: self.taper.clamp(0.0, 0.5),
             taper_ends: self.taper_ends,
             viscosity: self.viscosity.clamp(0.0, 1.0),
+            tip: self.tip(),
+        }
+    }
+
+    /// The nib shape for whichever outlined brush is current — Fluid and
+    /// Normal each keep their own, so switching between them does not lose
+    /// either one's setting.
+    pub fn tip(&self) -> TipShape {
+        match self.kind {
+            BrushKind::Fluid => self.fluid_tip,
+            BrushKind::Normal => self.normal_tip,
+            _ => TipShape::Round,
+        }
+    }
+
+    /// The current brush's own tip field, to edit in place — `None` for a
+    /// brush that has no tip of its own to edit.
+    pub fn tip_mut(&mut self) -> Option<&mut TipShape> {
+        match self.kind {
+            BrushKind::Fluid => Some(&mut self.fluid_tip),
+            BrushKind::Normal => Some(&mut self.normal_tip),
+            _ => None,
         }
     }
 
@@ -458,6 +488,15 @@ impl BrushSettings {
             self.set_custom_stamp(stamp);
         }
     }
+}
+
+/// The tip shapes remembered across sessions — the one part of
+/// [`BrushSettings`] that is per-person rather than per-stroke. See
+/// [`crate::workspace::Workspace::brush_tips`].
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct BrushTips {
+    pub fluid: TipShape,
+    pub normal: TipShape,
 }
 
 #[cfg(test)]
@@ -738,5 +777,43 @@ mod tests {
         ] {
             assert!(!other.composites_itself(), "{other:?}");
         }
+    }
+
+    /// Fluid and Normal each keep their own tip: switching between them, and
+    /// back again, must not lose either one's setting.
+    #[test]
+    fn each_outlined_brush_keeps_its_own_tip() {
+        let mut settings = BrushSettings::default();
+        assert_eq!(settings.tip(), TipShape::Round, "the default tip is round");
+
+        settings.kind = BrushKind::Fluid;
+        *settings.tip_mut().expect("fluid has a tip") = TipShape::Chisel {
+            angle: 20.0,
+            thickness: 0.3,
+        };
+        settings.kind = BrushKind::Normal;
+        *settings.tip_mut().expect("normal has a tip") = TipShape::Square;
+
+        settings.kind = BrushKind::Fluid;
+        assert_eq!(
+            settings.tip(),
+            TipShape::Chisel {
+                angle: 20.0,
+                thickness: 0.3,
+            },
+            "fluid's tip should still be its own"
+        );
+
+        settings.kind = BrushKind::Normal;
+        assert_eq!(
+            settings.tip(),
+            TipShape::Square,
+            "normal's tip should still be its own"
+        );
+
+        // And a brush with no tip of its own says so.
+        settings.kind = BrushKind::Pattern;
+        assert!(settings.tip_mut().is_none());
+        assert_eq!(settings.tip(), TipShape::Round);
     }
 }

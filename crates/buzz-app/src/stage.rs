@@ -11,10 +11,12 @@
 //! which is exactly the distinction Animate draws between the stage and what
 //! gets published.
 
+use std::sync::Arc;
+
 use buzz_geom::{Point, Rect, Vec2};
 use buzz_render::SceneBuilder;
 use buzz_render::document::{
-    DrawCache, FrameOptions, MaskDisplay, draw_frame_within, draw_stage_context,
+    DrawCache, FrameOptions, LightDetail, MaskDisplay, draw_frame_within, draw_stage_context,
 };
 use buzz_ui::{Metrics, Orientation, Palette};
 use egui::{Align2, Color32, FontId, Sense, Stroke, StrokeKind, Ui};
@@ -44,6 +46,28 @@ pub fn build_scene(
     scale: f64,
     cache: &mut DrawCache,
 ) {
+    // A plain stage — nothing but the live frame — goes through the
+    // editor-free path, which is what an off-thread encode runs too. Same
+    // ladder, same bytes. See [`build_plain_scene`].
+    if is_plain(editor) {
+        let inputs = StageInputs::from_editor(editor, area, scale);
+        build_plain_scene(vello, &inputs, cache);
+        return;
+    }
+    build_scene_generic(vello, editor, area, scale, cache);
+}
+
+/// [`build_scene`]'s editor-driven ladder, for every stage that is not plain
+/// (and the reference [`build_plain_scene`] is tested against). Public only for
+/// that test; call [`build_scene`].
+#[doc(hidden)]
+pub fn build_scene_generic(
+    vello: &mut vello::Scene,
+    editor: &Editor,
+    area: Rect,
+    scale: f64,
+    cache: &mut DrawCache,
+) {
     // **One cache generation for the whole screen frame.** What follows can be
     // a dozen draws — the context behind an opened symbol, every keyframe under
     // Edit Multiple Frames, the onion-skin ghosts either side, and the live
@@ -57,43 +81,284 @@ pub fn build_scene(
     // rasteriser is not drawn at all, and the answer is to encode it again with
     // less of the light rather than to submit one that will vanish. See
     // `buzz_render::document::DrawCache::reconsider`. Bounded because a level
-    // is only ever stepped one at a time, and there are three.
+    // is only ever stepped one at a time, and there are four.
     // The output the frame will be rasterised at, which is what decides how
     // dear a segment is: flattening is to a tolerance in device pixels.
     let pixels = area.width() * area.height();
-    for _ in 0..3 {
-        let segments = encode(vello, editor, area, scale, cache);
+    let cull = default_cull(editor);
+    for _ in 0..4 {
+        // `None`: `try_stamp_symbol` falls back to `cull` itself, which here
+        // already *is* the frame's whole visible rectangle. See
+        // [`FrameOptions::stamp_view`].
+        let (segments, lines) = encode(vello, editor, area, scale, cache, cull, None);
+        // Noted before `reconsider` judges the pass, so a frame whose own
+        // artwork overruns the line buffer well under the segment ceiling
+        // (curvy fills, strokes that flatten on both sides) is caught too —
+        // see Phase 4c in `docs/FLA_IMPORT_BLANK_AND_LAG_PLAN.md`.
+        cache.note_lines(lines);
         if !cache.reconsider(segments, pixels) {
             break;
         }
+    }
+    // L7: never leave the loop on a pass that was judged over budget when a
+    // level measured fitting this frame exists — one more pass, no more.
+    if let Some(level) = settle_after_ladder(
+        cache.over_budget_last_pass(),
+        cache.fitting_fallback(),
+        cache.last_pass_detail(),
+    ) {
+        cache.settle_on(level);
+        let (segments, lines) = encode(vello, editor, area, scale, cache, cull, None);
+        cache.note_settled_pass(segments, lines, pixels);
     }
     // The screen frame is finished; anything not drawn in it can go.
     cache.end();
 }
 
-/// One pass of the stage encode, answering how much geometry it took.
+/// **L7: what to do once the detail ladder's passes are spent.** `Some(level)`
+/// when the last judged pass was over budget and a different level, measured
+/// fitting this frame, exists (`fallback`): encode once more at it.
+/// `current` is the level the last judged pass was encoded at. Pure, so the
+/// decision is testable without encoding anything.
+pub fn settle_after_ladder(
+    over_budget_last: bool,
+    fallback: Option<LightDetail>,
+    current: LightDetail,
+) -> Option<LightDetail> {
+    match fallback {
+        Some(level) if over_budget_last && level != current => Some(level),
+        _ => None,
+    }
+}
+
+/// The visible document rectangle, handed to every stage pass so artwork far
+/// off the edge is culled rather than encoded. Display-only: the exporter and
+/// thumbnails leave it `None` and render everything. See
+/// `buzz_render::document::FrameOptions::cull`.
+///
+/// **The tight visible rectangle, not the clip rectangle.** `clip_bounds` is
+/// `RenderClip`'s margin-grown box — a hundred percent extra on every side, to
+/// keep the flattened path exact for geometry that pokes past the edge — and
+/// culling to it at fit zoom skips almost nothing. What a cull needs to know
+/// is what can actually be *seen*; a stroke or a seam seal can still poke a
+/// hair past an object's own fill bounds, so a small safety margin (2% of the
+/// rectangle's size, on each side) rides along instead of `clip_bounds`'s much
+/// larger one.
+///
+/// Taken straight from the camera rather than through a `SceneBuilder`
+/// (`Camera::visible_doc_rect` is all `SceneBuilder::visible_bounds` ever
+/// read), so [`build_scene`] can compute it once before the ladder loop
+/// rather than once per pass.
+fn default_cull(editor: &Editor) -> Option<Rect> {
+    cull_for(&editor.camera)
+}
+
+/// [`default_cull`] from the camera alone, so an encode that holds no
+/// [`Editor`] (see [`StageInputs`]) computes the same rectangle.
+pub fn cull_for(camera: &buzz_geom::Camera) -> Option<Rect> {
+    if std::env::var("BUZZ_NO_CULL").is_ok() {
+        return None;
+    }
+    let visible = camera.visible_doc_rect();
+    Some(visible.inflate(visible.width() * 0.02, visible.height() * 0.02))
+}
+
+/// **Everything a plain stage encode reads**, and nothing else — no
+/// [`Editor`] — so it can be handed to another thread. `scene` is a
+/// copy-on-write clone of the document scene (a handful of pointer copies),
+/// `area_px` the stage's region of the window in physical pixels, `scale` the
+/// display's `pixels_per_point`, and `buffer_scale` the rasteriser buffer
+/// scale the frame will be judged against (see [`encode_plain`]).
+#[derive(Clone)]
+pub struct StageInputs {
+    pub scene: Arc<buzz_scene::Scene>,
+    pub camera: buzz_geom::Camera,
+    pub frame: u32,
+    pub area_px: Rect,
+    pub scale: f64,
+    pub buffer_scale: u32,
+}
+
+impl StageInputs {
+    /// The inputs of the stage as `editor` shows it now. `buffer_scale` is the
+    /// calling thread's current one, so encoding these on this thread changes
+    /// nothing.
+    pub fn from_editor(editor: &Editor, area: Rect, scale: f64) -> Self {
+        Self {
+            scene: Arc::new(editor.scene().clone()),
+            camera: editor.camera,
+            frame: editor.current_frame,
+            area_px: area,
+            scale,
+            buffer_scale: buzz_render::vello_encoding::buffer_scale(),
+        }
+    }
+}
+
+/// Is the stage nothing but the live frame — no symbol being edited in place,
+/// no Edit Multiple Frames, no onion skin, no brush preview painted into the
+/// scene? Only then does [`encode_plain`] draw exactly what the stage draws.
+pub fn is_plain(editor: &Editor) -> bool {
+    editor.scene().edit_path().is_empty()
+        && editor.multi_frames().is_empty()
+        && editor.onion_frames().is_empty()
+        && !editor.preview_paints_into_scene()
+}
+
+/// [`build_scene`] for a plain stage, from [`StageInputs`] alone: one cache
+/// generation, the ladder of encode → `note_lines` → `reconsider` (at most four
+/// passes), then `end`. Byte-identical to what `build_scene` has always done
+/// for such a stage.
+pub fn build_plain_scene(vello: &mut vello::Scene, inputs: &StageInputs, cache: &mut DrawCache) {
+    cache.begin();
+    let pixels = inputs.area_px.width() * inputs.area_px.height();
+    let cull = cull_for(&inputs.camera);
+    for _ in 0..4 {
+        let (segments, lines) = encode_plain(vello, inputs, cache, cull);
+        // E5: an aborted pass drew a partial scene that is thrown away, so it
+        // is not judged (no `note_lines`, no `reconsider`); `end` still runs.
+        if cache.is_aborted() {
+            break;
+        }
+        cache.note_lines(lines);
+        if !cache.reconsider(segments, pixels) {
+            break;
+        }
+    }
+    // L7: as in `build_scene_generic` — one more pass at a level measured
+    // fitting, if the loop ended on an over-budget one. An aborted pass is
+    // never judged, so there is nothing to settle.
+    if !cache.is_aborted()
+        && let Some(level) = settle_after_ladder(
+            cache.over_budget_last_pass(),
+            cache.fitting_fallback(),
+            cache.last_pass_detail(),
+        )
+    {
+        cache.settle_on(level);
+        let (segments, lines) = encode_plain(vello, inputs, cache, cull);
+        if !cache.is_aborted() {
+            cache.note_settled_pass(segments, lines, pixels);
+        }
+    }
+    cache.end();
+}
+
+/// One pass of the plain stage encode — the stage rectangle, then the live
+/// frame — answering `(encoded segments, estimated lines)`.
+///
+/// **First sets this thread's buffer scale** to `inputs.buffer_scale`
+/// (`vello_encoding::set_scale_for_this_thread`), because the line budget the
+/// encode judges against reads it per thread; a fresh worker thread would
+/// otherwise encode against scale 1.
+pub fn encode_plain(
+    vello: &mut vello::Scene,
+    inputs: &StageInputs,
+    cache: &mut DrawCache,
+    cull: Option<Rect>,
+) -> (u32, u64) {
+    buzz_render::vello_encoding::set_scale_for_this_thread(inputs.buffer_scale);
+    let area = inputs.area_px;
+    let mut builder = SceneBuilder::new(vello, &inputs.camera)
+        .with_output_scale(inputs.scale)
+        .with_viewport_offset(Vec2::new(area.x0, area.y0));
+
+    let scene = &*inputs.scene;
+    builder.fill_shape(&scene.stage().stage_rect(), scene.stage().background);
+
+    let frame = inputs.frame;
+    let camera = scene.camera_transform(frame);
+    let live = FrameOptions {
+        masks: MaskDisplay::WhenLocked,
+        lit: true,
+        layer_alpha: true,
+        place: scene.edit_place(),
+        cull,
+        stamp_view: None,
+        ..FrameOptions::default()
+    };
+    draw_frame_within(&mut builder, scene, frame, camera, &live, cache);
+    (builder.encoded_segments(), builder.estimated_lines())
+}
+
+/// One band of the stage — a horizontal strip of the **target** texture's own
+/// physical rows, `band_px` — encoded at whatever level [`build_scene`]'s own
+/// ladder already settled on for this frame. No `reconsider`: judging a
+/// fraction of the artwork against the whole frame's budget would be
+/// answering a different question than the one already answered. Returns the
+/// band's own `estimated_lines()`, so the caller can tell whether even more
+/// bands are needed. See Phase 4d in `docs/FLA_IMPORT_BLANK_AND_LAG_PLAN.md`.
+pub fn build_band(
+    vello: &mut vello::Scene,
+    editor: &Editor,
+    area: Rect,
+    scale: f64,
+    cache: &mut DrawCache,
+    band_px: Rect,
+) -> u64 {
+    // The band's rows, restricted to the stage's own area — the rest of the
+    // target is chrome, which never goes through this Vello scene at all.
+    let rows = band_px.intersect(area);
+    // `area`'s origin and `scale` are exactly what `with_viewport_offset` and
+    // `with_output_scale` carry the camera's logical output up to physical
+    // pixels with below, so they are divided back out the same way to land
+    // in the camera's own logical viewport space before asking it for the
+    // document point.
+    let to_logical = |p: Point| Point::new((p.x - area.x0) / scale, (p.y - area.y0) / scale);
+    let top_left = editor
+        .camera
+        .screen_to_doc(to_logical(Point::new(rows.x0, rows.y0)));
+    let bottom_right = editor
+        .camera
+        .screen_to_doc(to_logical(Point::new(rows.x1, rows.y1)));
+    let doc_rect = Rect::new(
+        top_left.x.min(bottom_right.x),
+        top_left.y.min(bottom_right.y),
+        top_left.x.max(bottom_right.x),
+        top_left.y.max(bottom_right.y),
+    );
+    // Grown by 2%, for the same reason `default_cull` grows the whole-frame
+    // one: a stroke or a seam seal can poke a hair past an object's own fill
+    // bounds.
+    let doc_rect = doc_rect.inflate(doc_rect.width() * 0.02, doc_rect.height() * 0.02);
+
+    // The band is culled to `doc_rect`, its own strip, and `try_stamp_symbol`'s
+    // off-screen rule is judged against that same strip (`stamp_view: None`
+    // below falls back to `cull`) rather than the frame's whole visible
+    // rectangle. A prior follow-up passed the frame's rectangle instead, so a
+    // character mostly on screen passed the rule in every band it touched and
+    // was appended *whole* — unclipped to any one band — into each of them:
+    // more bands did not shrink the largest band's own lines, and a band
+    // still over budget rasterised as black. Judging a band's own strip means
+    // a character mostly inside one band is stamped once there, and drawn
+    // live and culled — genuinely smaller — in whichever other band it barely
+    // touches. See H0 item 1 in `docs/IMPORT_PERF_PLAN.md`.
+    let (_, lines) = encode(vello, editor, area, scale, cache, Some(doc_rect), None);
+    lines
+}
+
+/// One pass of the stage encode, answering how much geometry it took —
+/// encoded segments and estimated lines, in that order. `cull` is the
+/// document-space rectangle to draw within: the whole visible stage for an
+/// ordinary pass (see [`default_cull`]), or one band's own strip for
+/// [`build_band`]. `stamp_view` is [`FrameOptions::stamp_view`], always
+/// `None` from both callers, so `try_stamp_symbol`'s off-screen rule falls
+/// back to `cull` itself — a band's own strip for [`build_band`]. See H0 item
+/// 1 in `docs/IMPORT_PERF_PLAN.md`.
 fn encode(
     vello: &mut vello::Scene,
     editor: &Editor,
     area: Rect,
     scale: f64,
     cache: &mut DrawCache,
-) -> u32 {
+    cull: Option<Rect>,
+    stamp_view: Option<Rect>,
+) -> (u32, u64) {
     let mut builder = SceneBuilder::new(vello, &editor.camera)
         .with_output_scale(scale)
         .with_viewport_offset(Vec2::new(area.x0, area.y0));
 
     let scene = editor.scene();
-
-    // The visible document rectangle, handed to every stage pass so artwork far
-    // off the edge is culled rather than encoded. Display-only: the exporter and
-    // thumbnails leave it `None` and render everything. See
-    // `buzz_render::document::FrameOptions::cull`.
-    let cull = if std::env::var("BUZZ_NO_CULL").is_ok() {
-        None
-    } else {
-        Some(builder.clip_bounds())
-    };
 
     // The stage rectangle. Everything outside it is pasteboard, which the
     // window's clear colour already provides.
@@ -118,6 +383,7 @@ fn encode(
             // for reference read as dirt on the stage.
             lit: false,
             cull,
+            stamp_view,
             ..FrameOptions::default()
         };
         draw_stage_context(&mut builder, scene, frame, camera, &context, cache);
@@ -148,6 +414,7 @@ fn encode(
             pools: false,
             place,
             cull,
+            stamp_view,
             ..FrameOptions::default()
         };
         draw_frame_within(&mut builder, scene, other, camera, &options, cache);
@@ -175,6 +442,7 @@ fn encode(
             // scrubbing never pays for it.
             subframe: 0.0,
             cull,
+            stamp_view,
         };
         draw_frame_within(&mut builder, scene, ghost_frame, camera, &options, cache);
     }
@@ -189,6 +457,7 @@ fn encode(
         layer_alpha: true,
         place,
         cull,
+        stamp_view,
         ..FrameOptions::default()
     };
     draw_frame_within(&mut builder, scene, frame, camera, &live, cache);
@@ -279,7 +548,7 @@ fn encode(
         _ => {}
     }
 
-    builder.encoded_segments()
+    (builder.encoded_segments(), builder.estimated_lines())
 }
 
 /// Draw the chrome over the rendered stage.
@@ -519,7 +788,10 @@ fn draw_perspective(
     // The horizon runs the width of the view at its document height.
     let hy = to_screen(Point::new(0.0, p.horizon)).y;
     if hy >= area.min.y && hy <= area.max.y {
-        painter.line_segment([egui::pos2(area.min.x, hy), egui::pos2(area.max.x, hy)], horizon);
+        painter.line_segment(
+            [egui::pos2(area.min.x, hy), egui::pos2(area.max.x, hy)],
+            horizon,
+        );
     }
 
     // From each vanishing point, fan rays out to points walked around the edge
@@ -542,7 +814,11 @@ fn draw_perspective(
 /// place, an axis drawn through the view would sit where the artwork is not.
 /// Each axis is sampled rather than drawn end to end, so a tilted camera bends
 /// it the way it bends everything else on the stage.
-fn draw_symmetry(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point) -> egui::Pos2) {
+fn draw_symmetry(
+    painter: &egui::Painter,
+    editor: &Editor,
+    to_screen: impl Fn(Point) -> egui::Pos2,
+) {
     let sym = editor.style.symmetry;
     if !sym.is_on() {
         return;
@@ -605,7 +881,22 @@ fn border_point(area: egui::Rect, t: f32) -> egui::Pos2 {
     }
 }
 
-/// Selection outline and transform handles.
+/// Selection chrome: the hatch on a raw shape, the outline on everything else,
+/// and — for Free Transform only — the box, its handles, the rotate ring and the
+/// transformation point.
+///
+/// **Each tool's selection wears its own chrome**, so which one is in hand is
+/// never in doubt at a glance:
+///
+/// * The Selection tool is Animate's arrow. A selected fill or line is dotted
+///   over its own geometry (see `hatch`); an instance, group, text or rig gets a
+///   thin solid outline on its drawn corners. **No handles, no ring, no
+///   transformation point** — there is nothing on it to grab but the artwork.
+/// * Free Transform shows the full rig: the same hatch and outlines, the box, its
+///   eight filled square handles, the rotate ring outside the corners and the
+///   transformation point.
+/// * Subselection (below) shows the path's anchors, and Gradient Transform the
+///   gradient's grips.
 fn draw_selection(
     painter: &egui::Painter,
     editor: &Editor,
@@ -613,9 +904,19 @@ fn draw_selection(
     to_screen: impl Fn(Point) -> egui::Pos2,
     to_screen_view: impl Fn(Point) -> egui::Pos2,
 ) {
-    let Some(bounds) = editor.selection_bounds_drawn() else {
+    let Some(frame) = editor.selection_box() else {
         return;
     };
+    let tool = editor.tool();
+    let selecting = tool == buzz_ui::ToolId::Selection;
+    let transforming = tool == buzz_ui::ToolId::FreeTransform;
+
+    // **A raw shape is dotted over its own geometry**, with either tool: that is
+    // how Animate shows a selected fill or line, and what keeps a ring's hole and
+    // an L's notch from being reported as selected.
+    if selecting || transforming {
+        draw_selection_hatch(painter, editor, &to_screen_view);
+    }
 
     // Each selected object outlined where it is **drawn**. Under a tilted
     // camera, or on an object turned in space, that is a *quadrilateral* — and
@@ -625,6 +926,12 @@ fn draw_selection(
     // because two objects turned different ways have no common quad.
     let mut drawn_any = false;
     for id in editor.selection.iter() {
+        // The arrow shows a raw shape by its hatch alone; a box round it would
+        // say "selected" about the empty stage in its corners.
+        if selecting && editor.shows_hatch(id) {
+            drawn_any = true;
+            continue;
+        }
         let Some(quad) = editor.object_quad(id) else {
             continue;
         };
@@ -638,17 +945,15 @@ fn draw_selection(
         drawn_any = true;
     }
 
-    // The corners of the whole selection, for the handles below — and the
-    // outline itself when nothing could be asked object by object.
-    let corners = [
-        Point::new(bounds.x0, bounds.y0),
-        Point::new(bounds.x1, bounds.y0),
-        Point::new(bounds.x1, bounds.y1),
-        Point::new(bounds.x0, bounds.y1),
-    ]
-    .map(&to_screen);
+    // The corners of the whole selection's box, for the handles below — and the
+    // outline itself when nothing could be asked object by object, or, for Free
+    // Transform, **as its box**: the rectangle the handles hang off, turned with
+    // the selection. The box turns with a rotated or skewed selection, so these
+    // are the object's own corners rather than the corners of the rectangle
+    // round it.
+    let corners = frame.corners().map(&to_screen);
 
-    if !drawn_any {
+    if transforming || !drawn_any {
         let mut outline: Vec<egui::Pos2> = corners.to_vec();
         outline.push(corners[0]);
         painter.add(egui::Shape::line(
@@ -657,23 +962,41 @@ fn draw_selection(
         ));
     }
 
-    // The box the handles hang off. With no tilt it is exactly the old
-    // rectangle; with tilt it is the quad's extent, which is the honest
-    // approximation — a transform handle on a perspective quad wants a gizmo
-    // of its own, and that is recorded in §7 rather than faked here.
-    let mut rect = egui::Rect::from_two_pos(corners[0], corners[2]);
-    for corner in corners {
-        rect = rect.union(egui::Rect::from_two_pos(corner, corner));
-    }
+    // The handles hang off the box's corners and mid-edges, in the box's own
+    // order — turned with it, though each handle itself stays screen-aligned,
+    // as Animate's do. A selection with no frame of its own (mixed turns, a
+    // perspective tilt) has the axis-aligned box, so its handles are where they
+    // always were; a transform handle on a perspective quad wants a gizmo of its
+    // own, and that is recorded in §7 rather than faked here.
+    let handles = {
+        let [tl, tr, br, bl] = corners;
+        let [top, bottom, left, right] = frame.mid_edges().map(&to_screen);
+        [tl, top, tr, right, br, bottom, bl, left]
+    };
 
     // Subselection shows the path's anchors instead of a transform box, which
     // is what makes individual points grabbable.
-    if editor.tool() == buzz_ui::ToolId::Subselection {
+    if tool == buzz_ui::ToolId::Subselection {
         const ANCHOR: f32 = 5.0;
+        const TANGENT: f32 = 3.0;
+        let selected = editor.selected_anchor_elements();
+
+        // The tangent handles of the selected anchors — a small circle on a
+        // line to the anchor — drawn first so the anchors sit on top of them.
+        for handle in editor.selected_handles() {
+            let (from, at) = (to_screen(handle.anchor), to_screen(handle.point));
+            painter.line_segment([from, at], Stroke::new(1.0, Palette::selection()));
+            painter.circle_filled(at, TANGENT, Palette::handle_fill());
+            painter.circle_stroke(at, TANGENT, Stroke::new(1.0, Palette::selection()));
+        }
+
         for anchor in editor.selected_anchors() {
             let at = to_screen(anchor.point);
             let square = egui::Rect::from_center_size(at, egui::vec2(ANCHOR, ANCHOR));
-            painter.rect_filled(square, 0.0, Palette::handle_fill());
+            // Selected anchors are filled solid, the rest hollow.
+            if selected.contains(&anchor.element) {
+                painter.rect_filled(square, 0.0, Palette::selection());
+            }
             painter.rect_stroke(
                 square,
                 0.0,
@@ -684,60 +1007,29 @@ fn draw_selection(
         return;
     }
 
-    if editor.tool() == buzz_ui::ToolId::GradientTransform {
+    if tool == buzz_ui::ToolId::GradientTransform {
         draw_gradient_handles(painter, editor, &to_screen);
         return;
     }
 
-    // **Each tool's selection wears its own chrome**, so which one is in hand is
-    // never in doubt at a glance:
-    //
-    // * Subselection (handled above) shows the path's anchors.
-    // * Free Transform shows the full rig — eight filled square handles and the
-    //   rotate ring outside the corners.
-    // * The plain Selection tool shows a lighter mark: hollow round handles at
-    //   the four corners, and no ring.
-    //
-    // All three still move the transformation point, so it is drawn for each;
-    // and the corners still resize and the edges still skew from the Selection
-    // tool too (see `tools::begins_a_transform`) — the arrow simply does not
-    // dress itself up as the transform rig to say so.
-    if editor.tool() == buzz_ui::ToolId::FreeTransform {
-        draw_rotate_hint(painter, rect, pointer);
+    // Everything below is the Free Transform rig. The Selection tool stops here:
+    // it has no handles, no rotate ring and no transformation point to draw —
+    // and so none to grab (see `tools::begins_a_transform`).
+    if !transforming {
+        return;
+    }
 
-        const HANDLE: f32 = 6.0;
-        for corner in [
-            rect.left_top(),
-            rect.center_top(),
-            rect.right_top(),
-            rect.right_center(),
-            rect.right_bottom(),
-            rect.center_bottom(),
-            rect.left_bottom(),
-            rect.left_center(),
-        ] {
-            let handle = egui::Rect::from_center_size(corner, egui::vec2(HANDLE, HANDLE));
-            painter.rect_filled(handle, 0.0, Palette::handle_fill());
-            painter.rect_stroke(
-                handle,
-                0.0,
-                Stroke::new(1.0, Palette::handle_stroke()),
-                StrokeKind::Outside,
-            );
-        }
-    } else {
-        // The Selection tool: hollow round handles at the corners only, so its
-        // box reads as "selected, movable" rather than as the transform rig.
-        const RADIUS: f32 = 4.5;
-        for corner in [
-            rect.left_top(),
-            rect.right_top(),
-            rect.right_bottom(),
-            rect.left_bottom(),
-        ] {
-            painter.circle_filled(corner, RADIUS, Palette::handle_fill());
-            painter.circle_stroke(corner, RADIUS, Stroke::new(1.0, Palette::handle_stroke()));
-        }
+    draw_rotate_hint(painter, corners, pointer);
+    const HANDLE: f32 = 6.0;
+    for corner in handles {
+        let handle = egui::Rect::from_center_size(corner, egui::vec2(HANDLE, HANDLE));
+        painter.rect_filled(handle, 0.0, Palette::handle_fill());
+        painter.rect_stroke(
+            handle,
+            0.0,
+            Stroke::new(1.0, Palette::handle_stroke()),
+            StrokeKind::Outside,
+        );
     }
 
     // The transformation point: Animate's white circle, and what rotation,
@@ -746,6 +1038,32 @@ fn draw_selection(
     // it is usually put on a hinge or a joint, which is exactly the part you
     // need to see while placing it.
     draw_pivot(painter, editor, &to_screen);
+}
+
+/// The dotted hatch over every selected raw shape — see `hatch` for how it is
+/// made and why it costs next to nothing. One mesh, in the selection colour.
+fn draw_selection_hatch(
+    painter: &egui::Painter,
+    editor: &Editor,
+    to_screen: &impl Fn(Point) -> egui::Pos2,
+) {
+    let shapes = editor.selected_drawn_shapes();
+    if shapes.is_empty() {
+        return;
+    }
+    let dots = crate::hatch::selection_dots(
+        &shapes,
+        editor.camera.zoom,
+        to_screen,
+        painter.clip_rect(),
+    );
+    if dots.is_empty() {
+        return;
+    }
+    painter.add(egui::Shape::mesh(crate::hatch::dots_mesh(
+        &dots,
+        Palette::selection(),
+    )));
 }
 
 /// The transformation point: Animate's white circle.
@@ -846,6 +1164,12 @@ fn draw_gradient_handles(
 ///
 /// Bones are drawn as Animate draws them: a tapered quadrilateral, widest a
 /// quarter of the way along, so which end is the head can be read at a glance.
+/// BM: whether the stage draws armature bones, joints and limit wedges — only
+/// while the Bone tool is the active tool and its "Show bones" is on.
+pub(crate) fn bones_drawn(editor: &Editor) -> bool {
+    editor.workspace.rig.show_bones && editor.tool() == buzz_ui::ToolId::Bone
+}
+
 fn draw_rigs(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point) -> egui::Pos2) {
     // **Hidden means hidden.** A figure's skeleton covers most of its artwork,
     // and there is no way to draw on what is underneath while it is in the way.
@@ -858,8 +1182,49 @@ fn draw_rigs(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point)
     let frame = editor.current_frame;
     let scene = editor.scene();
     let selected = |id: buzz_scene::ObjectId| editor.selection.contains(id);
+    // **BM: bones only while the Bone tool is held.** With any other tool the
+    // armature is just an object, so its skeleton, joints and limit wedges are
+    // not drawn (and `Editor::begin_rig_gesture` does not find them either).
+    let segments = if bones_drawn(editor) {
+        crate::rigging::stage_segments(scene, frame)
+    } else {
+        Vec::new()
+    };
+    let arcs = if bones_drawn(editor) {
+        crate::rigging::stage_joint_arcs(scene, frame)
+    } else {
+        Vec::new()
+    };
 
-    for (object, segments) in crate::rigging::stage_segments(scene, frame) {
+    // **How far each limited joint may turn**, as a wedge at the joint, under
+    // the bones. Sized from the bone it belongs to, so a finger's wedge does
+    // not swamp the hand.
+    for (object, arcs) in arcs {
+        let colour = if selected(object) {
+            Palette::selection().gamma_multiply(0.4)
+        } else {
+            Color32::from_rgba_unmultiplied(255, 210, 90, 102)
+        };
+        let bones = segments
+            .iter()
+            .find(|(id, _)| *id == object)
+            .map(|(_, s)| s.as_slice())
+            .unwrap_or(&[]);
+        for (head, from, to, locked) in arcs {
+            if locked {
+                painter.circle_filled(to_screen(head), 4.0, colour);
+                continue;
+            }
+            let tip = bones
+                .iter()
+                .find(|(h, _)| (*h - head).hypot() <= 1e-9)
+                .map_or(head, |(_, t)| *t);
+            let radius = bone_width(editor, head, tip) * 2.5;
+            joint_wedge(painter, &to_screen, head, radius, from, to, colour);
+        }
+    }
+
+    for (object, segments) in segments {
         let colour = if selected(object) {
             Palette::selection()
         } else {
@@ -927,7 +1292,7 @@ fn draw_lights(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poin
         return;
     }
 
-    for gizmo in crate::lights::gizmos(editor.scene()) {
+    for gizmo in crate::lights::gizmos_at(editor.scene(), editor.frame()) {
         let [r, g, b, _] = gizmo.color.to_rgba8().to_u8_array();
         // A switched-off light still shows, dimmed: a handle that vanished
         // would leave a light nobody can find again.
@@ -979,6 +1344,11 @@ fn draw_lights(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poin
                 let edge = to_screen(at + Vec2::new(radius, 0.0));
                 // The reach ring, which is also a drag handle.
                 painter.circle_stroke(middle, edge.x - middle.x, Stroke::new(1.0, ghost));
+
+                // The reach knob on the ring: draggable to adjust reach falloff.
+                let reach_grip = if selected { 4.0 } else { 2.5 };
+                painter.circle_filled(edge, reach_grip, colour);
+                painter.circle_stroke(edge, reach_grip, Stroke::new(1.0, ink));
 
                 // **The stalk: how far in front of the stage the lamp hangs.**
                 //
@@ -1072,34 +1442,50 @@ fn draw_lights(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poin
 /// which scales; and anywhere outside the band. The band is the one
 /// `tools::transform_zone` turns in, so the mark cannot promise a gesture the
 /// release will not make.
-fn rotate_hint_at(rect: egui::Rect, pointer: egui::Pos2) -> Option<(egui::Pos2, f32)> {
-    if rect.contains(pointer) {
+///
+/// Takes the box's four screen corners (top-left, top-right, bottom-right,
+/// bottom-left of the box's own space) rather than a rectangle, because the box
+/// turns with a rotated selection and the arc has to turn with it: it is
+/// centred on the way out of the corner, which is the sum of the two edge
+/// directions leaving it — the diagonal for a rectangle, however it is turned.
+fn rotate_hint_at(corners: [egui::Pos2; 4], pointer: egui::Pos2) -> Option<(egui::Pos2, f32)> {
+    // Inside a convex quad, whichever way round it is wound: the pointer is on
+    // one side of every edge.
+    let sides: Vec<f32> = (0..4)
+        .map(|i| {
+            let (a, b) = (corners[i], corners[(i + 1) % 4]);
+            let (edge, rel) = (b - a, pointer - a);
+            edge.x * rel.y - edge.y * rel.x
+        })
+        .collect();
+    if sides.iter().all(|s| *s >= 0.0) || sides.iter().all(|s| *s <= 0.0) {
         return None;
     }
-    let corners = [
-        (rect.left_top(), std::f32::consts::PI),
-        (rect.right_top(), -std::f32::consts::FRAC_PI_2),
-        (rect.right_bottom(), 0.0),
-        (rect.left_bottom(), std::f32::consts::FRAC_PI_2),
-    ];
-    let (corner, from) = corners
-        .into_iter()
-        .min_by(|a, b| a.0.distance(pointer).total_cmp(&b.0.distance(pointer)))?;
+    let (index, corner) = corners.into_iter().enumerate().min_by(|a, b| {
+        a.1.distance(pointer)
+            .total_cmp(&b.1.distance(pointer))
+    })?;
 
     let grab = crate::tools::TRANSFORM_GRAB_PX as f32;
     let reach = corner.distance(pointer);
-    (reach > grab && reach <= grab * 3.0).then_some((corner, from))
+    if !(reach > grab && reach <= grab * 3.0) {
+        return None;
+    }
+    let outward = (corner - corners[(index + 3) % 4]).normalized()
+        + (corner - corners[(index + 1) % 4]).normalized();
+    let from = outward.y.atan2(outward.x) - std::f32::consts::FRAC_PI_4;
+    Some((corner, from))
 }
 
-fn draw_rotate_hint(painter: &egui::Painter, rect: egui::Rect, pointer: Option<egui::Pos2>) {
+fn draw_rotate_hint(painter: &egui::Painter, corners: [egui::Pos2; 4], pointer: Option<egui::Pos2>) {
     // Too small a selection has no room outside its corners for a ring.
-    if rect.width() < 34.0 || rect.height() < 34.0 {
+    if (corners[1] - corners[0]).length() < 34.0 || (corners[3] - corners[0]).length() < 34.0 {
         return;
     }
     let Some(pointer) = pointer else {
         return;
     };
-    let Some((corner, from)) = rotate_hint_at(rect, pointer) else {
+    let Some((corner, from)) = rotate_hint_at(corners, pointer) else {
         return;
     };
 
@@ -1144,6 +1530,42 @@ fn bone_width(editor: &Editor, head: Point, tip: Point) -> f64 {
     let zoom = editor.camera.zoom.max(f64::MIN_POSITIVE);
     let length = (tip - head).hypot();
     (length * 0.12).clamp(2.0 / zoom, 14.0 / zoom)
+}
+
+/// A filled sector about `centre`, from `from` to `to` (stage radians,
+/// clockwise), with its outline. Drawn as slices no wider than a quarter turn:
+/// egui fills only convex shapes correctly, and a joint's range can be most of
+/// a circle.
+fn joint_wedge(
+    painter: &egui::Painter,
+    to_screen: &impl Fn(Point) -> egui::Pos2,
+    centre: Point,
+    radius: f64,
+    from: f64,
+    to: f64,
+    colour: Color32,
+) {
+    const STEPS: usize = 8;
+    let span = (to - from).clamp(0.0, std::f64::consts::TAU);
+    let slices = ((span / std::f64::consts::FRAC_PI_2).ceil() as usize).max(1);
+    let at = |angle: f64| to_screen(centre + Vec2::new(angle.cos(), angle.sin()) * radius);
+    let hub = to_screen(centre);
+    let mut outline = vec![hub];
+    for slice in 0..slices {
+        let a0 = from + span * slice as f64 / slices as f64;
+        let a1 = from + span * (slice + 1) as f64 / slices as f64;
+        let mut points = vec![hub];
+        for step in 0..=STEPS {
+            let p = at(a0 + (a1 - a0) * step as f64 / STEPS as f64);
+            points.push(p);
+            if step > 0 || slice == 0 {
+                outline.push(p);
+            }
+        }
+        painter.add(egui::Shape::convex_polygon(points, colour, Stroke::NONE));
+    }
+    outline.push(hub);
+    painter.add(egui::Shape::line(outline, Stroke::new(1.0, colour)));
 }
 
 fn draw_preview(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Point) -> egui::Pos2) {
@@ -1351,35 +1773,41 @@ mod tests {
     #[test]
     fn the_rotate_mark_appears_on_the_corner_the_pointer_is_on() {
         let rect = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(300.0, 240.0));
+        let quad = [
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+        ];
         let grab = crate::tools::TRANSFORM_GRAB_PX as f32;
 
         // In the ring outside the top-left: the mark goes there.
         let at = egui::pos2(100.0 - grab * 1.4, 100.0 - grab * 1.4);
-        let (corner, _) = rotate_hint_at(rect, at).expect("the ring turns");
+        let (corner, _) = rotate_hint_at(quad, at).expect("the ring turns");
         assert_eq!(corner, rect.left_top(), "on the corner nearest the pointer");
 
         // And the far corner gets it when the pointer is there instead.
         let at = egui::pos2(300.0 + grab * 1.4, 240.0 + grab * 1.4);
-        let (corner, _) = rotate_hint_at(rect, at).expect("the ring turns");
+        let (corner, _) = rotate_hint_at(quad, at).expect("the ring turns");
         assert_eq!(corner, rect.right_bottom(), "not always the same corner");
 
         // Inside the box a drag moves the artwork.
         assert!(
-            rotate_hint_at(rect, rect.center()).is_none(),
+            rotate_hint_at(quad, rect.center()).is_none(),
             "no rotate mark over the artwork"
         );
 
         // On the handle itself, which scales rather than turns.
         let on_handle = egui::pos2(100.0 - grab * 0.4, 100.0 - grab * 0.4);
         assert!(
-            rotate_hint_at(rect, on_handle).is_none(),
+            rotate_hint_at(quad, on_handle).is_none(),
             "the handle scales; the mark must not claim it turns"
         );
 
         // And well outside, where a drag is a marquee.
         let far = egui::pos2(100.0 - grab * 6.0, 100.0 - grab * 6.0);
         assert!(
-            rotate_hint_at(rect, far).is_none(),
+            rotate_hint_at(quad, far).is_none(),
             "out here a drag marquees, and the mark must not say otherwise"
         );
     }
@@ -1571,5 +1999,252 @@ mod tests {
                 started.elapsed()
             );
         }
+    }
+
+    // -- Stage E: selection chrome ------------------------------------------
+
+    /// Every leaf shape painted, flattened out of the `Vec`s egui nests them in.
+    fn flatten(shapes: Vec<egui::epaint::ClippedShape>) -> Vec<egui::Shape> {
+        fn walk(shape: egui::Shape, out: &mut Vec<egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(inner) => inner.into_iter().for_each(|s| walk(s, out)),
+                other => out.push(other),
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// One frame of chrome for `editor`, as the shapes the painter was handed.
+    fn painted(editor: &Editor) -> Vec<egui::Shape> {
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+            let _ = draw_chrome(ui, editor, area);
+        });
+        flatten(output.shapes)
+    }
+
+    /// The transform handles: the filled 6-point squares of Free Transform (each
+    /// is a filled square with an outline over it; the fills are counted).
+    fn handle_squares(shapes: &[egui::Shape]) -> usize {
+        shapes
+            .iter()
+            .filter(|s| match s {
+                egui::Shape::Rect(r) => {
+                    (r.rect.width() - 6.0).abs() < 0.01
+                        && (r.rect.height() - 6.0).abs() < 0.01
+                        && r.fill == Palette::handle_fill()
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// The transformation point and the Selection tool's old round handles.
+    fn round_marks(shapes: &[egui::Shape]) -> usize {
+        shapes
+            .iter()
+            .filter(|s| matches!(s, egui::Shape::Circle(c) if (c.radius - 4.5).abs() < 0.01))
+            .count()
+    }
+
+    /// The hatch: a mesh of dots in the selection colour.
+    fn hatches(shapes: &[egui::Shape]) -> usize {
+        shapes
+            .iter()
+            .filter(|s| match s {
+                egui::Shape::Mesh(m) => {
+                    m.vertices.len() >= 4
+                        && m.vertices.iter().all(|v| v.color == Palette::selection())
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// Closed outlines in the selection colour: a box round something.
+    fn outlines(shapes: &[egui::Shape]) -> usize {
+        shapes
+            .iter()
+            .filter(|s| match s {
+                egui::Shape::Path(p) => {
+                    p.points.len() == 5
+                        && p.points[0] == p.points[4]
+                        && matches!(&p.stroke.color, egui::epaint::ColorMode::Solid(c)
+                            if *c == Palette::selection())
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// The editor's one shape, selected, with `tool` in hand.
+    fn with_the_art_selected(tool: buzz_ui::ToolId) -> Editor {
+        let mut editor = editor_with_art();
+        editor.set_tool(tool);
+        let id = editor
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter())
+            .map(|o| o.id)
+            .next()
+            .expect("the art");
+        editor.selection.select_one(id);
+        editor
+    }
+
+    /// **E1 + E2. The Selection tool dots a selected shape and draws nothing
+    /// else on it** — no box, no handles, no rotate ring, no transformation
+    /// point.
+    #[test]
+    fn the_selection_tool_hatches_a_shape_and_draws_no_gizmo() {
+        let editor = with_the_art_selected(buzz_ui::ToolId::Selection);
+        let shapes = painted(&editor);
+        assert_eq!(hatches(&shapes), 1, "the shape is dotted");
+        assert_eq!(handle_squares(&shapes), 0, "no square handles");
+        assert_eq!(round_marks(&shapes), 0, "no round handles, no transformation point");
+        assert_eq!(outlines(&shapes), 0, "and no box round it");
+    }
+
+    /// **E1 + E2. Free Transform dots it too, and adds its box** — the outline,
+    /// the eight handles and the transformation point.
+    #[test]
+    fn free_transform_hatches_a_shape_and_adds_its_gizmo() {
+        let editor = with_the_art_selected(buzz_ui::ToolId::FreeTransform);
+        let shapes = painted(&editor);
+        assert_eq!(hatches(&shapes), 1, "the shape is dotted");
+        assert_eq!(handle_squares(&shapes), 8, "eight handles");
+        assert!(round_marks(&shapes) >= 1, "the transformation point");
+        assert!(outlines(&shapes) >= 1, "the box");
+    }
+
+    /// **E1. A selected instance is a thin solid outline under the arrow** — not
+    /// dotted (it is not a raw shape) and not dashed, which is the old look.
+    #[test]
+    fn the_selection_tool_outlines_an_instance_and_does_not_hatch_it() {
+        let mut editor = Editor::default();
+        editor.camera.viewport = buzz_geom::Size::new(1000.0, 800.0);
+        let layer = editor.selection.active_layer().unwrap();
+        let mut instance = None;
+        editor.doc.edit("Build", |scene| {
+            let symbol = scene.add_symbol("Part", buzz_scene::SymbolKind::Graphic, None);
+            let inner = scene
+                .library()
+                .get(symbol)
+                .and_then(|s| s.layers.iter().next())
+                .map(|l| l.id)
+                .expect("a layer inside the symbol");
+            let art = buzz_scene::Object::shape(
+                scene.next_object_id(),
+                ShapeData::filled(KRect::new(0.0, 0.0, 80.0, 60.0).to_path(1e-9), Color::WHITE),
+            );
+            scene.library_mut().update(symbol, |s| {
+                s.layers.update(inner, |l| {
+                    l.frames.set_objects(0, vec![std::sync::Arc::new(art)]);
+                });
+            });
+            instance = scene.add_instance_at(layer, 0, symbol, Affine::translate((50.0, 50.0)));
+        });
+        editor.set_tool(buzz_ui::ToolId::Selection);
+        editor.selection.select_one(instance.expect("an instance"));
+
+        let shapes = painted(&editor);
+        assert_eq!(hatches(&shapes), 0, "an instance is not dotted");
+        assert_eq!(outlines(&shapes), 1, "it is outlined on its drawn corners");
+        assert_eq!(handle_squares(&shapes) + round_marks(&shapes), 0, "with nothing to grab");
+    }
+
+    /// **E2. Cost.** A 50-shape selection is hatched inside a frame's budget:
+    /// the geometry, the mesh and egui's tessellation of it, and the chrome as
+    /// a whole against the same frame with nothing selected. Prints what it
+    /// measured (`--nocapture`).
+    #[test]
+    fn fifty_selected_shapes_hatch_inside_a_frame() {
+        let mut editor = Editor::default();
+        editor.camera.viewport = buzz_geom::Size::new(1000.0, 800.0);
+        editor.camera.set_zoom_percent(100.0);
+        editor.camera.center = Point::new(450.0, 300.0);
+        let layer = editor.selection.active_layer().unwrap();
+        let mut ids = Vec::new();
+        editor.doc.edit("Build", |scene| {
+            for i in 0..50 {
+                let (col, row) = ((i % 10) as f64, (i / 10) as f64);
+                // Curved outlines, as real artwork is, and big enough to show.
+                let path = kurbo::Circle::new(Point::new(50.0 + col * 85.0, 50.0 + row * 110.0), 38.0)
+                    .to_path(0.05);
+                ids.extend(scene.add_shape(layer, ShapeData::filled(path, Color::WHITE)));
+            }
+        });
+        assert_eq!(ids.len(), 50);
+        editor.set_tool(buzz_ui::ToolId::Selection);
+        let camera = editor.camera.clone();
+        let to_screen = move |p: Point| {
+            let s = camera.doc_to_screen(p);
+            egui::pos2(s.x as f32, s.y as f32)
+        };
+        let clip = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+
+        let per_frame = |f: &mut dyn FnMut()| -> f64 {
+            // One to warm anything lazy, then the mean of twenty.
+            f();
+            let started = std::time::Instant::now();
+            for _ in 0..20 {
+                f();
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / 20.0
+        };
+
+        editor.selection.set(ids.clone());
+        let mut dots = 0;
+        let outline_ms = per_frame(&mut || {
+            let drawn = editor.selected_drawn_shapes();
+            assert_eq!(drawn.len(), 50);
+        });
+        let geometry_ms = per_frame(&mut || {
+            let drawn = editor.selected_drawn_shapes();
+            dots = crate::hatch::selection_dots(&drawn, editor.camera.zoom, &to_screen, clip).len();
+        });
+        let drawn = editor.selected_drawn_shapes();
+        let all_dots = crate::hatch::selection_dots(&drawn, editor.camera.zoom, &to_screen, clip);
+        let mesh_ms = per_frame(&mut || {
+            let _ = crate::hatch::dots_mesh(&all_dots, Palette::selection());
+        });
+
+        // The frame as a whole, with and without the selection.
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let frame_ms = |editor: &Editor| -> f64 {
+            per_frame(&mut || {
+                let output = ctx.run_ui(Default::default(), |ui| {
+                    let _ = draw_chrome(ui, editor, clip);
+                });
+                let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+            })
+        };
+        let with_selection = frame_ms(&editor);
+        editor.selection.clear();
+        let without = frame_ms(&editor);
+
+        eprintln!(
+            "HATCH COST, 50 selected shapes, {dots} dots: flatten+project {outline_ms:.3} ms, \
+             +dot geometry {geometry_ms:.3} ms (geometry alone {:.3}), mesh {mesh_ms:.3} ms, \
+             chrome+tessellate frame {with_selection:.3} ms vs {without:.3} ms unselected \
+             (hatch adds {:.3} ms)",
+            geometry_ms - outline_ms,
+            with_selection - without
+        );
+        assert!(dots > 1000, "the shapes were dotted: {dots}");
+        assert!(dots <= crate::hatch::MAX_DOTS, "inside the budget: {dots}");
+        assert!(
+            with_selection - without < 40.0,
+            "the hatch added {:.1} ms to a frame",
+            with_selection - without
+        );
     }
 }

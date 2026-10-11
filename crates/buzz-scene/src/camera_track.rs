@@ -310,6 +310,11 @@ pub struct FocusKey {
 pub struct CameraTrack {
     /// Off by default. Animate hides the camera until you enable it.
     pub enabled: bool,
+    /// The camera row's own padlock. A locked camera refuses `MoveCamera`,
+    /// keyframe add/remove and the named camera moves — the same protection
+    /// a locked layer gets, so a shot already cut cannot be nudged by a stray
+    /// drag. Defaulted on load: an older file's camera opens unlocked.
+    pub locked: bool,
     /// Distance from the camera to the depth-zero plane.
     ///
     /// This is what turns a layer's depth into a size: the smaller it is, the
@@ -363,6 +368,7 @@ impl Default for CameraTrack {
     fn default() -> Self {
         Self {
             enabled: false,
+            locked: false,
             focal_distance: DEFAULT_FOCAL_DISTANCE,
             aperture: 0.0,
             focus_depth: 0.0,
@@ -571,13 +577,7 @@ impl CameraTrack {
     /// Returns `false` and writes nothing for an empty or backwards span, which
     /// is the one case where two keys would land on the same frame and the
     /// second would silently replace the first.
-    pub fn add_move(
-        &mut self,
-        movement: CameraMove,
-        from: u32,
-        to: u32,
-        stage: Rect,
-    ) -> bool {
+    pub fn add_move(&mut self, movement: CameraMove, from: u32, to: u32, stage: Rect) -> bool {
         if to <= from {
             return false;
         }
@@ -777,6 +777,7 @@ impl CameraTrack {
         keys.dedup_by_key(|k| k.frame);
         Self {
             enabled,
+            locked: false,
             // A file written before depth existed, or a corrupt one, must not
             // produce a camera sitting on the artwork.
             focal_distance: if focal_distance.is_finite() && focal_distance > 0.0 {
@@ -829,7 +830,9 @@ impl CameraTrack {
             return FocusKey { frame, ..last };
         }
 
-        let after = self.focus_keys.partition_point(|k| (k.frame as f64) <= time);
+        let after = self
+            .focus_keys
+            .partition_point(|k| (k.frame as f64) <= time);
         let a = self.focus_keys[after - 1];
         let b = self.focus_keys[after];
         let span = (b.frame - a.frame) as f64;
@@ -1070,7 +1073,10 @@ mod tests {
 
         let mut t = track();
         t.add_move(CameraMove::PanLeft, 0, 48, move_stage());
-        assert!(t.keys()[1].center.x < t.keys()[0].center.x, "the pan did not go left");
+        assert!(
+            t.keys()[1].center.x < t.keys()[0].center.x,
+            "the pan did not go left"
+        );
     }
 
     /// **A deliberate move is eased at both ends; a drift is not.**
@@ -1146,7 +1152,10 @@ mod tests {
         });
         t.add_move(CameraMove::PushIn, 0, 48, move_stage());
         assert_eq!(t.keys()[0].center, Point::new(300.0, 200.0));
-        assert!(t.keys()[1].zoom > 2.0, "it did not start from the 2x it was on");
+        assert!(
+            t.keys()[1].zoom > 2.0,
+            "it did not start from the 2x it was on"
+        );
     }
 
     #[test]
@@ -1181,11 +1190,17 @@ mod tests {
 
         assert_eq!(offsets.len(), 8);
         let mean: f64 = offsets.iter().sum::<f64>() / offsets.len() as f64;
-        assert!(mean.abs() < 1e-9, "the instants average to the frame: {mean}");
+        assert!(
+            mean.abs() < 1e-9,
+            "the instants average to the frame: {mean}"
+        );
 
         let first = offsets[0];
         let last = offsets[offsets.len() - 1];
-        assert!(first < 0.0 && last > 0.0, "they straddle it: {first}..{last}");
+        assert!(
+            first < 0.0 && last > 0.0,
+            "they straddle it: {first}..{last}"
+        );
         assert!(
             first > -0.25 && last < 0.25,
             "and stay inside the open shutter: {first}..{last}"
@@ -1250,7 +1265,10 @@ mod tests {
         assert_eq!(track.dof_blur_at(0, 0.0), None, "the focus plane is sharp");
         let near = track.dof_blur_at(0, 200.0).expect("out of focus");
         let far = track.dof_blur_at(0, 800.0).expect("further out of focus");
-        assert!(far > near, "further from focus should blur more: {near} vs {far}");
+        assert!(
+            far > near,
+            "further from focus should blur more: {near} vs {far}"
+        );
     }
 
     /// The whole point of the static fields staying: a document that never
@@ -1287,14 +1305,24 @@ mod tests {
 
         // The layer sitting at depth 600: in focus at the start, out of it by
         // the end.
-        assert_eq!(track.dof_blur_at(0, 600.0), None, "sharp where the focus is");
+        assert_eq!(
+            track.dof_blur_at(0, 600.0),
+            None,
+            "sharp where the focus is"
+        );
         let pulled = track
             .dof_blur_at(24, 600.0)
             .expect("the focus has left this layer behind");
-        assert!(pulled > 1.0, "a full pull should be a real blur, got {pulled}");
+        assert!(
+            pulled > 1.0,
+            "a full pull should be a real blur, got {pulled}"
+        );
 
         // And the foreground it travelled to does the reverse.
-        assert!(track.dof_blur_at(0, 0.0).is_some(), "foreground starts soft");
+        assert!(
+            track.dof_blur_at(0, 0.0).is_some(),
+            "foreground starts soft"
+        );
         assert_eq!(track.dof_blur_at(24, 0.0), None, "and ends sharp");
     }
 
@@ -1312,7 +1340,11 @@ mod tests {
             aperture: 0.02,
         });
 
-        assert_eq!(track.focus_at(0).focus_depth, 100.0, "held before the first");
+        assert_eq!(
+            track.focus_at(0).focus_depth,
+            100.0,
+            "held before the first"
+        );
         assert_eq!(track.focus_at(99).focus_depth, 200.0, "held after the last");
         let middle = track.focus_at(15);
         assert!(
@@ -1332,9 +1364,21 @@ mod tests {
     fn loaded_focus_keys_are_sorted_and_sane() {
         let mut track = CameraTrack::new();
         track.set_focus_keys(vec![
-            FocusKey { frame: 20, focus_depth: 200.0, aperture: 0.02 },
-            FocusKey { frame: 0, focus_depth: 0.0, aperture: -1.0 },
-            FocusKey { frame: 20, focus_depth: 999.0, aperture: 0.5 },
+            FocusKey {
+                frame: 20,
+                focus_depth: 200.0,
+                aperture: 0.02,
+            },
+            FocusKey {
+                frame: 0,
+                focus_depth: 0.0,
+                aperture: -1.0,
+            },
+            FocusKey {
+                frame: 20,
+                focus_depth: 999.0,
+                aperture: 0.5,
+            },
         ]);
         let frames: Vec<u32> = track.focus_keys().iter().map(|k| k.frame).collect();
         assert_eq!(frames, vec![0, 20], "sorted, one key per frame");
@@ -1348,9 +1392,16 @@ mod tests {
     #[test]
     fn a_focus_key_can_be_replaced_and_removed() {
         let mut track = CameraTrack::new();
-        let key = FocusKey { frame: 5, focus_depth: 1.0, aperture: 0.1 };
+        let key = FocusKey {
+            frame: 5,
+            focus_depth: 1.0,
+            aperture: 0.1,
+        };
         track.set_focus_key(key);
-        track.set_focus_key(FocusKey { focus_depth: 2.0, ..key });
+        track.set_focus_key(FocusKey {
+            focus_depth: 2.0,
+            ..key
+        });
         assert_eq!(track.focus_keys().len(), 1, "re-keying replaces");
         assert_eq!(track.focus_keys()[0].focus_depth, 2.0);
         assert!(track.has_focus_key_at(5));
@@ -1742,7 +1793,10 @@ mod tests {
             // Never *behind* the stage. It reaches zero only for a lens sitting
             // on the near plane, where there is honestly no room in front of it
             // — no control offers that, but a file or a script can.
-            assert!(nearest <= 0.0, "the bound is never behind the stage: {focal}");
+            assert!(
+                nearest <= 0.0,
+                "the bound is never behind the stage: {focal}"
+            );
             assert!(
                 track.depth_scale(nearest).is_some(),
                 "a layer at the bound must still draw, at focal {focal}"

@@ -34,6 +34,129 @@
     );
   }
 
+  // ---- one element, on a frame ----------------------------------------------
+  //
+  // Bound to the element's id and the frame it was fetched on, not to a
+  // layer index: an id alone finds the layer, and the frame is what tells
+  // two keyframes sharing that id apart once `insertKeyframe` (Animate's F6)
+  // has cloned one onto a second span with its own edits. Every property
+  // re-reads the host on each access, so an element stays live across edits
+  // made through a different one, exactly as JSFL's own elements do.
+  function elementInfo(id, frame) {
+    return JSON.parse(host.elementDescribe(id, frame));
+  }
+  function Element(id, frame) {
+    Object.defineProperties(this, {
+      // Not part of JSFL's own Element — BuzzAnimate's way of letting
+      // `document.selection = [el]` and `doc.enterEditMode(...)` name which
+      // object an Element stands for, without inventing a public property
+      // Animate does not have.
+      __objectId: { value: id },
+      __frame: { value: frame },
+      elementType: {
+        get: function () { return elementInfo(id, frame).elementType; },
+        enumerable: true,
+      },
+      symbolType: {
+        get: function () { return elementInfo(id, frame).symbolType; },
+        enumerable: true,
+      },
+      libraryItem: {
+        get: function () {
+          var info = elementInfo(id, frame);
+          if (!info.libraryItemName) return null;
+          return {
+            name: info.libraryItemName,
+            itemType: info.libraryItemType,
+            // Only `.frameCount` is real: a nested `Timeline` over the
+            // symbol's own layers is not exposed here, and no ported
+            // command reads more than this one number off it.
+            timeline: { frameCount: info.libraryFrameCount },
+          };
+        },
+        enumerable: true,
+      },
+      x: {
+        get: function () { return elementInfo(id, frame).x; },
+        set: function (v) { host.setElementXY(id, frame, Number(v), NaN); },
+        enumerable: true,
+      },
+      y: {
+        get: function () { return elementInfo(id, frame).y; },
+        set: function (v) { host.setElementXY(id, frame, NaN, Number(v)); },
+        enumerable: true,
+      },
+      matrix: {
+        get: function () {
+          var info = elementInfo(id, frame);
+          return { a: info.a, b: info.b, c: info.c, d: info.d, tx: info.tx, ty: info.ty };
+        },
+        set: function (m) {
+          var mm = m || {};
+          host.setElementMatrix(id, frame, JSON.stringify([
+            Number(mm.a), Number(mm.b), Number(mm.c),
+            Number(mm.d), Number(mm.tx), Number(mm.ty),
+          ]));
+        },
+        enumerable: true,
+      },
+      // Which frame of the symbol's own timeline this instance shows.
+      // `undefined` on anything that is not an instance, matching JSFL.
+      firstFrame: {
+        get: function () { return elementInfo(id, frame).firstFrame; },
+        set: function (v) { host.setElementFirstFrame(id, frame, Number(v)); },
+        enumerable: true,
+      },
+    });
+  }
+  Element.prototype.getTransformationPoint = function () {
+    return JSON.parse(host.elementTransformationPoint(this.__objectId, this.__frame));
+  };
+
+  // ---- one frame, on one layer ----------------------------------------------
+  function Frame(layerIndex, frame) {
+    Object.defineProperties(this, {
+      isKeyframe: {
+        get: function () { return host.frameIsKeyframe(layerIndex, frame); },
+        enumerable: true,
+      },
+      startFrame: {
+        get: function () { return host.frameStart(layerIndex, frame); },
+        enumerable: true,
+      },
+      duration: {
+        get: function () { return host.frameDuration(layerIndex, frame); },
+        enumerable: true,
+      },
+      // "none" | "classic" | "motion" | "shape". Assignable, as the ported
+      // commands assign it directly (`frame.tweenType = "none"`) rather than
+      // going through `document.setTween`.
+      tweenType: {
+        get: function () { return host.frameTweenKind(layerIndex, frame); },
+        set: function (v) { host.setFrameTweenKind(layerIndex, frame, String(v)); },
+        enumerable: true,
+      },
+      // `{name, sourceFilePath}` if a sound starts on this keyframe, else
+      // `null`. BuzzAnimate's sound library holds decoded audio rather than
+      // a path on disk, so `sourceFilePath` is a synthesised `file:///name`
+      // — enough to pull a base name from, which is all any ported command
+      // does with it.
+      soundLibraryItem: {
+        get: function () { return JSON.parse(host.frameSoundInfo(layerIndex, frame)); },
+        enumerable: true,
+      },
+      elements: {
+        get: function () {
+          var ids = JSON.parse(host.frameElementIds(layerIndex, frame));
+          var out = [];
+          for (var i = 0; i < ids.length; i++) out.push(new Element(ids[i], frame));
+          return out;
+        },
+        enumerable: true,
+      },
+    });
+  }
+
   // ---- one layer ----------------------------------------------------------
   function Layer(index) {
     Object.defineProperties(this, {
@@ -58,6 +181,39 @@
       depth: {
         get: function () { return host.layerDepth(index); },
         set: function (v) { host.setLayerDepth(index, Number(v)); },
+        enumerable: true,
+      },
+      // "normal" | "folder" | "mask" | "masked" | "guide" | "guided" — the
+      // check almost every one of the ported commands starts a layer loop
+      // with, to skip folders.
+      layerType: {
+        get: function () { return host.layerType(index); },
+        enumerable: true,
+      },
+      // The enclosing folder, as a Layer, or null — Animate's own shape, so
+      // `layer.parentFolder !== null` reads the way the originals wrote it.
+      parentFolder: {
+        get: function () {
+          var p = host.layerParentIndex(index);
+          return p < 0 ? null : new Layer(p);
+        },
+        enumerable: true,
+      },
+      // This layer's own frame count, distinct from the timeline's
+      // document-wide `frameCount` below.
+      frameCount: {
+        get: function () { return host.layerFrameCount(index); },
+        enumerable: true,
+      },
+      // `layer.frames[f]`: one Frame per frame on this layer, rebuilt on
+      // each access for the same reason `Timeline.layers` below is.
+      frames: {
+        get: function () {
+          var count = host.layerFrameCount(index);
+          var out = [];
+          for (var f = 0; f < count; f++) out.push(new Frame(index, f));
+          return out;
+        },
         enumerable: true,
       },
     });
@@ -100,19 +256,71 @@
   Timeline.prototype.deleteLayer = function (index) {
     host.deleteLayer(index === undefined ? 0 : Number(index));
   };
-  Timeline.prototype.insertFrames = function (count) {
-    host.insertFrames(count === undefined ? 1 : Number(count));
+  // `insertFrames(numFrames, allLayers, frameIndex)` — every argument past
+  // the first is optional, as in JSFL. With none of them the frame is
+  // wherever `setSelectedFrames` last pointed (or the active layer's current
+  // frame, if it never has); with `frameIndex` given, that is where the
+  // insertion happens instead.
+  Timeline.prototype.insertFrames = function (count, allLayers, atFrame) {
+    host.insertFramesAt(
+      count === undefined ? 1 : Number(count),
+      !!allLayers,
+      atFrame === undefined ? -1 : Number(atFrame)
+    );
   };
-  Timeline.prototype.insertKeyframe = function () {
-    host.insertKeyframe();
+  // `insertKeyframe(frameIndex)` — the frame is optional; left off, it is
+  // wherever the playhead is.
+  Timeline.prototype.insertKeyframe = function (frame) {
+    host.insertKeyframeAt(frame === undefined ? -1 : Number(frame));
   };
-  Timeline.prototype.insertBlankKeyframe = function () {
-    host.insertBlankKeyframe();
+  Timeline.prototype.insertBlankKeyframe = function (frame) {
+    host.insertBlankKeyframeAt(frame === undefined ? -1 : Number(frame));
   };
   // Animate's name for the same thing.
-  Timeline.prototype.convertToBlankKeyframes = function () {
-    host.insertBlankKeyframe();
+  Timeline.prototype.convertToBlankKeyframes = function (frame) {
+    host.insertBlankKeyframeAt(frame === undefined ? -1 : Number(frame));
   };
+
+  // ---- the timeline's own selection ----------------------------------------
+  //
+  // What `removeFrames`, `clearKeyframes`, `copyFrames`, `pasteFrames` and
+  // `createMotionTween` below all act on, exactly as their JSFL originals
+  // act on Animate's own timeline selection rather than on an argument.
+  Timeline.prototype.setSelectedLayers = function (indexOrArray) {
+    var arr = Array.isArray(indexOrArray) ? indexOrArray : [indexOrArray];
+    host.setSelectedLayers(JSON.stringify(arr.map(Number)));
+  };
+  // Two shapes, both Animate's own: `setSelectedFrames(start, end)` on the
+  // layer `setSelectedLayers` last named, or
+  // `setSelectedFrames([layer, start, end, layer2, start2, end2, ...], replace)`
+  // naming a layer per range. `end` is exclusive — one past the last frame in
+  // the range — which is also what `getSelectedFrames` returns, so a value it
+  // gave back can be handed straight to this. The trailing `replace` flag
+  // this takes in JSFL is accepted and ignored: nothing here ever adds to an
+  // existing selection instead of replacing it.
+  Timeline.prototype.setSelectedFrames = function (a, b) {
+    if (Array.isArray(a)) {
+      host.setSelectedFramesArray(JSON.stringify(a.map(Number)));
+    } else {
+      var start = Number(a);
+      var end = b === undefined ? start + 1 : Number(b);
+      host.setSelectedFramesRange(start, end);
+    }
+  };
+  // The flat `[layer, start, end, layer2, start2, end2, ...]` array Animate
+  // returns, `end` exclusive.
+  Timeline.prototype.getSelectedFrames = function () {
+    return JSON.parse(host.getSelectedFrames());
+  };
+  Timeline.prototype.removeFrames = function () { host.removeFrames(); };
+  Timeline.prototype.clearKeyframes = function () { host.clearKeyframes(); };
+  Timeline.prototype.copyFrames = function () { host.copyFrames(); };
+  Timeline.prototype.pasteFrames = function () { host.pasteFrames(); };
+  // A classic tween across the selected span — see the note on `createMotionTween`
+  // in `docs/TIMELINE_LIGHTS_FOLDERS_PLAN.md`'s Impl J: named for JSFL's own
+  // call, which every one of the ported commands uses to mean the purple
+  // Classic Tween rather than Animate's newer Motion Tween.
+  Timeline.prototype.createMotionTween = function () { host.createMotionTween(); };
 
   // ---- the library --------------------------------------------------------
   function Library() {
@@ -163,18 +371,41 @@
         set: function (v) { host.setBackgroundColor(String(v)); },
         enumerable: true,
       },
-      // An array of the selected items. Length is what scripts overwhelmingly
-      // use it for, and it is the part we can answer honestly today.
+      // The selected elements, as real Elements — evaluated at the playhead,
+      // which is where a script that reads `document.selection` is looking.
+      // Assignable too: `document.selection = [el, ...]` is how a ported
+      // command hands `enterEditMode` something to enter, exactly as it does
+      // in Animate.
       selection: {
         get: function () {
+          var ids = JSON.parse(host.selectionIds());
+          var frame = host.currentFrame();
           var out = [];
-          for (var i = 0; i < host.selectionCount(); i++) out.push({ index: i });
+          for (var i = 0; i < ids.length; i++) out.push(new Element(ids[i], frame));
           return out;
+        },
+        set: function (list) {
+          var arr = list || [];
+          var ids = [];
+          for (var i = 0; i < arr.length; i++) {
+            var e = arr[i];
+            if (e && typeof e.__objectId === "number") ids.push(e.__objectId);
+          }
+          host.setSelectionIds(JSON.stringify(ids));
         },
         enumerable: true,
       },
       library: { value: new Library(), enumerable: true },
+      // `doc.timelines[0]` — Animate's root timeline, alongside every symbol
+      // a script may be editing in place. Simplified here to the timeline
+      // currently open for editing: every one of the ported commands reads
+      // this before it ever calls `enterEditMode`, at which point the two
+      // are the same thing anyway.
+      timelines: { value: [], enumerable: true, writable: true },
     });
+    // Not `this.getTimeline()`: that is defined further down this same
+    // constructor, and this line runs before it would exist.
+    this.timelines[0] = new Timeline();
 
     this.setFillColor = function (colour) {
       fill = colour === null || colour === undefined ? "" : String(colour);
@@ -204,6 +435,15 @@
       }
       host.moveSelectionBy(Number(delta.x) || 0, Number(delta.y) || 0);
     };
+
+    // Open the selected symbol instance's own timeline for editing —
+    // `'inPlace'` where the instance sits, or Animate's plain Edit Symbol
+    // (at the origin) for anything else. `document.selection` must name
+    // exactly the one instance to enter, as it does in Animate.
+    this.enterEditMode = function (mode) {
+      host.enterEditMode(mode === undefined ? "" : String(mode));
+    };
+    this.exitEditMode = function () { host.exitEditMode(); };
 
     this.convertToSymbol = function (type, name) {
       host.convertToSymbol(
@@ -562,10 +802,41 @@
       }
       return fn.apply(null, Array.prototype.slice.call(arguments, 2));
     },
+
+    // The nearest thing to Animate's menu a script gets: BuzzAnimate has no
+    // menu for a script to press, so this reads the *name* of the three
+    // commands the ported shelf actually calls (always as a fallback, after
+    // a direct call already did the same thing) and does that action on the
+    // timeline's current selection instead of leaving it a silent no-op.
+    // Anything else is accepted and does nothing, exactly as an unhandled
+    // menu name would if Animate's own dispatch swallowed it.
+    runMenuCommand: function (name) {
+      host.runMenuCommand(String(name === undefined ? "" : name));
+    },
+
+    // Animate dims the whole application while a script runs, so long ones
+    // do not look hung. BuzzAnimate already shows its own "running" overlay
+    // around the whole script, so this is a no-op rather than a second one.
+    showIdleMessage: function () {},
   };
   // Animate routes trace through the Output panel; scripts written against it
   // sometimes call it that way.
   fl.outputPanel = { trace: fl.trace, clear: function () {} };
+
+  // A script cannot reach the file system — that is the sandbox, and it
+  // stays — so `FLfile` only ever sees the same one folder `fl.runScript`
+  // does. None of the six ported commands call anything on `FLfile` but
+  // `.exists`, from a helper function none of them actually reaches; the
+  // rest are stubs so a shelf that does reach them fails on what it tried to
+  // do rather than on `FLfile` not existing at all.
+  globalThis.FLfile = {
+    exists: function (uri) {
+      return host.scriptExists(String(uri === undefined ? "" : uri));
+    },
+    uriToPlatformPath: function (uri) { return String(uri === undefined ? "" : uri); },
+    platformPathToURI: function (path) { return String(path === undefined ? "" : path); },
+    listFolder: function () { return []; },
+  };
 
   // ---- the dialogs a JSFL script expects ----------------------------------
   //
@@ -584,10 +855,14 @@
   // Animate's own spelling of the same thing.
   fl.alert = globalThis.alert;
 
+  // A real question, distinct from `alert`/`confirm` above: a caller may
+  // answer it. Unattended, this answers with `initial` exactly as it always
+  // has; a caller that first ran the script to find out what it would ask
+  // (see `ScriptContext::prompt_answers`) passes the person's own answers
+  // back in, one per call, in the order the script asks them.
   globalThis.prompt = function (message, initial) {
-    var answer = initial === undefined || initial === null ? "" : String(initial);
-    host.askedWith(message === undefined ? "" : String(message), answer);
-    return answer;
+    var fallback = initial === undefined || initial === null ? "" : String(initial);
+    return host.prompt(message === undefined ? "" : String(message), fallback);
   };
 
   // **Yes, because No means the script does nothing.** These are the user's

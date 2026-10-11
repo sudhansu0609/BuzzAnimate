@@ -29,6 +29,23 @@ use peniko::Color;
 
 use crate::{Light, LightKind};
 
+/// **Which way a light lies, for [`ShadeModel::Form`]**: the planar direction
+/// [`crescent_direction`] already answers, plus `lz` — how square-on the
+/// light strikes, in `-1..=1`. See [`Light::aim_at`].
+///
+/// [`ShadeModel::Form`]: crate::ShadeModel::Form
+/// [`Light::aim_at`]: crate::Light::aim_at
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Aim3 {
+    /// Which way the light lies across the picture. Not necessarily a unit
+    /// vector; only its direction is read, exactly as [`crescent_direction`]'s
+    /// result is.
+    pub planar: Vec2,
+    /// How square-on the light strikes: `1` dead in front, `0` exactly to the
+    /// side, `-1` directly behind.
+    pub lz: f64,
+}
+
 /// Everything one light generates for one shape.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ShadeGeometry {
@@ -100,6 +117,173 @@ const HARD_SHADE_WIDTH: f64 = 0.3;
 /// At the top the ramp spans the band, which is a window on an overcast day.
 pub fn shade_feather(softness: f64) -> f64 {
     softness.clamp(0.0, 1.0)
+}
+
+/// **The shaded fraction of the form's diameter, from geometry alone** — the
+/// width [`ShadeModel::Form`] shades with instead of [`shade_width`].
+///
+/// On a sphere lit from `lz`, the dark part of the visible disc is a band
+/// `R · (1 − lz)` thick along the light's own axis, where `R` is the radius —
+/// so as a fraction of the *diameter* that is `(1 − lz) / 2`: nothing at
+/// `lz = 1` (the light square in front), half at `lz = 0` (exactly to the
+/// side), the whole form at `lz = −1` (directly behind). Clamped to the same
+/// `0.9` ceiling [`shade_width`] uses, for the same reason: a band that
+/// reaches the shape's own far edge has nothing left to difference against.
+///
+/// [`ShadeModel::Form`]: crate::ShadeModel::Form
+pub fn form_shade_width(lz: f64) -> f64 {
+    ((1.0 - lz) * 0.5).clamp(0.0, 0.9)
+}
+
+/// [`form_shade_width`], mirrored: how much of the form a light **behind** it
+/// lights, rather than shades. `(1 + lz) / 2` — nothing at `lz = 1`, half at
+/// `lz = 0`, the whole form at `lz = −1` (the light dead behind, lighting the
+/// whole rim). Continuous with `form_shade_width` at `lz = 0`, which is the
+/// point: a light swinging from the front to the back thins one band to
+/// nothing exactly as it grows the other from nothing.
+pub fn form_lit_width(lz: f64) -> f64 {
+    ((1.0 + lz) * 0.5).clamp(0.0, 0.9)
+}
+
+/// **The narrowest a [`ShadeModel::Form`] band is allowed before it is treated
+/// as gone.** Below this the band has vanished — a light close enough to
+/// square-on the front that there is nothing left to draw a terminator with —
+/// and every `_form` builder below returns `None` rather than a sliver too
+/// thin to read as shading.
+///
+/// [`ShadeModel::Form`]: crate::ShadeModel::Form
+const FORM_BAND_FLOOR: f64 = 0.02;
+
+/// [`shade_crescent`], for [`ShadeModel::Form`]: the width comes from `lz`
+/// (see [`form_shade_width`]) rather than from softness, so a hard light
+/// still darkens exactly half a form at `lz = 0` instead of the narrowest
+/// sliver [`shade_width`]'s floor allows. `planar` is which way the light
+/// lies across the picture — [`Aim3::planar`] — and need not be a unit
+/// vector. `None` below [`FORM_BAND_FLOOR`]: a light close enough to the
+/// front that there is no terminator to draw, which is also true of every
+/// `lz < 0.0` — see [`crescents_form`] for what a light behind the figure
+/// draws instead.
+///
+/// [`ShadeModel::Form`]: crate::ShadeModel::Form
+pub fn shade_crescent_form(path: &BezPath, planar: Vec2, lz: f64) -> Option<BezPath> {
+    let width = form_shade_width(lz);
+    if width < FORM_BAND_FLOOR {
+        return None;
+    }
+    let bounds = path.bounding_box();
+    if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+        return None;
+    }
+    let offset = crescent_offset(bounds, planar, width);
+    if offset.hypot() < 1e-6 {
+        return None;
+    }
+    let shifted = Affine::translate(offset) * path.clone();
+    difference(path, &shifted)
+}
+
+/// [`highlight_crescent`], for [`ShadeModel::Form`]: narrower than the shaded
+/// side by the same [`HIGHLIGHT_SHARE`] the Crescent model uses, so a hard
+/// light still has a narrow glint rather than a highlight as wide as the
+/// terminator. `None` under the same floor `shade_crescent_form` uses — a
+/// shape with no shaded side this light draws has no glint either.
+///
+/// [`ShadeModel::Form`]: crate::ShadeModel::Form
+pub fn highlight_crescent_form(path: &BezPath, planar: Vec2, lz: f64) -> Option<BezPath> {
+    let width = form_shade_width(lz);
+    if width < FORM_BAND_FLOOR {
+        return None;
+    }
+    let bounds = path.bounding_box();
+    if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+        return None;
+    }
+    let offset = crescent_offset(bounds, -planar, width * HIGHLIGHT_SHARE);
+    if offset.hypot() < 1e-6 {
+        return None;
+    }
+    let shifted = Affine::translate(offset) * path.clone();
+    difference(path, &shifted)
+}
+
+/// **The lit band a light behind the figure leaves**, on the side nearest it.
+///
+/// The figure is otherwise filled at ambient only — there is no direct light
+/// to shade *from* — so this is the one thing a back light draws: a crescent
+/// on its own side, [`form_lit_width`] of the form, the full width rather than
+/// narrowed by [`HIGHLIGHT_SHARE`], because this is standing in for the whole
+/// lit side rather than for a glint on top of one. `None` below
+/// [`FORM_BAND_FLOOR`], which for this width means `lz` close enough to `-1`
+/// that the rim has grown to swallow the form — there is nothing left to
+/// difference against once the shift would reach past the shape's own centre,
+/// so the whole silhouette is left as the plain ambient fill.
+fn lit_band_form(path: &BezPath, planar: Vec2, lz: f64) -> Option<BezPath> {
+    let width = form_lit_width(lz);
+    if width < FORM_BAND_FLOOR {
+        return None;
+    }
+    let bounds = path.bounding_box();
+    if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+        return None;
+    }
+    let offset = crescent_offset(bounds, -planar, width);
+    if offset.hypot() < 1e-6 {
+        return None;
+    }
+    let shifted = Affine::translate(offset) * path.clone();
+    difference(path, &shifted)
+}
+
+/// **The two crescents for one shape, [`ShadeModel::Form`].**
+///
+/// `aim.lz >= 0.0`: the light is in front, so this is the same pair
+/// [`crescents`] draws, only widened or thinned by geometry instead of by
+/// softness — [`shade_crescent_form`] and [`highlight_crescent_form`].
+///
+/// `aim.lz < 0.0`: the light is *behind* the figure. There is no terminator
+/// to shade from — the figure is ambient-only already — so `shade` is `None`
+/// and `highlight` carries the lit rim instead, [`form_lit_width`] of the
+/// form on the light's own side. The renderer screens it in the light's
+/// colour rather than multiplying it in, exactly as an ordinary glint is; see
+/// `buzz_render::document`.
+///
+/// `softness` is accepted and not read: in this model the width is purely
+/// geometric, and softness only feathers how sharply the renderer's ramp
+/// arrives — see [`shade_feather`]. Kept in the signature so a caller can
+/// hold one `(aim, softness)` pair regardless of which model it is building
+/// for.
+///
+/// [`ShadeModel::Form`]: crate::ShadeModel::Form
+pub fn crescents_form(path: &BezPath, aim: Aim3, softness: f64) -> ShadeGeometry {
+    let _ = softness;
+    if aim.lz >= 0.0 {
+        ShadeGeometry {
+            shade: shade_crescent_form(path, aim.planar, aim.lz),
+            highlight: highlight_crescent_form(path, aim.planar, aim.lz),
+            cast: None,
+        }
+    } else {
+        ShadeGeometry {
+            shade: None,
+            highlight: lit_band_form(path, aim.planar, aim.lz),
+            cast: None,
+        }
+    }
+}
+
+/// [`shade_reach`], for [`ShadeModel::Form`]: how far the shaded side reaches
+/// in from the far edge, from `lz` rather than from softness.
+///
+/// [`ShadeModel::Form`]: crate::ShadeModel::Form
+pub fn shade_reach_form(bounds: Rect, planar: Vec2, lz: f64) -> f64 {
+    crescent_offset(bounds, planar, form_shade_width(lz)).hypot()
+}
+
+/// [`highlight_reach`], for [`ShadeModel::Form`].
+///
+/// [`ShadeModel::Form`]: crate::ShadeModel::Form
+pub fn highlight_reach_form(bounds: Rect, planar: Vec2, lz: f64) -> f64 {
+    crescent_offset(bounds, -planar, form_shade_width(lz) * HIGHLIGHT_SHARE).hypot()
 }
 
 /// The shaded crescent on the side away from the light.
@@ -239,7 +423,7 @@ pub fn shadow_transform(light: &Light, height: f64) -> Option<Affine> {
             let length = length * light.shadow_length.max(0.0) as f64;
             let (sin_a, cos_a) = azimuth.sin_cos();
             let away = Vec2::new(-cos_a, -sin_a) * length;
-            Some(Affine::translate(away))
+            Some(light.shadow_adjustment.affine() * Affine::translate(away))
         }
 
         LightKind::Lamp {
@@ -264,7 +448,8 @@ pub fn shadow_transform(light: &Light, height: f64) -> Option<Affine> {
             // triangles above, at 0 the shadow sits under its caster.
             let scale = 1.0 + (scale - 1.0) * light.shadow_length.max(0.0) as f64;
             Some(
-                Affine::translate(position.to_vec2())
+                light.shadow_adjustment.affine()
+                    * Affine::translate(position.to_vec2())
                     * Affine::scale(scale)
                     * Affine::translate(-position.to_vec2()),
             )
@@ -300,6 +485,8 @@ pub enum ShadowThrow {
         /// The lamp, as its position in the plane and its height above the
         /// floor.
         lamp: Option<(Point, f64)>,
+        /// Animator-authored adjustment composed after physical projection.
+        adjustment: crate::ShadowAdjustment,
     },
 }
 
@@ -357,6 +544,7 @@ pub fn shadow_throw(light: &Light, height: f64) -> Option<ShadowThrow> {
                         * light.shadow_length.max(0.0) as f64,
                 ),
                 lamp: None,
+                adjustment: light.shadow_adjustment,
             })
         }
         LightKind::Lamp {
@@ -365,6 +553,7 @@ pub fn shadow_throw(light: &Light, height: f64) -> Option<ShadowThrow> {
             away: None,
             stretch: Some(light.shadow_length.max(0.0) as f64),
             lamp: Some((position, height.max(1.0))),
+            adjustment: light.shadow_adjustment,
         }),
     }
 }
@@ -397,6 +586,7 @@ impl ShadowThrow {
                 away,
                 stretch,
                 lamp,
+                adjustment,
             } => {
                 // Where the caster meets the floor: the bottom of its box, and
                 // its middle across.
@@ -454,14 +644,9 @@ impl ShadowThrow {
                 // every shape of this caster.
                 let sx = away.x * stretch;
                 let sy = rake * stretch;
-                Affine::new([
-                    1.0,
-                    0.0,
-                    -sx,
-                    -sy,
-                    sx * base.y,
-                    base.y * (1.0 + sy),
-                ])
+                let ground_proj =
+                    Affine::new([1.0, 0.0, -sx, -sy, sx * base.y, base.y * (1.0 + sy)]);
+                adjustment.affine() * ground_proj
             }
         }
     }
@@ -476,7 +661,12 @@ impl ShadowThrow {
                 let c = affine.as_coeffs();
                 c[4].hypot(c[5])
             }
-            Self::Ground { stretch, lamp, .. } => {
+            Self::Ground {
+                stretch,
+                lamp,
+                adjustment,
+                ..
+            } => {
                 let stretch = stretch.unwrap_or(MAX_SHADOW_RATIO);
                 // A lamp's stretch is per caster and is not known here, so the
                 // worst case stands in for it — times the light's own length
@@ -487,7 +677,10 @@ impl ShadowThrow {
                     Some(_) => MAX_SHADOW_RATIO * stretch,
                     None => stretch,
                 };
-                height * stretch
+                let extra = adjustment.offset.hypot()
+                    + adjustment.pivot.to_vec2().hypot()
+                        * (adjustment.scale_x.max(adjustment.scale_y) - 1.0).max(0.0);
+                height * stretch + extra
             }
         }
     }
@@ -566,6 +759,31 @@ pub fn crescent_direction(light: &Light, at: Point, depth: f64, modelling: f32) 
     // produces no crescents — only fill. Trying to build them from a
     // zero-length vector is where a stray NaN would come from.
     (planar.hypot() > 1e-6).then_some(planar)
+}
+
+/// [`crescent_direction`], for [`ShadeModel::Form`]: the aim a Form crescent
+/// is built from at `at`, or `None` if this light draws none there.
+///
+/// **Deliberately does not bail on a zero planar direction.** A light dead in
+/// front has nothing to shade *around* under the Crescent model, so
+/// `crescent_direction` returns `None` there — but under Form that same light
+/// is exactly the case with the narrowest possible band (`aim.lz` near `1`),
+/// which [`form_shade_width`] already answers with a near-zero width and
+/// `crescents_form` with `None` geometry. Bailing here too would be right for
+/// that one light and wrong for every other one at that same instant whose
+/// own `lz` is not near `1` — a rig, not a single light, decides Form's
+/// width, so only "is this light directional at all" belongs in this
+/// function.
+///
+/// Returns `None` only when modelling is off or this light has no direction
+/// to shade from at all (a sky or a gloom).
+///
+/// [`ShadeModel::Form`]: crate::ShadeModel::Form
+pub fn crescent_aim(light: &Light, at: Point, depth: f64, modelling: f32) -> Option<Aim3> {
+    if modelling <= 0.01 {
+        return None;
+    }
+    light.aim_at(at, depth)
 }
 
 /// The two crescents for one shape lit from `towards` — the expensive half of
@@ -1839,10 +2057,7 @@ mod tests {
     /// direction at once and the other emits nothing at all.
     #[test]
     fn only_a_light_with_a_direction_rims() {
-        for kind in [
-            LightKind::sky(),
-            LightKind::gloom(Point::new(-400.0, 0.0)),
-        ] {
+        for kind in [LightKind::sky(), LightKind::gloom(Point::new(-400.0, 0.0))] {
             let mut light = Light::new(LightId(9), "L", kind);
             light.rim = 1.0;
             light.enabled = true;
@@ -1863,7 +2078,149 @@ mod tests {
         light.enabled = false;
         assert!(rim_glow(&light, Point::ZERO, 0.0).is_none());
     }
+}
 
+/// **`ShadeModel::Form`: the terminator from geometry, not from softness.**
+/// `docs/HARD_LIGHT_PLAN.md`, Stage A.
+#[cfg(test)]
+mod form_model_tests {
+    use super::*;
+    use buzz_geom::Point;
+
+    /// A disc a form band is measured against: round, so the crescent's area
+    /// is a fair proxy for "half the form", which a square's corners are not.
+    fn disc() -> BezPath {
+        kurbo::Circle::new(Point::new(50.0, 50.0), 50.0).to_path(0.01)
+    }
+
+    fn area_fraction(path: &BezPath, band: &BezPath) -> f64 {
+        band.area().abs() / path.area().abs()
+    }
+
+    /// **A hard side light darkens half the form**, which the Crescent model
+    /// cannot do at all — its floor leaves a hard light the *narrowest* band
+    /// there is (`HARD_SHADE_WIDTH`), not the widest. At `lz = 0` the light is
+    /// exactly to the side of the disc, and `form_shade_width(0.0) == 0.5`:
+    /// half the diameter, which the shifted-copy construction turns into
+    /// roughly half the disc's own area.
+    #[test]
+    fn a_side_light_darkens_half_the_form() {
+        let disc = disc();
+        let shade = shade_crescent_form(&disc, Vec2::new(1.0, 0.0), 0.0)
+            .expect("a side light must leave a shaded half");
+        let fraction = area_fraction(&disc, &shade);
+        assert!(
+            (0.35..=0.75).contains(&fraction),
+            "a side light should darken roughly half the disc, got {:.2} of it",
+            fraction
+        );
+    }
+
+    /// **Brought round to the front, the band thins to nothing** rather than
+    /// popping off in one step — see `raising_the_sun_lifts_the_light_up_the_picture`
+    /// for the Crescent model's version of "does not stay full width until it
+    /// vanishes".
+    #[test]
+    fn a_front_light_leaves_no_band() {
+        let disc = disc();
+        // `form_shade_width(0.96) == FORM_BAND_FLOOR` exactly, so the floor is
+        // crossed just past 0.96 rather than at it; 0.97 is comfortably past.
+        for lz in [0.97, 0.98, 1.0] {
+            assert!(
+                shade_crescent_form(&disc, Vec2::new(1.0, 0.0), lz).is_none(),
+                "lz = {lz} should leave no shaded side at all"
+            );
+            assert!(
+                highlight_crescent_form(&disc, Vec2::new(1.0, 0.0), lz).is_none(),
+                "lz = {lz} should leave no glint either \u{2014} there is nothing left to catch it against"
+            );
+        }
+    }
+
+    /// **A light behind the figure lights a rim; it does not shade one.** The
+    /// figure is already ambient-only with nothing behind it to shade from, so
+    /// `crescents_form` must answer with a lit band on the light's own side
+    /// rather than a shaded crescent.
+    #[test]
+    fn a_light_behind_leaves_a_lit_band_not_a_shade() {
+        let disc = disc();
+        let geometry = crescents_form(
+            &disc,
+            Aim3 {
+                planar: Vec2::new(1.0, 0.0),
+                lz: -0.4,
+            },
+            0.35,
+        );
+        assert!(
+            geometry.shade.is_none(),
+            "a light behind the figure must shade nothing"
+        );
+        let rim = geometry
+            .highlight
+            .expect("a light behind the figure must still light a rim");
+        // The rim sits on the light's own side — here, `planar` towards
+        // +x, so the lit band is the right-hand crescent, same side
+        // `the_highlight_is_on_the_near_side` puts an ordinary glint.
+        let bounds = rim.bounding_box();
+        assert!(
+            bounds.x1 > 90.0,
+            "the rim should reach the edge nearest the light: {bounds:?}"
+        );
+    }
+
+    /// **The band thins continuously as the light comes forward** — not a
+    /// full-width band that pops off in one step at some threshold, which is
+    /// the Crescent model's failure this whole stage exists to fix.
+    #[test]
+    fn the_band_thins_continuously_as_the_light_comes_forward() {
+        let disc = disc();
+        let widths: Vec<f64> = [0.0, 0.25, 0.5, 0.75]
+            .into_iter()
+            .map(|lz| {
+                shade_crescent_form(&disc, Vec2::new(1.0, 0.0), lz)
+                    .expect("still a band at this lz")
+                    .bounding_box()
+                    .width()
+            })
+            .collect();
+        for pair in widths.windows(2) {
+            assert!(
+                pair[0] > pair[1],
+                "the band should strictly thin as the light comes forward: {widths:?}"
+            );
+        }
+    }
+
+    /// **Softness no longer changes the width.** Under the Form model the
+    /// terminator's width is purely geometric — `lz` alone — so two
+    /// wildly different softness settings on the same aim must build exactly
+    /// the same bands. Softness still has a job (feathering how sharply the
+    /// terminator arrives), but that is the renderer's ramp, not this
+    /// geometry; see `buzz_light::shade_feather` and
+    /// `buzz_render::document`'s use of it.
+    #[test]
+    fn softness_no_longer_changes_width_in_form_model() {
+        let disc = disc();
+        let aim = Aim3 {
+            planar: Vec2::new(1.0, 0.0),
+            lz: 0.2,
+        };
+        let hard = crescents_form(&disc, aim, 0.05);
+        let soft = crescents_form(&disc, aim, 0.9);
+
+        let bounds = |g: &ShadeGeometry| {
+            (
+                g.shade.as_ref().map(|p| p.bounding_box()),
+                g.highlight.as_ref().map(|p| p.bounding_box()),
+            )
+        };
+        assert_eq!(
+            bounds(&hard),
+            bounds(&soft),
+            "softness must not move the Form model's bands at all"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1872,7 +2229,14 @@ mod shadow_length_tests {
     use crate::{Light, LightId, LightKind, ShadowFall};
 
     fn sun(elevation: f64) -> Light {
-        let mut light = Light::new(LightId(1), "Sun", LightKind::Sun { azimuth: 0.0, elevation });
+        let mut light = Light::new(
+            LightId(1),
+            "Sun",
+            LightKind::Sun {
+                azimuth: 0.0,
+                elevation,
+            },
+        );
         light.shadows = true;
         light
     }
@@ -1959,5 +2323,46 @@ mod shadow_length_tests {
     #[test]
     fn the_default_changes_nothing() {
         assert_eq!(sun(0.6).shadow_length, 1.0);
+    }
+
+    #[test]
+    fn ground_and_wall_shadows_apply_shadow_adjustment() {
+        let mut light = sun(0.6);
+        light.shadow_adjustment.offset = buzz_geom::Vec2::new(15.0, -25.0);
+        light.shadow_adjustment.scale_x = 1.5;
+        light.shadow_adjustment.scale_y = 0.8;
+        light.shadow_adjustment.rotation = 0.2;
+        light.shadow_adjustment.skew_x = 0.1;
+
+        let ground_throw = shadow_throw(&light, 100.0).expect("ground throw");
+        let wall_throw = {
+            let mut l = light.clone();
+            l.fall = ShadowFall::Wall;
+            shadow_throw(&l, 100.0).expect("wall throw")
+        };
+
+        let rect = buzz_geom::Rect::new(0.0, 0.0, 100.0, 100.0);
+        let p = buzz_geom::Point::new(50.0, 50.0);
+        let g_pt = ground_throw.at(rect) * p;
+        let w_pt = wall_throw.at(rect) * p;
+
+        // Verify that identity adjustment yields a different point from adjusted.
+        let mut unadjusted = light.clone();
+        unadjusted.shadow_adjustment = crate::ShadowAdjustment::default();
+        let unadjusted_ground = shadow_throw(&unadjusted, 100.0).expect("ground throw");
+        let unadjusted_g_pt = unadjusted_ground.at(rect) * p;
+        assert!(
+            (g_pt.x - unadjusted_g_pt.x).abs() > 1.0 || (g_pt.y - unadjusted_g_pt.y).abs() > 1.0
+        );
+
+        let unadjusted_wall = {
+            let mut l = unadjusted.clone();
+            l.fall = ShadowFall::Wall;
+            shadow_throw(&l, 100.0).expect("wall throw")
+        };
+        let unadjusted_w_pt = unadjusted_wall.at(rect) * p;
+        assert!(
+            (w_pt.x - unadjusted_w_pt.x).abs() > 1.0 || (w_pt.y - unadjusted_w_pt.y).abs() > 1.0
+        );
     }
 }

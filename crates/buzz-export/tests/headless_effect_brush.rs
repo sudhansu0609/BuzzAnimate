@@ -16,7 +16,7 @@ use buzz_export::{ExportSettings, Exporter, Frame};
 use buzz_geom::Point;
 use buzz_render::GpuPreference;
 use buzz_scene::{
-    EffectKind, ArtPiece, EffectStroke, LayerKind, Object, Scene, ShapeData, effect_artwork,
+    ArtPiece, EffectKind, EffectStroke, LayerKind, Object, Scene, ShapeData, effect_artwork,
 };
 use peniko::Color;
 

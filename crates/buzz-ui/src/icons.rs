@@ -15,14 +15,63 @@
 //!
 //! The shapes follow Animate's toolbar, because an animator coming from there
 //! should be able to find the Ink Bottle without reading a tooltip.
+//!
+//! # Why every tool is drawn this way now, not just some
+//!
+//! Thirteen of these once drew a raster outline mask cut from the user's own
+//! icon sheet instead (`icons::raster`, since removed) — a Sobel-derived
+//! silhouette of the sheet's own artwork, tinted like any other glyph. At
+//! 20 px most of them read as an unlabelled blob rather than the tool they
+//! named; two (Brush, Eraser) had already fallen back to a painted glyph for
+//! the same reason. Every tool now draws a hand-authored painter-path glyph
+//! instead, modelled on the sheet's own silhouettes but built from lines a
+//! 1.5 px stroke can actually resolve at button size — see
+//! `docs/WORKSPACE_DESIGN_PLAN.md`'s Follow-ups for the change.
 
 use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, vec2};
 
 use crate::tools::ToolId;
 
 /// Draw `tool`'s symbol, centred in `rect` and drawn in `color`.
+///
+/// A tool with a symbol on the user's icon sheet draws that (see
+/// `icon_sheet.rs`); the few the sheet has no picture for — Subselection,
+/// Bone, Camera, Hand, Zoom — keep the painted glyph below.
 pub fn tool_icon(painter: &Painter, rect: Rect, tool: ToolId, color: Color32) {
-    painter.extend(tool_shapes(rect, tool, color));
+    match sheet_icon(tool) {
+        Some(icon) => crate::icon_sheet::paint(painter, rect, icon, color),
+        None => {
+            painter.extend(tool_shapes(rect, tool, color));
+        }
+    }
+}
+
+/// The sheet's symbol for `tool`, if the sheet draws one.
+pub fn sheet_icon(tool: ToolId) -> Option<crate::icon_sheet::SheetIcon> {
+    use crate::icon_sheet::SheetIcon as S;
+    use ToolId::*;
+    Some(match tool {
+        Selection => S::Select,
+        Lasso => S::Lasso,
+        MagicWand => S::MagicSelect,
+        FreeTransform => S::Transform,
+        GradientTransform => S::Gradient,
+        Pen => S::Pen,
+        Text => S::Text,
+        Line => S::Line,
+        Rectangle => S::Rectangle,
+        Oval => S::Ellipse,
+        PolyStar => S::Star,
+        Pencil => S::Pencil,
+        Brush => S::Brush,
+        AssetWarp => S::Perspective,
+        MotionPath => S::MotionPath,
+        PaintBucket => S::Fill,
+        InkBottle => S::Stroke,
+        Eyedropper => S::Eyedropper,
+        Eraser => S::Eraser,
+        Subselection | Bone | Camera | Hand | Zoom => return None,
+    })
 }
 
 /// `tool`'s symbol, as shapes.
@@ -113,6 +162,19 @@ impl Draw {
         ));
     }
 
+    /// A dashed line: `dashes` short strokes between `a` and `b`, each
+    /// covering half the gap it and its neighbour split between them — a
+    /// hand-drawn stand-in for the marquee Animate's Selection tool draws
+    /// round whatever it has just lassoed.
+    fn dashed(&self, a: (f32, f32), b: (f32, f32), dashes: usize) {
+        for i in 0..dashes {
+            let t0 = i as f32 / dashes as f32;
+            let t1 = t0 + 0.5 / dashes as f32;
+            let p = |t: f32| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+            self.hairline(p(t0), p(t1));
+        }
+    }
+
     /// A closed outline through the given unit points.
     fn outline(&self, points: &[(f32, f32)]) {
         let mut pts: Vec<Pos2> = points.iter().map(|(x, y)| self.at(*x, *y)).collect();
@@ -159,7 +221,16 @@ impl Draw {
 
 /// The pointer. Solid is Selection, hollow is Subselection — which is exactly
 /// how Animate distinguishes them, and how every other editor does too.
+///
+/// **Selection alone carries a dashed marquee corner behind it.** That is
+/// the mark of a rectangular selection in progress — Subselection edits
+/// points one at a time and never draws one.
 fn arrow(d: &Draw, solid: bool) {
+    if solid {
+        d.dashed((0.06, 0.06), (0.58, 0.06), 4);
+        d.dashed((0.06, 0.06), (0.06, 0.58), 4);
+    }
+
     let body = [
         (0.30, 0.14),
         (0.30, 0.80),
@@ -191,26 +262,22 @@ fn lasso(d: &Draw) {
         .collect();
     d.curve(&pts);
     // The tail, falling from where the loop crosses itself.
-    d.curve(&[
-        (0.36, 0.49),
-        (0.32, 0.64),
-        (0.38, 0.76),
-        (0.34, 0.86),
-    ]);
+    d.curve(&[(0.36, 0.49), (0.32, 0.64), (0.38, 0.76), (0.34, 0.86)]);
+    // The small cursor throwing it — a short pointer, not the full arrow
+    // Selection draws, so the two stay tellable apart at a glance.
+    d.solid(&[(0.70, 0.60), (0.70, 0.90), (0.88, 0.78)]);
 }
 
 /// A wand at an angle with sparks off its tip.
 fn magic_wand(d: &Draw) {
     d.line((0.28, 0.80), (0.63, 0.38));
-    // The tip, and three sparks leaving it — enough to read as "magic" and few
-    // enough to stay legible at sixteen pixels.
+    // The tip, and three sparkles leaving it — each a tiny four-point glint
+    // rather than a single stroke, so they read as sparkle rather than
+    // scribble at sixteen pixels.
     d.circle((0.66, 0.34), 0.05, true);
-    for (a, b) in [
-        ((0.66, 0.20), (0.66, 0.11)),
-        ((0.78, 0.30), (0.86, 0.26)),
-        ((0.76, 0.19), (0.83, 0.13)),
-    ] {
-        d.hairline(a, b);
+    for (cx, cy, r) in [(0.68, 0.14, 0.045), (0.87, 0.26, 0.035), (0.82, 0.09, 0.03)] {
+        d.hairline((cx - r, cy), (cx + r, cy));
+        d.hairline((cx, cy - r), (cx, cy + r));
     }
 }
 
@@ -253,26 +320,27 @@ fn free_transform(d: &Draw) {
             (x - h, y + h),
         ]);
     }
+
+    // The diagonal arrow: what tells this frame apart from a plain
+    // Rectangle — Animate's own Transform icon carries one dragging a
+    // corner outward.
+    d.line((0.36, 0.64), (0.60, 0.40));
+    d.solid(&[(0.62, 0.38), (0.50, 0.42), (0.58, 0.54)]);
 }
 
-/// A gradient in a box, with the handle that stretches it.
+/// A gradient in a box, with the ramp its handle stretches.
 ///
-/// The ramp is drawn as bands thinning left to right, because a fill here
-/// cannot itself be a gradient. Few and inside the box: a column of even bars
-/// reads as a barcode, which is what this looked like when there were more.
+/// The ramp is three parallel diagonal strokes, thinning left to right,
+/// because a fill here cannot itself be a gradient — a stepped stand-in for
+/// the direction a gradient runs, not a literal wash.
 fn gradient_transform(d: &Draw) {
     // The box the gradient fills.
-    d.outline(&[(0.22, 0.22), (0.78, 0.22), (0.78, 0.60), (0.22, 0.60)]);
-    // Solid at the left, thinning to nothing at the right.
-    d.solid(&[(0.24, 0.24), (0.40, 0.24), (0.40, 0.58), (0.24, 0.58)]);
-    d.line((0.48, 0.24), (0.48, 0.58));
-    d.hairline((0.58, 0.24), (0.58, 0.58));
-    d.hairline((0.68, 0.30), (0.68, 0.52));
-
-    // The handle: drag it and the ramp follows.
-    d.line((0.24, 0.78), (0.76, 0.78));
-    d.circle((0.24, 0.78), 0.07, false);
-    d.circle((0.76, 0.78), 0.07, true);
+    d.outline(&[(0.22, 0.22), (0.78, 0.22), (0.78, 0.78), (0.22, 0.78)]);
+    // Three short diagonal strokes, heaviest at the left and thinning to
+    // the right — the ramp's own direction.
+    d.line((0.34, 0.64), (0.42, 0.48));
+    d.line((0.48, 0.64), (0.56, 0.48));
+    d.hairline((0.62, 0.64), (0.68, 0.48));
 }
 
 /// A fountain-pen nib: a tapered blade with a vent hole and the slit running
@@ -298,10 +366,15 @@ fn pen(d: &Draw) {
     d.hairline((0.42, 0.26), (0.58, 0.26));
 }
 
-/// A capital T, drawn rather than typed so it matches the weight of the rest.
+/// A capital, serif T, drawn rather than typed so it matches the weight of
+/// the rest. The serifs — short feet at each end of the crossbar and the
+/// stem — are what the sheet's own Text icon carries and a sans T does not.
 fn text(d: &Draw) {
     d.line((0.24, 0.22), (0.76, 0.22));
+    d.hairline((0.24, 0.16), (0.24, 0.28));
+    d.hairline((0.76, 0.16), (0.76, 0.28));
     d.line((0.5, 0.22), (0.5, 0.80));
+    d.hairline((0.38, 0.80), (0.62, 0.80));
 }
 
 fn line_tool(d: &Draw) {
@@ -398,8 +471,10 @@ fn warp(d: &Draw) {
 fn bucket(d: &Draw) {
     // The body, tapering downwards and tilted to pour.
     d.solid(&[(0.24, 0.34), (0.58, 0.22), (0.66, 0.52), (0.40, 0.62)]);
-    // The rim, a touch proud of the body so the opening reads.
-    d.line((0.22, 0.33), (0.60, 0.20));
+    // The rim: an ellipse, because that is what a round opening seen at an
+    // angle actually looks like — a straight line across the top read as a
+    // lid, not an opening.
+    d.ellipse((0.41, 0.28), 0.19, 0.07);
     // The handle over the top.
     d.curve(&[(0.28, 0.28), (0.40, 0.10), (0.58, 0.18)]);
     // The pour, and the drop that has already left.
@@ -435,6 +510,9 @@ fn eyedropper(d: &Draw) {
     d.solid(&[(0.60, 0.36), (0.70, 0.46), (0.34, 0.78), (0.26, 0.70)]);
     // The tip, a fine point where the colour is taken from.
     d.solid(&[(0.26, 0.70), (0.34, 0.78), (0.18, 0.86)]);
+    // The drop it has taken up — separate from the tip, the way the sheet's
+    // own Eyedropper draws one falling clear of the point.
+    d.circle((0.08, 0.94), 0.045, true);
 }
 
 /// A block eraser, tilted, with its working face showing. Animate draws the
@@ -564,7 +642,10 @@ mod contact_sheet {
                 r.rect.max.x,
                 r.rect.max.y
             ),
-            other => format!("    {{\"kind\":\"other\",\"debug\":{:?}}}", format!("{other:?}").len()),
+            other => format!(
+                "    {{\"kind\":\"other\",\"debug\":{:?}}}",
+                format!("{other:?}").len()
+            ),
         }
     }
 }

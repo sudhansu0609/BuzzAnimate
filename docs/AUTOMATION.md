@@ -363,6 +363,35 @@ written, along with the head turn and bitmap tracing.
 
 ---
 
+## Appendix: producing the UI review screenshots
+
+Stage 0 of [`WORKSPACE_DESIGN_PLAN.md`](WORKSPACE_DESIGN_PLAN.md) gives the
+workspace redesign an offscreen renderer, so every later stage ships PNGs
+rather than a description of what changed. Two ways to produce them:
+
+- **From a test**, with a real GPU adapter (the harness needs one; it is not
+  a software fallback):
+  `cargo test -p buzz-app ui_snapshot::tests::ui_snapshots -- --ignored`.
+  Writes `target/ui-snapshots/dark_default.png`, `light_default.png`,
+  `contrast_default.png` (1600 × 900 at 100%) and `dark_default_150.png`
+  (the same window at 150%), each with a small fixture document open — two
+  layers, a symbol instance and a classic tween, built entirely from the
+  `buzz_scene` API rather than a file on disk.
+- **From the command line**, against whatever document state the flag is
+  given: `buzzanimate --ui-snapshot [dir]` (default
+  `target/ui-snapshots`) writes the same four files and exits without
+  opening a window — the unattended path, for a script that wants the
+  pictures without running the test suite.
+
+Both go through `buzz_app::ui_snapshot::render_ui`: `App::build_ui` run
+through `egui::Context::run_ui`, tessellated, and rendered with
+`egui_wgpu::Renderer` into an offscreen texture on the same kind of headless
+`wgpu` device the exporter brings up (`buzz_render::GpuContext` /
+`GpuPreference`) — never a second, hand-rolled rendering path that could
+drift from what the real window draws.
+
+---
+
 *See also: [`SCENES_AND_THE_DIRECTOR.md`](SCENES_AND_THE_DIRECTOR.md) for how
 the automated parts work, [`USER_GUIDE.md`](USER_GUIDE.md) §17 for how to drive
 them, and `PROGRESS.md` in the repository root for the engineering roadmap.*

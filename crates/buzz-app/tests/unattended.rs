@@ -175,7 +175,11 @@ fn a_script_can_build_a_film_and_save_it() {
 
     let saved = job.save.as_deref().expect("a save path");
     let doc = buzz_doc::Document::open(saved).expect("the document should open");
-    assert_eq!(doc.scene_names().len(), 2, "both shots should be in the file");
+    assert_eq!(
+        doc.scene_names().len(),
+        2,
+        "both shots should be in the file"
+    );
 
     // The face rig survived the round trip: the parenting is what makes it a
     // rig rather than three layers that happen to line up.
@@ -195,11 +199,20 @@ fn a_script_can_build_a_film_and_save_it() {
 #[test]
 fn a_failing_script_is_reported_by_name() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let job = scripted(dir.path(), "fl.getDocumentDOM().layScenery('swamp', 100, 0);");
+    let job = scripted(
+        dir.path(),
+        "fl.getDocumentDOM().layScenery('swamp', 100, 0);",
+    );
     let err = render(&job).expect_err("no such scenery");
     let said = err.to_string();
-    assert!(said.contains("film.js"), "the reason should name the file: {said}");
-    assert!(said.contains("swamp"), "the reason should carry the complaint: {said}");
+    assert!(
+        said.contains("film.js"),
+        "the reason should name the file: {said}"
+    );
+    assert!(
+        said.contains("swamp"),
+        "the reason should carry the complaint: {said}"
+    );
     assert!(
         !job.save.as_deref().expect("a save path").exists(),
         "a document was written for a script that failed"
@@ -238,7 +251,11 @@ fn a_sound_can_be_sliced_on_the_way_in() {
     render(&job).expect("the sliced take should run");
     let doc = buzz_doc::Document::open(job.save.as_deref().expect("a save path"))
         .expect("the document should open");
-    assert_eq!(doc.film()[0].sounds().len(), 1, "the take is not in the document");
+    assert_eq!(
+        doc.film()[0].sounds().len(),
+        1,
+        "the take is not in the document"
+    );
 }
 
 /// A mono WAV of a steady tone, `seconds` long.

@@ -34,7 +34,10 @@ fn instance_heavy() -> Scene {
                     0,
                     std::sync::Arc::new(buzz_scene::Object::shape(
                         buzz_scene::ObjectId(10_000 + i),
-                        ShapeData::filled(Rect::new(x, 0.0, x + 4.0, 4.0).to_path(1e-9), Color::WHITE),
+                        ShapeData::filled(
+                            Rect::new(x, 0.0, x + 4.0, 4.0).to_path(1e-9),
+                            Color::WHITE,
+                        ),
                     )),
                 );
             });
@@ -59,11 +62,8 @@ fn instance_heavy() -> Scene {
                 l.frames.push_object(
                     0,
                     std::sync::Arc::new(
-                        buzz_scene::Object::instance_of(
-                            buzz_scene::ObjectId(20_000 + i),
-                            part,
-                        )
-                        .with_transform(Affine::translate((0.0, y))),
+                        buzz_scene::Object::instance_of(buzz_scene::ObjectId(20_000 + i), part)
+                            .with_transform(Affine::translate((0.0, y))),
                     ),
                 );
             });
@@ -100,7 +100,14 @@ fn measure_encode_zoomed_to_fit() {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &camera);
         cache.begin();
-        document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut cache);
+        document::draw_frame_within(
+            &mut builder,
+            &scene,
+            0,
+            Affine::IDENTITY,
+            &options,
+            &mut cache,
+        );
         cache.end();
     }
 
@@ -111,7 +118,14 @@ fn measure_encode_zoomed_to_fit() {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &camera);
         cache.begin();
-        document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut cache);
+        document::draw_frame_within(
+            &mut builder,
+            &scene,
+            0,
+            Affine::IDENTITY,
+            &options,
+            &mut cache,
+        );
         cache.end();
         n_paths = vs.encoding().n_paths;
     }
@@ -132,7 +146,14 @@ fn measure_encode_zoomed_to_fit() {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &near);
         cache.begin();
-        document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &near_options, &mut cache);
+        document::draw_frame_within(
+            &mut builder,
+            &scene,
+            0,
+            Affine::IDENTITY,
+            &near_options,
+            &mut cache,
+        );
         cache.end();
     }
     let start = Instant::now();
@@ -141,7 +162,14 @@ fn measure_encode_zoomed_to_fit() {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &near);
         cache.begin();
-        document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &near_options, &mut cache);
+        document::draw_frame_within(
+            &mut builder,
+            &scene,
+            0,
+            Affine::IDENTITY,
+            &near_options,
+            &mut cache,
+        );
         cache.end();
         near_paths = vs.encoding().n_paths;
     }
@@ -173,7 +201,14 @@ fn measure_encode_zoomed_to_fit() {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &camera);
         reuse.begin();
-        document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut reuse);
+        document::draw_frame_within(
+            &mut builder,
+            &scene,
+            0,
+            Affine::IDENTITY,
+            &options,
+            &mut reuse,
+        );
         reuse.end();
     }
     assert_eq!(
@@ -188,7 +223,14 @@ fn measure_encode_zoomed_to_fit() {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &camera);
         reuse.begin();
-        document::draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &options, &mut reuse);
+        document::draw_frame_within(
+            &mut builder,
+            &scene,
+            0,
+            Affine::IDENTITY,
+            &options,
+            &mut reuse,
+        );
         reuse.end();
     }
     let reuse_per = start.elapsed() / frames;
@@ -277,7 +319,14 @@ fn switching_a_light_on_does_not_draw_the_artwork_again_per_pass() {
         let mut vs = vello::Scene::new();
         let mut builder = SceneBuilder::new(&mut vs, &camera);
         cache.begin();
-        document::draw_frame_within(&mut builder, scene, 0, Affine::IDENTITY, &options, &mut cache);
+        document::draw_frame_within(
+            &mut builder,
+            scene,
+            0,
+            Affine::IDENTITY,
+            &options,
+            &mut cache,
+        );
         cache.end();
         let enc = vs.encoding();
         (
@@ -353,4 +402,3 @@ fn switching_a_light_on_does_not_draw_the_artwork_again_per_pass() {
          belongs in the paint, not in another pass over the artwork"
     );
 }
-

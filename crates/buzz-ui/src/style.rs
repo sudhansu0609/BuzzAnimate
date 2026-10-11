@@ -151,6 +151,13 @@ pub struct DrawStyle {
     /// four units across however large the brush was and nothing in the tool
     /// options said so.
     pub eraser_size: f64,
+    /// **Animate's "Zoom size with stage".** On (the default): the eraser's
+    /// size is in document units, so the rub grows on screen as the stage is
+    /// zoomed in — today's behaviour. Off: the size is fixed in screen
+    /// pixels, so the rub stays the same size on screen at any zoom. The
+    /// conversion between the two lives on `Editor::tool_style`, not here —
+    /// this field is only the switch.
+    pub eraser_zoom_size: bool,
     /// **What the eraser is allowed to take** — Animate's Erase Normal, Erase
     /// Fills, Erase Lines and Erase Selected Fills.
     pub eraser_mode: EraserMode,
@@ -161,6 +168,9 @@ pub struct DrawStyle {
     /// Brush tool settings. Kept here rather than on the tool so that
     /// switching tools and coming back does not reset them.
     pub brush: crate::brush::BrushSettings,
+    /// **Animate's "Zoom size with stage", for the brush.** Same switch as
+    /// [`Self::eraser_zoom_size`], for `brush.size` instead of `eraser_size`.
+    pub brush_zoom_size: bool,
     /// Magic Wand settings — tolerance and whether it spreads.
     ///
     /// Beside the brush settings and for the same reason: they belong to the
@@ -198,12 +208,7 @@ pub enum EraserMode {
 }
 
 impl EraserMode {
-    pub const ALL: [EraserMode; 4] = [
-        Self::Normal,
-        Self::Fills,
-        Self::Lines,
-        Self::SelectedFills,
-    ];
+    pub const ALL: [EraserMode; 4] = [Self::Normal, Self::Fills, Self::Lines, Self::SelectedFills];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -308,7 +313,10 @@ pub struct SymmetrySettings {
 
 impl Default for SymmetrySettings {
     fn default() -> Self {
-        Self { mode: SymmetryMode::Off, radial_count: 6 }
+        Self {
+            mode: SymmetryMode::Off,
+            radial_count: 6,
+        }
     }
 }
 
@@ -362,11 +370,13 @@ impl Default for DrawStyle {
             stroke_width: 1.0,
             // A little wider than the default brush, as a rubber is.
             eraser_size: 16.0,
+            eraser_zoom_size: true,
             eraser_mode: EraserMode::default(),
             hairline: false,
             stroke_kind: StrokeKind::Solid,
             drawing_mode: DrawingMode::default(),
             brush: crate::brush::BrushSettings::default(),
+            brush_zoom_size: true,
             wand: buzz_scene::WandOptions::default(),
             gap_size: buzz_scene::GapSize::default(),
             symmetry: SymmetrySettings::default(),

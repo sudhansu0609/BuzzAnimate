@@ -135,7 +135,7 @@ pub fn render(job: &RenderJob) -> Result<String> {
     }
 
     if let Some(path) = &job.preview {
-        let scenes = doc.film();
+        let scenes = doc.film_with_lengths();
         let sheet = contact_sheet(&scenes, job.height, &job.gpu)
             .with_context(|| format!("previewing into {}", path.display()))?;
         sheet
@@ -155,13 +155,14 @@ pub fn render(job: &RenderJob) -> Result<String> {
         return Ok(report.join(" "));
     };
 
-    // Every scene, in the order they play -- the same snapshots the Tasks panel
-    // would have taken.
-    let scenes: Vec<buzz_scene::Scene> = doc.film();
-    let Some(lead) = scenes.first() else {
+    // Every scene that plays, in film order, each with its playing length --
+    // the same snapshots the Tasks panel would have taken (a sequence's
+    // setups already skipped, its shots already in cut order).
+    let scenes: Vec<(buzz_scene::Scene, u32)> = doc.film_with_lengths();
+    let Some((lead, _)) = scenes.first() else {
         bail!("that document has no scenes in it");
     };
-    let frames = buzz_export::Reel::of(scenes.iter()).frames();
+    let frames = buzz_export::Reel::of_lengths(scenes.iter().map(|(s, l)| (s, *l))).frames();
     if frames == 0 {
         bail!("that film is zero frames long");
     }
@@ -215,9 +216,16 @@ pub fn render(job: &RenderJob) -> Result<String> {
 fn build(job: &RenderJob, report: &mut Vec<String>) -> Result<Document> {
     let mut doc = match &job.document {
         Some(path) => {
-            let (scenes, _) = buzz_doc::format::load_scenes(path)
+            // `load_scenes_full`, not the names-only `load_scenes`: a
+            // sequence's roles, stable keys, cut and master audio must
+            // survive an overnight render exactly as opening the same file
+            // in the window does, or a headless render of a sequence plays
+            // every scene (setups included) in plain document order instead
+            // of skipping setups and cutting shots the way `Document::open`
+            // does.
+            let loaded = buzz_doc::format::load_scenes_full(path)
                 .with_context(|| format!("opening {}", path.display()))?;
-            Document::from_scenes(scenes)
+            Document::from_loaded_scenes(loaded)
         }
         None => Document::default(),
     };
@@ -227,8 +235,8 @@ fn build(job: &RenderJob, report: &mut Vec<String>) -> Result<Document> {
     // no window, so it is built here and thrown away.
     let mut directed = 0usize;
     if let Some(path) = &job.brief {
-        let prose = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let prose =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         if prose.trim().is_empty() {
             bail!("{} is empty", path.display());
         }
@@ -261,8 +269,8 @@ fn build(job: &RenderJob, report: &mut Vec<String>) -> Result<Document> {
     // **The script, over the whole film.** See the note at the top of the file
     // on why it is handed every scene rather than one.
     if let Some(path) = &job.script {
-        let source = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let source =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let sounds = decode_all(&job.audio)?;
         for clip in &sounds {
             eprintln!(
@@ -286,7 +294,11 @@ fn build(job: &RenderJob, report: &mut Vec<String>) -> Result<Document> {
             selection: Vec::new(),
             active_layer: None,
             config_dir: buzz_script::default_config_dir(),
-            asset_root: buzz_doc::AssetLibrary::user().root().map(|p| p.to_path_buf()),
+            asset_root: buzz_doc::AssetLibrary::user()
+                .root()
+                .map(|p| p.to_path_buf()),
+            // Unattended: every `prompt()` answers with its own default.
+            prompt_answers: Vec::new(),
         };
         // **A generous budget, because nobody is waiting on it.** The five
         // seconds a script gets in the editor is right there -- a mistake must
@@ -348,11 +360,11 @@ const SHEET: (u32, u32) = (3, 2);
 /// Rendered through the exporter, so what the sheet shows is what the file
 /// would hold rather than what the stage would draw.
 pub fn contact_sheet(
-    scenes: &[buzz_scene::Scene],
+    scenes: &[(buzz_scene::Scene, u32)],
     height: Option<u32>,
     gpu: &GpuPreference,
 ) -> Result<buzz_export::Frame> {
-    let reel = buzz_export::Reel::of(scenes.iter());
+    let reel = buzz_export::Reel::of_lengths(scenes.iter().map(|(s, l)| (s, *l)));
     let total = reel.frames();
     let Some(lead) = reel.lead() else {
         bail!("that document has no scenes in it");
@@ -363,7 +375,10 @@ pub fn contact_sheet(
 
     // A cell of the sheet, at the film's own aspect. Deliberately small: this
     // is a check, not a delivery.
-    let settings = sized(lead, Some(height.unwrap_or(1080).min(2160) / SHEET.1.max(1)));
+    let settings = sized(
+        lead,
+        Some(height.unwrap_or(1080).min(2160) / SHEET.1.max(1)),
+    );
     let mut exporter = buzz_export::Exporter::new(gpu)?;
 
     let (cols, rows) = SHEET;
@@ -442,9 +457,7 @@ fn slice(clip: &buzz_audio::Clip, from: Option<f64>, length: Option<f64>) -> buz
 
     let start = ((from.unwrap_or(0.0).max(0.0) * rate).round() as usize).min(frames);
     let end = match length {
-        Some(seconds) if seconds > 0.0 => {
-            (start + (seconds * rate).round() as usize).min(frames)
-        }
+        Some(seconds) if seconds > 0.0 => (start + (seconds * rate).round() as usize).min(frames),
         _ => frames,
     };
     if end <= start {
@@ -456,8 +469,6 @@ fn slice(clip: &buzz_audio::Clip, from: Option<f64>, length: Option<f64>) -> buz
     buzz_audio::Clip::new(&name, clip.sample_rate, clip.channels, samples)
         .unwrap_or_else(|_| clip.clone())
 }
-
-
 
 /// The format an output path asks for, by its extension.
 ///
@@ -504,9 +515,7 @@ fn target_for(format: PresetFormat, path: &Path) -> Result<ExportTarget> {
             video: VideoSettings {
                 codec: match format {
                     PresetFormat::Mp4Av1 => buzz_export::VideoCodec::Av1,
-                    PresetFormat::Mp4Hevc | PresetFormat::MovHevc => {
-                        buzz_export::VideoCodec::Hevc
-                    }
+                    PresetFormat::Mp4Hevc | PresetFormat::MovHevc => buzz_export::VideoCodec::Hevc,
                     _ => buzz_export::VideoCodec::H264,
                 },
                 ..VideoSettings::default()
@@ -548,7 +557,10 @@ mod tests {
             format_for(Path::new("a.MOV")).unwrap(),
             PresetFormat::MovHevc
         ));
-        assert!(matches!(format_for(Path::new("a.gif")).unwrap(), PresetFormat::Gif));
+        assert!(matches!(
+            format_for(Path::new("a.gif")).unwrap(),
+            PresetFormat::Gif
+        ));
         assert!(format_for(Path::new("a.txt")).is_err());
         assert!(format_for(Path::new("nameonly")).is_err());
     }
@@ -568,7 +580,10 @@ mod tests {
         assert_eq!(small.height % 2, 0, "odd height: {}", small.height);
         assert_eq!(small.width % 2, 0, "odd width: {}", small.width);
         let aspect = small.width as f64 / small.height as f64;
-        assert!((aspect - 16.0 / 9.0).abs() < 0.02, "aspect drifted to {aspect}");
+        assert!(
+            (aspect - 16.0 / 9.0).abs() < 0.02,
+            "aspect drifted to {aspect}"
+        );
     }
 
     /// **Nothing in, a reason out.** A job with neither a document nor a brief
@@ -609,5 +624,54 @@ mod tests {
         };
         let err = render(&job).expect_err("an empty brief");
         assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    /// **Headless load of a sequence gets the same film length as the
+    /// in-app path.** `build` must honour a saved sequence file's roles and
+    /// cut, not just its scene names, or an overnight render of a sequence
+    /// plays every scene — setups included — in plain document order
+    /// instead of skipping setups and cutting shots. See
+    /// `docs/SEQUENCE_SETUPS_PLAN.md` S6.
+    #[test]
+    fn headless_load_of_a_sequence_matches_the_in_app_film_length() {
+        use buzz_doc::SceneRole;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("sequence.buzz");
+
+        let mut doc = Document::default();
+        doc.rename_scene(0, "Village");
+        doc.set_role(0, SceneRole::Setup);
+        let setup_key = doc.scene_key(0).unwrap();
+        doc.stamp_shot(setup_key, 0, 30).unwrap();
+        doc.stamp_shot(setup_key, 30, 80).unwrap();
+        doc.save_as(&path).expect("save");
+
+        let expected: u32 = doc.film_with_lengths().iter().map(|(_, l)| *l).sum();
+        assert_eq!(
+            doc.film_with_lengths().len(),
+            2,
+            "the setup itself never plays, only the two shots"
+        );
+
+        let job = RenderJob {
+            document: Some(path),
+            brief: None,
+            script: None,
+            audio: Vec::new(),
+            save: None,
+            preview: None,
+            output: None,
+            height: None,
+            gpu: GpuPreference::Automatic,
+        };
+        let mut report = Vec::new();
+        let loaded = build(&job, &mut report).expect("headless load");
+
+        let got: u32 = loaded.film_with_lengths().iter().map(|(_, l)| *l).sum();
+        assert_eq!(
+            got, expected,
+            "headless must skip the setup and total the shots' lengths, same as Document::open"
+        );
     }
 }

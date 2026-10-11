@@ -283,11 +283,11 @@ fn lip_sync_inside_the_head_symbol_uses_the_root_dialogue() {
     // layer after the sound, and a test that hard-codes "Audio" is a test of
     // the naming rather than of the timeline.
     assert!(
-        editor
-            .scene()
-            .layers()
+        editor.scene().layers().iter().any(|l| l
+            .frames
+            .keyframes()
             .iter()
-            .any(|l| l.frames.keyframes().iter().any(|k| k.sound.is_some())),
+            .any(|k| k.sound.is_some())),
         "the dialogue should still be on the root"
     );
 }

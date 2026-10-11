@@ -1,0 +1,44 @@
+[package]
+name = "buzz-ai"
+description = "Local AI models, ONNX runtime, and LLM integration for BuzzAnimate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+buzz-act.workspace = true
+buzz-audio.workspace = true
+buzz-doc.workspace = true
+buzz-geom.workspace = true
+buzz-jobs.workspace = true
+buzz-rig.workspace = true
+buzz-scene.workspace = true
+peniko.workspace = true
+kurbo.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+ureq = { version = "2.10", features = ["json"] }
+sha2 = "0.10"
+base64 = "0.22"
+ndarray = "0.17"
+[target.'cfg(windows)'.dependencies]
+ort = { version = "2.0.0-rc.13", default-features = true, features = ["directml"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "2.0.0-rc.13", default-features = true, features = ["coreml"] }
+
+[target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
+ort = { version = "2.0.0-rc.13", default-features = true }
+
+[dev-dependencies]
+buzz-export.workspace = true
+buzz-render.workspace = true
+tempfile = "3"

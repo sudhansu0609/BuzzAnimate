@@ -1,0 +1,85 @@
+{
+  "title": "Implement OBJECT_SELECTION_SHADOW_UI_PLAN.md (selection/transform, pose-aware shadows, right-side UI, FLA round-trip)",
+  "summary": "Execute the four workstreams of docs/OBJECT_SELECTION_SHADOW_UI_PLAN.md in its mandated order: baseline audit of existing partial changes (no clean checkout), failing-regression tests first, then shared transform-zone hit testing, shadow evaluation aligned to the authoritative artwork path, right-side workspace regrouping with layout migration, and finally Adobe FLA/XFL import/export fidelity. Each step preserves unrelated work in the working tree and verifies via the document's command list.",
+  "steps": [
+    {
+      "n": 1,
+      "description": "Baseline audit: inspect current git status/diff for the partial selection, shadow, and right-side UI changes described in the doc; record per-area verified/incomplete/unverified state with files and test evidence into a note (e.g. docs/baseline_audit_<date>.md). Establish compiling baseline.",
+      "files": [
+        "docs/"
+      ],
+      "verification": "git status + git diff reviewed; cargo check --workspace passes on current tree."
+    },
+    {
+      "n": 2,
+      "description": "Add/update failing regression tests BEFORE fixes: (a) transform-gesture regressions in buzz-app tools/editor/stage test modules — corner vs pivot priority on tiny selection, pivot-on-corner draggable with adjacent rotation, rotation ring at all corners, side-handle axis, subselection shows no transform cursors, hover/draw/drag classification agreement, 100/150/200% display scaling + camera/symbol edit-in-place handle reach; (b) pose-aware shadow test in buzz-export headless_filters using a genuinely changing extended timeline: render a nonzero tween frame, assert unfiltered artwork pixels that cannot pass on background, compare silhouette vs known-offset shadow, reject both stored endpoint poses; plus mask clipping, transparent-bitmap holes, stroke-only, breathing deformation cases; (c) workspace migration tests in buzz-ui dock_columns/real_layout_migration covering untouched legacy layout and layouts customized only by tab/collapse/grouping/dimensions/floating position, idempotent across repeated loads.",
+      "files": [
+        "crates/buzz-app/src/tools.rs",
+        "crates/buzz-app/src/editor/",
+        "crates/buzz-app/src/stage/",
+        "crates/buzz-export/tests/headless_filters.rs",
+        "crates/buzz-ui/tests/dock_columns.rs",
+        "crates/buzz-ui/tests/real_layout_migration.rs"
+      ],
+      "verification": "cargo test -p buzz-app tools::tests:: --lib etc.; each new test FAILS against current code (proves it detects the fault); zero-match filters rejected."
+    },
+    {
+      "n": 3,
+      "description": "Implement shared transform-zone classifier: one handle-geometry module in the tool layer deriving pointer-down classification, hover cursors, drawn handles/rotation hints from the same state; screen-space logical-pixel hit areas adjusted for display scaling; project geometry through full camera + symbol placement before hit-testing and convert drag positions to edit space (handle non-invertible transforms explicitly); resolve effective pivot once per interaction (stored pivot else selection center); proximity-based corner/pivot overlap priority with deliberate-pivot-on-corner exception, identical in hover/draw/drag; Shift = proportional resize / 45° rotation snap; Alt/Option rotates around opposite corner (distinct from scaling gesture); preview and commit share one transform calculation path; one history op per drag, no-op drags create none.",
+      "files": [
+        "crates/buzz-ui/src/tools.rs",
+        "crates/buzz-app/src/editor/",
+        "crates/buzz-app/src/stage/"
+      ],
+      "verification": "cargo test -p buzz-app tools::tests:: --lib && cargo test -p buzz-app tools::transform_preview_tests:: --lib && cargo test -p buzz-app editor::tests:: --lib — all previously-failing gesture tests now pass; undo/redo restores original and final geometry."
+    },
+    {
+      "n": 4,
+      "description": "Align character drop shadows to the renderer's single authoritative artwork-evaluation path: reuse identical frame resolution (stage frame, symbol-local frame, root-synchronized instances, graphic/movie-clip timing, layer keyframe elapsed time, shape/classic tweens); traverse nested symbols with the same drawable-layer and mask rules and apply masks' actual clipping to the silhouette; apply inherited layer transforms exactly once; apply live modifiers (spring/wiggle/pose, breathing deformation) after the same world/document transforms, including warped shapes through fill/stroke/deformation handling; derive coverage from evaluated visible alpha (transparent bitmap regions, partial opacity, vector holes, stroke width/caps/joins), using an alpha mask where concatenated vector paths are insufficient; preserve culling margins, blur quality, object/layer filter scopes and preview/export parity.",
+      "files": [
+        "crates/buzz-scene/src/layer.rs",
+        "crates/buzz-scene/src/symbol.rs",
+        "renderer crate (shadow/filter evaluation path — exact file located at implementation start)"
+      ],
+      "verification": "cargo test -p buzz-export --test headless_filters -- --nocapture with an actual GPU run (distinguish executed vs skipped in logs; report skips as unverified, not validated); shadow pixel/silhouette assertions pass and demonstrably fail on the old evaluation path."
+    },
+    {
+      "n": 5,
+      "description": "Right-side workspace redesign: default main right column order Inspector (Properties/Effects/Tool Options, expanded, Properties selected) → Layers (expanded, body capped at 180 logical px with own scroll) → Palette Color/Swatches (collapsed) → Utilities Story/Depth/Rigging/Lighting/Sound (collapsed); outer column Library/Assets/Cast tab order with Library default; contextual Tool Options without empty panels stealing tabs; consistent padding/row height/field widths, compact icon buttons/menus, collapsible advanced sections, overflow menus and labelled Library control at narrow widths. Add layout-version migration that detects an untouched legacy default only via the FULL saved layout state (positions, grouping, selected tabs, collapsed states); preserve all custom layouts (tab-only or collapse-only changes count as customized); keep Reset Layout restoring new defaults; Window menu exposes every panel.",
+      "files": [
+        "crates/buzz-ui/src/ (dock/layout/workspace modules — exact files located at implementation start)",
+        "crates/buzz-ui/tests/dock_columns.rs",
+        "crates/buzz-ui/tests/real_layout_migration.rs"
+      ],
+      "verification": "cargo test -p buzz-ui --test dock_columns -- --nocapture && cargo test -p buzz-ui --test real_layout_migration -- --nocapture; before/after UI screenshots at 1920x1080, 1366x768, 1280x720 and available display scalings."
+    },
+    {
+      "n": 6,
+      "description": "Adobe FLA/XFL large-import fidelity: (a) build a pre-conversion source inventory in buzz-import-xfl (all archive entries, scenes, library definitions incl. unused assets, instances, layer/frame counts, media refs, dependency edges) and reconcile against parsed/resolved/saved/rendered content; (b) persistent actionable diagnostics per skipped entry/missing symbol/dangling ref with reason — no partial import labelled fully successful; (c) complete media/library resolution: register all definitions before instance resolution, keep shared definitions, safe handling of escaped names/Unicode/folders/case collisions/duplicates/cycles, decode embedded bitmap/media variants preserving dimensions and alpha, implement bitmap fill matrices and text attributes; bundle dependencies in native .buzz saves. (d) Fix buzz-export/src/xfl/mod.rs solid helper to emit gradient and bitmap paints; address reported losses (tweens, sound, filters, inverse masks); keep the distinction between native document (.buzz per buzz-doc/format.rs) and Adobe-compatible export artifacts.",
+      "files": [
+        "crates/buzz-import-xfl/src/lib.rs",
+        "crates/buzz-export/src/xfl/mod.rs",
+        "crates/buzz-doc/src/format.rs"
+      ],
+      "verification": "Round-trip/import tests on a representative failing FLA (compressed + unpacked XFL, original preserved): inventory-vs-rendered reconciliation test passes; gradient/bitmap paint export assertions pass."
+    },
+    {
+      "n": 7,
+      "description": "Full validation and reporting: run the doc's exact command list (cargo fmt --all -- --check; cargo check --workspace; buzz-app tools/transform_preview/editor/stage/dock_geometry tests; buzz-ui lib + dock_columns + real_layout_migration; buzz-export headless_filters; cargo test --workspace). Record each command, outcome and executed test count against the final revision; keep GPU-executed/skipped/ignored/failed distinct; capture before/after UI images and animated pose/shadow comparison; report changed files, test commands, screenshots, remaining limitations.",
+      "files": [],
+      "verification": "All listed commands pass (or baseline failures reported separately); evidence artifacts saved."
+    }
+  ],
+  "risks": [
+    "Working tree contains partial changes from earlier interrupted attempts; must preserve them and avoid assuming a clean checkout.",
+    "Shadow acceptance requires an actual GPU run; without one the item remains unverified rather than passing nominally.",
+    "No failing customer FLA has been reproduced yet — import fidelity work may be blocked pending a representative file.",
+    "Display-scaling (150/200%) verification may not be fully achievable headless and must be recorded as such.",
+    "Scope spans four subsystems; a regression in one area can invalidate earlier passing evidence, so the broader workspace suite may need re-runs."
+  ],
+  "questions": [
+    "Is a representative failing FLA file available to use for step 6 (the doc requires obtaining one and preserves the original)?",
+    "Will an actual GPU run be possible on this machine for the shadow acceptance tests, or should that item stay explicitly unverified?",
+    "Given the four workstreams' size, confirm proceeding through all of them in a single implementation pass as authorized."
+  ]
+}

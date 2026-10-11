@@ -73,6 +73,9 @@ pub struct History {
     depth: usize,
     /// Set when the current state matches what is on disk.
     saved_revision: Option<u64>,
+    /// How many edits have ever been recorded (coalesced ones included), so a
+    /// caller can tell "something was edited" from "only undo/redo happened".
+    edits: u64,
 }
 
 impl Default for History {
@@ -88,6 +91,7 @@ impl History {
             redo: Vec::new(),
             depth: depth.max(1),
             saved_revision: None,
+            edits: 0,
         }
     }
 
@@ -128,6 +132,7 @@ impl History {
     pub fn record(&mut self, before: Scene, label: impl Into<UndoLabel>) {
         let label = label.into();
         let now = Instant::now();
+        self.edits += 1;
 
         // Coalesce a continuing gesture: keep the *earliest* pre-edit state so
         // one Ctrl+Z reverses the whole drag rather than one mouse move of it.
@@ -178,6 +183,51 @@ impl History {
             at: Instant::now(),
         });
         Some(step.scene)
+    }
+
+    /// Edits ever recorded on this history (see [`Self::collapse_run`]).
+    pub fn edit_count(&self) -> u64 {
+        self.edits
+    }
+
+    /// Collapse a whole run of edits into one undo step (the AI Assistant's
+    /// "one run = one Ctrl+Z").
+    ///
+    /// `start` is a clone of this history taken before the run and `pre_run`
+    /// the scene at that moment. Whatever happened in between, including the
+    /// run's own undo and redo, the result is `start`'s stack plus, if the run
+    /// changed anything, one step that restores `pre_run`. The redo branch is
+    /// cleared then, as after any new edit. The saved-revision marker is kept
+    /// as it is now (the run may have saved).
+    pub fn collapse_run(
+        &mut self,
+        start: &History,
+        pre_run: Scene,
+        label: impl Into<UndoLabel>,
+        changed: bool,
+    ) {
+        let saved = self.saved_revision;
+        let edits = self.edits;
+        *self = start.clone();
+        self.saved_revision = saved;
+        self.edits = edits;
+        if !changed {
+            return;
+        }
+        let now = Instant::now();
+        // Back-dated so the next edit never merges into the run's step.
+        let at = now
+            .checked_sub(COALESCE_WINDOW + Duration::from_millis(1))
+            .unwrap_or(now);
+        self.undo.push(Step {
+            scene: pre_run,
+            label: label.into(),
+            at,
+        });
+        self.redo.clear();
+        if self.undo.len() > self.depth {
+            self.undo.remove(0);
+        }
     }
 
     /// Forget everything, as opening a document does.
@@ -460,5 +510,64 @@ mod tests {
             elapsed.as_millis() < 1_000,
             "100 undo steps over a 10k-object document took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn a_run_of_edits_collapses_into_one_labelled_step() {
+        let mut history = History::default();
+        let mut scene = scene_with(1);
+        history.record(scene.clone(), "Before");
+        add_one(&mut scene);
+
+        let (start, pre_run) = (history.clone(), scene.clone());
+        for label in ["A", "B", "C"] {
+            history.record(scene.clone(), label);
+            add_one(&mut scene);
+        }
+        assert_eq!(history.undo_depth(), 4);
+
+        history.collapse_run(&start, pre_run, "AI: do it", true);
+        assert_eq!(history.undo_depth(), 2);
+        assert_eq!(history.next_undo_label(), Some("AI: do it"));
+        assert_eq!(history.undo(scene).unwrap().shape_count(), 2);
+    }
+
+    #[test]
+    fn a_run_that_undid_earlier_work_still_leaves_a_consistent_history() {
+        let mut history = History::default();
+        let mut scene = scene_with(1);
+        history.record(scene.clone(), "Earlier");
+        add_one(&mut scene);
+        let (start, pre_run) = (history.clone(), scene.clone());
+
+        // The run undoes "Earlier", then draws two things.
+        scene = history.undo(scene).unwrap();
+        for label in ["X", "Y"] {
+            history.record(scene.clone(), label);
+            add_one(&mut scene);
+        }
+        history.collapse_run(&start, pre_run.clone(), "AI: undo then draw", true);
+
+        assert_eq!(history.undo_depth(), 2);
+        assert!(!history.can_redo());
+        let back = history.undo(scene).unwrap();
+        assert_eq!(back.shape_count(), pre_run.shape_count());
+        let earlier = history.undo(back).unwrap();
+        assert_eq!(earlier.shape_count(), 1);
+    }
+
+    #[test]
+    fn an_unchanged_run_restores_the_starting_history() {
+        let mut history = History::default();
+        let mut scene = scene_with(1);
+        history.record(scene.clone(), "Earlier");
+        add_one(&mut scene);
+        let (start, pre_run) = (history.clone(), scene.clone());
+        scene = history.undo(scene).unwrap();
+        scene = history.redo(scene).unwrap();
+        history.collapse_run(&start, pre_run, "AI: nothing", false);
+        assert_eq!(history.undo_depth(), 1);
+        assert_eq!(history.next_undo_label(), Some("Earlier"));
+        assert_eq!(scene.shape_count(), 2);
     }
 }

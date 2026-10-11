@@ -5,8 +5,8 @@
 //! This is the strip of wiring between them — the same arrangement
 //! [`crate::staging`] has, and for the same reason.
 
-use buzz_act::scenery::{Scenery, SceneryArt, SceneryPart};
 use buzz_act::SceneRecipe;
+use buzz_act::scenery::{Scenery, SceneryArt, SceneryPart};
 use buzz_scene::SymbolId;
 
 use crate::editor::Editor;
@@ -33,7 +33,26 @@ pub fn part_of(choice: buzz_ui::SceneryPartChoice) -> SceneryPart {
     }
 }
 
+/// What a set from the user's assets came out as, for a status line.
+pub(crate) fn set_note(dressed: &crate::asset_sets::Dressed) -> String {
+    if dressed.needs_procedural() {
+        format!(" \u{2014} nothing in your assets fitted ({})", dressed.plan.notes.join("; "))
+    } else {
+        format!(" \u{2014} set from your assets: {}", dressed.summary())
+    }
+}
+
 impl Editor {
+    /// The asset index sets are dressed from, when **Use my assets** is on
+    /// and the library has one.
+    pub(crate) fn set_index(&self, use_my_assets: bool) -> Option<buzz_ai::asset_index::AssetIndex> {
+        if use_my_assets && crate::asset_sets::has_index(&self.assets) {
+            crate::asset_sets::index_for(&self.assets)
+        } else {
+            None
+        }
+    }
+
     /// Everything the Story panel needs to draw: the shot list, with the words
     /// each shot was made from.
     pub fn shot_summaries(&self) -> Vec<buzz_ui::ShotSummary> {
@@ -90,6 +109,8 @@ impl Editor {
     /// The same call the dialog made, taking the panel's own settings. One
     /// edit, so a set an animator does not like is one press to take back.
     pub fn story_set_scene(&mut self, state: &buzz_ui::StoryState) {
+        let index = self.set_index(state.use_my_assets);
+        let words = scenery_of(state.scenery);
         let recipe = SceneRecipe {
             setting: crate::staging::setting_of(state.setting),
             cast: state.cast,
@@ -101,8 +122,31 @@ impl Editor {
             water: state.water,
         };
         let mut message = String::new();
+        let assets = &self.assets;
         self.doc.edit("Set the Scene", |scene| {
-            message = buzz_act::stage_scene(scene, &recipe).message;
+            let built = buzz_act::stage_scene(scene, &recipe);
+            message = built.message.clone();
+            // **Use my assets** (AS3): the set dressed from the library.
+            if let Some(index) = &index {
+                let stage = scene.stage().stage_rect();
+                let marks = built
+                    .cast
+                    .iter()
+                    .filter_map(|(_, id)| buzz_act::layer_rig::placement(scene, *id))
+                    .map(|p| (p.as_coeffs()[4] - stage.x0) / stage.width().max(1e-6))
+                    .collect();
+                let request = buzz_act::SetRequest {
+                    setting: recipe.setting,
+                    scenery: words,
+                    text: String::new(),
+                    horizon: recipe.horizon,
+                    backdrop: built.backdrop,
+                    ground: built.ground,
+                    marks,
+                };
+                let dressed = crate::asset_sets::dress_request(scene, assets, index, &request);
+                message.push_str(&set_note(&dressed));
+            }
         });
         self.doc.end_gesture();
         self.status = Some(message);
@@ -158,14 +202,28 @@ impl Editor {
     /// staged scene over the first is never what re-directing means.
     pub fn story_direct(&mut self, state: &mut buzz_ui::StoryState) {
         let story = state.draft.clone();
+        let index = self.set_index(state.use_my_assets);
+        let assets = &self.assets;
+        let mut note = String::new();
         let mut outcome: Option<Result<buzz_act::DirectedScene, buzz_act::DirectError>> = None;
         self.doc.edit("Direct", |scene| {
             *scene = buzz_scene::Scene::default();
-            outcome = Some(buzz_act::direct(scene, &story));
+            outcome = Some(match &index {
+                Some(index) => {
+                    let mut dress = |scene: &mut buzz_scene::Scene, request: &buzz_act::SetRequest| {
+                        let dressed = crate::asset_sets::dress_request(scene, assets, index, request);
+                        note = set_note(&dressed);
+                        !dressed.needs_procedural()
+                    };
+                    buzz_act::direct_dressed(scene, &story, Some(&mut dress))
+                }
+                None => buzz_act::direct(scene, &story),
+            });
         });
 
         match outcome {
-            Some(Ok(directed)) => {
+            Some(Ok(mut directed)) => {
+                directed.message.push_str(&note);
                 self.doc.end_gesture();
                 let at = self.doc.active_scene();
                 let title = buzz_act::split_shots(&story)

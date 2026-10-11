@@ -596,7 +596,11 @@ impl Player {
 
         let fresh = if let Ok(mut mixer) = self.mixer.lock() {
             let rate = mixer.sample_rate.max(1) as f64;
-            let seconds = if mixer.fps > 0.0 { 1.0 / mixer.fps } else { 0.04 };
+            let seconds = if mixer.fps > 0.0 {
+                1.0 / mixer.fps
+            } else {
+                0.04
+            };
             // Two ramps and something to hear between them.
             mixer.scrub_window = (seconds.max(RAMP_SECONDS as f64 * 4.0) * rate) as u64;
             let was_scrubbing = mixer.scrub_left.is_some();
@@ -806,7 +810,10 @@ mod tests {
         m.cues = vec![cue(Arc::clone(&clip), 0, CueSync::Stream)];
         let mut out = vec![0.0f32; 512];
         m.render(&mut out);
-        assert!(loudness(&out) < 0.01, "untrimmed, the clip opens in its silence");
+        assert!(
+            loudness(&out) < 0.01,
+            "untrimmed, the clip opens in its silence"
+        );
 
         // Trimmed to skip the first second: the same first buffer is loud.
         let mut m = rolling(24.0);
@@ -839,7 +846,11 @@ mod tests {
         m.position = 20_000;
         let mut out = vec![0.0f32; 512];
         m.render(&mut out);
-        assert_eq!(loudness(&out), 0.0, "past the out-point the stream is silent");
+        assert_eq!(
+            loudness(&out),
+            0.0,
+            "past the out-point the stream is silent"
+        );
     }
 
     /// Scrubbing moves a stream and leaves an event where it is.

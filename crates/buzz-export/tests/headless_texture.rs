@@ -35,7 +35,13 @@ fn checkered() -> Scene {
     let fg = Color::from_rgb8(0xE0, 0x20, 0x20);
     let bg = Color::from_rgb8(0x20, 0x40, 0xE0);
     let px = buzz_scene::texture::tile(TextureKind::Checker, 64, fg, bg);
-    let asset = Arc::new(ImageAsset::from_pixels(ImageId(1), "checker", 64, 64, Arc::new(px)));
+    let asset = Arc::new(ImageAsset::from_pixels(
+        ImageId(1),
+        "checker",
+        64,
+        64,
+        Arc::new(px),
+    ));
 
     let rect = Rect::new(-160.0, -110.0, 160.0, 110.0).to_path(1e-9);
     let mut shape = ShapeData::filled(rect, Color::WHITE);

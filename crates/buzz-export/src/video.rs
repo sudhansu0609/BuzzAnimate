@@ -197,9 +197,9 @@ pub fn ffmpeg_cmd() -> Command {
     #[cfg(unix)]
     {
         for path in [
-            "/opt/homebrew/bin/ffmpeg",  // Apple Silicon Homebrew
-            "/usr/local/bin/ffmpeg",     // Intel Mac Homebrew
-            "/opt/local/bin/ffmpeg",     // MacPorts
+            "/opt/homebrew/bin/ffmpeg", // Apple Silicon Homebrew
+            "/usr/local/bin/ffmpeg",    // Intel Mac Homebrew
+            "/opt/local/bin/ffmpeg",    // MacPorts
         ] {
             if std::path::Path::new(path).exists() {
                 return Command::new(path);
@@ -436,7 +436,10 @@ pub fn export_video(
     // alpha to keep — force it whatever the checkbox says.
     let effective;
     let settings = if video.codec.is_alpha() && !settings.transparent {
-        effective = ExportSettings { transparent: true, ..*settings };
+        effective = ExportSettings {
+            transparent: true,
+            ..*settings
+        };
         &effective
     } else {
         settings

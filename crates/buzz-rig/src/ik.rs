@@ -95,7 +95,15 @@ pub fn solve_to(
     let mut points: Vec<Point> = chain.iter().map(|i| joints[*i].0).collect();
     points.push(joints[*chain.last().expect("non-empty")].1);
 
-    let lengths: Vec<f64> = chain.iter().map(|i| armature.bones[*i].length).collect();
+    // The distance FABRIK must hold between consecutive points. Ordinarily
+    // that is just the bone's own length — but where the *next* bone in the
+    // chain carries an offset (see `Bone::offset`), its head is not at this
+    // bone's tip, and the segment FABRIK is actually solving runs from this
+    // head to *that* head instead. `segment_vector` gives that combined,
+    // still-rigid vector; its length is what must not stretch.
+    let lengths: Vec<f64> = (0..chain.len())
+        .map(|i| segment_vector(armature, &chain, i).hypot())
+        .collect();
     let reach: f64 = lengths.iter().sum();
 
     let mut iterations = 0;
@@ -220,6 +228,20 @@ fn straighten_towards(points: &mut [Point], base: Point, target: Point, lengths:
     }
 }
 
+/// The rigid vector, in bone `chain[i]`'s own local frame (unrotated), from
+/// its head to the next point FABRIK is solving for: its own tip, plus — if
+/// the *next* bone in the chain carries an offset — the fixed socket that
+/// bone's head sits at. Both parts turn together with `chain[i]`'s own
+/// rotation, so this vector's length and its angle *within that frame* are
+/// constant regardless of pose; only its direction in world space moves.
+fn segment_vector(armature: &Armature, chain: &[usize], i: usize) -> Vec2 {
+    let mut v = Vec2::new(armature.bones[chain[i]].length, 0.0);
+    if let Some(&next) = chain.get(i + 1) {
+        v += armature.bones[next].offset;
+    }
+    v
+}
+
 /// Read joint positions back into bone angles, honouring joint limits.
 fn apply_positions(armature: &mut Armature, chain: &[usize], points: &[Point]) {
     for (slot, &bone_index) in chain.iter().enumerate() {
@@ -227,7 +249,15 @@ fn apply_positions(armature: &mut Armature, chain: &[usize], points: &[Point]) {
         if direction.hypot() <= f64::EPSILON {
             continue;
         }
-        let world = direction.y.atan2(direction.x);
+        let segment_angle = direction.y.atan2(direction.x);
+
+        // The segment from this bone's head to the next point is this bone's
+        // own world angle, turned by a fixed amount (`psi`) when the next
+        // bone in the chain carries an offset — see `segment_vector`. With no
+        // offset `psi` is zero and this bone's world angle *is* the segment's.
+        let local = segment_vector(armature, chain, slot);
+        let psi = local.y.atan2(local.x);
+        let world = segment_angle - psi;
 
         // Relative to the parent, which may itself have just moved — so it is
         // read from the armature as it now is, after the earlier bones in this
@@ -291,6 +321,48 @@ mod tests {
             );
             assert!(arm.pose().iter().all(|a| a.is_finite()), "NaN in the pose");
         }
+    }
+
+    /// A bone whose *child* carries an offset (its head is not at this
+    /// bone's tip) makes the chain longer than its bones' lengths alone would
+    /// say. A solver that measured reach from `bone.length` only would think
+    /// this chain short by the offset and give up on a target it can
+    /// actually just reach.
+    #[test]
+    fn a_chain_reaches_correctly_when_a_bone_carries_an_offset() {
+        let mut arm = Armature::new(Point::new(100.0, 100.0));
+        arm.push(Bone::new("upper", None, 50.0, 0.0));
+        let mut fore = Bone::new("fore", Some(0), 40.0, 0.0);
+        fore.offset = Vec2::new(0.0, 10.0); // the elbow sits 10 below the shoulder's tip
+        arm.push(fore);
+
+        // The true reach includes the offset's own length, not just the two
+        // bones' — naive maths using only `bones[i].length` (50 + 40 = 90)
+        // would call this target unreachable on the first check and
+        // straighten short of it in a single iteration. A target a hair
+        // beyond 90 but inside the true 90.99 proves the reach check itself
+        // used the offset; a generous iteration budget is given because
+        // FABRIK converges slowly right at the edge of a chain's extension,
+        // which is a property of the algorithm and not what this is testing.
+        let true_reach = 50.0f64.hypot(10.0) + 40.0;
+        let target = Point::new(100.0 + true_reach - 0.5, 100.0);
+        let options = IkOptions {
+            max_iterations: 500,
+            ..IkOptions::default()
+        };
+
+        let outcome = solve_to(&mut arm, 1, target, &options);
+        assert!(outcome.reached, "should have reached: {outcome:?}");
+        assert!((arm.tip(1) - target).hypot() < 0.01);
+
+        assert!(
+            (arm.tip(0) - arm.head(0)).hypot() - 50.0 < 1e-6,
+            "upper stretched"
+        );
+        assert!(
+            (arm.tip(1) - arm.head(1)).hypot() - 40.0 < 1e-6,
+            "forearm stretched"
+        );
     }
 
     /// The base joint stays put — dragging a hand must not slide the whole

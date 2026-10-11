@@ -114,8 +114,13 @@ enum Move {
 
 #[derive(Debug, Clone, PartialEq)]
 enum EventKind {
-    Travel { running: bool, movement: Move },
-    Talk { listener: Option<usize> },
+    Travel {
+        running: bool,
+        movement: Move,
+    },
+    Talk {
+        listener: Option<usize>,
+    },
     Idle,
     /// One of the **one-shot** actions — sitting, standing, turning, pointing,
     /// reaching, reacting. All scheduled the same way: in place, once, over a
@@ -156,20 +161,102 @@ struct Story {
 /// front of a sentence must not become a character. Lowercased for the
 /// comparison.
 const NOT_NAMES: &[&str] = &[
-    "a", "an", "the", "and", "then", "meanwhile", "while", "after", "before", "later", "suddenly",
-    "next", "now", "finally", "he", "she", "they", "it", "i", "we", "his", "her", "their", "at",
-    "in", "on", "to", "from", "into", "out", "off", "night", "day", "morning", "evening",
-    "sunset", "dusk", "dawn", "noon", "afternoon", "inside", "outside", "interior", "left",
-    "right", "two", "three", "four", "five", "one", "scene", "stage", "there", "everyone",
-    "somebody", "someone", "nobody", "moon", "moonlight", "stars", "rain", "snow", "wind", "sun",
-    "sky", "street", "room", "kitchen", "office", "house", "city", "park", "forest", "both",
+    "a",
+    "an",
+    "the",
+    "and",
+    "then",
+    "meanwhile",
+    "while",
+    "after",
+    "before",
+    "later",
+    "suddenly",
+    "next",
+    "now",
+    "finally",
+    "he",
+    "she",
+    "they",
+    "it",
+    "i",
+    "we",
+    "his",
+    "her",
+    "their",
+    "at",
+    "in",
+    "on",
+    "to",
+    "from",
+    "into",
+    "out",
+    "off",
+    "night",
+    "day",
+    "morning",
+    "evening",
+    "sunset",
+    "dusk",
+    "dawn",
+    "noon",
+    "afternoon",
+    "inside",
+    "outside",
+    "interior",
+    "left",
+    "right",
+    "two",
+    "three",
+    "four",
+    "five",
+    "one",
+    "scene",
+    "stage",
+    "there",
+    "everyone",
+    "somebody",
+    "someone",
+    "nobody",
+    "moon",
+    "moonlight",
+    "stars",
+    "rain",
+    "snow",
+    "wind",
+    "sun",
+    "sky",
+    "street",
+    "room",
+    "kitchen",
+    "office",
+    "house",
+    "city",
+    "park",
+    "forest",
+    // The other scenery words the AI director's script can name (its
+    // `scenery` enum), so "Village." opens a scene instead of casting a
+    // character called Village (F7 run, 2026-09-26).
+    "village",
+    "field",
+    "both",
 ];
 
 /// Nouns that stand for an unnamed character: "a man walks in" casts one, and
 /// "the man" thereafter is the same man.
 const ANONYMOUS: &[&str] = &[
-    "man", "woman", "boy", "girl", "person", "figure", "stranger", "child", "kid", "guard",
-    "friend", "character",
+    "man",
+    "woman",
+    "boy",
+    "girl",
+    "person",
+    "figure",
+    "stranger",
+    "child",
+    "kid",
+    "guard",
+    "friend",
+    "character",
 ];
 
 fn split_sentences(story: &str) -> Vec<String> {
@@ -181,7 +268,10 @@ fn split_sentences(story: &str) -> Vec<String> {
         .collect()
 }
 
-fn words_of(sentence: &str) -> Vec<String> {
+/// The words of a sentence, apostrophes kept so "don't" is one word.
+/// Shared with the episode builder's gesture choice, so the two split a
+/// sentence the same way.
+pub fn words_of(sentence: &str) -> Vec<String> {
     sentence
         .split(|c: char| !c.is_alphanumeric() && c != '\'')
         .filter(|w| !w.is_empty())
@@ -197,7 +287,14 @@ fn setting_of(sentences: &[String]) -> Setting {
         // **A storm before a night**, because a storm *is* a night and the
         // word that matters is the more specific one: "a stormy night" is a
         // storm, and matching "night" first would take the lightning out of it.
-        if has(&["storm", "stormy", "thunder", "lightning", "tempest", "downpour"]) {
+        if has(&[
+            "storm",
+            "stormy",
+            "thunder",
+            "lightning",
+            "tempest",
+            "downpour",
+        ]) {
             return Setting::Storm;
         }
         // Night before day: "one night, in broad daylight, he dreamed" is a
@@ -208,10 +305,20 @@ fn setting_of(sentences: &[String]) -> Setting {
         if has(&["sunset", "dusk", "evening", "golden hour", "sundown"]) {
             return Setting::Sunset;
         }
-        if has(&["inside", "indoors", "interior", "room", "kitchen", "office", "house"]) {
+        if has(&[
+            "inside", "indoors", "interior", "room", "kitchen", "office", "house",
+        ]) {
             return Setting::Interior;
         }
-        if has(&["day", "morning", "noon", "afternoon", "sunny", "daylight", "outside"]) {
+        if has(&[
+            "day",
+            "morning",
+            "noon",
+            "afternoon",
+            "sunny",
+            "daylight",
+            "outside",
+        ]) {
             return Setting::Daylight;
         }
     }
@@ -273,8 +380,17 @@ fn parse(story: &str) -> Story {
     let scenery = crate::scenery::Scenery::from_prose(&scenery_text);
     let clouds = mentions(&["cloud", "overcast", "clouded", "sky above", "clear sky"]);
     let water = mentions(&[
-        "river", "stream", "creek", "canal", "lake", "sea", "ocean", "shore", "beach",
-        "riverbank", "water",
+        "river",
+        "stream",
+        "creek",
+        "canal",
+        "lake",
+        "sea",
+        "ocean",
+        "shore",
+        "beach",
+        "riverbank",
+        "water",
     ]);
 
     let mut names: Vec<String> = Vec::new();
@@ -338,7 +454,9 @@ fn parse(story: &str) -> Story {
         // -- what --------------------------------------------------------
         let running = has_stem(
             &words_lower,
-            &["run", "dash", "sprint", "hurr", "rush", "race", "flee", "jog", "bolt"],
+            &[
+                "run", "dash", "sprint", "hurr", "rush", "race", "flee", "jog", "bolt",
+            ],
         );
         let walking = has_stem(
             &words_lower,
@@ -378,16 +496,27 @@ fn parse(story: &str) -> Story {
         let getting_up = has_stem(&words_lower, &["rise", "rose", "risen"])
             || (has_stem(&words_lower, &["stand", "get", "got", "clamber", "haul"])
                 && lower.contains(" up"));
-        let sitting = has_stem(&words_lower, &["sit", "sat", "seat", "perch", "slump"])
-            && !getting_up;
-        let turning = has_stem(&words_lower, &["turn", "spin", "spun", "whirl", "swivel", "wheel"]);
-        let pointing = has_stem(&words_lower, &["point", "gestur", "indicat", "beckon", "wave"]);
-        let reaching = has_stem(&words_lower, &[
-            "reach", "grab", "grasp", "seiz", "snatch", "lift", "pluck",
-        ]) || (has_stem(&words_lower, &["pick", "take", "took", "picks"]) && lower.contains(" up"));
-        let reacting = has_stem(&words_lower, &[
-            "react", "recoil", "flinch", "startl", "jump", "gasp", "wince", "jolt", "shrink",
-        ]);
+        let sitting =
+            has_stem(&words_lower, &["sit", "sat", "seat", "perch", "slump"]) && !getting_up;
+        let turning = has_stem(
+            &words_lower,
+            &["turn", "spin", "spun", "whirl", "swivel", "wheel"],
+        );
+        let pointing = has_stem(
+            &words_lower,
+            &["point", "gestur", "indicat", "beckon", "wave"],
+        );
+        let reaching = has_stem(
+            &words_lower,
+            &["reach", "grab", "grasp", "seiz", "snatch", "lift", "pluck"],
+        ) || (has_stem(&words_lower, &["pick", "take", "took", "picks"])
+            && lower.contains(" up"));
+        let reacting = has_stem(
+            &words_lower,
+            &[
+                "react", "recoil", "flinch", "startl", "jump", "gasp", "wince", "jolt", "shrink",
+            ],
+        );
         let gesture = if sitting {
             Some(Action::Sit)
         } else if getting_up {
@@ -579,9 +708,7 @@ pub fn frame_the_shot(scene: &mut Scene, directed: &DirectedScene) -> usize {
         Some((bounds.center(), bounds.height().max(1.0)))
     };
 
-    let zoom_for = |height: f64, fill: f64| {
-        ((stage.height() * fill) / height).clamp(1.0, MAX_ZOOM)
-    };
+    let zoom_for = |height: f64, fill: f64| ((stage.height() * fill) / height).clamp(1.0, MAX_ZOOM);
 
     let mut keys: Vec<CameraKey> = Vec::new();
     fn push(keys: &mut Vec<CameraKey>, frame: u32, at: Point, zoom: f64) {
@@ -606,19 +733,34 @@ pub fn frame_the_shot(scene: &mut Scene, directed: &DirectedScene) -> usize {
                 if beat.frames.start > 0
                     && let Some(previous) = keys.last().copied()
                 {
-                    push(&mut keys, beat.frames.start - 1, previous.center, previous.zoom);
+                    push(
+                        &mut keys,
+                        beat.frames.start - 1,
+                        previous.center,
+                        previous.zoom,
+                    );
                 }
                 push(&mut keys, beat.frames.start, at, zoom);
             }
             Action::Walk | Action::Run => {
                 // Followed, at both ends, so the camera travels with them.
                 if let Some((from, height)) = look_at(scene, beat.actor, beat.frames.start) {
-                    push(&mut keys, beat.frames.start, from, zoom_for(height, WIDE_FILL));
+                    push(
+                        &mut keys,
+                        beat.frames.start,
+                        from,
+                        zoom_for(height, WIDE_FILL),
+                    );
                 }
                 if beat.frames.end > beat.frames.start + 1
                     && let Some((to, height)) = look_at(scene, beat.actor, beat.frames.end - 1)
                 {
-                    push(&mut keys, beat.frames.end - 1, to, zoom_for(height, WIDE_FILL));
+                    push(
+                        &mut keys,
+                        beat.frames.end - 1,
+                        to,
+                        zoom_for(height, WIDE_FILL),
+                    );
                 }
             }
             // **A gesture is worth cutting in for.** A point, a reach or a
@@ -638,13 +780,21 @@ pub fn frame_the_shot(scene: &mut Scene, directed: &DirectedScene) -> usize {
                 if beat.frames.start > 0
                     && let Some(previous) = keys.last().copied()
                 {
-                    push(&mut keys, beat.frames.start - 1, previous.center, previous.zoom);
+                    push(
+                        &mut keys,
+                        beat.frames.start - 1,
+                        previous.center,
+                        previous.zoom,
+                    );
                 }
                 push(&mut keys, beat.frames.start, at, zoom);
             }
             // Standing still is not a reason to move the camera, and neither
             // is sitting down in the middle of the shot you are already in.
             Action::Idle | Action::Sit | Action::Stand | Action::Turn => {}
+            // The episode builder's conversational gestures. The director
+            // never schedules them, and a nod is not worth a cut.
+            Action::Wave | Action::Nod | Action::HeadShake | Action::Shrug | Action::Namaste => {}
         }
     }
 
@@ -663,9 +813,7 @@ pub fn frame_the_shot(scene: &mut Scene, directed: &DirectedScene) -> usize {
     // Every key still the opening wide one means nothing was worth cutting to,
     // and a locked-off camera says that with less machinery than a camera track
     // holding one key.
-    let untouched = keys
-        .iter()
-        .all(|k| k.zoom == 1.0 && k.center == centre);
+    let untouched = keys.iter().all(|k| k.zoom == 1.0 && k.center == centre);
     if untouched {
         return 0;
     }
@@ -775,9 +923,27 @@ fn is_setting_line(line: &str) -> bool {
         return false;
     }
     const SETTING_WORDS: &[&str] = &[
-        "night", "evening", "dark", "midnight", "dusk", "sunset", "sundown",
-        "interior", "inside", "indoors", "kitchen", "room", "day", "daylight",
-        "morning", "noon", "afternoon", "exterior", "outside", "later", "then",
+        "night",
+        "evening",
+        "dark",
+        "midnight",
+        "dusk",
+        "sunset",
+        "sundown",
+        "interior",
+        "inside",
+        "indoors",
+        "kitchen",
+        "room",
+        "day",
+        "daylight",
+        "morning",
+        "noon",
+        "afternoon",
+        "exterior",
+        "outside",
+        "later",
+        "then",
     ];
     words
         .iter()
@@ -805,7 +971,39 @@ fn shot_title(lines: &[String]) -> String {
     }
 }
 
+/// What a set dresser is asked to fill (AS3: the app dresses a directed
+/// shot from the user's own assets instead of the scenery brushes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetRequest {
+    pub setting: Setting,
+    /// The scenery the story's words chose for the brushes.
+    pub scenery: crate::scenery::Scenery,
+    /// The story itself, for matching pieces to its words.
+    pub text: String,
+    /// Where the ground meets the sky, `0..1` down the stage.
+    pub horizon: f64,
+    /// The staged sky and ground layers.
+    pub backdrop: Option<buzz_scene::LayerId>,
+    pub ground: Option<buzz_scene::LayerId>,
+    /// Where the cast stands, `0..1` across the stage.
+    pub marks: Vec<f64>,
+}
+
+/// Fills the set for a [`SetRequest`]; `true` when it did (the brushes are
+/// then not laid).
+pub type SetDresser<'a> = &'a mut dyn FnMut(&mut Scene, &SetRequest) -> bool;
+
 pub fn direct(scene: &mut Scene, story: &str) -> Result<DirectedScene, DirectError> {
+    direct_dressed(scene, story, None)
+}
+
+/// [`direct`], with the set filled by `dress` when given (and it says it
+/// did) instead of the scenery brushes.
+pub fn direct_dressed(
+    scene: &mut Scene,
+    story: &str,
+    dress: Option<SetDresser>,
+) -> Result<DirectedScene, DirectError> {
     let parsed = parse(story);
     if parsed.names.is_empty() || parsed.events.is_empty() {
         return Err(DirectError::NothingUnderstood);
@@ -840,7 +1038,31 @@ pub fn direct(scene: &mut Scene, story: &str) -> Result<DirectedScene, DirectErr
         let stage = scene.stage().stage_rect();
         stage.y0 + stage.height() * recipe.horizon.clamp(0.15, 0.95)
     };
-    crate::scenery::lay(scene, parsed.scenery, horizon_y, staged.backdrop);
+    let dressed = match dress {
+        Some(dress) => {
+            let stage = scene.stage().stage_rect();
+            let marks = staged
+                .cast
+                .iter()
+                .filter_map(|(_, id)| crate::layer_rig::placement(scene, *id))
+                .map(|placed| (placed.as_coeffs()[4] - stage.x0) / stage.width().max(1e-6))
+                .collect();
+            let request = SetRequest {
+                setting: parsed.setting,
+                scenery: parsed.scenery,
+                text: story.to_string(),
+                horizon: recipe.horizon.clamp(0.15, 0.95),
+                backdrop: staged.backdrop,
+                ground: staged.ground,
+                marks,
+            };
+            dress(scene, &request)
+        }
+        None => false,
+    };
+    if !dressed {
+        crate::scenery::lay(scene, parsed.scenery, horizon_y, staged.backdrop);
+    }
     // A storm arrives with rain the way it already arrives with cloud: it is
     // what a storm is, and the rule lives in one place so it cannot get out of
     // step with the setting that needs it.
@@ -869,10 +1091,9 @@ pub fn direct(scene: &mut Scene, story: &str) -> Result<DirectedScene, DirectErr
         .cast
         .iter()
         .map(|(_, id)| {
-            let placed = scene
-                .find_object(*id)
-                .map(|(_, o)| o.transform)
-                .unwrap_or(Affine::IDENTITY);
+            // Asked of the rig, so a layer rig stands where its root part does.
+            let placed =
+                crate::layer_rig::placement(scene, *id).unwrap_or(Affine::IDENTITY);
             let coeffs = placed.as_coeffs();
             ActorState {
                 placed,
@@ -977,7 +1198,7 @@ pub fn direct(scene: &mut Scene, story: &str) -> Result<DirectedScene, DirectErr
                     // at their mark before their entrance.
                     let placed = actors[actor].placed;
                     if let Some((_, id)) = staged.cast.get(actor) {
-                        scene.update_object_at(0, *id, |o| o.transform = placed);
+                        crate::layer_rig::set_placement(scene, *id, 0, placed);
                     }
                 }
 
@@ -988,9 +1209,7 @@ pub fn direct(scene: &mut Scene, story: &str) -> Result<DirectedScene, DirectErr
                 }
 
                 let speed = if *running { run_speed } else { walk_speed };
-                let seconds = event
-                    .seconds
-                    .unwrap_or((dx.abs() / speed).clamp(0.6, 8.0));
+                let seconds = event.seconds.unwrap_or((dx.abs() / speed).clamp(0.6, 8.0));
                 let frames = ((seconds * fps).round() as u32).max(4);
                 let range = start..start + frames;
 
@@ -1264,7 +1483,11 @@ mod tests {
         .expect("the story is readable");
 
         assert_eq!(directed.names, vec!["Ana", "Ben"]);
-        assert!(directed.ignored.is_empty(), "ignored: {:?}", directed.ignored);
+        assert!(
+            directed.ignored.is_empty(),
+            "ignored: {:?}",
+            directed.ignored
+        );
         assert!(
             directed.beats.len() >= 3,
             "an entrance, a talk, a listen and an exit: {:?}",
@@ -1364,10 +1587,7 @@ mod tests {
                 .collect();
             ranges.sort_by_key(|r| r.start);
             for pair in ranges.windows(2) {
-                assert!(
-                    pair[0].end <= pair[1].start,
-                    "actor {a} overlaps: {pair:?}"
-                );
+                assert!(pair[0].end <= pair[1].start, "actor {a} overlaps: {pair:?}");
             }
         }
     }
@@ -1484,7 +1704,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod framing_tests {
     use super::*;
@@ -1527,8 +1746,10 @@ mod framing_tests {
     /// to open on first, so there is a wide framing for the cut to leave.
     #[test]
     fn the_shot_comes_in_on_whoever_is_talking() {
-        let (scene, _) = shot("Ana walks in from the left.
-Ana talks to Ben.");
+        let (scene, _) = shot(
+            "Ana walks in from the left.
+Ana talks to Ben.",
+        );
         let zooms: Vec<f64> = scene.camera().keys().iter().map(|k| k.zoom).collect();
         let widest = zooms.iter().copied().fold(f64::MAX, f64::min);
         let closest = zooms.iter().copied().fold(0.0f64, f64::max);
@@ -1544,11 +1765,7 @@ Ana talks to Ben.");
     fn it_never_frames_tighter_than_a_person() {
         let (scene, _) = shot("Ana talks to Ben. Ben talks to Ana.");
         for key in scene.camera().keys() {
-            assert!(
-                key.zoom <= 2.2,
-                "a zoom of {} is somebody's chin",
-                key.zoom
-            );
+            assert!(key.zoom <= 2.2, "a zoom of {} is somebody's chin", key.zoom);
             assert!(key.zoom >= 1.0, "and never further out than the stage");
         }
     }
@@ -1598,18 +1815,14 @@ mod sequence_tests {
 
     #[test]
     fn a_blank_line_starts_a_new_shot() {
-        let shots = split_shots(
-            "Night. Ana walks in from the left.\n\nBen walks off right.",
-        );
+        let shots = split_shots("Night. Ana walks in from the left.\n\nBen walks off right.");
         assert_eq!(shots.len(), 2);
         assert!(shots[1].story.contains("Ben walks off"));
     }
 
     #[test]
     fn a_setting_on_its_own_line_starts_a_new_shot() {
-        let shots = split_shots(
-            "Night.\nAna walks in from the left.\nDay.\nBen walks off right.",
-        );
+        let shots = split_shots("Night.\nAna walks in from the left.\nDay.\nBen walks off right.");
         assert_eq!(shots.len(), 2, "the slug line cuts");
         assert!(shots[0].story.starts_with("Night."));
         assert!(shots[1].story.starts_with("Day."));

@@ -58,7 +58,9 @@ impl Shot {
 
 /// What to render, handed over when the user asks for it.
 pub struct Request {
-    pub scenes: Vec<Scene>,
+    /// The film's scenes, in play order, each with how many film frames it
+    /// contributes — see `buzz_doc::Document::film_with_lengths`.
+    pub scenes: Vec<(Scene, u32)>,
     pub range: std::ops::Range<u32>,
     /// The size the export is going out at, so the preview has its aspect.
     pub width: u32,
@@ -125,7 +127,8 @@ impl Preview {
             egui_renderer.free_texture(&shot.id);
         }
 
-        let reel = buzz_export::Reel::of(request.scenes.iter());
+        let reel =
+            buzz_export::Reel::of_lengths(request.scenes.iter().map(|(scene, length)| (scene, *length)));
         if reel.is_empty() || request.range.is_empty() {
             self.message = Some("There is nothing in that range to render".into());
             return;
@@ -153,8 +156,17 @@ impl Preview {
             let Some((scene, local)) = reel.at_clamped(at) else {
                 continue;
             };
-            if let Some(shot) = self.draw(gpu, egui_renderer, vello, scene, local, at, width, height, cache)
-            {
+            if let Some(shot) = self.draw(
+                gpu,
+                egui_renderer,
+                vello,
+                scene,
+                local,
+                at,
+                width,
+                height,
+                cache,
+            ) {
                 self.shots.push(shot);
             }
         }
@@ -182,42 +194,6 @@ impl Preview {
         height: u32,
         cache: &mut buzz_render::document::DrawCache,
     ) -> Option<Shot> {
-        // **The stage framed exactly**, as the exporter frames it: the stage
-        // centre in the middle of the picture, and one document unit to `zoom`
-        // pixels. Not a fitted camera with a margin -- a preview with a border
-        // the film will not have is a preview of a different picture.
-        let stage = scene.stage().stage_rect();
-        let camera = buzz_geom::Camera::new(
-            stage.center(),
-            width as f64 / stage.width().max(1e-6),
-            buzz_geom::Size::new(width as f64, height as f64),
-        );
-
-        vello.reset();
-        let mut builder = buzz_render::SceneBuilder::new(vello, &camera);
-        // The stage's own colour under it, because an export is not
-        // transparent unless it was asked to be.
-        builder.fill_shape(&stage, scene.stage().background);
-        buzz_render::document::draw_frame_cached(
-            &mut builder,
-            scene,
-            frame,
-            // The camera moves within the frame too, so it is asked for the
-            // same instant the artwork is.
-            scene.camera_transform(frame),
-            // **The export's options, not the stage's.** The whole value of a
-            // test render is that it is the picture the file will hold: lit,
-            // masks clipping, and no authoring aid anywhere in it.
-            &buzz_render::document::FrameOptions {
-                lit: true,
-                guides: false,
-                masks: buzz_render::document::MaskDisplay::Always,
-                ..buzz_render::document::FrameOptions::default()
-            },
-            cache,
-        );
-        drop(builder);
-
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("export preview"),
             size: wgpu::Extent3d {
@@ -235,8 +211,7 @@ impl Preview {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        gpu.render(vello, &view, width, height, scene.stage().background)
-            .ok()?;
+        render_export_frame(gpu, vello, scene, frame, width, height, cache, &view)?;
 
         let id =
             egui_renderer.register_native_texture(&gpu.device, &view, wgpu::FilterMode::Linear);
@@ -249,4 +224,71 @@ impl Preview {
             height,
         })
     }
+}
+
+/// Render one frame through the export's own pipeline: lit, masks always
+/// clipped, no authoring aid anywhere in the picture — the same frame the
+/// exported file would hold.
+///
+/// Shared by the export preview strip above and the Test Movie overlay
+/// (`test_movie.rs`), so what either shows on screen is what the file will
+/// hold, rendered exactly the same way.
+#[allow(clippy::too_many_arguments, reason = "a render takes what it takes")]
+pub(crate) fn render_export_frame(
+    gpu: &mut buzz_render::GpuContext,
+    vello: &mut vello::Scene,
+    scene: &Scene,
+    frame: u32,
+    width: u32,
+    height: u32,
+    cache: &mut buzz_render::document::DrawCache,
+    view: &wgpu::TextureView,
+) -> Option<()> {
+    // **The stage framed exactly**, as the exporter frames it: the stage
+    // centre in the middle of the picture, and one document unit to `zoom`
+    // pixels. Not a fitted camera with a margin -- a preview with a border
+    // the film will not have is a preview of a different picture.
+    let stage = scene.stage().stage_rect();
+    let camera = buzz_geom::Camera::new(
+        stage.center(),
+        width as f64 / stage.width().max(1e-6),
+        buzz_geom::Size::new(width as f64, height as f64),
+    );
+
+    vello.reset();
+    let mut builder = buzz_render::SceneBuilder::new(vello, &camera);
+    // The stage's own colour under it, because an export is not
+    // transparent unless it was asked to be.
+    builder.fill_shape(&stage, scene.stage().background);
+    // Culled to the stage, grown by 2% on each side for the same reason
+    // the exporter's own cull is: a stroke or a seam seal can poke a hair
+    // past an object's own fill bounds. This renders the exporter's
+    // pipeline, so it must skip what the export would skip — an instance
+    // heavy enough to overflow the rasteriser unculled must not blank the
+    // picture any more than it blanks the file.
+    let cull = Some(stage.inflate(stage.width() * 0.02, stage.height() * 0.02));
+    buzz_render::document::draw_frame_cached(
+        &mut builder,
+        scene,
+        frame,
+        // The camera moves within the frame too, so it is asked for the
+        // same instant the artwork is.
+        scene.camera_transform(frame),
+        // **The export's options, not the stage's.** The whole value of a
+        // test render is that it is the picture the file will hold: lit,
+        // masks clipping, and no authoring aid anywhere in it.
+        &buzz_render::document::FrameOptions {
+            lit: true,
+            guides: false,
+            masks: buzz_render::document::MaskDisplay::Always,
+            cull,
+            ..buzz_render::document::FrameOptions::default()
+        },
+        cache,
+    );
+    drop(builder);
+
+    gpu.render(vello, view, width, height, scene.stage().background)
+        .ok()?;
+    Some(())
 }

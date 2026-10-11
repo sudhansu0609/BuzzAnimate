@@ -214,7 +214,10 @@ fn a_gesture_is_as_long_as_the_action_takes() {
     let directed =
         buzz_act::direct(&mut scene, "Day. Ana points for three seconds.").expect("directs");
     let seconds = directed.beats[0].frames.len() as f64 / 24.0;
-    assert!((seconds - 3.0).abs() < 0.2, "the writer asked for 3s and got {seconds:.2}s");
+    assert!(
+        (seconds - 3.0).abs() < 0.2,
+        "the writer asked for 3s and got {seconds:.2}s"
+    );
 }
 
 /// **A gesture does not move the character**, so the staging stays where the
@@ -272,6 +275,10 @@ fn a_storm_arrives_wet() {
     assert!(
         scene.layers().iter().any(|l| l.name == "Rain"),
         "a storm with no rain in it: {:?}",
-        scene.layers().iter().map(|l| l.name.clone()).collect::<Vec<_>>()
+        scene
+            .layers()
+            .iter()
+            .map(|l| l.name.clone())
+            .collect::<Vec<_>>()
     );
 }

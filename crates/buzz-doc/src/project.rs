@@ -234,7 +234,13 @@ mod tests {
         let mut project = Project::new("Film");
         project.shots.push(Shot::new("a.buzz")); // 24 fps, the reference
         project.shots.push(Shot::new("b.buzz")); // 30 fps, the offender
-        let rate = |s: &Shot| if s.path.ends_with("b.buzz") { 30.0 } else { 24.0 };
+        let rate = |s: &Shot| {
+            if s.path.ends_with("b.buzz") {
+                30.0
+            } else {
+                24.0
+            }
+        };
         let errors = project.validate(rate).expect_err("should not validate");
         assert_eq!(errors.len(), 1);
         assert!(matches!(errors[0], FilmError::FrameRateMismatch { .. }));

@@ -29,8 +29,8 @@
 //! window, because everything here is rebuilt on every pointer move while the
 //! stroke is being drawn.
 
-use buzz_geom::{Affine, BezPath, Point, Rect, Shape as _, Vec2};
 use buzz_geom::brush::{BrushBudget, StrokeSample, condition};
+use buzz_geom::{Affine, BezPath, Point, Rect, Shape as _, Vec2};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
@@ -259,9 +259,8 @@ struct Fx<'a> {
 impl Fx<'_> {
     /// A deterministic value in `[0, 1)` for stamp `index`, stream `salt`.
     fn rng(&self, index: usize, salt: u64) -> f64 {
-        let x = splitmix(
-            self.seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt << 17,
-        );
+        let x =
+            splitmix(self.seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt << 17);
         (x >> 11) as f64 / (1u64 << 53) as f64
     }
 
@@ -414,7 +413,12 @@ fn glow(center: Point, r: f64, color: Color, alpha: f64) -> ShapeData {
             GradientStop::new(1.0, with_alpha(color, 0.0)),
         ],
     );
-    ramp.fit_to(Rect::new(center.x - r, center.y - r, center.x + r, center.y + r));
+    ramp.fit_to(Rect::new(
+        center.x - r,
+        center.y - r,
+        center.x + r,
+        center.y + r,
+    ));
     let mut path = BezPath::new();
     add_circle(&mut path, center, r);
     ShapeData {
@@ -561,7 +565,11 @@ fn stars(fx: &Fx<'_>) -> Vec<ArtPiece> {
             + normal * (fx.spread(i, 0x57A1) * fx.size * 2.5)
             + stamp.dir * (fx.spread(i, 0x57A2) * fx.size * 1.2);
         let roll = fx.rng(i, 0x57A3);
-        let bucket = if fx.rng(i, 0x57A4) < 0.4 { &mut bright } else { &mut dim };
+        let bucket = if fx.rng(i, 0x57A4) < 0.4 {
+            &mut bright
+        } else {
+            &mut dim
+        };
         if bucket.elements().len() >= caps::ELEMENTS {
             continue;
         }
@@ -788,9 +796,8 @@ fn light_rays(fx: &Fx<'_>) -> Vec<ArtPiece> {
         // The linear ramp lives on the unit segment (-1,0)..(1,0); carry it
         // onto the beam so it fades along the beam's own length.
         let mid = origin + along * (len / 2.0);
-        ramp.transform = Affine::translate(mid.to_vec2())
-            * Affine::rotate(angle)
-            * Affine::scale(len / 2.0);
+        ramp.transform =
+            Affine::translate(mid.to_vec2()) * Affine::rotate(angle) * Affine::scale(len / 2.0);
 
         out.push(ArtPiece::Shape(ShapeData {
             path,
@@ -945,10 +952,8 @@ fn lamps(fx: &Fx<'_>) -> Vec<ArtPiece> {
             ],
         );
         // Vertical, head to ground: rotate the unit ramp a quarter turn.
-        cone_ramp.transform = Affine::translate(Vec2::new(
-            head.x,
-            (head.y + base.y) / 2.0,
-        )) * Affine::rotate(std::f64::consts::FRAC_PI_2)
+        cone_ramp.transform = Affine::translate(Vec2::new(head.x, (head.y + base.y) / 2.0))
+            * Affine::rotate(std::f64::consts::FRAC_PI_2)
             * Affine::scale((base.y - head.y).abs() / 2.0);
         out.push(ArtPiece::Shape(ShapeData {
             path: cone,
@@ -965,14 +970,27 @@ fn lamps(fx: &Fx<'_>) -> Vec<ArtPiece> {
 
         // The ironwork, in one bucket for the whole stroke.
         let w = s * 0.07;
-        add_rect(&mut posts, Rect::new(base.x - w, head.y, base.x + w, base.y));
         add_rect(
             &mut posts,
-            Rect::new(base.x - s * 0.3, base.y - s * 0.06, base.x + s * 0.3, base.y),
+            Rect::new(base.x - w, head.y, base.x + w, base.y),
         );
         add_rect(
             &mut posts,
-            Rect::new(head.x - s * 0.22, head.y - s * 0.1, head.x + s * 0.22, head.y + s * 0.02),
+            Rect::new(
+                base.x - s * 0.3,
+                base.y - s * 0.06,
+                base.x + s * 0.3,
+                base.y,
+            ),
+        );
+        add_rect(
+            &mut posts,
+            Rect::new(
+                head.x - s * 0.22,
+                head.y - s * 0.1,
+                head.x + s * 0.22,
+                head.y + s * 0.02,
+            ),
         );
         add_circle(&mut posts, Point::new(head.x, head.y + s * 0.16), s * 0.16);
     }
@@ -1159,11 +1177,7 @@ fn houses(fx: &Fx<'_>) -> Vec<ArtPiece> {
     // The roof is the fill colour taken down towards black, so one chosen
     // colour still gives two tones and the row does not read as a silhouette.
     push_solid(&mut out, roofs, darken(fx.color, 0.55));
-    push_solid(
-        &mut out,
-        windows,
-        Color::from_rgba8(0xFF, 0xC9, 0x6B, 0xEA),
-    );
+    push_solid(&mut out, windows, Color::from_rgba8(0xFF, 0xC9, 0x6B, 0xEA));
     out
 }
 
@@ -1185,11 +1199,7 @@ fn pine_trees(fx: &Fx<'_>) -> Vec<ArtPiece> {
             Rect::new(base.x - tw, base.y - h * 0.25, base.x + tw, base.y),
         );
         // Three tiers, each a triangle: the canonical pine.
-        for (bottom, top, half) in [
-            (0.18, 0.55, 0.30),
-            (0.45, 0.78, 0.23),
-            (0.68, 1.02, 0.16),
-        ] {
+        for (bottom, top, half) in [(0.18, 0.55, 0.30), (0.45, 0.78, 0.23), (0.68, 1.02, 0.16)] {
             let mut tri = BezPath::new();
             tri.move_to(Point::new(base.x - h * half, base.y - h * bottom));
             tri.line_to(Point::new(base.x + h * half, base.y - h * bottom));
@@ -1259,7 +1269,11 @@ fn grass(fx: &Fx<'_>) -> Vec<ArtPiece> {
         let tip = Point::new(base.x + lean * h, base.y - h);
         let ctrl = Point::new(base.x + lean * h * 0.25, base.y - h * 0.6);
 
-        let bucket = if fx.rng(i, 0x6EA3) < 0.5 { &mut front } else { &mut back };
+        let bucket = if fx.rng(i, 0x6EA3) < 0.5 {
+            &mut front
+        } else {
+            &mut back
+        };
         if bucket.elements().len() >= caps::ELEMENTS {
             continue;
         }
@@ -1514,7 +1528,10 @@ mod tests {
                 }
             }
         }
-        assert!(partial > 100, "a cloud's edge should fade, found {partial} soft pixels");
+        assert!(
+            partial > 100,
+            "a cloud's edge should fade, found {partial} soft pixels"
+        );
     }
 
     #[test]

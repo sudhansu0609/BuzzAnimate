@@ -12,8 +12,8 @@
 //! Skips cleanly when no GPU is available, so it is safe in headless CI.
 
 use buzz_export::{ExportSettings, Exporter, Reel};
-use buzz_render::GpuPreference;
 use buzz_geom::{Rect, Shape as _};
+use buzz_render::GpuPreference;
 use buzz_scene::{LayerKind, LoopRegion, Scene, ShapeData};
 use peniko::Color;
 
@@ -77,7 +77,11 @@ fn read_png(path: &std::path::Path) -> buzz_export::Frame {
         .expect("png header");
     let mut pixels = vec![0u8; reader.output_buffer_size().expect("buffer size")];
     let info = reader.next_frame(&mut pixels).expect("png data");
-    assert_eq!(info.color_type, png::ColorType::Rgba, "expected RGBA output");
+    assert_eq!(
+        info.color_type,
+        png::ColorType::Rgba,
+        "expected RGBA output"
+    );
     pixels.truncate(info.buffer_size());
     buzz_export::Frame {
         width: info.width,

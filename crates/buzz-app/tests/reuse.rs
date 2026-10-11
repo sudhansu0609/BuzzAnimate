@@ -14,18 +14,28 @@ use peniko::Color;
 // ---------------------------------------------------------------------------
 
 /// A document with two symbols and three instances of the first.
-fn two_symbols() -> (Editor, buzz_scene::SymbolId, buzz_scene::SymbolId, Vec<ObjectId>) {
+fn two_symbols() -> (
+    Editor,
+    buzz_scene::SymbolId,
+    buzz_scene::SymbolId,
+    Vec<ObjectId>,
+) {
     let mut editor = Editor::default();
-    let layer = editor.doc.scene().layers().iter().next().expect("a layer").id;
+    let layer = editor
+        .doc
+        .scene()
+        .layers()
+        .iter()
+        .next()
+        .expect("a layer")
+        .id;
 
     let mut coat = buzz_scene::SymbolId(0);
     let mut jacket = buzz_scene::SymbolId(0);
     let mut placed = Vec::new();
 
     editor.doc.edit("setup", |scene| {
-        let art = |c: Color| {
-            ShapeData::filled(Rect::new(0.0, 0.0, 40.0, 80.0).to_path(1e-9), c)
-        };
+        let art = |c: Color| ShapeData::filled(Rect::new(0.0, 0.0, 40.0, 80.0).to_path(1e-9), c);
         coat = scene.add_symbol("Coat", SymbolKind::Graphic, None);
         scene.library_mut().update(coat, |symbol| {
             let inner = symbol.layers.iter().next().map(|l| l.id);
@@ -136,7 +146,14 @@ fn swapping_a_symbol_for_itself_does_nothing() {
 /// Two identical rigs on their own layers, the first with a performance on it.
 fn two_rigs() -> (Editor, ObjectId, ObjectId) {
     let mut editor = Editor::default();
-    let first = editor.doc.scene().layers().iter().next().expect("a layer").id;
+    let first = editor
+        .doc
+        .scene()
+        .layers()
+        .iter()
+        .next()
+        .expect("a layer")
+        .id;
     let mut second = LayerId(0);
     editor.doc.edit("layers", |scene| {
         second = scene.add_layer("Second", buzz_scene::LayerKind::Normal);
@@ -200,7 +217,14 @@ fn one_walk_drives_a_second_character() {
 fn rigs_with_different_skeletons_are_refused() {
     let (mut editor, a, _b) = two_rigs();
     // A plain shape is not a rig at all.
-    let layer = editor.doc.scene().layers().iter().next().expect("a layer").id;
+    let layer = editor
+        .doc
+        .scene()
+        .layers()
+        .iter()
+        .next()
+        .expect("a layer")
+        .id;
     let mut plain = None;
     editor.doc.edit("shape", |scene| {
         plain = scene.add_shape(

@@ -199,7 +199,10 @@ fn adding_a_light_settles_on_its_own() {
         "the window went to sleep with unlit artwork on screen; switching a \
          light on would do nothing until the pointer next crossed the window"
     );
-    assert!(!window.cache.lights.is_empty(), "the crescents were never built");
+    assert!(
+        !window.cache.lights.is_empty(),
+        "the crescents were never built"
+    );
 }
 
 /// Aiming a light has to reach the screen once the hand stops, without the user
@@ -234,7 +237,9 @@ fn aiming_a_light_settles_when_the_hand_stops() {
 #[test]
 fn moving_a_lamp_settles_when_the_hand_stops() {
     let mut window = Window::new(artwork());
-    window.editor.add_light(LightKind::lamp(Point::new(80.0, 80.0)));
+    window
+        .editor
+        .add_light(LightKind::lamp(Point::new(80.0, 80.0)));
     window.settle().expect("the lamp should settle");
 
     for step in 1..=8 {
@@ -303,7 +308,9 @@ fn switching_a_light_off_and_on_again_settles() {
 #[test]
 fn switching_the_rig_off_and_on_again_settles() {
     let mut window = Window::new(artwork());
-    window.editor.add_light(LightKind::lamp(Point::new(80.0, 80.0)));
+    window
+        .editor
+        .add_light(LightKind::lamp(Point::new(80.0, 80.0)));
     window.settle().expect("the lamp should settle");
 
     window.editor.doc.edit("Lighting", |scene| {

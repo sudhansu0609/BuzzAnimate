@@ -1,0 +1,594 @@
+{
+  "format_version": 45,
+  "stage": {
+    "width": 550.0,
+    "height": 400.0,
+    "background": "#FFFFFF",
+    "frame_rate": 24.0
+  },
+  "layers": [
+    {
+      "id": 1,
+      "name": "Character",
+      "kind": "Normal",
+      "visible": true,
+      "locked": false,
+      "outline": false,
+      "color": "#0099FF",
+      "height": "Normal",
+      "collapsed": false,
+      "length": 9,
+      "keyframes": [
+        {
+          "start": 0,
+          "objects": [
+            {
+              "id": 60,
+              "name": "Rig",
+              "transform": [
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                5.0,
+                5.0
+              ],
+              "visible": true,
+              "locked": false,
+              "kind": {
+                "type": "armature",
+                "root": [
+                  0.0,
+                  0.0
+                ],
+                "bones": [
+                  {
+                    "name": "hips",
+                    "length": 60.0,
+                    "rest_angle": 0.0,
+                    "angle": 0.0
+                  },
+                  {
+                    "name": "arm",
+                    "parent": 0,
+                    "length": 40.0,
+                    "rest_angle": 0.5,
+                    "angle": 0.0
+                  }
+                ],
+                "parts": [
+                  {
+                    "artwork": {
+                      "id": 50,
+                      "transform": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0
+                      ],
+                      "visible": true,
+                      "locked": false,
+                      "kind": {
+                        "type": "shape",
+                        "path": "M0,0 L0,0 L1.25,18.5 L2.5,5 L3.75,23.5 Z",
+                        "fill": {
+                          "color": "#884422",
+                          "rule": "NonZero"
+                        }
+                      }
+                    },
+                    "weights": [
+                      [
+                        [
+                          0,
+                          1.0
+                        ],
+                        [
+                          1,
+                          0.0
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          0.75
+                        ],
+                        [
+                          1,
+                          0.25
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          0.5
+                        ],
+                        [
+                          1,
+                          0.5
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          0.25
+                        ],
+                        [
+                          1,
+                          0.75
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          1.0
+                        ],
+                        [
+                          1,
+                          0.0
+                        ]
+                      ]
+                    ]
+                  },
+                  {
+                    "artwork": {
+                      "id": 51,
+                      "transform": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0
+                      ],
+                      "visible": true,
+                      "locked": false,
+                      "kind": {
+                        "type": "shape",
+                        "path": "M190,90 L210,90 L210,110 L190,110 Z",
+                        "fill": {
+                          "color": "#FFFFFF",
+                          "rule": "NonZero"
+                        }
+                      }
+                    },
+                    "rigid_bone": 1
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "start": 2,
+          "objects": [
+            {
+              "id": 60,
+              "name": "Rig",
+              "transform": [
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                5.0,
+                5.0
+              ],
+              "visible": true,
+              "locked": false,
+              "kind": {
+                "type": "armature",
+                "root": [
+                  0.0,
+                  0.0
+                ],
+                "bones": [
+                  {
+                    "name": "hips",
+                    "length": 60.0,
+                    "rest_angle": 0.0,
+                    "angle": 0.0
+                  },
+                  {
+                    "name": "arm",
+                    "parent": 0,
+                    "length": 40.0,
+                    "rest_angle": 0.5,
+                    "angle": 0.125
+                  }
+                ],
+                "parts": [
+                  {
+                    "artwork": {
+                      "id": 50,
+                      "transform": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0
+                      ],
+                      "visible": true,
+                      "locked": false,
+                      "kind": {
+                        "type": "shape",
+                        "path": "M0,0 L0,0 L1.25,18.5 L2.5,5 L3.75,23.5 Z",
+                        "fill": {
+                          "color": "#884422",
+                          "rule": "NonZero"
+                        }
+                      }
+                    },
+                    "weights": [
+                      [
+                        [
+                          0,
+                          1.0
+                        ],
+                        [
+                          1,
+                          0.0
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          0.75
+                        ],
+                        [
+                          1,
+                          0.25
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          0.5
+                        ],
+                        [
+                          1,
+                          0.5
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          0.25
+                        ],
+                        [
+                          1,
+                          0.75
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          1.0
+                        ],
+                        [
+                          1,
+                          0.0
+                        ]
+                      ]
+                    ]
+                  },
+                  {
+                    "artwork": {
+                      "id": 51,
+                      "transform": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0
+                      ],
+                      "visible": true,
+                      "locked": false,
+                      "kind": {
+                        "type": "shape",
+                        "path": "M190,90 L210,90 L210,110 L190,110 Z",
+                        "fill": {
+                          "color": "#FFFFFF",
+                          "rule": "NonZero"
+                        }
+                      }
+                    },
+                    "rigid_bone": 1
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "start": 4,
+          "objects": [
+            {
+              "id": 60,
+              "name": "Rig",
+              "transform": [
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                5.0,
+                5.0
+              ],
+              "visible": true,
+              "locked": false,
+              "kind": {
+                "type": "armature",
+                "root": [
+                  0.0,
+                  0.0
+                ],
+                "bones": [
+                  {
+                    "name": "hips",
+                    "length": 60.0,
+                    "rest_angle": 0.0,
+                    "angle": 0.0
+                  },
+                  {
+                    "name": "arm",
+                    "parent": 0,
+                    "length": 40.0,
+                    "rest_angle": 0.5,
+                    "angle": 0.25
+                  }
+                ],
+                "parts": [
+                  {
+                    "artwork": {
+                      "id": 50,
+                      "transform": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0
+                      ],
+                      "visible": true,
+                      "locked": false,
+                      "kind": {
+                        "type": "shape",
+                        "path": "M0,0 L0,0 L1.25,18.5 L2.5,5 L3.75,23.5 Z",
+                        "fill": {
+                          "color": "#884422",
+                          "rule": "NonZero"
+                        }
+                      }
+                    },
+                    "weights": [
+                      [
+                        [
+                          0,
+                          1.0
+                        ],
+                        [
+                          1,
+                          0.0
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          0.75
+                        ],
+                        [
+                          1,
+                          0.25
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          0.5
+                        ],
+                        [
+                          1,
+                          0.5
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          0.25
+                        ],
+                        [
+                          1,
+                          0.75
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          1.0
+                        ],
+                        [
+                          1,
+                          0.0
+                        ]
+                      ]
+                    ]
+                  },
+                  {
+                    "artwork": {
+                      "id": 51,
+                      "transform": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0
+                      ],
+                      "visible": true,
+                      "locked": false,
+                      "kind": {
+                        "type": "shape",
+                        "path": "M190,90 L210,90 L210,110 L190,110 Z",
+                        "fill": {
+                          "color": "#CC2222",
+                          "rule": "NonZero"
+                        }
+                      }
+                    },
+                    "rigid_bone": 1
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "start": 6,
+          "objects": [
+            {
+              "id": 60,
+              "name": "Rig",
+              "transform": [
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                5.0,
+                5.0
+              ],
+              "visible": true,
+              "locked": false,
+              "kind": {
+                "type": "armature",
+                "root": [
+                  0.0,
+                  0.0
+                ],
+                "bones": [
+                  {
+                    "name": "hips",
+                    "length": 60.0,
+                    "rest_angle": 0.0,
+                    "angle": 0.0
+                  },
+                  {
+                    "name": "arm",
+                    "parent": 0,
+                    "length": 40.0,
+                    "rest_angle": 0.5,
+                    "angle": 0.375
+                  }
+                ],
+                "parts": [
+                  {
+                    "artwork": {
+                      "id": 50,
+                      "transform": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0
+                      ],
+                      "visible": true,
+                      "locked": false,
+                      "kind": {
+                        "type": "shape",
+                        "path": "M0,0 L0,0 L1.25,18.5 L2.5,5 L3.75,23.5 Z",
+                        "fill": {
+                          "color": "#884422",
+                          "rule": "NonZero"
+                        }
+                      }
+                    },
+                    "weights": [
+                      [
+                        [
+                          0,
+                          1.0
+                        ],
+                        [
+                          1,
+                          0.0
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          0.75
+                        ],
+                        [
+                          1,
+                          0.25
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          0.5
+                        ],
+                        [
+                          1,
+                          0.5
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          0.25
+                        ],
+                        [
+                          1,
+                          0.75
+                        ]
+                      ],
+                      [
+                        [
+                          0,
+                          1.0
+                        ],
+                        [
+                          1,
+                          0.0
+                        ]
+                      ]
+                    ]
+                  },
+                  {
+                    "artwork": {
+                      "id": 51,
+                      "transform": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0
+                      ],
+                      "visible": true,
+                      "locked": false,
+                      "kind": {
+                        "type": "shape",
+                        "path": "M190,90 L210,90 L210,110 L190,110 Z",
+                        "fill": {
+                          "color": "#CC2222",
+                          "rule": "NonZero"
+                        }
+                      }
+                    },
+                    "rigid_bone": 1
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "max_id": 60
+}

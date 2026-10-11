@@ -227,7 +227,10 @@ fn feed(command: &mut Command, width: u32, height: u32, fps: f64) {
 }
 
 /// Render, pipe, and encode — everything the two formats share.
-#[allow(clippy::too_many_arguments, reason = "two call sites, all of it needed")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "two call sites, all of it needed"
+)]
 fn encode(
     reel: &crate::Reel<'_>,
     frames: std::ops::Range<u32>,
@@ -276,7 +279,8 @@ fn encode(
     // must not leave a broken file where the render was.
     let temporary = path.with_extension(format!("{}.part", format.extension()));
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
 
     let mut command = crate::video::ffmpeg_cmd();
@@ -287,7 +291,10 @@ fn encode(
         .stderr(Stdio::piped());
     let mut child: Child = command.spawn().context("starting ffmpeg")?;
 
-    let mut stdin = child.stdin.take().context("ffmpeg accepted no input pipe")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("ffmpeg accepted no input pipe")?;
 
     let mut written = 0u32;
     let mut cancelled = false;
@@ -347,8 +354,8 @@ fn encode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buzz_scene::Scene;
     use buzz_geom::{Rect, Shape as _};
+    use buzz_scene::Scene;
     use buzz_scene::{LayerKind, ShapeData};
     use peniko::Color;
 

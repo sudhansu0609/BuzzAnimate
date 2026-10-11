@@ -20,6 +20,7 @@
 //! of a decoder re-syncing to a bitstream on every playhead move.
 
 pub mod analysis;
+pub mod mic;
 pub mod player;
 
 use std::path::Path;
@@ -28,8 +29,8 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context, Result, bail};
 
 pub use analysis::{
-    LipSyncOptions, Phrase, PhraseOptions, Viseme, VisemeTrack, analyse_visemes,
-    beats_from_levels, detect_beats, detect_phrases, phrases_from_levels,
+    LipSyncOptions, Phrase, PhraseOptions, Viseme, VisemeTrack, analyse_visemes, beats_from_levels,
+    detect_beats, detect_phrases, phrases_from_levels,
 };
 pub use player::{Player, PlayerState};
 
@@ -116,48 +117,55 @@ impl Clip {
     }
 
     fn decode_symphonia(bytes: &[u8], name: &str) -> Result<Self> {
-        use symphonia::core::audio::SampleBuffer;
-        use symphonia::core::codecs::DecoderOptions;
-        use symphonia::core::formats::FormatOptions;
+        use symphonia::core::codecs::audio::AudioDecoderOptions;
+        use symphonia::core::formats::probe::Hint;
+        use symphonia::core::formats::{FormatOptions, TrackType};
         use symphonia::core::io::MediaSourceStream;
         use symphonia::core::meta::MetadataOptions;
-        use symphonia::core::probe::Hint;
 
+        // **0.6, not 0.5:** symphonia 0.5.5's MP3 decoder rejected every
+        // granule whose data starts exactly at the end of the frame's main
+        // data (a silent granule, legal) as "invalid main_data offset" and
+        // the packet was skipped. Bimari5's 320 kbps narration lost 641 of
+        // 7916 frames that way (8%, 16.8 s), so its sound ran early and sounded
+        // sped up. 0.6 fixed the check (`<` became `<=`).
         let source = std::io::Cursor::new(bytes.to_vec());
         let stream = MediaSourceStream::new(Box::new(source), Default::default());
 
-        let probed = symphonia::default::get_probe()
-            .format(
+        let mut format = symphonia::default::get_probe()
+            .probe(
                 &Hint::new(),
                 stream,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
+                FormatOptions::default(),
+                MetadataOptions::default(),
             )
             .context("this is not an audio format BuzzAnimate can read")?;
 
-        let mut format = probed.format;
         let track = format
-            .default_track()
+            .default_track(TrackType::Audio)
+            .context("the file has no audio track")?
+            .clone();
+        let params = track
+            .codec_params
+            .as_ref()
+            .and_then(|p| p.audio())
             .context("the file has no audio track")?
             .clone();
         let mut decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
+            .make_audio_decoder(&params, &AudioDecoderOptions::default())
             .context("no decoder for this audio codec")?;
 
         let mut samples: Vec<f32> = Vec::new();
-        let mut sample_rate = track.codec_params.sample_rate.unwrap_or(44_100);
-        let mut channels = track
-            .codec_params
-            .channels
-            .map(|c| c.count() as u16)
-            .unwrap_or(2);
+        let mut sample_rate = params.sample_rate.unwrap_or(44_100);
+        let mut channels = params.channels.as_ref().map(|c| c.count() as u16).unwrap_or(2);
+        let mut buffer: Vec<f32> = Vec::new();
 
         loop {
             let packet = match format.next_packet() {
-                Ok(p) => p,
-                // The end of the stream arrives as an error; anything else is
-                // a real failure and is reported rather than silently
-                // truncating the dialogue.
+                Ok(Some(p)) => p,
+                // The end of the stream; anything else is a real failure and
+                // is reported rather than silently truncating the dialogue.
+                Ok(None) => break,
                 Err(symphonia::core::errors::Error::IoError(e))
                     if e.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
@@ -166,19 +174,18 @@ impl Clip {
                 Err(symphonia::core::errors::Error::ResetRequired) => break,
                 Err(e) => return Err(e).context("reading audio packets"),
             };
-            if packet.track_id() != track.id {
+            if packet.track_id != track.id {
                 continue;
             }
 
             match decoder.decode(&packet) {
                 Ok(decoded) => {
-                    let spec = *decoded.spec();
-                    sample_rate = spec.rate;
-                    channels = spec.channels.count() as u16;
+                    let spec = decoded.spec();
+                    sample_rate = spec.rate();
+                    channels = spec.channels().count() as u16;
 
-                    let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-                    buffer.copy_interleaved_ref(decoded);
-                    samples.extend_from_slice(buffer.samples());
+                    decoded.copy_to_vec_interleaved(&mut buffer);
+                    samples.extend_from_slice(&buffer);
                 }
                 // A damaged packet in the middle of a file should cost that
                 // packet, not the whole take.
@@ -231,6 +238,38 @@ impl Clip {
             return 0;
         }
         (self.duration_seconds() * fps).ceil() as u32
+    }
+
+    /// **The section between two in-clip times**, as its own [`Clip`] — what
+    /// analysis wants for a sound that is only heard `trim_start..trim_end`
+    /// of its own file (see `buzz_scene::SoundRef::trim_start`/`trim_end`).
+    ///
+    /// Lip sync and phrase detection both search *from the front of the
+    /// clip*: without this, a shot whose Dialogue layer plays only a slice of
+    /// a longer master track would have its mouth shapes (or its proposed
+    /// cuts) searched for across audio that never plays in that shot at all.
+    /// `end_seconds` of `None` means to the clip's own end. Out-of-range or
+    /// empty requests come back as a clip of zero frames rather than
+    /// panicking; the caller (analysis) already treats "nothing to hear" as
+    /// its own, reportable outcome.
+    pub fn trimmed(&self, start_seconds: f32, end_seconds: Option<f32>) -> Clip {
+        let channels = self.channels.max(1) as usize;
+        let total_frames = self.len();
+        let to_frame = |seconds: f32| ((seconds.max(0.0) as f64) * self.sample_rate as f64).round() as usize;
+        let start_frame = to_frame(start_seconds).min(total_frames);
+        let end_frame = end_seconds
+            .map(|s| to_frame(s).min(total_frames))
+            .unwrap_or(total_frames)
+            .max(start_frame);
+
+        let samples = self.samples[start_frame * channels..end_frame * channels].to_vec();
+        Clip {
+            name: self.name.clone(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            samples,
+            mono_cache: OnceLock::new(),
+        }
     }
 
     /// One channel, averaged — what analysis and the waveform both want.
@@ -320,11 +359,77 @@ impl Clip {
     pub fn bytes(&self) -> usize {
         self.samples.len() * std::mem::size_of::<f32>()
     }
+
+    /// The mono mix-down at `target_rate` — what speech recognition wants
+    /// (Whisper takes 16 kHz mono).
+    ///
+    /// A Hann-windowed sinc resampler, low-passed at the lower of the two
+    /// Nyquist frequencies, so downsampling 44.1/48 kHz dialogue does not fold
+    /// sibilants back into the speech band the way picking or linearly
+    /// interpolating samples would.
+    pub fn resampled_mono(&self, target_rate: u32) -> Vec<f32> {
+        resample(&self.mono(), self.sample_rate, target_rate)
+    }
+}
+
+/// Resamples one channel from `from` Hz to `to` Hz with a windowed sinc.
+pub fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
+    if from == to || input.is_empty() || from == 0 || to == 0 {
+        return input.to_vec();
+    }
+    let ratio = to as f64 / from as f64;
+    // Cut-off relative to the input rate; a little under Nyquist.
+    let cutoff = ratio.min(1.0) * 0.95;
+    const ZERO_CROSSINGS: f64 = 16.0;
+    let half_width = ZERO_CROSSINGS / cutoff; // in input samples
+    let out_len = ((input.len() as f64) * ratio).floor() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for n in 0..out_len {
+        let centre = n as f64 / ratio;
+        let lo = ((centre - half_width).ceil().max(0.0)) as usize;
+        let hi = ((centre + half_width).floor() as usize).min(input.len() - 1);
+        let mut acc = 0.0f64;
+        let mut norm = 0.0f64;
+        for (k, &x) in input.iter().enumerate().take(hi + 1).skip(lo) {
+            let t = k as f64 - centre;
+            let arg = std::f64::consts::PI * t * cutoff;
+            let sinc = if arg.abs() < 1e-9 { 1.0 } else { arg.sin() / arg };
+            let w = 0.5 + 0.5 * (std::f64::consts::PI * t / half_width).cos();
+            let h = sinc * w;
+            acc += x as f64 * h;
+            norm += h;
+        }
+        out.push(if norm.abs() > 1e-12 { (acc / norm) as f32 } else { 0.0 });
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 44.1 kHz stereo → 16 kHz mono keeps the length, a 440 Hz tone's
+    /// amplitude, and removes a 10 kHz tone that 16 kHz cannot carry.
+    #[test]
+    fn resampling_to_16k_keeps_speech_band_and_drops_what_would_alias() {
+        let rate = 44_100u32;
+        let n = rate as usize; // one second
+        let low: Vec<f32> = (0..n)
+            .map(|i| (i as f32 / rate as f32 * 440.0 * std::f32::consts::TAU).sin() * 0.5)
+            .collect();
+        let high: Vec<f32> = (0..n)
+            .map(|i| (i as f32 / rate as f32 * 10_000.0 * std::f32::consts::TAU).sin() * 0.5)
+            .collect();
+        let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+        let lo16 = resample(&low, rate, 16_000);
+        let hi16 = resample(&high, rate, 16_000);
+        assert!((lo16.len() as i64 - 16_000).abs() <= 1, "{}", lo16.len());
+        let mid = &lo16[1000..15_000];
+        assert!((rms(mid) - 0.3536).abs() < 0.02, "440 Hz rms {}", rms(mid));
+        assert!(rms(&hi16[1000..15_000]) < 0.02, "10 kHz leaked: {}", rms(&hi16[1000..15_000]));
+        let stereo = Clip::new("s", rate, 2, low.iter().flat_map(|&x| [x, x]).collect()).unwrap();
+        assert_eq!(stereo.resampled_mono(16_000).len(), lo16.len());
+    }
 
     /// A second of a 440 Hz tone, as a real file would arrive.
     fn tone(seconds: f64, rate: u32, channels: u16) -> Clip {
@@ -397,6 +502,34 @@ mod tests {
             Clip::decode(b"this is not a sound file at all", "x").expect_err("should be refused");
         let message = error.to_string();
         assert!(!message.is_empty());
+    }
+
+    /// **`trimmed` keeps only the section between the two in-points**, at the
+    /// same sample rate — what a shot's own slice of a longer master track
+    /// wants handed to analysis.
+    #[test]
+    fn trimmed_keeps_only_the_section_asked_for() {
+        let clip = tone(4.0, 44_100, 1);
+
+        let middle = clip.trimmed(1.0, Some(3.0));
+        assert!(
+            (middle.duration_seconds() - 2.0).abs() < 0.01,
+            "expected ~2s, got {:.3}s",
+            middle.duration_seconds()
+        );
+
+        let to_end = clip.trimmed(3.0, None);
+        assert!(
+            (to_end.duration_seconds() - 1.0).abs() < 0.01,
+            "expected ~1s, got {:.3}s",
+            to_end.duration_seconds()
+        );
+
+        // The samples themselves come from the right place, not just the
+        // right length: frame 0 of the trimmed clip is frame 1s of the
+        // source.
+        let offset = (1.0 * 44_100.0) as usize;
+        assert_eq!(middle.samples[0], clip.samples[offset]);
     }
 
     #[test]

@@ -575,7 +575,11 @@ impl Turnaround {
             return false;
         }
         let view = TurnaroundView { angle, drawing };
-        match self.views.iter().position(|v| (v.angle - angle).abs() < 0.02) {
+        match self
+            .views
+            .iter()
+            .position(|v| (v.angle - angle).abs() < 0.02)
+        {
             Some(index) => self.views[index] = view,
             None => {
                 let at = self.views.partition_point(|v| v.angle < angle);
@@ -677,6 +681,15 @@ pub struct TextData {
     pub style: buzz_text::FontStyle,
     /// How the lines line up with each other. Only visible on more than one.
     pub align: buzz_text::TextAlign,
+    /// **Per-character styling** — a character or run of characters set apart
+    /// from the rest, overriding whichever of bold, italic, size, colour or
+    /// font it names. Sorted by `start`, non-overlapping, and present only
+    /// where a run actually differs from the base above.
+    ///
+    /// Empty for every text object as it always was — today's uniform text —
+    /// which is exactly what makes an old document open unchanged. See
+    /// [`crate::Object::text`] for how a text object with runs is represented.
+    pub runs: Vec<TextRun>,
 }
 
 impl TextData {
@@ -688,8 +701,184 @@ impl TextData {
             font,
             style: buzz_text::FontStyle::REGULAR,
             align: buzz_text::TextAlign::Left,
+            runs: Vec::new(),
         }
     }
+}
+
+/// **One run of per-character styling on a [`TextData`]**, overriding the
+/// base wherever it names something — see [`TextData::runs`].
+///
+/// Only the fields a selection was actually given are set: bolding a
+/// selection that was already italic must not silently un-italicise it, so
+/// each choice is recorded (or not) on its own rather than as one baked-in
+/// style.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TextRun {
+    /// Char range into `TextData::content` (`chars()` indices), half-open.
+    pub start: usize,
+    pub end: usize,
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub size: Option<f64>,
+    pub color: Option<Color>,
+    pub font: Option<String>,
+}
+
+/// **Apply one style change to `[start, end)` of `runs`**, splitting and
+/// merging so the result stays sorted, non-overlapping and records only what
+/// actually differs from the base — see [`TextData::runs`].
+///
+/// `mutate` sets the one field a UI button or picker is asking for (bold,
+/// italic, size, colour or font); everything else on each affected run is
+/// left exactly as it was. A cell the edit does not reach keeps whatever run
+/// already covered it (or none); a cell inside `[start, end)` that ends up
+/// with every field unset — because `mutate` cleared the one thing that made
+/// it a run — is dropped, since a run recording nothing is not a run.
+pub fn restyle_runs(
+    runs: &[TextRun],
+    content_len: usize,
+    start: usize,
+    end: usize,
+    mutate: impl Fn(&mut TextRun),
+) -> Vec<TextRun> {
+    let start = start.min(content_len);
+    let end = end.min(content_len);
+    if start >= end {
+        return runs.to_vec();
+    }
+
+    // Every boundary already in play — the edit's own, and every existing
+    // run's — so no cell this walks straddles one of them.
+    let mut points: Vec<usize> = vec![0, content_len, start, end];
+    for r in runs {
+        points.push(r.start.min(content_len));
+        points.push(r.end.min(content_len));
+    }
+    points.sort_unstable();
+    points.dedup();
+
+    let mut out: Vec<TextRun> = Vec::new();
+    for w in points.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a >= b {
+            continue;
+        }
+        let mut run = runs
+            .iter()
+            .find(|r| r.start <= a && r.end >= b)
+            .cloned()
+            .unwrap_or_default();
+        run.start = a;
+        run.end = b;
+        if a >= start && b <= end {
+            mutate(&mut run);
+        }
+        out.push(run);
+    }
+    prune_and_merge_runs(out)
+}
+
+/// Drop a run left recording nothing, then fuse adjacent runs that ended up
+/// styled identically — the two ways [`restyle_runs`] can leave the list
+/// longer than it needs to be.
+fn prune_and_merge_runs(runs: Vec<TextRun>) -> Vec<TextRun> {
+    let mut runs: Vec<TextRun> = runs
+        .into_iter()
+        .filter(|r| {
+            r.bold.is_some()
+                || r.italic.is_some()
+                || r.size.is_some()
+                || r.color.is_some()
+                || r.font.is_some()
+        })
+        .collect();
+    runs.sort_by_key(|r| r.start);
+
+    let mut merged: Vec<TextRun> = Vec::with_capacity(runs.len());
+    for run in runs {
+        if let Some(last) = merged.last_mut()
+            && last.end == run.start
+            && last.bold == run.bold
+            && last.italic == run.italic
+            && last.size == run.size
+            && last.color == run.color
+            && last.font == run.font
+        {
+            last.end = run.end;
+            continue;
+        }
+        merged.push(run);
+    }
+    merged
+}
+
+/// **Carry `runs` across a content edit**, from `old` to `new`, so a run's
+/// indices still point at the same letters after a keystroke.
+///
+/// The edit is found as the longest common prefix and suffix around whatever
+/// changed in the middle — a simple diff, not a real edit history, but enough
+/// to place the boundary: a run entirely before it is untouched, one entirely
+/// after it shifts by however much the middle grew or shrank, and one that
+/// overlaps it is pulled back (an end) or pushed forward (a start) to just
+/// outside it, so newly typed text defaults to plain rather than inheriting
+/// half of whatever run it landed in the middle of. A run left with nothing
+/// inside it is dropped.
+pub fn shift_runs_for_edit(old: &str, new: &str, runs: &[TextRun]) -> Vec<TextRun> {
+    let old_chars: Vec<char> = old.chars().collect();
+    let new_chars: Vec<char> = new.chars().collect();
+
+    let max_common = old_chars.len().min(new_chars.len());
+    let prefix = old_chars
+        .iter()
+        .zip(new_chars.iter())
+        .take(max_common)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let max_suffix = (old_chars.len() - prefix).min(new_chars.len() - prefix);
+    let suffix = old_chars[prefix..]
+        .iter()
+        .rev()
+        .zip(new_chars[prefix..].iter().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let old_removed_end = old_chars.len() - suffix;
+    let new_removed_end = new_chars.len() - suffix;
+    let delta = new_removed_end as i64 - old_removed_end as i64;
+
+    let shift_start = |pos: usize| -> usize {
+        if pos <= prefix {
+            pos
+        } else if pos < old_removed_end {
+            new_removed_end
+        } else {
+            (pos as i64 + delta).max(0) as usize
+        }
+    };
+    let shift_end = |pos: usize| -> usize {
+        if pos <= prefix {
+            pos
+        } else if pos <= old_removed_end {
+            prefix
+        } else {
+            (pos as i64 + delta).max(0) as usize
+        }
+    };
+
+    let mut out: Vec<TextRun> = runs
+        .iter()
+        .map(|r| {
+            let mut r = r.clone();
+            r.start = shift_start(r.start);
+            r.end = shift_end(r.end);
+            r
+        })
+        .filter(|r| r.end > r.start)
+        .collect();
+    out.sort_by_key(|r| r.start);
+    out
 }
 
 impl Object {
@@ -994,7 +1183,10 @@ mod turnaround_tests {
         turnaround.set(PI, drawing(2));
         assert!(turnaround.remove_nearest(1.4));
         assert_eq!(turnaround.views().len(), 1);
-        assert!(turnaround.back().is_some(), "the profile went, not the back");
+        assert!(
+            turnaround.back().is_some(),
+            "the profile went, not the back"
+        );
     }
 }
 
@@ -1229,5 +1421,158 @@ mod tests {
             "cloning a group should add one reference, not duplicate the child"
         );
         assert_eq!(group, copy);
+    }
+}
+
+#[cfg(test)]
+mod text_run_tests {
+    use super::*;
+
+    /// Bolding a range with no existing runs creates exactly one, covering
+    /// only that range and nothing else.
+    #[test]
+    fn styling_a_plain_range_creates_one_run() {
+        let runs = restyle_runs(&[], 10, 2, 5, |r| r.bold = Some(true));
+        assert_eq!(
+            runs,
+            vec![TextRun {
+                start: 2,
+                end: 5,
+                bold: Some(true),
+                ..Default::default()
+            }]
+        );
+    }
+
+    /// Bolding a range that sits astride an existing run splits it: the part
+    /// outside the new range keeps its old style, the part inside gains bold
+    /// alongside whatever it already had.
+    #[test]
+    fn styling_a_range_splits_and_merges_around_existing_runs() {
+        let existing = vec![TextRun {
+            start: 0,
+            end: 6,
+            italic: Some(true),
+            ..Default::default()
+        }];
+        let runs = restyle_runs(&existing, 10, 3, 6, |r| r.bold = Some(true));
+        assert_eq!(
+            runs,
+            vec![
+                TextRun {
+                    start: 0,
+                    end: 3,
+                    italic: Some(true),
+                    ..Default::default()
+                },
+                TextRun {
+                    start: 3,
+                    end: 6,
+                    italic: Some(true),
+                    bold: Some(true),
+                    ..Default::default()
+                },
+            ]
+        );
+    }
+
+    /// Un-setting the one field a run recorded drops the run entirely — a run
+    /// that records nothing is not a run.
+    #[test]
+    fn clearing_a_runs_only_field_drops_it() {
+        let existing = vec![TextRun {
+            start: 0,
+            end: 4,
+            bold: Some(true),
+            ..Default::default()
+        }];
+        let runs = restyle_runs(&existing, 10, 0, 4, |r| r.bold = Some(false));
+        // bold(false) still differs from an unset base in general, so record
+        // it — but explicitly clearing it back to "unset" drops the run.
+        assert_eq!(runs[0].bold, Some(false));
+
+        let runs = restyle_runs(&runs, 10, 0, 4, |r| r.bold = None);
+        assert!(runs.is_empty(), "a run recording nothing must not survive");
+    }
+
+    /// Two adjacent runs that end up styled identically fuse into one.
+    #[test]
+    fn adjacent_identically_styled_runs_merge() {
+        let runs = restyle_runs(&[], 10, 0, 5, |r| r.bold = Some(true));
+        let runs = restyle_runs(&runs, 10, 5, 10, |r| r.bold = Some(true));
+        assert_eq!(
+            runs,
+            vec![TextRun {
+                start: 0,
+                end: 10,
+                bold: Some(true),
+                ..Default::default()
+            }]
+        );
+    }
+
+    /// Typing after every run leaves them exactly where they were.
+    #[test]
+    fn typing_after_every_run_leaves_them_untouched() {
+        let runs = vec![TextRun {
+            start: 0,
+            end: 3,
+            bold: Some(true),
+            ..Default::default()
+        }];
+        let shifted = shift_runs_for_edit("Hi there", "Hi there!", &runs);
+        assert_eq!(shifted, runs);
+    }
+
+    /// Inserting text before a run shifts it forward by however much was
+    /// inserted, without changing its length.
+    #[test]
+    fn inserting_before_a_run_shifts_it_forward() {
+        let runs = vec![TextRun {
+            start: 3,
+            end: 6,
+            bold: Some(true),
+            ..Default::default()
+        }];
+        // "Hi there" -> "Hi, there": one character (",") inserted at index 2,
+        // so "the" (old indices 3..6) is now one character further along.
+        let shifted = shift_runs_for_edit("Hi there", "Hi, there", &runs);
+        assert_eq!(
+            shifted,
+            vec![TextRun {
+                start: 4,
+                end: 7,
+                bold: Some(true),
+                ..Default::default()
+            }]
+        );
+    }
+
+    /// Deleting a whole run along with the edit leaves nothing behind.
+    #[test]
+    fn deleting_a_runs_own_text_drops_it() {
+        let runs = vec![TextRun {
+            start: 3,
+            end: 8,
+            bold: Some(true),
+            ..Default::default()
+        }];
+        // "Hi there!" -> "Hi !": "there" (indices 3..8) removed outright.
+        let shifted = shift_runs_for_edit("Hi there!", "Hi !", &runs);
+        assert!(shifted.is_empty());
+    }
+
+    /// Text typed right after a run does not inherit it — the run stays
+    /// exactly where it was, it does not grow to cover what follows.
+    #[test]
+    fn a_run_does_not_grow_over_text_typed_right_after_it() {
+        let runs = vec![TextRun {
+            start: 0,
+            end: 2,
+            bold: Some(true),
+            ..Default::default()
+        }];
+        let shifted = shift_runs_for_edit("Hi", "Hi!!", &runs);
+        assert_eq!(shifted, runs, "typing after it must leave it untouched");
     }
 }

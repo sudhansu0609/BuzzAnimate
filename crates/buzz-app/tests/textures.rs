@@ -12,7 +12,14 @@ use peniko::Color;
 
 fn editor_with_a_shape() -> (Editor, LayerId, ObjectId) {
     let mut editor = Editor::default();
-    let layer = editor.doc.scene().layers().iter().next().expect("a layer").id;
+    let layer = editor
+        .doc
+        .scene()
+        .layers()
+        .iter()
+        .next()
+        .expect("a layer")
+        .id;
     let mut id = None;
     editor.doc.edit("setup", |scene| {
         id = scene.add_shape(
@@ -255,8 +262,15 @@ fn dragging_a_grip_turns_the_texture() {
     let (recipe, cell, angle) = editor
         .selected_texture()
         .expect("still the same texture, moved");
-    assert_eq!(recipe.kind, TextureKind::Stripes, "the pattern is unchanged");
-    assert!(cell > before_cell * 1.5, "the tile grew: {before_cell} to {cell}");
+    assert_eq!(
+        recipe.kind,
+        TextureKind::Stripes,
+        "the pattern is unchanged"
+    );
+    assert!(
+        cell > before_cell * 1.5,
+        "the tile grew: {before_cell} to {cell}"
+    );
     assert!(
         (angle - before_angle).abs() > 1.0,
         "and turned: {before_angle} to {angle}"

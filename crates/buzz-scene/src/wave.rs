@@ -499,9 +499,8 @@ struct Wave<'a> {
 impl Wave<'_> {
     /// A deterministic value in `[0, 1)` for strand `index`, stream `salt`.
     fn rng(&self, index: usize, salt: u64) -> f64 {
-        let x = splitmix(
-            self.seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt << 17,
-        );
+        let x =
+            splitmix(self.seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt << 17);
         (x >> 11) as f64 / (1u64 << 53) as f64
     }
 
@@ -552,11 +551,7 @@ impl Wave<'_> {
 
             if s.turbulence > 0.0 {
                 let fast = arc / (lambda * 0.41) + psi2 - phase2;
-                offset += s.turbulence
-                    * amp
-                    * 0.35
-                    * swing
-                    * (std::f64::consts::TAU * fast).sin();
+                offset += s.turbulence * amp * 0.35 * swing * (std::f64::consts::TAU * fast).sin();
             }
 
             // The draught: a lean that grows along the stroke.
@@ -879,21 +874,59 @@ mod tests {
         let reference = wave_artwork(WaveKind::Ribbon, &base, 0.15);
 
         let variants: [(&str, WaveSettings); 7] = [
-            ("amplitude", WaveSettings { amplitude: base.settings.amplitude * 2.5, ..base.settings }),
-            ("wavelength", WaveSettings { wavelength: base.settings.wavelength * 0.4, ..base.settings }),
-            ("strands", WaveSettings { strands: base.settings.strands + 5, ..base.settings }),
-            ("spread", WaveSettings { spread: base.settings.spread * 3.0, ..base.settings }),
-            ("thickness", WaveSettings { thickness: base.settings.thickness * 2.0, ..base.settings }),
-            ("taper", WaveSettings { taper: 0.95, ..base.settings }),
-            ("turbulence", WaveSettings { turbulence: 1.0, ..base.settings }),
+            (
+                "amplitude",
+                WaveSettings {
+                    amplitude: base.settings.amplitude * 2.5,
+                    ..base.settings
+                },
+            ),
+            (
+                "wavelength",
+                WaveSettings {
+                    wavelength: base.settings.wavelength * 0.4,
+                    ..base.settings
+                },
+            ),
+            (
+                "strands",
+                WaveSettings {
+                    strands: base.settings.strands + 5,
+                    ..base.settings
+                },
+            ),
+            (
+                "spread",
+                WaveSettings {
+                    spread: base.settings.spread * 3.0,
+                    ..base.settings
+                },
+            ),
+            (
+                "thickness",
+                WaveSettings {
+                    thickness: base.settings.thickness * 2.0,
+                    ..base.settings
+                },
+            ),
+            (
+                "taper",
+                WaveSettings {
+                    taper: 0.95,
+                    ..base.settings
+                },
+            ),
+            (
+                "turbulence",
+                WaveSettings {
+                    turbulence: 1.0,
+                    ..base.settings
+                },
+            ),
         ];
 
         for (name, settings) in variants {
-            let altered = wave_artwork(
-                WaveKind::Ribbon,
-                &WaveStroke { settings, ..base },
-                0.15,
-            );
+            let altered = wave_artwork(WaveKind::Ribbon, &WaveStroke { settings, ..base }, 0.15);
             assert_ne!(altered, reference, "{name} changed nothing");
         }
     }
@@ -904,11 +937,17 @@ mod tests {
         let base = stroke(&samples, WaveKind::Ribbon);
 
         let straight = WaveStroke {
-            settings: WaveSettings { drift: 0.0, ..base.settings },
+            settings: WaveSettings {
+                drift: 0.0,
+                ..base.settings
+            },
             ..base
         };
         let leaning = WaveStroke {
-            settings: WaveSettings { drift: 3.0, ..base.settings },
+            settings: WaveSettings {
+                drift: 3.0,
+                ..base.settings
+            },
             ..base
         };
 
@@ -927,11 +966,17 @@ mod tests {
         let samples = drag(Point::new(200.0, 400.0), Point::new(200.0, 100.0), 60);
         let base = stroke(&samples, WaveKind::Ribbon);
         let calm = WaveStroke {
-            settings: WaveSettings { amplitude: 0.2, ..base.settings },
+            settings: WaveSettings {
+                amplitude: 0.2,
+                ..base.settings
+            },
             ..base
         };
         let wild = WaveStroke {
-            settings: WaveSettings { amplitude: 3.0, ..base.settings },
+            settings: WaveSettings {
+                amplitude: 3.0,
+                ..base.settings
+            },
             ..base
         };
 
@@ -1046,7 +1091,10 @@ mod tests {
         let untapered = wave_artwork(
             WaveKind::Hair,
             &WaveStroke {
-                settings: WaveSettings { taper: 0.0, ..s.settings },
+                settings: WaveSettings {
+                    taper: 0.0,
+                    ..s.settings
+                },
                 ..s
             },
             0.0,
@@ -1113,7 +1161,11 @@ mod tests {
     fn empty_and_degenerate_input_do_not_panic() {
         for kind in WaveKind::ALL {
             assert!(wave_artwork(kind, &stroke(&[], kind), 0.0).is_empty());
-            assert!(wave_loop(kind, &stroke(&[], kind)).iter().all(Vec::is_empty));
+            assert!(
+                wave_loop(kind, &stroke(&[], kind))
+                    .iter()
+                    .all(Vec::is_empty)
+            );
 
             // A zero-size brush paints nothing.
             let samples = drag(Point::ZERO, Point::new(100.0, 0.0), 20);

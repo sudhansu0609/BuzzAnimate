@@ -239,6 +239,48 @@ pub fn all_tools() -> Vec<ToolId> {
     TOOL_GROUPS.iter().flat_map(|g| g.iter().copied()).collect()
 }
 
+/// **Tool families, for the flyout tool strip** — Stage 3, item 2 of
+/// `docs/WORKSPACE_DESIGN_PLAN.md`.
+///
+/// One button per family: it shows the family's last-used tool, and a family
+/// of more than one member gets a small corner triangle and a flyout (opened
+/// by a right-click or a press-and-hold) listing the rest. A tool's shortcut
+/// still selects it directly whether or not its flyout has ever been opened
+/// — a keyboard user never needs to know the families exist.
+///
+/// Distinct from [`TOOL_GROUPS`], which is the older, plain grid grouping and
+/// stays as it is: this is additive, not a replacement, so nothing that
+/// already reads `TOOL_GROUPS` has to change.
+pub const TOOL_FAMILIES: &[&[ToolId]] = &[
+    // Animate's arrow tools plus the two region-select tools, which pick by
+    // drawing a shape rather than by clicking an object.
+    &[
+        ToolId::Selection,
+        ToolId::Subselection,
+        ToolId::Lasso,
+        ToolId::MagicWand,
+    ],
+    &[ToolId::FreeTransform, ToolId::GradientTransform],
+    &[ToolId::Pen, ToolId::Text],
+    &[ToolId::Rectangle, ToolId::Oval, ToolId::PolyStar, ToolId::Line],
+    &[ToolId::Brush, ToolId::Pencil, ToolId::Eraser],
+    &[ToolId::PaintBucket, ToolId::InkBottle, ToolId::Eyedropper],
+    // A family of one: still drawn as a plain button, no triangle, no flyout.
+    &[ToolId::Camera],
+    &[ToolId::Bone, ToolId::AssetWarp, ToolId::MotionPath],
+    &[ToolId::Hand, ToolId::Zoom],
+];
+
+/// The family a tool belongs to. Every `ToolId` is in exactly one — see
+/// `every_tool_is_in_exactly_one_family`.
+pub fn family_of(tool: ToolId) -> &'static [ToolId] {
+    TOOL_FAMILIES
+        .iter()
+        .copied()
+        .find(|family| family.contains(&tool))
+        .expect("every tool is in a family — see every_tool_is_in_exactly_one_family")
+}
+
 /// Which tool a bare letter selects.
 pub fn tool_for_key(key: Key) -> Option<ToolId> {
     all_tools().into_iter().find(|t| t.shortcut() == Some(key))
@@ -399,6 +441,57 @@ mod tests {
             "only {ready} of {} tools are ready",
             all_tools().len()
         );
+    }
+
+    /// Stage 3, item 5: every tool is in exactly one family, and every family
+    /// member is still reachable by its own shortcut whether or not the
+    /// flyout that holds it has ever been opened.
+    #[test]
+    fn every_tool_is_in_exactly_one_family() {
+        let mut seen: HashSet<ToolId> = HashSet::new();
+        for family in TOOL_FAMILIES {
+            for tool in family.iter().copied() {
+                assert!(seen.insert(tool), "{tool:?} is in more than one family");
+            }
+        }
+        for tool in all_tools() {
+            assert!(
+                seen.contains(&tool),
+                "{tool:?} is not in any family at all"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            all_tools().len(),
+            "a family lists a tool that does not exist"
+        );
+    }
+
+    #[test]
+    fn family_of_finds_every_tool_and_agrees_with_the_table() {
+        for family in TOOL_FAMILIES {
+            for tool in family.iter().copied() {
+                assert_eq!(
+                    family_of(tool),
+                    *family,
+                    "{tool:?}'s family does not match the table it is listed in"
+                );
+            }
+        }
+    }
+
+    /// A tool with a shortcut is reachable by it directly, regardless of
+    /// which family's flyout it sits behind — the whole point of keeping the
+    /// shortcut map separate from the flyout grouping.
+    #[test]
+    fn every_tool_with_a_shortcut_is_still_reachable_through_its_family() {
+        for family in TOOL_FAMILIES {
+            for tool in family.iter().copied() {
+                if let Some(key) = tool.shortcut() {
+                    assert_eq!(tool_for_key(key), Some(tool));
+                }
+            }
+        }
     }
 
     #[test]

@@ -22,6 +22,9 @@ repository = "https://github.com/buzzcaf/buzzanimate"
 [workspace.dependencies]
 wgpu = "29.0.4"
 vello = "0.9.0"
+# Patched below to a verbatim copy with scale-aware buffer sizes — see
+# third_party/vello_encoding and docs/IMPORT_PERF_PLAN.md (P1).
+vello_encoding = "0.9.0"
 # Glyph-outline extraction for the Text tool. Already in the graph via vello.
 skrifa = "0.42.1"
 # Text shaping — turns a string into positioned glyphs, so Devanagari (Hindi)
@@ -101,6 +104,14 @@ buzz-fx = { path = "crates/buzz-fx" }
 buzz-act = { path = "crates/buzz-act" }
 buzz-physics = { path = "crates/buzz-physics" }
 buzz-text = { path = "crates/buzz-text" }
+buzz-ai = { path = "crates/buzz-ai" }
+
+[patch.crates-io]
+# Verbatim copy of vello_encoding 0.9.0 with one change: BufferSizes::new
+# scales lines/segments/seg_counts/tiles/ptcl/bin_data by a process-wide
+# AtomicU32 (default 1, upstream's own sizes). See
+# third_party/vello_encoding/src/config.rs and docs/IMPORT_PERF_PLAN.md (P1).
+vello_encoding = { path = "third_party/vello_encoding" }
 
 [profile.dev]
 opt-level = 1

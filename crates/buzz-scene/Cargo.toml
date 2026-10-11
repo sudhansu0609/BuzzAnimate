@@ -22,6 +22,8 @@ peniko.workspace = true
 rstar.workspace = true
 rayon.workspace = true
 serde.workspace = true
+# `trace_tuning.json`: the user's saved tracer tuning.
+serde_json.workspace = true
 image.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

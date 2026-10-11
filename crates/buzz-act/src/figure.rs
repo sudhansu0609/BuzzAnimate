@@ -30,9 +30,9 @@
 use std::sync::Arc;
 
 use buzz_geom::{Affine, Point, Rect, Shape as _, Vec2};
-use kurbo::RoundedRect;
 use buzz_rig::{Armature, Bone};
 use buzz_scene::{ArmatureData, Object, ObjectId, ObjectKind, ShapeData};
+use kurbo::RoundedRect;
 use peniko::Color;
 
 /// Every bone in the figure, in the order they are pushed.
@@ -186,9 +186,7 @@ impl Palette {
             (0xB77F52, 0xC9903A, 0x4A3A2C),
         ];
         let (skin, shirt, trousers) = ROTA[index % ROTA.len()];
-        let rgb = |v: u32| {
-            Color::from_rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
-        };
+        let rgb = |v: u32| Color::from_rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8);
         Self {
             skin: rgb(skin),
             shirt: rgb(shirt),
@@ -276,7 +274,12 @@ pub fn build(spec: &FigureSpec, id: ObjectId, mut next_id: impl FnMut() -> Objec
             upper_arm,
             std::f64::consts::PI + lean,
         ));
-        armature.push(Bone::new(elbow_joint.label(), Some(shoulder), forearm, 0.06));
+        armature.push(Bone::new(
+            elbow_joint.label(),
+            Some(shoulder),
+            forearm,
+            0.06,
+        ));
         debug_assert_eq!(shoulder, shoulder_joint.index());
     }
 
@@ -527,9 +530,9 @@ mod tests {
             panic!("a figure is an armature");
         };
         for joint in Joint::ALL {
-            let found = rig.parts.iter().any(|p| {
-                matches!(p.binding, buzz_scene::RigBinding::Rigid(b) if b == joint.index())
-            });
+            let found = rig.parts.iter().any(
+                |p| matches!(p.binding, buzz_scene::RigBinding::Rigid(b) if b == joint.index()),
+            );
             assert!(found, "{} has no artwork", joint.label());
         }
     }

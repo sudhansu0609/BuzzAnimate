@@ -110,16 +110,12 @@ impl Theme {
     /// What the theme is for, for the tooltip beside its name.
     pub fn description(self) -> &'static str {
         match self {
-            Theme::Dark => {
-                "The default. Neutral grey, so the artwork's own colours read true."
-            }
+            Theme::Dark => "The default. Neutral grey, so the artwork's own colours read true.",
             Theme::Light => "A light interface for a bright room.",
             Theme::Midnight => "Near-black and cool, for working in the dark.",
             Theme::Slate => "A softer blue-grey dark, easier over a long session.",
             Theme::Sepia => "Warm paper, for the light-table feel.",
-            Theme::Contrast => {
-                "Black behind white, with vivid guides. Built for legibility."
-            }
+            Theme::Contrast => "Black behind white, with vivid guides. Built for legibility.",
             Theme::Forest => "Deep green-black, with moss and leaf for the accents.",
             Theme::Dracula => "The Dracula palette: charcoal violet, purple and pink.",
             Theme::SolarizedDark => {
@@ -146,20 +142,11 @@ impl Theme {
         Self::ALL[(i + 1) % Self::ALL.len()]
     }
 
-    /// The colours this theme answers with.
+    /// The colours this theme answers with — derived once, from its seed;
+    /// see [`derive`] and [`colors_table`].
     pub fn colors(self) -> Colors {
-        match self {
-            Theme::Dark => DARK,
-            Theme::Light => LIGHT,
-            Theme::Midnight => MIDNIGHT,
-            Theme::Slate => SLATE,
-            Theme::Sepia => SEPIA,
-            Theme::Contrast => CONTRAST,
-            Theme::Forest => FOREST,
-            Theme::Dracula => DRACULA,
-            Theme::SolarizedDark => SOLARIZED_DARK,
-            Theme::Nord => NORD,
-        }
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        colors_table()[i]
     }
 }
 
@@ -221,12 +208,12 @@ macro_rules! palette {
 }
 
 palette!(
-    /// Window chrome behind the panels.
-    chrome,
+    /// Window background behind every panel.
+    bg,
     /// Panel interiors.
     panel,
-    /// Slightly raised surfaces: toolbar buttons, headers.
-    raised,
+    /// A raised field inside a panel: a text box, a swatch well.
+    field,
     /// Hovered control.
     hover,
     /// Active or selected control.
@@ -243,12 +230,25 @@ palette!(
     /// than the frost blue everyone pictures for exactly this reason, and
     /// `the_accent_can_be_written_on` holds every theme to it.
     active,
-    /// Separators and panel edges.
-    border,
+    /// The line **between** panels — dock columns, sections. Recedes rather
+    /// than rises: a groove, not a rule.
+    hairline,
+    /// A line **inside** a panel — a disclosure row, a section separator.
+    /// Softer than [`Colors::hairline`]: it reads as structure within
+    /// something rather than the edge of it.
+    divider,
     /// Ordinary text.
     text,
     /// Secondary text.
     text_dim,
+    /// The one colour used for a tab's underline, the active tool, and focus
+    /// — see the Decisions in `docs/WORKSPACE_DESIGN_PLAN.md`. Everything
+    /// else in the chrome is grey.
+    accent,
+    /// Text written on a fill of [`Colors::accent`] — whichever of black or
+    /// white actually reads against it; not every accent is dark enough for
+    /// white, see [`Colors::active`].
+    accent_text,
     /// The work area surrounding the stage. Objects here are editable but do
     /// not appear in published output.
     ///
@@ -257,6 +257,14 @@ palette!(
     /// loses the edge of the frame — which is the one boundary an animator has
     /// to see at all times. Animate keeps it grey in its light theme for the
     /// same reason, and so does every theme here.
+    ///
+    /// **This is the "match theme" answer, not necessarily what gets
+    /// painted.** View > Pasteboard Colour… lets a user override it; that
+    /// override lives in `Workspace::pasteboard`, not here — `Palette` only
+    /// ever knows the current *theme*, not the current *workspace*. Whatever
+    /// paints the pasteboard (`buzz-app`'s stage view) checks the override
+    /// first and falls back to this. See `derive`'s own note on how this is
+    /// built: a neutral step off `Colors::bg`, no tint mixed in.
     pasteboard,
     /// Edge of the stage rectangle.
     stage_border,
@@ -280,265 +288,553 @@ palette!(
     handle_stroke,
     /// A snap indicator, shown while a drag is snapping to something.
     snap,
+    /// A caution: an action that can be undone but should give pause.
+    warning,
+    /// An irreversible or destructive action.
+    danger,
+    /// A frame-grid cell that holds artwork — the timeline's own "paper",
+    /// kept close to white in every theme the way Animate's frame grid is,
+    /// rather than following the chrome's own polarity. See
+    /// `docs/WORKSPACE_DESIGN_PLAN.md` Stage 5 and `timeline_panel`'s
+    /// `draw_frame_cell`.
+    timeline_cell_filled,
+    /// A frame-grid cell that is a blank keyframe, or the span it holds
+    /// open — the mid-grey between [`Colors::timeline_cell_filled`] and an
+    /// empty cell.
+    timeline_cell_blank,
+    /// The hairline ruled along a frame cell's right and bottom edge when the
+    /// cell sits on [`Colors::timeline_cell_filled`] or
+    /// [`Colors::timeline_cell_blank`] — Animate's grid, half the ink of a
+    /// boxed cell. See `draw_frame_cell`.
+    timeline_rule_filled,
+    /// The same hairline, on a cell with no layer reaching it — subtler,
+    /// since the cell it rules is dark territory rather than paper.
+    timeline_rule_empty,
 );
 
+impl Palette {
+    /// The old name for [`Self::bg`], kept so panels that have not been
+    /// migrated to the Stage 1 role names still compile. See
+    /// `docs/WORKSPACE_DESIGN_PLAN.md`.
+    #[deprecated(note = "use Palette::bg")]
+    pub fn chrome() -> Color32 {
+        Self::bg()
+    }
+
+    /// The old name for [`Self::field`].
+    #[deprecated(note = "use Palette::field")]
+    pub fn raised() -> Color32 {
+        Self::field()
+    }
+
+    /// The old name for [`Self::hairline`].
+    #[deprecated(note = "use Palette::hairline")]
+    pub fn border() -> Color32 {
+        Self::hairline()
+    }
+}
+
+/// The four colours a theme's chrome roles are built from — see [`derive`].
+///
+/// Not `pub`: a `Seed` only ever exists for the length of a `derive` call.
+/// What a caller asks for is a theme's [`Colors`], never the seed it came
+/// from — the seed is this module's own working material, the way flour is
+/// not what a bakery sells.
+#[derive(Debug, Clone, Copy)]
+struct Seed {
+    /// Level 0 of the lightness ladder. Everything else in [`derive`] is
+    /// measured from here.
+    bg: Color32,
+    /// Ordinary text. Also which way the ladder runs: toward `text`'s pole
+    /// for the roles that rise (`panel`, `field`, `hover`, `divider`), away
+    /// from it for the one that recedes (`hairline`).
+    text: Color32,
+    /// The one accent colour — see [`Colors::accent`].
+    accent: Color32,
+    /// A warm/cool bias mixed a little into every neutral step, so a
+    /// theme's greys lean the way its own colours do rather than every
+    /// theme sharing one colourless ramp — Sepia's paper stays warm,
+    /// Forest's near-black stays green, Midnight's stays cool.
+    tint: Color32,
+}
+
+/// The roles [`derive`] does not touch: the timeline/ruler/guide colours the
+/// plan keeps as they were, hand-picked per theme rather than derived from a
+/// seed. See Stage 1, item 2 of `docs/WORKSPACE_DESIGN_PLAN.md`.
+///
+/// The four `timeline_*` fields are [`handle_fill`](Self::handle_fill)'s own
+/// pattern applied to the frame grid: a control that has to read as "paper"
+/// or "ink" regardless of which way a theme's own polarity runs, so — like
+/// the transform handle — it is named the same value in most themes rather
+/// than climbing the light/dark ladder [`derive`] builds for the chrome
+/// around it.
+#[derive(Debug, Clone, Copy)]
+struct Extras {
+    ruler_bg: Color32,
+    ruler_tick: Color32,
+    ruler_text: Color32,
+    guide: Color32,
+    guide_locked: Color32,
+    grid: Color32,
+    handle_fill: Color32,
+    handle_stroke: Color32,
+    snap: Color32,
+    timeline_cell_filled: Color32,
+    timeline_cell_blank: Color32,
+    timeline_rule_filled: Color32,
+    timeline_rule_empty: Color32,
+}
+
+/// Move `c` a rough `delta_l` (Lab-ish lightness, 0..100) toward `pole`
+/// (`Color32::WHITE` or `Color32::BLACK`). One `L` unit is approximated as
+/// 2.55 sRGB steps — exact enough to place a UI's flat fills apart from one
+/// another; nothing here claims real CIE Lab.
+fn nudge(c: Color32, pole: Color32, delta_l: f32) -> Color32 {
+    mix(c, pole, (delta_l * 2.55 / 255.0).clamp(0.0, 1.0))
+}
+
+/// `base`, nudged toward `pole` until it reads against `bg` (contrast ratio
+/// ≥ 3, WCAG's floor for a graphical object) or `pole` is reached.
+fn legible_against(base: Color32, bg: Color32, pole: Color32) -> Color32 {
+    let mut c = base;
+    for _ in 0..8 {
+        if contrast(c, bg) >= 3.0 {
+            break;
+        }
+        c = mix(c, pole, 0.25);
+    }
+    c
+}
+
+/// `c`, nudged toward `pole` until its own relative luminance is at least
+/// `floor`'s — a hue-preserving version of "clamp to a literal grey": a
+/// theme's own tinted text keeps its colour, it is only brightened as far as
+/// the floor actually requires. Used to hold every **dark** theme's `text` at
+/// least as bright as `#e8e8e8` and `text_dim` at least as bright as
+/// `#bdbdbd` — the user's report was section headers and field labels in dim
+/// grey on a dark panel, and `text_dim` was doing work that belongs to `text`
+/// (see `derive` and Stage's own follow-up notes).
+fn at_least_as_bright(c: Color32, floor: Color32, pole: Color32) -> Color32 {
+    let target = relative_luminance(floor);
+    let mut out = c;
+    for _ in 0..10 {
+        if relative_luminance(out) >= target {
+            break;
+        }
+        out = mix(out, pole, 0.2);
+    }
+    out
+}
+
+/// The mirror of [`at_least_as_bright`], for **light** themes: `c` nudged
+/// toward `pole` (black) until its luminance is at most `ceiling`'s. Holds
+/// `text` at most as bright as `#151515` and `text_dim` at most as bright as
+/// `#4a4a4a`.
+fn at_most_as_bright(c: Color32, ceiling: Color32, pole: Color32) -> Color32 {
+    let target = relative_luminance(ceiling);
+    let mut out = c;
+    for _ in 0..10 {
+        if relative_luminance(out) <= target {
+            break;
+        }
+        out = mix(out, pole, 0.2);
+    }
+    out
+}
+
+/// Build the sixteen roles Stage 1 reduced `Palette` to, from four seed
+/// colours, so every theme clears the same contrast floor by construction —
+/// see `every_theme_meets_contrast` — rather than by whoever tuned it having
+/// a good eye. `extras` supplies the nine roles this does not touch.
+fn derive(seed: Seed, extras: Extras) -> Colors {
+    let dark = relative_luminance(seed.text) > relative_luminance(seed.bg);
+    let toward_text = if dark { Color32::WHITE } else { Color32::BLACK };
+    let away_text = if dark { Color32::BLACK } else { Color32::WHITE };
+
+    // The Decision's own example numbers — app bg `#1e1e1e`, panel `#252525`,
+    // raised field `#2c2c2c`, hairline `#0f0f0f` between panels and `#3a3a3a`
+    // inside them — are exactly this ladder: panel/field/hover/divider rise
+    // toward `text` in four steps, and the *between-panel* hairline is the
+    // one step that goes the other way.
+    let step = |delta_l: f32| mix(nudge(seed.bg, toward_text, delta_l), seed.tint, 0.05);
+    let panel = step(3.0);
+    let field = step(6.0);
+    let hover = step(10.0);
+    let divider = step(14.0);
+
+    // Where `bg` already sits at the pole the hairline would recede toward
+    // (the Contrast theme's black), there is nowhere left to go — so it
+    // borrows `divider` rather than vanishing into `bg`, and the Contrast
+    // theme still gets the "visible border on every edge" its own
+    // description promises.
+    let hairline_recede = nudge(seed.bg, away_text, 6.0);
+    let hairline = if contrast(hairline_recede, seed.bg) > 1.05 {
+        hairline_recede
+    } else {
+        divider
+    };
+
+    let accent_text = if contrast(Color32::WHITE, seed.accent) >= contrast(Color32::BLACK, seed.accent)
+    {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
+
+    // Every dark theme's body text is held at least as bright as `#e8e8e8`
+    // (≥ 12:1 against Dark's own `#1e1e1e`), and its secondary text at least
+    // as bright as `#bdbdbd` (≥ 8:1) — a seed that was already bright enough
+    // keeps its own tint; one that was not is nudged up it, not flattened to
+    // a flat grey. Light themes hold the opposite floor, toward black:
+    // `#151515` and `#4a4a4a`. See `at_least_as_bright`/`at_most_as_bright`.
+    let text = if dark {
+        at_least_as_bright(seed.text, rgb(0xE8E8E8), Color32::WHITE)
+    } else {
+        at_most_as_bright(seed.text, rgb(0x15_15_15), Color32::BLACK)
+    };
+    let text_dim = {
+        let seeded = mix(text, seed.bg, 0.35);
+        if dark {
+            at_least_as_bright(seeded, rgb(0xBDBDBD), Color32::WHITE)
+        } else {
+            at_most_as_bright(seeded, rgb(0x4A4A4A), Color32::BLACK)
+        }
+    };
+
+    // **Animate's own pasteboard tracks the chrome's polarity: a neutral
+    // step darker than a dark `bg`, a step lighter than a light one** — not
+    // Stage 1's fixed mid-grey, which read as blue-grey the moment it was
+    // mixed with a theme's own accent `tint` (see the user's report and
+    // `Colors::pasteboard`'s own doc comment). No tint here at all: the one
+    // job this colour has is reading as "not the stage", in every theme, and
+    // a hue would work against that.
+    //
+    // The two steps are tuned rather than both a literal +/-12 L: a light
+    // theme's `bg` sits so close to the white stage itself (Light's own
+    // `#f5f5f5`) that a dark-theme-sized nudge barely moves it — short of
+    // Animate's own light grey, `#c8c8c8`. Dark's own `#1e1e1e` lands within
+    // a hex digit of Animate's dark grey, `#3c3c3c`, on the smaller step;
+    // `.max(45.0)` is only reached by Contrast's pure-black seed, so its
+    // pasteboard still clears `the_pasteboard_contrasts_with_the_stage_in_
+    // both_themes`'s own floor.
+    let bg_level = (seed.bg.r() as f32 + seed.bg.g() as f32 + seed.bg.b() as f32) / 3.0;
+    let pasteboard_level = if dark {
+        (bg_level + 30.0).max(45.0)
+    } else {
+        (bg_level - 46.0).max(0.0)
+    };
+    let pasteboard = Color32::from_gray(pasteboard_level.clamp(0.0, 255.0).round() as u8);
+
+    Colors {
+        bg: seed.bg,
+        panel,
+        field,
+        hover,
+        active: seed.accent,
+        hairline,
+        divider,
+        text,
+        text_dim,
+        accent: seed.accent,
+        accent_text,
+        pasteboard,
+        stage_border: hairline,
+        selection: seed.accent,
+        ruler_bg: extras.ruler_bg,
+        ruler_tick: extras.ruler_tick,
+        ruler_text: extras.ruler_text,
+        guide: extras.guide,
+        guide_locked: extras.guide_locked,
+        grid: extras.grid,
+        handle_fill: extras.handle_fill,
+        handle_stroke: extras.handle_stroke,
+        snap: extras.snap,
+        warning: legible_against(rgb(0xE0A020), seed.bg, toward_text),
+        danger: legible_against(rgb(0xE0524A), seed.bg, toward_text),
+        timeline_cell_filled: extras.timeline_cell_filled,
+        timeline_cell_blank: extras.timeline_cell_blank,
+        timeline_rule_filled: extras.timeline_rule_filled,
+        timeline_rule_empty: extras.timeline_rule_empty,
+    }
+}
+
 /// The default. Neutral grey, so the artwork's own colours read true.
-const DARK: Colors = Colors {
-    chrome: rgb(0x262626),
-    panel: rgb(0x2F2F2F),
-    raised: rgb(0x3A3A3A),
-    hover: rgb(0x4A4A4A),
-    active: rgb(0x2D6CB5),
-    border: rgb(0x1C1C1C),
-    text: rgb(0xD8D8D8),
-    text_dim: rgb(0x9A9A9A),
-    pasteboard: rgb(0x535353),
-    stage_border: rgb(0x1A1A1A),
+const DARK_SEED: Seed = Seed {
+    bg: rgb(0x1E1E1E),
+    text: rgb(0xE6E6E6),
+    accent: rgb(0x378EF0),
+    tint: rgb(0x378EF0),
+};
+const DARK_EXTRAS: Extras = Extras {
     ruler_bg: rgb(0x333333),
     ruler_tick: rgb(0x888888),
     ruler_text: rgb(0xAAAAAA),
     guide: rgb(0x00D0C8),
     guide_locked: rgb(0x8A8A60),
     grid: rgba(0x606060, 0x60),
-    selection: rgb(0x00A8FF),
     handle_fill: rgb(0xFFFFFF),
     handle_stroke: rgb(0x202020),
     snap: rgb(0xFF4080),
+    timeline_cell_filled: rgb(0xE8E8E8),
+    timeline_cell_blank: rgb(0x909090),
+    timeline_rule_filled: rgb(0x7C7C7C),
+    timeline_rule_empty: rgb(0x333333),
 };
 
 /// For bright rooms.
-const LIGHT: Colors = Colors {
-    chrome: rgb(0xD6D6D6),
-    panel: rgb(0xEEEEEE),
-    raised: rgb(0xDDDDDD),
-    hover: rgb(0xC8C8C8),
-    active: rgb(0x2D6CB5),
-    border: rgb(0xB4B4B4),
-    text: rgb(0x1E1E1E),
-    text_dim: rgb(0x5A5A5A),
-    pasteboard: rgb(0x8E8E8E),
-    stage_border: rgb(0x333333),
+const LIGHT_SEED: Seed = Seed {
+    bg: rgb(0xF5F5F5),
+    text: rgb(0x1B1B1B),
+    accent: rgb(0x1473E6),
+    tint: rgb(0x1473E6),
+};
+const LIGHT_EXTRAS: Extras = Extras {
     ruler_bg: rgb(0xE4E4E4),
     ruler_tick: rgb(0x707070),
     ruler_text: rgb(0x444444),
     guide: rgb(0x009A94),
     guide_locked: rgb(0x8A8A40),
     grid: rgba(0x404040, 0x40),
-    selection: rgb(0x0078D4),
     handle_fill: rgb(0xFFFFFF),
     handle_stroke: rgb(0x202020),
     snap: rgb(0xD00050),
+    timeline_cell_filled: rgb(0xE8E8E8),
+    timeline_cell_blank: rgb(0x909090),
+    timeline_rule_filled: rgb(0x7C7C7C),
+    timeline_rule_empty: rgb(0x333333),
 };
 
 /// Near-black, cool. The panel is not pure black: a true black behind a dark
 /// drawing makes the drawing read as a hole rather than as artwork.
-const MIDNIGHT: Colors = Colors {
-    chrome: rgb(0x0E1116),
-    panel: rgb(0x141922),
-    raised: rgb(0x1E2530),
-    hover: rgb(0x2A3340),
-    active: rgb(0x3B82F6),
-    border: rgb(0x080A0E),
+const MIDNIGHT_SEED: Seed = Seed {
+    bg: rgb(0x0E1116),
     text: rgb(0xD5DCE6),
-    text_dim: rgb(0x8B95A5),
-    pasteboard: rgb(0x39414F),
-    stage_border: rgb(0x05070A),
+    accent: rgb(0x3B82F6),
+    tint: rgb(0x3B82F6),
+};
+const MIDNIGHT_EXTRAS: Extras = Extras {
     ruler_bg: rgb(0x171D27),
     ruler_tick: rgb(0x7C879A),
     ruler_text: rgb(0xA3AEBF),
     guide: rgb(0x22D3EE),
     guide_locked: rgb(0x6B7280),
     grid: rgba(0x46505F, 0x60),
-    selection: rgb(0x38BDF8),
     handle_fill: rgb(0xFFFFFF),
     handle_stroke: rgb(0x0B0E13),
     snap: rgb(0xFB7185),
+    timeline_cell_filled: rgb(0xE8E8E8),
+    timeline_cell_blank: rgb(0x909090),
+    timeline_rule_filled: rgb(0x7C7C7C),
+    timeline_rule_empty: rgb(0x333333),
 };
 
-/// A softer dark: blue-grey, and a step lighter than [`DARK`].
-const SLATE: Colors = Colors {
-    chrome: rgb(0x2B313B),
-    panel: rgb(0x353C48),
-    raised: rgb(0x424A58),
-    hover: rgb(0x515B6B),
-    active: rgb(0x4C86C6),
-    border: rgb(0x21262E),
+/// A softer dark: blue-grey, and a step lighter than [`DARK_SEED`].
+const SLATE_SEED: Seed = Seed {
+    bg: rgb(0x2B313B),
     text: rgb(0xDCE1E8),
-    text_dim: rgb(0xA2ABB8),
-    pasteboard: rgb(0x5C6675),
-    stage_border: rgb(0x1B1F26),
+    accent: rgb(0x4C86C6),
+    tint: rgb(0x4C86C6),
+};
+const SLATE_EXTRAS: Extras = Extras {
     ruler_bg: rgb(0x3A424F),
     ruler_tick: rgb(0x939DAC),
     ruler_text: rgb(0xB4BDC9),
     guide: rgb(0x2FD4C8),
     guide_locked: rgb(0x8A8A60),
     grid: rgba(0x6E7887, 0x60),
-    selection: rgb(0x5AB0F5),
     handle_fill: rgb(0xFFFFFF),
     handle_stroke: rgb(0x232830),
     snap: rgb(0xFF6088),
+    timeline_cell_filled: rgb(0xE8E8E8),
+    timeline_cell_blank: rgb(0x909090),
+    timeline_rule_filled: rgb(0x7C7C7C),
+    timeline_rule_empty: rgb(0x333333),
 };
 
-/// Warm paper. The pasteboard is a deeper tan than the panels, so the stage
-/// still reads as a lit sheet lying on a desk.
-const SEPIA: Colors = Colors {
-    chrome: rgb(0xD8CCB3),
-    panel: rgb(0xF2E9D8),
-    raised: rgb(0xE6DAC3),
-    hover: rgb(0xD3C5A8),
-    active: rgb(0x2D6CB5),
-    border: rgb(0xBCAE92),
+/// Warm paper. The tint is the old hand-picked pasteboard tan, so the
+/// neutrals it biases still read as warm the way the paper itself does.
+const SEPIA_SEED: Seed = Seed {
+    bg: rgb(0xD8CCB3),
     text: rgb(0x2A2116),
-    text_dim: rgb(0x6B5B45),
-    pasteboard: rgb(0x9C907A),
-    stage_border: rgb(0x3A2E1E),
+    accent: rgb(0x2D6CB5),
+    tint: rgb(0x9C907A),
+};
+const SEPIA_EXTRAS: Extras = Extras {
     ruler_bg: rgb(0xEADFC9),
     ruler_tick: rgb(0x8A7B60),
     ruler_text: rgb(0x4A3E2C),
     guide: rgb(0x00857E),
     guide_locked: rgb(0x8A7A40),
     grid: rgba(0x463C2D, 0x40),
-    selection: rgb(0x0078D4),
     handle_fill: rgb(0xFFFFFF),
     handle_stroke: rgb(0x2A2116),
     snap: rgb(0xC02050),
+    timeline_cell_filled: rgb(0xE8E8E8),
+    timeline_cell_blank: rgb(0x909090),
+    timeline_rule_filled: rgb(0x7C7C7C),
+    timeline_rule_empty: rgb(0x333333),
 };
 
 /// Built for legibility rather than for comfort: black behind white, a visible
-/// border on every edge, and guides at full saturation.
-const CONTRAST: Colors = Colors {
-    chrome: rgb(0x000000),
-    panel: rgb(0x000000),
-    raised: rgb(0x141414),
-    hover: rgb(0x2E2E2E),
-    active: rgb(0x0A84FF),
-    border: rgb(0xFFFFFF),
+/// border on every edge, and guides at full saturation. The tint is white —
+/// deliberately colourless, so nothing here softens toward a hue.
+const CONTRAST_SEED: Seed = Seed {
+    bg: rgb(0x000000),
     text: rgb(0xFFFFFF),
-    text_dim: rgb(0xD0D0D0),
-    pasteboard: rgb(0x3A3A3A),
-    stage_border: rgb(0xFFFFFF),
+    accent: rgb(0x4FA3FF),
+    tint: rgb(0xFFFFFF),
+};
+const CONTRAST_EXTRAS: Extras = Extras {
     ruler_bg: rgb(0x000000),
     ruler_tick: rgb(0xFFFFFF),
     ruler_text: rgb(0xFFFFFF),
     guide: rgb(0x00FFFF),
     guide_locked: rgb(0xFFFF00),
     grid: rgba(0x969696, 0x90),
-    selection: rgb(0x00E5FF),
     handle_fill: rgb(0xFFFFFF),
     handle_stroke: rgb(0x000000),
     snap: rgb(0xFF2D95),
+    timeline_cell_filled: rgb(0xE8E8E8),
+    timeline_cell_blank: rgb(0x909090),
+    timeline_rule_filled: rgb(0x7C7C7C),
+    timeline_rule_empty: rgb(0x333333),
 };
 
 /// Deep green-black. Not a recognised palette but the one most often asked
 /// for alongside them, and the accents are picked from what a forest actually
 /// offers: moss, new leaf, and the orange of a fallen one for the snap mark.
-const FOREST: Colors = Colors {
-    chrome: rgb(0x0B1410),
-    panel: rgb(0x101B15),
-    raised: rgb(0x17271E),
-    hover: rgb(0x21362A),
-    active: rgb(0x2F7D53),
-    border: rgb(0x060D0A),
+const FOREST_SEED: Seed = Seed {
+    bg: rgb(0x0B1410),
     text: rgb(0xD3E3D8),
-    text_dim: rgb(0x8AA394),
-    pasteboard: rgb(0x33463C),
-    stage_border: rgb(0x040907),
+    accent: rgb(0x2F7D53),
+    tint: rgb(0x2F7D53),
+};
+const FOREST_EXTRAS: Extras = Extras {
     ruler_bg: rgb(0x132018),
     ruler_tick: rgb(0x7C9687),
     ruler_text: rgb(0xA6BFB0),
     guide: rgb(0x3FD9A0),
     guide_locked: rgb(0x7E8A5E),
     grid: rgba(0x4A5F52, 0x60),
-    selection: rgb(0x5BD98E),
     handle_fill: rgb(0xFFFFFF),
     handle_stroke: rgb(0x08110C),
     snap: rgb(0xFF7A59),
+    timeline_cell_filled: rgb(0xE8E8E8),
+    timeline_cell_blank: rgb(0x909090),
+    timeline_rule_filled: rgb(0x7C7C7C),
+    timeline_rule_empty: rgb(0x333333),
 };
 
 /// Dracula, from its published palette: background `#282A36`, foreground
 /// `#F8F8F2`, and the six brights.
 ///
 /// The accent is a deeper purple than the palette's `#BD93F9`, because that one
-/// is meant to be written *with* rather than written *on* — see `active`. The
-/// comment colour `#6272A4` is likewise lifted for the dimmed text, which in an
-/// interface has to stay readable rather than recede.
-const DRACULA: Colors = Colors {
-    chrome: rgb(0x21222C),
-    panel: rgb(0x282A36),
-    raised: rgb(0x343746),
-    hover: rgb(0x44475A),
-    active: rgb(0x7E52C9),
-    border: rgb(0x191A21),
+/// is meant to be written *with* rather than written *on* — see `Colors::active`.
+/// The comment colour `#6272A4` is the tint, so the ladder derived from it
+/// leans the same violet-grey as the rest of the published palette.
+const DRACULA_SEED: Seed = Seed {
+    bg: rgb(0x282A36),
     text: rgb(0xF8F8F2),
-    text_dim: rgb(0x9BA3C9),
-    pasteboard: rgb(0x4A4D63),
-    stage_border: rgb(0x14151B),
+    accent: rgb(0x7E52C9),
+    tint: rgb(0x6272A4),
+};
+const DRACULA_EXTRAS: Extras = Extras {
     ruler_bg: rgb(0x2D2F3D),
     ruler_tick: rgb(0x8B93B8),
     ruler_text: rgb(0xBDC3E0),
     guide: rgb(0x8BE9FD),
     guide_locked: rgb(0xF1FA8C),
     grid: rgba(0x6272A4, 0x60),
-    selection: rgb(0xFF79C6),
     handle_fill: rgb(0xFFFFFF),
     handle_stroke: rgb(0x21222C),
     snap: rgb(0xFF5555),
+    timeline_cell_filled: rgb(0xE8E8E8),
+    timeline_cell_blank: rgb(0x909090),
+    timeline_rule_filled: rgb(0x7C7C7C),
+    timeline_rule_empty: rgb(0x333333),
 };
 
-/// Solarized Dark, on its own base tones: `base03` behind, `base02` raised,
-/// `base1` for text and `base00` for what recedes.
+/// Solarized Dark, on its own base tones: `base03` behind, `base01` as the
+/// tint, and text a step above the published `base1`.
 ///
 /// The palette is built around a fixed lightness relationship rather than
 /// around contrast, which is why its text sits closer to its background than
-/// any other theme here. That is the point of it, and it still clears AA.
-const SOLARIZED_DARK: Colors = Colors {
-    chrome: rgb(0x00212B),
-    panel: rgb(0x002B36),
-    raised: rgb(0x073642),
-    hover: rgb(0x0F4B5C),
-    active: rgb(0x268BD2),
-    border: rgb(0x00161C),
-    text: rgb(0x93A1A1),
-    text_dim: rgb(0x657B83),
-    pasteboard: rgb(0x3E5B63),
-    stage_border: rgb(0x001015),
+/// any other theme here. That is the point of it, and published `base1`
+/// (`#93a1a1`) still clears AA against the *flat* background it was designed
+/// for — but `derive`'s `panel` sits a little above that background, closer
+/// to text, which pulls `text_dim` (measured against `panel`, not `bg`)
+/// under 3:1. Per the plan's own allowance ("if a named palette's published
+/// seed fails ... for body text, adjust only its text seed"), the text seed
+/// is nudged one step brighter, toward published `base2`, rather than
+/// touching the ladder every other theme shares.
+const SOLARIZED_DARK_SEED: Seed = Seed {
+    bg: rgb(0x002B36),
+    text: rgb(0xA6B4B4),
+    accent: rgb(0x268BD2),
+    tint: rgb(0x586E75),
+};
+const SOLARIZED_DARK_EXTRAS: Extras = Extras {
     ruler_bg: rgb(0x052F3A),
     ruler_tick: rgb(0x587B85),
     ruler_text: rgb(0x93A1A1),
     guide: rgb(0x2AA198),
     guide_locked: rgb(0xB58900),
     grid: rgba(0x586E75, 0x60),
-    selection: rgb(0x268BD2),
     handle_fill: rgb(0xFDF6E3),
     handle_stroke: rgb(0x00212B),
     snap: rgb(0xDC322F),
+    timeline_cell_filled: rgb(0xE8E8E8),
+    timeline_cell_blank: rgb(0x909090),
+    timeline_rule_filled: rgb(0x7C7C7C),
+    timeline_rule_empty: rgb(0x333333),
 };
 
 /// Nord, by its own numbering: the Polar Night greys `nord0`-`nord3` for the
-/// chrome, Snow Storm for the text, Frost for the accents and Aurora for the
-/// marks that have to be noticed.
-const NORD: Colors = Colors {
-    chrome: rgb(0x2E3440),
-    panel: rgb(0x3B4252),
-    raised: rgb(0x434C5E),
-    hover: rgb(0x4C566A),
-    active: rgb(0x5E81AC),
-    border: rgb(0x242933),
+/// chrome, Snow Storm for the text, Frost for the accent and tint, and
+/// Aurora for the marks that have to be noticed.
+const NORD_SEED: Seed = Seed {
+    bg: rgb(0x2E3440),
     text: rgb(0xECEFF4),
-    text_dim: rgb(0xA3AEC2),
-    pasteboard: rgb(0x616E85),
-    stage_border: rgb(0x21262F),
+    accent: rgb(0x5E81AC),
+    tint: rgb(0x88C0D0),
+};
+const NORD_EXTRAS: Extras = Extras {
     ruler_bg: rgb(0x39404F),
     ruler_tick: rgb(0x92A0B5),
     ruler_text: rgb(0xC3CCDA),
     guide: rgb(0x8FBCBB),
     guide_locked: rgb(0xEBCB8B),
     grid: rgba(0x616E85, 0x60),
-    selection: rgb(0x88C0D0),
     handle_fill: rgb(0xECEFF4),
     handle_stroke: rgb(0x2E3440),
     snap: rgb(0xBF616A),
+    timeline_cell_filled: rgb(0xE8E8E8),
+    timeline_cell_blank: rgb(0x909090),
+    timeline_rule_filled: rgb(0x7C7C7C),
+    timeline_rule_empty: rgb(0x333333),
 };
+
+/// Every theme's [`Colors`], computed once and cached — `derive` is a dozen
+/// or so float mixes, cheap in isolation but this is read from many widgets
+/// on every frame, and a `Colors` is 25 plain `Color32`s: worth the one-time
+/// cost of building the table against re-deriving it on every call.
+fn colors_table() -> &'static [Colors; Theme::ALL.len()] {
+    static TABLE: std::sync::OnceLock<[Colors; Theme::ALL.len()]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        Theme::ALL.map(|t| match t {
+            Theme::Dark => derive(DARK_SEED, DARK_EXTRAS),
+            Theme::Light => derive(LIGHT_SEED, LIGHT_EXTRAS),
+            Theme::Midnight => derive(MIDNIGHT_SEED, MIDNIGHT_EXTRAS),
+            Theme::Slate => derive(SLATE_SEED, SLATE_EXTRAS),
+            Theme::Sepia => derive(SEPIA_SEED, SEPIA_EXTRAS),
+            Theme::Contrast => derive(CONTRAST_SEED, CONTRAST_EXTRAS),
+            Theme::Forest => derive(FOREST_SEED, FOREST_EXTRAS),
+            Theme::Dracula => derive(DRACULA_SEED, DRACULA_EXTRAS),
+            Theme::SolarizedDark => derive(SOLARIZED_DARK_SEED, SOLARIZED_DARK_EXTRAS),
+            Theme::Nord => derive(NORD_SEED, NORD_EXTRAS),
+        })
+    })
+}
 
 /// The brand's three colours, in order along the frame.
 ///
@@ -649,8 +945,9 @@ pub struct Metrics;
 impl Metrics {
     /// Width of the ruler strips, in points.
     pub const RULER: f32 = 18.0;
-    /// Toolbar button edge.
-    pub const TOOL_BUTTON: f32 = 30.0;
+    /// Toolbar button edge — Stage 3 of `docs/WORKSPACE_DESIGN_PLAN.md`:
+    /// "one column of `Metrics::TOOL_BUTTON = 28` ghost buttons".
+    pub const TOOL_BUTTON: f32 = 28.0;
     /// Timeline row height at 100%.
     pub const LAYER_ROW: f32 = 20.0;
     /// Frame cell width in the timeline.
@@ -670,6 +967,47 @@ impl Metrics {
 /// two cannot drift apart.
 const SCROLL_BAR: f32 = 9.0;
 
+/// The chrome's design tokens: spacing, radii, type sizes and control
+/// heights, alongside [`Metrics`]. One place, so a panel reads a number
+/// rather than hard-coding it — see Stage 1 of
+/// `docs/WORKSPACE_DESIGN_PLAN.md`. Everything here is on the 8 px grid
+/// (4/8/12/16), checked by `tokens_are_on_the_four_pixel_grid`.
+pub struct Tokens;
+
+impl Tokens {
+    /// The 8 px grid's four steps.
+    pub const SPACE_1: f32 = 4.0;
+    pub const SPACE_2: f32 = 8.0;
+    pub const SPACE_3: f32 = 12.0;
+    pub const SPACE_4: f32 = 16.0;
+    /// Height of an ordinary control: a button, a field.
+    pub const CONTROL_H: f32 = 24.0;
+    /// Height of a row in a list: Layers, the Library.
+    pub const ROW_H: f32 = 20.0;
+    /// Height of a panel-group tab.
+    pub const TAB_H: f32 = 28.0;
+    /// Corner radius, everywhere a control has one.
+    pub const RADIUS: u8 = 2;
+    /// Width of a hairline: a panel edge, a divider.
+    pub const HAIRLINE: f32 = 1.0;
+    /// Body text.
+    pub const TEXT: f32 = 12.0;
+    /// Secondary text: a tab, a caption.
+    pub const TEXT_SMALL: f32 = 11.0;
+    /// A panel or section heading.
+    pub const HEADING: f32 = 13.0;
+    /// **The smallest a clickable control may be** — Stage 6, item 3 of
+    /// `docs/WORKSPACE_DESIGN_PLAN.md`: "a headless audit test walks the
+    /// `egui::Context` accesskit tree ... and fails on any clickable smaller
+    /// than 24 × 24 at scale 1." `CONTROL_H` and `TOOL_BUTTON` both meet it;
+    /// `ROW_H` (20) does not on its own — a Layers or Library row is 20 px
+    /// tall, and the audit (in `crates/buzz-app`, where a real window's
+    /// worth of widgets can be walked) is what settles whether the row
+    /// itself is the clickable target or whether egui's own hit-test
+    /// padding around a short row already clears the minimum in practice.
+    pub const MIN_TARGET: f32 = 24.0;
+}
+
 /// Apply the theme to an egui context.
 ///
 /// The chosen palette is installed into *both* egui theme slots. Which theme
@@ -682,10 +1020,35 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_visuals_of(egui::Theme::Light, visuals);
 
     ctx.all_styles_mut(|style| {
-        style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-        style.spacing.button_padding = egui::vec2(6.0, 3.0);
-        style.spacing.menu_margin = egui::Margin::same(4);
-        style.spacing.interact_size.y = 20.0;
+        // Stage 1, item 5 of `docs/WORKSPACE_DESIGN_PLAN.md`: spacing read
+        // from `Tokens` rather than hard-coded, so a panel that wants the
+        // same rhythm asks for the same numbers this does.
+        //
+        // **Deviation, recorded rather than silently taken:** the plan asks
+        // for `item_spacing = (8, 4)` — `(Tokens::SPACE_2, Tokens::SPACE_1)`
+        // on both axes. At `Tokens::SPACE_2` horizontally, the narrowest
+        // legal column (`COLUMN_WIDTH_RANGE`'s floor, with every panel
+        // stacked into it) overruns the window by 21 points and fails
+        // `dock_geometry_tests::the_stage_never_reaches_into_a_dock_column`
+        // — extra horizontal air between *every* widget in the busiest
+        // panels compounds across a row in a way the vertical gap and the
+        // button padding do not. The vertical component is the full
+        // `Tokens::SPACE_1`; only the horizontal one stays at the old 6.0,
+        // which is the nearest thing to the Decision that keeps a currently
+        // green test green. Widening `COLUMN_WIDTH_RANGE`'s floor instead
+        // would fix it more in the spirit of the plan but changes what a
+        // user can drag a column down to, which is out of scope for a
+        // token/visuals stage.
+        style.spacing.item_spacing = egui::vec2(6.0, Tokens::SPACE_1);
+        style.spacing.button_padding = egui::vec2(Tokens::SPACE_2, 3.0);
+        // Stage 2, item 4: menus specifically get a 6 px margin — tighter
+        // than the general `Tokens::SPACE_2` (8) the rest of the chrome
+        // reads, because a dropdown's items are already inset by their own
+        // `button_padding` and an 8 px margin on top of that read as too
+        // much air around a one-line list.
+        style.spacing.menu_margin = egui::Margin::same(6);
+        style.spacing.interact_size.y = Tokens::CONTROL_H;
+        style.spacing.indent = Tokens::SPACE_4;
 
         // **Scroll bars take space; they do not sit on top of the panel.**
         //
@@ -711,32 +1074,58 @@ fn build_visuals() -> Visuals {
 
     visuals.panel_fill = Palette::panel();
     visuals.window_fill = Palette::panel();
-    visuals.extreme_bg_color = Palette::chrome();
-    visuals.faint_bg_color = Palette::raised();
+    visuals.extreme_bg_color = Palette::bg();
+    visuals.faint_bg_color = Palette::field();
     visuals.override_text_color = Some(Palette::text());
+    // The one accent, on the one thing egui itself paints a link with.
+    visuals.hyperlink_color = Palette::accent();
+
+    let hairline = Stroke::new(Tokens::HAIRLINE, Palette::hairline());
 
     visuals.widgets.noninteractive.bg_fill = Palette::panel();
     visuals.widgets.noninteractive.weak_bg_fill = Palette::panel();
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Palette::border());
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Palette::text_dim());
+    visuals.widgets.noninteractive.bg_stroke = hairline;
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(Tokens::HAIRLINE, Palette::text_dim());
 
-    visuals.widgets.inactive.bg_fill = Palette::raised();
-    visuals.widgets.inactive.weak_bg_fill = Palette::raised();
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, Palette::text());
+    visuals.widgets.inactive.bg_fill = Palette::field();
+    visuals.widgets.inactive.weak_bg_fill = Palette::field();
+    visuals.widgets.inactive.bg_stroke = hairline;
+    visuals.widgets.inactive.fg_stroke = Stroke::new(Tokens::HAIRLINE, Palette::text());
 
     visuals.widgets.hovered.bg_fill = Palette::hover();
     visuals.widgets.hovered.weak_bg_fill = Palette::hover();
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.hovered.bg_stroke = hairline;
+    // `Palette::text()`, not a fixed white: on a light theme a white hover
+    // ink drew button labels white-on-light-grey the moment the pointer
+    // touched them.
+    visuals.widgets.hovered.fg_stroke = Stroke::new(Tokens::HAIRLINE, Palette::text());
 
     visuals.widgets.active.bg_fill = Palette::active();
     visuals.widgets.active.weak_bg_fill = Palette::active();
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.active.bg_stroke = Stroke::new(Tokens::HAIRLINE, Palette::accent());
+    // **The body text colour, not `accent_text`.** egui resolves every
+    // `.strong()` label through `Visuals::strong_text_color()`, which *is*
+    // this stroke — so while it was `accent_text` (black for Dark's
+    // `#378ef0`), every strong label in every dark theme painted near-black
+    // on a dark panel. Fixing those one call site at a time left dozens
+    // behind; fixing the source covers them all. Our own accent-filled
+    // controls (the active tool) still ink themselves with `accent_text`.
+    visuals.widgets.active.fg_stroke = Stroke::new(Tokens::HAIRLINE, Palette::text());
 
-    visuals.selection.bg_fill = Palette::active();
-    visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    // Selection is a wash of the accent, not a fill: it marks what is chosen
+    // without competing with the one place the accent is meant to be read as
+    // *action* — the tab underline, the active tool, focus.
+    visuals.selection.bg_fill = Palette::accent().gamma_multiply(0.25);
+    // **The focus ring** — Stage 6, item 2 of `docs/WORKSPACE_DESIGN_PLAN.md`:
+    // a 2 px accent outline on the focused widget. egui reads this same
+    // `Visuals::selection.stroke` both for a focused widget's outline and for
+    // a text selection's border, so the one number serves both.
+    visuals.selection.stroke = Stroke::new(2.0, Palette::accent());
 
-    // Square-ish corners read as a professional tool rather than a web app.
-    let radius = CornerRadius::same(2);
+    // Square-ish corners read as a professional tool rather than a web app;
+    // windows and menus get one step more so a floating panel still reads as
+    // a distinct object against the square controls inside it.
+    let radius = CornerRadius::same(Tokens::RADIUS);
     for w in [
         &mut visuals.widgets.noninteractive,
         &mut visuals.widgets.inactive,
@@ -746,9 +1135,48 @@ fn build_visuals() -> Visuals {
     ] {
         w.corner_radius = radius;
     }
-    visuals.window_corner_radius = radius;
+    let window_radius = CornerRadius::same(4);
+    visuals.window_corner_radius = window_radius;
+    visuals.menu_corner_radius = window_radius;
+
+    // No shadows anywhere flat chrome would cast one, except a menu lifting
+    // off the surface below it — the one place in this interface something
+    // genuinely floats over something else.
+    visuals.window_shadow = egui::epaint::Shadow::NONE;
+    visuals.popup_shadow = egui::epaint::Shadow {
+        offset: [0, 2],
+        blur: 8,
+        spread: 0,
+        color: Color32::from_black_alpha(96),
+    };
 
     visuals
+}
+
+/// WCAG relative luminance: gamma-corrected, and weighted for the eye.
+///
+/// Module-level rather than test-only: [`derive`] needs it (for
+/// `accent_text` and the hairline's legibility fallback) as much as the
+/// tests do, and the two must never drift into measuring two different
+/// things.
+fn relative_luminance(c: Color32) -> f32 {
+    let channel = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+}
+
+/// WCAG contrast ratio between two colours, 1.0 (identical) to 21.0
+/// (black against white).
+fn contrast(a: Color32, b: Color32) -> f32 {
+    let (x, y) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+    (hi + 0.05) / (lo + 0.05)
 }
 
 #[cfg(test)]
@@ -757,29 +1185,6 @@ mod tests {
 
     fn lum(c: Color32) -> f32 {
         0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
-    }
-
-    /// WCAG relative luminance: gamma-corrected, and weighted for the eye.
-    /// Not the same thing as `lum` above, which is a quick perceptual
-    /// brightness used for comparing two greys.
-    fn relative_luminance(c: Color32) -> f32 {
-        let channel = |v: u8| {
-            let v = v as f32 / 255.0;
-            if v <= 0.03928 {
-                v / 12.92
-            } else {
-                ((v + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
-    }
-
-    /// WCAG contrast ratio between two colours, 1.0 (identical) to 21.0
-    /// (black against white).
-    fn contrast(a: Color32, b: Color32) -> f32 {
-        let (x, y) = (relative_luminance(a), relative_luminance(b));
-        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
-        (hi + 0.05) / (lo + 0.05)
     }
 
     /// Run something in each theme, and leave the theme as it was found.
@@ -873,6 +1278,29 @@ mod tests {
         });
     }
 
+    /// Follow-up 2026-09-26, item 3: the pasteboard tracks the theme's own
+    /// polarity — a dark theme's is a dark neutral grey, a light theme's a
+    /// light one — rather than Stage 1's fixed mid-grey (which landed close
+    /// to `gray(128)` regardless of polarity, and read as blue-grey once
+    /// mixed with a theme's own accent tint).
+    #[test]
+    fn the_pasteboard_tracks_the_themes_own_polarity() {
+        in_each_theme(|t| {
+            let luminance = lum(Palette::pasteboard());
+            if t.is_dark() {
+                assert!(
+                    luminance < 128.0,
+                    "{t:?}: a dark theme's pasteboard should be dark, got {luminance}"
+                );
+            } else {
+                assert!(
+                    luminance > 128.0,
+                    "{t:?}: a light theme's pasteboard should be light, got {luminance}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn text_is_readable_against_panels_in_both_themes() {
         in_each_theme(|t| {
@@ -950,7 +1378,11 @@ mod tests {
         }
         assert_eq!(t, Theme::Dark, "the cycle should return to its start");
         for expected in Theme::ALL {
-            assert!(seen.contains(&expected), "{} is not on the cycle", expected.label());
+            assert!(
+                seen.contains(&expected),
+                "{} is not on the cycle",
+                expected.label()
+            );
         }
     }
 
@@ -980,22 +1412,52 @@ mod tests {
         });
     }
 
-    /// **White is written on the accent**, so the accent cannot be one of a
-    /// palette's bright colours.
+    /// **[`Colors::accent_text`] is written on the accent**, so the accent
+    /// cannot be one of a palette's bright colours with no reading legible on
+    /// it in either black or white.
     ///
-    /// `build_visuals` fills an active control with `Palette::active` and puts
-    /// `Color32::WHITE` on top. Dracula's `#BD93F9` and Nord's frost blue are
-    /// the obvious accents to reach for and both fail this: the label goes
-    /// nearly invisible the moment a control is pressed. 3.0 is WCAG AA for
-    /// text at this weight.
+    /// Originally this held every theme to white specifically, because
+    /// `build_visuals` put `Color32::WHITE` on every active control
+    /// regardless of theme. Stage 1 of `docs/WORKSPACE_DESIGN_PLAN.md`
+    /// replaced that with `accent_text` — whichever of black or white
+    /// actually reads — precisely so a theme like Contrast, whose own accent
+    /// `#4fa3ff` is legible with black but not with white at this floor, is
+    /// not forced to darken an otherwise-correct accent to satisfy a label
+    /// colour it no longer hard-codes. Dracula's `#BD93F9` and Nord's frost
+    /// blue remain the obvious accents to reach for and still fail if tried
+    /// with white; `accent_text` is what lets a theme reach for black instead
+    /// rather than tuning the accent itself. 3.0 is WCAG AA for text at this
+    /// weight; `every_theme_meets_contrast` holds `accent_text` itself to the
+    /// stricter 4.5.
+    /// **`.strong()` text reads on the panel it sits on, in every theme.**
+    /// egui takes strong text from `widgets.active.fg_stroke`; when that was
+    /// `accent_text`, Dark's strong labels came out black on a dark panel.
+    #[test]
+    fn strong_text_reads_on_the_panel() {
+        in_each_theme(|t| {
+            let v = build_visuals();
+            for (role, ink) in [
+                ("strong", v.strong_text_color()),
+                ("hovered", v.widgets.hovered.fg_stroke.color),
+            ] {
+                let ratio = contrast(ink, Palette::panel());
+                assert!(
+                    ratio >= 4.5,
+                    "{}: {role} text on the panel is {ratio:.2}:1",
+                    t.label()
+                );
+            }
+        });
+    }
+
     #[test]
     fn the_accent_can_be_written_on() {
         in_each_theme(|t| {
-            let ratio = contrast(Color32::WHITE, Palette::active());
+            let ratio = contrast(Palette::accent_text(), Palette::active());
             assert!(
                 ratio >= 3.0,
-                "{}: white on the accent is {ratio:.2}:1, so a pressed control \
-                 cannot be read",
+                "{}: accent_text on the accent is {ratio:.2}:1, so a pressed \
+                 control cannot be read",
                 t.label()
             );
         });
@@ -1014,6 +1476,149 @@ mod tests {
                 t.label()
             );
         });
+    }
+
+    /// Stage 1's own acceptance test, item 6 of
+    /// `docs/WORKSPACE_DESIGN_PLAN.md`: body text at 4.5:1 against the panel,
+    /// secondary text at 3:1, and `accent_text` at 4.5:1 against its own
+    /// accent fill — every theme, held to the same floor by construction
+    /// (`derive`) rather than by whoever tuned that theme having a good eye.
+    #[test]
+    fn every_theme_meets_contrast() {
+        in_each_theme(|t| {
+            let panel = Palette::panel();
+            let text_ratio = contrast(Palette::text(), panel);
+            assert!(
+                text_ratio >= 7.0,
+                "{}: text on the panel is {text_ratio:.2}:1, below 7:1",
+                t.label()
+            );
+            let dim_ratio = contrast(Palette::text_dim(), panel);
+            assert!(
+                dim_ratio >= 4.5,
+                "{}: text_dim on the panel is {dim_ratio:.2}:1, below 4.5:1",
+                t.label()
+            );
+            let accent_ratio = contrast(Palette::accent_text(), Palette::accent());
+            assert!(
+                accent_ratio >= 4.5,
+                "{}: accent_text on the accent is {accent_ratio:.2}:1, below 4.5:1",
+                t.label()
+            );
+        });
+    }
+
+    /// Stage 6, item 2: a 2 px accent outline on the focused widget, in
+    /// every theme — egui reads `Visuals::selection.stroke` for this.
+    #[test]
+    fn every_theme_draws_a_two_pixel_accent_focus_ring() {
+        in_each_theme(|t| {
+            let visuals = build_visuals();
+            assert_eq!(
+                visuals.selection.stroke.width,
+                2.0,
+                "{}: the focus ring is not 2 px",
+                t.label()
+            );
+            assert_eq!(
+                visuals.selection.stroke.color,
+                Palette::accent(),
+                "{}: the focus ring is not the accent",
+                t.label()
+            );
+        });
+    }
+
+    /// Stage 1, item 6: the spacing tokens are all on the 4 px grid the brief
+    /// asks for — `4/8/12/16`, and the control heights built from them.
+    #[test]
+    fn tokens_are_on_the_four_pixel_grid() {
+        for value in [
+            Tokens::SPACE_1,
+            Tokens::SPACE_2,
+            Tokens::SPACE_3,
+            Tokens::SPACE_4,
+            Tokens::CONTROL_H,
+            Tokens::ROW_H,
+            Tokens::TAB_H,
+        ] {
+            assert_eq!(
+                value % 4.0,
+                0.0,
+                "{value} is not a multiple of 4"
+            );
+        }
+        assert_eq!(Tokens::SPACE_1, 4.0);
+        assert_eq!(Tokens::SPACE_2, 8.0);
+        assert_eq!(Tokens::SPACE_3, 12.0);
+        assert_eq!(Tokens::SPACE_4, 16.0);
+    }
+
+    /// Stage 6, item 3: the controls that are always a full button — not a
+    /// short list row — already clear the 24 × 24 minimum on their own
+    /// token, with no audit needed to find out. `ROW_H` is deliberately not
+    /// asserted here; see `Tokens::MIN_TARGET`'s own doc comment.
+    #[test]
+    fn ordinary_controls_already_meet_the_minimum_hit_target() {
+        assert!(Tokens::CONTROL_H >= Tokens::MIN_TARGET);
+        assert!(Metrics::TOOL_BUTTON >= Tokens::MIN_TARGET);
+        assert!(Tokens::TAB_H >= Tokens::MIN_TARGET);
+    }
+
+    /// Stage 2, item 6 of `docs/WORKSPACE_DESIGN_PLAN.md`: "a headless
+    /// `build_ui` test asserting no widget uses the removed colour roles."
+    ///
+    /// A widget's *painted* colour is not something a headless test can read
+    /// back — `FullOutput` is triangles and glyphs, not a record of which
+    /// `Palette` function chose them — so this is the fence one level up:
+    /// every call to the three roles Stage 1 deprecated (`chrome`, `raised`,
+    /// `border`) is a `cargo build` warning already, and this turns "did that
+    /// count grow" into something a test run catches on its own rather than
+    /// something that only shows up if somebody reads the warnings. It counts
+    /// down as panels migrate — Stage 2 migrated `section_header`'s own use
+    /// of them, `app.rs` had none left after that — and Stage 5 owns getting
+    /// it to zero.
+    #[test]
+    fn deprecated_colour_roles_are_a_tracked_list_not_a_growing_one() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut count = 0usize;
+        let mut dirs = vec![src];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("buzz-ui/src should exist") {
+                let entry = entry.expect("a readable directory entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                // Not this file: it is where the three needles below are
+                // *declared* (as deprecated aliases) and where this very
+                // list of them is written out as a string, and neither of
+                // those is a call site.
+                if path.file_name().is_some_and(|f| f == "theme.rs") {
+                    continue;
+                }
+                if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+                    for needle in [
+                        "Palette::chrome()",
+                        "Palette::raised()",
+                        "Palette::border()",
+                    ] {
+                        count += text.matches(needle).count();
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            count, 14,
+            "deprecated colour role call sites in buzz-ui: was 17 when Stage 2 \
+             landed, 15 since Stage 3's tool strip stopped using `raised()`, \
+             14 since Stage 5's layer-switch hover fill did too, now {count} \
+             — if this grew, migrate the new call site to `bg`/`field`/`hairline` \
+             instead of adding to the list; if it shrank, lower this number"
+        );
     }
 }
 

@@ -28,7 +28,6 @@
 pub mod art;
 pub mod bucket;
 pub mod camera_track;
-pub mod time;
 pub mod effect_brush;
 pub mod gradient;
 pub mod image;
@@ -36,9 +35,9 @@ pub mod index;
 pub mod layer;
 pub mod looping;
 pub mod merge;
+pub mod modifier;
 pub mod object;
 pub mod post;
-pub mod modifier;
 pub mod raster;
 pub mod rig;
 pub mod sound;
@@ -46,8 +45,14 @@ pub mod stamp;
 pub mod swatch;
 pub mod symbol;
 pub mod texture;
+pub mod time;
 pub mod timeline;
 pub mod trace;
+mod trace_colour;
+mod trace_ink;
+mod trace_lines;
+pub mod trace_metrics;
+pub mod trace_tuning;
 pub mod tween;
 pub mod wand;
 pub mod wave;
@@ -62,19 +67,17 @@ use buzz_geom::{Affine, Point, Rect, Size};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
+pub use art::ArtPiece;
+pub use bucket::{Boundary, GapSize, fill_region};
 pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, GradientMap, Quality};
 pub use buzz_light::{
     DEFAULT_GLINT, EdgeMode, Light, LightId, LightKey, LightKind, LightRig, LightTrack,
-    SHADOW_LENGTH_RANGE, ShadowFall,
+    SHADOW_LENGTH_RANGE, ShadeModel, ShadowAdjustment, ShadowFall,
 };
-pub use art::ArtPiece;
-pub use bucket::{Boundary, GapSize, fill_region};
-pub use effect_brush::{EffectKind, EffectStroke, effect_artwork};
-pub use stamp::{BrushStamp, StampedArt};
-pub use time::AtTime;
 pub use camera_track::{
     CameraKey, CameraMove, CameraTrack, DEFAULT_FOCAL_DISTANCE, FocusKey, MAX_TILT, NamedAngle,
 };
+pub use effect_brush::{EffectKind, EffectStroke, effect_artwork};
 pub use gradient::{
     Gradient, GradientHandles, GradientKind, GradientSpread, GradientStop, MAX_STOPS, lerp_color,
 };
@@ -86,30 +89,31 @@ pub use merge::{ImportTarget, MergeReport};
 pub use modifier::{Breath, Modifier};
 pub use object::{
     FillSpec, Object, ObjectId, ObjectKind, Paint, PaintBlend, ShapeData, Spatial, StrokeSpec,
-    TextData,
-    Turnaround,
-    TurnaroundView,
+    TextData, TextRun, Turnaround, TurnaroundView, restyle_runs, shift_runs_for_edit,
 };
 pub use post::{
-    BloomSettings, GradeSettings, GrainSettings, HalftoneSettings, HatchingSettings,
-    PosteriseSettings, PostSettings, VignetteSettings,
+    BloomSettings, GradeSettings, GrainSettings, HalftoneSettings, HatchingSettings, PostSettings,
+    PosteriseSettings, VignetteSettings,
 };
+pub use stamp::{BrushStamp, StampedArt};
 pub use texture::{TextureKind, TextureRecipe};
+pub use time::AtTime;
 // A text object records which cut of a family it is set in and how its lines
 // line up. The types belong to `buzz-text`, which is what honours them; they are
 // re-exported here so a document can name them without depending on the font
 // machinery itself.
 pub use buzz_text::{FontStyle, TextAlign};
-pub use raster::{MergedPaint, merge_over, painted_ink,Canvas, SoftBrush};
+pub use raster::{Canvas, MergedPaint, SoftBrush, merge_over, painted_ink};
 pub use rig::{ArmatureData, NamedPose, RigBinding, RigPart, WarpData};
 pub use sound::{SoundAsset, SoundCue, SoundId, SoundLibrary, SoundRef, SoundSync};
 pub use swatch::{Swatch, SwatchId, Swatches, default_palette, default_swatches};
 pub use symbol::{
     ColorEffect, ColorTransform, Library, LoopMode, Symbol, SymbolId, SymbolInstance, SymbolKind,
 };
-pub use timeline::{FrameKind, Keyframe, LayerTimeline, ResolvedFrame, TweenSpan};
-pub use trace::{TraceOptions, TraceReport, trace, quantise};
-pub use tween::{Easing, Tween, TweenKind};
+pub use timeline::{FrameKind, FrameSegment, Keyframe, LayerTimeline, ResolvedFrame, TweenSpan};
+pub use trace::{LineStyle, TraceMode, TraceOptions, TraceReport, quantise, trace};
+pub use trace_tuning::{ColourTuning, InkTuning, TraceTuning};
+pub use tween::{Easing, EasingSet, Tween, TweenKind, eval_bezier_ease};
 pub use wand::{WandOptions, region_at as wand_region};
 pub use wave::{WaveKind, WaveSettings, WaveStroke, wave_artwork, wave_bounds, wave_loop};
 
@@ -211,6 +215,18 @@ impl EditAt {
             span: None,
         }
     }
+}
+
+/// Which frame of the newly picked symbol an instance starts on when it is
+/// switched to another member of its set ([`Scene::pick_from_set`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SetStart {
+    /// Carry on from the inner frame the instance was showing — frame 7 of
+    /// `Raju_idle` becomes frame 7 of `Raju_wave`, fitted into its length.
+    #[default]
+    SameFrame,
+    /// Start the new symbol from its own first frame.
+    FromStart,
 }
 
 /// An immutable snapshot of the document.
@@ -662,6 +678,29 @@ impl Scene {
     pub fn lights_mut(&mut self) -> &mut LightRig {
         self.revision += 1;
         &mut self.lights
+    }
+
+    /// **Where a light sits in the layer stack**: the stage layer it is
+    /// directly above, or `None` for the top of the stack. An anchor naming a
+    /// layer that no longer exists reads as the top, which is how the
+    /// renderer reads it too. See [`buzz_light::Light::above`].
+    pub fn light_slot(&self, id: LightId) -> Option<LayerId> {
+        let above = LayerId(self.lights.get(id)?.above?);
+        self.stage_layer_index(above).map(|_| above)
+    }
+
+    /// Put a light directly above `above` in the stage's layer stack — it then
+    /// lights that layer and those below it — or at the top with `None`.
+    /// Returns whether anything changed.
+    pub fn place_light(&mut self, id: LightId, above: Option<LayerId>) -> bool {
+        let above = above.filter(|l| self.stage_layer_index(*l).is_some());
+        if self.lights.get(id).is_none() || self.light_slot(id) == above {
+            return false;
+        }
+        if let Some(light) = self.lights_mut().get_mut(id) {
+            light.above = above.map(|l| l.0);
+        }
+        true
     }
 
     /// Add a light, with a fresh id and a name that is not taken.
@@ -1157,10 +1196,25 @@ impl Scene {
             }
             ObjectKind::Group(children) => children
                 .iter()
-                .map(|c| object::transform_rect(object.transform, self.object_bounds_memo(c, table, visiting)))
+                .map(|c| {
+                    object::transform_rect(
+                        object.transform,
+                        self.object_bounds_memo(c, table, visiting),
+                    )
+                })
                 .reduce(|a, b| a.union(b))
                 .unwrap_or_else(|| object.bounds()),
-            ObjectKind::Shape(_) | ObjectKind::Armature(_) | ObjectKind::Warp(_) => object.bounds(),
+            // **An armature's parts are often instances** (a character's
+            // clothing drawn once and reused), whose own `bounds()` is a
+            // placeholder: measured that way, a rig built from a real
+            // character came out a fraction of its drawn size, so a caller
+            // that framed it by these bounds zoomed in on one shoulder and
+            // left the rest off-stage (F7.6, `docs/LOCAL_AI_PLAN.md`). Each
+            // posed part is resolved through the table like any instance.
+            ObjectKind::Armature(rig) => armature_resolved_bounds(object, rig, |part| {
+                self.object_bounds_memo(part, table, visiting)
+            }),
+            ObjectKind::Shape(_) | ObjectKind::Warp(_) => object.bounds(),
         }
     }
 
@@ -1180,10 +1234,15 @@ impl Scene {
             },
             ObjectKind::Group(children) => children
                 .iter()
-                .map(|c| object::transform_rect(object.transform, self.resolved_bounds_with(c, table)))
+                .map(|c| {
+                    object::transform_rect(object.transform, self.resolved_bounds_with(c, table))
+                })
                 .reduce(|a, b| a.union(b))
                 .unwrap_or_else(|| object.bounds()),
-            ObjectKind::Shape(_) | ObjectKind::Armature(_) | ObjectKind::Warp(_) => object.bounds(),
+            ObjectKind::Armature(rig) => {
+                armature_resolved_bounds(object, rig, |part| self.resolved_bounds_with(part, table))
+            }
+            ObjectKind::Shape(_) | ObjectKind::Warp(_) => object.bounds(),
         }
     }
 
@@ -1323,6 +1382,31 @@ impl Scene {
         moved
     }
 
+    /// Move a layer to a new row on the active timeline (stage or open symbol).
+    pub fn reorder_layer(&mut self, id: LayerId, to_index: usize) -> bool {
+        let moved = self.active_layers_mut().reorder(id, to_index);
+        if moved {
+            self.bump();
+        }
+        moved
+    }
+
+    /// Move a layer — and everything filed under it — to a new row and
+    /// parent folder on the active timeline, as the timeline's drag does.
+    /// See [`crate::layer::LayerStack::move_to`].
+    pub fn move_layer_to(&mut self, id: LayerId, to_index: usize, parent: Option<LayerId>) -> bool {
+        let moved = self.active_layers_mut().move_to(id, to_index, parent);
+        if moved {
+            self.bump();
+        }
+        moved
+    }
+
+    /// Where a layer sits in paint order on the active timeline, front first.
+    pub fn layer_index(&self, id: LayerId) -> Option<usize> {
+        self.layers().iter().position(|l| l.id == id)
+    }
+
     /// Where a stage layer sits in paint order, front first.
     pub fn stage_layer_index(&self, id: LayerId) -> Option<usize> {
         self.stage_layers().iter().position(|l| l.id == id)
@@ -1374,10 +1458,13 @@ impl Scene {
             }
             // Where the parent stands right now, taken before the link exists
             // so it is the pose the user sees when they make it.
-            let rest = self
-                .layers()
-                .get(parent)
-                .and_then(|l| l.frames.resolved_at(frame).iter().next().map(|o| o.transform));
+            let rest = self.layers().get(parent).and_then(|l| {
+                l.frames
+                    .resolved_at(frame)
+                    .iter()
+                    .next()
+                    .map(|o| o.transform)
+            });
             self.update_layer(parent, |l| {
                 // Only if it has none: a second child must not move the rest
                 // the first one was rigged against.
@@ -1435,8 +1522,9 @@ impl Scene {
         let id = ObjectId(self.ids.take());
         let object = Arc::new(Object::shape(id, shape));
         let mut placed = false;
-        self.active_layers_mut()
-            .update(layer, |l| placed = l.frames.insert_object_behind(frame, object));
+        self.active_layers_mut().update(layer, |l| {
+            placed = l.frames.insert_object_behind(frame, object)
+        });
         placed.then(|| {
             self.bump();
             id
@@ -1539,8 +1627,7 @@ impl Scene {
                 for layer in layer_ids {
                     symbol.layers.update(layer, |l| {
                         for keyframe in l.frames.keyframes_mut() {
-                            for object in
-                                std::sync::Arc::make_mut(&mut keyframe.objects).iter_mut()
+                            for object in std::sync::Arc::make_mut(&mut keyframe.objects).iter_mut()
                             {
                                 walk_objects(
                                     std::sync::Arc::make_mut(object),
@@ -1558,6 +1645,97 @@ impl Scene {
             self.bump();
         }
         swapped
+    }
+
+    /// **Switch one instance to another symbol of its set, from `frame` on.**
+    ///
+    /// # What this is for
+    ///
+    /// A character drawn as `Raju_idle`, `Raju_wave` and `Raju_sit`, each its
+    /// own symbol with its own timeline from 0: the animator wants the wave to
+    /// start at frame 40 without opening any symbol or typing frame numbers.
+    /// This is that one step. Unlike [`Self::swap_symbol`], which repoints
+    /// every instance everywhere, this touches one instance and only from the
+    /// playhead on.
+    ///
+    /// The instance's layer is **always** keyed at `frame` first, whatever
+    /// Auto Keyframe says, so the frames before it keep the old symbol. When
+    /// the playhead is already on that keyframe, nothing is inserted and the
+    /// whole keyframe changes.
+    ///
+    /// The new symbol starts on the inner frame the instance was showing
+    /// ([`SetStart::SameFrame`], fitted into the new symbol's length) or on its
+    /// first ([`SetStart::FromStart`]). Transform, loop mode, colour effect,
+    /// `sync_to_root` and the object id are kept; nothing else in the document
+    /// moves — playhead, sound and other layers are untouched.
+    ///
+    /// Refused (`false`) when the object is not an instance on the current
+    /// timeline, or `to` is not in its set, or is the symbol already shown.
+    pub fn pick_from_set(
+        &mut self,
+        frame: u32,
+        id: ObjectId,
+        to: SymbolId,
+        start: SetStart,
+    ) -> bool {
+        // The instance as shown at `frame` — on the keyframe owning it when it
+        // is there, else wherever the layer holds it.
+        let Some((layer_id, fallback)) = self.find_object(id) else {
+            return false;
+        };
+        let Some(layer) = self.layers().get(layer_id) else {
+            return false;
+        };
+        let object = layer
+            .frames
+            .objects_at(frame)
+            .iter()
+            .find(|o| o.id == id)
+            .unwrap_or(fallback);
+        let ObjectKind::Instance(instance) = &object.kind else {
+            return false;
+        };
+        let instance = instance.clone();
+        if instance.symbol == to || !self.library().symbol_set(instance.symbol).contains(&to) {
+            return false;
+        }
+        let Some(target) = self.library().get(to) else {
+            return false;
+        };
+        let target_kind = target.kind;
+        let new_length = target.length().max(1);
+
+        let first_frame = match start {
+            SetStart::FromStart => 0,
+            SetStart::SameFrame => {
+                // What it shows now, counted the way the renderer counts it:
+                // from the start of the keyframe that owns `frame`.
+                let (kind, length) = self
+                    .library()
+                    .get(instance.symbol)
+                    .map(|s| (s.kind, s.length()))
+                    .unwrap_or((SymbolKind::Graphic, 1));
+                let owner = layer.frames.keyframe_start(frame).unwrap_or(0).min(frame);
+                let shown = instance.resolve_frame(kind, frame - owner, length);
+                // Fitted to the new symbol: a loop wraps, anything that holds
+                // its last frame clamps.
+                let loops = target_kind.follows_parent_timeline()
+                    && instance.loop_mode == LoopMode::Loop;
+                if loops {
+                    shown % new_length
+                } else {
+                    shown.min(new_length - 1)
+                }
+            }
+        };
+
+        self.ensure_keyframe_for(frame, id);
+        self.update_object_at(frame, id, |object| {
+            if let ObjectKind::Instance(instance) = &mut object.kind {
+                instance.symbol = to;
+                instance.first_frame = first_frame;
+            }
+        })
     }
 
     // -- the palette ---------------------------------------------------------
@@ -1739,7 +1917,8 @@ impl Scene {
                 for layer in layer_ids {
                     symbol.layers.update(layer, |l| {
                         for keyframe in l.frames.keyframes_mut() {
-                            for object in std::sync::Arc::make_mut(&mut keyframe.objects).iter_mut() {
+                            for object in std::sync::Arc::make_mut(&mut keyframe.objects).iter_mut()
+                            {
                                 repaint_object(
                                     std::sync::Arc::make_mut(object),
                                     repaint,
@@ -2014,7 +2193,10 @@ impl Scene {
         let id = out.next_object_id();
         let mut object = Object {
             kind: ObjectKind::Instance(crate::symbol::SymbolInstance::new(symbol)),
-            ..Object::shape(id, ShapeData::filled(buzz_geom::BezPath::new(), Color::WHITE))
+            ..Object::shape(
+                id,
+                ShapeData::filled(buzz_geom::BezPath::new(), Color::WHITE),
+            )
         };
         object.name = Some(source.name.clone());
         out.add_object_at(layer, 0, object);
@@ -2381,11 +2563,7 @@ impl Scene {
 /// holds objects, a rig holds artwork per part, and a turnaround holds whole
 /// drawings of its other sides. Anything that stops at the top level misses
 /// most of a character.
-fn walk_objects(
-    object: &mut Object,
-    f: &dyn Fn(&mut Object, &mut usize),
-    count: &mut usize,
-) {
+fn walk_objects(object: &mut Object, f: &dyn Fn(&mut Object, &mut usize), count: &mut usize) {
     f(object, count);
     match &mut object.kind {
         ObjectKind::Group(children) => {
@@ -2476,7 +2654,11 @@ fn repaint_object(
         }
         ObjectKind::Armature(rig) => {
             for part in rig.parts.iter_mut() {
-                repaint_object(std::sync::Arc::make_mut(&mut part.artwork), repaint, changed);
+                repaint_object(
+                    std::sync::Arc::make_mut(&mut part.artwork),
+                    repaint,
+                    changed,
+                );
             }
         }
         // An instance carries no artwork of its own — the symbol it points at
@@ -2501,11 +2683,73 @@ fn repaint_object(
     }
 }
 
+/// **An armature's bounds with each posed part resolved** — its parts are
+/// often instances (a character's clothing drawn once and reused), whose own
+/// `bounds()` is a placeholder. Measured that way, a rig built from a real
+/// character came out the wrong size and place, so a caller that framed it
+/// by these bounds showed one shoulder and left the rest off-stage (F7.6,
+/// `docs/LOCAL_AI_PLAN.md`). `resolve` measures one posed part, including
+/// its own transform; the armature's transform is applied here.
+fn armature_resolved_bounds(
+    object: &Object,
+    rig: &ArmatureData,
+    mut resolve: impl FnMut(&Object) -> Rect,
+) -> Rect {
+    let art = rig
+        .posed()
+        .iter()
+        .map(|part| object::transform_rect(object.transform, resolve(part)))
+        .reduce(|a, b| a.union(b));
+    let bones = rig
+        .armature
+        .bounds()
+        .map(|b| object::transform_rect(object.transform, b));
+    match (art, bones) {
+        (Some(a), Some(b)) => a.union(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => object.bounds(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use buzz_geom::{BezPath, Point, Shape as _};
     use kurbo::Rect as KRect;
+
+    /// F7.6: an armature whose part is an *instance* measures the symbol's
+    /// real extent (placed by the part and the armature transforms), not the
+    /// instance's placeholder box.
+    #[test]
+    fn an_armature_with_instance_parts_resolves_their_real_bounds() {
+        let mut scene = Scene::default();
+        let mut sym = Symbol::new(SymbolId(7), "shirt", SymbolKind::Graphic);
+        let mut l = Layer::new(LayerId(70), "art", LayerKind::Normal);
+        l.push_object_at(
+            0,
+            Arc::new(Object::shape(
+                ObjectId(71),
+                ShapeData::filled(Rect::new(0.0, 0.0, 200.0, 100.0).to_path(1e-9), Color::WHITE),
+            )),
+        );
+        sym.layers.push_front(l);
+        scene.library_mut().insert(sym);
+
+        let mut arm = buzz_rig::Armature::new(Point::ZERO);
+        arm.push(buzz_rig::Bone::new("spine", None, 10.0, 0.0));
+        let mut data = ArmatureData::new(arm);
+        let part = Object::instance_of(ObjectId(72), SymbolId(7))
+            .with_transform(Affine::translate((50.0, 20.0)));
+        data.bind_rigid(Arc::new(part), 0);
+        let mut obj = Object::group(ObjectId(73), vec![]);
+        obj.kind = ObjectKind::Armature(data);
+        obj.transform = Affine::translate((1000.0, 0.0));
+
+        let b = scene.resolved_bounds(&obj);
+        assert!((b.x0 - 1000.0).abs() < 1e-6, "{b:?}"); // the bone starts at the origin
+        assert!((b.x1 - 1250.0).abs() < 1e-6 && (b.y1 - 120.0).abs() < 1e-6, "{b:?}");
+    }
 
     fn square(x: f64, y: f64, size: f64) -> BezPath {
         KRect::new(x, y, x + size, y + size).to_path(1e-9)
@@ -2536,7 +2780,11 @@ mod tests {
         scene.add_shape(layer, ShapeData::filled(square(40.0, 0.0, 10.0), button));
 
         let palette = scene.colours_used();
-        assert_eq!(palette.first().map(|(c, _)| *c), Some(coat), "most worn first");
+        assert_eq!(
+            palette.first().map(|(c, _)| *c),
+            Some(coat),
+            "most worn first"
+        );
         assert_eq!(palette[0].1, 2, "the coat is on two parts");
         assert!(
             palette.iter().any(|(c, n)| *c == button && *n == 1),
@@ -3609,7 +3857,10 @@ mod tests {
         let bounds = scene.resolved_bounds(object);
         let elapsed = start.elapsed();
 
-        assert!(bounds.area() > 0.0, "the nested shape gives it real extents");
+        assert!(
+            bounds.area() > 0.0,
+            "the nested shape gives it real extents"
+        );
         // Exponential in 24 would never finish; linear is microseconds. The
         // bound is generous for a debug build under test-runner load.
         assert!(
@@ -3770,5 +4021,123 @@ mod tests {
         let (_, after) = scene.find_object(id).expect("in the scene");
         assert!(before.visible, "the snapshot must be untouched");
         assert!(!after.visible, "the live scene must have changed");
+    }
+
+    /// A 30-frame stage with a set `idle` (10 frames) + `wave` (4) + `sit`
+    /// (20), a loner `other`, and an instance of `idle` on frame 0 with a
+    /// transform, a colour effect and sync to root on.
+    fn set_scene() -> (Scene, LayerId, ObjectId, [SymbolId; 4]) {
+        let mut scene = Scene::default();
+        scene.set_frame_count(30);
+        let layer = scene.layers().iter().next().unwrap().id;
+        let mut ids = [SymbolId(0); 4];
+        for (slot, (name, length)) in
+            [("idle", 10), ("wave", 4), ("sit", 20), ("other", 5)].into_iter().enumerate()
+        {
+            let id = scene.add_symbol(name, SymbolKind::Graphic, None);
+            let inner = scene.library().get(id).unwrap().layers.iter().next().unwrap().id;
+            scene.library_mut().update(id, |s| {
+                s.layers.update(inner, |l| {
+                    while l.frames.length() < length {
+                        l.frames.insert_frame(l.frames.length());
+                    }
+                });
+            });
+            ids[slot] = id;
+        }
+        let [idle, wave, sit, _] = ids;
+        assert!(scene.library_mut().include_in_set(idle, wave));
+        assert!(scene.library_mut().include_in_set(idle, sit));
+        let id = scene
+            .add_instance_at(layer, 0, idle, Affine::translate((40.0, 7.0)))
+            .unwrap();
+        scene.update_object(id, |o| {
+            if let ObjectKind::Instance(i) = &mut o.kind {
+                i.color = ColorTransform::brightness(0.3);
+                i.sync_to_root = true;
+            }
+        });
+        (scene, layer, id, ids)
+    }
+
+    fn instance_on(scene: &Scene, layer: LayerId, frame: u32, id: ObjectId) -> Object {
+        let object = scene
+            .layers()
+            .get(layer)
+            .unwrap()
+            .frames
+            .objects_at(frame)
+            .iter()
+            .find(|o| o.id == id)
+            .expect("the instance is on that frame");
+        (**object).clone()
+    }
+
+    /// Frames before the playhead keep the old symbol; the playhead and after
+    /// show the new one, carrying on from the inner frame (a loop wraps into
+    /// the shorter symbol). Everything but the symbol and first frame is kept.
+    #[test]
+    fn pick_from_set_keys_at_the_playhead_and_continues_the_inner_frame() {
+        let (mut scene, layer, id, [idle, wave, _, _]) = set_scene();
+        let before = instance_on(&scene, layer, 0, id);
+
+        assert!(scene.pick_from_set(6, id, wave, SetStart::SameFrame));
+
+        assert_eq!(instance_on(&scene, layer, 5, id).instance().unwrap().symbol, idle);
+        for frame in [6, 29] {
+            let after = instance_on(&scene, layer, frame, id);
+            let i = after.instance().unwrap();
+            assert_eq!(i.symbol, wave, "frame {frame}");
+            // idle was on its frame 6; wave is 4 long, so a loop wraps to 2.
+            assert_eq!(i.first_frame, 2);
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.transform, before.transform);
+            let old = before.instance().unwrap();
+            assert_eq!(i.color, old.color);
+            assert_eq!(i.loop_mode, old.loop_mode);
+            assert!(i.sync_to_root);
+        }
+        assert_eq!(scene.layers().get(layer).unwrap().keyframe_count(), 2);
+    }
+
+    /// Play Once holds its last frame, so the carried frame clamps instead.
+    #[test]
+    fn pick_from_set_clamps_a_play_once_instance() {
+        let (mut scene, layer, id, [_, wave, _, _]) = set_scene();
+        scene.update_object(id, |o| {
+            if let ObjectKind::Instance(i) = &mut o.kind {
+                i.loop_mode = LoopMode::PlayOnce;
+            }
+        });
+        assert!(scene.pick_from_set(8, id, wave, SetStart::SameFrame));
+        let i = instance_on(&scene, layer, 8, id).instance().unwrap().clone();
+        assert_eq!(i.first_frame, 3, "idle frame 8 clamps to wave's last frame");
+        assert_eq!(i.loop_mode, LoopMode::PlayOnce);
+    }
+
+    /// From Start begins the new symbol at its own frame 0; picking again on
+    /// the keyframe just made inserts no further keyframe.
+    #[test]
+    fn pick_from_set_from_start_and_on_an_existing_keyframe() {
+        let (mut scene, layer, id, [idle, wave, sit, _]) = set_scene();
+        assert!(scene.pick_from_set(12, id, sit, SetStart::FromStart));
+        assert_eq!(instance_on(&scene, layer, 12, id).instance().unwrap().first_frame, 0);
+
+        assert!(scene.pick_from_set(12, id, wave, SetStart::FromStart));
+        assert_eq!(scene.layers().get(layer).unwrap().keyframe_count(), 2);
+        assert_eq!(instance_on(&scene, layer, 12, id).instance().unwrap().symbol, wave);
+        assert_eq!(instance_on(&scene, layer, 11, id).instance().unwrap().symbol, idle);
+    }
+
+    /// A symbol outside the set, or the one already shown, is refused and the
+    /// document is left alone.
+    #[test]
+    fn pick_from_set_refuses_a_symbol_outside_the_set() {
+        let (mut scene, layer, id, [idle, _, _, other]) = set_scene();
+        let revision = scene.revision();
+        assert!(!scene.pick_from_set(6, id, other, SetStart::SameFrame));
+        assert!(!scene.pick_from_set(6, id, idle, SetStart::SameFrame));
+        assert_eq!(scene.revision(), revision);
+        assert_eq!(scene.layers().get(layer).unwrap().keyframe_count(), 1);
     }
 }

@@ -31,7 +31,10 @@ fn limb(id: u64, name: &str, head: Point, tip: Point, width: f64) -> Arc<Object>
 
     let mut object = Object::shape(
         ObjectId(id),
-        ShapeData::filled(place * bar.to_path(1e-9), Color::from_rgb8(0x99, 0x77, 0x55)),
+        ShapeData::filled(
+            place * bar.to_path(1e-9),
+            Color::from_rgb8(0x99, 0x77, 0x55),
+        ),
     );
     object.name = Some(name.to_string());
     Arc::new(object)
@@ -53,15 +56,39 @@ fn drawn_character() -> Vec<Arc<Object>> {
     vec![
         // Painted back to front, which is the order they come off the stack.
         limb(1, "R_thigh", hips, Point::new(-20.0, -235.0), 60.0),
-        limb(2, "R.shin", Point::new(-20.0, -235.0), Point::new(-24.0, 0.0), 46.0),
+        limb(
+            2,
+            "R.shin",
+            Point::new(-20.0, -235.0),
+            Point::new(-24.0, 0.0),
+            46.0,
+        ),
         limb(3, "rightArm", shoulder, Point::new(-60.0, -680.0), 44.0),
-        limb(4, "R_forearm", Point::new(-60.0, -680.0), Point::new(-78.0, -540.0), 38.0),
+        limb(
+            4,
+            "R_forearm",
+            Point::new(-60.0, -680.0),
+            Point::new(-78.0, -540.0),
+            38.0,
+        ),
         limb(5, "hips", hips, chest, 130.0),
         limb(6, "torso", chest, shoulder, 150.0),
         limb(7, "L_thigh", hips, Point::new(20.0, -235.0), 60.0),
-        limb(8, "L.shin", Point::new(20.0, -235.0), Point::new(24.0, 0.0), 46.0),
+        limb(
+            8,
+            "L.shin",
+            Point::new(20.0, -235.0),
+            Point::new(24.0, 0.0),
+            46.0,
+        ),
         limb(9, "leftArm", shoulder, Point::new(60.0, -680.0), 44.0),
-        limb(10, "L_forearm", Point::new(60.0, -680.0), Point::new(78.0, -540.0), 38.0),
+        limb(
+            10,
+            "L_forearm",
+            Point::new(60.0, -680.0),
+            Point::new(78.0, -540.0),
+            38.0,
+        ),
         limb(11, "head", shoulder, crown, 120.0),
     ]
 }
@@ -141,7 +168,11 @@ fn the_bones_lie_along_the_drawings() {
 
     for (slot_name, head, tip) in [
         ("Thigh L", Point::new(0.0, -470.0), Point::new(20.0, -235.0)),
-        ("Elbow L", Point::new(60.0, -680.0), Point::new(78.0, -540.0)),
+        (
+            "Elbow L",
+            Point::new(60.0, -680.0),
+            Point::new(78.0, -540.0),
+        ),
         ("Head", Point::new(0.0, -820.0), Point::new(0.0, -1000.0)),
     ] {
         let index = pattern.slot_named(slot_name).expect(slot_name);
@@ -203,10 +234,10 @@ fn an_auto_rigged_character_walks() {
             layer,
             Object {
                 kind: ObjectKind::Armature(rig),
-                ..Object::shape(ObjectId(500), ShapeData::filled(
-                    Rect::new(0.0, 0.0, 1.0, 1.0).to_path(1e-9),
-                    Color::WHITE,
-                ))
+                ..Object::shape(
+                    ObjectId(500),
+                    ShapeData::filled(Rect::new(0.0, 0.0, 1.0, 1.0).to_path(1e-9), Color::WHITE),
+                )
             },
         )
         .expect("the rig went on a layer");

@@ -376,7 +376,10 @@ mod tests {
             let (p, tan) = frame_at_fraction(&line, f, 1e-6).unwrap();
             assert!((p.x - 100.0 * f).abs() < 1e-6, "x at {f} was {}", p.x);
             assert!(p.y.abs() < 1e-6, "y at {f} was {}", p.y);
-            assert!((tan.x - 1.0).abs() < 1e-9 && tan.y.abs() < 1e-9, "tangent {tan:?}");
+            assert!(
+                (tan.x - 1.0).abs() < 1e-9 && tan.y.abs() < 1e-9,
+                "tangent {tan:?}"
+            );
         }
     }
 
@@ -410,7 +413,10 @@ mod tests {
         // Endpoints sit on the unit circle, whichever way kurbo wound the arc.
         for f in [0.0, 1.0] {
             let (p, _) = frame_at_fraction(&arc, f, 1e-7).unwrap();
-            assert!((p.to_vec2().hypot() - 1.0).abs() < 1e-4, "endpoint {p:?} off circle");
+            assert!(
+                (p.to_vec2().hypot() - 1.0).abs() < 1e-4,
+                "endpoint {p:?} off circle"
+            );
         }
     }
 
@@ -1015,7 +1021,10 @@ mod winding_tests {
     fn a_path_that_already_agrees_is_left_alone() {
         let path = box_path(0.0, 0.0, 100.0, 100.0, true);
         assert!(!turns_backwards(&path));
-        assert!(matches!(wound_forward(&path), std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(
+            wound_forward(&path),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     /// An empty path has no direction and must not be called backwards.

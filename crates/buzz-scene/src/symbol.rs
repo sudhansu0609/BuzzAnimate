@@ -373,6 +373,17 @@ pub struct Symbol {
     pub layers: LayerStack,
     /// Registration point, which instance transforms are relative to.
     pub registration: buzz_geom::Point,
+    /// Semantic tags describing this symbol (character, prop, view, etc.).
+    pub tags: Vec<String>,
+    /// **The other symbols included in this symbol's set.**
+    ///
+    /// A set is a group of sibling library symbols — `Raju_idle`, `Raju_wave`,
+    /// `Raju_sit` — that an instance of any one of them can switch between
+    /// from Properties, keyed at the playhead. The symbol holding this list is
+    /// the set's *owner*; the listed ones are its *members*. Each keeps its own
+    /// timeline from frame 0; nothing is nested. Empty for a symbol with no
+    /// set. See [`Library::symbol_set`].
+    pub set: Vec<SymbolId>,
 }
 
 impl Symbol {
@@ -384,6 +395,8 @@ impl Symbol {
             folder: None,
             layers: LayerStack::new(),
             registration: buzz_geom::Point::ORIGIN,
+            tags: Vec::new(),
+            set: Vec::new(),
         }
     }
 
@@ -496,7 +509,97 @@ impl Library {
     }
 
     pub fn remove(&mut self, id: SymbolId) -> Option<Arc<Symbol>> {
-        Arc::make_mut(&mut self.symbols).remove(&id)
+        let removed = Arc::make_mut(&mut self.symbols).remove(&id);
+        if removed.is_some() {
+            // A deleted symbol leaves every set it was in. Only the symbols
+            // that actually list it are touched, so the others keep their
+            // `Arc` address (and the caches keyed on it).
+            let owners: Vec<SymbolId> = self
+                .symbols
+                .values()
+                .filter(|s| s.set.contains(&id))
+                .map(|s| s.id)
+                .collect();
+            for owner in owners {
+                self.update(owner, |s| s.set.retain(|m| *m != id));
+            }
+        }
+        removed
+    }
+
+    /// The owner of the set `id` belongs to: `id` itself when it owns a set,
+    /// else the first symbol whose set lists it, else `None`.
+    fn set_owner(&self, id: SymbolId) -> Option<SymbolId> {
+        let symbol = self.symbols.get(&id)?;
+        if !symbol.set.is_empty() {
+            return Some(id);
+        }
+        self.symbols.values().find(|s| s.set.contains(&id)).map(|s| s.id)
+    }
+
+    /// **The symbols an instance of `id` can pick from**, owner first, then
+    /// the members in the order they were included.
+    ///
+    /// `id` may be the owner or any member — either way the whole set comes
+    /// back, `id` included. Empty when `id` is in no set (Properties then hides
+    /// the Set dropdown). Ids no longer in the library are skipped, and no
+    /// symbol is listed twice.
+    pub fn symbol_set(&self, id: SymbolId) -> Vec<SymbolId> {
+        let Some(owner) = self.set_owner(id) else {
+            return Vec::new();
+        };
+        let Some(owner_symbol) = self.symbols.get(&owner) else {
+            return Vec::new();
+        };
+        let mut out = vec![owner];
+        for member in &owner_symbol.set {
+            if self.symbols.contains_key(member) && !out.contains(member) {
+                out.push(*member);
+            }
+        }
+        if out.len() < 2 {
+            // Every member was deleted — no set left to pick from.
+            return Vec::new();
+        }
+        out
+    }
+
+    /// **Include `member` in `owner`'s set.**
+    ///
+    /// When `owner` is itself a member of another symbol's set, `member` goes
+    /// into *that* owner's set instead, so the user can include from whichever
+    /// member is on stage. Refused (returns `false`) for: the symbol itself,
+    /// unknown ids, a symbol already in this set, a symbol that owns a set of
+    /// its own, and a symbol already in another owner's set — one set per
+    /// symbol keeps [`Self::symbol_set`] unambiguous.
+    pub fn include_in_set(&mut self, owner: SymbolId, member: SymbolId) -> bool {
+        if !self.symbols.contains_key(&owner) || !self.symbols.contains_key(&member) {
+            return false;
+        }
+        let owner = self.set_owner(owner).unwrap_or(owner);
+        if owner == member {
+            return false;
+        }
+        if !self.symbols[&member].set.is_empty() {
+            return false;
+        }
+        if self.symbols.values().any(|s| s.set.contains(&member)) {
+            // Already in this set, or in another one.
+            return false;
+        }
+        self.update(owner, |s| s.set.push(member))
+    }
+
+    /// Take `member` out of `owner`'s set (`owner` may be any symbol of the
+    /// set; the set's real owner is used). `false` when it was not in it.
+    pub fn remove_from_set(&mut self, owner: SymbolId, member: SymbolId) -> bool {
+        let Some(owner) = self.set_owner(owner) else {
+            return false;
+        };
+        if !self.symbols[&owner].set.contains(&member) {
+            return false;
+        }
+        self.update(owner, |s| s.set.retain(|m| *m != member))
     }
 
     /// Edit a symbol in place, cloning only if another snapshot shares it.
@@ -1025,5 +1128,83 @@ mod tests {
             ColorEffect::from_transform(&white),
             ColorEffect::Brightness(_)
         ));
+    }
+
+    /// Four plain graphics: idle (1), wave (2), sit (3), run (4).
+    fn set_library() -> Library {
+        let mut lib = Library::new();
+        for (id, name) in [(1, "idle"), (2, "wave"), (3, "sit"), (4, "run")] {
+            lib.insert(Symbol::new(SymbolId(id), name, SymbolKind::Graphic));
+        }
+        lib
+    }
+
+    /// The whole set comes back, owner first, whether asked from the owner or
+    /// from a member; a symbol in no set has none.
+    #[test]
+    fn a_symbol_set_is_found_from_the_owner_and_from_a_member() {
+        let mut lib = set_library();
+        assert!(lib.symbol_set(SymbolId(1)).is_empty(), "no set yet");
+        assert!(lib.include_in_set(SymbolId(1), SymbolId(2)));
+        assert!(lib.include_in_set(SymbolId(1), SymbolId(3)));
+
+        let full = vec![SymbolId(1), SymbolId(2), SymbolId(3)];
+        assert_eq!(lib.symbol_set(SymbolId(1)), full);
+        assert_eq!(lib.symbol_set(SymbolId(3)), full);
+        assert!(lib.symbol_set(SymbolId(4)).is_empty());
+    }
+
+    /// An id that is no longer in the library is skipped, never listed.
+    #[test]
+    fn a_symbol_set_skips_missing_ids() {
+        let mut lib = set_library();
+        lib.update(SymbolId(1), |s| s.set = vec![SymbolId(2), SymbolId(99), SymbolId(2)]);
+        assert_eq!(lib.symbol_set(SymbolId(1)), vec![SymbolId(1), SymbolId(2)]);
+    }
+
+    /// One set per symbol: everything that would make the lookup ambiguous is
+    /// refused.
+    #[test]
+    fn include_in_set_refuses_self_duplicates_owners_and_other_sets() {
+        let mut lib = set_library();
+        assert!(!lib.include_in_set(SymbolId(1), SymbolId(1)), "self");
+        assert!(!lib.include_in_set(SymbolId(1), SymbolId(99)), "unknown member");
+        assert!(!lib.include_in_set(SymbolId(99), SymbolId(1)), "unknown owner");
+
+        assert!(lib.include_in_set(SymbolId(1), SymbolId(2)));
+        assert!(!lib.include_in_set(SymbolId(1), SymbolId(2)), "already in this set");
+
+        // 3 owns a set of its own, so it cannot join 1's.
+        assert!(lib.include_in_set(SymbolId(3), SymbolId(4)));
+        assert!(!lib.include_in_set(SymbolId(1), SymbolId(3)), "owns a set");
+        assert!(!lib.include_in_set(SymbolId(1), SymbolId(4)), "in another set");
+        assert_eq!(lib.get(SymbolId(1)).unwrap().set, vec![SymbolId(2)]);
+    }
+
+    /// Including from a member puts the new symbol in the owner's set.
+    #[test]
+    fn include_via_a_member_goes_to_the_owner() {
+        let mut lib = set_library();
+        assert!(lib.include_in_set(SymbolId(1), SymbolId(2)));
+        assert!(lib.include_in_set(SymbolId(2), SymbolId(3)));
+        assert_eq!(lib.get(SymbolId(1)).unwrap().set, vec![SymbolId(2), SymbolId(3)]);
+        assert!(lib.get(SymbolId(2)).unwrap().set.is_empty());
+
+        assert!(lib.remove_from_set(SymbolId(3), SymbolId(2)), "via a member too");
+        assert_eq!(lib.get(SymbolId(1)).unwrap().set, vec![SymbolId(3)]);
+        assert!(!lib.remove_from_set(SymbolId(1), SymbolId(2)), "no longer in it");
+    }
+
+    /// Deleting a symbol strips it from every set.
+    #[test]
+    fn deleting_a_symbol_strips_it_from_sets() {
+        let mut lib = set_library();
+        assert!(lib.include_in_set(SymbolId(1), SymbolId(2)));
+        assert!(lib.include_in_set(SymbolId(1), SymbolId(3)));
+        lib.remove(SymbolId(2));
+        assert_eq!(lib.get(SymbolId(1)).unwrap().set, vec![SymbolId(3)]);
+        lib.remove(SymbolId(3));
+        assert!(lib.get(SymbolId(1)).unwrap().set.is_empty());
+        assert!(lib.symbol_set(SymbolId(1)).is_empty());
     }
 }

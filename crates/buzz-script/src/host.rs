@@ -17,9 +17,14 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use buzz_geom::{Affine, Rect, Shape as _};
 use buzz_scene::{LayerId, LayerKind, ObjectId, ShapeData, SymbolKind};
+// Aliased: `buzz_scene::Object` is the document's object; `rquickjs::Object`
+// (imported below, unaliased) is a JS object. The JSFL command-shelf section
+// near the bottom of this file is the one place both are needed together.
+use buzz_scene::Object as SceneObject;
 use peniko::Color;
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
 
@@ -94,6 +99,32 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             Ok(())
         }
     );
+    // `prompt`, kept apart from `askedWith` above so a caller can tell a real
+    // question from an alert or a confirm. Unattended — `context.prompt_answers`
+    // empty — this answers with `default`, exactly what `askedWith` already
+    // did; a caller that collected the questions from a first, discarded run
+    // and is now running for real passes the answers back here, indexed by
+    // the order the script asks them in.
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "prompt",
+        |state, question: String, default: String| {
+            let mut s = state.borrow_mut();
+            let index = s.prompt_index;
+            s.prompt_index += 1;
+            let answer = s
+                .context
+                .prompt_answers
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| default.clone());
+            s.prompts.push((question.clone(), default));
+            s.alerts.push(format!("{question} - answered {answer:?}"));
+            Ok(answer)
+        }
+    );
 
     // -- the script shelf ---------------------------------------------------
     //
@@ -130,8 +161,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 "{uri} is outside the script folder, which scripts may not read past"
             )));
         }
-        std::fs::read_to_string(&real)
-            .map_err(|e| throw(&format!("could not read {uri}: {e}")))
+        std::fs::read_to_string(&real).map_err(|e| throw(&format!("could not read {uri}: {e}")))
     });
 
     // -- document properties ------------------------------------------------
@@ -191,7 +221,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         "setLayerName",
         |state, index: i32, name: String| {
             let id = layer_id(&state.borrow(), index)?;
-            state.borrow_mut().scene_mut().update_layer(id, |l| l.name = name);
+            state
+                .borrow_mut()
+                .scene_mut()
+                .update_layer(id, |l| l.name = name);
             Ok(())
         }
     );
@@ -224,7 +257,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         "setLayerLocked",
         |state, index: i32, on: bool| {
             let id = layer_id(&state.borrow(), index)?;
-            state.borrow_mut().scene_mut().update_layer(id, |l| l.locked = on);
+            state
+                .borrow_mut()
+                .scene_mut()
+                .update_layer(id, |l| l.locked = on);
             Ok(())
         }
     );
@@ -427,7 +463,11 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
     );
 
     host_fn!(ctx, host, state, "removeCameraKey", |state, frame: u32| {
-        Ok(state.borrow_mut().scene_mut().camera_mut().remove_key(frame))
+        Ok(state
+            .borrow_mut()
+            .scene_mut()
+            .camera_mut()
+            .remove_key(frame))
     });
 
     host_fn!(
@@ -437,11 +477,13 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         "setFocusKey",
         |state, frame: u32, depth: f64, aperture: f64| {
             let mut s = state.borrow_mut();
-            s.scene_mut().camera_mut().set_focus_key(buzz_scene::FocusKey {
-                frame,
-                focus_depth: depth,
-                aperture: aperture.max(0.0),
-            });
+            s.scene_mut()
+                .camera_mut()
+                .set_focus_key(buzz_scene::FocusKey {
+                    frame,
+                    focus_depth: depth,
+                    aperture: aperture.max(0.0),
+                });
             Ok(())
         }
     );
@@ -711,12 +753,666 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         }
     );
 
+    // -- the JSFL command-shelf subset (Impl J) ------------------------------
+    //
+    // The API a shelf of Animate commands actually calls: per-layer frame
+    // arrays, elements with a real matrix, the timeline's own selection of
+    // layers and frame ranges, and entering a symbol's timeline in place.
+    // Grouped here because the six ported commands
+    // (`docs/commands/*.js`) are what it exists for, and reading it against
+    // any one of them should make sense of the primitive it calls.
+
+    // -- layer metadata not covered by `Layer` above -------------------------
+    host_fn!(ctx, host, state, "layerType", |state, index: i32| {
+        let s = state.borrow();
+        Ok(layer_kind_str(layer_at(&s, index)?.kind).to_string())
+    });
+    host_fn!(ctx, host, state, "layerParentIndex", |state, index: i32| {
+        let s = state.borrow();
+        let l = layer_at(&s, index)?;
+        let Some(parent) = l.parent else {
+            return Ok(-1i32);
+        };
+        Ok(s.scene()
+            .layers()
+            .iter()
+            .position(|x| x.id == parent)
+            .map(|p| p as i32)
+            .unwrap_or(-1))
+    });
+    host_fn!(ctx, host, state, "layerFrameCount", |state, index: i32| {
+        let s = state.borrow();
+        Ok(layer_at(&s, index)?.frames.length() as i32)
+    });
+
+    // -- one frame on one layer: `timeline.layers[i].frames[f]` --------------
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "frameIsKeyframe",
+        |state, layer: i32, frame: u32| {
+            let s = state.borrow();
+            Ok(layer_at(&s, layer)?.frames.is_keyframe(frame))
+        }
+    );
+    host_fn!(ctx, host, state, "frameStart", |state, layer: i32, frame: u32| {
+        let s = state.borrow();
+        let l = layer_at(&s, layer)?;
+        Ok(l.frames.keyframe_start(frame).unwrap_or(frame) as i32)
+    });
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "frameDuration",
+        |state, layer: i32, frame: u32| {
+            let s = state.borrow();
+            let l = layer_at(&s, layer)?;
+            let start = l.frames.keyframe_start(frame).unwrap_or(frame);
+            let next = l
+                .frames
+                .keyframes()
+                .iter()
+                .map(|k| k.start)
+                .find(|s2| *s2 > start)
+                .unwrap_or(l.frames.length());
+            Ok(next.saturating_sub(start) as i32)
+        }
+    );
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "frameTweenKind",
+        |state, layer: i32, frame: u32| {
+            let s = state.borrow();
+            let l = layer_at(&s, layer)?;
+            Ok(tween_kind_str(l.frames.tween_at(frame).kind).to_string())
+        }
+    );
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setFrameTweenKind",
+        |state, layer: i32, frame: u32, kind: String| {
+            let mut s = state.borrow_mut();
+            let id = layer_id(&s, layer)?;
+            let tween = match kind.as_str() {
+                "classic" => buzz_scene::Tween::classic(),
+                "motion" => buzz_scene::Tween::motion(),
+                "shape" => buzz_scene::Tween::shape(),
+                _ => buzz_scene::Tween::default(),
+            };
+            // Lenient rather than erroring on a frame with no keyframe to
+            // carry a tween: several of the ported commands assign
+            // `frame.tweenType` outside a `try`/`catch`, on frames their own
+            // arithmetic has not always made a keyframe yet, exactly as they
+            // do against real Animate.
+            s.scene_mut().update_layer(id, |l| {
+                l.frames.set_tween(frame, tween);
+            });
+            Ok(())
+        }
+    );
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "frameSoundInfo",
+        |state, layer: i32, frame: u32| {
+            let s = state.borrow();
+            let l = layer_at(&s, layer)?;
+            let Some(kf) = l.frames.keyframe_at(frame) else {
+                return Ok("null".to_string());
+            };
+            let Some(sound_ref) = &kf.sound else {
+                return Ok("null".to_string());
+            };
+            // The library stores decoded audio, not a path on disk, so there
+            // is no real file to hand back. A `file:///`-prefixed name is
+            // enough for the one thing the ported script does with it — pull
+            // a base name out of the last path segment — and is recorded as
+            // a deviation in the port's notes.
+            let name = s
+                .scene()
+                .sounds()
+                .get(sound_ref.sound)
+                .map(|a| a.file_name())
+                .unwrap_or_default();
+            let json =
+                serde_json::json!({ "name": name, "sourceFilePath": format!("file:///{name}") });
+            Ok(json.to_string())
+        }
+    );
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "frameElementIds",
+        |state, layer: i32, frame: u32| {
+            let s = state.borrow();
+            let id = layer_id(&s, layer)?;
+            let l = s
+                .scene()
+                .layers()
+                .get(id)
+                .ok_or_else(|| throw("that layer is gone"))?;
+            let ids: Vec<u64> = l.frames.objects_at(frame).iter().map(|o| o.id.0).collect();
+            Ok(serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string()))
+        }
+    );
+
+    // -- one element: `frame.elements[i]`, or `document.selection[i]` --------
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "elementDescribe",
+        |state, id: u64, frame: u32| {
+            let s = state.borrow();
+            let obj = locate_element(&s, id, frame)?;
+            let coeffs = obj.transform.as_coeffs();
+            let (element_type, symbol_type, lib_name, lib_type, lib_frames, first_frame) =
+                match &obj.kind {
+                    buzz_scene::ObjectKind::Instance(inst) => {
+                        let symbol = s.scene().library().get(inst.symbol);
+                        let kind_str = symbol.map(|sy| symbol_kind_str(sy.kind)).unwrap_or("");
+                        let name = symbol.map(|sy| sy.name.clone()).unwrap_or_default();
+                        let frames = symbol.map(|sy| sy.layers.frame_count()).unwrap_or(0);
+                        (
+                            "instance",
+                            kind_str,
+                            name,
+                            kind_str.to_string(),
+                            frames,
+                            Some(inst.first_frame),
+                        )
+                    }
+                    buzz_scene::ObjectKind::Group(_) => {
+                        ("group", "", String::new(), String::new(), 0, None)
+                    }
+                    _ => ("shape", "", String::new(), String::new(), 0, None),
+                };
+            let json = serde_json::json!({
+                "elementType": element_type,
+                "symbolType": symbol_type,
+                "libraryItemName": lib_name,
+                "libraryItemType": lib_type,
+                "libraryFrameCount": lib_frames,
+                "x": coeffs[4],
+                "y": coeffs[5],
+                "a": coeffs[0], "b": coeffs[1], "c": coeffs[2], "d": coeffs[3],
+                "tx": coeffs[4], "ty": coeffs[5],
+                "firstFrame": first_frame,
+            });
+            Ok(json.to_string())
+        }
+    );
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "elementTransformationPoint",
+        |state, id: u64, frame: u32| {
+            let s = state.borrow();
+            let obj = locate_element(&s, id, frame)?;
+            let p = obj.pivot_local();
+            Ok(serde_json::json!({"x": p.x, "y": p.y}).to_string())
+        }
+    );
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setElementXY",
+        |state, id: u64, frame: u32, x: f64, y: f64| {
+            let mut s = state.borrow_mut();
+            let ok = s.scene_mut().update_object_at(frame, ObjectId(id), |o| {
+                let c = o.transform.as_coeffs();
+                let tx = if x.is_nan() { c[4] } else { x };
+                let ty = if y.is_nan() { c[5] } else { y };
+                o.transform = Affine::new([c[0], c[1], c[2], c[3], tx, ty]);
+            });
+            if !ok {
+                return Err(throw(&format!("there is no element {id} on frame {frame}")));
+            }
+            Ok(())
+        }
+    );
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setElementMatrix",
+        |state, id: u64, frame: u32, json: String| {
+            let values: [f64; 6] = serde_json::from_str(&json)
+                .map_err(|_| throw("expected a matrix [a, b, c, d, tx, ty]"))?;
+            let mut s = state.borrow_mut();
+            let ok = s
+                .scene_mut()
+                .update_object_at(frame, ObjectId(id), |o| {
+                    o.transform = Affine::new(values);
+                });
+            if !ok {
+                return Err(throw(&format!("there is no element {id} on frame {frame}")));
+            }
+            Ok(())
+        }
+    );
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setElementFirstFrame",
+        |state, id: u64, frame: u32, value: u32| {
+            let mut s = state.borrow_mut();
+            let ok = s.scene_mut().update_object_at(frame, ObjectId(id), |o| {
+                if let buzz_scene::ObjectKind::Instance(inst) = &mut o.kind {
+                    inst.first_frame = value;
+                }
+            });
+            if !ok {
+                return Err(throw(&format!("there is no element {id} on frame {frame}")));
+            }
+            Ok(())
+        }
+    );
+
+    // -- `document.selection`, as real elements rather than placeholders -----
+    host_fn!(ctx, host, state, "selectionIds", |state| {
+        let ids: Vec<u64> = state
+            .borrow()
+            .context
+            .selection
+            .iter()
+            .map(|o| o.0)
+            .collect();
+        Ok(serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string()))
+    });
+    host_fn!(ctx, host, state, "setSelectionIds", |state, json: String| {
+        let ids: Vec<u64> = serde_json::from_str(&json)
+            .map_err(|_| throw("expected an array of element ids"))?;
+        state.borrow_mut().context.selection = ids.into_iter().map(ObjectId).collect();
+        Ok(())
+    });
+
+    // -- the timeline's own selection: `setSelectedLayers`/`setSelectedFrames` --
+    host_fn!(ctx, host, state, "setSelectedLayers", |state, json: String| {
+        let ids: Vec<i32> = serde_json::from_str(&json).unwrap_or_default();
+        state.borrow_mut().selected_layer = ids.first().copied();
+        Ok(())
+    });
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setSelectedFramesRange",
+        |state, start: i32, end: i32| {
+            let mut s = state.borrow_mut();
+            let layer = s.selected_layer.unwrap_or(0);
+            let lo = start.min(end).max(0) as u32;
+            let hi = start.max(end).max(0) as u32;
+            s.selected_ranges = vec![(layer, lo, hi)];
+            Ok(())
+        }
+    );
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setSelectedFramesArray",
+        |state, json: String| {
+            let flat: Vec<i32> = serde_json::from_str(&json)
+                .map_err(|_| throw("expected [layer, start, end, ...]"))?;
+            let ranges: Vec<(i32, u32, u32)> = flat
+                .chunks_exact(3)
+                .map(|c| (c[0], c[1].max(0) as u32, c[2].max(0) as u32))
+                .collect();
+            state.borrow_mut().selected_ranges = ranges;
+            Ok(())
+        }
+    );
+    host_fn!(ctx, host, state, "getSelectedFrames", |state| {
+        let s = state.borrow();
+        let mut flat: Vec<i32> = Vec::new();
+        for (layer, start, end) in &s.selected_ranges {
+            flat.push(*layer);
+            flat.push(*start as i32);
+            flat.push(*end as i32);
+        }
+        Ok(serde_json::to_string(&flat).unwrap_or_else(|_| "[]".to_string()))
+    });
+
+    // -- frame operations the six commands drive through that selection ------
+    host_fn!(ctx, host, state, "insertKeyframeAt", |state, frame: i32| {
+        let (id, f) = {
+            let s = state.borrow();
+            let id = selection_layer(&s)?;
+            let f = if frame >= 0 {
+                frame as u32
+            } else {
+                s.context.current_frame
+            };
+            (id, f)
+        };
+        state.borrow_mut().scene_mut().update_layer(id, |l| {
+            l.frames.insert_keyframe(f);
+        });
+        Ok(())
+    });
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "insertBlankKeyframeAt",
+        |state, frame: i32| {
+            let (id, f) = {
+                let s = state.borrow();
+                let id = selection_layer(&s)?;
+                let f = if frame >= 0 {
+                    frame as u32
+                } else {
+                    s.context.current_frame
+                };
+                (id, f)
+            };
+            state.borrow_mut().scene_mut().update_layer(id, |l| {
+                l.frames.insert_blank_keyframe(f);
+            });
+            Ok(())
+        }
+    );
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "insertFramesAt",
+        |state, count: i32, all_layers: bool, at_frame: i32| {
+            let layer_ids: Vec<LayerId> = {
+                let s = state.borrow();
+                if all_layers {
+                    s.scene().layers().iter().map(|l| l.id).collect()
+                } else if let Some(idx) = s.selected_layer {
+                    vec![layer_id(&s, idx)?]
+                } else if let Some((idx, _, _)) = s.selected_ranges.first().copied() {
+                    vec![layer_id(&s, idx)?]
+                } else {
+                    vec![target(&s)?.0]
+                }
+            };
+            let frame = if at_frame >= 0 {
+                at_frame as u32
+            } else {
+                let s = state.borrow();
+                match s.selected_ranges.first() {
+                    Some((_, start, _)) => *start,
+                    None => s.context.current_frame,
+                }
+            };
+            let mut s = state.borrow_mut();
+            for id in layer_ids {
+                for _ in 0..count.max(0) {
+                    s.scene_mut().update_layer(id, |l| {
+                        l.frames.insert_frame(frame);
+                    });
+                }
+            }
+            Ok(())
+        }
+    );
+    host_fn!(ctx, host, state, "removeFrames", |state| {
+        let mut s = state.borrow_mut();
+        let ranges = s.selected_ranges.clone();
+        if ranges.is_empty() {
+            return Err(throw("no frames are selected to remove"));
+        }
+        for (layer_idx, start, end) in ranges {
+            let id = layer_id(&s, layer_idx)?;
+            let count = end.saturating_sub(start);
+            s.scene_mut().update_layer(id, |l| {
+                for _ in 0..count {
+                    l.frames.remove_frame(start);
+                }
+            });
+        }
+        Ok(())
+    });
+    host_fn!(ctx, host, state, "clearKeyframes", |state| {
+        let mut s = state.borrow_mut();
+        let ranges = s.selected_ranges.clone();
+        for (layer_idx, start, end) in ranges {
+            let id = layer_id(&s, layer_idx)?;
+            s.scene_mut().update_layer(id, |l| {
+                for frame in start..end {
+                    l.frames.clear_keyframe(frame);
+                }
+            });
+        }
+        Ok(())
+    });
+    host_fn!(ctx, host, state, "createMotionTween", |state| {
+        let mut s = state.borrow_mut();
+        let ranges = s.selected_ranges.clone();
+        if ranges.is_empty() {
+            return Err(throw("select a frame span before creating a tween"));
+        }
+        for (layer_idx, start, _end) in ranges {
+            let id = layer_id(&s, layer_idx)?;
+            s.scene_mut().update_layer(id, |l| {
+                l.frames.set_tween(start, buzz_scene::Tween::classic());
+            });
+        }
+        Ok(())
+    });
+    host_fn!(ctx, host, state, "copyFrames", |state| {
+        let mut s = state.borrow_mut();
+        let ranges = s.selected_ranges.clone();
+        if ranges.is_empty() {
+            return Err(throw("nothing is selected to copy"));
+        }
+        let mut clip = Vec::new();
+        for (layer_idx, start, end) in ranges {
+            let id = layer_id(&s, layer_idx)?;
+            let Some(layer) = s.scene().layers().get(id) else {
+                continue;
+            };
+            let kfs: Vec<(u32, buzz_scene::timeline::Keyframe)> = layer
+                .frames
+                .keyframes()
+                .iter()
+                .filter(|k| k.start >= start && k.start < end)
+                .map(|k| (k.start - start, k.clone()))
+                .collect();
+            clip.push((id, kfs));
+        }
+        s.frame_clip = clip;
+        Ok(())
+    });
+    host_fn!(ctx, host, state, "pasteFrames", |state| {
+        let (target_id, start, clip) = {
+            let s = state.borrow();
+            let Some((layer_idx, start, _end)) = s.selected_ranges.first().copied() else {
+                return Err(throw("select where to paste before pasting"));
+            };
+            let id = layer_id(&s, layer_idx)?;
+            (id, start, s.frame_clip.clone())
+        };
+        if clip.is_empty() {
+            return Err(throw("there is nothing on the frame clipboard"));
+        }
+        let mut s = state.borrow_mut();
+        for (_src_layer, kfs) in clip.iter() {
+            for (offset, kf) in kfs.iter() {
+                let dest = start + *offset;
+                let mut objects: Vec<Arc<SceneObject>> = Vec::with_capacity(kf.objects.len());
+                for o in kf.objects.iter() {
+                    let mut copy = (**o).clone();
+                    copy.id = s.scene_mut().next_object_id();
+                    objects.push(Arc::new(copy));
+                }
+                let tween = kf.tween;
+                s.scene_mut().update_layer(target_id, |l| {
+                    l.frames.insert_blank_keyframe(dest);
+                    l.frames.set_objects(dest, objects);
+                    l.frames.set_tween(dest, tween);
+                });
+            }
+        }
+        Ok(())
+    });
+
+    // -- entering and leaving a symbol's own timeline -------------------------
+    host_fn!(ctx, host, state, "enterEditMode", |state, mode: String| {
+        let mut s = state.borrow_mut();
+        let selected = s
+            .context
+            .selection
+            .first()
+            .copied()
+            .ok_or_else(|| throw("select a symbol instance before entering edit mode"))?;
+        let frame = s.context.current_frame;
+        let obj = locate_element(&s, selected.0, frame)?;
+        let buzz_scene::ObjectKind::Instance(inst) = &obj.kind else {
+            return Err(throw("the selected element is not a symbol instance"));
+        };
+        let symbol = inst.symbol;
+        let place = obj.transform;
+        let entered = if mode.eq_ignore_ascii_case("inplace") {
+            s.scene_mut().enter_symbol_in_place(symbol, place)
+        } else {
+            s.scene_mut().enter_symbol(symbol)
+        };
+        if !entered {
+            return Err(throw("that symbol is not in the library"));
+        }
+        Ok(())
+    });
+    host_fn!(ctx, host, state, "exitEditMode", |state| {
+        state.borrow_mut().scene_mut().exit_symbol();
+        Ok(())
+    });
+
+    // -- the two calls that stand in for Animate's menu -----------------------
+    host_fn!(ctx, host, state, "runMenuCommand", |state, name: String| {
+        let mut s = state.borrow_mut();
+        let ranges = s.selected_ranges.clone();
+        match name.as_str() {
+            "Insert Classic Tween" => {
+                for (layer_idx, start, _end) in ranges {
+                    if let Ok(id) = layer_id(&s, layer_idx) {
+                        s.scene_mut().update_layer(id, |l| {
+                            l.frames.set_tween(start, buzz_scene::Tween::classic());
+                        });
+                    }
+                }
+            }
+            "Clear Classic Tween" | "Remove Tween" | "Remove Classic Tween" => {
+                for (layer_idx, start, end) in ranges {
+                    if let Ok(id) = layer_id(&s, layer_idx) {
+                        let stop = end.max(start + 1);
+                        s.scene_mut().update_layer(id, |l| {
+                            for frame in start..stop {
+                                l.frames.set_tween(frame, buzz_scene::Tween::default());
+                            }
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    });
+    host_fn!(ctx, host, state, "scriptExists", |state, uri: String| {
+        let borrowed = state.borrow();
+        let Some(root) = borrowed.context.config_dir.clone() else {
+            return Ok(false);
+        };
+        drop(borrowed);
+        let Ok(path) = uri_to_path(&uri) else {
+            return Ok(false);
+        };
+        let (Ok(real), Ok(root)) = (path.canonicalize(), root.canonicalize()) else {
+            return Ok(false);
+        };
+        Ok(real.starts_with(&root) && real.is_file())
+    });
+
     // The film-making half: scenes, staging, casting, rigging, dialogue and the
     // camera. See `crate::film`.
     crate::film::install(ctx, &host, state)?;
 
     ctx.globals().set("__host", host)?;
     Ok(())
+}
+
+/// The layer `setSelectedLayers` last named, falling back to
+/// [`target`] — the active layer, or the front one — for a caller that named
+/// none. Used by `insertKeyframe`/`insertBlankKeyframe`, which JSFL addresses
+/// through the timeline's current layer rather than through an argument.
+fn selection_layer(state: &State) -> JsResult<LayerId> {
+    match state.selected_layer {
+        Some(idx) => layer_id(state, idx),
+        None => target(state).map(|(id, _)| id),
+    }
+}
+
+/// The object an `Element(id, frame)` on the JavaScript side names: found by
+/// id, then read back from the keyframe that actually governs `frame` — not
+/// necessarily the same stored copy `find_object` would meet first, once an
+/// `insertKeyframe` has cloned it onto a second span with its own edits.
+fn locate_element(state: &State, id: u64, frame: u32) -> JsResult<Arc<SceneObject>> {
+    let object_id = ObjectId(id);
+    let (layer_id, _) = state
+        .scene()
+        .find_object(object_id)
+        .ok_or_else(|| throw(&format!("there is no element with id {id}")))?;
+    let layer = state
+        .scene()
+        .layers()
+        .get(layer_id)
+        .ok_or_else(|| throw("that element's layer is gone"))?;
+    layer
+        .frames
+        .objects_at(frame)
+        .iter()
+        .find(|o| o.id == object_id)
+        .cloned()
+        .ok_or_else(|| throw(&format!("element {id} is not on frame {frame}")))
+}
+
+/// JSFL's `symbolType`/`libraryItem.itemType` spelling of a [`SymbolKind`].
+fn symbol_kind_str(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Graphic => "graphic",
+        SymbolKind::MovieClip => "movie clip",
+        SymbolKind::Button => "button",
+    }
+}
+
+/// JSFL's `layerType` spelling of a [`LayerKind`]. Animate has no inverse
+/// mask, so it reads as an ordinary mask — the nearest thing it has a name
+/// for.
+fn layer_kind_str(kind: LayerKind) -> &'static str {
+    match kind {
+        LayerKind::Normal => "normal",
+        LayerKind::Folder => "folder",
+        LayerKind::Mask | LayerKind::InverseMask => "mask",
+        LayerKind::Masked => "masked",
+        LayerKind::Guide => "guide",
+        LayerKind::Guided => "guided",
+    }
+}
+
+/// JSFL's `tweenType` spelling of a [`buzz_scene::TweenKind`].
+fn tween_kind_str(kind: buzz_scene::TweenKind) -> &'static str {
+    match kind {
+        buzz_scene::TweenKind::None => "none",
+        buzz_scene::TweenKind::Classic => "classic",
+        buzz_scene::TweenKind::Motion => "motion",
+        buzz_scene::TweenKind::Shape => "shape",
+    }
 }
 
 /// Add a rectangle or an oval to the layer the editor is working on.
@@ -818,10 +1514,7 @@ fn uri_to_path(uri: &str) -> JsResult<std::path::PathBuf> {
 /// Across the whole film rather than on one frame, because a modifier is a
 /// property of the object and not of a moment — the same reason the editor's
 /// own Add Wiggle writes it that way.
-fn add_modifier(
-    state: &Rc<RefCell<State>>,
-    modifier: buzz_scene::Modifier,
-) -> JsResult<()> {
+fn add_modifier(state: &Rc<RefCell<State>>, modifier: buzz_scene::Modifier) -> JsResult<()> {
     let mut s = state.borrow_mut();
     let ids = s.context.selection.clone();
     if ids.is_empty() {

@@ -20,7 +20,14 @@ const OTHER: Color = Color::from_rgb8(0xC0, 0x30, 0x20);
 
 fn editor() -> (Editor, LayerId) {
     let editor = Editor::default();
-    let layer = editor.doc.scene().layers().iter().next().expect("a layer").id;
+    let layer = editor
+        .doc
+        .scene()
+        .layers()
+        .iter()
+        .next()
+        .expect("a layer")
+        .id;
     (editor, layer)
 }
 
@@ -64,9 +71,9 @@ fn painted_area(editor: &Editor, id: buzz_scene::ObjectId) -> buzz_geom::Rect {
         panic!("not a shape")
     };
     match &shape.fill.as_ref().expect("a fill").paint {
-        Paint::Image(img) => img.transform.transform_rect_bbox(buzz_geom::Rect::new(
-            0.0, 0.0, 1.0, 1.0,
-        )),
+        Paint::Image(img) => img
+            .transform
+            .transform_rect_bbox(buzz_geom::Rect::new(0.0, 0.0, 1.0, 1.0)),
         other => panic!("expected paint, got {other:?}"),
     }
 }
@@ -77,11 +84,21 @@ fn two_strokes_of_one_colour_become_one_shape() {
     editor.style.drawing_mode = DrawingMode::MergeShape;
     let b = brush(INK);
 
-    paint(&mut editor, Point::new(40.0, 40.0), Point::new(90.0, 40.0), &b);
+    paint(
+        &mut editor,
+        Point::new(40.0, 40.0),
+        Point::new(90.0, 40.0),
+        &b,
+    );
     assert_eq!(shapes(&editor, layer).len(), 1, "the first stroke");
 
     // Straight over the first one.
-    paint(&mut editor, Point::new(60.0, 40.0), Point::new(120.0, 40.0), &b);
+    paint(
+        &mut editor,
+        Point::new(60.0, 40.0),
+        Point::new(120.0, 40.0),
+        &b,
+    );
     assert_eq!(
         shapes(&editor, layer).len(),
         1,
@@ -141,7 +158,9 @@ fn fusing_leaves_the_picture_as_it_was() {
             let mut expected = 0.0f64;
             for id in shapes(&stacked, layer2) {
                 let (_, o) = stacked.doc.scene().find_object(id).expect("a shape");
-                let ObjectKind::Shape(s) = &o.kind else { continue };
+                let ObjectKind::Shape(s) = &o.kind else {
+                    continue;
+                };
                 let Paint::Image(i) = &s.fill.as_ref().unwrap().paint else {
                     continue;
                 };
@@ -172,9 +191,23 @@ fn object_drawing_leaves_every_stroke_its_own() {
     let (mut editor, layer) = editor();
     editor.style.drawing_mode = DrawingMode::ObjectDrawing;
     let b = brush(INK);
-    paint(&mut editor, Point::new(40.0, 40.0), Point::new(90.0, 40.0), &b);
-    paint(&mut editor, Point::new(60.0, 40.0), Point::new(120.0, 40.0), &b);
-    assert_eq!(shapes(&editor, layer).len(), 2, "nothing fuses in this mode");
+    paint(
+        &mut editor,
+        Point::new(40.0, 40.0),
+        Point::new(90.0, 40.0),
+        &b,
+    );
+    paint(
+        &mut editor,
+        Point::new(60.0, 40.0),
+        Point::new(120.0, 40.0),
+        &b,
+    );
+    assert_eq!(
+        shapes(&editor, layer).len(),
+        2,
+        "nothing fuses in this mode"
+    );
 }
 
 #[test]
@@ -205,7 +238,12 @@ fn paint_at_the_other_end_of_the_stage_does_not_fuse() {
     let (mut editor, layer) = editor();
     editor.style.drawing_mode = DrawingMode::MergeShape;
     let b = brush(INK);
-    paint(&mut editor, Point::new(40.0, 40.0), Point::new(90.0, 40.0), &b);
+    paint(
+        &mut editor,
+        Point::new(40.0, 40.0),
+        Point::new(90.0, 40.0),
+        &b,
+    );
     paint(
         &mut editor,
         Point::new(600.0, 400.0),

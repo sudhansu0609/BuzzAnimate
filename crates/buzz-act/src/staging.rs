@@ -587,9 +587,7 @@ fn clouds(scene: &mut Scene, recipe: &SceneRecipe, horizon_y: f64, wide: Rect) -
             let y = cy - r * 0.35;
             // Wider than tall: a cloud lump is a squashed disc, and a circle
             // gives a bunch of grapes.
-            path.extend(
-                kurbo::Ellipse::new((x, y), (r * 1.15, r), 0.0).path_elements(0.1),
-            );
+            path.extend(kurbo::Ellipse::new((x, y), (r * 1.15, r), 0.0).path_elements(0.1));
         }
         // A flat base joining them, so the bottom of the cloud is a line.
         path.extend(
@@ -702,8 +700,7 @@ fn water(scene: &mut Scene, recipe: &SceneRecipe, horizon_y: f64, wide: Rect) ->
         // Rounded, so the ends taper rather than stopping square: a square-cut
         // highlight on water is a floating plank.
         let streak =
-            kurbo::RoundedRect::new(x, y, x + length, y + thickness, thickness * 0.5)
-                .to_path(0.05);
+            kurbo::RoundedRect::new(x, y, x + length, y + thickness, thickness * 0.5).to_path(0.05);
         // Fainter far away, brighter near: the far end of a river is mostly
         // sky colour and the near end is where the glitter is.
         let colour = crate::staging::mix(body, shine, (0.25 + 0.65 * t) as f32);
@@ -755,7 +752,7 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
 /// own documentation explains why a spot and an area light mean nothing on flat
 /// artwork, and adding one here would be adding a lamp with extra numbers.
 fn light(scene: &mut Scene, recipe: &SceneRecipe, horizon_y: f64) {
-    use buzz_scene::{LightKind, Light};
+    use buzz_scene::{Light, LightKind};
 
     let stage = scene.stage().stage_rect();
 
@@ -788,7 +785,10 @@ fn light(scene: &mut Scene, recipe: &SceneRecipe, horizon_y: f64) {
         Setting::Storm => LightKind::sky(),
         Setting::Night | Setting::Interior => LightKind::Lamp {
             // Off to one side and above the heads, where a practical hangs.
-            position: Point::new(stage.x0 + stage.width() * 0.22, horizon_y - stage.height() * 0.55),
+            position: Point::new(
+                stage.x0 + stage.width() * 0.22,
+                horizon_y - stage.height() * 0.55,
+            ),
             height: 220.0,
             radius: stage.width() * 0.75,
         },
@@ -814,21 +814,14 @@ fn light(scene: &mut Scene, recipe: &SceneRecipe, horizon_y: f64) {
         // each setting's key looks like stays complete.
         Setting::Storm => Color::from_rgb8(0xD6, 0xE4, 0xFF),
     };
-    // **The rim is the point of lighting a set-up scene.** Everything else
-    // lighting does happens inside the silhouette; the rim is what puts an edge
-    // of the key's colour around a figure and separates them from the ground
-    // behind. Strongest where the key is lowest, which is where a real rim is
-    // strongest too.
-    key.rim = match recipe.setting {
-        Setting::Daylight => 0.30,
-        Setting::Sunset => 0.55,
-        Setting::Night => 0.55,
-        Setting::Interior => 0.35,
-        // The strongest of the lot: a sheet of lightning is *behind* everything
-        // and the figures are in front of it, which is the one arrangement
-        // where an edge really does come up brighter than the picture.
-        Setting::Storm => 0.7,
-    };
+    // **No rim.** A set-up scene used to arrive with a rim glow on the key
+    // (0.30–0.7 by setting), on the theory that it puts the cast *in* the
+    // background. On traced characters it read as a white halo round
+    // everyone, and the user asked for it to go (2026-10-06, "remove the rim
+    // glow"). It also cost a silhouette and a glow filter per lit layer per
+    // frame — see `docs/RIG_SCENE_LAG_PLAN.md` C0. The Lights panel's Rim
+    // slider still exists for anyone who wants one on a particular light.
+    key.rim = 0.0;
     key.shadows = true;
     key.shadow_strength = match recipe.setting {
         Setting::Night => 0.5,
@@ -847,6 +840,9 @@ fn light(scene: &mut Scene, recipe: &SceneRecipe, horizon_y: f64) {
         // also strikes more often at this setting, which is what stops a
         // four-second test looking like an ordinary dark night.
         key.storm = 0.8;
+        // `make_storm` switches a rim on (a flash behind the figures); the
+        // no-rim rule above holds for set-up scenes whatever the weather.
+        key.rim = 0.0;
     }
     // **How far the cast is assumed to stand off the background**, which is the
     // only thing that gives flat artwork a shadow at all — and, for the same
@@ -865,39 +861,29 @@ fn light(scene: &mut Scene, recipe: &SceneRecipe, horizon_y: f64) {
     fill.name = "Sky".to_string();
     // The fill is the *other* end of the picture's range, so it takes the
     // complement of the key: cool against a warm key, and dim at night.
-    let (fill_colour, fill_horizon, fill_strength) = match recipe.setting {
-        Setting::Daylight => (
-            Color::from_rgb8(0xA8, 0xC6, 0xE8),
-            Color::from_rgb8(0xC8, 0xC0, 0xA8),
-            0.85,
-        ),
-        Setting::Sunset => (
-            Color::from_rgb8(0x6C, 0x7E, 0xC2),
-            Color::from_rgb8(0xC0, 0x86, 0x64),
-            0.6,
-        ),
-        Setting::Night => (
-            Color::from_rgb8(0x2C, 0x3C, 0x6A),
-            Color::from_rgb8(0x1A, 0x22, 0x38),
-            0.35,
-        ),
-        Setting::Interior => (
-            Color::from_rgb8(0x8E, 0x88, 0x80),
-            Color::from_rgb8(0x6A, 0x5E, 0x50),
-            0.55,
-        ),
+    let (fill_colour, fill_strength) = match recipe.setting {
+        Setting::Daylight => (Color::from_rgb8(0xA8, 0xC6, 0xE8), 0.85),
+        Setting::Sunset => (Color::from_rgb8(0x6C, 0x7E, 0xC2), 0.6),
+        Setting::Night => (Color::from_rgb8(0x2C, 0x3C, 0x6A), 0.35),
+        Setting::Interior => (Color::from_rgb8(0x8E, 0x88, 0x80), 0.55),
         // Barely there. Between strikes a storm is the darkest setting of the
         // five, and the fill's whole job is to keep the artwork from going to
         // a flat silhouette while it waits.
-        Setting::Storm => (
-            Color::from_rgb8(0x22, 0x2E, 0x52),
-            Color::from_rgb8(0x10, 0x14, 0x22),
-            0.22,
-        ),
+        Setting::Storm => (Color::from_rgb8(0x22, 0x2E, 0x52), 0.22),
     };
     fill.color = fill_colour;
+    // **A flat sky: the horizon is the sky's own colour, for every setting.**
+    //
+    // A sky that mixes `color` to `horizon` by height makes the light depend on
+    // where a shape stands, so no lit symbol could be stamped once and placed
+    // anywhere (`LightRig::is_position_independent`): every instance of every
+    // rig was walked and encoded live, shape by shape, every frame — most of the
+    // frame of a lit scene (`docs/RIG_SCENE_LAG_PLAN.md` L3''). Flat, the fill
+    // is the same everywhere and the stamp cache works under it. The gradient
+    // this replaced is [`gradient_fill_horizon`]; a document that sets a horizon
+    // in the Lights panel still gets it, drawn live as before.
     fill.kind = LightKind::Sky {
-        horizon: fill_horizon,
+        horizon: fill_colour,
     };
     fill.intensity = fill_strength;
 
@@ -906,11 +892,38 @@ fn light(scene: &mut Scene, recipe: &SceneRecipe, horizon_y: f64) {
     // with.
     let rig = scene.lights_mut();
     rig.enabled = true;
+    // **No edge bands on a set-up scene.** The figure bands are rebuilt for
+    // every pose a rig takes (boolean offsets of its whole silhouette), and on
+    // traced characters with brush outlines that was seconds per frame of
+    // playback (measured 2026-10-06: a held frame 37 ms with the bands, 8 ms
+    // without; the first moving frame 8.4 s with them). The user asked for
+    // speed first and shading later, so a set-up scene lights its cast with
+    // the tint, the fill and the cast shadows only; the Lights panel can turn
+    // the bands back on per document (`EdgeMode::Figure`). See
+    // `docs/RIG_SCENE_LAG_PLAN.md`.
+    rig.edges = buzz_scene::EdgeMode::Off;
     if let Some(slot) = rig.get_mut(key_id) {
         *slot = key;
     }
     if let Some(slot) = rig.get_mut(fill_id) {
         *slot = fill;
+    }
+}
+
+/// **The gradient alternative to the flat fill sky**: the colour each setting's
+/// sky fill mixes to at the horizon (the bottom of the stage), which is what
+/// [`light`] used before 2026-10-06. Not used by [`build`]: a sky whose horizon
+/// differs from its colour is position-dependent light, which draws live (no
+/// symbol stamps) — see the comment on the fill in [`light`]. Kept so the look
+/// can be put back by setting `LightKind::Sky { horizon }` to this.
+#[allow(dead_code)]
+pub(crate) fn gradient_fill_horizon(setting: Setting) -> Color {
+    match setting {
+        Setting::Daylight => Color::from_rgb8(0xC8, 0xC0, 0xA8),
+        Setting::Sunset => Color::from_rgb8(0xC0, 0x86, 0x64),
+        Setting::Night => Color::from_rgb8(0x1A, 0x22, 0x38),
+        Setting::Interior => Color::from_rgb8(0x6A, 0x5E, 0x50),
+        Setting::Storm => Color::from_rgb8(0x10, 0x14, 0x22),
     }
 }
 
@@ -1022,7 +1035,10 @@ mod tests {
             for object in objects.iter() {
                 for m in &object.modifiers {
                     if let Modifier::Drift { span, .. } = m {
-                        assert!(*span > 0.0, "a piece of {what} drifts away and never returns");
+                        assert!(
+                            *span > 0.0,
+                            "a piece of {what} drifts away and never returns"
+                        );
                     }
                 }
             }
@@ -1108,8 +1124,16 @@ mod tests {
             },
         );
 
-        let striking = scene.lights().lights.iter().filter(|l| l.storm > 0.0).count();
-        assert_eq!(striking, 1, "a storm scene needs exactly one light striking");
+        let striking = scene
+            .lights()
+            .lights
+            .iter()
+            .filter(|l| l.storm > 0.0)
+            .count();
+        assert_eq!(
+            striking, 1,
+            "a storm scene needs exactly one light striking"
+        );
 
         // And the rig animates, so the window and the exporter both know to
         // redraw frame by frame.
@@ -1189,10 +1213,11 @@ mod tests {
         );
     }
 
-    /// The lights arrive switched on, with a rim: an unlit set-up scene is a
-    /// pile of flat colour, and the rim is what puts the cast *in* it.
+    /// The lights arrive switched on, and **without a rim**: the user asked
+    /// for the halo round traced characters to go (2026-10-06), and it was
+    /// the single most expensive thing a lit frame drew.
     #[test]
-    fn a_lit_scene_arrives_with_a_key_a_fill_and_a_rim() {
+    fn a_lit_scene_arrives_with_a_key_a_fill_and_no_rim() {
         let mut scene = Scene::default();
         build(&mut scene, &SceneRecipe::default());
 
@@ -1200,7 +1225,57 @@ mod tests {
         assert!(rig.enabled, "the rig is on");
         assert_eq!(rig.lights.len(), 2, "a key and a fill");
         let key = rig.key().expect("a key light");
-        assert!(key.rim > 0.0, "and the key rims the cast");
+        assert_eq!(key.rim, 0.0, "and the key lays no rim");
+        assert_eq!(rig.edges, buzz_scene::EdgeMode::Off, "and no edge bands");
+    }
+
+    /// **The fill sky is flat in every setting** (`RIG_SCENE_LAG_PLAN` L3''):
+    /// its horizon is its own colour, so the light does not depend on where a
+    /// shape stands and the renderer can stamp lit symbols. With a sun for a key
+    /// (daylight, sunset) the whole rig is position-independent; a practical
+    /// lamp (night, interior) and the storm's sky-light key are not, by their
+    /// nature, and those scenes draw live.
+    #[test]
+    fn the_fill_sky_is_flat_in_every_setting() {
+        use buzz_scene::LightKind;
+
+        for setting in [
+            Setting::Daylight,
+            Setting::Sunset,
+            Setting::Night,
+            Setting::Interior,
+            Setting::Storm,
+        ] {
+            let mut scene = Scene::default();
+            build(
+                &mut scene,
+                &SceneRecipe {
+                    setting,
+                    ..SceneRecipe::default()
+                },
+            );
+            let rig = scene.lights();
+            let fill = rig
+                .lights
+                .iter()
+                .find(|l| l.name == "Sky")
+                .expect("a fill sky");
+            let LightKind::Sky { horizon } = fill.kind else {
+                panic!("the fill is a sky");
+            };
+            assert_eq!(horizon, fill.color, "{setting:?}: the fill sky is flat");
+            assert_ne!(
+                gradient_fill_horizon(setting),
+                fill.color,
+                "{setting:?}: the gradient alternative is a different horizon"
+            );
+            let sun_keyed = matches!(setting, Setting::Daylight | Setting::Sunset);
+            assert_eq!(
+                rig.is_position_independent(),
+                sun_keyed,
+                "{setting:?}: position-independent exactly when the key is a sun"
+            );
+        }
     }
 
     /// Asking for no lights really leaves the document unlit, so this can be

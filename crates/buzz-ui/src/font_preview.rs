@@ -71,10 +71,8 @@ impl FontPreviews {
         }
 
         let width = (traced.width * ROW_HEIGHT).clamp(40.0, 240.0);
-        let (rect, response) = ui.allocate_exact_size(
-            Vec2::new(width + 8.0, ROW_HEIGHT),
-            Sense::click(),
-        );
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(width + 8.0, ROW_HEIGHT), Sense::click());
         if ui.is_rect_visible(rect) {
             let visuals = ui.style().interact_selectable(&response, selected);
             if selected || response.hovered() {

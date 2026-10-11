@@ -57,6 +57,30 @@ pub enum ToolAction {
     TransformSelection { transform: Affine },
     /// Drag one anchor of the selected path — Animate's Subselection tool.
     MoveAnchor { element: usize, delta: Vec2 },
+    /// Drag several of the selected path's anchors together, each carrying its
+    /// handles. Sent step by step as the pointer travels, so the path is
+    /// reshaped under it and the release has nothing left to commit.
+    MoveAnchors { elements: Vec<usize>, delta: Vec2 },
+    /// Change which of the selected path's anchors are selected.
+    SelectAnchors {
+        elements: Vec<usize>,
+        mode: AnchorSelect,
+    },
+    /// Put one tangent handle of an anchor at `to` (document space).
+    ///
+    /// **Absolute, not a delta**, so the drag lands where the pointer is
+    /// however many steps it took. `mirror` says whether the opposite handle
+    /// turns with it — decided by the tool from whether the anchor was smooth
+    /// when the press landed and whether Alt is down.
+    MoveHandle {
+        element: usize,
+        side: buzz_geom::HandleSide,
+        to: Point,
+        mirror: bool,
+    },
+    /// Alt-drag on a corner anchor: pull symmetric handles out of it, the
+    /// outgoing one at `to` (document space).
+    PullHandles { element: usize, to: Point },
     /// Place a painted stroke: a bitmap, and the rectangle it fills.
     ///
     /// The tool cannot make this artwork itself, because a bitmap needs an id
@@ -133,6 +157,17 @@ pub enum ToolAction {
     /// Place a text object here. The editor shapes the glyphs (it holds the
     /// font), so the tool only says where.
     PlaceText { at: Point },
+}
+
+/// How a [`ToolAction::SelectAnchors`] changes the set of selected anchors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorSelect {
+    /// Only these.
+    Replace,
+    /// These as well as what is selected.
+    Add,
+    /// Each of these flips: out if it was in, in otherwise — Shift-click.
+    Toggle,
 }
 
 /// Which handle of a gradient is being dragged.
@@ -212,17 +247,122 @@ pub enum Preview {
     Pivot(Point),
 }
 
+/// The selection's transform box: a rectangle **in its own space**, and where
+/// that space sits on the focal plane the pointer works in.
+///
+/// # Why it is not just a `Rect`
+///
+/// The box used to be the axis-aligned rectangle round the selection's drawn
+/// corners. Turn a rectangle 30 degrees and its handles jumped to the box
+/// *around* it, and a side handle then stretched along world x — which is not
+/// along the rectangle's own width, so the rectangle sheared into a rhombus. In
+/// Animate the box turns with the object, and a side handle stretches only
+/// along the object's own width or height. Keeping the box's own axes next to
+/// its rectangle is what lets the gizmo do the same: the handles sit on the
+/// object's corners and every scale or skew is worked out in those axes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransformBox {
+    /// The box in its own (unrotated) space.
+    pub local: Rect,
+    /// Its own space → the focal plane the pointer works in (the same space
+    /// `Editor::selection_bounds_drawn` returns).
+    pub to_doc: Affine,
+}
+
+impl TransformBox {
+    /// A box that is not turned: its own space *is* the focal plane. What the
+    /// selection had before the box could follow a rotation, and still what an
+    /// unrotated or mixed selection has.
+    pub fn axis_aligned(local: Rect) -> Self {
+        Self {
+            local,
+            to_doc: Affine::IDENTITY,
+        }
+    }
+
+    /// The four corners on the focal plane: top-left, top-right, bottom-right,
+    /// bottom-left **of the box's own space** — they keep those names however
+    /// far the box has turned.
+    pub fn corners(&self) -> [Point; 4] {
+        let r = self.local;
+        [
+            Point::new(r.x0, r.y0),
+            Point::new(r.x1, r.y0),
+            Point::new(r.x1, r.y1),
+            Point::new(r.x0, r.y1),
+        ]
+        .map(|p| self.to_doc * p)
+    }
+
+    /// The middle of each edge on the focal plane: top, bottom, left, right —
+    /// again the box's own top and bottom, not the screen's.
+    pub fn mid_edges(&self) -> [Point; 4] {
+        let r = self.local;
+        let mid = r.center();
+        [
+            Point::new(mid.x, r.y0),
+            Point::new(mid.x, r.y1),
+            Point::new(r.x0, mid.y),
+            Point::new(r.x1, mid.y),
+        ]
+        .map(|p| self.to_doc * p)
+    }
+
+    /// The centre of the box on the focal plane.
+    pub fn center(&self) -> Point {
+        self.to_doc * self.local.center()
+    }
+
+    /// Is `p`, on the focal plane, inside the box?
+    ///
+    /// Asked in the box's own space, so the empty corner of the rectangle
+    /// *around* a turned object is outside it. A singular box contains nothing:
+    /// it has no inverse to ask in.
+    pub fn contains(&self, p: Point) -> bool {
+        let c = self.to_doc.as_coeffs();
+        let det = c[0] * c[3] - c[1] * c[2];
+        if !(det.abs() > 0.0 && det.is_finite()) {
+            return false;
+        }
+        contains(self.local, self.to_doc.inverse() * p)
+    }
+
+    /// The axis-aligned rectangle round the box's corners — what the box was
+    /// before it could turn.
+    pub fn aabb(&self) -> Rect {
+        let corners = self.corners();
+        corners[1..]
+            .iter()
+            .fold(Rect::from_points(corners[0], corners[0]), |r, p| {
+                r.union_pt(*p)
+            })
+    }
+}
+
 /// State shared with a tool for the duration of a gesture.
 pub struct ToolContext<'a> {
     pub style: &'a DrawStyle,
     /// Document units per screen pixel, for size-independent thresholds.
     pub zoom: f64,
     pub selection_bounds: Option<Rect>,
+    /// The selection's transform box — turned with the selection when the
+    /// selection is turned, and the axis-aligned `selection_bounds` otherwise.
+    ///
+    /// What the gizmo's zones, the "did this press land on the selection?" test
+    /// and every scale or skew are measured against.
+    pub selection_box: Option<TransformBox>,
     /// Anchors of the single selected shape, in document space.
     ///
     /// Supplied by the editor because only it can see the scene; empty unless
     /// exactly one shape is selected.
     pub anchors: &'a [buzz_geom::Anchor],
+    /// Which of those anchors (by element) the user has selected. Empty
+    /// unless exactly one shape is sub-selected.
+    pub selected_anchors: &'a [usize],
+    /// The tangent handles of the selected anchors, in document space — and of
+    /// the anchor under the pointer, so a press can tell a corner from a
+    /// smooth point before it is selected.
+    pub handles: &'a [buzz_geom::Handle],
     /// The selection's transformation point, in document space — what a
     /// rotation or a skew turns about. `None` when nothing is selected.
     pub pivot: Option<Point>,
@@ -239,6 +379,13 @@ pub struct ToolContext<'a> {
 #[derive(Debug, Clone, PartialEq)]
 enum Gesture {
     Idle,
+    /// Captured before selection picking; preview only until release.
+    Pivot {
+        origin: Point,
+        origin_screen: Point,
+        pivot: Point,
+        current: Point,
+    },
     /// Press-drag-release from a fixed origin.
     Dragging {
         origin: Point,
@@ -276,11 +423,52 @@ enum Gesture {
         /// and saves a second gesture variant that differs in one field.
         mods: Mods,
     },
-    /// Dragging one anchor of a path.
+    /// Dragging the selected anchors of a path, by one of them.
     Anchor {
+        /// The anchor that was grabbed.
         element: usize,
         origin: Point,
+        origin_screen: Point,
+        /// Where the anchors have been carried to so far — each move applies
+        /// the step since.
         current: Point,
+        /// Every anchor the drag carries: the whole selection, or the grabbed
+        /// one alone when it was not selected.
+        moving: Vec<usize>,
+        /// What a click that never became a drag does — the press already
+        /// selected what it could, but a click on one of several selected
+        /// anchors means "just this one", and Shift-click on a selected one
+        /// means "not this one".
+        on_click: Option<AnchorSelect>,
+        /// The pointer has gone far enough for this to be a drag.
+        dragged: bool,
+    },
+    /// Dragging a tangent handle.
+    Handle {
+        element: usize,
+        side: buzz_geom::HandleSide,
+        /// Was the anchor smooth when the press landed? Decided once, here,
+        /// because dragging the handle is what stops it being smooth.
+        smooth: bool,
+        /// Whether the last step turned the opposite handle too, so a release
+        /// — which does not know what Alt is doing — finishes the same way.
+        mirror: bool,
+        /// Where the handle was, so it is carried by how far the pointer
+        /// went rather than snapping to it.
+        handle_at: Point,
+        origin: Point,
+        origin_screen: Point,
+        current: Point,
+        dragged: bool,
+    },
+    /// Alt-dragging out of a corner anchor: pulling its handles out.
+    Pull {
+        element: usize,
+        anchor_at: Point,
+        origin: Point,
+        origin_screen: Point,
+        current: Point,
+        dragged: bool,
     },
 }
 
@@ -291,13 +479,14 @@ struct Transforming {
     zone: TransformZone,
     /// The point a rotation or an Alt-scale turns about.
     pivot: Point,
-    /// The selection's box **as it was when the drag began**.
+    /// The selection's box **as it was when the drag began**, turned as it was
+    /// turned.
     ///
     /// Held rather than re-read, because the artwork is transformed as the
     /// pointer travels: by the second step the box is no longer the one the
     /// scale is a proportion of, and reading it again would compound the
     /// gesture against itself.
-    bounds: Rect,
+    frame: TransformBox,
     /// Everything committed to the document so far, so each move can commit
     /// the *difference*. Applying the whole transform each time would apply it
     /// on top of itself once per frame.
@@ -339,10 +528,10 @@ pub struct ToolMachine {
 ///
 /// In *screen* pixels, converted using the zoom, so the threshold feels the
 /// same at every magnification.
-const CLICK_SLOP_PX: f64 = 3.0;
+pub(crate) const CLICK_SLOP_PX: f64 = 3.0;
 
 /// How close, in screen pixels, a click must come to grab an anchor.
-const ANCHOR_GRAB_PX: f64 = 7.0;
+pub(crate) const ANCHOR_GRAB_PX: f64 = 7.0;
 
 impl ToolMachine {
     pub fn new(tool: ToolId) -> Self {
@@ -381,6 +570,30 @@ impl ToolMachine {
         self.gesture = Gesture::Idle;
     }
 
+    pub(crate) fn begin_pivot_drag(&mut self, doc: Point, screen: Point, pivot: Point) {
+        self.last_screen = screen;
+        self.gesture = Gesture::Pivot {
+            origin: doc,
+            origin_screen: screen,
+            pivot,
+            current: pivot,
+        };
+    }
+
+    pub(crate) fn dragging_pivot(&self) -> bool {
+        matches!(self.gesture, Gesture::Pivot { .. })
+    }
+
+    /// Did the press begin a **move of the selection**?
+    ///
+    /// The editor asks right after the press, to know whether an Alt-drag is a
+    /// drag of a copy: only a press that moves artwork has anything to copy. A
+    /// press on a Free Transform handle transforms instead (Alt there keeps its
+    /// own meaning), and one off the selection marquees.
+    pub(crate) fn is_moving(&self) -> bool {
+        matches!(self.gesture, Gesture::Dragging { moving: true, .. })
+    }
+
     pub fn pointer_down(
         &mut self,
         doc: Point,
@@ -412,8 +625,24 @@ impl ToolMachine {
             Clock::Wall(_) => time.unwrap_or_else(|| self.clock.now()),
         };
         self.last_screen = screen;
+        // **The transformation point belongs to Free Transform alone.** The
+        // Selection tool is Animate's arrow: it picks and it moves, and has no
+        // white circle to grab.
+        if self.tool == ToolId::FreeTransform
+            && let Some(frame) = ctx.selection_box
+        {
+            let pivot = ctx.pivot.unwrap_or_else(|| frame.center());
+            let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+            if transform_zone(frame, pivot, doc, grab) == TransformZone::Pivot {
+                self.begin_pivot_drag(doc, screen, pivot);
+                return ToolAction::None;
+            }
+        }
         match self.tool {
-            ToolId::Pencil | ToolId::Brush | ToolId::Eraser | ToolId::Lasso
+            ToolId::Pencil
+            | ToolId::Brush
+            | ToolId::Eraser
+            | ToolId::Lasso
             | ToolId::MotionPath => {
                 self.gesture = Gesture::Freehand {
                     samples: vec![sample_at(doc, now, pressure)],
@@ -424,6 +653,35 @@ impl ToolMachine {
             // falls through to ordinary selection behaviour.
             ToolId::Subselection => {
                 let tolerance = ANCHOR_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+                let selected = |element: usize| ctx.selected_anchors.contains(&element);
+
+                // **A tangent handle first.** Only a selected anchor shows
+                // its handles, so only those can be grabbed; and they are
+                // tried before the anchors because a handle pulled in close
+                // to its anchor would otherwise be unreachable.
+                let handle = ctx
+                    .handles
+                    .iter()
+                    .filter(|h| selected(h.element))
+                    .map(|h| (h, (h.point - doc).hypot()))
+                    .filter(|(_, d)| *d <= tolerance)
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(h, _)| *h);
+                if let Some(h) = handle {
+                    self.gesture = Gesture::Handle {
+                        element: h.element,
+                        side: h.side,
+                        smooth: h.smooth,
+                        mirror: h.smooth && !mods.alt,
+                        handle_at: h.point,
+                        origin: doc,
+                        origin_screen: screen,
+                        current: doc,
+                        dragged: false,
+                    };
+                    return ToolAction::None;
+                }
+
                 let grabbed = ctx
                     .anchors
                     .iter()
@@ -432,19 +690,71 @@ impl ToolMachine {
                     .min_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(a, _)| *a);
 
-                self.gesture = match grabbed {
-                    Some(anchor) => Gesture::Anchor {
-                        element: anchor.element,
+                if let Some(anchor) = grabbed {
+                    let element = anchor.element;
+                    // **Alt on a corner pulls handles out of it** — an anchor
+                    // with none, which is a corner by definition.
+                    if mods.alt && !ctx.handles.iter().any(|h| h.element == element) {
+                        self.gesture = Gesture::Pull {
+                            element,
+                            anchor_at: anchor.point,
+                            origin: doc,
+                            origin_screen: screen,
+                            current: doc,
+                            dragged: false,
+                        };
+                        return ToolAction::SelectAnchors {
+                            elements: vec![element],
+                            mode: AnchorSelect::Replace,
+                        };
+                    }
+
+                    // **What the press selects, and what the drag carries.**
+                    // Pressing an unselected anchor selects it (alone, or
+                    // added with Shift) and carries it; pressing a selected
+                    // one keeps the selection, so the whole set moves.
+                    // Whether a *click* then narrows it is left to the
+                    // release, when it is known to have been one.
+                    let was = selected(element);
+                    let everything = || ctx.selected_anchors.to_vec();
+                    let (moving, on_press, on_click) = match (mods.shift, was) {
+                        (true, true) => (everything(), None, Some(AnchorSelect::Toggle)),
+                        (true, false) => {
+                            let mut all = everything();
+                            all.push(element);
+                            (all, Some(AnchorSelect::Add), None)
+                        }
+                        (false, true) => (
+                            everything(),
+                            None,
+                            (ctx.selected_anchors.len() > 1).then_some(AnchorSelect::Replace),
+                        ),
+                        (false, false) => (vec![element], Some(AnchorSelect::Replace), None),
+                    };
+                    self.gesture = Gesture::Anchor {
+                        element,
                         origin: doc,
+                        origin_screen: screen,
                         current: doc,
-                    },
-                    None => Gesture::Dragging {
-                        origin: doc,
-                        current: doc,
-                        mods,
-                        moving: self.begins_a_move(doc, ctx),
-                        transforming: self.begins_a_transform(doc, ctx),
-                    },
+                        moving,
+                        on_click,
+                        dragged: false,
+                    };
+                    return match on_press {
+                        Some(mode) => ToolAction::SelectAnchors {
+                            elements: vec![element],
+                            mode,
+                        },
+                        None => ToolAction::None,
+                    };
+                }
+
+                self.gesture = Gesture::Dragging {
+                    origin: doc,
+                    current: doc,
+                    mods,
+                    moving: self.begins_a_move(doc, ctx),
+                    transforming: self.begins_a_transform(doc, ctx),
                 };
             }
             _ => {
@@ -472,57 +782,62 @@ impl ToolMachine {
         ) {
             return false;
         }
-        let Some(bounds) = ctx.selection_bounds else {
+        let Some(frame) = ctx.selection_box else {
             return false;
         };
-        // Which point counts as "the transformation point" is per tool, and
-        // matches what `finish_drag` does with it. Free Transform always draws
-        // one, falling back to the centre. The selection tools can only grab a
-        // point that actually exists — without one the centre of a selection is
-        // ordinary artwork, and a press there moves it like anywhere else.
+        // Only Free Transform has a transformation point and handles; it
+        // always draws the point, falling back to the centre.
+        //
+        // **The Selection and Subselection tools have no point and no
+        // handles**: they are Animate's arrows, and a press that lands in the
+        // box moves what is in it, whatever part of the box that is. (The editor only hands it a box
+        // when the press is on a selected object — see `Editor::pointer_down_at`.)
         let pivot = match (self.tool, ctx.pivot) {
-            (ToolId::FreeTransform, p) => p.unwrap_or_else(|| bounds.center()),
-            (_, Some(p)) => p,
-            (_, None) => return contains(bounds, at),
+            (ToolId::Selection | ToolId::Subselection, _) => return frame.contains(at),
+            (ToolId::FreeTransform, p) => p.unwrap_or_else(|| frame.center()),
+            _ => return false,
         };
         let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
         if !matches!(
-            transform_zone(bounds, pivot, at, grab),
+            transform_zone(frame, pivot, at, grab),
             TransformZone::Inside
         ) {
             return false;
         }
         // `Inside` means "on none of the handles", which is also true of empty
-        // stage far from the selection — and a drag out there is a marquee.
-        // Free Transform has no marquee, so anywhere off its handles moves.
-        self.tool == ToolId::FreeTransform || contains(bounds, at)
+        // stage far from the selection. The box check distinguishes an
+        // artwork move from an exterior marquee — and it is the *turned* box,
+        // so the empty corner of the rectangle round a rotated object is
+        // outside the selection, as it is in Animate.
+        frame.contains(at)
     }
 
     /// Which part of the gizmo a press at `at` grabbed, if any.
     ///
-    /// **The whole gizmo, from every tool that shows it.** Corners scale, the
+    /// **The whole gizmo, and only Free Transform has it.** Corners scale, the
     /// mid-edge handles squeeze one dimension, the edges either side of them
-    /// skew and the ring outside a corner turns — for the selection
-    /// tools as well as Free Transform, because the handles are drawn for all
-    /// of them and a handle you can see and cannot use is worse than none.
+    /// skew and the ring outside a corner turns.
+    ///
+    /// The Selection tool used to share it, which is not what Animate's arrow
+    /// does: it draws no handles, and a drag anywhere on a selection but inside
+    /// it is a marquee. Handles that are not drawn must not be there to grab.
     ///
     /// Asked once at the press, where the answer is still true: the artwork
     /// moves under the pointer from the next step onwards.
     fn begins_a_transform(&self, at: Point, ctx: &ToolContext<'_>) -> Option<Transforming> {
-        if !matches!(
-            self.tool,
-            ToolId::Selection | ToolId::Subselection | ToolId::FreeTransform
-        ) {
+        // Subselection's visible chrome is the path anchors.  It deliberately
+        // has no transform box, so do not let an invisible box steal a press
+        // from anchor editing (or turn an inside drag into a scale).
+        if self.tool != ToolId::FreeTransform {
             return None;
         }
-        let bounds = ctx.selection_bounds?;
-        let pivot = match (self.tool, ctx.pivot) {
-            (ToolId::FreeTransform, p) => p.unwrap_or_else(|| bounds.center()),
-            (_, Some(p)) => p,
-            (_, None) => return None,
-        };
+        let frame = ctx.selection_box?;
+        // A fresh selection may not have a stored pivot yet, but its visible
+        // corner handles must still work; Animate uses the box centre until
+        // the pivot is explicitly moved.
+        let pivot = ctx.pivot.unwrap_or_else(|| frame.center());
         let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
-        let zone = transform_zone(bounds, pivot, at, grab);
+        let zone = transform_zone(frame, pivot, at, grab);
         matches!(
             zone,
             TransformZone::Rotate
@@ -533,7 +848,7 @@ impl ToolMachine {
         .then_some(Transforming {
             zone,
             pivot,
-            bounds,
+            frame,
             applied: Affine::IDENTITY,
         })
     }
@@ -545,8 +860,15 @@ impl ToolMachine {
     /// point: the gizmo is drawn *outside* the artwork, so a handle can sit over
     /// another object, and reaching for the handle to resize must not pick that
     /// object up instead. A press that grabs the gizmo is left for the gizmo.
+    /// Only Free Transform has one.
     pub fn press_on_gizmo(&self, at: Point, ctx: &ToolContext<'_>) -> bool {
         self.begins_a_transform(at, ctx).is_some()
+            || (self.tool == ToolId::FreeTransform
+                && ctx.selection_box.is_some_and(|frame| {
+                    let pivot = ctx.pivot.unwrap_or_else(|| frame.center());
+                    transform_zone(frame, pivot, at,
+                        TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE)) == TransformZone::Pivot
+                }))
     }
 
     pub fn pointer_move(&mut self, doc: Point, screen: Point, mods: Mods) -> ToolAction {
@@ -583,9 +905,89 @@ impl ToolMachine {
 
         match &mut self.gesture {
             Gesture::Idle => ToolAction::None,
-            Gesture::Anchor { current, .. } => {
-                *current = doc;
+            Gesture::Pivot { origin, pivot, current, .. } => {
+                *current = *pivot + (doc - *origin);
                 ToolAction::None
+            }
+            // **The path is reshaped under the pointer.** An anchor drag used
+            // to be committed on release, with nothing on screen to say what
+            // it would do. Applied by the step since the last move, as a
+            // selection move is, and folded into one undo step by
+            // `end_gesture`. Nothing happens until the pointer has gone far
+            // enough to be a drag, so a click does not nudge the anchor.
+            Gesture::Anchor {
+                origin_screen,
+                current,
+                moving,
+                dragged,
+                ..
+            } => {
+                if !*dragged && (screen - *origin_screen).hypot() <= CLICK_SLOP_PX {
+                    return ToolAction::None;
+                }
+                *dragged = true;
+                let delta = doc - *current;
+                *current = doc;
+                if delta.hypot() > 0.0 {
+                    ToolAction::MoveAnchors {
+                        elements: moving.clone(),
+                        delta,
+                    }
+                } else {
+                    ToolAction::None
+                }
+            }
+            Gesture::Handle {
+                element,
+                side,
+                smooth,
+                mirror,
+                handle_at,
+                origin,
+                origin_screen,
+                current,
+                dragged,
+            } => {
+                if !*dragged && (screen - *origin_screen).hypot() <= CLICK_SLOP_PX {
+                    return ToolAction::None;
+                }
+                *dragged = true;
+                // Alt breaks the point: this handle goes alone.
+                let wants = *smooth && !mods.alt;
+                // Absolute, so repeating the last step is harmless — but it
+                // need not be sent.
+                if doc == *current && wants == *mirror {
+                    return ToolAction::None;
+                }
+                *current = doc;
+                *mirror = wants;
+                ToolAction::MoveHandle {
+                    element: *element,
+                    side: *side,
+                    to: *handle_at + (doc - *origin),
+                    mirror: wants,
+                }
+            }
+            Gesture::Pull {
+                element,
+                anchor_at,
+                origin,
+                origin_screen,
+                current,
+                dragged,
+            } => {
+                if !*dragged && (screen - *origin_screen).hypot() <= CLICK_SLOP_PX {
+                    return ToolAction::None;
+                }
+                *dragged = true;
+                if doc == *current {
+                    return ToolAction::None;
+                }
+                *current = doc;
+                ToolAction::PullHandles {
+                    element: *element,
+                    to: *anchor_at + (doc - *origin),
+                }
             }
             Gesture::Freehand { samples, .. } => {
                 // Drop samples that add nothing, so a slow drag does not build
@@ -694,14 +1096,88 @@ impl ToolMachine {
 
         match gesture {
             Gesture::Idle => ToolAction::None,
+            Gesture::Pivot { origin, origin_screen, pivot, .. } => {
+                if (screen - origin_screen).hypot() <= CLICK_SLOP_PX {
+                    if self.tool == ToolId::FreeTransform {
+                        ToolAction::ResetTransformPoint
+                    } else {
+                        ToolAction::None
+                    }
+                } else {
+                    ToolAction::SetTransformPoint { at: pivot + (doc - origin) }
+                }
+            }
             Gesture::Anchor {
-                element, origin, ..
+                element,
+                origin_screen,
+                current,
+                moving,
+                on_click,
+                dragged,
+                ..
             } => {
-                let delta = doc - origin;
+                if !dragged && (screen - origin_screen).hypot() <= CLICK_SLOP_PX {
+                    // A click: it may narrow or toggle the selection.
+                    return match on_click {
+                        Some(mode) => ToolAction::SelectAnchors {
+                            elements: vec![element],
+                            mode,
+                        },
+                        None => ToolAction::None,
+                    };
+                }
+                // The last step, if the release came with no move after it.
+                let delta = doc - current;
                 if delta.hypot() <= f64::EPSILON {
                     ToolAction::None
                 } else {
-                    ToolAction::MoveAnchor { element, delta }
+                    ToolAction::MoveAnchors {
+                        elements: moving,
+                        delta,
+                    }
+                }
+            }
+            Gesture::Handle {
+                element,
+                side,
+                mirror,
+                handle_at,
+                origin,
+                origin_screen,
+                current,
+                dragged,
+                ..
+            } => {
+                if (!dragged && (screen - origin_screen).hypot() <= CLICK_SLOP_PX)
+                    || doc == current
+                {
+                    ToolAction::None
+                } else {
+                    ToolAction::MoveHandle {
+                        element,
+                        side,
+                        to: handle_at + (doc - origin),
+                        mirror,
+                    }
+                }
+            }
+            Gesture::Pull {
+                element,
+                anchor_at,
+                origin,
+                origin_screen,
+                current,
+                dragged,
+            } => {
+                if (!dragged && (screen - origin_screen).hypot() <= CLICK_SLOP_PX)
+                    || doc == current
+                {
+                    ToolAction::None
+                } else {
+                    ToolAction::PullHandles {
+                        element,
+                        to: anchor_at + (doc - origin),
+                    }
                 }
             }
             Gesture::Freehand { mut samples, mods } => {
@@ -734,9 +1210,12 @@ impl ToolMachine {
     pub fn preview(&self, ctx: &ToolContext<'_>) -> Preview {
         match &self.gesture {
             Gesture::Idle => Preview::None,
-            // The stage already draws anchors for the selected path; a
-            // rubber-band line here would just add noise.
-            Gesture::Anchor { .. } => Preview::None,
+            Gesture::Pivot { current, .. } => Preview::Pivot(*current),
+            // The path itself is reshaped as the pointer moves and the stage
+            // draws its anchors and handles, so there is no outline to add.
+            Gesture::Anchor { .. } | Gesture::Handle { .. } | Gesture::Pull { .. } => {
+                Preview::None
+            }
             Gesture::Freehand { samples, .. } => match self.tool {
                 // The lasso previews the region it is enclosing, closed, so the
                 // user can see what is about to be caught rather than only the
@@ -861,21 +1340,21 @@ impl ToolMachine {
                 // as it decides what the release commits — the pointer's shape
                 // there is the promise, and the preview has to keep it.
                 ToolId::FreeTransform | ToolId::Selection | ToolId::Subselection => {
-                    let zone = match (ctx.pivot, ctx.selection_bounds) {
-                        (Some(pivot), Some(bounds)) => {
+                    // Only Free Transform has a gizmo. The Selection and
+                    // Subselection tools — Animate's arrows — have no handles,
+                    // ring or transformation point, so their drags are always
+                    // the rubber band.
+                    let zone = match (ctx.pivot, ctx.selection_box) {
+                        (Some(pivot), Some(frame)) if self.tool == ToolId::FreeTransform => {
                             let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
-                            Some((pivot, bounds, transform_zone(bounds, pivot, *origin, grab)))
+                            Some((pivot, frame, transform_zone(frame, pivot, *origin, grab)))
                         }
                         _ => None,
                     };
-                    // A marquee everywhere the tools do not transform.
-                    let marquee = || {
-                        if self.tool == ToolId::FreeTransform {
-                            Preview::None
-                        } else {
-                            Preview::Marquee(Rect::from_points(*origin, *current))
-                        }
-                    };
+                    // A marquee everywhere the tools do not transform —
+                    // Free Transform included, so its drags preview the
+                    // same rubber band as Selection's.
+                    let marquee = || Preview::Marquee(Rect::from_points(*origin, *current));
                     match zone {
                         Some((_, _, TransformZone::Pivot)) => Preview::Pivot(*current),
 
@@ -884,30 +1363,27 @@ impl ToolMachine {
                         // will happen rather than a second approximation of it.
                         // Nothing is edited until the pointer comes up, so the
                         // whole drag is still one undo step.
-                        Some((pivot, _, TransformZone::Rotate)) => Preview::Transform(
-                            rotate_about(pivot, *origin, *current, mods.shift),
-                        ),
-                        Some((pivot, bounds, TransformZone::Corner))
-                            if self.tool == ToolId::FreeTransform =>
-                        {
-                            Preview::Transform(if mods.alt {
-                                scale_about(pivot, bounds, *origin, *current, mods.shift)
-                            } else {
-                                scale_about_corner(bounds, *origin, *current, mods.shift)
-                            })
-                        }
-                        Some((pivot, bounds, TransformZone::Side(horizontal)))
-                            if self.tool == ToolId::FreeTransform =>
-                        {
-                            Preview::Transform(scale_about_side(
-                                pivot, bounds, *origin, *current, horizontal, *mods,
+                        //
+                        // A rotation goes through `transform_in_frame` as well,
+                        // since Alt turns it about a corner of the box rather
+                        // than about the transformation point.
+                        Some((pivot, frame, zone @ TransformZone::Rotate)) => {
+                            Preview::Transform(transform_in_frame(
+                                zone, pivot, frame, *origin, *current, *mods,
                             ))
                         }
-                        Some((pivot, bounds, TransformZone::Edge(horizontal)))
+                        //
+                        // Corner, side and edge all go through
+                        // `transform_in_frame`, so they are worked out in the
+                        // box's own axes here exactly as on the move that
+                        // commits them.
+                        Some((pivot, frame, zone @ TransformZone::Corner))
+                        | Some((pivot, frame, zone @ TransformZone::Side(_)))
+                        | Some((pivot, frame, zone @ TransformZone::Edge(_)))
                             if self.tool == ToolId::FreeTransform =>
                         {
-                            Preview::Transform(skew_about(
-                                pivot, bounds, *origin, *current, horizontal,
+                            Preview::Transform(transform_in_frame(
+                                zone, pivot, frame, *origin, *current, *mods,
                             ))
                         }
 
@@ -993,10 +1469,8 @@ impl ToolMachine {
                     }
                     return ToolAction::AddArtwork { pieces, label };
                 }
-                let frames = buzz_scene::wave_loop(
-                    ctx.style.brush.wave,
-                    &wave_stroke(&samples, ctx.style),
-                );
+                let frames =
+                    buzz_scene::wave_loop(ctx.style.brush.wave, &wave_stroke(&samples, ctx.style));
                 if frames.iter().all(Vec::is_empty) {
                     return ToolAction::None;
                 }
@@ -1009,7 +1483,10 @@ impl ToolMachine {
                     return ToolAction::None;
                 }
                 ToolAction::AddArtwork {
-                    pieces: shapes.into_iter().map(buzz_scene::ArtPiece::Shape).collect(),
+                    pieces: shapes
+                        .into_iter()
+                        .map(buzz_scene::ArtPiece::Shape)
+                        .collect(),
                     label: "Brush",
                 }
             }
@@ -1082,24 +1559,6 @@ impl ToolMachine {
             return ToolAction::None;
         }
 
-        // **The transformation point can be dragged with the selection tools
-        // too**, not only with Free Transform.
-        //
-        // A deviation from Animate, and a deliberate one: the point is what a
-        // rotation, a skew and an Alt-scale all turn about, and having to
-        // change tools to move it — then change back to carry on selecting —
-        // is a step nobody thanks you for. Only a **drag** counts, so clicking
-        // the middle of a shape still selects and moves it as before.
-        if matches!(self.tool, ToolId::Selection | ToolId::Subselection)
-            && !was_click
-            && let Some(pivot) = ctx.pivot
-            && ctx.selection_bounds.is_some()
-            && (origin - pivot).hypot()
-                <= (TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE)) * 1.5
-        {
-            return ToolAction::SetTransformPoint { at: end };
-        }
-
         match self.tool {
             // Animate's Gradient Transform: grab a grip and the ramp follows.
             // With nothing gradient-filled selected it selects, so picking the
@@ -1126,27 +1585,28 @@ impl ToolMachine {
                     };
                 }
 
-                // **Rotating without changing tools.**
+                // **A marquee over a sub-selected path selects its anchors.**
                 //
-                // `preview` has drawn this rotation for the whole drag — the
-                // ring just outside a corner is the same one Free Transform
-                // uses, and the pointer turns there — but the release used to
-                // fall straight through to a marquee, so the artwork snapped
-                // back and the selection was replaced by whatever the rubber
-                // band had swept. A preview that promises something the release
-                // does not do is worse than no preview, and this is the file
-                // that says so.
-                //
-                // Committed by the same `rotate_about` the preview called, so
-                // the two cannot drift apart.
-                if let Some((pivot, bounds)) = ctx.pivot.zip(ctx.selection_bounds) {
-                    let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
-                    if matches!(
-                        transform_zone(bounds, pivot, origin, grab),
-                        TransformZone::Rotate
-                    ) {
-                        return ToolAction::TransformSelection {
-                            transform: rotate_about(pivot, origin, end, mods.shift),
+                // Only when it catches some: one that sweeps none is still a
+                // marquee over *objects*, so choosing another shape does not
+                // need a trip back to the Selection tool. Shift adds to the
+                // anchors already selected, as it does for objects.
+                if self.tool == ToolId::Subselection {
+                    let rect = Rect::from_points(origin, end);
+                    let inside: Vec<usize> = ctx
+                        .anchors
+                        .iter()
+                        .filter(|a| rect.contains(a.point))
+                        .map(|a| a.element)
+                        .collect();
+                    if !inside.is_empty() {
+                        return ToolAction::SelectAnchors {
+                            elements: inside,
+                            mode: if mods.shift {
+                                AnchorSelect::Add
+                            } else {
+                                AnchorSelect::Replace
+                            },
                         };
                     }
                 }
@@ -1160,20 +1620,31 @@ impl ToolMachine {
             }
 
             ToolId::FreeTransform => {
-                let Some(bounds) = ctx.selection_bounds else {
-                    return ToolAction::PickAt {
-                        point: end,
-                        additive: false,
+                let Some(frame) = ctx.selection_box else {
+                    // No selection under the drag: a *click* picks one object,
+                    // but a drag is a marquee — Animate's Free Transform
+                    // rubber-bands the same way the Selection tool does, so
+                    // the box the user drew is the box that selects.
+                    if was_click {
+                        return ToolAction::PickAt {
+                            point: end,
+                            additive: false,
+                        };
+                    }
+                    return ToolAction::PickInRect {
+                        rect: Rect::from_points(origin, end),
+                        additive: mods.shift,
                     };
                 };
-                let pivot = ctx.pivot.unwrap_or_else(|| bounds.center());
+                let pivot = ctx.pivot.unwrap_or_else(|| frame.center());
                 let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
 
                 // Which part of the gizmo the drag *started* on decides what
                 // it does, exactly as in Animate: the pointer's shape there is
                 // the promise, and changing the answer half way through a drag
                 // would break it.
-                match transform_zone(bounds, pivot, origin, grab) {
+                let zone = transform_zone(frame, pivot, origin, grab);
+                match zone {
                     TransformZone::Pivot => {
                         if was_click {
                             // A click on the circle without moving it means
@@ -1209,26 +1680,23 @@ impl ToolMachine {
                         point: end,
                         additive: mods.shift,
                     },
-                    TransformZone::Corner => ToolAction::TransformSelection {
-                        transform: if mods.alt {
-                            // Animate's Alt: scale about the transformation
-                            // point rather than the opposite corner.
-                            scale_about(pivot, bounds, origin, end, mods.shift)
-                        } else {
-                            scale_about_corner(bounds, origin, end, mods.shift)
-                        },
+                    // Rotate, corner, side and edge are the one function the
+                    // preview and every live move call, so a release cannot
+                    // disagree with them about the box's own axes.
+                    TransformZone::Corner
+                    | TransformZone::Rotate
+                    | TransformZone::Side(_)
+                    | TransformZone::Edge(_) => ToolAction::TransformSelection {
+                        transform: transform_in_frame(zone, pivot, frame, origin, end, mods),
                     },
-                    TransformZone::Rotate => ToolAction::TransformSelection {
-                        transform: rotate_about(pivot, origin, end, mods.shift),
+                    // A move is already applied move by move; see the early
+                    // return above. Anything that still reads "drag began
+                    // inside the selection" is a marquee, so the box selects
+                    // rather than the release being a no-op.
+                    TransformZone::Inside => ToolAction::PickInRect {
+                        rect: Rect::from_points(origin, end),
+                        additive: mods.shift,
                     },
-                    TransformZone::Side(horizontal) => ToolAction::TransformSelection {
-                        transform: scale_about_side(pivot, bounds, origin, end, horizontal, mods),
-                    },
-                    TransformZone::Edge(horizontal) => ToolAction::TransformSelection {
-                        transform: skew_about(pivot, bounds, origin, end, horizontal),
-                    },
-                    // Already applied move by move; see the early return above.
-                    TransformZone::Inside => ToolAction::None,
                 }
             }
 
@@ -1705,7 +2173,7 @@ pub(crate) const TRANSFORM_GRAB_PX: f64 = 8.0;
 
 /// Which part of the Free Transform gizmo a drag started on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransformZone {
+pub(crate) enum TransformZone {
     /// The transformation point itself.
     Pivot,
     /// A corner handle: scale.
@@ -1774,30 +2242,104 @@ pub fn grip_at(
 /// and asking `self` for it while the gesture is mutably borrowed is a borrow
 /// the compiler is right to refuse.
 fn transform_for(t: &Transforming, origin: Point, end: Point, mods: Mods) -> Affine {
-    match t.zone {
-        TransformZone::Rotate => rotate_about(t.pivot, origin, end, mods.shift),
+    transform_in_frame(t.zone, t.pivot, t.frame, origin, end, mods)
+}
+
+/// The transform a drag on `zone` asks for, **worked out in the box's own
+/// axes** and handed back on the focal plane.
+///
+/// One function for the live preview, every live move and the release, so the
+/// three cannot disagree about which way is "along the object's width".
+///
+/// # Why a scale is not computed on the focal plane
+///
+/// `scale_about_corner`, `scale_about_side` and `skew_about` all scale or shear
+/// along x and y. On a box turned 30 degrees those are not the box's own
+/// directions, and a stretch along world x shears the rectangle into a rhombus.
+/// So the pointer and the pivot are carried into the box's own space (`Fi`), the
+/// existing functions are run there against `box.local`, and the answer is
+/// carried back out: `F * T_local * Fi`. Corners then hold the opposite corner
+/// of the *turned* box, Shift keeps the proportions along its own axes, and a
+/// side handle stretches only the object's own width or height.
+///
+/// A rotation needs none of that — a turn is the same in any frame — and is
+/// worked out on the focal plane as it always was. With a box that is not turned
+/// the maths below is skipped altogether, so that case is exactly what it was.
+///
+/// **Alt turns about the opposite corner**, as in Animate: the corner of the
+/// (turned) box furthest from where the drag began stays where it is, and the
+/// transformation point is left out of it. Shift still snaps the turn to 45
+/// degrees. Alt's other meaning — scale about the point — is unchanged below.
+fn transform_in_frame(
+    zone: TransformZone,
+    pivot: Point,
+    frame: TransformBox,
+    origin: Point,
+    end: Point,
+    mods: Mods,
+) -> Affine {
+    if matches!(zone, TransformZone::Pivot | TransformZone::Inside) {
+        return Affine::IDENTITY;
+    }
+    if zone == TransformZone::Rotate {
+        let about = if mods.alt {
+            opposite_corner(frame, origin)
+        } else {
+            pivot
+        };
+        return rotate_about(about, origin, end, mods.shift);
+    }
+
+    let turned = frame.to_doc != Affine::IDENTITY;
+    let back = if turned {
+        let c = frame.to_doc.as_coeffs();
+        let det = c[0] * c[3] - c[1] * c[2];
+        // A singular box has no axes to work in, and nothing to scale.
+        if !(det.abs() > 0.0 && det.is_finite()) {
+            return Affine::IDENTITY;
+        }
+        frame.to_doc.inverse()
+    } else {
+        Affine::IDENTITY
+    };
+    let (origin, end, pivot) = if turned {
+        (back * origin, back * end, back * pivot)
+    } else {
+        (origin, end, pivot)
+    };
+
+    let local = frame.local;
+    let t = match zone {
         TransformZone::Corner => {
             if mods.alt {
-                scale_about(t.pivot, t.bounds, origin, end, mods.shift)
+                scale_about(pivot, local, origin, end, mods.shift)
             } else {
-                scale_about_corner(t.bounds, origin, end, mods.shift)
+                scale_about_corner(local, origin, end, mods.shift)
             }
         }
         TransformZone::Side(horizontal) => {
-            scale_about_side(t.pivot, t.bounds, origin, end, horizontal, mods)
+            scale_about_side(pivot, local, origin, end, horizontal, mods)
         }
-        TransformZone::Edge(horizontal) => skew_about(t.pivot, t.bounds, origin, end, horizontal),
-        TransformZone::Pivot | TransformZone::Inside => Affine::IDENTITY,
+        TransformZone::Edge(horizontal) => skew_about(pivot, local, origin, end, horizontal),
+        TransformZone::Rotate | TransformZone::Pivot | TransformZone::Inside => Affine::IDENTITY,
+    };
+    if turned {
+        frame.to_doc * t * back
+    } else {
+        t
     }
 }
 
-fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> TransformZone {
-    let corners = [
-        Point::new(bounds.x0, bounds.y0),
-        Point::new(bounds.x1, bounds.y0),
-        Point::new(bounds.x1, bounds.y1),
-        Point::new(bounds.x0, bounds.y1),
-    ];
+pub(crate) fn transform_zone(
+    frame: TransformBox,
+    pivot: Point,
+    at: Point,
+    grab: f64,
+) -> TransformZone {
+    // Everything below is measured on the focal plane, against the box's
+    // *turned* corners and edges — with a box that is not turned they are the
+    // axis-aligned ones, and the answers are the ones this has always given.
+    let corners = frame.corners();
     let nearest = corners
         .iter()
         .map(|c| (*c - at).hypot())
@@ -1824,7 +2366,7 @@ fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> Transform
     }
     // Animate's rotate ring: just *outside* a corner, where the pointer turns
     // into the rotation cursor.
-    if nearest <= grab * 3.0 && !contains(bounds, at) {
+    if nearest <= grab * 3.0 && !frame.contains(at) {
         return TransformZone::Rotate;
     }
 
@@ -1833,34 +2375,53 @@ fn transform_zone(bounds: Rect, pivot: Point, at: Point, grab: f64) -> Transform
     // on, so the handle wins over the skew zone it overlaps: a square you can
     // see is a promise that grabbing it does one thing, and the line either
     // side of it is where the other one lives.
-    let mid = bounds.center();
-    for (p, horizontal) in [
-        (Point::new(mid.x, bounds.y0), true),
-        (Point::new(mid.x, bounds.y1), true),
-        (Point::new(bounds.x0, mid.y), false),
-        (Point::new(bounds.x1, mid.y), false),
-    ] {
+    //
+    // `true` is the box's own top or bottom, however far it has turned.
+    let [top, bottom, left, right] = frame.mid_edges();
+    for (p, horizontal) in [(top, true), (bottom, true), (left, false), (right, false)] {
         if (p - at).hypot() <= grab {
             return TransformZone::Side(horizontal);
         }
     }
 
-    // An edge, but not near a corner: skew along it.
-    let near_vertical_edge = ((at.x - bounds.x0).abs() <= grab || (at.x - bounds.x1).abs() <= grab)
-        && at.y > bounds.y0 + grab
-        && at.y < bounds.y1 - grab;
-    let near_horizontal_edge = ((at.y - bounds.y0).abs() <= grab
-        || (at.y - bounds.y1).abs() <= grab)
-        && at.x > bounds.x0 + grab
-        && at.x < bounds.x1 - grab;
-    if near_horizontal_edge {
+    // An edge, but not near a corner: skew along it. The distance to the edge
+    // *segment*, with `grab` shaved off each end so the corners win — the top
+    // and bottom first, as they always were.
+    let near_edge = |from: Point, to: Point| {
+        let along = to - from;
+        let length = along.hypot();
+        if length < 1e-12 {
+            return false;
+        }
+        let unit = along / length;
+        let rel = at - from;
+        let reach = rel.dot(unit);
+        let off = rel.cross(unit).abs();
+        off <= grab && reach > grab && reach < length - grab
+    };
+    if near_edge(corners[0], corners[1]) || near_edge(corners[3], corners[2]) {
         return TransformZone::Edge(true);
     }
-    if near_vertical_edge {
+    if near_edge(corners[0], corners[3]) || near_edge(corners[1], corners[2]) {
         return TransformZone::Edge(false);
     }
 
     TransformZone::Inside
+}
+
+/// The corner of the box opposite the one nearest `at` — what an Alt-rotation
+/// holds still. Measured on the focal plane against the box's turned corners, so
+/// "opposite" is the box's own opposite however far it has turned.
+fn opposite_corner(frame: TransformBox, at: Point) -> Point {
+    let corners = frame.corners();
+    let nearest = (0..4)
+        .min_by(|&a, &b| {
+            (corners[a] - at)
+                .hypot()
+                .total_cmp(&(corners[b] - at).hypot())
+        })
+        .unwrap_or(0);
+    corners[(nearest + 2) % 4]
 }
 
 /// The angle a drag has swept about `pivot`, snapped to 45 degrees with Shift.
@@ -2112,7 +2673,10 @@ mod tests {
             style,
             zoom: 1.0,
             selection_bounds: None,
+            selection_box: None,
             anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
             pivot: None,
             gradient: None,
         }
@@ -2143,7 +2707,14 @@ mod tests {
         let bounds = box_10();
         let pivot = Point::new(50.0, 50.0);
         let grab = 8.0;
-        let zone = |x: f64, y: f64| transform_zone(bounds, pivot, Point::new(x, y), grab);
+        let zone = |x: f64, y: f64| {
+            transform_zone(
+                TransformBox::axis_aligned(bounds),
+                pivot,
+                Point::new(x, y),
+                grab,
+            )
+        };
 
         assert_eq!(zone(50.0, 50.0), TransformZone::Pivot, "on the circle");
         assert_eq!(zone(0.0, 0.0), TransformZone::Corner, "on a corner");
@@ -2182,15 +2753,207 @@ mod tests {
         let pivot = bounds.center();
         let grab = 8.0;
         assert_eq!(
-            transform_zone(bounds, pivot, Point::new(0.0, 0.0), grab),
+            transform_zone(
+                TransformBox::axis_aligned(bounds),
+                pivot,
+                Point::new(0.0, 0.0),
+                grab
+            ),
             TransformZone::Corner,
             "the corner of a small box must scale, not be swallowed by the point"
         );
         assert_eq!(
-            transform_zone(bounds, pivot, pivot, grab),
+            transform_zone(TransformBox::axis_aligned(bounds), pivot, pivot, grab),
             TransformZone::Pivot,
             "the centre is still the transformation point"
         );
+    }
+
+    /// Was `selection_corner_scales_when_the_pivot_has_not_been_stored_yet`,
+    /// which asserted it of the Selection tool. The corner handles are Free
+    /// Transform's alone now (E1); the Selection tool's side of it is
+    /// `the_selection_tool_has_no_handles_and_moves_from_anywhere_in_the_box`.
+    #[test]
+    fn free_transform_corner_scales_when_the_pivot_has_not_been_stored_yet() {
+        let style = DrawStyle::default();
+        let context = ToolContext {
+            style: &style,
+            zoom: 1.0,
+            selection_bounds: Some(box_10()),
+            selection_box: Some(TransformBox::axis_aligned(box_10())),
+            anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
+            pivot: None,
+            gradient: None,
+        };
+        let mut machine = ToolMachine::new(ToolId::FreeTransform);
+        machine.pointer_down(
+            Point::new(0.0, 0.0),
+            Point::new(0.0, 0.0),
+            Mods::default(),
+            &context,
+        );
+        let action = machine.pointer_move(
+            Point::new(20.0, 20.0),
+            Point::new(20.0, 20.0),
+            Mods::default(),
+        );
+        assert!(
+            matches!(action, ToolAction::TransformSelection { .. }),
+            "a fresh selection must resize from its visible corner: {action:?}"
+        );
+        assert!(matches!(
+            machine.pointer_up(Point::new(20.0, 20.0), Point::new(20.0, 20.0), &context),
+            ToolAction::None
+        ));
+    }
+
+    // -- E1: the Selection tool is Animate's arrow ---------------------------
+
+    /// **No handle, no ring, no skew edge, no transformation point.** Every
+    /// part of the box that Free Transform reads as a gizmo is, for the
+    /// Selection tool, either part of the selection (a press moves it) or off
+    /// it (a drag is a marquee) — and nothing is ever transformed.
+    #[test]
+    fn the_selection_tool_has_no_handles_and_moves_from_anywhere_in_the_box() {
+        let style = DrawStyle::default();
+        let bounds = box_10();
+        let context = ToolContext {
+            style: &style,
+            zoom: 1.0,
+            selection_bounds: Some(bounds),
+            selection_box: Some(TransformBox::axis_aligned(bounds)),
+            anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
+            pivot: Some(bounds.center()),
+            gradient: None,
+        };
+        let step = Vec2::new(30.0, 20.0);
+
+        // Corners, mid-edge handles, the skew edges and the transformation
+        // point are all just *inside* the box to this tool: a drag moves.
+        for (what, at) in [
+            ("a corner", Point::new(0.0, 0.0)),
+            ("the other corner", Point::new(100.0, 100.0)),
+            ("a side handle", Point::new(50.0, 0.0)),
+            ("a skew edge", Point::new(75.0, 0.0)),
+            ("the transformation point", bounds.center()),
+        ] {
+            let mut m = ToolMachine::new(ToolId::Selection);
+            m.pointer_down(at, at, Mods::default(), &context);
+            let moved = m.pointer_move(at + step, at + step, Mods::default());
+            assert!(
+                matches!(moved, ToolAction::MoveSelection { delta } if delta == step),
+                "{what}: the Selection tool must move, not transform or grab the point: {moved:?}"
+            );
+            assert_eq!(
+                m.pointer_up(at + step, at + step, &context),
+                ToolAction::None,
+                "{what}: the release has nothing left to commit"
+            );
+        }
+
+        // The ring outside a corner is empty stage: a marquee, not a rotation.
+        let ring = Point::new(-12.0, -12.0);
+        let mut m = ToolMachine::new(ToolId::Selection);
+        m.pointer_down(ring, ring, Mods::default(), &context);
+        assert_eq!(
+            m.pointer_move(ring + step, ring + step, Mods::default()),
+            ToolAction::None,
+            "nothing turns under the pointer"
+        );
+        assert!(
+            matches!(m.preview(&context), Preview::Marquee(_)),
+            "the drag previews a rubber band, not a rotation"
+        );
+        assert!(
+            matches!(
+                m.pointer_up(ring + step, ring + step, &context),
+                ToolAction::PickInRect { .. }
+            ),
+            "and the release is a marquee"
+        );
+    }
+
+    /// **Animate's Subselection tool has no transformation point and no
+    /// rotation either.** It used to keep both, hidden: a drag from the
+    /// centre moved an invisible point, and a drag outside a corner turned
+    /// the artwork.
+    #[test]
+    fn the_subselection_tool_has_no_point_and_no_rotation() {
+        let style = DrawStyle::default();
+        let bounds = box_10();
+        let context = ToolContext {
+            style: &style,
+            zoom: 1.0,
+            selection_bounds: Some(bounds),
+            selection_box: Some(TransformBox::axis_aligned(bounds)),
+            anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
+            pivot: Some(bounds.center()),
+            gradient: None,
+        };
+        let step = Vec2::new(30.0, 20.0);
+
+        let centre = bounds.center();
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        m.pointer_down(centre, centre, Mods::default(), &context);
+        assert!(
+            matches!(m.pointer_move(centre + step, centre + step, Mods::default()),
+                ToolAction::MoveSelection { delta } if delta == step),
+            "a drag from the centre moves the selection"
+        );
+        assert!(
+            !matches!(m.pointer_up(centre + step, centre + step, &context), ToolAction::SetTransformPoint { .. }),
+            "and never moves a transformation point"
+        );
+
+        let ring = Point::new(-12.0, -12.0);
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        m.pointer_down(ring, ring, Mods::default(), &context);
+        m.pointer_move(ring + step, ring + step, Mods::default());
+        assert!(
+            matches!(m.preview(&context), Preview::Marquee(_)),
+            "outside a corner is a rubber band, not a rotation"
+        );
+        assert!(
+            matches!(m.pointer_up(ring + step, ring + step, &context), ToolAction::PickInRect { .. }),
+            "and the release is a marquee, not a turn"
+        );
+    }
+
+    #[test]
+    fn subselection_keeps_anchor_dragging_instead_of_grabbing_an_invisible_box() {
+        let style = DrawStyle::default();
+        let context = ToolContext {
+            style: &style,
+            zoom: 1.0,
+            selection_bounds: Some(box_10()),
+            selection_box: Some(TransformBox::axis_aligned(box_10())),
+            anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
+            pivot: None,
+            gradient: None,
+        };
+        let mut machine = ToolMachine::new(ToolId::Subselection);
+        machine.pointer_down(
+            Point::new(0.0, 0.0),
+            Point::new(0.0, 0.0),
+            Mods::default(),
+            &context,
+        );
+        assert!(matches!(
+            machine.pointer_move(
+                Point::new(20.0, 20.0),
+                Point::new(20.0, 20.0),
+                Mods::default()
+            ),
+            ToolAction::MoveSelection { .. }
+        ));
     }
 
     /// **Pressing the top handle down squashes the box and holds the bottom.**
@@ -2278,8 +3041,472 @@ mod tests {
         let bounds = box_10();
         let corner = Point::new(0.0, 0.0);
         assert_eq!(
-            transform_zone(bounds, corner, corner, 8.0),
+            transform_zone(TransformBox::axis_aligned(bounds), corner, corner, 8.0),
             TransformZone::Pivot
+        );
+    }
+
+    // -- the oriented transform box ----------------------------------------
+
+    /// A 100 x 50 box turned 30 degrees and put somewhere off the origin, so a
+    /// test cannot pass by accident of being at (0, 0).
+    fn turned_box() -> TransformBox {
+        TransformBox {
+            local: Rect::new(0.0, 0.0, 100.0, 50.0),
+            to_doc: Affine::translate((200.0, 100.0)) * Affine::rotate(30.0_f64.to_radians()),
+        }
+    }
+
+    /// The two columns of an affine's linear part — where its x and y axes go.
+    fn axes_of(a: Affine) -> (Vec2, Vec2) {
+        let c = a.as_coeffs();
+        (Vec2::new(c[0], c[1]), Vec2::new(c[2], c[3]))
+    }
+
+    /// The zone test as it was written for a rectangle, kept here word for word
+    /// so the oriented one can be held to it: with a box that is not turned the
+    /// two must agree everywhere.
+    fn zone_for_a_rectangle(bounds: Rect, pivot: Point, at: Point, grab: f64) -> TransformZone {
+        let corners = [
+            Point::new(bounds.x0, bounds.y0),
+            Point::new(bounds.x1, bounds.y0),
+            Point::new(bounds.x1, bounds.y1),
+            Point::new(bounds.x0, bounds.y1),
+        ];
+        let nearest = corners
+            .iter()
+            .map(|c| (*c - at).hypot())
+            .fold(f64::INFINITY, f64::min);
+        let to_pivot = (at - pivot).hypot();
+        if to_pivot <= grab * 1.5 && to_pivot <= nearest {
+            return TransformZone::Pivot;
+        }
+        if nearest <= grab {
+            return TransformZone::Corner;
+        }
+        if nearest <= grab * 3.0 && !contains(bounds, at) {
+            return TransformZone::Rotate;
+        }
+        let mid = bounds.center();
+        for (p, horizontal) in [
+            (Point::new(mid.x, bounds.y0), true),
+            (Point::new(mid.x, bounds.y1), true),
+            (Point::new(bounds.x0, mid.y), false),
+            (Point::new(bounds.x1, mid.y), false),
+        ] {
+            if (p - at).hypot() <= grab {
+                return TransformZone::Side(horizontal);
+            }
+        }
+        let near_vertical_edge = ((at.x - bounds.x0).abs() <= grab
+            || (at.x - bounds.x1).abs() <= grab)
+            && at.y > bounds.y0 + grab
+            && at.y < bounds.y1 - grab;
+        let near_horizontal_edge = ((at.y - bounds.y0).abs() <= grab
+            || (at.y - bounds.y1).abs() <= grab)
+            && at.x > bounds.x0 + grab
+            && at.x < bounds.x1 - grab;
+        if near_horizontal_edge {
+            return TransformZone::Edge(true);
+        }
+        if near_vertical_edge {
+            return TransformZone::Edge(false);
+        }
+        TransformZone::Inside
+    }
+
+    #[test]
+    fn oriented_zone_matches_axis_aligned_when_unrotated() {
+        let grab = 8.0;
+        for bounds in [
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            Rect::new(10.0, -20.0, 190.0, 60.0),
+            Rect::new(0.0, 0.0, 12.0, 12.0),
+        ] {
+            for pivot in [bounds.center(), Point::new(bounds.x0, bounds.y0)] {
+                let frame = TransformBox::axis_aligned(bounds);
+                for ix in -30..=30 {
+                    for iy in -30..=30 {
+                        let at = Point::new(
+                            bounds.x0 + f64::from(ix) * (bounds.width() / 20.0),
+                            bounds.y0 + f64::from(iy) * (bounds.height() / 20.0),
+                        );
+                        assert_eq!(
+                            transform_zone(frame, pivot, at, grab),
+                            zone_for_a_rectangle(bounds, pivot, at, grab),
+                            "{bounds:?} pivot {pivot:?} at {at:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rotated_box_corner_is_a_corner() {
+        let frame = turned_box();
+        let grab = 8.0;
+        let pivot = frame.center();
+
+        // A press on the turned top-right corner is a corner...
+        let tr = frame.corners()[1];
+        assert_eq!(transform_zone(frame, pivot, tr, grab), TransformZone::Corner);
+        // ...and just outside it, the rotate ring.
+        let out = tr + (tr - frame.center()).normalize() * (grab * 2.0);
+        assert_eq!(transform_zone(frame, pivot, out, grab), TransformZone::Rotate);
+
+        // The empty corner of the rectangle round the turned box is nowhere near
+        // one of its corners: it can be the ring or the middle, never a corner.
+        let aabb = frame.aabb();
+        for empty in [
+            Point::new(aabb.x0, aabb.y0),
+            Point::new(aabb.x1, aabb.y0),
+            Point::new(aabb.x1, aabb.y1),
+            Point::new(aabb.x0, aabb.y1),
+        ] {
+            let zone = transform_zone(frame, pivot, empty, grab);
+            assert!(
+                matches!(zone, TransformZone::Rotate | TransformZone::Inside),
+                "{empty:?} read as {zone:?}"
+            );
+            assert!(!frame.contains(empty), "{empty:?} is outside the box");
+        }
+
+        // The handles keep the box's own names: its local top edge is `true`.
+        let [top, _, left, _] = frame.mid_edges();
+        assert_eq!(transform_zone(frame, pivot, top, grab), TransformZone::Side(true));
+        assert_eq!(transform_zone(frame, pivot, left, grab), TransformZone::Side(false));
+        // An edge line between handles skews along that edge.
+        let along_top = frame.corners()[0] + (frame.corners()[1] - frame.corners()[0]) * 0.8;
+        assert_eq!(
+            transform_zone(frame, pivot, along_top, grab),
+            TransformZone::Edge(true)
+        );
+    }
+
+    /// A press in the empty corner of the rectangle round a turned object does
+    /// not move it; one on the object does.
+    #[test]
+    fn pressing_the_empty_corner_of_a_turned_boxs_aabb_does_not_move_it() {
+        let style = DrawStyle::default();
+        let frame = turned_box();
+        let context = ToolContext {
+            style: &style,
+            zoom: 1.0,
+            selection_bounds: Some(frame.aabb()),
+            selection_box: Some(frame),
+            anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
+            pivot: Some(frame.center()),
+            gradient: None,
+        };
+        let pivot = frame.center();
+        let empty = Point::new(frame.aabb().x0, frame.aabb().y0);
+        let on_it = pivot + Vec2::new(25.0, 5.0);
+        assert!(frame.contains(on_it) && !frame.contains(empty));
+
+        let mut machine = ToolMachine::new(ToolId::Selection);
+        machine.pointer_down(on_it, on_it, Mods::default(), &context);
+        assert!(matches!(
+            machine.pointer_move(on_it + Vec2::new(30.0, 0.0), on_it, Mods::default()),
+            ToolAction::MoveSelection { .. }
+        ));
+        machine.pointer_up(on_it, on_it, &context);
+
+        machine.pointer_down(empty, empty, Mods::default(), &context);
+        assert_eq!(
+            machine.pointer_move(empty + Vec2::new(30.0, 0.0), empty, Mods::default()),
+            ToolAction::None,
+            "the empty corner of the rectangle round it is a marquee, not a move"
+        );
+    }
+
+    #[test]
+    fn side_scale_on_rotated_box_stays_rectangular() {
+        let frame = turned_box();
+        let pivot = frame.center();
+        let (x_before, y_before) = axes_of(frame.to_doc);
+
+        // The right-hand side handle, pulled 50 outward along the box's own x.
+        let handle = frame.mid_edges()[3];
+        let out = handle + x_before * 50.0;
+        let t = transform_in_frame(
+            TransformZone::Side(false),
+            pivot,
+            frame,
+            handle,
+            out,
+            Mods::default(),
+        );
+        let (x_after, y_after) = axes_of(t * frame.to_doc);
+
+        assert!(
+            x_after.dot(y_after).abs() < 1e-9,
+            "the box must stay a rectangle, but its axes now lean by {}",
+            x_after.dot(y_after)
+        );
+        // 100 wide with the left side held: dragging the right one 50 out is 1.5x.
+        assert!(
+            (x_after.hypot() / x_before.hypot() - 1.5).abs() < 1e-9,
+            "width ratio {}",
+            x_after.hypot() / x_before.hypot()
+        );
+        assert!(
+            (y_after - y_before).hypot() < 1e-9,
+            "the box's own y axis is untouched, got {y_after:?} for {y_before:?}"
+        );
+        // And the far side stayed where it was.
+        let left = frame.mid_edges()[2];
+        assert!((t * left - left).hypot() < 1e-9, "the held side moved");
+    }
+
+    #[test]
+    fn corner_scale_on_rotated_box_holds_opposite_corner() {
+        let frame = turned_box();
+        let pivot = frame.center();
+        let (x_axis, y_axis) = axes_of(frame.to_doc);
+
+        let [tl, _, br, _] = frame.corners();
+        let end = br + x_axis * 30.0 + y_axis * 10.0;
+        let t = transform_in_frame(
+            TransformZone::Corner,
+            pivot,
+            frame,
+            br,
+            end,
+            Mods::default(),
+        );
+        assert!((t * tl - tl).hypot() < 1e-9, "the opposite corner is held");
+        assert!(
+            (t * br - end).hypot() < 1e-9,
+            "the grabbed corner follows the pointer"
+        );
+        let (x_after, y_after) = axes_of(t * frame.to_doc);
+        assert!(x_after.dot(y_after).abs() < 1e-9, "still a rectangle");
+        assert!((x_after.hypot() - 1.3).abs() < 1e-9, "130 of 100 wide");
+        assert!((y_after.hypot() - 1.2).abs() < 1e-9, "60 of 50 tall");
+
+        // Shift keeps the proportions along the box's own axes.
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        let t = transform_in_frame(TransformZone::Corner, pivot, frame, br, end, shift);
+        assert!((t * tl - tl).hypot() < 1e-9, "still held with Shift");
+        let (x_after, y_after) = axes_of(t * frame.to_doc);
+        assert!(x_after.dot(y_after).abs() < 1e-9, "still a rectangle");
+        assert!(
+            (x_after.hypot() - y_after.hypot()).abs() < 1e-9,
+            "Shift scales both of its own axes alike"
+        );
+
+        // Alt scales about the transformation point instead.
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        let t = transform_in_frame(TransformZone::Corner, pivot, frame, br, end, alt);
+        assert!((t * pivot - pivot).hypot() < 1e-9, "the point is held with Alt");
+    }
+
+    #[test]
+    fn skew_on_rotated_box_shears_along_its_own_edge() {
+        let frame = turned_box();
+        // The pivot is at the centre of the box, 25 below the top edge.
+        let pivot = frame.center();
+        let (x_before, y_before) = axes_of(frame.to_doc);
+
+        let [tl, tr, ..] = frame.corners();
+        let grab_at = tl + (tr - tl) * 0.8;
+        let end = grab_at + x_before * 20.0;
+        let t = transform_in_frame(
+            TransformZone::Edge(true),
+            pivot,
+            frame,
+            grab_at,
+            end,
+            Mods::default(),
+        );
+        let (x_after, y_after) = axes_of(t * frame.to_doc);
+
+        // The box's x axis is the line it slid along, so it does not move...
+        assert!((x_after - x_before).hypot() < 1e-9, "x axis {x_after:?}");
+        // ...its y axis leans over by the amount slid, and only along x.
+        let lean = y_after - y_before;
+        assert!(lean.cross(x_before).abs() < 1e-9, "lean {lean:?} is off the x axis");
+        assert!(
+            (lean.dot(x_before) + 20.0 / 25.0).abs() < 1e-9,
+            "20 along an edge 25 from the point is a shear of 0.8, got {}",
+            lean.dot(x_before)
+        );
+        // The grabbed point went where the pointer did; the point itself held.
+        assert!((t * grab_at - end).hypot() < 1e-9);
+        assert!((t * pivot - pivot).hypot() < 1e-9);
+    }
+
+    /// A box that is not turned must give exactly the answer the rectangle
+    /// functions give on their own — no matrix round trip in between.
+    #[test]
+    fn an_unturned_box_is_scaled_exactly_as_before() {
+        let bounds = box_10();
+        let frame = TransformBox::axis_aligned(bounds);
+        let pivot = bounds.center();
+        let (from, to) = (Point::new(100.0, 100.0), Point::new(130.0, 120.0));
+        assert_eq!(
+            transform_in_frame(TransformZone::Corner, pivot, frame, from, to, Mods::default())
+                .as_coeffs(),
+            scale_about_corner(bounds, from, to, false).as_coeffs()
+        );
+        assert_eq!(
+            transform_in_frame(
+                TransformZone::Side(true),
+                pivot,
+                frame,
+                Point::new(50.0, 100.0),
+                Point::new(50.0, 140.0),
+                Mods::default()
+            )
+            .as_coeffs(),
+            scale_about_side(
+                pivot,
+                bounds,
+                Point::new(50.0, 100.0),
+                Point::new(50.0, 140.0),
+                true,
+                Mods::default()
+            )
+            .as_coeffs()
+        );
+    }
+
+    // -- E5: Alt turns about the opposite corner ----------------------------
+
+    /// `p` swung `degrees` about `about`.
+    fn swung(about: Point, p: Point, degrees: f64) -> Point {
+        Affine::translate(about.to_vec2())
+            * Affine::rotate(degrees.to_radians())
+            * Affine::translate(-about.to_vec2())
+            * p
+    }
+
+    /// **Alt-rotate holds the corner opposite the one the drag began at.** On a
+    /// box that is turned, "opposite" is the box's own: the test is made on
+    /// every corner of a 30-degree box, and the transformation point is left
+    /// wherever it is — which, with Alt up, is what the turn is about instead.
+    #[test]
+    fn alt_rotate_turns_about_the_opposite_corner() {
+        let frame = turned_box();
+        let pivot = frame.center();
+        let corners = frame.corners();
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+
+        for (i, corner) in corners.iter().enumerate() {
+            // Just outside the corner, on the way out of the box.
+            let start = *corner + (*corner - pivot).normalize() * 20.0;
+            // Swung 40 degrees about the corner opposite the grabbed one.
+            let held = corners[(i + 2) % 4];
+            let end = swung(held, start, 40.0);
+            assert!(
+                !frame.contains(start)
+                    && transform_zone(frame, pivot, start, 8.0) == TransformZone::Rotate,
+                "corner {i}: the press is in the rotate ring"
+            );
+
+            let t = transform_in_frame(TransformZone::Rotate, pivot, frame, start, end, alt);
+            assert!(
+                (t * held - held).hypot() < 1e-9,
+                "corner {i}: the opposite corner stays put"
+            );
+            assert!(
+                (t * pivot - pivot).hypot() > 1.0,
+                "corner {i}: the transformation point is not what it turns about"
+            );
+            let (x, y) = axes_of(t);
+            assert!(
+                (x.y.atan2(x.x) - 40.0_f64.to_radians()).abs() < 1e-9 && x.dot(y).abs() < 1e-9,
+                "corner {i}: a pure 40 degree turn, got {x:?}"
+            );
+
+            // Without Alt the very same drag turns about the point.
+            let plain =
+                transform_in_frame(TransformZone::Rotate, pivot, frame, start, end, Mods::default());
+            assert!(
+                (plain * pivot - pivot).hypot() < 1e-9,
+                "corner {i}: the plain turn holds the transformation point"
+            );
+            assert!(
+                (plain * held - held).hypot() > 1.0,
+                "corner {i}: and does not hold the corner"
+            );
+        }
+
+        // Shift still snaps the turn to 45 degrees.
+        let start = corners[1] + (corners[1] - pivot).normalize() * 20.0;
+        let held = corners[3];
+        let end = swung(held, start, 40.0);
+        let both = Mods {
+            alt: true,
+            shift: true,
+            ..Mods::default()
+        };
+        let t = transform_in_frame(TransformZone::Rotate, pivot, frame, start, end, both);
+        let c = t.as_coeffs();
+        assert!(
+            (c[1].atan2(c[0]) - std::f64::consts::FRAC_PI_4).abs() < 1e-9,
+            "40 degrees snaps to 45, got {}",
+            c[1].atan2(c[0]).to_degrees()
+        );
+        assert!((t * held - held).hypot() < 1e-9, "still about the corner");
+    }
+
+    /// The machine turns the live drag about the opposite corner with Alt held —
+    /// the step it hands the editor is the one `transform_in_frame` makes, and
+    /// letting go of Alt part-way goes back to the transformation point.
+    #[test]
+    fn a_live_alt_rotation_is_about_the_opposite_corner() {
+        let style = DrawStyle::default();
+        let frame = turned_box();
+        let pivot = frame.center();
+        let context = ToolContext {
+            style: &style,
+            zoom: 1.0,
+            selection_bounds: Some(frame.aabb()),
+            selection_box: Some(frame),
+            anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
+            pivot: Some(pivot),
+            gradient: None,
+        };
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        let [_, tr, _, bl] = frame.corners();
+        let start = tr + (tr - pivot).normalize() * 20.0;
+        let end = swung(bl, start, 25.0);
+
+        let mut m = ToolMachine::new(ToolId::FreeTransform);
+        m.pointer_down(start, start, alt, &context);
+        let ToolAction::TransformSelection { transform } = m.pointer_move(end, end, alt) else {
+            panic!("a drag on the ring should turn the selection");
+        };
+        assert!((transform * bl - bl).hypot() < 1e-9, "the far corner is held");
+
+        // Back to the point with Alt up: the target is recomputed from the
+        // press, so the step is the difference between the two turns.
+        let plain = m.pointer_move(end, end, Mods::default());
+        let ToolAction::TransformSelection { transform: step } = plain else {
+            panic!("releasing Alt changes the turn: {plain:?}");
+        };
+        let total = step * transform;
+        assert!(
+            (total * pivot - pivot).hypot() < 1e-9,
+            "without Alt the total turn is about the point"
         );
     }
 
@@ -2464,7 +3691,10 @@ mod tests {
             style: &style,
             zoom: 1.0,
             selection_bounds: None,
+            selection_box: None,
             anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
             pivot: None,
             gradient: None,
         };
@@ -2476,7 +3706,10 @@ mod tests {
             style: &style,
             zoom: 10.0,
             selection_bounds: None,
+            selection_box: None,
             anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
             pivot: None,
             gradient: None,
         };
@@ -2539,6 +3772,19 @@ mod tests {
     /// The move arrives **while the pointer travels**, a step at a time, so the
     /// artwork is under the pointer the whole way rather than jumping to it on
     /// release. The release itself therefore has nothing left to commit.
+    ///
+    /// **Not from the box's exact centre.** With no pivot stored yet,
+    /// `ctx.pivot` and `TRANSFORM_GRAB_PX` both default to `bounds.center()` —
+    /// see `transform_zone`'s own
+    /// `the_centre_is_still_the_transformation_point`-style assertion and
+    /// `selection_corner_scales_when_the_pivot_has_not_been_stored_yet` — so a
+    /// press exactly there is, by design, a pivot grab, not a move: that is
+    /// what lets a fresh selection's corner handles and pivot dot work before
+    /// the pivot has ever been dragged. `Editor::pivot()` never actually
+    /// hands the tool machine a `None` pivot while something is selected, so
+    /// this exact coincidence cannot happen live; picking a point merely
+    /// *inside* the box, off both the pivot and the corners, is what "from
+    /// inside the selection" means here.
     #[test]
     fn dragging_from_inside_the_selection_moves_it() {
         let style = DrawStyle::default();
@@ -2546,14 +3792,19 @@ mod tests {
             style: &style,
             zoom: 1.0,
             selection_bounds: Some(Rect::new(0.0, 0.0, 100.0, 100.0)),
+            selection_box: Some(TransformBox::axis_aligned(Rect::new(
+                0.0, 0.0, 100.0, 100.0,
+            ))),
             anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
             pivot: None,
             gradient: None,
         };
         let mut m = ToolMachine::new(ToolId::Selection);
         m.pointer_down(
-            Point::new(50.0, 50.0),
-            Point::new(50.0, 50.0),
+            Point::new(30.0, 30.0),
+            Point::new(30.0, 30.0),
             Mods::default(),
             &c,
         );
@@ -2561,7 +3812,7 @@ mod tests {
         // Walked in two steps, so the deltas have to add up to the whole move
         // rather than each being measured from the origin.
         let mut total = buzz_geom::Vec2::new(0.0, 0.0);
-        for at in [Point::new(60.0, 70.0), Point::new(80.0, 90.0)] {
+        for at in [Point::new(40.0, 50.0), Point::new(60.0, 70.0)] {
             match m.pointer_move(at, at, Mods::default()) {
                 ToolAction::MoveSelection { delta } => total += delta,
                 other => panic!("mid-drag: got {other:?}"),
@@ -2572,7 +3823,7 @@ mod tests {
             "the steps should sum to the drag, got {total:?}"
         );
 
-        let end = Point::new(80.0, 90.0);
+        let end = Point::new(60.0, 70.0);
         assert!(
             matches!(m.pointer_up(end, end, &c), ToolAction::None),
             "the release must not move it a second time"
@@ -2659,7 +3910,10 @@ mod tests {
             "a plain stroke merges"
         );
         assert_eq!(
-            blend_of(Mods { ctrl: true, ..Default::default() }),
+            blend_of(Mods {
+                ctrl: true,
+                ..Default::default()
+            }),
             buzz_scene::PaintBlend::Additive,
             "Ctrl flips the merging default into build-up for the stroke"
         );
@@ -3290,7 +4544,12 @@ mod tests {
             style: &style,
             zoom: 1.0,
             selection_bounds: Some(Rect::new(0.0, 0.0, 100.0, 80.0)),
+            selection_box: Some(TransformBox::axis_aligned(Rect::new(
+                0.0, 0.0, 100.0, 80.0,
+            ))),
             anchors: &anchors,
+            selected_anchors: &[],
+            handles: &[],
             pivot: None,
             gradient: None,
         };
@@ -3298,16 +4557,25 @@ mod tests {
         let mut m = ToolMachine::new(ToolId::Subselection);
         let start = Point::new(102.0, 2.0);
         let end = Point::new(140.0, 20.0);
-        m.pointer_down(start, start, Mods::default(), &ctx);
-        m.pointer_move(end, end, Mods::default());
+        // The press selects the anchor it grabbed.
+        assert_eq!(
+            m.pointer_down(start, start, Mods::default(), &ctx),
+            ToolAction::SelectAnchors {
+                elements: vec![1],
+                mode: AnchorSelect::Replace
+            }
+        );
 
-        match m.pointer_up(end, end, &ctx) {
-            ToolAction::MoveAnchor { element, delta } => {
-                assert_eq!(element, 1, "should have grabbed the nearest anchor");
+        // The path is reshaped as the pointer moves, so the move carries the
+        // drag and the release has nothing left to commit.
+        match m.pointer_move(end, end, Mods::default()) {
+            ToolAction::MoveAnchors { elements, delta } => {
+                assert_eq!(elements, vec![1], "should have grabbed the nearest anchor");
                 assert!((delta.x - 38.0).abs() < 1e-9, "delta was {delta:?}");
             }
             other => panic!("expected an anchor drag, got {other:?}"),
         }
+        assert_eq!(m.pointer_up(end, end, &ctx), ToolAction::None);
     }
 
     #[test]
@@ -3321,7 +4589,10 @@ mod tests {
             style: &style,
             zoom: 1.0,
             selection_bounds: None,
+            selection_box: None,
             anchors: &anchors,
+            selected_anchors: &[],
+            handles: &[],
             pivot: None,
             gradient: None,
         };
@@ -3354,7 +4625,10 @@ mod tests {
             style: &style,
             zoom: 1.0,
             selection_bounds: None,
+            selection_box: None,
             anchors: &anchors,
+            selected_anchors: &[],
+            handles: &[],
             pivot: None,
             gradient: None,
         };
@@ -3362,7 +4636,7 @@ mod tests {
         m.pointer_down(start, start, Mods::default(), &near);
         assert!(matches!(
             m.pointer_up(end, end, &near),
-            ToolAction::MoveAnchor { .. }
+            ToolAction::MoveAnchors { .. }
         ));
 
         // At 10x it is 50 px away, far outside the radius.
@@ -3370,7 +4644,10 @@ mod tests {
             style: &style,
             zoom: 10.0,
             selection_bounds: None,
+            selection_box: None,
             anchors: &anchors,
+            selected_anchors: &[],
+            handles: &[],
             pivot: None,
             gradient: None,
         };
@@ -3378,7 +4655,376 @@ mod tests {
         m.pointer_down(start, start, Mods::default(), &far);
         assert!(!matches!(
             m.pointer_up(end, end, &far),
-            ToolAction::MoveAnchor { .. }
+            ToolAction::MoveAnchors { .. }
+        ));
+    }
+
+    // -- Subselection: selected anchors, handles ------------------------------
+
+    fn anchor_at(element: usize, x: f64, y: f64) -> buzz_geom::Anchor {
+        buzz_geom::Anchor {
+            element,
+            point: Point::new(x, y),
+        }
+    }
+
+    /// Three anchors along a line, so presses can be aimed at each one.
+    fn three_anchors() -> [buzz_geom::Anchor; 3] {
+        [
+            anchor_at(0, 0.0, 0.0),
+            anchor_at(1, 100.0, 0.0),
+            anchor_at(2, 200.0, 0.0),
+        ]
+    }
+
+    fn sub_ctx<'a>(
+        style: &'a DrawStyle,
+        anchors: &'a [buzz_geom::Anchor],
+        selected: &'a [usize],
+        handles: &'a [buzz_geom::Handle],
+    ) -> ToolContext<'a> {
+        ToolContext {
+            style,
+            zoom: 1.0,
+            selection_bounds: None,
+            selection_box: None,
+            anchors,
+            selected_anchors: selected,
+            handles,
+            pivot: None,
+            gradient: None,
+        }
+    }
+
+    fn handle(element: usize, side: buzz_geom::HandleSide, at: Point, anchor: Point, smooth: bool) -> buzz_geom::Handle {
+        buzz_geom::Handle {
+            element,
+            side,
+            point: at,
+            anchor,
+            smooth,
+        }
+    }
+
+    #[test]
+    fn clicking_an_anchor_selects_only_it() {
+        let style = DrawStyle::default();
+        let anchors = three_anchors();
+        let ctx = sub_ctx(&style, &anchors, &[], &[]);
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        let at = Point::new(101.0, 0.0);
+        assert_eq!(
+            m.pointer_down(at, at, Mods::default(), &ctx),
+            ToolAction::SelectAnchors {
+                elements: vec![1],
+                mode: AnchorSelect::Replace
+            }
+        );
+        assert_eq!(m.pointer_up(at, at, &ctx), ToolAction::None);
+    }
+
+    #[test]
+    fn shift_adds_an_unselected_anchor_and_a_shift_click_removes_a_selected_one() {
+        let style = DrawStyle::default();
+        let anchors = three_anchors();
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+
+        let ctx = sub_ctx(&style, &anchors, &[0], &[]);
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        let at = Point::new(100.0, 0.0);
+        assert_eq!(
+            m.pointer_down(at, at, shift, &ctx),
+            ToolAction::SelectAnchors {
+                elements: vec![1],
+                mode: AnchorSelect::Add
+            }
+        );
+        // Dragging it carries both.
+        let to = Point::new(100.0, 30.0);
+        assert_eq!(
+            m.pointer_move(to, to, shift),
+            ToolAction::MoveAnchors {
+                elements: vec![0, 1],
+                delta: Vec2::new(0.0, 30.0)
+            }
+        );
+        m.pointer_up(to, to, &ctx);
+
+        // Shift-clicking one that is selected toggles it out — on release,
+        // when it is known to have been a click.
+        let ctx = sub_ctx(&style, &anchors, &[0, 1], &[]);
+        assert_eq!(m.pointer_down(at, at, shift, &ctx), ToolAction::None);
+        assert_eq!(
+            m.pointer_up(at, at, &ctx),
+            ToolAction::SelectAnchors {
+                elements: vec![1],
+                mode: AnchorSelect::Toggle
+            }
+        );
+    }
+
+    #[test]
+    fn dragging_a_selected_anchor_moves_every_selected_one() {
+        let style = DrawStyle::default();
+        let anchors = three_anchors();
+        let ctx = sub_ctx(&style, &anchors, &[0, 2], &[]);
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        let start = Point::new(200.0, 0.0);
+        // Already selected: pressing it changes nothing.
+        assert_eq!(
+            m.pointer_down(start, start, Mods::default(), &ctx),
+            ToolAction::None
+        );
+        let end = Point::new(215.0, 10.0);
+        assert_eq!(
+            m.pointer_move(end, end, Mods::default()),
+            ToolAction::MoveAnchors {
+                elements: vec![0, 2],
+                delta: Vec2::new(15.0, 10.0)
+            }
+        );
+        // Further moves carry only the step since.
+        let more = Point::new(220.0, 10.0);
+        assert_eq!(
+            m.pointer_move(more, more, Mods::default()),
+            ToolAction::MoveAnchors {
+                elements: vec![0, 2],
+                delta: Vec2::new(5.0, 0.0)
+            }
+        );
+        assert_eq!(m.pointer_up(more, more, &ctx), ToolAction::None);
+    }
+
+    #[test]
+    fn clicking_one_of_several_selected_anchors_narrows_to_it() {
+        let style = DrawStyle::default();
+        let anchors = three_anchors();
+        let ctx = sub_ctx(&style, &anchors, &[0, 1, 2], &[]);
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        let at = Point::new(100.0, 0.0);
+        m.pointer_down(at, at, Mods::default(), &ctx);
+        assert_eq!(
+            m.pointer_up(at, at, &ctx),
+            ToolAction::SelectAnchors {
+                elements: vec![1],
+                mode: AnchorSelect::Replace
+            }
+        );
+    }
+
+    #[test]
+    fn a_marquee_selects_the_anchors_inside_it() {
+        let style = DrawStyle::default();
+        let anchors = three_anchors();
+        let ctx = sub_ctx(&style, &anchors, &[], &[]);
+
+        let from = Point::new(-20.0, -20.0);
+        let to = Point::new(120.0, 20.0);
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        m.pointer_down(from, from, Mods::default(), &ctx);
+        m.pointer_move(to, to, Mods::default());
+        assert_eq!(
+            m.pointer_up(to, to, &ctx),
+            ToolAction::SelectAnchors {
+                elements: vec![0, 1],
+                mode: AnchorSelect::Replace
+            }
+        );
+
+        // Shift adds to what is selected.
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        m.pointer_down(from, from, shift, &ctx);
+        m.pointer_move(to, to, shift);
+        assert!(matches!(
+            m.pointer_up(to, to, &ctx),
+            ToolAction::SelectAnchors {
+                mode: AnchorSelect::Add,
+                ..
+            }
+        ));
+
+        // A marquee that catches no anchor is still a marquee over objects.
+        let (from, to) = (Point::new(300.0, 300.0), Point::new(400.0, 400.0));
+        m.pointer_down(from, from, Mods::default(), &ctx);
+        m.pointer_move(to, to, Mods::default());
+        assert!(matches!(
+            m.pointer_up(to, to, &ctx),
+            ToolAction::PickInRect { .. }
+        ));
+    }
+
+    #[test]
+    fn a_selected_anchors_handle_is_grabbed_before_the_anchor() {
+        let style = DrawStyle::default();
+        let anchors = three_anchors();
+        let anchor = Point::new(100.0, 0.0);
+        // A handle pulled in so close that its grab radius covers the anchor.
+        let handles = [handle(
+            1,
+            buzz_geom::HandleSide::Out,
+            Point::new(103.0, 0.0),
+            anchor,
+            true,
+        )];
+        let ctx = sub_ctx(&style, &anchors, &[1], &handles);
+
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        let start = Point::new(104.0, 0.0);
+        assert_eq!(
+            m.pointer_down(start, start, Mods::default(), &ctx),
+            ToolAction::None
+        );
+        let end = Point::new(134.0, 40.0);
+        // The handle is carried by how far the pointer went, not snapped to it.
+        assert_eq!(
+            m.pointer_move(end, end, Mods::default()),
+            ToolAction::MoveHandle {
+                element: 1,
+                side: buzz_geom::HandleSide::Out,
+                to: Point::new(133.0, 40.0),
+                mirror: true,
+            }
+        );
+    }
+
+    #[test]
+    fn handles_of_unselected_anchors_cannot_be_grabbed() {
+        let style = DrawStyle::default();
+        let anchors = three_anchors();
+        let handles = [handle(
+            1,
+            buzz_geom::HandleSide::Out,
+            Point::new(130.0, 0.0),
+            Point::new(100.0, 0.0),
+            true,
+        )];
+        let ctx = sub_ctx(&style, &anchors, &[0], &handles);
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        let at = Point::new(130.0, 0.0);
+        m.pointer_down(at, at, Mods::default(), &ctx);
+        let end = Point::new(150.0, 0.0);
+        assert!(
+            !matches!(
+                m.pointer_move(end, end, Mods::default()),
+                ToolAction::MoveHandle { .. }
+            ),
+            "the handle is not drawn, so it is not there to grab"
+        );
+    }
+
+    #[test]
+    fn alt_breaks_a_smooth_point_and_a_corner_never_mirrors() {
+        let style = DrawStyle::default();
+        let anchors = three_anchors();
+        let anchor = Point::new(100.0, 0.0);
+        let at = Point::new(130.0, 0.0);
+        let end = Point::new(130.0, 40.0);
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+
+        for (smooth, mods, expected) in [
+            (true, Mods::default(), true),
+            (true, alt, false),
+            (false, Mods::default(), false),
+        ] {
+            let handles = [handle(1, buzz_geom::HandleSide::Out, at, anchor, smooth)];
+            let ctx = sub_ctx(&style, &anchors, &[1], &handles);
+            let mut m = ToolMachine::new(ToolId::Subselection);
+            m.pointer_down(at, at, mods, &ctx);
+            let ToolAction::MoveHandle { mirror, .. } = m.pointer_move(end, end, mods) else {
+                panic!("expected a handle drag")
+            };
+            assert_eq!(mirror, expected, "smooth {smooth}, alt {}", mods.alt);
+        }
+    }
+
+    /// The same point however many steps the drag took: handle moves are
+    /// absolute, which is what keeps the preview equal to the commit.
+    #[test]
+    fn a_handle_drag_lands_on_the_same_point_in_one_step_or_many() {
+        let style = DrawStyle::default();
+        let anchors = three_anchors();
+        let handles = [handle(
+            1,
+            buzz_geom::HandleSide::In,
+            Point::new(70.0, 0.0),
+            Point::new(100.0, 0.0),
+            true,
+        )];
+        let ctx = sub_ctx(&style, &anchors, &[1], &handles);
+        let last_target = |steps: &[Point]| {
+            let mut m = ToolMachine::new(ToolId::Subselection);
+            let start = Point::new(70.0, 0.0);
+            m.pointer_down(start, start, Mods::default(), &ctx);
+            let mut to = None;
+            for p in steps {
+                if let ToolAction::MoveHandle { to: t, .. } = m.pointer_move(*p, *p, Mods::default())
+                {
+                    to = Some(t);
+                }
+            }
+            to
+        };
+        let one = last_target(&[Point::new(60.0, 50.0)]);
+        let many = last_target(&[
+            Point::new(65.0, 10.0),
+            Point::new(62.0, 30.0),
+            Point::new(60.0, 50.0),
+        ]);
+        assert_eq!(one, many);
+        assert_eq!(one, Some(Point::new(60.0, 50.0)));
+    }
+
+    #[test]
+    fn alt_drag_on_a_corner_pulls_handles_out_and_selects_it() {
+        let style = DrawStyle::default();
+        let anchors = three_anchors();
+        let ctx = sub_ctx(&style, &anchors, &[], &[]);
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        let start = Point::new(100.0, 0.0);
+        assert_eq!(
+            m.pointer_down(start, start, alt, &ctx),
+            ToolAction::SelectAnchors {
+                elements: vec![1],
+                mode: AnchorSelect::Replace
+            }
+        );
+        let end = Point::new(130.0, 25.0);
+        assert_eq!(
+            m.pointer_move(end, end, alt),
+            ToolAction::PullHandles {
+                element: 1,
+                to: Point::new(130.0, 25.0)
+            }
+        );
+
+        // An anchor that already has handles is not a corner: Alt-pressing it
+        // is an ordinary drag.
+        let handles = [handle(
+            1,
+            buzz_geom::HandleSide::Out,
+            Point::new(130.0, 0.0),
+            Point::new(100.0, 0.0),
+            true,
+        )];
+        let ctx = sub_ctx(&style, &anchors, &[1], &handles);
+        let mut m = ToolMachine::new(ToolId::Subselection);
+        m.pointer_down(start, start, alt, &ctx);
+        assert!(matches!(
+            m.pointer_move(end, end, alt),
+            ToolAction::MoveAnchors { .. }
         ));
     }
 
@@ -3508,7 +5154,7 @@ mod tests {
 
 #[cfg(test)]
 mod transform_preview_tests {
-    use crate::tools::{Mods, Preview, ToolAction, ToolContext, ToolId, ToolMachine};
+    use crate::tools::{Mods, Preview, ToolAction, ToolContext, ToolId, ToolMachine, TransformBox};
     use buzz_geom::{Point, Rect};
     use buzz_ui::DrawStyle;
 
@@ -3524,7 +5170,10 @@ mod transform_preview_tests {
             style,
             zoom: 1.0,
             selection_bounds: Some(BOX),
+            selection_box: Some(TransformBox::axis_aligned(BOX)),
             anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
             pivot: Some(BOX.center()),
             gradient: None,
         }
@@ -3552,9 +5201,21 @@ mod transform_preview_tests {
     fn the_preview_matches_what_the_release_commits() {
         // A rotate handle sits outside a corner.
         let cases = [
-            (ToolId::FreeTransform, Point::new(-8.0, -8.0), Point::new(60.0, -30.0)),
-            (ToolId::FreeTransform, Point::new(100.0, 80.0), Point::new(160.0, 130.0)),
-            (ToolId::FreeTransform, Point::new(50.0, 0.0), Point::new(90.0, 0.0)),
+            (
+                ToolId::FreeTransform,
+                Point::new(-8.0, -8.0),
+                Point::new(60.0, -30.0),
+            ),
+            (
+                ToolId::FreeTransform,
+                Point::new(100.0, 80.0),
+                Point::new(160.0, 130.0),
+            ),
+            (
+                ToolId::FreeTransform,
+                Point::new(50.0, 0.0),
+                Point::new(90.0, 0.0),
+            ),
         ];
 
         for (tool, from, to) in cases {
@@ -3688,5 +5349,21 @@ mod transform_preview_tests {
             matches!(m.pointer_up(to, to, &ctx), ToolAction::None),
             "the release must not move it a second time"
         );
+    }
+
+    #[test]
+    fn dragging_outside_free_transform_does_not_move_the_selection() {
+        let style = DrawStyle::default();
+        let ctx = context(&style);
+        let mut m = ToolMachine::new(ToolId::FreeTransform);
+        let from = Point::new(150.0, 40.0);
+        let to = Point::new(180.0, 60.0);
+        m.pointer_down(from, from, Mods::default(), &ctx);
+
+        assert_eq!(m.pointer_move(to, to, Mods::default()), ToolAction::None);
+        assert!(matches!(
+            m.pointer_up(to, to, &ctx),
+            ToolAction::PickInRect { .. }
+        ));
     }
 }

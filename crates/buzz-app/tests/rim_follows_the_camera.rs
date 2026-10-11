@@ -129,10 +129,7 @@ fn variation_across(frame: &Frame, row: f64, from: f64, to: f64) -> u8 {
 /// The window the blocks were *drawn* in, as fractions of the frame — which is
 /// where a ghost lands, and which the camera has moved the artwork out of.
 fn ghost_window() -> (f64, f64) {
-    (
-        (BLOCKS.0 - 30.0) / STAGE_W,
-        (BLOCKS.1 + 30.0) / STAGE_W,
-    )
+    ((BLOCKS.0 - 30.0) / STAGE_W, (BLOCKS.1 + 30.0) / STAGE_W)
 }
 
 /// **Nothing is drawn where the artwork used to be.**

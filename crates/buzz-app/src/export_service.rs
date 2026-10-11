@@ -35,7 +35,10 @@ pub enum ExportTarget {
     /// One frame, as a PNG.
     Image { frame: u32, path: PathBuf },
     /// A numbered PNG per frame, into a folder.
-    Sequence { directory: PathBuf, base_name: String },
+    Sequence {
+        directory: PathBuf,
+        base_name: String,
+    },
     /// An MP4 or MOV.
     Video { path: PathBuf, video: VideoSettings },
     /// An animated GIF.
@@ -60,12 +63,16 @@ impl ExportTarget {
 
 /// One export, everything it needs owned outright so it can cross to its thread.
 pub struct ExportRequest {
-    /// **The film's scenes, in the order they play.**
+    /// **The film's scenes, in the order they play, each with how many film
+    /// frames it contributes.**
     ///
     /// Copy-on-write snapshots — pointer copies, not the artwork — so the user
     /// can keep editing while it renders. A film of one scene is the ordinary
-    /// case and behaves exactly as a single-scene export always did.
-    pub scenes: Vec<Scene>,
+    /// case and behaves exactly as a single-scene export always did. See
+    /// `buzz_doc::Document::film_with_lengths`: a sequence's setups are
+    /// already skipped and its shots already in play order by the time this
+    /// is built.
+    pub scenes: Vec<(Scene, u32)>,
     pub settings: ExportSettings,
     /// The frames to render, for everything but a single image.
     pub range: std::ops::Range<u32>,
@@ -201,10 +208,10 @@ pub fn run_export(request: ExportRequest, ctx: &TaskCtx) -> TaskOutcome {
         label: _,
     } = request;
 
-    // The film: every scene end to end, each still resolving its own looping
-    // section. Built here rather than by the caller because it borrows the
-    // scenes, and the scenes had to cross to this thread owned.
-    let reel = buzz_export::Reel::of(scenes.iter());
+    // The film: every scene end to end, each contributing exactly its own
+    // playing length. Built here rather than by the caller because it
+    // borrows the scenes, and the scenes had to cross to this thread owned.
+    let reel = buzz_export::Reel::of_lengths(scenes.iter().map(|(scene, length)| (scene, *length)));
 
     let result = match target {
         ExportTarget::Image { frame, path } => run_image(&reel, frame, &path, &settings, &gpu, ctx),
@@ -225,7 +232,13 @@ pub fn run_export(request: ExportRequest, ctx: &TaskCtx) -> TaskOutcome {
                 &gpu,
                 report_progress(ctx),
             );
-            report.map(|r| format!("Exported {} \u{2014} {} frames", file_name(&r.path), r.frames))
+            report.map(|r| {
+                format!(
+                    "Exported {} \u{2014} {} frames",
+                    file_name(&r.path),
+                    r.frames
+                )
+            })
         }
         ExportTarget::Webp { path, webp } => {
             let report = buzz_export::export_webp(
@@ -237,7 +250,13 @@ pub fn run_export(request: ExportRequest, ctx: &TaskCtx) -> TaskOutcome {
                 &gpu,
                 report_progress(ctx),
             );
-            report.map(|r| format!("Exported {} \u{2014} {} frames", file_name(&r.path), r.frames))
+            report.map(|r| {
+                format!(
+                    "Exported {} \u{2014} {} frames",
+                    file_name(&r.path),
+                    r.frames
+                )
+            })
         }
     };
 
@@ -439,8 +458,10 @@ mod tests {
     use super::*;
 
     fn request(label: &str) -> ExportRequest {
+        let scene = Scene::default();
+        let length = scene.rendered_frame_count();
         ExportRequest {
-            scenes: vec![Scene::default()],
+            scenes: vec![(scene, length)],
             settings: ExportSettings::for_stage(&Scene::default()),
             range: 0..1,
             target: ExportTarget::Image {

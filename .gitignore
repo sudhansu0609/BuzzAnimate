@@ -10,3 +10,9 @@
 # Documents and the recovery files autosave writes beside them. Test fixtures
 # and hand-made scratch documents must never be committed.
 *.buzz
+
+# The Claude proxy key (CLAUDE_API_KEY) lives here. Never commit it;
+# .env.example shows the shape.
+.env
+.env.*
+!.env.example

@@ -20,12 +20,59 @@
 //!
 //! [`ObjectKind`]: crate::ObjectKind
 
-use std::sync::Arc;
+use std::hash::Hasher as _;
+use std::sync::{Arc, Mutex};
 
 use buzz_geom::{Affine, BezPath, Point, Rect, Shape as _};
 use buzz_rig::{Armature, SkinBinding, WarpHandle};
 
 use crate::object::{Object, ShapeData};
+
+/// What [`ArmatureData::posed`] last built: the fingerprint of the inputs it
+/// was built from, the artwork `Arc`s it was built from, and the result.
+type PosedEntry = (u64, Vec<Arc<Object>>, Arc<[Arc<Object>]>);
+
+/// A memo of the posed parts, so that the same pose gives the same `Arc`s.
+///
+/// # Why this exists
+///
+/// Every consumer that keys a cache on an object's address (the lighting
+/// cache above all) used to see a brand-new `Arc<Object>` per part per call
+/// and so never hit. With the memo a held pose returns the very same parts.
+///
+/// # Why it is not part of the rig's identity
+///
+/// It is derived data: `Clone` gives an **empty** memo (a clone is a new rig
+/// that must prove its own parts), `PartialEq` is always true (two rigs are
+/// equal by their bones and parts, not by what happens to be cached), and
+/// `Debug` is opaque. Correctness never depends on invalidating it:
+/// `armature` and `parts` are public and are edited in place, so
+/// [`ArmatureData::posed`] re-derives a fingerprint of everything the posing
+/// reads and only reuses the memo when it still matches. The memo also
+/// keeps the artwork `Arc`s it was built from alive, so an artwork address
+/// in the fingerprint cannot be reused by another allocation, and a
+/// copy-on-write edit of an artwork (`Arc::make_mut`) must copy it, which
+/// gives a new address.
+#[derive(Default)]
+pub struct PosedMemo(Mutex<Option<PosedEntry>>);
+
+impl Clone for PosedMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for PosedMemo {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for PosedMemo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PosedMemo(..)")
+    }
+}
 
 /// How one piece of artwork follows the bones.
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +132,9 @@ pub struct ArmatureData {
     /// a file from a later version, a pattern that was renamed — leaves the
     /// panel showing the plain bone list, which is what it showed before.
     pub pattern: Option<String>,
+    /// The posed parts, memoised (see [`PosedMemo`]). Derived; never part of
+    /// equality or of a clone.
+    pub posed_memo: PosedMemo,
 }
 
 /// A pose worth keeping, and what to call it.
@@ -109,7 +159,21 @@ impl ArmatureData {
             parts: Vec::new(),
             poses: Vec::new(),
             pattern: None,
+            posed_memo: PosedMemo::default(),
         }
+    }
+
+    /// A straight chain of bones from the origin, each `lengths[i]` long and
+    /// a child of the one before, all at angle zero. **A test fixture**:
+    /// crates that test rigs without depending on `buzz-rig` build theirs here.
+    #[doc(hidden)]
+    pub fn chain(lengths: &[f64]) -> Self {
+        let mut armature = Armature::new(Point::ZERO);
+        for (i, length) in lengths.iter().enumerate() {
+            let parent = i.checked_sub(1);
+            armature.push(buzz_rig::Bone::new(format!("bone{i}"), parent, *length, 0.0));
+        }
+        Self::new(armature)
     }
 
     /// Attach a shape, skinned to the bones as they are now.
@@ -154,11 +218,75 @@ impl ArmatureData {
     /// frame is: a pose is a handful of angles, and keeping a deformed copy in
     /// the document would mean two things that can disagree — and the stored
     /// one would be the one that got saved.
+    ///
+    /// **Memoised** (see [`PosedMemo`]): while the pose, the skeleton and the
+    /// parts are unchanged the same `Arc`s come back, so a cache keyed on an
+    /// object's address can hit across frames.
     pub fn posed(&self) -> Vec<Arc<Object>> {
-        self.parts
+        let fingerprint = self.pose_fingerprint();
+        let mut memo = self
+            .posed_memo
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((print, _, parts)) = memo.as_ref()
+            && *print == fingerprint
+        {
+            return parts.to_vec();
+        }
+        let built: Arc<[Arc<Object>]> = self
+            .parts
             .iter()
             .map(|part| Arc::new(self.pose_part(part)))
-            .collect()
+            .collect();
+        let artwork = self.parts.iter().map(|p| p.artwork.clone()).collect();
+        let out = built.to_vec();
+        *memo = Some((fingerprint, artwork, built));
+        out
+    }
+
+    /// A hash of everything [`ArmatureData::posed`] reads: the skeleton (root
+    /// and every bone's parent, length, rest angle, angle and offset), and for
+    /// each part its artwork's address and its binding (a skin's weights too).
+    ///
+    /// Cheap next to posing; also the "has this rig's pose changed" test the
+    /// renderer's caches use.
+    pub fn pose_fingerprint(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let f = |h: &mut std::collections::hash_map::DefaultHasher, v: f64| h.write_u64(v.to_bits());
+        f(&mut h, self.armature.root.x);
+        f(&mut h, self.armature.root.y);
+        h.write_usize(self.armature.len());
+        for bone in &self.armature.bones {
+            h.write_usize(bone.parent.map_or(usize::MAX, |p| p));
+            f(&mut h, bone.length);
+            f(&mut h, bone.rest_angle);
+            f(&mut h, bone.angle);
+            f(&mut h, bone.offset.x);
+            f(&mut h, bone.offset.y);
+        }
+        h.write_usize(self.parts.len());
+        for part in &self.parts {
+            h.write_usize(Arc::as_ptr(&part.artwork) as usize);
+            match &part.binding {
+                RigBinding::Rigid(bone) => {
+                    h.write_u8(0);
+                    h.write_usize(*bone);
+                }
+                RigBinding::Skin(skin) => {
+                    h.write_u8(1);
+                    h.write_usize(skin.points.len());
+                    for point in &skin.points {
+                        h.write_usize(point.len());
+                        for (bone, weight) in point {
+                            h.write_usize(*bone);
+                            f(&mut h, *weight);
+                        }
+                    }
+                }
+            }
+        }
+        h.finish()
     }
 
     fn pose_part(&self, part: &RigPart) -> Object {
@@ -479,6 +607,34 @@ mod tests {
         assert!((end.armature.bones[1].angle - 1.0).abs() < 1e-9);
     }
 
+    /// A tween between two legal poses stays inside the joint's limits, and a
+    /// tween towards a pose written straight into the field past them (a
+    /// hand-edited file, an old key) is clamped rather than followed.
+    #[test]
+    fn a_tween_stays_inside_the_joint_limits() {
+        let mut from = ArmatureData::new(arm());
+        from.armature.bones[1].limits = Some(buzz_rig::JointLimits::new(-0.5, 0.5));
+        let mut to = from.clone();
+        from.armature.bones[1].angle = -0.4;
+        to.armature.bones[1].angle = 0.4;
+        for step in 0..=20 {
+            let t = step as f64 / 20.0;
+            let angle = tween_armature(&from, &to, t).armature.bones[1].angle;
+            assert!(
+                (-0.5 - 1e-12..=0.5 + 1e-12).contains(&angle),
+                "t = {t}: {angle} is outside -0.5..0.5"
+            );
+        }
+
+        let mut wild = from.clone();
+        wild.armature.bones[1].angle = 2.0;
+        // Unclamped, half way would be 0.8 and the end 2.0.
+        let half = tween_armature(&from, &wild, 0.5).armature.bones[1].angle;
+        assert!((half - 0.5).abs() < 1e-9, "half way went to {half}");
+        let end = tween_armature(&from, &wild, 1.0).armature.bones[1].angle;
+        assert!((end - 0.5).abs() < 1e-9, "the end went to {end}");
+    }
+
     /// Making artwork warpable subdivides it — more points, same shape. So
     /// this compares the *geometry*, not the path string: an identical string
     /// would mean subdivision had silently stopped happening, and the middle
@@ -565,5 +721,100 @@ mod tests {
             data.parts[0].binding, before,
             "the weights should have followed the new skeleton"
         );
+    }
+
+    /// L1: a held pose returns the very same parts, so a cache keyed on their
+    /// address can hit from one frame to the next.
+    #[test]
+    fn posed_twice_gives_pointer_equal_parts() {
+        let mut data = ArmatureData::new(arm());
+        data.bind_shape(limb());
+        data.bind_rigid(limb(), 1);
+
+        let a = data.posed();
+        let b = data.posed();
+        assert_eq!(a.len(), 2);
+        for (x, y) in a.iter().zip(&b) {
+            assert!(Arc::ptr_eq(x, y), "a held pose must reuse its parts");
+        }
+    }
+
+    /// L1: the memo is re-derived, never trusted. Every public field that the
+    /// posing reads invalidates it when edited in place.
+    #[test]
+    fn a_changed_pose_or_skeleton_gives_new_parts() {
+        let mut data = ArmatureData::new(arm());
+        data.bind_shape(limb());
+        data.bind_rigid(limb(), 1);
+        let before = data.posed();
+
+        data.armature.set_pose(&[0.0, 0.7]);
+        let moved = data.posed();
+        assert!(!Arc::ptr_eq(&before[1], &moved[1]));
+        let again = data.posed();
+        assert!(Arc::ptr_eq(&moved[1], &again[1]));
+
+        // A bone edited by hand (not through the angle) is a change too.
+        data.armature.bones[1].length = 70.0;
+        let longer = data.posed();
+        assert!(!Arc::ptr_eq(&moved[1], &longer[1]));
+        data.armature.root = Point::new(5.0, 5.0);
+        let shifted = data.posed();
+        assert!(!Arc::ptr_eq(&longer[1], &shifted[1]));
+
+        // So is an artwork replaced in place.
+        data.parts[1].artwork = limb();
+        let swapped = data.posed();
+        assert!(!Arc::ptr_eq(&shifted[1], &swapped[1]));
+
+        // And a re-bound skin.
+        let skin_before = swapped[0].clone();
+        data.armature.bones[0].angle = 0.3;
+        data.rebind();
+        let skin_after = data.posed();
+        assert!(!Arc::ptr_eq(&skin_before, &skin_after[0]));
+    }
+
+    /// L1: a clone is a new rig. It does not share the memo (its parts are
+    /// its own) yet still compares equal.
+    #[test]
+    fn a_cloned_armature_does_not_share_the_memo_but_is_equal() {
+        let mut data = ArmatureData::new(arm());
+        data.bind_rigid(limb(), 1);
+        let original = data.posed();
+
+        let copy = data.clone();
+        assert_eq!(copy, data);
+        let copied = copy.posed();
+        assert!(!Arc::ptr_eq(&original[0], &copied[0]));
+        assert_eq!(
+            original[0].transform, copied[0].transform,
+            "same pose, same geometry"
+        );
+        // And the original's memo was not disturbed by the clone.
+        assert!(Arc::ptr_eq(&original[0], &data.posed()[0]));
+    }
+
+    /// L1: the pose that the memo returns is the pose the rig is in, bit for
+    /// bit, whether it was just built or remembered.
+    #[test]
+    fn the_memoised_pose_equals_a_fresh_one() {
+        let mut data = ArmatureData::new(arm());
+        data.bind_shape(limb());
+        data.bind_rigid(limb(), 1);
+        data.armature.bones[1].angle = 0.4;
+
+        let remembered = {
+            data.posed();
+            data.posed()
+        };
+        let fresh = data.clone().posed();
+        for (a, b) in remembered.iter().zip(&fresh) {
+            assert_eq!(a.transform, b.transform);
+            match (&a.kind, &b.kind) {
+                (ObjectKind::Shape(x), ObjectKind::Shape(y)) => assert_eq!(x.path, y.path),
+                _ => panic!("expected shapes"),
+            }
+        }
     }
 }

@@ -13,7 +13,9 @@
 //!   sun is, and the shadow runs the other way.
 
 use buzz_geom::Point;
-use buzz_scene::{EdgeMode, Light, LightId, LightKind, LightRig, SHADOW_LENGTH_RANGE, ShadowFall};
+use buzz_scene::{
+    EdgeMode, Light, LightId, LightKind, LightRig, SHADOW_LENGTH_RANGE, ShadeModel, ShadowFall,
+};
 use egui::{Color32, RichText, Ui};
 use peniko::Color;
 
@@ -51,9 +53,29 @@ pub struct LightResponse {
     /// What the light draws its bands around: nothing, each shape, or the
     /// whole figure.
     pub set_edges: Option<EdgeMode>,
+    /// Where the terminator comes from: the old crescent, sized by softness,
+    /// or the new one, sized by geometry. See [`buzz_scene::ShadeModel`] and
+    /// `docs/HARD_LIGHT_PLAN.md`'s Stage A.
+    pub set_model: Option<ShadeModel>,
     /// The keyframe button was pressed: `true` to key the selected light at the
     /// playhead, `false` to remove the key there.
     pub key: Option<bool>,
+}
+
+/// **Where this frame's Model and preset widgets landed**, so a headless test
+/// can find and click them without hand-computing a layout — the same purpose
+/// `App::title_rects` serves for the title row. Costs three `Option<Rect>`s
+/// and is overwritten every draw; nothing in the running app reads it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LightPanelRects {
+    /// The Model row's **Form** option.
+    pub model_form: Option<egui::Rect>,
+    /// The Model row's **Crescent** option.
+    pub model_crescent: Option<egui::Rect>,
+    /// The **Hard** softness preset.
+    pub hard: Option<egui::Rect>,
+    /// The **Soft** softness preset.
+    pub soft: Option<egui::Rect>,
 }
 
 /// Panel state that is not part of the document.
@@ -65,6 +87,8 @@ pub struct LightPanelState {
     pub current_frame: u32,
     /// Draw the light handles on the stage, and let them be dragged.
     pub gizmos: bool,
+    /// Keep the two manual shadow scale axes together while editing.
+    pub shadow_scale_linked: bool,
     /// **What the renderer had to leave out of the last frame**, if anything.
     ///
     /// A document dense enough that its lit frame will not fit the rasteriser
@@ -73,6 +97,8 @@ pub struct LightPanelState {
     /// looking at a lamp with the modelling missing, and no explanation, is
     /// looking at the same silence this whole mechanism exists to end.
     pub trimmed: Option<&'static str>,
+    /// See [`LightPanelRects`].
+    pub rects: LightPanelRects,
 }
 
 impl Default for LightPanelState {
@@ -83,7 +109,9 @@ impl Default for LightPanelState {
             // On: a light you cannot see is a light you cannot aim, and the
             // handles cost nothing when there are no lights to draw.
             gizmos: true,
+            shadow_scale_linked: true,
             trimmed: None,
+            rects: LightPanelRects::default(),
         }
     }
 }
@@ -475,11 +503,7 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
                     changed |= ui
                         .add(egui::DragValue::new(&mut edge.y).speed(1.0).prefix("y "))
                         .changed();
-                    ui.label(
-                        RichText::new("keep it off the stage")
-                            .small()
-                            .weak(),
-                    );
+                    ui.label(RichText::new("keep it off the stage").small().weak());
                 });
 
                 ui.horizontal(|ui| {
@@ -607,17 +631,136 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
                 });
             }
 
+            if edited.shadows {
+                egui::CollapsingHeader::new(RichText::new("Shadow placement").strong())
+                    .id_salt("shadow-placement")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Adjusts the silhouette after automatic projection. The light still controls its direction and motion.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+
+                        egui::Grid::new("shadow-placement-grid")
+                            .num_columns(2)
+                            .show(ui, |ui| {
+                                ui.label("Offset X");
+                                changed |= ui
+                                    .add(egui::DragValue::new(&mut edited.shadow_adjustment.offset.x).speed(1.0).suffix(" px"))
+                                    .changed();
+                                ui.end_row();
+                                ui.label("Offset Y");
+                                changed |= ui
+                                    .add(egui::DragValue::new(&mut edited.shadow_adjustment.offset.y).speed(1.0).suffix(" px"))
+                                    .changed();
+                                ui.end_row();
+
+                                ui.label("Width");
+                                let before_x = edited.shadow_adjustment.scale_x;
+                                let x_changed = ui
+                                    .add(egui::DragValue::new(&mut edited.shadow_adjustment.scale_x).speed(0.01).range(0.01..=100.0))
+                                    .changed();
+                                if x_changed && state.shadow_scale_linked && before_x.abs() > f64::EPSILON {
+                                    edited.shadow_adjustment.scale_y *= edited.shadow_adjustment.scale_x / before_x;
+                                }
+                                changed |= x_changed;
+                                ui.end_row();
+
+                                ui.label("Height");
+                                let before_y = edited.shadow_adjustment.scale_y;
+                                let y_changed = ui
+                                    .add(egui::DragValue::new(&mut edited.shadow_adjustment.scale_y).speed(0.01).range(0.01..=100.0))
+                                    .changed();
+                                if y_changed && state.shadow_scale_linked && before_y.abs() > f64::EPSILON {
+                                    edited.shadow_adjustment.scale_x *= edited.shadow_adjustment.scale_y / before_y;
+                                }
+                                changed |= y_changed;
+                                ui.end_row();
+
+                                ui.label("Rotation");
+                                let mut rotation = edited.shadow_adjustment.rotation.to_degrees();
+                                if ui.add(egui::DragValue::new(&mut rotation).speed(0.5).suffix(" deg")).changed() {
+                                    edited.shadow_adjustment.rotation = rotation.to_radians();
+                                    changed = true;
+                                }
+                                ui.end_row();
+                                ui.label("Horizontal skew");
+                                let mut skew_x = edited.shadow_adjustment.skew_x.to_degrees();
+                                if ui.add(egui::Slider::new(&mut skew_x, -80.0..=80.0).suffix(" deg")).changed() {
+                                    edited.shadow_adjustment.skew_x = skew_x.to_radians();
+                                    changed = true;
+                                }
+                                ui.end_row();
+                                ui.label("Vertical skew");
+                                let mut skew_y = edited.shadow_adjustment.skew_y.to_degrees();
+                                if ui.add(egui::Slider::new(&mut skew_y, -80.0..=80.0).suffix(" deg")).changed() {
+                                    edited.shadow_adjustment.skew_y = skew_y.to_radians();
+                                    changed = true;
+                                }
+                                ui.end_row();
+                                ui.label("Pivot X");
+                                changed |= ui.add(egui::DragValue::new(&mut edited.shadow_adjustment.pivot.x).speed(1.0)).changed();
+                                ui.end_row();
+                                ui.label("Pivot Y");
+                                changed |= ui.add(egui::DragValue::new(&mut edited.shadow_adjustment.pivot.y).speed(1.0)).changed();
+                                ui.end_row();
+                            });
+
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut state.shadow_scale_linked, "Link width and height");
+                            if ui.small_button("Reset placement").clicked() {
+                                edited.shadow_adjustment = buzz_scene::ShadowAdjustment::default();
+                                changed = true;
+                            }
+                        });
+                    });
+            }
+
             ui.horizontal(|ui| {
                 ui.label("Softness");
                 changed |= ui
                     .add(egui::Slider::new(&mut edited.softness, 0.0..=1.0).fixed_decimals(2))
-                    .on_hover_text(
-                        "How gradually the shaded side arrives. 0 is a hard light: \
-                         one step from lit to shaded, an exact boundary. Turning it \
-                         up feathers the terminator and wraps it further round the \
-                         form, the way a bigger source does.",
-                    )
+                    .on_hover_text(match rig.model {
+                        // **Form**: the terminator's *width* comes from where
+                        // the light stands, not from this. This is the
+                        // feather only — how gradually it arrives.
+                        ShadeModel::Form => {
+                            "How gradually the terminator arrives. 0 is a hard light: \
+                             one step from lit to shaded, an exact boundary. The \
+                             terminator's width comes from where the light stands, not \
+                             from this \u{2014} see the Model setting below."
+                        }
+                        ShadeModel::Crescent => {
+                            "How gradually the shaded side arrives. 0 is a hard light: \
+                             one step from lit to shaded, an exact boundary. Turning it \
+                             up feathers the terminator and wraps it further round the \
+                             form, the way a bigger source does."
+                        }
+                    })
                     .changed();
+                // **Two presets, not a description of the ends of the
+                // slider.** A hard light is a specific number to reach for,
+                // not a direction to drag towards; see
+                // `docs/HARD_LIGHT_PLAN.md`'s Stage A.
+                let hard = ui
+                    .button("Hard")
+                    .on_hover_text("A hard, narrow light \u{2014} softness 0.05");
+                state.rects.hard = Some(hard.rect);
+                if hard.clicked() {
+                    edited.softness = 0.05;
+                    changed = true;
+                }
+                let soft = ui
+                    .button("Soft")
+                    .on_hover_text("A broad, gentle light \u{2014} softness 0.8");
+                state.rects.soft = Some(soft.rect);
+                if soft.clicked() {
+                    edited.softness = 0.8;
+                    changed = true;
+                }
             });
 
             // **How hard the lit edge lands**, which is the other half of the
@@ -724,6 +867,36 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
             .changed()
         {
             out.set_base = Some(from_egui(base));
+        }
+
+        // **Model before Edges**, because it decides where the terminator
+        // itself comes from; Edges only decides what it is measured against.
+        // See [`ShadeModel`] and `docs/HARD_LIGHT_PLAN.md`'s Stage A.
+        ui.label("Model");
+        let mut model = rig.model;
+        for candidate in ShadeModel::ALL {
+            let response = ui
+                .selectable_value(&mut model, candidate, candidate.label())
+                .on_hover_text(match candidate {
+                    ShadeModel::Crescent => {
+                        "The shaded side's width comes from Softness. A hard light \
+                         is also the narrowest band \u{2014} it can never darken half \
+                         a face."
+                    }
+                    ShadeModel::Form => {
+                        "The shaded side's width comes from where the light stands: \
+                         a hard side light darkens half the form with a razor \
+                         terminator, and softness only feathers how sharply it \
+                         arrives."
+                    }
+                });
+            match candidate {
+                ShadeModel::Form => state.rects.model_form = Some(response.rect),
+                ShadeModel::Crescent => state.rects.model_crescent = Some(response.rect),
+            }
+            if response.changed() {
+                out.set_model = Some(model);
+            }
         }
 
         // **Edges before strength**, because it is the bigger decision. See
@@ -1011,7 +1184,11 @@ mod tests {
             Light::new(LightId(1), "Sun", LightKind::sun()),
             Light::new(LightId(2), "Sky", LightKind::sky()),
             Light::new(LightId(3), "Lamp", LightKind::lamp(Point::new(10.0, 10.0))),
-            Light::new(LightId(4), "Gloom", LightKind::gloom(Point::new(-20.0, 10.0))),
+            Light::new(
+                LightId(4),
+                "Gloom",
+                LightKind::gloom(Point::new(-20.0, 10.0)),
+            ),
         ]);
 
         for selected in [
@@ -1067,5 +1244,111 @@ mod tests {
     #[test]
     fn gizmos_are_on_by_default() {
         assert!(LightPanelState::default().gizmos);
+    }
+
+    fn screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 1200.0))
+    }
+
+    fn click_at(pos: egui::Pos2) -> egui::RawInput {
+        let mods = egui::Modifiers::default();
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: mods,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: mods,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// **The widgets `docs/HARD_LIGHT_PLAN.md`'s Stage A added are actually
+    /// there, and actually work.** Every other test in this module proves the
+    /// panel draws without panicking; this proves a click on the Model row's
+    /// **Form** option and on the **Hard** preset reaches the response the
+    /// app applies — `buzz-app/src/app.rs`'s light-panel handler turns
+    /// `set_model` into `scene.lights_mut().model = model` and `changed` into
+    /// the whole light, exactly as simulated here.
+    #[test]
+    fn clicking_model_form_and_hard_sets_both() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+
+        let mut sun = Light::new(LightId(1), "Sun", LightKind::sun());
+        sun.softness = 0.35;
+        let mut lit_rig = rig(vec![sun]);
+        // Start from the old model, as a file saved before this existed
+        // would open — see `buzz_scene::ShadeModel`'s `#[serde(default)]`.
+        lit_rig.model = ShadeModel::Crescent;
+        let mut state = LightPanelState {
+            selected: Some(LightId(1)),
+            ..LightPanelState::default()
+        };
+
+        // Frame 1: draw once with no input, to find where the widgets landed.
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen()),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = light_panel(ui, &lit_rig, &mut state);
+            },
+        );
+        let model_form = state
+            .rects
+            .model_form
+            .expect("the Model row's Form option must be drawn");
+        let model_crescent = state
+            .rects
+            .model_crescent
+            .expect("the Model row's Crescent option must be drawn");
+        let hard = state.rects.hard.expect("the Hard preset must be drawn");
+        let soft = state.rects.soft.expect("the Soft preset must be drawn");
+        assert_ne!(model_form, model_crescent, "Form and Crescent are two widgets");
+        assert_ne!(hard, soft, "Hard and Soft are two widgets");
+
+        // Frame 2: click Form.
+        let mut response = LightResponse::default();
+        let _ = ctx.run_ui(click_at(model_form.center()), |ui| {
+            response = light_panel(ui, &lit_rig, &mut state);
+        });
+        assert_eq!(
+            response.set_model,
+            Some(ShadeModel::Form),
+            "clicking Form should ask for the Form model"
+        );
+        // The app applies the response before the next frame is drawn — see
+        // `buzz-app/src/app.rs`'s `if let Some(model) = response.set_model`.
+        lit_rig.model = response.set_model.expect("checked above");
+
+        // Frame 3: click Hard.
+        let hard = state.rects.hard.expect("Hard is still drawn under Form");
+        let mut response = LightResponse::default();
+        let _ = ctx.run_ui(click_at(hard.center()), |ui| {
+            response = light_panel(ui, &lit_rig, &mut state);
+        });
+        let edited = response.changed.expect("clicking Hard should edit the light");
+        assert!(
+            edited.softness <= 0.05,
+            "Hard should set softness to 0.05 or lower, got {}",
+            edited.softness
+        );
+        assert_eq!(
+            lit_rig.model,
+            ShadeModel::Form,
+            "the model chosen in the previous click must still hold"
+        );
     }
 }

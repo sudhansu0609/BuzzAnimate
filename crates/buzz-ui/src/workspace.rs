@@ -56,6 +56,12 @@ pub enum PanelId {
     /// See [`crate::cast_panel`].
     Cast,
     Timeline,
+    /// **The Sequence strip** — the master audio's waveform across the whole
+    /// film, with shots as coloured blocks on it. Tabbed beside the Timeline
+    /// in `Dock::Bottom`, but not the front tab: the Timeline is what a new
+    /// document opens onto. See `docs/SEQUENCE_SETUPS_PLAN.md` "The Sequence
+    /// strip" and [`crate::sequence_panel`].
+    Sequence,
     Actions,
     /// **The brief, the set and the scenery.**
     ///
@@ -69,6 +75,11 @@ pub enum PanelId {
     /// Everything the program is doing in the background: exports, imports,
     /// asset scans. Global rather than per-document; hidden until asked for.
     Tasks,
+    /// **Every AI flow in one place** (F7.0 of `docs/LOCAL_AI_PLAN.md`):
+    /// Models, Character from Image, Auto-Rig, Scene from Image, Direct Story,
+    /// Identify & Rename, Transcribe and the running AI tasks, as sections.
+    /// Hidden until asked for; its home is the outer right column.
+    Ai,
 }
 
 impl PanelId {
@@ -83,17 +94,19 @@ impl PanelId {
             Self::Swatches => "Swatches",
             Self::Depth => "Layer Depth",
             Self::Rig => "Rigging",
-            Self::Filters => "Filters",
+            Self::Filters => "Effects",
             Self::Lighting => "Lighting",
             Self::Sound => "Sound",
             Self::Library => "Library",
             Self::Assets => "Assets",
             Self::Cast => "Cast",
             Self::Timeline => "Timeline",
+            Self::Sequence => "Sequence",
             Self::Actions => "Actions",
             Self::Story => "Story",
             Self::MotionEditor => "Motion Editor",
             Self::Tasks => "Tasks",
+            Self::Ai => "AI",
         }
     }
 
@@ -109,7 +122,7 @@ impl PanelId {
             Self::Depth => "Depth",
             Self::Rig => "Rig",
             Self::Lighting => "Light",
-            Self::Properties => "Props",
+            Self::Filters => "Effects",
             Self::ToolOptions => "Tool",
             other => other.title(),
         }
@@ -121,10 +134,10 @@ impl PanelId {
     /// otherwise be nameless strips, so the dock chrome names them, and the
     /// rest are left alone rather than labelled twice.
     pub fn draws_own_title(self) -> bool {
-        !matches!(self, Self::Tools | Self::Timeline)
+        !matches!(self, Self::Tools | Self::Timeline | Self::Sequence | Self::Ai)
     }
 
-    pub const ALL: [PanelId; 19] = [
+    pub const ALL: [PanelId; 21] = [
         PanelId::Tools,
         PanelId::ToolOptions,
         PanelId::Layers,
@@ -140,10 +153,12 @@ impl PanelId {
         PanelId::Assets,
         PanelId::Cast,
         PanelId::Timeline,
+        PanelId::Sequence,
         PanelId::Actions,
         PanelId::Story,
         PanelId::MotionEditor,
         PanelId::Tasks,
+        PanelId::Ai,
     ];
 }
 
@@ -164,21 +179,78 @@ impl PanelId {
 /// what you reach for to move it. So building is a mode you turn on, and
 /// posing — dragging any part of a bone, including its tip — is what the tool
 /// does the rest of the time.
+///
+/// **BM** (`docs/PRODUCTION_SPEED_PLAN.md`): the bones are drawn and found
+/// only while the Bone tool is held, and the tool is in one of two modes —
+/// [`BoneMode::Create`] builds, [`BoneMode::Move`] poses, never both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RigOptionsWire")]
 pub struct RigOptions {
-    /// Draw the bones over the artwork, and let the pointer find them.
-    #[serde(default = "yes")]
+    /// Draw the bones over the artwork while the Bone tool is active, and let
+    /// the pointer find them.
     pub show_bones: bool,
-    /// Dragging from a bone's tip **extends the chain** rather than posing it.
+    /// What a press with the Bone tool does: build bones, or move them.
+    pub mode: BoneMode,
+}
+
+/// The Bone tool's two modes. **Create** builds a skeleton (a press on artwork
+/// starts a chain, on a tip extends it, on a bone body branches from it);
+/// **Move** poses one (a press on a bone or its tip moves the limb).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BoneMode {
+    Create,
+    #[default]
+    Move,
+}
+
+impl BoneMode {
+    /// The other mode, for the toggle shortcut.
+    pub fn toggled(self) -> Self {
+        match self {
+            BoneMode::Create => BoneMode::Move,
+            BoneMode::Move => BoneMode::Create,
+        }
+    }
+
+    /// The mode's name, as the status bar and Tool Options say it.
+    pub fn label(self) -> &'static str {
+        match self {
+            BoneMode::Create => "Create bones",
+            BoneMode::Move => "Move bones",
+        }
+    }
+}
+
+/// [`RigOptions`] as read from disk: a workspace saved before BM has
+/// `build: bool` instead of `mode`, and `build: true` means Create.
+#[derive(Deserialize)]
+struct RigOptionsWire {
+    #[serde(default = "yes")]
+    show_bones: bool,
     #[serde(default)]
-    pub build: bool,
+    mode: Option<BoneMode>,
+    #[serde(default)]
+    build: Option<bool>,
+}
+
+impl From<RigOptionsWire> for RigOptions {
+    fn from(wire: RigOptionsWire) -> Self {
+        let mode = wire.mode.unwrap_or(match wire.build {
+            Some(true) => BoneMode::Create,
+            _ => BoneMode::Move,
+        });
+        Self {
+            show_bones: wire.show_bones,
+            mode,
+        }
+    }
 }
 
 impl Default for RigOptions {
     fn default() -> Self {
         Self {
             show_bones: true,
-            build: false,
+            mode: BoneMode::Move,
         }
     }
 }
@@ -399,6 +471,26 @@ pub struct Workspace {
     /// here with the other preferences and survives a restart.
     #[serde(default)]
     pub rig: RigOptions,
+    /// **Pan speed** — how far the stage moves for a given drag of the Hand
+    /// tool, a Space-drag or the middle mouse button (I4b of
+    /// `docs/INTERACTION_FIXES_PLAN.md`). `1.0` tracks the pointer exactly;
+    /// the others move the view faster than the hand, for a canvas too big
+    /// to cross in one comfortable drag. Never touches the wheel or
+    /// Ctrl+wheel zoom. A person's own preference, not part of any one film.
+    #[serde(default = "default_pan_speed")]
+    pub pan_speed: f32,
+    /// The nib shape remembered for the Fluid and Normal brushes.
+    ///
+    /// A person's own preference, not part of any one film, so it lives here
+    /// with the other per-person settings rather than travelling inside a
+    /// `.buzz` file. See [`crate::brush::BrushSettings::tip`].
+    #[serde(default)]
+    pub brush_tips: crate::brush::BrushTips,
+    /// The Trace Bitmap settings, remembered between traces. A person's own
+    /// preference for the same reason [`Self::brush_tips`] is. Only the
+    /// dialog reads this directly — see `Editor::default()`'s note about why.
+    #[serde(default)]
+    pub trace: buzz_scene::TraceOptions,
     /// The user's keyboard-shortcut overrides, keyed by a stable command id.
     ///
     /// `Some(chord)` rebinds a command; `None` explicitly unbinds one that has a
@@ -406,6 +498,20 @@ pub struct Workspace {
     /// here because a keymap belongs to the person, not to any one film.
     #[serde(default)]
     pub keymap: std::collections::BTreeMap<String, Option<KeyChord>>,
+    /// Settings for local AI models, vision, and LLM backends.
+    #[serde(default)]
+    pub ai: AiSettings,
+    /// **UI Size** — Stage 6, item 1 of `docs/WORKSPACE_DESIGN_PLAN.md`:
+    /// View > UI Size (100/125/150/175/200 %), applied with
+    /// `ctx.set_zoom_factor` and persisted here rather than left to reset on
+    /// every launch. A person's own preference, not part of any film.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+    /// **Reduced motion** — Stage 6, item 5: when set, the window is asked
+    /// to run with `ctx.options().animation_time = 0`, so nothing — a
+    /// section's roll-up, the reveal emphasis outline — animates into place.
+    #[serde(default)]
+    pub reduce_motion: bool,
     /// **A panel its column should scroll to**, once.
     ///
     /// The fourth way a panel can be out of sight, and the one none of the
@@ -426,6 +532,50 @@ pub struct Workspace {
     /// seconds, then clears this. Not saved, for the same reason.
     #[serde(skip)]
     pub highlight: Option<PanelId>,
+    /// **View > Pasteboard Colour…'s override.** `None` (the default) means
+    /// "match the theme" — see `Palette::pasteboard` and
+    /// `theme::pasteboard_for`. `Some(rgba)` is the user's own colour,
+    /// straight sRGB bytes so it round-trips through JSON without a colour
+    /// type of its own. A person's own preference, not part of any one
+    /// film, so it lives here with the theme rather than travelling inside
+    /// a `.buzz` file.
+    #[serde(default)]
+    pub pasteboard: Option<[u8; 4]>,
+}
+
+/// User preferences for local AI models, vision, and LLM backends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiSettings {
+    #[serde(default)]
+    pub backend: Option<buzz_ai::llm::Backend>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub vision_model: Option<String>,
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    #[serde(default = "default_true")]
+    pub auto_detect: bool,
+    /// Ask models for no hidden reasoning (F7.3). On by default.
+    #[serde(default = "default_true")]
+    pub low_reasoning: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            backend: None,
+            model: None,
+            vision_model: None,
+            embedding_model: None,
+            auto_detect: true,
+            low_reasoning: true,
+        }
+    }
 }
 
 /// A serialisable keyboard chord — the modifiers and the key, stored by name so
@@ -459,7 +609,10 @@ impl KeyChord {
 
     /// Rebuild an egui shortcut, or `None` if the key name is not one egui knows.
     pub fn to_shortcut(&self) -> Option<egui::KeyboardShortcut> {
-        let key = egui::Key::ALL.iter().copied().find(|k| k.name() == self.key)?;
+        let key = egui::Key::ALL
+            .iter()
+            .copied()
+            .find(|k| k.name() == self.key)?;
         let modifiers = egui::Modifiers {
             alt: self.alt,
             ctrl: self.ctrl,
@@ -520,13 +673,21 @@ pub const ROW_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.6..=2.5;
 pub const COLUMN_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 216.0..=900.0;
 /// The tool strip, which holds icons rather than rows.
 ///
-/// One 30-point tool button, the panel frame's margins either side of it, and
-/// the scroll bar's own width. It was 46, which was one button and its margins
-/// and nothing else — correct until the dock's scroll bars stopped floating
-/// over the content and started reserving space, at which point the buttons no
-/// longer fitted the strip they were measured for.
-pub const LEFT_WIDTH_RANGE: std::ops::RangeInclusive<f32> =
-    (46.0 + crate::theme::Metrics::SCROLL_BAR)..=400.0;
+/// Wide enough for **two** 28 px tool buttons side by side, the gap between
+/// them, the panel frame's margins either side, and the scroll bar's own
+/// width — not one, as it was measured at before the workspace defects brief:
+/// `panels::tool_bar` falls back to two columns (`tool_strip_columns`)
+/// whenever the strip is too short to stack all twenty-four tools in one,
+/// which most window heights are once Properties, Library and the Timeline
+/// are also on screen, and a column too narrow to actually hold two side by
+/// side turned that fallback into tools silently scrolled out of reach
+/// sideways rather than a second column anyone could see.
+pub const LEFT_WIDTH_RANGE: std::ops::RangeInclusive<f32> = (2.0
+    * crate::theme::Metrics::TOOL_BUTTON
+    + crate::theme::Tokens::SPACE_1
+    + 2.0 * crate::theme::Tokens::SPACE_2
+    + crate::theme::Metrics::SCROLL_BAR)
+    ..=400.0;
 /// The timeline, which needs a couple of layer rows to be worth having.
 pub const BOTTOM_HEIGHT_RANGE: std::ops::RangeInclusive<f32> = 80.0..=900.0;
 
@@ -551,15 +712,14 @@ pub const MIN_STAGE_WIDTH: f32 = 200.0;
 /// Numbered above any `order` so they cannot collide with the one-panel
 /// sections, which take their group from their position.
 const GROUP_UTILITY: GroupId = 100;
-/// The tool's own settings, in a section of their own.
-///
-/// A number of its own rather than the `order`-derived one every ungrouped
-/// panel gets, and that is what makes it safe to add to a layout somebody has
-/// already arranged: a saved file has no slot with this group, so the panel
-/// arrives in its own section instead of tabbing itself in front of whatever
-/// already held that number. See `Workspace::fill_gaps`.
-const GROUP_TOOL_OPTIONS: GroupId = 102;
 const GROUP_ASSETS: GroupId = 101;
+/// The compact inspector stack: Properties stays visible first, while
+/// Effects, Tool Options, Library, Assets and Cast remain one click away in
+/// the same chrome.
+const GROUP_INSPECTOR: GroupId = 103;
+const GROUP_PALETTE: GroupId = 104;
+/// Essentials' own right column: Properties and the Library, tabbed.
+const GROUP_ESSENTIALS_RIGHT: GroupId = 105;
 
 /// What the three dock columns are actually drawn at this frame.
 ///
@@ -738,9 +898,52 @@ fn default_row_scale() -> f32 {
     1.0
 }
 
+/// 1x — the pointer is tracked exactly until a person asks for faster.
+fn default_pan_speed() -> f32 {
+    1.0
+}
+
+/// 100 % — the middle of Stage 6's 100–200 % UI Size range is 150, but the
+/// range a workspace with no saved preference starts at is the one that
+/// changes nothing until asked.
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
 impl Default for Workspace {
     fn default() -> Self {
-        Self::animate()
+        Self::essentials()
+    }
+}
+
+/// One of Window > Workspace's named presets — Stage 4, item 2 of
+/// `docs/WORKSPACE_DESIGN_PLAN.md`. A command's payload rather than a
+/// `Workspace` itself, so raising `Command::SetWorkspacePreset` does not
+/// require building one just to name which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkspacePreset {
+    Essentials,
+    Animator,
+    Classic,
+}
+
+impl WorkspacePreset {
+    pub const ALL: [WorkspacePreset; 3] = [Self::Essentials, Self::Animator, Self::Classic];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Essentials => "Essentials",
+            Self::Animator => "Animator",
+            Self::Classic => "Classic",
+        }
+    }
+
+    pub fn build(self) -> Workspace {
+        match self {
+            Self::Essentials => Workspace::essentials(),
+            Self::Animator => Workspace::animate(),
+            Self::Classic => Workspace::classic(),
+        }
     }
 }
 
@@ -818,19 +1021,49 @@ impl Workspace {
         };
     }
 
+    /// **Switch to one of Window > Workspace's named presets.**
+    ///
+    /// Same preserved fields as [`Self::reset_layout`], and for the same
+    /// reason: the theme, the new-document settings, the crash-recovery
+    /// directories, the UI scale and reduced-motion preference all belong to
+    /// the person rather than to any one arrangement of panels, and picking
+    /// a different arrangement is not asking to lose any of them.
+    pub fn apply_preset(&mut self, preset: WorkspacePreset) {
+        let recovery_dirs = std::mem::take(&mut self.recovery_dirs);
+        let new_document = self.new_document.clone();
+        let theme = self.theme;
+        let ui_scale = self.ui_scale;
+        let reduce_motion = self.reduce_motion;
+
+        *self = Self {
+            recovery_dirs,
+            new_document,
+            theme,
+            ui_scale,
+            reduce_motion,
+            ..preset.build()
+        };
+    }
+
     /// The layout this program opens with: Animate's, near enough — tools down
     /// the left, properties and the library on the right, timeline along the
     /// bottom.
     pub fn animate() -> Self {
         // `group` is the section this panel shares; `front` marks the tab that
         // starts at the front of it.
-        let tab = |id: PanelId, dock: Dock, order: u32, home: Dock, group: GroupId, front: bool| {
+        let tab = |id: PanelId,
+                   dock: Dock,
+                   order: u32,
+                   home: Dock,
+                   group: GroupId,
+                   front: bool,
+                   collapsed: bool| {
             Slot {
                 id,
                 dock,
                 home,
                 order,
-                collapsed: false,
+                collapsed,
                 group,
                 selected: front,
                 // Floating panels start over the stage rather than at the
@@ -841,7 +1074,7 @@ impl Workspace {
         };
         // A panel in a section of its own, which is what most of them are.
         let slot = |id: PanelId, dock: Dock, order: u32, home: Dock| {
-            tab(id, dock, order, home, order, true)
+            tab(id, dock, order, home, order, true, false)
         };
 
         Self {
@@ -851,103 +1084,148 @@ impl Workspace {
             highlight: None,
             slots: vec![
                 slot(PanelId::Tools, Dock::Left, 0, Dock::Left),
+                // Layers leads the column — what you have selected is the
+                // more urgent question than what is in the inspector.
                 slot(PanelId::Layers, Dock::Right, 0, Dock::Right),
-                // Above Properties, because it answers the question asked
-                // most often and most urgently — "how big is this brush" —
-                // and because the two read as a pair: what you are holding,
-                // then what you have selected.
+                // The inspector follows directly under it: Properties is its
+                // initial tab, Effects/Filters and contextual Tool Options
+                // share its body.
                 tab(
-                    PanelId::ToolOptions,
+                    PanelId::Properties,
                     Dock::Right,
                     1,
                     Dock::Right,
-                    GROUP_TOOL_OPTIONS,
+                    GROUP_INSPECTOR,
                     true,
-                ),
-                slot(PanelId::Properties, Dock::Right, 2, Dock::Right),
-                slot(PanelId::Color, Dock::Right, 3, Dock::Right),
-                // Beside the colour controls, which is where a palette is
-                // reached for. Animate docks Swatches with Color for the same
-                // reason.
-                slot(PanelId::Swatches, Dock::Right, 4, Dock::Right),
-                // **One section, six tabs.** Each of these is reached for now
-                // and then rather than all day. Rolled up they were six title
-                // bars taking six rows and showing nothing; as tabs they take
-                // one row and always show one of them. That is what the
-                // grouping is *for*, and the default arrangement should
-                // demonstrate it rather than leave it as something to discover.
-                //
-                // **Story is the one at the front.** Setting a shot up is what
-                // an animator does before anything else in it, and it is the
-                // panel that replaced two menu items nobody would find.
-                tab(PanelId::Story, Dock::Right, 5, Dock::Right, GROUP_UTILITY, true),
-                tab(
-                    PanelId::Depth,
-                    Dock::Right,
-                    6,
-                    Dock::Right,
-                    GROUP_UTILITY,
                     false,
                 ),
-                tab(PanelId::Rig, Dock::Right, 7, Dock::Right, GROUP_UTILITY, false),
                 tab(
                     PanelId::Filters,
                     Dock::Right,
-                    8,
+                    2,
                     Dock::Right,
-                    GROUP_UTILITY,
+                    GROUP_INSPECTOR,
+                    false,
                     false,
                 ),
                 tab(
-                    PanelId::Lighting,
+                    PanelId::ToolOptions,
+                    Dock::Right,
+                    3,
+                    Dock::Right,
+                    GROUP_INSPECTOR,
+                    false,
+                    false,
+                ),
+                // **One tab stack.** Library, Assets and Cast join Properties,
+                // Effects and Tool Options rather than keep a second column of
+                // their own — a character is an asset with a face, and the
+                // comparison an animator makes between this film's symbols,
+                // the shelf of reusable things and the people is the one all
+                // six tabs now sit behind, one click apart. `Dock::RightOuter`
+                // is left empty by this default; a panel dragged out there
+                // still docks fine, it is just nobody's home any more.
+                tab(
+                    PanelId::Library,
+                    Dock::Right,
+                    4,
+                    Dock::Right,
+                    GROUP_INSPECTOR,
+                    false,
+                    false,
+                ),
+                tab(
+                    PanelId::Assets,
+                    Dock::Right,
+                    5,
+                    Dock::Right,
+                    GROUP_INSPECTOR,
+                    false,
+                    false,
+                ),
+                tab(
+                    PanelId::Cast,
+                    Dock::Right,
+                    6,
+                    Dock::Right,
+                    GROUP_INSPECTOR,
+                    false,
+                    false,
+                ),
+                tab(
+                    PanelId::Color,
+                    Dock::Right,
+                    7,
+                    Dock::Right,
+                    GROUP_PALETTE,
+                    true,
+                    false,
+                ),
+                // Beside the colour controls, which is where a palette is
+                // reached for. Animate docks Swatches with Color for the same
+                // reason.
+                tab(
+                    PanelId::Swatches,
+                    Dock::Right,
+                    8,
+                    Dock::Right,
+                    GROUP_PALETTE,
+                    false,
+                    false,
+                ),
+                // Contextual controls share one short stack instead of
+                // pushing every occasional panel down the column.
+                tab(
+                    PanelId::Story,
                     Dock::Right,
                     9,
                     Dock::Right,
                     GROUP_UTILITY,
+                    true,
                     false,
                 ),
                 tab(
-                    PanelId::Sound,
+                    PanelId::Depth,
                     Dock::Right,
                     10,
                     Dock::Right,
                     GROUP_UTILITY,
                     false,
-                ),
-                // The Library and the Assets panel share a section too: one
-                // holds this film's symbols and the other what outlives the
-                // film, which is the comparison an animator is making when
-                // they reach for either.
-                tab(
-                    PanelId::Library,
-                    Dock::RightOuter,
-                    0,
-                    Dock::RightOuter,
-                    GROUP_ASSETS,
-                    true,
-                ),
-                tab(
-                    PanelId::Assets,
-                    Dock::RightOuter,
-                    1,
-                    Dock::RightOuter,
-                    GROUP_ASSETS,
                     false,
                 ),
-                // **The cast tabs in with the Library and the Assets panel.** A
-                // character is an asset with a face, and the comparison an
-                // animator makes — this film's symbols, the shelf of reusable
-                // things, the people — is the one these three tabs put side by
-                // side.
                 tab(
-                    PanelId::Cast,
-                    Dock::RightOuter,
-                    2,
-                    Dock::RightOuter,
-                    GROUP_ASSETS,
+                    PanelId::Rig,
+                    Dock::Right,
+                    11,
+                    Dock::Right,
+                    GROUP_UTILITY,
+                    false,
+                    false,
+                ),
+                tab(
+                    PanelId::Lighting,
+                    Dock::Right,
+                    12,
+                    Dock::Right,
+                    GROUP_UTILITY,
+                    false,
+                    false,
+                ),
+                tab(
+                    PanelId::Sound,
+                    Dock::Right,
+                    13,
+                    Dock::Right,
+                    GROUP_UTILITY,
+                    false,
                     false,
                 ),
                 slot(PanelId::Timeline, Dock::Bottom, 0, Dock::Bottom),
+                // A tab beside the Timeline, not the front one — a new
+                // document opens onto the Timeline, and the Sequence strip
+                // is there to switch to once there is a sequence to look at.
+                // See `docs/SEQUENCE_SETUPS_PLAN.md` S5.
+                tab(PanelId::Sequence, Dock::Bottom, 1, Dock::Bottom, 0, false, false),
                 // Closed until F9 asks for it — and it belongs at the bottom,
                 // under the stage, where Animate keeps it.
                 slot(PanelId::Actions, Dock::Hidden, 1, Dock::Bottom),
@@ -957,6 +1235,10 @@ impl Workspace {
                 // Closed until asked for; docks on the right beside Properties,
                 // where a curve editor sits next to the tween's settings.
                 slot(PanelId::MotionEditor, Dock::Hidden, 3, Dock::Right),
+                // Closed until asked for (Window ▸ AI, or any AI menu
+                // command); opens in the outer right column, which the one
+                // tab stack otherwise leaves empty.
+                slot(PanelId::Ai, Dock::Hidden, 4, Dock::RightOuter),
             ],
             locked: false,
             theme: crate::theme::Theme::default(),
@@ -974,9 +1256,102 @@ impl Workspace {
             parenting_view: false,
             depth_view: false,
             rig: RigOptions::default(),
+            pan_speed: default_pan_speed(),
+            brush_tips: crate::brush::BrushTips::default(),
+            trace: buzz_scene::TraceOptions::default(),
             asset_thumbnail_size: crate::assets_panel::ThumbnailSize::default(),
             keymap: std::collections::BTreeMap::new(),
+            ai: AiSettings::default(),
+            ui_scale: default_ui_scale(),
+            reduce_motion: false,
+            pasteboard: None,
         }
+    }
+
+    /// **Stage 4's new preset: four things on screen, everything else one
+    /// click away in Window.**
+    ///
+    /// Built from [`Self::animate`] rather than from scratch, so nothing
+    /// about a panel's identity — its shortcut, its `home` when revealed,
+    /// its float size — has to be repeated or can drift out of step with the
+    /// full layout. Only what Essentials actually shows or hides changes:
+    /// Tools stays on the left, the one tab stack — Properties in front,
+    /// Effects, Tool Options, Library, Assets and Cast riding along behind
+    /// it — on the right at 300 px, Timeline keeps the bottom at 220 px, and
+    /// every other panel moves to [`Dock::Hidden`] — kept, not deleted: its
+    /// `home` is still wherever [`Self::animate`] would dock it, which is
+    /// where Window opens it back to.
+    pub fn essentials() -> Self {
+        let mut workspace = Self::animate();
+        workspace.name = "Essentials".into();
+
+        // Properties fronts the stack; the other five come along behind it,
+        // one click away rather than hidden in Window.
+        for (order, (id, front)) in [
+            (PanelId::Properties, true),
+            (PanelId::Filters, false),
+            (PanelId::ToolOptions, false),
+            (PanelId::Library, false),
+            (PanelId::Assets, false),
+            (PanelId::Cast, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(slot) = workspace.slot_mut(id) {
+                slot.dock = Dock::Right;
+                slot.home = Dock::Right;
+                slot.order = order as u32;
+                slot.group = GROUP_ESSENTIALS_RIGHT;
+                slot.selected = front;
+                slot.collapsed = false;
+            }
+        }
+
+        for id in PanelId::ALL {
+            if matches!(
+                id,
+                PanelId::Tools
+                    | PanelId::Properties
+                    | PanelId::Filters
+                    | PanelId::ToolOptions
+                    | PanelId::Library
+                    | PanelId::Assets
+                    | PanelId::Cast
+                    | PanelId::Timeline
+            ) {
+                continue;
+            }
+            if let Some(slot) = workspace.slot_mut(id) {
+                slot.dock = Dock::Hidden;
+            }
+        }
+
+        workspace.right_width = 300.0;
+        workspace.bottom_height = 220.0;
+        // Every section still shows exactly one of its panels, and a
+        // section nobody rolled up is not left rolled up — the same two
+        // invariants `fill_gaps` protects a saved file with.
+        workspace.mend_fronts();
+        workspace.mend_collapse();
+        workspace
+    }
+
+    /// **"Classic": today's shipped default, under the name Stage 4's
+    /// Workspace submenu (Essentials, Animator, Classic, …) asks for
+    /// alongside "Animator".**
+    ///
+    /// The plan names three presets in Window > Workspace but the Decision
+    /// above it describes only two — Essentials and Animator — with no
+    /// arrangement of Classic's own to distinguish it. Rather than invent a
+    /// third layout nothing in the brief specifies, this is `Self::animate`
+    /// again, under its own name: a deviation recorded here, not a design
+    /// decided silently. Should the two ever need to differ, this is the one
+    /// to change.
+    pub fn classic() -> Self {
+        let mut workspace = Self::animate();
+        workspace.name = "Classic".into();
+        workspace
     }
 
     /// Every panel on one side, in order.
@@ -1022,9 +1397,7 @@ impl Workspace {
             if !section.panels.contains(&section.front) {
                 section.front = section.panels[0];
             }
-            section.collapsed = self
-                .slot(section.front)
-                .is_some_and(|slot| slot.collapsed);
+            section.collapsed = self.slot(section.front).is_some_and(|slot| slot.collapsed);
         }
         sections
     }
@@ -1151,7 +1524,9 @@ impl Workspace {
     /// The section a panel belongs to, if it is on screen.
     pub fn section_of(&self, id: PanelId) -> Option<Section> {
         let dock = self.slot(id)?.dock;
-        self.sections(dock).into_iter().find(|s| s.panels.contains(&id))
+        self.sections(dock)
+            .into_iter()
+            .find(|s| s.panels.contains(&id))
     }
 
     /// Bring a panel to the front of its section.
@@ -1382,6 +1757,12 @@ impl Workspace {
         if !self.is_open(id) {
             self.restore_default_place(id);
         }
+        // A panel the default arrangement keeps closed (Tasks, the AI panel)
+        // is still hidden after that: open it at its home, the way Window's
+        // own toggle does.
+        if !self.is_open(id) && !self.locked {
+            self.toggle(id);
+        }
         self.select_tab(id);
         // Selecting a tab deliberately leaves a rolled-up section rolled up —
         // right for clicking a tab, wrong for a menu item, which has no other
@@ -1502,6 +1883,130 @@ impl Workspace {
         self.mend_fronts();
     }
 
+    /// Every panel sharing `id`'s dock and group, in tab order — the whole
+    /// tab stack `id` sits in, not just `id` itself. A hidden panel has no
+    /// section to speak of, so it is alone.
+    pub fn section_members(&self, id: PanelId) -> Vec<PanelId> {
+        let Some(slot) = self.slot(id) else {
+            return vec![id];
+        };
+        if slot.dock == Dock::Hidden {
+            return vec![id];
+        }
+        let dock = slot.dock;
+        let group = slot.group;
+        let mut members: Vec<&Slot> = self
+            .slots
+            .iter()
+            .filter(|s| s.dock == dock && s.group == group)
+            .collect();
+        members.sort_by_key(|s| s.order);
+        members.iter().map(|s| s.id).collect()
+    }
+
+    /// The front tab of `id`'s section, before any of the section-level moves
+    /// below rearrange it. Used so a whole-section move can put the same tab
+    /// back in front afterwards.
+    fn front_before_move(&self, id: PanelId) -> PanelId {
+        match self.slot(id) {
+            Some(slot) if slot.dock != Dock::Hidden => {
+                self.section_of(id).map(|s| s.front).unwrap_or(id)
+            }
+            _ => id,
+        }
+    }
+
+    /// **Move a whole section to a side** — every tab it carries, not just the
+    /// one the caller named. The section keeps its tab order and whichever tab
+    /// was showing stays showing.
+    pub fn move_section(&mut self, id: PanelId, dock: Dock) {
+        if self.locked {
+            return;
+        }
+        let members = self.section_members(id);
+        let Some(&first) = members.first() else {
+            return;
+        };
+        let original_front = self.front_before_move(id);
+
+        self.move_to(first, dock);
+        let mut previous = first;
+        for &member in members.iter().skip(1) {
+            self.group_with(member, previous);
+            previous = member;
+        }
+        self.select_tab(original_front);
+    }
+
+    /// **Float a whole section at a point on the screen**, as one window
+    /// rather than one per tab.
+    pub fn float_section_at(&mut self, id: PanelId, pos: (f32, f32)) {
+        if self.locked {
+            return;
+        }
+        let members = self.section_members(id);
+        let Some(&first) = members.first() else {
+            return;
+        };
+        let original_front = self.front_before_move(id);
+
+        self.float_at(first, pos);
+        let size = self
+            .slot(first)
+            .map(|s| s.float_size)
+            .unwrap_or((300.0, 380.0));
+        let mut previous = first;
+        for &member in members.iter().skip(1) {
+            self.group_with(member, previous);
+            previous = member;
+        }
+        for &member in &members {
+            if let Some(slot) = self.slot_mut(member) {
+                slot.float_pos = pos;
+                slot.float_size = size;
+            }
+        }
+        self.select_tab(original_front);
+    }
+
+    /// **Dock a whole section in a column at a chosen place**, the
+    /// section-level counterpart to [`Self::dock_at`].
+    pub fn dock_section_at(&mut self, id: PanelId, dock: Dock, before: Option<GroupId>) {
+        if self.locked || !dock.is_docked() {
+            return;
+        }
+        let members = self.section_members(id);
+        let Some(&first) = members.first() else {
+            return;
+        };
+        let original_front = self.front_before_move(id);
+
+        self.dock_at(first, dock, before);
+        let mut previous = first;
+        for &member in members.iter().skip(1) {
+            self.group_with(member, previous);
+            previous = member;
+        }
+        self.select_tab(original_front);
+    }
+
+    /// **Tab a whole section in with `target`'s section**, every member
+    /// chained in after it in order, then the same tab restored to the front.
+    pub fn group_section_with(&mut self, id: PanelId, target: PanelId) {
+        if self.locked || id == target {
+            return;
+        }
+        let members = self.section_members(id);
+        let original_front = self.front_before_move(id);
+
+        let mut previous = target;
+        for &member in &members {
+            self.group_with(member, previous);
+            previous = member;
+        }
+        self.select_tab(original_front);
+    }
+
     /// Show a hidden panel, or hide a shown one.
     ///
     /// Allowed while locked: a locked *layout* is about where things are, and
@@ -1590,6 +2095,21 @@ impl Workspace {
     /// reports that a panel "does not exist".
     pub fn fill_gaps(&mut self) {
         let defaults = Self::animate();
+        // Only migrate the untouched shipped geometry. A user's moved or
+        // regrouped panels must remain exactly where they put them.
+        let adopt_effects_front =
+            self.version < VERSION_EFFECTS_FRONT && self.legacy_default_shape();
+        // Unlike the earlier migrations, this one deliberately compares the
+        // whole saved layout state.  A user who merely chose another tab or
+        // rolled a section up has customised their workspace just as surely as
+        // one who moved a dock; neither should be reset by a new default.
+        let adopt_compact_right = self.version < VERSION_COMPACT_RIGHT
+            && self.untouched_compact_legacy_layout();
+        // Narrower than the two above: only the three panels' own corner of
+        // the layout has to still be untouched, not the whole arrangement,
+        // because the migration itself only reaches into that corner.
+        let adopt_properties_stack = self.version < VERSION_PROPERTIES_STACK
+            && self.untouched_assets_outer_group();
 
         // A layout from before panels could be rolled up: adopt which ones
         // start rolled, once. Everything else the user arranged is left alone
@@ -1644,12 +2164,88 @@ impl Workspace {
         if self.version < VERSION_STORY_PLACED {
             self.restore_default_place(PanelId::Story);
         }
+        if adopt_effects_front {
+            for slot in &mut self.slots {
+                if let Some(default) = defaults.slot(slot.id) {
+                    slot.group = default.group;
+                    slot.selected = default.selected;
+                    slot.collapsed = default.collapsed;
+                }
+            }
+        }
+        if adopt_compact_right {
+            self.slots = defaults.slots.clone();
+        }
+        // **Library, Assets and Cast fold into Properties' tab stack.** Only
+        // once, and only for the corner `untouched_assets_outer_group`
+        // checked above — if `adopt_compact_right` already replaced the
+        // whole layout, that corner is the new shape already and the guard
+        // below (still `Dock::RightOuter`) quietly does nothing.
+        if adopt_properties_stack
+            && let Some(target_group) = self.slot(PanelId::Properties).map(|s| s.group)
+        {
+            let mut next_order = self
+                .slots
+                .iter()
+                .filter(|s| s.dock == Dock::Right && s.group == target_group)
+                .map(|s| s.order)
+                .max()
+                .map_or(0, |order| order + 1);
+            for id in [PanelId::Library, PanelId::Assets, PanelId::Cast] {
+                if let Some(slot) = self.slot_mut(id)
+                    && slot.dock == Dock::RightOuter
+                {
+                    slot.dock = Dock::Right;
+                    slot.home = Dock::Right;
+                    slot.group = target_group;
+                    slot.order = next_order;
+                    slot.selected = false;
+                    slot.collapsed = false;
+                    next_order += 1;
+                }
+            }
+        }
+        // **A layout from before the Sequence panel existed** gets it added
+        // hidden rather than suddenly showing a tab beside the Timeline it
+        // never asked for. Only for a file that does not have it at all —
+        // once it has been opened once, a user's own choice to hide, move or
+        // show it is never touched again. See
+        // `docs/SEQUENCE_SETUPS_PLAN.md` S5.
+        if self.version < VERSION_SEQUENCE_PANEL && self.slot(PanelId::Sequence).is_none() {
+            let order = self
+                .slots
+                .iter()
+                .filter(|s| s.dock == Dock::Hidden)
+                .map(|s| s.order)
+                .max()
+                .map_or(0, |o| o + 1);
+            self.slots.push(Slot {
+                id: PanelId::Sequence,
+                dock: Dock::Hidden,
+                home: Dock::Bottom,
+                order,
+                float_pos: (320.0 + order as f32 * 24.0, 140.0 + order as f32 * 24.0),
+                float_size: (300.0, 380.0),
+                collapsed: false,
+                group: order,
+                selected: false,
+            });
+        }
         self.version = LAYOUT_VERSION;
 
         for id in PanelId::ALL {
             if self.slot(id).is_none()
-                && let Some(slot) = defaults.slot(id)
+                && let Some(found) = defaults.slot(id)
             {
+                let mut slot = *found;
+                // **A panel manufactured from the default arrives in a
+                // section of its own.** Copying the default's `group`
+                // verbatim would tab it in behind whatever front tab is
+                // already there in a fresh install's grouping — at the exact
+                // spot the user is looking — which is indistinguishable from
+                // the panel not existing. A group nothing else on this side
+                // is using keeps it visible.
+                slot.group = self.next_group(slot.dock);
                 // **Room is made at the position the default gives it**, not
                 // left to the end of the column.
                 //
@@ -1664,12 +2260,26 @@ impl Workspace {
                 // Pushing the rest of the dock down by one preserves every
                 // relative position the user arranged and costs nothing to the
                 // groups, which are keyed by `group` rather than by `order`.
+                //
+                // A panel whose *default* group is still on this side (its
+                // groupmates survived the older file, only this one member
+                // was missing) is anchored on that group's front tab rather
+                // than on its own raw default order: it used to live there,
+                // and arriving one row above the tab a user already has open
+                // reads as "this came back", not as a row shuffled in from
+                // wherever the numbers happened to land it.
+                let anchor = self
+                    .slots
+                    .iter()
+                    .find(|s| s.dock == slot.dock && s.group == found.group && s.selected)
+                    .map_or(slot.order, |s| s.order);
                 for existing in &mut self.slots {
-                    if existing.dock == slot.dock && existing.order >= slot.order {
+                    if existing.dock == slot.dock && existing.order >= anchor {
                         existing.order += 1;
                     }
                 }
-                self.slots.push(*slot);
+                slot.order = anchor;
+                self.slots.push(slot);
             }
         }
         // And drop anything unrecognised, which is what a *newer* build's
@@ -1721,6 +2331,131 @@ impl Workspace {
         self.right_outer_width = clamp_to(self.right_outer_width, COLUMN_WIDTH_RANGE);
         self.bottom_height = clamp_to(self.bottom_height, BOTTOM_HEIGHT_RANGE);
     }
+
+    /// Whether a saved layout still has the old untouched default geometry.
+    /// Group zero is accepted for files written before tab groups existed;
+    /// otherwise the utility and asset relationships must still be intact.
+    fn legacy_default_shape(&self) -> bool {
+        let expected = [
+            (PanelId::Tools, Dock::Left, 0),
+            (PanelId::Layers, Dock::Right, 0),
+            (PanelId::ToolOptions, Dock::Right, 1),
+            (PanelId::Properties, Dock::Right, 2),
+            (PanelId::Color, Dock::Right, 3),
+            (PanelId::Swatches, Dock::Right, 4),
+            (PanelId::Story, Dock::Right, 5),
+            (PanelId::Depth, Dock::Right, 6),
+            (PanelId::Rig, Dock::Right, 7),
+            (PanelId::Filters, Dock::Right, 8),
+            (PanelId::Lighting, Dock::Right, 9),
+            (PanelId::Sound, Dock::Right, 10),
+            (PanelId::Library, Dock::RightOuter, 0),
+            (PanelId::Assets, Dock::RightOuter, 1),
+            (PanelId::Cast, Dock::RightOuter, 2),
+            (PanelId::Timeline, Dock::Bottom, 0),
+            (PanelId::Actions, Dock::Hidden, 1),
+            (PanelId::Tasks, Dock::Hidden, 2),
+            (PanelId::MotionEditor, Dock::Hidden, 3),
+        ];
+        if self.slots.len() != expected.len()
+            || expected.iter().any(|(id, dock, order)| {
+                self.slot(*id)
+                    .is_none_or(|slot| slot.dock != *dock || slot.order != *order)
+            })
+        {
+            return false;
+        }
+        let utility_group = self.slot(PanelId::Filters).map(|s| s.group).unwrap();
+        let assets_group = self.slot(PanelId::Library).map(|s| s.group).unwrap();
+        let groups_zero = self.slots.iter().all(|slot| slot.group == 0);
+        let utility_intact = [
+            PanelId::Story,
+            PanelId::Depth,
+            PanelId::Rig,
+            PanelId::Lighting,
+            PanelId::Sound,
+        ]
+        .iter()
+        .all(|id| {
+            self.slot(*id)
+                .is_some_and(|slot| slot.group == utility_group)
+        });
+        let assets_intact = [PanelId::Assets, PanelId::Cast].iter().all(|id| {
+            self.slot(*id)
+                .is_some_and(|slot| slot.group == assets_group)
+        });
+        groups_zero || (utility_intact && assets_intact)
+    }
+
+    /// The complete version-4 shipped layout.  This is intentionally stricter
+    /// than `legacy_default_shape`: its purpose is to distinguish a genuinely
+    /// untouched workspace from one customised only through tabs, collapse
+    /// state, grouping, dimensions, or a floating panel rectangle.
+    fn untouched_compact_legacy_layout(&self) -> bool {
+        const EXPECTED: &[(PanelId, Dock, Dock, u32, GroupId, bool, bool)] = &[
+            (PanelId::Tools, Dock::Left, Dock::Left, 0, 0, true, false),
+            (PanelId::Layers, Dock::Right, Dock::Right, 0, 0, true, false),
+            (PanelId::ToolOptions, Dock::Right, Dock::Right, 1, GROUP_INSPECTOR, false, false),
+            (PanelId::Properties, Dock::Right, Dock::Right, 2, GROUP_INSPECTOR, true, false),
+            (PanelId::Color, Dock::Right, Dock::Right, 3, GROUP_PALETTE, true, false),
+            (PanelId::Swatches, Dock::Right, Dock::Right, 4, GROUP_PALETTE, false, false),
+            (PanelId::Story, Dock::Right, Dock::Right, 5, GROUP_UTILITY, true, false),
+            (PanelId::Depth, Dock::Right, Dock::Right, 6, GROUP_UTILITY, false, false),
+            (PanelId::Rig, Dock::Right, Dock::Right, 7, GROUP_UTILITY, false, false),
+            (PanelId::Filters, Dock::Right, Dock::Right, 8, GROUP_INSPECTOR, false, false),
+            (PanelId::Lighting, Dock::Right, Dock::Right, 9, GROUP_UTILITY, false, false),
+            (PanelId::Sound, Dock::Right, Dock::Right, 10, GROUP_UTILITY, false, false),
+            (PanelId::Library, Dock::RightOuter, Dock::RightOuter, 0, GROUP_ASSETS, true, false),
+            (PanelId::Assets, Dock::RightOuter, Dock::RightOuter, 1, GROUP_ASSETS, false, false),
+            (PanelId::Cast, Dock::RightOuter, Dock::RightOuter, 2, GROUP_ASSETS, false, false),
+            (PanelId::Timeline, Dock::Bottom, Dock::Bottom, 0, 0, true, false),
+            (PanelId::Actions, Dock::Hidden, Dock::Bottom, 1, 1, true, false),
+            (PanelId::Tasks, Dock::Hidden, Dock::Bottom, 2, 2, true, false),
+            (PanelId::MotionEditor, Dock::Hidden, Dock::Right, 3, 3, true, false),
+        ];
+        self.slots.len() == EXPECTED.len()
+            && self.left_width == *LEFT_WIDTH_RANGE.start()
+            && self.right_width == 300.0
+            && self.right_outer_width == 240.0
+            && self.bottom_height == 170.0
+            && EXPECTED.iter().all(|(id, dock, home, order, group, selected, collapsed)| {
+                self.slot(*id).is_some_and(|slot| {
+                    slot.dock == *dock
+                        && slot.home == *home
+                        && slot.order == *order
+                        && slot.group == *group
+                        && slot.selected == *selected
+                        && slot.collapsed == *collapsed
+                        && slot.float_pos == (320.0 + *order as f32 * 24.0, 140.0 + *order as f32 * 24.0)
+                        && slot.float_size == (300.0, 380.0)
+                })
+            })
+    }
+
+    /// Whether Library, Assets and Cast are still sharing one section in
+    /// `Dock::RightOuter`, with Properties still in `Dock::Right` — the one
+    /// corner `VERSION_PROPERTIES_STACK` reaches into. Deliberately narrower
+    /// than `untouched_compact_legacy_layout`: a user who rearranged anything
+    /// else on the right has still customised their workspace, but the three
+    /// tabs this migration folds in are the only ones it touches, so they are
+    /// the only ones it need find untouched.
+    fn untouched_assets_outer_group(&self) -> bool {
+        let Some(properties) = self.slot(PanelId::Properties) else {
+            return false;
+        };
+        if properties.dock != Dock::Right {
+            return false;
+        }
+        let outer_groups: Vec<GroupId> = [PanelId::Library, PanelId::Assets, PanelId::Cast]
+            .iter()
+            .filter_map(|id| {
+                self.slot(*id)
+                    .filter(|slot| slot.dock == Dock::RightOuter)
+                    .map(|slot| slot.group)
+            })
+            .collect();
+        outer_groups.len() == 3 && outer_groups.iter().all(|group| *group == outer_groups[0])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1729,7 +2464,7 @@ impl Workspace {
 
 /// Bumped when the *default arrangement* changes in a way a saved layout
 /// should adopt. See [`Workspace::version`].
-pub const LAYOUT_VERSION: u32 = VERSION_STORY_PLACED;
+pub const LAYOUT_VERSION: u32 = VERSION_SEQUENCE_PANEL;
 
 /// Panels gained the roll-up, and five of them started rolled.
 const VERSION_ROLL_UPS: u32 = 1;
@@ -1747,6 +2482,18 @@ const VERSION_TAB_GROUPS: u32 = 2;
 /// A saved layout cannot fix itself, because `fill_gaps` only fills *gaps* and
 /// the slot is present. So this migration puts it back once.
 const VERSION_STORY_PLACED: u32 = 3;
+/// Effects is the first tab in the occasional-controls stack.
+const VERSION_EFFECTS_FRONT: u32 = 4;
+/// Inspector-first, compact right-side workspace.
+const VERSION_COMPACT_RIGHT: u32 = 5;
+/// **One tab stack.** Library, Assets and Cast fold into Properties' section
+/// instead of keeping a second column of their own in `Dock::RightOuter`.
+const VERSION_PROPERTIES_STACK: u32 = 6;
+/// **The Sequence strip arrives.** A saved layout from before it existed gets
+/// it added `Hidden`, home `Dock::Bottom` — never suddenly shown as a tab
+/// beside the Timeline it did not choose. See `docs/SEQUENCE_SETUPS_PLAN.md`
+/// S5.
+const VERSION_SEQUENCE_PANEL: u32 = 7;
 
 /// The home a slot takes when a saved layout predates the field.
 fn default_home() -> Dock {
@@ -1859,7 +2606,11 @@ mod tests {
     #[test]
     fn a_key_chord_round_trips_through_egui() {
         let shortcut = egui::KeyboardShortcut::new(
-            egui::Modifiers { ctrl: true, shift: true, ..Default::default() },
+            egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
             egui::Key::S,
         );
         let chord = KeyChord::from_shortcut(shortcut);
@@ -1874,7 +2625,11 @@ mod tests {
         let mut ws = Workspace::animate();
         let cmd = Command::PlayPause;
         let default = cmd.shortcut();
-        assert_eq!(ws.shortcut_for(cmd), default, "unset resolves to the default");
+        assert_eq!(
+            ws.shortcut_for(cmd),
+            default,
+            "unset resolves to the default"
+        );
 
         // Rebind to a new chord.
         let chord = KeyChord {
@@ -1903,12 +2658,21 @@ mod tests {
         let mut ws = Workspace::animate();
         ws.rebind(
             Command::Save,
-            KeyChord { command: true, ctrl: false, alt: false, shift: true, key: "S".into() },
+            KeyChord {
+                command: true,
+                ctrl: false,
+                alt: false,
+                shift: true,
+                key: "S".into(),
+            },
         );
         ws.unbind(Command::PlayPause);
         let json = serde_json::to_string(&ws).unwrap();
         let back: Workspace = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.shortcut_for(Command::Save), ws.shortcut_for(Command::Save));
+        assert_eq!(
+            back.shortcut_for(Command::Save),
+            ws.shortcut_for(Command::Save)
+        );
         assert_eq!(back.shortcut_for(Command::PlayPause), None);
     }
 
@@ -1933,8 +2697,11 @@ mod tests {
 
     #[test]
     fn a_window_with_room_to_spare_leaves_the_columns_alone() {
+        // 100, not the tool strip's own floor: this is a plain "comfortably
+        // above the floor" width, standing in for whatever the left column
+        // happens to be, not a claim about what that floor is.
         let wanted = ColumnWidths {
-            left: 60.0,
+            left: 100.0,
             right: 300.0,
             right_outer: 240.0,
         };
@@ -1972,7 +2739,7 @@ mod tests {
     #[test]
     fn an_empty_side_takes_nothing() {
         let wanted = ColumnWidths {
-            left: 60.0,
+            left: 100.0,
             right: 900.0,
             right_outer: 0.0,
         };
@@ -1980,7 +2747,7 @@ mod tests {
         assert_eq!(fitted.right_outer, 0.0);
         assert_eq!(
             fitted.right,
-            1000.0 - MIN_STAGE_WIDTH - 60.0,
+            1000.0 - MIN_STAGE_WIDTH - 100.0,
             "the hidden column's points were reserved anyway"
         );
     }
@@ -1990,12 +2757,12 @@ mod tests {
     #[test]
     fn the_widest_column_gives_up_the_space() {
         let wanted = ColumnWidths {
-            left: 60.0,
+            left: 100.0,
             right: 800.0,
             right_outer: 240.0,
         };
         let fitted = fit_columns(1200.0, wanted, floors());
-        assert_eq!(fitted.left, 60.0, "the tool strip was trimmed");
+        assert_eq!(fitted.left, 100.0, "the tool strip was trimmed");
         assert_eq!(fitted.right_outer, 240.0, "the narrow column was trimmed");
         assert!(fitted.right < 800.0);
         assert!((fitted.total() - (1200.0 - MIN_STAGE_WIDTH)).abs() < 1.0);
@@ -2013,10 +2780,16 @@ mod tests {
             right_outer: 240.0,
         };
         let free = fit_columns(1100.0, wanted, floors());
-        assert!(free.left < 380.0, "nothing was over-subscribed to begin with");
+        assert!(
+            free.left < 380.0,
+            "nothing was over-subscribed to begin with"
+        );
 
         let dragged = fit_columns_keeping(1100.0, wanted, floors(), Some(Dock::Left));
-        assert_eq!(dragged.left, 380.0, "the dragged column did not follow the pointer");
+        assert_eq!(
+            dragged.left, 380.0,
+            "the dragged column did not follow the pointer"
+        );
         assert!(dragged.right < 300.0, "the property column did not shrink");
         assert!(dragged.total() <= 1100.0 - MIN_STAGE_WIDTH + 0.5);
     }
@@ -2062,7 +2835,10 @@ mod tests {
     fn a_boundary_stops_where_its_neighbours_run_out() {
         let workspace = Workspace::animate();
         let cap = workspace.column_cap(Dock::Left, 1200.0);
-        let neighbours = *COLUMN_WIDTH_RANGE.start() * 2.0;
+        // `Dock::RightOuter` is empty by default now that the inspector's
+        // one tab stack holds everything Right used to share the side with
+        // — so Left's only occupied neighbour is Right.
+        let neighbours = *COLUMN_WIDTH_RANGE.start();
         assert!((cap - (1200.0 - MIN_STAGE_WIDTH - neighbours)).abs() < 0.5);
 
         // And a drag to the cap leaves a layout that fits.
@@ -2088,10 +2864,7 @@ mod tests {
 
         // The Properties column dragged as wide as this window allows, which
         // is what the splitter clamps the drag to.
-        let dropped = clamp_to(
-            workspace.column_cap(Dock::Right, ROOM),
-            COLUMN_WIDTH_RANGE,
-        );
+        let dropped = clamp_to(workspace.column_cap(Dock::Right, ROOM), COLUMN_WIDTH_RANGE);
         assert!(dropped > 300.0, "this window had no squeezing to do");
         workspace.right_width = dropped;
 
@@ -2120,6 +2893,137 @@ mod tests {
         }
     }
 
+    /// **Stage 4, item 4: Essentials shows three regions** — Tools, one tab
+    /// stack (Properties in front, Effects, Tool Options, Library, Assets and
+    /// Cast behind it) and Timeline — and hides the rest without losing them:
+    /// every hidden panel still has a slot and a `home` to reopen into.
+    #[test]
+    fn essentials_shows_three_regions() {
+        let workspace = Workspace::essentials();
+        assert_eq!(workspace.name, "Essentials");
+
+        let shown: Vec<PanelId> = PanelId::ALL
+            .into_iter()
+            .filter(|id| workspace.dock_of(*id) != Dock::Hidden)
+            .collect();
+        assert_eq!(
+            shown.len(),
+            8,
+            "Essentials should show exactly eight panels (Tools, the six-tab \
+             stack, Timeline), shows {shown:?}"
+        );
+        for id in [
+            PanelId::Tools,
+            PanelId::Properties,
+            PanelId::Filters,
+            PanelId::ToolOptions,
+            PanelId::Library,
+            PanelId::Assets,
+            PanelId::Cast,
+            PanelId::Timeline,
+        ] {
+            assert_ne!(
+                workspace.dock_of(id),
+                Dock::Hidden,
+                "{id:?} should be one of Essentials' things"
+            );
+        }
+
+        // Properties, Effects, Tool Options, the Library, Assets and Cast
+        // all share the one column Essentials keeps beside the stage.
+        let section = workspace
+            .section_of(PanelId::Properties)
+            .expect("Properties is on screen");
+        for id in [
+            PanelId::Filters,
+            PanelId::ToolOptions,
+            PanelId::Library,
+            PanelId::Assets,
+            PanelId::Cast,
+        ] {
+            assert!(
+                section.panels.contains(&id),
+                "{id:?} should ride in Properties' stack"
+            );
+        }
+        assert_eq!(section.front, PanelId::Properties);
+        assert_eq!(workspace.right_width, 300.0);
+        assert_eq!(workspace.bottom_height, 220.0);
+
+        // Nothing hidden is lost: every panel still has somewhere to reopen
+        // into, which is what makes it "one click away" rather than gone.
+        for id in PanelId::ALL {
+            if workspace.dock_of(id) == Dock::Hidden {
+                let home = workspace.slot(id).map(|s| s.home);
+                assert_ne!(
+                    home,
+                    Some(Dock::Hidden),
+                    "{id:?} is hidden with nowhere to come back to"
+                );
+            }
+        }
+    }
+
+    /// Every panel Essentials hides is still there under the name Stage 4's
+    /// preset is a deviation from — see [`Workspace::classic`] — and every
+    /// preset opens with a name a Workspace submenu can show.
+    #[test]
+    fn the_three_presets_are_named_and_place_every_panel() {
+        for workspace in [
+            Workspace::essentials(),
+            Workspace::animate(),
+            Workspace::classic(),
+        ] {
+            assert!(!workspace.name.is_empty());
+            for id in PanelId::ALL {
+                assert!(workspace.slot(id).is_some(), "{id:?} has nowhere to live");
+            }
+        }
+        assert_eq!(Workspace::essentials().name, "Essentials");
+        assert_eq!(Workspace::animate().name, "Animator");
+        assert_eq!(Workspace::classic().name, "Classic");
+    }
+
+    /// **Every panel is reachable from the Window menu**, whichever preset
+    /// put it out of sight: `TogglePanel` opens it (and closing it again
+    /// leaves it exactly where it was) regardless of preset. Stage 4, item 4.
+    #[test]
+    fn every_panel_is_reachable_from_every_preset() {
+        for preset in WorkspacePreset::ALL {
+            let mut workspace = preset.build();
+            for id in PanelId::ALL {
+                if workspace.dock_of(id) == Dock::Hidden {
+                    workspace.toggle(id);
+                    assert_ne!(
+                        workspace.dock_of(id),
+                        Dock::Hidden,
+                        "{id:?} did not open from {}",
+                        preset.label()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Switching presets keeps what is not layout, exactly as resetting the
+    /// layout does — see `resetting_the_layout_keeps_the_preferences_that_are_not_layout`.
+    #[test]
+    fn switching_presets_keeps_the_preferences_that_are_not_layout() {
+        let mut workspace = Workspace::animate();
+        workspace.theme = crate::theme::Theme::Light;
+        workspace.ui_scale = 1.5;
+        workspace.reduce_motion = true;
+        workspace.recovery_dirs = vec![std::path::PathBuf::from("B:/films/one")];
+
+        workspace.apply_preset(WorkspacePreset::Essentials);
+
+        assert_eq!(workspace.name, "Essentials");
+        assert_eq!(workspace.theme, crate::theme::Theme::Light);
+        assert_eq!(workspace.ui_scale, 1.5);
+        assert!(workspace.reduce_motion);
+        assert_eq!(workspace.recovery_dirs.len(), 1);
+    }
+
     #[test]
     fn panels_come_back_in_order() {
         let workspace = Workspace::animate();
@@ -2127,7 +3031,10 @@ mod tests {
         assert_eq!(right.first(), Some(&PanelId::Layers));
         assert!(right.contains(&PanelId::Filters));
         assert_eq!(workspace.on(Dock::Left), vec![PanelId::Tools]);
-        assert_eq!(workspace.on(Dock::Bottom), vec![PanelId::Timeline]);
+        assert_eq!(
+            workspace.on(Dock::Bottom),
+            vec![PanelId::Timeline, PanelId::Sequence]
+        );
     }
 
     #[test]
@@ -2181,7 +3088,7 @@ mod tests {
         assert_eq!(workspace.dock_of(PanelId::Library), Dock::Hidden);
 
         workspace.toggle(PanelId::Library);
-        assert_eq!(workspace.dock_of(PanelId::Library), Dock::RightOuter);
+        assert_eq!(workspace.dock_of(PanelId::Library), Dock::Right);
     }
 
     /// A panel moved somewhere, closed, and reopened comes back where the user
@@ -2322,6 +3229,121 @@ mod tests {
         assert_eq!(back, workspace);
     }
 
+    /// The remembered tip shapes round-trip, and a layout saved before they
+    /// existed at all must still load — with the default, round, tips.
+    #[test]
+    fn brush_tips_round_trip_and_old_layouts_load() {
+        let mut workspace = Workspace::animate();
+        workspace.brush_tips.fluid = buzz_geom::TipShape::Chisel {
+            angle: 30.0,
+            thickness: 0.4,
+        };
+        workspace.brush_tips.normal = buzz_geom::TipShape::Square;
+
+        let json = serde_json::to_string(&workspace).expect("serialise");
+        let back: Workspace = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back.brush_tips, workspace.brush_tips, "the tips round-trip");
+
+        // An old layout file, saved before `brush_tips` existed, has no such
+        // key at all.
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("parse as json");
+        value
+            .as_object_mut()
+            .expect("a json object")
+            .remove("brush_tips");
+        let old_json = value.to_string();
+        let loaded: Workspace = serde_json::from_str(&old_json)
+            .expect("an old layout with no brush_tips key must still load");
+        assert_eq!(
+            loaded.brush_tips,
+            crate::brush::BrushTips::default(),
+            "a layout that never saved tips gets the default: round"
+        );
+    }
+
+    /// The Trace Bitmap settings round-trip, and an old layout with no
+    /// `trace` key at all still loads, with the tracer's own defaults.
+    #[test]
+    fn trace_options_round_trip_and_old_layouts_load() {
+        let mut workspace = Workspace::animate();
+        workspace.trace = buzz_scene::TraceOptions {
+            mode: buzz_scene::TraceMode::LineArt,
+            colours: 12,
+            ..buzz_scene::TraceOptions::default()
+        };
+
+        let json = serde_json::to_string(&workspace).expect("serialise");
+        let back: Workspace = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back.trace, workspace.trace, "the trace settings round-trip");
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("parse as json");
+        value.as_object_mut().expect("a json object").remove("trace");
+        let old_json = value.to_string();
+        let loaded: Workspace = serde_json::from_str(&old_json)
+            .expect("an old layout with no trace key must still load");
+        assert_eq!(
+            loaded.trace,
+            buzz_scene::TraceOptions::default(),
+            "a layout that never saved trace settings gets the tracer's own defaults"
+        );
+    }
+
+    /// Follow-up 2026-09-26, item 3: the pasteboard override round-trips,
+    /// and an old layout with no `pasteboard` key at all still loads, as
+    /// "match theme" (`None`) — see `Workspace::pasteboard`'s own doc
+    /// comment.
+    #[test]
+    fn pasteboard_override_round_trips_and_old_layouts_load() {
+        let mut workspace = Workspace::animate();
+        workspace.pasteboard = Some([0xC8, 0x20, 0x40, 0xFF]);
+
+        let json = serde_json::to_string(&workspace).expect("serialise");
+        let back: Workspace = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(
+            back.pasteboard, workspace.pasteboard,
+            "the pasteboard override round-trips"
+        );
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("parse as json");
+        value
+            .as_object_mut()
+            .expect("a json object")
+            .remove("pasteboard");
+        let old_json = value.to_string();
+        let loaded: Workspace = serde_json::from_str(&old_json)
+            .expect("an old layout with no pasteboard key must still load");
+        assert_eq!(
+            loaded.pasteboard, None,
+            "a layout that never saved an override matches the theme"
+        );
+    }
+
+    /// BM: the Bone tool's mode survives a restart, and a workspace saved
+    /// before the modes existed (`build: true/false`) loads as Create/Move.
+    #[test]
+    fn bone_mode_round_trips_and_old_build_flag_migrates() {
+        let mut workspace = Workspace::animate();
+        workspace.rig.mode = BoneMode::Create;
+        workspace.rig.show_bones = false;
+        let json = serde_json::to_string(&workspace).expect("serialise");
+        let back: Workspace = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back.rig, workspace.rig, "the mode survives a restart");
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("parse as json");
+        let old = |build: bool| {
+            let mut value = value.clone();
+            value["rig"] = serde_json::json!({"show_bones": true, "build": build});
+            serde_json::from_str::<Workspace>(&value.to_string()).expect("an old layout loads")
+        };
+        assert_eq!(old(true).rig.mode, BoneMode::Create, "build: true is Create");
+        assert_eq!(old(false).rig.mode, BoneMode::Move, "build: false is Move");
+
+        value.as_object_mut().expect("a json object").remove("rig");
+        let none: Workspace = serde_json::from_str(&value.to_string()).expect("no rig key loads");
+        assert_eq!(none.rig, RigOptions::default());
+        assert_eq!(none.rig.mode, BoneMode::Move, "Move is the default");
+    }
+
     #[test]
     fn a_workspace_survives_being_written_and_read() {
         let dir = std::env::temp_dir().join("buzz-workspace-test");
@@ -2451,11 +3473,11 @@ mod tests {
 
         let missing = dir.join("not-here.json");
         let _ = std::fs::remove_file(&missing);
-        assert_eq!(Workspace::load_from(&missing), Workspace::animate());
+        assert_eq!(Workspace::load_from(&missing), Workspace::essentials());
 
         let broken = dir.join("broken.json");
         std::fs::write(&broken, "{ not json at all").expect("write");
-        assert_eq!(Workspace::load_from(&broken), Workspace::animate());
+        assert_eq!(Workspace::load_from(&broken), Workspace::essentials());
         let _ = std::fs::remove_file(&broken);
     }
 
@@ -2532,19 +3554,25 @@ mod migration_tests {
             "every panel on the right ended up in one section of {} tabs",
             right.first().map(|s| s.panels.len()).unwrap_or(0)
         );
-        // And it adopted the arrangement this build ships: the occasional
-        // panels as one tabbed section, everything else on its own.
+        // And it adopted the arrangement this build ships: contextual utility
+        // panels and the compact inspector are separate tab stacks.
         let utility = right
             .iter()
             .find(|s| s.panels.contains(&PanelId::Depth))
             .expect("the Depth panel is on the right");
         assert!(utility.panels.contains(&PanelId::Sound));
         assert!(utility.is_tabbed());
-        // Story is the tab at the front: setting a shot up comes before
-        // anything else done in it.
+        // Story is the utility tab at the front.
         assert_eq!(utility.front, PanelId::Story);
 
-        for id in [PanelId::Layers, PanelId::Properties] {
+        let inspector = right
+            .iter()
+            .find(|s| s.panels.contains(&PanelId::Properties))
+            .expect("the inspector is on the right");
+        assert!(inspector.panels.contains(&PanelId::Filters));
+        assert_eq!(inspector.front, PanelId::Properties);
+
+        for id in [PanelId::Layers] {
             let section = right
                 .iter()
                 .find(|s| s.panels.contains(&id))
@@ -2604,12 +3632,17 @@ mod migration_tests {
         // A layout saved before Tool Options existed.
         let mut saved = Workspace::animate();
         saved.slots.retain(|s| s.id != PanelId::ToolOptions);
-        assert!(saved.slot(PanelId::ToolOptions).is_none(), "it starts absent");
+        assert!(
+            saved.slot(PanelId::ToolOptions).is_none(),
+            "it starts absent"
+        );
 
         saved.fill_gaps();
 
         let added = saved.slot(PanelId::ToolOptions).expect("it was added back");
-        let properties = saved.slot(PanelId::Properties).expect("Properties is there");
+        let properties = saved
+            .slot(PanelId::Properties)
+            .expect("Properties is there");
         assert_ne!(
             added.group, properties.group,
             "Tool Options tabbed itself into the Properties section"
@@ -2699,27 +3732,139 @@ mod migration_tests {
         );
     }
 
-    /// The Library and the Assets panel are both reachable in the default
-    /// arrangement — which is the complaint that started this.
+    /// **One tab stack.** Properties, Effects, Tool Options, Library, Assets
+    /// and Cast all share the one section `Dock::Right` docks by default —
+    /// Properties in front, the rest one click behind it — and none of the
+    /// six is hidden. `Dock::RightOuter` is left empty.
     #[test]
-    fn the_library_and_the_assets_panel_share_a_column_and_neither_is_hidden() {
+    fn the_default_right_section_holds_all_six_inspector_tabs() {
         let workspace = Workspace::animate();
-        let outer = workspace.on(Dock::RightOuter);
-        assert!(outer.contains(&PanelId::Library));
-        assert!(outer.contains(&PanelId::Assets));
-        for id in [PanelId::Library, PanelId::Assets] {
+        let section = workspace
+            .section_of(PanelId::Properties)
+            .expect("Properties is on screen");
+        assert_eq!(
+            section.panels,
+            vec![
+                PanelId::Properties,
+                PanelId::Filters,
+                PanelId::ToolOptions,
+                PanelId::Library,
+                PanelId::Assets,
+                PanelId::Cast,
+            ]
+        );
+        assert_eq!(section.front, PanelId::Properties);
+        for id in section.panels.clone() {
             assert!(
                 !workspace.is_collapsed(id),
                 "{id:?} starts rolled up, so it still looks missing"
             );
             assert_ne!(workspace.dock_of(id), Dock::Hidden);
         }
-        // And they share it as tabs, which is what makes them one section.
-        let section = workspace
-            .section_of(PanelId::Library)
-            .expect("the Library is on screen");
-        assert!(section.panels.contains(&PanelId::Assets));
-        assert_eq!(section.front, PanelId::Library);
+        assert!(
+            workspace.on(Dock::RightOuter).is_empty(),
+            "RightOuter should be empty now the tab stack holds everything it used to"
+        );
+    }
+
+    /// **`VERSION_PROPERTIES_STACK` folds an untouched Library/Assets/Cast
+    /// group into Properties' tab stack**, appended after its existing tabs,
+    /// not selected and not rolled up.
+    #[test]
+    fn an_old_assets_group_folds_into_the_inspector_stack() {
+        let mut saved = Workspace::animate();
+        saved.version = VERSION_COMPACT_RIGHT;
+        // As the shape before Impl W has it: the three sharing a section of
+        // their own in the outer column.
+        for (order, id) in [PanelId::Library, PanelId::Assets, PanelId::Cast]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(slot) = saved.slot_mut(id) {
+                slot.dock = Dock::RightOuter;
+                slot.home = Dock::RightOuter;
+                slot.order = order as u32;
+                slot.group = GROUP_ASSETS;
+                slot.selected = order == 0;
+                slot.collapsed = false;
+            }
+        }
+
+        saved.fill_gaps();
+
+        assert_eq!(saved.version, LAYOUT_VERSION);
+        assert!(
+            saved.on(Dock::RightOuter).is_empty(),
+            "Library, Assets and Cast should have moved out of the outer column"
+        );
+        let section = saved
+            .section_of(PanelId::Properties)
+            .expect("Properties is still on screen");
+        assert_eq!(section.front, PanelId::Properties, "Properties stays in front");
+        assert_eq!(
+            section.panels,
+            vec![
+                PanelId::Properties,
+                PanelId::Filters,
+                PanelId::ToolOptions,
+                PanelId::Library,
+                PanelId::Assets,
+                PanelId::Cast,
+            ],
+            "the three should be appended after Properties' existing tabs"
+        );
+        for id in [PanelId::Library, PanelId::Assets, PanelId::Cast] {
+            let slot = saved.slot(id).expect("still on screen");
+            assert!(!slot.selected, "{id:?} should not have taken the front tab");
+            assert!(!slot.collapsed, "{id:?} arrived rolled up");
+        }
+    }
+
+    /// **A customised Library/Assets/Cast arrangement is left alone.** Only
+    /// the exact shape this migration reaches into — all three sharing one
+    /// section, Properties still in `Dock::Right` — is folded in; anything
+    /// else is a layout the user already rearranged.
+    #[test]
+    fn a_customised_assets_group_is_left_alone() {
+        let mut saved = Workspace::animate();
+        saved.version = VERSION_COMPACT_RIGHT;
+        // Library and Assets still paired in the outer column, but Cast was
+        // pulled out into a section of its own first — the customisation
+        // this migration must not undo.
+        for (order, id) in [PanelId::Library, PanelId::Assets].into_iter().enumerate() {
+            if let Some(slot) = saved.slot_mut(id) {
+                slot.dock = Dock::RightOuter;
+                slot.home = Dock::RightOuter;
+                slot.order = order as u32;
+                slot.group = GROUP_ASSETS;
+                slot.selected = order == 0;
+                slot.collapsed = false;
+            }
+        }
+        if let Some(slot) = saved.slot_mut(PanelId::Cast) {
+            slot.dock = Dock::RightOuter;
+            slot.home = Dock::RightOuter;
+            slot.order = 2;
+            slot.group = 999;
+            slot.selected = true;
+            slot.collapsed = false;
+        }
+
+        saved.fill_gaps();
+
+        assert_eq!(saved.version, LAYOUT_VERSION);
+        assert_eq!(
+            saved.dock_of(PanelId::Cast),
+            Dock::RightOuter,
+            "the user's own arrangement was disturbed"
+        );
+        let inspector = saved
+            .section_of(PanelId::Properties)
+            .expect("Properties is on screen");
+        assert!(
+            !inspector.panels.contains(&PanelId::Library),
+            "an untouched shape was assumed from a partial match"
+        );
     }
 }
 
@@ -2787,9 +3932,7 @@ mod group_tests {
         workspace.reveal(PanelId::Story);
 
         assert!(workspace.is_open(PanelId::Story));
-        let section = workspace
-            .section_of(PanelId::Story)
-            .expect("on screen");
+        let section = workspace.section_of(PanelId::Story).expect("on screen");
         assert!(
             section.panels.contains(&PanelId::Depth),
             "reveal dumped it in a section of its own: {:?}",
@@ -2853,8 +3996,15 @@ mod group_tests {
         workspace.dock_at(PanelId::Library, Dock::Right, Some(properties));
 
         let side = workspace.on(Dock::Right);
-        let at = side.iter().position(|p| *p == PanelId::Library).expect("docked right");
-        assert_eq!(side[at + 1], PanelId::Properties, "not directly above Properties: {side:?}");
+        let at = side
+            .iter()
+            .position(|p| *p == PanelId::Library)
+            .expect("docked right");
+        assert_eq!(
+            side[at + 1],
+            PanelId::Properties,
+            "not directly above Properties: {side:?}"
+        );
         assert_eq!(
             workspace.section_of(PanelId::Library).unwrap().panels,
             vec![PanelId::Library],
@@ -2872,12 +4022,18 @@ mod group_tests {
         let mut workspace = Workspace::animate();
         workspace.float_at(PanelId::Library, (100.0, 200.0));
         assert_eq!(workspace.dock_of(PanelId::Library), Dock::Float);
-        assert_eq!(workspace.slot(PanelId::Library).unwrap().float_pos, (100.0, 200.0));
+        assert_eq!(
+            workspace.slot(PanelId::Library).unwrap().float_pos,
+            (100.0, 200.0)
+        );
         // Already floating: the window moves rather than being re-made.
         let group = workspace.slot(PanelId::Library).unwrap().group;
         workspace.float_at(PanelId::Library, (10.0, 20.0));
         assert_eq!(workspace.slot(PanelId::Library).unwrap().group, group);
-        assert_eq!(workspace.slot(PanelId::Library).unwrap().float_pos, (10.0, 20.0));
+        assert_eq!(
+            workspace.slot(PanelId::Library).unwrap().float_pos,
+            (10.0, 20.0)
+        );
     }
 
     /// **Revealing a panel asks its column to scroll to it.**
@@ -2901,8 +4057,8 @@ mod group_tests {
         assert_eq!(Workspace::load_from(&path).scroll_to, None);
     }
 
-    /// The default arrangement puts the six occasional panels in one section,
-    /// which is what turns a column of ten into a column of five.
+    /// The default arrangement keeps inspector and contextual utility controls
+    /// in compact tab stacks.
     #[test]
     fn the_occasional_panels_share_one_section() {
         let workspace = Workspace::animate();
@@ -2914,7 +4070,6 @@ mod group_tests {
             PanelId::Story,
             PanelId::Depth,
             PanelId::Rig,
-            PanelId::Filters,
             PanelId::Lighting,
             PanelId::Sound,
         ] {
@@ -2930,7 +4085,12 @@ mod group_tests {
         // Five panels, one section. The right column holds ten panels — Layers,
         // Tool Options, Properties, Color, Swatches and these five — and the
         // grouping makes that six sections rather than ten.
-        assert_eq!(workspace.sections(Dock::Right).len(), 6);
+        let inspector = workspace
+            .section_of(PanelId::Properties)
+            .expect("the inspector is on screen");
+        assert!(inspector.panels.contains(&PanelId::Filters));
+        assert_eq!(inspector.front, PanelId::Properties);
+        assert_eq!(workspace.sections(Dock::Right).len(), 4);
     }
 
     /// **Every section has exactly one front tab, always.**
@@ -2979,10 +4139,13 @@ mod group_tests {
         assert_eq!(section.front, PanelId::Assets);
         assert_eq!(workspace.dock_of(PanelId::Assets), Dock::Right);
 
-        // And the section it left still shows something.
-        let outer = workspace.sections(Dock::RightOuter);
-        assert_eq!(outer.len(), 1);
-        assert_eq!(outer[0].front, PanelId::Library);
+        // And the section it left — the inspector stack — still shows
+        // something.
+        let inspector = workspace
+            .section_of(PanelId::Properties)
+            .expect("the inspector stack is still there");
+        assert!(!inspector.panels.contains(&PanelId::Assets));
+        assert_eq!(inspector.front, PanelId::Properties);
     }
 
     /// Ungrouping gives a tab a section of its own, and leaves the old one
@@ -2993,11 +4156,15 @@ mod group_tests {
         workspace.select_tab(PanelId::Sound);
         workspace.ungroup(PanelId::Sound);
 
-        let sound = workspace.section_of(PanelId::Sound).expect("still on screen");
+        let sound = workspace
+            .section_of(PanelId::Sound)
+            .expect("still on screen");
         assert!(!sound.is_tabbed());
         assert_eq!(sound.front, PanelId::Sound);
 
-        let utility = workspace.section_of(PanelId::Depth).expect("still on screen");
+        let utility = workspace
+            .section_of(PanelId::Depth)
+            .expect("still on screen");
         assert!(!utility.panels.contains(&PanelId::Sound));
         assert!(utility.panels.contains(&utility.front));
     }
@@ -3110,5 +4277,180 @@ mod group_tests {
                 .collect();
             assert_eq!(found.len(), 1, "{id:?} is in {} sections", found.len());
         }
+    }
+
+    #[test]
+    fn workspace_round_trips_ai_settings() {
+        let mut workspace = Workspace::animate();
+        workspace.ai = AiSettings {
+            backend: Some(buzz_ai::llm::Backend::OpenAiCompatible {
+                base_url: "http://127.0.0.1:1234/v1".into(),
+            }),
+            model: Some("google/gemma-4-12b".into()),
+            vision_model: Some("google/gemma-4-12b".into()),
+            embedding_model: Some("text-embedding-nomic-embed-text-v1.5".into()),
+            auto_detect: false,
+            low_reasoning: false,
+        };
+
+        let json = serde_json::to_string_pretty(&workspace).expect("serializes to json");
+        let restored: Workspace = serde_json::from_str(&json).expect("deserializes from json");
+
+        assert_eq!(workspace.ai, restored.ai);
+    }
+
+    /// Stage 6, items 1 and 5: UI Size and reduced motion are per-person
+    /// preferences, so they have to survive the same save/load round trip as
+    /// the theme and the keymap do, and a layout saved before either existed
+    /// must not crash on load — old files have neither key at all.
+    #[test]
+    fn ui_scale_and_reduced_motion_round_trip_and_old_layouts_load() {
+        let mut workspace = Workspace::animate();
+        workspace.ui_scale = 1.5;
+        workspace.reduce_motion = true;
+
+        let json = serde_json::to_string_pretty(&workspace).expect("serializes to json");
+        let restored: Workspace = serde_json::from_str(&json).expect("deserializes from json");
+        assert_eq!(restored.ui_scale, 1.5);
+        assert!(restored.reduce_motion);
+
+        // What a file saved before either field existed looks like: neither
+        // key present at all, not merely `null` or a default value written
+        // out.
+        let mut old_shape = serde_json::to_value(Workspace::animate()).expect("serialises");
+        let map = old_shape.as_object_mut().expect("an object");
+        map.remove("ui_scale");
+        map.remove("reduce_motion");
+        let from_before: Workspace =
+            serde_json::from_value(old_shape).expect("a file with neither key still loads");
+        assert_eq!(from_before.ui_scale, 1.0);
+        assert!(!from_before.reduce_motion);
+    }
+
+    /// **Floating the inspector floats the whole section**, not just its
+    /// front tab — all six of Properties, Filters, Tool Options, Library,
+    /// Assets and Cast arrive in one window.
+    #[test]
+    fn the_inspector_floats_as_one_window() {
+        let mut workspace = Workspace::animate();
+        workspace.float_section_at(PanelId::Properties, (200.0, 150.0));
+
+        let floating = workspace.sections(Dock::Float);
+        assert_eq!(floating.len(), 1, "one window, not several");
+        assert_eq!(
+            floating[0].panels.len(),
+            6,
+            "the whole inspector should have floated: {:?}",
+            floating[0].panels
+        );
+        assert_eq!(floating[0].front, PanelId::Properties);
+        for id in [
+            PanelId::Properties,
+            PanelId::Filters,
+            PanelId::ToolOptions,
+            PanelId::Library,
+            PanelId::Assets,
+            PanelId::Cast,
+        ] {
+            let slot = workspace.slot(id).expect("still on screen");
+            assert_eq!(slot.dock, Dock::Float);
+            assert_eq!(slot.float_pos, (200.0, 150.0));
+        }
+    }
+
+    /// **Tabbing the inspector in with the Library groups all six panels**,
+    /// with Properties still in front. The default already docks the two
+    /// together (Impl W's one tab stack), so this also covers the operation
+    /// being a no-op on an already-merged pair rather than duplicating tabs
+    /// or losing one.
+    #[test]
+    fn the_inspector_tabs_in_with_the_library() {
+        let mut workspace = Workspace::animate();
+        workspace.group_section_with(PanelId::Properties, PanelId::Library);
+
+        assert_eq!(workspace.dock_of(PanelId::Properties), Dock::Right);
+        let section = workspace
+            .section_of(PanelId::Properties)
+            .expect("on screen");
+        assert_eq!(section.front, PanelId::Properties);
+        for id in [
+            PanelId::Library,
+            PanelId::Assets,
+            PanelId::Cast,
+            PanelId::Properties,
+            PanelId::Filters,
+            PanelId::ToolOptions,
+        ] {
+            assert!(
+                section.panels.contains(&id),
+                "{id:?} missing from the merged section: {:?}",
+                section.panels
+            );
+        }
+        assert_eq!(section.panels.len(), 6);
+    }
+
+    /// **A floated inspector docks back as one section**, in the same tab
+    /// order it floated with.
+    #[test]
+    fn a_floated_inspector_docks_back_whole() {
+        let mut workspace = Workspace::animate();
+        workspace.float_section_at(PanelId::Properties, (200.0, 150.0));
+
+        workspace.dock_section_at(PanelId::Properties, Dock::Right, None);
+
+        assert_eq!(workspace.dock_of(PanelId::Properties), Dock::Right);
+        let section = workspace
+            .section_of(PanelId::Properties)
+            .expect("docked");
+        assert_eq!(section.front, PanelId::Properties);
+        assert_eq!(section.panels.len(), 6);
+        for id in [
+            PanelId::Properties,
+            PanelId::Filters,
+            PanelId::ToolOptions,
+            PanelId::Library,
+            PanelId::Assets,
+            PanelId::Cast,
+        ] {
+            assert!(section.panels.contains(&id));
+        }
+    }
+
+    /// **Reset Layout brings a moved inspector home**, whole and in the
+    /// default place.
+    #[test]
+    fn reset_layout_brings_the_inspector_home() {
+        let mut workspace = Workspace::animate();
+        workspace.float_section_at(PanelId::Properties, (200.0, 150.0));
+        assert_eq!(workspace.dock_of(PanelId::Properties), Dock::Float);
+
+        workspace.reset_layout();
+
+        assert_eq!(workspace.dock_of(PanelId::Properties), Dock::Right);
+        let section = workspace
+            .section_of(PanelId::Properties)
+            .expect("back on screen");
+        assert_eq!(section.front, PanelId::Properties);
+        assert!(section.panels.contains(&PanelId::Filters));
+        assert!(section.panels.contains(&PanelId::ToolOptions));
+    }
+
+    /// **A moved inspector survives a save and load** — the whole-section
+    /// move is ordinary slot state, so the round trip needs nothing special.
+    #[test]
+    fn a_moved_inspector_survives_save_and_load() {
+        let mut workspace = Workspace::animate();
+        workspace.group_section_with(PanelId::Properties, PanelId::Library);
+
+        let json = serde_json::to_string(&workspace).expect("serialise");
+        let restored: Workspace = serde_json::from_str(&json).expect("deserialise");
+
+        assert_eq!(restored.dock_of(PanelId::Properties), Dock::Right);
+        let section = restored
+            .section_of(PanelId::Properties)
+            .expect("still on screen");
+        assert_eq!(section.front, PanelId::Properties);
+        assert_eq!(section.panels.len(), 6);
     }
 }

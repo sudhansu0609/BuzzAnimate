@@ -63,7 +63,10 @@ fn document(kind: WaveKind, color: Color, frames: u32) -> Scene {
     assert_eq!(cycle.len(), frames as usize);
 
     for (i, pieces) in cycle.iter().enumerate() {
-        assert!(!pieces.is_empty(), "{kind:?} frame {i} made nothing to draw");
+        assert!(
+            !pieces.is_empty(),
+            "{kind:?} frame {i} made nothing to draw"
+        );
         let frame = i as u32;
         scene.update_layer(layer, |l| {
             l.frames.insert_blank_keyframe(frame);

@@ -139,7 +139,10 @@ fn each_menu_item_opens_the_part_it_names() {
 fn directing_a_story_puts_the_caret_in_the_brief() {
     let mut directing = app();
     directing.run(Command::DirectScene);
-    assert!(directing.story.focus_draft, "the brief box was not asked for");
+    assert!(
+        directing.story.focus_draft,
+        "the brief box was not asked for"
+    );
 
     // The other two are about the panel's other sections, and stealing the
     // keyboard from somebody adjusting a slider would be a nuisance.

@@ -78,9 +78,7 @@ fn extending_a_posed_rig_does_not_tear_the_artwork_off_it() {
     let tip = {
         let (_, found) = scene.find_object(figure).expect("the figure");
         match &found.kind {
-            ObjectKind::Armature(rig) => {
-                rig.armature.tip(buzz_act::figure::Joint::ElbowL.index())
-            }
+            ObjectKind::Armature(rig) => rig.armature.tip(buzz_act::figure::Joint::ElbowL.index()),
             _ => panic!("not rigged"),
         }
     };

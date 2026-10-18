@@ -393,6 +393,197 @@ pub fn dress_set(
     out
 }
 
+/// A word's plain singular form, lower case: `glasses` → `glass`.
+fn prop_stem(w: &str) -> String {
+    let w = w.to_lowercase();
+    if w.len() > 4 && ["sses", "shes", "ches", "xes"].iter().any(|e| w.ends_with(e)) {
+        w[..w.len() - 2].to_string()
+    } else if w.len() > 3 && w.ends_with('s') && !w.ends_with("ss") {
+        w[..w.len() - 1].to_string()
+    } else {
+        w
+    }
+}
+
+fn prop_words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && !matches!(w.to_lowercase().as_str(), "a" | "an" | "the" | "of" | "and" | "with"))
+        .map(prop_stem)
+        .collect()
+}
+
+/// About how tall a prop stands next to a person (1.0), by its head word.
+fn prop_height(head: &str, kind: AssetKind) -> f64 {
+    let m = match head {
+        "glass" | "cup" | "watch" | "wristwatch" | "bowl" | "lota" => 0.12,
+        "kettle" | "pot" | "newspaper" | "book" | "bottle" | "lantern" | "lamp" => 0.2,
+        "bag" | "jhola" | "sack" | "basket" | "bucket" | "box" | "stool" => 0.3,
+        "bench" | "table" | "charpai" | "khatiya" | "machan" => 0.32,
+        "chair" | "cart" | "drum" => 0.55,
+        "cycle" | "bicycle" | "door" => 0.65,
+        _ => match kind {
+            AssetKind::Furniture => 0.4,
+            AssetKind::Vehicle => 0.8,
+            AssetKind::Animal => 0.5,
+            _ => 0.25,
+        },
+    };
+    m
+}
+
+/// A seeded fraction `0..1` for `key`.
+fn prop_unit(key: &str) -> f64 {
+    (sets::seed_of(key) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// **Props on a set that is a picture** (P8-C1): the breakdown's prop words,
+/// each matched to one index record (its head word in the record's name or
+/// label; furniture, vehicles or animals only, never the Cast) and stood on
+/// a ground line a little behind the cast (`ground` − 0.05 of the stage,
+/// sizes × 0.9), placed before the cast so it paints behind them, with the
+/// AS3 ground-piece placing ([`place_piece`]).
+///
+/// **One layout per location**: `key` (the location key) seeds every spot,
+/// and the caller passes the words and the cast marks (`0..1` across) of
+/// every scene at that location, so each of them gets the same props in the
+/// same places. 13 spots are seeded inside x 0.2..0.8 (round the
+/// structure); the one whose box covers the least of the figures (the sum
+/// over the marks of the fraction of each figure's width covered) wins, ties
+/// by seeded order. A prop is never skipped for cover: behind the cast it
+/// is only hidden.
+///
+/// Handheld or counter things (kettle, glasses, a bag: under 0.25 of a
+/// figure's height in the size table, or only `other` records match) need a
+/// surface we cannot find; they are noted "not placed (needs a surface)".
+/// The casting's own `props` with x/y place them. Notes go in `plan.notes`.
+#[allow(clippy::too_many_arguments)]
+pub fn dress_props(
+    scene: &mut Scene,
+    library: &AssetLibrary,
+    index: &AssetIndex,
+    key: &str,
+    words: &[String],
+    marks: &[f64],
+    ground: f64,
+    figure_h: f64,
+) -> Dressed {
+    let stage = scene.stage().stage_rect();
+    let aspect = stage.width() / stage.height().max(1e-6);
+    let base = (ground - 0.05).clamp(0.2, 1.0);
+    let base_y = stage.y0 + stage.height() * base;
+    // A figure's width, as a fraction of the stage width.
+    let figure_w = figure_h * 0.3 / aspect;
+    let mut out = Dressed::default();
+    let mut taken: Vec<(f64, f64)> = Vec::new();
+    let mut used: HashSet<String> = HashSet::new();
+    let words_of = |r: &IndexRecord| prop_words(&format!("{} {}", r.name, r.label.as_deref().unwrap_or("")));
+    for (k, word) in words.iter().enumerate() {
+        let want = prop_words(word);
+        let Some(head) = want.last().cloned() else { continue };
+        let surface = || format!("prop {word:?}: not placed (needs a surface)");
+        if prop_height(&head, AssetKind::Furniture) < 0.25 {
+            out.plan.notes.push(surface());
+            continue;
+        }
+        let best = index
+            .records
+            .iter()
+            .filter(|r| matches!(r.kind, AssetKind::Furniture | AssetKind::Vehicle | AssetKind::Animal))
+            .filter(|r| !ai_index::is_cast(&r.folder) && r.blank != Some(true) && !used.contains(&r.path))
+            .filter_map(|r| {
+                let named = words_of(r);
+                let tags: Vec<String> = r.tags.iter().flat_map(|t| prop_words(t)).collect();
+                if !named.contains(&head) {
+                    return None;
+                }
+                let score: usize = want
+                    .iter()
+                    .map(|w| if named.contains(w) { 2 } else if tags.contains(w) { 1 } else { 0 })
+                    .sum();
+                Some((score, r))
+            })
+            .max_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then(a.1.is_asset().cmp(&b.1.is_asset()))
+                    .then(b.1.id.len().cmp(&a.1.id.len()))
+                    .then(b.1.id.cmp(&a.1.id))
+            })
+            .map(|(_, r)| r);
+        let Some(record) = best else {
+            let other = index.records.iter().any(|r| r.kind == AssetKind::Other && words_of(r).contains(&head));
+            out.plan.notes.push(if other { surface() } else { format!("prop {word:?}: nothing in the index") });
+            continue;
+        };
+        let height = (prop_height(&head, record.kind) * figure_h * 0.9).clamp(0.03, 0.6);
+        let half_w = height * record.aspect.max(0.05) / aspect / 2.0;
+        // How much of the cast it would hide: the sum over the marks of the
+        // fraction of each figure's width the prop's box covers. A spot on
+        // another prop counts 10 (props never stack while a spot is free).
+        let cover = |x: f64| -> f64 {
+            let figures: f64 = marks
+                .iter()
+                .map(|m| {
+                    let over = ((x + half_w).min(m + figure_w / 2.0) - (x - half_w).max(m - figure_w / 2.0)).max(0.0);
+                    over / figure_w.max(1e-6)
+                })
+                .sum();
+            let on_prop = taken.iter().any(|(t, w)| (t - x).abs() < half_w + w + 0.01);
+            figures + if on_prop { 10.0 } else { 0.0 }
+        };
+        let (lo, hi) = if 0.2 + half_w <= 0.8 - half_w { (0.2 + half_w, 0.8 - half_w) } else { (0.5, 0.5) };
+        // 13 seeded spots; the lowest cover wins, ties by seeded order. Never
+        // skipped: it paints behind the cast, so a covered prop is only hidden.
+        let mut x = 0.5;
+        let mut best_cover = f64::INFINITY;
+        for j in 0..13 {
+            let c = lo + (hi - lo) * prop_unit(&format!("{key} prop {k} {head} spot {j}"));
+            let score = cover(c);
+            if score < best_cover - 1e-9 {
+                best_cover = score;
+                x = c;
+            }
+        }
+        let piece = SetPiece {
+            id: record.id.clone(),
+            path: record.path.clone(),
+            symbol: record.symbol,
+            part: record.part,
+            name: record.name.clone(),
+            role: SetRole::Ground,
+            x,
+            base,
+            height,
+            depth: SetRole::Ground.depth(),
+            why: format!("prop {word:?}"),
+        };
+        match place_piece(scene, library, record, &piece, base_y) {
+            Ok(layers) => {
+                for id in &layers {
+                    scene.update_stage_layer(*id, |l| l.name = l.name.replacen("Set ground", "Prop", 1));
+                }
+                taken.push((x, half_w));
+                used.insert(record.path.clone());
+                out.placed.push(format!(
+                    "prop \u{2014} {} ({}) at {:.2}, {:.2} h {:.3}, covers {:.2} figure(s) \u{2014} {:?}",
+                    record.name, record.id, x, base, height, best_cover, word
+                ));
+                out.layers.extend(layers.iter().copied());
+                out.plan.pieces.push(piece);
+            }
+            Err(e) => out.failed.push(format!("{}: {e}", record.id)),
+        }
+    }
+    let last = scene.frame_count().saturating_sub(1);
+    for id in out.layers.clone() {
+        scene.update_stage_layer(id, |l| {
+            if l.frames.length() <= last {
+                l.frames.insert_frame(last);
+            }
+        });
+    }
+    out
+}
+
 /// The time of day a staging setting means, for choosing a sky.
 pub fn time_of(setting: buzz_act::Setting) -> sets::TimeOfDay {
     match setting {

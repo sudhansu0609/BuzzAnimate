@@ -1454,6 +1454,23 @@ fn complete_parts_impl(
                 triggered[1] = true;
             }
         }
+        // A side that borrows anywhere is the far side: its other slots borrow too
+        // when they are still mostly hidden (a profile leg shows a sliver of
+        // thigh and shin beside the near leg, over 20 % but far from whole).
+        for (k, s) in ["L", "R"].into_iter().enumerate() {
+            if !triggered[k] {
+                continue;
+            }
+            let o = if s == "L" { "R" } else { "L" };
+            for slot in chain {
+                let (Some((i, _)), Some((j, _))) = (slot_index(slot, s), slot_index(slot, o)) else {
+                    continue;
+                };
+                if borrow_src[i].is_none() && crate::outpaint::chain_borrows(px_count[i], px_count[j]) {
+                    borrow_src[i] = Some(j);
+                }
+            }
+        }
         let back_is_left = match triggered {
             [true, false] => Some(true),
             [false, true] => Some(false),
@@ -1539,7 +1556,7 @@ fn complete_parts_impl(
             }
             let over_is_child = rank(c) > rank(p);
             let over = if over_is_child { c } else { p };
-            if let Some(cut) = crate::outpaint::measure_joint_cut(
+            if let Some(cut) = crate::outpaint::measure_joint_cut_with(
                 &label,
                 wu,
                 hu,
@@ -1549,6 +1566,7 @@ fn complete_parts_impl(
                 bone.head,
                 bone.tail,
                 (parent_bone.head, parent_bone.tail),
+                (parent == "Chest" && child == "Shoulder") || (parent == "Hips" && child == "Thigh"),
             ) {
                 joints.push(LimbJoint { parent: p, child: c, over_is_child, cut });
             } else if log {
@@ -1563,7 +1581,7 @@ fn complete_parts_impl(
             .filter_map(|(i, s)| {
                 s.map(|s| {
                     format!(
-                        "{} from {} ({} px < 20 % of {} px; depth {} -> {})",
+                        "{} from {} ({} px of {} px; depth {} -> {})",
                         all_parts[i].name, all_parts[s].name, px_count[i], px_count[s], all_parts[i].depth, depths[i]
                     )
                 })
@@ -1603,6 +1621,154 @@ fn complete_parts_impl(
                 joint.cut.t_cut,
                 moved
             );
+        }
+    }
+    // **B4b-3** (docs/TRACE_SPILL_AND_OUTPAINT_PLAN.md): at the knee, where the shin
+    // paints over the thigh, the shin gets a round end past the joint (source
+    // pixels, `outpaint::round_over_end`) instead of B1c's bare straight top, and
+    // the thigh is extruded under it from the top of that round end to past the
+    // joint (`tail_cut`, read by the completion below).
+    let mut tail_cut: Vec<Option<f32>> = vec![None; all_parts.len()];
+    for joint in &joints {
+        let (p, c) = (joint.parent, joint.child);
+        let slot = |i: usize| all_parts[i].name.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        // B4c: an arm that paints over the chest (Guddu's and Woman1's left arm)
+        // takes its sleeve cap the same way, so no square tab of sleeve stays on
+        // the chest above the shoulder line when the arm swings down.
+        let knee = slot(p) == "thigh" && slot(c) == "knee";
+        let shoulder = slot(c) == "shoulder" && !crate::outpaint::is_limb_bone(&all_parts[p].name);
+        if !joint.over_is_child || !(knee || shoulder) {
+            continue;
+        }
+        // The chest keeps its core: its completion capsule (as B1d's prior).
+        let keep_radius = shoulder.then(|| {
+            let pb = skel.bone(&all_parts[p].name)?;
+            let (dx, dy) = (pb.tail.0 - pb.head.0, pb.tail.1 - pb.head.1);
+            let widths: Vec<f32> = [0.2f32, 0.4, 0.6, 0.8]
+                .iter()
+                .map(|t| {
+                    let sx = (pb.head.0 + t * dx).clamp(0.0, (w - 1) as f32) as usize;
+                    let sy = (pb.head.1 + t * dy).clamp(0.0, (h - 1) as f32) as usize;
+                    dt[sy * wu + sx]
+                })
+                .filter(|&d| d > 0.0)
+                .collect();
+            let lw = if widths.is_empty() { (height * 0.05).max(8.0) } else { (widths.iter().sum::<f32>() / widths.len() as f32).max(5.0) };
+            Some((lw * 0.75).min((dx * dx + dy * dy).max(1.0).sqrt()))
+        });
+        if let Some((moved, r)) =
+            crate::outpaint::round_over_end(&mut label, wu, hu, &joint.cut, p as i32, c as i32, keep_radius.flatten())
+        {
+            if knee {
+                tail_cut[p] = Some(r.ceil() + 1.0);
+            }
+            if log {
+                eprintln!("outpaint: B4b-3 {} round end r {:.1} px over {}, {} px moved", all_parts[c].name, r, all_parts[p].name, moved);
+            }
+        }
+    }
+    // **B1d** (docs/TRACE_SPILL_AND_OUTPAINT_PLAN.md): a body part that paints over
+    // the limb at its joint (Hips over a thigh, Chest over a far arm) takes back
+    // the limb's pixels on the joint side of the cut that lie inside its own prior
+    // (`outpaint::body_prior`: its completion capsule and the span of its own rows),
+    // with their source colours: the rest picture is unchanged (it paints over the
+    // limb), and the strips B1c's band did not reach no longer swing out with the
+    // limb and leave the body notched; the limb is completed under them.
+    for joint in &joints {
+        let (p, c) = (joint.parent, joint.child);
+        if joint.over_is_child || crate::outpaint::is_limb_bone(&all_parts[p].name) {
+            continue;
+        }
+        let Some(pb) = skel.bone(&all_parts[p].name) else { continue };
+        let (dx, dy) = (pb.tail.0 - pb.head.0, pb.tail.1 - pb.head.1);
+        let widths: Vec<f32> = [0.2f32, 0.4, 0.6, 0.8]
+            .iter()
+            .map(|t| {
+                let sx = (pb.head.0 + t * dx).clamp(0.0, (w - 1) as f32) as usize;
+                let sy = (pb.head.1 + t * dy).clamp(0.0, (h - 1) as f32) as usize;
+                dt[sy * wu + sx]
+            })
+            .filter(|&d| d > 0.0)
+            .collect();
+        let limb_width =
+            if widths.is_empty() { (height * 0.05).max(8.0) } else { (widths.iter().sum::<f32>() / widths.len() as f32).max(5.0) };
+        let radius = (limb_width * 0.75).min((dx * dx + dy * dy).max(1.0).sqrt());
+        let prior = crate::outpaint::body_prior(&label, wu, hu, p as i32, pb.head, pb.tail, radius);
+        let moved = crate::outpaint::take_back_joint_side(&mut label, wu, hu, &joint.cut, p as i32, c as i32, &prior);
+        // B4c: and the limb's flank beside the joint (a front view's shirt hem).
+        let flank = crate::outpaint::take_back_flank(&mut label, wu, hu, &joint.cut, p as i32, c as i32);
+        if log {
+            eprintln!("outpaint: B1d {} takes back {} px of {} (+{} px of its flank, B4c)", all_parts[p].name, moved, all_parts[c].name, flank);
+        }
+    }
+    // **B4c** shoulders, front view: a chest under an arm (the arm paints over it)
+    // is completed over that arm's joint disc (`body_discs`, read by the completion
+    // below), so the dropped sleeve cap leaves no notch.
+    let mut body_discs: Vec<Vec<((f32, f32), f32)>> = vec![Vec::new(); all_parts.len()];
+    for joint in &joints {
+        let (p, c) = (joint.parent, joint.child);
+        let shoulder = all_parts[c].name.split_whitespace().next().is_some_and(|s| s.eq_ignore_ascii_case("shoulder"));
+        if !shoulder || crate::outpaint::is_limb_bone(&all_parts[p].name) {
+            continue;
+        }
+        if joint.over_is_child {
+            if let Some(disc) = crate::outpaint::joint_disc(&joint.cut, &matte_in, wu, hu) {
+                body_discs[p].push(disc);
+            }
+        }
+    }
+    // **B4b-4**: where a limb paints over the body part it hangs from (the near arm
+    // over the chest), an object of the body the segmenter's boundary cut through at
+    // the limb's root (the pens in the shirt pocket) goes back to the body
+    // (`outpaint::return_foreign_objects`), so it does not swing out with the limb.
+    for joint in &joints {
+        let (p, c) = (joint.parent, joint.child);
+        if !joint.over_is_child || crate::outpaint::is_limb_bone(&all_parts[p].name) {
+            continue;
+        }
+        let mut moved = crate::outpaint::return_foreign_objects(&mut label, wu, hu, &joint.cut, p as i32, c as i32, img);
+        if moved > 0 {
+            // What is left of the limb between the object and the body is a sliver.
+            moved += crate::outpaint::remove_spikes(&mut label, wu, hu, c as i32);
+        }
+        if log {
+            eprintln!("outpaint: B4b-4 {} returns {} px of foreign objects at {}'s root", all_parts[p].name, moved, all_parts[c].name);
+        }
+    }
+    // **B4b-3** spikes: what is left of a thigh or shin under 4 px wide (the teeth of
+    // a comb-shaped segmenter boundary) goes to the part it lies in.
+    for side in ["L", "R"] {
+        for slot in ["Thigh", "Knee"] {
+            if let Some((i, name)) = slot_index(slot, side) {
+                let moved = crate::outpaint::remove_spikes(&mut label, wu, hu, i as i32);
+                if log {
+                    eprintln!("outpaint: B4b-3 spikes of {name}: {moved} px moved");
+                }
+            }
+        }
+    }
+    // **B4b-1**: a borrowing limb's own slivers and small fragments go to the part
+    // over it they lie in, so its borrowed picture shows whole when it swings away
+    // (`outpaint::drop_borrower_fragments`); the borrowed picture's size is taken
+    // as the two limbs' pixels together.
+    for (position, src) in borrow_src.iter().enumerate() {
+        let Some(src) = *src else { continue };
+        let Some(bone) = skel.bone(&all_parts[position].name) else { continue };
+        let count = |l: usize| label.iter().filter(|&&v| v == l as i32).count();
+        let borrowed_px = count(src) + count(position);
+        let moved = crate::outpaint::drop_borrower_fragments(
+            &mut label,
+            wu,
+            hu,
+            position as i32,
+            bone.head,
+            bone.tail,
+            borrowed_px,
+            src as i32,
+            |l| l >= 0 && rank(l as usize) > rank(position),
+        );
+        if log {
+            eprintln!("outpaint: B4b-1 {} drops {} px of slivers/fragments (borrowed picture ~{} px)", all_parts[position].name, moved, borrowed_px);
         }
     }
     // The parts' own pixels after the cuts (a part no cut touched keeps its mask).
@@ -1756,6 +1922,15 @@ fn complete_parts_impl(
             let max_x = ((x0.max(x1) + radius).ceil().min((w - 1) as f32)) as u32;
             let min_y = ((y0.min(y1) - radius).floor().max(0.0)) as u32;
             let max_y = ((y0.max(y1) + radius).ceil().min((h - 1) as f32)) as u32;
+            // B4c: the scan also covers the joint discs of arms painting over it.
+            let (min_x, max_x, min_y, max_y) = body_discs[position].iter().fold((min_x, max_x, min_y, max_y), |b, &((cx, cy), r)| {
+                (
+                    b.0.min((cx - r).floor().max(0.0) as u32),
+                    b.1.max(((cx + r).ceil().min((w - 1) as f32)) as u32),
+                    b.2.min((cy - r).floor().max(0.0) as u32),
+                    b.3.max(((cy + r).ceil().min((h - 1) as f32)) as u32),
+                )
+            });
 
             // First pass: which pixels the capsule/joint cap would newly
             // add (not already covered by visible pixels).
@@ -1788,7 +1963,11 @@ fn complete_parts_impl(
                     // or an owner that paints over this part. See `owner_rank`.
                     let hidden = owner_rank[idx].is_none_or(|owner| owner > (depth, position));
 
-                    if (inside_capsule || inside_joint_cap) && hidden && out_rgba[idx * 4 + 3] == 0 {
+                    // B4c: and the joint disc of an arm painting over it.
+                    let inside_disc = body_discs[position]
+                        .iter()
+                        .any(|&((cx, cy), r)| (px_f - cx).powi(2) + (py_f - cy).powi(2) <= r * r);
+                    if (inside_capsule || inside_joint_cap || inside_disc) && hidden && out_rgba[idx * 4 + 3] == 0 {
                         hole[idx] = true;
                         any_hole = true;
                     }
@@ -1840,7 +2019,13 @@ fn complete_parts_impl(
                                 && owner_rank[idx].is_none_or(|owner| owner > (depth, position))
                         })
                         .collect();
-                    crate::outpaint::outpaint_limb(&out_rgba, &allowed, &matte_in, bone.head, bone.tail, img)
+                    match tail_cut[position] {
+                        // B4b-3: under the shin's round end, extruded at the knee too.
+                        Some(cut) => crate::outpaint::outpaint_limb_both_ends(
+                            &out_rgba, &allowed, &matte_in, bone.head, bone.tail, img, cut,
+                        ),
+                        None => crate::outpaint::outpaint_limb(&out_rgba, &allowed, &matte_in, bone.head, bone.tail, img),
+                    }
                 });
                 match outpainted.flatten() {
                     Some(limb) => {
@@ -2441,6 +2626,8 @@ const FACE_PART_MIN_SHARE: f64 = 0.25;
 /// neighbours' (the colour path): a 3 px line along a boundary is drawn whole by
 /// both; on rotation a 3 px stub of the neighbour's outline rides along, unseen.
 const INK_PIECE_OVERLAP_PX: f64 = 3.0;
+/// P8-B B4c: the most a part's boundary is simplified (px) for the clips.
+const BOUNDARY_TOL_MAX_PX: f64 = 4.0;
 /// Distance from `p` to the segment `a`–`b`.
 fn segment_distance(p: Point, a: Point, b: Point) -> f64 {
     let ab = b - a;
@@ -2454,12 +2641,16 @@ fn segment_distance(p: Point, a: Point, b: Point) -> f64 {
 /// `qualifying` owner whose bone segment is nearest the loop's centroid (`largest`
 /// when no owner has a bone). Returned paths are one per owner, in owner order,
 /// so the caller merges each into that owner's piece.
+#[allow(clippy::too_many_arguments)]
 fn split_remainder_by_bone(
     remainder: &BezPath,
     qualifying: &[i32],
     largest: i32,
     completed: &CompletedParts,
     skel: &Skeleton,
+    owner_map: &[i32],
+    w: u32,
+    h: u32,
 ) -> Vec<(i32, BezPath)> {
     if remainder.is_empty() {
         return Vec::new();
@@ -2484,12 +2675,31 @@ fn split_remainder_by_bone(
             continue;
         }
         let (_, centroid) = polygon_area_centroid(&pts[i]);
-        let owner = bones
+        let nearest = bones
             .iter()
-            .map(|(id, a, b)| (segment_distance(centroid, *a, *b), *id))
-            .min_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)))
-            .map(|(_, id)| id)
-            .unwrap_or(largest);
+            .map(|(id, a, b)| (segment_distance(centroid, *a, *b), *id, *a, *b))
+            .min_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        // P8-B B4c: a loop lying past the nearest bone's HEAD (on its parent's side
+        // of the joint) goes to the qualifying owner holding most of its pixels
+        // instead, when that is another part. By distance to the clamped segment
+        // a front view's shirt stripe above the hip joint went to the thigh (its
+        // head is nearer than the short Hips bone's line), 88 % of it the Hips',
+        // and swung out of the shirt with the leg.
+        let past_head = nearest.is_some_and(|(_, _, a, b)| {
+            let ab = b - a;
+            let len2 = ab.hypot2();
+            len2 > 1e-12 && (centroid - a).dot(ab) / len2 < 0.0
+        });
+        let majority = past_head
+            .then(|| {
+                let (hist, _) = area_by_owner(&pts[i..=i], owner_map, w, h);
+                hist.into_iter()
+                    .filter(|(id, _)| qualifying.contains(id))
+                    .max_by(|x, y| x.1.cmp(&y.1).then(y.0.cmp(&x.0)))
+                    .map(|(id, _)| id)
+            })
+            .flatten();
+        let owner = majority.or(nearest.map(|n| n.1)).unwrap_or(largest);
         let group = match groups.iter_mut().find(|(id, _)| *id == owner) {
             Some(g) => &mut g.1,
             None => {
@@ -2506,6 +2716,99 @@ fn split_remainder_by_bone(
     }
     groups.sort_by_key(|(id, _)| *id);
     groups
+}
+
+/// P8-B B4c: a clipped piece larger than this multiple of the pixels its owner
+/// holds in the region (plus [`PIECE_GUARD_SLACK_PX`]) took someone else's share.
+const PIECE_GUARD_SHARE: f64 = 1.15;
+/// P8-B B4c: the slack (px²) of that guard, for the boundary's own approximation.
+const PIECE_GUARD_SLACK_PX: f64 = 200.0;
+
+/// **P8-B B4c: a straddling fill region split by rasterised ownership**, the guard
+/// for a clip that handed one owner far more than it holds (a piece over
+/// [`PIECE_GUARD_SHARE`] × its pixels): the region (`subpaths`, even-odd, as
+/// [`area_by_owner`]) is cut into per-owner pixel masks by the owner map (a pixel of
+/// an owner not in `qualifying`, or of none, goes to `largest`), each grown 1 px so
+/// neighbouring pieces overlap instead of leaving a seam, and traced as an outline
+/// on a window round the region (the per-part boundary's Outline trace).
+fn split_region_by_ownership(subpaths: &[Vec<Point>], owner: &[i32], w: u32, h: u32, qualifying: &[i32], largest: i32) -> Vec<(i32, BezPath)> {
+    let pts = subpaths.iter().flatten();
+    let (mut bx0, mut by0, mut bx1, mut by1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for p in pts {
+        (bx0, by0, bx1, by1) = (bx0.min(p.x), by0.min(p.y), bx1.max(p.x), by1.max(p.y));
+    }
+    if bx0 > bx1 {
+        return Vec::new();
+    }
+    const PAD: i64 = 3;
+    let x0 = (bx0.floor() as i64 - PAD).max(0) as usize;
+    let y0 = (by0.floor() as i64 - PAD).max(0) as usize;
+    let x1 = ((bx1.ceil() as i64 + PAD).min(w as i64 - 1)).max(0) as usize;
+    let y1 = ((by1.ceil() as i64 + PAD).min(h as i64 - 1)).max(0) as usize;
+    let (cw, ch) = (x1 - x0 + 1, y1 - y0 + 1);
+    // Who gets each region pixel (window coordinates), -2 outside the region.
+    let mut assign = vec![-2i32; cw * ch];
+    for y in y0..=y1 {
+        let yc = y as f64 + 0.5;
+        let mut xs: Vec<f64> = Vec::new();
+        for sp in subpaths {
+            let n = sp.len();
+            if n < 2 {
+                continue;
+            }
+            for i in 0..n {
+                let (a, b) = (sp[i], sp[(i + 1) % n]);
+                if (a.y <= yc && b.y > yc) || (b.y <= yc && a.y > yc) {
+                    xs.push(a.x + (yc - a.y) / (b.y - a.y) * (b.x - a.x));
+                }
+            }
+        }
+        xs.sort_by(f64::total_cmp);
+        for pair in xs.chunks_exact(2) {
+            let xa = (pair[0].round() as i64).max(x0 as i64);
+            let xb = (pair[1].round() as i64).min(x1 as i64 + 1);
+            for x in xa..xb {
+                let o = owner[y * w as usize + x as usize];
+                assign[(y - y0) * cw + (x as usize - x0)] = if qualifying.contains(&o) { o } else { largest };
+            }
+        }
+    }
+    let opts = buzz_scene::trace::TraceOptions {
+        mode: buzz_scene::trace::TraceMode::Outline,
+        smooth: 1.0,
+        speckle: 0,
+        ..Default::default()
+    };
+    let to_canvas = Affine::translate((x0 as f64, y0 as f64));
+    let mut out = Vec::new();
+    for &id in qualifying {
+        let mut buf = vec![0u8; cw * ch * 4];
+        let mut any = false;
+        for y in 0..ch {
+            for x in 0..cw {
+                // Grown 1 px (8-neighbourhood) into the rest of the region.
+                let hit = (y.saturating_sub(1)..(y + 2).min(ch))
+                    .any(|ny| (x.saturating_sub(1)..(x + 2).min(cw)).any(|nx| assign[ny * cw + nx] == id))
+                    && assign[y * cw + x] != -2;
+                if hit {
+                    buf[(y * cw + x) * 4 + 3] = 255;
+                    any = true;
+                }
+            }
+        }
+        if !any {
+            continue;
+        }
+        let report = buzz_scene::trace::trace(cw as u32, ch as u32, &buf, &opts);
+        let mut piece = BezPath::new();
+        for s in report.shapes.into_iter().filter(|s| s.fill.is_some()) {
+            piece.extend((to_canvas * s.path).elements().iter().copied());
+        }
+        if !piece.is_empty() {
+            out.push((id, piece));
+        }
+    }
+    out
 }
 
 /// `2 · area / perimeter`: the mean width of a filled shape (0 for an empty one).
@@ -4038,7 +4341,10 @@ pub fn trace_character_whole_with(
             };
             let sil_report = buzz_scene::trace::trace(w, h, &sil_buf, &sil_opts);
             let tol = match skel.bone(&part.name) {
-                Some(bone) => (limb_radius_at_head(bone, &dt, w, h, height) as f64 * 2.0 / 12.0).max(1.5),
+                // P8-B B4c: at most `BOUNDARY_TOL_MAX_PX`: a torso's limb radius made it
+                // 12 px, the simplified Hips cut the shirt's corners off, and its grown
+                // ink clip lost the hem line once those corners were the Hips'.
+                Some(bone) => (limb_radius_at_head(bone, &dt, w, h, height) as f64 * 2.0 / 12.0).clamp(1.5, BOUNDARY_TOL_MAX_PX),
                 None => 1.5,
             };
             let (mut verts_before, mut verts_after) = (0usize, 0usize);
@@ -4532,12 +4838,16 @@ pub fn trace_character_whole_with(
                         // outline network left solid squares and bars behind). The
                         // grown boundaries cover the figure, so nothing is lost.
                         let mut out: Vec<(i32, BezPath)> = Vec::with_capacity(qualifying.len());
+                        // P8-A A3: even-odd. The ink network's NonZero intersect
+                        // returned a sliver outside both operands (Munna's hips: a
+                        // bar bounded by x = 643 beside the shirt, 9 px of spill).
+                        let ink_opts = BooleanOptions { fill: buzz_geom::FillMode::EvenOdd, ..bool_opts };
                         for &id in &qualifying {
                             let piece = buzz_geom::boolean(
                                 &shape.path,
                                 &part_ink_clip[id as usize],
                                 BoolOp::Intersect,
-                                bool_opts,
+                                ink_opts,
                             );
                             if !piece.is_empty() {
                                 out.push((id, piece));
@@ -4593,10 +4903,31 @@ pub fn trace_character_whole_with(
                                 Some(done) => buzz_geom::boolean(&shape.path, done, BoolOp::Difference, bool_opts),
                                 None => shape.path.clone(),
                             };
-                            for (id, sliver) in split_remainder_by_bone(&remainder, &qualifying, largest, completed, skel) {
+                            for (id, sliver) in split_remainder_by_bone(&remainder, &qualifying, largest, completed, skel, &owner, w, h) {
                                 match out.iter_mut().find(|(pid, _)| *pid == id) {
                                     Some(piece) => piece.1 = buzz_geom::boolean(&piece.1, &sliver, BoolOp::Union, bool_opts),
                                     None => out.push((id, sliver)),
+                                }
+                            }
+                            // P8-B B4c guard: a piece far larger than what its owner
+                            // holds in the region took another part's share (the
+                            // whole shirt stripe on a thigh); split by the owner map.
+                            let wrong = out.iter().find(|(id, p)| {
+                                let held = hist.get(id).copied().unwrap_or(0) as f64;
+                                p.area().abs() > PIECE_GUARD_SHARE * held + PIECE_GUARD_SLACK_PX
+                            });
+                            if let Some((id, p)) = wrong {
+                                if std::env::var_os("BUZZ_TRACE_INK_LOG").is_some() {
+                                    eprintln!(
+                                        "trace_character_whole: piece guard: {:?} got {:.0} px² of a {total} px region it holds {} px of; split by ownership",
+                                        completed.parts[*id as usize].name,
+                                        p.area().abs(),
+                                        hist.get(id).copied().unwrap_or(0)
+                                    );
+                                }
+                                let split = split_region_by_ownership(&subpaths, &owner, w, h, &qualifying, largest);
+                                if !split.is_empty() {
+                                    out = split;
                                 }
                             }
                         }

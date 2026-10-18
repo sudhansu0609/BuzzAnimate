@@ -17,6 +17,7 @@ pub mod asset_sets;
 pub mod rerig;
 pub mod scene_builder;
 pub mod director;
+pub mod breakdown;
 pub mod siglip;
 pub mod transcribe;
 pub mod voice;

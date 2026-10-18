@@ -207,6 +207,13 @@ pub struct SceneSet {
     /// Assets that cover the stage, back to front.
     pub background: Vec<String>,
     pub props: Vec<PropSpec>,
+    /// P8-C1: the breakdown's prop words. On a set from a `background`
+    /// asset, each is matched in the asset index and stood on the ground in
+    /// front of it, clear of the cast's marks; ignored without an index.
+    pub props_wanted: Vec<String>,
+    /// The breakdown's location key: scenes that share it share one prop
+    /// layout (P8-C1). Absent: the `background` names are the key.
+    pub location: Option<String>,
     pub place: BTreeMap<String, PlaceSpec>,
     /// **Named but not here.** "Raju is gone." and "a woman is talking to
     /// Amma" both name a character the scene does not show; without this the
@@ -218,6 +225,62 @@ pub struct SceneSet {
     /// The words of this scene's title card (with `title_cards` on), instead
     /// of the script's own scene title.
     pub title: Option<String>,
+    /// P5: the camera. `"auto"`, or a list of [`ShotSpec`]s. Absent: no
+    /// camera keys at all.
+    pub shots: Option<Shots>,
+    /// P5: the key light, mapped onto the built set's lights. Absent: the
+    /// setting's own lights, unchanged.
+    pub lighting: Option<Lighting>,
+}
+
+/// P5: a scene's shots, `"auto"` or a list.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Shots {
+    /// `"auto"` (any other word is warned about and ignored).
+    Auto(String),
+    List(Vec<ShotSpec>),
+}
+
+/// P5: one cut, from the casting file (or P1's breakdown).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ShotSpec {
+    /// Index among the scene's dialogue lines (voice-over too); the shot
+    /// starts as that line starts.
+    pub at_line: usize,
+    /// `wide`, `medium` or `close`.
+    pub kind: String,
+    /// The character a medium or close is on; the line's speaker when absent.
+    pub on: Option<String>,
+    /// Seconds before cutting back to wide, when shorter than the time to the
+    /// next shot.
+    pub hold: Option<f64>,
+}
+
+/// P5: how a scene is lit, in the words of P1's breakdown.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Lighting {
+    /// `sun`, `lamp`, `moon`, `window` or `none`.
+    pub key: String,
+    /// `left`, `right` or `front`.
+    pub from: String,
+    pub warm: bool,
+}
+
+/// P5: one cut the camera makes, for the report.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ShotCut {
+    pub frame: u32,
+    pub kind: String,
+    pub on: Option<String>,
+    /// The camera's centre on the stage and its zoom.
+    pub x: f64,
+    pub y: f64,
+    pub scale: f64,
+    /// A wide that pushes in 3 % ends its push on this frame.
+    pub push_to: Option<u32>,
 }
 
 /// The casting file.
@@ -344,6 +407,11 @@ pub struct BuildOptions {
     /// The asset index sets are dressed from (AS3). `None`: [`build_episode`]
     /// reads the library's own, when it has one.
     pub index: Option<Arc<buzz_ai::asset_index::AssetIndex>>,
+    /// P2: the dialogue recording, matched to the script
+    /// ([`buzz_act::audio_align`]). A scene with lines in it is timed by the
+    /// recording, carries its cut of it on a sound layer and is lip-synced
+    /// from it; every other scene and line keeps its text timing.
+    pub audio: Option<Arc<buzz_act::audio_align::AudioPlan>>,
 }
 
 impl Default for BuildOptions {
@@ -356,6 +424,7 @@ impl Default for BuildOptions {
             ground: 0.9,
             timing: Timing::default(),
             index: None,
+            audio: None,
         }
     }
 }
@@ -409,6 +478,11 @@ pub struct SceneReport {
     /// Names skipped, with why.
     pub skipped: Vec<String>,
     pub warnings: Vec<String>,
+    /// How the scene was timed: which lines from the recording, which from
+    /// their text (P2).
+    pub notes: Vec<String>,
+    /// P5: the camera's cuts, in order. Empty with no `shots`.
+    pub shots: Vec<ShotCut>,
 }
 
 /// The report for a build, as markdown.
@@ -477,6 +551,12 @@ pub fn report_markdown(title: &str, reports: &[SceneReport], fps: f64) -> String
             out.push_str("* **Skipped:**\n");
             for s in &r.skipped {
                 out.push_str(&format!("  * {s}\n"));
+            }
+        }
+        if !r.notes.is_empty() {
+            out.push_str("* **Notes:**\n");
+            for n in &r.notes {
+                out.push_str(&format!("  * {n}\n"));
             }
         }
         if !r.warnings.is_empty() {
@@ -1533,7 +1613,16 @@ pub fn build_scene(
         fps: opts.fps,
         ..opts.timing
     };
-    let schedule = timing.schedule(src);
+    // P2: a recording with lines for this scene times them; text times the rest.
+    let mut audio_notes: Vec<String> = Vec::new();
+    let audio = opts
+        .audio
+        .as_deref()
+        .and_then(|plan| scene_audio(plan, &timing, src, &mut audio_notes));
+    let schedule = match &audio {
+        Some(a) => a.timed.schedule.clone(),
+        None => timing.schedule(src),
+    };
     let total = schedule.total_frames;
     let fps = opts.fps;
     let stage = scene.stage().stage_rect();
@@ -1549,6 +1638,7 @@ pub fn build_scene(
             .iter()
             .filter(|i| matches!(i, Item::Dialogue(_)))
             .count(),
+        notes: audio_notes,
         ..Default::default()
     };
 
@@ -1563,7 +1653,12 @@ pub fn build_scene(
     if !set.background.is_empty() {
         let mut used = Vec::new();
         for name in &set.background {
-            match find_asset(assets, name, None, false) {
+            // `Backgrounds/<series>/<key>` (the producer's) names its folder too.
+            let found = match name.trim().trim_matches('/').rsplit_once('/') {
+                Some((folder, base)) => find_asset(assets, base, Some(folder), false),
+                None => find_asset(assets, name, None, false),
+            };
+            match found {
                 Some(asset) => match place_asset(scene, assets, asset) {
                     Ok(placed) => {
                         if let Some(b) = placed.bounds {
@@ -1579,6 +1674,78 @@ pub fn build_scene(
             }
         }
         report.set = format!("background: {}", used.join(", "));
+        // P8-C1: the breakdown's props from the index, on the ground in front
+        // of the picture, clear of the cast's marks. No index: none.
+        if !used.is_empty()
+            && !set.props_wanted.is_empty()
+            && let Some(index) = opts.index.as_deref()
+        {
+            // One layout per location: the words and the cast's marks of
+            // every scene at it, seeded by its key.
+            let key_of = |s: &SceneSet| {
+                s.location
+                    .clone()
+                    .filter(|l| !l.trim().is_empty())
+                    .unwrap_or_else(|| s.background.join("|"))
+            };
+            let key = key_of(&set);
+            let mut numbered: Vec<(u32, &SceneSet)> = casting
+                .scenes
+                .iter()
+                .filter(|(_, s)| key_of(s) == key)
+                .map(|(n, s)| (n.parse().unwrap_or(u32::MAX), s))
+                .collect();
+            numbered.sort_by_key(|(n, _)| *n);
+            let mut words: Vec<String> = Vec::new();
+            let mut marks: Vec<f64> = Vec::new();
+            for (_, s) in &numbered {
+                for w in &s.props_wanted {
+                    if !words.iter().any(|x| x.eq_ignore_ascii_case(w)) {
+                        words.push(w.clone());
+                    }
+                }
+                marks.extend(s.place.values().filter_map(|p| p.x).map(|x| x.clamp(-0.5, 1.5)));
+            }
+            if numbered.is_empty() {
+                words = set.props_wanted.clone();
+                marks = marks_of(&members, &set);
+            }
+            let dressed = crate::asset_sets::dress_props(
+                scene,
+                assets,
+                index,
+                &key,
+                &words,
+                &marks,
+                ground,
+                opts.figure_height,
+            );
+            report.set_pieces.extend(dressed.placed.iter().cloned());
+            report.notes.extend(dressed.plan.notes.iter().cloned());
+            for f in &dressed.failed {
+                report.warnings.push(format!("prop not placed: {f}"));
+            }
+        }
+        // P6: a background asset brings no lights, so the casting's lighting
+        // gets the key and the sky fill a built set would have made first.
+        // The asset's cover layers (its Sky) stay unlit as they were saved.
+        if let Some(lighting) = &set.lighting {
+            if set.lit.unwrap_or(true) {
+                let setting = set
+                    .setting
+                    .as_deref()
+                    .and_then(setting_named)
+                    .or_else(|| src.slugline.as_ref().map(setting_for))
+                    .or(carry.setting)
+                    .unwrap_or(Setting::Daylight);
+                let lights_before = scene.lights().lights.len();
+                add_set_lights(scene, setting);
+                apply_lighting(scene, lighting, setting, stage, lights_before, &mut report);
+                carry.setting = Some(setting);
+            } else {
+                report.warnings.push("lighting ignored: the scene is not lit".into());
+            }
+        }
     } else {
         let setting = set
             .setting
@@ -1603,7 +1770,16 @@ pub fn build_scene(
             frames: total,
             ..SceneRecipe::default()
         };
+        let lights_before = scene.lights().lights.len();
         let staged = staging::build(scene, &recipe);
+        // P5: the casting's key light, over the lights the setting just made.
+        if let Some(lighting) = &set.lighting {
+            if recipe.lit {
+                apply_lighting(scene, lighting, setting, stage, lights_before, &mut report);
+            } else {
+                report.warnings.push("lighting ignored: the scene is not lit".into());
+            }
+        }
         let horizon_y = stage.y0 + stage.height() * horizon;
 
         // **AS3: the set from the user's own assets**, when the casting names
@@ -1703,6 +1879,8 @@ pub fn build_scene(
     let unspecified = members.iter().filter(|m| m.place.x.is_none()).count();
     let mut spread_index = 0usize;
     let mut actors: Vec<Actor> = Vec::new();
+    // P5: each staged actor's feet, for framing a shot on them.
+    let mut feet: Vec<(String, f64)> = Vec::new();
     for member in members {
         let x_fraction = match member.place.x {
             Some(x) => x.clamp(-0.5, 1.5),
@@ -1721,10 +1899,12 @@ pub fn build_scene(
             .unwrap_or(opts.figure_height)
             .clamp(0.05, 1.5);
         let height = stage.height() * height_fraction;
+        let key = member.key.clone();
         if let Some(actor) = stage_actor(
             scene, assets, member, mark_x, feet_y, height, stage, total, &mut report,
         ) {
             actors.push(actor);
+            feet.push((key, feet_y));
         }
     }
 
@@ -1746,7 +1926,10 @@ pub fn build_scene(
         }
     }
     for actor in &mut actors {
-        sync_mouth(scene, actor, total, fps, &mut report);
+        sync_mouth(scene, actor, total, fps, audio.as_ref(), &mut report);
+    }
+    if let Some(a) = &audio {
+        attach_scene_sound(scene, a, src, fps, &mut report);
     }
 
     for prop in front_props {
@@ -1797,6 +1980,13 @@ pub fn build_scene(
         }
     }
 
+    // -- shots (P5) ---------------------------------------------------------------------------
+    if let Some(shots) = &set.shots {
+        let cast = ShotCast { actors: &actors, feet: &feet };
+        let plan = plan_shots(shots, src, &schedule, casting, &cast, stage, &timing, total, &mut report);
+        write_shots(scene, &plan, total, &mut report);
+    }
+
     // Every layer reaches the end, so nothing vanishes mid-shot.
     scene.set_frame_count(total);
     let last = total.saturating_sub(1);
@@ -1822,6 +2012,592 @@ pub fn build_scene(
         });
     }
     report
+}
+
+// -- shots and lights (P5) ----------------------------------------------------------------
+
+/// The cast as the camera sees it.
+struct ShotCast<'a> {
+    actors: &'a [Actor],
+    /// Each staged actor's feet, by casting key.
+    feet: &'a [(String, f64)],
+}
+
+impl ShotCast<'_> {
+    fn actor(&self, key: &str) -> Option<&Actor> {
+        self.actors.iter().find(|a| a.member.key == key)
+    }
+
+    fn feet_y(&self, key: &str) -> Option<f64> {
+        self.feet.iter().find(|(k, _)| k == key).map(|(_, y)| *y)
+    }
+}
+
+/// One shot of a plan: from `start` until the next shot starts.
+#[derive(Debug, Clone)]
+struct Shot {
+    start: u32,
+    kind: String,
+    on: Option<String>,
+    center: Point,
+    zoom: f64,
+    /// A slow 3 % push-in over the shot.
+    push: bool,
+}
+
+/// A dialogue line, as the camera plans around it.
+struct ShotLine {
+    slot: buzz_act::script_timing::Slot,
+    /// The casting key of a speaker who has a figure on stage; `None` for
+    /// voice-over, voice-only and uncast names.
+    speaker: Option<String>,
+}
+
+fn wide_shot(start: u32, stage: Rect) -> Shot {
+    Shot {
+        start,
+        kind: "wide".into(),
+        on: None,
+        center: stage.center(),
+        zoom: 1.0,
+        push: false,
+    }
+}
+
+/// Is `a` on stage over `from..to`: on their mark inside the stage, arrived
+/// by the start, not gone before the end.
+fn on_stage(a: &Actor, schedule: &Schedule, stage: Rect, from: u32, to: u32) -> bool {
+    let inside = a.mark_x >= stage.x0 && a.mark_x <= stage.x1;
+    let arrived = a
+        .member
+        .enter_item
+        .map_or(true, |i| schedule.slots.get(i).is_some_and(|s| s.start <= from));
+    let gone = a
+        .member
+        .exit
+        .is_some_and(|(i, _)| schedule.slots.get(i).is_some_and(|s| s.start < to));
+    inside && arrived && !gone
+}
+
+/// A frame of `zoom` centred near `(cx, cy)`, moved so it never leaves the
+/// stage.
+fn clamp_frame(stage: Rect, cx: f64, cy: f64, zoom: f64) -> (Point, f64) {
+    let zoom = zoom.max(1.0);
+    let (w, h) = (stage.width() / zoom, stage.height() / zoom);
+    (
+        Point::new(
+            cx.clamp(stage.x0 + w / 2.0, stage.x1 - w / 2.0),
+            cy.clamp(stage.y0 + h / 2.0, stage.y1 - h / 2.0),
+        ),
+        zoom,
+    )
+}
+
+/// **A medium (knees up) or a close (chest up) on `who`**: that much of the
+/// figure fills 70 % of the frame height, with a little headroom. A partner
+/// within 0.35 of the stage width is kept in frame, by centring between the
+/// two and widening the shot as far as it takes (never past the stage).
+fn frame_on(stage: Rect, who: &Actor, feet_y: f64, partner: Option<&Actor>, close: bool) -> (Point, f64) {
+    // How much of the figure shows, from the top of the head down: the knees
+    // are about 0.28 of a standing height up from the feet.
+    let shows = if close { 0.42 } else { 0.72 };
+    let mut zoom = (stage.height() * 0.70 / (who.height * shows).max(1.0)).max(1.0);
+    let mut cx = who.mark_x;
+    if let Some(p) = partner {
+        let dx = (p.mark_x - who.mark_x).abs();
+        if dx <= 0.35 * stage.width() {
+            let need = dx + who.half_width + p.half_width + 0.04 * stage.width();
+            zoom = zoom.min(stage.width() / need.max(1.0)).max(1.0);
+            let slack = (stage.width() / zoom / 2.0 - who.half_width).max(0.0);
+            cx = ((who.mark_x + p.mark_x) / 2.0).clamp(who.mark_x - slack, who.mark_x + slack);
+        }
+    }
+    let frame_h = stage.height() / zoom;
+    let top = feet_y - who.height - 0.12 * frame_h;
+    clamp_frame(stage, cx, top + frame_h / 2.0, zoom)
+}
+
+/// The shot on `key` over line `at`, keeping the other speaker (the line
+/// before's, else the line after's) in frame when they are near.
+#[allow(clippy::too_many_arguments)]
+fn shot_on(
+    cast: &ShotCast,
+    lines: &[ShotLine],
+    at: usize,
+    key: &str,
+    close: bool,
+    schedule: &Schedule,
+    stage: Rect,
+    start: u32,
+) -> Option<Shot> {
+    let who = cast.actor(key)?;
+    let feet_y = cast.feet_y(key)?;
+    let line = lines.get(at)?;
+    let (from, to) = (line.slot.start, line.slot.end());
+    let other = |l: &ShotLine| {
+        l.speaker
+            .as_deref()
+            .filter(|k| *k != key)
+            .and_then(|k| cast.actor(k))
+            .filter(|a| on_stage(a, schedule, stage, from, to))
+    };
+    let partner = lines[..at]
+        .iter()
+        .rev()
+        .find_map(|l| other(l))
+        .or_else(|| lines[at + 1..].iter().find_map(|l| other(l)));
+    let (center, zoom) = frame_on(stage, who, feet_y, partner, close);
+    Some(Shot {
+        start,
+        kind: if close { "close" } else { "medium" }.into(),
+        on: Some(key.to_string()),
+        center,
+        zoom,
+        push: false,
+    })
+}
+
+/// **Plan a scene's shots**, `"auto"` or from a list.
+///
+/// Auto: wide for the first 2 s; a medium on the speaker for a line of 3 s or
+/// more when two or more characters are on stage, cut in as the line starts
+/// and back to wide after it (with its caption gap); the same for a change
+/// of speaker whose line is 1.5 s or more once the shot before has run 6 s
+/// (P8-C3); never two cuts within
+/// 3 s; a wide that holds more than 10 s pushes in 3 %.
+#[allow(clippy::too_many_arguments)]
+fn plan_shots(
+    shots: &Shots,
+    src: &ScriptScene,
+    schedule: &Schedule,
+    casting: &Casting,
+    cast: &ShotCast,
+    stage: Rect,
+    timing: &Timing,
+    total: u32,
+    report: &mut SceneReport,
+) -> Vec<Shot> {
+    let fps = timing.fps;
+    let secs = |s: f64| (s * fps).round().max(0.0) as u32;
+    let gap = timing.frames(timing.line_gap);
+    let lines: Vec<ShotLine> = src
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let Item::Dialogue(Dialogue { speaker, voice, .. }) = item else {
+                return None;
+            };
+            let slot = *schedule.slots.get(index)?;
+            let speaker = if *voice == Voice::VoiceOver {
+                None
+            } else {
+                casting
+                    .character(speaker)
+                    .filter(|(_, e)| !e.voice_only)
+                    .map(|(k, _)| k)
+                    .filter(|k| cast.actor(k).is_some())
+            };
+            Some(ShotLine { slot, speaker })
+        })
+        .collect();
+
+    let mut plan: Vec<Shot> = Vec::new();
+    match shots {
+        Shots::Auto(word) => {
+            if !word.trim().eq_ignore_ascii_case("auto") {
+                report
+                    .warnings
+                    .push(format!("shots {word:?}: not \"auto\" or a list; no camera"));
+                return plan;
+            }
+            let (open, spacing, long) = (secs(2.0), secs(3.0).max(1), secs(3.0));
+            plan.push(wide_shot(0, stage));
+            let mut last_cut: Option<u32> = None;
+            for (at, line) in lines.iter().enumerate() {
+                let Some(key) = line.speaker.as_deref() else {
+                    continue;
+                };
+                let (start, end) = (line.slot.start, line.slot.end());
+                // P8-C3: a change of speaker also cuts, when the shot before
+                // has run 6 s and the new speaker's line is 1.5 s or more.
+                let previous = lines[..at].iter().rev().find_map(|l| l.speaker.as_deref());
+                let ran = start.saturating_sub(plan.last().map_or(0, |s| s.start));
+                let change = previous != Some(key) && ran >= secs(6.0) && line.slot.frames >= secs(1.5);
+                if (line.slot.frames < long && !change) || start < open || start >= total {
+                    continue;
+                }
+                if last_cut.is_some_and(|c| start < c + spacing) {
+                    continue;
+                }
+                let here = cast
+                    .actors
+                    .iter()
+                    .filter(|a| on_stage(a, schedule, stage, start, end))
+                    .count();
+                let speaker_here = cast
+                    .actor(key)
+                    .is_some_and(|a| on_stage(a, schedule, stage, start, end));
+                if here < 2 || !speaker_here {
+                    continue;
+                }
+                let Some(shot) = shot_on(cast, &lines, at, key, false, schedule, stage, start) else {
+                    continue;
+                };
+                plan.push(shot);
+                last_cut = Some(start);
+                let back = (end + gap).min(total);
+                if back + 1 < total {
+                    plan.push(wide_shot(back, stage));
+                    last_cut = Some(back);
+                }
+            }
+            let hold = secs(10.0);
+            for i in 0..plan.len() {
+                let end = plan.get(i + 1).map_or(total, |s| s.start);
+                if plan[i].kind == "wide" && end.saturating_sub(plan[i].start) > hold {
+                    plan[i].push = true;
+                }
+            }
+        }
+        Shots::List(list) => {
+            let mut specs = list.clone();
+            specs.sort_by_key(|s| s.at_line);
+            let mut holds: Vec<(u32, u32)> = Vec::new();
+            for spec in &specs {
+                let Some(line) = lines.get(spec.at_line) else {
+                    report.warnings.push(format!(
+                        "shot at line {}: the scene has {} line(s); skipped",
+                        spec.at_line,
+                        lines.len()
+                    ));
+                    continue;
+                };
+                let start = if spec.at_line == 0 { 0 } else { line.slot.start.min(total.saturating_sub(1)) };
+                let kind = spec.kind.trim().to_lowercase();
+                let shot = match kind.as_str() {
+                    "medium" | "close" => {
+                        let who = match spec.on.as_deref().filter(|n| !n.trim().is_empty()) {
+                            Some(name) => casting.character(name).map(|(k, _)| k),
+                            None => line.speaker.clone(),
+                        };
+                        match who.and_then(|k| {
+                            shot_on(cast, &lines, spec.at_line, &k, kind == "close", schedule, stage, start)
+                        }) {
+                            Some(s) => s,
+                            None => {
+                                report.warnings.push(format!(
+                                    "{kind} shot at line {}: {} is not on stage; wide instead",
+                                    spec.at_line,
+                                    spec.on.as_deref().unwrap_or("the speaker")
+                                ));
+                                wide_shot(start, stage)
+                            }
+                        }
+                    }
+                    "wide" | "" => wide_shot(start, stage),
+                    other => {
+                        report
+                            .warnings
+                            .push(format!("shot at line {}: unknown kind {other:?}; wide", spec.at_line));
+                        wide_shot(start, stage)
+                    }
+                };
+                plan.retain(|s| s.start != start);
+                plan.push(shot);
+                if let Some(h) = spec.hold.filter(|h| *h > 0.0) {
+                    holds.push((start, start + secs(h)));
+                }
+            }
+            plan.sort_by_key(|s| s.start);
+            for (start, end) in holds {
+                let next = plan.iter().find(|s| s.start > start).map_or(total, |s| s.start);
+                let held_is_wide = plan.iter().find(|s| s.start == start).is_none_or(|s| s.kind == "wide");
+                if end < next && end + 1 < total && !held_is_wide {
+                    plan.push(wide_shot(end, stage));
+                }
+            }
+            plan.sort_by_key(|s| s.start);
+            if plan.first().is_none_or(|s| s.start > 0) {
+                plan.insert(0, wide_shot(0, stage));
+            }
+        }
+    }
+    plan
+}
+
+/// **Key the camera for a plan**: each shot is a key on its first frame and a
+/// held (or 3 %-pushed) key on its last, so a cut is two keys a frame apart
+/// and never a move. Then the captions are pinned to the frame.
+fn write_shots(scene: &mut Scene, plan: &[Shot], total: u32, report: &mut SceneReport) {
+    if plan.is_empty() || total == 0 {
+        return;
+    }
+    let last = total - 1;
+    {
+        let camera = scene.camera_mut();
+        camera.enabled = true;
+        for (i, shot) in plan.iter().enumerate() {
+            if shot.start > last {
+                break;
+            }
+            let end = plan.get(i + 1).map_or(total, |s| s.start).min(total);
+            let mut key = buzz_scene::CameraKey::new(shot.start, shot.center);
+            key.zoom = shot.zoom;
+            camera.set_key(key);
+            let hold_to = end.saturating_sub(1);
+            let mut push_to = None;
+            if hold_to > shot.start {
+                let mut held = key;
+                held.frame = hold_to;
+                if shot.push {
+                    held.zoom = shot.zoom * 1.03;
+                    push_to = Some(hold_to);
+                }
+                camera.set_key(held);
+            }
+            report.shots.push(ShotCut {
+                frame: shot.start,
+                kind: shot.kind.clone(),
+                on: shot.on.clone(),
+                x: shot.center.x,
+                y: shot.center.y,
+                scale: shot.zoom,
+                push_to,
+            });
+            report.notes.push(format!(
+                "shot: frame {} {}{} (camera {:.0}, {:.0} x{:.2}){}",
+                shot.start,
+                shot.kind,
+                shot.on.as_deref().map(|o| format!(" on {o}")).unwrap_or_default(),
+                shot.center.x,
+                shot.center.y,
+                shot.zoom,
+                push_to.map(|f| format!(", pushing in 3 % to frame {f}")).unwrap_or_default()
+            ));
+        }
+    }
+    pin_captions(scene);
+}
+
+/// **Captions stay on the screen.** A layer cannot ignore the camera, so each
+/// caption keyframe is counter-transformed by the inverse of the camera on its
+/// frame: split at every camera key a caption spans, and where the camera
+/// moves under one (a push-in), split at its last frame and classic-tweened
+/// between, so it holds still on the screen while the world moves. A split
+/// copy keeps the speaker label, so `Lip Sync from Captions` still covers the
+/// whole line.
+fn pin_captions(scene: &mut Scene) {
+    let Some(layer) = scene.layers().iter().find(|l| l.name == "Subtitles").map(|l| l.id) else {
+        return;
+    };
+    let camera = scene.camera().clone();
+    let size = scene.stage().size;
+    let at = |frame: u32| camera.transform_at(frame, size);
+    let keys: Vec<u32> = camera.keys().iter().map(|k| k.frame).collect();
+    fn split(frames: &mut buzz_scene::LayerTimeline, f: u32) {
+        if f < frames.length() && !frames.is_keyframe(f) && !frames.objects_at(f).is_empty() {
+            let label = frames.keyframe_at(f).and_then(|k| k.label.clone());
+            frames.insert_keyframe(f);
+            frames.set_label(f, label);
+        }
+    }
+    scene.update_layer(layer, |l| {
+        let length = l.frames.length();
+        for &f in &keys {
+            split(&mut l.frames, f);
+        }
+        let starts: Vec<u32> = l.frames.keyframes().iter().map(|k| k.start).collect();
+        for (i, &s) in starts.iter().enumerate() {
+            let next = starts.get(i + 1).copied().unwrap_or(length);
+            if next > s + 1 && at(s) != at(next - 1) {
+                split(&mut l.frames, next - 1);
+            }
+        }
+        let starts: Vec<u32> = l.frames.keyframes().iter().map(|k| k.start).collect();
+        for (i, &s) in starts.iter().enumerate() {
+            let objects = l.frames.objects_at(s).to_vec();
+            if objects.is_empty() {
+                continue;
+            }
+            let inverse = at(s).inverse();
+            let pinned: Vec<Arc<Object>> = objects
+                .iter()
+                .map(|o| {
+                    let mut o = (**o).clone();
+                    o.transform = inverse * o.transform;
+                    Arc::new(o)
+                })
+                .collect();
+            l.frames.set_objects(s, pinned);
+            let next = starts.get(i + 1).copied().unwrap_or(length);
+            if next > s + 1 && next < length && at(s) != at(next) {
+                l.frames.set_tween(s, buzz_scene::Tween::classic());
+            }
+        }
+    });
+}
+
+/// The key and the sky fill a built set gets from `staging` (its private
+/// `light`), for a set made of a background asset: same names, colours and
+/// strengths, no rim, no edge bands. [`apply_lighting`] then sets the key.
+fn add_set_lights(scene: &mut Scene, setting: Setting) {
+    use buzz_scene::LightKind;
+    let stage = scene.stage().stage_rect();
+    let key_kind = match setting {
+        Setting::Daylight => LightKind::Sun { azimuth: -0.9, elevation: 1.05 },
+        Setting::Sunset => LightKind::Sun { azimuth: -0.35, elevation: 0.55 },
+        Setting::Storm => LightKind::sky(),
+        Setting::Night | Setting::Interior => LightKind::Lamp {
+            position: Point::new(stage.x0 + stage.width() * 0.22, stage.y0 + stage.height() * 0.05),
+            height: 220.0,
+            radius: stage.width() * 0.75,
+        },
+    };
+    let (key_colour, fill_colour, fill_strength) = match setting {
+        Setting::Daylight => (Color::from_rgb8(0xFF, 0xF6, 0xE2), Color::from_rgb8(0xA8, 0xC6, 0xE8), 0.85),
+        Setting::Sunset => (Color::from_rgb8(0xFF, 0xB2, 0x6B), Color::from_rgb8(0x6C, 0x7E, 0xC2), 0.6),
+        Setting::Night => (Color::from_rgb8(0xFF, 0xC9, 0x7A), Color::from_rgb8(0x2C, 0x3C, 0x6A), 0.35),
+        Setting::Interior => (Color::from_rgb8(0xFF, 0xE3, 0xB8), Color::from_rgb8(0x8E, 0x88, 0x80), 0.55),
+        Setting::Storm => (Color::from_rgb8(0xD6, 0xE4, 0xFF), Color::from_rgb8(0x22, 0x2E, 0x52), 0.22),
+    };
+    let key_id = scene.add_light(key_kind);
+    let fill_id = scene.add_light(LightKind::sky());
+    let rig = scene.lights_mut();
+    rig.enabled = true;
+    rig.edges = buzz_scene::EdgeMode::Off;
+    if let Some(key) = rig.get_mut(key_id) {
+        key.name = "Key".to_string();
+        key.color = key_colour;
+        key.rim = 0.0;
+        key.shadows = true;
+        key.shadow_strength = if setting == Setting::Night { 0.5 } else { 0.38 };
+        key.standing_height = 26.0;
+    }
+    if let Some(fill) = rig.get_mut(fill_id) {
+        fill.name = "Sky".to_string();
+        fill.color = fill_colour;
+        fill.kind = LightKind::Sky { horizon: fill_colour };
+        fill.intensity = fill_strength;
+    }
+}
+
+/// **The casting's key light, over the lights the setting made** (the ones
+/// from index `first` on): `sun` a sun from `from` at 55° (15° and warm at
+/// sunset), `moon` a cool sun at 30° with the sky fill turned down, `lamp` a
+/// lamp at the top of the stage on the `from` side, `window` a lamp just
+/// outside the frame on that side, `none` the setting's sky fill alone.
+fn apply_lighting(
+    scene: &mut Scene,
+    lighting: &Lighting,
+    setting: Setting,
+    stage: Rect,
+    first: usize,
+    report: &mut SceneReport,
+) {
+    use buzz_scene::LightKind;
+    use std::f64::consts::{FRAC_PI_2, PI};
+
+    let from = lighting.from.trim().to_lowercase();
+    let side = match from.as_str() {
+        "left" => -1.0,
+        "right" => 1.0,
+        "front" | "" => 0.0,
+        other => {
+            report.warnings.push(format!("lighting from {other:?}: not left, right or front; front"));
+            0.0
+        }
+    };
+    // Clockwise from the right, towards the light; the sun's depth component
+    // kept the sign the setting's own key uses (-0.9 is from the right).
+    let azimuth = if side < 0.0 {
+        -(PI - 0.9)
+    } else if side > 0.0 {
+        -0.9
+    } else {
+        -FRAC_PI_2
+    };
+    let word = lighting.key.trim().to_lowercase();
+    let rig = scene.lights_mut();
+    let new: Vec<(buzz_scene::LightId, String)> =
+        rig.lights.iter().skip(first).map(|l| (l.id, l.name.clone())).collect();
+    let Some(key_id) = new.iter().find(|(_, n)| n != "Sky").map(|(id, _)| *id) else {
+        report.warnings.push("lighting ignored: the set made no key light".into());
+        return;
+    };
+    let fill_id = new.iter().find(|(_, n)| n == "Sky").map(|(id, _)| *id);
+    let warm = lighting.warm;
+    match word.as_str() {
+        "sun" => {
+            let sunset = setting == Setting::Sunset;
+            let elevation = if sunset { 15f64 } else { 55f64 }.to_radians();
+            if let Some(key) = rig.get_mut(key_id) {
+                key.kind = LightKind::Sun { azimuth, elevation };
+                key.color = if sunset {
+                    Color::from_rgb8(0xFF, 0xB2, 0x6B)
+                } else if warm {
+                    Color::from_rgb8(0xFF, 0xE6, 0xBF)
+                } else {
+                    Color::from_rgb8(0xF4, 0xF6, 0xFF)
+                };
+            }
+        }
+        "moon" => {
+            if let Some(key) = rig.get_mut(key_id) {
+                key.kind = LightKind::Sun {
+                    azimuth,
+                    elevation: 30f64.to_radians(),
+                };
+                key.color = Color::from_rgb8(0xB8, 0xC8, 0xF0);
+                key.intensity *= 0.7;
+            }
+            if let Some(fill) = fill_id.and_then(|id| rig.get_mut(id)) {
+                fill.intensity *= 0.6;
+            }
+        }
+        "lamp" | "window" => {
+            let position = if word == "lamp" {
+                Point::new(stage.center().x + side * stage.width() * 0.35, stage.y0)
+            } else if side == 0.0 {
+                Point::new(stage.center().x, stage.y0 - stage.height() * 0.05)
+            } else {
+                let x = if side < 0.0 {
+                    stage.x0 - stage.width() * 0.05
+                } else {
+                    stage.x1 + stage.width() * 0.05
+                };
+                Point::new(x, stage.y0 + stage.height() * 0.3)
+            };
+            if let Some(key) = rig.get_mut(key_id) {
+                let mut kind = LightKind::lamp(position);
+                if let LightKind::Lamp { height, radius, .. } = &mut kind {
+                    *height = 220.0;
+                    *radius = stage.width() * if word == "lamp" { 0.75 } else { 0.9 };
+                }
+                key.kind = kind;
+                key.color = match (word.as_str(), warm) {
+                    ("lamp", true) => Color::from_rgb8(0xFF, 0xBE, 0x78),
+                    ("lamp", false) => Color::from_rgb8(0xFF, 0xDD, 0xAA),
+                    (_, true) => Color::from_rgb8(0xFF, 0xE8, 0xC8),
+                    _ => Color::from_rgb8(0xEE, 0xF2, 0xFF),
+                };
+            }
+        }
+        "none" => {
+            rig.remove(key_id);
+        }
+        other => {
+            report
+                .warnings
+                .push(format!("lighting key {other:?}: not sun, lamp, moon, window or none; the setting's"));
+            return;
+        }
+    }
+    report.notes.push(format!(
+        "lighting: {word} from {}{}",
+        if from.is_empty() { "front" } else { from.as_str() },
+        if warm { ", warm" } else { "" }
+    ));
 }
 
 fn place_prop(
@@ -2790,25 +3566,145 @@ fn perform_actor(
     }
 }
 
+/// P2: one scene's cut of the recording, and what it timed.
+struct SceneAudio {
+    timed: buzz_act::audio_align::AudioSchedule,
+    /// The span, padded with the pre- and post-roll: scene frame 0 is its start.
+    clip: buzz_audio::Clip,
+    /// The mouth shapes heard in [`Self::clip`], on the scene's frames.
+    visemes: buzz_audio::VisemeTrack,
+    /// The frames of every line timed by the recording, `start..end`.
+    ranges: Vec<Range<u32>>,
+}
+
+/// The recording's cut for `src`, when the plan has lines for it. Notes say
+/// which lines were timed from the audio and which from their text.
+fn scene_audio(
+    plan: &buzz_act::audio_align::AudioPlan,
+    timing: &Timing,
+    src: &ScriptScene,
+    notes: &mut Vec<String>,
+) -> Option<SceneAudio> {
+    use buzz_act::audio_align;
+    let line_name = |item: usize| match src.items.get(item) {
+        Some(Item::Dialogue(d)) => {
+            let words: Vec<&str> = d.text.split_whitespace().take(4).collect();
+            format!("{} \"{}\u{2026}\" (item {item})", d.speaker, words.join(" "))
+        }
+        _ => format!("item {item}"),
+    };
+    let Some(timed) = audio_align::schedule_scene(timing, src, plan) else {
+        if plan.lines.iter().any(|l| l.scene == src.number) || plan.scene_spans.contains_key(&src.number) {
+            notes.push("audio: the plan's lines for this scene could not be laid out; text timing".to_string());
+        }
+        return None;
+    };
+    let path = plan.path_for(src.number);
+    let whole = match buzz_audio::Clip::open(path) {
+        Ok(c) => c,
+        Err(e) => {
+            notes.push(format!("audio: {} did not open ({e}); text timing", path.display()));
+            return None;
+        }
+    };
+    let clip = audio_align::cut(&whole, timed.span, timed.pre_roll, timed.post_roll)?;
+    let visemes = buzz_audio::analyse_visemes(&clip, timing.fps, &buzz_audio::LipSyncOptions::default());
+    let ranges = timed
+        .schedule
+        .slots
+        .iter()
+        .filter(|s| timed.from_audio.contains(&s.item))
+        .map(|s| s.start..s.end())
+        .collect();
+    notes.push(format!(
+        "audio: {} {:.2}\u{2013}{:.2} s (+{:.2} s before, +{:.2} s after); {} line(s) timed from the recording, {} from their text",
+        path.display(),
+        timed.span.0,
+        timed.span.1,
+        timed.pre_roll,
+        timed.post_roll,
+        timed.from_audio.len(),
+        timed.from_text.len()
+    ));
+    for &item in &timed.from_audio {
+        notes.push(format!("from audio: {}", line_name(item)));
+    }
+    for &item in &timed.from_text {
+        notes.push(format!("from text: {}", line_name(item)));
+    }
+    Some(SceneAudio {
+        timed,
+        clip,
+        visemes,
+        ranges,
+    })
+}
+
+/// Put the scene's cut of the recording on a layer of its own, streaming from
+/// frame 0 — the same as File ▸ Import Sound places one.
+fn attach_scene_sound(scene: &mut Scene, audio: &SceneAudio, src: &ScriptScene, fps: f64, report: &mut SceneReport) {
+    let clip = &audio.clip;
+    let bytes = Arc::new(buzz_act::audio_align::wav_bytes(clip));
+    let name = format!("Dialogue scene {}", src.number);
+    let id = scene.add_sound(&name, bytes, "wav", clip.sample_rate, clip.channels, clip.len() as u64);
+    let frames = clip.duration_frames(fps.max(1.0));
+    if frames == 0 {
+        report.warnings.push("audio: the scene's cut of the recording is empty".to_string());
+        return;
+    }
+    let layer = scene.add_stage_layer(name, buzz_scene::LayerKind::Normal);
+    scene.update_stage_layer(layer, |l| {
+        l.frames.insert_frame(frames.saturating_sub(1));
+        if let Some(keyframe) = l.frames.keyframe_at_mut(0) {
+            keyframe.sound = Some(buzz_scene::SoundRef::stream(id));
+        }
+    });
+}
+
 /// Write one character's mouth over their lines, closed everywhere else.
-fn sync_mouth(scene: &mut Scene, actor: &Actor, total: u32, fps: f64, report: &mut SceneReport) {
+///
+/// With the scene's recording, a line it timed gets the shapes heard over its
+/// frames; a line timed by its text gets the shapes read from its words.
+fn sync_mouth(
+    scene: &mut Scene,
+    actor: &Actor,
+    total: u32,
+    fps: f64,
+    audio: Option<&SceneAudio>,
+    report: &mut SceneReport,
+) {
     if actor.member.lines.is_empty() && actor.mouth == Mouth::None {
         return;
     }
+    // The recording's range a line sits in: the one holding its middle.
+    let heard = |l: &Line| -> Option<Range<u32>> {
+        let mid = l.start + l.frames / 2;
+        audio?.ranges.iter().find(|r| r.contains(&mid)).cloned()
+    };
     let spoken: Vec<SpokenLine<'_>> = actor
         .member
         .lines
         .iter()
+        .filter(|l| heard(l).is_none())
         .map(|l| SpokenLine {
             start: l.start,
             frames: l.frames,
             text: l.text.as_str(),
         })
         .collect();
-    if spoken.is_empty() {
+    if spoken.is_empty() && actor.member.lines.iter().all(|l| heard(l).is_none()) {
         return;
     }
-    let track = textsync::line_track(total, fps, &spoken);
+    let mut track = textsync::line_track(total, fps, &spoken);
+    if let Some(a) = audio {
+        for range in actor.member.lines.iter().filter_map(|l| heard(l)) {
+            for f in range {
+                if let Some(slot) = track.frames.get_mut(f as usize) {
+                    *slot = a.visemes.at(f);
+                }
+            }
+        }
+    }
     match &actor.mouth {
         Mouth::None => report.warnings.push(format!(
             "{}: no mouth found on the rig, so the lines are not lip-synced",

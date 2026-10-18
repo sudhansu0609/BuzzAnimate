@@ -38,6 +38,7 @@
 //! generated would be a thing you cannot draw on top of, which is the opposite
 //! of what a drawing tool is for.
 
+pub mod audio_align;
 pub mod autorig;
 pub mod direct;
 pub mod figure;

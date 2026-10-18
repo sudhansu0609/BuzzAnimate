@@ -50,6 +50,14 @@ const SLOPE_STATIONS: i64 = 8;
 const SAMPLE_SEARCH_PX: i64 = 3;
 /// Slack on the tube's edge tests (px), for pixel centres exactly on the edge.
 const EDGE_EPS: f32 = 1e-3;
+/// A cross-section is full when it is at least this share of the widest one
+/// near the cut; the colour is taken from the first full one.
+const FULL_SECTION: f32 = 0.9;
+/// Alpha from which a pixel's straight colour is trusted as the limb's own.
+const OPAQUE_ALPHA: u8 = 250;
+/// How far past `t_cut` (px) a row's own first visible pixel may lie for the
+/// tube to run on to it.
+const ROW_REACH_PX: f32 = 12.0;
 
 /// What [`outpaint_limb`] made of a limb part.
 #[derive(Debug, Clone, PartialEq)]
@@ -178,6 +186,52 @@ pub fn outpaint_limb(
     tail: (f32, f32),
     source: &image::RgbaImage,
 ) -> Option<OutpaintedLimb> {
+    outpaint_limb_end(visible, allowed, matte, head, tail, source, LimbEnd::Either)
+}
+
+/// Which end(s) of a limb [`outpaint_limb_end`] extrudes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LimbEnd {
+    /// The head when it is cut, else the tail (B1).
+    Either,
+    /// The head only, when it is cut.
+    Head,
+    /// The tail, from at least this far (px) from the tail joint (B4b-3).
+    Tail(f32),
+}
+
+/// **B4b-3: a limb under the part below it at a round joint** (the thigh under
+/// the shin's round end, [`round_over_end`]) is extruded at both ends: at its
+/// head as [`outpaint_limb`] does when that end is cut, and at its tail from the
+/// cross-section `tail_cut` px up from the tail joint (the top of the over part's
+/// round end, where its full width starts) down to the joint, with a round end
+/// past it, on the pixels it may paint (so the tube is clipped to the matte).
+pub fn outpaint_limb_both_ends(
+    visible: &[u8],
+    allowed: &[bool],
+    matte: &[bool],
+    head: (f32, f32),
+    tail: (f32, f32),
+    source: &image::RgbaImage,
+    tail_cut: f32,
+) -> Option<OutpaintedLimb> {
+    let first = outpaint_limb_end(visible, allowed, matte, head, tail, source, LimbEnd::Head)?;
+    let Some(second) = outpaint_limb_end(&first.rgba, allowed, matte, head, tail, source, LimbEnd::Tail(tail_cut)) else {
+        return Some(first);
+    };
+    let extruded = first.extruded.iter().zip(&second.extruded).map(|(a, b)| *a || *b).collect();
+    Some(OutpaintedLimb { rgba: second.rgba, extruded })
+}
+
+fn outpaint_limb_end(
+    visible: &[u8],
+    allowed: &[bool],
+    matte: &[bool],
+    head: (f32, f32),
+    tail: (f32, f32),
+    source: &image::RgbaImage,
+    end: LimbEnd,
+) -> Option<OutpaintedLimb> {
     let (w, h) = (source.width() as usize, source.height() as usize);
     let n = w * h;
     if visible.len() != n * 4 || allowed.len() != n || matte.len() != n || !(0..n).any(|i| visible[i * 4 + 3] > 128) {
@@ -192,16 +246,26 @@ pub fn outpaint_limb(
     let u_head = (ax / len, ay / len);
     // The head side first; else the tail side, roles swapped.
     let frames = [(head, u_head), (tail, (-u_head.0, -u_head.1))];
-    let Some((origin, u, profile)) = frames.into_iter().find_map(|(o, u)| {
+    let (frames, min_cut): (&[((f32, f32), (f32, f32))], f32) = match end {
+        LimbEnd::Either => (&frames[..], 0.0),
+        LimbEnd::Head => (&frames[..1], 0.0),
+        LimbEnd::Tail(c) => (&frames[1..], c.max(0.0)),
+    };
+    let Some((origin, u, profile)) = frames.iter().copied().find_map(|(o, u)| {
         let p = Profile::measure(visible, w, h, o, u)?;
-        (p.t_min > 0.0).then_some((o, u, p))
+        (p.t_min > 0.0 || min_cut > 0.0).then_some((o, u, p))
     }) else {
         return Some(out);
     };
     let nrm = (-u.1, u.0);
 
-    // The cut station and its cross-section.
-    let k_cut = profile.k0;
+    // The cut station and its cross-section (B4b-3: no nearer the joint than
+    // `min_cut`, at the first station from there that has visible pixels).
+    let Some(k_cut) = (profile.k0.max(min_cut.ceil() as i64)..profile.k0.max(min_cut.ceil() as i64) + 2 * SLOPE_STATIONS)
+        .find(|&k| profile.at(k).is_some())
+    else {
+        return Some(out);
+    };
     let t_cut = k_cut as f32;
     let (lo0, hi0) = profile.at(k_cut)?;
     let c0 = 0.5 * (lo0 + hi0);
@@ -219,9 +283,17 @@ pub fn outpaint_limb(
 
     // The source station: `t_cut + 2`, else the nearest visible station inward of
     // it, else outward.
-    let k_src = (k_cut + CUT_INSET_PX..k_cut + CUT_INSET_PX + SLOPE_STATIONS)
-        .chain((k_cut..k_cut + CUT_INSET_PX).rev())
-        .find(|&k| profile.at(k).is_some())?;
+    // A station only counts when its cross-section is full: a stroke's corner
+    // that pokes out past a hand-made cut (Extend Part on a lasso-cut symbol)
+    // starts the profile with a few narrow stations, whose colours are the
+    // outline's and the anti-aliased edge's, not the limb's.
+    let width_at = |k: i64| profile.at(k).map(|(lo, hi)| hi - lo);
+    let full = (k_cut..k_cut + CUT_INSET_PX + 2 * SLOPE_STATIONS).filter_map(width_at).fold(0.0f32, f32::max);
+    let is_full = |k: i64| width_at(k).is_some_and(|wd| wd >= FULL_SECTION * full);
+    let k_src = (k_cut + CUT_INSET_PX..k_cut + CUT_INSET_PX + 2 * SLOPE_STATIONS)
+        .find(|&k| is_full(k))
+        .or_else(|| (k_cut + CUT_INSET_PX..k_cut + CUT_INSET_PX + SLOPE_STATIONS).find(|&k| profile.at(k).is_some()))
+        .or_else(|| (k_cut..k_cut + CUT_INSET_PX).rev().find(|&k| profile.at(k).is_some()))?;
     let (lo_s, hi_s) = profile.at(k_src)?;
     let (c_s, hw_s) = (0.5 * (lo_s + hi_s), 0.5 * (hi_s - lo_s));
 
@@ -237,20 +309,24 @@ pub fn outpaint_limb(
             let px = origin.0 + k_src as f32 * u.0 + s * nrm.0;
             let py = origin.1 + k_src as f32 * u.1 + s * nrm.1;
             let (cx, cy) = (px.round() as i64, py.round() as i64);
-            // The nearest visible pixel to the sample point (scan order on a tie).
-            let mut best: Option<(f32, i64, i64)> = None;
+            // The nearest visible pixel to the sample point (scan order on a
+            // tie), a fully opaque one when there is one: an anti-aliased edge
+            // pixel's straight colour is not the limb's.
+            let mut best: Option<(bool, f32, i64, i64)> = None;
             for dy in -SAMPLE_SEARCH_PX..=SAMPLE_SEARCH_PX {
                 for dx in -SAMPLE_SEARCH_PX..=SAMPLE_SEARCH_PX {
                     let (x, y) = (cx + dx, cy + dy);
                     if !visible_at(x, y) {
                         continue;
                     }
+                    let opaque = visible[(y as usize * w + x as usize) * 4 + 3] >= OPAQUE_ALPHA;
                     let d = (x as f32 - px).powi(2) + (y as f32 - py).powi(2);
-                    if best.is_none_or(|(bd, _, _)| d < bd) {
-                        best = Some((d, x, y));
+                    if best.is_none_or(|(bo, bd, _, _)| (opaque && !bo) || (opaque == bo && d < bd)) {
+                        best = Some((opaque, d, x, y));
                     }
                 }
             }
+            let best = best.map(|(_, d, x, y)| (d, x, y));
             best.map(|(_, x, y)| {
                 let p = source.get_pixel(x as u32, y as u32).0;
                 [p[0], p[1], p[2]]
@@ -268,9 +344,34 @@ pub fn outpaint_limb(
         }
     }
 
+    // Per row across the tube (`s` rounded), the first visible `t`: a cut that
+    // is not square to the bone (a lasso cut) starts later on some rows than
+    // `t_cut`, and the tube runs on to it there, so no gap is left.
+    let s_lo = (c0 - hw0 - 2.0).floor() as i64;
+    let mut row_start = vec![f32::INFINITY; ((c0 + hw0 + 2.0).ceil() as i64 - s_lo + 1).max(1) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            if visible[(y * w + x) * 4 + 3] <= 128 {
+                continue;
+            }
+            let (dx, dy) = (x as f32 - origin.0, y as f32 - origin.1);
+            let t = dx * u.0 + dy * u.1;
+            let j = (dx * nrm.0 + dy * nrm.1).round() as i64 - s_lo;
+            if (0..row_start.len() as i64).contains(&j) && t < t_cut + ROW_REACH_PX {
+                row_start[j as usize] = row_start[j as usize].min(t);
+            }
+        }
+    }
+    let tube_end = |s: f32| -> f32 {
+        let j = s.round() as i64 - s_lo;
+        let row = if (0..row_start.len() as i64).contains(&j) { row_start[j as usize] } else { f32::INFINITY };
+        if row.is_finite() { (row + 0.5).max(t_cut + 1.0) } else { t_cut + 1.0 }
+    };
+
     // The tube's bounds on the picture.
     let reach_s = hw0 + 1.0;
-    let corners = [(-r_end - 1.0, c0 - reach_s), (-r_end - 1.0, c0 + reach_s), (t_cut + 1.0, c0 - reach_s), (t_cut + 1.0, c0 + reach_s)];
+    let t_far = t_cut + ROW_REACH_PX + 1.0;
+    let corners = [(-r_end - 1.0, c0 - reach_s), (-r_end - 1.0, c0 + reach_s), (t_far, c0 - reach_s), (t_far, c0 + reach_s)];
     let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
     for (t, s) in corners {
         let (x, y) = (origin.0 + t * u.0 + s * nrm.0, origin.1 + t * u.1 + s * nrm.1);
@@ -291,7 +392,7 @@ pub fn outpaint_limb(
             let hw = if t >= 0.0 {
                 // The tube's body, from the joint up to the cut station.
                 let hw = half_width_at(t);
-                if t >= t_cut + 1.0 || (s - c0).abs() > hw + EDGE_EPS {
+                if t >= tube_end(s) || (s - c0).abs() > hw + EDGE_EPS {
                     continue;
                 }
                 hw
@@ -449,6 +550,26 @@ pub fn measure_joint_cut(
     tail: (f32, f32),
     parent_bone: ((f32, f32), (f32, f32)),
 ) -> Option<JointCut> {
+    measure_joint_cut_with(label, w, h, matte, over, child, joint, tail, parent_bone, false)
+}
+
+/// [`measure_joint_cut`]; with `near_when_unmeasured` (B4c: the chest over an arm
+/// whose whole root the segmenter gave the arm, a front view), an over part with
+/// no pixel past the joint still gets a cut, at 0.1 × the bone's length, instead
+/// of none.
+#[allow(clippy::too_many_arguments)]
+pub fn measure_joint_cut_with(
+    label: &[i32],
+    w: usize,
+    h: usize,
+    matte: &[bool],
+    over: i32,
+    child: i32,
+    joint: (f32, f32),
+    tail: (f32, f32),
+    parent_bone: ((f32, f32), (f32, f32)),
+    near_when_unmeasured: bool,
+) -> Option<JointCut> {
     if label.len() != w * h || matte.len() != w * h {
         return None;
     }
@@ -546,11 +667,16 @@ pub fn measure_joint_cut(
             _ => 0.0,
         })
         .collect();
-    let k_found = (0..=len.floor() as usize).find(|&k| {
-        let mut ahead: Vec<f32> =
-            (k + 1..=k + CUT_LOOKAHEAD_STATIONS as usize).map(|j| width.get(j).copied().unwrap_or(0.0)).collect();
-        width[k] > 0.0 && width[k] >= CUT_WIDTH_SHARE * lower_median(&mut ahead)
-    })?;
+    // B4c: an over part with no pixel past the joint (a front view's chest, the
+    // arm's whole root its own) may still get a cut, at the clamp's near end, so
+    // the limb ends straight across and the body takes back its flank (B1d).
+    let k_found = (0..=len.floor() as usize)
+        .find(|&k| {
+            let mut ahead: Vec<f32> =
+                (k + 1..=k + CUT_LOOKAHEAD_STATIONS as usize).map(|j| width.get(j).copied().unwrap_or(0.0)).collect();
+            width[k] > 0.0 && width[k] >= CUT_WIDTH_SHARE * lower_median(&mut ahead)
+        })
+        .or(near_when_unmeasured.then_some(0))?;
     cut.t_cut = (k_found as f32).clamp(CUT_CLAMP.0 * len, CUT_CLAMP.1 * len).round();
     Some(cut)
 }
@@ -612,6 +738,563 @@ pub fn apply_joint_cut(
     moved
 }
 
+/// **B4b-3: a round end on the part that paints over at a limb joint** (the shin
+/// over the thigh at the knee). B1c's straight cut left the shin a bare straight
+/// top `t_cut` below the knee and the thigh a straight bottom there: when the knee
+/// bends, the two straight ends turn apart into a step on one side and a wedge
+/// gap on the other. Here, within the cut's band, the over part (`child`) takes
+/// everything from the joint on (`t ≥ 0`, nearer its bone than the parent's) and
+/// a half-disc past the joint: centred on the band's centre at the joint, radius
+/// half the band's width there. It keeps the source pixels (it paints over the
+/// parent, so the rest picture is the same), and turning about the joint it
+/// sweeps over its own disc: no step. The parent keeps the rest, is hidden under
+/// the disc and is extruded under it from `r` above the joint
+/// ([`outpaint_limb_both_ends`]). `keep_radius` (B4c, a body parent: the chest
+/// under an arm): parent pixels within it of the parent's bone are never moved,
+/// so the arm takes only the sleeve cap outside the torso's capsule. Returns the
+/// pixels moved and `r`; `None` when the band has no run at the joint.
+pub fn round_over_end(
+    label: &mut [i32],
+    w: usize,
+    h: usize,
+    cut: &JointCut,
+    parent: i32,
+    child: i32,
+    keep_radius: Option<f32>,
+) -> Option<(usize, f32)> {
+    if label.len() != w * h {
+        return None;
+    }
+    let i0 = usize::try_from(-cut.k_lo).ok()?;
+    let (lo, hi) = (*cut.band.get(i0)?)?;
+    let (c, r) = (0.5 * (lo + hi), 0.5 * (hi - lo) + 0.5);
+    let child_end = (cut.origin.0 + cut.len * cut.u.0, cut.origin.1 + cut.len * cut.u.1);
+    let (x0, y0, x1, y1) = cut.bounds(-r - 1.0, cut.len, w, h);
+    let mut moved = 0;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let i = y * w + x;
+            let l = label[i];
+            if l != parent && l != child {
+                continue;
+            }
+            let (t, s) = cut.frame(x, y);
+            if t < -r - 1.0 || t > cut.len || !cut.in_band(t, s) {
+                continue;
+            }
+            let in_disc = t < 0.0 && t * t + (s - c) * (s - c) <= r * r;
+            // B4c: a body parent keeps its core, the pixels within its capsule.
+            let kept = keep_radius
+                .is_some_and(|kr| segment_distance((x as f32, y as f32), cut.parent_bone.0, cut.parent_bone.1) <= kr);
+            if l == parent
+                && !kept
+                && (in_disc
+                    || (t >= 0.0
+                        && segment_distance((x as f32, y as f32), cut.origin, child_end)
+                            < segment_distance((x as f32, y as f32), cut.parent_bone.0, cut.parent_bone.1)))
+            {
+                label[i] = child;
+                moved += 1;
+            } else if l == child && t < 0.0 && !in_disc {
+                label[i] = parent;
+                moved += 1;
+            }
+        }
+    }
+    Some((moved, r))
+}
+
+/// **B4c: a limb's joint disc**: centred on the band's centre at the joint (image
+/// coordinates), radius half the band's width there, no larger than the distance
+/// from that centre to the nearest pixel outside `matte` less 1 px (`w × h`), so it
+/// stays inside the silhouette whichever way the limb turns. `None` when the band
+/// has no run at the joint.
+pub fn joint_disc(cut: &JointCut, matte: &[bool], w: usize, h: usize) -> Option<((f32, f32), f32)> {
+    let i0 = usize::try_from(-cut.k_lo).ok()?;
+    let (lo, hi) = (*cut.band.get(i0)?)?;
+    let (c, r) = (0.5 * (lo + hi), 0.5 * (hi - lo) + 0.5);
+    let nrm = (-cut.u.1, cut.u.0);
+    let centre = (cut.origin.0 + c * nrm.0, cut.origin.1 + c * nrm.1);
+    let r = if matte.len() == w * h { r.min(distance_to_outside(matte, w, h, centre, r + 2.0) - 1.0) } else { r };
+    (r > 0.0).then_some((centre, r))
+}
+
+/// The 8-neighbourhood.
+const NEIGHBOURS_8: [(i64, i64); 8] = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
+
+/// B4b-3: a part's pixels under this many px wide are spikes.
+const SPIKE_PX: usize = 4;
+
+/// **B4b-3: spikes.** The pixels of `part` that no `SPIKE_PX` × `SPIKE_PX` square of
+/// its own pixels covers (an opening: everything under 4 px wide, the teeth a
+/// comb-shaped segmenter boundary leaves along a limb) go to the other part that
+/// shares the most 8-neighbours with them, when one does (a spike only bordering
+/// the background stays). They show the same source pixels at rest; posed they
+/// stay with the part they lie in. Returns the number of pixels moved.
+pub fn remove_spikes(label: &mut [i32], w: usize, h: usize, part: i32) -> usize {
+    if label.len() != w * h || w < SPIKE_PX || h < SPIKE_PX {
+        return 0;
+    }
+    let k = SPIKE_PX;
+    // Integral image of the part's pixels; `eroded[(x, y)]`: the k × k square from (x, y) is all the part's.
+    let mut integral = vec![0u32; (w + 1) * (h + 1)];
+    for y in 0..h {
+        let mut row = 0u32;
+        for x in 0..w {
+            row += (label[y * w + x] == part) as u32;
+            integral[(y + 1) * (w + 1) + x + 1] = integral[y * (w + 1) + x + 1] + row;
+        }
+    }
+    let sum = |ig: &[u32], x0: usize, y0: usize, x1: usize, y1: usize| -> u32 {
+        ig[y1 * (w + 1) + x1] + ig[y0 * (w + 1) + x0] - ig[y0 * (w + 1) + x1] - ig[y1 * (w + 1) + x0]
+    };
+    let mut eroded_ig = vec![0u32; (w + 1) * (h + 1)];
+    for y in 0..h {
+        let mut row = 0u32;
+        for x in 0..w {
+            let full = x + k <= w && y + k <= h && sum(&integral, x, y, x + k, y + k) == (k * k) as u32;
+            row += full as u32;
+            eroded_ig[(y + 1) * (w + 1) + x + 1] = eroded_ig[y * (w + 1) + x + 1] + row;
+        }
+    }
+    let spikes: Vec<usize> = (0..w * h)
+        .filter(|&i| {
+            if label[i] != part {
+                return false;
+            }
+            let (x, y) = (i % w, i / w);
+            // Covered when a full square starts within the k × k window ending here.
+            sum(&eroded_ig, x.saturating_sub(k - 1), y.saturating_sub(k - 1), x + 1, y + 1) == 0
+        })
+        .collect();
+    relabel_to_neighbours(label, w, h, part, &spikes, |_| true)
+}
+
+/// Passes [`relabel_to_neighbours`] makes at most (each moves the front 1 px in).
+const RELABEL_PASSES: usize = 64;
+
+/// Gives each of `pixels` (all `part`'s) to the part, `accept`ed, that shares the
+/// most 8-neighbours with it (ties: the lower label), in passes that each look at
+/// the labels as the pass found them (so a strip is eaten in from all its sides,
+/// not run down from one end in scan order), until nothing moves; a pixel with no
+/// such neighbour stays `part`'s. Returns the number of pixels moved.
+fn relabel_to_neighbours(label: &mut [i32], w: usize, h: usize, part: i32, pixels: &[usize], accept: impl Fn(i32) -> bool) -> usize {
+    let mut moved = 0;
+    let mut pending = pixels.to_vec();
+    for _ in 0..RELABEL_PASSES {
+        let mut next = Vec::new();
+        let mut assign: Vec<(usize, i32)> = Vec::new();
+        for &i in &pending {
+            let (x, y) = ((i % w) as i64, (i / w) as i64);
+            let mut counts: Vec<(i32, u32)> = Vec::new();
+            for (dx, dy) in NEIGHBOURS_8 {
+                let (nx, ny) = (x + dx, y + dy);
+                if nx < 0 || ny < 0 || nx as usize >= w || ny as usize >= h {
+                    continue;
+                }
+                let l = label[ny as usize * w + nx as usize];
+                if l < 0 || l == part || !accept(l) {
+                    continue;
+                }
+                match counts.iter_mut().find(|e| e.0 == l) {
+                    Some(e) => e.1 += 1,
+                    None => counts.push((l, 1)),
+                }
+            }
+            match counts.iter().max_by_key(|e| (e.1, std::cmp::Reverse(e.0))) {
+                Some(&(l, _)) => assign.push((i, l)),
+                None => next.push(i),
+            }
+        }
+        if assign.is_empty() {
+            break;
+        }
+        moved += assign.len();
+        for (i, l) in assign {
+            label[i] = l;
+        }
+        pending = next;
+    }
+    moved
+}
+
+/// B4b-4: an object's seed colour is saturated at least this much (max − min channel).
+const FOREIGN_SATURATION: i32 = 100;
+/// B4b-4: a colour bin is foreign to a limb when under this share of its far pixels fall in it.
+const FOREIGN_BIN_SHARE: f64 = 0.001;
+/// B4b-4: ... and under this share of the body part's own pixels.
+const FOREIGN_BODY_SHARE: f64 = 0.005;
+/// B4b-4: an object takes the darker (outline, anti-aliased) pixels this close to its colour (px).
+const FOREIGN_GROW_PX: usize = 3;
+/// B4b-4: below this luminance a pixel next to an object is its outline (the limb's cloth is lighter).
+const FOREIGN_OUTLINE_LUM: u32 = 170;
+/// B4b-4: and the limb pixels this close to an object, outline included (px).
+const FOREIGN_MARGIN_PX: usize = 4;
+
+/// **B4b-4: an object of the body caught at a limb's root.** Where a limb paints
+/// over the body part it hangs from (the near arm over the chest), the segmenter's
+/// boundary can run through an object that belongs to the body: Raju's pens stand
+/// in his shirt pocket and overlap the near sleeve's root, so the arm took their
+/// tops, and swung down they lay across the sleeve as a dark slash. Here, near the
+/// joint (`t` up to `t_cut` + a quarter of the limb), the limb's pixels whose
+/// colour is strongly saturated (max − min ≥ 100: a plaid stripe is not) and foreign to the rest of the limb (its
+/// 8-level-per-channel colour bin holds under 0.1 % of the limb's pixels past that
+/// zone) and rare on the body part too (under 0.5 % of its pixels), with the
+/// darker pixels (luminance < 170) within 3 px of them (their
+/// anti-aliased outline) and a 4 px margin, form objects;
+/// each object that touches the body part goes to it. The body part paints under
+/// the limb, which then does not paint there, so the rest picture is the same; the
+/// limb has a notch at its root under nothing. Returns the number of pixels moved.
+pub fn return_foreign_objects(
+    label: &mut [i32],
+    w: usize,
+    h: usize,
+    cut: &JointCut,
+    parent: i32,
+    child: i32,
+    source: &image::RgbaImage,
+) -> usize {
+    if label.len() != w * h || source.width() as usize != w || source.height() as usize != h {
+        return 0;
+    }
+    let zone_end = cut.t_cut + 0.25 * cut.len;
+    let bin = |p: [u8; 4]| ((p[0] as usize >> 5) << 6) | ((p[1] as usize >> 5) << 3) | (p[2] as usize >> 5);
+    let mut hist = vec![0usize; 512];
+    let mut far = 0usize;
+    let mut zone: Vec<usize> = Vec::new();
+    // The body part's own colours: an object foreign to the limb but common on the
+    // body (a short sleeve's stains on a shirt, a sari border) is not an object.
+    let mut body_hist = vec![0usize; 512];
+    let mut body = 0usize;
+    for i in (0..w * h).filter(|&i| label[i] == parent) {
+        body_hist[bin(source.get_pixel((i % w) as u32, (i / w) as u32).0)] += 1;
+        body += 1;
+    }
+    for i in (0..w * h).filter(|&i| label[i] == child) {
+        let (t, _) = cut.frame(i % w, i / w);
+        if t > zone_end {
+            hist[bin(source.get_pixel((i % w) as u32, (i / w) as u32).0)] += 1;
+            far += 1;
+        } else {
+            zone.push(i);
+        }
+    }
+    if far == 0 || zone.is_empty() {
+        return 0;
+    }
+    let mut object = vec![false; w * h];
+    for &i in &zone {
+        let p = source.get_pixel((i % w) as u32, (i / w) as u32).0;
+        let (mx, mn) = (p[0].max(p[1]).max(p[2]) as i32, p[0].min(p[1]).min(p[2]) as i32);
+        object[i] = mx - mn >= FOREIGN_SATURATION
+            && (hist[bin(p)] as f64) < FOREIGN_BIN_SHARE * far as f64
+            && (body_hist[bin(p)] as f64) < FOREIGN_BODY_SHARE * body as f64;
+    }
+    // The objects' outlines: dark zone pixels next to them, grown 1 px at a time.
+    let in_zone: Vec<bool> = {
+        let mut v = vec![false; w * h];
+        for &i in &zone {
+            v[i] = true;
+        }
+        v
+    };
+    for _ in 0..FOREIGN_GROW_PX {
+        let grow: Vec<usize> = zone
+            .iter()
+            .copied()
+            .filter(|&i| {
+                if object[i] {
+                    return false;
+                }
+                let p = source.get_pixel((i % w) as u32, (i / w) as u32).0;
+                let lum = (299 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32) / 1000;
+                let (x, y) = ((i % w) as i64, (i / w) as i64);
+                lum < FOREIGN_OUTLINE_LUM
+                    && NEIGHBOURS_8.iter().any(|&(dx, dy)| {
+                        let (nx, ny) = (x + dx, y + dy);
+                        nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h && object[ny as usize * w + nx as usize]
+                    })
+            })
+            .collect();
+        for i in grow {
+            object[i] = true;
+        }
+    }
+    // And a margin round them, whatever its colour: the trace draws a part's ink up
+    // to 3 px past its boundary (`INK_PIECE_OVERLAP_PX` in `character.rs`), so a
+    // limb boundary hugging the object would still draw the object's outline.
+    for _ in 0..FOREIGN_MARGIN_PX {
+        let grow: Vec<usize> = zone
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let (x, y) = ((i % w) as i64, (i / w) as i64);
+                !object[i]
+                    && NEIGHBOURS_8.iter().any(|&(dx, dy)| {
+                        let (nx, ny) = (x + dx, y + dy);
+                        nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h && object[ny as usize * w + nx as usize]
+                    })
+            })
+            .collect();
+        for i in grow {
+            object[i] = true;
+        }
+    }
+    // Objects (8-connected) that touch the body part go to it.
+    let mut seen = vec![false; w * h];
+    let mut moved = 0;
+    for &start in &zone {
+        if !object[start] || seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut comp = vec![start];
+        let mut touches = false;
+        let mut k = 0;
+        while k < comp.len() {
+            let (x, y) = ((comp[k] % w) as i64, (comp[k] / w) as i64);
+            k += 1;
+            for (dx, dy) in NEIGHBOURS_8 {
+                let (nx, ny) = (x + dx, y + dy);
+                if nx < 0 || ny < 0 || nx as usize >= w || ny as usize >= h {
+                    continue;
+                }
+                let j = ny as usize * w + nx as usize;
+                if label[j] == parent {
+                    touches = true;
+                }
+                if in_zone[j] && object[j] && !seen[j] {
+                    seen[j] = true;
+                    comp.push(j);
+                }
+            }
+        }
+        if touches {
+            for j in comp {
+                label[j] = parent;
+                moved += 1;
+            }
+        }
+    }
+    moved
+}
+
+/// B4b-1: a borrower's own pixels whose run across its bone is shorter than this are slivers.
+const SLIVER_RUN_PX: usize = 4;
+/// B4b-1: a borrower's own component under this share of the borrowed picture is a fragment.
+const FRAGMENT_SHARE: f64 = 0.15;
+
+/// **B4b-1: a borrowing limb's slivers and fragments.** A limb that borrows its
+/// counterpart's picture (B1b) shows its own visible pixels on top of it; where
+/// those are thin slivers (a run across the bone `head`–`tail` under 4 px) or a
+/// component (8-connected) under 15 % of `borrowed_px` (the borrowed picture's
+/// size), they were drawn ragged over the whole borrowed limb when it swung away
+/// (the far thigh's strips, the tongue of it the segmenter put in the middle of
+/// the near trouser leg). Each goes to the part that paints over `part` (`over`)
+/// and shares the most 8-neighbours with it: that part shows the same source pixel
+/// at rest, and the borrowed picture is completed under it, so the far limb shows
+/// whole; the counterpart `prefer` takes what touches it first. Returns the number
+/// of pixels moved.
+#[allow(clippy::too_many_arguments)]
+pub fn drop_borrower_fragments(
+    label: &mut [i32],
+    w: usize,
+    h: usize,
+    part: i32,
+    head: (f32, f32),
+    tail: (f32, f32),
+    borrowed_px: usize,
+    prefer: i32,
+    over: impl Fn(i32) -> bool,
+) -> usize {
+    if label.len() != w * h {
+        return 0;
+    }
+    let (ax, ay) = (tail.0 - head.0, tail.1 - head.1);
+    let len = (ax * ax + ay * ay).sqrt();
+    if len < 1e-3 {
+        return 0;
+    }
+    let nrm = (-ay / len, ax / len);
+    let own = |x: i64, y: i64| x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h && label[y as usize * w + x as usize] == part;
+    // The run across the bone through a pixel: 1 px steps along the normal, both ways.
+    let run = |x: usize, y: usize| -> usize {
+        let mut n = 1;
+        for sign in [-1.0f32, 1.0] {
+            for k in 1..SLIVER_RUN_PX {
+                let (px, py) = (x as f32 + sign * k as f32 * nrm.0, y as f32 + sign * k as f32 * nrm.1);
+                if !own(px.round() as i64, py.round() as i64) {
+                    break;
+                }
+                n += 1;
+            }
+        }
+        n
+    };
+    let mut drop = vec![false; w * h];
+    for i in (0..w * h).filter(|&i| label[i] == part) {
+        drop[i] = run(i % w, i / w) < SLIVER_RUN_PX;
+    }
+    // Components of what is left; the small ones are fragments.
+    let limit = FRAGMENT_SHARE * borrowed_px as f64;
+    let mut seen = vec![false; w * h];
+    for start in 0..w * h {
+        if seen[start] || label[start] != part || drop[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut comp = vec![start];
+        let mut k = 0;
+        while k < comp.len() {
+            let (x, y) = ((comp[k] % w) as i64, (comp[k] / w) as i64);
+            k += 1;
+            for (dx, dy) in NEIGHBOURS_8 {
+                let (nx, ny) = (x + dx, y + dy);
+                if !own(nx, ny) {
+                    continue;
+                }
+                let j = ny as usize * w + nx as usize;
+                if !seen[j] && !drop[j] {
+                    seen[j] = true;
+                    comp.push(j);
+                }
+            }
+        }
+        if (comp.len() as f64) < limit {
+            for j in comp {
+                drop[j] = true;
+            }
+        }
+    }
+    // Only to the counterpart (`prefer`: the near limb the fragment lies in), so a
+    // strip along it goes with it whole; a fragment that does not touch it (one
+    // beside the hips or the near shoe) stays: handing it to those parts changed
+    // their traced ink at rest.
+    let pixels: Vec<usize> = (0..w * h).filter(|&i| drop[i]).collect();
+    relabel_to_neighbours(label, w, h, part, &pixels, |l| l == prefer && over(l))
+}
+
+/// **B1d: a body part's prior** (Chest, Hips, Head): the region it may take back
+/// from a limb that paints behind it. Its completion capsule (`radius` round the
+/// bone `head`–`tail`) and, per 1 px station along that bone, the span across it
+/// of its own pixels (`label == part`; the extents smoothed by a 5-station
+/// median), so the strips and holes the segmenter left inside its rows (a thigh's
+/// seam line running up through the hips) are inside it, and nothing past its
+/// own outline is.
+pub fn body_prior(label: &[i32], w: usize, h: usize, part: i32, head: (f32, f32), tail: (f32, f32), radius: f32) -> Vec<bool> {
+    let mut prior = vec![false; w * h];
+    if label.len() != w * h {
+        return prior;
+    }
+    let (ax, ay) = (tail.0 - head.0, tail.1 - head.1);
+    let len = (ax * ax + ay * ay).sqrt();
+    if len < 1e-3 {
+        return prior;
+    }
+    let u = (ax / len, ay / len);
+    let nrm = (-u.1, u.0);
+    let mut own: Vec<(i64, f32)> = Vec::new();
+    for i in (0..w * h).filter(|&i| label[i] == part) {
+        let (dx, dy) = ((i % w) as f32 - head.0, (i / w) as f32 - head.1);
+        own.push(((dx * u.0 + dy * u.1).floor() as i64, dx * nrm.0 + dy * nrm.1));
+    }
+    let (k0, k1) = (own.iter().map(|p| p.0).min().unwrap_or(0), own.iter().map(|p| p.0).max().unwrap_or(-1));
+    let n = (k1 - k0 + 1).max(0) as usize;
+    let mut raw: Vec<Option<(f32, f32)>> = vec![None; n];
+    for &(k, s) in &own {
+        let e = &mut raw[(k - k0) as usize];
+        *e = Some(e.map_or((s, s), |(lo, hi)| (lo.min(s), hi.max(s))));
+    }
+    let half = MEDIAN_STATIONS / 2;
+    let span: Vec<Option<(f32, f32)>> = (0..n as i64)
+        .map(|i| {
+            raw[i as usize]?;
+            let window: Vec<(f32, f32)> =
+                ((i - half).max(0)..=(i + half).min(n as i64 - 1)).filter_map(|j| raw[j as usize]).collect();
+            let mut los: Vec<f32> = window.iter().map(|e| e.0).collect();
+            let mut his: Vec<f32> = window.iter().map(|e| e.1).collect();
+            los.sort_by(f32::total_cmp);
+            his.sort_by(f32::total_cmp);
+            Some((los[(los.len() - 1) / 2], his[his.len() / 2]))
+        })
+        .collect();
+    for (i, p) in prior.iter_mut().enumerate() {
+        let (x, y) = ((i % w) as f32, (i / w) as f32);
+        if segment_distance((x, y), head, tail) <= radius {
+            *p = true;
+            continue;
+        }
+        let (dx, dy) = (x - head.0, y - head.1);
+        let k = (dx * u.0 + dy * u.1).floor() as i64 - k0;
+        if k >= 0 && (k as usize) < n {
+            let s = dx * nrm.0 + dy * nrm.1;
+            *p = span[k as usize].is_some_and(|(lo, hi)| s >= lo && s <= hi);
+        }
+    }
+    prior
+}
+
+/// **B1d: a body part takes back the joint side of a limb behind it.** Every pixel
+/// of `child` (a limb that paints behind `parent`, a Chest / Hips / Head that
+/// paints over it at this joint) on the joint side of the cut (`t < t_cut` along
+/// the child bone) and inside the parent's `prior` ([`body_prior`]) goes to the
+/// parent: B1c's band only reached across the limb's own width, so the strips
+/// beside it (the hips' seam lines, the thigh's old lobe under the belt) stayed
+/// the limb's, swung out with it and left the body notched. The parent now shows
+/// those source pixels (it paints over the limb, so the rest picture is the
+/// same), and the limb completes under them. Returns the number of pixels moved.
+pub fn take_back_joint_side(label: &mut [i32], w: usize, h: usize, cut: &JointCut, parent: i32, child: i32, prior: &[bool]) -> usize {
+    if label.len() != w * h || prior.len() != w * h {
+        return 0;
+    }
+    let mut moved = 0;
+    for i in 0..w * h {
+        if label[i] != child || !prior[i] {
+            continue;
+        }
+        let (t, _) = cut.frame(i % w, i / w);
+        if t < cut.t_cut {
+            label[i] = parent;
+            moved += 1;
+        }
+    }
+    moved
+}
+
+/// B4c: how far (× the limb's half-width at the joint) a body part takes the limb's flank back.
+const FLANK_REACH: f32 = 2.0;
+
+/// **B4c: a body part takes back the limb's flank** on the joint side of the cut:
+/// the limb's pixels outside its band (`t < t_cut`, beside the limb's own width)
+/// within `FLANK_REACH` × its half-width of the joint. A front view's shirt hem
+/// hangs past the hip joint beside the thigh: the segmenter gave its corners to
+/// the thighs, and they swung out of the shirt with the legs. Returns the number
+/// of pixels moved.
+pub fn take_back_flank(label: &mut [i32], w: usize, h: usize, cut: &JointCut, parent: i32, child: i32) -> usize {
+    if label.len() != w * h {
+        return 0;
+    }
+    let Some(reach) = usize::try_from(-cut.k_lo)
+        .ok()
+        .and_then(|i0| *cut.band.get(i0)?)
+        .map(|(lo, hi)| FLANK_REACH * 0.5 * (hi - lo + 1.0))
+    else {
+        return 0;
+    };
+    let mut moved = 0;
+    for i in 0..w * h {
+        if label[i] != child {
+            continue;
+        }
+        let (t, s) = cut.frame(i % w, i / w);
+        if t < cut.t_cut && !cut.in_band(t, s) && t * t + s * s <= reach * reach {
+            label[i] = parent;
+            moved += 1;
+        }
+    }
+    moved
+}
+
 /// B1b: a limb borrows its counterpart's picture when it owns less than this
 /// share of the counterpart's pixel count.
 const BORROW_SHARE: f64 = 0.2;
@@ -620,6 +1303,16 @@ const BORROW_SHARE: f64 = 0.2;
 /// its L/R counterpart owning `counterpart_px`: under 20 % of it.
 pub fn borrows_counterpart(own_px: usize, counterpart_px: usize) -> bool {
     (own_px as f64) < BORROW_SHARE * counterpart_px as f64
+}
+
+/// B1b: once one slot of a side borrows, that side's other slots borrow too
+/// when they own less than this share of their counterpart's pixels.
+const CHAIN_BORROW_SHARE: f64 = 0.4;
+
+/// **B1b**, along the chain: whether a slot on a side that already borrows is
+/// still mostly hidden (under 40 % of its counterpart).
+pub fn chain_borrows(own_px: usize, counterpart_px: usize) -> bool {
+    (own_px as f64) < CHAIN_BORROW_SHARE * counterpart_px as f64
 }
 
 /// **B1b: a hidden limb borrows its counterpart's picture.** Returns the part's
@@ -1052,8 +1745,11 @@ mod tests {
                 assert_eq!(px(&far.rgba, x, y), px(&near.rgba, x - 4, y), "({x}, {y}) is the near leg's mapped picture");
                 assert!(far.extruded[y * w + x], "({x}, {y}) is marked as completion (traced with no reach gate)");
             }
+            // B4b-1 (P8-B): its own 2 px sliver goes to the near leg, which shows the
+            // source there; under it the far leg shows its borrowed picture whole.
             for x in 114..=115usize {
-                assert_eq!(px(&far.rgba, x, y), source.get_pixel(x as u32, y as u32).0, "its own sliver stays on top");
+                assert_eq!(px(&near.rgba, x, y), source.get_pixel(x as u32, y as u32).0, "its sliver is the near leg's now");
+                assert_eq!(px(&far.rgba, x, y), px(&near.rgba, x - 4, y), "({x}, {y}) is the near leg's mapped picture");
             }
         }
 

@@ -1,17 +1,20 @@
-//! The export queue: many exports, one at a time, none of them in the way.
+//! The export queue: many exports, a few at a time, none of them in the way.
 //!
-//! # Why a queue, and why serial
+//! # Why a queue, and how many at once
 //!
 //! Before this an export was a single slot on `App`: starting one while another
 //! ran was simply refused. That is the wrong answer for the thing exports are
 //! for — rendering a batch of shots overnight — so "export while exporting" now
 //! means "joins the queue".
 //!
-//! The queue runs **one at a time on purpose**, not as a limitation. Each export
+//! A lone export is not GPU-bound: Ep1 scene 5 (1085 frames) kept the GPU only
+//! 16 % busy and took 53 s alone. Measured wall time for N scenes at once:
+//! 1 → 53 s, 2 → 58 s, 3 → 65 s, 4 → 72 s, 6 → 87 s, 8 → 172 s. Each export
 //! builds its own second wgpu device and Vello renderer
-//! (`buzz-export/src/lib.rs`), so four at once would quadruple VRAM and fight
-//! NVENC's session limit to finish the same total work no sooner. Serial is the
-//! correct scheduling, not a shortcut.
+//! (`buzz-export/src/lib.rs`), about 1.9 GB of VRAM apiece, so 8 fills a 16 GB
+//! card and half the jobs slow down 2×. The queue therefore runs up to the
+//! user's **Exports at once** (default 4), capped by the free VRAM sampled when
+//! the queue starts ([`vram_cap`]).
 //!
 //! # Why it lives here and runs on the task registry
 //!
@@ -99,7 +102,7 @@ pub struct Finished {
     pub message: String,
 }
 
-/// The export currently running.
+/// An export currently running.
 struct Active {
     task: TaskId,
     reveal: PathBuf,
@@ -107,54 +110,69 @@ struct Active {
 }
 
 /// The export queue on `App`.
-#[derive(Default)]
 pub struct ExportQueue {
     pending: VecDeque<ExportRequest>,
-    active: Option<Active>,
+    /// Every export running right now, oldest first.
+    active: Vec<Active>,
+    /// How many may run at once; never below 1. `App` sets it from the
+    /// workspace's **Exports at once** and the VRAM cap.
+    max_parallel: usize,
     /// Most recent first, capped so a long session does not grow it without
     /// bound.
     finished: Vec<Finished>,
+}
+
+impl Default for ExportQueue {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            active: Vec::new(),
+            max_parallel: 1,
+            finished: Vec::new(),
+        }
+    }
 }
 
 /// How many finished exports to remember.
 const REMEMBERED: usize = 12;
 
 impl ExportQueue {
-    /// Add an export. It starts when whatever is ahead of it has finished.
+    /// Add an export. It starts when a running slot is free and whatever is
+    /// ahead of it has started.
     pub fn enqueue(&mut self, request: ExportRequest) {
         self.pending.push_back(request);
     }
 
-    /// How many are waiting, not counting the one running.
+    /// How many may run at once, clamped to at least 1.
+    pub fn set_max_parallel(&mut self, n: usize) {
+        self.max_parallel = n.max(1);
+    }
+
+    /// How many are waiting, not counting the ones running.
     pub fn waiting(&self) -> usize {
         self.pending.len()
     }
 
     pub fn is_active(&self) -> bool {
-        self.active.is_some()
+        !self.active.is_empty()
     }
 
     /// Nothing to do and nothing running.
     pub fn is_idle(&self) -> bool {
-        self.active.is_none() && self.pending.is_empty()
+        self.active.is_empty() && self.pending.is_empty()
     }
 
     pub fn finished(&self) -> &[Finished] {
         &self.finished
     }
 
-    /// The id of the running export, if any.
-    pub fn active_task(&self) -> Option<TaskId> {
-        self.active.as_ref().map(|a| a.task)
-    }
-
-    /// Take the next request to run, if the queue is free.
+    /// Take the next request to run, if a running slot is free.
     ///
     /// The caller spawns it and hands the id straight back to [`Self::started`];
     /// splitting the two keeps this crate's threading in `App`, where the task
     /// registry lives.
     pub fn next_to_start(&mut self) -> Option<ExportRequest> {
-        if self.active.is_some() {
+        if self.active.len() >= self.max_parallel {
             return None;
         }
         self.pending.pop_front()
@@ -162,22 +180,23 @@ impl ExportQueue {
 
     /// Record the task that was spawned for the request just taken.
     pub fn started(&mut self, task: TaskId, reveal: PathBuf, label: String) {
-        self.active = Some(Active {
+        self.active.push(Active {
             task,
             reveal,
             label,
         });
     }
 
-    /// Note that the running export ended, freeing the queue for the next.
+    /// Note that a running export ended, freeing its slot for the next.
     ///
-    /// Ignores a task that is not the one running: a straggling completion from
-    /// a job already accounted for must not free the queue out from under the
-    /// export currently in flight.
+    /// Ignores a task that is not one of those running: a straggling completion
+    /// from a job already accounted for must not free a slot out from under the
+    /// exports currently in flight.
     pub fn complete(&mut self, task: TaskId, ok: bool, message: String) {
-        let Some(active) = self.active.take_if(|a| a.task == task) else {
+        let Some(index) = self.active.iter().position(|a| a.task == task) else {
             return;
         };
+        let active = self.active.remove(index);
         self.finished.insert(
             0,
             Finished {
@@ -190,10 +209,42 @@ impl ExportQueue {
         self.finished.truncate(REMEMBERED);
     }
 
-    /// Everything still to do, for the quit prompt: the running export plus the
-    /// count waiting behind it.
+    /// Everything still to do, for the quit prompt: the exports running plus the
+    /// count waiting behind them.
     pub fn outstanding(&self) -> usize {
-        self.active.is_some() as usize + self.pending.len()
+        self.active.len() + self.pending.len()
+    }
+}
+
+/// How many exports the free VRAM can hold at once, at about 2 GB apiece with
+/// 2 GB left over for the editor.
+///
+/// Asks `nvidia-smi` for the first GPU's free memory (MiB):
+/// `max(1, (free − 2048) / 2048)`. Any failure — no NVIDIA card, no tool, an
+/// unreadable answer — gives 2. Sample it when the queue starts, never per job:
+/// a job that has just started has not allocated yet.
+pub fn vram_cap() -> usize {
+    let mut command = std::process::Command::new("nvidia-smi");
+    command.args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // CREATE_NO_WINDOW: no console flashes up over the editor.
+        command.creation_flags(0x0800_0000);
+    }
+    let free_mib = command
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .and_then(|line| line.trim().parse::<usize>().ok())
+        });
+    match free_mib {
+        Some(free) => (free.saturating_sub(2048) / 2048).max(1),
+        None => 2,
     }
 }
 

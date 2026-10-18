@@ -178,6 +178,11 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             // Studio writes the script (`docs/ECOSYSTEM_BRIDGE_PLAN.md`).
             item(ui, Command::SendToBuzzEdit, true, &mut raised);
             item(ui, Command::ImportScriptFromStudio, true, &mut raised);
+            // The producer (PRODUCER_PLAN P6): script, audio and art in, an
+            // episode out.
+            ui.menu_button("AI", |ui| {
+                item(ui, Command::ProduceEpisode, true, &mut raised);
+            });
             ui.separator();
             for c in [Command::Save, Command::SaveAs] {
                 item(ui, c, true, &mut raised);
@@ -823,6 +828,9 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             ] {
                 item(ui, c, has_selection, &mut raised);
             }
+            ui.separator();
+            ui.label(RichText::new("Rig").small().weak());
+            item(ui, Command::ExtendPart, has_selection, &mut raised);
             ui.separator();
             ui.label(RichText::new("Shape").small().weak());
             for c in [

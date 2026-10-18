@@ -321,6 +321,19 @@ pub fn build_tools_with(allow_all: bool) -> Vec<ToolSpec> {
                 },
                 "required": ["query"]
             }),
+            "produce_episode" => json!({
+                "type": "object",
+                "properties": {
+                    "script": {"type": "string", "description": "the screenplay file"},
+                    "out": {"type": "string", "description": "the output folder"},
+                    "audio": {"type": "string", "description": "the dialogue recording, in script order"},
+                    "characters": {"type": "string", "description": "a folder with one sub-folder of pictures per character"},
+                    "style": {"type": "string", "description": "comic, painterly, inked, or free words"},
+                    "series": {"type": "string", "description": "the series name"},
+                    "world": {"type": "string", "description": "where and when the story lives (default for Chirailiya: rural Bihar, India, late 1990s)"}
+                },
+                "required": ["script", "out"]
+            }),
             "arrange_assets" => json!({
                 "type": "object",
                 "properties": {

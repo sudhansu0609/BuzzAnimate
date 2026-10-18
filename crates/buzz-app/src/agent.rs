@@ -67,6 +67,7 @@ pub const AGENT_EXCLUDED: &[(&str, &str)] = &[
     ("buzzedit_send", "opens the Send to BuzzEdit dialog; the agent uses the send_to_buzzedit tool (and buzzedit_projects to pick a project)"),
     ("buzzedit_transcribe", "opens the Transcribe with BuzzEdit dialog; the agent uses the transcribe_with_buzzedit tool"),
     ("studio_import_script", "opens the Import Script from Studio dialog; the agent uses the studio_projects and studio_build_episode tools"),
+    ("produce_episode_dialog", "opens the Produce Episode dialog; the agent uses the produce_episode tool"),
 ];
 
 /// How the agent reaches a command.
@@ -128,6 +129,8 @@ pub fn route(command: Command) -> Route {
         | TestMovie | RunScript | VoicePushToTalk | VoiceMute => Route::Excluded,
         // Dialogs over BuzzEdit and Buzzcaf Studio; their tools take args.
         SendToBuzzEdit | TranscribeWithBuzzEdit | ImportScriptFromStudio => Route::Excluded,
+        // The producer's dialog; its tool takes args (`produce_episode`).
+        ProduceEpisode => Route::Excluded,
 
         // Everything else runs as it does from the menu or the keyboard.
         SaveSnapshot | AttachSound | RemoveSound | NewMouthSymbol | DetectBeats | FitToNarration
@@ -139,7 +142,7 @@ pub fn route(command: Command) -> Route {
         | PaintThrough | ExposeOnTwos | ExposeOnThrees | SelectSameColour | ThickenStroke
         | ThinStroke | TraceBitmap | TraceLineArt | ConvertLinesToFills | ExpandFill
         | SmoothSelection | StraightenSelection | RecogniseShape | FlipHorizontal | FlipVertical
-        | RotateClockwise | RotateAnticlockwise | NewLayer | NewLayerFolder | MoveLayerUp
+        | RotateClockwise | RotateAnticlockwise | ExtendPart | NewLayer | NewLayerFolder | MoveLayerUp
         | MoveLayerDown | NewReferenceLayer | DeleteLayer | ConvertToSymbol | NewSymbol
         | EditSymbol | EditDocument | PlaceInstance | DuplicateSymbol | SymbolToAsset
         | DeleteSymbol | NewLibraryFolder | BrushFromSelection | ToggleLayoutLock | ToggleTheme
@@ -185,6 +188,7 @@ pub fn execute(app: &mut App, call: &AgentCall) -> AgentResult {
         // BuzzEdit and Buzzcaf Studio (`crate::estate`, plan steps E2 and E3).
         "send_to_buzzedit" | "buzzedit_projects" | "transcribe_with_buzzedit" | "studio_projects"
         | "studio_build_episode" => crate::estate::tool(app, &call.tool, &call.args),
+        "produce_episode" => produce_episode(app, &call.args),
         other => AgentResult::err(format!("unknown tool '{other}'")),
     }
 }
@@ -867,7 +871,46 @@ pub const AGENT_TOOLS: &[(&str, &str)] = &[
     ("studio_build_episode", "{project: Studio project id, asset?: the project's script asset (default script), out_dir?: folder (default <the Studio project's folder>/animation), start?: bool} -> {started:true, job}; fetches the script and builds the episode (.buzz + report.md) as POST /api/episode does; wait_for_jobs gives {files, warnings, out_dir}. The script needs '## SCENE n — TITLE' headings"),
     ("dress_set_from_assets", "{query: the scene's words (slugline + what happens, e.g. \"EXT. CHHOTU'S TEA STALL - MORNING, a village lane\"; INT./room/inside -> a room; night/evening -> that sky), style?: name of an asset whose style to follow} -> dresses the open scene's set from the user's own assets (the asset index): a sky, trees and buildings along the horizon at three depths, bushes clear of the rigs on stage, or one room indoors; behind everything already there (in front of Set the scene's Sky/Ground layers; with none, a ground and a sky are staged first); one undo step. Returns {pieces:[{role, name, record, why}], notes, failed, interior, procedural_advised, layers}. Needs the index"),
     ("arrange_assets", "{dry_run?: bool (default true)} -> Arrange by type & style from the asset index: dry run gives {moves, counts:{\"Type/Style\": n}, cast_kept, unindexed, first_moves:[{name, from, to, guessed}]} and moves nothing; dry_run:false moves the files (Cast/ never) and returns {moved, created_folders}; the Assets panel's Undo arrange reverses it. Needs the index (built by the Assets panel's Arrange by type & style…)"),
+    ("produce_episode", "{script: screenplay file ('## SCENE n — TITLE' headings), out: output folder, audio?: the dialogue recording of the script's scenes in order, characters?: folder with one sub-folder of pictures per character, style?: comic|painterly|inked|free words (default comic), series?: the series name (names the .buzz and Backgrounds/<series>/), world?: where and when the story lives, ending every background prompt (default \"rural Bihar, India, late 1990s\" for Chirailiya, else none)} -> {started:true, job}; the producer: script breakdown by the model, layer rigs for the cast (kept when Cast has them), one ComfyUI background per place traced into Backgrounds/<series>/, the recording's lines found, the episode built (<out>/<series>.buzz) with auto camera cuts, lights and title cards, a preview MP4 per scene joined into <series>.mp4, and <out>/report.md; resumable (a second call skips unchanged steps); takes minutes, so call wait_for_jobs for {buzz, mp4, report, cast, backgrounds, cuts, lines_from_audio, lines_from_text, warnings}"),
 ];
+
+/// The `produce_episode` tool: the producer as an Assistant job.
+fn produce_episode(app: &mut App, args: &Value) -> AgentResult {
+    const KEYS: [&str; 7] = ["script", "out", "audio", "characters", "style", "series", "world"];
+    if let Some(map) = args.as_object() {
+        for key in map.keys() {
+            if !KEYS.contains(&key.as_str()) {
+                return AgentResult::err(format!("unknown arg '{key}'; valid: {}", KEYS.join(", ")));
+            }
+        }
+    }
+    let text = |key: &str| args.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let (Some(script), Some(out)) = (text("script"), text("out")) else {
+        return AgentResult::err("missing required args: script, out");
+    };
+    let script = std::path::PathBuf::from(script);
+    if !script.is_file() {
+        return AgentResult::err(format!("no script file at {}", script.display()));
+    }
+    let mut req = crate::produce::ProduceRequest::new(script, std::path::PathBuf::from(out));
+    req.audio = text("audio").map(std::path::PathBuf::from);
+    if let Some(a) = &req.audio
+        && !a.is_file()
+    {
+        return AgentResult::err(format!("no audio file at {}", a.display()));
+    }
+    req.characters_dir = text("characters").map(std::path::PathBuf::from);
+    req.series = text("series").unwrap_or_default();
+    req.world = text("world").unwrap_or_else(|| buzz_ui::produce_dialog::default_world(&req.series).to_string());
+    if let Some(style) = text("style") {
+        req.style = crate::backdrop::Style::by_name(&style)
+            .unwrap_or(crate::backdrop::Style { name: "custom".into(), suffix: style });
+    }
+    match app.agent_produce_async(req) {
+        Ok(started) => AgentResult::ok(started),
+        Err(e) => AgentResult::err(e),
+    }
+}
 
 /// The tool catalog the model sees, generated from code so it cannot drift:
 /// one `{id, label, args, how}` per command.

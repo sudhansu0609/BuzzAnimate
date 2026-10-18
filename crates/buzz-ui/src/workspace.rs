@@ -479,6 +479,12 @@ pub struct Workspace {
     /// Ctrl+wheel zoom. A person's own preference, not part of any one film.
     #[serde(default = "default_pan_speed")]
     pub pan_speed: f32,
+    /// **Exports at once** — how many exports the queue runs side by side
+    /// (step P of `docs/PRODUCTION_SPEED_PLAN.md`), set in the Tasks panel.
+    /// The queue still holds it under what the GPU's free memory allows. A
+    /// person's own preference, not part of any one film.
+    #[serde(default = "default_exports_at_once")]
+    pub exports_at_once: u8,
     /// The nib shape remembered for the Fluid and Normal brushes.
     ///
     /// A person's own preference, not part of any one film, so it lives here
@@ -903,6 +909,12 @@ fn default_pan_speed() -> f32 {
     1.0
 }
 
+/// 4 — the knee of P0's measurements: four scenes in about a third of the
+/// serial time, without filling the card.
+fn default_exports_at_once() -> u8 {
+    4
+}
+
 /// 100 % — the middle of Stage 6's 100–200 % UI Size range is 150, but the
 /// range a workspace with no saved preference starts at is the one that
 /// changes nothing until asked.
@@ -1257,6 +1269,7 @@ impl Workspace {
             depth_view: false,
             rig: RigOptions::default(),
             pan_speed: default_pan_speed(),
+            exports_at_once: default_exports_at_once(),
             brush_tips: crate::brush::BrushTips::default(),
             trace: buzz_scene::TraceOptions::default(),
             asset_thumbnail_size: crate::assets_panel::ThumbnailSize::default(),

@@ -45,8 +45,10 @@ pub struct FinishedRow {
 pub struct TasksView<'a> {
     pub running: &'a [TaskRow],
     pub finished: &'a [FinishedRow],
-    /// Exports queued behind the one running, if any.
+    /// Exports queued behind the ones running, if any.
     pub queued: usize,
+    /// How many exports may run at once (the workspace setting).
+    pub exports_at_once: u8,
 }
 
 /// What the user asked the panel to do.
@@ -56,6 +58,8 @@ pub enum TaskAction {
     Cancel(u64),
     /// Show this finished file in its folder.
     Reveal(u64),
+    /// Let this many exports run at once.
+    ExportsAtOnce(u8),
 }
 
 /// Draw the panel and return whatever the user asked for.
@@ -73,13 +77,23 @@ pub fn tasks_panel(ui: &mut Ui, view: &TasksView) -> Option<TaskAction> {
             );
         }
     });
+    ui.horizontal(|ui| {
+        let mut at_once = view.exports_at_once;
+        ui.label(RichText::new("Exports at once").small());
+        if ui
+            .add(egui::DragValue::new(&mut at_once).range(1..=8))
+            .changed()
+        {
+            action = Some(TaskAction::ExportsAtOnce(at_once));
+        }
+    });
     ui.separator();
 
     if view.running.is_empty() && view.finished.is_empty() {
         ui.add_space(8.0);
         ui.weak("Nothing running.");
         ui.weak("Exports, imports and other background work appear here.");
-        return None;
+        return action;
     }
 
     egui::ScrollArea::vertical()

@@ -16,8 +16,14 @@
 //! instead (a frame past a scene's end is skipped).
 //!
 //! The screenplay and casting formats are in `buzz_app::episode` (and the
-//! screenplay's in `buzz_act::screenplay`). There is no audio: timing comes
-//! from the words, and so does the lip sync.
+//! screenplay's in `buzz_act::screenplay`). Without audio, timing comes from
+//! the words, and so does the lip sync. `--audio <file>` gives the dialogue
+//! recording of the chosen scenes, in script order; `--audio-dir <dir>` one file
+//! per scene named `scene<N>.*`. The lines are found in it
+//! (`buzz_act::audio_align`; Whisper's transcript helps when it is installed,
+//! `--no-whisper` skips it), each scene gets its cut on a sound layer and the
+//! mouths follow the recording; `<out>/audio_lines.tsv` lists where each line
+//! was found. Lines and scenes with no audio keep their text timing.
 //!
 //! `--scenes` takes the script's own scene numbers (`4,5,6`, or `4-6`); leave it
 //! out for every scene. `--assets` points at an asset library other than the
@@ -27,7 +33,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use buzz_act::screenplay::Screenplay;
+use buzz_act::audio_align::{self, AudioPlan, Heard};
+use buzz_act::screenplay::{Screenplay, ScriptScene};
 use buzz_app::episode::{BuildOptions, Casting, build_episode, report_markdown, scene_file_stem};
 use buzz_app::headless::{RenderJob, render};
 use buzz_doc::{AssetLibrary, Document};
@@ -45,6 +52,9 @@ struct Args {
     assets: Option<PathBuf>,
     index: Option<PathBuf>,
     size: Option<(f64, f64)>,
+    audio: Option<PathBuf>,
+    audio_dir: Option<PathBuf>,
+    no_whisper: bool,
 }
 
 fn parse_scenes(text: &str) -> Result<Vec<u32>> {
@@ -73,6 +83,9 @@ fn parse_args() -> Result<Args> {
     let mut assets = None;
     let mut index = None;
     let mut size = None;
+    let mut audio = None;
+    let mut audio_dir = None;
+    let mut no_whisper = false;
     while let Some(flag) = args.next() {
         let mut value = |what: &str| -> Result<String> {
             args.next().with_context(|| format!("{what} needs a value"))
@@ -92,6 +105,9 @@ fn parse_args() -> Result<Args> {
             "--height" => height = value("--height")?.parse()?,
             "--assets" => assets = Some(PathBuf::from(value("--assets")?)),
             "--index" => index = Some(PathBuf::from(value("--index")?)),
+            "--audio" => audio = Some(PathBuf::from(value("--audio")?)),
+            "--audio-dir" => audio_dir = Some(PathBuf::from(value("--audio-dir")?)),
+            "--no-whisper" => no_whisper = true,
             "--size" => {
                 let text = value("--size")?;
                 let (w, h) = text
@@ -114,7 +130,77 @@ fn parse_args() -> Result<Args> {
         assets,
         index,
         size,
+        audio,
+        audio_dir,
+        no_whisper,
     })
+}
+
+/// Whisper's transcript of `clip`, as the aligner's [`Heard`], when a model is
+/// installed and it runs.
+fn transcript(clip: &buzz_audio::Clip, skip: bool) -> Option<Vec<Heard>> {
+    if skip {
+        return None;
+    }
+    if let Err(e) = buzz_ai::transcribe::installed_whisper() {
+        eprintln!("No transcript: {e}");
+        return None;
+    }
+    match buzz_ai::transcribe::transcribe_clip(clip, &mut |_, _| {}, &|| false) {
+        Ok(t) => {
+            eprintln!("Transcript ({}): {} segment(s)", t.provider, t.segments.len());
+            Some(
+                t.segments
+                    .into_iter()
+                    .map(|s| Heard {
+                        start: s.start,
+                        end: s.end,
+                        text: s.text,
+                    })
+                    .collect(),
+            )
+        }
+        Err(e) => {
+            eprintln!("No transcript: {e}");
+            None
+        }
+    }
+}
+
+/// The audio plan for `--audio` / `--audio-dir`.
+fn audio_plan(args: &Args, play: &Screenplay, numbers: &[u32]) -> Result<Option<AudioPlan>> {
+    let scenes: Vec<&ScriptScene> = numbers.iter().filter_map(|n| play.scene(*n)).collect();
+    if let Some(path) = &args.audio {
+        let clip = buzz_audio::Clip::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let heard = transcript(&clip, args.no_whisper);
+        return Ok(Some(audio_align::plan(&scenes, path, &clip, heard.as_deref())));
+    }
+    let Some(dir) = &args.audio_dir else {
+        return Ok(None);
+    };
+    let mut plan = AudioPlan {
+        path: dir.clone(),
+        ..AudioPlan::default()
+    };
+    for scene in scenes {
+        let wanted = format!("scene{}", scene.number);
+        let file = std::fs::read_dir(dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.is_file()
+                    && p.file_stem()
+                        .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(&wanted))
+            });
+        let Some(file) = file else {
+            plan.notes.push(format!("scene {}: no {wanted}.* in {}; text timing", scene.number, dir.display()));
+            continue;
+        };
+        let clip = buzz_audio::Clip::open(&file).with_context(|| format!("opening {}", file.display()))?;
+        let heard = transcript(&clip, args.no_whisper);
+        plan.merge(audio_align::plan(&[scene], &file, &clip, heard.as_deref()));
+    }
+    Ok(Some(plan))
 }
 
 fn main() -> Result<()> {
@@ -151,6 +237,19 @@ fn main() -> Result<()> {
         opts.width = w;
         opts.height = h;
     }
+    if let Some(plan) = audio_plan(&args, &play, &numbers)? {
+        for note in &plan.notes {
+            eprintln!("Audio: {note}");
+        }
+        let mut tsv = String::from("scene\titem\tstart\tend\n");
+        for l in &plan.lines {
+            tsv.push_str(&format!("{}\t{}\t{:.3}\t{:.3}\n", l.scene, l.item, l.start, l.end));
+        }
+        let path = args.out.join("audio_lines.tsv");
+        std::fs::write(&path, tsv).with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("Wrote {}", path.display());
+        opts.audio = Some(std::sync::Arc::new(plan));
+    }
 
     eprintln!(
         "{}: {} scene(s) in the script; building {:?} from {} asset(s)",
@@ -186,6 +285,38 @@ fn main() -> Result<()> {
                 format!("; skipped {}", r.skipped.len())
             }
         );
+    }
+
+    // P5: the camera's cuts, printed and saved as `<out>/shots.json`.
+    if reports.iter().any(|r| !r.shots.is_empty()) {
+        let mut cuts = Vec::new();
+        for r in &reports {
+            for s in &r.shots {
+                println!(
+                    "scene {} frame {:>5}: {:<6} {:<8} camera ({:.0}, {:.0}) x{:.3}{}",
+                    r.number,
+                    s.frame,
+                    s.kind,
+                    s.on.as_deref().unwrap_or("-"),
+                    s.x,
+                    s.y,
+                    s.scale,
+                    s.push_to.map(|f| format!(" push 3% to {f}")).unwrap_or_default()
+                );
+                cuts.push(serde_json::json!({
+                    "scene": r.number,
+                    "frame": s.frame,
+                    "kind": s.kind,
+                    "on": s.on,
+                    "camera": {"x": s.x, "y": s.y, "scale": s.scale},
+                    "push_to": s.push_to,
+                }));
+            }
+        }
+        let path = args.out.join("shots.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&serde_json::json!({ "cuts": cuts }))?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("Wrote {}", path.display());
     }
 
     if args.mp4 || args.stills > 0 || !args.frames.is_empty() {

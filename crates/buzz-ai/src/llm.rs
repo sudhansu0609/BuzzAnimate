@@ -19,6 +19,26 @@ pub trait Llm: Send + Sync {
         schema: serde_json::Value,
     ) -> Result<T, LlmError>;
 
+    /// [`Llm::chat_json`] that gives up when `cancel` says so (P8-C2): a
+    /// backend that can runs the call on a worker and polls `cancel` every
+    /// quarter second, returning `LlmError::Other("cancelled")` within about
+    /// that long and abandoning the call. The default just calls
+    /// `chat_json` (cancel is checked before it starts).
+    fn chat_json_cancellable<T: DeserializeOwned + Send + 'static>(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        images: &[&[u8]],
+        schema: serde_json::Value,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<T, LlmError> {
+        if cancel() {
+            return Err(LlmError::Other("cancelled".into()));
+        }
+        self.chat_json(model, system, user, images, schema)
+    }
+
     /// Generates vector embeddings for a batch of text strings.
     fn embed(
         &self,
@@ -390,6 +410,47 @@ pub fn detect() -> Vec<(Backend, Vec<String>)> {
 }
 
 impl Llm for Backend {
+    fn chat_json_cancellable<T: DeserializeOwned + Send + 'static>(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        images: &[&[u8]],
+        schema: serde_json::Value,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<T, LlmError> {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        if cancel() {
+            return Err(LlmError::Other("cancelled".into()));
+        }
+        // The call runs on a worker; this thread polls `cancel`. On cancel
+        // the worker is abandoned: its answer (or its timeout) is dropped.
+        let me = self.clone();
+        let (model, system, user) = (model.to_string(), system.to_string(), user.to_string());
+        let images: Vec<Vec<u8>> = images.iter().map(|i| i.to_vec()).collect();
+        let (tx, rx) = channel();
+        std::thread::Builder::new()
+            .name("llm-call".into())
+            .spawn(move || {
+                let refs: Vec<&[u8]> = images.iter().map(Vec::as_slice).collect();
+                let _ = tx.send(me.chat_json::<T>(&model, &system, &user, &refs, schema));
+            })
+            .map_err(|e| LlmError::Other(format!("could not start the model call: {e}")))?;
+        loop {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(answer) => return answer,
+                Err(RecvTimeoutError::Timeout) => {
+                    if cancel() {
+                        return Err(LlmError::Other("cancelled".into()));
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(LlmError::Other("the model call ended without an answer".into()));
+                }
+            }
+        }
+    }
+
     fn chat_json<T: DeserializeOwned>(
         &self,
         model: &str,

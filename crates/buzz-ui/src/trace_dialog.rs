@@ -38,6 +38,9 @@ pub fn trace_dialog(ctx: &egui::Context, options: &mut TraceOptions) -> TraceDia
 fn body(ui: &mut Ui, options: &mut TraceOptions, action: &mut TraceDialogAction) {
     ui.set_min_width(320.0);
 
+    recommended_row(ui, || *options = TraceOptions::ink_colour());
+    ui.separator();
+
     ui.label("Mode");
     ui.horizontal(|ui| {
         ui.selectable_value(&mut options.mode, TraceMode::Ink, "Ink");
@@ -176,6 +179,30 @@ fn body(ui: &mut Ui, options: &mut TraceOptions, action: &mut TraceDialogAction)
         }
         if ui.button("Trace").clicked() {
             *action = TraceDialogAction::Trace;
+        }
+    });
+}
+
+/// The settings settled on for tracing characters (2026-10-07/08): Ink + colour,
+/// bold 0 (the source's own line weight), smoothness 0.5, 24 colours, speck 12,
+/// the built-in tuning. Shown at the top of both trace dialogs.
+pub const RECOMMENDED_NOTE: &str =
+    "Ink + colour, bold 0 px, smoothness 0.5, 24 colours, speck 12 px, built-in tuning";
+
+/// **Reset to recommended**: a button that puts every setting of the dialog
+/// back to [`RECOMMENDED_NOTE`]'s values — not the saved tuning file, so a
+/// tuning saved by mistake is undone too. `reset` does the putting back.
+pub fn recommended_row(ui: &mut Ui, reset: impl FnOnce()) {
+    ui.horizontal(|ui| {
+        if ui
+            .button("\u{21ba} Reset to recommended")
+            .on_hover_text(format!(
+                "Every setting back to the ones we settled on: {RECOMMENDED_NOTE}. \
+                 Ignores the saved tuning file."
+            ))
+            .clicked()
+        {
+            reset();
         }
     });
 }

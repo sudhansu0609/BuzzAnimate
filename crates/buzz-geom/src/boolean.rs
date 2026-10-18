@@ -170,11 +170,86 @@ fn to_contours(path: &BezPath, tolerance: f64) -> Vec<Vec<[f64; 2]>> {
     contours
 }
 
-/// Rebuild a path from `i_overlay`'s shape/contour output.
+/// Two contour points closer than this are one point (see [`despike`]).
+const SPIKE_MERGE_DISTANCE: f64 = 1e-3;
+
+/// A vertex whose two edges fold back to within this angle (radians) of a
+/// full reversal is a zero-width spike (see [`despike`]).
+const SPIKE_FOLD_ANGLE: f64 = 1e-6;
+
+/// ... or whose two edges fold back no further apart than this: `i_overlay`'s
+/// integer grid leaves a spike's two sides ~1e-3 apart (Raju 3-4's sole: 34 px
+/// out along y = 1390.25 and back at y = 1390.249), far over the angle above.
+const SPIKE_FOLD_WIDTH: f64 = 5e-3;
+
+/// Does the contour fold back at `b` (edge `a→b`, then `b→c` the other way
+/// along the same line: within [`SPIKE_FOLD_ANGLE`], or the shorter edge's far
+/// end within [`SPIKE_FOLD_WIDTH`] of the longer edge's line)?
+fn folds_back(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> bool {
+    let (ux, uy) = (b[0] - a[0], b[1] - a[1]);
+    let (vx, vy) = (c[0] - b[0], c[1] - b[1]);
+    let (lu, lv) = (ux.hypot(uy), vx.hypot(vy));
+    if lu == 0.0 || lv == 0.0 {
+        return false;
+    }
+    let dot = ux * vx + uy * vy;
+    let cross = ux * vy - uy * vx;
+    dot < 0.0 && (cross.abs() <= SPIKE_FOLD_ANGLE.sin() * lu * lv || cross.abs() <= SPIKE_FOLD_WIDTH * lu.max(lv))
+}
+
+/// **A contour without zero-width spikes** (P8-A A3). `i_overlay` can return
+/// a contour that runs out along a line and straight back (Guddu 3-4's
+/// trouser remainder: 250 px up x = 680.25 and back down; a tip of two points
+/// 7e-5 px apart). It encloses nothing, but the refit turns it into curves
+/// with width and it renders as a stray bar outside the shape. Points closer
+/// than [`SPIKE_MERGE_DISTANCE`] are merged and every vertex whose edges fold
+/// back (within [`SPIKE_FOLD_ANGLE`]) is removed, repeatedly, round the
+/// closed contour. Linear: each point is pushed and removed at most once,
+/// plus one wrap-around pass.
+fn despike(contour: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= SPIKE_MERGE_DISTANCE;
+    let mut out: Vec<[f64; 2]> = Vec::with_capacity(contour.len());
+    for &p in contour {
+        if out.last().is_some_and(|&l| near(l, p)) {
+            continue;
+        }
+        out.push(p);
+        while out.len() >= 3 {
+            let n = out.len();
+            if !folds_back(out[n - 3], out[n - 2], out[n - 1]) {
+                break;
+            }
+            out.remove(n - 2);
+            let n = out.len();
+            if near(out[n - 2], out[n - 1]) {
+                out.pop();
+            }
+        }
+    }
+    // The wrap-around: the closing edge and the first point's fold.
+    loop {
+        let n = out.len();
+        if n < 3 {
+            break;
+        }
+        if near(out[n - 1], out[0]) || folds_back(out[n - 2], out[n - 1], out[0]) {
+            out.pop();
+        } else if folds_back(out[n - 1], out[0], out[1]) {
+            out.remove(0);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Rebuild a path from `i_overlay`'s shape/contour output, zero-width spikes
+/// removed ([`despike`]).
 fn from_shapes(shapes: &[Vec<Vec<[f64; 2]>>]) -> BezPath {
     let mut out = BezPath::new();
     for shape in shapes {
         for contour in shape {
+            let contour = despike(contour);
             if contour.len() < 3 {
                 continue;
             }

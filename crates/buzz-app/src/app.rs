@@ -615,6 +615,12 @@ enum AiResult {
         sym_name: String,
         rerigged: Box<buzz_ai::rerig::ReriggedCharacter>,
     },
+    /// File ▸ AI ▸ Produce Episode… / the `produce_episode` tool (P6): what
+    /// the producer made; the dialog's run opens the `.buzz`.
+    Produced {
+        report: Box<crate::produce::ProduceReport>,
+        open: bool,
+    },
 }
 
 /// What the Assistant's `transcribe` listens to.
@@ -857,9 +863,12 @@ pub struct App {
     /// Per-frame section timing and the over-budget warning. See
     /// [`crate::profile`].
     profiler: crate::profile::FrameProfiler,
-    /// Every export, run one at a time on the task registry. Replaces the old
+    /// Every export, run a few at a time on the task registry. Replaces the old
     /// single slot that refused a second export outright.
     exports: crate::export_service::ExportQueue,
+    /// How many exports the free VRAM allowed when the queue last started
+    /// ([`crate::export_service::vram_cap`]); 2 until first sampled.
+    export_vram_cap: usize,
     /// The pressure the pen last reported, `0.0`–`1.0`.
     ///
     /// Remembered between events because a gesture's press and release arrive
@@ -963,6 +972,9 @@ pub struct App {
     /// that task reports.
     arrange: buzz_ui::ArrangeDialogState,
     arrange_task: Option<crate::tasks::TaskId>,
+    /// **File ▸ AI ▸ Produce Episode…** (PRODUCER_PLAN P6): the dialog's choices.
+    produce: buzz_ui::produce_dialog::ProduceDialogState,
+    produce_task: Option<crate::tasks::TaskId>,
     arrange_rx: Option<crossbeam_channel::Receiver<ArrangeMsg>>,
     /// The open character's loaded document, and the wardrobe and poses derived
     /// from it. Held here rather than re-read from disk every frame: a
@@ -1224,6 +1236,7 @@ impl App {
             retain_stage: std::env::var("BUZZ_NO_RETAIN").is_err(),
             profiler: crate::profile::FrameProfiler::default(),
             exports: crate::export_service::ExportQueue::default(),
+            export_vram_cap: 2,
             pen_pressure: None,
             pan_last_screen: None,
             quit_prompt: false,
@@ -1254,6 +1267,8 @@ impl App {
             asset_thumbnails: crate::thumbnails::AssetThumbnails::default(),
             arrange: buzz_ui::ArrangeDialogState::default(),
             arrange_task: None,
+            produce: buzz_ui::produce_dialog::ProduceDialogState::default(),
+            produce_task: None,
             arrange_rx: None,
             cast_sheet: None,
             preview: crate::preview::Preview::default(),
@@ -3649,6 +3664,7 @@ impl App {
         self.staging_dialog(&ctx);
         self.recovery_dialog(&ctx);
         self.trace_dialog(&ctx);
+        self.produce_dialog(&ctx);
         self.snapshots_dialog(&ctx);
         self.estate_dialog(&ctx);
         self.pasteboard_colour_dialog(&ctx);
@@ -8068,6 +8084,7 @@ impl App {
             Command::SendToBuzzEdit => self.estate_open_dialog(crate::estate::DialogKind::Send),
             Command::TranscribeWithBuzzEdit => self.estate_open_dialog(crate::estate::DialogKind::Transcribe),
             Command::ImportScriptFromStudio => self.estate_open_dialog(crate::estate::DialogKind::Studio),
+            Command::ProduceEpisode => self.produce.open = true,
             other => self.editor.run(other),
         }
     }
@@ -9490,6 +9507,37 @@ impl App {
             AiResult::Rigged { target, sym_name, rerigged } => {
                 self.commit_rig(target, sym_name, *rerigged);
             }
+            AiResult::Produced { report, open } => {
+                self.produce.busy = false;
+                let r = &report;
+                let summary = format!(
+                    "Produced {} ({} cut(s), {} line(s) from the recording); report {}",
+                    r.buzz.display(),
+                    r.cuts,
+                    r.lines_from_audio,
+                    r.report.display()
+                );
+                self.produce.status = Some(summary.clone());
+                if job_value.is_some() {
+                    job_value = Some(serde_json::json!({
+                        "buzz": r.buzz,
+                        "mp4": r.mp4,
+                        "report": r.report,
+                        "cast": r.cast,
+                        "backgrounds": r.backgrounds,
+                        "generated_characters": r.generated_characters,
+                        "cuts": r.cuts,
+                        "lines_from_audio": r.lines_from_audio,
+                        "lines_from_text": r.lines_from_text,
+                        "skipped_steps": r.skipped_steps,
+                        "warnings": r.warnings,
+                    }));
+                }
+                if open {
+                    self.open_path(&report.buzz);
+                }
+                self.editor.status = Some(summary);
+            }
         }
 
         if let Some(mut value) = job_value {
@@ -10108,6 +10156,98 @@ impl App {
             "ai_character_from_image",
             job,
             &format!("'{shown}' is being detected, segmented, completed and rigged off the UI thread (this takes a minute or two)"),
+        ))
+    }
+
+    /// **Produce an episode** (P6) as one AI task in the Tasks panel: the
+    /// producer's step and line as the task's detail, Cancel between steps.
+    /// `open`: open the `.buzz` when it is done (the dialog's run).
+    fn start_produce(&mut self, req: crate::produce::ProduceRequest, open: bool) -> crate::tasks::TaskId {
+        let (send, receive) = crossbeam_channel::bounded(1);
+        self.last_ai_task = None;
+        let id = self
+            .tasks
+            .spawn_thread(crate::tasks::TaskKind::Ai, "AI: Produce Episode", move |ctx| {
+                let progress = ctx.progress.clone();
+                let cancel = ctx.cancel.clone();
+                let total = crate::produce::Step::ALL.len() as u64;
+                let mut on_progress = |step: crate::produce::Step, line: &str| {
+                    progress.set(step.index() as u64, total);
+                    progress.detail(format!("{}: {line}", step.label()));
+                };
+                match crate::produce::produce(&req, &mut on_progress, &|| cancel.is_cancelled()) {
+                    Ok(report) => {
+                        let _ = send.send(AiResult::Produced { report: Box::new(report), open });
+                        crate::tasks::TaskOutcome::Finished(String::new())
+                    }
+                    Err(_) if cancel.is_cancelled() => crate::tasks::TaskOutcome::Cancelled,
+                    Err(e) => crate::tasks::TaskOutcome::Failed(format!("Produce Episode: {e:#}")),
+                }
+            });
+        self.track_ai(id, receive);
+        id
+    }
+
+    /// The dialog behind File ▸ AI ▸ Produce Episode…
+    fn produce_dialog(&mut self, ctx: &egui::Context) {
+        // A run that ended without a result (cancelled, failed) frees the button.
+        if self.produce.busy && self.produce_task.is_some_and(|t| !self.tasks.is_running(t)) {
+            self.produce.busy = false;
+            self.produce_task = None;
+        }
+        match buzz_ui::produce_dialog::produce_dialog(ctx, &mut self.produce) {
+            buzz_ui::produce_dialog::ProduceDialogAction::Produce => {
+                let state = &self.produce;
+                let scenes = match state.scene_numbers() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.produce.status = Some(e);
+                        return;
+                    }
+                };
+                let script = std::path::PathBuf::from(state.script.trim());
+                if !script.is_file() {
+                    self.produce.status = Some(format!("No script file at {}", script.display()));
+                    return;
+                }
+                let mut req = crate::produce::ProduceRequest::new(script, std::path::PathBuf::from(state.out.trim()));
+                let optional = |t: &str| Some(t.trim()).filter(|t| !t.is_empty()).map(std::path::PathBuf::from);
+                req.audio = optional(&state.audio);
+                req.characters_dir = optional(&state.characters);
+                let preset = buzz_ui::produce_dialog::STYLE_PRESETS.get(state.style).copied().unwrap_or("comic");
+                let mut style = crate::backdrop::Style::by_name(preset).unwrap_or_default();
+                if !state.style_text.trim().is_empty() {
+                    style.suffix = format!("{}, {}", style.suffix, state.style_text.trim());
+                }
+                req.style = style;
+                req.series = state.series.trim().to_string();
+                req.world = if state.world.trim().is_empty() {
+                    buzz_ui::produce_dialog::default_world(&req.series).to_string()
+                } else {
+                    state.world.trim().to_string()
+                };
+                req.scenes = scenes;
+                req.backgrounds = state.backgrounds;
+                req.launch_comfy = state.backgrounds && state.launch_comfy;
+                req.mp4 = state.mp4;
+                let id = self.start_produce(req, true);
+                self.produce_task = Some(id);
+                self.produce.busy = true;
+                self.produce.status = Some("Producing: see the Tasks panel (Cancel is there)".into());
+            }
+            buzz_ui::produce_dialog::ProduceDialogAction::Cancel | buzz_ui::produce_dialog::ProduceDialogAction::None => {}
+        }
+    }
+
+    /// The Assistant's `produce_episode` (P6): the producer as a job.
+    pub(crate) fn agent_produce_async(&mut self, req: crate::produce::ProduceRequest) -> Result<serde_json::Value, String> {
+        let out = req.out.display().to_string();
+        self.start_produce(req, false);
+        let job = self.agent_track_last_job("produce_episode").ok_or("the producer task did not start")?;
+        Ok(crate::agent::jobs::started(
+            "produce_episode",
+            job,
+            &format!("the episode is being produced into {out} off the UI thread (minutes: breakdown, cast, backgrounds, audio, build, render)"),
         ))
     }
 
@@ -10850,23 +10990,32 @@ impl App {
         });
     }
 
-    /// Start the next queued export, if the queue is free.
+    /// Start as many queued exports as there are free running slots.
     ///
-    /// Serial by construction: [`ExportQueue::next_to_start`] hands back nothing
-    /// while one is running, so this does nothing until it finishes.
+    /// The cap is the workspace's **Exports at once**, held under the VRAM cap
+    /// ([`crate::export_service::vram_cap`]). That is sampled only when the
+    /// queue goes from idle to busy, never per job: a job that has just started
+    /// has not allocated its VRAM yet.
     fn pump_export_queue(&mut self) {
-        let Some(request) = self.exports.next_to_start() else {
-            return;
-        };
-        let reveal = request.reveal_path();
-        let label = request.label.clone();
-        let id =
-            self.tasks
-                .spawn_thread(crate::tasks::TaskKind::Export, label.clone(), move |ctx| {
-                    crate::export_service::run_export(request, &ctx)
-                });
-        self.api.export_started(id, &reveal);
-        self.exports.started(id, reveal, label);
+        if !self.exports.is_active() && self.exports.waiting() > 0 {
+            self.export_vram_cap = crate::export_service::vram_cap();
+        }
+        self.exports.set_max_parallel(
+            (self.editor.workspace.exports_at_once as usize)
+                .min(self.export_vram_cap)
+                .max(1),
+        );
+        while let Some(request) = self.exports.next_to_start() {
+            let reveal = request.reveal_path();
+            let label = request.label.clone();
+            let id =
+                self.tasks
+                    .spawn_thread(crate::tasks::TaskKind::Export, label.clone(), move |ctx| {
+                        crate::export_service::run_export(request, &ctx)
+                    });
+            self.api.export_started(id, &reveal);
+            self.exports.started(id, reveal, label);
+        }
     }
 
     /// The local API (`crate::api`) queues an episode's previews here, beside
@@ -11231,6 +11380,7 @@ impl App {
             running: &running,
             finished: &finished,
             queued: self.exports.waiting(),
+            exports_at_once: self.editor.workspace.exports_at_once,
         };
 
         if let Some(action) = buzz_ui::tasks_panel(ui, &view) {
@@ -11243,6 +11393,10 @@ impl App {
                     if let Some(f) = self.exports.finished().get(i as usize) {
                         reveal_in_folder(&f.reveal);
                     }
+                }
+                buzz_ui::TaskAction::ExportsAtOnce(n) => {
+                    self.editor.workspace.exports_at_once = n;
+                    self.editor.workspace.save();
                 }
             }
         }

@@ -32,6 +32,7 @@ pub mod lipsync_panel;
 pub mod motion_editor;
 pub mod new_document;
 pub mod panels;
+pub mod produce_dialog;
 pub mod recovery_panel;
 pub mod rig_panel;
 pub mod selection;

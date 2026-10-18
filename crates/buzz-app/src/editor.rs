@@ -5165,6 +5165,7 @@ impl Editor {
             FlipVertical => self.mirror_selection(false),
             RotateClockwise => self.turn_selection(std::f64::consts::FRAC_PI_2),
             RotateAnticlockwise => self.turn_selection(-std::f64::consts::FRAC_PI_2),
+            ExtendPart => self.extend_part(),
 
             NewLayer => {
                 let id = self.doc_add_layer("Layer", LayerKind::Normal);
@@ -5500,6 +5501,7 @@ impl Editor {
                 self.workspace.reveal(buzz_ui::PanelId::Ai);
             }
             AiCharacterFromImage => {
+                self.preload_ai_character_from_selection();
                 self.ai_character.open = true;
                 self.workspace.reveal(buzz_ui::PanelId::Ai);
             }
@@ -5516,6 +5518,8 @@ impl Editor {
             // Handled by `App` (`crate::estate`): they talk to BuzzEdit and
             // Buzzcaf Studio over HTTP, which `Editor` has no thread for.
             SendToBuzzEdit | TranscribeWithBuzzEdit | ImportScriptFromStudio => {}
+            // Handled by `App` (`crate::produce`): a dialog, then a task.
+            ProduceEpisode => {}
             // Agent only (`agent::dialogs::mouth_chart`): it needs a chart file
             // and a character, which no menu item can ask for.
             AiMouthChart => {}
@@ -11067,6 +11071,42 @@ impl Editor {
     /// them onto the stage is the composition of what the editor already knows:
     /// the unit square to the image's own space (the fill's transform), and
     /// that space to the layer (the object's).
+    /// When a picture is selected, Character from Image starts from it: its
+    /// file is written to the temp folder and put in the wizard's path box, so
+    /// the AI segments that picture into parts, completes what one part hides
+    /// of another, traces and rigs it. Nothing selected (or not a picture)
+    /// leaves the wizard as it was.
+    fn preload_ai_character_from_selection(&mut self) {
+        let picked = self.selection.ids().into_iter().find_map(|id| {
+            let (_, object) = self.doc.scene().find_object(id)?;
+            let ObjectKind::Shape(shape) = &object.kind else { return None };
+            let Some(buzz_scene::Paint::Image(fill)) = shape.fill.as_ref().map(|f| &f.paint) else {
+                return None;
+            };
+            (fill.asset.width > 0 && !fill.asset.source.is_empty()).then(|| fill.asset.clone())
+        });
+        let Some(asset) = picked else { return };
+        let stem: String = std::path::Path::new(&asset.name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("character")
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let ext = if asset.format.is_empty() { "png" } else { asset.format.as_str() };
+        let dir = std::env::temp_dir().join("buzzanimate-character-input");
+        let path = dir.join(format!("{stem}.{ext}"));
+        match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, asset.source.as_slice())) {
+            Ok(()) => {
+                self.ai_character.image_path_input = path.display().to_string();
+                if self.ai_character.character_name == "Character" {
+                    self.ai_character.character_name = stem;
+                }
+            }
+            Err(e) => self.status = Some(format!("Could not hand the picture to the wizard: {e}")),
+        }
+    }
+
     pub fn trace_with(&mut self, options: buzz_scene::TraceOptions) {
         if let Some(status) = self.picture_selection_status() {
             self.status = Some(status);
@@ -11164,6 +11204,318 @@ impl Editor {
             ),
             (false, false) => format!("Traced {made} shapes"),
         });
+    }
+
+    /// **Extend Part Under Neighbours** — continue each selected part symbol's
+    /// artwork under whatever hides its cut, to its transformation point.
+    ///
+    /// For a character the user cut by hand: Trace Bitmap, Lasso round the
+    /// arm, Convert to Symbol, put the transformation point on the joint under
+    /// the torso, then this. The part alone and everything drawn above it are
+    /// rendered into one grid; [`buzz_ai::outpaint::outpaint_limb`] carries the
+    /// part's cross-section (outline, stripes, shading) from the cut to the
+    /// joint, only where the neighbours cover it; the extruded pixels are
+    /// traced as Ink + colour and put on an "Extension" layer at the bottom of
+    /// the part's symbol, so every instance shares it and a second run
+    /// replaces it rather than stacking.
+    pub fn extend_part(&mut self) {
+        let ids = self.selection.ids();
+        if ids.is_empty() {
+            self.status = Some("Select a part symbol to extend first".into());
+            return;
+        }
+        let frame = self.current_frame;
+        let scene = self.doc.scene().clone();
+        let table = self.symbol_bounds();
+
+        // What is drawn, back to front, each with where its layer puts it on
+        // the timeline being authored and its bounds there.
+        let layers = scene.layers();
+        let order: Vec<&Arc<buzz_scene::Layer>> = if scene.stage().sort_by_depth {
+            layers.drawable_at_by_depth(frame)
+        } else {
+            layers.drawable_at(frame).collect()
+        };
+        let mut painted: Vec<(LayerId, Object, Affine, Rect)> = Vec::new();
+        for layer in order {
+            if !layer.kind.paints_to_output() || layer.kind.is_mask() {
+                continue;
+            }
+            let follows = layers.inherited_transform(layer.id, frame);
+            for object in layers.resolved_at_rigged(layer.id, frame).iter() {
+                if !object.visible {
+                    continue;
+                }
+                let bounds = follows.transform_rect_bbox(scene.resolved_bounds_with(object, &table));
+                painted.push((layer.id, object.clone(), follows, bounds));
+            }
+        }
+
+        let nothing_above = |name: &str| {
+            format!(
+                "Nothing above {name} hides its cut \u{2014} put the part under its neighbour \
+                 and run again"
+            )
+        };
+        let mut reasons: Vec<String> = Vec::new();
+        let mut jobs: Vec<(buzz_scene::SymbolId, u32, Vec<ShapeData>)> = Vec::new();
+        let mut exporter: Option<buzz_export::Exporter> = None;
+        for id in &ids {
+            let Some(at) = painted.iter().position(|(_, o, _, _)| o.id == *id) else {
+                continue;
+            };
+            let (layer_id, part, follows, part_bounds) = &painted[at];
+            let instance = match &part.kind {
+                ObjectKind::Instance(instance) => instance,
+                ObjectKind::Armature(_) => {
+                    reasons.push(
+                        "Extend Part works on layer rigs; convert the rig to layers in the Rig panel"
+                            .into(),
+                    );
+                    continue;
+                }
+                _ => {
+                    reasons.push("Convert the part to a symbol first (F8)".into());
+                    continue;
+                }
+            };
+            let Some(symbol) = scene.library().get(instance.symbol) else {
+                continue;
+            };
+            // Instances of one symbol share its Extension layer: once is enough.
+            if jobs.iter().any(|(s, ..)| *s == symbol.id) {
+                continue;
+            }
+            let name = part
+                .name
+                .clone()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| symbol.name.clone());
+
+            // 1–2. The joint, and what is drawn above the part near it.
+            let joint = *follows * scene.pivot_of(part);
+            let grown = part_bounds.inflate(part_bounds.width() * 0.125, part_bounds.height() * 0.125);
+            let occluders: Vec<ObjectId> = painted[at + 1..]
+                .iter()
+                .filter(|(_, _, _, b)| !b.intersect(grown).is_zero_area())
+                .map(|(_, o, _, _)| o.id)
+                .collect();
+            if occluders.is_empty() {
+                reasons.push(nothing_above(&name));
+                continue;
+            }
+
+            // 3. One grid for the part, its occluders and the joint.
+            let r = 0.5 * part_bounds.width().max(part_bounds.height());
+            let union = painted[at + 1..]
+                .iter()
+                .filter(|(_, o, _, _)| occluders.contains(&o.id))
+                .fold(
+                    part_bounds.union(Rect::new(joint.x - r, joint.y - r, joint.x + r, joint.y + r)),
+                    |u, (_, _, _, b)| u.union(*b),
+                );
+            let region = union.inflate(union.width() * 0.1, union.height() * 0.1);
+            let long = region.width().max(region.height()).max(1e-6);
+            let scale = if long * 2.0 <= 2048.0 { 2.0 } else { 2048.0 / long };
+            let w = (region.width() * scale).ceil().clamp(1.0, 2048.0) as u32;
+            let h = (region.height() * scale).ceil().clamp(1.0, 2048.0) as u32;
+            let region = Rect::new(
+                region.x0,
+                region.y0,
+                region.x0 + w as f64 / scale,
+                region.y0 + h as f64 / scale,
+            );
+
+            if exporter.is_none() {
+                match buzz_export::Exporter::new(&buzz_render::GpuPreference::default()) {
+                    Ok(made) => exporter = Some(made),
+                    Err(e) => {
+                        self.status = Some(format!("Could not render the part to extend it: {e:#}"));
+                        return;
+                    }
+                }
+            }
+            let renderer = exporter.as_mut().expect("made just above");
+            let alone: std::collections::HashSet<ObjectId> = [part.id].into_iter().collect();
+            let above: std::collections::HashSet<ObjectId> = occluders.iter().copied().collect();
+            let rendered = render_only(&scene, &alone, instance.symbol, frame, region, (w, h), renderer)
+                .and_then(|visible| {
+                    render_only(&scene, &above, instance.symbol, frame, region, (w, h), renderer)
+                        .map(|cover| (visible, cover))
+                });
+            let (visible, cover) = match rendered {
+                Ok(pair) => pair,
+                Err(e) => {
+                    self.status = Some(format!("Could not render {name} to extend it: {e:#}"));
+                    return;
+                }
+            };
+
+            // 4. Masks, and the bone: from the joint towards the part's middle
+            // near it.
+            let n = (w * h) as usize;
+            let part_at = |i: usize| visible[i * 4 + 3] > 127;
+            let mut allowed = vec![false; n];
+            let mut matte = vec![false; n];
+            for i in 0..n {
+                let over = cover[i * 4 + 3] > 127;
+                allowed[i] = over && !part_at(i);
+                matte[i] = over || part_at(i);
+            }
+            if !allowed.iter().any(|&a| a) {
+                reasons.push(nothing_above(&name));
+                continue;
+            }
+            let head = (
+                ((joint.x - region.x0) * scale) as f32,
+                ((joint.y - region.y0) * scale) as f32,
+            );
+            let near: Vec<(f32, f32, f32)> = (0..n)
+                .filter(|&i| part_at(i))
+                .map(|i| {
+                    let (x, y) = ((i as u32 % w) as f32 + 0.5, (i as u32 / w) as f32 + 0.5);
+                    ((x - head.0).hypot(y - head.1), x, y)
+                })
+                .collect();
+            if near.is_empty() {
+                reasons.push(format!("{name} shows nothing to extend on this frame"));
+                continue;
+            }
+            let median = {
+                let mut d: Vec<f32> = near.iter().map(|p| p.0).collect();
+                let mid = d.len() / 2;
+                *d.select_nth_unstable_by(mid, |a, b| a.total_cmp(b)).1
+            };
+            let (mut sx, mut sy, mut count) = (0.0f64, 0.0f64, 0usize);
+            for &(d, x, y) in &near {
+                if d <= median {
+                    sx += x as f64;
+                    sy += y as f64;
+                    count += 1;
+                }
+            }
+            let tail = ((sx / count as f64) as f32, (sy / count as f64) as f32);
+            let source = image::RgbaImage::from_raw(w, h, visible.clone())
+                .expect("the render is width × height RGBA");
+            let Some(extended) =
+                buzz_ai::outpaint::outpaint_limb(&visible, &allowed, &matte, head, tail, &source)
+                    .filter(|o| o.extruded.iter().any(|&e| e))
+            else {
+                reasons.push(
+                    "Put the part's transformation point on its joint, under the neighbour, \
+                     and run again"
+                        .into(),
+                );
+                continue;
+            };
+
+            // 6. The extruded pixels, plus the part's own within 2 px of them
+            // (Chebyshev), so the extension overlaps the seam.
+            let (wu, hu) = (w as usize, h as usize);
+            let mut rows = vec![false; n];
+            for y in 0..hu {
+                for x in 0..wu {
+                    rows[y * wu + x] = (x.saturating_sub(2)..(x + 3).min(wu))
+                        .any(|xx| extended.extruded[y * wu + xx]);
+                }
+            }
+            let mut picture = vec![0u8; n * 4];
+            for y in 0..hu {
+                for x in 0..wu {
+                    let i = y * wu + x;
+                    let seam = (y.saturating_sub(2)..(y + 3).min(hu)).any(|yy| rows[yy * wu + x]);
+                    if extended.extruded[i] || (seam && part_at(i)) {
+                        picture[i * 4..i * 4 + 4].copy_from_slice(&extended.rgba[i * 4..i * 4 + 4]);
+                    }
+                }
+            }
+            let options = buzz_scene::TraceOptions {
+                drop_background: true,
+                ..buzz_scene::TraceOptions::ink_colour().with_saved_tuning()
+            };
+            let report = buzz_scene::trace(w, h, &picture, &options);
+            if report.shapes.is_empty() {
+                reasons.push(format!("{name}: {}", report.message));
+                continue;
+            }
+
+            // Pixels → the timeline → the part's own (symbol) space.
+            let Some(back) = invert(*follows * part.transform) else {
+                continue;
+            };
+            let place = back
+                * Affine::translate((region.x0, region.y0))
+                * Affine::scale(1.0 / scale);
+            let shapes = report
+                .shapes
+                .into_iter()
+                .map(|mut shape| {
+                    shape.path = place * shape.path;
+                    if let Some(s) = shape.stroke.as_mut() {
+                        s.width *= place.determinant().abs().sqrt();
+                    }
+                    shape
+                })
+                .collect();
+            // The symbol frame this instance shows here, which is the one extended.
+            let elapsed = layers.get(*layer_id).map(|l| elapsed_on(l, frame)).unwrap_or(0);
+            let shown = instance.resolve_frame(symbol.kind, elapsed, symbol.length());
+            jobs.push((symbol.id, shown, shapes));
+        }
+
+        if jobs.is_empty() {
+            self.status = Some(
+                reasons
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "Select a part symbol to extend first".into()),
+            );
+            return;
+        }
+
+        // 7. One undo step: an "Extension" layer at the bottom of each symbol,
+        // keyed at the symbol frame shown and held over the symbol's span.
+        let made = jobs.len();
+        self.doc.edit("Extend Part", |scene| {
+            for (symbol, shown, shapes) in jobs {
+                let objects: Vec<Arc<Object>> = shapes
+                    .into_iter()
+                    .map(|s| Arc::new(Object::shape(scene.next_object_id(), s)))
+                    .collect();
+                let Some((length, old)) = scene.library().get(symbol).map(|s| {
+                    (
+                        s.length().max(shown + 1),
+                        s.layers.iter().find(|l| l.name == EXTENSION_LAYER).map(|l| l.id),
+                    )
+                }) else {
+                    continue;
+                };
+                let mut keyframes = vec![buzz_scene::Keyframe::new(0)];
+                if shown > 0 {
+                    keyframes.push(buzz_scene::Keyframe::new(shown));
+                }
+                keyframes.last_mut().expect("one at least").objects = Arc::new(objects);
+                let frames = buzz_scene::LayerTimeline::from_parts(keyframes, length);
+                let fresh = LayerId(scene.next_object_id().0);
+                scene.library_mut().update(symbol, |s| match old {
+                    Some(id) => {
+                        s.layers.update(id, |l| l.frames = frames);
+                    }
+                    None => {
+                        let mut layer = buzz_scene::Layer::new(fresh, EXTENSION_LAYER, LayerKind::Normal);
+                        layer.frames = frames;
+                        let bottom = s.layers.len();
+                        s.layers.insert(bottom, layer);
+                    }
+                });
+            }
+        });
+
+        let mut status = format!("Extended {made} part(s) under their neighbours");
+        if !reasons.is_empty() {
+            status.push_str(&format!(" \u{2014} {}", reasons.join("; ")));
+        }
+        self.status = Some(status);
     }
 
     /// **Re-weight the outlines of everything selected**, and nothing else.
@@ -11370,6 +11722,61 @@ fn elapsed_on(layer: &buzz_scene::Layer, frame: u32) -> u32 {
             .map(|k| k.start)
             .unwrap_or(0)
             .min(frame)
+}
+
+/// The layer Extend Part writes, at the bottom of a part's symbol.
+const EXTENSION_LAYER: &str = "Extension";
+
+/// Renders only the objects in `keep` of the timeline being authored, at
+/// `frame`, into `region` (document units of that timeline) at `size`:
+/// straight RGBA on a transparent background (the exporter un-premultiplies).
+///
+/// A disposable copy: that timeline becomes the stage, the camera is off and
+/// every other object is hidden (mask layers keep theirs, so they still
+/// clip). `symbol`'s own "Extension" layer is left out, so Extend Part sees
+/// the part as it was cut and a second run replaces, not extends, the first.
+fn render_only(
+    scene: &Scene,
+    keep: &std::collections::HashSet<ObjectId>,
+    symbol: buzz_scene::SymbolId,
+    frame: u32,
+    region: Rect,
+    (width, height): (u32, u32),
+    exporter: &mut buzz_export::Exporter,
+) -> anyhow::Result<Vec<u8>> {
+    let mut scene = scene.clone();
+    let mut timeline = scene.layers().clone();
+    let ids: Vec<LayerId> = timeline.iter().map(|l| l.id).collect();
+    for id in ids {
+        timeline.update(id, |layer| {
+            if layer.kind.is_mask() {
+                return;
+            }
+            for keyframe in layer.frames.keyframes_mut() {
+                for object in Arc::make_mut(&mut keyframe.objects) {
+                    if !keep.contains(&object.id) {
+                        Arc::make_mut(object).visible = false;
+                    }
+                }
+            }
+        });
+    }
+    scene.edit_document();
+    *scene.edit_stage_layers() = timeline;
+    scene.camera_mut().enabled = false;
+    scene.library_mut().update(symbol, |s| {
+        let old = s.layers.iter().find(|l| l.name == EXTENSION_LAYER).map(|l| l.id);
+        if let Some(id) = old {
+            s.layers.remove(id);
+        }
+    });
+    let settings = buzz_export::ExportSettings {
+        width,
+        height,
+        transparent: true,
+        region: Some(region),
+    };
+    Ok(exporter.render(&scene, frame, &settings)?.pixels)
 }
 
 /// Edit a shape in place, ignoring groups.

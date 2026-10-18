@@ -77,6 +77,10 @@ pub enum Command {
     /// **Import Script from Studio**: a Buzzcaf Studio project's script,
     /// built into an episode. See `buzz_app::estate` (E3).
     ImportScriptFromStudio,
+    /// **Produce Episode**: a script, a recording and character art in, a
+    /// finished episode out (breakdown, cast, backgrounds, audio, build,
+    /// render). See `buzz_app::produce` (PRODUCER_PLAN P6).
+    ProduceEpisode,
 
     // Edit
     Undo,
@@ -170,6 +174,10 @@ pub enum Command {
     RotateClockwise,
     /// Modify ▸ Transform ▸ Rotate 90° Counter-clockwise.
     RotateAnticlockwise,
+    /// Modify ▸ Rig ▸ Extend Part Under Neighbours: continue each selected
+    /// part symbol's artwork under whatever hides its cut, to its
+    /// transformation point, on a bottom "Extension" layer.
+    ExtendPart,
 
     // Insert
     NewLayer,
@@ -577,6 +585,7 @@ command_table! {
             TranscribeWithBuzzEdit => "buzzedit_transcribe",
             SendToBuzzEdit => "buzzedit_send",
             ImportScriptFromStudio => "studio_import_script",
+            ProduceEpisode => "produce_episode_dialog",
             Undo => "undo",
             Redo => "redo",
             Cut => "cut",
@@ -625,6 +634,7 @@ command_table! {
             FlipVertical => "flip_vertical",
             RotateClockwise => "rotate_clockwise",
             RotateAnticlockwise => "rotate_anticlockwise",
+            ExtendPart => "extend_part",
             NewLayer => "new_layer",
             NewLayerFolder => "new_layer_folder",
             MoveLayerUp => "move_layer_up",
@@ -922,6 +932,7 @@ impl Command {
             TranscribeWithBuzzEdit => "Transcribe with BuzzEdit\u{2026}",
             SendToBuzzEdit => "Send to BuzzEdit\u{2026}",
             ImportScriptFromStudio => "Import Script from Studio\u{2026}",
+            ProduceEpisode => "Produce Episode\u{2026}",
 
             Undo => "Undo",
             Redo => "Redo",
@@ -973,6 +984,7 @@ impl Command {
             FlipVertical => "Flip Vertical",
             RotateClockwise => "Rotate 90\u{b0} CW",
             RotateAnticlockwise => "Rotate 90\u{b0} CCW",
+            ExtendPart => "Extend Part Under Neighbours",
 
             NewLayer => "New Layer",
             NewLayerFolder => "New Folder",
@@ -1193,6 +1205,7 @@ impl Command {
             FlipHorizontal | FlipVertical => None,
             RotateClockwise => sc(ctrl_shift, Key::Num9),
             RotateAnticlockwise => sc(ctrl_shift, Key::Num7),
+            ExtendPart => None,
 
             NewLayer => sc(ctrl_alt, Key::N),
             NewLayerFolder => sc(ctrl_alt, Key::F),
@@ -1328,6 +1341,8 @@ impl Command {
             SaveAsTemplate | NewFromTemplate(_) => None,
             // No Animate binding to follow: they reach other apps.
             TranscribeWithBuzzEdit | SendToBuzzEdit | ImportScriptFromStudio => None,
+            // A dialog with a whole form behind it.
+            ProduceEpisode => None,
             AiModels | AiCharacterFromImage | AiIdentifyAssets | AiRigVectorCharacter | AiSceneFromImage | AiDirectStory | AiMouthChart => None,
         }
     }
@@ -1356,6 +1371,7 @@ impl Command {
                 | RecogniseShape
                 | StraightenSelection
                 | ConvertToSymbol
+                | ExtendPart
                 | BrushFromSelection
                 | ClearModifiers
                 | BakeModifiers
@@ -1439,6 +1455,7 @@ pub fn palette_commands() -> Vec<Command> {
         FlipVertical,
         RotateClockwise,
         RotateAnticlockwise,
+        ExtendPart,
         NewLayer,
         NewLayerFolder,
         MoveLayerUp,
@@ -1530,6 +1547,7 @@ pub fn palette_commands() -> Vec<Command> {
         ExportWebp,
         SendToBuzzEdit,
         ImportScriptFromStudio,
+        ProduceEpisode,
         ImportSound,
         ImportImage,
         AttachSound,
@@ -1844,7 +1862,7 @@ mod tests {
             assert!(seen.insert(c.id()), "duplicate id {}", c.id());
             assert_eq!(Command::from_id(c.id(), &serde_json::Value::Null), Ok(c));
         }
-        assert_eq!(Command::unit_commands().len() + Command::data_command_hints().len(), 196);
+        assert_eq!(Command::unit_commands().len() + Command::data_command_hints().len(), 198);
     }
 
     #[test]

@@ -913,6 +913,12 @@ fn render_preview(
         // than tracing on every slider move; they are greyed while it runs.
         let tracing = state.rx_process.is_some();
         ui.add_enabled_ui(!tracing, |ui| {
+            let mut reset = false;
+            crate::trace_dialog::recommended_row(ui, || reset = true);
+            if reset {
+                state.trace_options = TraceCharacterOptions::default();
+                state.uniform_width = 2.0; // as `AiCharacterState::default`
+            }
             ui.horizontal(|ui| {
                 ui.label("Uniform Stroke Width:");
                 let mut uw = state.uniform_width;

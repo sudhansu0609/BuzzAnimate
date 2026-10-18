@@ -644,6 +644,10 @@ pub(crate) fn loop_component(loop_pts: &[(usize, usize)], labels: &[u32], uw: us
 /// Douglas–Peucker. See [`fit_run`].
 const FIT_MARGIN_PX: f64 = 2.0;
 
+/// The densest run [`fit_run`] hands to kurbo, in points per px of the run's
+/// box perimeter; denser runs are decimated first (P8-A A1 bound).
+const FIT_MAX_POINTS_PER_PX: f64 = 12.0;
+
 /// Index `i` wrapped into `0..n`, for any `i` (positive or negative).
 fn wrap(i: isize, n: usize) -> usize {
     i.rem_euclid(n as isize) as usize
@@ -822,8 +826,45 @@ fn fit_run(points: &[Point], t: &InkTuning) -> BezPath {
     if points.len() < 2 {
         return open_path(points);
     }
-    let input = open_path(points);
-    let input_len = input.elements().len();
+    // **Degenerate runs never reach kurbo** (P8-A A1): `kurbo::simplify`
+    // (0.13.1) never returned on a 70-point closed sliver about 2 × 6 px
+    // (Guddu's side sheet) or 1.3 × 7 px (Chhotu): the whole character trace
+    // hung. A run whose box is under 3 px both ways, a closed run (first
+    // point = last) whose box is under 6 px both ways or under 3 px across,
+    // or one with fewer than 4 distinct points is drawn by the Douglas–Peucker
+    // fallback instead. (A long, nearly straight OPEN run, its box thin one
+    // way only, still goes to kurbo.)
+    let raw_bounds = points
+        .iter()
+        .fold(buzz_geom::Rect::new(f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |r, p| {
+            buzz_geom::Rect::new(r.x0.min(p.x), r.y0.min(p.y), r.x1.max(p.x), r.y1.max(p.y))
+        });
+    let (bw, bh) = (raw_bounds.width(), raw_bounds.height());
+    let closed = (points[0] - points[points.len() - 1]).hypot() < 1e-9;
+    let distinct = {
+        let mut v: Vec<(u64, u64)> = points.iter().map(|p| (p.x.to_bits(), p.y.to_bits())).collect();
+        v.sort_unstable();
+        v.dedup();
+        v.len()
+    };
+    if !(bw.max(bh) >= 3.0) || (closed && (bw.max(bh) < 6.0 || bw.min(bh) < 3.0)) || distinct < 4 {
+        return open_path(&douglas_peucker(points, 0.2));
+    }
+    // A bound on the general case: a run far denser than any traced contour
+    // (over `FIT_MAX_POINTS_PER_PX` points per px of its box perimeter; the
+    // densest normal run, a staircase on the 6× grid, is under 9) is evenly
+    // decimated before the fit, first and last points kept.
+    let max_points = ((2.0 * (bw + bh) * FIT_MAX_POINTS_PER_PX).ceil() as usize).max(4);
+    let decimated: Vec<Point>;
+    let fit_points: &[Point] = if points.len() > max_points {
+        let n = points.len();
+        decimated = (0..max_points).map(|i| points[i * (n - 1) / (max_points - 1)]).collect();
+        &decimated
+    } else {
+        points
+    };
+    let input = open_path(fit_points);
+    let input_len = open_path(points).elements().len();
     // kurbo's default `angle_thresh` (1e-3) splits the fit at every vertex
     // of a dense polyline (points `1/U` px apart turn more than that), so
     // nothing gets fit. Corners were already split off in step D; only a

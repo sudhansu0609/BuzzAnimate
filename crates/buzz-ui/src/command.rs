@@ -211,6 +211,9 @@ pub enum Command {
     DuplicateSymbol,
     /// Keep the selected library symbol in the Assets library.
     SymbolToAsset,
+    /// **Clear All Keyframes…** in a symbol or character: every layer keeps
+    /// one keyframe (the chosen pose) and the rest become normal frames.
+    ClearAllKeyframes,
     DeleteSymbol,
     NewLibraryFolder,
 
@@ -358,6 +361,13 @@ pub enum Command {
     /// Point the master audio at a sound already carried by a layer of the
     /// active (Normal) scene, instead of importing a new file.
     SetMasterAudioFromLayer(buzz_scene::LayerId),
+    /// **Sequence \u{25b8} Master Audio Mode**: only the master clip may play.
+    /// Turning it on asks first, then enforces it across every scene (see
+    /// `docs/MASTER_AUDIO_AND_PROTECT_PLAN.md` Part M).
+    ToggleMasterAudioMode,
+    /// **Sequence \u{25b8} Re-apply Master Audio**: enforce Master Audio mode
+    /// again, for example after new characters are placed.
+    ReapplyMasterAudio,
     /// **Sequence \u{25b8} Make Setup from This Scene**: mark the active scene a
     /// reusable Setup — a source to stamp shots from, never itself in the
     /// exported film.
@@ -438,8 +448,26 @@ pub enum Command {
     ClearFrames,
     /// Play this layer's keyframes back to front.
     ReverseFrames,
+    /// **Clean Up Layers…**: delete empty layers, trim trailing blank
+    /// frames, remove empty folders (`docs/LAYER_MANAGEMENT_PLAN.md` L2).
+    CleanUpLayers,
+    /// **Arrange Layers**: file top-level layers into folders by content
+    /// without changing the drawing order (`docs/LAYER_MANAGEMENT_PLAN.md` L3).
+    ArrangeLayers,
+    /// **Repair Layer Rigs…**: rewire layer-parenting rigs built with the
+    /// old Bones → Layers wiring so a limb's front piece leads, rebaking keys
+    /// so no frame changes.
+    RepairLayerRigs,
     ToggleOnionSkin,
     ToggleAutoKeyframe,
+    /// **Edit ▸ Protect Other Keyframes**: an edit inside a shared symbol
+    /// opened in place changes only the clicked keyframe (a copy is made), and
+    /// Auto Keyframe is held on (`docs/MASTER_AUDIO_AND_PROTECT_PLAN.md` K2).
+    ToggleProtectKeyframes,
+    /// Protect scope: only the clicked keyframe.
+    ProtectThisKeyframe,
+    /// Protect scope: the clicked keyframe and every later stage keyframe.
+    ProtectFromHere,
     ToggleEditMultipleFrames,
 
     // Camera
@@ -650,6 +678,7 @@ command_table! {
             PlaceInstance => "place_instance",
             DuplicateSymbol => "duplicate_symbol",
             SymbolToAsset => "symbol_to_asset",
+            ClearAllKeyframes => "clear_symbol_keyframes",
             DeleteSymbol => "delete_symbol",
             NewLibraryFolder => "new_library_folder",
             BrushFromSelection => "brush_from_selection",
@@ -699,6 +728,8 @@ command_table! {
             AddThreeQuarterRight => "add_three_quarter_right",
             AddThreeQuarterLeft => "add_three_quarter_left",
             SetMasterAudio => "set_master_audio",
+            ToggleMasterAudioMode => "toggle_master_audio_mode",
+            ReapplyMasterAudio => "reapply_master_audio",
             MakeSetupFromScene => "make_setup_from_scene",
             SplitAtPlayhead => "split_at_playhead",
             FlattenToMasterScene => "flatten_to_master_scene",
@@ -725,8 +756,14 @@ command_table! {
             PasteFrames => "paste_frames",
             ClearFrames => "clear_frames",
             ReverseFrames => "reverse_frames",
+            CleanUpLayers => "clean_up_layers",
+            ArrangeLayers => "arrange_layers",
+            RepairLayerRigs => "repair_layer_rigs",
             ToggleOnionSkin => "toggle_onion_skin",
             ToggleAutoKeyframe => "toggle_auto_keyframe",
+            ToggleProtectKeyframes => "toggle_protect_keyframes",
+            ProtectThisKeyframe => "protect_scope_this_keyframe",
+            ProtectFromHere => "protect_scope_from_here",
             ToggleEditMultipleFrames => "toggle_edit_multiple_frames",
             ToggleCamera => "toggle_camera",
             AddCameraKeyframe => "add_camera_keyframe",
@@ -1002,6 +1039,7 @@ impl Command {
             PlaceInstance => "Place on Stage",
             DuplicateSymbol => "Duplicate Symbol",
             SymbolToAsset => "Keep Symbol as Asset",
+            ClearAllKeyframes => "Clear All Keyframes\u{2026}",
             DeleteSymbol => "Delete Symbol",
             NewLibraryFolder => "New Library Folder",
 
@@ -1061,6 +1099,8 @@ impl Command {
 
             SetMasterAudio => "Set Master Audio\u{2026}",
             SetMasterAudioFromLayer(_) => "Set Master Audio",
+            ToggleMasterAudioMode => "Master Audio Mode",
+            ReapplyMasterAudio => "Re-apply Master Audio",
             MakeSetupFromScene => "Make Setup from This Scene",
             NewShotFromSetup(_) => "New Shot from Setup",
             SplitAtPlayhead => "Split at Playhead",
@@ -1097,8 +1137,14 @@ impl Command {
             PasteFrames => "Paste Frames",
             ClearFrames => "Clear Frames",
             ReverseFrames => "Reverse Frames",
+            CleanUpLayers => "Clean Up Layers\u{2026}",
+            ArrangeLayers => "Arrange Layers",
+            RepairLayerRigs => "Repair Layer Rigs\u{2026}",
             ToggleOnionSkin => "Onion Skin",
             ToggleAutoKeyframe => "Auto Keyframe",
+            ToggleProtectKeyframes => "Protect Other Keyframes",
+            ProtectThisKeyframe => "This Keyframe",
+            ProtectFromHere => "This Keyframe and Later",
             ToggleEditMultipleFrames => "Edit Multiple Frames",
 
             ToggleCamera => "Enable Camera",
@@ -1220,7 +1266,7 @@ impl Command {
             EditSymbol => sc(ctrl, Key::E),
             EditDocument => sc(ctrl, Key::F4),
             PlaceInstance => None,
-            DuplicateSymbol | SymbolToAsset => None,
+            DuplicateSymbol | SymbolToAsset | ClearAllKeyframes => None,
             DeleteSymbol => None,
             NewLibraryFolder => None,
 
@@ -1262,7 +1308,8 @@ impl Command {
             // the pointer's attention (`sequence_panel` itself reads the key),
             // not a document-wide binding — so it carries none here, and
             // never collides with a tool's own shortcut.
-            SetMasterAudio | SetMasterAudioFromLayer(_) | MakeSetupFromScene
+            SetMasterAudio | SetMasterAudioFromLayer(_) | ToggleMasterAudioMode
+            | ReapplyMasterAudio | MakeSetupFromScene
             | NewShotFromSetup(_) | SplitAtPlayhead | TryAnotherSetup(..)
             | DuplicateShot(_) | AddMissingSetupLayers(_) | EditSetup(_)
             | FlattenToMasterScene | CutOnDialogue(_) | ContinueFromShot(..) => None,
@@ -1313,8 +1360,12 @@ impl Command {
             PasteFrames => sc(ctrl_alt, Key::V),
             ClearFrames => sc(Modifiers::ALT, Key::Backspace),
             ReverseFrames => None,
+            CleanUpLayers => None,
+            ArrangeLayers => None,
+            RepairLayerRigs => None,
             ToggleOnionSkin => None,
             ToggleAutoKeyframe => None,
+            ToggleProtectKeyframes | ProtectThisKeyframe | ProtectFromHere => None,
             ToggleEditMultipleFrames => None,
 
             ToggleCamera => None,
@@ -1443,7 +1494,6 @@ pub fn palette_commands() -> Vec<Command> {
         SendToBack,
         ThickenStroke,
         ThinStroke,
-        TraceBitmap,
         TraceLineArt,
         TraceBitmapOptions,
         ConvertLinesToFills,
@@ -1478,8 +1528,14 @@ pub fn palette_commands() -> Vec<Command> {
         PasteFrames,
         ClearFrames,
         ReverseFrames,
+        CleanUpLayers,
+        ArrangeLayers,
+        RepairLayerRigs,
         ToggleOnionSkin,
         ToggleAutoKeyframe,
+        ToggleProtectKeyframes,
+        ProtectThisKeyframe,
+        ProtectFromHere,
         ToggleEditMultipleFrames,
         ToggleCamera,
         AddCameraKeyframe,
@@ -1496,6 +1552,7 @@ pub fn palette_commands() -> Vec<Command> {
         PlaceInstance,
         DuplicateSymbol,
         SymbolToAsset,
+        ClearAllKeyframes,
         DeleteSymbol,
         NewLibraryFolder,
         CreateClassicTween,
@@ -1526,6 +1583,8 @@ pub fn palette_commands() -> Vec<Command> {
         SetReverse,
         ClearReverse,
         SetMasterAudio,
+        ToggleMasterAudioMode,
+        ReapplyMasterAudio,
         MakeSetupFromScene,
         SplitAtPlayhead,
         FlattenToMasterScene,
@@ -1686,6 +1745,9 @@ mod tests {
             PasteFrames,
             ClearFrames,
             ReverseFrames,
+            CleanUpLayers,
+            ArrangeLayers,
+            RepairLayerRigs,
             ToggleOnionSkin,
             ToggleAutoKeyframe,
             ToggleEditMultipleFrames,
@@ -1704,6 +1766,7 @@ mod tests {
             PlaceInstance,
             DuplicateSymbol,
             SymbolToAsset,
+            ClearAllKeyframes,
             DeleteSymbol,
             NewLibraryFolder,
             CreateClassicTween,
@@ -1862,7 +1925,7 @@ mod tests {
             assert!(seen.insert(c.id()), "duplicate id {}", c.id());
             assert_eq!(Command::from_id(c.id(), &serde_json::Value::Null), Ok(c));
         }
-        assert_eq!(Command::unit_commands().len() + Command::data_command_hints().len(), 198);
+        assert_eq!(Command::unit_commands().len() + Command::data_command_hints().len(), 207);
     }
 
     #[test]

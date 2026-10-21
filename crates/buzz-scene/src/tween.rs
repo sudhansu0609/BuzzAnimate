@@ -2370,6 +2370,7 @@ mod tests {
             modifiers: Vec::new(),
             text: None,
             turnaround: Default::default(),
+            drawing_object: false,
         }
     }
 
@@ -2445,6 +2446,7 @@ mod tests {
             modifiers: Vec::new(),
             text: None,
             turnaround: Default::default(),
+            drawing_object: false,
         };
 
         let mid = interpolate_object(

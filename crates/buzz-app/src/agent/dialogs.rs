@@ -50,6 +50,10 @@ pub fn args_hint(command: Command) -> Option<&'static str> {
         AiDirectStory => "{brief: text} -> {started:true, job}; an LLM parses the brief and the result is applied as one undo step when done; call wait_for_jobs for the result",
         AiCharacterFromImage => "{path: image file (PNG/JPG of one character, full body), character_name?: text (default the file name), rig?: layers|bones (default layers)} -> {started:true, job}; the Character from Image wizard with its default choices (pose and skeleton, parts, hidden parts completed, vector trace, biped rig) as one undo step, rigged by layer parenting (one followed layer per part) or, with rig:bones, as an armature; takes a minute or two, so call wait_for_jobs for {character, symbols, elements, rig_kind: layers|bones, rig_root_element, armature_element}. rig_root_element is the id to pass as `element` to perform / ai_direct_story (the root part of a layer rig, the armature of a bone rig); armature_element is null for a layer rig. A rig whose artwork is skinned stays bones, and rig_kind says so. The rigged character is then on stage and in Cast",
         AiMouthChart => "{element: id of the character's rig on stage | character: name (finds the library symbol `<name>_mouth`), path: image file of a labelled mouth chart (mouths in rows on a plain page, coloured mouths with grey/black labels under them), labels?: [text] in reading order (default Raju's 19: Neutral Closed, Small Smile, Broad Smile, Frown, A, E, I, O, U, M/B/P, F/V, L, TH, CH/J, S/Z, Open Laugh, Angry Tight Mouth, Confused Half-Open, Skeptical Side-Mouth)} -> replaces the character's mouth-symbol frames, as one undo step: frames 0..9 are the ten lip-sync visemes (Rest, Ai, E, O, U, L, WQ, MBP, FV, Etc) so lip_sync keeps working, then every other mouth as an extra named frame (10.. : Small Smile, Broad Smile, Frown, I, TH, CH/J, Open Laugh...) to key by hand (an instance's first_frame, or the keyframe label). Sized to the current Rest mouth and drawn in its line weight. Takes a few seconds",
+        ClearAllKeyframes => "{symbol: library symbol name|id, keep?: first|playhead (first; playhead = the inner frame a selected instance of it shows, else the open frame when that symbol is being edited, else first), nested?: bool (default true for a character: tag character or folder Cast)} -> Clear All Keyframes: every layer keeps one keyframe at frame 0 holding the kept pose, the rest become normal frames, lengths unchanged, audio-guide layers untouched; one undo step; returns {keyframes_cleared, layers, symbols}",
+        CleanUpLayers => "{scope?: timeline|whole_scene (timeline = the timeline being edited; whole_scene = the stage and every library symbol), empty?: bool (true: delete layers with no artwork and no sound), trim?: bool (true: trim blank keyframes after each layer's last content, never below the longest content end), folders?: bool (true: remove folders with no children, including ones this run empties)} -> Clean Up Layers: never deletes a folder with children, a layer something files under or follows, a mask/guide with its run, an audio-guide layer, or the last layer; one undo step; returns {layers_deleted, frames_trimmed, folders_removed, symbols_touched}",
+        ArrangeLayers => "{} -> Arrange Layers on the timeline being edited: deletes empty layers, then files top-level layers into folders (one per character with its layer-parenting chain, Background, FX, Props, Audio at the bottom), reusing same-named folders; a layer whose artwork overlaps a layer it would have to pass stays where it is, so the picture never changes; one undo step (none when already tidy); returns {folders_made, layers_moved, layers_left_in_place, emptied}",
+        RepairLayerRigs => "{scope?: timeline|whole_scene (timeline = the timeline being edited; whole_scene = the stage and every library symbol)} -> Repair Layer Rigs: rewires layer-parenting rigs built with the old Bones -> Layers wiring (each part's front-most layer leads, the slot's other pieces and its child parts follow it), rebaking every keyframe so no frame changes; an already-correct rig is left alone; one undo step (none when nothing changes); returns {rigs, links_changed, keys_rebaked}",
         _ => return None,
     })
 }
@@ -179,8 +183,153 @@ pub fn run(app: &mut App, command: Command, a: &Value) -> AgentResult {
         Command::AiDirectStory => direct_story(app, a),
         Command::AiCharacterFromImage => character_from_image(app, a),
         Command::AiMouthChart => mouth_chart(app, a),
+        Command::ClearAllKeyframes => clear_symbol_keyframes(app, a),
+        Command::CleanUpLayers => clean_up_layers(app, a),
+        Command::ArrangeLayers => arrange_layers(app, a),
+        Command::RepairLayerRigs => repair_layer_rigs(app, a),
         _ => AgentResult::err(format!("needs_dialog {id}")),
     }
+}
+
+/// Clear All Keyframes dialog -> `Editor::clear_symbol_keyframes`.
+fn clear_symbol_keyframes(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["symbol", "keep", "nested"]) {
+        return AgentResult::err(e);
+    }
+    let Some(v) = given(a, "symbol") else { return missing(&["symbol"]) };
+    let id = match symbol_by_ref(app.agent_editor().doc.scene(), v, "") {
+        Ok(id) => id,
+        Err(e) => return AgentResult::err(e),
+    };
+    let playhead = match text(a, "keep") {
+        Ok(None) | Ok(Some("first")) => false,
+        Ok(Some("playhead")) => true,
+        Ok(Some(other)) => return AgentResult::err(format!("'keep' must be first or playhead, not '{other}'")),
+        Err(e) => return AgentResult::err(e),
+    };
+    let nested = match flag(a, "nested") {
+        Ok(n) => n,
+        Err(e) => return AgentResult::err(e),
+    };
+    let editor = app.agent_editor_mut();
+    let nested = nested.unwrap_or_else(|| {
+        editor.doc.scene().library().get(id).is_some_and(|s| crate::editor::is_character_symbol(s))
+    });
+    let keep = if playhead {
+        editor
+            .selected_instance_inner_frame(id)
+            .or_else(|| (editor.doc.scene().editing_symbol() == Some(id)).then_some(editor.current_frame))
+            .map(buzz_scene::KeepPose::Frame)
+            .unwrap_or(buzz_scene::KeepPose::First)
+    } else {
+        buzz_scene::KeepPose::First
+    };
+    let before = depth(app);
+    let report = app.agent_editor_mut().clear_symbol_keyframes(id, keep, nested);
+    finish(
+        app,
+        "clear_symbol_keyframes",
+        before,
+        json!({
+            "keyframes_cleared": report.keyframes_cleared,
+            "layers": report.layers,
+            "symbols": report.symbols,
+        }),
+    )
+}
+
+/// Modify > Timeline > Arrange Layers -> `Editor::arrange_layers`.
+fn arrange_layers(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &[]) {
+        return AgentResult::err(e);
+    }
+    let before = depth(app);
+    let done = app.agent_editor_mut().arrange_layers();
+    let extra = json!({
+        "folders_made": done.folders_made,
+        "layers_moved": done.layers_moved,
+        "layers_left_in_place": done.layers_left_in_place,
+        "emptied": done.emptied,
+    });
+    if !done.changed() {
+        // Already tidy is an answer, not a failure.
+        let mut value = report(app, "arrange_layers");
+        value["undo_steps_added"] = json!(0);
+        if let (Some(map), Some(more)) = (value.as_object_mut(), extra.as_object()) {
+            for (k, v) in more {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+        return AgentResult::ok(value);
+    }
+    finish(app, "arrange_layers", before, extra)
+}
+
+/// Repair Layer Rigs -> `Editor::repair_layer_rigs`.
+fn repair_layer_rigs(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["scope"]) {
+        return AgentResult::err(e);
+    }
+    let scope = match text(a, "scope") {
+        Ok(None) | Ok(Some("timeline")) => buzz_scene::CleanupScope::Timeline,
+        Ok(Some("whole_scene")) => buzz_scene::CleanupScope::WholeScene,
+        Ok(Some(other)) => {
+            return AgentResult::err(format!("'scope' must be timeline or whole_scene, not '{other}'"));
+        }
+        Err(e) => return AgentResult::err(e),
+    };
+    let before = depth(app);
+    let report = app.agent_editor_mut().repair_layer_rigs(scope);
+    finish(
+        app,
+        "repair_layer_rigs",
+        before,
+        json!({
+            "rigs": report.rigs,
+            "links_changed": report.links_changed,
+            "keys_rebaked": report.keys_rebaked,
+        }),
+    )
+}
+
+/// Clean Up Layers dialog -> `Editor::clean_up_layers`.
+fn clean_up_layers(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["scope", "empty", "trim", "folders"]) {
+        return AgentResult::err(e);
+    }
+    let scope = match text(a, "scope") {
+        Ok(None) | Ok(Some("timeline")) => buzz_scene::CleanupScope::Timeline,
+        Ok(Some("whole_scene")) => buzz_scene::CleanupScope::WholeScene,
+        Ok(Some(other)) => {
+            return AgentResult::err(format!("'scope' must be timeline or whole_scene, not '{other}'"));
+        }
+        Err(e) => return AgentResult::err(e),
+    };
+    let mut options = buzz_scene::CleanupOptions::default();
+    for (key, slot) in [
+        ("empty", &mut options.empty_layers),
+        ("trim", &mut options.trim),
+        ("folders", &mut options.folders),
+    ] {
+        match flag(a, key) {
+            Ok(Some(v)) => *slot = v,
+            Ok(None) => {}
+            Err(e) => return AgentResult::err(e),
+        }
+    }
+    let before = depth(app);
+    let report = app.agent_editor_mut().clean_up_layers(scope, options);
+    finish(
+        app,
+        "clean_up_layers",
+        before,
+        json!({
+            "layers_deleted": report.layers_deleted,
+            "frames_trimmed": report.frames_trimmed,
+            "folders_removed": report.folders_removed,
+            "symbols_touched": report.symbols_touched,
+        }),
+    )
 }
 
 /// New dialog -> `Editor::create_document`.

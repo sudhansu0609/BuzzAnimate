@@ -114,6 +114,9 @@ pub struct LibraryState {
     pub new_symbol_kind: SymbolKind,
     /// Whether the list shows every symbol, only animated ones, or only stills.
     pub motion: MotionFilter,
+    /// Clear All Keyframes was raised from this panel's menu, so it targets
+    /// `selected` rather than a selected stage instance. Taken by the editor.
+    pub clear_keys_from_library: bool,
     /// Folder paths the user has opened.
     expanded: BTreeSet<String>,
     /// Rename buffer, live only while a rename is in progress.
@@ -585,10 +588,12 @@ fn draw_symbol_row(
                 Command::PlaceInstance,
                 Command::DuplicateSymbol,
                 Command::SymbolToAsset,
+                Command::ClearAllKeyframes,
                 Command::DeleteSymbol,
             ] {
                 if ui.button(c.label()).clicked() {
                     state.selected = Some(id);
+                    state.clear_keys_from_library = c == Command::ClearAllKeyframes;
                     *command = Some(c);
                     ui.close();
                 }

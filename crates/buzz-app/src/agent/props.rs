@@ -122,6 +122,7 @@ pub const PROPERTY_FIELDS: &[(&str, &str, &str, &str)] = &[
     ("element", "tint", "colour #rrggbb (colour effect tint)", "Properties/Instance"),
     ("element", "tint_amount", "percent 0..100 (colour effect tint)", "Properties/Instance"),
     ("element", "symbol_set", "read-only: names of the symbols in this instance's set, owner first ([] when none)", "Properties/Instance"),
+    ("element", "similar_symbols", "read-only: names of the symbols Swap… lists as similar to the one shown, ranked (set members first)", "Properties/Instance"),
     ("element", "pick_from_set", "set member name, or {\"symbol\": name, \"start\": \"same_frame\"|\"from_start\"}: swap from the playhead on (reads the symbol shown there)", "Properties/Instance"),
     ("element", "include_in_set", "library symbol name to include in this instance's set (reads the names it would accept)", "Properties/Instance"),
     ("element", "remove_from_set", "member name to take out of the set (reads the names it would accept)", "Properties/Instance"),
@@ -236,6 +237,8 @@ struct Ctx {
     auto_key: bool,
     scene_index: usize,
     scene_names: Vec<String>,
+    /// Master Audio mode: `Editor::master_audio_lock` — `None` while off.
+    master_lock: Option<(Option<std::sync::Arc<Vec<u8>>>, String)>,
 }
 
 pub(super) fn layer_by_ref(scene: &Scene, text: &str) -> Result<LayerId, String> {
@@ -512,7 +515,8 @@ const INSTANCE_FIELDS: &[&str] = &[
     "tint", "tint_amount",
 ];
 /// The Set row and Include… menu of the Symbol Instance section.
-const SET_FIELDS: &[&str] = &["symbol_set", "pick_from_set", "include_in_set", "remove_from_set"];
+const SET_FIELDS: &[&str] =
+    &["symbol_set", "similar_symbols", "pick_from_set", "include_in_set", "remove_from_set"];
 const TEXT_FIELDS: &[&str] =
     &["text", "text_size", "text_font", "text_bold", "text_italic", "text_align"];
 
@@ -674,7 +678,7 @@ fn access(scene: &mut Scene, ctx: &Ctx, target: &Target, field: &str, op: Op) ->
         },
         Target::Camera => camera(scene, ctx, field, op),
         Target::Layer(id) => layer(scene, ctx, *id, field, op),
-        Target::Frame(layer, frame) => frame_field(scene, *layer, *frame, field, op),
+        Target::Frame(layer, frame) => frame_field(scene, ctx, *layer, *frame, field, op),
         Target::Element(id) => element(scene, ctx, *id, field, op),
         Target::Light(id) => light(scene, ctx, *id, field, op),
         Target::LightRig => {
@@ -1088,7 +1092,14 @@ fn parse_easing(v: &Value) -> Result<Easing, String> {
         .ok_or_else(|| usage.to_string())
 }
 
-fn frame_field(scene: &mut Scene, layer: LayerId, frame: u32, field: &str, op: Op) -> Result<Value, String> {
+fn frame_field(
+    scene: &mut Scene,
+    ctx: &Ctx,
+    layer: LayerId,
+    frame: u32,
+    field: &str,
+    op: Op,
+) -> Result<Value, String> {
     let set = op.is_set();
     let l = scene.layers().get(layer).cloned().ok_or("that layer no longer exists")?;
     let key = l.frames.keyframe_at(frame).ok_or("no keyframe governs that frame")?.clone();
@@ -1157,6 +1168,16 @@ fn frame_field(scene: &mut Scene, layer: LayerId, frame: u32, field: &str, op: O
                         let names: Vec<String> = scene.sounds().iter().map(|a| a.name.clone()).collect();
                         return Err(format!("no sound '{name}' in the library; sounds: {}", names.join(", ")));
                     };
+                    // Master Audio mode: only the master clip may go on a keyframe.
+                    if let Some((master, master_name)) = &ctx.master_lock {
+                        let is_master = match (master, scene.sounds().get(id)) {
+                            (Some(m), Some(a)) => std::sync::Arc::ptr_eq(m, &a.data),
+                            _ => false,
+                        };
+                        if !is_master {
+                            return Err(crate::editor::Editor::master_audio_refusal_text(master_name));
+                        }
+                    }
                     // Keep the settings and swap the clip, as the panel does.
                     Some(match key.sound {
                         Some(existing) => SoundRef { sound: id, ..existing },
@@ -1555,6 +1576,15 @@ fn set_field(
         ("symbol_set", Op::Set(_)) => {
             Err("'symbol_set' is read-only; use include_in_set, remove_from_set or pick_from_set".into())
         }
+        ("similar_symbols", Op::Get) => {
+            let bounds = scene.cached_bounds_table();
+            let similar: Vec<buzz_scene::SymbolId> =
+                library.similar_symbols(shown, &bounds).into_iter().map(|(sid, _)| sid).collect();
+            Ok(json!(names(&similar)))
+        }
+        ("similar_symbols", Op::Set(_)) => {
+            Err("'similar_symbols' is read-only; set 'symbol' to swap".into())
+        }
         ("include_in_set", Op::Get) => Ok(json!(names(&includable))),
         ("remove_from_set", Op::Get) => Ok(json!(names(&removable))),
         ("pick_from_set", Op::Get) => Ok(json!(name_of(shown))),
@@ -1749,6 +1779,7 @@ fn context(app: &App) -> Ctx {
         auto_key: editor.auto_keyframe,
         scene_index: editor.doc.active_scene(),
         scene_names: editor.doc.scene_names(),
+        master_lock: editor.master_audio_lock(),
     }
 }
 

@@ -453,7 +453,9 @@ fn frame_xml(
     if keyframe.tween.kind != buzz_scene::TweenKind::None {
         report.skip("tweens (keyframes are written, the interpolation is not)");
     }
-    if keyframe.sound.is_some() {
+    // A Master Audio guide layer's sound is never exported (nor reported as
+    // skipped: it was never meant to be heard).
+    if keyframe.sound.is_some() && !layer.audio_guide {
         report.skip("sound");
     }
 
@@ -474,7 +476,7 @@ fn object_xml(scene: &Scene, object: &Object, report: &mut FlaReport, indent: us
     match &object.kind {
         ObjectKind::Shape(shape) => {
             report.objects += 1;
-            shape_xml(shape, object.transform, report, indent)
+            shape_xml(shape, object.transform, object.drawing_object, report, indent)
         }
         ObjectKind::Group(children) => {
             report.objects += 1;
@@ -536,7 +538,7 @@ fn object_xml(scene: &Scene, object: &Object, report: &mut FlaReport, indent: us
         ObjectKind::Warp(warp) => {
             report.skip("warp handles (the warped artwork is written, the handles are not)");
             report.objects += 1;
-            shape_xml(&warp.warped(), object.transform, report, indent)
+            shape_xml(&warp.warped(), object.transform, object.drawing_object, report, indent)
         }
     }
 }
@@ -544,6 +546,7 @@ fn object_xml(scene: &Scene, object: &Object, report: &mut FlaReport, indent: us
 fn shape_xml(
     shape: &buzz_scene::ShapeData,
     transform: Affine,
+    drawing_object: bool,
     report: &mut FlaReport,
     indent: usize,
 ) -> String {
@@ -565,7 +568,8 @@ fn shape_xml(
     let has_fill = fill.is_some();
     let has_stroke = stroke.is_some();
 
-    let mut out = format!("{pad}<DOMShape>\n");
+    let drawing = if drawing_object { " isDrawingObject=\"true\"" } else { "" };
+    let mut out = format!("{pad}<DOMShape{drawing}>\n");
     if let Some((colour, alpha)) = fill {
         out.push_str(&format!(
             "{pad}  <fills>\n{pad}    <FillStyle index=\"1\">\n{pad}      <SolidColor color=\"{colour}\"{}/>\n{pad}    </FillStyle>\n{pad}  </fills>\n",

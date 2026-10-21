@@ -216,6 +216,7 @@ impl Remapper<'_> {
             modifiers: source.modifiers.clone(),
             text: source.text.clone(),
             turnaround: source.turnaround.clone(),
+            drawing_object: source.drawing_object,
         }
     }
 }

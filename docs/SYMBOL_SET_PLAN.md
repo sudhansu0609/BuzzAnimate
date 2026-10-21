@@ -141,3 +141,34 @@ name). Keep `ai_agent_coverage` green.
   later if asked).
 - Thumbnails in the dropdown.
 - Director / episode_build use of sets.
+
+## Part W: Swap… lists only similar symbols (asked 2026-10-21)
+
+The user asked for Properties ▸ Symbol Instance ▸ **Swap…** to show only symbols
+similar to the current one. Today it lists every other library symbol
+(`panels.rs`, `others`, ~1351), which on ep1 is 256 entries in random order.
+
+* **Similar** means any one of these:
+  1. A member of the same set (`Library::symbol_set`).
+  2. The same Library folder.
+  3. The same name stem. Lowercase the name and strip trailing digits,
+     " copy N", " (fN)", and separators `_ - .`.
+  4. A shared tag.
+  5. Similar size: the bounds aspect ratio is within ×1.5, and the area is
+     within ×3. Use the existing memoized symbol bounds and never re-measure
+     per frame.
+
+  It must also be the same `SymbolKind`, unless it's a set member. Order: set
+  members first, then by score (number of criteria matched), then by name.
+* Each entry shows the name with its folder in small weak text.
+* A search box sits at the top when there are more than 12 entries.
+* An **All symbols ▸** submenu sits at the bottom, so nothing becomes
+  unreachable. When nothing is similar, show "No similar symbols" above it.
+* The candidate list is computed once per selected symbol and cached by
+  `(symbol id, library revision)`, never rebuilt every frame.
+* The agent's `swap` read path (if any) gets the same ranked list as a
+  read-only field `similar_symbols`.
+
+| Step | What | State |
+|---|---|---|
+| W1 | `buzz_scene` helper `Library::similar_symbols(id, bounds) -> Vec<(SymbolId, score)>` + Swap… menu + cache + agent field | done 2026-10-21: `Library::similar_symbols` + `name_stem` (symbol.rs), Swap… lists similar (folder hint, search >12, All symbols ▸), cached in egui temp by (symbol id, `Library::content_id`); agent read-only `similar_symbols`. **Tightened same day:** a strong signal is required (set, tag, same non-root folder under 40 symbols, name stem, or shared meaningful `name_tokens`: at least 3 chars, in ≤25% of names, weighted by rarity, `ROLE_TOKENS` above character names); two role-named symbols must share a role; size adds only a bonus point. ep1 probe (256 symbols): Guddu_head → 4 (Lalten_head, Munna_head, headBAck, Police3Head34th1 copy 2); Guddu → 0 (shows "No similar symbols" + All symbols ▸); OldManSideBody copy 2 → 6 OldMan side limbs; helper ~0.25 ms per call, cached per (symbol, library). **Fix 2 (same day):** character class is a strong signal (+3) and a role. A character is tagged "character", filed under Cast/ (the master_audio rule, duplicated because that function is private to buzz-doc), or holds a depth-1 instance of a head/face symbol, unless its own name has a role token. Tokens, frequencies, folder sizes and character flags now sit in `Library`'s `SimilarIndex` memo, keyed on the symbol map through a `Weak`, so any edit misses. ep1: Guddu → chaiwalaback, Lalten, Munna; Guddu_head → Lalten_head, Munna_head, headBAck, Police3Head34th1 copy 2. The first call builds the index in 0.9 ms; later calls take about 0.05 ms. buzz-scene lib 549/549, buzz-ui lib 375/375, ai_agent_coverage 41/41. Not yet clicked in the real app. |

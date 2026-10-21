@@ -250,6 +250,12 @@ pub struct Layer {
     /// state — it never affects rendering.
     pub collapsed: bool,
 
+    /// **Master Audio guide**: a sound layer inside a character or head symbol
+    /// that carries the master clip so its waveform shows while animating
+    /// inside the symbol. Never heard and never exported (`Scene::stage_cues`
+    /// and XFL export skip it). `false` for every layer of every older document.
+    pub audio_guide: bool,
+
     /// Filters applied to everything on this layer, as one subject.
     ///
     /// **Animate has no layer filters** — there, filters belong to a movie clip
@@ -312,6 +318,7 @@ impl Layer {
             // On the focal plane, so a new layer is unaffected by perspective.
             depth: 0.0,
             collapsed: false,
+            audio_guide: false,
             filters: Vec::new(),
             frames: LayerTimeline::new(),
         }
@@ -405,6 +412,15 @@ impl Layer {
             .map(|o| o.bounds())
             .reduce(|a, b| a.union(b))
     }
+
+    /// **No artwork and no sound in any keyframe.** Shared by master audio's
+    /// layer tidy and Clean Up Layers (`docs/LAYER_MANAGEMENT_PLAN.md` L2).
+    pub fn is_empty_layer(&self) -> bool {
+        self.frames
+            .keyframes()
+            .iter()
+            .all(|k| k.objects.is_empty() && k.sound.is_none())
+    }
 }
 
 #[cfg(test)]
@@ -489,6 +505,13 @@ impl LayerStack {
 
     pub fn index_of(&self, id: LayerId) -> Option<usize> {
         self.layers.iter().position(|l| l.id == id)
+    }
+
+    /// A stack from rows already built, front to back (Arrange Layers, L3).
+    pub(crate) fn from_rows(rows: Vec<Arc<Layer>>) -> Self {
+        Self {
+            layers: Arc::new(rows),
+        }
     }
 
     /// Insert at the front (top of the timeline), where Animate puts new layers.
@@ -786,6 +809,14 @@ impl LayerStack {
             .filter(|l| l.follows == Some(id))
             .map(|l| l.id)
             .collect()
+    }
+
+    /// Does anything in the stack file itself under (`parent`), or follow,
+    /// `id`? Such a layer must not be deleted by a tidy pass.
+    pub fn is_depended_on(&self, id: LayerId) -> bool {
+        self.layers
+            .iter()
+            .any(|l| l.id != id && (l.parent == Some(id) || l.follows == Some(id)))
     }
 
     /// **Which layer rig each layer belongs to**: every layer in a follow tree

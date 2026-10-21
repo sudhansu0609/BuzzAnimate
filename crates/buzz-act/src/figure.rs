@@ -364,6 +364,7 @@ pub fn build(spec: &FigureSpec, id: ObjectId, mut next_id: impl FnMut() -> Objec
         modifiers: Vec::new(),
         text: None,
         turnaround: Default::default(),
+        drawing_object: false,
     }
 }
 

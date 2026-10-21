@@ -17,6 +17,8 @@ pub mod assets_panel;
 pub mod brush;
 pub mod camera_panel;
 pub mod character_panel;
+pub mod clear_keys_dialog;
+pub mod cleanup_dialog;
 pub mod command;
 pub mod command_palette;
 pub mod depth_panel;
@@ -63,6 +65,8 @@ pub use ai_models_dialog::{AiModelsState, ai_models_dialog, ModelDownloadProgres
 pub use ai_rename_dialog::{AiRenameAction, AiRenameState};
 pub use align::{Align, Distribute, MatchSize};
 pub use arrange_dialog::{ArrangeAction, ArrangeDialogState, arrange_dialog};
+pub use clear_keys_dialog::{ClearKeysState, clear_keys_dialog};
+pub use cleanup_dialog::{CleanupState, cleanup_dialog};
 pub use assets_panel::{AssetAction, AssetPanelState, ThumbnailSize, assets_panel};
 pub use brush::{BrushKind, BrushSettings, BrushTips, PatternShape};
 pub use camera_panel::{CameraPanelState, CameraResponse, camera_hud, camera_panel};
@@ -104,13 +108,15 @@ pub use story_panel::{
 };
 pub use style::{
     DrawStyle, DrawingMode, EraserMode, FillKind, StrokeKind, SymmetryMode, SymmetrySettings,
+    ToolDrawingModes,
 };
 pub use swatch_panel::{SwatchState, swatch_panel};
 pub use tasks_panel::{FinishedRow, TaskAction, TaskRow, TasksView, tasks_panel};
 pub use theme::{Metrics, Palette};
 pub use timeline_panel::{
-    FrameAction, MoveFrames, TimelineResponse, TimelineState, TweenRequest, Waveform,
-    frame_move_targets, timeline_panel,
+    FrameAction, LayerFilter, LayerRowCache, MoveFrames, RowFilter, TimelineResponse,
+    TimelineState, TweenRequest, Waveform, frame_move_targets, frame_move_targets_filtered,
+    row_filter_hidden, timeline_panel,
     timeline_panel_with_tools_slot,
 };
 pub use tools::{ToolId, ToolStatus, all_tools, tool_for_key};

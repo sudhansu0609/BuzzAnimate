@@ -93,6 +93,7 @@ fn character_with_head(editor: &mut Editor) -> (buzz_scene::SymbolId, buzz_scene
                         modifiers: Vec::new(),
                         text: None,
                         turnaround: Default::default(),
+                        drawing_object: false,
                     })],
                 );
             });

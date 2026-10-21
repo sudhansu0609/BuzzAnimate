@@ -1271,6 +1271,10 @@ pub struct LayerDto {
     pub depth: f64,
     #[serde(default)]
     pub collapsed: bool,
+    /// Master Audio guide layer (never heard, never exported). Absent means
+    /// an ordinary layer, which is every layer of every older document.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub audio_guide: bool,
     /// Filters applied to the whole layer. Version 9.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<FilterDto>,
@@ -1792,6 +1796,10 @@ pub struct ObjectDto {
     /// can hold, which keep writing `reverse` as they always did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub views: Vec<TurnaroundViewDto>,
+    /// Drawn in Object Drawing mode, so Merge strokes leave it alone. Absent
+    /// means merge paint, which is every object written before it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drawing_object: bool,
     pub kind: ObjectKindDto,
 }
 
@@ -2510,6 +2518,7 @@ impl LayerDto {
             height: layer.height,
             depth: layer.depth,
             collapsed: layer.collapsed,
+            audio_guide: layer.audio_guide,
             filters: layer.filters.iter().map(FilterDto::from_filter).collect(),
             length: layer.frames.length(),
             keyframes: layer
@@ -2576,6 +2585,7 @@ impl LayerDto {
             0.0
         };
         layer.collapsed = self.collapsed;
+        layer.audio_guide = self.audio_guide;
         layer.brightness = self.brightness;
         if let Some(t) = &self.tint {
             layer.tint = color_from_hex(t).unwrap_or(peniko::Color::WHITE);
@@ -3276,6 +3286,7 @@ impl ObjectDto {
                     drawing: Box::new(Self::from_object(&v.drawing, max_id, pool)),
                 })
                 .collect(),
+            drawing_object: object.drawing_object,
             kind,
         }
     }
@@ -3501,6 +3512,7 @@ impl ObjectDto {
                 }
                 turnaround
             },
+            drawing_object: self.drawing_object,
         })
     }
 }
@@ -4924,6 +4936,7 @@ mod tests {
                 modifiers: Vec::new(),
                 text: None,
                 turnaround: Default::default(),
+                drawing_object: false,
             },
         );
         scene
@@ -5240,6 +5253,7 @@ mod tests {
                 modifiers: Vec::new(),
                 text: None,
                 turnaround: Default::default(),
+                drawing_object: false,
             },
         );
 
@@ -6311,6 +6325,7 @@ pub(crate) mod test_support {
                 modifiers: Vec::new(),
                 text: None,
                 turnaround: Default::default(),
+                drawing_object: false,
             },
         );
 
@@ -6616,6 +6631,7 @@ mod rig_part_table_tests {
             modifiers: Vec::new(),
             text: None,
             turnaround: Default::default(),
+            drawing_object: false,
         };
         scene.library_mut().update(symbol, |s| {
             s.layers.update(symbol_layer, |l| {

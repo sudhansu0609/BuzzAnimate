@@ -256,6 +256,15 @@ fn file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// An Animate document: `.fla`, `.xfl`, an XFL folder or its
+/// `DOMDocument.xml` — what L3's auto-tidy runs after importing.
+fn is_animate_file(path: &std::path::Path) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
+    matches!(ext.as_deref(), Some("fla") | Some("xfl"))
+        || path.file_name().is_some_and(|n| n.eq_ignore_ascii_case("DOMDocument.xml"))
+        || path.join("DOMDocument.xml").is_file()
+}
+
 /// The resize arrow that lies along `direction` on screen — horizontal,
 /// vertical, or one of the two diagonals, whichever the line is nearest.
 ///
@@ -426,6 +435,9 @@ pub enum Pick {
     ImportSound,
     /// Sequence ▸ Set Master Audio\u{2026}
     SetMasterAudio,
+    /// Sequence ▸ Master Audio Mode with no master set yet: the master is
+    /// set from this file, then turning the mode on carries on.
+    SetMasterAudioForMode,
     /// File ▸ Import, into the stage or into the library.
     ImportInto(buzz_scene::ImportTarget),
     /// The root of an Animate asset library.
@@ -1165,6 +1177,10 @@ pub struct App {
     /// Ctrl+W on a dirty tab, or by Quit with any tab dirty. `None` when
     /// nothing is being asked.
     close_prompt: Option<ClosePrompt>,
+    /// Sequence ▸ Master Audio Mode was chosen once and its confirm is on
+    /// the status line; choosing it again turns the mode on. Disarmed by any
+    /// other command (`Self::dispatch`).
+    master_audio_confirm: bool,
 }
 
 /// **D2.** One open document that is not the live one in `self.editor` right
@@ -1319,6 +1335,7 @@ impl App {
             active_document: 0,
             open_queue: std::collections::VecDeque::new(),
             close_prompt: None,
+            master_audio_confirm: false,
         };
         app.recovery = app.find_recoveries();
         app
@@ -2593,7 +2610,7 @@ const KEYBOARD_COMMANDS: &[Command] = &[
 ];
 
 /// Collect commands raised by the keyboard.
-fn keyboard_commands(ctx: &egui::Context, editor: &Editor) -> Vec<Command> {
+fn keyboard_commands(ctx: &egui::Context, editor: &mut Editor) -> Vec<Command> {
     let mut out = Vec::new();
 
     // A focused text field owns the keyboard; stealing single letters from it
@@ -2682,10 +2699,10 @@ fn keyboard_commands(ctx: &egui::Context, editor: &Editor) -> Vec<Command> {
                 out.push(Command::SelectTool(tool));
             }
         }
-        // `J` toggles object drawing, as in Animate.
+        // `J` toggles the current tool's object drawing, as in Animate.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::J)) {
             // Handled directly; there is no menu command for it.
-            let _ = editor;
+            editor.toggle_drawing_mode();
         }
     }
 
@@ -3160,6 +3177,10 @@ impl App {
     pub(crate) fn build_ui(&mut self, ui: &mut egui::Ui) -> egui::Rect {
         let mut commands: Vec<Command> = Vec::new();
         self.editor.forget_bone_if_deselected();
+        // L3: Focus selection, when the active layer has changed.
+        self.editor.focus_folders_if_changed();
+        // K2: Protect Other Keyframes status lines and held Auto Keyframe.
+        self.editor.note_protected_edits();
         let can_undo = self.editor.doc.can_undo();
         let can_redo = self.editor.doc.can_redo();
         let ctx = ui.ctx().clone();
@@ -3723,6 +3744,44 @@ impl App {
         if let Some(settings) = title_card.add {
             let _ = self.editor.add_title_card(&settings);
         }
+        // Clear All Keyframes: one undo step on the chosen symbol.
+        if let Some((symbol, keep, nested)) =
+            buzz_ui::clear_keys_dialog(&ctx, &mut self.editor.clear_keys)
+        {
+            let origin = self.editor.clear_keys_origin.take();
+            self.editor.clear_symbol_keyframes_from(symbol, keep, nested, origin);
+        }
+        // Clean Up Layers: one undo step over the chosen scope.
+        if let Some((scope, options)) =
+            buzz_ui::cleanup_dialog(&ctx, &mut self.editor.cleanup, self.editor.doc.scene())
+        {
+            self.editor.clean_up_layers(scope, options);
+        }
+        // Repair Layer Rigs: pick the scope, one undo step.
+        if self.editor.repair_rigs_open {
+            let mut open = true;
+            let mut chosen = None;
+            egui::Window::new("Repair Layer Rigs")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(&ctx, |ui| {
+                    ui.label("Rewire rigs built with the old Bones \u{2192} Layers wiring. No frame changes.");
+                    ui.horizontal(|ui| {
+                        if ui.button("This timeline").clicked() {
+                            chosen = Some(buzz_scene::CleanupScope::Timeline);
+                        }
+                        if ui.button("Whole scene").clicked() {
+                            chosen = Some(buzz_scene::CleanupScope::WholeScene);
+                        }
+                    });
+                });
+            if let Some(scope) = chosen {
+                self.editor.repair_layer_rigs(scope);
+                open = false;
+            }
+            self.editor.repair_rigs_open = open;
+        }
 
         // Ctrl+K opens the command palette, a search box over every command;
         // it runs whatever the list has highlighted. Handled here, ahead of the
@@ -3737,7 +3796,7 @@ impl App {
             commands.push(command);
         }
 
-        commands.extend(keyboard_commands(&ctx, &self.editor));
+        commands.extend(keyboard_commands(&ctx, &mut self.editor));
         // While a script owns the document — or an import is being merged —
         // nothing else may touch it, keyboard shortcuts included, which the
         // modal backdrop does not catch. The one thing still live is the
@@ -4519,7 +4578,9 @@ impl App {
                     &mut editor.workspace.rig,
                     &mut editor.workspace.pan_speed,
                 );
+                let modes_changed = self.editor.remember_drawing_modes();
                 if self.editor.remember_brush_tips()
+                    || modes_changed
                     || self.editor.workspace.pan_speed != pan_speed_before
                     || self.editor.workspace.rig != rig_before
                 {
@@ -4538,12 +4599,14 @@ impl App {
             }
 
             Layers => {
+                let row_filter = self.editor.layer_row_filter();
                 let editor = &mut self.editor;
                 let selection = &mut editor.selection;
                 let frame = editor.current_frame;
                 let mut raised = None;
                 editor.doc.edit("Layer Properties", |scene| {
-                    raised = panels::layers_panel(ui, scene, selection, frame);
+                    raised =
+                        panels::layers_panel_filtered(ui, scene, selection, frame, &row_filter);
                 });
                 if let Some(command) = raised {
                     commands.push(command);
@@ -5122,6 +5185,7 @@ impl App {
             }
 
             Timeline => {
+                let row_filter = self.editor.layer_row_filter();
                 let state = buzz_ui::TimelineState {
                     current_frame: self.editor.current_frame,
                     active_layer: self.editor.selection.active_layer(),
@@ -5138,6 +5202,12 @@ impl App {
                     onion_after: self.editor.onion.after,
                     frame_width: self.editor.workspace.frame_width,
                     row_scale: self.editor.workspace.row_scale,
+                    compact: self.editor.workspace.row_scale_before_compact.is_some(),
+                    focus_folders: self.editor.workspace.focus_folders,
+                    protect_keyframes: self.editor.workspace.protect_scope(),
+                    layer_filter: self.editor.workspace.layer_filter,
+                    layer_search: self.editor.layer_search.clone(),
+                    row_filter,
                     parenting_view: self.editor.workspace.parenting_view,
                     depth_view: self.editor.workspace.depth_view,
                     focal_distance: self.editor.scene().camera().focal_distance,
@@ -5577,7 +5647,13 @@ impl App {
 
         let response = buzz_ui::sound_panel(ui, &library, current, on_keyframe, sound_frame);
 
-        if let Some(reference) = response.set
+        // Master Audio mode: only the master clip (or none) may be picked.
+        let refusal = response
+            .set
+            .and_then(|reference| editor.master_audio_refusal(reference.map(|r| r.sound)));
+        if let Some(refusal) = refusal {
+            editor.status = Some(refusal);
+        } else if let Some(reference) = response.set
             && let Some(layer) = layer
         {
             editor.doc.edit("Sound Settings", |scene| {
@@ -6723,7 +6799,47 @@ impl App {
                 *buzz_ui::workspace::ROW_SCALE_RANGE.start(),
                 *buzz_ui::workspace::ROW_SCALE_RANGE.end(),
             );
+            // Sizing the rows by hand ends Compact.
+            self.editor.workspace.row_scale_before_compact = None;
             self.editor.workspace.save();
+        }
+        // L1: Compact rows, and back to the height they had before.
+        if response.toggle_compact {
+            let ws = &mut self.editor.workspace;
+            match ws.row_scale_before_compact.take() {
+                Some(previous) => ws.row_scale = previous,
+                None => {
+                    ws.row_scale_before_compact = Some(ws.row_scale);
+                    ws.row_scale = *buzz_ui::workspace::ROW_SCALE_RANGE.start();
+                }
+            }
+            ws.save();
+        }
+        // L1: the layer filter is a saved view setting; the search is not.
+        if let Some(filter) = response.set_layer_filter {
+            self.editor.workspace.layer_filter = filter;
+            self.editor.workspace.save();
+        }
+        if let Some(search) = response.set_layer_search {
+            self.editor.layer_search = search;
+        }
+        // L3: Focus selection is a saved view setting.
+        if response.toggle_focus_folders {
+            let ws = &mut self.editor.workspace;
+            ws.focus_folders = !ws.focus_folders;
+            ws.save();
+            self.editor.focus_seen = None;
+        }
+        // K2: the Protect lock and its scope run the same commands as the menu.
+        if response.toggle_protect_keyframes {
+            self.editor.run(Command::ToggleProtectKeyframes);
+        }
+        match response.set_protect_scope {
+            Some(buzz_scene::ProtectScope::ThisKeyframe) => {
+                self.editor.run(Command::ProtectThisKeyframe)
+            }
+            Some(buzz_scene::ProtectScope::FromHere) => self.editor.run(Command::ProtectFromHere),
+            None => {}
         }
     }
 
@@ -7483,6 +7599,12 @@ impl App {
                         .small(),
                 );
             }
+            // Master Audio mode's badge (docs/MASTER_AUDIO_AND_PROTECT_PLAN.md Part M).
+            if let Some((_, name)) = self.editor.master_audio_lock() {
+                ui.separator();
+                ui.label(egui::RichText::new(format!("\u{266a} MASTER: {name}")).small())
+                    .on_hover_text("Master Audio mode: other sounds are blocked");
+            }
             if let Some(status) = &self.editor.status {
                 ui.separator();
                 // Capped, so a long message truncates rather than pushing
@@ -7636,6 +7758,14 @@ impl App {
             ui.separator();
 
             item(ui, Command::ConvertToSymbol, has_selection);
+            let has_instance = self.editor.selection.iter().any(|id| {
+                self.editor
+                    .doc
+                    .scene()
+                    .find_object(id)
+                    .is_some_and(|(_, o)| o.instance().is_some())
+            });
+            item(ui, Command::ClearAllKeyframes, has_instance);
             // **Keeping artwork as an asset, where the artwork is.** The panel
             // has a button for this, but it is the panel's button — you have to
             // find the panel, and by then you have stopped looking at the thing
@@ -8014,9 +8144,15 @@ impl App {
     }
 
     pub(crate) fn dispatch(&mut self, command: Command) {
+        // Master Audio mode's confirm is "choose it again"; anything else in
+        // between disarms it, so a stale count is never confirmed.
+        if command != Command::ToggleMasterAudioMode {
+            self.master_audio_confirm = false;
+        }
         match command {
             Command::ImportSound => self.import_sound_dialog(),
             Command::SetMasterAudio => self.set_master_audio_dialog(),
+            Command::ToggleMasterAudioMode => self.toggle_master_audio_mode(),
             Command::ImportCaptions => self.ask_for_path(
                 crate::dialogs::Request::open_file().filter("Subtitles", &["srt", "vtt"]),
                 Pick::ImportCaptions,
@@ -8762,6 +8898,12 @@ impl App {
             Pick::SequenceFolder => self.sequence_folder_from(path),
             Pick::ImportSound => self.import_sound_from(path),
             Pick::SetMasterAudio => self.set_master_audio_from(path),
+            Pick::SetMasterAudioForMode => {
+                self.set_master_audio_from(path);
+                if self.editor.doc.master_audio().is_some() {
+                    self.toggle_master_audio_mode();
+                }
+            }
             Pick::ImportCaptions => match self.editor.import_captions(&path) {
                 Ok(_) => {}
                 Err(e) => self.editor.status = Some(format!("Could not read those captions: {e}")),
@@ -9682,6 +9824,8 @@ impl App {
                             }
                         }
                         self.editor.status = Some(msg);
+                        // L3 auto-tidy after AI scene direction.
+                        self.editor.auto_tidy_layers("Directed story");
                     }
                     Some(Err(e)) => {
                         self.editor.status = Some(format!("Directing failed: {e}"));
@@ -9746,6 +9890,7 @@ impl App {
                             modifiers: Vec::new(),
                             text: None,
                             turnaround: Default::default(),
+                            drawing_object: false,
                         };
                         match replace {
                             Some(object_id) => {
@@ -11162,6 +11307,10 @@ impl App {
     }
 
     fn import_sound_from(&mut self, path: std::path::PathBuf) {
+        if let Some(refusal) = self.editor.master_audio_import_refusal() {
+            self.editor.status = Some(refusal);
+            return;
+        }
         match self.editor.import_sound(&path) {
             Ok(name) => {
                 self.editor.status = Some(if self.editor.sound_was_placed() {
@@ -11179,6 +11328,10 @@ impl App {
     /// own (`Editor::import_sound` already gives every call its own layer).
     fn import_sounds_from(&mut self, mut paths: Vec<std::path::PathBuf>) {
         if paths.is_empty() {
+            return;
+        }
+        if let Some(refusal) = self.editor.master_audio_import_refusal() {
+            self.editor.status = Some(refusal);
             return;
         }
         if paths.len() == 1 {
@@ -11207,6 +11360,9 @@ impl App {
 
     fn set_master_audio_from(&mut self, path: std::path::PathBuf) {
         match self.editor.set_master_audio_from_file(&path) {
+            // With Master Audio mode on, the status already says what the
+            // re-run Enforce did.
+            Ok(_) if self.editor.doc.master_audio_mode() => {}
             Ok(name) => {
                 self.editor.status =
                     Some(format!("{name} is the master audio \u{2014} the Sequence strip shows it"))
@@ -11215,6 +11371,43 @@ impl App {
                 self.editor.status = Some(format!("Could not set that as the master audio: {e:#}"))
             }
         }
+    }
+
+    /// **Sequence \u{25b8} Master Audio Mode** — see
+    /// `docs/MASTER_AUDIO_AND_PROTECT_PLAN.md` Part M. Off: just turns it off.
+    /// On with no master yet: the Set Master Audio dialog first. On: the
+    /// counts go on the status line, and choosing it again confirms (the
+    /// app's click-again confirm, as Delete in the Cast and Assets panels).
+    fn toggle_master_audio_mode(&mut self) {
+        if self.editor.doc.master_audio_mode() {
+            self.master_audio_confirm = false;
+            self.editor.doc.set_master_audio_mode(false);
+            self.editor.status = Some("Master Audio mode off".into());
+            return;
+        }
+        if self.editor.doc.master_audio().is_none() {
+            self.master_audio_confirm = false;
+            self.ask_for_path(
+                crate::dialogs::Request::open_file()
+                    .filter("Sound", &["wav", "mp3", "ogg", "flac", "m4a", "aac"]),
+                Pick::SetMasterAudioForMode,
+            );
+            return;
+        }
+        if !self.master_audio_confirm {
+            let p = self.editor.doc.master_audio_preview();
+            self.master_audio_confirm = true;
+            self.editor.status = Some(format!(
+                "Master Audio mode will remove {} other sound(s) and {} empty layer(s) across {} scene(s), \
+                 and add the master to every scene, character and head ({} symbol(s)). Each scene can be \
+                 undone with Ctrl+Z. Choose Sequence \u{25b8} Master Audio Mode again to confirm.",
+                p.sounds_removed, p.layers_removed, p.scenes_touched, p.symbols_given_guide
+            ));
+            return;
+        }
+        self.master_audio_confirm = false;
+        self.editor.doc.set_master_audio_mode(true);
+        self.editor.enforce_master_audio_now();
     }
 
     /// Open the Lip Sync dialog.
@@ -11572,8 +11765,10 @@ impl App {
         // through an `Option` so the closure can move the owned scene in even
         // though `edit` takes an `FnMut`.
         let mut scene = Some(scene);
+        let mut stage_grew = false;
         self.editor.doc.edit("Import", |live| {
             if let Some(merged) = scene.take() {
+                stage_grew = merged.stage_layers().len() != live.stage_layers().len();
                 *live = merged;
             }
         });
@@ -11587,6 +11782,10 @@ impl App {
 
         let name = file_name(&path);
         self.editor.status = Some(format!("Imported {name}: {}", report.summary()));
+        // L3 auto-tidy after an XFL/FLA import onto the stage.
+        if stage_grew && is_animate_file(&path) {
+            self.editor.auto_tidy_layers(&format!("Imported {name}"));
+        }
 
         // Only interrupt the user when something was actually lost or moved.
         if !imported_unsupported.is_empty() || !report.renamed.is_empty() {
@@ -12017,6 +12216,10 @@ impl App {
         self.open_document_in_new_tab(doc);
         self.remember_document_directory(path);
         self.editor.status = Some(format!("Opened {name} — {}", imported.summary));
+        // L3 auto-tidy after an XFL/FLA import (`Workspace::auto_tidy_layers`).
+        if is_animate_file(path) {
+            self.editor.auto_tidy_layers(&format!("Opened {name}"));
+        }
 
         // What did not survive the translation is worth interrupting for: it is
         // the difference between the file they had and the one they now have.
@@ -20112,6 +20315,7 @@ mod every_menu_command_tests {
         Command::TestMovie,
         Command::ImportSound,
         Command::SetMasterAudio,
+        Command::ToggleMasterAudioMode,
         Command::ImportCaptions,
         Command::ExportCaptions,
         Command::ImportVideoReference,

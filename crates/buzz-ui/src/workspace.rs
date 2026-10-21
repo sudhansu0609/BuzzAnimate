@@ -450,6 +450,26 @@ pub struct Workspace {
     /// Row height, as a multiple of the standard row.
     #[serde(default = "default_row_scale")]
     pub row_scale: f32,
+    /// The row height to go back to when the timeline's **Compact** toggle is
+    /// switched off. `Some` while Compact is on. L1 of
+    /// `docs/LAYER_MANAGEMENT_PLAN.md`.
+    #[serde(default)]
+    pub row_scale_before_compact: Option<f32>,
+    /// Which layer rows the timeline and Layers panel show: all of them, only
+    /// the ones with content, or only the ones with content at the playhead.
+    /// A view setting, never part of the film. L1.
+    #[serde(default)]
+    pub layer_filter: crate::timeline_panel::LayerFilter,
+    /// **Auto-tidy**: run Arrange Layers (with its empty-layer cleanup)
+    /// silently after the builds that make the mess — episode/Producer scene
+    /// builds, Set Up Shot, XFL/FLA import, AI scene direction. On by default.
+    /// L3 of `docs/LAYER_MANAGEMENT_PLAN.md`.
+    #[serde(default = "default_true")]
+    pub auto_tidy_layers: bool,
+    /// **Focus selection**: when the active layer changes, open its folders
+    /// and close the other top-level folders. Off by default. L3.
+    #[serde(default)]
+    pub focus_folders: bool,
     /// How big the Assets panel draws its pictures, and so how it lays them
     /// out. A way of looking at the library rather than part of any film.
     #[serde(default)]
@@ -492,6 +512,19 @@ pub struct Workspace {
     /// `.buzz` file. See [`crate::brush::BrushSettings::tip`].
     #[serde(default)]
     pub brush_tips: crate::brush::BrushTips,
+    /// Merge or Object Drawing for each drawing tool and brush. Per person,
+    /// like [`Self::brush_tips`].
+    #[serde(default)]
+    pub drawing_modes: crate::style::ToolDrawingModes,
+    /// **Protect Other Keyframes** (Part K of
+    /// `docs/MASTER_AUDIO_AND_PROTECT_PLAN.md`): edits inside a shared symbol
+    /// opened in place change only the clicked keyframe. Per person, like
+    /// [`Self::drawing_modes`]; see [`Self::protect_scope`].
+    #[serde(default)]
+    pub protect_keyframes: bool,
+    /// Protect scope: `false` = this keyframe, `true` = this keyframe and later.
+    #[serde(default)]
+    pub protect_from_here: bool,
     /// The Trace Bitmap settings, remembered between traces. A person's own
     /// preference for the same reason [`Self::brush_tips`] is. Only the
     /// dialog reads this directly — see `Editor::default()`'s note about why.
@@ -960,6 +993,15 @@ impl WorkspacePreset {
 }
 
 impl Workspace {
+    /// The Protect Other Keyframes scope to hand the document, `None` when off.
+    pub fn protect_scope(&self) -> Option<buzz_scene::ProtectScope> {
+        self.protect_keyframes.then_some(if self.protect_from_here {
+            buzz_scene::ProtectScope::FromHere
+        } else {
+            buzz_scene::ProtectScope::ThisKeyframe
+        })
+    }
+
     /// The shortcut a command runs on now: the user's override if there is one,
     /// otherwise the command's built-in default. An override of `None` means the
     /// user has unbound it, so it has no shortcut at all.
@@ -1265,12 +1307,19 @@ impl Workspace {
             bottom_height: 170.0,
             frame_width: default_frame_width(),
             row_scale: default_row_scale(),
+            row_scale_before_compact: None,
+            layer_filter: crate::timeline_panel::LayerFilter::All,
+            auto_tidy_layers: true,
+            focus_folders: false,
             parenting_view: false,
             depth_view: false,
             rig: RigOptions::default(),
             pan_speed: default_pan_speed(),
             exports_at_once: default_exports_at_once(),
             brush_tips: crate::brush::BrushTips::default(),
+            drawing_modes: crate::style::ToolDrawingModes::default(),
+            protect_keyframes: false,
+            protect_from_here: false,
             trace: buzz_scene::TraceOptions::default(),
             asset_thumbnail_size: crate::assets_panel::ThumbnailSize::default(),
             keymap: std::collections::BTreeMap::new(),

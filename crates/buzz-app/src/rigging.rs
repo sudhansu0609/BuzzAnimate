@@ -217,6 +217,7 @@ pub fn rig_object(
             modifiers: Vec::new(),
             text: None,
             turnaround: Default::default(),
+            drawing_object: false,
         };
 
         let mut rig = ArmatureData::new(armature);
@@ -628,6 +629,7 @@ pub fn rig_character(
             modifiers: Vec::new(),
             text: None,
             turnaround: Default::default(),
+            drawing_object: false,
         },
     )
 }
@@ -754,7 +756,11 @@ fn place_layer_rig(
         anchor = layer;
     }
 
-    let layer_of = |slot: usize| layers.iter().find(|(s, _)| *s == slot).map(|(_, l)| *l);
+    // A bone can carry several parts (an arm and its sleeve), each on its own
+    // layer. The slot's *front-most* layer leads: it is the one a click on
+    // the limb lands on, the other pieces of the limb follow it, and so does
+    // every child — so moving the arm carries its sleeve and its elbow.
+    let layer_of = |slot: usize| layers.iter().rev().find(|(s, _)| *s == slot).map(|(_, l)| *l);
     let ancestor_layer = |slot: usize| {
         let mut current = parents.get(slot).copied().flatten();
         // Bounded by the slot count, against a parent cycle.
@@ -775,7 +781,10 @@ fn place_layer_rig(
         .and_then(layer_of)?;
 
     for &(slot, layer) in &layers {
-        let parent = ancestor_layer(slot).or((layer != root).then_some(root));
+        let lead = layer_of(slot).filter(|lead| *lead != layer);
+        let parent = lead
+            .or_else(|| ancestor_layer(slot))
+            .or((layer != root).then_some(root));
         if parent.is_some() {
             scene.set_follows(layer, parent, frame);
         }
@@ -922,6 +931,276 @@ pub fn layer_rig_of(scene: &Scene, layer: LayerId) -> Option<Vec<LayerId>> {
         index += 1;
     }
     (tree.len() > 1).then_some(tree)
+}
+
+/// What [`repair_layer_rigs`] found and did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepairReport {
+    /// Layer rigs (follow trees of two or more layers) looked at.
+    pub rigs: usize,
+    /// Layers whose `follows` link changed.
+    pub links_changed: usize,
+    /// Keyframes whose objects were rebaked so nothing moved.
+    pub keys_rebaked: usize,
+}
+
+/// One rig's rewiring: the new link of every layer in it, and the order to
+/// rebake them in (every layer after the layer it follows).
+struct RigRepair {
+    follows: Vec<(LayerId, Option<LayerId>)>,
+    order: Vec<LayerId>,
+}
+
+/// **Repair Layer Rigs.** Rewire layer rigs built with the old
+/// [`place_layer_rig`] wiring — a slot's *back-most* layer led, its other
+/// pieces followed the parent slot, its children followed the back-most piece
+/// — to the current one: the slot's front-most layer leads, the slot's other
+/// pieces follow it, and so does every child slot's lead.
+///
+/// A slot is recovered from the layer names (every piece of one part is named
+/// after its slot), and a slot's parent from the layer its pieces follow
+/// outside the slot. Every keyframe of every layer in a rewired rig is rebaked
+/// so its world transform is what it was, parents before children, so no
+/// keyframe looks different. A rig already wired this way is left alone.
+pub fn repair_layer_rigs(scene: &mut Scene, scope: buzz_scene::CleanupScope) -> RepairReport {
+    let mut report = RepairReport::default();
+    let targets: Vec<Option<buzz_scene::SymbolId>> = match scope {
+        buzz_scene::CleanupScope::Timeline => {
+            vec![scene.editing_symbol().filter(|id| scene.library().get(*id).is_some())]
+        }
+        buzz_scene::CleanupScope::WholeScene => std::iter::once(None)
+            .chain(scene.library().iter().map(|s| Some(s.id)))
+            .collect(),
+    };
+    for target in targets {
+        let plans = {
+            let stack = match target {
+                None => scene.stage_layers(),
+                Some(id) => match scene.library().get(id) {
+                    Some(symbol) => &symbol.layers,
+                    None => continue,
+                },
+            };
+            let (rigs, plans) = rig_repair_plans(stack);
+            report.rigs += rigs;
+            plans
+        };
+        if plans.is_empty() {
+            continue;
+        }
+        let stack = match target {
+            None => scene.edit_stage_layers(),
+            Some(id) => match scene.library_mut().layers_mut(id) {
+                Some(stack) => stack,
+                None => continue,
+            },
+        };
+        for plan in &plans {
+            let (links, keys) = apply_rig_repair(stack, plan);
+            report.links_changed += links;
+            report.keys_rebaked += keys;
+        }
+    }
+    report
+}
+
+/// How many follow trees `stack` holds, and the rewiring of those that need it.
+fn rig_repair_plans(stack: &buzz_scene::LayerStack) -> (usize, Vec<RigRepair>) {
+    use std::collections::HashMap;
+    let roots = stack.follow_roots();
+    // Members of each tree, front to back.
+    let mut trees: Vec<(LayerId, Vec<LayerId>)> = Vec::new();
+    for layer in stack.iter() {
+        let Some(&root) = roots.get(&layer.id) else {
+            continue;
+        };
+        match trees.iter_mut().find(|(r, _)| *r == root) {
+            Some((_, members)) => members.push(layer.id),
+            None => trees.push((root, vec![layer.id])),
+        }
+    }
+    let follows_of = |id: LayerId| stack.get(id).and_then(|l| l.follows);
+
+    let mut plans = Vec::new();
+    'tree: for (root, members) in &trees {
+        if members
+            .iter()
+            .any(|id| stack.get(*id).is_some_and(|l| l.follows_bone.is_some()))
+        {
+            continue;
+        }
+        // Slots by layer name, each front to back; a name whose pieces hang
+        // off different slots is not one part, so its pieces stand alone.
+        let mut slots: Vec<Vec<LayerId>> = Vec::new();
+        for id in members {
+            let name = stack.get(*id).map_or("", |l| l.name.as_str());
+            match slots.iter_mut().find(|s| stack.get(s[0]).is_some_and(|l| l.name == name)) {
+                Some(slot) => slot.push(*id),
+                None => slots.push(vec![*id]),
+            }
+        }
+        let parent_slot = loop {
+            let slot_of: HashMap<LayerId, usize> = slots
+                .iter()
+                .enumerate()
+                .flat_map(|(i, s)| s.iter().map(move |id| (*id, i)))
+                .collect();
+            let mut parents: Vec<Option<usize>> = vec![None; slots.len()];
+            let mut split = None;
+            for (i, pieces) in slots.iter().enumerate() {
+                let outside: Vec<usize> = pieces
+                    .iter()
+                    .filter_map(|id| follows_of(*id))
+                    .filter_map(|t| slot_of.get(&t).copied())
+                    .filter(|s| *s != i)
+                    .collect();
+                if outside.iter().any(|s| *s != outside[0]) {
+                    split = Some(i);
+                    break;
+                }
+                parents[i] = outside.first().copied();
+            }
+            match split {
+                Some(i) => {
+                    let pieces = slots.remove(i);
+                    slots.extend(pieces.into_iter().map(|id| vec![id]));
+                }
+                None => break parents,
+            }
+        };
+        let Some(root_slot) = slots.iter().position(|s| s.contains(root)) else {
+            continue;
+        };
+        // Every slot but the root's must hang off another, and reach the root.
+        for (i, _) in slots.iter().enumerate() {
+            let mut current = i;
+            for _ in 0..=slots.len() {
+                if current == root_slot {
+                    break;
+                }
+                match parent_slot[current] {
+                    Some(up) => current = up,
+                    None => continue 'tree,
+                }
+            }
+            if current != root_slot {
+                continue 'tree;
+            }
+        }
+
+        let lead = |slot: usize| slots[slot][0];
+        let mut follows = Vec::new();
+        let mut order = Vec::new();
+        let mut queue = vec![root_slot];
+        let mut index = 0;
+        while index < queue.len() {
+            let slot = queue[index];
+            index += 1;
+            for &piece in &slots[slot] {
+                let target = if piece == lead(slot) {
+                    (slot != root_slot).then(|| parent_slot[slot].map(lead)).flatten()
+                } else {
+                    Some(lead(slot))
+                };
+                follows.push((piece, target));
+                order.push(piece);
+            }
+            queue.extend((0..slots.len()).filter(|s| *s != root_slot && parent_slot[*s] == Some(slot)));
+        }
+        if follows.iter().any(|(id, target)| follows_of(*id) != *target) {
+            plans.push(RigRepair { follows, order });
+        }
+    }
+    (trees.len(), plans)
+}
+
+/// Rewire one rig and rebake it so every keyframe keeps its world transform:
+/// `(links changed, keyframes rebaked)`.
+fn apply_rig_repair(stack: &mut buzz_scene::LayerStack, plan: &RigRepair) -> (usize, usize) {
+    use std::collections::{HashMap, HashSet};
+    let close = |a: Affine, b: Affine| {
+        a.as_coeffs()
+            .iter()
+            .zip(b.as_coeffs().iter())
+            .all(|(x, y)| (x - y).abs() < 1e-6)
+    };
+
+    // Where everything stands under the old links.
+    let mut worlds: HashMap<LayerId, Vec<(u32, Vec<Affine>)>> = HashMap::new();
+    for &id in &plan.order {
+        let Some(layer) = stack.get(id) else { continue };
+        let keys = layer
+            .frames
+            .keyframes()
+            .iter()
+            .map(|k| {
+                let inherited = stack.inherited_transform(id, k.start);
+                (k.start, k.objects.iter().map(|o| inherited * o.transform).collect())
+            })
+            .collect();
+        worlds.insert(id, keys);
+    }
+    let was_followed: HashSet<LayerId> = plan
+        .order
+        .iter()
+        .copied()
+        .filter(|id| !stack.followers_of(*id).is_empty())
+        .collect();
+    let followed: HashSet<LayerId> = plan.follows.iter().filter_map(|(_, t)| *t).collect();
+
+    let mut links = 0;
+    for &(id, target) in &plan.follows {
+        if stack.get(id).and_then(|l| l.follows) != target {
+            stack.update(id, |l| {
+                l.follows = target;
+                l.follows_bone = None;
+            });
+            links += 1;
+        }
+    }
+
+    // Parents first, so each layer's new inheritance is already final.
+    let mut keys = 0;
+    for &id in &plan.order {
+        let mut rebaked = false;
+        for (start, objects) in worlds.get(&id).map(Vec::as_slice).unwrap_or(&[]) {
+            let Some(into_local) = invert(stack.inherited_transform(id, *start)) else {
+                continue;
+            };
+            let local: Vec<Affine> = objects.iter().map(|w| into_local * *w).collect();
+            let differs = stack
+                .get(id)
+                .and_then(|l| l.frames.keyframes().iter().find(|k| k.start == *start))
+                .is_some_and(|k| k.objects.iter().zip(&local).any(|(o, n)| !close(o.transform, *n)));
+            if differs {
+                stack.update(id, |l| {
+                    if let Some(k) = l.frames.keyframes_mut().iter_mut().find(|k| k.start == *start) {
+                        let objects = Arc::make_mut(&mut k.objects);
+                        for (object, transform) in objects.iter_mut().zip(&local) {
+                            Arc::make_mut(object).transform = *transform;
+                        }
+                    }
+                });
+                keys += 1;
+                rebaked = true;
+            }
+        }
+        // The rest pose its followers measure motion from: where it stands at
+        // frame 0, recorded as `Scene::set_follows` does, for a layer that has
+        // just become a parent or whose keys moved; none for one nothing
+        // follows any more.
+        if followed.contains(&id) {
+            if rebaked || !was_followed.contains(&id) {
+                let rest = stack
+                    .get(id)
+                    .and_then(|l| l.frames.resolved_at(0u32).iter().next().map(|o| o.transform));
+                stack.update(id, |l| l.rest_pose = rest);
+            }
+        } else if stack.get(id).is_some_and(|l| l.rest_pose.is_some()) {
+            stack.update(id, |l| l.rest_pose = None);
+        }
+    }
+    (links, keys)
 }
 
 /// The built-in pattern whose slot names match the most of these layers'

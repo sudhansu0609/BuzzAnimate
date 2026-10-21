@@ -2057,6 +2057,8 @@ struct FrameContext {
     shape_wants_matrix: bool,
     /// The open shape's own placement: its edges are in its own space.
     shape_matrix: Option<Affine>,
+    /// The open shape says `isDrawingObject="true"`.
+    shape_drawing_object: bool,
     /// A `<transformationPoint>` is open and the `<Point>` inside it belongs
     /// to the object just pushed. `<Point>` appears elsewhere in XFL, so it
     /// is only taken when something has asked for it.
@@ -2415,6 +2417,15 @@ impl FrameContext {
                 object.transform = matrix * object.transform;
             }
         }
+        // A drawing object stays out of later Merge strokes.
+        if std::mem::take(&mut self.shape_drawing_object)
+            && let Some(frame) = self.current.as_mut()
+        {
+            let from = frame.objects.len().saturating_sub(made);
+            for object in &mut frame.objects[from..] {
+                std::sync::Arc::make_mut(object).drawing_object = true;
+            }
+        }
         self.shape_wants_matrix = false;
         // Counted after the closure has finished with `report`.
         report.shapes += made;
@@ -2508,6 +2519,8 @@ impl FrameContext {
                 self.styles.begin_shape();
                 self.shape_wants_matrix = true;
                 self.shape_matrix = None;
+                self.shape_drawing_object =
+                    attrs.get("isDrawingObject").is_some_and(|v| v.trim() == "true");
             }
             // Past the point where a shape's own matrix could come.
             "fills" | "strokes" | "edges" => {

@@ -11,6 +11,7 @@ pub mod autosave;
 pub mod commands;
 pub mod format;
 pub mod history;
+pub mod master_audio;
 pub mod project;
 pub mod sequence;
 pub mod serial;
@@ -21,12 +22,15 @@ pub mod templates;
 use std::path::{Path, PathBuf};
 
 use buzz_scene::{ImportTarget, LayerId, LayerKind, Scene, SoundAsset, SoundId, SoundRef, SoundSync};
+pub use buzz_scene::{EditOrigin, ForkReport, ProtectScope};
 
 pub use assets::{Asset, AssetLibrary, rig_kind_of};
 pub use autosave::{Autosave, AutosavePlan, Recovery, find_recoveries};
 pub use commands::{CommandLibrary, SavedCommand};
 pub use format::{DocError, EXTENSION, MIMETYPE, Meta};
-pub use history::{History, UndoLabel};pub use project::{FilmError, PROJECT_EXTENSION, PROJECT_VERSION, Project, Shot};
+pub use history::{History, UndoLabel};
+pub use master_audio::MasterAudioReport;
+pub use project::{FilmError, PROJECT_EXTENSION, PROJECT_VERSION, Project, Shot};
 pub use sequence::{SceneKey, SceneRole, ShotInfo};
 pub use serial::{FORMAT_VERSION, SerialError};
 pub use snapshots::SnapshotLibrary;
@@ -94,6 +98,15 @@ pub struct Document {
     /// meaningful inside the `SoundLibrary` of the scene that holds it —
     /// there is no document-wide sound namespace to point a reference at.
     master_audio: Option<(SceneKey, LayerId)>,
+    /// **Master Audio mode**: only the master clip may play anywhere in the
+    /// document. See `docs/MASTER_AUDIO_AND_PROTECT_PLAN.md` Part M.
+    master_audio_mode: bool,
+    /// **Protect Other Keyframes** (Part K): when set, an edit inside a shared
+    /// symbol opened in place forks the path for the clicked keyframe. View
+    /// state, set by the editor from the workspace; never saved.
+    protect_keyframes: Option<ProtectScope>,
+    /// What the last protected edit copied, until the editor takes it.
+    last_fork: Option<ForkReport>,
 }
 
 impl Default for Document {
@@ -125,6 +138,9 @@ impl Document {
             next_scene_key: 1,
             sequence: Vec::new(),
             master_audio: None,
+            master_audio_mode: false,
+            protect_keyframes: None,
+            last_fork: None,
         }
     }
 
@@ -200,6 +216,7 @@ impl Document {
         doc.next_scene_key = next_scene_key;
         doc.sequence = loaded.sequence;
         doc.master_audio = loaded.master_audio;
+        doc.master_audio_mode = loaded.master_audio_mode;
         doc.switch_scene(loaded.active);
         doc
     }
@@ -630,6 +647,17 @@ impl Document {
         self.master_audio = Some((scene, layer));
     }
 
+    /// Whether **Master Audio mode** is on: only the master clip may play.
+    pub fn master_audio_mode(&self) -> bool {
+        self.master_audio_mode
+    }
+
+    /// Turn Master Audio mode on or off. Only records the flag; the caller
+    /// runs `Self::enforce_master_audio` when turning it on.
+    pub fn set_master_audio_mode(&mut self, on: bool) {
+        self.master_audio_mode = on;
+    }
+
     /// The frame rate `audio_in`/`audio_out` are counted in: the frame rate
     /// of the scene the master audio itself lives on.
     fn master_fps(&self) -> Option<f64> {
@@ -983,6 +1011,52 @@ impl Document {
         if slot.scene.revision() == before.revision() {
             return;
         }
+        // Protect Other Keyframes: an edit inside a shared symbol opened in
+        // place forks the path, inside this same undo step.
+        if let Some(scope) = self.protect_keyframes
+            && !slot.scene.edit_path().is_empty()
+            && let Some(report) = slot.scene.fork_edit_path(&before, scope)
+        {
+            self.last_fork = Some(report);
+        }
+        slot.history.record(before, label);
+    }
+
+    /// **Protect Other Keyframes** scope, or `None` when it is off.
+    pub fn protect_keyframes(&self) -> Option<ProtectScope> {
+        self.protect_keyframes
+    }
+
+    /// Turn Protect Other Keyframes on (with a scope) or off. View state.
+    pub fn set_protect_keyframes(&mut self, scope: Option<ProtectScope>) {
+        self.protect_keyframes = scope;
+    }
+
+    /// What the last protected edit copied, once; `None` if nothing forked
+    /// since the last call.
+    pub fn take_last_fork(&mut self) -> Option<ForkReport> {
+        self.last_fork.take()
+    }
+
+    /// Apply an edit to the scene at `index` (any scene, not just the active
+    /// one), recording it to that scene's own history exactly as
+    /// [`Self::edit`] does. Does nothing if `index` is out of range.
+    pub fn edit_scene_at(
+        &mut self,
+        index: usize,
+        label: impl Into<UndoLabel>,
+        f: impl FnOnce(&mut Scene),
+    ) {
+        let Some(slot) = self.scenes.get_mut(index) else {
+            return;
+        };
+        let before = slot.scene.clone();
+        f(&mut slot.scene);
+
+        // Nothing actually changed, so there is nothing to undo.
+        if slot.scene.revision() == before.revision() {
+            return;
+        }
         slot.history.record(before, label);
     }
 
@@ -1102,6 +1176,7 @@ impl Document {
                 self.active,
                 &self.sequence,
                 self.master_audio,
+                self.master_audio_mode,
                 &path,
             )?;
         }
@@ -1182,8 +1257,10 @@ impl Document {
             roles: self.scenes.iter().map(|s| s.role.clone()).collect(),
             sequence: self.sequence.clone(),
             master_audio: self.master_audio,
+            master_audio_mode: self.master_audio_mode,
         }
     }
+
 
     /// Where this document's recovery file would be written.
     pub fn recovery_path(&self) -> PathBuf {

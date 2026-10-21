@@ -440,6 +440,84 @@ impl Symbol {
     }
 }
 
+/// The **name stem** Swap… compares ([`Library::similar_symbols`]): the name
+/// lowercased, with trailing digits, " copy N", " (fN)" and the separators
+/// `_ - .` (and spaces) stripped off the end, repeatedly. "Head_02 copy 3" and
+/// "head (f12)" both give "head".
+pub fn name_stem(name: &str) -> String {
+    let mut s = name.to_lowercase();
+    loop {
+        let before = s.len();
+        let trimmed = s
+            .trim_end_matches(|c: char| c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | ' '))
+            .len();
+        s.truncate(trimmed);
+        // " (fN)" — after the digits, a "(f" … ")" tail.
+        if let Some(open) = s.rfind("(f") {
+            let tail = &s[open + 2..];
+            if tail.ends_with(')') && tail[..tail.len() - 1].chars().all(|c| c.is_ascii_digit()) {
+                s.truncate(open);
+            }
+        }
+        if s.ends_with(" copy") {
+            let cut = s.len() - "copy".len();
+            s.truncate(cut);
+        }
+        if s.len() == before {
+            return s;
+        }
+    }
+}
+
+/// Name tokens that say what part a symbol is. Swap… ranks these above
+/// character names, and two role-named symbols must share one to match.
+pub const ROLE_TOKENS: &[&str] = &[
+    "head", "face", "hand", "arm", "leg", "foot", "body", "torso", "eye", "mouth", "hair",
+    "back", "palm",
+];
+
+/// A symbol name's **tokens**, as Swap… compares them
+/// ([`Library::similar_symbols`]): split on `_ - .` and spaces, at camelCase
+/// boundaries and at letter/digit boundaries, lowercased, with pure numbers
+/// and "copy" dropped. "Police3Head34th1 copy 2" gives police, head, th.
+pub fn name_tokens(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut pieces: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if matches!(c, '_' | '-' | '.') || c.is_whitespace() || !c.is_alphanumeric() {
+            if !current.is_empty() {
+                pieces.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        if let Some(prev) = current.chars().last() {
+            let next = chars.get(i + 1).copied();
+            let boundary = (prev.is_ascii_digit() != c.is_ascii_digit())
+                || (prev.is_lowercase() && c.is_uppercase())
+                || (prev.is_uppercase()
+                    && c.is_uppercase()
+                    && next.is_some_and(|n| n.is_lowercase()));
+            if boundary {
+                pieces.push(std::mem::take(&mut current));
+            }
+        }
+        current.push(c);
+    }
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    let mut out: Vec<String> = Vec::new();
+    for p in pieces {
+        let p = p.to_lowercase();
+        if p.chars().all(|c| c.is_ascii_digit()) || p == "copy" || out.contains(&p) {
+            continue;
+        }
+        out.push(p);
+    }
+    out
+}
+
 /// The document's library.
 ///
 /// Folders are stored as paths on the symbols themselves plus an explicit
@@ -462,6 +540,79 @@ impl Symbol {
 pub struct Library {
     symbols: Arc<BTreeMap<SymbolId, Arc<Symbol>>>,
     folders: Arc<BTreeSet<String>>,
+    /// What Swap… compares, built once per symbol map (see
+    /// [`Library::similar_symbols`]). Derived; never part of equality.
+    similar_memo: SimilarMemo,
+}
+
+/// The per-library table [`Library::similar_symbols`] reads: every name's
+/// tokens, how many names hold each token, folder sizes, and which symbols are
+/// whole characters.
+#[derive(Debug, Default)]
+struct SimilarIndex {
+    tokens: std::collections::HashMap<SymbolId, std::collections::HashSet<String>>,
+    frequency: std::collections::HashMap<String, usize>,
+    folder_size: std::collections::HashMap<String, usize>,
+    characters: std::collections::HashSet<SymbolId>,
+}
+
+/// The memo behind [`SimilarIndex`], keyed on the symbol map it was built from.
+/// It holds a `Weak` to that map, so the address cannot be reused by a later
+/// map while the entry lives, and a library edit (which forks the map) misses.
+/// Clones share it (a pointer copy, as the library's own maps are); it never
+/// takes part in equality.
+type SimilarSlot = Option<(std::sync::Weak<BTreeMap<SymbolId, Arc<Symbol>>>, Arc<SimilarIndex>)>;
+
+#[derive(Clone, Default)]
+struct SimilarMemo(Arc<std::sync::Mutex<SimilarSlot>>);
+
+impl PartialEq for SimilarMemo {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for SimilarMemo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SimilarMemo(..)")
+    }
+}
+
+/// Is `symbol` a whole character: tagged "character", filed under `Cast`
+/// (the rule `buzz_doc::master_audio` uses), or — unless its own name names a
+/// part (a [`ROLE_TOKENS`] word) — holding, directly on one of its layers, an
+/// instance of a symbol whose name has a "head" or "face" token.
+fn is_character(library: &Library, symbol: &Symbol) -> bool {
+    if symbol.tags.iter().any(|t| t.eq_ignore_ascii_case("character"))
+        || symbol
+            .folder
+            .as_deref()
+            .is_some_and(|f| f == "Cast" || f.starts_with("Cast/"))
+    {
+        return true;
+    }
+    if name_tokens(&symbol.name).iter().any(|t| ROLE_TOKENS.contains(&t.as_str())) {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for layer in symbol.layers.iter() {
+        for key in layer.frames.keyframes() {
+            for object in key.objects.iter() {
+                let Some(instance) = object.instance() else {
+                    continue;
+                };
+                if !seen.insert(instance.symbol) {
+                    continue;
+                }
+                if let Some(child) = library.symbols.get(&instance.symbol)
+                    && name_tokens(&child.name).iter().any(|t| t == "head" || t == "face")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 impl Library {
@@ -562,6 +713,170 @@ impl Library {
             return Vec::new();
         }
         out
+    }
+
+    /// The table [`Self::similar_symbols`] reads, built once per symbol map
+    /// and memoised until the library is edited.
+    fn similar_index(&self) -> Arc<SimilarIndex> {
+        if let Ok(slot) = self.similar_memo.0.lock()
+            && let Some((built_from, index)) = slot.as_ref()
+            && std::ptr::eq(built_from.as_ptr(), Arc::as_ptr(&self.symbols))
+        {
+            return Arc::clone(index);
+        }
+        let mut index = SimilarIndex::default();
+        for s in self.symbols.values() {
+            let tokens: std::collections::HashSet<String> = name_tokens(&s.name).into_iter().collect();
+            for t in &tokens {
+                *index.frequency.entry(t.clone()).or_default() += 1;
+            }
+            index.tokens.insert(s.id, tokens);
+            if let Some(f) = s.folder.as_deref().filter(|f| !f.is_empty()) {
+                *index.folder_size.entry(f.to_string()).or_default() += 1;
+            }
+            if is_character(self, s) {
+                index.characters.insert(s.id);
+            }
+        }
+        let index = Arc::new(index);
+        if let Ok(mut slot) = self.similar_memo.0.lock() {
+            *slot = Some((Arc::downgrade(&self.symbols), Arc::clone(&index)));
+        }
+        index
+    }
+
+    /// **The symbols similar to `id`**, ranked, for Properties ▸ Swap… —
+    /// `id` itself excluded.
+    ///
+    /// A candidate qualifies only on a **strong signal**: a member of the same
+    /// set, a shared tag, the same non-root folder (only when that folder holds
+    /// fewer than 40 symbols), the same name stem ([`name_stem`]), both being
+    /// whole characters (`is_character`; "character" also counts as a role,
+    /// so a character never matches a single head or hand), or a shared
+    /// meaningful name token ([`name_tokens`]: at least 3 letters, in no more
+    /// than 25% of the library's names; role tokens such as "head" or "hand"
+    /// weigh more than character names, and rarer tokens more than common
+    /// ones). When both names carry a role token they must share one — a head
+    /// swaps with heads. Similar size (aspect within ×1.5, area within ×3, read
+    /// from `bounds`, the scene's memoised table) only adds a bonus point on top
+    /// of a strong signal. A candidate must also be the same [`SymbolKind`]
+    /// unless it is a set member. Set members come first, then by score
+    /// (highest first), then by name.
+    pub fn similar_symbols(
+        &self,
+        id: SymbolId,
+        bounds: &std::collections::HashMap<SymbolId, Rect>,
+    ) -> Vec<(SymbolId, u32)> {
+        use std::collections::HashSet;
+        let Some(me) = self.symbols.get(&id) else {
+            return Vec::new();
+        };
+        let set: Vec<SymbolId> = self.symbol_set(id);
+        let total = self.symbols.len().max(1);
+
+        // Tokens, token frequencies, folder sizes and character flags: built
+        // once per symbol map, not per call.
+        let index = self.similar_index();
+        let tokens = &index.tokens;
+        let frequency = &index.frequency;
+        let folder_size = &index.folder_size;
+        let meaningful = |t: &str| {
+            t.chars().count() >= 3 && frequency.get(t).copied().unwrap_or(0) * 4 <= total
+        };
+        // A symbol's roles: its role-name tokens, plus "character" for a whole
+        // character — so a character never matches a single head or hand.
+        let roles_of = |sid: SymbolId, s: &HashSet<String>| -> HashSet<String> {
+            let mut roles: HashSet<String> =
+                s.iter().filter(|t| ROLE_TOKENS.contains(&t.as_str())).cloned().collect();
+            if index.characters.contains(&sid) {
+                roles.insert("character".to_string());
+            }
+            roles
+        };
+        let me_character = index.characters.contains(&id);
+        let folder = me
+            .folder
+            .as_deref()
+            .filter(|f| !f.is_empty() && folder_size.get(*f).copied().unwrap_or(0) < 40);
+        let stem = name_stem(&me.name);
+        let tags: Vec<String> = me.tags.iter().map(|t| t.to_lowercase()).collect();
+        let empty = HashSet::new();
+        let my_tokens = tokens.get(&id).unwrap_or(&empty);
+        let my_roles = roles_of(id, my_tokens);
+        let usable = |r: Option<&Rect>| {
+            r.copied().filter(|r| r.width() > 0.0 && r.height() > 0.0)
+        };
+        let my_bounds = usable(bounds.get(&id));
+
+        let mut out: Vec<(SymbolId, u32, bool, String)> = Vec::new();
+        for other in self.symbols.values() {
+            if other.id == id {
+                continue;
+            }
+            let in_set = set.contains(&other.id);
+            if !in_set && other.kind != me.kind {
+                continue;
+            }
+            let other_tokens = tokens.get(&other.id).unwrap_or(&empty);
+            // A head swaps with heads: two role-named parts must share a role.
+            let other_roles = roles_of(other.id, other_tokens);
+            if !in_set
+                && !my_roles.is_empty()
+                && !other_roles.is_empty()
+                && my_roles.is_disjoint(&other_roles)
+            {
+                continue;
+            }
+            let mut score = 0u32;
+            if in_set {
+                score += 4;
+            }
+            if !tags.is_empty() && other.tags.iter().any(|t| tags.contains(&t.to_lowercase())) {
+                score += 2;
+            }
+            if folder.is_some() && other.folder.as_deref().filter(|f| !f.is_empty()) == folder {
+                score += 2;
+            }
+            if !stem.is_empty() && name_stem(&other.name) == stem {
+                score += 3;
+            }
+            // Character class: whole characters swap with whole characters.
+            if me_character && index.characters.contains(&other.id) {
+                score += 3;
+            }
+            for t in my_tokens.intersection(other_tokens) {
+                if !meaningful(t) {
+                    continue;
+                }
+                if ROLE_TOKENS.contains(&t.as_str()) {
+                    score += 3;
+                } else {
+                    // Rarer names say more: within 2% of the library, 2 points.
+                    let n = frequency.get(t.as_str()).copied().unwrap_or(0);
+                    score += if n * 50 <= total { 2 } else { 1 };
+                }
+            }
+            if score == 0 {
+                // No strong signal; size alone never qualifies.
+                continue;
+            }
+            if let (Some(a), Some(b)) = (my_bounds, usable(bounds.get(&other.id))) {
+                let ratio = |x: f64, y: f64| if x > y { x / y } else { y / x };
+                let aspect = ratio(a.width() / a.height(), b.width() / b.height());
+                let area = ratio(a.area(), b.area());
+                if aspect <= 1.5 && area <= 3.0 {
+                    score += 1;
+                }
+            }
+            out.push((other.id, score, in_set, other.name.to_lowercase()));
+        }
+        out.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then(b.1.cmp(&a.1))
+                .then_with(|| a.3.cmp(&b.3))
+                .then(a.0.cmp(&b.0))
+        });
+        out.into_iter().map(|(sid, score, _, _)| (sid, score)).collect()
     }
 
     /// **Include `member` in `owner`'s set.**

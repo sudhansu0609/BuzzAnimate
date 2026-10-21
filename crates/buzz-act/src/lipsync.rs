@@ -157,6 +157,7 @@ pub fn write_track(
                 modifiers: Vec::new(),
                 text: None,
                 turnaround: Default::default(),
+                drawing_object: false,
             };
             target.frames.set_objects(frame, vec![Arc::new(object)]);
         }
@@ -254,6 +255,7 @@ pub fn fill_placeholder_mouth(scene: &mut Scene, symbol: SymbolId) {
                     modifiers: Vec::new(),
                     text: None,
                     turnaround: Default::default(),
+                    drawing_object: false,
                 };
                 l.frames.set_objects(frame, vec![Arc::new(object)]);
             }

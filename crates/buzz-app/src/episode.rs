@@ -412,6 +412,10 @@ pub struct BuildOptions {
     /// recording, carries its cut of it on a sound layer and is lip-synced
     /// from it; every other scene and line keeps its text timing.
     pub audio: Option<Arc<buzz_act::audio_align::AudioPlan>>,
+    /// L3 of `docs/LAYER_MANAGEMENT_PLAN.md`: run Arrange Layers (with its
+    /// empty-layer cleanup) on every built scene, inside the same
+    /// "Build Scene N" undo step. On by default.
+    pub tidy_layers: bool,
 }
 
 impl Default for BuildOptions {
@@ -425,6 +429,7 @@ impl Default for BuildOptions {
             timing: Timing::default(),
             index: None,
             audio: None,
+            tidy_layers: true,
         }
     }
 }
@@ -3791,6 +3796,11 @@ pub fn build_episode(
         let mut report = SceneReport::default();
         doc.edit(format!("Build Scene {number}"), |scene| {
             report = build_scene(scene, src, casting, assets, opts, &mut carry);
+            // L3 auto-tidy: the built scene's layers into folders, its empty
+            // layers gone, drawing order untouched. Part of the same step.
+            if opts.tidy_layers {
+                scene.arrange_layers(buzz_scene::ArrangeOptions::default());
+            }
         });
         doc.end_gesture();
         doc.rename_scene(index, format!("Scene {number} \u{2014} {}", src.title));

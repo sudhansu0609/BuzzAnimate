@@ -25,9 +25,11 @@
 //! [`SpatialIndex`] records the revision it was built from, so a consumer can
 //! tell whether what it holds is current instead of trusting it blindly.
 
+pub mod arrange;
 pub mod art;
 pub mod bucket;
 pub mod camera_track;
+pub mod cleanup;
 pub mod effect_brush;
 pub mod gradient;
 pub mod image;
@@ -67,6 +69,7 @@ use buzz_geom::{Affine, Point, Rect, Size};
 use peniko::Color;
 use serde::{Deserialize, Serialize};
 
+pub use arrange::{ArrangeOptions, ArrangeReport, LayerGroup};
 pub use art::ArtPiece;
 pub use bucket::{Boundary, GapSize, fill_region};
 pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, GradientMap, Quality};
@@ -74,6 +77,7 @@ pub use buzz_light::{
     DEFAULT_GLINT, EdgeMode, Light, LightId, LightKey, LightKind, LightRig, LightTrack,
     SHADOW_LENGTH_RANGE, ShadeModel, ShadowAdjustment, ShadowFall,
 };
+pub use cleanup::{CleanupOptions, CleanupPlan, CleanupReport, CleanupScope};
 pub use camera_track::{
     CameraKey, CameraMove, CameraTrack, DEFAULT_FOCAL_DISTANCE, FocusKey, MAX_TILT, NamedAngle,
 };
@@ -294,6 +298,12 @@ pub struct Scene {
     /// Symbol* — and the instance's own transform for one opened from the
     /// stage, which is *Edit in Place*. View state exactly as `editing` is.
     edit_places: Vec<Affine>,
+    /// Which instance each open symbol was opened from, one per entry in
+    /// `editing`: the instance clicked in the parent timeline for *Edit in
+    /// Place*, `None` for a symbol opened from the Library. Copy-on-write
+    /// symbol edits ([`Scene::fork_edit_path`]) repoint exactly these. View
+    /// state exactly as `editing` is.
+    edit_origins: Vec<Option<EditOrigin>>,
     /// Memoised resolved-bounds table, tagged with the revision it was built
     /// for. Rebuilding it is linear in the library, but resolving bounds is a
     /// per-object, per-frame operation on every selection, so even a linear
@@ -326,6 +336,7 @@ impl Clone for Scene {
             revision: self.revision,
             editing: self.editing.clone(),
             edit_places: self.edit_places.clone(),
+            edit_origins: self.edit_origins.clone(),
             // A fresh, empty cache: a snapshot rebuilds its own on first use,
             // so a clone shares no mutable state with the scene it came from.
             bounds_cache: std::sync::RwLock::new(None),
@@ -368,6 +379,96 @@ fn collect_symbols(object: &Object, out: &mut Vec<SymbolId>) {
     }
 }
 
+/// Which pose [`Scene::clear_symbol_keyframes`] keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepPose {
+    /// What every layer shows on its first frame.
+    First,
+    /// What every layer shows at this frame of the symbol's timeline (clamped
+    /// to each layer's last frame).
+    Frame(u32),
+}
+
+/// What [`Scene::clear_symbol_keyframes`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClearReport {
+    /// Keyframes turned back into normal frames.
+    pub keyframes_cleared: usize,
+    /// Layers that changed.
+    pub layers: usize,
+    /// Nested symbols visited besides the one asked for.
+    pub symbols: usize,
+}
+
+/// **The instance a symbol on the edit path was opened from**: the object
+/// clicked for *Edit in Place*, on its layer, in the keyframe showing at the
+/// playhead, all in the parent timeline (the stage for the outermost symbol).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditOrigin {
+    pub layer: LayerId,
+    /// Start frame of the keyframe holding `object` when it was clicked.
+    pub keyframe_start: u32,
+    pub object: ObjectId,
+}
+
+/// How far *Protect Other Keyframes* lets an edit inside a shared symbol reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProtectScope {
+    /// Only the clicked keyframe's instance gets the change.
+    #[default]
+    ThisKeyframe,
+    /// The clicked keyframe and every later stage keyframe showing the symbol.
+    FromHere,
+}
+
+/// What [`Scene::fork_edit_path`] copied: `(original, copy)` symbol ids,
+/// outermost first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForkReport {
+    pub copied: Vec<(SymbolId, SymbolId)>,
+}
+
+/// Point the top-level instance `origin.object` in keyframe
+/// `origin.keyframe_start` of layer `origin.layer` at `to`.
+fn repoint_origin(layers: &mut LayerStack, origin: &EditOrigin, to: SymbolId) -> bool {
+    let mut done = false;
+    layers.update(origin.layer, |layer| {
+        let Some(keyframe) = layer
+            .frames
+            .keyframes_mut()
+            .iter_mut()
+            .find(|k| k.start == origin.keyframe_start)
+        else {
+            return;
+        };
+        let Some(index) = keyframe
+            .objects
+            .iter()
+            .position(|o| o.id == origin.object && o.instance().is_some())
+        else {
+            return;
+        };
+        let objects = Arc::make_mut(&mut keyframe.objects);
+        if let ObjectKind::Instance(i) = &mut Arc::make_mut(&mut objects[index]).kind {
+            i.symbol = to;
+            done = true;
+        }
+    });
+    done
+}
+
+/// Is `origin` a top-level instance of `symbol` in `layers`?
+fn origin_points_at(layers: &LayerStack, origin: &EditOrigin, symbol: SymbolId) -> bool {
+    layers
+        .get(origin.layer)
+        .and_then(|l| l.frames.keyframes().iter().find(|k| k.start == origin.keyframe_start))
+        .is_some_and(|k| {
+            k.objects.iter().any(|o| {
+                o.id == origin.object && o.instance().is_some_and(|i| i.symbol == symbol)
+            })
+        })
+}
+
 impl PartialEq for Scene {
     fn eq(&self, other: &Self) -> bool {
         self.stage == other.stage
@@ -402,6 +503,7 @@ impl Default for Scene {
             revision: 0,
             editing: Vec::new(),
             edit_places: Vec::new(),
+            edit_origins: Vec::new(),
             bounds_cache: std::sync::RwLock::new(None),
             modifier_cache: std::sync::RwLock::new(None),
         };
@@ -450,6 +552,7 @@ impl Scene {
             revision: 0,
             editing: Vec::new(),
             edit_places: Vec::new(),
+            edit_origins: Vec::new(),
             bounds_cache: std::sync::RwLock::new(None),
             modifier_cache: std::sync::RwLock::new(None),
         }
@@ -518,6 +621,18 @@ impl Scene {
     /// The places compose down the path, so opening a hand inside an arm
     /// inside a character lands the hand on the character's wrist.
     pub fn enter_symbol_in_place(&mut self, id: SymbolId, place: Affine) -> bool {
+        self.enter_symbol_in_place_from(id, place, None)
+    }
+
+    /// [`Self::enter_symbol_in_place`], recording which instance was clicked
+    /// (`origin`), so a protected edit can fork the path for that keyframe
+    /// alone. `None` behaves exactly like opening from the Library.
+    pub fn enter_symbol_in_place_from(
+        &mut self,
+        id: SymbolId,
+        place: Affine,
+        origin: Option<EditOrigin>,
+    ) -> bool {
         if self.library.get(id).is_none() {
             return false;
         }
@@ -526,11 +641,19 @@ impl Scene {
         if let Some(index) = self.editing.iter().position(|s| *s == id) {
             self.editing.truncate(index + 1);
             self.edit_places.truncate(index + 1);
+            self.edit_origins.truncate(index + 1);
         } else {
             self.editing.push(id);
             self.edit_places.push(place);
+            self.edit_origins.push(origin);
         }
         true
+    }
+
+    /// Which instance each open symbol was opened from, one per entry in
+    /// [`Self::edit_path`]; `None` where it was opened from the Library.
+    pub fn edit_origins(&self) -> &[Option<EditOrigin>] {
+        &self.edit_origins
     }
 
     /// Where the symbol being edited sits, in the document's own space.
@@ -546,6 +669,7 @@ impl Scene {
     /// Step out one level, towards the main timeline.
     pub fn exit_symbol(&mut self) -> bool {
         self.edit_places.pop();
+        self.edit_origins.pop();
         self.editing.pop().is_some()
     }
 
@@ -553,6 +677,208 @@ impl Scene {
     pub fn edit_document(&mut self) {
         self.editing.clear();
         self.edit_places.clear();
+        self.edit_origins.clear();
+    }
+
+    /// **Copy-on-write for a symbol edited in place** (*Protect Other
+    /// Keyframes*).
+    ///
+    /// Called after an edit, with the scene as it stood `before` it. When a
+    /// symbol on the open path that is used more than once was changed, the
+    /// path from the first shared symbol inwards is forked: each copy takes the
+    /// edited content, each original goes back to `before`'s, and the clicked
+    /// instances are repointed at the copies, so only the clicked keyframe
+    /// changes ([`ProtectScope::FromHere`] also takes later stage keyframes).
+    /// The edit path is rewritten to the copies. `None` when nothing needed
+    /// forking or any symbol on the path was opened from the Library.
+    pub fn fork_edit_path(&mut self, before: &Scene, scope: ProtectScope) -> Option<ForkReport> {
+        let path = self.editing.clone();
+        if path.is_empty() || self.edit_origins.len() != path.len() {
+            return None;
+        }
+        let origins: Vec<EditOrigin> = self.edit_origins.iter().copied().collect::<Option<_>>()?;
+        let usage = before.symbol_usage();
+        let k = path
+            .iter()
+            .position(|id| usage.get(id).copied().unwrap_or(0) > 1)?;
+        // Only a change at or inside the first shared symbol reaches other
+        // keyframes; every symbol from there in must exist on both sides.
+        let mut changed = false;
+        for id in &path[k..] {
+            let (Some(old), Some(new)) = (before.library.get(*id), self.library.get(*id)) else {
+                return None;
+            };
+            if !Arc::ptr_eq(old, new) && old != new {
+                changed = true;
+            }
+        }
+        if !changed {
+            return None;
+        }
+        // Every instance to repoint has to be where the origins say, or the
+        // copy would be left unreferenced and the edit would vanish.
+        for i in k..path.len() {
+            let found = if i == 0 {
+                origin_points_at(&self.layers, &origins[0], path[0])
+            } else {
+                self.library
+                    .get(path[i - 1])
+                    .is_some_and(|s| origin_points_at(&s.layers, &origins[i], path[i]))
+            };
+            if !found {
+                return None;
+            }
+        }
+
+        let suffix = format!(" (f{})", origins[0].keyframe_start + 1);
+        let mut copied = Vec::new();
+        for &old in &path[k..] {
+            let mut copy = (**self.library.get(old)?).clone();
+            let original = (**before.library.get(old)?).clone();
+            let new_id = SymbolId(self.ids.take());
+            copy.id = new_id;
+            copy.name = self.library.unique_name(&format!("{}{suffix}", copy.name));
+            copy.set = Vec::new();
+            self.library.insert(copy);
+            self.library.update(old, |s| *s = original);
+            copied.push((old, new_id));
+        }
+
+        // The first shared symbol's instance lives in the stage or in a
+        // private parent; each deeper one inside the previous copy.
+        let (old_k, new_k) = copied[0];
+        if k == 0 {
+            repoint_origin(&mut self.layers, &origins[0], new_k);
+            if scope == ProtectScope::FromHere {
+                let from = origins[0].keyframe_start;
+                let ids: Vec<LayerId> = self.layers.iter().map(|l| l.id).collect();
+                for layer in ids {
+                    self.layers.update(layer, |layer| {
+                        for keyframe in layer.frames.keyframes_mut() {
+                            if keyframe.start < from
+                                || !keyframe
+                                    .objects
+                                    .iter()
+                                    .any(|o| o.instance().is_some_and(|i| i.symbol == old_k))
+                            {
+                                continue;
+                            }
+                            for object in Arc::make_mut(&mut keyframe.objects) {
+                                if object.instance().is_some_and(|i| i.symbol == old_k)
+                                    && let ObjectKind::Instance(i) = &mut Arc::make_mut(object).kind
+                                {
+                                    i.symbol = new_k;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        } else {
+            let parent = path[k - 1];
+            let origin = origins[k];
+            self.library.update(parent, |s| {
+                repoint_origin(&mut s.layers, &origin, new_k);
+            });
+        }
+        for i in 1..copied.len() {
+            let parent = copied[i - 1].1;
+            let origin = origins[k + i];
+            let to = copied[i].1;
+            self.library.update(parent, |s| {
+                repoint_origin(&mut s.layers, &origin, to);
+            });
+        }
+        for (i, (_, new)) in copied.iter().enumerate() {
+            self.editing[k + i] = *new;
+        }
+        self.bump();
+        Some(ForkReport { copied })
+    }
+
+    /// **Deep-fork a stage instance's character** (*Protect Other Keyframes*,
+    /// K3): every symbol reachable from the instance `origin` names (on the
+    /// main timeline) is copied once, cycle-safe, as name + `" (f<keyframe
+    /// start + 1>)"` with an empty `set`. Instances inside the copies point at
+    /// the copies, and `origin`'s instance is repointed at the top copy, so a
+    /// whole-character command applied to the copies changes only that
+    /// keyframe. `None` when `origin` is not an instance on the stage.
+    pub fn fork_instance_subtree(&mut self, origin: EditOrigin) -> Option<ForkReport> {
+        let top = self
+            .layers
+            .get(origin.layer)?
+            .frames
+            .keyframes()
+            .iter()
+            .find(|k| k.start == origin.keyframe_start)?
+            .objects
+            .iter()
+            .find(|o| o.id == origin.object)?
+            .instance()?
+            .symbol;
+        // Breadth-first, outermost first, each symbol once.
+        let mut order: Vec<SymbolId> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut queue = std::collections::VecDeque::from([top]);
+        while let Some(id) = queue.pop_front() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(symbol) = self.library.get(id) else {
+                continue;
+            };
+            order.push(id);
+            let mut reached = Vec::new();
+            for layer in symbol.layers.iter() {
+                for object in layer.all_objects() {
+                    collect_symbols(object, &mut reached);
+                    for view in object.turnaround.views() {
+                        collect_symbols(&view.drawing, &mut reached);
+                    }
+                }
+            }
+            queue.extend(reached.into_iter().filter(|s| !seen.contains(s)));
+        }
+        if order.is_empty() {
+            return None;
+        }
+
+        let map: std::collections::BTreeMap<SymbolId, SymbolId> = order
+            .iter()
+            .map(|&old| (old, SymbolId(self.ids.take())))
+            .collect();
+        let repoint = |object: &mut Object, n: &mut usize| {
+            if let ObjectKind::Instance(i) = &mut object.kind
+                && let Some(&to) = map.get(&i.symbol)
+            {
+                i.symbol = to;
+                *n += 1;
+            }
+        };
+        let suffix = format!(" (f{})", origin.keyframe_start + 1);
+        let mut copied = Vec::new();
+        for &old in &order {
+            let mut copy = (**self.library.get(old)?).clone();
+            copy.id = map[&old];
+            copy.name = self.library.unique_name(&format!("{}{suffix}", copy.name));
+            copy.set = Vec::new();
+            let layer_ids: Vec<LayerId> = copy.layers.iter().map(|l| l.id).collect();
+            for layer in layer_ids {
+                copy.layers.update(layer, |l| {
+                    for keyframe in l.frames.keyframes_mut() {
+                        for object in Arc::make_mut(&mut keyframe.objects).iter_mut() {
+                            let mut n = 0;
+                            walk_objects(Arc::make_mut(object), &repoint, &mut n);
+                        }
+                    }
+                });
+            }
+            self.library.insert(copy);
+            copied.push((old, map[&old]));
+        }
+        repoint_origin(&mut self.layers, &origin, map[&top]);
+        self.bump();
+        Some(ForkReport { copied })
     }
 
     pub fn stage(&self) -> &StageProperties {
@@ -901,6 +1227,10 @@ impl Scene {
             // and an animator hides layers constantly while working. Losing
             // the soundtrack because a layer was hidden would be surprising in
             // exactly the way this whole design is trying to avoid.
+            // A Master Audio guide layer is never heard.
+            if layer.audio_guide {
+                continue;
+            }
             let keyframes = layer.frames.keyframes();
             for (i, keyframe) in keyframes.iter().enumerate() {
                 let Some(sound) = keyframe.sound else {
@@ -1298,6 +1628,81 @@ impl Scene {
         counts
     }
 
+    /// **Clear All Keyframes** in a symbol: every layer keeps one keyframe at
+    /// frame 0 holding what it showed at `keep`, and every other keyframe
+    /// becomes a normal frame. Layer lengths are unchanged, tweens and ease
+    /// curves on the remaining keyframe are dropped, frame 0's label and sound
+    /// are kept, and `audio_guide` layers are left alone.
+    ///
+    /// With `nested`, every symbol reachable through instances in the kept
+    /// pose gets the same treatment from its first frame, each once.
+    pub fn clear_symbol_keyframes(&mut self, id: SymbolId, keep: KeepPose, nested: bool) -> ClearReport {
+        let mut report = ClearReport::default();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut queue = vec![(id, keep)];
+        while let Some((sid, pose)) = queue.pop() {
+            if !seen.insert(sid) {
+                continue;
+            }
+            let Some(symbol) = self.library.get(sid) else {
+                continue;
+            };
+            if sid != id {
+                report.symbols += 1;
+            }
+            let mut changes: Vec<(LayerId, LayerTimeline)> = Vec::new();
+            let mut reached: Vec<SymbolId> = Vec::new();
+            for layer in symbol.layers.iter() {
+                if layer.audio_guide {
+                    continue;
+                }
+                let length = layer.frames.length();
+                let frame = match pose {
+                    KeepPose::First => 0,
+                    KeepPose::Frame(f) => f.min(length.saturating_sub(1)),
+                };
+                let keyframes = layer.frames.keyframes();
+                let first = &keyframes[0];
+                let objects = layer
+                    .frames
+                    .keyframe_at(frame)
+                    .map(|k| k.objects.clone())
+                    .unwrap_or_else(|| first.objects.clone());
+                if nested {
+                    for object in objects.iter() {
+                        collect_symbols(object, &mut reached);
+                    }
+                }
+                let unchanged = keyframes.len() == 1
+                    && first.tween == crate::tween::Tween::default()
+                    && first.ease_curve.is_none();
+                if unchanged {
+                    continue;
+                }
+                let mut kept = Keyframe::new(0);
+                kept.objects = objects;
+                kept.label = first.label.clone();
+                kept.sound = first.sound.clone();
+                report.keyframes_cleared += keyframes.len() - 1;
+                report.layers += 1;
+                changes.push((layer.id, LayerTimeline::from_parts(vec![kept], length)));
+            }
+            if !changes.is_empty() {
+                if let Some(stack) = self.library_mut().layers_mut(sid) {
+                    for (layer, timeline) in changes {
+                        stack.update(layer, |l| l.frames = timeline);
+                    }
+                }
+            }
+            for next in reached {
+                if !seen.contains(&next) {
+                    queue.push((next, KeepPose::First));
+                }
+            }
+        }
+        report
+    }
+
     /// Mutable access that bumps the revision.
     ///
     /// All edits go through here so no path can change the document without
@@ -1421,6 +1826,21 @@ impl Scene {
             self.bump();
         }
         changed
+    }
+
+    /// Remove a layer from the document's own timeline, whatever is open for
+    /// editing. The companion to [`Self::add_stage_layer`]; anything that
+    /// followed it is released, as [`Self::remove_layer`] does.
+    pub fn remove_stage_layer(&mut self, id: LayerId) -> Option<Arc<Layer>> {
+        let removed = self.layers.remove(id);
+        if removed.is_some() {
+            let orphans = self.layers.followers_of(id);
+            for orphan in orphans {
+                self.layers.update(orphan, |l| l.follows = None);
+            }
+            self.bump();
+        }
+        removed
     }
 
     pub fn remove_layer(&mut self, id: LayerId) -> Option<Arc<Layer>> {

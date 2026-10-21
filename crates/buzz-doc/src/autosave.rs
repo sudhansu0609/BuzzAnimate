@@ -277,6 +277,7 @@ pub struct SequenceMeta {
     pub roles: Vec<crate::SceneRole>,
     pub sequence: Vec<crate::SceneKey>,
     pub master_audio: Option<(crate::SceneKey, buzz_scene::LayerId)>,
+    pub master_audio_mode: bool,
 }
 
 impl AutosavePlan {
@@ -309,7 +310,14 @@ impl AutosavePlan {
                         role: role.clone(),
                     })
                     .collect();
-                format::to_bytes_scenes_full(&records, self.active, &meta.sequence, meta.master_audio)?
+                format::to_bytes_scenes_full(
+                    &records,
+                    self.active,
+                    &meta.sequence,
+                    meta.master_audio,
+                    meta.master_audio_mode,
+                )?
+
             }
             _ => {
                 let refs: Vec<(&str, &Scene)> = self

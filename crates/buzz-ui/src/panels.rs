@@ -83,6 +83,8 @@ pub struct SequenceMenuInfo {
     pub active_shot_setup: Option<buzz_doc::SceneKey>,
     /// A master audio is already set.
     pub master_audio_set: bool,
+    /// Master Audio mode is on: only the master clip may play.
+    pub master_audio_mode: bool,
     /// Every Setup scene, by key and name — for "New Shot from Setup" and
     /// "Try Another Setup" to list.
     pub setups: Vec<(buzz_doc::SceneKey, String)>,
@@ -221,6 +223,35 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 !scene.edit_path().is_empty(),
                 &mut raised,
             );
+            // Protect Other Keyframes (docs/MASTER_AUDIO_AND_PROTECT_PLAN.md K2).
+            ui.separator();
+            let tick = |on: bool| if on { "\u{2714} " } else { "   " };
+            if ui
+                .button(format!(
+                    "{}{}",
+                    tick(workspace.protect_keyframes),
+                    Command::ToggleProtectKeyframes.label()
+                ))
+                .on_hover_text(
+                    "Edits inside a shared symbol change only the clicked keyframe; \
+                     Auto Keyframe stays on",
+                )
+                .clicked()
+            {
+                raised.push(Command::ToggleProtectKeyframes);
+                ui.close();
+            }
+            ui.menu_button("Protect Scope", |ui| {
+                for (c, on) in [
+                    (Command::ProtectThisKeyframe, !workspace.protect_from_here),
+                    (Command::ProtectFromHere, workspace.protect_from_here),
+                ] {
+                    if ui.button(format!("{}{}", tick(on), c.label())).clicked() {
+                        raised.push(c);
+                        ui.close();
+                    }
+                }
+            });
         });
 
         ui.menu_button("View", |ui| {
@@ -627,6 +658,17 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                     }
                 });
             }
+            // Master Audio mode (docs/MASTER_AUDIO_AND_PROTECT_PLAN.md Part M).
+            let mark = if sequence.master_audio_mode { "\u{2714} " } else { "   " };
+            if ui
+                .button(format!("{mark}{}", Command::ToggleMasterAudioMode.label()))
+                .on_hover_text("Only the master audio may play; other sounds are removed and blocked")
+                .clicked()
+            {
+                raised.push(Command::ToggleMasterAudioMode);
+                ui.close();
+            }
+            item(ui, Command::ReapplyMasterAudio, sequence.master_audio_mode, &mut raised);
             ui.separator();
             item(ui, Command::MakeSetupFromScene, true, &mut raised);
             ui.add_enabled_ui(!sequence.setups.is_empty(), |ui| {
@@ -737,6 +779,16 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             // Insert — Insert's entry is New Symbol, which is a different
             // thing: one wraps a selection, the other starts from nothing.
             item(ui, Command::ConvertToSymbol, has_selection, &mut raised);
+            ui.menu_button("Symbol", |ui| {
+                // The selected instance's symbol, else the Library's.
+                item(ui, Command::ClearAllKeyframes, true, &mut raised);
+            });
+            // Animate's Modify ▸ Timeline: layer housekeeping (L2).
+            ui.menu_button("Timeline", |ui| {
+                item(ui, Command::CleanUpLayers, true, &mut raised);
+                item(ui, Command::ArrangeLayers, true, &mut raised);
+                item(ui, Command::RepairLayerRigs, true, &mut raised);
+            });
             ui.separator();
             item(ui, Command::GroupSelection, has_selection, &mut raised);
             item(ui, Command::UngroupSelection, has_selection, &mut raised);
@@ -823,7 +875,6 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             ui.label(RichText::new("Bitmap").small().weak());
             for c in [
                 Command::TraceBitmapOptions,
-                Command::TraceBitmap,
                 Command::TraceLineArt,
             ] {
                 item(ui, c, has_selection, &mut raised);
@@ -1296,13 +1347,27 @@ fn instance_properties(
     let mut new_sync_to_root = instance.sync_to_root;
     let mut edited = false;
 
-    // Every other symbol this instance could point at instead.
-    let others: Vec<(buzz_scene::SymbolId, String)> = scene
-        .library()
-        .iter()
-        .filter(|s| s.id != instance.symbol)
-        .map(|s| (s.id, s.name.clone()))
-        .collect();
+    // What Swap… offers first: the symbols similar to this one, ranked
+    // (`Library::similar_symbols`). Computed once per (symbol, library) and
+    // kept in egui temp data, never rebuilt per frame; the library's content id
+    // changes exactly when the library is edited.
+    let similar: std::sync::Arc<Vec<(buzz_scene::SymbolId, u32)>> = {
+        let cache_key = egui::Id::new("swap-similar-cache");
+        let stamp = (instance.symbol.0, scene.library().content_id());
+        let cached: Option<((u64, usize), std::sync::Arc<Vec<(buzz_scene::SymbolId, u32)>>)> =
+            ui.data(|d| d.get_temp(cache_key));
+        match cached {
+            Some((at, list)) if at == stamp => list,
+            _ => {
+                let bounds = scene.cached_bounds_table();
+                let list = std::sync::Arc::new(
+                    scene.library().similar_symbols(instance.symbol, &bounds),
+                );
+                ui.data_mut(|d| d.insert_temp(cache_key, (stamp, list.clone())));
+                list
+            }
+        }
+    };
 
     // -- the symbol set ----------------------------------------------------
     //
@@ -1365,16 +1430,60 @@ fn instance_properties(
                 // instance instead would lose all of that, which is exactly
                 // what the button exists to avoid.
                 ui.menu_button("Swap\u{2026}", |ui| {
-                    if others.is_empty() {
-                        ui.label(RichText::new("no other symbols").small().weak());
-                    }
-                    for (id, name) in &others {
-                        if ui.button(name).clicked() {
-                            new_symbol = *id;
-                            edited = true;
-                            ui.close();
+                    // Only the similar symbols, ranked; a search box once the
+                    // list is long; everything else under All symbols ▸.
+                    let search_key = egui::Id::new("swap-similar-search");
+                    let mut search: String =
+                        ui.data(|d| d.get_temp(search_key)).unwrap_or_default();
+                    if similar.len() > 12 {
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut search).hint_text("Search"))
+                            .changed()
+                        {
+                            ui.data_mut(|d| d.insert_temp(search_key, search.clone()));
                         }
                     }
+                    let needle = if similar.len() > 12 {
+                        search.trim().to_lowercase()
+                    } else {
+                        String::new()
+                    };
+                    if similar.is_empty() {
+                        ui.label(RichText::new("No similar symbols").small().weak());
+                    }
+                    for (sid, _score) in similar.iter() {
+                        let Some(s) = library.get(*sid) else {
+                            continue;
+                        };
+                        if !needle.is_empty() && !s.name.to_lowercase().contains(&needle) {
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button(&s.name).clicked() {
+                                new_symbol = *sid;
+                                edited = true;
+                                ui.close();
+                            }
+                            if let Some(folder) = s.folder.as_deref().filter(|f| !f.is_empty()) {
+                                ui.label(RichText::new(folder).small().weak());
+                            }
+                        });
+                    }
+                    ui.separator();
+                    ui.menu_button("All symbols", |ui| {
+                        let mut any = false;
+                        for s in library.iter().filter(|s| s.id != shown_symbol) {
+                            any = true;
+                            if ui.button(&s.name).clicked() {
+                                new_symbol = s.id;
+                                edited = true;
+                                ui.close();
+                            }
+                        }
+                        if !any {
+                            ui.label(RichText::new("no other symbols").small().weak());
+                        }
+                    });
                 })
                 .response
                 .on_hover_text("Point this instance at a different symbol");
@@ -1981,6 +2090,24 @@ pub fn tool_options_panel(
         _ => anything = false,
     }
 
+    if matches!(
+        tool,
+        ToolId::Brush
+            | ToolId::Pencil
+            | ToolId::Line
+            | ToolId::Pen
+            | ToolId::Rectangle
+            | ToolId::Oval
+            | ToolId::PolyStar
+    ) {
+        if anything {
+            ui.add_space(6.0);
+        }
+        ui.label(RichText::new("Strokes").strong());
+        strokes_properties(ui, tool, style);
+        anything = true;
+    }
+
     // Symmetry belongs to *drawing*, not to any one tool, so it follows
     // whichever of them is in hand rather than living in a section of its own
     // that has to be found separately.
@@ -2025,6 +2152,46 @@ fn draws_through_symmetry(tool: ToolId) -> bool {
             | ToolId::PolyStar
             | ToolId::Eraser
     )
+}
+
+/// **Merge or keep separate**: Animate's Merge / Object Drawing, per tool.
+///
+/// Next to the tool rather than in Properties, because each tool (and each
+/// brush kind) remembers its own; the Brush row shows the current kind's.
+fn strokes_properties(ui: &mut Ui, tool: ToolId, style: &mut DrawStyle) {
+    let kind = style.brush.kind;
+    let current = style.drawing_mode_for(tool, kind);
+    ui.horizontal_wrapped(|ui| {
+        for (mode, label, hover) in [
+            (
+                DrawingMode::MergeShape,
+                "Merge together",
+                "Strokes that touch become one shape and are selected together; \
+                 a different colour cuts what it covers (Animate's Merge Drawing).",
+            ),
+            (
+                DrawingMode::ObjectDrawing,
+                "Keep separate",
+                "Every stroke is its own object (Animate's Object Drawing). \
+                 Shortcut: J.",
+            ),
+        ] {
+            if ui
+                .selectable_label(current == mode, label)
+                .on_hover_text(hover)
+                .clicked()
+            {
+                style.set_drawing_mode_for(tool, kind, mode);
+            }
+        }
+    });
+    if tool == ToolId::Brush && style.brush.build_up {
+        ui.label(
+            RichText::new("Build up strokes always stay separate.")
+                .small()
+                .weak(),
+        );
+    }
 }
 
 /// Symmetry: the mirror every drawing tool draws through.
@@ -3191,24 +3358,6 @@ pub fn properties_panel(
         });
     });
 
-    // The Merge Shape / Object Drawing toggle, which changes how the drawing
-    // tools behave rather than how anything looks.
-    let mut object_drawing = style.drawing_mode == DrawingMode::ObjectDrawing;
-    if ui
-        .checkbox(&mut object_drawing, "Object Drawing")
-        .on_hover_text(
-            "Off: shapes merge and cut destructively, like Animate's default.\n\
-             On: each shape stays a separate object.",
-        )
-        .changed()
-    {
-        style.drawing_mode = if object_drawing {
-            DrawingMode::ObjectDrawing
-        } else {
-            DrawingMode::MergeShape
-        };
-    }
-
     ui.add_space(Tokens::SPACE_2);
     // **Rolled up.** Ten checkboxes and a number, every one of which is also on
     // the View menu with its keyboard shortcut beside it. Open, they were a
@@ -4082,6 +4231,24 @@ pub fn layers_panel(
     selection: &mut Selection,
     frame: u32,
 ) -> Option<Command> {
+    layers_panel_filtered(
+        ui,
+        scene,
+        selection,
+        frame,
+        &crate::timeline_panel::RowFilter::default(),
+    )
+}
+
+/// [`layers_panel`], showing only the rows the timeline's layer filter
+/// leaves (L1 of `docs/LAYER_MANAGEMENT_PLAN.md`), so the two lists agree.
+pub fn layers_panel_filtered(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    selection: &mut Selection,
+    frame: u32,
+    row_filter: &crate::timeline_panel::RowFilter,
+) -> Option<Command> {
     let mut command = None;
     let can_delete = scene.layers().len() > 1;
 
@@ -4211,7 +4378,7 @@ pub fn layers_panel(
         // always is, and `row_idx` still counts every layer in the stack, so
         // the drag-and-drop maths below (which reads it against
         // `scene.layer_index`) is unaffected by what is or is not on screen.
-        if scene.layers().is_row_hidden(id) {
+        if row_filter.row_hidden(scene.layers(), id) {
             continue;
         }
         for light in lights_in(scene, Some(id)) {
@@ -4391,7 +4558,7 @@ pub fn layers_panel(
                             // folder itself falls inside the range. The
                             // anchor itself does not move.
                             let anchor = selection.range_anchor().or(active).unwrap_or(id);
-                            let order = scene.layers().visible_row_order();
+                            let order = row_filter.visible_row_order(scene.layers());
                             let range = crate::selection::layer_range(&order, anchor, id);
                             let expanded = crate::selection::expand_collapsed_folders(scene, &range);
                             selection.select_layers(scene, &expanded, frame);

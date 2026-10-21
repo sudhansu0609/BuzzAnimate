@@ -122,7 +122,8 @@ pub fn route(command: Command) -> Route {
         // Open a dialog or panel that needs parameters: run from args.
         New | LipSync | TraceBitmapOptions | SetScene | DirectScene | SceneryFor | Perform
         | AddFollowThrough | AddWiggle | AddTitleCard | AiIdentifyAssets | AiRigVectorCharacter
-        | AiDirectStory | AiCharacterFromImage | AiMouthChart => Route::Args,
+        | AiDirectStory | AiCharacterFromImage | AiMouthChart | ClearAllKeyframes | CleanUpLayers
+        | ArrangeLayers | RepairLayerRigs => Route::Args,
 
         // Needs the user, or has no document effect.
         Quit | Close | ShortcutEditor | Snapshots | About | AiModels | PasteboardColour
@@ -152,11 +153,13 @@ pub fn route(command: Command) -> Route {
         | DuplicateScene | AddPerson | ClearModifiers | BakeModifiers | SetReverse
         | ClearReverse | AddProfileRight | AddProfileLeft | AddThreeQuarterRight
         | AddThreeQuarterLeft | MakeSetupFromScene | SplitAtPlayhead | FlattenToMasterScene
+        | ToggleMasterAudioMode | ReapplyMasterAudio
         | ToggleActionsPanel | ClearScriptOutput | CreateClassicTween | CreateMotionTween
         | CreateShapeTween | RemoveTween | InsertFrame | RemoveFrame | InsertKeyframe
         | InsertBlankKeyframe | ClearKeyframe | PlayPause | NextFrame | PreviousFrame
         | FirstFrame | LastFrame | CutFrames | CopyFrames | PasteFrames | ClearFrames
         | ReverseFrames | ToggleOnionSkin | ToggleAutoKeyframe | ToggleEditMultipleFrames
+        | ToggleProtectKeyframes | ProtectThisKeyframe | ProtectFromHere
         | ToggleCamera | AddCameraKeyframe | RemoveCameraKeyframe | ResetCamera
         | AddLightKeyframe | RemoveLightKeyframe | SaveAsTemplate => Route::Run,
 
@@ -694,7 +697,7 @@ fn apply_style_field(
         }
         "drawing_mode" => {
             use buzz_ui::style::DrawingMode::*;
-            style.drawing_mode = pick_named(&[MergeShape, ObjectDrawing], text()?, key)?
+            style.set_all_drawing_modes(pick_named(&[MergeShape, ObjectDrawing], text()?, key)?)
         }
         _ => return Err(format!("unknown style field '{key}'")),
     }

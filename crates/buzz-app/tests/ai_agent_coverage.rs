@@ -839,7 +839,7 @@ fn every_property_field_is_settable_readable_and_one_undo_step() {
         // The symbol-set fields read back lists and act on names, so a value
         // written is not the value read; they have a test of their own.
         if kind == "element"
-            && matches!(field, "symbol_set" | "pick_from_set" | "include_in_set" | "remove_from_set")
+            && matches!(field, "symbol_set" | "similar_symbols" | "pick_from_set" | "include_in_set" | "remove_from_set")
         {
             continue;
         }

@@ -528,6 +528,10 @@ pub struct Object {
     /// Empty for everything that has only one view, which is almost everything.
     /// See [`Turnaround`].
     pub turnaround: Turnaround,
+
+    /// Drawn in Object Drawing mode (Animate's drawing object): Merge strokes
+    /// never fuse with it or cut it. Only meaningful on a raw shape.
+    pub drawing_object: bool,
 }
 
 /// One drawing of an object, seen from a particular way round.
@@ -897,6 +901,7 @@ impl Object {
             modifiers: Vec::new(),
             text: None,
             turnaround: Turnaround::default(),
+            drawing_object: false,
         }
     }
 
@@ -915,6 +920,7 @@ impl Object {
             modifiers: Vec::new(),
             text: None,
             turnaround: Turnaround::default(),
+            drawing_object: false,
         }
     }
 
@@ -1047,6 +1053,7 @@ impl Object {
             modifiers: Vec::new(),
             text: None,
             turnaround: Turnaround::default(),
+            drawing_object: false,
         }
     }
 }

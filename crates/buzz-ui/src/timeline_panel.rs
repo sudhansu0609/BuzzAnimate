@@ -121,6 +121,18 @@ pub struct TimelineResponse {
     pub set_frame_width: Option<f32>,
     /// The rows were made taller or shorter.
     pub set_row_scale: Option<f32>,
+    /// L1: the layer filter was changed (the dropdown, or "N hidden" → All).
+    pub set_layer_filter: Option<LayerFilter>,
+    /// L1: the layer search text was edited.
+    pub set_layer_search: Option<String>,
+    /// L1: the Compact toggle was clicked — rows to 60 % and back.
+    pub toggle_compact: bool,
+    /// L3: the Focus toggle was clicked (`Workspace::focus_folders`).
+    pub toggle_focus_folders: bool,
+    /// K2: the Protect Other Keyframes lock was clicked.
+    pub toggle_protect_keyframes: bool,
+    /// K2: a Protect scope was picked from the dropdown beside the lock.
+    pub set_protect_scope: Option<buzz_scene::ProtectScope>,
 }
 
 /// Frame operations, matching Animate's shortcuts.
@@ -241,14 +253,325 @@ impl FrameMoveDrag {
 }
 
 /// The timeline's layer rows, in display order — top to bottom, skipping a
-/// row folded away inside a collapsed folder. The rows a frame drag counts.
-fn display_rows(scene: &Scene) -> Vec<LayerId> {
-    scene
-        .layers()
-        .iter()
-        .map(|l| l.id)
-        .filter(|id| !scene.layers().is_row_hidden(*id))
-        .collect()
+/// row folded away inside a collapsed folder or hidden by the layer filter
+/// (L1). The rows a frame drag counts.
+fn display_rows(scene: &Scene, filter: &RowFilter) -> Vec<LayerId> {
+    filter.visible_row_order(scene.layers())
+}
+
+// -- L1: the layer filter (`docs/LAYER_MANAGEMENT_PLAN.md`) -------------------
+
+/// Which layer rows the timeline and Layers panel show. A view setting only:
+/// it never touches the stage, rendering or export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum LayerFilter {
+    /// Every row.
+    #[default]
+    All,
+    /// Hide a layer with no objects and no sound in any keyframe, and a folder
+    /// whose children are all hidden.
+    HideEmpty,
+    /// Only layers with objects (or a sound) at the playhead, plus the folders
+    /// they sit in.
+    HereOnly,
+}
+
+impl LayerFilter {
+    pub const EVERY: [LayerFilter; 3] = [LayerFilter::All, LayerFilter::HideEmpty, LayerFilter::HereOnly];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LayerFilter::All => "All layers",
+            LayerFilter::HideEmpty => "Hide empty",
+            LayerFilter::HereOnly => "Only at playhead",
+        }
+    }
+}
+
+/// What a layer holds, measured once per scene revision: whether any keyframe
+/// has objects or a sound, and the frame spans (inclusive) those keyframes
+/// cover, merged and in order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LayerContent {
+    pub has_content: bool,
+    pub spans: Vec<(u32, u32)>,
+}
+
+impl LayerContent {
+    /// Does content cover `frame`? A binary search over the spans.
+    pub fn covers(&self, frame: u32) -> bool {
+        let after = self.spans.partition_point(|(start, _)| *start <= frame);
+        after
+            .checked_sub(1)
+            .and_then(|i| self.spans.get(i))
+            .is_some_and(|(_, end)| frame <= *end)
+    }
+
+    fn measure(layer: &buzz_scene::Layer) -> Self {
+        let keys = layer.frames.keyframes();
+        let length = layer.frames.length();
+        let mut spans: Vec<(u32, u32)> = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            if (key.objects.is_empty() && key.sound.is_none()) || key.start >= length {
+                continue;
+            }
+            let next = keys.get(i + 1).map_or(length, |n| n.start.min(length));
+            let end = next.saturating_sub(1).max(key.start);
+            match spans.last_mut() {
+                Some(last) if last.1.saturating_add(1) >= key.start => last.1 = last.1.max(end),
+                _ => spans.push((key.start, end)),
+            }
+        }
+        Self {
+            has_content: !spans.is_empty(),
+            spans,
+        }
+    }
+}
+
+/// Everything [`row_filter_hidden`] reads besides the scene.
+pub struct RowFilterCtx<'a> {
+    pub content: &'a std::collections::HashMap<LayerId, LayerContent>,
+    /// Folder nesting, parent to children, from the same revision.
+    pub children: &'a std::collections::HashMap<LayerId, Vec<LayerId>>,
+    /// Lower-case search text; empty for none.
+    pub search: &'a str,
+    pub frame: u32,
+    /// Always shown: the active layer, selected layers, layers holding a
+    /// selected object.
+    pub pinned: &'a [LayerId],
+}
+
+/// **The one rule for which rows the layer filter hides** (L1). Combined with
+/// [`buzz_scene::LayerStack::is_row_hidden`] wherever rows are drawn or a
+/// Shift+click sweeps a range — never for rendering, export or anything that
+/// addresses layers by id.
+///
+/// A row shows when it is pinned, when it passes the filter and the search on
+/// its own, or when any row filed under it shows (so ancestors of a shown row
+/// show, and a folder whose children are all hidden hides).
+pub fn row_filter_hidden(scene: &Scene, id: LayerId, filter: LayerFilter, ctx: &RowFilterCtx) -> bool {
+    if filter == LayerFilter::All && ctx.search.is_empty() {
+        return false;
+    }
+    let stack = scene.layers();
+    if stack.get(id).is_none() {
+        return false;
+    }
+    !row_shown(stack, id, filter, ctx, 0)
+}
+
+fn row_shown(
+    stack: &buzz_scene::LayerStack,
+    id: LayerId,
+    filter: LayerFilter,
+    ctx: &RowFilterCtx,
+    depth: usize,
+) -> bool {
+    let Some(layer) = stack.get(id) else {
+        return false;
+    };
+    if ctx.pinned.contains(&id) {
+        return true;
+    }
+    let name_ok = ctx.search.is_empty() || layer.name.to_lowercase().contains(ctx.search);
+    let own = if layer.kind == LayerKind::Folder {
+        // A folder holds nothing itself: it shows for its children, or by
+        // name when only the search is narrowing the list.
+        filter == LayerFilter::All && !ctx.search.is_empty() && name_ok
+    } else {
+        name_ok
+            && match filter {
+                LayerFilter::All => true,
+                LayerFilter::HideEmpty => ctx.content.get(&id).is_some_and(|c| c.has_content),
+                LayerFilter::HereOnly => ctx.content.get(&id).is_some_and(|c| c.covers(ctx.frame)),
+            }
+    };
+    if own {
+        return true;
+    }
+    // Bounded by the layer count against a corrupt parent cycle.
+    if depth > stack.len() {
+        return false;
+    }
+    ctx.children
+        .get(&id)
+        .is_some_and(|kids| kids.iter().any(|&k| row_shown(stack, k, filter, ctx, depth + 1)))
+}
+
+/// The layer filter's answer for one frame of drawing: which rows it hides.
+/// Cheap to clone and to ask; built by [`LayerRowCache::view`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RowFilter {
+    hidden: Option<std::sync::Arc<std::collections::HashSet<LayerId>>>,
+    /// Rows the filter hides that folder collapse alone would have shown —
+    /// the timeline's "N hidden".
+    pub hidden_count: usize,
+}
+
+impl RowFilter {
+    /// Does the filter (not folder collapse) hide this row?
+    pub fn hides(&self, id: LayerId) -> bool {
+        self.hidden.as_ref().is_some_and(|h| h.contains(&id))
+    }
+
+    /// Folder collapse and the filter together: is this row left out?
+    pub fn row_hidden(&self, stack: &buzz_scene::LayerStack, id: LayerId) -> bool {
+        stack.is_row_hidden(id) || self.hides(id)
+    }
+
+    /// [`buzz_scene::LayerStack::visible_row_order`], less the rows the filter
+    /// hides: what is drawn, and what a Shift+click sweeps across.
+    pub fn visible_row_order(&self, stack: &buzz_scene::LayerStack) -> Vec<LayerId> {
+        stack
+            .iter()
+            .map(|l| l.id)
+            .filter(|&id| !self.row_hidden(stack, id))
+            .collect()
+    }
+}
+
+/// Identity of the layer stack a [`LayerRowCache`] measured.
+#[derive(Debug, Clone, PartialEq)]
+struct ContentKey {
+    scene: usize,
+    revision: u64,
+    path: Vec<buzz_scene::SymbolId>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ViewKey {
+    generation: usize,
+    filter: LayerFilter,
+    search: String,
+    frame: Option<u32>,
+    pinned: Vec<LayerId>,
+}
+
+/// **The layer filter's cache** (L1): emptiness and content spans per layer,
+/// measured once per (scene, revision, editing path), never per frame; and
+/// the last [`RowFilter`] built from it, rebuilt only when the filter, the
+/// search, the pinned rows or (for Only at playhead) the frame change.
+#[derive(Debug, Default)]
+pub struct LayerRowCache {
+    key: Option<ContentKey>,
+    content: std::collections::HashMap<LayerId, LayerContent>,
+    children: std::collections::HashMap<LayerId, Vec<LayerId>>,
+    builds: usize,
+    objects_key: Option<(usize, Vec<buzz_scene::ObjectId>)>,
+    object_layers: Vec<LayerId>,
+    view_key: Option<ViewKey>,
+    view: RowFilter,
+}
+
+impl LayerRowCache {
+    /// How many times the content map has been measured.
+    pub fn builds(&self) -> usize {
+        self.builds
+    }
+
+    /// What the cache measured for a layer, as of the last refresh.
+    pub fn content(&self, id: LayerId) -> Option<&LayerContent> {
+        self.content.get(&id)
+    }
+
+    /// The last view built — what is on screen now.
+    pub fn current(&self) -> RowFilter {
+        self.view.clone()
+    }
+
+    /// Re-measure if the scene, its revision or the editing path moved on.
+    pub fn refresh(&mut self, scene: &Scene) {
+        let key = ContentKey {
+            scene: scene as *const Scene as usize,
+            revision: scene.revision(),
+            path: scene.edit_path().to_vec(),
+        };
+        if self.key.as_ref() == Some(&key) {
+            return;
+        }
+        let stack = scene.layers();
+        self.content.clear();
+        self.children.clear();
+        for layer in stack.iter() {
+            self.content.insert(layer.id, LayerContent::measure(layer));
+            if let Some(parent) = layer.parent {
+                self.children.entry(parent).or_default().push(layer.id);
+            }
+        }
+        self.key = Some(key);
+        self.builds += 1;
+    }
+
+    /// The rows to hide for this frame. `All` with no search costs nothing.
+    pub fn view(
+        &mut self,
+        scene: &Scene,
+        filter: LayerFilter,
+        search: &str,
+        frame: u32,
+        pinned_layers: &[LayerId],
+        selected_objects: &[buzz_scene::ObjectId],
+    ) -> RowFilter {
+        let search = search.trim().to_lowercase();
+        if filter == LayerFilter::All && search.is_empty() {
+            self.view = RowFilter::default();
+            self.view_key = None;
+            return self.view.clone();
+        }
+        self.refresh(scene);
+
+        // Layers holding a selected object: worked out once per revision and
+        // selection, not per frame.
+        let objects_key = (self.builds, selected_objects.to_vec());
+        if self.objects_key.as_ref() != Some(&objects_key) {
+            self.object_layers.clear();
+            if !selected_objects.is_empty() {
+                let wanted: std::collections::HashSet<_> = selected_objects.iter().copied().collect();
+                for layer in scene.layers().iter() {
+                    if layer.all_objects().any(|o| wanted.contains(&o.id)) {
+                        self.object_layers.push(layer.id);
+                    }
+                }
+            }
+            self.objects_key = Some(objects_key);
+        }
+        let mut pinned: Vec<LayerId> = pinned_layers.to_vec();
+        pinned.extend(self.object_layers.iter().copied());
+        pinned.sort();
+        pinned.dedup();
+
+        let key = ViewKey {
+            generation: self.builds,
+            filter,
+            search: search.clone(),
+            frame: (filter == LayerFilter::HereOnly).then_some(frame),
+            pinned: pinned.clone(),
+        };
+        if self.view_key.as_ref() == Some(&key) {
+            return self.view.clone();
+        }
+        let ctx = RowFilterCtx {
+            content: &self.content,
+            children: &self.children,
+            search: &search,
+            frame,
+            pinned: &pinned,
+        };
+        let stack = scene.layers();
+        let hidden: std::collections::HashSet<LayerId> = stack
+            .iter()
+            .map(|l| l.id)
+            .filter(|&id| row_filter_hidden(scene, id, filter, &ctx))
+            .collect();
+        let hidden_count = hidden.iter().filter(|&&id| !stack.is_row_hidden(id)).count();
+        self.view = RowFilter {
+            hidden: Some(std::sync::Arc::new(hidden)),
+            hidden_count,
+        };
+        self.view_key = Some(key);
+        self.view.clone()
+    }
 }
 
 /// **M6**: where each selected layer's frames go when a frame drag moves
@@ -267,6 +590,17 @@ pub fn frame_move_targets(
     layers: impl IntoIterator<Item = LayerId>,
     rows: i32,
 ) -> Result<Vec<(LayerId, LayerId)>, String> {
+    frame_move_targets_filtered(scene, &RowFilter::default(), layers, rows)
+}
+
+/// [`frame_move_targets`], counting rows as the layer filter (L1) shows them,
+/// so a drag across a filtered timeline lands where its ghost was drawn.
+pub fn frame_move_targets_filtered(
+    scene: &Scene,
+    filter: &RowFilter,
+    layers: impl IntoIterator<Item = LayerId>,
+    rows: i32,
+) -> Result<Vec<(LayerId, LayerId)>, String> {
     let stack = scene.layers();
     let sources: Vec<LayerId> = layers
         .into_iter()
@@ -278,7 +612,7 @@ pub fn frame_move_targets(
     if rows == 0 {
         return Ok(sources.into_iter().map(|id| (id, id)).collect());
     }
-    let display = display_rows(scene);
+    let display = display_rows(scene, filter);
     let mut pairs = Vec::with_capacity(sources.len());
     for source in sources {
         let Some(index) = display.iter().position(|id| *id == source) else {
@@ -329,7 +663,7 @@ fn frame_move_drag(
     let Some(selection) = state.timeline_selection.as_ref() else {
         return;
     };
-    let display = display_rows(scene);
+    let display = display_rows(scene, &state.row_filter);
     let row_of = |id: LayerId| display.iter().position(|l| *l == id);
     if let Some(pos) = ui
         .ctx()
@@ -355,8 +689,13 @@ fn frame_move_drag(
         .and_then(|from| display.get(from))
         .is_some_and(|from| selection.layers.contains(from));
     if moving && lands_here {
-        let refused =
-            frame_move_targets(scene, selection.layers.iter().copied(), drag.rows).is_err();
+        let refused = frame_move_targets_filtered(
+            scene,
+            &state.row_filter,
+            selection.layers.iter().copied(),
+            drag.rows,
+        )
+        .is_err();
         let count = selection.last_frame - selection.first_frame + 1;
         let ghost = egui::Rect::from_min_size(
             egui::pos2(grid_left + to as f32 * cell_width, rect.min.y),
@@ -431,6 +770,19 @@ pub struct TimelineState {
     /// standard one. Both come from the workspace, so they survive a restart.
     pub frame_width: f32,
     pub row_scale: f32,
+    /// L1: the Compact toggle is on (rows at 60 %, the old height remembered).
+    pub compact: bool,
+    /// L3: Focus selection is on (`Workspace::focus_folders`).
+    pub focus_folders: bool,
+    /// K2: Protect Other Keyframes, with its scope; `None` when off.
+    pub protect_keyframes: Option<buzz_scene::ProtectScope>,
+    /// L1: which rows the layer filter keeps (`Workspace::layer_filter`).
+    pub layer_filter: LayerFilter,
+    /// L1: the layer search text. Not saved.
+    pub layer_search: String,
+    /// L1: the rows the filter and search hide this frame, from
+    /// [`LayerRowCache::view`]. The default hides nothing.
+    pub row_filter: RowFilter,
     /// Show Animate's **parenting view** in the layer column: a node per layer,
     /// wired to the layer it follows.
     pub parenting_view: bool,
@@ -824,8 +1176,10 @@ pub fn timeline_panel(ui: &mut Ui, scene: &Scene, state: &TimelineState) -> Time
 /// The least width the layer tools need on one line: wider than the row
 /// they draw ([`layer_tools`] at the theme's own sizes — checked by
 /// `the_layer_tools_fit_the_header_slot_they_ask_for`), so a slot this wide
-/// never clips the Reset button off its end.
-pub const LAYER_TOOLS_INLINE_WIDTH: f32 = 860.0;
+/// never clips the Reset button off its end. L1's filter, search, Compact and
+/// "N hidden" label added about 330 points; K2's Protect lock about 70, and
+/// its scope dropdown (shown while protect is on) about 175 more.
+pub const LAYER_TOOLS_INLINE_WIDTH: f32 = 1450.0;
 
 /// [`timeline_panel`], with the layer tools (New Layer, Folder, Camera,
 /// Parent, Depth, the two size sliders) drawn into `tools_slot` rather than
@@ -973,7 +1327,8 @@ pub fn timeline_panel_with_tools_slot(
                 // neither its own row nor a light keyed to it — though the
                 // folder's own row always is. Collapse never touches the
                 // stage; see `LayerStack::is_row_hidden`.
-                if scene.layers().is_row_hidden(id) {
+                // L1: and a row the layer filter or search leaves out.
+                if state.row_filter.row_hidden(scene.layers(), id) {
                     continue;
                 }
                 for light_id in lights_in(Some(id)) {
@@ -1178,6 +1533,97 @@ fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Time
                 .small()
                 .weak(),
         );
+
+        // **L1: the layer filter.** Hide empty rows, or show only what is on
+        // the playhead frame, plus a name search — view only, never the film.
+        ui.separator();
+        let mut filter = state.layer_filter;
+        egui::ComboBox::from_id_salt("timeline-layer-filter")
+            .width(112.0)
+            .selected_text(filter.label())
+            .show_ui(ui, |ui| {
+                for option in LayerFilter::EVERY {
+                    ui.selectable_value(&mut filter, option, option.label());
+                }
+            })
+            .response
+            .on_hover_text("Which layer rows to show");
+        if filter != state.layer_filter {
+            out.set_layer_filter = Some(filter);
+        }
+        let mut search = state.layer_search.clone();
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut search)
+                    .id_salt("timeline-layer-search")
+                    .hint_text("Find layer")
+                    .desired_width(80.0),
+            )
+            .on_hover_text("Show only layers whose name contains this")
+            .changed()
+        {
+            out.set_layer_search = Some(search);
+        }
+        if state.row_filter.hidden_count > 0
+            && ui
+                .add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{} hidden", state.row_filter.hidden_count))
+                            .small()
+                            .color(Palette::warning()),
+                    )
+                    .sense(Sense::click()),
+                )
+                .on_hover_text("Show all layers")
+                .clicked()
+        {
+            out.set_layer_filter = Some(LayerFilter::All);
+            out.set_layer_search = Some(String::new());
+        }
+        if ui
+            .add(egui::Button::new("Compact").selected(state.compact))
+            .on_hover_text("Short rows, to see more layers at once")
+            .clicked()
+        {
+            out.toggle_compact = true;
+        }
+        // L3: Focus selection — open the active layer's folders, close the rest.
+        if ui
+            .add(egui::Button::new("Focus").selected(state.focus_folders))
+            .on_hover_text("Open the active layer's folder and close the other folders")
+            .clicked()
+        {
+            out.toggle_focus_folders = true;
+        }
+        // K2: Protect Other Keyframes — the lock, and its scope beside it.
+        if ui
+            .add(egui::Button::new("\u{1F512} Protect").selected(state.protect_keyframes.is_some()))
+            .on_hover_text(
+                "Protect Other Keyframes \u{2014} an edit inside a shared symbol opened \
+                 from the stage changes only the clicked keyframe (a copy is made); \
+                 Auto Keyframe stays on",
+            )
+            .clicked()
+        {
+            out.toggle_protect_keyframes = true;
+        }
+        if let Some(scope) = state.protect_keyframes {
+            let name = |s: buzz_scene::ProtectScope| match s {
+                buzz_scene::ProtectScope::ThisKeyframe => "This keyframe",
+                buzz_scene::ProtectScope::FromHere => "This keyframe and later",
+            };
+            let mut picked = scope;
+            egui::ComboBox::from_id_salt("protect_scope")
+                .selected_text(name(scope))
+                .show_ui(ui, |ui| {
+                    for s in [buzz_scene::ProtectScope::ThisKeyframe, buzz_scene::ProtectScope::FromHere] {
+                        ui.selectable_value(&mut picked, s, name(s));
+                    }
+                });
+            if picked != scope {
+                out.set_protect_scope = Some(picked);
+            }
+        }
 
         // **The two zooms.** Animate has a Tiny-to-Large menu for the frames
         // and a Short/Normal/Tall one for the rows; these are the same two
@@ -2723,7 +3169,7 @@ fn layer_row(
                 // folder itself falls inside the range. The anchor itself
                 // does not move.
                 let anchor = state.range_anchor.or(state.active_layer).unwrap_or(layer.id);
-                let order = scene.layers().visible_row_order();
+                let order = state.row_filter.visible_row_order(scene.layers());
                 let range = crate::selection::layer_range(&order, anchor, layer.id);
                 out.select_layers =
                     Some(crate::selection::expand_collapsed_folders(scene, &range));
@@ -3907,6 +4353,12 @@ mod tests {
             onion_after: 2,
             frame_width: Metrics::FRAME_WIDTH,
             row_scale: 1.0,
+            compact: false,
+            focus_folders: false,
+            protect_keyframes: None,
+            layer_filter: Default::default(),
+            layer_search: String::new(),
+            row_filter: Default::default(),
             parenting_view: false,
             depth_view: false,
             focal_distance: 1000.0,

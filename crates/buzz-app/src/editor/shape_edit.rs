@@ -216,16 +216,23 @@ impl Editor {
 
         // A press on a selected object moves it. Asked last, and only when
         // there is something to take hold of: it is the costly question.
+        //
+        // A press on something drawn *above* every grabbed piece is a press
+        // on that thing, not on geometry hidden under it: a rig's arm (a
+        // symbol on its own layer) over a background shape's corner used to
+        // reshape the background, so the arm — and every layer following it —
+        // never moved.
+        let (grip, pieces) = if at_corner.is_empty() {
+            (ShapeGrip::Edge, at_edge)
+        } else {
+            (ShapeGrip::Corner, at_corner)
+        };
         if let Some(top) = self.object_at(doc, self.pick_tolerance())
-            && self.selection.contains(top)
+            && (self.selection.contains(top) || !pieces.iter().any(|p| p.id == top))
         {
             return None;
         }
-        if at_corner.is_empty() {
-            Some((ShapeGrip::Edge, at_edge))
-        } else {
-            Some((ShapeGrip::Corner, at_corner))
-        }
+        Some((grip, pieces))
     }
 
     /// The Selection tool's press on raw geometry: move a corner, bend an

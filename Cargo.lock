@@ -735,6 +735,7 @@ dependencies = [
 name = "buzz-doc"
 version = "0.1.0"
 dependencies = [
+ "buzz-audio",
  "buzz-geom",
  "buzz-light",
  "buzz-rig",

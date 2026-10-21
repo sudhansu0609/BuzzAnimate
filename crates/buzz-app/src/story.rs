@@ -224,6 +224,11 @@ impl Editor {
         match outcome {
             Some(Ok(mut directed)) => {
                 directed.message.push_str(&note);
+                // L3 auto-tidy (`Workspace::auto_tidy_layers`), folded into the
+                // "Direct" step so one undo still takes the shot back.
+                if let Some(tidied) = self.auto_tidy_into_step("Direct") {
+                    directed.message.push_str(&tidied);
+                }
                 self.doc.end_gesture();
                 let at = self.doc.active_scene();
                 let title = buzz_act::split_shots(&story)

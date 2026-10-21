@@ -120,6 +120,14 @@ pub struct Editor {
     /// Off by default: it is a mode, and a mode that silently adds keyframes
     /// must be one the user asked for.
     pub auto_keyframe: bool,
+    /// K2: what `auto_keyframe` was before Protect Other Keyframes forced it
+    /// on, restored when protect is turned off.
+    pub auto_keyframe_before_protect: Option<bool>,
+    /// K2: the scene revision last looked at by [`Self::note_protected_edits`].
+    protect_seen_revision: u64,
+    /// K2: the edit path the Library-opened warning was last shown for, so
+    /// it shows once per entry.
+    protect_warned_path: Option<Vec<buzz_scene::SymbolId>>,
     /// Library panel state: what is selected, what is open, what is typed in
     /// the search box. View state, so it lives here and not in the document.
     pub library: LibraryState,
@@ -164,6 +172,14 @@ pub struct Editor {
     pub new_document: buzz_ui::NewDocumentState,
     /// Insert > Title Card: the settings of the next card.
     pub title_card: buzz_ui::TitleCardState,
+    /// Modify > Symbol > Clear All Keyframes: the symbol and the choices.
+    pub clear_keys: buzz_ui::ClearKeysState,
+    /// K3: the stage instance Clear All Keyframes was opened from, if any.
+    pub clear_keys_origin: Option<buzz_scene::EditOrigin>,
+    /// Modify > Timeline > Clean Up Layers: the passes and the scope.
+    pub cleanup: buzz_ui::CleanupState,
+    /// Modify > Timeline > Repair Layer Rigs: the scope prompt is open.
+    pub repair_rigs_open: bool,
     /// Help ▸ About, and the banner it shows once it has been opened.
     pub about: buzz_ui::AboutState,
     /// Local AI models and LLM backends dialog.
@@ -276,6 +292,14 @@ pub struct Editor {
     /// ticks on one ruler would be unreadable. The last command run wins, and
     /// its status line says which.
     pub ruler_marks: Vec<u32>,
+    /// L1 of `docs/LAYER_MANAGEMENT_PLAN.md`: the layer filter's emptiness
+    /// cache (measured once per scene revision) and the last rows it hid.
+    pub layer_rows: buzz_ui::LayerRowCache,
+    /// L1: the timeline's layer search text. View state, never saved.
+    pub layer_search: String,
+    /// L3: the active layer Focus selection last acted on (`None` forces a
+    /// fresh look). View state, never saved.
+    pub focus_seen: Option<buzz_scene::LayerId>,
     /// **The playhead of every timeline above the one being edited**, outermost
     /// first: `edit_frames[d]` is the frame depth `d` was at when a symbol was
     /// entered from it. Leaving a symbol goes back to that frame instead of
@@ -557,8 +581,10 @@ impl Editor {
         let mut style = DrawStyle::default();
         style.brush.fluid_tip = workspace.brush_tips.fluid;
         style.brush.normal_tip = workspace.brush_tips.normal;
+        style.drawing_modes = workspace.drawing_modes;
+        let protect_seen_revision = doc.scene().revision();
 
-        Self {
+        let mut editor = Self {
             doc,
             camera,
             selection,
@@ -575,6 +601,9 @@ impl Editor {
             anchor_selection: None,
             restyle: false,
             auto_keyframe: false,
+            auto_keyframe_before_protect: None,
+            protect_seen_revision,
+            protect_warned_path: None,
             library: LibraryState::default(),
             swatch_panel: buzz_ui::SwatchState::default(),
             frame_clipboard: None,
@@ -583,6 +612,10 @@ impl Editor {
             templates: buzz_doc::TemplateLibrary::user(),
             new_document: buzz_ui::NewDocumentState::default(),
             title_card: buzz_ui::TitleCardState::default(),
+            clear_keys: buzz_ui::ClearKeysState::default(),
+            clear_keys_origin: None,
+            cleanup: buzz_ui::CleanupState::default(),
+            repair_rigs_open: false,
             about: buzz_ui::AboutState::default(),
             ai_models: buzz_ui::AiModelsState::default(),
             ai_character: buzz_ui::AiCharacterState::default(),
@@ -606,6 +639,9 @@ impl Editor {
             scrub_until: None,
             scrub_frame: None,
             ruler_marks: Vec::new(),
+            layer_rows: buzz_ui::LayerRowCache::default(),
+            layer_search: String::new(),
+            focus_seen: None,
             edit_frames: Vec::new(),
             enter_frame: None,
             lip_sync: buzz_ui::LipSyncState::default(),
@@ -621,6 +657,112 @@ impl Editor {
             master_waveform_cache: None,
             sequence_scrub: None,
             bounds_cache: std::cell::RefCell::new(None),
+        };
+        // K2: a saved Protect Other Keyframes is on from the start.
+        if editor.workspace.protect_keyframes {
+            editor.auto_keyframe_before_protect = Some(editor.auto_keyframe);
+            editor.auto_keyframe = true;
+        }
+        editor.sync_protect_keyframes();
+        editor
+    }
+
+    /// K2: hand the workspace's Protect Other Keyframes setting to the
+    /// document (view state there, so every document opened or made gets it).
+    pub fn sync_protect_keyframes(&mut self) {
+        self.doc.set_protect_keyframes(self.workspace.protect_scope());
+        self.protect_seen_revision = self.doc.scene().revision();
+    }
+
+    /// K2: **Edit ▸ Protect Other Keyframes** on or off. While on, Auto
+    /// Keyframe is held on; its old value comes back when protect goes off.
+    pub fn set_protect_keyframes(&mut self, on: bool) {
+        if on != self.workspace.protect_keyframes {
+            self.workspace.protect_keyframes = on;
+            if on {
+                self.auto_keyframe_before_protect = Some(self.auto_keyframe);
+                self.auto_keyframe = true;
+            } else if let Some(before) = self.auto_keyframe_before_protect.take() {
+                self.auto_keyframe = before;
+            }
+            self.workspace.save();
+        }
+        self.protect_warned_path = None;
+        self.sync_protect_keyframes();
+        self.status = Some(if on {
+            format!(
+                "Protect Other Keyframes on ({}) \u{2014} Auto Keyframe held on",
+                self.protect_scope_text()
+            )
+        } else {
+            "Protect Other Keyframes off".into()
+        });
+    }
+
+    /// K2: pick the Protect scope (`true` = this keyframe and later).
+    pub fn set_protect_from_here(&mut self, from_here: bool) {
+        if from_here != self.workspace.protect_from_here {
+            self.workspace.protect_from_here = from_here;
+            self.workspace.save();
+        }
+        self.sync_protect_keyframes();
+        self.status = Some(format!("Protect scope: {}", self.protect_scope_text()));
+    }
+
+    fn protect_scope_text(&self) -> &'static str {
+        if self.workspace.protect_from_here {
+            "this keyframe and later"
+        } else {
+            "this keyframe"
+        }
+    }
+
+    /// K2: after edits, while Protect Other Keyframes is on: keep Auto
+    /// Keyframe on, report a fork made by the last edit, and warn once per
+    /// entry when a shared symbol opened from the Library is edited (it
+    /// cannot fork, so the change reaches every keyframe). Run once a frame.
+    pub fn note_protected_edits(&mut self) {
+        if self.workspace.protect_keyframes && !self.auto_keyframe {
+            self.auto_keyframe = true;
+        }
+        if let Some(report) = self.doc.take_last_fork()
+            && let Some(&(old, new)) = report.copied.first()
+        {
+            let library = self.doc.scene().library();
+            let name = |id| library.get(id).map(|s| s.name.clone()).unwrap_or_default();
+            self.status = Some(format!(
+                "Protected: {} copied as {} for {}",
+                name(old),
+                name(new),
+                self.protect_scope_text()
+            ));
+        }
+        let revision = self.doc.scene().revision();
+        let edited = revision != self.protect_seen_revision;
+        self.protect_seen_revision = revision;
+        let path = self.doc.scene().edit_path().to_vec();
+        if self.protect_warned_path.as_ref().is_some_and(|p| *p != path) {
+            self.protect_warned_path = None;
+        }
+        if !edited
+            || !self.workspace.protect_keyframes
+            || self.protect_warned_path.is_some()
+            || path.is_empty()
+        {
+            return;
+        }
+        let scene = self.doc.scene();
+        let Some(&id) = path.last() else { return };
+        if scene.edit_origins().last().copied().flatten().is_some() {
+            return;
+        }
+        let uses = scene.symbol_usage().get(&id).copied().unwrap_or(0);
+        if uses > 1 {
+            let name = scene.library().get(id).map(|s| s.name.clone()).unwrap_or_default();
+            self.status = Some(format!(
+                "{name} is used in {uses} keyframes \u{2014} open it from the stage to change only one"
+            ));
+            self.protect_warned_path = Some(path);
         }
     }
 
@@ -637,6 +779,38 @@ impl Editor {
         }
         self.workspace.brush_tips = tips;
         true
+    }
+
+    /// Copy the per-tool Merge/Object Drawing choices into the workspace, as
+    /// [`Self::remember_brush_tips`] does. Returns whether anything changed.
+    pub fn remember_drawing_modes(&mut self) -> bool {
+        if self.style.drawing_modes == self.workspace.drawing_modes {
+            return false;
+        }
+        self.workspace.drawing_modes = self.style.drawing_modes;
+        true
+    }
+
+    /// **`J`: flip the current tool's Merge/Object Drawing**, as in Animate.
+    /// The Brush flips only its current kind. Tools that do not draw ignore it.
+    pub fn toggle_drawing_mode(&mut self) {
+        let tool = self.tool();
+        let kind = self.style.brush.kind;
+        let mut slots = self.style.drawing_modes;
+        if slots.slot_mut(tool, kind).is_none() {
+            return;
+        }
+        let mode = self.style.drawing_mode_for(tool, kind).toggled();
+        self.style.set_drawing_mode_for(tool, kind, mode);
+        let what = match mode {
+            DrawingMode::MergeShape => "Merge together",
+            DrawingMode::ObjectDrawing => "Keep separate",
+        };
+        self.status = Some(if tool == ToolId::Brush {
+            format!("Brush ({}): {what}", kind.label())
+        } else {
+            format!("{}: {what}", tool.name())
+        });
     }
 
     /// Every symbol's resolved extent, memoised by revision. Rebuilt only on an
@@ -805,6 +979,7 @@ impl Editor {
     pub fn adopt(&mut self, doc: Document) {
         self.doc = doc;
         self.doc.mark_clean();
+        self.sync_protect_keyframes();
         self.selection = Selection::new();
         self.selection.ensure_active_layer(self.doc.scene());
         self.current_frame = 0;
@@ -846,6 +1021,7 @@ impl Editor {
             sound: std::mem::replace(&mut self.sound, view.sound),
         };
         let old_doc = std::mem::replace(&mut self.doc, doc);
+        self.sync_protect_keyframes();
         // Object ids are per document, so one document's anchors must not
         // follow the selection into another that happens to reuse the id.
         self.anchor_selection = None;
@@ -862,6 +1038,7 @@ impl Editor {
     pub fn create_document(&mut self, setup: buzz_ui::DocumentSetup) {
         let setup = setup.sane();
         self.doc = Self::build_new_document(&setup);
+        self.sync_protect_keyframes();
 
         self.selection = Selection::new();
         self.selection.ensure_active_layer(self.doc.scene());
@@ -1603,6 +1780,23 @@ impl Editor {
     /// [`buzz_doc::Document::playing_length`].
     pub fn playing_length(&self) -> u32 {
         self.doc.playing_length(self.doc.active_scene()).max(1)
+    }
+
+    /// L1: the rows the timeline and Layers panel hide this frame, from the
+    /// workspace's layer filter and the search text. Measures layer content
+    /// only when the scene revision moves on; free with the filter off.
+    pub fn layer_row_filter(&mut self) -> buzz_ui::RowFilter {
+        let mut pinned: Vec<LayerId> = self.selection.selected_layers().to_vec();
+        pinned.extend(self.selection.active_layer());
+        let objects = self.selection.ids();
+        self.layer_rows.view(
+            self.doc.scene(),
+            self.workspace.layer_filter,
+            &self.layer_search,
+            self.current_frame,
+            &pinned,
+            &objects,
+        )
     }
 
     /// The active scene's own end marker for the Timeline, if it is a
@@ -3101,7 +3295,8 @@ impl Editor {
             return;
         }
 
-        let merge = self.style.drawing_mode == DrawingMode::MergeShape;
+        let merge = self.style.drawing_mode_for(self.tool(), self.style.brush.kind)
+            == DrawingMode::MergeShape;
         let mirrors = self.symmetry_mirrors();
         let frame = self.current_frame;
         let auto = self.auto_keyframe;
@@ -4402,7 +4597,9 @@ impl Editor {
         // and what every other drawing tool here already honours — a stroke laid
         // over paint of the same colour becomes part of it rather than a second
         // object stacked on top. See `fusable_paint`.
-        let fuse = (self.style.drawing_mode == buzz_ui::DrawingMode::MergeShape)
+        let merge = self.style.drawing_mode_for(ToolId::Brush, buzz_ui::BrushKind::Raster)
+            == buzz_ui::DrawingMode::MergeShape;
+        let fuse = merge
             .then(|| self.fusable_paint(layer, frame, canvas, brush))
             .flatten();
 
@@ -4458,10 +4655,18 @@ impl Editor {
             // The copies first, so the stroke being watched stays selected.
             // Each reflection is carried by the fill's own transform, so the
             // pixels are stored once however many mirrors there are.
+            // In Object Drawing each one is a protected drawing object.
+            let place = |scene: &mut Scene, shape: ShapeData| {
+                if merge {
+                    scene.add_shape_at(layer, frame, shape)
+                } else {
+                    add_drawing_object(scene, layer, frame, shape)
+                }
+            };
             for t in &mirrors {
-                scene.add_shape_at(layer, frame, mirror_shape(&shape, *t));
+                place(scene, mirror_shape(&shape, *t));
             }
-            painted = scene.add_shape_at(layer, frame, shape);
+            painted = place(scene, shape);
         });
         self.doc.end_gesture();
         match painted {
@@ -4507,6 +4712,10 @@ impl Editor {
         let resolved = scene.layers().get(layer)?.frames.resolved_at(frame);
         let objects: Vec<_> = resolved.iter().collect();
         for object in objects.into_iter().rev() {
+            // A drawing object never takes in later paint.
+            if object.drawing_object {
+                continue;
+            }
             let ObjectKind::Shape(shape) = &object.kind else {
                 continue;
             };
@@ -4581,6 +4790,9 @@ impl Editor {
         let frame = self.current_frame;
         let auto = self.auto_keyframe;
         let mirrors = self.symmetry_mirrors();
+        let merge = self.style.drawing_mode_for(ToolId::Brush, self.style.brush.kind)
+            == DrawingMode::MergeShape;
+        let place = if merge { place_artwork_merged } else { place_artwork };
         let mut created: Option<ObjectId> = None;
         self.doc.edit(label, |scene| {
             ensure_keyframe_for_drawing(scene, layer, frame, auto);
@@ -4611,9 +4823,9 @@ impl Editor {
             // leaves you holding the piece you drew.
             for t in &mirrors {
                 let copies = shapes.iter().map(|s| mirror_shape(s, *t)).collect();
-                place_artwork(scene, layer, frame, copies);
+                place(scene, layer, frame, copies);
             }
-            created = place_artwork(scene, layer, frame, shapes);
+            created = place(scene, layer, frame, shapes);
         });
         self.doc.end_gesture();
         match created {
@@ -5198,6 +5410,11 @@ impl Editor {
             ClearKeyframe => self.frame_op(FrameOp::ClearKeyframe),
             ClearFrames => self.frame_op(FrameOp::ClearFrames),
             ReverseFrames => self.frame_op(FrameOp::ReverseFrames),
+            CleanUpLayers => self.cleanup.open_fresh(),
+            RepairLayerRigs => self.repair_rigs_open = true,
+            ArrangeLayers => {
+                self.arrange_layers();
+            }
             CopyFrames => self.copy_frames(false),
             CutFrames => self.copy_frames(true),
             PasteFrames => self.paste_frames(),
@@ -5213,7 +5430,22 @@ impl Editor {
                 self.set_frame(last);
             }
             ToggleOnionSkin => self.onion.enabled = !self.onion.enabled,
-            ToggleAutoKeyframe => self.auto_keyframe = !self.auto_keyframe,
+            ToggleAutoKeyframe => {
+                if self.workspace.protect_keyframes {
+                    self.auto_keyframe = true;
+                    self.status = Some(
+                        "Auto Keyframe stays on while Protect Other Keyframes is on".into(),
+                    );
+                } else {
+                    self.auto_keyframe = !self.auto_keyframe;
+                }
+            }
+            ToggleProtectKeyframes => {
+                let on = !self.workspace.protect_keyframes;
+                self.set_protect_keyframes(on);
+            }
+            ProtectThisKeyframe => self.set_protect_from_here(false),
+            ProtectFromHere => self.set_protect_from_here(true),
             ToggleEditMultipleFrames => {
                 self.edit_multiple = !self.edit_multiple;
                 self.prune_selection();
@@ -5342,6 +5574,16 @@ impl Editor {
             // Opens a file dialog; the shell intercepts this before it ever
             // reaches here (see `App::dispatch`).
             SetMasterAudio => {}
+            // Asks first (and may open the Set Master Audio dialog); the
+            // shell intercepts this too (see `App::toggle_master_audio_mode`).
+            ToggleMasterAudioMode => {}
+            ReapplyMasterAudio => {
+                if self.doc.master_audio_mode() {
+                    self.enforce_master_audio_now();
+                } else {
+                    self.status = Some("Master Audio mode is off (Sequence \u{25b8} Master Audio Mode)".into());
+                }
+            }
             AddPerson => self.add_person(),
             // The dialog asks for the text; `add_title_card` makes the card.
             AddTitleCard => self.title_card.open = true,
@@ -5557,6 +5799,7 @@ impl Editor {
             DuplicateSymbol => self.duplicate_library_symbol(),
             DeleteSymbol => self.delete_library_symbol(),
             SymbolToAsset => self.keep_symbol_as_asset(),
+            ClearAllKeyframes => self.open_clear_keys_dialog(),
             NewLibraryFolder => self.new_library_folder(),
 
             // -- tweens ------------------------------------------------------
@@ -6096,6 +6339,9 @@ impl Editor {
     /// answering the one question its callers ask it — folding "and it went on
     /// a layer" into the returned name would make the name unusable as a name.
     pub fn import_sound(&mut self, path: &std::path::Path) -> anyhow::Result<String> {
+        if let Some(refusal) = self.master_audio_import_refusal() {
+            anyhow::bail!(refusal);
+        }
         // Decoded once here to learn its shape and to fail *before* the
         // document is touched: a file that cannot be decoded should not leave
         // an entry in the library that plays nothing.
@@ -6148,6 +6394,9 @@ impl Editor {
         };
         let on_stage = self.doc.scene().stage_cues().iter().any(|c| c.sound == id);
         if !on_stage {
+            if let Some(refusal) = self.master_audio_refusal(Some(id)) {
+                anyhow::bail!(refusal);
+            }
             let fps = self.doc.scene().stage().frame_rate.max(1.0);
             self.doc.edit("Place Sound", |scene| {
                 place_sound_on_stage(scene, id, fps);
@@ -6281,6 +6530,10 @@ impl Editor {
             self.status = Some("Import a sound first: File > Import Sound".into());
             return;
         };
+        if let Some(refusal) = self.master_audio_refusal(Some(sound)) {
+            self.status = Some(refusal);
+            return;
+        }
 
         // **A sound inside a symbol is a sound nobody hears.**
         //
@@ -6608,6 +6861,7 @@ impl Editor {
             active_shot,
             active_shot_setup,
             master_audio_set: self.doc.master_audio().is_some(),
+            master_audio_mode: self.doc.master_audio_mode(),
             setups: self.sequence_setups(),
             sound_layers,
             continue_from_choices,
@@ -6662,6 +6916,10 @@ impl Editor {
         };
         self.doc.set_master_audio(scene_key, layer_id);
         self.master_waveform_cache = None;
+        // Master Audio mode: a new master is enforced straight away.
+        if self.doc.master_audio_mode() {
+            self.enforce_master_audio_now();
+        }
         Ok(name)
     }
 
@@ -6687,6 +6945,82 @@ impl Editor {
         self.doc.set_master_audio(scene_key, layer);
         self.master_waveform_cache = None;
         self.status = Some("That layer is now the master audio".into());
+        // Master Audio mode: a new master is enforced straight away.
+        if self.doc.master_audio_mode() {
+            self.enforce_master_audio_now();
+        }
+    }
+
+    // -- Master Audio mode (docs/MASTER_AUDIO_AND_PROTECT_PLAN.md Part M) ----
+
+    /// `None` while Master Audio mode is off; otherwise the master clip's
+    /// bytes (a sound is the master when it shares them, the same identity
+    /// test `Document::enforce_master_audio` uses) and the master's name.
+    pub(crate) fn master_audio_lock(&self) -> Option<(Option<std::sync::Arc<Vec<u8>>>, String)> {
+        if !self.doc.master_audio_mode() {
+            return None;
+        }
+        let master = self.doc.master_sound();
+        let name = master
+            .as_ref()
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| "the master audio".to_string());
+        Some((master.map(|m| m.data.clone()), name))
+    }
+
+    /// The status line every refused sound gets while Master Audio mode is on.
+    pub(crate) fn master_audio_refusal_text(name: &str) -> String {
+        format!(
+            "Master Audio mode is on \u{2014} only {name} is allowed (Sequence \u{25b8} Master Audio Mode)"
+        )
+    }
+
+    /// Why putting `sound` (from the active scene's library) on a keyframe is
+    /// refused, or `None` if it is allowed: always allowed while the mode is
+    /// off, and clearing (`None`) or the master clip itself always are.
+    pub(crate) fn master_audio_refusal(&self, sound: Option<buzz_scene::SoundId>) -> Option<String> {
+        let (data, name) = self.master_audio_lock()?;
+        let Some(id) = sound else {
+            return None;
+        };
+        let allowed = match (data, self.doc.scene().sounds().get(id)) {
+            (Some(master), Some(asset)) => std::sync::Arc::ptr_eq(&master, &asset.data),
+            _ => false,
+        };
+        (!allowed).then(|| Self::master_audio_refusal_text(&name))
+    }
+
+    /// Why importing a new sound is refused, or `None` while the mode is off.
+    /// A freshly imported clip is never the master clip.
+    pub(crate) fn master_audio_import_refusal(&self) -> Option<String> {
+        self.master_audio_lock()
+            .map(|(_, name)| Self::master_audio_refusal_text(&name))
+    }
+
+    /// Run `Document::enforce_master_audio` and say what it did on the status
+    /// line: the counts, then the first three notes.
+    pub fn enforce_master_audio_now(&mut self) {
+        match self.doc.enforce_master_audio() {
+            Ok(report) => {
+                let mut text = format!(
+                    "Master Audio mode: removed {} other sound(s) and {} empty layer(s) across {} scene(s); \
+                     master in {} symbol(s)",
+                    report.sounds_removed,
+                    report.layers_removed,
+                    report.scenes_touched,
+                    report.symbols_given_guide
+                );
+                for note in report.notes.iter().take(3) {
+                    text.push_str(" \u{2014} ");
+                    text.push_str(note);
+                }
+                self.status = Some(text);
+            }
+            Err(e) => self.status = Some(format!("Master Audio mode: {e}")),
+        }
+        self.master_waveform_cache = None;
+        let scene = self.doc.scene().clone();
+        self.sound.refresh(&scene);
     }
 
     /// The master audio's own waveform, decoded once and cached until the
@@ -6813,6 +7147,8 @@ impl Editor {
             .sum();
         let audio_in = self.film_playhead().max(cut_so_far);
         let audio_out = total.max(audio_in + 1);
+        // No L3 auto-tidy here: a shot's setup layers are matched by name
+        // to continue/split shots, so they must stay as stamped.
         let key = self.doc.stamp_shot(setup, audio_in, audio_out)?;
         if let Some(index) = self.doc.index_of_key(key) {
             self.switch_scene(index);
@@ -7996,15 +8332,27 @@ impl Editor {
                     let elapsed = scene.layers().get(layer).map(|l| elapsed_on(l, frame)).unwrap_or(0);
                     instance.resolve_frame(symbol.kind, elapsed, symbol.length())
                 });
-                Some((instance.symbol, follows * object.transform, inner))
+                // Which instance was clicked, in which keyframe, so a
+                // protected edit can fork the symbol for this keyframe alone.
+                let origin = scene
+                    .layers()
+                    .get(layer)
+                    .and_then(|l| l.frames.keyframe_start(frame))
+                    .map(|keyframe_start| buzz_scene::EditOrigin {
+                        layer,
+                        keyframe_start,
+                        object: object.id,
+                    });
+                Some((instance.symbol, follows * object.transform, inner, origin))
             });
 
         match opened {
-            Some((id, place, inner)) => {
+            Some((id, place, inner, origin)) => {
                 self.enter_frame = inner;
                 let mut entered = false;
-                self.doc
-                    .edit_view(|scene| entered = scene.enter_symbol_in_place(id, place));
+                self.doc.edit_view(|scene| {
+                    entered = scene.enter_symbol_in_place_from(id, place, origin)
+                });
                 if !entered {
                     self.enter_frame = None;
                 }
@@ -8679,6 +9027,8 @@ impl Editor {
             });
             match failed {
                 None => {
+                    // L3 auto-tidy, folded into this shot's "Direct" step.
+                    let _ = self.auto_tidy_into_step("Direct");
                     let at = self.doc.active_scene();
                     self.doc.rename_scene(at, &shot.title);
                     directed += 1;
@@ -8966,6 +9316,362 @@ impl Editor {
         });
     }
 
+    /// **Clear All Keyframes…**: open the dialog for the selected instance's
+    /// symbol (keep-at-playhead = the inner frame it shows now), else the
+    /// Library's symbol (keep-at-playhead = the open frame when that symbol is
+    /// being edited). Raised from the Library menu, the Library's symbol wins.
+    fn open_clear_keys_dialog(&mut self) {
+        let from_library = std::mem::take(&mut self.library.clear_keys_from_library);
+        // K3: the stage instance as it stands at the playhead, so a protected
+        // clear can work on a copy for this keyframe alone.
+        let at_playhead = if from_library {
+            None
+        } else {
+            self.selection.iter().find_map(|id| self.stage_instance_at_playhead(id))
+        };
+        self.clear_keys_origin = at_playhead.map(|(origin, _)| origin);
+        let from_instance = if from_library {
+            None
+        } else {
+            at_playhead.map(|(_, symbol)| symbol).or_else(|| {
+                self.selection
+                    .iter()
+                    .find_map(|id| self.doc.scene().find_object(id).and_then(|(_, o)| o.instance().map(|i| i.symbol)))
+            })
+        };
+        let Some(id) = from_instance.or(self.library.selected) else {
+            self.status = Some("Select a symbol or an instance first".into());
+            return;
+        };
+        let playhead = if from_instance.is_some() {
+            self.selected_instance_inner_frame(id)
+        } else {
+            (self.doc.scene().editing_symbol() == Some(id)).then_some(self.current_frame)
+        };
+        let Some(symbol) = self.doc.scene().library().get(id) else {
+            self.status = Some("That symbol is no longer in the library".into());
+            return;
+        };
+        self.clear_keys = buzz_ui::ClearKeysState {
+            open: true,
+            symbol: Some(id),
+            name: symbol.name.clone(),
+            playhead,
+            keep_playhead: false,
+            nested: is_character_symbol(symbol),
+        };
+    }
+
+    /// The inner frame the first selected instance of `symbol` shows at the
+    /// playhead, as Edit in Place opens it.
+    pub fn selected_instance_inner_frame(&self, symbol: buzz_scene::SymbolId) -> Option<u32> {
+        let frame = self.current_frame;
+        let scene = self.doc.scene();
+        self.selection.iter().find_map(|id| {
+            let (layer, object) = scene.find_object(id)?;
+            let instance = object.instance().filter(|i| i.symbol == symbol)?;
+            let def = scene.library().get(instance.symbol)?;
+            let elapsed = scene.layers().get(layer).map(|l| elapsed_on(l, frame)).unwrap_or(0);
+            Some(instance.resolve_frame(def.kind, elapsed, def.length()))
+        })
+    }
+
+    /// Apply Clear All Keyframes as one undo step, with the status line.
+    pub fn clear_symbol_keyframes(
+        &mut self,
+        id: buzz_scene::SymbolId,
+        keep: buzz_scene::KeepPose,
+        nested: bool,
+    ) -> buzz_scene::ClearReport {
+        self.clear_symbol_keyframes_from(id, keep, nested, None)
+    }
+
+    /// [`Self::clear_symbol_keyframes`], started from the stage instance
+    /// `origin` (K3): with Protect Other Keyframes on and the symbol used more
+    /// than once, the instance's character is deep-forked for this keyframe
+    /// and the copy is cleared, in the same undo step. `None` (the Library)
+    /// clears the symbol itself.
+    pub fn clear_symbol_keyframes_from(
+        &mut self,
+        id: buzz_scene::SymbolId,
+        keep: buzz_scene::KeepPose,
+        nested: bool,
+        origin: Option<buzz_scene::EditOrigin>,
+    ) -> buzz_scene::ClearReport {
+        let name = self.doc.scene().library().get(id).map(|s| s.name.clone()).unwrap_or_default();
+        let fork_from = origin.filter(|o| self.protect_wants_fork(*o, id));
+        let mut report = buzz_scene::ClearReport::default();
+        let mut fork = None;
+        self.doc.edit("Clear All Keyframes", |scene| {
+            let mut target = id;
+            if let Some(origin) = fork_from
+                && let Some(made) = scene.fork_instance_subtree(origin)
+            {
+                target = made.copied.first().map(|(_, new)| *new).unwrap_or(id);
+                fork = Some(made);
+            }
+            report = scene.clear_symbol_keyframes(target, keep, nested);
+        });
+        self.doc.end_gesture();
+        let cleared = if report.layers == 0 {
+            format!("{name}: no keyframes to clear")
+        } else {
+            format!(
+                "{name}: {} keyframes cleared on {} layers ({} nested symbols)",
+                report.keyframes_cleared, report.layers, report.symbols
+            )
+        };
+        self.status = Some(match &fork {
+            Some(made) => format!("{} \u{2014} {cleared}", self.fork_status(made)),
+            None => cleared,
+        });
+        report
+    }
+
+    /// K3: the selected stage instance `object` as it stands in the keyframe
+    /// at the playhead, and the symbol it shows there. `None` inside a symbol
+    /// or when it is not an instance on the stage.
+    pub fn stage_instance_at_playhead(
+        &self,
+        object: ObjectId,
+    ) -> Option<(buzz_scene::EditOrigin, buzz_scene::SymbolId)> {
+        let scene = self.doc.scene();
+        if !scene.edit_path().is_empty() {
+            return None;
+        }
+        let frame = self.current_frame;
+        scene.stage_layers().iter().find_map(|l| {
+            let keyframe = l.frames.keyframe_at(frame)?;
+            let symbol = keyframe.objects.iter().find(|o| o.id == object)?.instance()?.symbol;
+            Some((
+                buzz_scene::EditOrigin { layer: l.id, keyframe_start: keyframe.start, object },
+                symbol,
+            ))
+        })
+    }
+
+    /// K3: should a whole-character command on the stage instance `origin`
+    /// (showing `symbol`) work on a copy? Protect on, and the symbol is used
+    /// more than once.
+    fn protect_wants_fork(&self, origin: buzz_scene::EditOrigin, symbol: buzz_scene::SymbolId) -> bool {
+        self.workspace.protect_keyframes
+            && self.doc.scene().edit_path().is_empty()
+            && self
+                .stage_instance_at_playhead(origin.object)
+                .is_some_and(|(o, s)| o == origin && s == symbol)
+            && self.doc.scene().symbol_usage().get(&symbol).copied().unwrap_or(0) > 1
+    }
+
+    /// K3: "Protected: <name> copied as <copy> for this keyframe".
+    fn fork_status(&self, report: &buzz_scene::ForkReport) -> String {
+        let library = self.doc.scene().library();
+        let name = |id| library.get(id).map(|s| s.name.clone()).unwrap_or_default();
+        match report.copied.first() {
+            Some(&(old, new)) => {
+                let more = report.copied.len() - 1;
+                let parts = match more {
+                    0 => String::new(),
+                    1 => " (+1 nested symbol)".to_string(),
+                    n => format!(" (+{n} nested symbols)"),
+                };
+                format!("Protected: {} copied as {}{parts} for this keyframe", name(old), name(new))
+            }
+            None => "Protected: nothing to copy".to_string(),
+        }
+    }
+
+    /// Apply Clean Up Layers as one undo step, with the status line
+    /// (`docs/LAYER_MANAGEMENT_PLAN.md` L2).
+    pub fn clean_up_layers(
+        &mut self,
+        scope: buzz_scene::CleanupScope,
+        options: buzz_scene::CleanupOptions,
+    ) -> buzz_scene::CleanupReport {
+        let preview = self.doc.scene().cleanup_preview(scope, options);
+        let mut report = buzz_scene::CleanupReport::default();
+        if !preview.is_empty() {
+            self.doc.edit("Clean Up Layers", |scene| {
+                report = scene.cleanup_layers(scope, options);
+            });
+            self.doc.end_gesture();
+            self.selection.prune(self.doc.scene());
+            self.selection.ensure_active_layer(&self.doc.scene().clone());
+        }
+        self.status = Some(if report.is_empty() {
+            "Clean Up Layers: nothing to clean up".to_string()
+        } else {
+            format!(
+                "Clean Up Layers: {} layers deleted, {} frames trimmed, {} folders removed ({} symbols)",
+                report.layers_deleted, report.frames_trimmed, report.folders_removed, report.symbols_touched
+            )
+        });
+        report
+    }
+
+    /// **Repair Layer Rigs** over `scope`, as one undo step ("Repair Layer
+    /// Rigs"), with the status line. Nothing to repair records no step.
+    pub fn repair_layer_rigs(&mut self, scope: buzz_scene::CleanupScope) -> crate::rigging::RepairReport {
+        let mut report = crate::rigging::RepairReport::default();
+        self.doc.end_gesture();
+        self.doc.edit("Repair Layer Rigs", |scene| {
+            report = crate::rigging::repair_layer_rigs(scene, scope);
+        });
+        if report.links_changed > 0 {
+            self.doc.end_gesture();
+            self.selection.prune(self.doc.scene());
+        }
+        self.status = Some(if report.links_changed == 0 {
+            format!("Repair Layer Rigs: {} rigs checked, nothing to repair", report.rigs)
+        } else {
+            format!(
+                "Repair Layer Rigs: {} rigs, {} links rewired, {} keyframes rebaked",
+                report.rigs, report.links_changed, report.keys_rebaked
+            )
+        });
+        report
+    }
+
+    /// **Arrange Layers** on the timeline being edited, as one undo step
+    /// ("Arrange Layers"), with the status line. Nothing to do records no
+    /// step (`docs/LAYER_MANAGEMENT_PLAN.md` L3).
+    pub fn arrange_layers(&mut self) -> buzz_scene::ArrangeReport {
+        let options = buzz_scene::ArrangeOptions {
+            active: self.selection.active_layer(),
+            delete_empty: true,
+        };
+        let mut report = buzz_scene::ArrangeReport::default();
+        // `edit` records nothing when the revision didn't move, and
+        // `arrange_layers` only bumps it when something changed.
+        self.doc.end_gesture();
+        self.doc.edit("Arrange Layers", |scene| {
+            report = scene.arrange_layers(options);
+        });
+        if report.changed() {
+            self.doc.end_gesture();
+            self.selection.prune(self.doc.scene());
+            self.selection.ensure_active_layer(&self.doc.scene().clone());
+        }
+        self.status = Some(if !report.changed() {
+            "Arrange Layers: already tidy".to_string()
+        } else {
+            format!(
+                "Arrange Layers: {} folders made, {} layers filed, {} left in place (overlapping), {} empty deleted",
+                report.folders_made, report.layers_moved, report.layers_left_in_place, report.emptied
+            )
+        });
+        report
+    }
+
+    /// **Auto-tidy** after a build (`Workspace::auto_tidy_layers`): Arrange
+    /// Layers when the setting is on, silently but for the status line. `what`
+    /// names the build for the status line.
+    pub fn auto_tidy_layers(&mut self, what: &str) {
+        if !self.workspace.auto_tidy_layers {
+            return;
+        }
+        let previous = self.status.clone();
+        let report = self.arrange_layers();
+        self.status = if report.changed() {
+            Some(format!(
+                "{what}: layers tidied ({} folders, {} filed, {} empty deleted)",
+                report.folders_made, report.layers_moved, report.emptied
+            ))
+        } else {
+            previous
+        };
+    }
+
+    /// **Auto-tidy folded into the build's own undo step**: Arrange Layers
+    /// as an edit under `label` — the label of the edit that just ran, before
+    /// any `end_gesture` — so the two coalesce and one Ctrl+Z still takes
+    /// the whole build back (AI scene direction promises one step). Returns
+    /// the note for the caller's status line when something was tidied.
+    pub fn auto_tidy_into_step(&mut self, label: &str) -> Option<String> {
+        if !self.workspace.auto_tidy_layers {
+            return None;
+        }
+        let options = buzz_scene::ArrangeOptions {
+            active: self.selection.active_layer(),
+            delete_empty: true,
+        };
+        let mut report = buzz_scene::ArrangeReport::default();
+        self.doc.edit(label.to_string(), |scene| {
+            report = scene.arrange_layers(options);
+        });
+        if !report.changed() {
+            return None;
+        }
+        self.selection.prune(self.doc.scene());
+        self.selection.ensure_active_layer(&self.doc.scene().clone());
+        Some(format!(
+            " \u{2014} layers tidied ({} folders, {} filed, {} empty deleted)",
+            report.folders_made, report.layers_moved, report.emptied
+        ))
+    }
+
+    /// **Focus selection** (`Workspace::focus_folders`): open the active
+    /// layer's folders and close the other top-level folders. Collapse is
+    /// document state, so this is an edit labelled "Focus folders",
+    /// consecutive focus changes coalescing into one undo step. Does nothing
+    /// when every folder is already as wanted.
+    pub fn focus_folders_if_changed(&mut self) {
+        if !self.workspace.focus_folders {
+            return;
+        }
+        let active = self.selection.active_layer();
+        if active.is_none() || active == self.focus_seen {
+            return;
+        }
+        self.focus_seen = active;
+        self.focus_folders();
+    }
+
+    /// [`Self::focus_folders_if_changed`] for the current active layer, now.
+    pub fn focus_folders(&mut self) {
+        if !self.workspace.focus_folders {
+            return;
+        }
+        let Some(active) = self.selection.active_layer() else { return };
+        let scene = self.doc.scene();
+        let layers = scene.layers();
+        if layers.get(active).is_none() {
+            return;
+        }
+        let mut ancestors: Vec<buzz_scene::LayerId> = Vec::new();
+        let mut next = layers.get(active).and_then(|l| l.parent);
+        for _ in 0..layers.len() {
+            let Some(id) = next else { break };
+            if ancestors.contains(&id) {
+                break;
+            }
+            ancestors.push(id);
+            next = layers.get(id).and_then(|l| l.parent);
+        }
+        let changes: Vec<(buzz_scene::LayerId, bool)> = layers
+            .iter()
+            .filter(|l| l.kind == buzz_scene::LayerKind::Folder)
+            .filter_map(|l| {
+                let want = if ancestors.contains(&l.id) {
+                    Some(false)
+                } else if l.parent.is_none() && l.id != active {
+                    Some(true)
+                } else {
+                    None
+                };
+                want.filter(|w| *w != l.collapsed).map(|w| (l.id, w))
+            })
+            .collect();
+        if changes.is_empty() {
+            return;
+        }
+        self.doc.edit("Focus folders", |scene| {
+            let stack = scene.edit_layers();
+            for (id, collapsed) in &changes {
+                stack.update(*id, |l| l.collapsed = *collapsed);
+            }
+        });
+    }
+
     /// **Point every instance of one symbol at another.**
     ///
     /// With two instances selected: everything wearing the first symbol now
@@ -8987,6 +9693,41 @@ impl Editor {
             self.status = Some(
                 "Select two instances: the one to replace, then the one to replace it with".into(),
             );
+            return;
+        }
+
+        // K3: with Protect Other Keyframes on, only the selected instance in
+        // the keyframe at the playhead is repointed, not every use.
+        if self.workspace.protect_keyframes && self.doc.scene().edit_path().is_empty() {
+            let found: Vec<_> =
+                ids.iter().filter_map(|id| self.stage_instance_at_playhead(*id)).collect();
+            if found.len() != 2 || found[0].1 == found[1].1 {
+                self.status = Some(
+                    "Protect Other Keyframes: select two different instances at the playhead"
+                        .into(),
+                );
+                return;
+            }
+            let (origin, from) = found[0];
+            let to = found[1].1;
+            let others = self.doc.scene().symbol_usage().get(&from).copied().unwrap_or(1) - 1;
+            let mut swapped = false;
+            self.doc.edit("Swap Symbol", |scene| {
+                swapped = scene.update_object_at(origin.keyframe_start, origin.object, |object| {
+                    if let ObjectKind::Instance(instance) = &mut object.kind {
+                        instance.symbol = to;
+                    }
+                });
+            });
+            self.doc.end_gesture();
+            self.status = Some(if swapped {
+                format!(
+                    "Protected: swapped only the selected instance in this keyframe \
+                     ({others} other uses kept)"
+                )
+            } else {
+                "Nothing was swapped".to_string()
+            });
             return;
         }
 
@@ -9760,8 +10501,9 @@ impl Editor {
         }
         let label = if copy { "Copy Frames" } else { "Move Frames" };
 
-        let pairs = match buzz_ui::frame_move_targets(
+        let pairs = match buzz_ui::frame_move_targets_filtered(
             self.doc.scene(),
+            &self.layer_rows.current(),
             selection.layers.iter().copied(),
             rows,
         ) {
@@ -10748,6 +11490,8 @@ impl Editor {
                     let mut updated = (*object).clone();
                     updated.kind = ObjectKind::Shape(baked_shape);
                     updated.transform = Affine::IDENTITY;
+                    // Broken apart, a drawing object becomes merge paint.
+                    updated.drawing_object = false;
                     scene.remove_object(id);
                     if let Some(new_id) = scene.add_object_at(layer, at.frame, updated) {
                         produced.push(new_id);
@@ -11709,6 +12453,15 @@ fn update_object(scene: &mut Scene, at: EditAt, id: ObjectId, f: impl FnMut(&mut
     scene.update_object_where(at, id, f);
 }
 
+/// A character: tagged `character`, or filed under `Cast`.
+pub fn is_character_symbol(symbol: &buzz_scene::Symbol) -> bool {
+    symbol.tags.iter().any(|t| t.eq_ignore_ascii_case("character"))
+        || symbol
+            .folder
+            .as_deref()
+            .is_some_and(|f| f == "Cast" || f.starts_with("Cast/"))
+}
+
 /// How long the keyframe governing `frame` has been on screen — what a
 /// symbol instance on the layer counts its own playhead from. Mirrors
 /// `buzz_render::document::elapsed_on`, which a rendered instance uses for
@@ -12263,6 +13016,69 @@ fn place_artwork(
     scene.add_object_at(layer, frame, Object::group(id, children))
 }
 
+/// Lay brush artwork down in **Merge Drawing**: it joins what it lands on.
+///
+/// The topmost visible, unlocked object it overlaps takes it in when that is a
+/// plain group of raw shapes, appended last so stacking never changes.
+/// Anything else is left alone and the artwork goes down as its own group,
+/// even one piece, so the next stroke has a group to join.
+fn place_artwork_merged(
+    scene: &mut Scene,
+    layer: LayerId,
+    frame: u32,
+    shapes: Vec<ShapeData>,
+) -> Option<ObjectId> {
+    let bb = shapes
+        .iter()
+        .map(|s| s.path.bounding_box())
+        .reduce(|a, b| a.union(b))?;
+    let plain_group = |o: &Object| {
+        o.text.is_none()
+            && matches!(&o.kind, ObjectKind::Group(children) if children
+                .iter()
+                .all(|c| c.text.is_none() && matches!(c.kind, ObjectKind::Shape(_))))
+    };
+    let target = scene.layers().get(layer).and_then(|l| {
+        l.objects_at(frame)
+            .iter()
+            .rev()
+            .filter(|o| o.visible && !o.locked)
+            .find(|o| scene.resolved_bounds(o).overlaps(bb))
+            .filter(|o| plain_group(o))
+            .and_then(|o| invert(o.transform).map(|back| (o.id, back)))
+    });
+    let mut pending: Option<Vec<Arc<Object>>> = Some(
+        shapes
+            .into_iter()
+            .map(|shape| {
+                let id = scene.next_object_id();
+                Arc::new(Object::shape(id, shape))
+            })
+            .collect(),
+    );
+    if let Some((id, back)) = target {
+        // The group's children live in its own space; the strokes were drawn
+        // in the layer's.
+        scene.update_object_at(frame, id, |o| {
+            if let ObjectKind::Group(children) = &mut o.kind
+                && let Some(new) = pending.take()
+            {
+                children.extend(new.into_iter().map(|c| {
+                    let mut c = Arc::unwrap_or_clone(c);
+                    c.transform = back * c.transform;
+                    Arc::new(c)
+                }));
+            }
+        });
+        if pending.is_none() {
+            return Some(id);
+        }
+    }
+    let children = pending?;
+    let id = scene.next_object_id();
+    scene.add_object_at(layer, frame, Object::group(id, children))
+}
+
 /// One symmetry copy of a shape: its path and any gradient/image paint carried
 /// through the mirror transform, so the copy is a true reflection, fill and all.
 fn mirror_shape(shape: &ShapeData, t: Affine) -> ShapeData {
@@ -12500,7 +13316,7 @@ fn lay_shape(
     shape: ShapeData,
 ) -> Option<ObjectId> {
     if !merge {
-        return scene.add_shape_at(layer, frame, shape);
+        return add_drawing_object(scene, layer, frame, shape);
     }
     if shape.fill.is_some() && shape.stroke.is_some() {
         // The fill goes down first so it cuts and merges with the colour that
@@ -12527,6 +13343,19 @@ fn lay_shape(
     }
 }
 
+/// Place a shape drawn in Object Drawing mode, flagged so later Merge strokes
+/// leave it alone.
+fn add_drawing_object(
+    scene: &mut Scene,
+    layer: LayerId,
+    frame: u32,
+    shape: ShapeData,
+) -> Option<ObjectId> {
+    let id = scene.add_shape_at(layer, frame, shape)?;
+    scene.update_object_at(frame, id, |o| o.drawing_object = true);
+    Some(id)
+}
+
 /// **Cut the colour a line is drawn across.**
 ///
 /// Every filled shape on this layer and frame that `cutter` — the outlined ink
@@ -12547,13 +13376,14 @@ fn cut_fills_along(
         return;
     }
     let cutter_bb = cutter.bounding_box();
+    // A drawing object is never cut.
     let ids: Vec<ObjectId> = scene
         .layers()
         .get(layer)
         .map(|l| {
             l.objects_at(frame)
                 .iter()
-                .filter(|o| o.visible && !o.locked)
+                .filter(|o| o.visible && !o.locked && !o.drawing_object)
                 .filter_map(|o| match &o.kind {
                     // Only flat, Normal-blend paint is cut. Build-up paint
                     // layers rather than merges, so a line does not divide it;
@@ -12682,13 +13512,14 @@ fn merge_stroke_into_layer(
     }
 
     // Lines already on the frame that share this one's ink and could touch it.
+    // Drawing objects stay whole.
     let candidates: Vec<(ObjectId, BezPath)> = scene
         .layers()
         .get(layer)
         .map(|l| {
             l.objects_at(frame)
                 .iter()
-                .filter(|o| o.visible && !o.locked)
+                .filter(|o| o.visible && !o.locked && !o.drawing_object)
                 .filter_map(|o| match &o.kind {
                     // Only an unfilled line fuses with an unfilled line. A
                     // stroked *fill* is a shape with an outline: fusing its
@@ -12815,14 +13646,15 @@ fn merge_shape_into_layer(
         _ => false,
     };
 
-    // Existing filled shapes that overlap the new one.
+    // Existing filled shapes that overlap the new one. Drawing objects are
+    // never merged into or cut, as in Animate.
     let candidates: Vec<(ObjectId, Paint, BezPath)> = scene
         .layers()
         .get(layer)
         .map(|l| {
             l.objects_at(frame)
                 .iter()
-                .filter(|o| o.visible && !o.locked)
+                .filter(|o| o.visible && !o.locked && !o.drawing_object)
                 .filter_map(|o| match &o.kind {
                     // Normal-blend fills only. Build-up (and any special blend)
                     // paint layers rather than merges, so it is never fused

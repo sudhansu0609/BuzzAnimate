@@ -135,6 +135,10 @@ struct ScenesDto {
     /// anything inside the `SoundLibrary` of the scene that holds it.
     #[serde(default)]
     master_audio: Option<(SceneKey, LayerId)>,
+    /// Master Audio mode: only the master clip may play anywhere. Absent
+    /// means off, which is every file written before it existed.
+    #[serde(default)]
+    master_audio_mode: bool,
 }
 
 /// One scene plus the manifest metadata that travels with it: its stable key
@@ -160,6 +164,7 @@ pub struct LoadedScenes {
     pub roles: Vec<SceneRole>,
     pub sequence: Vec<SceneKey>,
     pub master_audio: Option<(SceneKey, LayerId)>,
+    pub master_audio_mode: bool,
 }
 
 /// The archive entry holding one scene's document JSON, and the media directory
@@ -199,7 +204,7 @@ pub fn to_bytes_scenes(scenes: &[(&str, &Scene)], active: usize) -> Result<Vec<u
             role: SceneRole::Normal,
         })
         .collect();
-    to_bytes_scenes_full(&records, active, &[], None)
+    to_bytes_scenes_full(&records, active, &[], None, false)
 }
 
 /// Serialise several scenes, with their roles and stable keys, the
@@ -209,9 +214,10 @@ pub fn to_bytes_scenes_full(
     active: usize,
     sequence: &[SceneKey],
     master_audio: Option<(SceneKey, LayerId)>,
+    master_audio_mode: bool,
 ) -> Result<Vec<u8>, DocError> {
     let mut buffer = Cursor::new(Vec::new());
-    write_archive(&mut buffer, scenes, active, sequence, master_audio)?;
+    write_archive(&mut buffer, scenes, active, sequence, master_audio, master_audio_mode)?;
     Ok(buffer.into_inner())
 }
 
@@ -221,6 +227,7 @@ fn write_archive<W: Write + Seek>(
     active: usize,
     sequence: &[SceneKey],
     master_audio: Option<(SceneKey, LayerId)>,
+    master_audio_mode: bool,
 ) -> Result<(), DocError> {
     let mut zip = ZipWriter::new(writer);
 
@@ -243,7 +250,8 @@ fn write_archive<W: Write + Seek>(
     let needs_manifest = scenes.len() > 1
         || scenes.iter().any(|s| !matches!(s.role, SceneRole::Normal))
         || !sequence.is_empty()
-        || master_audio.is_some();
+        || master_audio.is_some()
+        || master_audio_mode;
     if needs_manifest {
         let index = ScenesDto {
             active,
@@ -252,6 +260,7 @@ fn write_archive<W: Write + Seek>(
             roles: scenes.iter().map(|s| s.role.clone()).collect(),
             sequence: sequence.to_vec(),
             master_audio,
+            master_audio_mode,
         };
         zip.start_file(ENTRY_SCENES, deflated)?;
         zip.write_all(&serde_json::to_vec_pretty(&index)?)?;
@@ -343,7 +352,7 @@ pub fn from_bytes_scenes_full(bytes: &[u8]) -> Result<LoadedScenes, DocError> {
         return Err(DocError::WrongType(mimetype.trim().to_string()));
     }
 
-    let (names, active, keys, roles, sequence, master_audio) = match archive.by_name(ENTRY_SCENES)
+    let (names, active, keys, roles, sequence, master_audio, master_audio_mode) = match archive.by_name(ENTRY_SCENES)
     {
         Ok(mut file) => {
             let mut json = String::new();
@@ -369,6 +378,7 @@ pub fn from_bytes_scenes_full(bytes: &[u8]) -> Result<LoadedScenes, DocError> {
                 roles,
                 index.sequence,
                 index.master_audio,
+                index.master_audio_mode,
             )
         }
         Err(_) => (
@@ -378,6 +388,7 @@ pub fn from_bytes_scenes_full(bytes: &[u8]) -> Result<LoadedScenes, DocError> {
             vec![SceneRole::Normal],
             Vec::new(),
             None,
+            false,
         ),
     };
 
@@ -394,6 +405,7 @@ pub fn from_bytes_scenes_full(bytes: &[u8]) -> Result<LoadedScenes, DocError> {
         roles,
         sequence,
         master_audio,
+        master_audio_mode,
     })
 }
 
@@ -514,9 +526,10 @@ pub fn save_scenes_full(
     active: usize,
     sequence: &[SceneKey],
     master_audio: Option<(SceneKey, LayerId)>,
+    master_audio_mode: bool,
     path: impl AsRef<Path>,
 ) -> Result<(), DocError> {
-    let bytes = to_bytes_scenes_full(scenes, active, sequence, master_audio)?;
+    let bytes = to_bytes_scenes_full(scenes, active, sequence, master_audio, master_audio_mode)?;
     write_atomic(path.as_ref(), &bytes)
 }
 
@@ -912,7 +925,8 @@ mod tests {
         ];
         let master_audio = Some((shot_key, buzz_scene::LayerId(3)));
         let bytes =
-            to_bytes_scenes_full(&records, 1, &[shot_key], master_audio).unwrap();
+            to_bytes_scenes_full(&records, 1, &[shot_key], master_audio, false).unwrap();
+
 
         let loaded = from_bytes_scenes_full(&bytes).unwrap();
         assert_eq!(loaded.active, 1);

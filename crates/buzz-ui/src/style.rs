@@ -47,6 +47,90 @@ impl DrawingMode {
     }
 }
 
+/// **Merge or Object Drawing, remembered per tool and per brush** — as
+/// Animate remembers Object Drawing per tool.
+///
+/// `None` follows [`DrawStyle::drawing_mode`], so code (and tests) that set
+/// the global still decide every slot nobody has chosen for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolDrawingModes {
+    pub fluid: Option<DrawingMode>,
+    pub normal: Option<DrawingMode>,
+    pub raster: Option<DrawingMode>,
+    pub pattern: Option<DrawingMode>,
+    pub art: Option<DrawingMode>,
+    pub effect: Option<DrawingMode>,
+    pub wave: Option<DrawingMode>,
+    pub pencil: Option<DrawingMode>,
+    pub line: Option<DrawingMode>,
+    pub pen: Option<DrawingMode>,
+    pub rectangle: Option<DrawingMode>,
+    pub oval: Option<DrawingMode>,
+    pub polystar: Option<DrawingMode>,
+}
+
+impl Default for ToolDrawingModes {
+    /// Effect and Wave start separate: that is how they always behaved.
+    fn default() -> Self {
+        Self {
+            fluid: None,
+            normal: None,
+            raster: None,
+            pattern: None,
+            art: None,
+            effect: Some(DrawingMode::ObjectDrawing),
+            wave: Some(DrawingMode::ObjectDrawing),
+            pencil: None,
+            line: None,
+            pen: None,
+            rectangle: None,
+            oval: None,
+            polystar: None,
+        }
+    }
+}
+
+impl ToolDrawingModes {
+    /// The slot for `tool` (and, for the Brush, its kind); `None` for tools
+    /// that do not draw.
+    pub fn slot_mut(
+        &mut self,
+        tool: crate::tools::ToolId,
+        kind: crate::brush::BrushKind,
+    ) -> Option<&mut Option<DrawingMode>> {
+        use crate::brush::BrushKind as K;
+        use crate::tools::ToolId as T;
+        Some(match tool {
+            T::Brush => match kind {
+                K::Fluid => &mut self.fluid,
+                K::Normal => &mut self.normal,
+                K::Raster => &mut self.raster,
+                K::Pattern => &mut self.pattern,
+                K::Art => &mut self.art,
+                K::Effect => &mut self.effect,
+                K::Wave => &mut self.wave,
+            },
+            T::Pencil => &mut self.pencil,
+            T::Line => &mut self.line,
+            T::Pen => &mut self.pen,
+            T::Rectangle => &mut self.rectangle,
+            T::Oval => &mut self.oval,
+            T::PolyStar => &mut self.polystar,
+            _ => return None,
+        })
+    }
+
+    pub fn get(
+        &self,
+        tool: crate::tools::ToolId,
+        kind: crate::brush::BrushKind,
+    ) -> Option<DrawingMode> {
+        let mut copy = *self;
+        copy.slot_mut(tool, kind).and_then(|slot| *slot)
+    }
+}
+
 /// Stroke style options offered in the Properties panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum StrokeKind {
@@ -165,6 +249,9 @@ pub struct DrawStyle {
     pub hairline: bool,
     pub stroke_kind: StrokeKind,
     pub drawing_mode: DrawingMode,
+    /// **Per-tool and per-brush overrides** of [`Self::drawing_mode`]; read
+    /// them through [`Self::drawing_mode_for`].
+    pub drawing_modes: ToolDrawingModes,
     /// Brush tool settings. Kept here rather than on the tool so that
     /// switching tools and coming back does not reset them.
     pub brush: crate::brush::BrushSettings,
@@ -375,6 +462,7 @@ impl Default for DrawStyle {
             hairline: false,
             stroke_kind: StrokeKind::Solid,
             drawing_mode: DrawingMode::default(),
+            drawing_modes: ToolDrawingModes::default(),
             brush: crate::brush::BrushSettings::default(),
             brush_zoom_size: true,
             wand: buzz_scene::WandOptions::default(),
@@ -478,6 +566,50 @@ impl DrawStyle {
     /// unselectable, so the tools refuse to create one.
     pub fn can_draw(&self) -> bool {
         self.stroke_enabled || self.fill_enabled
+    }
+
+    /// **The mode `tool` draws in**: its own setting, else the global one.
+    pub fn drawing_mode_for(
+        &self,
+        tool: crate::tools::ToolId,
+        kind: crate::brush::BrushKind,
+    ) -> DrawingMode {
+        self.drawing_modes
+            .get(tool, kind)
+            .unwrap_or(self.drawing_mode)
+    }
+
+    /// Set `tool`'s own mode. Does nothing for tools that do not draw.
+    pub fn set_drawing_mode_for(
+        &mut self,
+        tool: crate::tools::ToolId,
+        kind: crate::brush::BrushKind,
+        mode: DrawingMode,
+    ) {
+        if let Some(slot) = self.drawing_modes.slot_mut(tool, kind) {
+            *slot = Some(mode);
+        }
+    }
+
+    /// One mode for everything: the global and every per-tool slot.
+    pub fn set_all_drawing_modes(&mut self, mode: DrawingMode) {
+        self.drawing_mode = mode;
+        let m = Some(mode);
+        self.drawing_modes = ToolDrawingModes {
+            fluid: m,
+            normal: m,
+            raster: m,
+            pattern: m,
+            art: m,
+            effect: m,
+            wave: m,
+            pencil: m,
+            line: m,
+            pen: m,
+            rectangle: m,
+            oval: m,
+            polystar: m,
+        };
     }
 }
 

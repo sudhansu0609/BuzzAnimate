@@ -69,6 +69,9 @@ pub struct MenuState<'a> {
     /// because a menu cannot borrow the editor while it draws. See
     /// `docs/SEQUENCE_SETUPS_PLAN.md`.
     pub sequence: &'a SequenceMenuInfo,
+    /// A symbol is chosen in the Library — with a stage instance selected,
+    /// what AI ▸ Rig Character as Layers… works on.
+    pub library_symbol: bool,
 }
 
 /// What the Sequence and Shot menus need about the active scene and the
@@ -110,6 +113,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         light_gizmos,
         templates,
         sequence,
+        library_symbol,
     } = *state;
     let mut raised = Vec::new();
 
@@ -580,6 +584,21 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             ] {
                 item(ui, c, true, &mut raised);
             }
+            // Animate's Copy Motion / Paste Motion sit with the frame
+            // clipboard (C1); they work on the selected objects.
+            ui.separator();
+            for c in [
+                Command::CopyMotion,
+                Command::PasteMotion,
+                Command::PasteMotionSpecial,
+                Command::CopyPose,
+                Command::PastePose,
+                Command::CopyPerformance,
+                Command::PastePerformance,
+                Command::PastePerformanceSpecial,
+            ] {
+                item(ui, c, has_selection, &mut raised);
+            }
             ui.separator();
             item(ui, Command::ToggleOnionSkin, true, &mut raised);
             item(ui, Command::ToggleAutoKeyframe, true, &mut raised);
@@ -788,6 +807,9 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 item(ui, Command::CleanUpLayers, true, &mut raised);
                 item(ui, Command::ArrangeLayers, true, &mut raised);
                 item(ui, Command::RepairLayerRigs, true, &mut raised);
+                item(ui, Command::RenameBodyLayers, true, &mut raised);
+                item(ui, Command::RenameFaceLayers, true, &mut raised);
+                item(ui, Command::RigHead, true, &mut raised);
             });
             ui.separator();
             item(ui, Command::GroupSelection, has_selection, &mut raised);
@@ -924,6 +946,12 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::AiCharacterFromImage, true, &mut raised);
             item(ui, Command::AiIdentifyAssets, true, &mut raised);
             item(ui, Command::AiRigVectorCharacter, true, &mut raised);
+            let instance_selected = selection
+                .iter()
+                .next()
+                .and_then(|id| scene.find_object(id))
+                .is_some_and(|(_, o)| o.instance().is_some());
+            item(ui, Command::AiRigLayers, instance_selected || library_symbol, &mut raised);
             item(ui, Command::AiSceneFromImage, true, &mut raised);
             item(ui, Command::AiDirectStory, true, &mut raised);
         });
@@ -5490,6 +5518,7 @@ mod tests {
                     light_gizmos: true,
                     templates: &[],
                     sequence: &sequence,
+                    library_symbol: false,
                 },
             );
             let _ = tool_bar(ui, ToolId::Selection, &mut style);
@@ -5630,6 +5659,7 @@ mod tests {
                     light_gizmos: false,
                     templates: &[],
                     sequence: &sequence,
+                    library_symbol: false,
                 },
             );
             let _ = properties_panel(

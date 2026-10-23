@@ -646,6 +646,14 @@ impl RigPattern {
         self.slots.iter().position(|s| s.name == name)
     }
 
+    /// [`Self::slot_named`], also taking a slot's display name
+    /// ([`canonical_slot`]): "Upper Arm R" finds "Shoulder R". For reading a
+    /// layer rig's slots back from its layer names.
+    pub fn slot_for(&self, name: &str) -> Option<usize> {
+        self.slot_named(name)
+            .or_else(|| canonical_slot(name).and_then(|slot| self.slot_named(slot)))
+    }
+
     /// Give every slot the limits `defaults` has for its name (relative to the
     /// rest angle); a slot the table does not name, or names as free, turns
     /// freely.
@@ -779,6 +787,441 @@ impl JointLimitDefaults {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Display names: what an animator calls each biped slot.
+// ---------------------------------------------------------------------------
+
+/// `(slot name, display name)` for every `RigPattern::biped_full` slot.
+const DISPLAY_NAMES: &[(&str, &str)] = &[
+    ("Hips", "Hips"),
+    ("Chest", "Torso"),
+    ("Head", "Head"),
+    ("Shoulder L", "Upper Arm L"),
+    ("Elbow L", "Forearm L"),
+    ("Shoulder R", "Upper Arm R"),
+    ("Elbow R", "Forearm R"),
+    ("Thigh L", "Thigh L"),
+    ("Knee L", "Shin L"),
+    ("Thigh R", "Thigh R"),
+    ("Knee R", "Shin R"),
+    ("Wrist L", "Hand L"),
+    ("Wrist R", "Hand R"),
+    ("Ankle L", "Foot L"),
+    ("Ankle R", "Foot R"),
+    ("Brow L", "Brow L"),
+    ("Brow R", "Brow R"),
+];
+
+/// **The one alias table for layer-rig names**: the biped slot a layer name
+/// means, whether it is the slot's own name ("Shoulder R"), its display
+/// name ("Upper Arm R"), or the user's Animate convention ("leftArm",
+/// "rightWrist" = forearm, "leftPalm" = hand, "body", "midCloth", typos such
+/// as "righttThigh" / "rightThgh" and trailing digits included — see
+/// [`body_part`]). Case-insensitive. A part with sides needs a side word in
+/// the name. `None` for any other name. Everything that reads a layer rig
+/// back from its layer names goes through this (usually via
+/// [`RigPattern::slot_for`]), so rigs named any of these ways keep working.
+pub fn canonical_slot(name: &str) -> Option<&'static str> {
+    if let Some(slot) = exact_slot(name) {
+        return Some(slot);
+    }
+    let stem = body_part(name)?;
+    let sided = |left: &'static str, right: &'static str| match name_side(name) {
+        Some(Side::Left) => Some(left),
+        Some(Side::Right) => Some(right),
+        _ => None,
+    };
+    match stem {
+        "Hips" => Some("Hips"),
+        "Chest" => Some("Chest"),
+        "Head" => Some("Head"),
+        "Shoulder" => sided("Shoulder L", "Shoulder R"),
+        "Elbow" => sided("Elbow L", "Elbow R"),
+        "Wrist" => sided("Wrist L", "Wrist R"),
+        "Thigh" => sided("Thigh L", "Thigh R"),
+        "Knee" => sided("Knee L", "Knee R"),
+        "Ankle" => sided("Ankle L", "Ankle R"),
+        "Brow" => sided("Brow L", "Brow R"),
+        _ => None,
+    }
+}
+
+/// A biped slot's own name or display name, case-insensitively ("wrist r",
+/// "Upper Arm L"); `None` for anything else — the user's convention names
+/// included. Repair Layer Rigs groups a rig's layers by this: two layers
+/// that merely both read as a torso ("TorsoOldManSide1", "TorsoOldManSide2")
+/// are two parts, not one.
+pub fn exact_slot(name: &str) -> Option<&'static str> {
+    let name = name.trim();
+    DISPLAY_NAMES
+        .iter()
+        .find(|(slot, display)| slot.eq_ignore_ascii_case(name) || display.eq_ignore_ascii_case(name))
+        .map(|(slot, _)| *slot)
+}
+
+/// The side a layer name says, case-insensitively: "left"/"lef" or a lone
+/// "l"/"lt"/"lft" word, "right"/"righ" or a lone "r"/"rt"/"rgt" word.
+/// `None` when it says neither, or both.
+pub fn name_side(name: &str) -> Option<Side> {
+    let squashed = squash(name);
+    let words = tokens(name);
+    let word = |list: &[&str]| words.iter().any(|w| list.contains(&w.as_str()));
+    let left = squashed.contains("lef") || word(&["l", "lt", "lft"]);
+    let right = squashed.contains("righ") || word(&["r", "rt", "rgt"]);
+    match (left, right) {
+        (true, false) => Some(Side::Left),
+        (false, true) => Some(Side::Right),
+        _ => None,
+    }
+}
+
+/// **What a layer name says it is, in the user's Animate convention**
+/// (`docs/AI_LAYER_RIG_AND_MOTION_COPY_PLAN.md` Part N), as a `biped_full`
+/// slot stem: "Hips", "Chest", "Head", "Shoulder", "Elbow", "Wrist",
+/// "Thigh", "Knee", "Ankle", "Brow". Substring matching on the lowercased
+/// letters and digits, as the user's own JSFL commands match, so camel case,
+/// trailing digits and typos all read: `leftArm1` / `sideArm` → Shoulder;
+/// `rightWrist` / `backWrisat1a` → **Elbow** (the forearm: that is what the
+/// convention calls a wrist); `leftPalm` / `leftPlam2` → **Wrist** (the hand);
+/// `righttThigh` / `rightThgh` → Thigh; `rightShin1` → Knee; `rightFoot` /
+/// `shoe` → Ankle; `body` / `tttorso1` / `torsoTop` → Chest; `midCloth1` /
+/// `backCloth` / `lowTorso` → Hips; `frontHEadman` / `manFaceFront1` → Head.
+/// Face pieces (eye, mouth, nose, hair, base, mask...) say nothing (only a
+/// brow is a slot), nor do shadow, sound, an "Extra" piece, or an old
+/// "<Slot> · <role>" extra.
+pub fn body_part(name: &str) -> Option<&'static str> {
+    if name.contains('\u{b7}') {
+        return None;
+    }
+    let s = squash(name);
+    if s.is_empty() {
+        return None;
+    }
+    let words = tokens(name);
+    let has = |list: &[&str]| list.iter().any(|w| s.contains(w));
+    let word = |list: &[&str]| words.iter().any(|w| list.contains(&w.as_str()));
+    if has(&["extra", "shadow", "sound"]) {
+        return None;
+    }
+    if has(&["brow"]) {
+        return Some("Brow");
+    }
+    if has(&[
+        "eye", "mouth", "nose", "hair", "moustache", "mustache", "jaw", "teeth", "tongue", "mask", "ball",
+        "base", "lips", "pupil",
+    ]) || word(&["lip"])
+    {
+        return None;
+    }
+    if has(&["palm", "plam", "hand", "fist", "finger", "thumb"]) {
+        return Some("Wrist");
+    }
+    if has(&["wrist", "wrisat", "forearm", "elbow", "lowerarm"]) {
+        return Some("Elbow");
+    }
+    if has(&["shin", "knee", "calf", "lowerleg"]) {
+        return Some("Knee");
+    }
+    if has(&["foot", "feet", "shoe", "boot", "ankle", "toe"]) {
+        return Some("Ankle");
+    }
+    if has(&["thigh", "thgh", "thig", "upperleg"]) || (s.contains("leg") && !s.contains("legs")) {
+        return Some("Thigh");
+    }
+    if has(&["arm", "shoulder", "bicep", "sleeve"]) {
+        return Some("Shoulder");
+    }
+    if has(&["head", "face", "skull"]) {
+        return Some("Head");
+    }
+    let torso = has(&["torso", "torss"]);
+    if has(&["midcloth", "cloth", "hips", "pelvis", "waist", "dhoti", "lungi", "skirt", "pant", "trouser"])
+        || word(&["hip"])
+        || (torso && word(&["low", "lower", "bottom", "bot"]))
+    {
+        return Some("Hips");
+    }
+    if torso || has(&["chest", "body"]) {
+        return Some("Chest");
+    }
+    None
+}
+
+/// **Shift+R, the user's Rename Face Layers rule** (`renameHeadLayers.jsfl`,
+/// `characterSetup.jsfl` step 4), for one layer name: brow →
+/// `leftEyebrow` / `rightEyebrow` / `eyebrow`; eye white → `leftEyeWhite` /
+/// `rightEyeWhite` / `eyeWhite`; ball → `eyeBall`; jaw / mouth / lips →
+/// `mouth`. `None` for anything else (eyeLid, eyeMask, nose, hair, base keep
+/// their names) and for "Layer…", "sound" and blank names. Compare the answer
+/// case-insensitively: `leftEyeBrow` already is `leftEyebrow`.
+pub fn face_layer_name(name: &str) -> Option<String> {
+    let lower = name.to_lowercase();
+    if lower.trim().is_empty() || lower.starts_with("layer") || lower.contains("sound") {
+        return None;
+    }
+    let side = name_side(name).or_else(|| {
+        let left = lower.contains("l_") || lower.contains("_l");
+        let right = lower.contains("r_") || lower.contains("_r");
+        match (left, right) {
+            (true, false) => Some(Side::Left),
+            (false, true) => Some(Side::Right),
+            _ => None,
+        }
+    });
+    let sided = |left: &str, right: &str, either: &str| {
+        Some(match side {
+            Some(Side::Left) => left.to_string(),
+            Some(Side::Right) => right.to_string(),
+            _ => either.to_string(),
+        })
+    };
+    if lower.contains("brow") {
+        return sided("leftEyebrow", "rightEyebrow", "eyebrow");
+    }
+    if lower.contains("eyewhite") || (lower.contains("eye") && lower.contains("white")) {
+        return sided("leftEyeWhite", "rightEyeWhite", "eyeWhite");
+    }
+    if lower.contains("ball") {
+        return Some("eyeBall".into());
+    }
+    if lower.contains("jaw") || lower.contains("mouth") || lower.contains("lips") || tokens(name).iter().any(|w| w == "lip") {
+        return Some("mouth".into());
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Naming profiles: what AI Rig as Layers and Rename Body / Face Layers call
+// each body part, and what each part follows
+// (docs/AI_LAYER_RIG_AND_MOTION_COPY_PLAN.md N1).
+// ---------------------------------------------------------------------------
+
+/// One body part in a [`NamingProfile`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfilePart {
+    /// A `biped_full` slot stem: "Hips", "Chest", "Head", "Shoulder",
+    /// "Elbow", "Wrist", "Thigh", "Knee", "Ankle" or "Brow".
+    pub part: String,
+    /// The layer name on the left and on the right (the same for a part with
+    /// one side).
+    pub left: String,
+    pub right: String,
+    /// The part it follows, on the same side; `None` is a root.
+    #[serde(default)]
+    pub parent: Option<String>,
+}
+
+/// **A naming convention as data**: each body part's layer name and parent,
+/// and the conventions around them. Built in: [`Self::animate_convention`]
+/// (the default) and [`Self::descriptive`]; `rig_naming.json` beside the
+/// workspace can override (see [`Self::with_overrides`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamingProfile {
+    pub name: String,
+    pub parts: Vec<ProfilePart>,
+    /// Left and right are the **screen's** (a side word in the name wins,
+    /// then the screen side of the limb's root joint, then on a side view the
+    /// front-most limb is the right one); `false`: the slot's own L/R.
+    #[serde(default)]
+    pub screen_sides: bool,
+    /// Every part with no parent follows the rig's first root, so the
+    /// character moves as one (`false`: roots stand alone).
+    #[serde(default)]
+    pub join_roots: bool,
+    /// The folder the leg layers go in, when they are together below the
+    /// body (`None`: no folder).
+    #[serde(default)]
+    pub legs_folder: Option<String>,
+    /// A shadow's layer name; shadow pieces are left out of the rig.
+    /// `None`: a shadow is an ordinary piece.
+    #[serde(default)]
+    pub shadow: Option<String>,
+    /// Face pieces take the Shift+R names ([`face_layer_name`]), inside the
+    /// head symbol too; other kept names stay as written. `false`: kept names
+    /// have their side written "Eye R".
+    #[serde(default)]
+    pub face_names: bool,
+    /// The name of an extra piece with no name of its own: `{name}` is its
+    /// part's layer name, `{n}` counts from 1.
+    #[serde(default = "default_extra")]
+    pub extra: String,
+    /// The part an upper-body extra goes to and follows — a piece whose name
+    /// says no body part (gamcha, scarf) put on the torso or an upper arm,
+    /// above the hips. `None`: it stays where it was put.
+    #[serde(default)]
+    pub upper_extras: Option<String>,
+}
+
+fn default_extra() -> String {
+    "{name} Extra {n}".into()
+}
+
+impl NamingProfile {
+    /// **"My Animate convention"**, the user's own (sampleNaming.fla and
+    /// their Animate commands): `head`, `body`, `leftArm`, `leftWrist`
+    /// (forearm), `leftPalm` (hand), `midCloth`, `leftThigh`, `leftShin`,
+    /// `leftFoot`, `leftEyebrow`; screen sides; body, midCloth and the thighs
+    /// are roots; legs in a `legs` folder; `shadow` left out.
+    pub fn animate_convention() -> Self {
+        let part = |part: &str, left: &str, right: &str, parent: Option<&str>| ProfilePart {
+            part: part.into(),
+            left: left.into(),
+            right: right.into(),
+            parent: parent.map(str::to_string),
+        };
+        Self {
+            name: "My Animate convention".into(),
+            parts: vec![
+                part("Hips", "midCloth", "midCloth", None),
+                part("Chest", "body", "body", None),
+                part("Head", "head", "head", Some("Chest")),
+                part("Shoulder", "leftArm", "rightArm", Some("Chest")),
+                part("Elbow", "leftWrist", "rightWrist", Some("Shoulder")),
+                part("Wrist", "leftPalm", "rightPalm", Some("Elbow")),
+                part("Thigh", "leftThigh", "rightThigh", None),
+                part("Knee", "leftShin", "rightShin", Some("Thigh")),
+                part("Ankle", "leftFoot", "rightFoot", Some("Knee")),
+                part("Brow", "leftEyebrow", "rightEyebrow", Some("Head")),
+            ],
+            screen_sides: true,
+            join_roots: false,
+            legs_folder: Some("legs".into()),
+            shadow: Some("shadow".into()),
+            face_names: true,
+            extra: "{name}Extra{n}".into(),
+            upper_extras: Some("Chest".into()),
+        }
+    }
+
+    /// **"Descriptive"**: the display names ("Upper Arm R", "Forearm R",
+    /// "Hand R", "Torso") on the biped's own parents, every root following the
+    /// hips, sides as the slots have them.
+    pub fn descriptive() -> Self {
+        let pattern = RigPattern::biped_full();
+        let mut parts: Vec<ProfilePart> = Vec::new();
+        for slot in &pattern.slots {
+            let stem = slot.name.trim_end_matches(" L").trim_end_matches(" R").to_string();
+            if parts.iter().any(|p| p.part == stem) {
+                continue;
+            }
+            let display = |side: &str| {
+                let name = if stem == slot.name { stem.clone() } else { format!("{stem} {side}") };
+                display_slot_name(&name).to_string()
+            };
+            let parent = slot.parent.map(|p| {
+                let name = &pattern.slots[p].name;
+                name.trim_end_matches(" L").trim_end_matches(" R").to_string()
+            });
+            parts.push(ProfilePart { left: display("L"), right: display("R"), part: stem, parent });
+        }
+        Self {
+            name: "Descriptive".into(),
+            parts,
+            screen_sides: false,
+            join_roots: true,
+            legs_folder: None,
+            shadow: None,
+            face_names: false,
+            extra: default_extra(),
+            upper_extras: None,
+        }
+    }
+
+    /// The built-in profiles, the default first.
+    pub fn builtin() -> Vec<NamingProfile> {
+        vec![Self::animate_convention(), Self::descriptive()]
+    }
+
+    /// The built-in profiles with `overrides` (from `rig_naming.json`) laid
+    /// over them: one with a built-in's name replaces it, any other is added,
+    /// and the first override becomes the default (first in the list).
+    pub fn with_overrides(overrides: Vec<NamingProfile>) -> Vec<NamingProfile> {
+        let mut all = Self::builtin();
+        for (index, profile) in overrides.into_iter().enumerate() {
+            all.retain(|p| !p.name.eq_ignore_ascii_case(&profile.name));
+            all.insert(index.min(all.len()), profile);
+        }
+        all
+    }
+
+    fn part(&self, stem: &str) -> Option<&ProfilePart> {
+        self.parts.iter().find(|p| p.part.eq_ignore_ascii_case(stem))
+    }
+
+    /// The layer name for a `biped_full` slot ("Shoulder L") on `side`
+    /// (`None`: the slot's own side). A slot the profile does not name keeps
+    /// its display name.
+    pub fn layer_name(&self, slot: &str, side: Option<Side>) -> String {
+        let stem = slot.trim_end_matches(" L").trim_end_matches(" R");
+        let side = side.unwrap_or(if slot.ends_with(" L") {
+            Side::Left
+        } else if slot.ends_with(" R") {
+            Side::Right
+        } else {
+            Side::Either
+        });
+        match self.part(stem) {
+            Some(part) if side == Side::Right => part.right.clone(),
+            Some(part) => part.left.clone(),
+            None => display_slot_name(slot).to_string(),
+        }
+    }
+
+    /// The parent of every slot of `pattern` by this profile's table, for
+    /// the layer rig builder: a part's parent on the slot's own side.
+    pub fn parents(&self, pattern: &RigPattern) -> Vec<Option<usize>> {
+        pattern
+            .slots
+            .iter()
+            .map(|slot| {
+                let stem = slot.name.trim_end_matches(" L").trim_end_matches(" R");
+                let Some(part) = self.part(stem) else {
+                    return slot.parent;
+                };
+                let parent = part.parent.as_deref()?;
+                let suffix = &slot.name[stem.len()..];
+                pattern
+                    .slot_named(&format!("{parent}{suffix}"))
+                    .or_else(|| pattern.slot_named(parent))
+            })
+            .collect()
+    }
+
+    /// The name of an extra piece of the part named `name`.
+    pub fn extra_name(&self, name: &str, n: usize) -> String {
+        self.extra.replace("{name}", name).replace("{n}", &n.to_string())
+    }
+
+    /// **Rename Body Layers** (Ctrl+R in the user's Animate) for one layer
+    /// name: the profile's name for the part it names ([`canonical_slot`] /
+    /// [`body_part`], its own side), the shadow name for a shadow. `None` for
+    /// a name that says no part (or a part with sides but no side), for
+    /// "Layer…" and "sound" names, and when the name already is the answer
+    /// (case-insensitively).
+    pub fn body_layer_name(&self, name: &str) -> Option<String> {
+        let lower = name.trim().to_lowercase();
+        if lower.is_empty() || lower.starts_with("layer") || lower.contains("sound") {
+            return None;
+        }
+        let new = if let Some(shadow) = self.shadow.as_ref().filter(|_| lower.contains("shadow")) {
+            shadow.clone()
+        } else {
+            let slot = canonical_slot(name)?;
+            self.layer_name(slot, None)
+        };
+        (!new.eq_ignore_ascii_case(name.trim())).then_some(new)
+    }
+}
+
+/// The display name of a biped slot ("Shoulder R" → "Upper Arm R"); a name
+/// that is not a biped slot comes back as it is.
+pub fn display_slot_name(slot: &str) -> &str {
+    DISPLAY_NAMES
+        .iter()
+        .find(|(s, _)| *s == slot)
+        .map_or(slot, |(_, display)| display)
 }
 
 // ---------------------------------------------------------------------------

@@ -121,9 +121,10 @@ pub fn route(command: Command) -> Route {
 
         // Open a dialog or panel that needs parameters: run from args.
         New | LipSync | TraceBitmapOptions | SetScene | DirectScene | SceneryFor | Perform
-        | AddFollowThrough | AddWiggle | AddTitleCard | AiIdentifyAssets | AiRigVectorCharacter
+        | AddFollowThrough | AddWiggle | AddTitleCard | AiIdentifyAssets | AiRigVectorCharacter | AiRigLayers
         | AiDirectStory | AiCharacterFromImage | AiMouthChart | ClearAllKeyframes | CleanUpLayers
-        | ArrangeLayers | RepairLayerRigs => Route::Args,
+        | ArrangeLayers | RepairLayerRigs | RigHead | PasteMotion | PasteMotionSpecial | PastePose | CopyPerformance
+        | PastePerformance | PastePerformanceSpecial => Route::Args,
 
         // Needs the user, or has no document effect.
         Quit | Close | ShortcutEditor | Snapshots | About | AiModels | PasteboardColour
@@ -157,11 +158,12 @@ pub fn route(command: Command) -> Route {
         | ToggleActionsPanel | ClearScriptOutput | CreateClassicTween | CreateMotionTween
         | CreateShapeTween | RemoveTween | InsertFrame | RemoveFrame | InsertKeyframe
         | InsertBlankKeyframe | ClearKeyframe | PlayPause | NextFrame | PreviousFrame
-        | FirstFrame | LastFrame | CutFrames | CopyFrames | PasteFrames | ClearFrames
+        | FirstFrame | LastFrame | CutFrames | CopyFrames | PasteFrames | CopyMotion | CopyPose | ClearFrames
         | ReverseFrames | ToggleOnionSkin | ToggleAutoKeyframe | ToggleEditMultipleFrames
         | ToggleProtectKeyframes | ProtectThisKeyframe | ProtectFromHere
         | ToggleCamera | AddCameraKeyframe | RemoveCameraKeyframe | ResetCamera
-        | AddLightKeyframe | RemoveLightKeyframe | SaveAsTemplate => Route::Run,
+        | AddLightKeyframe | RemoveLightKeyframe | SaveAsTemplate | RenameBodyLayers
+        | RenameFaceLayers => Route::Run,
 
         // Data-carrying: the args select the value.
         TogglePanel(_) | SetTheme(_) | SetUiScale(_) | SetWorkspacePreset(_)
@@ -865,7 +867,7 @@ pub const AGENT_TOOLS: &[(&str, &str)] = &[
     ("snapshot", "{frame?: 0-based frame} -> {png_base64, width, height}, longest side <= 768"),
     ("set_property", "{target: element:<id>|layer:<index|name> (index = inspect timeline \"index\", not \"id\")|frame:<layer>:<frame>|light:<id>|light:rig|camera|document|scene, field, value}; inspect {what:\"properties\", target} lists the fields, values and hints. {target:\"document\", field:\"playhead\", value:<0-based frame>} moves the playhead (frame 24 = 23)"),
     ("edit_list", "{target: element:<id>|layer:<index|name> (index = inspect timeline \"index\", not \"id\")|document, list: filters|modifiers|swatches|swatch_folders|poses|bones|rig, op: get|add|remove|move|set (rig list: set_rest_pose|mirror_pose|reset_pose), index?, to?, item?}; one undo step per op, returns the list. filters (element|layer): item {kind: blur|drop_shadow|glow|bevel|adjust|gradient_map, enabled?, <kind parameters>}, move uses to. modifiers (element): item {kind: wiggle|spring|look_at|squash_stretch|breathe|blink|turn|sway|drift, <parameters>}. swatches (document): add {name, color, folder?}; set index {name?, color? (repaints linked fills), folder?|null}; remove; move index to folder. swatch_folders (document): add {name}; remove {name}|index. poses (armature element): add {name} saves the pose; set index applies (item {key:true} also keys it); remove index. bones (armature element): remove index deletes a bone; move index to parent bone|null reparents"),
-    ("wait_for_jobs", "{timeout_s?: 1..300 (default 120)} -> {jobs:[{id, kind, status: running|done|failed, result?, error?}], running, timed_out}; waits for every AI job started in this run (ai_rig_vector_character, ai_direct_story, ai_character_from_image, ai_scene_from_image, transcribe) and returns as soon as none is running, or at the timeout with the ones still running; the BuzzEdit and Studio tools' jobs are waited for the same way. A finished job's result is given once"),
+    ("wait_for_jobs", "{timeout_s?: 1..300 (default 120)} -> {jobs:[{id, kind, status: running|done|failed, result?, error?}], running, timed_out}; waits for every AI job started in this run (ai_rig_vector_character, ai_rig_layers, ai_direct_story, ai_character_from_image, ai_scene_from_image, transcribe) and returns as soon as none is running, or at the timeout with the ones still running; the BuzzEdit and Studio tools' jobs are waited for the same way. A finished job's result is given once"),
     ("transcribe", "{sound?: name of a sound in the library, path?: audio file} (exactly one) -> {started:true, job}; Whisper runs in the background (the multilingual model when installed, else base.en); call wait_for_jobs for {text, language, model, timing, speakers:\"not identified\", segments:[{start_s, end_s, text}]}. There is no speaker separation: infer who speaks from the content"),
     ("send_to_buzzedit", "{scope?: document|scene (default document: the whole film; scene: the scene being edited), project?: BuzzEdit project id from buzzedit_projects (default: a new BuzzEdit project), path?: .mp4 to write (must not exist; default beside the document), start?: bool (launch BuzzEdit if it is not running)} -> {started:true, job}; exports an MP4 on the export queue, then imports it into BuzzEdit; wait_for_jobs gives {project_id, project_name, new_project, video}. Needs ffmpeg"),
     ("buzzedit_projects", "{start?: bool} -> {started:true, job}; wait_for_jobs gives {projects:[{id, name, status}]} from BuzzEdit"),

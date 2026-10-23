@@ -133,7 +133,7 @@ pub fn rig_of_layer(scene: &Scene, layer: LayerId) -> Option<LayerRigView> {
         .collect();
     let pattern = RigPattern::builtin()
         .into_iter()
-        .map(|p| (names.iter().filter(|n| p.slot_named(n).is_some()).count(), p))
+        .map(|p| (names.iter().filter(|n| p.slot_for(n).is_some()).count(), p))
         .filter(|(hits, _)| *hits > 0)
         .min_by(|(a, pa), (b, pb)| b.cmp(a).then(pa.slots.len().cmp(&pb.slots.len())))
         .map(|(_, p)| p)?;
@@ -143,7 +143,7 @@ pub fn rig_of_layer(scene: &Scene, layer: LayerId) -> Option<LayerRigView> {
         let Some(l) = layers.get(id) else {
             continue;
         };
-        let Some(slot) = pattern.slot_named(&l.name) else {
+        let Some(slot) = pattern.slot_for(&l.name) else {
             continue;
         };
         let Some(object) = l.frames.keyframes().first().and_then(|k| k.objects.first()) else {

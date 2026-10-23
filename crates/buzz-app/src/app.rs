@@ -627,6 +627,14 @@ enum AiResult {
         sym_name: String,
         rerigged: Box<buzz_ai::rerig::ReriggedCharacter>,
     },
+    /// AI ▸ Rig Character as Layers' background half (plan R3): the plan
+    /// worked out from the joints DWPose found (or the `fit_slots` fallback),
+    /// for the review dialog — or, for the Assistant's `ai_rig_layers`, its
+    /// overrides and whether to apply.
+    LayerRigPlanned {
+        plan: Box<crate::rigging::LayerRigPlan>,
+        request: Option<LayerRigRequest>,
+    },
     /// File ▸ AI ▸ Produce Episode… / the `produce_episode` tool (P6): what
     /// the producer made; the dialog's run opens the `.buzz`.
     Produced {
@@ -641,6 +649,168 @@ pub(crate) enum TranscribeSource {
     Sound(String),
     /// An audio file on disk.
     File(std::path::PathBuf),
+}
+
+/// The Assistant's `ai_rig_layers` (plan R3): what to change in the plan
+/// before it is applied or returned.
+pub(crate) struct LayerRigRequest {
+    pub overrides: Vec<LayerRigOverride>,
+    /// `false`: return the plan as JSON, changing nothing.
+    pub apply: bool,
+    /// The naming profile, by name (`None`: the default,
+    /// `rigging::naming_profile`).
+    pub profile: Option<String>,
+    /// R4: cut merged drawings along the skeleton (`None`: when there are
+    /// any).
+    pub split_merged: Option<bool>,
+}
+
+/// One reviewer correction: every piece on the layer now called `layer` goes
+/// to `slot` (a slot or display name, or "Extra" / "Extra / follow parent"),
+/// and the first of them is named `name`.
+pub(crate) struct LayerRigOverride {
+    pub layer: String,
+    pub slot: Option<String>,
+    pub name: Option<String>,
+}
+
+/// The `biped_full` slot a reviewer named, by slot or display name;
+/// `Ok(None)` for "Extra" / "Extra / follow parent".
+pub(crate) fn layer_rig_slot_by_name(name: &str) -> Result<Option<usize>, String> {
+    let trimmed = name.trim();
+    if trimmed.eq_ignore_ascii_case("extra") || trimmed == buzz_ui::ai_layer_rig_dialog::EXTRA_LABEL {
+        return Ok(None);
+    }
+    let pattern = buzz_rig::RigPattern::biped_full();
+    buzz_rig::pattern::canonical_slot(trimmed)
+        .and_then(|slot| pattern.slots.iter().position(|s| s.name == slot))
+        .map(Some)
+        .ok_or_else(|| {
+            let names: Vec<&str> = pattern
+                .slots
+                .iter()
+                .map(|s| buzz_rig::pattern::display_slot_name(&s.name))
+                .collect();
+            format!("no slot '{trimmed}'; slots: {}, Extra", names.join(", "))
+        })
+}
+
+/// The name a plan piece's layer has now.
+fn layer_rig_old_name(scene: &buzz_scene::Scene, plan: &crate::rigging::LayerRigPlan, layer: buzz_scene::LayerId) -> String {
+    scene
+        .library()
+        .get(plan.symbol)
+        .and_then(|s| s.layers.get(layer))
+        .map(|l| l.name.clone())
+        .unwrap_or_default()
+}
+
+/// Carry the Assistant's overrides into `plan`: slots first, then leads and
+/// names worked out again (`rigging::relabel_layer_rig_plan`), then the names
+/// it gave.
+fn apply_layer_rig_overrides(
+    scene: &buzz_scene::Scene,
+    plan: &mut crate::rigging::LayerRigPlan,
+    overrides: &[LayerRigOverride],
+) -> Result<(), String> {
+    let olds: Vec<String> = plan.pieces.iter().map(|p| layer_rig_old_name(scene, plan, p.layer)).collect();
+    let mut extra = vec![false; plan.pieces.len()];
+    let mut names: Vec<(usize, String)> = Vec::new();
+    let mut moved = false;
+    for o in overrides {
+        let hits: Vec<usize> = (0..plan.pieces.len()).filter(|&i| olds[i] == o.layer).collect();
+        if hits.is_empty() {
+            return Err(format!("no piece on a layer called '{}'; layers: {}", o.layer, olds.join(", ")));
+        }
+        if let Some(slot) = &o.slot {
+            match layer_rig_slot_by_name(slot)? {
+                Some(index) => hits.iter().for_each(|&i| {
+                    plan.pieces[i].slot = index;
+                    extra[i] = false;
+                }),
+                None => hits.iter().for_each(|&i| extra[i] = true),
+            }
+            moved = true;
+        }
+        if let Some(name) = &o.name {
+            if name.trim().is_empty() {
+                return Err(format!("the new name for '{}' is empty", o.layer));
+            }
+            names.push((hits[0], name.trim().to_string()));
+        }
+    }
+    if moved && !crate::rigging::relabel_layer_rig_plan(scene, plan, &extra) {
+        return Err("the plan no longer matches the symbol".into());
+    }
+    for (i, name) in names {
+        plan.pieces[i].new_layer_name = name;
+    }
+    Ok(())
+}
+
+/// A side call worth the reviewer's eye (`rigging::LayerRigPlan::side_calls`):
+/// the side was flipped against the name ("named L, put on …"), or the name
+/// was kept although the bone on its side overlaps it less than the other
+/// side's ("… bone overlap 0.10 L, 0.60 R)"). Every other side-named piece
+/// gets a call too, confirming it, and those are not highlighted.
+fn side_call_is_doubtful(call: &str) -> bool {
+    if call.contains(", put on ") {
+        return true;
+    }
+    let Some((_, rest)) = call.split_once("bone overlap ") else {
+        return false;
+    };
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    match (words.first().and_then(|w| w.parse::<f64>().ok()), words.get(2).and_then(|w| w.parse::<f64>().ok())) {
+        (Some(named), Some(other)) => named < other,
+        _ => false,
+    }
+}
+
+/// A plan as the Assistant reads it.
+fn layer_rig_plan_json(scene: &buzz_scene::Scene, plan: &crate::rigging::LayerRigPlan) -> serde_json::Value {
+    use serde_json::json;
+    let pieces: Vec<serde_json::Value> = plan
+        .pieces
+        .iter()
+        .map(|p| {
+            json!({
+                "layer": layer_rig_old_name(scene, plan, p.layer),
+                "object": p.object.0,
+                "new_name": p.new_layer_name,
+                "slot": buzz_rig::pattern::display_slot_name(&p.slot_name),
+                "slot_name": p.slot_name,
+                "lead": p.lead,
+                "score": (p.score * 1000.0).round() / 1000.0,
+            })
+        })
+        .collect();
+    let renames: Vec<serde_json::Value> =
+        plan.symbol_renames.iter().map(|r| json!({"from": r.from, "to": r.to})).collect();
+    json!({
+        "symbol": scene.library().get(plan.symbol).map(|s| s.name.clone()),
+        "frame": plan.frame,
+        "source": match plan.source {
+            crate::rigging::JointSource::DwPose => "dwpose",
+            crate::rigging::JointSource::FitSlots => "fit_slots",
+        },
+        "confidence": (plan.confidence * 1000.0).round() / 1000.0,
+        "low_confidence": plan.low_confidence,
+        "pieces": pieces,
+        "symbol_renames": renames,
+        "notes": plan.notes,
+        "side_calls": plan.side_calls,
+        "profile": plan.profile.name,
+        "head_symbol": plan.head_symbol.and_then(|id| scene.library().get(id)).map(|s| s.name.clone()),
+        "head_renames": plan.head_renames.iter().map(|r| json!({"from": r.from, "to": r.to})).collect::<Vec<_>>(),
+        "merged_found": plan.merged_found,
+        "split_merged": plan.split.as_ref().map(|s| json!({
+            "drawings": s.merged,
+            "parts": s.parts.len(),
+            "joint_overlaps": s.overlaps.len(),
+            "unsplit_keys": s.unsplit_keys,
+        })),
+    })
 }
 
 /// What `wait_for_jobs` reports for a finished AI job, from what the task
@@ -1090,6 +1260,10 @@ pub struct App {
     ai_scene_pending: Option<Box<SceneReviewData>>,
     ai_story_pending: Option<Box<buzz_ai::director::DirectorScript>>,
     ai_rig_pending: Option<(RigTarget, String, Box<buzz_ai::rerig::ReriggedCharacter>)>,
+    /// AI ▸ Rig Character as Layers… (plan R3): the plan under review and
+    /// its dialog.
+    ai_layer_rig_pending: Option<Box<crate::rigging::LayerRigPlan>>,
+    pub(crate) ai_layer_rig: buzz_ui::AiLayerRigState,
     ai_pose_images: Option<Vec<(String, image::RgbaImage)>>,
     /// Set by an AI panel action just before it starts a task, so the task
     /// is remembered as the panel's (see `track_ai`).
@@ -1311,6 +1485,8 @@ impl App {
             ai_scene_pending: None,
             ai_story_pending: None,
             ai_rig_pending: None,
+            ai_layer_rig_pending: None,
+            ai_layer_rig: buzz_ui::AiLayerRigState::default(),
             ai_pose_images: None,
             ai_next_from_panel: false,
             agent_jobs: Vec::new(),
@@ -2590,6 +2766,8 @@ const KEYBOARD_COMMANDS: &[Command] = &[
     Command::ToggleLightGizmos,
     Command::ToggleBoneRig,
     Command::ToggleBoneMode,
+    // The user's Animate key for renaming face layers (N2).
+    Command::RenameFaceLayers,
     // Timeline. Animators press these constantly, so they must be live.
     Command::InsertFrame,
     Command::RemoveFrame,
@@ -2882,6 +3060,42 @@ fn rig_vector_character_from_detected_skeleton(
     let limits = crate::rig_limits::load_or_default();
     buzz_ai::rerig::rerig_vector_character(&skel, &parts, sym_name, Some(&limits))
         .map_err(|e| format!("Auto-rigging failed: {e}"))
+}
+
+/// AI ▸ Rig Character as Layers' detector half (plan R1): the
+/// `RigPattern::biped_full` joints, `(head, tip)` per slot in `sym_id`'s own
+/// coordinates, found by the same render + DWPose path as
+/// [`rig_vector_character_from_detected_skeleton`]. Errors, with nothing
+/// guessed, when the pose models are not installed or no figure is found.
+pub(crate) fn detect_symbol_joints(
+    mut scene: buzz_scene::Scene,
+    sym_id: buzz_scene::SymbolId,
+) -> Result<Vec<Option<(Point, Point)>>, String> {
+    if !buzz_ai::models::status(buzz_ai::models::ModelId::DwPoseEstimator).is_ready() {
+        return Err("pose models not installed".into());
+    }
+    let symbol = scene
+        .library()
+        .get(sym_id)
+        .cloned()
+        .ok_or_else(|| "That symbol is no longer in the library".to_string())?;
+    let (image, map) = render_symbol_alone(&mut scene, &symbol)
+        .map_err(|e| format!("Could not render '{}' for pose detection: {e}", symbol.name))?;
+    let persons =
+        buzz_ai::pose::detect(&image).map_err(|e| format!("Pose detection failed: {e}"))?;
+    let Some(mut person) = persons.into_iter().next() else {
+        return Err(format!("No figure detected in '{}'", symbol.name));
+    };
+    for kp in person.keypoints.iter_mut() {
+        let (x, y) = map.to_symbol_local(kp.0, kp.1);
+        kp.0 = x;
+        kp.1 = y;
+    }
+    let (bx0, by0) = map.to_symbol_local(person.bbox[0], person.bbox[1]);
+    let (bx1, by1) = map.to_symbol_local(person.bbox[2], person.bbox[3]);
+    person.bbox = [bx0, by0, bx1, by1];
+    let skel = buzz_ai::character::skeleton(&person);
+    Ok(buzz_ai::rerig::biped_full_joints(&skel))
 }
 
 /// SigLIP embeddings for AI ▸ Scene from Image's asset matching: each
@@ -3733,6 +3947,9 @@ impl App {
             buzz_ui::ArrangeAction::Undo => self.start_arrange_undo(),
             buzz_ui::ArrangeAction::None => {}
         }
+        // AI ▸ Rig Character as Layers… review (R3).
+        let layer_rig = buzz_ui::ai_layer_rig_dialog(&ctx, &mut self.ai_layer_rig);
+        self.layer_rig_review_action(layer_rig);
 
         // File ▸ New asks before it acts, and the answer is remembered.
         let new_document = buzz_ui::new_document_dialog(&ctx, &mut self.editor.new_document);
@@ -3781,6 +3998,100 @@ impl App {
                 open = false;
             }
             self.editor.repair_rigs_open = open;
+        }
+        // Paste Motion Special…: parts, relative/absolute, time stretch; one undo step.
+        if self.editor.paste_motion_special_open {
+            let mut open = true;
+            let mut paste = false;
+            let mut cancel = false;
+            let options = &mut self.editor.motion_paste_options;
+            egui::Window::new("Paste Motion Special")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(&ctx, |ui| {
+                    ui.checkbox(&mut options.position, "Position");
+                    ui.checkbox(&mut options.scale, "Scale");
+                    ui.checkbox(&mut options.rotation, "Rotation and skew");
+                    ui.checkbox(&mut options.colour, "Colour effect and alpha");
+                    ui.checkbox(&mut options.timing, "Timing (first frame, looping)");
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut options.relative, true, "Relative");
+                        ui.radio_value(&mut options.relative, false, "Absolute");
+                    });
+                    ui.add(
+                        egui::Slider::new(&mut options.stretch, 0.25..=4.0)
+                            .text("Time stretch")
+                            .suffix("\u{00d7}"),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Paste").clicked() {
+                            paste = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if paste {
+                let options = self.editor.motion_paste_options;
+                self.editor.paste_motion(options);
+            }
+            self.editor.paste_motion_special_open = open && !paste && !cancel;
+        }
+        // Paste Performance Special…: range, offset, time stretch, travel; one undo step.
+        if self.editor.paste_performance_special_open {
+            let mut open = true;
+            let mut paste = false;
+            let mut cancel = false;
+            let span = self.editor.performance_clip.as_ref().map(|c| c.span).unwrap_or(1).max(1);
+            let options = &mut self.editor.performance_paste_options;
+            egui::Window::new("Paste Performance Special")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(&ctx, |ui| {
+                    let mut whole = options.range.is_none();
+                    ui.checkbox(&mut whole, "The whole copied performance");
+                    if whole {
+                        options.range = None;
+                    } else {
+                        let (mut a, mut b) = options.range.unwrap_or((0, span - 1));
+                        ui.add(egui::Slider::new(&mut a, 0..=span - 1).text("From frame (of the copy)"));
+                        ui.add(egui::Slider::new(&mut b, 0..=span - 1).text("To frame (of the copy)"));
+                        options.range = Some((a.min(b), a.max(b)));
+                    }
+                    let mut at = options.offset.unwrap_or(self.editor.current_frame);
+                    ui.add(egui::DragValue::new(&mut at).prefix("Start at frame "));
+                    options.offset = Some(at);
+                    ui.add(
+                        egui::Slider::new(&mut options.stretch, 0.25..=4.0)
+                            .text("Time stretch")
+                            .suffix("\u{00d7}"),
+                    );
+                    ui.checkbox(&mut options.travel, "Include the instance's own travel");
+                    ui.add_enabled(
+                        options.travel,
+                        egui::Checkbox::new(&mut options.scale_travel, "Scale travel to size"),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Paste").clicked() {
+                            paste = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if paste {
+                let options = self.editor.performance_paste_options;
+                self.editor.paste_performance(options);
+            }
+            if !open || paste || cancel {
+                self.editor.performance_paste_options.offset = None;
+            }
+            self.editor.paste_performance_special_open = open && !paste && !cancel;
         }
 
         // Ctrl+K opens the command palette, a search box over every command;
@@ -4291,6 +4602,7 @@ impl App {
             light_gizmos: self.editor.light_panel.gizmos,
             templates: template_names,
             sequence: sequence_menu,
+            library_symbol: self.editor.library.selected.is_some(),
         }
     }
 
@@ -7766,6 +8078,22 @@ impl App {
                     .is_some_and(|(_, o)| o.instance().is_some())
             });
             item(ui, Command::ClearAllKeyframes, has_instance);
+            item(ui, Command::RigHead, has_instance);
+            // Copy Motion / Paste Motion (C1), on what was right-clicked.
+            let has_motion = self.editor.motion_clip.is_some();
+            item(ui, Command::CopyMotion, has_selection);
+            item(ui, Command::PasteMotion, has_selection && has_motion);
+            item(ui, Command::PasteMotionSpecial, has_selection && has_motion);
+            // Copy Pose / Paste Pose (C2), on the rig right-clicked.
+            let has_pose = self.editor.pose_clip.is_some();
+            item(ui, Command::CopyPose, has_selection);
+            item(ui, Command::PastePose, has_selection && has_pose);
+            // Copy Performance / Paste Performance (C3), on the character
+            // right-clicked.
+            let has_performance = self.editor.performance_clip.is_some();
+            item(ui, Command::CopyPerformance, has_selection);
+            item(ui, Command::PastePerformance, has_selection && has_performance);
+            item(ui, Command::PastePerformanceSpecial, has_selection && has_performance);
             // **Keeping artwork as an asset, where the artwork is.** The panel
             // has a button for this, but it is the panel's button — you have to
             // find the panel, and by then you have stopped looking at the thing
@@ -8215,6 +8543,9 @@ impl App {
                 self.editor.workspace.reveal(buzz_ui::PanelId::Ai);
                 self.ai_rig_vector_character_async()
             }
+            // Pose detection again, off the UI thread; the review dialog
+            // opens when the plan is ready. See `ai_rig_layers_async`.
+            Command::AiRigLayers => self.ai_rig_layers_async(0, None),
             // The other apps of the estate (`crate::estate`): a dialog that
             // asks them what there is, then a flow off the UI thread.
             Command::SendToBuzzEdit => self.estate_open_dialog(crate::estate::DialogKind::Send),
@@ -9551,6 +9882,238 @@ impl App {
         self.track_ai(id, receive);
     }
 
+    /// **AI ▸ Rig Character as Layers…** (plan R3): plan the layer rig of the
+    /// character a selected stage instance shows — else the Library's
+    /// selection, as [`Self::ai_rig_vector_character_async`] resolves it — at
+    /// symbol `frame`, off the UI thread (DWPose renders and detects; without
+    /// it, `rigging::plan_layer_rig_auto` falls back to `fit_slots`). The plan
+    /// then opens in the review dialog, or, with an Assistant `request`, is
+    /// returned or applied by `collect_ai_result`.
+    pub(crate) fn ai_rig_layers_async(&mut self, frame: u32, request: Option<LayerRigRequest>) {
+        let stage_symbol = self.editor.selection.iter().next().and_then(|id| {
+            self.editor.doc.scene().find_object(id).and_then(|(_, o)| o.instance().map(|i| i.symbol))
+        });
+        let Some(sym_id) = stage_symbol.or(self.editor.library.selected) else {
+            self.editor.status = Some("Select a character symbol in the Library or on stage first".into());
+            return;
+        };
+        let Some(symbol) = self.editor.doc.scene().library().get(sym_id) else {
+            self.editor.status = Some("That symbol is no longer in the library".into());
+            return;
+        };
+        let sym_name = symbol.name.clone();
+        let profile = match crate::rigging::naming_profile(request.as_ref().and_then(|r| r.profile.as_deref())) {
+            Ok(profile) => profile,
+            Err(e) => {
+                self.editor.status = Some(format!("Rig Character as Layers: {e}"));
+                return;
+            }
+        };
+        let split = request.as_ref().and_then(|r| r.split_merged);
+        let scene = self.editor.doc.scene().clone();
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "AI", move |_ctx| {
+            match crate::rigging::plan_layer_rig_auto(&scene, sym_id, frame, &profile, split) {
+                Some(plan) => {
+                    let _ = send.send(AiResult::LayerRigPlanned { plan: Box::new(plan), request });
+                    crate::tasks::TaskOutcome::Finished(String::new())
+                }
+                None => crate::tasks::TaskOutcome::Failed(format!(
+                    "Rig Character as Layers: '{sym_name}' has no pieces at frame {frame}"
+                )),
+            }
+        });
+        self.track_ai(id, receive);
+        self.editor.status = Some(format!("Rig Character as Layers: finding the body parts of '{}'\u{2026}", self.ai_rig_layers_name(sym_id)));
+    }
+
+    fn ai_rig_layers_name(&self, sym: buzz_scene::SymbolId) -> String {
+        self.editor.doc.scene().library().get(sym).map(|s| s.name.clone()).unwrap_or_default()
+    }
+
+    /// Open the review dialog on `plan`.
+    fn open_layer_rig_review(&mut self, plan: Box<crate::rigging::LayerRigPlan>) {
+        let scene = self.editor.doc.scene();
+        let pattern = buzz_rig::RigPattern::biped_full();
+        let state = &mut self.ai_layer_rig;
+        state.symbol = scene.library().get(plan.symbol).map(|s| s.name.clone()).unwrap_or_default();
+        state.source = match plan.source {
+            crate::rigging::JointSource::DwPose => "DWPose".into(),
+            crate::rigging::JointSource::FitSlots => "fitted to the drawings (no pose detector)".into(),
+        };
+        state.confidence = plan.confidence;
+        state.low_confidence = plan.low_confidence;
+        state.slots = pattern
+            .slots
+            .iter()
+            .map(|s| buzz_rig::pattern::display_slot_name(&s.name).to_string())
+            .collect();
+        state.rows = plan
+            .pieces
+            .iter()
+            .map(|p| {
+                let old = layer_rig_old_name(scene, &plan, p.layer);
+                let flagged = plan
+                    .notes
+                    .iter()
+                    .any(|n| n.contains("matched no body part") && n.starts_with(&format!("'{old}'")))
+                    || plan
+                        .side_calls
+                        .iter()
+                        .any(|c| c.starts_with(&format!("{old}:")) && side_call_is_doubtful(c));
+                buzz_ui::LayerRigRow {
+                    old,
+                    new_name: p.new_layer_name.clone(),
+                    slot: p.slot,
+                    extra: false,
+                    lead: p.lead,
+                    flagged,
+                    name_edited: false,
+                    slot_edited: false,
+                }
+            })
+            .collect();
+        state.renames = plan
+            .symbol_renames
+            .iter()
+            .map(|r| buzz_ui::LayerRigRenameRow { from: r.from.clone(), to: r.to.clone(), keep: true })
+            .collect();
+        state.notes = plan.notes.clone();
+        state.side_calls = plan.side_calls.clone();
+        state.merged_found = plan.merged_found;
+        state.split_merged = plan.split.is_some();
+        state.open = true;
+        self.editor.status = Some(format!(
+            "Rig Character as Layers: check the {} pieces of '{}', then Apply",
+            plan.pieces.len(),
+            state.symbol
+        ));
+        self.ai_layer_rig_pending = Some(plan);
+    }
+
+    /// The review dialog's answer.
+    fn layer_rig_review_action(&mut self, action: buzz_ui::AiLayerRigAction) {
+        match action {
+            buzz_ui::AiLayerRigAction::None => {}
+            buzz_ui::AiLayerRigAction::Cancel => {
+                self.ai_layer_rig_pending = None;
+                self.ai_layer_rig.open = false;
+                self.editor.status = Some("Rig Character as Layers cancelled".into());
+            }
+            buzz_ui::AiLayerRigAction::SplitChanged(split) => {
+                // R4: planned again from the same joints, split or not. R4b:
+                // the slot edits and typed names of pieces still in the new
+                // plan (the same layer and object) are kept.
+                let Some(plan) = self.ai_layer_rig_pending.take() else { return };
+                let edits: Vec<_> = plan
+                    .pieces
+                    .iter()
+                    .zip(&self.ai_layer_rig.rows)
+                    .filter(|(_, row)| row.slot_edited || row.name_edited)
+                    .map(|(piece, row)| ((piece.layer, piece.object), row.clone()))
+                    .collect();
+                match crate::rigging::replan_layer_rig(self.editor.doc.scene(), &plan, split) {
+                    Some(again) => {
+                        self.open_layer_rig_review(Box::new(again));
+                        let mut slots_kept = false;
+                        if let Some(plan) = self.ai_layer_rig_pending.as_ref() {
+                            for (piece, row) in plan.pieces.iter().zip(self.ai_layer_rig.rows.iter_mut()) {
+                                let Some((_, old)) = edits.iter().find(|(key, _)| *key == (piece.layer, piece.object))
+                                else {
+                                    continue;
+                                };
+                                if old.slot_edited {
+                                    row.slot = old.slot;
+                                    row.extra = old.extra;
+                                    row.slot_edited = true;
+                                    slots_kept = true;
+                                }
+                                if old.name_edited {
+                                    row.new_name = old.new_name.clone();
+                                    row.name_edited = true;
+                                }
+                            }
+                        }
+                        if slots_kept {
+                            self.layer_rig_review_action(buzz_ui::AiLayerRigAction::SlotChanged(0));
+                        }
+                    }
+                    None => {
+                        self.ai_layer_rig_pending = Some(plan);
+                        self.editor.status = Some("Rig Character as Layers: the symbol changed; run it again".into());
+                    }
+                }
+            }
+            buzz_ui::AiLayerRigAction::SlotChanged(_) => {
+                let Some(plan) = self.ai_layer_rig_pending.as_mut() else { return };
+                let rows = &mut self.ai_layer_rig.rows;
+                for (piece, row) in plan.pieces.iter_mut().zip(rows.iter()) {
+                    piece.slot = row.slot;
+                }
+                let extra: Vec<bool> = rows.iter().map(|r| r.extra).collect();
+                if !crate::rigging::relabel_layer_rig_plan(self.editor.doc.scene(), plan, &extra) {
+                    self.editor.status = Some("Rig Character as Layers: the symbol changed; run it again".into());
+                    return;
+                }
+                for (piece, row) in plan.pieces.iter().zip(rows.iter_mut()) {
+                    row.lead = piece.lead;
+                    if !row.name_edited {
+                        row.new_name = piece.new_layer_name.clone();
+                    }
+                }
+                self.ai_layer_rig.renames = plan
+                    .symbol_renames
+                    .iter()
+                    .map(|r| {
+                        let keep = self
+                            .ai_layer_rig
+                            .renames
+                            .iter()
+                            .find(|old| old.from == r.from)
+                            .is_none_or(|old| old.keep);
+                        buzz_ui::LayerRigRenameRow { from: r.from.clone(), to: r.to.clone(), keep }
+                    })
+                    .collect();
+            }
+            buzz_ui::AiLayerRigAction::Apply => {
+                let Some(mut plan) = self.ai_layer_rig_pending.take() else { return };
+                for (piece, row) in plan.pieces.iter_mut().zip(&self.ai_layer_rig.rows) {
+                    piece.new_layer_name = row.new_name.trim().to_string();
+                }
+                let keep: Vec<String> =
+                    self.ai_layer_rig.renames.iter().filter(|r| r.keep).map(|r| r.from.clone()).collect();
+                plan.symbol_renames.retain(|r| keep.contains(&r.from));
+                plan.rig_head = !self.ai_layer_rig.no_head_rig;
+                self.ai_layer_rig.open = false;
+                let _ = self.commit_layer_rig(*plan);
+            }
+        }
+    }
+
+    /// Apply a reviewed plan as one undo step, with the status line
+    /// ("Guddu rigged as layers: 20 parts on 17 slots, 0 renamed symbols").
+    pub(crate) fn commit_layer_rig(
+        &mut self,
+        plan: crate::rigging::LayerRigPlan,
+    ) -> Result<crate::rigging::AppliedLayerRig, String> {
+        let name = self.ai_rig_layers_name(plan.symbol);
+        let parts = plan.pieces.len();
+        let mut slots: Vec<usize> = plan.pieces.iter().map(|p| p.slot).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let low = plan.low_confidence;
+        let applied = self.editor.ai_rig_layers(plan.symbol, plan.frame, Some(plan))?;
+        let head = self.editor.status.as_ref().and_then(|s| s.find("; head").map(|i| s[i..].to_string()));
+        self.editor.status = Some(format!(
+            "{name} rigged as layers: {parts} parts on {} slots, {} renamed symbols{}{}",
+            slots.len(),
+            applied.renamed,
+            if low { " (lower confidence)" } else { "" },
+            head.unwrap_or_default()
+        ));
+        Ok(applied)
+    }
+
     /// An AI task finished. Commit whatever it built in one `Document::edit`,
     /// so it lands as a single undo step, and report the result.
     fn collect_ai_result(&mut self, id: crate::tasks::TaskId) {
@@ -9648,6 +10211,53 @@ impl App {
             }
             AiResult::Rigged { target, sym_name, rerigged } => {
                 self.commit_rig(target, sym_name, *rerigged);
+            }
+            AiResult::LayerRigPlanned { plan, request: None } => {
+                self.open_layer_rig_review(plan);
+            }
+            AiResult::LayerRigPlanned { mut plan, request: Some(request) } => {
+                let scene = self.editor.doc.scene().clone();
+                let value = match apply_layer_rig_overrides(&scene, &mut plan, &request.overrides) {
+                    Err(e) => {
+                        self.editor.status = Some(format!("ai_rig_layers: {e}"));
+                        serde_json::json!({"ok": false, "error": e})
+                    }
+                    Ok(()) if !request.apply => {
+                        self.editor.status = Some(format!(
+                            "Rig Character as Layers: planned {} pieces (not applied)",
+                            plan.pieces.len()
+                        ));
+                        serde_json::json!({"applied": false, "plan": layer_rig_plan_json(&scene, &plan)})
+                    }
+                    Ok(()) => {
+                        let summary = layer_rig_plan_json(&scene, &plan);
+                        let before = self.editor.doc.history().undo_depth();
+                        match self.commit_layer_rig(*plan) {
+                            Ok(applied) => serde_json::json!({
+                                "applied": true,
+                                "symbol": summary["symbol"],
+                                "parts": summary["pieces"].as_array().map_or(0, |p| p.len()),
+                                "slots": applied.rig.layers.iter().map(|(slot, _)| *slot).collect::<std::collections::BTreeSet<_>>().len(),
+                                "layers_before": applied.layers_before,
+                                "layers_after": applied.layers_after,
+                                "keys_rebaked": applied.keys_rebaked,
+                                "renamed_symbols": applied.renamed,
+                                "legs_folder": applied.legs_folder,
+                                "face_layers_renamed": applied.face_renamed,
+                                "profile": summary["profile"],
+                                "undo_steps_added": self.editor.doc.history().undo_depth() as i64 - before as i64,
+                                "source": summary["source"],
+                                "confidence": summary["confidence"],
+                                "low_confidence": summary["low_confidence"],
+                                "pieces": summary["pieces"],
+                            }),
+                            Err(e) => serde_json::json!({"ok": false, "error": e}),
+                        }
+                    }
+                };
+                if job_value.is_some() {
+                    job_value = Some(value);
+                }
             }
             AiResult::Produced { report, open } => {
                 self.produce.busy = false;
@@ -20328,6 +20938,7 @@ mod every_menu_command_tests {
         Command::AiSceneFromImage,
         Command::AiDirectStory,
         Command::AiRigVectorCharacter,
+        Command::AiRigLayers,
         // These ask the machine's own BuzzEdit and Buzzcaf Studio
         // (`crate::estate`, whose tests use fake ones).
         Command::SendToBuzzEdit,

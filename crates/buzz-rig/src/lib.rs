@@ -20,7 +20,9 @@
 //! is where the bone is now. A document keyframe stores angles, so tweening
 //! between poses is interpolating numbers rather than rebuilding a rig.
 
+pub mod cut_style;
 pub mod follow;
+pub mod head_style;
 pub mod ik;
 pub mod pattern;
 pub mod skin;

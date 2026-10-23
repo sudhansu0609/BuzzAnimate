@@ -265,6 +265,9 @@ pub enum Command {
     AiIdentifyAssets,
     /// Auto-rig an existing vector character symbol via skeleton bone capsules.
     AiRigVectorCharacter,
+    /// Put every piece of a character symbol on its own layer, named after its
+    /// body part and rigged by layer parenting, after a review.
+    AiRigLayers,
     /// Build and stage a scene from a reference image using local VLM and library assets.
     AiSceneFromImage,
     /// Direct a sequence from natural language brief using local LLM verbs.
@@ -444,6 +447,32 @@ pub enum Command {
     CopyFrames,
     /// Animate's Paste Frames.
     PasteFrames,
+    /// **Copy Motion**: store the selected object's keyframed motion (pose,
+    /// colour, timing, tweens) as a `MotionClip`
+    /// (`docs/AI_LAYER_RIG_AND_MOTION_COPY_PLAN.md` C1).
+    CopyMotion,
+    /// **Paste Motion**: write the copied motion onto each selected object at
+    /// the playhead, relative to its own starting place.
+    PasteMotion,
+    /// **Paste Motion Special…**: choose parts, relative/absolute and a time
+    /// stretch before pasting.
+    PasteMotionSpecial,
+    /// **Copy Pose**: store the selected rig's joint angles at the playhead,
+    /// by slot (`docs/AI_LAYER_RIG_AND_MOTION_COPY_PLAN.md` C2).
+    CopyPose,
+    /// **Paste Pose**: key the copied joint angles onto the selected rig at
+    /// the playhead, bone or layer rig, matched by slot name.
+    PastePose,
+    /// **Copy Performance**: store the selected character's joint angles,
+    /// root travel and keys over a frame range
+    /// (`docs/AI_LAYER_RIG_AND_MOTION_COPY_PLAN.md` C3).
+    CopyPerformance,
+    /// **Paste Performance**: key the copied performance onto the selected
+    /// character at the playhead, by slot name, bone or layer rig.
+    PastePerformance,
+    /// **Paste Performance Special…**: choose the offset, time stretch and
+    /// whether the instance's own travel comes too, before pasting.
+    PastePerformanceSpecial,
     /// Empty the frames here, keeping the span — Animate's Clear Frames.
     ClearFrames,
     /// Play this layer's keyframes back to front.
@@ -458,6 +487,17 @@ pub enum Command {
     /// old Bones → Layers wiring so a limb's front piece leads, rebaking keys
     /// so no frame changes.
     RepairLayerRigs,
+    /// **Rename Body Layers**: the naming profile's names for every layer of
+    /// this timeline that names a body part — the user's Animate Ctrl+R
+    /// (`docs/AI_LAYER_RIG_AND_MOTION_COPY_PLAN.md` N2).
+    RenameBodyLayers,
+    /// **Rename Face Layers**: the Shift+R face names (eyebrows, eye whites,
+    /// eyeBall, mouth) on this timeline and inside its head symbol (N2).
+    RenameFaceLayers,
+    /// **Rig Head**: a head symbol with separate face parts rebuilt like the
+    /// user's heads (eyeLid blink, eyeMask over eyeBall, eyeWhite, brows,
+    /// mouth symbol, base; `docs/HEAD_RIG_PLAN.md` H1).
+    RigHead,
     ToggleOnionSkin,
     ToggleAutoKeyframe,
     /// **Edit ▸ Protect Other Keyframes**: an edit inside a shared symbol
@@ -697,6 +737,7 @@ command_table! {
             AiCharacterFromImage => "ai_character_from_image",
             AiIdentifyAssets => "ai_identify_assets",
             AiRigVectorCharacter => "ai_rig_vector_character",
+            AiRigLayers => "ai_rig_layers",
             AiSceneFromImage => "ai_scene_from_image",
             AiDirectStory => "ai_direct_story",
             AiMouthChart => "ai_mouth_chart",
@@ -754,11 +795,22 @@ command_table! {
             CutFrames => "cut_frames",
             CopyFrames => "copy_frames",
             PasteFrames => "paste_frames",
+            CopyMotion => "copy_motion",
+            PasteMotion => "paste_motion",
+            PasteMotionSpecial => "paste_motion_special",
+            CopyPose => "copy_pose",
+            PastePose => "paste_pose",
+            CopyPerformance => "copy_performance",
+            PastePerformance => "paste_performance",
+            PastePerformanceSpecial => "paste_performance_special",
             ClearFrames => "clear_frames",
             ReverseFrames => "reverse_frames",
             CleanUpLayers => "clean_up_layers",
             ArrangeLayers => "arrange_layers",
             RepairLayerRigs => "repair_layer_rigs",
+            RenameBodyLayers => "rename_body_layers",
+            RenameFaceLayers => "rename_face_layers",
+            RigHead => "rig_head",
             ToggleOnionSkin => "toggle_onion_skin",
             ToggleAutoKeyframe => "toggle_auto_keyframe",
             ToggleProtectKeyframes => "toggle_protect_keyframes",
@@ -1064,6 +1116,7 @@ impl Command {
             AiCharacterFromImage => "Character from Image\u{2026}",
             AiIdentifyAssets => "Identify & Rename Assets\u{2026}",
             AiRigVectorCharacter => "Auto-Rig Vector Character\u{2026}",
+            AiRigLayers => "Rig Character as Layers\u{2026}",
             AiSceneFromImage => "Scene from Image\u{2026}",
             AiDirectStory => "Direct Story with LLM\u{2026}",
             AiMouthChart => "Mouth Chart\u{2026}",
@@ -1135,11 +1188,22 @@ impl Command {
             CutFrames => "Cut Frames",
             CopyFrames => "Copy Frames",
             PasteFrames => "Paste Frames",
+            CopyMotion => "Copy Motion",
+            PasteMotion => "Paste Motion",
+            PasteMotionSpecial => "Paste Motion Special\u{2026}",
+            CopyPose => "Copy Pose",
+            PastePose => "Paste Pose",
+            CopyPerformance => "Copy Performance",
+            PastePerformance => "Paste Performance",
+            PastePerformanceSpecial => "Paste Performance Special\u{2026}",
             ClearFrames => "Clear Frames",
             ReverseFrames => "Reverse Frames",
             CleanUpLayers => "Clean Up Layers\u{2026}",
             ArrangeLayers => "Arrange Layers",
             RepairLayerRigs => "Repair Layer Rigs\u{2026}",
+            RenameBodyLayers => "Rename Body Layers",
+            RenameFaceLayers => "Rename Face Layers",
+            RigHead => "Rig Head",
             ToggleOnionSkin => "Onion Skin",
             ToggleAutoKeyframe => "Auto Keyframe",
             ToggleProtectKeyframes => "Protect Other Keyframes",
@@ -1358,11 +1422,18 @@ impl Command {
             CutFrames => sc(ctrl_alt, Key::X),
             CopyFrames => sc(ctrl_alt, Key::C),
             PasteFrames => sc(ctrl_alt, Key::V),
+            CopyMotion | PasteMotion | PasteMotionSpecial | CopyPose | PastePose | CopyPerformance
+            | PastePerformance | PastePerformanceSpecial => None,
             ClearFrames => sc(Modifiers::ALT, Key::Backspace),
             ReverseFrames => None,
             CleanUpLayers => None,
             ArrangeLayers => None,
             RepairLayerRigs => None,
+            // Ctrl+R, the user's key for it in Animate, is Import to Stage
+            // here; it stays unbound rather than steal it.
+            RenameBodyLayers => None,
+            RenameFaceLayers => sc(Modifiers::SHIFT, Key::R),
+            RigHead => None,
             ToggleOnionSkin => None,
             ToggleAutoKeyframe => None,
             ToggleProtectKeyframes | ProtectThisKeyframe | ProtectFromHere => None,
@@ -1394,7 +1465,7 @@ impl Command {
             TranscribeWithBuzzEdit | SendToBuzzEdit | ImportScriptFromStudio => None,
             // A dialog with a whole form behind it.
             ProduceEpisode => None,
-            AiModels | AiCharacterFromImage | AiIdentifyAssets | AiRigVectorCharacter | AiSceneFromImage | AiDirectStory | AiMouthChart => None,
+            AiModels | AiCharacterFromImage | AiIdentifyAssets | AiRigVectorCharacter | AiRigLayers | AiSceneFromImage | AiDirectStory | AiMouthChart => None,
         }
     }
 
@@ -1526,11 +1597,22 @@ pub fn palette_commands() -> Vec<Command> {
         CutFrames,
         CopyFrames,
         PasteFrames,
+        CopyMotion,
+        PasteMotion,
+        PasteMotionSpecial,
+        CopyPose,
+        PastePose,
+        CopyPerformance,
+        PastePerformance,
+        PastePerformanceSpecial,
         ClearFrames,
         ReverseFrames,
         CleanUpLayers,
         ArrangeLayers,
         RepairLayerRigs,
+        RenameBodyLayers,
+        RenameFaceLayers,
+        RigHead,
         ToggleOnionSkin,
         ToggleAutoKeyframe,
         ToggleProtectKeyframes,
@@ -1625,6 +1707,7 @@ pub fn palette_commands() -> Vec<Command> {
         AiCharacterFromImage,
         AiIdentifyAssets,
         AiRigVectorCharacter,
+        AiRigLayers,
         AiSceneFromImage,
         AiDirectStory,
     ]
@@ -1743,11 +1826,21 @@ mod tests {
             CutFrames,
             CopyFrames,
             PasteFrames,
+            CopyMotion,
+            PasteMotion,
+            PasteMotionSpecial,
+            CopyPose,
+            PastePose,
+            CopyPerformance,
+            PastePerformance,
+            PastePerformanceSpecial,
             ClearFrames,
             ReverseFrames,
             CleanUpLayers,
             ArrangeLayers,
             RepairLayerRigs,
+            RenameBodyLayers,
+            RenameFaceLayers,
             ToggleOnionSkin,
             ToggleAutoKeyframe,
             ToggleEditMultipleFrames,
@@ -1925,7 +2018,7 @@ mod tests {
             assert!(seen.insert(c.id()), "duplicate id {}", c.id());
             assert_eq!(Command::from_id(c.id(), &serde_json::Value::Null), Ok(c));
         }
-        assert_eq!(Command::unit_commands().len() + Command::data_command_hints().len(), 207);
+        assert_eq!(Command::unit_commands().len() + Command::data_command_hints().len(), 219);
     }
 
     #[test]

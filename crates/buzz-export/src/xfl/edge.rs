@@ -29,23 +29,72 @@ const TWIPS_PER_PIXEL: f64 = 20.0;
 /// record — so nothing is lost that the format could have kept.
 const CURVE_TOLERANCE: f64 = 1.0 / TWIPS_PER_PIXEL;
 
-/// One coordinate, in twips, as Animate writes them.
+/// One coordinate, in whole twips.
 ///
-/// Whole twips print as integers because that is what Animate's own files are
-/// full of and it keeps them diffable; anything else keeps enough decimals to
-/// come back unchanged.
-fn twips(value: f64) -> String {
-    let t = value * TWIPS_PER_PIXEL;
-    if (t - t.round()).abs() < 1e-9 {
-        format!("{}", t.round() as i64)
-    } else {
-        let text = format!("{t:.4}");
-        text.trim_end_matches('0').trim_end_matches('.').to_string()
-    }
+/// **Rounded, not kept to a fraction.** Measured in Animate 2024
+/// (docs/FLA_EXPORT_PLAN.md X1): a real hair fill written with fractional
+/// twips — as decimals to 1, 2 or 4 places, or as Animate's own `#hex.frac`
+/// — opened as a few slivers, the rest of the fill dropped; the same outline
+/// rounded to whole twips opened whole. Sub-twip segments are what Animate's
+/// shape builder loses, and with them the closure of the fill. A twip is a
+/// twentieth of a pixel, so nothing visible is given up.
+fn twips(value: f64) -> i64 {
+    (value * TWIPS_PER_PIXEL).round() as i64
 }
 
-fn point(p: Point) -> String {
-    format!("{} {}", twips(p.x), twips(p.y))
+fn grid(p: Point) -> (i64, i64) {
+    (twips(p.x), twips(p.y))
+}
+
+/// Writes segments on the twip grid, leaving out the ones rounding has
+/// collapsed to nothing.
+///
+/// **Zero-length segments lose holes.** Measured in Animate 2024
+/// (docs/FLA_EXPORT_PLAN.md X1): Guddu's eye ring, whose inner outline had 32
+/// segments shorter than a twip, opened as a solid black disc; the same
+/// outlines without them opened as the ring.
+struct Writer {
+    out: String,
+    /// The current point as written, on the grid.
+    at: (i64, i64),
+    /// A subpath's start, held back until it has a segment to start.
+    pending: Option<(i64, i64)>,
+}
+
+impl Writer {
+    fn move_to(&mut self, p: Point) {
+        self.pending = Some(grid(p));
+        self.at = grid(p);
+    }
+
+    fn begin(&mut self) {
+        if let Some((x, y)) = self.pending.take() {
+            self.out.push_str(&format!("!{x} {y}"));
+        }
+    }
+
+    fn line_to(&mut self, p: Point) {
+        let to = grid(p);
+        if to == self.at {
+            return;
+        }
+        self.begin();
+        self.out.push_str(&format!("|{} {}", to.0, to.1));
+        self.at = to;
+    }
+
+    // `[` takes **four** numbers — control point then anchor — with no
+    // separator between the pairs. A `|` in there is a different command, and
+    // the reader stops on it.
+    fn quad_to(&mut self, c: Point, p: Point) {
+        let (control, to) = (grid(c), grid(p));
+        if to == self.at {
+            return;
+        }
+        self.begin();
+        self.out.push_str(&format!("[{} {} {} {}", control.0, control.1, to.0, to.1));
+        self.at = to;
+    }
 }
 
 /// Turn a path into an Animate edge string.
@@ -54,7 +103,7 @@ fn point(p: Point) -> String {
 /// is not something to write, and Animate treats an empty `edges` attribute as
 /// a malformed shape rather than an empty one.
 pub fn write_edges(path: &BezPath) -> Option<String> {
-    let mut out = String::new();
+    let mut w = Writer { out: String::new(), at: (0, 0), pending: None };
     // Where the current subpath began, so `ClosePath` can be written as the
     // line back that Animate's format actually stores — it has no close
     // command of its own.
@@ -64,53 +113,39 @@ pub fn write_edges(path: &BezPath) -> Option<String> {
     for element in path.elements() {
         match *element {
             PathEl::MoveTo(p) => {
-                out.push('!');
-                out.push_str(&point(p));
+                w.move_to(p);
                 start = Some(p);
                 here = p;
             }
             PathEl::LineTo(p) => {
-                out.push('|');
-                out.push_str(&point(p));
+                w.line_to(p);
                 here = p;
             }
-            // `[` takes **four** numbers — control point then anchor — with no
-            // separator between the pairs. A `|` in there is a different
-            // command, and the reader stops on it.
             PathEl::QuadTo(c, p) => {
-                out.push('[');
-                out.push_str(&point(c));
-                out.push(' ');
-                out.push_str(&point(p));
+                w.quad_to(c, p);
                 here = p;
             }
             PathEl::CurveTo(c1, c2, p) => {
                 let cubic = kurbo::CubicBez::new(here, c1, c2, p);
                 for (_, _, quad) in cubic.to_quads(CURVE_TOLERANCE) {
-                    out.push('[');
-                    out.push_str(&point(quad.p1));
-                    out.push(' ');
-                    out.push_str(&point(quad.p2));
+                    w.quad_to(quad.p1, quad.p2);
                 }
                 here = p;
             }
             PathEl::ClosePath => {
                 // The format has no close: a closed outline is one whose last
                 // point is its first. Written only when it is not already
-                // there, so a path that closes itself is not given a
-                // zero-length edge Animate would have to discard.
-                if let Some(first) = start
-                    && (first - here).hypot() > 1e-9
-                {
-                    out.push('|');
-                    out.push_str(&point(first));
+                // there (on the grid), so a path that closes itself is not
+                // given a zero-length edge.
+                if let Some(first) = start {
+                    w.line_to(first);
                     here = first;
                 }
             }
         }
     }
 
-    (!out.is_empty()).then_some(out)
+    (!w.out.is_empty()).then_some(w.out)
 }
 
 /// Does this path enclose anything?

@@ -8,6 +8,7 @@
 pub mod about;
 pub mod actions_panel;
 pub mod ai_character_dialog;
+pub mod ai_layer_rig_dialog;
 pub mod ai_models_dialog;
 pub mod ai_panel;
 pub mod ai_rename_dialog;
@@ -60,6 +61,9 @@ pub use about::{AboutState, about_dialog};
 pub use actions_panel::{ActionsResponse, ActionsState, SampleEntry, SavedScript, actions_panel};
 pub use ai_character_dialog::{
     AiCharacterDialogAction, AiCharacterState, AiCharacterStep, ai_character_dialog,
+};
+pub use ai_layer_rig_dialog::{
+    AiLayerRigAction, AiLayerRigState, LayerRigRenameRow, LayerRigRow, ai_layer_rig_dialog,
 };
 pub use ai_models_dialog::{AiModelsState, ai_models_dialog, ModelDownloadProgress};
 pub use ai_rename_dialog::{AiRenameAction, AiRenameState};

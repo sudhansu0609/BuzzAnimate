@@ -506,3 +506,355 @@ pub fn classify_timeline_motions(
         end_frame: (total_frames - 1) as u32,
     }]
 }
+
+// ---------------------------------------------------------------------------
+// AI Rig as Layers (docs/AI_LAYER_RIG_AND_MOTION_COPY_PLAN.md R1): the same
+// capsule overlap and name affinity, on `RigPattern::biped_full`'s seventeen
+// slots, one piece per top-level object, any number of pieces per slot.
+// ---------------------------------------------------------------------------
+
+/// `(head, tip)` per `RigPattern::biped_full` slot from a detected skeleton,
+/// in the skeleton's coordinates; `None` where the detector was not sure.
+pub fn biped_full_joints(skel: &Skeleton) -> Vec<Option<(Point, Point)>> {
+    crate::character::biped_joints_from_skeleton(skel)
+}
+
+/// A standing, front-facing figure filling `bounds`, as `(head, tip)` per
+/// `RigPattern::biped_full` slot: the stand-in skeleton when no detector ran.
+/// "L" slots on the viewer's left, as the pattern's own rest angles have them.
+pub fn guessed_biped_full_joints(bounds: Rect) -> Vec<Option<(Point, Point)>> {
+    let h = bounds.height().max(1.0);
+    let cx = bounds.center().x;
+    let p = |dx: f64, fy: f64| Point::new(cx + dx * h, bounds.y0 + fy * h);
+    let shoulder = |s: f64| (p(s * 0.11, 0.20), p(s * 0.14, 0.37));
+    let elbow = |s: f64| (p(s * 0.14, 0.37), p(s * 0.15, 0.50));
+    let wrist = |s: f64| (p(s * 0.15, 0.50), p(s * 0.15, 0.57));
+    let thigh = |s: f64| (p(s * 0.06, 0.53), p(s * 0.06, 0.75));
+    let knee = |s: f64| (p(s * 0.06, 0.75), p(s * 0.06, 0.94));
+    let ankle = |s: f64| (p(s * 0.06, 0.94), p(s * 0.10, 0.98));
+    let brow = |s: f64| (p(s * 0.015, 0.08), p(s * 0.05, 0.08));
+    vec![
+        Some((p(0.0, 0.55), p(0.0, 0.42))), // Hips
+        Some((p(0.0, 0.42), p(0.0, 0.17))), // Chest
+        Some((p(0.0, 0.17), p(0.0, 0.0))),  // Head
+        Some(shoulder(-1.0)),               // Shoulder L
+        Some(elbow(-1.0)),                  // Elbow L
+        Some(shoulder(1.0)),                // Shoulder R
+        Some(elbow(1.0)),                   // Elbow R
+        Some(thigh(-1.0)),                  // Thigh L
+        Some(knee(-1.0)),                   // Knee L
+        Some(thigh(1.0)),                   // Thigh R
+        Some(knee(1.0)),                    // Knee R
+        Some(wrist(-1.0)),                  // Wrist L
+        Some(wrist(1.0)),                   // Wrist R
+        Some(ankle(-1.0)),                  // Ankle L
+        Some(ankle(1.0)),                   // Ankle R
+        Some(brow(-1.0)),                   // Brow L
+        Some(brow(1.0)),                    // Brow R
+    ]
+}
+
+/// One capsule per `RigPattern::biped_full` slot from `(head, tip)` joints
+/// (`guessed` fills any the detector left out), radii as a fraction of the
+/// figure's `height`.
+pub fn biped_full_capsules(
+    joints: &[Option<(Point, Point)>],
+    guessed: &[Option<(Point, Point)>],
+    height: f64,
+) -> Vec<BoneCapsule> {
+    let pattern = RigPattern::biped_full();
+    let radius = [
+        0.10, 0.11, 0.12, 0.05, 0.045, 0.05, 0.045, 0.07, 0.06, 0.07, 0.06, 0.05, 0.05, 0.045, 0.045,
+        0.025, 0.025,
+    ];
+    pattern
+        .slots
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            let (head, tail) = joints
+                .get(index)
+                .copied()
+                .flatten()
+                .or_else(|| guessed.get(index).copied().flatten())
+                .unwrap_or((Point::ORIGIN, Point::ORIGIN));
+            BoneCapsule {
+                slot_index: index,
+                slot_name: slot.name.clone(),
+                head,
+                tail,
+                radius: height.max(1.0) * radius.get(index).copied().unwrap_or(0.05),
+            }
+        })
+        .collect()
+}
+
+/// What a piece's name says it is, as a `biped_full` slot stem ("Head",
+/// "Wrist", "Brow", ...), or `None` when the name says nothing about the body.
+/// Whole words (`buzz_rig::pattern::tokens`), so `forearm` is not an arm.
+pub fn body_word(name: &str) -> Option<&'static str> {
+    // A slot's own or display name ("Wrist R" is the hand), then the user's
+    // Animate convention ("rightWrist" is the forearm, "leftPalm" the hand,
+    // "midCloth" the hips), then the words below.
+    if let Some(slot) = buzz_rig::pattern::canonical_slot(name) {
+        return Some(match slot.trim_end_matches(" L").trim_end_matches(" R") {
+            "Hips" => "Hips",
+            "Chest" => "Chest",
+            "Head" => "Head",
+            "Shoulder" => "Shoulder",
+            "Elbow" => "Elbow",
+            "Wrist" => "Wrist",
+            "Thigh" => "Thigh",
+            "Knee" => "Knee",
+            "Ankle" => "Ankle",
+            _ => "Brow",
+        });
+    }
+    if let Some(part) = buzz_rig::pattern::body_part(name) {
+        return Some(part);
+    }
+    let words = buzz_rig::pattern::tokens(name);
+    let has = |list: &[&str]| words.iter().any(|w| list.contains(&w.as_str()));
+    let joined = words.join(" ");
+    if has(&["brow", "brows", "eyebrow", "eyebrows"]) {
+        return Some("Brow");
+    }
+    if has(&[
+        "head", "face", "eye", "eyes", "eyelid", "eyelids", "pupil", "pupils", "mouth", "lip", "lips",
+        "hair", "nose", "ear", "ears", "beard", "moustache", "mustache", "teeth", "tongue", "skull",
+        "cap", "hat", "turban", "cheek", "chin", "jaw", "glasses", "neck",
+    ]) {
+        return Some("Head");
+    }
+    if has(&[
+        "hand", "hands", "palm", "palms", "wrist", "wrists", "fist", "finger", "fingers", "thumb",
+    ]) {
+        return Some("Wrist");
+    }
+    if has(&[
+        "foot", "feet", "shoe", "shoes", "boot", "boots", "ankle", "toe", "toes", "sandal", "chappal",
+    ]) {
+        return Some("Ankle");
+    }
+    if has(&["forearm", "elbow"]) || joined.contains("lower arm") {
+        return Some("Elbow");
+    }
+    if has(&["knee", "shin", "calf"]) || joined.contains("lower leg") {
+        return Some("Knee");
+    }
+    if has(&["arm", "arms", "upperarm", "shoulder", "bicep", "sleeve"]) {
+        return Some("Shoulder");
+    }
+    if has(&["thigh", "leg", "legs"]) {
+        return Some("Thigh");
+    }
+    if has(&[
+        "hips", "hip", "pelvis", "waist", "dhoti", "skirt", "pants", "trouser", "trousers", "shorts",
+        "lungi", "pyjama", "pajama",
+    ]) {
+        return Some("Hips");
+    }
+    if has(&["chest", "torso", "body", "kurta", "shirt", "vest", "jacket", "coat", "spine", "belly"]) {
+        return Some("Chest");
+    }
+    None
+}
+
+/// `(left, right)`: which side a piece's name says it is on.
+fn name_sides(name: &str) -> (bool, bool) {
+    // `buzz_rig::pattern::name_side`: substrings as the user's own Animate
+    // commands match, so typos read (bhatta2's `righFoot`, `righttThigh`,
+    // `man2BBleftEyebrow`, `lefEyebrow1`).
+    match buzz_rig::pattern::name_side(name) {
+        Some(buzz_rig::Side::Left) => (true, false),
+        Some(buzz_rig::Side::Right) => (false, true),
+        _ => {
+            let (squashed, words) = (name.to_lowercase(), buzz_rig::pattern::tokens(name));
+            let both = |w: &[&str]| words.iter().any(|t| w.contains(&t.as_str()));
+            // Both said: as before, both flags.
+            let left = squashed.contains("lef") || both(&["l", "lt", "lft"]);
+            let right = squashed.contains("righ") || both(&["r", "rt", "rgt"]);
+            (left && right, left && right)
+        }
+    }
+}
+
+/// A piece's own name with its side written the rig's way — "Right Eye" →
+/// "Eye R", "palmLeft" → "Palm L" — and a name that says no side (or both)
+/// as it is ("Mouth").
+pub fn side_normalised_name(name: &str) -> String {
+    let (left, right) = name_sides(name);
+    if left == right {
+        return name.trim().to_string();
+    }
+    let words: Vec<String> = buzz_rig::pattern::tokens(name)
+        .into_iter()
+        .filter(|w| {
+            !matches!(w.as_str(), "l" | "lt" | "lft" | "r" | "rt" | "rgt") && !w.starts_with("lef") && !w.starts_with("righ")
+        })
+        .map(|w| {
+            let mut chars = w.chars();
+            chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
+        })
+        .collect();
+    let side = if left { "L" } else { "R" };
+    if words.is_empty() { side.to_string() } else { format!("{} {side}", words.join(" ")) }
+}
+
+/// [`compute_overlap_score`] for a `biped_full` capsule: the geometric
+/// overlap plus 1.5 when the name names the slot ([`body_word`]); `0.0` when
+/// the name says the other side.
+pub fn full_overlap_score(part: &VectorPartCandidate, capsule: &BoneCapsule) -> f64 {
+    full_score(part, capsule, false)
+}
+
+/// The side a name says, read with left and right swapped when `swap`.
+fn sides_read(name: &str, swap: bool) -> (bool, bool) {
+    let (left, right) = name_sides(name);
+    if swap { (right, left) } else { (left, right) }
+}
+
+/// True when a name that says one side meets a slot of the other.
+fn sides_clash((left, right): (bool, bool), slot: &str) -> bool {
+    let (slot_left, slot_right) = (slot.ends_with(" L"), slot.ends_with(" R"));
+    (left && !right && slot_right) || (right && !left && slot_left)
+}
+
+fn full_score(part: &VectorPartCandidate, capsule: &BoneCapsule, swap: bool) -> f64 {
+    let slot = capsule.slot_name.as_str();
+    if sides_clash(sides_read(&part.name, swap), slot) {
+        return 0.0;
+    }
+    let stem = slot.trim_end_matches(" L").trim_end_matches(" R");
+    let affinity = match body_word(&part.name) {
+        Some(word) if word == stem => 1.5,
+        _ => 0.0,
+    };
+    geometric_overlap(part, capsule) + affinity
+}
+
+/// Each piece onto its best `biped_full` slot (several pieces may share one):
+/// the best [`full_overlap_score`]; a head piece (eyes, mouth, hair, ...)
+/// always on Head and a brow on its side's Brow (Head when it names no side);
+/// nothing at all → the capsule nearest the piece's middle on its side.
+/// **A side word in a name wins**: a piece whose name says left or right
+/// keeps that side unless, with `try_swap` (real detected joints), geometry
+/// clearly contradicts it — a [`full_overlap_score`] (name affinity included)
+/// under [`SIDE_CONTRADICTION`] on the side it names, and higher on the other. Each sided
+/// piece's call comes back beside its mapping.
+pub fn map_pieces_to_full_slots(
+    parts: &[VectorPartCandidate],
+    capsules: &[BoneCapsule],
+    try_swap: bool,
+) -> Vec<(PartSlotMapping, Option<SideCall>)> {
+    let as_written = map_pieces_once(parts, capsules, false);
+    // The names' sides swapped, not the names: `swap_sides` lowercases, and
+    // `body_word` needs the camel case to find the words in `palmLeft`.
+    let swapped = map_pieces_once(parts, capsules, true);
+    let inside = |m: &PartSlotMapping, p: &VectorPartCandidate| {
+        capsules.get(m.slot_index).map_or(0.0, |c| geometric_overlap(p, c))
+    };
+    as_written
+        .into_iter()
+        .zip(swapped)
+        .zip(parts)
+        .map(|((written, other), part)| {
+            let (left, right) = name_sides(&part.name);
+            if left == right {
+                return (written, None);
+            }
+            // The score includes the name's own affinity, so a name that
+            // says the part as well as the side ("OldmanFrontArmLeft") is
+            // never overruled; only a bare side word on a piece that sits
+            // in neither its bone nor its name's can be.
+            let flip = try_swap
+                && written.overlap_score < SIDE_CONTRADICTION
+                && other.overlap_score > written.overlap_score;
+            let call = SideCall {
+                named: if left { 'L' } else { 'R' },
+                flipped: flip,
+                named_score: written.overlap_score,
+                other_score: other.overlap_score,
+                named_overlap: inside(&written, part),
+                other_overlap: inside(&other, part),
+            };
+            (if flip { other } else { written }, Some(call))
+        })
+        .collect()
+}
+
+/// Below this score on the side its side word names, geometry
+/// is taken to contradict the name ([`map_pieces_to_full_slots`]).
+pub const SIDE_CONTRADICTION: f64 = 0.2;
+
+/// How a piece whose name says a side was placed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SideCall {
+    /// The side the name says: `'L'` or `'R'`.
+    pub named: char,
+    /// Put on the other side, because geometry contradicted the name.
+    pub flipped: bool,
+    /// [`full_overlap_score`] on the named side's best slot, and on the
+    /// other side's (what the flip is decided on).
+    pub named_score: f64,
+    pub other_score: f64,
+    /// Share of the piece inside the named side's bone, and the other's.
+    pub named_overlap: f64,
+    pub other_overlap: f64,
+}
+
+fn map_pieces_once(
+    parts: &[VectorPartCandidate],
+    capsules: &[BoneCapsule],
+    swap: bool,
+) -> Vec<PartSlotMapping> {
+    let named = |name: &str| capsules.iter().position(|c| c.slot_name == name);
+    parts
+        .iter()
+        .map(|part| {
+            let (left, right) = sides_read(&part.name, swap);
+            let forced = match body_word(&part.name) {
+                Some("Head") => named("Head"),
+                Some("Brow") if left && !right => named("Brow L"),
+                Some("Brow") if right && !left => named("Brow R"),
+                Some("Brow") => named("Head"),
+                _ => None,
+            };
+            let (best, score) = match forced {
+                Some(index) => (index, full_score(part, &capsules[index], swap).max(1.5)),
+                None => {
+                    let mut best = 0;
+                    let mut best_score = -1.0;
+                    for (index, capsule) in capsules.iter().enumerate() {
+                        let score = full_score(part, capsule, swap);
+                        if score > best_score {
+                            best_score = score;
+                            best = index;
+                        }
+                    }
+                    if best_score <= 0.0 {
+                        let c = part.bounds.center();
+                        if let Some((index, _)) = capsules
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, cap)| !sides_clash((left, right), &cap.slot_name))
+                            .map(|(i, cap)| (i, cap.distance_to_point(c)))
+                            .min_by(|a, b| a.1.total_cmp(&b.1))
+                        {
+                            best = index;
+                        }
+                    }
+                    (best, best_score.max(0.0))
+                }
+            };
+            let capsule = &capsules[best];
+            PartSlotMapping {
+                part_name: part.name.clone(),
+                slot_index: capsule.slot_index,
+                slot_name: capsule.slot_name.clone(),
+                pivot: (capsule.head.x, capsule.head.y),
+                overlap_score: score,
+            }
+        })
+        .collect()
+}

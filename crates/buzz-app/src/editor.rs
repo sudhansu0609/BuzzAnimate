@@ -152,6 +152,18 @@ pub struct Editor {
     /// paste puts it back where it belongs rather than piling every layer's
     /// artwork onto whichever one happens to be active.
     pub frame_clipboard: Option<Vec<(LayerId, Vec<std::sync::Arc<Object>>)>>,
+    /// Copy Motion's clipboard (C1).
+    pub motion_clip: Option<MotionClip>,
+    /// Copy Pose's clipboard (C2).
+    pub pose_clip: Option<PoseClip>,
+    /// Paste Motion Special…: the dialog is open, and its choices (kept between uses).
+    pub paste_motion_special_open: bool,
+    pub motion_paste_options: MotionPasteOptions,
+    /// Copy Performance's clipboard (C3).
+    pub performance_clip: Option<PerformanceClip>,
+    /// Paste Performance Special…: the dialog is open, and its choices.
+    pub paste_performance_special_open: bool,
+    pub performance_paste_options: PerformancePasteOptions,
     /// Artwork on the clipboard, from Cut or Copy.
     ///
     /// # Why a whole `Scene`
@@ -607,6 +619,13 @@ impl Editor {
             library: LibraryState::default(),
             swatch_panel: buzz_ui::SwatchState::default(),
             frame_clipboard: None,
+            motion_clip: None,
+            pose_clip: None,
+            paste_motion_special_open: false,
+            motion_paste_options: MotionPasteOptions::default(),
+            performance_clip: None,
+            paste_performance_special_open: false,
+            performance_paste_options: PerformancePasteOptions::default(),
             clipboard: None,
             rig_panel: buzz_ui::RigPanelState::default(),
             templates: buzz_doc::TemplateLibrary::user(),
@@ -5412,12 +5431,54 @@ impl Editor {
             ReverseFrames => self.frame_op(FrameOp::ReverseFrames),
             CleanUpLayers => self.cleanup.open_fresh(),
             RepairLayerRigs => self.repair_rigs_open = true,
+            RenameBodyLayers => {
+                self.rename_body_layers();
+            }
+            RenameFaceLayers => {
+                self.rename_face_layers();
+            }
+            RigHead => {
+                let _ = self.rig_head(None);
+            }
             ArrangeLayers => {
                 self.arrange_layers();
             }
             CopyFrames => self.copy_frames(false),
             CutFrames => self.copy_frames(true),
             PasteFrames => self.paste_frames(),
+            CopyMotion => {
+                self.copy_motion();
+            }
+            PasteMotion => {
+                self.paste_motion(MotionPasteOptions::default());
+            }
+            CopyPose => {
+                self.copy_pose();
+            }
+            PastePose => {
+                self.paste_pose(None);
+            }
+            CopyPerformance => {
+                self.copy_performance(None);
+            }
+            PastePerformance => {
+                self.paste_performance(PerformancePasteOptions::default());
+            }
+            PastePerformanceSpecial => {
+                if self.performance_clip.is_some() {
+                    self.paste_performance_special_open = true;
+                } else {
+                    self.status =
+                        Some("There is no performance on the clipboard \u{2014} Copy Performance first".into());
+                }
+            }
+            PasteMotionSpecial => {
+                if self.motion_clip.is_some() {
+                    self.paste_motion_special_open = true;
+                } else {
+                    self.status = Some("There is no motion on the clipboard \u{2014} Copy Motion first".into());
+                }
+            }
             PlayPause => self.toggle_playback(),
             NextFrame => {
                 // Stepping past the end extends nothing; use F5 for that.
@@ -5756,7 +5817,7 @@ impl Editor {
             // all three need a background thread (rigging also a GPU render
             // and pose detection; the scene-from-image one, a non-blocking
             // file dialog too) that `Editor` has no way to start on its own.
-            AiRigVectorCharacter | AiSceneFromImage | AiDirectStory => {}
+            AiRigVectorCharacter | AiRigLayers | AiSceneFromImage | AiDirectStory => {}
             // Handled by `App` (`crate::estate`): they talk to BuzzEdit and
             // Buzzcaf Studio over HTTP, which `Editor` has no thread for.
             SendToBuzzEdit | TranscribeWithBuzzEdit | ImportScriptFromStudio => {}
@@ -9531,6 +9592,169 @@ impl Editor {
         report
     }
 
+    /// **AI ▸ Rig Character as Layers** (plan R2): carry out `plan` — or,
+    /// with `None`, the plan [`crate::rigging::plan_layer_rig_auto`] makes for
+    /// `symbol` at its `frame` — inside the character symbol, as one undo step
+    /// ("AI Rig as Layers"), with the status line.
+    pub fn ai_rig_layers(
+        &mut self,
+        symbol: buzz_scene::SymbolId,
+        frame: u32,
+        plan: Option<crate::rigging::LayerRigPlan>,
+    ) -> Result<crate::rigging::AppliedLayerRig, String> {
+        let plan = match plan {
+            Some(plan) => plan,
+            None => crate::rigging::plan_layer_rig_auto(
+                self.doc.scene(),
+                symbol,
+                frame,
+                &crate::rigging::naming_profile(None)?,
+                None,
+            )
+                .ok_or_else(|| "AI Rig as Layers: no pieces to rig at that frame".to_string())?,
+        };
+        if plan.symbol != symbol || plan.frame != frame {
+            return Err("AI Rig as Layers: the plan is for another symbol or frame".into());
+        }
+        let mut applied = None;
+        self.doc.end_gesture();
+        let mut head_rig = None;
+        self.doc.edit("AI Rig as Layers", |scene| {
+            applied = crate::rigging::apply_layer_rig_plan(scene, &plan);
+            // H1: the head rigged like the user's, in the same step.
+            if let (true, Some(_), Some(head)) = (plan.rig_head, &applied, plan.head_symbol) {
+                let style = buzz_rig::head_style::HeadStyle::animate_convention();
+                head_rig = Some(crate::rigging::rig_head(scene, head, &style));
+            }
+        });
+        self.doc.end_gesture();
+        match applied {
+            Some(applied) => {
+                self.selection.prune(self.doc.scene());
+                self.status = Some(format!(
+                    "AI Rig as Layers: {} pieces on {} layers ({} before), {} keyframes rebaked, {} symbols renamed{}",
+                    plan.pieces.len(),
+                    applied.layers_after,
+                    applied.layers_before,
+                    applied.keys_rebaked,
+                    applied.renamed,
+                    if plan.low_confidence { " (lower confidence)" } else { "" }
+                ));
+                if let (Some(status), Some(head)) = (self.status.as_mut(), head_rig) {
+                    status.push_str(&match head {
+                        Ok(r) if r.already_rigged => "; head already rigged".to_string(),
+                        Ok(r) => format!("; head rigged: {}", r.layers.join(" > ")),
+                        Err(e) => format!("; head not rigged ({e})"),
+                    });
+                }
+                Ok(applied)
+            }
+            None => {
+                let message = "AI Rig as Layers: the plan no longer matches the symbol".to_string();
+                self.status = Some(message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    /// **Rename Body Layers** (N2) on the timeline being edited, by the
+    /// default naming profile, as one undo step ("Rename Body Layers"), with
+    /// the status line. Nothing to rename records no step. Returns
+    /// `(from, to)` per renamed layer.
+    pub fn rename_body_layers(&mut self) -> Vec<(String, String)> {
+        let profile = match crate::rigging::naming_profile(None) {
+            Ok(profile) => profile,
+            Err(e) => {
+                self.status = Some(format!("Rename Body Layers: {e}"));
+                return Vec::new();
+            }
+        };
+        let planned = crate::rigging::body_layer_renames(self.doc.scene().layers(), &profile);
+        let mut made = Vec::new();
+        if !planned.is_empty() {
+            self.doc.end_gesture();
+            self.doc.edit("Rename Body Layers", |scene| {
+                made = crate::rigging::rename_body_layers(scene, crate::rigging::RigHome::Active, &profile);
+            });
+            self.doc.end_gesture();
+        }
+        let pairs: Vec<(String, String)> = made.into_iter().map(|r| (r.from, r.to)).collect();
+        self.status = Some(if pairs.is_empty() {
+            format!("Rename Body Layers ({}): every body layer already has its name", profile.name)
+        } else {
+            format!(
+                "Rename Body Layers ({}): {}",
+                profile.name,
+                pairs.iter().map(|(f, t)| format!("{f} \u{2192} {t}")).collect::<Vec<_>>().join(", ")
+            )
+        });
+        pairs
+    }
+
+    /// **Rename Face Layers** (N2) on the timeline being edited and inside
+    /// its head symbol, as one undo step ("Rename Face Layers"), with the
+    /// status line. Nothing to rename records no step. Returns `(from, to)`
+    /// per renamed layer, the head symbol's after this timeline's.
+    pub fn rename_face_layers(&mut self) -> Vec<(String, String)> {
+        let mut probe = self.doc.scene().clone();
+        let (own, head) = crate::rigging::rename_face_layers(&mut probe, crate::rigging::RigHome::Active);
+        let mut pairs: Vec<(String, String)> = own.into_iter().map(|r| (r.from, r.to)).collect();
+        pairs.extend(head.into_iter().flat_map(|(_, renames)| renames).map(|r| (r.from, r.to)));
+        if !pairs.is_empty() {
+            self.doc.end_gesture();
+            self.doc.edit("Rename Face Layers", |scene| {
+                crate::rigging::rename_face_layers(scene, crate::rigging::RigHome::Active);
+            });
+            self.doc.end_gesture();
+        }
+        self.status = Some(if pairs.is_empty() {
+            "Rename Face Layers: every face layer already has its name".to_string()
+        } else {
+            format!(
+                "Rename Face Layers: {}",
+                pairs.iter().map(|(f, t)| format!("{f} \u{2192} {t}")).collect::<Vec<_>>().join(", ")
+            )
+        });
+        pairs
+    }
+
+    /// **Rig Head** (`docs/HEAD_RIG_PLAN.md` H1) on the head of `symbol`
+    /// (else of the selected instance, else of the symbol being edited, else
+    /// the head on the stage): its face parts rebuilt like the user's heads
+    /// (`HeadStyle`), as one undo step ("Rig Head"), with the status line.
+    /// A head already rigged, or one with no separate eyes, records no step.
+    pub fn rig_head(&mut self, symbol: Option<buzz_scene::SymbolId>) -> Result<crate::rigging::HeadRigReport, String> {
+        let scene = self.doc.scene();
+        let picked = symbol.or_else(|| {
+            self.selection
+                .iter()
+                .find_map(|id| scene.find_object(id).and_then(|(_, o)| o.instance().map(|i| i.symbol)))
+        });
+        let Some(head) = crate::rigging::head_target(scene, picked) else {
+            let message = "Rig Head: no head symbol here (select a head instance, or open the head)".to_string();
+            self.status = Some(message.clone());
+            return Err(message);
+        };
+        let name = scene.library().get(head).map(|s| s.name.clone()).unwrap_or_default();
+        let style = buzz_rig::head_style::HeadStyle::animate_convention();
+        let mut result = None;
+        self.doc.end_gesture();
+        self.doc.edit("Rig Head", |scene| {
+            result = Some(crate::rigging::rig_head(scene, head, &style));
+        });
+        self.doc.end_gesture();
+        let result = result.unwrap_or_else(|| Err("Rig Head: nothing was done".into()));
+        self.status = Some(match &result {
+            Ok(r) if r.already_rigged => format!("Rig Head: '{name}' is already rigged"),
+            Ok(r) => format!("Rig Head: '{name}' ({}) as {}", r.view, r.layers.join(" > ")),
+            Err(e) => e.clone(),
+        });
+        if result.is_ok() {
+            self.selection.prune(self.doc.scene());
+        }
+        result
+    }
+
     /// **Arrange Layers** on the timeline being edited, as one undo step
     /// ("Arrange Layers"), with the status line. Nothing to do records no
     /// step (`docs/LAYER_MANAGEMENT_PLAN.md` L3).
@@ -10727,6 +10951,844 @@ impl Editor {
                 String::new()
             }
         ));
+    }
+
+    /// **Copy Motion** (`docs/AI_LAYER_RIG_AND_MOTION_COPY_PLAN.md` C1): the
+    /// first selected object's keyframes on its layer — limited to the
+    /// timeline's frame span when one (wider than a frame) covers that layer,
+    /// otherwise the object's whole run of keyframes around the playhead — as
+    /// a [`MotionClip`]. Reads the timeline being edited, so it works inside a
+    /// symbol as on the stage. Changes nothing in the document.
+    pub fn copy_motion(&mut self) -> bool {
+        let frame = self.current_frame;
+        let clip = {
+            let scene = self.doc.scene();
+            let Some((id, layer_id)) = self
+                .selection
+                .iter()
+                .find_map(|id| scene.find_object(id).map(|(l, _)| (id, l)))
+            else {
+                self.status = Some("Select an object to copy its motion".into());
+                return false;
+            };
+            let Some(layer) = scene.layers().get(layer_id) else {
+                return false;
+            };
+            let frames = &layer.frames;
+            let keys = frames.keyframes();
+            let has = |k: &buzz_scene::Keyframe| k.objects.iter().any(|o| o.id == id);
+            let range = self
+                .selection
+                .timeline()
+                .filter(|t| t.last_frame > t.first_frame && t.layers.contains(&layer_id))
+                .map(|t| (t.first_frame, t.last_frame));
+            let chosen: Vec<usize> = if let Some((a, b)) = range {
+                (0..keys.len())
+                    .filter(|&i| keys[i].start >= a && keys[i].start <= b && has(&keys[i]))
+                    .collect()
+            } else {
+                let at = frame.min(frames.length().saturating_sub(1));
+                let here = keys.partition_point(|k| k.start <= at).saturating_sub(1);
+                let here = if keys.get(here).is_some_and(|k| has(k)) {
+                    Some(here)
+                } else {
+                    (0..keys.len()).find(|&i| has(&keys[i]))
+                };
+                match here {
+                    Some(here) => {
+                        let mut lo = here;
+                        while lo > 0 && has(&keys[lo - 1]) {
+                            lo -= 1;
+                        }
+                        let mut hi = here;
+                        while hi + 1 < keys.len() && has(&keys[hi + 1]) {
+                            hi += 1;
+                        }
+                        (lo..=hi).collect()
+                    }
+                    None => Vec::new(),
+                }
+            };
+            let (Some(&first), Some(&last)) = (chosen.first(), chosen.last()) else {
+                self.status = Some("There are no keyframes of that object to copy".into());
+                return false;
+            };
+            let start = keys[first].start;
+            // The last key's own hold: up to the next key when there is one.
+            // A copy without a timeline span stops there (or after one frame
+            // when the last key is the layer's last), not at the layer's end,
+            // so a paste doesn't lengthen the target by that whole hold.
+            let mut end = match keys.get(last + 1) {
+                Some(next) => next.start.saturating_sub(1),
+                None if range.is_some() => frames.length().saturating_sub(1),
+                None => keys[last].start,
+            }
+            .max(keys[last].start);
+            if let Some((_, b)) = range {
+                end = end.min(b).max(keys[last].start);
+            }
+            let motion_keys: Vec<MotionKey> = chosen
+                .iter()
+                .filter_map(|&i| {
+                    let k = &keys[i];
+                    let o = k.objects.iter().find(|o| o.id == id)?;
+                    Some(MotionKey {
+                        offset: k.start - start,
+                        transform: o.transform,
+                        pivot: o.pivot,
+                        pivot_local: scene.pivot_local_of(o),
+                        color: o.instance().map(|inst| inst.color),
+                        timing: o.instance().map(|inst| (inst.first_frame, inst.loop_mode)),
+                        tween: k.tween,
+                        ease_curve: k.ease_curve.clone(),
+                    })
+                })
+                .collect();
+            MotionClip {
+                keys: motion_keys,
+                span: end - start + 1,
+            }
+        };
+        let n = clip.keys.len();
+        self.status = Some(format!(
+            "Copied motion: {n} keyframe{} over {} frame{}",
+            if n == 1 { "" } else { "s" },
+            clip.span,
+            if clip.span == 1 { "" } else { "s" },
+        ));
+        self.motion_clip = Some(clip);
+        true
+    }
+
+    /// **Paste Motion** (C1): the copied [`MotionClip`] onto every selected
+    /// object, each on its own layer, starting at the playhead — keyframes at
+    /// the clip's offsets (scaled by `stretch`, rounded, duplicates merged)
+    /// carrying the clip's tweens. Relative (the default) applies each key's
+    /// change from the clip's first key about the target's own transformation
+    /// point, so the target keeps its starting place; absolute writes the
+    /// copied values. Parts left out keep the target's value at the playhead.
+    ///
+    /// Frames outside the pasted span keep what they showed: a keyframe is
+    /// split in at the playhead and just after the span with the poses those
+    /// frames resolved to, and the layer is only ever lengthened. A key the
+    /// clip makes mid-span holds what that frame showed for everything else
+    /// on the layer; keyframes already inside the span are kept, and only the
+    /// target is posed on them, at the clip's interpolated value. One undo
+    /// step for every target.
+    /// Returns how many objects took the motion.
+    pub fn paste_motion(&mut self, options: MotionPasteOptions) -> usize {
+        let Some(clip) = self.motion_clip.clone() else {
+            self.status = Some("There is no motion on the clipboard \u{2014} Copy Motion first".into());
+            return 0;
+        };
+        let Some(key0) = clip.keys.first().cloned() else {
+            self.status = Some("The copied motion has no keyframes".into());
+            return 0;
+        };
+        let frame = self.current_frame;
+        let stretch = if options.stretch.is_finite() {
+            options.stretch.clamp(0.25, 4.0)
+        } else {
+            1.0
+        };
+
+        // The clip's keys at their stretched offsets, one per frame: where two
+        // land together the later one wins, except on the first frame.
+        let mut keys: Vec<(u32, MotionKey)> = Vec::new();
+        for key in &clip.keys {
+            let offset = (key.offset as f64 * stretch).round() as u32;
+            match keys.last_mut() {
+                Some((last, kept)) if *last == offset => {
+                    if offset != 0 {
+                        *kept = key.clone();
+                    }
+                }
+                _ => keys.push((offset, key.clone())),
+            }
+        }
+        let last_offset = keys.last().map(|(o, _)| *o).unwrap_or(0);
+        let span = (((clip.span.max(1) - 1) as f64 * stretch).round() as u32 + 1).max(last_offset + 1);
+        let end = frame + span - 1;
+        let offsets: std::collections::BTreeSet<u32> = keys.iter().map(|(o, _)| frame + *o).collect();
+
+        // Targets and, per layer, the poses the frames at the edges of the
+        // span resolve to now — read before anything is written.
+        struct Target {
+            id: ObjectId,
+            layer: LayerId,
+            base: Object,
+            pivot_local: Point,
+        }
+        let mut targets: Vec<Target> = Vec::new();
+        let mut edges: Vec<(LayerId, Vec<Arc<Object>>, Option<Vec<Arc<Object>>>)> = Vec::new();
+        // Per layer, what each frame the clip keys showed, where that frame is
+        // not a keyframe yet: a key made there holds it, so nothing else on the
+        // layer jumps.
+        let mut fills: Vec<(LayerId, Vec<(u32, Vec<Arc<Object>>)>)> = Vec::new();
+        let mut locked = 0usize;
+        {
+            let scene = self.doc.scene();
+            for id in self.selection.ids() {
+                let Some((layer_id, stored)) = scene.find_object(id) else {
+                    continue;
+                };
+                if scene.layers().is_effectively_locked(layer_id) {
+                    locked += 1;
+                    continue;
+                }
+                let Some(layer) = scene.layers().get(layer_id) else {
+                    continue;
+                };
+                let base = layer
+                    .frames
+                    .resolved_at(frame)
+                    .iter()
+                    .find(|o| o.id == id)
+                    .cloned()
+                    .unwrap_or_else(|| (**stored).clone());
+                let pivot_local = scene.pivot_local_of(&base);
+                if !edges.iter().any(|(l, _, _)| *l == layer_id) {
+                    let snap = |f: u32| -> Vec<Arc<Object>> {
+                        layer
+                            .frames
+                            .resolved_at(f)
+                            .iter()
+                            .map(|o| Arc::new(o.clone()))
+                            .collect()
+                    };
+                    let after = (end + 1 < layer.frames.length()).then(|| snap(end + 1));
+                    edges.push((layer_id, snap(frame), after));
+                    let made: Vec<(u32, Vec<Arc<Object>>)> = offsets
+                        .iter()
+                        .copied()
+                        .filter(|f| *f > frame && *f < layer.frames.length() && !layer.frames.is_keyframe(*f))
+                        .map(|f| (f, snap(f)))
+                        .collect();
+                    fills.push((layer_id, made));
+                }
+                targets.push(Target {
+                    id,
+                    layer: layer_id,
+                    base,
+                    pivot_local,
+                });
+            }
+        }
+        if targets.is_empty() {
+            self.status = Some(if locked > 0 {
+                "The selected objects are on locked layers".into()
+            } else {
+                "Select the objects to paste the motion onto".to_string()
+            });
+            return 0;
+        }
+
+        let count = targets.len();
+        self.doc.edit("Paste Motion", |scene| {
+            for (layer_id, at_frame, after) in &edges {
+                let made = fills
+                    .iter()
+                    .find(|(l, _)| l == layer_id)
+                    .map(|(_, m)| m.as_slice())
+                    .unwrap_or(&[]);
+                scene.update_layer(*layer_id, |l| {
+                    let frames = &mut l.frames;
+                    // Split a keyframe in at `f` holding what `f` showed, with
+                    // the governing key's tween carried on past it.
+                    let split = |frames: &mut buzz_scene::LayerTimeline, f: u32, objects: &[Arc<Object>]| {
+                        if f >= frames.length() || frames.is_keyframe(f) {
+                            return;
+                        }
+                        let (tween, ease) = frames
+                            .keyframe_at(f)
+                            .map(|k| (k.tween, k.ease_curve.clone()))
+                            .unwrap_or_default();
+                        frames.insert_keyframe(f);
+                        frames.set_objects(f, objects.to_vec());
+                        if let Some(k) = frames.keyframes_mut().iter_mut().find(|k| k.start == f) {
+                            k.tween = tween;
+                            k.ease_curve = ease;
+                        }
+                    };
+                    if let Some(after) = after {
+                        split(frames, end + 1, after);
+                    }
+                    split(frames, frame, at_frame);
+                    if end >= frames.length() {
+                        frames.insert_frame(end);
+                    }
+                    for (f, objects) in made {
+                        split(frames, *f, objects);
+                    }
+                    for (offset, key) in &keys {
+                        let f = frame + offset;
+                        frames.insert_keyframe(f);
+                        if let Some(k) = frames.keyframes_mut().iter_mut().find(|k| k.start == f) {
+                            k.tween = key.tween;
+                            k.ease_curve = key.ease_curve.clone();
+                        }
+                    }
+                });
+            }
+            for target in &targets {
+                scene.update_layer(target.layer, |l| {
+                    for (offset, key) in &keys {
+                        let f = frame + offset;
+                        let Some(k) = l.frames.keyframes_mut().iter_mut().find(|k| k.start == f) else {
+                            continue;
+                        };
+                        let objects = Arc::make_mut(&mut k.objects);
+                        if !objects.iter().any(|o| o.id == target.id) {
+                            objects.push(Arc::new(target.base.clone()));
+                        }
+                        if let Some(o) = objects.iter_mut().find(|o| o.id == target.id) {
+                            apply_motion_key(
+                                Arc::make_mut(o),
+                                &target.base,
+                                target.pivot_local,
+                                &key0,
+                                key,
+                                &options,
+                            );
+                        }
+                    }
+                    // Keyframes already inside the span that the clip does not
+                    // key stay, and so does everything else on them: only the
+                    // target takes the clip's pose there, interpolated as the
+                    // renderer would between the clip keys around it.
+                    for k in l.frames.keyframes_mut().iter_mut() {
+                        if k.start <= frame || k.start > end || offsets.contains(&k.start) {
+                            continue;
+                        }
+                        let Some(posed) = motion_pose_between(
+                            &keys,
+                            k.start - frame,
+                            &target.base,
+                            target.pivot_local,
+                            &key0,
+                            &options,
+                        ) else {
+                            continue;
+                        };
+                        let objects = Arc::make_mut(&mut k.objects);
+                        if let Some(o) = objects.iter_mut().find(|o| o.id == target.id) {
+                            let o = Arc::make_mut(o);
+                            o.transform = posed.transform;
+                            o.pivot = posed.pivot;
+                            if let (ObjectKind::Instance(inst), Some(p)) = (&mut o.kind, posed.instance()) {
+                                inst.color = p.color;
+                                inst.first_frame = p.first_frame;
+                                inst.loop_mode = p.loop_mode;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        self.status = Some(format!(
+            "Pasted motion onto {count} object{} ({}){}",
+            if count == 1 { "" } else { "s" },
+            if options.relative { "relative" } else { "absolute" },
+            if locked > 0 {
+                format!(" \u{2014} {locked} on locked layers skipped")
+            } else {
+                String::new()
+            }
+        ));
+        count
+    }
+
+    /// The rigs Copy Pose / Paste Pose work on (C2): each selected object
+    /// that is a bone rig or a part of a layer rig in the timeline being
+    /// edited, or a character instance with a rig inside its symbol; with
+    /// nothing selected, the object under the playhead on the active layer.
+    /// One entry per rig.
+    fn pose_homes(&self) -> Vec<PoseHome> {
+        let scene = self.doc.scene();
+        let frame = self.current_frame;
+        let mut ids = self.selection.ids();
+        if ids.is_empty()
+            && let Some(layer) = self.selection.active_layer().and_then(|l| scene.layers().get(l))
+            && let Some(object) = layer.frames.resolved_at(frame).iter().next()
+        {
+            ids.push(object.id);
+        }
+        let mut homes: Vec<PoseHome> = Vec::new();
+        let mut seen: Vec<ObjectId> = Vec::new();
+        for id in ids {
+            if let Some(rig) = pose_rig_here(scene, id) {
+                let body = match &rig {
+                    PoseRig::Bones(object) => *object,
+                    PoseRig::Layers(view) => view.body,
+                };
+                if !seen.contains(&body) {
+                    seen.push(body);
+                    homes.push(PoseHome { object: id, instance: None });
+                }
+                continue;
+            }
+            let Some((layer, stored)) = scene.find_object(id) else {
+                continue;
+            };
+            // The instance as it stands at the playhead, not its earliest
+            // keyframe's copy: a later key (a travel key) has its own first
+            // frame and place.
+            let object = scene
+                .layers()
+                .get(layer)
+                .and_then(|l| l.frames.resolved_at(frame).iter().find(|o| o.id == id).cloned())
+                .unwrap_or_else(|| (**stored).clone());
+            let Some(instance) = object.instance() else {
+                continue;
+            };
+            let Some(symbol) = scene.library().get(instance.symbol) else {
+                continue;
+            };
+            if scene.edit_path().contains(&instance.symbol) || seen.contains(&id) {
+                continue;
+            }
+            let Some(l) = scene.layers().get(layer) else {
+                continue;
+            };
+            let place = scene.layers().inherited_transform(layer, frame) * object.transform;
+            let inner = instance.resolve_frame(symbol.kind, elapsed_on(l, frame), symbol.length());
+            let origin = l.frames.keyframe_start(frame).map(|keyframe_start| buzz_scene::EditOrigin {
+                layer,
+                keyframe_start,
+                object: id,
+            });
+            let mut inside = scene.clone();
+            if !inside.enter_symbol_in_place(instance.symbol, place) || pose_rig_inside(&inside, inner).is_none() {
+                continue;
+            }
+            seen.push(id);
+            homes.push(PoseHome { object: id, instance: Some((instance.symbol, place, inner, origin)) });
+        }
+        homes
+    }
+
+    /// **Copy Pose** (`docs/AI_LAYER_RIG_AND_MOTION_COPY_PLAN.md` C2): the
+    /// first rig of [`Self::pose_homes`] at the playhead (inside an instance,
+    /// at the inner frame it shows), as each `biped_full` slot's joint angle
+    /// relative to its nearest copied ancestor, in the rig's own space.
+    /// Changes nothing in the document.
+    pub fn copy_pose(&mut self) -> bool {
+        let Some(home) = self.pose_homes().into_iter().next() else {
+            self.status = Some("Select a rigged character (a bone rig, a layer rig part, or an instance with a rig inside) to copy its pose".into());
+            return false;
+        };
+        let scene = self.doc.scene();
+        let (now, from) = match home.instance {
+            Some((symbol, place, inner, _)) => {
+                let mut inside = scene.clone();
+                inside.enter_symbol_in_place(symbol, place);
+                let name = scene.library().get(symbol).map(|s| s.name.clone()).unwrap_or_default();
+                (pose_rig_inside(&inside, inner).map(|rig| pose_now(&inside, &rig, inner)), name)
+            }
+            None => {
+                let name = scene
+                    .find_object(home.object)
+                    .and_then(|(l, _)| scene.layers().get(l).map(|l| l.name.clone()))
+                    .unwrap_or_default();
+                (pose_rig_here(scene, home.object).map(|rig| pose_now(scene, &rig, self.current_frame)), name)
+            }
+        };
+        let now = now.unwrap_or_default();
+        if now.is_empty() {
+            self.status = Some("That rig has no posed parts to copy".into());
+            return false;
+        }
+        let full = buzz_rig::RigPattern::biped_full();
+        let world = |slot: usize| now.iter().find(|n| n.slot == slot).map(|n| n.world);
+        let slots: Vec<PoseSlot> = now
+            .iter()
+            .map(|n| {
+                let angle = match pose_ancestor(&full, n.slot, |a| world(a).is_some()) {
+                    Some(a) => buzz_rig::wrap_pi(n.world - world(a).unwrap_or(0.0)),
+                    None => n.world,
+                };
+                PoseSlot { slot: full.slots[n.slot].name.clone(), angle, world: n.world }
+            })
+            .collect();
+        self.status = Some(format!("Copied pose of {from}: {} joints", slots.len()));
+        self.pose_clip = Some(PoseClip { from, slots });
+        true
+    }
+
+    /// **Paste Pose** (C2): the copied [`PoseClip`] onto every rig of
+    /// [`Self::pose_homes`], bone or layer, by slot name, keyed at the
+    /// playhead (inside an instance: at the inner frame it shows, through
+    /// the ordinary in-place edit, so Protect Other Keyframes forks a shared
+    /// symbol as it would for a hand edit). Angles only: each pasted joint
+    /// takes the copied angle relative to its nearest ancestor slot both rigs
+    /// have, turning about its own joint, so the target keeps its limb
+    /// lengths and where its root stands. `parts` (slot names, any naming)
+    /// limits what is pasted. One undo step "Paste Pose".
+    /// Returns the slots pasted and the copied slots the targets lack.
+    pub fn paste_pose(&mut self, parts: Option<&[String]>) -> Option<PastePoseReport> {
+        let Some(clip) = self.pose_clip.clone() else {
+            self.status = Some("There is no pose on the clipboard \u{2014} Copy Pose first".into());
+            return None;
+        };
+        let full = buzz_rig::RigPattern::biped_full();
+        let wanted: Option<Vec<usize>> = parts.map(|names| {
+            names.iter().filter_map(|n| full.slot_for(n)).collect()
+        });
+        let homes = self.pose_homes();
+        if homes.is_empty() {
+            self.status = Some("Select the rigged character to paste the pose onto".into());
+            return None;
+        }
+        let frame = self.current_frame;
+        let checkpoint = self.doc.run_checkpoint();
+        self.doc.end_gesture();
+        let mut report = PastePoseReport::default();
+        for home in homes {
+            let mut done: Option<PastePoseReport> = None;
+            match home.instance {
+                Some((symbol, place, inner, origin)) => {
+                    let mut entered = false;
+                    self.doc.edit_view(|scene| entered = scene.enter_symbol_in_place_from(symbol, place, origin));
+                    if !entered {
+                        continue;
+                    }
+                    self.doc.edit("Paste Pose", |scene| {
+                        if let Some(rig) = pose_rig_inside(scene, inner) {
+                            done = Some(paste_pose_on(scene, &rig, inner, &clip, wanted.as_deref()));
+                        }
+                    });
+                    self.doc.edit_view(|scene| {
+                        scene.exit_symbol();
+                    });
+                }
+                None => {
+                    self.doc.edit("Paste Pose", |scene| {
+                        if let Some(rig) = pose_rig_here(scene, home.object) {
+                            done = Some(paste_pose_on(scene, &rig, frame, &clip, wanted.as_deref()));
+                        }
+                    });
+                }
+            }
+            if let Some(done) = done {
+                report.targets += 1;
+                for s in done.pasted {
+                    if !report.pasted.contains(&s) {
+                        report.pasted.push(s);
+                    }
+                }
+                for s in done.skipped {
+                    if !report.skipped.contains(&s) {
+                        report.skipped.push(s);
+                    }
+                }
+            }
+        }
+        // A slot one target took and another lacked counts as pasted: the
+        // status and the agent's lists never name a slot twice.
+        report.skipped.retain(|s| !report.pasted.contains(s));
+        self.doc.collapse_run(checkpoint, "Paste Pose");
+        self.doc.end_gesture();
+        self.selection.prune(self.doc.scene());
+        let fork = self.doc.take_last_fork();
+        let mut status = format!(
+            "Pasted pose of {} onto {} rig{}: {} joints",
+            clip.from,
+            report.targets,
+            if report.targets == 1 { "" } else { "s" },
+            report.pasted.len()
+        );
+        if !report.skipped.is_empty() {
+            status.push_str(&format!(" \u{2014} skipped (not on the target): {}", report.skipped.join(", ")));
+        }
+        if let Some(fork) = fork {
+            status = format!("{} \u{2014} {status}", self.fork_status(&fork));
+        }
+        self.status = Some(status);
+        Some(report)
+    }
+
+    /// **Copy Performance** (`docs/AI_LAYER_RIG_AND_MOTION_COPY_PLAN.md` C3):
+    /// the first rig of [`Self::pose_homes`] over a frame range — `range`
+    /// when given, else the timeline's frame span when it covers the rig,
+    /// else the rig's keyed span (an instance: the frames it stands on) — as
+    /// a [`PerformanceClip`]: per frame the pose as Copy Pose takes it, the
+    /// root joint, whether the source keys there (with the key's tween and
+    /// ease), and for an instance its own placement (C1). Changes nothing in
+    /// the document.
+    pub fn copy_performance(&mut self, range: Option<(u32, u32)>) -> bool {
+        let Some(home) = self.pose_homes().into_iter().next() else {
+            self.status = Some(
+                "Select a rigged character (a bone rig, a layer rig part, or an instance with a rig inside) to copy its performance"
+                    .into(),
+            );
+            return false;
+        };
+        match copy_performance_of(self.doc.scene(), &home, range, self.selection.timeline()) {
+            Ok(clip) => {
+                let keys = clip.frames.iter().filter(|f| f.key).count();
+                self.status = Some(format!(
+                    "Copied performance of {}: {keys} keys over {} frames ({}\u{2013}{})",
+                    clip.from,
+                    clip.span,
+                    clip.first,
+                    clip.first + clip.span.saturating_sub(1)
+                ));
+                self.performance_clip = Some(clip);
+                true
+            }
+            Err(why) => {
+                self.status = Some(why);
+                false
+            }
+        }
+    }
+
+    /// **Paste Performance** (C3): the copied [`PerformanceClip`] (or the
+    /// part `options.range` picks) onto every rig of [`Self::pose_homes`] at
+    /// `options.offset` (else the playhead), bone or layer rig, by slot name,
+    /// stretched in time by `options.stretch` — see [`paste_performance_on`].
+    /// Inside an instance the keys go on its symbol's timeline from the
+    /// inner frame it shows there, through the ordinary in-place edit (so
+    /// Protect Other Keyframes forks a shared symbol), and with
+    /// `options.travel` the source instance's own travel is pasted onto the
+    /// target instance as Paste Motion does it (relative; position, scale,
+    /// rotation), its inner timeline carried on across the keys that makes.
+    /// One undo step "Paste Performance".
+    pub fn paste_performance(&mut self, options: PerformancePasteOptions) -> Option<PastePerformanceReport> {
+        let Some(clip) = self.performance_clip.as_ref().map(|c| c.part(options.range)) else {
+            self.status = Some("There is no performance on the clipboard \u{2014} Copy Performance first".into());
+            return None;
+        };
+        if clip.span == 0 {
+            self.status = Some("The copied performance is empty".into());
+            return None;
+        }
+        let stretch = if options.stretch.is_finite() {
+            options.stretch.clamp(0.25, 4.0)
+        } else {
+            1.0
+        };
+        let playhead = self.current_frame;
+        let start = options.offset.unwrap_or(playhead);
+        self.current_frame = start;
+        let homes = self.pose_homes();
+        if homes.is_empty() {
+            self.current_frame = playhead;
+            self.status = Some("Select the rigged character to paste the performance onto".into());
+            return None;
+        }
+        let has_travel = clip.frames.iter().any(|f| f.travel.is_some());
+        let checkpoint = self.doc.run_checkpoint();
+        self.doc.end_gesture();
+        let mut report = PastePerformanceReport::default();
+        for home in homes {
+            let mut done: Option<PastePerformanceReport> = None;
+            match home.instance {
+                Some((symbol, place, inner, origin)) => {
+                    let mut entered = false;
+                    self.doc.edit_view(|scene| entered = scene.enter_symbol_in_place_from(symbol, place, origin));
+                    if !entered {
+                        continue;
+                    }
+                    self.doc.edit("Paste Performance", |scene| {
+                        if let Some(rig) = pose_rig_inside(scene, inner) {
+                            done = Some(paste_performance_on(scene, &rig, inner, &clip, stretch));
+                        }
+                    });
+                    self.doc.edit_view(|scene| {
+                        scene.exit_symbol();
+                    });
+                    if done.is_some() && options.travel && has_travel {
+                        let ratio = done.as_ref().and_then(|d| d.hip_ratio);
+                        let scale = match (options.scale_travel, ratio) {
+                            (true, Some(r)) => Some(r),
+                            (true, None) => {
+                                let note = "hip height not measured on both rigs; the instance's travel copied 1:1"
+                                    .to_string();
+                                if !report.notes.contains(&note) {
+                                    report.notes.push(note);
+                                }
+                                None
+                            }
+                            (false, _) => None,
+                        };
+                        report.travel_keys += self.paste_performance_travel(home.object, start, &clip, stretch, scale);
+                    }
+                }
+                None => {
+                    self.doc.edit("Paste Performance", |scene| {
+                        if let Some(rig) = pose_rig_here(scene, home.object) {
+                            done = Some(paste_performance_on(scene, &rig, start, &clip, stretch));
+                        }
+                    });
+                    if options.travel && has_travel {
+                        let note = "the source instance's own travel needs an instance to go on".to_string();
+                        if !report.notes.contains(&note) {
+                            report.notes.push(note);
+                        }
+                    }
+                }
+            }
+            if let Some(done) = done {
+                report.targets += 1;
+                report.keys_written += done.keys_written;
+                report.frames = done.frames;
+                report.hip_ratio = done.hip_ratio.or(report.hip_ratio);
+                for s in done.slots {
+                    if !report.slots.contains(&s) {
+                        report.slots.push(s);
+                    }
+                }
+                for s in done.skipped {
+                    if !report.skipped.contains(&s) {
+                        report.skipped.push(s);
+                    }
+                }
+                for n in done.notes {
+                    if !report.notes.contains(&n) {
+                        report.notes.push(n);
+                    }
+                }
+            }
+        }
+        report.skipped.retain(|s| !report.slots.contains(s));
+        self.doc.collapse_run(checkpoint, "Paste Performance");
+        self.doc.end_gesture();
+        self.selection.prune(self.doc.scene());
+        self.current_frame = playhead;
+        let fork = self.doc.take_last_fork();
+        let mut status = format!(
+            "Pasted performance of {} onto {} rig{}: {} keys, {} joints",
+            clip.from,
+            report.targets,
+            if report.targets == 1 { "" } else { "s" },
+            report.keys_written,
+            report.slots.len()
+        );
+        if let Some(ratio) = report.hip_ratio {
+            status.push_str(&format!(", steps \u{00d7}{ratio:.2}"));
+        }
+        if report.travel_keys > 0 {
+            status.push_str(&format!(", travel {} keys", report.travel_keys));
+        }
+        if !report.skipped.is_empty() {
+            status.push_str(&format!(" \u{2014} skipped (not on the target): {}", report.skipped.join(", ")));
+        }
+        if !report.notes.is_empty() {
+            status.push_str(&format!(" \u{2014} {}", report.notes.join("; ")));
+        }
+        if let Some(fork) = fork {
+            status = format!("{} \u{2014} {status}", self.fork_status(&fork));
+        }
+        self.status = Some(status);
+        Some(report)
+    }
+
+    /// The copied instance travel of `clip` (C3) onto the instance `object`
+    /// from `start`, by [`Self::paste_motion`] (relative; position, scale,
+    /// rotation). A keyframe that makes on the instance's layer keeps each
+    /// instance's inner timeline running on from the key before it, as if
+    /// no key were there. With `scale`, each key's change of place (its
+    /// transformation point's travel from the first key) is multiplied by it,
+    /// turns and scale left as copied. Returns the frames the travel keyed.
+    fn paste_performance_travel(
+        &mut self,
+        object: ObjectId,
+        start: u32,
+        clip: &PerformanceClip,
+        stretch: f64,
+        scale: Option<f64>,
+    ) -> usize {
+        let last = clip.frames.len().saturating_sub(1);
+        let mut keys: Vec<MotionKey> = clip
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(o, f)| *o == 0 || *o == last || f.travel_key)
+            .filter_map(|(_, f)| f.travel.clone())
+            .collect();
+        if keys.is_empty() {
+            return 0;
+        }
+        if let Some(r) = scale.filter(|r| r.is_finite() && *r > 0.0) {
+            // Paste Motion moves the target's point by key·key0⁻¹ applied to
+            // the first key's point; scaling that change scales the steps.
+            let pivot0 = keys[0].pivot_local;
+            let p0 = keys[0].transform * pivot0;
+            for key in keys.iter_mut().skip(1) {
+                let moved = key.transform * pivot0 - p0;
+                key.transform = Affine::translate(moved * (r - 1.0)) * key.transform;
+            }
+        }
+        let frames: std::collections::BTreeSet<u32> =
+            keys.iter().map(|k| start + (k.offset as f64 * stretch).round() as u32).collect();
+        let Some((layer_id, _)) = self.doc.scene().find_object(object) else {
+            return 0;
+        };
+        let (before, governing) = {
+            let Some(l) = self.doc.scene().layers().get(layer_id) else {
+                return 0;
+            };
+            let before: Vec<u32> = l.frames.keyframes().iter().map(|k| k.start).collect();
+            let governing: Vec<(u32, Vec<(ObjectId, u32, buzz_scene::LoopMode)>)> = l
+                .frames
+                .keyframes()
+                .iter()
+                .map(|k| {
+                    (
+                        k.start,
+                        k.objects
+                            .iter()
+                            .filter_map(|o| o.instance().map(|i| (o.id, i.first_frame, i.loop_mode)))
+                            .collect(),
+                    )
+                })
+                .collect();
+            (before, governing)
+        };
+        let saved_clip = self.motion_clip.replace(MotionClip { keys, span: clip.span });
+        let saved_selection = self.selection.clone();
+        let saved_frame = self.current_frame;
+        self.selection.select_one(object);
+        self.current_frame = start;
+        let options = MotionPasteOptions {
+            colour: false,
+            timing: false,
+            stretch,
+            ..MotionPasteOptions::default()
+        };
+        let pasted = self.paste_motion(options);
+        self.current_frame = saved_frame;
+        self.motion_clip = saved_clip;
+        self.selection = saved_selection;
+        if pasted == 0 {
+            return 0;
+        }
+        self.doc.edit("Paste Performance", |scene| {
+            scene.update_layer(layer_id, |l| {
+                for k in l.frames.keyframes_mut().iter_mut() {
+                    if before.contains(&k.start) {
+                        continue;
+                    }
+                    let Some((s, firsts)) = governing.iter().rev().find(|(s, _)| *s <= k.start) else {
+                        continue;
+                    };
+                    for o in Arc::make_mut(&mut k.objects).iter_mut() {
+                        let Some(&(_, first, mode)) = firsts.iter().find(|(id, _, _)| *id == o.id) else {
+                            continue;
+                        };
+                        if mode == buzz_scene::LoopMode::SingleFrame {
+                            continue;
+                        }
+                        if let ObjectKind::Instance(inst) = &mut Arc::make_mut(o).kind {
+                            inst.first_frame = first + (k.start - s);
+                        }
+                    }
+                }
+            });
+        });
+        frames.len()
     }
 
     /// Turn the camera on, seeding a key so it has something to show.
@@ -13146,6 +14208,1309 @@ fn new_document_frames(fps: f64) -> u32 {
 /// separate parallel lines has boxes that cross constantly and no ink in
 /// common; fusing those would make one object of a whole drawing, which is the
 /// failure the filled path documents at length just below.
+/// One keyframe of a copied motion (`docs/AI_LAYER_RIG_AND_MOTION_COPY_PLAN.md` C1).
+#[derive(Debug, Clone)]
+pub struct MotionKey {
+    /// Frames after the clip's first keyframe.
+    pub offset: u32,
+    pub transform: Affine,
+    /// The stored transformation point, as on the object.
+    pub pivot: Option<Point>,
+    /// The transformation point resolved, in the object's own coordinates.
+    pub pivot_local: Point,
+    /// Colour effect and alpha, for an instance.
+    pub color: Option<buzz_scene::ColorTransform>,
+    /// First frame and looping, for an instance.
+    pub timing: Option<(u32, buzz_scene::LoopMode)>,
+    pub tween: Tween,
+    pub ease_curve: Option<buzz_scene::tween::EasingSet>,
+}
+
+/// **Copy Motion**'s clipboard: an object's keyframed poses and tweens.
+#[derive(Debug, Clone)]
+pub struct MotionClip {
+    pub keys: Vec<MotionKey>,
+    /// Frames the motion covers, from the first keyframe.
+    pub span: u32,
+}
+
+/// How **Paste Motion** writes a [`MotionClip`]. The default is Paste
+/// Motion's own: everything, relative, at the copied speed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionPasteOptions {
+    /// Each key as a change from the clip's first key, about the target's own
+    /// transformation point; false writes the copied values as they are.
+    pub relative: bool,
+    pub position: bool,
+    pub scale: bool,
+    /// Rotation and skew.
+    pub rotation: bool,
+    /// Colour effect and alpha.
+    pub colour: bool,
+    /// An instance's first frame and looping.
+    pub timing: bool,
+    /// Time stretch, 0.25..=4.
+    pub stretch: f64,
+}
+
+impl Default for MotionPasteOptions {
+    fn default() -> Self {
+        Self {
+            relative: true,
+            position: true,
+            scale: true,
+            rotation: true,
+            colour: true,
+            timing: true,
+            stretch: 1.0,
+        }
+    }
+}
+
+/// One joint of a copied pose (C2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoseSlot {
+    /// The `biped_full` slot ("Shoulder R"); "Upper Arm R" or "rightArm"
+    /// names on the target find it too.
+    pub slot: String,
+    /// The joint's angle relative to its nearest copied ancestor slot, in
+    /// radians; for a slot with none, its bone's direction.
+    pub angle: f64,
+    /// The bone's direction in the rig's own space (the armature's, or the
+    /// layer rig's timeline), radians.
+    pub world: f64,
+}
+
+/// **Copy Pose**'s clipboard (C2): one frame of a rig as joint angles.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PoseClip {
+    /// What it was copied from, for the status line.
+    pub from: String,
+    pub slots: Vec<PoseSlot>,
+}
+
+/// What **Paste Pose** did (C2).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PastePoseReport {
+    /// Rigs posed.
+    pub targets: usize,
+    /// Slots written.
+    pub pasted: Vec<String>,
+    /// Copied slots a target has no part for.
+    pub skipped: Vec<String>,
+}
+
+/// One frame of a copied performance (C3).
+#[derive(Debug, Clone, Default)]
+pub struct PerformanceFrame {
+    /// The pose, as Copy Pose takes it.
+    pub slots: Vec<PoseSlot>,
+    /// The rig's root joint (Hips, else its first part), in the space the
+    /// rig is placed in: a layer rig's timeline, an armature's layer.
+    pub root: Option<Point>,
+    /// The source has a key here (the first and last frames always count).
+    pub key: bool,
+    /// The tween and ease of the source key governing this frame.
+    pub tween: Tween,
+    pub ease_curve: Option<buzz_scene::tween::EasingSet>,
+    /// The source instance as it stands here, for its own travel (C1).
+    pub travel: Option<MotionKey>,
+    /// The source instance has a keyframe here.
+    pub travel_key: bool,
+}
+
+/// Leg lengths of a rig, averaged over its sides, for the hip-height ratio
+/// (C3): hip to knee, knee to ankle, in the space the rig is placed in.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PerformanceLegs {
+    pub thigh: Option<f64>,
+    pub shin: Option<f64>,
+}
+
+/// **Copy Performance**'s clipboard (C3): a rig's movement over a frame
+/// range, one entry per frame.
+#[derive(Debug, Clone, Default)]
+pub struct PerformanceClip {
+    /// What it was copied from, for the status line.
+    pub from: String,
+    /// The source frame of the first entry.
+    pub first: u32,
+    pub frames: Vec<PerformanceFrame>,
+    /// Frames covered (`frames.len()`).
+    pub span: u32,
+    /// The source's legs, at the first frame.
+    pub legs: PerformanceLegs,
+}
+
+impl PerformanceClip {
+    /// Frames `a..=b` of the clip (offsets, clamped), as a clip of their own:
+    /// its first and last frames are keys.
+    pub fn part(&self, range: Option<(u32, u32)>) -> PerformanceClip {
+        let last = self.span.saturating_sub(1);
+        let (a, b) = range.map_or((0, last), |(a, b)| (a.min(b).min(last), a.max(b).min(last)));
+        let mut frames: Vec<PerformanceFrame> = self.frames[a as usize..=(b as usize).min(self.frames.len().saturating_sub(1))].to_vec();
+        let n = frames.len();
+        for (i, f) in frames.iter_mut().enumerate() {
+            if i == 0 || i + 1 == n {
+                f.key = true;
+            }
+            if let Some(t) = f.travel.as_mut() {
+                t.offset = i as u32;
+            }
+        }
+        PerformanceClip {
+            from: self.from.clone(),
+            first: self.first + a,
+            span: frames.len() as u32,
+            frames,
+            legs: self.legs,
+        }
+    }
+}
+
+/// How **Paste Performance** writes a [`PerformanceClip`] (C3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PerformancePasteOptions {
+    /// Part of the clip (frame offsets in it, inclusive); `None` = all.
+    pub range: Option<(u32, u32)>,
+    /// The frame the paste starts on; `None` = the playhead.
+    pub offset: Option<u32>,
+    /// Time stretch, 0.25..=4.
+    pub stretch: f64,
+    /// Also copy the source instance's own travel onto the target instance
+    /// (C1, relative), when both are instances.
+    pub travel: bool,
+    /// Scale that travel's position change by the target / source hip
+    /// height, as the root travel inside the rig is; 1:1 (with a note) when
+    /// the ratio cannot be measured.
+    pub scale_travel: bool,
+}
+
+impl Default for PerformancePasteOptions {
+    fn default() -> Self {
+        Self {
+            range: None,
+            offset: None,
+            stretch: 1.0,
+            travel: true,
+            scale_travel: true,
+        }
+    }
+}
+
+/// What **Paste Performance** did (C3).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PastePerformanceReport {
+    /// Rigs that took the performance.
+    pub targets: usize,
+    /// Frames keyed on the targets: the clip's keys and the targets' own
+    /// keys inside the span, posed.
+    pub keys_written: usize,
+    /// The frames the clip's keys landed on (the last target's timeline).
+    pub frames: Vec<u32>,
+    /// Slots written.
+    pub slots: Vec<String>,
+    /// Copied slots no target took.
+    pub skipped: Vec<String>,
+    /// Target / source hip height, when both could be measured.
+    pub hip_ratio: Option<f64>,
+    /// Keyframes the target instance's own travel got.
+    pub travel_keys: usize,
+    pub notes: Vec<String>,
+}
+
+/// A rig Copy / Paste Pose reads or writes, in the timeline open.
+#[derive(Debug, Clone)]
+enum PoseRig {
+    Bones(ObjectId),
+    Layers(buzz_act::layer_rig::LayerRigView),
+}
+
+/// Where a pose rig is: the selected `object` itself (a bone rig, a layer
+/// rig part) in the timeline open, or a rig inside the selected instance's
+/// symbol — `(symbol, place, inner frame shown at the playhead, origin)`.
+#[derive(Debug, Clone, Copy)]
+struct PoseHome {
+    object: ObjectId,
+    instance: Option<(buzz_scene::SymbolId, Affine, u32, Option<buzz_scene::EditOrigin>)>,
+}
+
+/// One `biped_full` slot of a rig at a frame: its bone's direction and the
+/// joint it turns about, in the rig's own space.
+#[derive(Debug, Clone, Copy)]
+struct PoseNow {
+    slot: usize,
+    world: f64,
+    joint: Point,
+}
+
+/// `id` as a pose rig in the timeline open: an armature, or a part of a
+/// layer rig — with every other follow tree and lone slot-named layer of the
+/// same character ([`pose_character_layers`]), so a convention rig whose
+/// body, midCloth and thighs are roots is whole on the stage too.
+fn pose_rig_here(scene: &Scene, id: ObjectId) -> Option<PoseRig> {
+    match buzz_act::layer_rig::rig_of(scene, id)? {
+        buzz_act::layer_rig::CharacterRig::Armature(object) => Some(PoseRig::Bones(object)),
+        buzz_act::layer_rig::CharacterRig::Layers(view) => Some(PoseRig::Layers(pose_character_layers(scene, view))),
+    }
+}
+
+/// **The whole character a layer-rig tree belongs to**, in the timeline open
+/// (C2 fix, 2026-10-22). A naming profile whose body, midCloth and thighs are
+/// roots makes several follow trees, and a part like `midCloth` can stand
+/// alone. Starting from `view`'s tree, the layers around it in the stack are
+/// read outward: another follow tree, or a lone normal layer named after a
+/// `biped_full` slot, joins the character while it names no slot the
+/// character already has; the first one that does (the next character)
+/// stops the reading in that direction. Layers that name no slot are passed
+/// over. Several found: one view on `biped_full` slots, biggest tree first
+/// (ties to the higher in the stack), then the lone layers, as
+/// [`pose_rig_inside`] gives inside a symbol; only `view`'s tree: `view`.
+fn pose_character_layers(
+    scene: &Scene,
+    view: buzz_act::layer_rig::LayerRigView,
+) -> buzz_act::layer_rig::LayerRigView {
+    let full = buzz_rig::RigPattern::biped_full();
+    let layers = scene.layers();
+    let stack: Vec<&Arc<buzz_scene::Layer>> = layers.iter().collect();
+    let top_of = |id: LayerId| -> LayerId {
+        let mut top = id;
+        // Bounded by the layer count, against a follow cycle.
+        for _ in 0..layers.len() {
+            match layers.get(top).and_then(|l| l.follows) {
+                Some(up) if up != id && layers.get(up).is_some() => top = up,
+                _ => break,
+            }
+        }
+        top
+    };
+    let tops: Vec<LayerId> = stack.iter().map(|l| top_of(l.id)).collect();
+    let tree_slots = |top: LayerId| -> Vec<usize> {
+        stack
+            .iter()
+            .zip(&tops)
+            .filter(|(_, t)| **t == top)
+            .filter_map(|(l, _)| full.slot_for(&l.name))
+            .collect()
+    };
+    let mine = top_of(view.root);
+    let mut taken_tops: Vec<LayerId> = vec![mine];
+    let mut taken_slots: Vec<usize> = tree_slots(mine);
+    let mut lone: Vec<usize> = Vec::new();
+    let mine_at: Vec<usize> = (0..stack.len()).filter(|&i| tops[i] == mine).collect();
+    let (Some(&lo), Some(&hi)) = (mine_at.first(), mine_at.last()) else {
+        return view;
+    };
+    // One layer: does the reading go on past it?
+    let visit = |i: usize, taken_tops: &mut Vec<LayerId>, taken_slots: &mut Vec<usize>, lone: &mut Vec<usize>| -> bool {
+        let l = stack[i];
+        if taken_tops.contains(&tops[i]) || lone.contains(&i) {
+            return true;
+        }
+        let in_tree = l.follows.is_some() || !layers.followers_of(l.id).is_empty();
+        if in_tree {
+            let slots = tree_slots(tops[i]);
+            if slots.is_empty() {
+                return true;
+            }
+            if slots.iter().any(|s| taken_slots.contains(s)) {
+                return false;
+            }
+            taken_tops.push(tops[i]);
+            taken_slots.extend(slots);
+            return true;
+        }
+        if l.kind != LayerKind::Normal {
+            return true;
+        }
+        match full.slot_for(&l.name) {
+            Some(s) if taken_slots.contains(&s) => false,
+            Some(s) if l.frames.keyframes().first().is_some_and(|k| !k.objects.is_empty()) => {
+                lone.push(i);
+                taken_slots.push(s);
+                true
+            }
+            _ => true,
+        }
+    };
+    for i in lo..=hi {
+        visit(i, &mut taken_tops, &mut taken_slots, &mut lone);
+    }
+    for i in (0..lo).rev() {
+        if !visit(i, &mut taken_tops, &mut taken_slots, &mut lone) {
+            break;
+        }
+    }
+    for i in hi + 1..stack.len() {
+        if !visit(i, &mut taken_tops, &mut taken_slots, &mut lone) {
+            break;
+        }
+    }
+    if taken_tops.len() == 1 && lone.is_empty() {
+        return view;
+    }
+    let index_of = |id: LayerId| stack.iter().position(|l| l.id == id).unwrap_or(usize::MAX);
+    let mut views: Vec<buzz_act::layer_rig::LayerRigView> = taken_tops
+        .iter()
+        .filter_map(|top| buzz_act::layer_rig::rig_of_layer(scene, *top))
+        .collect();
+    views.sort_by_key(|v| (std::cmp::Reverse(v.parts.len()), index_of(v.root)));
+    let mut parts: Vec<(usize, LayerId, ObjectId)> = Vec::new();
+    for v in &views {
+        for (slot, layer, object) in &v.parts {
+            if let Some(fs) = v.pattern.slots.get(*slot).and_then(|s| full.slot_for(&s.name)) {
+                parts.push((fs, *layer, *object));
+            }
+        }
+    }
+    lone.sort_unstable();
+    for i in lone {
+        let l = stack[i];
+        if let (Some(fs), Some(object)) =
+            (full.slot_for(&l.name), l.frames.keyframes().first().and_then(|k| k.objects.first()))
+        {
+            parts.push((fs, l.id, object.id));
+        }
+    }
+    let Some(&(_, root, body)) = parts.first() else {
+        return view;
+    };
+    buzz_act::layer_rig::LayerRigView { root, body, pattern: full, parts }
+}
+
+/// The character rig of the symbol open in `scene` at `frame`: every layer
+/// rig in it taken as one character on `biped_full` slots — a profile whose
+/// body, midCloth and thighs are roots makes several follow trees, plus lone
+/// root layers named after a slot (`midCloth`) — biggest tree first; else
+/// its first armature.
+fn pose_rig_inside(scene: &Scene, frame: u32) -> Option<PoseRig> {
+    let full = buzz_rig::RigPattern::biped_full();
+    let mut views: Vec<buzz_act::layer_rig::LayerRigView> = Vec::new();
+    let mut seen: Vec<LayerId> = Vec::new();
+    for layer in scene.layers().iter() {
+        if layer.follows.is_none() || seen.contains(&layer.id) {
+            continue;
+        }
+        let Some(view) = buzz_act::layer_rig::rig_of_layer(scene, layer.id) else {
+            continue;
+        };
+        seen.extend(view.layers());
+        // A follower that is no part (an eye on the head) finds its tree
+        // again.
+        if !views.iter().any(|v| v.root == view.root) {
+            views.push(view);
+        }
+    }
+    views.sort_by_key(|v| std::cmp::Reverse(v.parts.len()));
+    let mut parts: Vec<(usize, LayerId, ObjectId)> = Vec::new();
+    for view in &views {
+        for (slot, layer, object) in &view.parts {
+            if let Some(fs) = view.pattern.slots.get(*slot).and_then(|s| full.slot_for(&s.name)) {
+                parts.push((fs, *layer, *object));
+            }
+        }
+    }
+    if !parts.is_empty() {
+        for layer in scene.layers().iter() {
+            if layer.kind != LayerKind::Normal
+                || seen.contains(&layer.id)
+                || layer.follows.is_some()
+                || !scene.layers().followers_of(layer.id).is_empty()
+            {
+                continue;
+            }
+            let (Some(fs), Some(object)) =
+                (full.slot_for(&layer.name), layer.frames.keyframes().first().and_then(|k| k.objects.first()))
+            else {
+                continue;
+            };
+            parts.push((fs, layer.id, object.id));
+        }
+        let (_, root, body) = parts[0];
+        return Some(PoseRig::Layers(buzz_act::layer_rig::LayerRigView { root, body, pattern: full, parts }));
+    }
+    scene.layers().iter().find_map(|l| {
+        l.frames
+            .resolved_at(frame)
+            .iter()
+            .find(|o| matches!(o.kind, ObjectKind::Armature(_)))
+            .map(|o| PoseRig::Bones(o.id))
+    })
+}
+
+/// The nearest ancestor of `slot` in `pattern` that `has`.
+fn pose_ancestor(pattern: &buzz_rig::RigPattern, slot: usize, has: impl Fn(usize) -> bool) -> Option<usize> {
+    let mut current = pattern.slots.get(slot)?.parent;
+    for _ in 0..pattern.slots.len() {
+        let parent = current?;
+        if has(parent) {
+            return Some(parent);
+        }
+        current = pattern.slots.get(parent)?.parent;
+    }
+    None
+}
+
+/// A layer's drawn transform at `frame`: what it inherits times its
+/// (tweened) object's own.
+fn pose_layer_world(scene: &Scene, layer: LayerId, frame: u32) -> Option<Affine> {
+    let l = scene.layers().get(layer)?;
+    let object = l.frames.resolved_at(frame).iter().next().map(|o| o.transform)?;
+    Some(scene.layers().inherited_transform(layer, frame) * object)
+}
+
+/// A layer rig's rest bones (`rest_armature`) by pattern slot, and each part
+/// layer's rest.
+fn pose_layer_rest(
+    scene: &Scene,
+    view: &buzz_act::layer_rig::LayerRigView,
+) -> Option<(Vec<(Point, Point)>, Vec<buzz_act::layer_rig::PartRest>)> {
+    let (armature, rests) = buzz_act::layer_rig::rest_armature(scene, view)?;
+    Some((armature.joints(), rests))
+}
+
+/// Each `biped_full` slot of a layer rig at `frame` (its first layer in
+/// follow order leads): the rest bone carried to where its part is drawn.
+fn pose_layers_now(
+    scene: &Scene,
+    view: &buzz_act::layer_rig::LayerRigView,
+    rest: &(Vec<(Point, Point)>, Vec<buzz_act::layer_rig::PartRest>),
+    frame: u32,
+) -> Vec<PoseNow> {
+    let full = buzz_rig::RigPattern::biped_full();
+    let (joints, rests) = rest;
+    let mut out: Vec<PoseNow> = Vec::new();
+    for (slot, layer, _) in &view.parts {
+        let Some(name) = view.pattern.slots.get(*slot).map(|s| s.name.as_str()) else {
+            continue;
+        };
+        let Some(fs) = full.slot_for(name) else {
+            continue;
+        };
+        if out.iter().any(|n| n.slot == fs) {
+            continue;
+        }
+        let (Some(rest), Some(&(head, tip))) = (rests.iter().find(|r| r.layer == *layer), joints.get(*slot)) else {
+            continue;
+        };
+        let Some(now) = pose_layer_world(scene, *layer, frame) else {
+            continue;
+        };
+        let c = rest.rest.as_coeffs();
+        if (c[0] * c[3] - c[1] * c[2]).abs() < 1e-12 {
+            continue;
+        }
+        let carry = now * rest.rest.inverse();
+        let (h, t) = (carry * head, carry * tip);
+        out.push(PoseNow { slot: fs, world: (t.y - h.y).atan2(t.x - h.x), joint: h });
+    }
+    out
+}
+
+/// Each `biped_full` slot of a rig at `frame`, in the rig's own space.
+fn pose_now(scene: &Scene, rig: &PoseRig, frame: u32) -> Vec<PoseNow> {
+    match rig {
+        PoseRig::Layers(view) => match pose_layer_rest(scene, view) {
+            Some(rest) => pose_layers_now(scene, view, &rest, frame),
+            None => Vec::new(),
+        },
+        PoseRig::Bones(id) => {
+            let full = buzz_rig::RigPattern::biped_full();
+            let Some((layer, _)) = scene.find_object(*id) else {
+                return Vec::new();
+            };
+            let Some(l) = scene.layers().get(layer) else {
+                return Vec::new();
+            };
+            let resolved = l.frames.resolved_at(frame);
+            let Some(ObjectKind::Armature(rig)) = resolved.iter().find(|o| o.id == *id).map(|o| &o.kind) else {
+                return Vec::new();
+            };
+            let armature = &rig.armature;
+            let mut out: Vec<PoseNow> = Vec::new();
+            for (index, bone) in armature.bones.iter().enumerate() {
+                let Some(fs) = full.slot_for(&bone.name) else {
+                    continue;
+                };
+                if out.iter().any(|n| n.slot == fs) {
+                    continue;
+                }
+                out.push(PoseNow { slot: fs, world: armature.world_angle(index), joint: armature.head(index) });
+            }
+            out
+        }
+    }
+}
+
+/// Where `clip` wants slot `fs` to point, given the target's slots as they
+/// stand now (`now`): the copied angle relative to the nearest ancestor both
+/// have, else the copied direction.
+fn pose_desired(
+    full: &buzz_rig::RigPattern,
+    clip: &PoseClip,
+    fs: usize,
+    now: impl Fn(usize) -> Option<f64>,
+) -> Option<f64> {
+    let copied = |slot: usize| clip.slots.iter().find(|s| full.slot_named(&s.slot) == Some(slot)).map(|s| s.world);
+    let mine = copied(fs)?;
+    Some(match pose_ancestor(full, fs, |a| copied(a).is_some() && now(a).is_some()) {
+        Some(a) => now(a).unwrap_or(0.0) + (mine - copied(a).unwrap_or(0.0)),
+        None => mine,
+    })
+}
+
+/// **Paste Pose on one rig** (C2), in the timeline open, keyed at `frame`.
+fn paste_pose_on(
+    scene: &mut Scene,
+    rig: &PoseRig,
+    frame: u32,
+    clip: &PoseClip,
+    wanted: Option<&[usize]>,
+) -> PastePoseReport {
+    let full = buzz_rig::RigPattern::biped_full();
+    let copied: Vec<usize> = clip
+        .slots
+        .iter()
+        .filter_map(|s| full.slot_named(&s.slot))
+        .filter(|s| wanted.is_none_or(|w| w.contains(s)))
+        .collect();
+    let mut report = PastePoseReport::default();
+    match rig {
+        PoseRig::Layers(view) => {
+            buzz_act::layer_rig::record_rests(scene, view);
+            let Some(rest) = pose_layer_rest(scene, view) else {
+                return report;
+            };
+            let have: Vec<usize> = pose_layers_now(scene, view, &rest, frame).iter().map(|n| n.slot).collect();
+            // Slots ancestors first, so a joint is turned before the ones
+            // hanging off it are measured.
+            let mut order: Vec<usize> = Vec::new();
+            for (slot, _, _) in &view.parts {
+                if let Some(fs) = view.pattern.slots.get(*slot).and_then(|s| full.slot_for(&s.name))
+                    && !order.contains(&fs)
+                {
+                    order.push(fs);
+                }
+            }
+            let depth = |mut s: usize| {
+                let mut d = 0;
+                while let Some(p) = full.slots.get(s).and_then(|x| x.parent) {
+                    s = p;
+                    d += 1;
+                    if d > full.slots.len() {
+                        break;
+                    }
+                }
+                d
+            };
+            order.sort_by_key(|s| depth(*s));
+            for fs in order {
+                if !copied.contains(&fs) || !have.contains(&fs) {
+                    continue;
+                }
+                let now = pose_layers_now(scene, view, &rest, frame);
+                let world = |s: usize| now.iter().find(|n| n.slot == s).map(|n| n.world);
+                let (Some(desired), Some(here)) = (pose_desired(&full, clip, fs, world), now.iter().find(|n| n.slot == fs))
+                else {
+                    continue;
+                };
+                let turn = Affine::translate(here.joint.to_vec2())
+                    * Affine::rotate(buzz_rig::wrap_pi(desired - here.world))
+                    * Affine::translate(-here.joint.to_vec2());
+                // Every layer of the slot that does not follow another of
+                // the slot's own layers (those come along with it).
+                let mut layers: Vec<LayerId> = Vec::new();
+                for (s, l, _) in &view.parts {
+                    if view.pattern.slots.get(*s).and_then(|x| full.slot_for(&x.name)) == Some(fs) && !layers.contains(l) {
+                        layers.push(*l);
+                    }
+                }
+                let mut wrote = false;
+                for &layer in &layers {
+                    let follows = scene.layers().get(layer).and_then(|l| l.follows);
+                    if follows.is_some_and(|f| layers.contains(&f)) {
+                        continue;
+                    }
+                    buzz_act::layer_rig::key_at(scene, layer, frame);
+                    if !scene.layers().get(layer).is_some_and(|l| l.frames.is_keyframe(frame)) {
+                        continue;
+                    }
+                    let inherited = scene.layers().inherited_transform(layer, frame);
+                    let c = inherited.as_coeffs();
+                    if (c[0] * c[3] - c[1] * c[2]).abs() <= 1e-12 {
+                        continue;
+                    }
+                    let back = inherited.inverse();
+                    scene.update_layer(layer, |l| {
+                        if let Some(key) = l.frames.keyframe_at_mut(frame) {
+                            for object in Arc::make_mut(&mut key.objects).iter_mut() {
+                                let object = Arc::make_mut(object);
+                                object.transform = back * turn * inherited * object.transform;
+                            }
+                        }
+                    });
+                    wrote = true;
+                }
+                if wrote {
+                    report.pasted.push(full.slots[fs].name.clone());
+                }
+            }
+            // Everything copied and not written, so the two lists never
+            // share a slot.
+            report.skipped =
+                copied.iter().map(|s| full.slots[*s].name.clone()).filter(|n| !report.pasted.contains(n)).collect();
+        }
+        PoseRig::Bones(id) => {
+            scene.ensure_keyframe_for(frame, *id);
+            let Some(mut working) = scene
+                .find_object(*id)
+                .and_then(|(l, _)| scene.layers().get(l))
+                .and_then(|l| {
+                    l.frames.resolved_at(frame).iter().find(|o| o.id == *id).and_then(|o| match &o.kind {
+                        ObjectKind::Armature(rig) => Some(rig.armature.clone()),
+                        _ => None,
+                    })
+                })
+            else {
+                return report;
+            };
+            let bone_of: Vec<Option<usize>> = (0..full.slots.len())
+                .map(|fs| working.bones.iter().position(|b| full.slot_for(&b.name) == Some(fs)))
+                .collect();
+            for index in 0..working.bones.len() {
+                let Some(fs) = full.slot_for(&working.bones[index].name) else {
+                    continue;
+                };
+                if bone_of[fs] != Some(index) || !copied.contains(&fs) {
+                    continue;
+                }
+                let desired = {
+                    let w = &working;
+                    pose_desired(&full, clip, fs, |s| bone_of[s].map(|b| w.world_angle(b)))
+                };
+                let Some(desired) = desired else {
+                    continue;
+                };
+                let parent = working.bones[index].parent.map_or(0.0, |p| working.world_angle(p));
+                working.bones[index].angle = buzz_rig::wrap_pi(desired - parent);
+                report.pasted.push(full.slots[fs].name.clone());
+            }
+            let pose = working.pose();
+            scene.update_object_at(frame, *id, |object| {
+                if let ObjectKind::Armature(rig) = &mut object.kind {
+                    rig.armature.set_pose(&pose);
+                }
+            });
+            // Everything copied and not written, so the two lists never
+            // share a slot.
+            report.skipped =
+                copied.iter().map(|s| full.slots[*s].name.clone()).filter(|n| !report.pasted.contains(n)).collect();
+        }
+    }
+    report
+}
+
+/// A rig's slots at `frame` for Copy / Paste Performance (C3), as
+/// [`pose_now`] (a layer rig's rest given once, `rest`), and the transform
+/// from the rig's own space to the space it is placed in: none for a layer
+/// rig (its joints are on the timeline already); an armature's object
+/// transform.
+fn perf_now(
+    scene: &Scene,
+    rig: &PoseRig,
+    rest: Option<&(Vec<(Point, Point)>, Vec<buzz_act::layer_rig::PartRest>)>,
+    frame: u32,
+) -> (Vec<PoseNow>, Affine) {
+    match (rig, rest) {
+        (PoseRig::Layers(view), Some(rest)) => (pose_layers_now(scene, view, rest, frame), Affine::IDENTITY),
+        (PoseRig::Layers(_), None) => (Vec::new(), Affine::IDENTITY),
+        (PoseRig::Bones(id), _) => {
+            let placed = scene
+                .find_object(*id)
+                .and_then(|(l, _)| scene.layers().get(l))
+                .and_then(|l| l.frames.resolved_at(frame).iter().find(|o| o.id == *id).map(|o| o.transform))
+                .unwrap_or(Affine::IDENTITY);
+            (pose_now(scene, rig, frame), placed)
+        }
+    }
+}
+
+/// The rig's root joint, placed: Hips, else its first slot.
+fn perf_root(now: &[PoseNow], placed: Affine) -> Option<Point> {
+    let hips = buzz_rig::RigPattern::biped_full().slot_named("Hips");
+    now.iter().find(|n| Some(n.slot) == hips).or(now.first()).map(|n| placed * n.joint)
+}
+
+/// The rig's legs, placed (hip to knee, knee to ankle, averaged over sides).
+fn perf_legs(now: &[PoseNow], placed: Affine) -> PerformanceLegs {
+    let full = buzz_rig::RigPattern::biped_full();
+    let at = |name: &str| {
+        let slot = full.slot_named(name)?;
+        now.iter().find(|n| n.slot == slot).map(|n| placed * n.joint)
+    };
+    let segment = |a: &str, b: &str| match (at(a), at(b)) {
+        (Some(p), Some(q)) => Some((q - p).hypot()),
+        _ => None,
+    };
+    let mean = |x: Option<f64>, y: Option<f64>| match (x, y) {
+        (Some(a), Some(b)) => Some((a + b) / 2.0),
+        (a, b) => a.or(b),
+    };
+    PerformanceLegs {
+        thigh: mean(segment("Thigh L", "Knee L"), segment("Thigh R", "Knee R")),
+        shin: mean(segment("Knee L", "Ankle L"), segment("Knee R", "Ankle R")),
+    }
+}
+
+/// Target / source hip height, over the leg segments both rigs have.
+fn perf_ratio(source: PerformanceLegs, target: PerformanceLegs) -> Option<f64> {
+    let (mut s, mut t) = (0.0, 0.0);
+    for (a, b) in [(source.thigh, target.thigh), (source.shin, target.shin)] {
+        if let (Some(a), Some(b)) = (a, b) {
+            s += a;
+            t += b;
+        }
+    }
+    (s > 1e-9 && t > 1e-9).then(|| t / s)
+}
+
+/// A pose as Copy Pose stores it: each slot's angle relative to its nearest
+/// copied ancestor, and its direction.
+fn perf_slots(now: &[PoseNow]) -> Vec<PoseSlot> {
+    let full = buzz_rig::RigPattern::biped_full();
+    let world = |slot: usize| now.iter().find(|n| n.slot == slot).map(|n| n.world);
+    now.iter()
+        .map(|n| {
+            let angle = match pose_ancestor(&full, n.slot, |a| world(a).is_some()) {
+                Some(a) => buzz_rig::wrap_pi(n.world - world(a).unwrap_or(0.0)),
+                None => n.world,
+            };
+            PoseSlot { slot: full.slots[n.slot].name.clone(), angle, world: n.world }
+        })
+        .collect()
+}
+
+/// The layers of a layer rig's slot `fs` that Paste Pose turns: those not
+/// following another of the slot's own layers.
+fn perf_slot_layers(scene: &Scene, view: &buzz_act::layer_rig::LayerRigView, fs: usize) -> Vec<LayerId> {
+    let full = buzz_rig::RigPattern::biped_full();
+    let mut layers: Vec<LayerId> = Vec::new();
+    for (s, l, _) in &view.parts {
+        if view.pattern.slots.get(*s).and_then(|x| full.slot_for(&x.name)) == Some(fs) && !layers.contains(l) {
+            layers.push(*l);
+        }
+    }
+    let all = layers.clone();
+    layers.retain(|l| !scene.layers().get(*l).and_then(|x| x.follows).is_some_and(|f| all.contains(&f)));
+    layers
+}
+
+/// **Copy Performance of one rig** (C3): see [`Editor::copy_performance`].
+fn copy_performance_of(
+    scene: &Scene,
+    home: &PoseHome,
+    range: Option<(u32, u32)>,
+    timeline: Option<&buzz_ui::TimelineSelection>,
+) -> Result<PerformanceClip, String> {
+    // The timeline's frame span, when it is wider than a frame and covers one
+    // of `layers`.
+    let picked = |layers: &[LayerId]| {
+        timeline
+            .filter(|t| t.last_frame > t.first_frame && layers.iter().any(|l| t.layers.contains(l)))
+            .map(|t| (t.first_frame, t.last_frame))
+    };
+    let rest_of = |s: &Scene, rig: &PoseRig| -> Result<Option<(Vec<(Point, Point)>, Vec<buzz_act::layer_rig::PartRest>)>, String> {
+        match rig {
+            PoseRig::Layers(view) => pose_layer_rest(s, view).map(Some).ok_or_else(|| "That rig has no parts to read".to_string()),
+            PoseRig::Bones(_) => Ok(None),
+        }
+    };
+    let layers_of = |s: &Scene, rig: &PoseRig| -> Vec<LayerId> {
+        match rig {
+            PoseRig::Layers(view) => {
+                let mut ls: Vec<LayerId> = Vec::new();
+                for l in view.layers() {
+                    if !ls.contains(&l) {
+                        ls.push(l);
+                    }
+                }
+                ls
+            }
+            PoseRig::Bones(id) => s.find_object(*id).map(|(l, _)| vec![l]).unwrap_or_default(),
+        }
+    };
+    let governing = |s: &Scene, layer: Option<LayerId>, f: u32| {
+        layer
+            .and_then(|l| s.layers().get(l))
+            .and_then(|l| l.frames.keyframe_at(f))
+            .map(|k| (k.tween, k.ease_curve.clone()))
+            .unwrap_or_default()
+    };
+    let mut frames: Vec<PerformanceFrame> = Vec::new();
+    let (a, b, from, legs) = match home.instance {
+        Some((symbol, place, inner0, _)) => {
+            let (layer_id, _) = scene.find_object(home.object).ok_or("The instance is no longer there")?;
+            let layer = scene.layers().get(layer_id).ok_or("The instance's layer is no longer there")?;
+            let def = scene.library().get(symbol).ok_or("That symbol is no longer in the library")?;
+            let mut inside = scene.clone();
+            inside.enter_symbol_in_place(symbol, place);
+            let rig = pose_rig_inside(&inside, inner0).ok_or("There is no rig inside that instance")?;
+            let rest = rest_of(&inside, &rig)?;
+            let rig_layers = layers_of(&inside, &rig);
+            let lead = rig_layers.first().copied();
+            let has = |k: &buzz_scene::Keyframe| k.objects.iter().any(|o| o.id == home.object);
+            let keys = layer.frames.keyframes();
+            let (a, b) = match range.or_else(|| picked(&[layer_id])) {
+                Some(r) => r,
+                None => {
+                    let first = keys.iter().position(has).ok_or("That instance has no keyframes")?;
+                    let last = keys.iter().rposition(has).unwrap_or(first);
+                    let end = keys
+                        .get(last + 1)
+                        .map(|k| k.start.saturating_sub(1))
+                        .unwrap_or(layer.frames.length().saturating_sub(1))
+                        .max(keys[last].start);
+                    (keys[first].start, end)
+                }
+            };
+            let (a, b) = (a.min(b), a.max(b));
+            let shown = |f: u32| -> Option<(u32, Object)> {
+                let o = layer.frames.resolved_at(f).iter().find(|o| o.id == home.object).cloned()?;
+                let inner = o.instance()?.resolve_frame(def.kind, elapsed_on(layer, f), def.length());
+                Some((inner, o))
+            };
+            let mut previous: Option<u32> = None;
+            let mut legs = None;
+            for f in a..=b {
+                let Some((inner, object)) = shown(f) else {
+                    frames.push(PerformanceFrame::default());
+                    previous = None;
+                    continue;
+                };
+                let (now, placed) = perf_now(&inside, &rig, rest.as_ref(), inner);
+                if legs.is_none() {
+                    legs = Some(perf_legs(&now, placed));
+                }
+                let inner_key = previous != Some(inner)
+                    && rig_layers.iter().any(|l| inside.layers().get(*l).is_some_and(|x| x.frames.is_keyframe(inner)));
+                let (tween, ease_curve) = governing(&inside, lead, inner);
+                let kf = layer.frames.keyframe_at(f);
+                let travel = MotionKey {
+                    offset: f - a,
+                    transform: object.transform,
+                    pivot: object.pivot,
+                    pivot_local: scene.pivot_local_of(&object),
+                    color: object.instance().map(|i| i.color),
+                    timing: object.instance().map(|i| (i.first_frame, i.loop_mode)),
+                    tween: kf.map(|k| k.tween).unwrap_or_default(),
+                    ease_curve: kf.and_then(|k| k.ease_curve.clone()),
+                };
+                frames.push(PerformanceFrame {
+                    slots: perf_slots(&now),
+                    root: perf_root(&now, placed),
+                    key: f == a || f == b || inner_key,
+                    tween,
+                    ease_curve,
+                    travel: Some(travel),
+                    travel_key: layer.frames.is_keyframe(f) && kf.is_some_and(has),
+                });
+                previous = Some(inner);
+            }
+            (a, b, def.name.clone(), legs.unwrap_or_default())
+        }
+        None => {
+            let rig = pose_rig_here(scene, home.object).ok_or("That is not a rig")?;
+            let rest = rest_of(scene, &rig)?;
+            let rig_layers = layers_of(scene, &rig);
+            let lead = match &rig {
+                PoseRig::Layers(view) => Some(view.root),
+                PoseRig::Bones(_) => rig_layers.first().copied(),
+            };
+            let (a, b) = match range.or_else(|| picked(&rig_layers)) {
+                Some(r) => r,
+                None => {
+                    let starts: Vec<u32> = rig_layers
+                        .iter()
+                        .filter_map(|l| scene.layers().get(*l))
+                        .flat_map(|l| l.frames.keyframes().iter().map(|k| k.start))
+                        .collect();
+                    let first = starts.iter().copied().min().ok_or("That rig has no keyframes")?;
+                    (first, starts.iter().copied().max().unwrap_or(first))
+                }
+            };
+            let (a, b) = (a.min(b), a.max(b));
+            for f in a..=b {
+                let (now, placed) = perf_now(scene, &rig, rest.as_ref(), f);
+                let (tween, ease_curve) = governing(scene, lead, f);
+                frames.push(PerformanceFrame {
+                    slots: perf_slots(&now),
+                    root: perf_root(&now, placed),
+                    key: f == a
+                        || f == b
+                        || rig_layers.iter().any(|l| scene.layers().get(*l).is_some_and(|x| x.frames.is_keyframe(f))),
+                    tween,
+                    ease_curve,
+                    travel: None,
+                    travel_key: false,
+                });
+            }
+            let (now, placed) = perf_now(scene, &rig, rest.as_ref(), a);
+            let from = scene
+                .find_object(home.object)
+                .and_then(|(l, _)| scene.layers().get(l).map(|l| l.name.clone()))
+                .unwrap_or_default();
+            (a, b, from, perf_legs(&now, placed))
+        }
+    };
+    if frames.iter().all(|f| f.slots.is_empty()) {
+        return Err("That rig has no posed parts to copy".into());
+    }
+    let _ = b;
+    Ok(PerformanceClip {
+        from,
+        first: a,
+        span: frames.len() as u32,
+        frames,
+        legs,
+    })
+}
+
+/// **Paste Performance on one rig** (C3), in the timeline open, from `start`.
+///
+/// The clip's keys land at `start + round(offset × stretch)` (one per frame,
+/// the later winning except on the first), each posed by [`paste_pose_on`]
+/// (angles only, by slot, so the target keeps its lengths) with the clip's
+/// tween and ease written on the keys it made. The target's own keyframes
+/// inside the span stay, posed as the clip stands at that moment. The root
+/// travels as the source's did from its first frame, scaled by the target /
+/// source hip height (1:1 when either has no legs to measure): a layer rig
+/// moves every root layer of the character, an armature its object. A
+/// keyframe holding what the frame after the span showed keeps it.
+fn paste_performance_on(
+    scene: &mut Scene,
+    rig: &PoseRig,
+    start: u32,
+    clip: &PerformanceClip,
+    stretch: f64,
+) -> PastePerformanceReport {
+    let full = buzz_rig::RigPattern::biped_full();
+    let mut report = PastePerformanceReport::default();
+    let span = clip.frames.len() as u32;
+    if span == 0 {
+        return report;
+    }
+    let mut keys: Vec<(u32, usize)> = Vec::new();
+    for (o, f) in clip.frames.iter().enumerate() {
+        if !f.key {
+            continue;
+        }
+        let t = (o as f64 * stretch).round() as u32;
+        match keys.last_mut() {
+            Some((last, kept)) if *last == t => {
+                if t != 0 {
+                    *kept = o;
+                }
+            }
+            _ => keys.push((t, o)),
+        }
+    }
+    let last_t = keys.last().map(|(t, _)| *t).unwrap_or(0);
+    let span_t = (((span - 1) as f64 * stretch).round() as u32 + 1).max(last_t + 1);
+    let end = start + span_t - 1;
+
+    // The rig's layers, and the ones nothing else of it carries.
+    let (layers, roots): (Vec<LayerId>, Vec<LayerId>) = match rig {
+        PoseRig::Layers(view) => {
+            let mut ls: Vec<LayerId> = Vec::new();
+            for l in view.layers() {
+                if !ls.contains(&l) {
+                    ls.push(l);
+                }
+            }
+            let roots = ls
+                .iter()
+                .copied()
+                .filter(|l| !scene.layers().get(*l).and_then(|x| x.follows).is_some_and(|f| ls.contains(&f)))
+                .collect();
+            (ls, roots)
+        }
+        PoseRig::Bones(id) => match scene.find_object(*id) {
+            Some((l, _)) => (vec![l], vec![l]),
+            None => return report,
+        },
+    };
+    let lengths: Vec<u32> = layers.iter().map(|l| scene.layers().get(*l).map_or(0, |x| x.frames.length())).collect();
+
+    // Frames to pose: the clip's keys, and the target's own keys inside.
+    let source_at = |g: u32| ((((g - start) as f64) / stretch).round() as usize).min(span as usize - 1);
+    let mut posed: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for l in &layers {
+        if let Some(x) = scene.layers().get(*l) {
+            for k in x.frames.keyframes() {
+                if k.start > start && k.start <= end {
+                    posed.insert(k.start, source_at(k.start));
+                }
+            }
+        }
+    }
+    for (t, o) in &keys {
+        posed.insert(start + t, *o);
+    }
+    let made: std::collections::BTreeSet<u32> = keys.iter().map(|(t, _)| start + t).collect();
+
+    // The target as it stands before anything is written.
+    let rest = match rig {
+        PoseRig::Layers(view) => {
+            buzz_act::layer_rig::record_rests(scene, view);
+            match pose_layer_rest(scene, view) {
+                Some(rest) => Some(rest),
+                None => return report,
+            }
+        }
+        PoseRig::Bones(_) => None,
+    };
+    let (now0, placed0) = perf_now(scene, rig, rest.as_ref(), start);
+    let root0 = perf_root(&now0, placed0);
+    let ratio = perf_ratio(clip.legs, perf_legs(&now0, placed0));
+    report.hip_ratio = ratio;
+    if ratio.is_none() {
+        report.notes.push("hip height not measured on both rigs; root travel copied 1:1".into());
+    }
+    let source_root0 = clip.frames[0].root;
+
+    // Long enough, and what follows the span held.
+    for l in &layers {
+        scene.update_layer(*l, |x| {
+            if x.frames.length() <= end {
+                x.frames.insert_frame(end);
+            }
+        });
+    }
+    for (l, len) in layers.iter().zip(&lengths) {
+        if end + 1 < *len {
+            buzz_act::layer_rig::key_at(scene, *l, end + 1);
+        }
+    }
+
+    for (&g, &o) in &posed {
+        let frame = &clip.frames[o];
+        for &l in &roots {
+            buzz_act::layer_rig::key_at(scene, l, g);
+        }
+        // Root travel, scaled.
+        if let (Some(r0), Some(s0), Some(s)) = (root0, source_root0, frame.root) {
+            let want = r0 + (s - s0) * ratio.unwrap_or(1.0);
+            let (now, placed) = perf_now(scene, rig, rest.as_ref(), g);
+            if let Some(here) = perf_root(&now, placed) {
+                let d = want - here;
+                if d.hypot() > 1e-12 {
+                    match rig {
+                        PoseRig::Layers(_) => {
+                            for &l in &roots {
+                                let inherited = scene.layers().inherited_transform(l, g);
+                                let c = inherited.as_coeffs();
+                                if (c[0] * c[3] - c[1] * c[2]).abs() <= 1e-12 {
+                                    continue;
+                                }
+                                let shift = inherited.inverse() * Affine::translate(d) * inherited;
+                                scene.update_layer(l, |x| {
+                                    if let Some(key) = x.frames.keyframe_at_mut(g) {
+                                        for object in Arc::make_mut(&mut key.objects).iter_mut() {
+                                            let object = Arc::make_mut(object);
+                                            object.transform = shift * object.transform;
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        PoseRig::Bones(id) => {
+                            scene.ensure_keyframe_for(g, *id);
+                            scene.update_object_at(g, *id, |object| {
+                                object.transform = Affine::translate(d) * object.transform;
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let pose = PoseClip { from: clip.from.clone(), slots: frame.slots.clone() };
+        let done = paste_pose_on(scene, rig, g, &pose, None);
+        if made.contains(&g) {
+            // The clip's tween on the keys it made.
+            let mut written: Vec<LayerId> = roots.clone();
+            if let PoseRig::Layers(view) = rig {
+                for name in &done.pasted {
+                    if let Some(fs) = full.slot_named(name) {
+                        for l in perf_slot_layers(scene, view, fs) {
+                            if !written.contains(&l) {
+                                written.push(l);
+                            }
+                        }
+                    }
+                }
+            }
+            for l in written {
+                scene.update_layer(l, |x| {
+                    if let Some(k) = x.frames.keyframes_mut().iter_mut().find(|k| k.start == g) {
+                        k.tween = frame.tween;
+                        k.ease_curve = frame.ease_curve.clone();
+                    }
+                });
+            }
+            report.frames.push(g);
+        }
+        report.keys_written += 1;
+        for s in done.pasted {
+            if !report.slots.contains(&s) {
+                report.slots.push(s);
+            }
+        }
+        for s in done.skipped {
+            if !report.skipped.contains(&s) {
+                report.skipped.push(s);
+            }
+        }
+    }
+    report.skipped.retain(|s| !report.slots.contains(s));
+    report.targets = 1;
+    report
+}
+
+/// Animate's split of a matrix: x/y scale and x/y skew (as `buzz_scene::tween`).
+fn motion_decompose(a: Affine) -> (f64, f64, f64, f64) {
+    let c = a.as_coeffs();
+    (c[0].hypot(c[1]), c[2].hypot(c[3]), (-c[2]).atan2(c[3]), c[1].atan2(c[0]))
+}
+
+fn motion_linear(scale_x: f64, scale_y: f64, skew_x: f64, skew_y: f64) -> Affine {
+    Affine::new([
+        scale_x * skew_y.cos(),
+        scale_x * skew_y.sin(),
+        -scale_y * skew_x.sin(),
+        scale_y * skew_x.cos(),
+        0.0,
+        0.0,
+    ])
+}
+
+/// The target's pasted pose `offset` frames into the (stretched) clip, between
+/// the clip keys around it: their two pasted poses interpolated with the
+/// earlier key's tween and ease, exactly as `resolved_at` would draw them.
+fn motion_pose_between(
+    keys: &[(u32, MotionKey)],
+    offset: u32,
+    base: &Object,
+    pivot_local: Point,
+    key0: &MotionKey,
+    options: &MotionPasteOptions,
+) -> Option<Object> {
+    let i = keys.partition_point(|(o, _)| *o <= offset).checked_sub(1)?;
+    let pose = |key: &MotionKey| {
+        let mut o = base.clone();
+        apply_motion_key(&mut o, base, pivot_local, key0, key, options);
+        Arc::new(o)
+    };
+    let (o_i, key_i) = &keys[i];
+    let from = pose(key_i);
+    let Some((o_n, key_n)) = keys.get(i + 1) else {
+        return Some((*from).clone());
+    };
+    if !key_i.tween.is_active() || *o_n <= *o_i {
+        return Some((*from).clone());
+    }
+    let progress = (offset - o_i) as f64 / (o_n - o_i) as f64;
+    let to = pose(key_n);
+    buzz_scene::tween::interpolate_objects(
+        std::slice::from_ref(&from),
+        std::slice::from_ref(&to),
+        &key_i.tween,
+        key_i.ease_curve.as_ref(),
+        progress,
+        None,
+    )
+    .into_iter()
+    .find(|o| o.id == base.id)
+}
+
+/// Pose `object` (already on the keyframe) as the clip's `key`, for a target
+/// whose pose at the playhead is `base` with transformation point `pivot_local`.
+fn apply_motion_key(
+    object: &mut Object,
+    base: &Object,
+    pivot_local: Point,
+    key0: &MotionKey,
+    key: &MotionKey,
+    options: &MotionPasteOptions,
+) {
+    let t = base.transform;
+    let pasted = if options.relative {
+        match buzz_scene::invert_affine(key0.transform) {
+            Some(back) => {
+                let delta = key.transform * back;
+                let p_s = key0.transform * key0.pivot_local;
+                let p_t = t * pivot_local;
+                Affine::translate(p_t - p_s) * delta * Affine::translate(p_s - p_t) * t
+            }
+            None => t,
+        }
+    } else {
+        key.transform
+    };
+    let all = options.position && options.scale && options.rotation;
+    object.transform = if all {
+        pasted
+    } else {
+        let (psx, psy, pkx, pky) = motion_decompose(pasted);
+        let (tsx, tsy, tkx, tky) = motion_decompose(t);
+        let (sx, sy) = if options.scale { (psx, psy) } else { (tsx, tsy) };
+        let (kx, ky) = if options.rotation { (pkx, pky) } else { (tkx, tky) };
+        let linear = motion_linear(sx, sy, kx, ky);
+        let at = if options.position { pasted * pivot_local } else { t * pivot_local };
+        Affine::translate(at - linear * pivot_local) * linear
+    };
+    object.pivot = if !options.relative && all { key.pivot } else { base.pivot };
+
+    let base_instance = base.instance();
+    if let ObjectKind::Instance(inst) = &mut object.kind {
+        if options.colour
+            && let Some(color) = key.color
+        {
+            inst.color = if options.relative {
+                let start = key0.color.unwrap_or_default();
+                let mut out = base_instance.map(|b| b.color).unwrap_or_default();
+                for c in 0..4 {
+                    out.multiply[c] = if start.multiply[c].abs() > 1e-6 {
+                        out.multiply[c] * (color.multiply[c] / start.multiply[c])
+                    } else {
+                        color.multiply[c]
+                    };
+                    out.add[c] += color.add[c] - start.add[c];
+                }
+                out
+            } else {
+                color
+            };
+        } else if let Some(b) = base_instance {
+            inst.color = b.color;
+        }
+        if options.timing
+            && let Some((first, looping)) = key.timing
+        {
+            inst.first_frame = if options.relative {
+                let start = key0.timing.map(|(f, _)| f).unwrap_or(first) as i64;
+                let from = base_instance.map(|b| b.first_frame).unwrap_or(0) as i64;
+                (from + first as i64 - start).max(0) as u32
+            } else {
+                first
+            };
+            inst.loop_mode = looping;
+        } else if let Some(b) = base_instance {
+            inst.first_frame = b.first_frame;
+            inst.loop_mode = b.loop_mode;
+        }
+    }
+}
+
 /// **Key the frame a stroke is about to land on, so it does not reach back
 /// into a blank keyframe and fill the whole hold.**
 ///

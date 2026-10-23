@@ -696,6 +696,24 @@ fn import_sound_bytes(
             }
         }
     }
+    // **The file itself under `LIBRARY/`**, at the item's `href`: where
+    // Animate keeps a copy of each sound it imported, and where this
+    // program's own export puts them (with nothing in `bin/`).
+    if let Some(href) = attrs.get("href")
+        && let Some(bytes) = read_media(MediaRoot::Library, href)?
+    {
+        let format = if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+            "wav".to_string()
+        } else if bytes.starts_with(b"ID3") || is_mpeg_frame_sync(&bytes) {
+            "mp3".to_string()
+        } else {
+            Path::new(href)
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_else(|| "mp3".to_string())
+        };
+        return Ok(Some((bytes, format)));
+    }
     if let (Some(base), Some(path)) = (base_dir, attrs.get("sourceExternalFilepath")) {
         let resolved = base.join(path.replace('\\', "/"));
         if let Ok(bytes) = std::fs::read(&resolved) {
@@ -832,7 +850,11 @@ fn parse_tween(attrs: &HashMap<String, String>) -> Tween {
         Some("shape") => buzz_scene::TweenKind::Shape,
         _ => buzz_scene::TweenKind::None,
     };
-    let ease = attr_f64(attrs, "acceleration", 0.0);
+    // **`acceleration` is Animate's ease slider negated**: how much the
+    // tween speeds up, so 100 is a full ease *in*, which our slider (like
+    // Animate's own, and JSFL's `tweenEasing`) calls -100. Measured in
+    // Animate 2024 (docs/FLA_EXPORT_PLAN.md X2).
+    let ease = -attr_f64(attrs, "acceleration", 0.0);
     Tween {
         kind,
         easing: if ease.abs() < f64::EPSILON {
@@ -840,10 +862,16 @@ fn parse_tween(attrs: &HashMap<String, String>) -> Tween {
         } else {
             buzz_scene::Easing::Strength(ease)
         },
+        // Whole extra turns, counter-clockwise ones negative.
         extra_rotations: attrs
             .get("motionTweenRotateTimes")
             .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(0),
+            .unwrap_or(0)
+            * if attrs.get("motionTweenRotate").map(String::as_str) == Some("counter-clockwise") {
+                -1
+            } else {
+                1
+            },
         orient_to_path: attr_bool(attrs, "motionTweenOrientToPath", false),
     }
 }
@@ -869,13 +897,15 @@ fn parse_sound_ref(attrs: &HashMap<String, String>, sounds: &SoundMap) -> Option
         Some("repeat") => attr_u32(attrs, "soundLoop", 1).max(1),
         _ => 1,
     };
+    // In- and out-points, in samples at 44.1 kHz.
+    let point = |key: &str| attrs.get(key).and_then(|v| v.parse::<f64>().ok()).map(|v| (v / 44_100.0) as f32);
     Some(SoundRef {
         sound,
         sync,
         volume: 1.0,
         loops,
-        trim_start: 0.0,
-        trim_end: None,
+        trim_start: point("inPoint44").unwrap_or(0.0),
+        trim_end: point("outPoint44"),
     })
 }
 
@@ -1344,7 +1374,13 @@ fn parse_document(
                             attr_f64(&attrs, "height", 400.0),
                         );
                         stage.frame_rate = attr_f64(&attrs, "frameRate", 24.0);
-                        stage.background = parse_color(&attrs, "backgroundColor", "__none");
+                        // Animate leaves the attribute off for its default
+                        // white stage (sampleNaming.fla); black opened it dark.
+                        stage.background = if attrs.contains_key("backgroundColor") {
+                            parse_color(&attrs, "backgroundColor", "__none")
+                        } else {
+                            Color::WHITE
+                        };
                     }
                     "DOMTimeline" => {
                         timeline_depth += 1;
@@ -3354,7 +3390,8 @@ mod tests {
         let foreground = scene.layers().iter().next().unwrap();
         let tween = foreground.frames.tween_at(0);
         assert_eq!(tween.kind, buzz_scene::TweenKind::Classic);
-        assert!(matches!(tween.easing, buzz_scene::Easing::Strength(a) if (a - 50.0).abs() < 1e-9));
+        // `acceleration="50"` is an ease *in* of 50 (X2, measured).
+        assert!(matches!(tween.easing, buzz_scene::Easing::Strength(a) if (a + 50.0).abs() < 1e-9));
     }
 
     /// Hand-computed: x moves 0 → 100, rotating 0° → 90° with a flip

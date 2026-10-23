@@ -47,6 +47,7 @@ pub fn args_hint(command: Command) -> Option<&'static str> {
         AddWiggle => "{element?: id (else the selection), amplitude?, frequency?, live?: bool (modifier, default true; false bakes), from_frame?, to_frame?, step?} -> Wiggle dialog's Add",
         AiIdentifyAssets => "{renames?: [{symbol: name|id, name, tags?: [text]}] (applied as the rename dialog's Apply) | start?: true (VLM job, returns {started:true}; review in the AI panel) | apply_proposals?: true (apply the proposals that job produced)}",
         AiRigVectorCharacter => "{symbol: library symbol name|id, element?: instance id on stage} -> {started:true, job}; detects a skeleton on the GPU and rigs it as one undo step when done; call wait_for_jobs for the result",
+        AiRigLayers => "{symbol?: library symbol name|id, element?: instance id on stage (its symbol; one of the two is required), frame?: symbol frame the pieces are read at (default 0), overrides?: [{layer: the layer's name now, slot?: slot or display name (Hips, Torso, Head, Upper Arm L, Forearm R, Hand L, Thigh R, Shin L, Foot R, Brow L...) | Extra (stays on its slot, never its lead), name?: new layer name}], apply?: bool (default true), profile?: naming profile name (default My Animate convention: head, body, leftArm, leftWrist = forearm, leftPalm = hand, midCloth, leftThigh, leftShin, leftFoot, screen sides, body/midCloth/thighs are roots, legs folder; Descriptive: Upper Arm R, Forearm R, Hand R, Torso, everything follows the hips; rig_naming.json beside the workspace can override), split_merged?: bool (default: on when a merged drawing is found, i.e. one vector piece covering more than one body part; cuts its fills and strokes along the skeleton into pieces, each child part overlapping its parent across the joint so bends show no gap; off: pieces as drawn)} -> {started:true, job}; AI > Rig Character as Layers: finds the body parts (DWPose when installed, else fitted to the drawings, lower confidence), puts every piece on its own layer inside the symbol named after its body part and rigs them by layer parenting, nothing moving on any frame; an override that moves a piece works the leads and names out again before its own name is used. Call wait_for_jobs: apply:false gives {applied:false, plan:{symbol, frame, source, confidence, low_confidence, pieces:[{layer, new_name, slot, lead, score}], symbol_renames, notes, side_calls, merged_found, split_merged:{drawings, parts, joint_overlaps, unsplit_keys}|null}} and changes nothing; otherwise one undo step and {applied:true, parts, slots, layers_before, layers_after, keys_rebaked, renamed_symbols, undo_steps_added, pieces}",
         AiDirectStory => "{brief: text} -> {started:true, job}; an LLM parses the brief and the result is applied as one undo step when done; call wait_for_jobs for the result",
         AiCharacterFromImage => "{path: image file (PNG/JPG of one character, full body), character_name?: text (default the file name), rig?: layers|bones (default layers)} -> {started:true, job}; the Character from Image wizard with its default choices (pose and skeleton, parts, hidden parts completed, vector trace, biped rig) as one undo step, rigged by layer parenting (one followed layer per part) or, with rig:bones, as an armature; takes a minute or two, so call wait_for_jobs for {character, symbols, elements, rig_kind: layers|bones, rig_root_element, armature_element}. rig_root_element is the id to pass as `element` to perform / ai_direct_story (the root part of a layer rig, the armature of a bone rig); armature_element is null for a layer rig. A rig whose artwork is skinned stays bones, and rig_kind says so. The rigged character is then on stage and in Cast",
         AiMouthChart => "{element: id of the character's rig on stage | character: name (finds the library symbol `<name>_mouth`), path: image file of a labelled mouth chart (mouths in rows on a plain page, coloured mouths with grey/black labels under them), labels?: [text] in reading order (default Raju's 19: Neutral Closed, Small Smile, Broad Smile, Frown, A, E, I, O, U, M/B/P, F/V, L, TH, CH/J, S/Z, Open Laugh, Angry Tight Mouth, Confused Half-Open, Skeptical Side-Mouth)} -> replaces the character's mouth-symbol frames, as one undo step: frames 0..9 are the ten lip-sync visemes (Rest, Ai, E, O, U, L, WQ, MBP, FV, Etc) so lip_sync keeps working, then every other mouth as an extra named frame (10.. : Small Smile, Broad Smile, Frown, I, TH, CH/J, Open Laugh...) to key by hand (an instance's first_frame, or the keyframe label). Sized to the current Rest mouth and drawn in its line weight. Takes a few seconds",
@@ -54,6 +55,11 @@ pub fn args_hint(command: Command) -> Option<&'static str> {
         CleanUpLayers => "{scope?: timeline|whole_scene (timeline = the timeline being edited; whole_scene = the stage and every library symbol), empty?: bool (true: delete layers with no artwork and no sound), trim?: bool (true: trim blank keyframes after each layer's last content, never below the longest content end), folders?: bool (true: remove folders with no children, including ones this run empties)} -> Clean Up Layers: never deletes a folder with children, a layer something files under or follows, a mask/guide with its run, an audio-guide layer, or the last layer; one undo step; returns {layers_deleted, frames_trimmed, folders_removed, symbols_touched}",
         ArrangeLayers => "{} -> Arrange Layers on the timeline being edited: deletes empty layers, then files top-level layers into folders (one per character with its layer-parenting chain, Background, FX, Props, Audio at the bottom), reusing same-named folders; a layer whose artwork overlaps a layer it would have to pass stays where it is, so the picture never changes; one undo step (none when already tidy); returns {folders_made, layers_moved, layers_left_in_place, emptied}",
         RepairLayerRigs => "{scope?: timeline|whole_scene (timeline = the timeline being edited; whole_scene = the stage and every library symbol)} -> Repair Layer Rigs: rewires layer-parenting rigs built with the old Bones -> Layers wiring (each part's front-most layer leads, the slot's other pieces and its child parts follow it), rebaking every keyframe so no frame changes; an already-correct rig is left alone; one undo step (none when nothing changes); returns {rigs, links_changed, keys_rebaked}",
+        RigHead => "{symbol?: head symbol name|id (or a character symbol: the head inside it), element?: instance id on stage (its symbol, same rule); default the selected instance, else the symbol being edited, else the head on the stage} -> Rig Head (Modify > Timeline): a head symbol whose face parts are separate layers or named objects is rebuilt like the user's heads, top first: eyeLid (7-frame blink symbol, resting open on frame 0, single frame), eyeMask (mask: the eye whites' fill without outline), eyeBall (masked: both irises/pupils, a cut iris completed as a circle; gaze = move this instance), eyeWhite (whites + outlines), rightEyebrow, leftEyebrow, extras, mouth (a symbol; an existing mouth-shape symbol is kept), Nose, hair, base; no layer parenting; rest picture unchanged; one undo step; an already rigged head is left alone; returns {head, view, layers, eyes, irises_completed, eye_white, eye_mask, eye_ball, eye_lid, mouth, skin, ink, already_rigged, notes}",
+        PasteMotion | PasteMotionSpecial => "{relative?: bool (default true: each key is the change from the copied motion's first key, applied about the target's own transformation point, so it keeps its starting place; false writes the copied transforms as they are), parts?: [position|scale|rotation|colour|timing] (default all; rotation includes skew, colour is the colour effect and alpha, timing an instance's first frame and looping), stretch?: 0.25..4 (1; key offsets scaled and rounded, keys landing on one frame merged)} -> Paste Motion: the motion taken by copy_motion onto every selected object, each on its own layer, starting at the playhead, keyframes at the copied offsets with the copied tweens; frames outside the pasted span keep what they showed; works inside a symbol being edited; one undo step; returns {pasted, relative, parts, stretch}",
+        PastePose => "{parts?: [slot names] (default every copied slot; any naming: Shoulder R, Upper Arm R, rightArm...)} -> Paste Pose: the joint angles taken by copy_pose (the selected rig at the playhead: a bone rig, a layer rig part, or a character instance with a rig inside its symbol) onto every selected rig, bone or layer, matched by slot name; angles only, each joint relative to its parent, so the target keeps its limb lengths and where its root stands; keyed at the playhead (inside an instance at the inner frame it shows; Protect Other Keyframes forks a shared symbol as a hand edit would); one undo step; returns {pasted: [slots], skipped: [copied slots the target lacks]}",
+        CopyPerformance => "{from?: element id of the character that performs (a bone rig, any part of a layer rig, or an instance with a rig inside; default the selection), to?: element id of the character to paste onto (without it the performance is only copied), range?: [first, last] frames of the source (default the timeline's frame span when it covers the source, else its keyed span), offset?: the frame the paste starts on (default the playhead), stretch?: 0.25..4 (1), travel?: bool (true: also the source instance's own travel, relative, onto the target instance), scale_travel?: bool (true: that travel's change of place scaled by the target/source hip height; 1:1 with a note when not measurable)} -> Copy Performance, then Paste Performance onto 'to': the source's joint angles per key over the range, by slot name (Shoulder R = Upper Arm R = rightArm), keyed on the target's layers or armature with the source's key frames (scaled by stretch) and tweens; angles only, so the target keeps its limb lengths; the root's travel inside the rig scaled by the target/source hip height; layer and bone rigs in any combination; inside an instance through the in-place edit (Protect Other Keyframes forks a shared symbol); one undo step 'Paste Performance'; returns {keys_written, frames, slots, skipped, hip_ratio, travel_keys, notes}",
+        PastePerformance | PastePerformanceSpecial => "{range?: [first, last] offsets within the copied performance (default all), offset?: the frame the paste starts on (default the playhead), stretch?: 0.25..4 (1), travel?: bool (true), scale_travel?: bool (true)} -> Paste Performance: the performance taken by copy_performance onto every selected rigged character (see copy_performance); one undo step; returns {keys_written, frames, slots, skipped, hip_ratio, travel_keys, notes}",
         _ => return None,
     })
 }
@@ -180,6 +186,7 @@ pub fn run(app: &mut App, command: Command, a: &Value) -> AgentResult {
         Command::AddTitleCard => title_card(app, a),
         Command::AiIdentifyAssets => identify_assets(app, a),
         Command::AiRigVectorCharacter => rig_vector_character(app, a),
+        Command::AiRigLayers => rig_layers(app, a),
         Command::AiDirectStory => direct_story(app, a),
         Command::AiCharacterFromImage => character_from_image(app, a),
         Command::AiMouthChart => mouth_chart(app, a),
@@ -187,6 +194,11 @@ pub fn run(app: &mut App, command: Command, a: &Value) -> AgentResult {
         Command::CleanUpLayers => clean_up_layers(app, a),
         Command::ArrangeLayers => arrange_layers(app, a),
         Command::RepairLayerRigs => repair_layer_rigs(app, a),
+        Command::RigHead => rig_head(app, a),
+        Command::PasteMotion | Command::PasteMotionSpecial => paste_motion(app, id, a),
+        Command::PastePose => paste_pose(app, id, a),
+        Command::CopyPerformance => copy_performance(app, id, a),
+        Command::PastePerformance | Command::PastePerformanceSpecial => paste_performance(app, id, a),
         _ => AgentResult::err(format!("needs_dialog {id}")),
     }
 }
@@ -265,6 +277,209 @@ fn arrange_layers(app: &mut App, a: &Value) -> AgentResult {
     finish(app, "arrange_layers", before, extra)
 }
 
+/// Paste Motion / Paste Motion Special -> `Editor::paste_motion` (C1).
+fn paste_motion(app: &mut App, id: &str, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["relative", "parts", "stretch"]) {
+        return AgentResult::err(e);
+    }
+    let mut options = crate::editor::MotionPasteOptions::default();
+    match flag(a, "relative") {
+        Ok(Some(r)) => options.relative = r,
+        Ok(None) => {}
+        Err(e) => return AgentResult::err(e),
+    }
+    match num(a, "stretch", 0.25, 4.0) {
+        Ok(Some(s)) => options.stretch = s,
+        Ok(None) => {}
+        Err(e) => return AgentResult::err(e),
+    }
+    if let Some(parts) = given(a, "parts") {
+        let Some(list) = parts.as_array() else {
+            return AgentResult::err("'parts' needs a list of position|scale|rotation|colour|timing");
+        };
+        options.position = false;
+        options.scale = false;
+        options.rotation = false;
+        options.colour = false;
+        options.timing = false;
+        for part in list {
+            match part.as_str() {
+                Some("position") => options.position = true,
+                Some("scale") => options.scale = true,
+                Some("rotation") => options.rotation = true,
+                Some("colour") | Some("color") => options.colour = true,
+                Some("timing") => options.timing = true,
+                _ => {
+                    return AgentResult::err(format!(
+                        "unknown part {part}; valid: position, scale, rotation, colour, timing"
+                    ));
+                }
+            }
+        }
+    }
+    let before = depth(app);
+    let pasted = app.agent_editor_mut().paste_motion(options);
+    let parts: Vec<&str> = [
+        ("position", options.position),
+        ("scale", options.scale),
+        ("rotation", options.rotation),
+        ("colour", options.colour),
+        ("timing", options.timing),
+    ]
+    .iter()
+    .filter(|(_, on)| *on)
+    .map(|(n, _)| *n)
+    .collect();
+    finish(
+        app,
+        id,
+        before,
+        json!({
+            "pasted": pasted,
+            "relative": options.relative,
+            "parts": parts,
+            "stretch": options.stretch,
+        }),
+    )
+}
+
+/// Paste Pose -> `Editor::paste_pose` (C2).
+fn paste_pose(app: &mut App, id: &str, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["parts"]) {
+        return AgentResult::err(e);
+    }
+    let mut parts: Option<Vec<String>> = None;
+    if let Some(list) = given(a, "parts") {
+        let Some(list) = list.as_array() else {
+            return AgentResult::err("'parts' needs a list of slot names");
+        };
+        let full = buzz_rig::RigPattern::biped_full();
+        let mut names = Vec::new();
+        for part in list {
+            match part.as_str().filter(|n| full.slot_for(n).is_some()) {
+                Some(n) => names.push(n.to_string()),
+                None => {
+                    let slots: Vec<&str> = full.slots.iter().map(|s| s.name.as_str()).collect();
+                    return AgentResult::err(format!("unknown slot {part}; valid: {}", slots.join(", ")));
+                }
+            }
+        }
+        parts = Some(names);
+    }
+    let before = depth(app);
+    let report = app.agent_editor_mut().paste_pose(parts.as_deref());
+    let (pasted, skipped) = report.map(|r| (r.pasted, r.skipped)).unwrap_or_default();
+    finish(app, id, before, json!({ "pasted": pasted, "skipped": skipped }))
+}
+
+/// A `[first, last]` frame pair.
+fn frame_pair(a: &Value, key: &str) -> Result<Option<(u32, u32)>, String> {
+    let Some(v) = given(a, key) else { return Ok(None) };
+    let pair = v
+        .as_array()
+        .filter(|p| p.len() == 2)
+        .and_then(|p| Some((p[0].as_u64()?, p[1].as_u64()?)))
+        .filter(|(x, y)| *x <= u32::MAX as u64 && *y <= u32::MAX as u64)
+        .ok_or_else(|| format!("'{key}' needs [first, last] frame numbers"))?;
+    Ok(Some((pair.0 as u32, pair.1 as u32)))
+}
+
+/// An element id that is in the scene.
+fn element_arg(app: &App, a: &Value, key: &str) -> Result<Option<ObjectId>, String> {
+    let Some(v) = given(a, key) else { return Ok(None) };
+    let id = ObjectId(v.as_u64().ok_or_else(|| format!("'{key}' needs an element id"))?);
+    if app.agent_editor().doc.scene().find_object(id).is_none() {
+        return Err(format!("no element {} in this scene", id.0));
+    }
+    Ok(Some(id))
+}
+
+/// `{offset?, stretch?, travel?, scale_travel?}` onto the default paste options.
+fn performance_options(a: &Value) -> Result<crate::editor::PerformancePasteOptions, String> {
+    let mut options = crate::editor::PerformancePasteOptions::default();
+    if let Some(o) = int(a, "offset", 0, 1_000_000)? {
+        options.offset = Some(o);
+    }
+    if let Some(s) = num(a, "stretch", 0.25, 4.0)? {
+        options.stretch = s;
+    }
+    if let Some(t) = flag(a, "travel")? {
+        options.travel = t;
+    }
+    if let Some(t) = flag(a, "scale_travel")? {
+        options.scale_travel = t;
+    }
+    Ok(options)
+}
+
+/// The report fields Copy / Paste Performance return.
+fn performance_report(report: Option<crate::editor::PastePerformanceReport>) -> Value {
+    let r = report.unwrap_or_default();
+    json!({
+        "keys_written": r.keys_written,
+        "frames": r.frames,
+        "slots": r.slots,
+        "skipped": r.skipped,
+        "hip_ratio": r.hip_ratio,
+        "travel_keys": r.travel_keys,
+        "notes": r.notes,
+    })
+}
+
+/// Copy Performance -> `Editor::copy_performance`, then, with `to`,
+/// `Editor::paste_performance` (C3).
+fn copy_performance(app: &mut App, id: &str, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["from", "to", "range", "offset", "stretch", "travel", "scale_travel"]) {
+        return AgentResult::err(e);
+    }
+    let (from, to, range, options) = match (
+        element_arg(app, a, "from"),
+        element_arg(app, a, "to"),
+        frame_pair(a, "range"),
+        performance_options(a),
+    ) {
+        (Ok(f), Ok(t), Ok(r), Ok(o)) => (f, t, r, o),
+        (Err(e), ..) | (_, Err(e), ..) | (_, _, Err(e), _) | (.., Err(e)) => return AgentResult::err(e),
+    };
+    if let Some(from) = from {
+        app.agent_editor_mut().selection.select_one(from);
+    }
+    if !app.agent_editor_mut().copy_performance(range) {
+        let why = app.agent_editor().status.clone().unwrap_or_default();
+        return AgentResult::err(format!("{id}: {why}"));
+    }
+    let Some(to) = to else {
+        // Copied only: paste with paste_performance, or give `to`.
+        let mut value = report(app, id);
+        value["undo_steps_added"] = json!(0);
+        if let (Some(map), Some(more)) = (value.as_object_mut(), performance_report(None).as_object()) {
+            for (k, v) in more {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+        return AgentResult::ok(value);
+    };
+    app.agent_editor_mut().selection.select_one(to);
+    let before = depth(app);
+    let done = app.agent_editor_mut().paste_performance(options);
+    finish(app, id, before, performance_report(done))
+}
+
+/// Paste Performance / Paste Performance Special -> `Editor::paste_performance` (C3).
+fn paste_performance(app: &mut App, id: &str, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["range", "offset", "stretch", "travel", "scale_travel"]) {
+        return AgentResult::err(e);
+    }
+    let (range, mut options) = match (frame_pair(a, "range"), performance_options(a)) {
+        (Ok(r), Ok(o)) => (r, o),
+        (Err(e), _) | (_, Err(e)) => return AgentResult::err(e),
+    };
+    options.range = range;
+    let before = depth(app);
+    let done = app.agent_editor_mut().paste_performance(options);
+    finish(app, id, before, performance_report(done))
+}
+
 /// Repair Layer Rigs -> `Editor::repair_layer_rigs`.
 fn repair_layer_rigs(app: &mut App, a: &Value) -> AgentResult {
     if let Err(e) = check_keys(a, &["scope"]) {
@@ -290,6 +505,54 @@ fn repair_layer_rigs(app: &mut App, a: &Value) -> AgentResult {
             "keys_rebaked": report.keys_rebaked,
         }),
     )
+}
+
+/// Rig Head -> `Editor::rig_head` (`docs/HEAD_RIG_PLAN.md` H1).
+fn rig_head(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["symbol", "element"]) {
+        return AgentResult::err(e);
+    }
+    let scene = app.agent_editor().doc.scene();
+    let symbol = match (given(a, "symbol"), given(a, "element")) {
+        (Some(v), _) => match symbol_by_ref(scene, v, "head") {
+            Ok(id) => Some(id),
+            Err(e) => return AgentResult::err(e),
+        },
+        (None, Some(v)) => {
+            let Some(id) = v.as_u64() else { return AgentResult::err("'element' needs an element id") };
+            match scene.find_object(ObjectId(id)).map(|(_, o)| o.instance().map(|i| i.symbol)) {
+                Some(Some(symbol)) => Some(symbol),
+                Some(None) => return AgentResult::err(format!("element {id} is not a symbol instance")),
+                None => return AgentResult::err(format!("no element {id} in this scene")),
+            }
+        }
+        (None, None) => None,
+    };
+    let before = depth(app);
+    let report = match app.agent_editor_mut().rig_head(symbol) {
+        Ok(report) => report,
+        Err(e) => return AgentResult::err(e),
+    };
+    let value = json!({
+        "head": report.symbol.map(|s| s.0),
+        "view": report.view,
+        "layers": report.layers,
+        "eyes": report.eyes,
+        "irises_completed": report.irises_completed,
+        "eye_white": report.eye_white.map(|s| s.0),
+        "eye_mask": report.eye_mask.map(|s| s.0),
+        "eye_ball": report.eye_ball.map(|s| s.0),
+        "eye_lid": report.eye_lid.map(|s| s.0),
+        "mouth": report.mouth.map(|s| s.0),
+        "skin": format!("#{:02x}{:02x}{:02x}", report.skin[0], report.skin[1], report.skin[2]),
+        "ink": format!("#{:02x}{:02x}{:02x}", report.ink[0], report.ink[1], report.ink[2]),
+        "already_rigged": report.already_rigged,
+        "notes": report.notes,
+    });
+    if report.already_rigged {
+        return AgentResult::ok(value);
+    }
+    finish(app, "rig_head", before, value)
 }
 
 /// Clean Up Layers dialog -> `Editor::clean_up_layers`.
@@ -1089,6 +1352,117 @@ fn rig_vector_character(app: &mut App, a: &Value) -> AgentResult {
         "ai_rig_vector_character",
         job,
         "skeleton detection runs off the UI thread; the armature replaces the instance (or lands on a new layer) as one undo step when done",
+    ))
+}
+
+/// Rig Character as Layers -> `App::ai_rig_layers_async`; the finished job
+/// applies the plan as the review dialog's Apply does (`App::commit_layer_rig`)
+/// or, with `apply:false`, returns it.
+fn rig_layers(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["symbol", "element", "frame", "overrides", "apply", "profile", "split_merged"]) {
+        return AgentResult::err(e);
+    }
+    if given(a, "symbol").is_none() && given(a, "element").is_none() {
+        return missing(&["symbol | element"]);
+    }
+    let frame = match int(a, "frame", 0, 1_000_000) {
+        Ok(f) => f.unwrap_or(0),
+        Err(e) => return AgentResult::err(e),
+    };
+    let apply = match flag(a, "apply") {
+        Ok(f) => f.unwrap_or(true),
+        Err(e) => return AgentResult::err(e),
+    };
+    let profile = match text(a, "profile") {
+        Ok(profile) => profile.map(str::to_string),
+        Err(e) => return AgentResult::err(e),
+    };
+    // R4: cut merged drawings along the skeleton; unset = when there are any.
+    let split_merged = match flag(a, "split_merged") {
+        Ok(f) => f,
+        Err(e) => return AgentResult::err(e),
+    };
+    if let Err(e) = crate::rigging::naming_profile(profile.as_deref()) {
+        return AgentResult::err(e);
+    }
+    let scene = app.agent_editor().doc.scene().clone();
+    let id = match given(a, "element") {
+        Some(v) => {
+            let Some(element) = v.as_u64().map(ObjectId) else {
+                return AgentResult::err("'element' needs an element id");
+            };
+            match scene.find_object(element).and_then(|(_, o)| o.instance().map(|i| i.symbol)) {
+                Some(id) => id,
+                None => return AgentResult::err(format!("element {} is not a symbol instance on stage", element.0)),
+            }
+        }
+        None => match symbol_by_ref(&scene, &a["symbol"], "character") {
+            Ok(id) => id,
+            Err(e) => return AgentResult::err(e),
+        },
+    };
+    let layer_names: Vec<String> = scene
+        .library()
+        .get(id)
+        .map(|s| s.layers.iter().map(|l| l.name.clone()).collect())
+        .unwrap_or_default();
+    let mut overrides = Vec::new();
+    if let Some(list) = given(a, "overrides") {
+        let Some(list) = list.as_array() else {
+            return AgentResult::err("'overrides' needs a list of {layer, slot?, name?}");
+        };
+        for o in list {
+            if let Err(e) = check_keys(o, &["layer", "slot", "name"]) {
+                return AgentResult::err(format!("overrides: {e}"));
+            }
+            let layer = match text(o, "layer") {
+                Ok(Some(l)) => l.to_string(),
+                Ok(None) => return missing(&["overrides[].layer"]),
+                Err(e) => return AgentResult::err(format!("overrides: {e}")),
+            };
+            if !layer_names.contains(&layer) {
+                return AgentResult::err(format!("overrides: no layer '{layer}'; layers: {}", layer_names.join(", ")));
+            }
+            let slot = match text(o, "slot") {
+                Ok(slot) => slot.map(str::to_string),
+                Err(e) => return AgentResult::err(format!("overrides: {e}")),
+            };
+            if let Some(slot) = &slot
+                && let Err(e) = crate::app::layer_rig_slot_by_name(slot)
+            {
+                return AgentResult::err(format!("overrides: {e}"));
+            }
+            let name = match text(o, "name") {
+                Ok(name) => name.map(str::to_string),
+                Err(e) => return AgentResult::err(format!("overrides: {e}")),
+            };
+            overrides.push(crate::app::LayerRigOverride { layer, slot, name });
+        }
+    }
+    if let Err(e) = select_element(app, a) {
+        return AgentResult::err(e);
+    }
+    let editor = app.agent_editor_mut();
+    if given(a, "element").is_none() {
+        // The symbol chosen in the Library, with nothing on stage overriding it.
+        editor.selection.clear();
+        editor.library.selected = Some(id);
+    }
+    editor.status = None;
+    app.agent_forget_last_task();
+    app.ai_rig_layers_async(frame, Some(crate::app::LayerRigRequest { overrides, apply, profile, split_merged }));
+    let Some(job) = app.agent_track_last_job("ai_rig_layers") else {
+        let why = app.agent_editor().status.clone().unwrap_or_else(|| "the planning job did not start".into());
+        return AgentResult::err(why);
+    };
+    AgentResult::ok(super::jobs::started(
+        "ai_rig_layers",
+        job,
+        if apply {
+            "body-part detection runs off the UI thread; the layer rig is applied as one undo step when done"
+        } else {
+            "body-part detection runs off the UI thread; the plan comes back without changing anything"
+        },
     ))
 }
 
